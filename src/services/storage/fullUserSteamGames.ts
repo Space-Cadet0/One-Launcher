@@ -151,6 +151,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 16,
         lastPlayed: '1500118662',
+        achievements: {
+          unlocked: 0,
+          total: 18,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/57300/header.jpg?t=1751032707",
@@ -219,6 +225,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 3982,
         lastPlayed: '1694186888',
+        achievements: {
+          unlocked: 14,
+          total: 54,
+          percentage: 26,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1086940/48a2fcbda8565bb45025e98fd8ebde8a7203f6a0/header.jpg?t=1777363040",
@@ -242,6 +254,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 23813,
         lastPlayed: '1730666199',
+        achievements: {
+          unlocked: 47,
+          total: 93,
+          percentage: 51,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/257350/486ef7ce52fdb1ee5d2909ac97f26d4e26da18d3/header.jpg?t=1787947512",
@@ -265,6 +283,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 6800,
         lastPlayed: '1726344413',
+        achievements: {
+          unlocked: 34,
+          total: 129,
+          percentage: 26,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/228280/9761e1ed90324b2102ffc3dac295eeabf03bea55/header.jpg?t=1787947527",
@@ -449,6 +473,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 1769,
         lastPlayed: '1722979295',
+        achievements: {
+          unlocked: 10,
+          total: 50,
+          percentage: 20,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/362890/674b9a0e7b31996efd5032dc15e695dbf457d71d/header.jpg?t=1790377127",
@@ -540,6 +570,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 276,
         lastPlayed: '1605383903',
+        achievements: {
+          unlocked: 1,
+          total: 12,
+          percentage: 8,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/204360/header.jpg?t=1764096331",
@@ -563,6 +599,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 3882,
         lastPlayed: '1752873381',
+        achievements: {
+          unlocked: 55,
+          total: 55,
+          percentage: 100,
+          isMastered: true,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1903340/be3305b02d4db0dffa3458537118423bf2792d7e/header.jpg?t=1782830877",
@@ -700,6 +742,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 2022,
         lastPlayed: '1714591209',
+        achievements: {
+          unlocked: 2,
+          total: 51,
+          percentage: 4,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1608070/header.jpg?t=1777343206",
@@ -861,6 +909,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 12452,
         lastPlayed: '1770425699',
+        achievements: {
+          unlocked: 57,
+          total: 57,
+          percentage: 100,
+          isMastered: true,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1091500/e9047d8ec47ae3d94bb8b464fb0fc9e9972b4ac7/header.jpg?t=1784714077",
@@ -884,6 +938,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 393,
         lastPlayed: '1728595555',
+        achievements: {
+          unlocked: 3,
+          total: 43,
+          percentage: 7,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/374320/header.jpg?t=1748630784",
@@ -1276,6 +1336,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 6985,
         lastPlayed: '1704664144',
+        achievements: {
+          unlocked: 60,
+          total: 97,
+          percentage: 62,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/435150/3f6ee788cb01bd65097c52399d536eb424b4876f/header.jpg?t=1765811123",
@@ -1299,6 +1365,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 5268,
         lastPlayed: '1776632475',
+        achievements: {
+          unlocked: 0,
+          total: 54,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/373420/header.jpg?t=1765505119",
@@ -1552,6 +1624,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 30,
         lastPlayed: '1661594182',
+        achievements: {
+          unlocked: 2,
+          total: 50,
+          percentage: 4,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/288470/header.jpg?t=1742377409",
@@ -1713,6 +1791,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 7634,
         lastPlayed: '1750715208',
+        achievements: {
+          unlocked: 47,
+          total: 61,
+          percentage: 77,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2909400/64a1006a85342c7d3e4b1e1b8e562fee2dc86578/header.jpg?t=1789446799",
@@ -2103,6 +2187,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 108,
         lastPlayed: '1714860545',
+        achievements: {
+          unlocked: 0,
+          total: 79,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1151640/header.jpg?t=1776465788",
@@ -2148,6 +2238,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 243,
         lastPlayed: '1769463325',
+        achievements: {
+          unlocked: 0,
+          total: 16,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1373960/header.jpg?t=1765218123",
@@ -2562,6 +2658,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 5788,
         lastPlayed: '1765750590',
+        achievements: {
+          unlocked: 21,
+          total: 42,
+          percentage: 50,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/287700/header.jpg?t=1778872866",
@@ -2585,6 +2687,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 1267,
         lastPlayed: '1771161237',
+        achievements: {
+          unlocked: 0,
+          total: 45,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2417610/header.jpg",
@@ -2721,6 +2829,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 586,
         lastPlayed: '1783379016',
+        achievements: {
+          unlocked: 0,
+          total: 49,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/287390/header.jpg?t=1725444535",
@@ -3066,6 +3180,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 115,
         lastPlayed: '1585752810',
+        achievements: {
+          unlocked: 2,
+          total: 15,
+          percentage: 13,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/400/header.jpg?t=1745368554",
@@ -3479,6 +3599,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 376,
         lastPlayed: '1791493610',
+        achievements: {
+          unlocked: 10,
+          total: 49,
+          percentage: 20,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172",
@@ -3525,6 +3651,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 1522,
         lastPlayed: '1757535009',
+        achievements: {
+          unlocked: 0,
+          total: 143,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/391220/header.jpg?t=1766187095",
@@ -3640,6 +3772,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 36,
         lastPlayed: '1715964588',
+        achievements: {
+          unlocked: 1,
+          total: 34,
+          percentage: 3,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/814380/header.jpg?t=1762888662",
@@ -3663,6 +3801,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 1488,
         lastPlayed: '1769293214',
+        achievements: {
+          unlocked: 42,
+          total: 99,
+          percentage: 42,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/750920/header.jpg?t=1765239925",
@@ -3870,6 +4014,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 934,
         lastPlayed: '1787605192',
+        achievements: {
+          unlocked: 22,
+          total: 50,
+          percentage: 44,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/213670/header.jpg?t=1777994062",
@@ -4215,6 +4365,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 4442,
         lastPlayed: '1790800391',
+        achievements: {
+          unlocked: 36,
+          total: 46,
+          percentage: 78,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326",
@@ -4377,6 +4533,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 10449,
         lastPlayed: '1606604017',
+        achievements: {
+          unlocked: 51,
+          total: 78,
+          percentage: 65,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/292030/e8afc4252e3fee8ed2525ab2fd7675cca39aa38d/header_alt_assets_1.jpg?t=1790845156",
@@ -4538,6 +4700,12 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
         installed: false,
         playtimeMinutes: 111,
         lastPlayed: '1705422176',
+        achievements: {
+          unlocked: 0,
+          total: 50,
+          percentage: 0,
+          isMastered: false,
+        },
       }
     ],
     headerImage: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203160/9e67774e97cdd155f287146e62611eb445514ac6/header.jpg?t=1765220424",

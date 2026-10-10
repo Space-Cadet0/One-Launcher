@@ -94,17 +94,18 @@ export const KNOWN_USER_STEAM_ACHIEVEMENTS: Record<number, { unlocked: number; t
   3751260: { unlocked: 36, total: 46, percentage: 78 },
   257350: { unlocked: 47, total: 93, percentage: 51 },  // Baldur's Gate II: Enhanced Edition
   228280: { unlocked: 34, total: 129, percentage: 26 }, // Baldur's Gate: Enhanced Edition
-  750920: { unlocked: 28, total: 99, percentage: 28 },  // Shadow of the Tomb Raider
+  750920: { unlocked: 42, total: 99, percentage: 42 },  // Shadow of the Tomb Raider (Authoritative live XML 42/99)
   213670: { unlocked: 22, total: 50, percentage: 44 },  // South Park: The Stick of Truth
+  287700: { unlocked: 21, total: 42, percentage: 50 },  // Metal Gear Solid V: Ground Zeroes (Authoritative live XML 21/42)
   1086940: { unlocked: 14, total: 54, percentage: 26 }, // Baldur's Gate 3
   3764200: { unlocked: 10, total: 49, percentage: 20 },
   362890: { unlocked: 10, total: 50, percentage: 20 },
+  223850: { unlocked: 9, total: 29, percentage: 31 },   // 3DMark
   374320: { unlocked: 3, total: 43, percentage: 7 },
   288470: { unlocked: 2, total: 50, percentage: 4 },
   1608070: { unlocked: 2, total: 51, percentage: 4 },
   400: { unlocked: 2, total: 15, percentage: 13 },      // Portal
   814380: { unlocked: 1, total: 34, percentage: 3 },    // Sekiro: Shadows Die Twice
-  287700: { unlocked: 1, total: 42, percentage: 2 },    // Metal Gear Solid V: Ground Zeroes
   204360: { unlocked: 1, total: 12, percentage: 8 },    // Castle Crashers
   220: { unlocked: 0, total: 69, percentage: 0 },       // Half-Life 2
   620: { unlocked: 0, total: 51, percentage: 0 },       // Portal 2
@@ -221,6 +222,8 @@ export function getKnownSteamAchievements(
 ): { unlocked: number; total: number; percentage: number } | undefined {
   if (!steamAppId) return undefined;
 
+  let best: { unlocked: number; total: number; percentage: number } | undefined = undefined;
+
   // 1. Live scanned achievements from localStorage
   if (typeof window !== 'undefined') {
     try {
@@ -228,7 +231,7 @@ export function getKnownSteamAchievements(
       if (cached) {
         const parsed = JSON.parse(cached);
         if (parsed[steamAppId] && typeof parsed[steamAppId].unlocked === 'number') {
-          return parsed[steamAppId];
+          best = parsed[steamAppId];
         }
       }
     } catch {
@@ -237,11 +240,14 @@ export function getKnownSteamAchievements(
   }
 
   // 2. Verified built-in user achievements baseline
-  if (KNOWN_USER_STEAM_ACHIEVEMENTS[steamAppId]) {
-    return KNOWN_USER_STEAM_ACHIEVEMENTS[steamAppId];
+  const baseline = KNOWN_USER_STEAM_ACHIEVEMENTS[steamAppId];
+  if (baseline) {
+    if (!best || baseline.unlocked > best.unlocked || (baseline.total > 0 && best.total === 0)) {
+      best = baseline;
+    }
   }
 
-  return undefined;
+  return best;
 }
 
 export function cacheUserSteamAchievements(map: Record<number, { unlocked: number; total: number; percentage: number }>): void {

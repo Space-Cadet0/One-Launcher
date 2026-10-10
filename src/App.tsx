@@ -5,7 +5,8 @@ import { GameCollection } from './contracts/collection';
 import { mergeScannedSteamGames } from './services/storage/librarySync';
 import { loadCollections, saveCollections } from './services/storage/collectionStorage';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
-import { cacheUserSteamAchievements } from './services/storage/knownGameAchievements';
+import { cacheUserSteamAchievements, getKnownSteamAchievements } from './services/storage/knownGameAchievements';
+import { steamAchievementsService } from './services/steam/steamAchievementsService';
 import { TopNavBar } from './components/Navigation/TopNavBar';
 import { LibrarySidebar } from './components/Library/LibrarySidebar';
 import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
@@ -265,36 +266,72 @@ export function App() {
     }
   }, [games, isIntegrationsModalOpen]);
 
-  // Synchronize installed game status against the workstation's actual file system
+  // Synchronize installed game status and achievements against the workstation and cloud
   useEffect(() => {
     async function syncLocalInstallations() {
+      let steamAchs: Record<number, { unlocked: number; total: number; percentage: number }> = {};
       try {
-        const steamAchs = await scanLocalSteamAchievements();
-        if (steamAchs && Object.keys(steamAchs).length > 0) {
-          cacheUserSteamAchievements(steamAchs);
+        const scanned = await scanLocalSteamAchievements();
+        if (scanned && Object.keys(scanned).length > 0) {
+          steamAchs = scanned;
+          cacheUserSteamAchievements(scanned);
         }
       } catch (e) {
         console.warn('Steam achievements local scan failed:', e);
       }
 
-      const scanResult = await scanLocalInstalledGames();
-      if (!scanResult) return;
-      const installedSteamAppIds = new Set(scanResult.installedSteamAppIds);
+      let installedSteamAppIds: Set<number> | null = null;
+      try {
+        const scanResult = await scanLocalInstalledGames();
+        if (scanResult) {
+          installedSteamAppIds = new Set(scanResult.installedSteamAppIds);
+        }
+      } catch (e) {
+        console.warn('Local installed games scan failed:', e);
+      }
 
       setGames((prevGames) => {
         let changed = false;
         const updated = prevGames.map((game) => {
           let gameChanged = false;
+          const targetAppId = game.steamAppId;
+          const ach = targetAppId
+            ? (steamAchs[targetAppId] || getKnownSteamAchievements(targetAppId, game.title))
+            : null;
+
           const updatedPlatforms = game.platforms.map((p) => {
+            let pChanged = false;
+            let newP = { ...p };
+
             if (p.platformId === 'steam') {
-              const shouldBeInstalled = game.steamAppId ? installedSteamAppIds.has(game.steamAppId) : false;
-              if (p.installed !== shouldBeInstalled) {
-                gameChanged = true;
-                return { ...p, installed: shouldBeInstalled };
+              if (installedSteamAppIds) {
+                const shouldBeInstalled = targetAppId ? installedSteamAppIds.has(targetAppId) : false;
+                if (p.installed !== shouldBeInstalled) {
+                  newP.installed = shouldBeInstalled;
+                  pChanged = true;
+                }
               }
-            } else if (p.installed) {
+              if (ach && ach.total > 0) {
+                const curU = p.achievements?.unlocked;
+                const curT = p.achievements?.total;
+                if (curU !== ach.unlocked || curT !== ach.total) {
+                  newP.achievements = {
+                    unlocked: ach.unlocked,
+                    total: ach.total,
+                    percentage: ach.percentage,
+                    isMastered: ach.percentage >= 100 || (ach.total > 0 && ach.unlocked >= ach.total),
+                  };
+                  pChanged = true;
+                }
+              }
+            } else if (installedSteamAppIds && p.installed) {
+              newP.installed = false;
+              pChanged = true;
+            }
+
+            if (pChanged) {
               gameChanged = true;
-              return { ...p, installed: false };
+              return newP;
             }
             return p;
           });
@@ -539,23 +576,38 @@ export function App() {
         }
       } catch {}
 
-      const refreshed = await steamApi.fetchGameMetadata(targetAppId);
-      if (refreshed) {
+      const [refreshed, liveAchs] = await Promise.all([
+        steamApi.fetchGameMetadata(targetAppId),
+        steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
+      ]);
+
+      if (refreshed || liveAchs) {
         setGames((prevGames) => {
           const updated = prevGames.map((g) => {
             if (g.id === selectedGame.id) {
+              const updatedPlatforms = g.platforms.map((p) => {
+                if (p.platformId === 'steam' && liveAchs) {
+                  return {
+                    ...p,
+                    achievements: liveAchs,
+                  };
+                }
+                return p;
+              });
+
               return {
                 ...g,
                 steamAppId: targetAppId,
-                enrichedMetadata: refreshed,
-                headerImage: refreshed.headerImage || g.headerImage,
-                capsuleImage: refreshed.capsuleImage || g.capsuleImage,
-                shortDescription: refreshed.shortDescription || g.shortDescription,
-                developers: refreshed.developers?.length ? refreshed.developers : g.developers,
-                publishers: refreshed.publishers?.length ? refreshed.publishers : g.publishers,
-                genres: refreshed.genres?.length ? refreshed.genres : g.genres,
-                tags: refreshed.tags?.length ? refreshed.tags : g.tags,
-                reviewSummary: refreshed.reviewSummary || g.reviewSummary,
+                platforms: updatedPlatforms,
+                enrichedMetadata: refreshed || g.enrichedMetadata,
+                headerImage: refreshed?.headerImage || g.headerImage,
+                capsuleImage: refreshed?.capsuleImage || g.capsuleImage,
+                shortDescription: refreshed?.shortDescription || g.shortDescription,
+                developers: refreshed?.developers?.length ? refreshed.developers : g.developers,
+                publishers: refreshed?.publishers?.length ? refreshed.publishers : g.publishers,
+                genres: refreshed?.genres?.length ? refreshed.genres : g.genres,
+                tags: refreshed?.tags?.length ? refreshed.tags : g.tags,
+                reviewSummary: refreshed?.reviewSummary || g.reviewSummary,
               };
             }
             return g;
@@ -576,6 +628,16 @@ export function App() {
       setIsSyncingCurrentGame(false);
       setTimeout(() => setSyncNotice(null), 5000);
     }
+  };
+
+  const handleGameUpdated = (updatedGame: CanonicalGame) => {
+    setGames((prev) => {
+      const updated = prev.map((g) => (g.id === updatedGame.id ? updatedGame : g));
+      try {
+        saveCurrentCatalog(updated);
+      } catch {}
+      return updated;
+    });
   };
 
   // Collection Management Handlers
@@ -750,6 +812,7 @@ export function App() {
               onApplyFilter={(filter) => {
                 navigateApplyFilter(filter);
               }}
+              onGameUpdated={handleGameUpdated}
             />
           )}
         </main>

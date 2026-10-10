@@ -28,6 +28,7 @@ import {
   getKnownGogAchievements,
   getKnownSteamAchievements,
 } from '../../services/storage/knownGameAchievements';
+import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { GameCollection } from '../../contracts/collection';
 import { loadCollections } from '../../services/storage/collectionStorage';
@@ -153,7 +154,9 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   // Multi-store achievements evaluation
   const targetSteamAppId = game.steamAppId || metadata?.appId;
   const knownTotal = getKnownAchievementTotal(targetSteamAppId, game.id, game.title);
-  const steamData = targetSteamAppId ? getKnownSteamAchievements(targetSteamAppId, game.title) : undefined;
+  const steamData = targetSteamAppId
+    ? (steamAchievementsService.getCachedAchievements(targetSteamAppId) || getKnownSteamAchievements(targetSteamAppId, game.title))
+    : undefined;
 
   // If verified Steam client data or metadata has achievement count, it takes precedence
   const effectiveTotal =
@@ -179,12 +182,16 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
     // Check store-specific live scan and verified cache
     if (p.platformId === 'steam' && targetSteamAppId) {
-      if (steamData && (steamData.unlocked > (pAchievements?.unlocked ?? 0) || steamData.total > (pAchievements?.total ?? 0))) {
+      const sData = steamData || (pAchievements ? { unlocked: pAchievements.unlocked, total: pAchievements.total, percentage: pAchievements.percentage } : undefined);
+      if (sData) {
+        const u = Math.max(sData.unlocked, pAchievements?.unlocked ?? 0);
+        const t = Math.max(sData.total, pAchievements?.total ?? effectiveTotal ?? 0);
+        const pct = t > 0 ? Math.round((u / t) * 100) : 0;
         pAchievements = {
-          unlocked: steamData.unlocked,
-          total: steamData.total > 0 ? steamData.total : (pAchievements?.total ?? effectiveTotal ?? 0),
-          percentage: steamData.percentage,
-          isMastered: steamData.percentage >= 100 || (steamData.total > 0 && steamData.unlocked >= steamData.total),
+          unlocked: u,
+          total: t,
+          percentage: pct,
+          isMastered: pct >= 100 || (t > 0 && u >= t),
         };
       }
     } else if (p.platformId === 'gog') {
@@ -254,18 +261,23 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   const hasAchievements = platformAchievements.some((p) => p.total > 0);
 
-  // Best platform achievement by highest percentage
-  const bestAchievement = platformAchievements.reduce(
-    (best, cur) => (cur.percentage > best.percentage ? cur : best),
-    platformAchievements[0] || {
-      platformId: 'steam',
-      platformName: 'Steam',
-      unlocked: 0,
-      total: 0,
-      percentage: 0,
-      isMastered: false,
+  // Best platform achievement by highest percentage, then unlocked count, then total
+  const bestAchievement = platformAchievements.reduce((best, cur) => {
+    if (cur.percentage > best.percentage) return cur;
+    if (cur.percentage === best.percentage) {
+      if (cur.unlocked > best.unlocked) return cur;
+      if (cur.total > best.total) return cur;
+      if (cur.platformId === 'steam') return cur;
     }
-  );
+    return best;
+  }, platformAchievements[0] || {
+    platformId: 'steam',
+    platformName: 'Steam',
+    unlocked: 0,
+    total: 0,
+    percentage: 0,
+    isMastered: false,
+  });
 
   const isAnyMastered = platformAchievements.some((p) => p.isMastered || p.percentage >= 100);
 

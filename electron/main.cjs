@@ -467,10 +467,8 @@ ipcMain.handle('scan:steam-achievements', async () => {
             const appId = parseInt(m[1], 10);
             try {
               const content = fs.readFileSync(path.join(lcDir, file), 'utf8');
-              const achMatch = content.match(/"achievements"\s*,\s*\{[\s\S]*?"data"\s*:\s*\{([\s\S]*?)\}\s*\}\]/);
-              const dataBlock = achMatch ? achMatch[1] : content;
-              const mTotal = dataBlock.match(/"nTotal"\s*:\s*(\d+)/);
-              const mAchieved = dataBlock.match(/"nAchieved"\s*:\s*(\d+)/);
+              const mTotal = content.match(/"nTotal"\s*:\s*(\d+)/);
+              const mAchieved = content.match(/"nAchieved"\s*:\s*(\d+)/);
               if (mTotal || mAchieved) {
                 const total = mTotal ? parseInt(mTotal[1], 10) : 0;
                 const unlocked = mAchieved ? parseInt(mAchieved[1], 10) : 0;

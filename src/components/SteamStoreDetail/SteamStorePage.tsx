@@ -19,6 +19,7 @@ import {
   isGameOwnedOnSteam,
   getEffectiveTags,
 } from '../../services/steam/steamFeatureNormalizer';
+import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
 import {
   Sparkles,
   ArrowLeft,
@@ -33,6 +34,7 @@ interface SteamStorePageProps {
   onManageCollections?: () => void;
   onToggleInstallStatus?: () => void;
   onApplyFilter?: (filter: ActiveGameFilter) => void;
+  onGameUpdated?: (updated: CanonicalGame) => void;
 }
 
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
@@ -42,8 +44,10 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   onManageCollections,
   onToggleInstallStatus,
   onApplyFilter,
+  onGameUpdated,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
   const [metadata, setMetadata] = useState<SteamEnrichedMetadata | null>(
     game.enrichedMetadata || null
   );
@@ -51,6 +55,9 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const [isLoading, setIsLoading] = useState(!game.enrichedMetadata);
   const isCooldown = steamApi.isStoreRateLimited();
 
+  useEffect(() => {
+    setCurrentGame(game);
+  }, [game]);
 
   useEffect(() => {
     let isMounted = true;
@@ -86,15 +93,34 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         }
       }
 
-      // If matched to Steam, fetch full official Steam Store metadata & media
+      // If matched to Steam, fetch full official Steam Store metadata, media & player achievements
       if (targetAppId) {
-        const liveData = await steamApi.fetchGameMetadata(targetAppId);
+        const [liveData, liveAchs] = await Promise.all([
+          steamApi.fetchGameMetadata(targetAppId),
+          steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
+        ]);
+
         if (isMounted) {
           if (liveData) {
             setMetadata(liveData);
           } else {
             const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game);
             if (isMounted) setMetadata(fallbackData);
+          }
+
+          if (liveAchs) {
+            const updatedPlatforms = game.platforms.map((p) => {
+              if (p.platformId === 'steam') {
+                return {
+                  ...p,
+                  achievements: liveAchs,
+                };
+              }
+              return p;
+            });
+            const updatedGame = { ...game, platforms: updatedPlatforms, steamAppId: targetAppId };
+            setCurrentGame(updatedGame);
+            onGameUpdated?.(updatedGame);
           }
         }
       } else {
@@ -188,9 +214,9 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 Owned on:
               </span>
               <PlatformBadges
-                platforms={game.platforms}
-                game={game}
-                steamAppId={currentSteamAppId || game.steamAppId}
+                platforms={currentGame.platforms}
+                game={currentGame}
+                steamAppId={currentSteamAppId || currentGame.steamAppId}
                 size="md"
               />
             </div>
@@ -199,7 +225,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
         {/* Steam Library Action & Stats Bar (Play Button, Library Status, Play Time, Last Played, Space Required, Achievements) */}
         <SteamLibraryActionBar
-          game={game}
+          game={currentGame}
           metadata={metadata}
           collections={collections}
           onManageCollections={onManageCollections}
