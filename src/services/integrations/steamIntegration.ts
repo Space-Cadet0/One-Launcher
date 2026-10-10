@@ -2,6 +2,7 @@ import axios from 'axios';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontCredentials } from '../../contracts/integration';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
+import { steamAchievementsService } from '../steam/steamAchievementsService';
 
 export interface SteamPlayerProfile {
   steamId: string;
@@ -183,31 +184,44 @@ export class SteamIntegrationService {
               tags: [],
             });
           }
-
-          return { profile, games };
         }
       } catch (err: any) {
         console.warn('Steam GetOwnedGames API call failed:', err?.message || err);
       }
     }
 
-    // Attempt 2: If credentials match the SpaceCadet verified account or as authenticated default catalog
-    if (steamId === '76561198244849198') {
-      profile.gamesCount = FULL_USER_STEAM_GAMES.length;
-      return {
-        profile,
-        games: FULL_USER_STEAM_GAMES,
-      };
+    // Determine final games list
+    let finalGames = games;
+    if (finalGames.length === 0 && steamId === '76561198244849198') {
+      finalGames = FULL_USER_STEAM_GAMES;
     }
 
-    // Attempt 3: If no API key and not the default account, return whatever was found or throw descriptive error
-    if (games.length === 0) {
+    if (finalGames.length === 0) {
       throw new Error(
         'Could not fetch games from Steam. If your Steam profile game details are set to Private or Friends-Only, please provide a Steam Web API Key from steamcommunity.com/dev/apikey.'
       );
     }
 
-    return { profile, games };
+    profile.gamesCount = finalGames.length;
+
+    // Real live Steam achievement integration sync across all owned games
+    try {
+      const liveAchs = await steamAchievementsService.syncUserLibraryAchievements(finalGames);
+      if (liveAchs && Object.keys(liveAchs).length > 0) {
+        finalGames = finalGames.map((g) => {
+          if (!g.steamAppId || !liveAchs[g.steamAppId]) return g;
+          const ach = liveAchs[g.steamAppId];
+          const updatedPlatforms = g.platforms.map((p) =>
+            p.platformId === 'steam' ? { ...p, achievements: ach } : p
+          );
+          return { ...g, platforms: updatedPlatforms };
+        });
+      }
+    } catch (e) {
+      console.warn('Steam live achievements sync warning:', e);
+    }
+
+    return { profile, games: finalGames };
   }
 }
 

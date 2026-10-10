@@ -349,6 +349,48 @@ export function App() {
         }
         return prevGames;
       });
+
+      // Background live Steam cloud sync for player achievements
+      steamAchievementsService
+        .syncUserLibraryAchievements(games)
+        .then((liveSyncMap) => {
+          if (liveSyncMap && Object.keys(liveSyncMap).length > 0) {
+            setGames((currentGames) => {
+              let updatedAny = false;
+              const refreshedCatalog = currentGames.map((game) => {
+                if (!game.steamAppId || !liveSyncMap[game.steamAppId]) return game;
+                const liveAch = liveSyncMap[game.steamAppId];
+                let platChanged = false;
+                const newPlatforms = game.platforms.map((p) => {
+                  if (p.platformId === 'steam') {
+                    if (
+                      p.achievements?.unlocked !== liveAch.unlocked ||
+                      p.achievements?.total !== liveAch.total
+                    ) {
+                      platChanged = true;
+                      return { ...p, achievements: liveAch };
+                    }
+                  }
+                  return p;
+                });
+                if (platChanged) {
+                  updatedAny = true;
+                  return { ...game, platforms: newPlatforms };
+                }
+                return game;
+              });
+
+              if (updatedAny) {
+                try {
+                  saveCurrentCatalog(refreshedCatalog);
+                } catch {}
+                return refreshedCatalog;
+              }
+              return currentGames;
+            });
+          }
+        })
+        .catch((e) => console.warn('Background Steam achievements sync:', e));
     }
 
     syncLocalInstallations();

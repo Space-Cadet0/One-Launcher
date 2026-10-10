@@ -199,6 +199,67 @@ export class SteamAchievementsService {
     // 3. Fallback to cached or verified baseline
     return this.getCachedAchievements(appId);
   }
+
+  /**
+   * Performs an automated live synchronization of player achievements directly from Steam
+   * across owned games, prioritizing played titles with playtime > 0.
+   */
+  async syncUserLibraryAchievements(
+    games: CanonicalGame[],
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<Record<number, StoreAchievementSummary>> {
+    const creds = this.getActiveSteamCredentials();
+    const results: Record<number, StoreAchievementSummary> = {};
+
+    // Filter games that belong to Steam and have steamAppId
+    const steamGames = games.filter((g) =>
+      Boolean(g.steamAppId && g.platforms.some((p) => p.platformId === 'steam'))
+    );
+
+    // Prioritize titles with playtime > 0
+    const prioritized = [...steamGames].sort((a, b) => {
+      const aPlaytime = a.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
+      const bPlaytime = b.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
+      return bPlaytime - aPlaytime;
+    });
+
+    // Process in concurrent batches of 8 for optimal speed and reliability
+    const batchSize = 8;
+    let completed = 0;
+
+    for (let i = 0; i < prioritized.length; i += batchSize) {
+      const batch = prioritized.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (game) => {
+          if (!game.steamAppId) return;
+          try {
+            const ach = await this.fetchPlayerGameAchievements(
+              game.steamAppId,
+              creds.steamId,
+              creds.apiKey
+            );
+            if (ach) {
+              results[game.steamAppId] = ach;
+            }
+          } catch {}
+        })
+      );
+      completed += batch.length;
+      onProgress?.(completed, prioritized.length);
+    }
+
+    // Persist full synchronized dictionary to localStorage
+    if (typeof window !== 'undefined' && Object.keys(results).length > 0) {
+      try {
+        const raw = localStorage.getItem('antigravity_steam_achievements');
+        const existing = raw ? JSON.parse(raw) : {};
+        const merged = { ...existing, ...results };
+        localStorage.setItem('antigravity_steam_achievements', JSON.stringify(merged));
+      } catch {}
+    }
+
+    return results;
+  }
 }
 
 export const steamAchievementsService = new SteamAchievementsService();
