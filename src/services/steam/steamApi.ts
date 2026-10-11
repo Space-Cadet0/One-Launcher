@@ -72,6 +72,13 @@ export class SteamApiService {
     return 'https://store.steampowered.com';
   }
 
+  getCachedMetadata(appId: number): SteamEnrichedMetadata | null {
+    if (this.cache.has(appId)) return this.cache.get(appId)!;
+    const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
+    if (preCached && preCached.shortDescription) return preCached as SteamEnrichedMetadata;
+    return null;
+  }
+
   async fetchGameMetadata(appId: number): Promise<SteamEnrichedMetadata | null> {
     if (this.cache.has(appId)) {
       return this.cache.get(appId)!;

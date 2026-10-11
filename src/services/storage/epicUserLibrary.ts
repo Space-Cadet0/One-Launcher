@@ -1,9 +1,5 @@
-import { CanonicalGame } from '../../contracts/game';
+import { CanonicalGame } from "../../contracts/game";
 
-/**
- * Complete, verified library of all 402 Epic Games Store titles owned by the user.
- * Verified matching official Epic Games Launcher catalog with intelligent Steam metadata integration.
- */
 export const EPIC_USER_LIBRARY: CanonicalGame[] = [
   {
     "id": "steam-793460",
@@ -140,7 +136,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/library_600x900_2x.jpg",
-    "shortDescription": "A Plague Tale: Innocence",
+    "shortDescription": "Follow the grim tale of young Amicia and her little brother Hugo, in a heartrending journey through the darkest hours of history.",
     "releaseDate": "2024-04-18",
     "developers": [
       "Focus Entertainment Publishing"
@@ -420,7 +416,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/57300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/57300/library_600x900_2x.jpg",
-    "shortDescription": "Amnesia:  The Dark Descent",
+    "shortDescription": "Amnesia: The Dark Descent, a first person survival horror. A game about immersion, discovery and living through a nightmare. An experience that will chill you to the core.",
     "releaseDate": "2025-03-25",
     "developers": [
       "Frictional Games"
@@ -510,7 +506,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945360/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945360/library_600x900_2x.jpg",
-    "shortDescription": "Among Us",
+    "shortDescription": "An online and local party game of teamwork and betrayal for 4-15 players...in space!",
     "releaseDate": "2025-06-26",
     "developers": [
       "Innersloth"
@@ -540,7 +536,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/library_600x900_2x.jpg",
-    "shortDescription": "Ancient Enemy is an RPG card battler set in a crumbling world where the forces of evil have already won. Blast distorted enemies with a satisfying range of spells and abilities. Journey into a scarred wilderness and defeat the deadliest foe of all!",
+    "shortDescription": "Ancient Enemy is an RPG card battler set in a crumbling world where the forces of evil have already won. Blast distorted enemies with a satisfying range of spells and abilities. Journey into a scarred wilderness and draw power and hope from the landscape to defeat the deadliest foe of all!",
     "releaseDate": "2025-05-05",
     "developers": [
       "Grey Alien Games"
@@ -810,7 +806,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/library_600x900_2x.jpg",
-    "shortDescription": "BioShock 2 Remastered",
+    "shortDescription": "In BioShock 2, you step into the boots of the most iconic denizen of Rapture, the Big Daddy, as you explore through the decrepit and beautiful fallen city, chasing an unseen foe in search of answers and your own survival.",
     "releaseDate": "2026-07-21",
     "developers": [
       "2K Games, Inc."
@@ -840,7 +836,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/library_600x900_2x.jpg",
-    "shortDescription": "BioShock Infinite: Complete Edition",
+    "shortDescription": "Indebted to the wrong people, with his life on the line, veteran of the U.S. Cavalry and now hired gun, Booker DeWitt has only one opportunity to wipe his slate clean. He must rescue Elizabeth, a mysterious girl imprisoned since childhood and locked up in the flying city of Columbia.",
     "releaseDate": "2026-07-21",
     "developers": [
       "2K Games, Inc."
@@ -870,7 +866,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/library_600x900_2x.jpg",
-    "shortDescription": "BioShock Remastered",
+    "shortDescription": "BioShock is a shooter unlike any other, loaded with unique weapons and tactics. Complete with an arsenal of revolvers, shotguns, and grenade launchers, players will be forced to genetically modify their DNA to become an even deadlier weapon.",
     "releaseDate": "2026-07-21",
     "developers": [
       "2K Games, Inc."
@@ -1020,7 +1016,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/49520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/49520/library_600x900_2x.jpg",
-    "shortDescription": "Borderlands 2",
+    "shortDescription": "The Ultimate Vault Hunter’s Upgrade lets you get the most out of the Borderlands 2 experience.",
     "releaseDate": "2021-02-19",
     "developers": [
       "2K Games, Inc."
@@ -1230,7 +1226,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/738520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/738520/library_600x900_2x.jpg",
-    "shortDescription": "Breathedge",
+    "shortDescription": "Survive in outer space! Together with your immortal chicken, discover the truth behind your sudden spaceship crash. Craft tools, pilot vehicles, and even control space stations to survive and explore the wreckage.",
     "releaseDate": "2026-09-02",
     "developers": [
       "Hypetrain Digital"
@@ -1888,7 +1884,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg",
-    "shortDescription": "Control",
+    "shortDescription": "Winner of over 80 awards, CONTROL is a visually stunning third-person action-adventure that will keep you on the edge of your seat.",
     "releaseDate": "2026-01-21",
     "developers": [
       "Remedy Entertainment"
@@ -2217,7 +2213,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/library_600x900_2x.jpg",
-    "shortDescription": "Death Stranding",
+    "shortDescription": "From legendary game creator Hideo Kojima comes an all-new, genre-defying experience. Sam Bridges must brave a world utterly transformed by the Death Stranding. Carrying the disconnected remnants of our future in his hands, he embarks on a journey to reconnect the shattered world one step at a time.",
     "releaseDate": "2022-03-30",
     "developers": [
       "505 Games"
@@ -2396,7 +2392,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/library_600x900_2x.jpg",
-    "shortDescription": "Delores: A Thimbleweed Park mini-adventure",
+    "shortDescription": "Delores is back home and working as a photographer for the Nickel News. Thimbleweed Park hasn’t changed at all in the year she’s been away… or has it? Sample Ron Gilbert’s new adventure game engine in this free prototype that uses “found art” from the award-winning Thimbleweed Park.",
     "releaseDate": "2020-05-09",
     "developers": [
       "Terrible Toybox, Inc."
@@ -2456,7 +2452,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1085660/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1085660/library_600x900_2x.jpg",
-    "shortDescription": "Destiny 2",
+    "shortDescription": "Explore the mysteries of Sol and experience exhilirating first-person shooter combat in Destiny 2. Unlock powerful abilities and collect unique gear across story missions, co-op, and PvP modes.",
     "releaseDate": "2026-06-09",
     "developers": [
       "Bungie"
@@ -2545,7 +2541,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/632470/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/632470/library_600x900_2x.jpg",
-    "shortDescription": "Disco Elysium - The Final Cut is a groundbreaking role playing game. You?re a detective with a unique skill system at your disposal. Interrogate unforgettable characters, crack murders or take bribes. Become a hero or an absolute disaster of a human being.",
+    "shortDescription": "Disco Elysium - The Final Cut is a groundbreaking role playing game. You’re a detective with a unique skill system at your disposal and a whole city to carve your path across. Interrogate unforgettable characters, crack murders or take bribes. Become a hero or an absolute disaster of a human being.",
     "releaseDate": "2024-05-16",
     "developers": [
       "ZA/UM"
@@ -2575,7 +2571,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/library_600x900_2x.jpg",
-    "shortDescription": "Dishonored - Definitive Edition",
+    "shortDescription": "Dishonored is an immersive first-person action game that casts you as a supernatural assassin driven by revenge. With Dishonored’s flexible combat system, creatively eliminate your targets as you combine the supernatural abilities, weapons and unusual gadgets at your disposal.",
     "releaseDate": "2024-10-17",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3292,7 +3288,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38410/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38410/library_600x900_2x.jpg",
-    "shortDescription": "Fallout 2: A Post Nuclear Role Playing Game",
+    "shortDescription": "Fallout® 2 is the sequel to the critically acclaimed game that took RPG'ing out of the dungeons and into a dynamic, apocalyptic retro-future. It's been 80 long years since your ancestors trod across the wastelands.",
     "releaseDate": "2024-02-16",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3322,7 +3318,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/library_600x900_2x.jpg",
-    "shortDescription": "Fallout 3: Game of the Year Edition",
+    "shortDescription": "Prepare for the Future™ With Fallout 3: Game of the Year Edition, experience the most acclaimed game of 2008 like never before. Create a character of your choosing and descend into an awe-inspiring, post-apocalyptic world where every minute is a fight for survival.",
     "releaseDate": "2023-06-28",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3352,7 +3348,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38420/library_600x900_2x.jpg",
-    "shortDescription": "Fallout Tactics: Brotherhood of Steel",
+    "shortDescription": "Tactical Squad-Based Combat comes to the Fallout® Universe! You are the wretched refuse. You may be born from dirt, but we will forge you into steel. You will learn to bend; if not you, will you break. In these dark times, the Brotherhood - your Brotherhood - is all that stands between the rekindled flame of civilization and the howling,...",
     "releaseDate": "2024-02-16",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3382,7 +3378,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38400/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/38400/library_600x900_2x.jpg",
-    "shortDescription": "Fallout: A Post Nuclear Role Playing Game",
+    "shortDescription": "You've just unearthed the classic post-apocalyptic role-playing game that revitalized the entire CRPG genre. The Fallout® SPECIAL system allows drastically different types of characters, meaningful decisions and development that puts you in complete control. Explore the devastated ruins of a golden age civilization.",
     "releaseDate": "2024-02-16",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3412,7 +3408,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22380/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22380/library_600x900_2x.jpg",
-    "shortDescription": "Fallout: New Vegas",
+    "shortDescription": "Welcome to Vegas. New Vegas. Enjoy your stay!",
     "releaseDate": "2024-09-27",
     "developers": [
       "Bethesda Softworks LLC"
@@ -3977,7 +3973,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
     "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
-    "shortDescription": "Ghostrunner",
+    "shortDescription": "Ghostrunner offers a unique single-player experience: fast-paced, violent combat, and an original setting that blends science fiction with post-apocalyptic themes. It tells the story of a world that has already ended and its inhabitants who fight to survive.",
     "releaseDate": "2021-08-31",
     "developers": [
       "505 Games"
@@ -4337,7 +4333,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/275390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/275390/library_600x900_2x.jpg",
-    "shortDescription": "Guacamelee! is a Metroidvania-style action-platformer set in a magical Mexican-inspired world. The game draws its inspiration from traditional Mexican culture and folklore, and features many interesting and unique characters.",
+    "shortDescription": "The definitive version of the smash-hit Metroidvania-style action-platformer, Guacamelee! STCE adds new levels, powers, challenges, and refinements to the sprawling, ridiculous, Mexican-inspired adventure of the original Guacamelee! Gold Edition.",
     "releaseDate": "2026-07-31",
     "developers": [
       "Drinkbox Studios Inc."
@@ -4935,7 +4931,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/library_600x900_2x.jpg",
-    "shortDescription": "INDUSTRIA",
+    "shortDescription": "Embark on a gripping journey in INDUSTRIA, an atmospheric FPS set in Cold War-era East Berlin. Unravel the secrets of a mysterious parallel dimension while searching for a missing colleague. Explore a haunting reality where the truth awaits. Discover the dark past that lies beyond.",
     "releaseDate": "2024-04-17",
     "developers": [
       "Headup Gmbh"
@@ -5145,7 +5141,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/323580/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/323580/library_600x900_2x.jpg",
-    "shortDescription": "Jotun Valhalla Edition",
+    "shortDescription": "Jotun is a hand-drawn action-exploration game set in Norse mythology. In Jotun, you play Thora, a Viking warrior who died an inglorious death and must prove herself to the Gods to enter Valhalla. Impress the Gods!",
     "releaseDate": "2019-12-05",
     "developers": [
       "Thunder Lotus Games"
@@ -5324,7 +5320,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/library_600x900_2x.jpg",
-    "shortDescription": "Kerbal Space Program",
+    "shortDescription": "In Kerbal Space Program, take charge of the space program for the alien race known as the Kerbals. You have access to an array of parts to assemble fully-functional spacecraft that flies (or doesn’t) based on realistic aerodynamic and orbital physics.",
     "releaseDate": "2026-04-08",
     "developers": [
       "The Kerbal Company"
@@ -5501,7 +5497,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/379430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/379430/library_600x900_2x.jpg",
-    "shortDescription": "Kingdom Come: Deliverance",
+    "shortDescription": "Story-driven open-world RPG that immerses you in an epic adventure in the Holy Roman Empire. Avenge your parents' death as you battle invading forces, go on game-changing quests, and make influential choices. Explore castles, forests, villages and other realistic settings in medieval Bohemia!",
     "releaseDate": "2026-02-13",
     "developers": [
       "Warhorse Studios"
@@ -6097,7 +6093,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/286690/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/286690/library_600x900_2x.jpg",
-    "shortDescription": "Metro 2033 Redux",
+    "shortDescription": "In 2013 the world was devastated by an apocalyptic event, annihilating almost all mankind and turning the Earth's surface into a poisonous wasteland. A handful of survivors took refuge in the depths of the Moscow underground, and human civilization entered a new Dark Age. The year is 2033.",
     "releaseDate": "2022-11-21",
     "developers": [
       "Plaion"
@@ -6127,7 +6123,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/287390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/287390/library_600x900_2x.jpg",
-    "shortDescription": "Metro Last Light Redux",
+    "shortDescription": "It is the year 2034. Beneath the ruins of post-apocalyptic Moscow, in the tunnels of the Metro, the remnants of mankind are besieged by deadly threats from outside – and within. Mutants stalk the catacombs beneath the desolate surface, and hunt amidst the poisoned skies above.",
     "releaseDate": "2022-11-21",
     "developers": [
       "Plaion"
@@ -6994,7 +6990,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/library_600x900_2x.jpg",
-    "shortDescription": "Overcooked! 2",
+    "shortDescription": "Overcooked is a chaotic couch co-op cooking game for one to four players. Working as a team, you and your fellow chefs must prepare, cook and serve up a variety of tasty orders before the baying customers storm out in a huff.",
     "releaseDate": "2025-10-24",
     "developers": [
       "Team17 Digital Ltd"
@@ -7234,7 +7230,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/291650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/291650/library_600x900_2x.jpg",
-    "shortDescription": "Pillars of Eternity - Definitive Edition",
+    "shortDescription": "Prepare to be enchanted by a world where the choices you make and the paths you choose shape your destiny. Obsidian Entertainment, the developer of Fallout: New Vegas™ and South Park: The Stick of Truth™, together with Paradox Interactive is proud to present Pillars of Eternity.",
     "releaseDate": "2026-07-06",
     "developers": [
       "Microsoft"
@@ -7352,7 +7348,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg",
-    "shortDescription": "PREY",
+    "shortDescription": "In Prey, you awaken aboard Talos I, a space station orbiting the moon in the year 2032. You are the key subject of an experiment meant to alter humanity forever – but things have gone terribly wrong. The space station has been overrun by hostile aliens and you are now being hunted.",
     "releaseDate": "2024-10-17",
     "developers": [
       "Bethesda Softworks LLC"
@@ -7472,7 +7468,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2310/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2310/library_600x900_2x.jpg",
-    "shortDescription": "Quake",
+    "shortDescription": "Developed by the award-winning id Software, Quake® is the ground-breaking, original dark fantasy first-person shooter that inspires today’s retro-style FPS games. With Quake (Enhanced), experience the authentic, updated, and visually enhanced version of the original.",
     "releaseDate": "2023-08-04",
     "developers": [
       "Bethesda Softworks LLC"
@@ -8098,7 +8094,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/library_600x900_2x.jpg",
-    "shortDescription": "Saints Row IV Re-Elected",
+    "shortDescription": "Experience the insane antics of Saints Row IV. The Saints have gone from the Penthouse to the White House - but Earth has been invaded and it’s up to you to save it with an arsenal of superpowers and strange weapons, in the wildest open world game ever.",
     "releaseDate": "2022-12-08",
     "developers": [
       "Plaion"
@@ -8128,7 +8124,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/library_600x900_2x.jpg",
-    "shortDescription": "Saints Row The Third Remastered",
+    "shortDescription": "The Full Package, Remastered – With enhanced graphics, improved lighting, reworked environments, and visual effects, Steelport and The Third Street Saints have never looked so good.",
     "releaseDate": "2023-10-04",
     "developers": [
       "Plaion"
@@ -8429,7 +8425,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/750920/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/750920/library_600x900_2x.jpg",
-    "shortDescription": "Shadow of the Tomb Raider: Definitive Edition",
+    "shortDescription": "As Lara Croft races to save the world from a Maya apocalypse, she must become the Tomb Raider she is destined to be.",
     "releaseDate": "2025-04-01",
     "developers": [
       "Crystal Dynamics, Inc."
@@ -8518,7 +8514,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/234650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/234650/library_600x900_2x.jpg",
-    "shortDescription": "Shadowrun Returns",
+    "shortDescription": "The unique cyberpunk-meets-fantasy world of Shadowrun has gained a huge cult following since its creation nearly 25 years ago. Now, creator Jordan Weisman returns to the world of Shadowrun, modernizing this classic game setting as a single player, turn-based tactical RPG.",
     "releaseDate": "2024-04-02",
     "developers": [
       "Paradox Interactive"
@@ -8607,7 +8603,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/library_600x900_2x.jpg",
-    "shortDescription": "Shogun Showdown",
+    "shortDescription": "Shogun Showdown is a turn-based combat game with rogue-like and deck-building elements. Position yourself and attack at the right time, upgrade your tiles and combo them to get ready to face the Shogun!",
     "releaseDate": "2026-09-17",
     "developers": [
       "Goblinz Studio SAS"
@@ -9865,7 +9861,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/library_600x900_2x.jpg",
-    "shortDescription": "The Evil Within 2",
+    "shortDescription": "Detective Sebastian Castellanos has lost everything, including his daughter, Lily. To save her, he must descend into the nightmarish world of STEM. Horrifying threats emerge from every corner, and he must rely on his wits to survive. For his one chance at redemption, the only way out is in.",
     "releaseDate": "2023-10-23",
     "developers": [
       "Bethesda Softworks LLC"
@@ -10074,7 +10070,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/library_600x900_2x.jpg",
-    "shortDescription": "The Outer Worlds",
+    "shortDescription": "The Outer Worlds is an award-winning single-player RPG from Obsidian Entertainment and Private Division. As you explore a space colony, the character you decide to become will determine how this player-driven story unfolds. In the colony's corporate equation, you are the unplanned variable.",
     "releaseDate": "2026-03-17",
     "developers": [
       "Microsoft"
@@ -10104,7 +10100,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/library_600x900_2x.jpg",
-    "shortDescription": "The Outer Worlds: Spacer's Choice Edition",
+    "shortDescription": "The Outer Worlds: Spacer’s Choice Edition is the ultimate way to play the award-winning RPG from Obsidian Entertainment and Private Division. Including the base game and all DLC, this remastered masterpiece is the absolute best version of The Outer Worlds.",
     "releaseDate": "2026-03-17",
     "developers": [
       "Microsoft"
@@ -10374,7 +10370,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/library_600x900_2x.jpg",
-    "shortDescription": "Thief is a 1st person stealth-action game by Eidos-Montr?al. In this reimagination of the cult classic Thief franchise, steal, stealth and infiltrate your way through the treacherous City as Garrett, the Master Thief.",
+    "shortDescription": "Garrett, the Master Thief, steps out of the shadows into the City. In this treacherous place, where the Baron’s Watch spreads a rising tide of fear and oppression, his skills are the only things he can trust. Even the most cautious citizens and their best-guarded possessions are not safe from his reach.",
     "releaseDate": "2026-08-18",
     "developers": [
       "Crystal Dynamics, Inc."
@@ -10404,7 +10400,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712840/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712840/library_600x900_2x.jpg",
-    "shortDescription": "Tiny Tina's Assault on Dragon Keep: A Wonderlands One-shot Adventure",
+    "shortDescription": "Smash skeletons, defeat dragons, and battle giant golems in Tiny Tina's Assault on Dragon Keep: A Wonderlands One-Shot Adventure. Experience the acclaimed 2013 quest that started it all in this standalone campaign jam-packed with fantasy, fun, and mountains of magical loot!",
     "releaseDate": "2025-05-02",
     "developers": [
       "2K Games, Inc."
@@ -10494,7 +10490,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203160/library_600x900_2x.jpg",
-    "shortDescription": "Tomb Raider GAME OF THE YEAR EDITION",
+    "shortDescription": "Tomb Raider explores the intense origin story of Lara Croft and her ascent from a young woman to a hardened survivor.",
     "releaseDate": "2024-05-20",
     "developers": [
       "Crystal Dynamics, Inc."
@@ -11865,7 +11861,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/268500/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/268500/library_600x900_2x.jpg",
-    "shortDescription": "XCOM 2",
+    "shortDescription": "XCOM 2 is the sequel to XCOM: Enemy Unknown, the 2012 award-winning strategy game of the year. Earth has changed and is now under alien rule. Facing impossible odds you must rebuild XCOM, and ignite a global resistance to reclaim our world and save humanity.",
     "releaseDate": "2023-06-26",
     "developers": [
       "2K Games, Inc."

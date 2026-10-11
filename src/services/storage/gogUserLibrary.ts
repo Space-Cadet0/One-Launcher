@@ -16,7 +16,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
     "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "You have exactly 60 minutes to save humanity from nuclear extinction. There are no second attempts. No manual saves. Explore a collapsing bunker, repair critical systems, and solve puzzles under pressure. Succeed or watch the world end.",
     "releaseDate": "2025-10-07",
     "developers": [
       "mc2games"
@@ -72,7 +72,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Follow the grim tale of young Amicia and her little brother Hugo, in a heartrending journey through the darkest hours of history.",
     "releaseDate": "2019-05-14",
     "developers": [
       "Asobo Studio"
@@ -179,7 +179,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Agony UNRATED is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.",
     "releaseDate": "2018-10-30",
     "developers": [
       "Madmind Studio"
@@ -277,7 +277,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22650/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Can you survive the alien onslaught? Gamers across the world will now have a chance to play the next chapter in this high-budget, high-quality series.",
     "releaseDate": "2010-09-22",
     "developers": [
       "Team17 Software"
@@ -325,7 +325,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22670/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Experience the final explosive chapter in the Alien Breed series and uncover the horrifying truth surrounding the existence of the Breed. Launch discount good thru Nov. 24 10am PST.",
     "releaseDate": "2010-11-17",
     "developers": [
       "Team17 Software"
@@ -373,7 +373,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22610/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22610/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Experience the explosive science fiction arcade-shooter that resurrects a much revered franchise in an epic single player and co-op multiplayer campaign.",
     "releaseDate": "2010-06-03",
     "developers": [
       "Team17 Software"
@@ -423,7 +423,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548090/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548090/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Alone in the Dark: Classic Collection brings the seminal survival horror masterpieces of the 90's to your PC today.",
     "releaseDate": "1992-01-02",
     "developers": [
       "Pieces Interactive"
@@ -477,7 +477,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548890/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548890/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The sequel to the critically acclaimed Alone in the Dark, this new adventure sees our hero, Edward Carnby, in 1923 confronting the many faces of evil in the darkness of Derceto, a house in which entering is the easy part and leaving could be hell!",
     "releaseDate": "1992-01-02",
     "developers": [
       "Infogrames"
@@ -519,7 +519,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548900/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Enjoy up to 70 hours of gameplay piecing together this dusty puzzle and breaking the grip of the town's curse. Every cobwebbed corner holds a new clue, but be warned: you'll find no friends in the trigger-happy souls who drift across your path like so much tumbleweed.",
     "releaseDate": "1992-01-02",
     "developers": [
       "Infogrames"
@@ -561,7 +561,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/949200/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/949200/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "18th century Paris - a city of love, lies and revolution. You are a woman of fashion trying to survive the political turmoil. Date a cast of unforgettable characters. Amass the wealth and respect you deserve. Engage in gossip that can alter the course of history, or lead you to the guillotine.",
     "releaseDate": "2021-08-18",
     "developers": [
       "Joy Manufacturing Co."
@@ -668,7 +668,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Ancient Enemy is an RPG card battler set in a crumbling world where the forces of evil have already won. Blast distorted enemies with a satisfying range of spells and abilities. Journey into a scarred wilderness and draw power and hope from the landscape to defeat the deadliest foe of all!",
     "releaseDate": "2020-04-09",
     "developers": [
       "Grey Alien Games"
@@ -769,7 +769,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388870/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Turn a rundown laundromat into a radical ’90s arcade. Manage your business, expand your neon empire, and balance dirty laundry with over 35 playable arcade games. Build the ultimate arcade! From the team behind Vampire Crawlers.",
     "releaseDate": "2022-08-11",
     "developers": [
       "Nosebleed Interactive"
@@ -868,7 +868,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/580320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/580320/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Fight, scavenge, and survive in Ashworld, a post-apocalyptic open world filled with danger. Explore the desolate Ragelands, battle ruthless Ragers, and fend off night-stalking Skellies. Drive, craft, and strategize to endure this unforgiving wasteland where every resource matters.",
     "releaseDate": "2017-09-19",
     "developers": [
       "Orangepixel"
@@ -1026,7 +1026,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/761620/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/761620/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "You are an intern at the central ministry of a totalitarian state with your whole career ahead of you. Work your way up the ladder by scheming against employees, spying on your boss, and completing paperwork. Or do you turn against the state and expose corruption. The choice is still yours to make!",
     "releaseDate": "2018-12-05",
     "developers": [
       "Warm Lamp Games"
@@ -1126,7 +1126,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368340/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368340/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "After being abducted by brutal soldiers and his kinfolk butchered, Robert Foster finds himself in Union City - a vast metropolis under the tyranny of a fascist AI. Alone, save for the circuit board of his best friend, Foster must discover the sinister truth - and why they specifically came for him.",
     "releaseDate": "1994-04-11",
     "developers": [
       "Revolution Software"
@@ -1177,7 +1177,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1561340/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1561340/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "BERSERK BOY is a high speed action packed Platformer, with Metroidvania elements. Packed with vibrant and stylish pixel art. Go Berserk! as you change into different forms and use the power of Lightning, Fire, Ice, Air, and Earth to save the planet!",
     "releaseDate": "2024-03-06",
     "developers": [
       "BerserkBoy Games"
@@ -1327,7 +1327,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Indebted to the wrong people, with his life on the line, veteran of the U.S. Cavalry and now hired gun, Booker DeWitt has only one opportunity to wipe his slate clean. He must rescue Elizabeth, a mysterious girl imprisoned since childhood and locked up in the flying city of Columbia.",
     "releaseDate": "2013-03-25",
     "developers": [
       "Irrational Games"
@@ -1375,7 +1375,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8850/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8850/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Set approximately 10 years after the events of the original BioShock, the halls of Rapture once again echo with sins of the past. Along the Atlantic coastline, a monster has been snatching little girls and bringing them back to the undersea city of Rapture.",
     "releaseDate": "2010-02-09",
     "developers": [
       "2K Marin",
@@ -1431,7 +1431,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7670/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "BioShock is a shooter unlike any you've ever played, loaded with weapons and tactics never seen. You'll have a complete arsenal at your disposal from simple revolvers to grenade launchers and chemical throwers, but you'll also be forced to genetically modify your DNA to create an even more deadly weapon: you.",
     "releaseDate": "2007-08-21",
     "developers": [
       "2K Marin",
@@ -1487,7 +1487,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "In BioShock 2, you step into the boots of the most iconic denizen of Rapture, the Big Daddy, as you explore through the decrepit and beautiful fallen city, chasing an unseen foe in search of answers and your own survival.",
     "releaseDate": "2016-09-16",
     "developers": [
       "2K Marin",
@@ -1543,7 +1543,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "BioShock is a shooter unlike any other, loaded with unique weapons and tactics. Complete with an arsenal of revolvers, shotguns, and grenade launchers, players will be forced to genetically modify their DNA to become an even deadlier weapon.",
     "releaseDate": "2016-09-16",
     "developers": [
       "2K Marin",
@@ -1599,7 +1599,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1710170/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1710170/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Blade of Darkness is a hardcore fantasy action-adventure with unique combat mechanics and role-playing elements that pioneered the “soulsborne” genre. Pick one of four characters to hack and slash through a gory quest to save the world from the forces of Chaos.",
     "releaseDate": "2021-10-07",
     "developers": [
       "Rebel Act Studios",
@@ -1694,7 +1694,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2056220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2056220/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "A short but sweet game about an Angel on a Bloody Bullet-hell mission to kill Satan! Dash, Double Dash, Grapple &amp; Blast your way through Hell to fulfill your Holy Mission. Will you be able to kill Satan? Or will you fail to master your abilities and DIE in this BLOODY HELL?",
     "releaseDate": "2023-01-27",
     "developers": [
       "Pun Intended"
@@ -1799,7 +1799,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1614440/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1614440/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Flow gracefully through a colorful, hand-drawn 2.5D action platformer inspired by Japanese folklore. Engage in acrobatic aerial combat, unlock powerful mystical abilities, and explore an interconnected world of myth as you seek to unravel the mysteries of your origin.",
     "releaseDate": "2024-07-17",
     "developers": [
       "Squid Shock Studios",
@@ -1849,7 +1849,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3020/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3020/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Call of Juarez is an epic adventure western themed FPS game. The player alternately assumes the roles of two distinct, antagonistic characters: a sneaking fugitive Billy and his hunter the reverend Ray.",
     "releaseDate": "2006-09-07",
     "developers": [
       "Techland"
@@ -1901,7 +1901,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/204450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/204450/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "From the dust of a gold mine to the dirt of a saloon, Call of Juarez® Gunslinger is a real homage to the Wild West tales. Live the epic and violent journey of a ruthless bounty hunter on the trail of the West’s most notorious outlaws.",
     "releaseDate": "2013-05-22",
     "developers": [
       "Techland"
@@ -1952,7 +1952,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3040220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3040220/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Captain Blood is a pirate-themed action game where you play as a fearsome pirate seeking gold and glory. Expect adventures with cannon firing, pistol shooting, swashbuckling sword fights, and plenty of pirate shenanigans. This hack'n'slash features fierce combat, hordes of enemies and flashy combos.",
     "releaseDate": "2025-05-06",
     "developers": [
       "Seawolf Studio",
@@ -2002,7 +2002,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/532840/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/532840/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Hadley wakes in a facility. She is 9 months pregnant. They want her baby... CAYNE is the FREE, isometric horror game from the creators of STASIS.",
     "releaseDate": "2017-01-24",
     "developers": [
       "The Brotherhood"
@@ -2054,7 +2054,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1990-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2097,7 +2097,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2061230/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2061230/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Prepare for terror in this ground-breaking classic old-school FPS. Following the destruction of Time you are left to battle in this horrific hellhole of multilevel interconnected missions populated by gruesome grotesque creatures.",
     "releaseDate": "2022-10-10",
     "developers": [
       "Action Forms",
@@ -2195,7 +2195,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/968870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/968870/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Deep in international waters, Tesla’s Helios stands still. An unbound utopia for scientific research, Rose Archer steps aboard in search of her sister, quickly to discover not all is as it seems. A single word covers the entrance… QUARANTINE!",
     "releaseDate": "2020-05-05",
     "developers": [
       "Storm in a Teacup"
@@ -2245,7 +2245,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Winner of over 80 awards, CONTROL is a visually stunning third-person action-adventure that will keep you on the edge of your seat.",
     "releaseDate": "2020-09-10",
     "developers": [
       "Remedy Entertainment"
@@ -2296,7 +2296,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203770/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203770/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Explore one of the defining periods in world history in an experience crafted by the masters of Grand Strategy.",
     "releaseDate": "2012-02-14",
     "developers": [
       "Paradox Development Studio"
@@ -2344,7 +2344,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904520/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "After you saved the entire city of Phlan and located the Pool of Radiance, a simple trip to Tilverton should have been as easy as a noon-day stroll. But it wasn’t… Ambushed, captured and knocked unconscious, you awake with no idea who attacked you or how you arrived in Tilverton.",
     "releaseDate": "1989-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2428,7 +2428,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2464690/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2464690/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "CyClones is a first-person shooter (FPS) classic from the 90s that challenges players to explore maze-like environments and take down flesh-steel monstrosities using an impressive arsenal of hi-tech weaponry.",
     "releaseDate": "1994-11-01",
     "developers": [
       "Raven Software"
@@ -2566,7 +2566,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1481400/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1481400/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Face unspeakable horrors. Succumb to madness. Welcome to a free daemonic narrative experience inspired by H. P. Lovecraft.",
     "releaseDate": "2021-09-24",
     "developers": [
       "Bit Golem"
@@ -2620,7 +2620,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945770/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945770/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Lead a party of relic hunters in an epic cRPG adventure set in a war-torn Guns N’ Sorcery world. Experiment with a tactical slo-mo and a modern combat system!",
     "releaseDate": "2023-10-24",
     "developers": [
       "Event Horizon"
@@ -2670,7 +2670,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904600/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Unleash your imagination into a vast, savage world, sun-scorched and wind-scraped.",
     "releaseDate": "1993-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2713,7 +2713,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904601/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904601/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Unleash your imagination into a vast, savage world, sun-scorched and wind-scraped.",
     "releaseDate": "1994-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2756,7 +2756,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1991-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2799,7 +2799,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/471810/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/471810/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Death Squared is a co-op puzzle game about cooperation, communication, and robot explosions. You should buy it!",
     "releaseDate": "2017-03-14",
     "developers": [
       "SMG Studio"
@@ -2847,7 +2847,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350540/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350540/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "DeathKeep is a D&amp;D dungeon delving the way you like it - fast, furious and fun! An evil Necromancer has escaped from his icy prison and is wreaking havoc upon the surrounding lands. Journey to this frozen wasteland and destroy the forces of evil - if you dare.",
     "releaseDate": "1995-11-01",
     "developers": [
       "Lion Entertainment"
@@ -2894,7 +2894,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698640/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Deep Sky Derelicts is an original combination of turn-based strategy and RPG, enriched with tactical card combat and popular roguelike elements. Explore derelict alien ships, fight, loot and upgrade your gear, all in distinctive retro-futuristic comic book aesthetic style.",
     "releaseDate": "2018-09-26",
     "developers": [
       "Snowhound Games"
@@ -2948,7 +2948,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Delores is back home and working as a photographer for the Nickel News. Thimbleweed Park hasn’t changed at all in the year she’s been away… or has it? Sample Ron Gilbert’s new adventure game engine in this free prototype that uses “found art” from the award-winning Thimbleweed Park.",
     "releaseDate": "2020-05-09",
     "developers": [
       "Terrible Toybox"
@@ -3294,7 +3294,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Dishonored is an immersive first-person action game that casts you as a supernatural assassin driven by revenge. With Dishonored’s flexible combat system, creatively eliminate your targets as you combine the supernatural abilities, weapons and unusual gadgets at your disposal.",
     "releaseDate": "2012-10-12",
     "developers": [
       "Arkane Studios"
@@ -3348,7 +3348,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/403640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/403640/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Reprise your role as a supernatural assassin in Dishonored 2. Declared a “masterpiece” by Eurogamer and hailed “a must-play revenge tale” by Game Informer, Dishonored 2 is the follow up to Arkane’s 1st-person action blockbuster &amp; winner of 100+ 'Game of the Year' awards, Dishonored.",
     "releaseDate": "2016-11-11",
     "developers": [
       "Arkane Studios"
@@ -3781,7 +3781,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350512/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350512/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Takhisis, Queen of Darkness, and her Draconian hordes have overrun much of the homeland Krynn. Only the returning Companions of the Lance that can halt this wave of tyranny before Krynn is consumed by evil.",
     "releaseDate": "",
     "developers": [
       "Westwood Studios"
@@ -3823,7 +3823,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350520/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "The FIRST-EVER dragon combat simulator! This is DragonStrike, where the deadly skies above the Dragonlance game world of Krynn explode before your very eyes. The first-person viewpoint propels you into a fully animated, 3D world of action and excitement! To the skies brave knight - and victory!",
     "releaseDate": "1990-01-01",
     "developers": [
       "Westwood Associates",
@@ -3870,7 +3870,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1562430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1562430/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "DREDGE is a single-player fishing adventure with a sinister undercurrent. Sell your catch, upgrade your boat, and dredge the depths for long-buried secrets. Explore a mysterious archipelago and discover why some things are best left forgotten.",
     "releaseDate": "2023-03-30",
     "developers": [
       "Black Salt Games"
@@ -3921,7 +3921,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904551/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904551/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Explore countless new dungeons in a game that never has to be the same twice. Send your character on quest after quest, down through the many pits, traps, and puzzles that Dungeon Hack has to offer.",
     "releaseDate": "1993-01-01",
     "developers": [
       "DreamForge Intertainment"
@@ -3964,7 +3964,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/727850/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/727850/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "ELDERBORN - a Metal AF* Slasher with brutal FPP melee combat and souls-like/RPG character progression. In the times of legend, barbarian tribes need a new dark messiah. Be that merciless slayer. Uncover ancient secrets in the city of doom. Forge your own destiny! *Action Fantasy.",
     "releaseDate": "2020-01-30",
     "developers": [
       "Hyperstrange"
@@ -4019,7 +4019,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2243110/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2243110/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "EMPTY SHELL will throw you in a dark industrial environment, a secret facility on a Japanese island. Each volunteer has signed a contract for a &quot;recovery operation&quot; without being privy to too many details. A tense roguelite survival horror with a top down perspective.",
     "releaseDate": "2023-10-16",
     "developers": [
       "CC ARTS"
@@ -4061,7 +4061,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/25600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/25600/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Eschalon: Book I is an old-school role-playing game that will take you across massive outdoor environments and deep into dozens of sprawling dungeons as you seek to uncover the mystery of who you are. It features a tile-built, turn-based game world where the result of absolutely every action is rolled, calculated or statistically...",
     "releaseDate": "2006-11-17",
     "developers": [
       "Basilisk Games"
@@ -4108,7 +4108,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1425330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1425330/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Step into war-torn enemy territory in this immersive VR game experience based on the Oscar-shortlisted documentary MY ENEMY, MY BROTHER (2015). EYE OF THE BEHOLDER is a 20 minute beta experience that subverts the war-game genre as players must choose to combat or collaborate with others.",
     "releaseDate": "1991-01-01",
     "developers": [
       "Westwood Associates"
@@ -4151,7 +4151,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882261/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882261/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Sequel to Eye of the Beholder is a bigger adventure that includes a forest, temple, catacomb and three huge towers. Smarter, meaner monsters, more people, clues and mysteries make this adventure the best role-playing experience ever!",
     "releaseDate": "1991-12-01",
     "developers": [
       "Westwood Associates"
@@ -4194,7 +4194,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882262/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882262/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "The Grand Finale of the Meanest Adventure Series! Prepare to be transported to the ruined city of Myth Drannor in the FORGOTTEN REALMS' world, where you journey through the forest, mausoleum, temple and guilds, each filled with its own intricate puzzles and traps.",
     "releaseDate": "1993-01-01",
     "developers": [
       "Strategic Simulations"
@@ -4285,7 +4285,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/0584f7fbcb480d39f317067ba81e78c76f6735d41c3d281b8db8b1bbe8d715d4_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/0584f7fbcb480d39f317067ba81e78c76f6735d41c3d281b8db8b1bbe8d715d4_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "You've just unearthed the classic post-apocalyptic role-playing game that revitalized the entire CRPG genre. The Fallout® SPECIAL system allows drastically different types of characters, meaningful decisions and development that puts you in complete control. Explore the devastated ruins of a golden age civilization.",
     "releaseDate": "1997-09-30",
     "developers": [
       "Interplay"
@@ -4340,7 +4340,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/e1fb495117c3c3c5b50c30db055acdc7545893b842111058d49c5039f2014680_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/e1fb495117c3c3c5b50c30db055acdc7545893b842111058d49c5039f2014680_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Fallout® 2 is the sequel to the critically acclaimed game that took RPG'ing out of the dungeons and into a dynamic, apocalyptic retro-future. It's been 80 long years since your ancestors trod across the wastelands.",
     "releaseDate": "1998-09-30",
     "developers": [
       "Interplay"
@@ -4393,7 +4393,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Prepare for the Future™ With Fallout 3: Game of the Year Edition, experience the most acclaimed game of 2008 like never before. Create a character of your choosing and descend into an awe-inspiring, post-apocalyptic world where every minute is a fight for survival.",
     "releaseDate": "2009-10-13",
     "developers": [
       "Bethesda Game Studios"
@@ -4444,7 +4444,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/4970369a94834801c5b15def214e62a281f495b665261a39b6de5d52a9d04735_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/4970369a94834801c5b15def214e62a281f495b665261a39b6de5d52a9d04735_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Tactical Squad-Based Combat comes to the Fallout® Universe! You are the wretched refuse. You may be born from dirt, but we will forge you into steel. You will learn to bend; if not you, will you break. In these dark times, the Brotherhood - your Brotherhood - is all that stands between the rekindled flame of civilization and the howling,...",
     "releaseDate": "2001-03-15",
     "developers": [
       "14° East"
@@ -4606,7 +4606,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350530/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350530/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Create alliances, defeat enemy kingdoms and forge an empire in this Dungeons &amp; Dragons game world! Under the computer Dungeon Master, you’ll interact with fantastic races, command dozens of troop types, send your heroes on quests and construct a variety of buildings and fortifications.",
     "releaseDate": "1993-10-01",
     "developers": [
       "Silicon Knights"
@@ -4658,7 +4658,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741120/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741120/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Fantasy General invites you to enter a world of heroes, swords, magic and beasts. You must lead your army into battle with the Shadowlord’s forces and defeat each of his lieutenants across varying terrain and battlefields.",
     "releaseDate": "1996-03-01",
     "developers": [
       "Strategic Simulations"
@@ -4748,7 +4748,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "FATE fans! You asked for it and we delivered. FATE: Undiscovered Realms, the dungeon crawl-ier sequel to our classic dungeon crawler, is now available! Take up the quest to find a mysterious tome. Import your characters from the original FATE and start a new adventure today!",
     "releaseDate": "2008-08-08",
     "developers": [
       "WildTangent"
@@ -4801,7 +4801,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1360980/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1360980/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Play as a young college student exploring love, lust, and sexual fetishes with the hottest women in town. Score points in the Fetish Locator app, which has taken the campus by storm. Make choices and decide the fate of the story in Fetish Locator!",
     "releaseDate": "2020-07-27",
     "developers": [
       "ViNovella Games"
@@ -5027,7 +5027,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1931730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1931730/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Answer the call from a mining base on Mars as engineer Jack Leary and search for the missing crew. Fort Solis will immerse you with cinematic visuals powered by UE 5 and voice acting of Roger Clark and Troy Baker. Explore the mining complex and reach climax of this narrative thriller experience.",
     "releaseDate": "2023-08-22",
     "developers": [
       "Fallen Leaf",
@@ -5079,7 +5079,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322450/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Rearrange the panels of an animated comic book to craft the story of a noir-styled spy adventure in the FRAMED Collection--a compilation of the multi-award winning puzzle games FRAMED and FRAMED 2.",
     "releaseDate": "2018-05-17",
     "developers": [
       "Loveshack Entertainment"
@@ -5128,7 +5128,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2484130/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2484130/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "A journey of flavors and friendships awaits you in your cozy, customisable food truck! Forage for fresh ingredients to create your own menu, then feed tummies and souls with home-cooked meals. Change the world, one apple at a time.",
     "releaseDate": "2024-10-08",
     "developers": [
       "Krillbite Studio"
@@ -5233,7 +5233,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904523/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904523/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Enter the foreboding lands of an area never before explored in a computer fantasy RPG: the Savage Frontier! Sail the Trackless Sea; conquer the heights of the Lost Peaks; brave the ruins of Ascore, guardian of the Great Desert; visit magical Silvermoon - and much, much more!",
     "releaseDate": "1991-01-01",
     "developers": [
       "Beyond Software"
@@ -5276,7 +5276,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
     "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Ghostrunner offers a unique single-player experience: fast-paced, violent combat, and an original setting that blends science fiction with post-apocalyptic themes. It tells the story of a world that has already ended and its inhabitants who fight to survive.",
     "releaseDate": "2020-10-27",
     "developers": [
       "One More Level"
@@ -5326,7 +5326,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/488730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/488730/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Slay enemies with speed and precision in an over-the-top show of blood and explosions. Play solo or with others, make split-second decisions, dodge bullets, and use weapons and abilities to inflict violence in the most graphic way possible.",
     "releaseDate": "2019-04-19",
     "developers": [
       "One More Level"
@@ -5381,7 +5381,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431240/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431240/library_600x900_2x.jpg",
-    "shortDescription": "Sports experience",
+    "shortDescription": "Why have friends if not to play Golf... With Your Friends! Nothing is out of bounds as you take on courses filled with fast paced, exciting, simultaneous mini golf for up to 12 players!",
     "releaseDate": "2020-05-19",
     "developers": [
       "Blacklight Interactive",
@@ -5433,7 +5433,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606880/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606880/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Engage in a core roleplaying experience, and forge the destiny of a new world seeping with magic, and filled with riches, lost secrets, and fantastic creatures. With diplomacy, deception and force, become part of a living, evolving world - influence its course and shape your story.",
     "releaseDate": "2019-09-10",
     "developers": [
       "Spiders"
@@ -5486,7 +5486,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/316790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/316790/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "One of the most acclaimed adventure games of all time is now back, better than ever. Grim Fandango Remastered has the all the beautiful art and engaging story fans remember, but has also been remastered to look, sound, and control even better than the award-winning original release.",
     "releaseDate": "2015-01-27",
     "developers": [
       "Double Fine Productions"
@@ -5585,7 +5585,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1284410/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1284410/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Command mighty Witcher-world heroes in epic online PvP card battles!",
     "releaseDate": "2018-10-23",
     "developers": [
       "CD PROJEKT RED"
@@ -5632,7 +5632,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1282410/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1282410/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Hard West 2 is a journey to the heart of darkness in the American West. Take control of a supernatural posse and catch the mysterious Ghost Train. Outsmart, outcheat and outgun your enemies in this turn-based tactics game set in a Wild West world where nothing is as it seems.",
     "releaseDate": "2022-08-04",
     "developers": [
       "Ice Code Games"
@@ -5676,7 +5676,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/924750/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/924750/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Harold Halibut is a handmade narrative game about friendship and life on a city-sized spaceship submerged in an alien ocean. Join Harold as he explores a vibrant retro-future world in his quest to find the true meaning of ‘home’.",
     "releaseDate": "2024-04-16",
     "developers": [
       "Slow Bros."
@@ -5732,7 +5732,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1549550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1549550/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Be Flint, who is doing his best to keep his grandma's park up and running and make it a place for the campers to enjoy. Learn the camper's wishes and build whatever their hearts desire to attract even more quirky characters and look forward to whimsical conversations and quests.",
     "releaseDate": "2021-08-05",
     "developers": [
       "Fabien Weibel"
@@ -5784,7 +5784,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/681330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/681330/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "Trade your wares and eliminate the competition in a cutthroat world. Buy new ships and stations to mine and haul resources. Explore the vast emptiness of space.",
     "releaseDate": "2018-10-11",
     "developers": [
       "Deimos Games"
@@ -5886,7 +5886,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/628670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/628670/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Hellpoint is an intense action RPG taking place on Irid Novo, a derelict space station soaked in an intoxicating dark sci fi atmosphere. Fight dreadful creatures, face the Cosmic Gods and unravel their twisted story. Should the challenge be too great, play with a friend in local or online coop.",
     "releaseDate": "2020-07-30",
     "developers": [
       "Cradle Games"
@@ -5942,7 +5942,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1243140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1243140/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "This is a standalone story in Hellpoint universe, a dark and challenging action RPG set in the world where the line between science and occultism is blurred. The Thespian Feast tells the story of an investigator arriving at Irid Novo station 50 years after the Hellpoint events.",
     "releaseDate": "2020-02-20",
     "developers": [
       "Cradle Games"
@@ -5998,7 +5998,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1590730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1590730/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Helping the Hotties is a unique adult visual novel harem game filled with gorgeous girls, humor, exciting secrets, and spicy romance set in a hot summer. It’s time to enjoy your summer in a whole new way.",
     "releaseDate": "2023-08-31",
     "developers": [
       "xRedGames"
@@ -6054,7 +6054,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1656780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1656780/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "A fast turn-based strategy RPG with real-time combat. Develop your cities and armies, level up your heroes to gain new, powerful spells and skills, and explore the wonders and dangers of the procedurally generated maps as you aim to conquer your enemies before they do the same to you.",
     "releaseDate": "2022-03-01",
     "developers": [
       "Benjamin \"ThingOnItsOwn\" Hauer"
@@ -6107,7 +6107,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350511/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350511/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Discover the world of Krynn in this D&amp;D epic. Control the Companions of the Lance (they aren’t Heroes until they succeed!) in their quest to recover the Disks of Mishakal. Only this can defeat the Queen of Darkness and restore the balance between Good and Evil.",
     "releaseDate": "",
     "developers": [
       "Strategic Simulations"
@@ -6202,7 +6202,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904525/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904525/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Every visit to Hillsfar is a different, exhilarating experience. Explore the city, meet its colorful denizens on the streets or in pubs and discover a quest.",
     "releaseDate": "1989-01-01",
     "developers": [
       "Westwood Studios"
@@ -6244,7 +6244,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203140/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The original assassin is back! Betrayed by the Agency and hunted by the police, Agent 47 finds himself pursuing redemption in a corrupt and twisted world.",
     "releaseDate": "2012-11-20",
     "developers": [
       "Io-Interactive"
@@ -6293,7 +6293,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/833040/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/833040/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "You’ve crash landed on a dangerous alien planet with no food, medicine, or prospects, but you do know one thing—you are absolutely desperate for friendship.",
     "releaseDate": "2018-04-13",
     "developers": [
       "What Pumpkin Games, Inc."
@@ -6344,7 +6344,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/892860/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/892860/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "As an elite SWAT operator, think fast and put your tactics to the test to master a series of missions and save lives. Summon your team of up to four players in online and local co-op, or hone your skills solo. Don’t just be the best—be the best of the best.",
     "releaseDate": "2021-02-26",
     "developers": [
       "Walk with Kings"
@@ -6448,7 +6448,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/611790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/611790/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "House Party is an edgy comedy adventure game inspired by classic comedies of the '90s. Every decision changes your story and every character has something to reveal. There’s also a button to take your pants off.",
     "releaseDate": "2022-07-16",
     "developers": [
       "Eek! Games, LLC"
@@ -6502,7 +6502,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/339800/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/339800/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "HuniePop is a unique sim experience for PC, Mac and Linux. It's a gameplay first approach that's part dating sim, part puzzle game, with light RPG elements, a visual novel style of presentation, an abrasive western writing style and plenty of &quot;plot&quot;.",
     "releaseDate": "2015-01-19",
     "developers": [
       "HuniePot"
@@ -6557,7 +6557,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/844590/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/844590/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "Greetings Enforcer, and thank you for enlisting in the Hypnospace Patrol Department! As the world falls into its slumber, Hypnospace becomes a bustling global village. These virtual streets aren't going to police themselves!",
     "releaseDate": "2019-03-12",
     "developers": [
       "Tendershoot",
@@ -6614,7 +6614,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/595140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/595140/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Immortal Redneck is a FPS set in Egypt with rogue-lite elements. Frantic gameplay, twitch controls and an arcade-style feel meet randomly generated dungeons, a complete skill tree, permanent death and 9 classes with different traits.",
     "releaseDate": "2017-04-25",
     "developers": [
       "Crema Games"
@@ -6665,7 +6665,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Embark on a gripping journey in INDUSTRIA, an atmospheric FPS set in Cold War-era East Berlin. Unravel the secrets of a mysterious parallel dimension while searching for a missing colleague. Explore a haunting reality where the truth awaits. Discover the dark past that lies beyond.",
     "releaseDate": "2021-09-30",
     "developers": [
       "Gaming Minds Studios"
@@ -6707,7 +6707,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/807120/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/807120/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Iratus: Lord of the Dead is a turn-based tactical roguelike RPG set in a dark fantasy universe. Lead an army of undead to help an angry necromancer in his quest to reach the surface world and bring death to the mortal realms!",
     "releaseDate": "2020-04-23",
     "developers": [
       "Unfrozen"
@@ -6759,7 +6759,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1412170/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1412170/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Challenging retro pixel graphics action-platformer. Become a legendary rogue Janosik and explore the big mountain castle level full of secrets. Available for FREE!",
     "releaseDate": "2020-09-25",
     "developers": [
       "Onix Games"
@@ -6854,7 +6854,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/811320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/811320/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "True Roguelike. Turn-based shooter. Permadeath. Tribute to the sci-fi classics of the Golden VHS era. Successor to DRL. Just you and your gun against hordes of horrors and monstrosities. Give them hell to the rhythm of heavy metal.",
     "releaseDate": "2019-08-01",
     "developers": [
       "ChaosForge "
@@ -6904,7 +6904,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "In Kerbal Space Program, take charge of the space program for the alien race known as the Kerbals. You have access to an array of parts to assemble fully-functional spacecraft that flies (or doesn’t) based on realistic aerodynamic and orbital physics.",
     "releaseDate": "2015-04-27",
     "developers": [
       "Squad"
@@ -7061,7 +7061,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1469300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1469300/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Leap of Love is a fantasy game where you play as Kaheroux a frog turned prince by a shady wizard. The catch of that spell is that he needs to find and marry a princess within a month or go back to being a frog.",
     "releaseDate": "2020-12-31",
     "developers": [
       "Andrealphus Games"
@@ -7114,7 +7114,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242960/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242960/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Cast down from power by a mysterious warlord centuries ago, Kain reawakens in a world he barely recognises. His armies slain, his vampire brethren nearly extinct, Kain is one of the last of his kind. With an agenda of vengeance, Kain shall unleash a wicked wrath to uncover the plot that threatens the land he seeks to conquer.",
     "releaseDate": "2002-03-20",
     "developers": [
       "Crystal Dynamics"
@@ -7159,7 +7159,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/224300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/224300/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Take control of two powerful and highly evolved vampires: Kain, an all-powerful demigod, and Raziel, a demonic angel of death. Each equipped with a legendary sword, Kain &amp; Raziel must battle through a world loaded with conflict and intrigue as they attempt to unravel their destinies and defeat the dark forces that seek to condemn...",
     "releaseDate": "2003-12-17",
     "developers": [
       "Crystal Dynamics"
@@ -7315,7 +7315,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/285160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/285160/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Reclaim the Lost Kingdom brick by brick! Join Bilbo Baggins, Gandalf, Thorin and his company of Dwarves in an epic adventure across Middle-earth to recapture the Lonely Mountain in the most expansive LEGO game to date.",
     "releaseDate": "2014-04-10",
     "developers": [
       "Traveller's Tales"
@@ -7368,7 +7368,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/214510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/214510/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Based on The Lord of the Rings motion picture trilogy, LEGO® The Lord of the Rings follows the original story-lines of The Lord of the Rings: The Fellowship of the Ring, The Lord of the Rings: The Two Towers, and The Lord of the Rings: The Return of the King, taking players through the epic story events re-imagined with the humor and endl",
     "releaseDate": "2012-11-27",
     "developers": [
       "Traveller's Tales"
@@ -7424,7 +7424,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/946660/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/946660/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Loria is a homage to classics from golden era of strategy games, with modern spin on controls and user experience.",
     "releaseDate": "2018-11-27",
     "developers": [
       "Black Eye Games"
@@ -7574,7 +7574,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/50130/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/50130/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Vito Scaletta has started to make a name for himself on the streets of Empire Bay as someone who can be trusted to get a job done. Together with his buddy Joe, he is working to prove himself to the Mafia, quickly escalating up the family ladder with crimes of larger reward, status and consequence… the life as a wise guy isn’t quite as...",
     "releaseDate": "2011-03-22",
     "developers": [
       "2K Czech"
@@ -7773,7 +7773,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712390/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Martial Law is a game about difficulties that came with Communism in Poland. The story is shown from the perspective of a man who is abandoned because of his low social status. He tries his best to be there for his daughter despite the difficulties.",
     "releaseDate": "2021-12-23",
     "developers": [
       "FIXER"
@@ -7818,7 +7818,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606030/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606030/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Meganoid is a brutal, fast-paced platformer where every descent into its ever-shifting spaceship is a new challenge. Navigate deadly traps, outsmart security drones, and discover powerful upgrades to reshape how you play. Will you rush to survive, or risk it all to uncover its deepest secrets?",
     "releaseDate": "2017-03-29",
     "developers": [
       "Orangepixel"
@@ -7873,7 +7873,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904550/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "While resting in Icewind Dale, members of your party have been captured by the evil Drow. To make matters worse, they have been taken underground, deep to where the Drow reign supreme.",
     "releaseDate": "1994-01-01",
     "developers": [
       "DreamForge Intertainment"
@@ -7972,7 +7972,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/241930/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/241930/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Fight through Mordor and uncover the truth of the spirit that compels you, discover the origins of the Rings of Power, build your legend and ultimately confront the evil of Sauron in this new chronicle of Middle-earth.",
     "releaseDate": "2014-09-30",
     "developers": [
       "Monolith Productions"
@@ -8025,7 +8025,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356190/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Experience an epic open-world brought to life by the award-winning Nemesis System. Forge a new Ring of Power, conquer Fortresses in massive battles and dominate Mordor with your personal orc army in Middle-earth™: Shadow of War™.",
     "releaseDate": "2017-10-10",
     "developers": [
       "Monolith Productions"
@@ -8129,7 +8129,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276810/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276810/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Mordheim: City of the Damned is the first video game adaptation of Games Workshop's cult classic tabletop game Mordheim. Set in the Warhammer World's decimated Empire city, Mordheim: City of the Damned is a turn-based tactical game where you lead warbands into bloody and lethal skirmishes.",
     "releaseDate": "2015-11-19",
     "developers": [
       "Rogue Factor"
@@ -8179,7 +8179,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1080750/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1080750/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "A mutant soap opera where small-town gossip meets the supernatural. Explore the Mutazione community as Kai as she cares for her ailing grandfather. Discover magical gardens, new friends &amp; old secrets. They can survive an apocalyptic meteor strike, but can they survive their small-town drama?",
     "releaseDate": "2019-09-19",
     "developers": [
       "Die Gute Fabrik"
@@ -8235,7 +8235,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2852980/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2852980/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Necroking is a turn-based tactics roguelite with vast deckbuilding. You play as a Master of Necromancy. Build your skulls deck, raise skeletons and other scum to defeat settlements desecrated by life.",
     "releaseDate": "2024-09-04",
     "developers": [
       "KORO.GAMES"
@@ -8290,7 +8290,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/794540/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/794540/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "A visual novel about emotional survival in an automated world. Play as Lina, the last human cab driver. It’s your first night driving the lonely streets of Los Ojos, and your best friend has just disappeared. Stay on the road. Stay on the search. Stay human.",
     "releaseDate": "2019-10-03",
     "developers": [
       "Chance Agency"
@@ -8381,7 +8381,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/704450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/704450/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Return to the Forgotten Realms in this bestselling Dungeons &amp; Dragons roleplaying game. Combines all the content of Neverwinter Nights Diamond Edition with all-new enhanced features. Includes 100+ hours of award-winning adventures and the tools to create your own!",
     "releaseDate": "2018-03-27",
     "developers": [
       "Beamdog"
@@ -8431,7 +8431,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6420/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Ambitious megacorporations monopolize the conquest of space and the colonization of the solar system. At the very edge of the solar system, the companies make a discovery that will shift the technological advantage and upset the balance. And so a new conflict is born: &quot;The Jupiter Incident.&quot;",
     "releaseDate": "2004-11-05",
     "developers": [
       "Mithis Entertainment"
@@ -8480,7 +8480,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1400520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1400520/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Not everyone on the planet Driftland is happy with the new order brought by the mages-rulers. Is this nothing more than an attempt to restore the apparent balance that has almost destroyed the entire planet once? Join the brave Nomads and fight for freedom on your own terms.",
     "releaseDate": "2020-12-07",
     "developers": [
       "Star Drifters"
@@ -8529,7 +8529,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1348690/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1348690/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Oaken, a turn-based tactical roguelike set in the spirit inhabited world. Explore the Great Oak, gather allies and trinkets, learn to use the positioning for your advantage, choose how to upgrade your cards. Wake the spirits and save the Oak!",
     "releaseDate": "2022-05-03",
     "developers": [
       "Laki Studios"
@@ -8631,7 +8631,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1536610/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1536610/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "OpenTTD is a business simulation game in which players earn money by transporting passengers and cargo via road, rail, water, and air. It is an open-source remake and expansion of the 1995 Chris Sawyer video game Transport Tycoon Deluxe.",
     "releaseDate": "2004-03-14",
     "developers": [
       "OpenTTD"
@@ -8683,7 +8683,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1129190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1129190/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "A twenty-dollar bill, four summers, fifteen years, and a one of a kind life. Create an experience that’s all your own in this near-fully customizable visual novel where you grow from childhood to adulthood with the lonely boy next door.",
     "releaseDate": "2020-11-16",
     "developers": [
       "GB Patch Games"
@@ -8734,7 +8734,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "Overcooked is a chaotic couch co-op cooking game for one to four players. Working as a team, you and your fellow chefs must prepare, cook and serve up a variety of tasty orders before the baying customers storm out in a huff.",
     "releaseDate": "2018-08-07",
     "developers": [
       "Ghost Town Games Ltd.",
@@ -8885,7 +8885,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/388880/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/388880/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Oxenfree is a supernatural thriller about a group of friends who unwittingly open a ghostly rift. You are Alex, and you’ve just brought your new stepbrother Jonas to an overnight island party gone horribly wrong.",
     "releaseDate": "2016-01-15",
     "developers": [
       "Night School Studios"
@@ -8944,7 +8944,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1768280/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1768280/library_600x900_2x.jpg",
-    "shortDescription": "Simulation experience",
+    "shortDescription": "Build an empire in a single sitting. All the strategy of a classic 4X in a faster format, which also shines in multiplayer.",
     "releaseDate": "2022-10-11",
     "developers": [
       "The Secret Games Company"
@@ -8995,7 +8995,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1374290/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1374290/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "You wake up in a spaceship with no memories. In this escape room with a sci-fi setting you will have to investigate your past solving different puzzles. Will you be able to discover what happened to you and how did you get there?",
     "releaseDate": "2020-10-14",
     "developers": [
       "mc2games"
@@ -9047,7 +9047,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2702050/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2702050/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Phantasie: Memorial Set compiles the classic RPG trilogy, featuring party-based adventures, turn-based combat, diverse classes, and epic quests. Phantasie series is a timeless contribution to early RPGs that embodies fantasy world exploration and strategic gameplay.",
     "releaseDate": "2023-12-19",
     "developers": [
       "Strategic Simulations",
@@ -9097,7 +9097,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431650/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "A tale of survival about two shipwrecked robots - ION and ANI - on their life-defining journey in this unique genre-mix of exploration, puzzle and survival.",
     "releaseDate": "2017-02-07",
     "developers": [
       "ION LANDS"
@@ -9153,7 +9153,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2601940/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2601940/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Action adventure meets pinball in this one-of-a-kind pinballvania adventure. When a mysterious spire appears from thin air, it's up to an intrepid pinball to bump, spin, shoot, and flip its way to the top and solve the tower’s mysteries!",
     "releaseDate": "2024-10-02",
     "developers": [
       "Apparition Games"
@@ -9206,7 +9206,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1608230/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1608230/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "In a world torn between nature’s grace and cold machine invasion, one girl and her companion must rely on their bond to survive and protect what they hold dear. Their story of hope, loss, and love will stay with you long after the journey ends.",
     "releaseDate": "2023-05-23",
     "developers": [
       "Wishfully"
@@ -9258,7 +9258,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882370/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882370/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Located on the northern shore of the Moonsea, the fabled city of Phlan has been overrun by monsters led by a mysterious leader. Your quest: uncover the identity of this evil force and rid Phlan of its scourge, restoring the city to its former glory.",
     "releaseDate": "1988-01-01",
     "developers": [
       "Stormfront Studios"
@@ -9305,7 +9305,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904522/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904522/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "The Final Challenge. The Ultimate Enemy. First there was Pool of Radiance. Next came Curse of the Azure Bonds. Then followed Secret of the Silver Blades. Now, the epic has come full circle - Pools of Darkness takes you back to the Moonsea region for the final battle against the ultimate enemy.",
     "releaseDate": "1991-01-01",
     "developers": [
       "Strategic Simulations"
@@ -9347,7 +9347,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/223470/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/223470/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Live a week in the life of &quot;The POSTAL Dude&quot;; a hapless everyman just trying to check off some chores. Buying milk, returning an overdue library book, getting Gary Coleman's autograph, what could possibly go wrong?",
     "releaseDate": "2003-04-14",
     "developers": [
       "Running With Scissors"
@@ -9447,7 +9447,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "In Prey, you awaken aboard Talos I, a space station orbiting the moon in the year 2032. You are the key subject of an experiment meant to alter humanity forever – but things have gone terribly wrong. The space station has been overrun by hostile aliens and you are now being hunted.",
     "releaseDate": "2017-05-04",
     "developers": [
       "Arkane Studios"
@@ -9501,7 +9501,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2833640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2833640/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Embark on an archaeological adventure inside an ancient pyramid to find your missing mentor. As an intrepid explorer, solve puzzles, investigate clues, and unravel the pyramid's secrets. Spoiler: it was not built by humans!",
     "releaseDate": "2024-12-05",
     "developers": [
       "mc2games"
@@ -9550,7 +9550,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2210/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2210/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "As part of the elite Rhino Squad, you must spearhead Earth’s military invasion of a hostile alien homeworld. But, in this desperate war for humanity’s survival against an unrelenting enemy, you may discover that the only way to defeat them...is to become one of them.",
     "releaseDate": "2005-10-18",
     "developers": [
       "RavenSoft",
@@ -9729,7 +9729,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/290300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/290300/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Rebel Galaxy is a swashbuckling space adventure, with action-packed combat, exploration, discovery, trade, and “negotiation” with the outlandish denizens at the edge of the known universe.",
     "releaseDate": "2015-10-20",
     "developers": [
       "Double Damage Games"
@@ -9780,7 +9780,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/910830/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/910830/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Out of cash, out of luck, out on the fringe. Juno Markev has a killer to tail, a debt to pay, and more trouble headed her way. Rebel Galaxy Outlaw takes place in a greasy, blue-collar world of outlaws, truckers, cops and thieves.",
     "releaseDate": "2020-09-22",
     "developers": [
       "Double Damage Games"
@@ -9829,7 +9829,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1142390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1142390/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Broken Porcelain brings an abundance of welcome changes to the series, introducing new gameplay and storytelling elements that breathe new life into the characters and an unprecedented level of immersion in this haunting adventure – perfect for both new and returning fans to the series.",
     "releaseDate": "2020-10-13",
     "developers": [
       "Stormind Games"
@@ -9876,7 +9876,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1290780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1290780/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Explore a forgotten galaxy full of different planets, venture deeper into the planet to mine for rare resources, craft items to fix your ship, and discover ancient secrets and life forms. An exploration (survival) game like no other.. Adventure awaits!",
     "releaseDate": "2021-09-09",
     "developers": [
       "Orangepixel"
@@ -9925,7 +9925,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1299710/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1299710/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "The legendary Phantom of the Opera has returned! As Inspector Raoul Montand, you are the only one who can pursue the Red Death into the past and prevent him from terrorizing the present in this point and click mystery.",
     "releaseDate": "1993-09-01",
     "developers": [
       "MPS Labs"
@@ -9974,7 +9974,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/9480/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/9480/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Saints Row 2 brings true freedom to open-world gaming. Players can play as who they want, how they want, and with whomever they want in this sequel to the much acclaimed and tremendously successful Saints Row.",
     "releaseDate": "2009-01-07",
     "developers": [
       "Volition"
@@ -10024,7 +10024,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Experience the insane antics of Saints Row IV. The Saints have gone from the Penthouse to the White House - but Earth has been invaded and it’s up to you to save it with an arsenal of superpowers and strange weapons, in the wildest open world game ever.",
     "releaseDate": "2013-08-22",
     "developers": [
       "Deep Silver Volition"
@@ -10067,7 +10067,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/301910/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/301910/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Join Johnny Gat &amp; Kinzie Kensington as you tear apart Hell in a quest to save the Boss’ soul. Historical icons, old friends, older enemies, a talking gun, a full length musical number &amp; a whole lot more shenanigans await!",
     "releaseDate": "2015-01-22",
     "developers": [
       "Deep Silver Volition",
@@ -10118,7 +10118,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The Full Package, Remastered – With enhanced graphics, improved lighting, reworked environments, and visual effects, Steelport and The Third Street Saints have never looked so good.",
     "releaseDate": "2021-05-22",
     "developers": [
       "Deep Silver Volition",
@@ -10162,7 +10162,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1580970/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1580970/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Explore the beginnings of the Samorost series in the space gnome’s original bite-sized adventure, formerly released in 2003. Now with remastered sounds, enhanced graphics, and new music by Floex.",
     "releaseDate": "2021-05-20",
     "developers": [
       "Amanita Design"
@@ -10212,7 +10212,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/227220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/227220/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Combining action and strategy in a unique way, Sang-Froid: Tales of Werewolves transports you into an epic folktale co-written with best-selling Canadian author Bryan Perro (Amos Daragon, Wariwulf), in which two feuding brothers will have to put aside their differences to save their sister, who is pursued by the Devil himself!",
     "releaseDate": "2013-03-15",
     "developers": [
       "Artifice Studio"
@@ -10263,7 +10263,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1526900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1526900/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Answer the call of the wild with Sapphire Safari, an open-world Photography Adventure Game! Capture the beauty of real-life Monster Girls in their natural habitats, use tools to lure them into more erotic poses, and become intimate with them if you are brave enough...",
     "releaseDate": "2023-10-06",
     "developers": [
       "Kinky Fridays"
@@ -10311,7 +10311,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698670/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Scorn is an atmospheric first-person horror adventure game set in a nightmarish universe of odd forms and somber tapestry.",
     "releaseDate": "2022-10-14",
     "developers": [
       "Ebb Software"
@@ -10367,7 +10367,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904521/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904521/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "The frigid valleys of the Dragonspine Mountains echo with the desperate plea of terrified miners: &quot;Heroes of the Forgotten Realms, save us from evil!&quot; Unwittingly digging in unhallowed ground, they have disturbed an ancient vault and released its terrible content.",
     "releaseDate": "1990-01-01",
     "developers": [
       "Strategic Simulations"
@@ -10409,7 +10409,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350510/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Shadow Sorcerer combines elements of role-playing with strategy, exploration and animated action. It’s an exciting new way to play computer D&amp;D fantasy gaming!",
     "releaseDate": "",
     "developers": [
       "U.S. Gold"
@@ -10443,7 +10443,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/324800/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/324800/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Shadow Warrior 2 is the stunning evolution of Flying Wild Hog’s offbeat first-person shooter starring the brash warrior Lo Wang, who must again wield a devastating combination of guns, blades, magic and wit to strike down the demonic legions overwhelming the world.",
     "releaseDate": "2016-10-13",
     "developers": [
       "Flying Wild Hog"
@@ -10702,7 +10702,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/585450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/585450/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Shadows: Awakening is a unique, isometric single-player RPG with real-time tactical combat. You embark on an epic adventure with challenging gameplay, a gripping storyline and enchanting graphics.",
     "releaseDate": "2018-08-31",
     "developers": [
       "Games Farm"
@@ -10744,7 +10744,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Shogun Showdown is a turn-based combat game with rogue-like and deck-building elements. Position yourself and attack at the right time, upgrade your tiles and combo them to get ready to face the Shogun!",
     "releaseDate": "2024-09-05",
     "developers": [
       "Roboatino"
@@ -10835,7 +10835,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1155330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1155330/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "As a contestant on a high stakes reality game show of the future, you must survive a dangerous urban environment packed with traps, confounding puzzles, and heavily armed psychopaths. Turn-based combat in hand crafted levels, built for entertainment.",
     "releaseDate": "2023-05-02",
     "developers": [
       "Artificer"
@@ -10925,7 +10925,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3910/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3910/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Sid Meier's Civilization III: Complete, the latest offering in the Sid Meier's Civilization III franchise, provides gaming fans with Sid Meier's Civilization III, the highly-addictive journey of discovery.",
     "releaseDate": "2001-10-30",
     "developers": [
       "Firaxis Games"
@@ -10977,7 +10977,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1558990/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1558990/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Siege of Avalon is an isometric story-driven fantasy-RPG. The Citadel of Avalon is all that remains of the once-mighty seven kingdoms. The invaders have surrounded Avalon and the depleted garrison is bracing for the final assault. Now is the time for the birth of a legend.",
     "releaseDate": "2001-09-17",
     "developers": [
       "Digital Tome",
@@ -11070,7 +11070,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1811040/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1811040/library_600x900_2x.jpg",
-    "shortDescription": "Classic title",
+    "shortDescription": "South of the Circle is a deep narrative experience of the emerging relationship between Peter and Clara, Cambridge academics involved in a political conflict. The story focuses on promises made in between career and true love, where our choices burdened by our past seem to be illusory.",
     "releaseDate": "2022-08-03",
     "developers": [
       "State of Play Games"
@@ -11115,7 +11115,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/371430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/371430/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "A turn-based game on a planet outpost - with no waiting between turns! Play it at the speed of an arcade game, or take your time and think about your next step.. no matter how fast you take your turn, it might be your last!",
     "releaseDate": "2016-01-12",
     "developers": [
       "Orangepixel"
@@ -11222,7 +11222,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350550/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Swashbuckling excitement and the magic of D&amp;D adventures - in wildspace. Captain your own Spelljammer ship. Recruit officers and crew to man your magical ship. Soar into the ether and explore the planets of Realmspace.",
     "releaseDate": "1992-01-01",
     "developers": [
       "Cybertech"
@@ -11273,7 +11273,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239350/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239350/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Spelunky is a unique platformer with randomized levels that offer a challenging new experience each time you play. Journey deep underground and explore fantastic places filled with all manner of monsters, traps, and treasure.",
     "releaseDate": "2013-08-08",
     "developers": [
       "Mossmouth"
@@ -11326,7 +11326,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6060/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6060/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "Join the rise of Darth Vader’s elite 501st Legion of Stormtroopers as you fight through an all new story-based saga where every action you take impacts the battlefront and, ultimately, the fate of the Star Wars galaxy.",
     "releaseDate": "2005-10-31",
     "developers": [
       "Lucasfilm"
@@ -11377,7 +11377,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356500/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356500/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "Lead the great armies of the Star Wars™ Episode II: Attack of the Clones saga in intense real-time strategy clashes. Enter the fray as the Galactic Empire, Rebel Alliance, Wookies, Trade Federation, Gungans or Royal Naboo to determine the course of the Galactic Civil War.",
     "releaseDate": "2001-11-09",
     "developers": [
       "Lucasfilm"
@@ -11426,7 +11426,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/32380/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/32380/library_600x900_2x.jpg",
-    "shortDescription": "Classic title",
+    "shortDescription": "Jedi Knight: Dark Forces II picks up where the award-winning Dark Forces™ game left off...with even more features and firepower in dazzling 3D graphics. As Kyle Katarn, you must acquire a lightsaber and learn the ways of the Force to become a Jedi Knight.",
     "releaseDate": "1997-09-30",
     "developers": [
       "Lucasfilm"
@@ -11553,7 +11553,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2419090/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2419090/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Bring In Your Bounty, Dead or Alive",
     "releaseDate": "2024-08-01",
     "developers": [
       "Aspyr"
@@ -11599,7 +11599,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/358390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/358390/library_600x900_2x.jpg",
-    "shortDescription": "Shooter experience",
+    "shortDescription": "In the far distant future, an epic war for survival takes place... Deep within the Andromeda galaxy, the people of Zile grow restless and greedy. The Zilions secretly prepare for a massive strike against the nearby planet Ytima. Fearing such an attack, the Ytimians train an elite squad of &quot;Stargunners.",
     "releaseDate": "1996-11-19",
     "developers": [
       "Apogee Entertainment"
@@ -11646,7 +11646,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/380150/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/380150/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "STASIS The isometric, point-and-click, sci-fi horror adventure game! In the distant future aboard a seemingly abandoned spacecraft, John Maracheck awakes from stasis. He must push himself to new physical and emotional limits and unravel the mysteries around him.",
     "releaseDate": "2015-08-31",
     "developers": [
       "The Brotherhood"
@@ -11701,7 +11701,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/437630/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/437630/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "State of Mind is a futuristic thriller game delving into transhumanism. The game explores themes of separation, disjuncture and reunification, in a world that is torn between a dystopian material reality and a utopian virtual future.",
     "releaseDate": "2018-08-15",
     "developers": [
       "Daedalic Entertainment"
@@ -11756,7 +11756,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322190/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Command a steam-driven pirate crew in a series of epic tactical shootouts in SteamWorld Heist. This is turn-based strategy with a twist: You manually aim the guns of your robots, allowing for insane skill shots and bullet-bouncing action!",
     "releaseDate": "2016-06-07",
     "developers": [
       "Image and Form"
@@ -11808,7 +11808,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/804010/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/804010/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Lead a party of aspiring heroes through a beautifully hand-drawn world and intense battles using only your wits and a handful of cards. Take on whatever threat comes your way by crafting your own deck choosing from over 100 unique punch-cards!",
     "releaseDate": "2019-05-31",
     "developers": [
       "Image and Form"
@@ -11861,7 +11861,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920780/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Gods. Romance. Murder. Musical Numbers?! Play as Grace in a world where Greek Gods live in hiding among us. Change your fate as you draw friends, foes &amp; lovers into song using your powers of musical persuasion to unravel the mystery of the Last Muse's death.",
     "releaseDate": "2023-08-10",
     "developers": [
       "Summerfall Studios"
@@ -11915,7 +11915,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242640/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Styx: Master of Shadows is an infiltration game with RPG elements taking place in a dark fantasy universe, where you sneak, steal and assassinate your way through as Styx, a Goblin two-centuries of age.",
     "releaseDate": "2014-10-07",
     "developers": [
       "Cyanide Studio"
@@ -11969,7 +11969,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/355790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/355790/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Styx returns in a new stealth adventure! Explore and master huge open environments, sneak past or assassinate new enemies and bosses, and experiment with the new array of lethal abilities and weapons in our goblin assassin's arsenal.",
     "releaseDate": "2017-03-14",
     "developers": [
       "Cyanide Studio"
@@ -12071,7 +12071,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/313730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/313730/library_600x900_2x.jpg",
-    "shortDescription": "Strategy experience",
+    "shortDescription": "As Captain Kayto Shields, embark on a galactic voyage of heroism and survival. With his home world destroyed and his nation conquered, the inexperienced Captain Shields, and his newly minted vessel, the Sunrider, are left as the only hope against a galactic evil intent on subjugating all sentient life.",
     "releaseDate": "2014-07-02",
     "developers": [
       "Love in Space"
@@ -12229,7 +12229,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1410640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1410640/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Embark on a quest for identity through time, as you piece together the puzzle of two lives.",
     "releaseDate": "",
     "developers": [
       "Microids Studio Paris"
@@ -12452,7 +12452,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1483780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1483780/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "You are the test subject. In this dark environment escape room, you have to solve various puzzles to escape from the research center where you are trapped. Can you find out how you got there and escape???",
     "releaseDate": "2021-02-24",
     "developers": [
       "mc2games"
@@ -12504,7 +12504,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/792300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/792300/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The Beast Inside is a unique, gripping twist on thriller and survival horror. Immerse in the story of long-buried secrets, personal tragedies, and madness. Play as two protagonists bounded by dark heritage. Combat the enemies, solve riddles and experience real terror in the 3D-scanned environment.",
     "releaseDate": "2019-10-17",
     "developers": [
       "Illusion Ray Studio"
@@ -12562,7 +12562,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203830/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203830/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Face your Destiny! In Andergast, whose inhabitants are considered to be superstitious, King Efferdan awaits a state visit from high-ranking dignitaries. For centuries the kingdom has been at odds with neighboring Nostria, but now first steps are being undertaken toward a lasting peace.",
     "releaseDate": "2012-06-22",
     "developers": [
       "Daedalic Entertainment"
@@ -12610,7 +12610,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1992-01-01",
     "developers": [
       "Strategic Simulations"
@@ -12694,7 +12694,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812390/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "THE GREAT MACHINE AWAKENS",
     "releaseDate": "1996-08-31",
     "developers": [
       "Bethesda Softworks"
@@ -12739,7 +12739,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22320/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "The Elder Scrolls III: Morrowind® Game of the Year Edition includes Morrowind plus all of the content from the Bloodmoon and Tribunal expansions. The original Mod Construction Set is not included in this package. An epic, open-ended single-player RPG, Morrowind allows you to create and play any kind of character imaginable.",
     "releaseDate": "2003-11-07",
     "developers": [
       "Bethesda Softworks"
@@ -12789,7 +12789,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812290/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812290/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "THE LEGEND BEGINS",
     "releaseDate": "1994-03-01",
     "developers": [
       "Bethesda Softworks"
@@ -12833,7 +12833,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Detective Sebastian Castellanos has lost everything, including his daughter, Lily. To save her, he must descend into the nightmarish world of STEM. Horrifying threats emerge from every corner, and he must rely on his wits to survive. For his one chance at redemption, the only way out is in.",
     "releaseDate": "2017-10-12",
     "developers": [
       "Tango Gameworks"
@@ -12926,7 +12926,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1105670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1105670/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing experience",
+    "shortDescription": "Defend the last bastion of humanity with your squad of heroes! Exterminate fiendish monsters with magic and brute force by night and re-build your battered city defenses by day in this tactical RPG with rogue-lite mechanics.",
     "releaseDate": "2023-03-09",
     "developers": [
       "Ishtar Games"
@@ -13078,7 +13078,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2493180/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2493180/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Play musical notes to solve timing-based puzzles in a journey where you bring dormant beings to life. Explore colorful environments and create harmonious sounds to navigate through this tranquil puzzle adventure inspired by the origins of life.",
     "releaseDate": "2024-04-30",
     "developers": [
       "1 Simple Game"
@@ -13124,7 +13124,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The Outer Worlds is an award-winning single-player RPG from Obsidian Entertainment and Private Division. As you explore a space colony, the character you decide to become will determine how this player-driven story unfolds. In the colony's corporate equation, you are the unplanned variable.",
     "releaseDate": "2020-10-23",
     "developers": [
       "Obsidian Entertainment",
@@ -13176,7 +13176,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The Outer Worlds: Spacer’s Choice Edition is the ultimate way to play the award-winning RPG from Obsidian Entertainment and Private Division. Including the base game and all DLC, this remastered masterpiece is the absolute best version of The Outer Worlds.",
     "releaseDate": "2023-03-07",
     "developers": [
       "Obsidian Entertainment",
@@ -13278,7 +13278,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/257510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/257510/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "The Talos Principle is a first-person puzzle game in the tradition of philosophical science fiction. Made by Croteam and written by Tom Jubert (FTL, The Swapper) and Jonas Kyratzes (The Sea Will Claim Everything).",
     "releaseDate": "2014-12-11",
     "developers": [
       "Croteam"
@@ -13470,7 +13470,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2329580/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2329580/library_600x900_2x.jpg",
-    "shortDescription": "Adventure experience",
+    "shortDescription": "Join Suzie on her journey to rescue her cute little friends.",
     "releaseDate": "2021-12-16",
     "developers": [
       "Studio Chien d'Or"
@@ -13582,7 +13582,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Garrett, the Master Thief, steps out of the shadows into the City. In this treacherous place, where the Baron’s Watch spreads a rising tide of fear and oppression, his skills are the only things he can trust. Even the most cautious citizens and their best-guarded possessions are not safe from his reach.",
     "releaseDate": "2014-02-28",
     "developers": [
       "Eidos Montreal"
@@ -13730,7 +13730,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211600/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Stalk your prey on the quest for stolen goods with your blackjack, sword, and an assortment of unique arrows. Steal for money and uncover the hidden agendas of your allies and enemies as you play through an unravelling story of deception and revenge.",
     "releaseDate": "1998-11-30",
     "developers": [
       "Looking Glass Studios"
@@ -14057,7 +14057,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8000/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Tomb Raider: Anniversary retraces Lara Croft's original genre-defining adventure  globe-trotting 3rd person action-adventure in pursuit of the legendary Scion artifact. Using an enhanced 'Tomb Raider: Legend' game engine, the graphics, technology and physics bring Lara's adventure and pursuit of a mystical artifact known only as the...",
     "releaseDate": "2007-06-05",
     "developers": [
       "Crystal Dynamics"
@@ -14102,7 +14102,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7000/library_600x900_2x.jpg",
-    "shortDescription": "Action experience",
+    "shortDescription": "Follow Lara Croft down a path of discovery as she travels the globe to remote, exotic locales in search of one of history's greatest artifacts, that unleashes unwelcome figures from Lara's mysterious past.",
     "releaseDate": "2006-04-07",
     "developers": [
       "Crystal Dynamics"

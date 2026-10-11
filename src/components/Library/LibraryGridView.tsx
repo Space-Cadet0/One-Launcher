@@ -19,6 +19,8 @@ import { getOpenCriticData, getTierColor } from '../../services/opencritic/openC
 import { getHowLongToBeat } from '../../services/hltb/howLongToBeat';
 import { steamMatcher } from '../../services/steam/steamMatcher';
 import steamEnrichedCache from '../../services/storage/steamEnrichedCache.json';
+import steamBlurbCache from '../../services/storage/steamBlurbCache.json';
+import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 
@@ -36,7 +38,15 @@ function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
 }
 
 function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): string | null {
-  // 1. Steam enriched cache
+  // 1. Steam blurb cache (curated store blurbs for 379+ matched catalog titles)
+  if (targetAppId) {
+    const blurb = (steamBlurbCache as Record<string, string>)[String(targetAppId)];
+    if (blurb && !isPlaceholderSynopsis(blurb, game.title)) {
+      return blurb.trim();
+    }
+  }
+
+  // 2. Steam enriched cache
   if (targetAppId) {
     const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
     if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) {
@@ -44,28 +54,54 @@ function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): str
     }
   }
 
-  // 2. Enriched metadata on game
+  // 3. Steam API live memory cache
+  if (targetAppId) {
+    const live = steamApi.getCachedMetadata(targetAppId);
+    if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) {
+      return live.shortDescription.trim();
+    }
+  }
+
+  // 4. Enriched metadata on game
   if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
     return game.enrichedMetadata.shortDescription.trim();
   }
 
-  // 3. Game shortDescription
+  // 5. Game shortDescription (if not a placeholder)
   if (game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
     return game.shortDescription.trim();
   }
 
-  // 4. Clean summary from genres and developers
+  // 6. Clean summary from genres and developers
   if (game.genres && game.genres.length > 0) {
     const cleanGenres = game.genres
       .map((g) => g.replace(/\s*on GOG\.com.*$/i, '').replace(/\s*\(DRM-Free\)/i, '').trim())
       .filter((g) => g.length > 0 && !g.toLowerCase().includes('drm-free') && !g.toLowerCase().includes('gog'));
     if (cleanGenres.length > 0) {
       const dev = game.developers?.[0] ? ` developed by ${game.developers[0]}` : '';
-      return `${cleanGenres.slice(0, 3).join(', ')} experience${dev}.`;
+      return `${game.title} is a ${cleanGenres.slice(0, 3).join(', ')} title${dev}.`;
     }
   }
 
   return null;
+}
+
+function hasStoreSynopsis(game: CanonicalGame, targetAppId?: number | null): boolean {
+  if (targetAppId) {
+    const blurb = (steamBlurbCache as Record<string, string>)[String(targetAppId)];
+    if (blurb && !isPlaceholderSynopsis(blurb, game.title)) return true;
+    const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
+    if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) return true;
+    const live = steamApi.getCachedMetadata(targetAppId);
+    if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) return true;
+  }
+  if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
+    return true;
+  }
+  if (game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
+    return true;
+  }
+  return false;
 }
 
 function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): string | null {
@@ -123,7 +159,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const popoutRef = useRef<HTMLDivElement | null>(null);
   const activeCardRef = useRef<HTMLDivElement | null>(null);
 
-  // Fast auto-dismiss on scroll, wheel, window blur, resize, or pointer leave
+  const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
+
+  // Fast auto-dismiss on scroll, wheel, window blur, resize, or pointer outside bounds
   useEffect(() => {
     const handleDismiss = () => {
       if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
@@ -139,23 +177,41 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
       let inCard = false;
       let inPopout = false;
+      let inBridge = false;
+
+      let cardRect: DOMRect | null = null;
+      let popoutRect: DOMRect | null = null;
 
       if (activeCardRef.current) {
-        const r = activeCardRef.current.getBoundingClientRect();
-        // Generous 12px bridge between card and popout
-        if (x >= r.left - 12 && x <= r.right + 12 && y >= r.top - 12 && y <= r.bottom + 12) {
+        cardRect = activeCardRef.current.getBoundingClientRect();
+        // Strict bounding box for the active card
+        if (x >= cardRect.left && x <= cardRect.right && y >= cardRect.top && y <= cardRect.bottom) {
           inCard = true;
         }
       }
 
       if (popoutRef.current) {
-        const r = popoutRef.current.getBoundingClientRect();
-        if (x >= r.left - 6 && x <= r.right + 6 && y >= r.top - 6 && y <= r.bottom + 6) {
+        popoutRect = popoutRef.current.getBoundingClientRect();
+        // Strict bounding box for the popout
+        if (x >= popoutRect.left && x <= popoutRect.right && y >= popoutRect.top && y <= popoutRect.bottom) {
           inPopout = true;
         }
       }
 
-      if (!inCard && !inPopout) {
+      // Check narrow bridge corridor between active card and popout to allow seamless cursor movement
+      if (cardRect && popoutRect) {
+        const top = Math.min(cardRect.top, popoutRect.top);
+        const bottom = Math.max(cardRect.bottom, popoutRect.bottom);
+        if (y >= top && y <= bottom) {
+          if (cardRect.right <= popoutRect.left && x >= cardRect.right && x <= popoutRect.left) {
+            inBridge = true;
+          } else if (popoutRect.right <= cardRect.left && x >= popoutRect.right && x <= cardRect.left) {
+            inBridge = true;
+          }
+        }
+      }
+
+      if (!inCard && !inPopout && !inBridge) {
         handleDismiss();
       }
     };
@@ -174,6 +230,25 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       window.removeEventListener('mousemove', handleMouseMove);
     };
   }, []);
+
+  // Live dynamic blurb fetching for newly synced games without a cached description
+  useEffect(() => {
+    if (!hoveredGame) return;
+    const targetAppId = hoveredGame.steamAppId || steamMatcher.matchGameToSteamInstant(hoveredGame.title);
+    if (!targetAppId) return;
+
+    if (!hasStoreSynopsis(hoveredGame, targetAppId)) {
+      let active = true;
+      steamApi.fetchGameMetadata(targetAppId).then((meta) => {
+        if (active && meta?.shortDescription && !isPlaceholderSynopsis(meta.shortDescription, hoveredGame.title)) {
+          setDynamicBlurb({ id: hoveredGame.id, blurb: meta.shortDescription.trim() });
+        }
+      });
+      return () => {
+        active = false;
+      };
+    }
+  }, [hoveredGame?.id]);
 
   const handleSortChange = (newSort: 'alphabetical' | 'rating' | 'playtime' | 'recent') => {
     setSortBy(newSort);
@@ -217,6 +292,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
     if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
 
+    // If another card's popout is open, close it immediately!
+    if (hoveredGame && hoveredGame.id !== game.id) {
+      setHoveredGame(null);
+    }
+
     const cardEl = e.currentTarget;
     activeCardRef.current = cardEl;
 
@@ -229,7 +309,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         align: isRight ? 'right' : 'left',
       });
       setHoveredGame(game);
-    }, 220);
+    }, 200);
   };
 
   const handleCardMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -240,10 +320,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       return;
     }
 
-    hoverTimeoutRef.current = setTimeout(() => {
-      setHoveredGame(null);
-      activeCardRef.current = null;
-    }, 60);
+    // Immediately close popout when pointer leaves the coverart
+    setHoveredGame(null);
+    activeCardRef.current = null;
   };
 
   const handlePopoutMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -254,10 +333,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       return;
     }
 
-    hoverTimeoutRef.current = setTimeout(() => {
-      setHoveredGame(null);
-      activeCardRef.current = null;
-    }, 60);
+    // Immediately close popout when pointer leaves the popout
+    setHoveredGame(null);
+    activeCardRef.current = null;
   };
 
   const formatPlaytime = (game: CanonicalGame) => {
@@ -708,35 +786,24 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     };
 
                     return (
-                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[10px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1">
-                            <span className="w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center bg-[#29435c]">
-                              HL
-                            </span>
-                            HowLongToBeat
+                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5 text-[10px]">
+                        <div className="flex items-center gap-1.5 text-white/70">
+                          <Clock className="w-3.5 h-3.5 text-sky-400" />
+                          <span className="font-semibold uppercase tracking-wider text-[9px] text-white/60">
+                            Playtime
                           </span>
-                          {hltb.isAccurate ? (
-                            <span className="px-1.5 py-0.2 rounded text-[9px] font-semibold bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
-                              Verified
-                            </span>
-                          ) : (
-                            <span className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-white/5 border border-white/10 text-white/50">
-                              Estimate
-                            </span>
-                          )}
                         </div>
-                        <div className="flex items-center gap-2.5 text-[10px]">
+                        <div className="flex items-center gap-3">
                           {hltb.mainStoryHours > 0 && (
                             <span className="flex items-center gap-1 text-white/90">
-                              <span className="text-steam-subtext">Main:</span>
-                              <strong className="text-sky-300 font-bold">{formatHours(hltb.mainStoryHours)}</strong>
+                              <span className="text-steam-subtext text-[10px]">Main:</span>
+                              <strong className="text-sky-300 font-bold text-[11px]">{formatHours(hltb.mainStoryHours)}</strong>
                             </span>
                           )}
                           {hltb.completionistHours > 0 && (
                             <span className="flex items-center gap-1 text-white/90">
-                              <span className="text-steam-subtext">100%:</span>
-                              <strong className="text-amber-300 font-bold">{formatHours(hltb.completionistHours)}</strong>
+                              <span className="text-steam-subtext text-[10px]">100%:</span>
+                              <strong className="text-amber-300 font-bold text-[11px]">{formatHours(hltb.completionistHours)}</strong>
                             </span>
                           )}
                         </div>
@@ -745,9 +812,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   })()}
 
                   {/* Synopsis Snippet */}
-                  {cleanSynopsis && (
+                  {(dynamicBlurb?.id === hoveredGame.id ? dynamicBlurb.blurb : cleanSynopsis) && (
                     <p className="text-[11px] text-steam-subtext leading-relaxed line-clamp-3">
-                      {cleanSynopsis}
+                      {dynamicBlurb?.id === hoveredGame.id ? dynamicBlurb.blurb : cleanSynopsis}
                     </p>
                   )}
 
