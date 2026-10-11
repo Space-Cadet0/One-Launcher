@@ -169,7 +169,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
                 </button>
 
-                {/* Sync All */}
+                {/* Sync Integrations */}
                 <button
                   type="button"
                   onClick={() => {
@@ -178,6 +178,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   }}
                   disabled={isSyncing}
                   className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                  title="Sync all connected accounts (owned games, trophies & achievements, playtime)"
                 >
                   <div className="flex items-center gap-2.5">
                     <RefreshCw
@@ -189,9 +190,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     />
                     <div className="flex flex-col">
                       <span className="font-semibold text-white">
-                        {isSyncing ? 'Syncing...' : 'Sync All'}
+                        {isSyncing ? 'Syncing...' : 'Sync Integrations'}
                       </span>
-                      <span className="text-[10px] text-steam-subtext">Manifests & cloud libraries</span>
+                      <span className="text-[10px] text-steam-subtext">Games, trophies & playtime</span>
                     </div>
                   </div>
                   {isSyncing && (

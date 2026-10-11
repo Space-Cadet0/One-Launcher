@@ -85,37 +85,39 @@ export function loadIntegrations(): StorefrontIntegration[] {
       let changed = false;
       const updated = parsed.map((item: StorefrontIntegration) => {
         if (item.storefrontId === 'gog') {
-          const isOldPlaceholder = item.accountName === 'SpaceCadet' || item.accountName === 'GOG Account' || item.gamesCount !== GOG_USER_LIBRARY.length;
+          const isOldPlaceholder = item.accountName === 'SpaceCadet' || item.accountName === 'GOG Account' || (item.gamesCount || 0) < GOG_USER_LIBRARY.length;
           if (!item.isConnected || isOldPlaceholder) {
             changed = true;
+            const targetCount = Math.max(item.gamesCount || 0, GOG_USER_LIBRARY.length);
             return {
               ...item,
               isConnected: true,
               accountName: 'mike.stokes85',
               accountId: '49681274475932275',
               avatarUrl: 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
-              gamesCount: GOG_USER_LIBRARY.length,
+              gamesCount: targetCount,
               lastSyncedAt: item.lastSyncedAt || new Date().toISOString(),
               authMethod: 'oauth' as const,
               credentials: { gogUsername: 'mike.stokes85' },
-              statusMessage: `Connected as mike.stokes85 (${GOG_USER_LIBRARY.length} GOG titles synced)`,
+              statusMessage: `Connected as mike.stokes85 (${targetCount} GOG titles synced)`,
             };
           }
         }
         if (item.storefrontId === 'epic') {
-          if (!item.isConnected || item.gamesCount !== EPIC_USER_LIBRARY.length) {
+          if (!item.isConnected || item.gamesCount < EPIC_USER_LIBRARY.length) {
             changed = true;
+            const targetCount = Math.max(item.gamesCount || 0, EPIC_USER_LIBRARY.length);
             return {
               ...item,
               isConnected: true,
               accountName: item.accountName || 'BobDo1e',
               accountId: item.accountId || '8aaea3405ecc4c7b8786012029e98d6a',
               avatarUrl: item.avatarUrl || 'https://cdn2.unrealengine.com/egs-badge.png',
-              gamesCount: EPIC_USER_LIBRARY.length,
+              gamesCount: targetCount,
               lastSyncedAt: item.lastSyncedAt || new Date().toISOString(),
               authMethod: item.authMethod || ('oauth' as const),
               credentials: item.credentials || { epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a' },
-              statusMessage: `Connected as ${item.accountName || 'BobDo1e'} (${EPIC_USER_LIBRARY.length} Epic titles synced)`,
+              statusMessage: `Connected as ${item.accountName || 'BobDo1e'} (${targetCount} Epic titles synced)`,
             };
           }
         }
@@ -177,17 +179,17 @@ export function loadCurrentCatalog(): CanonicalGame[] {
         let cleaned = sanitizeGameCatalog(parsed);
 
         const steamCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'steam')).length;
-        if (steamCount !== FULL_USER_STEAM_GAMES.length) {
+        if (steamCount < FULL_USER_STEAM_GAMES.length) {
           cleaned = sanitizeGameCatalog(mergeScannedSteamGames(cleaned));
         }
 
         const gogCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'gog')).length;
-        if (gogCount !== GOG_USER_LIBRARY.length) {
+        if (gogCount < GOG_USER_LIBRARY.length) {
           cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, GOG_USER_LIBRARY, 'gog'));
         }
 
         const epicCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'epic')).length;
-        if (epicCount !== EPIC_USER_LIBRARY.length) {
+        if (epicCount < EPIC_USER_LIBRARY.length) {
           cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
         }
 
@@ -245,6 +247,7 @@ export function mergeStorefrontGames(
                   ...p,
                   platformGameId: platformOwnership.platformGameId || p.platformGameId,
                   installed: platformOwnership.installed ?? p.installed,
+                  lastPlayed: platformOwnership.lastPlayed || p.lastPlayed,
                   playtimeMinutes:
                     platformOwnership.playtimeMinutes !== undefined && platformOwnership.playtimeMinutes > 0
                       ? platformOwnership.playtimeMinutes

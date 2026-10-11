@@ -412,8 +412,19 @@ export class EpicIntegrationService {
     // Fetch user achievements for target Epic account
     const achievementsMap = await this.fetchUserAchievements(targetAccountId, accessToken);
 
-    // Apply achievements to the authoritative 402-game user library
-    const gamesWithAchievements = EPIC_USER_LIBRARY.map((game) => {
+    // Fetch live owned games if access token is available, otherwise fall back to verified baseline
+    let liveGames: CanonicalGame[] = [];
+    if (accessToken) {
+      try {
+        liveGames = await this.fetchOwnedGames(accessToken);
+      } catch (err) {
+        console.warn('Live Epic games fetch failed, using baseline catalog:', err);
+      }
+    }
+    const baseGames = liveGames.length > 0 ? liveGames : EPIC_USER_LIBRARY;
+
+    // Apply achievements to the resolved user library
+    const gamesWithAchievements = baseGames.map((game) => {
       const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
       if (!epicPlat) return game;
 

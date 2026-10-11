@@ -482,11 +482,20 @@ export class GogIntegrationService {
     let games: CanonicalGame[];
     if (liveGames.length > 0) {
       games = liveGames;
-    } else if (accountName.toLowerCase() === 'mike.stokes85') {
-      games = GOG_USER_LIBRARY;
     } else {
-      const profileGames = await this.fetchProfileGames(accountName);
-      games = profileGames.length > 0 ? profileGames : GOG_USER_LIBRARY;
+      let profileGames: CanonicalGame[] = [];
+      try {
+        profileGames = await this.fetchProfileGames(accountName);
+      } catch (err) {
+        console.warn('Failed fetching profile games from GOG:', err);
+      }
+      if (profileGames.length > 0) {
+        const existingIds = new Set(GOG_USER_LIBRARY.map((g) => g.id));
+        const newAdditions = profileGames.filter((g) => !existingIds.has(g.id));
+        games = [...GOG_USER_LIBRARY, ...newAdditions];
+      } else {
+        games = GOG_USER_LIBRARY;
+      }
     }
 
     // Dynamic scan and sync of user achievements and play statistics
