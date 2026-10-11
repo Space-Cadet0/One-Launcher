@@ -344,31 +344,6 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     </div>
                   )}
 
-                  {/* Top-Left: Storefront Not Connected Badge */}
-                  {(() => {
-                    const isAllDisconnected =
-                      game.platforms.length > 0 &&
-                      game.platforms.every((p) => !connectedSet.has(p.platformId));
-                    if (!isAllDisconnected) return null;
-                    const storeName =
-                      game.platforms.length === 1
-                        ? getStorefrontDisplayName(game.platforms[0].platformId)
-                        : 'Store';
-                    return (
-                      <div
-                        className={`absolute ${
-                          isInstalled ? 'top-8' : 'top-2'
-                        } left-2 flex items-center gap-1 bg-amber-950/90 border border-amber-500/70 text-amber-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow-lg backdrop-blur-sm z-10`}
-                        title={`Storefront account not connected (${game.platforms
-                          .map((p) => getStorefrontDisplayName(p.platformId))
-                          .join(', ')})`}
-                      >
-                        <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
-                        <span>{storeName} (Not Connected)</span>
-                      </div>
-                    );
-                  })()}
-
                   {/* Top-Right: OpenCritic Score Pill */}
                   {(() => {
                     const oc = getOpenCriticData(
