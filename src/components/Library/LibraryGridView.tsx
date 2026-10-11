@@ -679,8 +679,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
                   {/* Top-Right: OpenCritic Score Pill */}
                   {(() => {
+                    const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
                     const oc = getOpenCriticData(
-                      game.steamAppId,
+                      targetSteamId || undefined,
                       game.title,
                       game.reviewSummary?.positivePercent
                     );
@@ -866,24 +867,26 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     );
                     const ocColors = getTierColor(oc.tier);
                     return (
-                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[10px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1">
-                            <span className={`w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center ${ocColors.scoreBg}`}>
-                              OC
-                            </span>
+                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5 text-[10px]">
+                        <div className="flex items-center gap-1.5 text-white/70">
+                          <span className={`w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center shrink-0 ${ocColors.scoreBg}`}>
+                            OC
+                          </span>
+                          <span className="font-semibold uppercase tracking-wider text-[9px] text-white/60">
                             OpenCritic
                           </span>
-                          <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold border ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}>
                             {oc.score}
                           </span>
                           <span className={`text-[10px] font-bold ${ocColors.accentText}`}>
                             {oc.tier}
                           </span>
+                          <span className="text-[10px] text-steam-subtext">
+                            ({oc.percentRecommended}% rec)
+                          </span>
                         </div>
-                        <span className="text-[10px] text-steam-subtext">
-                          {oc.percentRecommended}% Rec.
-                        </span>
                       </div>
                     );
                   })()}
@@ -909,7 +912,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                         <div className="flex items-center gap-1.5 text-white/70">
                           <Clock className="w-3.5 h-3.5 text-sky-400" />
                           <span className="font-semibold uppercase tracking-wider text-[9px] text-white/60">
-                            Playtime
+                            HowLongToBeat
                           </span>
                         </div>
                         <div className="flex items-center gap-3">
