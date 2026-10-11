@@ -125,8 +125,12 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         const parsed = JSON.parse(trimmed);
-        if (parsed.authorizationCode) return parsed.authorizationCode;
-        if (parsed.code) return parsed.code;
+        if (parsed.authorizationCode && typeof parsed.authorizationCode === 'string') {
+          return parsed.authorizationCode;
+        }
+        if (parsed.code && typeof parsed.code === 'string') {
+          return parsed.code;
+        }
         if (parsed.redirectUrl && parsed.redirectUrl.includes('code=')) {
           const match = parsed.redirectUrl.match(/code=([a-zA-Z0-9_\-]+)/);
           if (match) return match[1];
@@ -143,13 +147,20 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     if (trimmed.includes('code=')) {
       try {
         const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-        return url.searchParams.get('code') || null;
+        const code = url.searchParams.get('code');
+        if (code && code.length >= 20) return code;
       } catch {
-        const match = trimmed.match(/code=([a-zA-Z0-9_\-]+)/);
-        return match ? match[1] : null;
+        const match = trimmed.match(/code=([a-zA-Z0-9_\-]{20,})/i);
+        if (match) return match[1];
       }
     }
-    return trimmed.length > 20 ? trimmed : null;
+
+    // Pure authorization code (Epic codes are 32-char hex, GOG codes are alphanumeric)
+    if (/^[a-zA-Z0-9_\-]{28,64}$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    return null;
   };
 
   useEffect(() => {
@@ -159,31 +170,6 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       setAuthenticatingStore(null);
     }
   }, [isOpen]);
-
-  // Auto-detect when the user switches focus back to this window after completing login in popup
-  useEffect(() => {
-    const handleWindowFocus = () => {
-      if (
-        authenticatingStore &&
-        popupRef.current &&
-        Date.now() - authStartTimeRef.current > 3500
-      ) {
-        // User has returned to the main application window after interacting with the sign-in window.
-        // Auto-close popup and finalize the sync immediately.
-        try {
-          popupRef.current.close();
-        } catch {
-          // Cross-origin catch
-        }
-        completeStoreAuthentication(authenticatingStore);
-      }
-    };
-
-    window.addEventListener('focus', handleWindowFocus);
-    return () => {
-      window.removeEventListener('focus', handleWindowFocus);
-    };
-  }, [authenticatingStore, authRedirectInput, gogToken, steamInput, epicToken, xboxInput]);
 
   if (!isOpen) return null;
 
@@ -267,13 +253,15 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     );
     popupRef.current = popup;
 
-    // Watch for popup closure to complete authentication automatically
+    // Watch for popup closure
     if (popup) {
       const checkClosedTimer = window.setInterval(async () => {
         try {
           if (popup.closed) {
             window.clearInterval(checkClosedTimer);
-            await completeStoreAuthentication(storefrontId);
+            if (authRedirectInput.trim()) {
+              await completeStoreAuthentication(storefrontId);
+            }
           }
         } catch {
           // Cross-origin read boundary
@@ -317,9 +305,20 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         resultGames = games;
         accountName = integration.accountName || 'Steam User';
       } else if (storefrontId === 'epic') {
+        const hasExistingToken = Boolean(
+          currentIntegration.credentials?.epicToken || currentIntegration.credentials?.epicRefreshToken
+        );
+        if (!tokenOrCode && !hasExistingToken) {
+          setErrorMsg('To sync live Epic purchases, please copy the authorization URL or code from the Epic pop-up window and paste it here.');
+          setIsSubmitting(false);
+          return;
+        }
+
         const { integration, games } = await connectEpicIntegration({
-          epicAccountId: epicInput.trim() || undefined,
-          epicToken: tokenOrCode || epicToken.trim() || undefined,
+          epicAccountId: epicInput.trim() || currentIntegration.credentials?.epicAccountId || undefined,
+          epicToken: tokenOrCode || currentIntegration.credentials?.epicToken || undefined,
+          epicRefreshToken: currentIntegration.credentials?.epicRefreshToken,
+          epicTokenExpiresAt: currentIntegration.credentials?.epicTokenExpiresAt,
         });
         resultGames = games;
         accountName = integration.accountName || 'Epic Games User';
@@ -509,13 +508,26 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
               {/* Special callout banner for Epic Games Store */}
               {selectedTab === 'epic' && (
-                <div className="p-3 bg-blue-950/40 border border-blue-500/50 rounded text-blue-200 text-xs text-left max-w-lg mx-auto flex items-start gap-2.5 shadow-inner">
-                  <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-sky-400 mt-0.5" />
-                  <div className="space-y-1">
-                    <span className="font-bold text-sky-300">Epic Games Authentication:</span>
-                    <p className="text-[11px] leading-relaxed text-blue-200/90">
-                      After logging into Epic Games, the pop-up will display your confirmation redirect or authorization JSON. Paste the URL or text below, or click <strong>I've Completed Sign In</strong> to finalize sync.
-                    </p>
+                <div className="p-3.5 bg-blue-950/40 border border-blue-500/50 rounded text-blue-200 text-xs text-left max-w-lg mx-auto space-y-2 shadow-inner">
+                  <div className="flex items-start gap-2.5">
+                    <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-sky-400 mt-0.5" />
+                    <div className="space-y-1.5">
+                      <span className="font-bold text-sky-300">How to link your live Epic Games session:</span>
+                      <ol className="list-decimal list-inside space-y-1 text-[11px] text-blue-200/90 leading-relaxed">
+                        <li>Log into your Epic Games account in the pop-up window.</li>
+                        <li>
+                          After login, Epic redirects to the launcher authorization endpoint.
+                          <div className="mt-1 pl-4 text-[10px] text-blue-300/80">
+                            The pop-up address bar will show:
+                            <code className="block mt-0.5 bg-black/60 px-1.5 py-1 rounded font-mono text-emerald-300 break-all select-all">
+                              https://localhost/launcher/authorized?code=...
+                            </code>
+                            or the page will display JSON with your <code className="text-emerald-300">"authorizationCode"</code>.
+                          </div>
+                        </li>
+                        <li>Copy the address bar URL or the JSON text and paste it into the box below.</li>
+                      </ol>
+                    </div>
                   </div>
                 </div>
               )}
@@ -558,9 +570,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 >
                   {isSubmitting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
                   {isSubmitting
-                    ? 'Syncing...'
+                    ? 'Syncing Live Library...'
                     : selectedTab === 'gog'
                     ? 'Close Pop-Up & Connect GOG Now'
+                    : selectedTab === 'epic'
+                    ? 'Link Epic Account & Sync Live Games'
                     : "I've Completed Sign In — Sync Now"}
                 </button>
 
@@ -603,9 +617,15 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                       <h3 className="text-base font-bold text-white">
                         {currentIntegration.accountName || `${STORE_AUTH_CONFIGS[selectedTab]?.storeName} User`}
                       </h3>
-                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                        <ShieldCheck className="w-3 h-3" /> Connected
-                      </span>
+                      {selectedTab === 'epic' && !currentIntegration.credentials?.epicToken && !currentIntegration.credentials?.epicRefreshToken ? (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
+                          <AlertCircle className="w-3 h-3" /> Cached Baseline
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
+                          <ShieldCheck className="w-3 h-3" /> Connected
+                        </span>
+                      )}
                     </div>
                     {currentIntegration.accountId && (
                       <p className="text-xs text-steam-subtext font-mono mt-0.5">
@@ -628,10 +648,40 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 </button>
               </div>
 
+              {/* Action Banner for Epic Games when running on cached baseline */}
+              {selectedTab === 'epic' && !currentIntegration.credentials?.epicToken && !currentIntegration.credentials?.epicRefreshToken && (
+                <div className="p-3.5 bg-blue-950/40 border border-blue-500/40 rounded text-blue-200 text-xs space-y-2.5">
+                  <div className="flex items-start gap-2.5">
+                    <Sparkles className="w-4 h-4 text-sky-400 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold text-sky-300">Link Live Account to Sync New Purchases</span>
+                      <p className="text-[11px] text-blue-200/85 mt-0.5 leading-relaxed">
+                        Currently displaying the cataloged 402 baseline titles for BobDo1e. To pull newly purchased games and real-time achievements from your Epic Games Store account, link your live session below.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleLaunchStoreSignIn('epic')}
+                    className="w-full py-2.5 px-4 rounded bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow"
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>Sign In with Epic Games to Link Live Purchases</span>
+                    <ExternalLink className="w-3 h-3 opacity-80" />
+                  </button>
+                </div>
+              )}
+
               <div className="flex items-center justify-between pt-1">
                 <div className="text-[11px] text-steam-subtext">
                   Sync Method:{' '}
-                  <span className="text-white font-medium">Cloud Web API</span> (No local client required)
+                  <span className="text-white font-medium">
+                    {selectedTab === 'epic'
+                      ? currentIntegration.credentials?.epicToken || currentIntegration.credentials?.epicRefreshToken
+                        ? 'Live Cloud OAuth (Auto-renewing)'
+                        : 'Cached Baseline Catalog'
+                      : 'Cloud Web API'}
+                  </span>
                 </div>
                 <button
                   onClick={() => completeStoreAuthentication(selectedTab)}

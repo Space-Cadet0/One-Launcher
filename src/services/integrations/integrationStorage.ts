@@ -55,11 +55,11 @@ export const DEFAULT_INTEGRATIONS: StorefrontIntegration[] = [
     avatarUrl: 'https://cdn2.unrealengine.com/egs-badge.png',
     gamesCount: EPIC_USER_LIBRARY.length,
     lastSyncedAt: new Date().toISOString(),
-    authMethod: 'oauth',
+    authMethod: 'public_profile',
     credentials: {
       epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a',
     },
-    statusMessage: `Connected as BobDo1e (${EPIC_USER_LIBRARY.length} Epic titles synced)`,
+    statusMessage: `Cached Baseline (${EPIC_USER_LIBRARY.length} Epic titles cataloged)`,
   },
   {
     storefrontId: 'xbox',
@@ -104,7 +104,8 @@ export function loadIntegrations(): StorefrontIntegration[] {
           }
         }
         if (item.storefrontId === 'epic') {
-          if (!item.isConnected || item.gamesCount < EPIC_USER_LIBRARY.length) {
+          const hasOAuth = Boolean(item.credentials?.epicToken || item.credentials?.epicRefreshToken);
+          if (!item.isConnected || item.gamesCount < EPIC_USER_LIBRARY.length || (!hasOAuth && item.authMethod === 'oauth')) {
             changed = true;
             const targetCount = Math.max(item.gamesCount || 0, EPIC_USER_LIBRARY.length);
             return {
@@ -115,9 +116,11 @@ export function loadIntegrations(): StorefrontIntegration[] {
               avatarUrl: item.avatarUrl || 'https://cdn2.unrealengine.com/egs-badge.png',
               gamesCount: targetCount,
               lastSyncedAt: item.lastSyncedAt || new Date().toISOString(),
-              authMethod: item.authMethod || ('oauth' as const),
+              authMethod: hasOAuth ? ('oauth' as const) : ('public_profile' as const),
               credentials: item.credentials || { epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a' },
-              statusMessage: `Connected as ${item.accountName || 'BobDo1e'} (${targetCount} Epic titles synced)`,
+              statusMessage: hasOAuth
+                ? `Connected as ${item.accountName || 'BobDo1e'} (${targetCount} Epic titles synced)`
+                : `Cached Baseline (${targetCount} Epic titles cataloged)`,
             };
           }
         }
@@ -135,9 +138,9 @@ export function loadIntegrations(): StorefrontIntegration[] {
           avatarUrl: 'https://cdn2.unrealengine.com/egs-badge.png',
           gamesCount: EPIC_USER_LIBRARY.length,
           lastSyncedAt: new Date().toISOString(),
-          authMethod: 'oauth',
+          authMethod: 'public_profile',
           credentials: { epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a' },
-          statusMessage: `Connected as BobDo1e (${EPIC_USER_LIBRARY.length} Epic titles synced)`,
+          statusMessage: `Cached Baseline (${EPIC_USER_LIBRARY.length} Epic titles cataloged)`,
         });
       }
 
@@ -402,9 +405,11 @@ export async function connectEpicIntegration(
     avatarUrl,
     gamesCount: epicGames.length,
     lastSyncedAt: new Date().toISOString(),
-    authMethod: finalCredentials.epicToken ? 'oauth' : 'public_profile',
+    authMethod: (finalCredentials.epicToken || finalCredentials.epicRefreshToken) ? 'oauth' : 'public_profile',
     credentials: finalCredentials,
-    statusMessage: `Connected as ${accountName} (${epicGames.length} Epic titles synced)`,
+    statusMessage: (finalCredentials.epicToken || finalCredentials.epicRefreshToken)
+      ? `Connected as ${accountName} (${epicGames.length} Epic titles synced)`
+      : `Cached Baseline (${epicGames.length} Epic titles cataloged)`,
   };
 
   const current = loadCurrentCatalog();

@@ -252,8 +252,8 @@ export class EpicIntegrationService {
 
       while (hasMore && pageCount < 30) {
         const fetchUrl: string = cursor
-          ? `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true&platform=Windows&cursor=${cursor}`
-          : `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true&platform=Windows`;
+          ? `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true&cursor=${cursor}`
+          : `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true`;
 
         const response: any = await axios.get(fetchUrl, {
           headers: { Authorization: `Bearer ${accessToken}` },
@@ -415,7 +415,10 @@ export class EpicIntegrationService {
         hasMore = Boolean(cursor);
         pageCount++;
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.response?.status === 401) {
+        throw err;
+      }
       console.warn('Failed to fetch Epic library records:', err);
     }
     return games;
@@ -473,6 +476,8 @@ export class EpicIntegrationService {
           if (tokenRes.expiresIn) {
             updatedCredentials.epicTokenExpiresAt = new Date(Date.now() + tokenRes.expiresIn * 1000).toISOString();
           }
+        } else {
+          throw new Error('Failed to exchange authorization code with Epic Games. The code may have expired or already been used. Please click "Re-open Sign-In Window" to generate a fresh code.');
         }
       }
     }
@@ -508,7 +513,21 @@ export class EpicIntegrationService {
         }
       }
     }
-    const baseGames = liveGames.length > 0 ? liveGames : EPIC_USER_LIBRARY;
+
+    let baseGames: CanonicalGame[] = [];
+    if (liveGames.length > 0) {
+      // Merge live games with baseline so no previously indexed title is lost
+      const gameMap = new Map<string, CanonicalGame>();
+      for (const g of EPIC_USER_LIBRARY) {
+        gameMap.set(g.id, g);
+      }
+      for (const g of liveGames) {
+        gameMap.set(g.id, g);
+      }
+      baseGames = Array.from(gameMap.values());
+    } else {
+      baseGames = EPIC_USER_LIBRARY;
+    }
 
     // Apply achievements to the resolved user library
     const gamesWithAchievements = baseGames.map((game) => {

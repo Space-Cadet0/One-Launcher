@@ -736,8 +736,11 @@ export function App() {
           `Sync complete! Detected ${newGamesDetected} newly added title${newGamesDetected === 1 ? '' : 's'} across your storefronts! (${currentCatalog.length} total titles)`
         );
       } else {
+        const epicItem = updatedIntegrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
+        const epicHasOAuth = Boolean(epicItem?.credentials?.epicToken || epicItem?.credentials?.epicRefreshToken);
+        const epicLabel = epicHasOAuth ? `${epicCount} Epic` : `${epicCount} Epic (cached baseline; link in Accounts to sync new purchases)`;
         setSyncNotice(
-          `All connected storefronts up to date: ${epicCount} Epic, ${gogCount} GOG, ${steamCount} Steam titles (trophies & playtime refreshed)`
+          `All connected storefronts up to date: ${epicLabel}, ${gogCount} GOG, ${steamCount} Steam titles (trophies & playtime refreshed)`
         );
       }
     } catch (err: any) {
