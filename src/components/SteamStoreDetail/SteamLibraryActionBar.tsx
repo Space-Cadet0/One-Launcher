@@ -28,6 +28,7 @@ import {
   getKnownGogAchievements,
   getKnownSteamAchievements,
 } from '../../services/storage/knownGameAchievements';
+import { reconcileAchievementSummaries } from '../../services/storage/achievementReconciliation';
 import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { GameCollection } from '../../contracts/collection';
@@ -180,29 +181,31 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
     let pAchievements = p.achievements;
 
-    // Check store-specific live scan and verified cache
+    // Check store-specific live scan and verified cache using authority reconciliation
     if (p.platformId === 'steam' && targetSteamAppId) {
       const sData = steamData || (pAchievements ? { unlocked: pAchievements.unlocked, total: pAchievements.total, percentage: pAchievements.percentage } : undefined);
       if (sData) {
-        const u = Math.max(sData.unlocked, pAchievements?.unlocked ?? 0);
-        const t = Math.max(sData.total, pAchievements?.total ?? effectiveTotal ?? 0);
-        const pct = t > 0 ? Math.round((u / t) * 100) : 0;
-        pAchievements = {
-          unlocked: u,
-          total: t,
-          percentage: pct,
-          isMastered: pct >= 100 || (t > 0 && u >= t),
-        };
+        pAchievements = reconcileAchievementSummaries(pAchievements, sData, {
+          title: game.title,
+          appId: targetSteamAppId,
+          store: 'steam',
+        }) || pAchievements;
       }
     } else if (p.platformId === 'gog') {
       const gogKnown = getKnownGogAchievements(p.platformGameId || game.id, game.title);
-      if (gogKnown && (gogKnown.unlocked > (pAchievements?.unlocked ?? 0) || gogKnown.total > (pAchievements?.total ?? 0))) {
-        pAchievements = gogKnown;
+      if (gogKnown) {
+        pAchievements = reconcileAchievementSummaries(pAchievements, gogKnown, {
+          title: game.title,
+          store: 'gog',
+        }) || pAchievements;
       }
     } else if (p.platformId === 'epic') {
       const epicKnown = getKnownEpicAchievements(game.id, game.title);
-      if (epicKnown && (epicKnown.unlocked > (pAchievements?.unlocked ?? 0) || epicKnown.total > (pAchievements?.total ?? 0))) {
-        pAchievements = epicKnown;
+      if (epicKnown) {
+        pAchievements = reconcileAchievementSummaries(pAchievements, epicKnown, {
+          title: game.title,
+          store: 'epic',
+        }) || pAchievements;
       }
     }
 
@@ -214,28 +217,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       if (known && known > 0) platTotal = known;
     }
 
-    let unlocked = pAchievements?.unlocked ?? 0;
-    let customXp: { earned: number; total: number } | undefined = pAchievements?.xp;
-
-    if (p.platformId === 'steam' && targetSteamAppId) {
-      if (steamData) {
-        if (steamData.unlocked > unlocked) unlocked = steamData.unlocked;
-        if (steamData.total > 0 && platTotal === 0) platTotal = steamData.total;
-      }
-    } else if (p.platformId === 'gog') {
-      const gogData = getKnownGogAchievements(p.platformGameId || game.id, game.title);
-      if (gogData) {
-        if (gogData.unlocked > unlocked) unlocked = gogData.unlocked;
-        if (gogData.total > 0 && platTotal === 0) platTotal = gogData.total;
-      }
-    } else if (p.platformId === 'epic') {
-      const epicData = getKnownEpicAchievements(game.id, game.title);
-      if (epicData) {
-        if (epicData.unlocked > unlocked) unlocked = epicData.unlocked;
-        if (epicData.total > 0 && platTotal === 0) platTotal = epicData.total;
-        if (epicData.xp) customXp = epicData.xp;
-      }
-    }
+    const unlocked = pAchievements?.unlocked ?? 0;
+    const customXp: { earned: number; total: number } | undefined = pAchievements?.xp;
 
     const percentage = platTotal > 0 ? Math.round((unlocked / platTotal) * 100) : 0;
     const isMastered = (platTotal > 0 && unlocked >= platTotal) || !!pAchievements?.isMastered;
@@ -247,6 +230,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       total: platTotal,
       percentage,
       isMastered,
+      hasConflict: pAchievements?.hasConflict,
+      conflictDetails: pAchievements?.conflictDetails,
     };
 
     if (p.platformId === 'epic' && platTotal > 0) {

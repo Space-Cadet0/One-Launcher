@@ -6,6 +6,7 @@ import {
   cacheUserGogAchievements,
   getKnownAchievementTotal,
 } from '../storage/knownGameAchievements';
+import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
 export interface GogProductItem {
   id: number;
@@ -501,7 +502,11 @@ export class GogIntegrationService {
             achievements[`gog-${gameId}`] ||
             (game.title ? achievements[game.title.toLowerCase().trim()] : undefined);
           if (ach) {
-            gogPlatform.achievements = ach;
+            gogPlatform.achievements =
+              reconcileAchievementSummaries(gogPlatform.achievements, ach, {
+                title: game.title,
+                store: 'gog',
+              }) || ach;
           }
           const st = stats[gameId] || stats[`gog-${gameId}`];
           if (st) {

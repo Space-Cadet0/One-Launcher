@@ -6,7 +6,12 @@ import { mergeScannedSteamGames } from './services/storage/librarySync';
 import { FULL_USER_STEAM_GAMES } from './services/storage/fullUserSteamGames';
 import { loadCollections, saveCollections } from './services/storage/collectionStorage';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
-import { cacheUserSteamAchievements, getKnownSteamAchievements } from './services/storage/knownGameAchievements';
+import {
+  cacheUserSteamAchievements,
+  getKnownSteamAchievements,
+  getKnownGogAchievements,
+  getKnownEpicAchievements,
+} from './services/storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from './services/storage/achievementReconciliation';
 import { steamAchievementsService } from './services/steam/steamAchievementsService';
 import { TopNavBar } from './components/Navigation/TopNavBar';
@@ -332,6 +337,44 @@ export function App() {
                     conflictDetails: (ach as any).conflictDetails,
                   },
                   { title: game.title, appId: targetAppId, store: 'steam' }
+                );
+                if (
+                  reconciled &&
+                  (!p.achievements ||
+                    p.achievements.unlocked !== reconciled.unlocked ||
+                    p.achievements.total !== reconciled.total ||
+                    p.achievements.hasConflict !== reconciled.hasConflict)
+                ) {
+                  newP.achievements = reconciled;
+                  pChanged = true;
+                }
+              }
+            } else if (p.platformId === 'gog') {
+              const gogAch = getKnownGogAchievements(p.platformGameId || game.id, game.title);
+              if (gogAch && gogAch.total > 0) {
+                const reconciled = reconcileAchievementSummaries(
+                  p.achievements,
+                  gogAch,
+                  { title: game.title, store: 'gog' }
+                );
+                if (
+                  reconciled &&
+                  (!p.achievements ||
+                    p.achievements.unlocked !== reconciled.unlocked ||
+                    p.achievements.total !== reconciled.total ||
+                    p.achievements.hasConflict !== reconciled.hasConflict)
+                ) {
+                  newP.achievements = reconciled;
+                  pChanged = true;
+                }
+              }
+            } else if (p.platformId === 'epic') {
+              const epicAch = getKnownEpicAchievements(game.id, game.title);
+              if (epicAch && epicAch.total > 0) {
+                const reconciled = reconcileAchievementSummaries(
+                  p.achievements,
+                  epicAch,
+                  { title: game.title, store: 'epic' }
                 );
                 if (
                   reconciled &&

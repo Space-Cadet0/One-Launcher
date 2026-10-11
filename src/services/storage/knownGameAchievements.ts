@@ -285,20 +285,22 @@ export function getKnownEpicAchievements(
   gameId?: string,
   title?: string
 ): StoreAchievementSummary | undefined {
+  let cachedSummary: StoreAchievementSummary | undefined = undefined;
+
   if (typeof window !== 'undefined') {
     try {
       const cached = localStorage.getItem('antigravity_epic_achievements');
       if (cached) {
         const parsed = JSON.parse(cached);
         if (title && parsed[title.toLowerCase().trim()]) {
-          return parsed[title.toLowerCase().trim()];
-        }
-        const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-        if (normTitle && parsed[normTitle]) {
-          return parsed[normTitle];
-        }
-        if (gameId && parsed[gameId.toLowerCase()]) {
-          return parsed[gameId.toLowerCase()];
+          cachedSummary = parsed[title.toLowerCase().trim()];
+        } else {
+          const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+          if (normTitle && parsed[normTitle]) {
+            cachedSummary = parsed[normTitle];
+          } else if (gameId && parsed[gameId.toLowerCase()]) {
+            cachedSummary = parsed[gameId.toLowerCase()];
+          }
         }
       }
     } catch {
@@ -306,21 +308,49 @@ export function getKnownEpicAchievements(
     }
   }
 
+  let baseline: StoreAchievementSummary | undefined = undefined;
   if (title && KNOWN_USER_EPIC_ACHIEVEMENTS[title.toLowerCase().trim()]) {
-    return KNOWN_USER_EPIC_ACHIEVEMENTS[title.toLowerCase().trim()];
+    baseline = KNOWN_USER_EPIC_ACHIEVEMENTS[title.toLowerCase().trim()];
+  } else {
+    const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (normTitle && KNOWN_USER_EPIC_ACHIEVEMENTS[normTitle]) {
+      baseline = KNOWN_USER_EPIC_ACHIEVEMENTS[normTitle];
+    } else if (gameId && KNOWN_USER_EPIC_ACHIEVEMENTS[gameId.toLowerCase()]) {
+      baseline = KNOWN_USER_EPIC_ACHIEVEMENTS[gameId.toLowerCase()];
+    }
   }
-  if (gameId && KNOWN_USER_EPIC_ACHIEVEMENTS[gameId.toLowerCase()]) {
-    return KNOWN_USER_EPIC_ACHIEVEMENTS[gameId.toLowerCase()];
+
+  if (baseline && !baseline.source) {
+    baseline = { ...baseline, source: 'baseline_fallback' };
   }
-  return undefined;
+
+  return reconcileAchievementSummaries(cachedSummary, baseline, { title, store: 'epic' });
 }
 
 export function cacheUserEpicAchievements(map: Record<string, StoreAchievementSummary>): void {
   if (typeof window === 'undefined') return;
   try {
     const existingRaw = localStorage.getItem('antigravity_epic_achievements');
-    const existing = existingRaw ? JSON.parse(existingRaw) : {};
-    const merged = { ...existing, ...map };
+    const existing: Record<string, StoreAchievementSummary> = existingRaw ? JSON.parse(existingRaw) : {};
+    const merged: Record<string, StoreAchievementSummary> = { ...existing };
+
+    for (const [key, inc] of Object.entries(map)) {
+      const normKey = key.toLowerCase().trim();
+      const incSummary: StoreAchievementSummary = {
+        unlocked: inc.unlocked,
+        total: inc.total,
+        percentage: inc.percentage ?? (inc.total > 0 ? Math.round((inc.unlocked / inc.total) * 100) : 0),
+        xp: inc.xp,
+        isMastered: inc.isMastered ?? (inc.total > 0 && inc.unlocked >= inc.total),
+        source: inc.source || 'live_cloud_graphql',
+        syncedAt: inc.syncedAt || new Date().toISOString(),
+        hasConflict: inc.hasConflict,
+        conflictDetails: inc.conflictDetails,
+      };
+      merged[normKey] =
+        reconcileAchievementSummaries(merged[normKey], incSummary, { title: key, store: 'epic' }) || incSummary;
+    }
+
     localStorage.setItem('antigravity_epic_achievements', JSON.stringify(merged));
   } catch (err) {
     console.warn('Failed to cache Epic achievements to localStorage:', err);
@@ -334,24 +364,27 @@ export function getKnownGogAchievements(
   gameId?: string,
   title?: string
 ): StoreAchievementSummary | undefined {
+  let cachedSummary: StoreAchievementSummary | undefined = undefined;
+
   if (typeof window !== 'undefined') {
     try {
       const cached = localStorage.getItem('antigravity_gog_achievements');
       if (cached) {
         const parsed = JSON.parse(cached);
         if (title && parsed[title.toLowerCase().trim()]) {
-          return parsed[title.toLowerCase().trim()];
-        }
-        const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-        if (normTitle && parsed[normTitle]) {
-          return parsed[normTitle];
-        }
-        if (gameId && parsed[gameId.toLowerCase()]) {
-          return parsed[gameId.toLowerCase()];
-        }
-        const cleanId = gameId?.replace(/^gog-/, '');
-        if (cleanId && parsed[cleanId]) {
-          return parsed[cleanId];
+          cachedSummary = parsed[title.toLowerCase().trim()];
+        } else {
+          const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+          if (normTitle && parsed[normTitle]) {
+            cachedSummary = parsed[normTitle];
+          } else if (gameId && parsed[gameId.toLowerCase()]) {
+            cachedSummary = parsed[gameId.toLowerCase()];
+          } else {
+            const cleanId = gameId?.replace(/^gog-/, '');
+            if (cleanId && parsed[cleanId]) {
+              cachedSummary = parsed[cleanId];
+            }
+          }
         }
       }
     } catch {
@@ -359,32 +392,57 @@ export function getKnownGogAchievements(
     }
   }
 
+  let baseline: StoreAchievementSummary | undefined = undefined;
   if (title && KNOWN_USER_GOG_ACHIEVEMENTS[title.toLowerCase().trim()]) {
-    return KNOWN_USER_GOG_ACHIEVEMENTS[title.toLowerCase().trim()];
+    baseline = KNOWN_USER_GOG_ACHIEVEMENTS[title.toLowerCase().trim()];
+  } else {
+    const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (normTitle && KNOWN_USER_GOG_ACHIEVEMENTS[normTitle]) {
+      baseline = KNOWN_USER_GOG_ACHIEVEMENTS[normTitle];
+    } else if (gameId && KNOWN_USER_GOG_ACHIEVEMENTS[gameId.toLowerCase()]) {
+      baseline = KNOWN_USER_GOG_ACHIEVEMENTS[gameId.toLowerCase()];
+    } else {
+      const cleanId = gameId?.replace(/^gog-/, '');
+      if (cleanId && KNOWN_USER_GOG_ACHIEVEMENTS[cleanId]) {
+        baseline = KNOWN_USER_GOG_ACHIEVEMENTS[cleanId];
+      }
+    }
   }
-  const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (normTitle && KNOWN_USER_GOG_ACHIEVEMENTS[normTitle]) {
-    return KNOWN_USER_GOG_ACHIEVEMENTS[normTitle];
+
+  if (baseline && !baseline.source) {
+    baseline = { ...baseline, source: 'baseline_fallback' };
   }
-  if (gameId && KNOWN_USER_GOG_ACHIEVEMENTS[gameId.toLowerCase()]) {
-    return KNOWN_USER_GOG_ACHIEVEMENTS[gameId.toLowerCase()];
-  }
-  const cleanId = gameId?.replace(/^gog-/, '');
-  if (cleanId && KNOWN_USER_GOG_ACHIEVEMENTS[cleanId]) {
-    return KNOWN_USER_GOG_ACHIEVEMENTS[cleanId];
-  }
-  return undefined;
+
+  return reconcileAchievementSummaries(cachedSummary, baseline, { title, store: 'gog' });
 }
 
 export function cacheUserGogAchievements(map: Record<string, StoreAchievementSummary>): void {
   if (typeof window === 'undefined') return;
   try {
     const existingRaw = localStorage.getItem('antigravity_gog_achievements');
-    const existing = existingRaw ? JSON.parse(existingRaw) : {};
-    const merged = { ...existing, ...map };
+    const existing: Record<string, StoreAchievementSummary> = existingRaw ? JSON.parse(existingRaw) : {};
+    const merged: Record<string, StoreAchievementSummary> = { ...existing };
+
+    for (const [key, inc] of Object.entries(map)) {
+      const normKey = key.toLowerCase().trim();
+      const incSummary: StoreAchievementSummary = {
+        unlocked: inc.unlocked,
+        total: inc.total,
+        percentage: inc.percentage ?? (inc.total > 0 ? Math.round((inc.unlocked / inc.total) * 100) : 0),
+        isMastered: inc.isMastered ?? (inc.total > 0 && inc.unlocked >= inc.total),
+        source: inc.source || 'live_cloud_xml',
+        syncedAt: inc.syncedAt || new Date().toISOString(),
+        hasConflict: inc.hasConflict,
+        conflictDetails: inc.conflictDetails,
+      };
+      merged[normKey] =
+        reconcileAchievementSummaries(merged[normKey], incSummary, { title: key, store: 'gog' }) || incSummary;
+    }
+
     localStorage.setItem('antigravity_gog_achievements', JSON.stringify(merged));
   } catch (err) {
     console.warn('Failed to cache GOG achievements to localStorage:', err);
   }
 }
+
 

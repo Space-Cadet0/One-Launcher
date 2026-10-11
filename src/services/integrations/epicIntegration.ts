@@ -5,6 +5,7 @@ import { EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
 import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { steamMatcher } from '../steam/steamMatcher';
 import { cacheUserEpicAchievements } from '../storage/knownGameAchievements';
+import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
 export class EpicIntegrationService {
   private getOAuthBaseUrl(): string {
@@ -427,7 +428,16 @@ export class EpicIntegrationService {
         return {
           ...game,
           platforms: game.platforms.map((p) =>
-            p.platformId === 'epic' ? { ...p, achievements: achievement } : p
+            p.platformId === 'epic'
+              ? {
+                  ...p,
+                  achievements:
+                    reconcileAchievementSummaries(p.achievements, achievement, {
+                      title: game.title,
+                      store: 'epic',
+                    }) || achievement,
+                }
+              : p
           ),
         };
       }

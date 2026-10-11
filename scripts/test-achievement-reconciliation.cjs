@@ -158,4 +158,47 @@ console.log('=== RUNNING ACHIEVEMENT RECONCILIATION & CONFLICT TESTS ===');
   console.log('PASS: Test 6 - Matching values produce no conflict');
 }
 
+// Test 7: GOG live cloud XML (0 trophies) overrides stale cache (25 trophies) with conflict tracking
+{
+  const staleCache = { unlocked: 25, total: 57, percentage: 44, source: 'local_client_cache' };
+  const liveGogCloud = { unlocked: 0, total: 57, percentage: 0, source: 'live_cloud_xml', syncedAt: '2026-10-11T12:00:00Z' };
+
+  const res = reconcileAchievementSummaries(staleCache, liveGogCloud, { title: 'Cyberpunk 2077', store: 'gog' });
+  assert.strictEqual(res.unlocked, 0, 'Live GOG cloud (0 trophies) must override stale cache (25 trophies)');
+  assert.strictEqual(res.hasConflict, true, 'Discrepancy must be detected and flagged');
+  assert.ok(res.conflictDetails.includes('Discrepancy: existing [local_client_cache: 25/57] vs incoming [live_cloud_xml: 0/57]'));
+  console.log('PASS: Test 7 - GOG live cloud XML (0 trophies) overrides stale cache (25 trophies) with conflict tracking');
+}
+
+// Test 8: Epic live cloud GraphQL (59 trophies, 830 XP) overrides stale baseline and preserves XP
+{
+  const baseline = { unlocked: 0, total: 88, percentage: 0, source: 'baseline_fallback' };
+  const epicLive = {
+    unlocked: 59,
+    total: 88,
+    percentage: 67,
+    xp: { earned: 830, total: 1360 },
+    source: 'live_cloud_graphql',
+    syncedAt: '2026-10-11T12:00:00Z',
+  };
+
+  const res = reconcileAchievementSummaries(baseline, epicLive, { title: 'Alan Wake 2', store: 'epic' });
+  assert.strictEqual(res.unlocked, 59, 'Epic live cloud GraphQL must override baseline');
+  assert.strictEqual(res.xp.earned, 830, 'XP earned must be preserved');
+  assert.strictEqual(res.hasConflict, true, 'Discrepancy must be flagged');
+  console.log('PASS: Test 8 - Epic live cloud GraphQL (59 trophies, 830 XP) overrides stale baseline and preserves XP');
+}
+
+// Test 9: GOG / Epic static baseline cannot downgrade live cloud data
+{
+  const liveEpic = { unlocked: 59, total: 88, percentage: 67, source: 'live_cloud_graphql' };
+  const staleBaseline = { unlocked: 0, total: 88, percentage: 0, source: 'baseline_fallback' };
+
+  const res = reconcileAchievementSummaries(liveEpic, staleBaseline, { title: 'Alan Wake 2', store: 'epic' });
+  assert.strictEqual(res.unlocked, 59, 'Baseline cannot downgrade live cloud data');
+  assert.strictEqual(res.source, 'live_cloud_graphql');
+  console.log('PASS: Test 9 - Epic static baseline blocked from corrupting live cloud GraphQL');
+}
+
 console.log('ALL ACHIEVEMENT RECONCILIATION TESTS PASSED!');
+
