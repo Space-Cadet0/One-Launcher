@@ -54,6 +54,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const [currentSteamAppId, setCurrentSteamAppId] = useState<number | undefined>(game.steamAppId);
   const [isLoading, setIsLoading] = useState(!game.enrichedMetadata);
   const isCooldown = steamApi.isStoreRateLimited();
+  const activeGameIdRef = useRef<string>(game.id);
 
   useEffect(() => {
     setCurrentGame(game);
@@ -61,18 +62,27 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
   useEffect(() => {
     let isMounted = true;
+    const isNewGame = activeGameIdRef.current !== game.id;
+    activeGameIdRef.current = game.id;
+
+    if (isNewGame) {
+      setMetadata(game.enrichedMetadata || null);
+      setCurrentSteamAppId(game.steamAppId);
+      if (!game.enrichedMetadata) {
+        setIsLoading(true);
+      }
+    }
 
     async function loadData() {
-      setIsLoading(true);
       let targetAppId = game.steamAppId;
 
       // If no Steam App ID is set, intelligently search Steam Store for match
       if (!targetAppId) {
         try {
           const matched = await steamMatcher.matchGameToSteam(game.title);
-          if (matched) {
+          if (matched && isMounted) {
             targetAppId = matched;
-            if (isMounted) setCurrentSteamAppId(matched);
+            setCurrentSteamAppId(matched);
 
             // Persist the matched Steam App ID to the catalog
             try {
@@ -101,24 +111,59 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         ]);
 
         if (isMounted) {
+          let resolvedMetadata: SteamEnrichedMetadata | null = null;
           if (liveData) {
+            resolvedMetadata = liveData;
             setMetadata(liveData);
           } else {
             const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game);
-            if (isMounted) setMetadata(fallbackData);
+            if (isMounted) {
+              resolvedMetadata = fallbackData;
+              setMetadata(fallbackData);
+            }
           }
 
+          let hasChanges = false;
+          let updatedPlatforms = game.platforms;
+
           if (liveAchs) {
-            const updatedPlatforms = game.platforms.map((p) => {
-              if (p.platformId === 'steam') {
-                return {
-                  ...p,
-                  achievements: liveAchs,
-                };
-              }
-              return p;
-            });
-            const updatedGame = { ...game, platforms: updatedPlatforms, steamAppId: targetAppId };
+            const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
+            const curAch = currentSteamPlat?.achievements;
+            const achChanged =
+              !curAch ||
+              curAch.unlocked !== liveAchs.unlocked ||
+              curAch.total !== liveAchs.total ||
+              curAch.source !== liveAchs.source;
+
+            if (achChanged) {
+              hasChanges = true;
+              updatedPlatforms = game.platforms.map((p) => {
+                if (p.platformId === 'steam') {
+                  return {
+                    ...p,
+                    achievements: liveAchs,
+                  };
+                }
+                return p;
+              });
+            }
+          }
+
+          if (targetAppId !== game.steamAppId) {
+            hasChanges = true;
+          }
+
+          if (resolvedMetadata && !game.enrichedMetadata) {
+            hasChanges = true;
+          }
+
+          if (hasChanges && isMounted) {
+            const updatedGame: CanonicalGame = {
+              ...game,
+              platforms: updatedPlatforms,
+              steamAppId: targetAppId,
+              enrichedMetadata: resolvedMetadata || game.enrichedMetadata,
+            };
             setCurrentGame(updatedGame);
             onGameUpdated?.(updatedGame);
           }
@@ -128,20 +173,26 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game);
         if (isMounted && fallbackData) {
           setMetadata(fallbackData);
+          if (!game.enrichedMetadata) {
+            const updatedGame: CanonicalGame = {
+              ...game,
+              enrichedMetadata: fallbackData,
+            };
+            setCurrentGame(updatedGame);
+            onGameUpdated?.(updatedGame);
+          }
         }
       }
 
       if (isMounted) setIsLoading(false);
     }
 
-    setMetadata(game.enrichedMetadata || null);
-    setCurrentSteamAppId(game.steamAppId);
     loadData();
 
     return () => {
       isMounted = false;
     };
-  }, [game]);
+  }, [game.id, game.steamAppId]);
 
   const screenshots = metadata?.screenshots || [];
   const movies = metadata?.movies || [];
