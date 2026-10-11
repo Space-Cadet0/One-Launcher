@@ -101,17 +101,15 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
   }
 
   // Determine stream URLs
-  const hlsUrl = movie.hls || '';
+  const hlsUrl = movie.hls || (movie as any).hls_h264 || '';
   const mp4MaxUrl =
-    (movie.mp4?.max && !movie.mp4.max.includes('.mpd') && !movie.mp4.max.includes('.m3u8')
+    movie.mp4?.max && !movie.mp4.max.includes('.mpd') && !movie.mp4.max.includes('.m3u8')
       ? movie.mp4.max
-      : '') ||
-    (!hlsUrl && movie.id ? `https://video.akamai.steamstatic.com/store_trailers/${movie.id}/movie_max.mp4` : '');
+      : '';
   const mp4LowUrl =
-    (movie.mp4?.['480'] && !movie.mp4['480'].includes('.mpd') && !movie.mp4['480'].includes('.m3u8')
+    movie.mp4?.['480'] && !movie.mp4['480'].includes('.mpd') && !movie.mp4['480'].includes('.m3u8')
       ? movie.mp4['480']
-      : '') ||
-    (!hlsUrl && movie.id ? `https://video.akamai.steamstatic.com/store_trailers/${movie.id}/movie480.mp4` : '');
+      : '';
 
   useEffect(() => {
     const video = videoRef.current;
@@ -127,13 +125,25 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
 
       hlsInstance.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
-          hlsInstance?.destroy();
-          hlsInstance = null;
-          // Fall back to direct MP4 if available
-          if (mp4MaxUrl) {
-            video.src = mp4MaxUrl;
-          } else {
-            setIsError(true);
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              console.warn('HLS network error, attempting recovery...', data);
+              hlsInstance?.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn('HLS media error, attempting recovery...', data);
+              hlsInstance?.recoverMediaError();
+              break;
+            default:
+              console.warn('HLS unrecoverable fatal error:', data);
+              hlsInstance?.destroy();
+              hlsInstance = null;
+              if (mp4MaxUrl) {
+                video.src = mp4MaxUrl;
+              } else {
+                setIsError(true);
+              }
+              break;
           }
         }
       });
@@ -211,18 +221,42 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
       )}
 
       {isError && (
-        <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-2 text-steam-subtext text-xs p-4 text-center">
-          <span>Unable to stream video directly</span>
-          {(mp4MaxUrl || hlsUrl) && (
+        <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center gap-3 text-steam-subtext text-xs p-6 text-center backdrop-blur-sm z-20">
+          <div className="w-12 h-12 rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center text-red-400">
+            <Play className="w-5 h-5 translate-x-0.5 opacity-60" />
+          </div>
+          <div className="flex flex-col gap-1 max-w-sm">
+            <span className="font-semibold text-sm text-white">Trailer Stream Unavailable</span>
+            <span className="text-steam-subtext text-xs">
+              Direct video playback encountered a network or codec issue.
+            </span>
+          </div>
+          <div className="flex items-center gap-2 mt-1">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsError(false);
+                if (videoRef.current) {
+                  videoRef.current.load();
+                }
+              }}
+              className="px-3 py-1.5 rounded bg-white/10 hover:bg-white/20 text-white font-medium text-xs transition-colors cursor-pointer"
+            >
+              Retry
+            </button>
             <a
-              href={mp4MaxUrl || hlsUrl}
+              href={`https://www.youtube.com/results?search_query=${encodeURIComponent(
+                `${movie.name || 'Game Trailer'} official trailer`
+              )}`}
               target="_blank"
               rel="noreferrer"
-              className="text-steam-accent hover:underline"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#c4302b]/90 hover:bg-[#c4302b] text-white font-medium text-xs shadow transition-colors cursor-pointer"
             >
-              Open video stream in new tab
+              <ExternalLink className="w-3.5 h-3.5" />
+              Watch on YouTube
             </a>
-          )}
+          </div>
         </div>
       )}
     </div>

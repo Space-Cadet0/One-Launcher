@@ -79,8 +79,18 @@ export class SteamApiService {
 
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
     if (preCached && preCached.aboutTheGame) {
+      const normalizedMovies: SteamMovie[] = (preCached.movies || []).map((m: any) => ({
+        id: m.id,
+        name: m.name,
+        thumbnail: m.thumbnail,
+        hls: m.hls || m.hls_h264 || '',
+        webm: m.webm || {},
+        mp4: m.mp4 || {},
+      }));
+
       const enriched: SteamEnrichedMetadata = {
         ...preCached,
+        movies: normalizedMovies,
         categories: (preCached.categories || []).map((c: any) => ({
           ...c,
           icon: getSteamCategoryIconUrl(c.id),
@@ -117,13 +127,9 @@ export class SteamApiService {
 
       // Extract movies / trailers
       const rawMovies: SteamMovie[] = (data.movies || []).map((m: any) => {
-        const hlsUrl = m.hls_h264 || '';
+        const hlsUrl = m.hls_h264 || m.hls || '';
         const rawMp4Max = m.mp4?.max && !m.mp4.max.includes('.mpd') && !m.mp4.max.includes('.m3u8') ? m.mp4.max : '';
         const rawMp4Low = m.mp4?.['480'] && !m.mp4['480'].includes('.mpd') && !m.mp4['480'].includes('.m3u8') ? m.mp4['480'] : '';
-
-        // Synthesize official Steam Akamai trailer CDN URLs if not directly provided and HLS is absent
-        const mp4Max = rawMp4Max || (!hlsUrl && m.id ? `https://video.akamai.steamstatic.com/store_trailers/${m.id}/movie_max.mp4` : '');
-        const mp4Low = rawMp4Low || (!hlsUrl && m.id ? `https://video.akamai.steamstatic.com/store_trailers/${m.id}/movie480.mp4` : '');
 
         return {
           id: m.id,
@@ -135,8 +141,8 @@ export class SteamApiService {
             max: m.webm?.max || '',
           },
           mp4: {
-            480: mp4Low,
-            max: mp4Max,
+            480: rawMp4Low,
+            max: rawMp4Max,
           },
         };
       });
