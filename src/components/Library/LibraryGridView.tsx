@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useEffect } from 'react';
+import React, { useState, useRef, useMemo, useEffect, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { StorefrontId } from '../../contracts/platform';
@@ -115,6 +115,48 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
   return match ? match[1] : null;
 }
 
+const HOVER_DELAY_MS = 400;
+
+function getPortraitCoverUrl(game: CanonicalGame): string | null {
+  // 1. If game has an explicitly designated vertical portrait cover, use it
+  if (game.capsuleImage) {
+    const lower = game.capsuleImage.toLowerCase();
+    const isExplicitPortrait =
+      lower.includes('library_600x900') ||
+      lower.includes('glx_vertical_cover') ||
+      lower.includes('offerimagetall') ||
+      lower.includes('dieselstorefronttall') ||
+      lower.includes('vertical') ||
+      lower.includes('portrait');
+    if (isExplicitPortrait) {
+      return game.capsuleImage;
+    }
+  }
+
+  // 2. Next, if there is a Steam App ID (direct or matched), use Steam's official 600x900 2:3 portrait poster
+  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+  if (targetSteamId) {
+    return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
+  }
+
+  // 3. Fallback: check if capsuleImage is not a horizontal banner
+  if (game.capsuleImage) {
+    const lower = game.capsuleImage.toLowerCase();
+    const isHorizontal =
+      lower.includes('231x87') ||
+      lower.includes('616x353') ||
+      lower.includes('467x181') ||
+      lower.includes('header') ||
+      lower.includes('wide') ||
+      lower.includes('landscape');
+    if (!isHorizontal) {
+      return game.capsuleImage;
+    }
+  }
+
+  return game.headerImage || game.capsuleImage || null;
+}
+
 interface LibraryGridViewProps {
   games: CanonicalGame[];
   onSelectGame: (game: CanonicalGame) => void;
@@ -158,8 +200,48 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const popoutRef = useRef<HTMLDivElement | null>(null);
   const activeCardRef = useRef<HTMLDivElement | null>(null);
+  const gamesRef = useRef(games);
+  const lastMousePosRef = useRef<{ x: number; y: number } | null>(null);
+  const scrollEndTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
+
+  useEffect(() => {
+    gamesRef.current = games;
+  }, [games]);
+
+  const startHoverForCard = useCallback((game: CanonicalGame, cardEl: HTMLDivElement) => {
+    // If already targeting this exact card and a timer is running or it is already hovered, don't restart timer
+    if (activeCardRef.current === cardEl && (hoverTimeoutRef.current || hoveredGame?.id === game.id)) {
+      return;
+    }
+
+    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+
+    // If another card's popout is open, close it immediately!
+    if (hoveredGame && hoveredGame.id !== game.id) {
+      setHoveredGame(null);
+    }
+
+    activeCardRef.current = cardEl;
+
+    hoverTimeoutRef.current = setTimeout(() => {
+      const currentRect = cardEl.getBoundingClientRect();
+      const isRight = currentRect.right + 340 > window.innerWidth;
+      setPreviewPos({
+        x: isRight ? Math.max(12, currentRect.left - 330) : currentRect.right + 12,
+        y: Math.max(80, Math.min(currentRect.top - 20, window.innerHeight - 440)),
+        align: isRight ? 'right' : 'left',
+      });
+      setHoveredGame(game);
+      hoverTimeoutRef.current = null;
+    }, HOVER_DELAY_MS);
+  }, [hoveredGame]);
+
+  const startHoverForCardRef = useRef(startHoverForCard);
+  useEffect(() => {
+    startHoverForCardRef.current = startHoverForCard;
+  }, [startHoverForCard]);
 
   // Fast auto-dismiss on scroll, wheel, window blur, resize, or pointer outside bounds
   useEffect(() => {
@@ -169,8 +251,46 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       activeCardRef.current = null;
     };
 
+    const handleScrollOrWheel = () => {
+      // Dismiss any open popout immediately while scrolling
+      handleDismiss();
+
+      if (scrollEndTimeoutRef.current) {
+        clearTimeout(scrollEndTimeoutRef.current);
+      }
+
+      // 150ms after scroll/wheel events cease, check if cursor is resting over a card
+      scrollEndTimeoutRef.current = setTimeout(() => {
+        if (!lastMousePosRef.current) return;
+        const { x, y } = lastMousePosRef.current;
+        const el = document.elementFromPoint(x, y);
+        const cardEl = el?.closest<HTMLDivElement>('[data-game-id]');
+        if (cardEl) {
+          const gameId = cardEl.getAttribute('data-game-id');
+          const game = gamesRef.current.find((g) => g.id === gameId);
+          if (game) {
+            startHoverForCardRef.current(game, cardEl);
+          }
+        }
+      }, 150);
+    };
+
     const handleMouseMove = (e: MouseEvent) => {
-      if (!activeCardRef.current && !popoutRef.current) return;
+      lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+
+      // If no card or popout is actively tracked, check if mouse is over a card
+      if (!activeCardRef.current && !popoutRef.current) {
+        const target = e.target as HTMLElement | null;
+        const cardEl = target?.closest<HTMLDivElement>('[data-game-id]');
+        if (cardEl) {
+          const gameId = cardEl.getAttribute('data-game-id');
+          const game = gamesRef.current.find((g) => g.id === gameId);
+          if (game) {
+            startHoverForCardRef.current(game, cardEl);
+          }
+        }
+        return;
+      }
 
       const x = e.clientX;
       const y = e.clientY;
@@ -213,18 +333,30 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
       if (!inCard && !inPopout && !inBridge) {
         handleDismiss();
+
+        // Check if cursor moved directly into another card
+        const target = e.target as HTMLElement | null;
+        const nextCardEl = target?.closest<HTMLDivElement>('[data-game-id]');
+        if (nextCardEl && nextCardEl !== activeCardRef.current) {
+          const gameId = nextCardEl.getAttribute('data-game-id');
+          const game = gamesRef.current.find((g) => g.id === gameId);
+          if (game) {
+            startHoverForCardRef.current(game, nextCardEl);
+          }
+        }
       }
     };
 
-    window.addEventListener('scroll', handleDismiss, true);
-    window.addEventListener('wheel', handleDismiss, { passive: true });
+    window.addEventListener('scroll', handleScrollOrWheel, true);
+    window.addEventListener('wheel', handleScrollOrWheel, { passive: true });
     window.addEventListener('resize', handleDismiss, { passive: true });
     window.addEventListener('blur', handleDismiss);
     window.addEventListener('mousemove', handleMouseMove, { passive: true });
 
     return () => {
-      window.removeEventListener('scroll', handleDismiss, true);
-      window.removeEventListener('wheel', handleDismiss, true);
+      if (scrollEndTimeoutRef.current) clearTimeout(scrollEndTimeoutRef.current);
+      window.removeEventListener('scroll', handleScrollOrWheel, true);
+      window.removeEventListener('wheel', handleScrollOrWheel, true);
       window.removeEventListener('resize', handleDismiss);
       window.removeEventListener('blur', handleDismiss);
       window.removeEventListener('mousemove', handleMouseMove);
@@ -290,26 +422,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   });
 
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
-    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
-
-    // If another card's popout is open, close it immediately!
-    if (hoveredGame && hoveredGame.id !== game.id) {
-      setHoveredGame(null);
-    }
-
-    const cardEl = e.currentTarget;
-    activeCardRef.current = cardEl;
-
-    hoverTimeoutRef.current = setTimeout(() => {
-      const currentRect = cardEl.getBoundingClientRect();
-      const isRight = currentRect.right + 340 > window.innerWidth;
-      setPreviewPos({
-        x: isRight ? Math.max(12, currentRect.left - 330) : currentRect.right + 12,
-        y: Math.max(80, Math.min(currentRect.top - 20, window.innerHeight - 440)),
-        align: isRight ? 'right' : 'left',
-      });
-      setHoveredGame(game);
-    }, 200);
+    startHoverForCard(game, e.currentTarget);
   };
 
   const handleCardMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -496,15 +609,12 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
           {sortedGames.map((game) => {
             const isInstalled = game.platforms.some((p) => p.installed);
-            const coverArtUrl =
-              game.capsuleImage ||
-              (game.steamAppId
-                ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/library_600x900_2x.jpg`
-                : game.headerImage);
+            const coverArtUrl = getPortraitCoverUrl(game);
 
             return (
               <div
                 key={game.id}
+                data-game-id={game.id}
                 onClick={() => onSelectGame(game)}
                 onMouseEnter={(e) => handleMouseEnter(game, e)}
                 onMouseLeave={handleCardMouseLeave}
@@ -519,10 +629,19 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       loading="lazy"
                       onError={(e) => {
                         const target = e.currentTarget;
-                        const steamHeader = game.steamAppId
-                          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/header.jpg`
+                        const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+                        const steam1x = targetSteamId
+                          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`
                           : null;
-                        if (steamHeader && target.src !== steamHeader) {
+                        const steamHeader = targetSteamId
+                          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/header.jpg`
+                          : null;
+
+                        if (steam1x && target.src.includes('library_600x900_2x.jpg')) {
+                          target.src = steam1x;
+                        } else if (game.capsuleImage && target.src !== game.capsuleImage) {
+                          target.src = game.capsuleImage;
+                        } else if (steamHeader && target.src !== steamHeader) {
                           target.src = steamHeader;
                         } else if (game.headerImage && target.src !== game.headerImage) {
                           target.src = game.headerImage;
