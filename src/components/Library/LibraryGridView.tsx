@@ -24,6 +24,7 @@ import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
+import { igdbCoverService, isKnownDeadSteamCover } from '../../services/igdb/igdbCoverService';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
@@ -119,30 +120,50 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
 const HOVER_DELAY_MS = 400;
 
 function getPortraitCoverUrl(game: CanonicalGame): string | null {
-  // 1. If game has an explicitly designated vertical portrait cover, use it
+  // 1. Instant verified IGDB portrait cover if known or cached
+  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+  if (igdbCover) {
+    return igdbCover;
+  }
+
+  // 2. If game has an explicitly designated vertical portrait cover, use it
   if (game.capsuleImage) {
-    const lower = game.capsuleImage.toLowerCase();
+    let cap = game.capsuleImage;
+    if (cap.includes('gog-statics.com') && !cap.includes('_glx_vertical_cover')) {
+      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
+    }
+    const lower = cap.toLowerCase();
     const isExplicitPortrait =
       lower.includes('library_600x900') ||
       lower.includes('glx_vertical_cover') ||
       lower.includes('offerimagetall') ||
       lower.includes('dieselstorefronttall') ||
       lower.includes('vertical') ||
-      lower.includes('portrait');
+      lower.includes('portrait') ||
+      lower.includes('t_cover_big');
     if (isExplicitPortrait) {
-      return game.capsuleImage;
+      const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+      if (lower.includes('library_600x900') && targetSteamId && isKnownDeadSteamCover(targetSteamId)) {
+        // Skip dead Steam asset
+      } else {
+        return cap;
+      }
     }
   }
 
-  // 2. Next, if there is a Steam App ID (direct or matched), use Steam's official 600x900 2:3 portrait poster
+  // 3. Next, if there is a Steam App ID (direct or matched) and it is NOT a known dead 600x900 asset, use Steam's official 600x900 2:3 portrait poster
   const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
-  if (targetSteamId) {
+  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
     return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
   }
 
-  // 3. Fallback: check if capsuleImage is not a horizontal banner
+  // 4. Fallback: check if capsuleImage is not a horizontal banner
   if (game.capsuleImage) {
-    const lower = game.capsuleImage.toLowerCase();
+    let cap = game.capsuleImage;
+    if (cap.includes('gog-statics.com') && !cap.includes('_glx_vertical_cover')) {
+      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
+    }
+    const lower = cap.toLowerCase();
     const isHorizontal =
       lower.includes('231x87') ||
       lower.includes('616x353') ||
@@ -151,12 +172,13 @@ function getPortraitCoverUrl(game: CanonicalGame): string | null {
       lower.includes('wide') ||
       lower.includes('landscape');
     if (!isHorizontal) {
-      return game.capsuleImage;
+      return cap;
     }
   }
 
   return game.headerImage || game.capsuleImage || null;
 }
+
 
 interface LibraryGridViewProps {
   games: CanonicalGame[];
@@ -215,6 +237,17 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const scrollEndTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
+  const [, setCoverUpdateNonce] = useState(0);
+
+  useEffect(() => {
+    const handleCoverUpdate = () => {
+      setCoverUpdateNonce((prev) => prev + 1);
+    };
+    window.addEventListener('antigravity:igdb-cover-updated', handleCoverUpdate);
+    return () => {
+      window.removeEventListener('antigravity:igdb-cover-updated', handleCoverUpdate);
+    };
+  }, []);
 
   useEffect(() => {
     gamesRef.current = games;
@@ -640,30 +673,62 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       onError={(e) => {
                         const target = e.currentTarget;
                         const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
-                        const steam1x = targetSteamId
-                          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`
-                          : null;
-                        const steamHeader = targetSteamId
-                          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/header.jpg`
-                          : null;
+                        const instantIgdb = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
 
-                        if (steam1x && target.src.includes('library_600x900_2x.jpg')) {
-                          target.src = steam1x;
-                        } else if (game.capsuleImage && target.src !== game.capsuleImage) {
+                        let gogVertical: string | null = null;
+                        if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com')) {
+                          gogVertical = game.capsuleImage.replace(/_glx_vertical_cover\.jpg|\.jpg$/, '_glx_vertical_cover.jpg');
+                        }
+
+                        if (instantIgdb && target.src !== instantIgdb) {
+                          target.src = instantIgdb;
+                        } else if (gogVertical && target.src !== gogVertical) {
+                          target.src = gogVertical;
+                        } else if (
+                          targetSteamId &&
+                          !isKnownDeadSteamCover(targetSteamId) &&
+                          target.src.includes('library_600x900_2x.jpg')
+                        ) {
+                          target.src = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`;
+                        } else if (
+                          game.capsuleImage &&
+                          target.src !== game.capsuleImage &&
+                          !game.capsuleImage.includes('231x87') &&
+                          !game.capsuleImage.includes('616x353')
+                        ) {
                           target.src = game.capsuleImage;
-                        } else if (steamHeader && target.src !== steamHeader) {
-                          target.src = steamHeader;
-                        } else if (game.headerImage && target.src !== game.headerImage) {
-                          target.src = game.headerImage;
                         } else {
-                          target.style.display = 'none';
-                          const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
-                          if (fallback) fallback.style.display = 'flex';
+                          // Dynamic IGDB fetch for newly synced or unknown titles
+                          igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+                            if (resolvedCover && target) {
+                              target.src = resolvedCover;
+                              target.style.display = 'block';
+                              const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
+                              if (fallback) fallback.style.display = 'none';
+                            }
+                          });
+
+                          const steamHeader = targetSteamId
+                            ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/header.jpg`
+                            : null;
+                          if (steamHeader && target.src !== steamHeader) {
+                            target.src = steamHeader;
+                          } else if (game.headerImage && target.src !== game.headerImage) {
+                            target.src = game.headerImage;
+                          } else {
+                            target.style.display = 'none';
+                            const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
+                            if (fallback) fallback.style.display = 'flex';
+                          }
                         }
                       }}
                       className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
                     />
-                  ) : null}
+                  ) : (() => {
+                    // Trigger dynamic IGDB background fetch if game has no cover art yet
+                    igdbCoverService.fetchIgdbCover(game.title);
+                    return null;
+                  })()}
 
                   {/* Fallback branded card if image unavailable or failed */}
                   <div

@@ -522,13 +522,22 @@ async function fetchGogOwnedGames(accessToken, username) {
         const stats = playtimeMap.get(String(p.id)) || {};
         const steamAppId = await matchSteamAppId(title);
 
+        const verticalGogCover = p.image
+          ? p.image.startsWith('http')
+            ? p.image.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
+            : `https:${p.image}_glx_vertical_cover.jpg`
+          : null;
+
+        const DEAD_STEAM_COVERS = new Set([1904620, 1904621, 1904622, 1018010, 3783210]);
+        const hasSteamVertical = steamAppId && !DEAD_STEAM_COVERS.has(steamAppId);
+
         const headerImg = steamAppId
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`
           : coverUrl;
 
-        const capsuleImg = steamAppId
+        const capsuleImg = hasSteamVertical
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
-          : coverUrl;
+          : (verticalGogCover || coverUrl);
 
         games.push({
           id: steamAppId ? `steam-${steamAppId}` : `gog-${p.id}`,
@@ -1003,6 +1012,38 @@ async function renewEpicTokens(refreshToken) {
   return data;
 }
 
+async function fetchIgdbCover(gameTitle) {
+  if (!gameTitle) return null;
+  const cleanTitle = gameTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+  try {
+    const url = `https://lutris.net/api/games?search=${encodeURIComponent(cleanTitle)}`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const items = data.results || [];
+    if (items.length === 0) return null;
+
+    const normTarget = cleanTitle.toLowerCase();
+    for (const item of items) {
+      if (!item.coverart) continue;
+      const candNorm = (item.name || '').toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+      const sim = computeTokenSimilarity(normTarget, candNorm);
+      if (sim >= 0.5 || candNorm.includes(normTarget) || normTarget.includes(candNorm)) {
+        const m = item.coverart.match(/\/([a-zA-Z0-9_-]+)\.(?:jpg|png|webp)/i);
+        if (m) {
+          return `https://images.igdb.com/igdb/image/upload/t_cover_big/${m[1]}.jpg`;
+        }
+        return item.coverart;
+      }
+    }
+  } catch (err) {
+    console.warn('IGDB cover fetch warning:', err.message);
+  }
+  return null;
+}
+
 module.exports = {
   exchangeGogCode,
   renewGogTokens,
@@ -1015,4 +1056,5 @@ module.exports = {
   loadSavedTokens,
   saveTokens,
   clearTokens,
+  fetchIgdbCover,
 };

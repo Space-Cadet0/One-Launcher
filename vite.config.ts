@@ -237,6 +237,14 @@ export default defineConfig({
           Referer: 'https://howlongtobeat.com/',
         },
       },
+      '/api/lutris': {
+        target: 'https://lutris.net',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/lutris/, ''),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        },
+      },
     },
   }
 });

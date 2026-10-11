@@ -14,8 +14,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg",
     "shortDescription": "You have exactly 60 minutes to save humanity from nuclear extinction. There are no second attempts. No manual saves. Explore a collapsing bunker, repair critical systems, and solve puzzles under pressure. Succeed or watch the world end.",
     "releaseDate": "2025-10-07",
     "developers": [
@@ -2053,7 +2053,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/library_600x900_2x.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp",
     "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1990-01-01",
     "developers": [
@@ -2755,7 +2755,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/library_600x900_2x.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/jwamgwjf5mei3uyxazwc.jpg",
     "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1991-01-01",
     "developers": [
@@ -12609,7 +12609,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/library_600x900_2x.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/hvbou7fij6enuysl0zyp.jpg",
     "shortDescription": "Return to the first fantasy role-playing epic set in the legendary Dragonlance game world of Krynn.",
     "releaseDate": "1992-01-01",
     "developers": [

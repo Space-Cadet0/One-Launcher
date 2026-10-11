@@ -3,6 +3,7 @@ import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
+import { igdbCoverService, isKnownDeadSteamCover } from '../igdb/igdbCoverService';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -327,8 +328,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
     if (
       (normTitle === 'blood omen legacy of kain' || currentTitleLower.includes('blood omen')) &&
       !currentTitleLower.includes('2') &&
-      !currentTitleLower.includes('ii') &&
-      game.steamAppId === 242960
+      !currentTitleLower.includes('ii')
     ) {
       game = {
         ...game,
@@ -466,7 +466,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       };
     }
 
-    // Disambiguate / normalize 60 Minutes to Extinction: Escape Room (hashed Steam assets)
+    // Disambiguate / normalize 60 Minutes to Extinction: Escape Room (hashed Steam assets -> IGDB portrait)
     if (
       currentTitleLower.includes('60 minutes to extinction') ||
       normTitle.includes('60 minutes to extinction') ||
@@ -477,8 +477,34 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         id: 'steam-3783210',
         steamAppId: 3783210,
         headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432',
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
+        iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Champions of Krynn (Steam 600x900 404s, GOG lacks vertical -> IGDB portrait)
+    if (
+      currentTitleLower.includes('champions of krynn') ||
+      normTitle.includes('champions of krynn') ||
+      game.steamAppId === 1904620
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
+        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
+      };
+    }
+
+    // Disambiguate / normalize Castlevania Anniversary Collection (Steam 600x900 404s -> IGDB portrait)
+    if (
+      currentTitleLower.includes('castlevania anniversary collection') ||
+      normTitle.includes('castlevania anniversary collection') ||
+      game.steamAppId === 1018010
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
+        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
       };
     }
 
@@ -644,6 +670,34 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       game = { ...game, shortDescription: '' };
     }
 
+    // Normalize GOG image covers to official high-quality vertical cover format
+    if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com') && !game.capsuleImage.includes('glx_vertical_cover')) {
+      const gogMatch = game.capsuleImage.match(/^(https?:\/\/images-\d+\.gog-statics\.com\/[a-f0-9]+)/i);
+      if (gogMatch) {
+        game = {
+          ...game,
+          capsuleImage: `${gogMatch[1]}_glx_vertical_cover.jpg`,
+        };
+      }
+    }
+
+    // Attach verified IGDB portrait cover if game lacks vertical art or has known dead Steam art
+    const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+    if (instantIgdbCover) {
+      if (
+        !game.capsuleImage ||
+        isKnownDeadSteamCover(game.steamAppId) ||
+        game.capsuleImage.includes('231x87') ||
+        game.capsuleImage.includes('616x353')
+      ) {
+        game = {
+          ...game,
+          capsuleImage: instantIgdbCover,
+          iconUrl: game.iconUrl || instantIgdbCover,
+        };
+      }
+    }
+
     // 9. Intelligent cross-store deduplication by Steam App ID and Normalized Title
     const existingIndex =
       (game.steamAppId && steamIdToIndex.has(game.steamAppId)
@@ -681,7 +735,33 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
           : existing.id,
         platforms: mergedPlatforms,
         headerImage: (game.headerImage && (!existing.headerImage || existing.headerImage.includes('egs-badge.png') || existing.headerImage.includes('1225270') || existing.headerImage.endsWith('/3286930/header.jpg') || existing.headerImage.endsWith('/3783210/header.jpg') || existing.headerImage.endsWith('/3280350/header.jpg') || existing.headerImage.endsWith('/2149010/header.jpg') || existing.headerImage.endsWith('/3751260/header.jpg') || existing.headerImage.endsWith('/3504780/header.jpg') || existing.headerImage.endsWith('/480/header.jpg'))) ? game.headerImage : (existing.headerImage || game.headerImage),
-        capsuleImage: (game.capsuleImage && (!existing.capsuleImage || existing.capsuleImage.includes('egs-badge.png') || existing.capsuleImage.includes('1225270') || existing.capsuleImage.includes('/3783210/library_') || existing.capsuleImage.includes('/3280350/library_') || existing.capsuleImage.includes('/2149010/library_') || existing.capsuleImage.includes('/3751260/library_') || existing.capsuleImage.includes('/3504780/library_') || existing.capsuleImage.includes('/480/'))) ? game.capsuleImage : (existing.capsuleImage || game.capsuleImage),
+        capsuleImage: (() => {
+          const igdb = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId || existing.steamAppId, game.id || existing.id);
+          if (igdb && (isKnownDeadSteamCover(existing.steamAppId) || isKnownDeadSteamCover(game.steamAppId))) {
+            return igdb;
+          }
+          if (
+            game.capsuleImage &&
+            (!existing.capsuleImage ||
+              existing.capsuleImage.includes('egs-badge.png') ||
+              existing.capsuleImage.includes('1225270') ||
+              existing.capsuleImage.includes('231x87') ||
+              isKnownDeadSteamCover(existing.steamAppId) ||
+              existing.capsuleImage.includes('/3783210/library_') ||
+              existing.capsuleImage.includes('/3280350/library_') ||
+              existing.capsuleImage.includes('/2149010/library_') ||
+              existing.capsuleImage.includes('/3751260/library_') ||
+              existing.capsuleImage.includes('/3504780/library_') ||
+              existing.capsuleImage.includes('/1904620/library_') ||
+              existing.capsuleImage.includes('/1904621/library_') ||
+              existing.capsuleImage.includes('/1904622/library_') ||
+              existing.capsuleImage.includes('/1018010/library_') ||
+              existing.capsuleImage.includes('/480/'))
+          ) {
+            return game.capsuleImage;
+          }
+          return existing.capsuleImage || game.capsuleImage;
+        })(),
         iconUrl: (game.iconUrl && (!existing.iconUrl || existing.iconUrl.includes('egs-badge.png') || existing.iconUrl.includes('1225270'))) ? game.iconUrl : (existing.iconUrl || game.iconUrl || game.capsuleImage),
         shortDescription: (!isPlaceholderDesc(existing.shortDescription, existing.title))
           ? existing.shortDescription

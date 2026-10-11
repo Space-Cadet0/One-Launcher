@@ -333,6 +333,10 @@ export class GogIntegrationService {
               : `https:${g.image}`
             : undefined;
 
+          const verticalCover = coverUrl
+            ? coverUrl.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
+            : undefined;
+
           games.push({
             id: `gog-${g.id}`,
             title: g.title.trim(),
@@ -347,7 +351,7 @@ export class GogIntegrationService {
               },
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            capsuleImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
+            capsuleImage: verticalCover || coverUrl || 'https://images.gog-statics.com/avatars/default.png',
             shortDescription: '',
             releaseDate: '',
             developers: [],
@@ -397,6 +401,12 @@ export class GogIntegrationService {
               : `https:${p.image}.jpg`
             : undefined;
 
+          const verticalCover = p.image
+            ? p.image.startsWith('http')
+              ? p.image.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
+              : `https:${p.image}_glx_vertical_cover.jpg`
+            : undefined;
+
           games.push({
             id: `gog-${p.id}`,
             title: gameTitle,
@@ -410,7 +420,7 @@ export class GogIntegrationService {
               },
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            capsuleImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
+            capsuleImage: verticalCover || coverUrl || 'https://images.gog-statics.com/avatars/default.png',
             shortDescription: p.category ? `${p.category} title` : '',
             releaseDate: '',
             developers: [],

@@ -652,3 +652,12 @@ ipcMain.handle('hltb:search', async (_event, gameTitle) => {
   }
 });
 
+ipcMain.handle('igdb:fetch-cover', async (_event, gameTitle) => {
+  try {
+    return await storeSync.fetchIgdbCover(gameTitle);
+  } catch (err) {
+    console.warn('IPC igdb:fetch-cover warning:', err.message);
+    return null;
+  }
+});
+

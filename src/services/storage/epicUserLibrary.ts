@@ -1465,7 +1465,7 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1018010/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1018010/library_600x900_2x.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg",
     "shortDescription": "Castlevania Anniversary Collection",
     "releaseDate": "2026-07-03",
     "developers": [

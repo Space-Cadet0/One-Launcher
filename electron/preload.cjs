@@ -13,4 +13,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
   searchHltb: (title) => ipcRenderer.invoke('hltb:search', title),
   fetchEpicAchievements: (accountId, accessToken) =>
     ipcRenderer.invoke('epic:fetch-achievements', { accountId, accessToken }),
+  fetchIgdbCover: (title) => ipcRenderer.invoke('igdb:fetch-cover', title),
 });
