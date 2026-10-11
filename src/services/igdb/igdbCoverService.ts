@@ -62,9 +62,78 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   // Little Nightmares Enhanced Edition
   'little nightmares enhanced edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
 
+  // Akalabeth: World of Doom
+  'akalabeth world of doom': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+  'akalabeth: world of doom': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+  'akalabeth': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+
+  // Broken Sword: Director's Cut
+  'broken sword directors cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+  'broken sword: directors cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+  'broken sword: director\'s cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+  'broken sword the shadow of the templars the directors cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+  'broken sword: the shadow of the templars – the director\'s cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+  'broken sword shadow of the templars': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+
+  // Citadel Remonstered / Cytadela
+  'citadel remonstered': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+  'citadel: remonstered': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+  'cytadela': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+
+  // DOOM + DOOM II
+  'doom + doom ii': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2280/library_600x900_2x.jpg',
+  'doom + doom 2': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2280/library_600x900_2x.jpg',
+
+  // Retro & GOG Classics
+  'daggerfall unity - gog cut': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1vup.jpg',
+  'daggerfall unity': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1vup.jpg',
+  'syndicate plus': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2fz3.jpg',
+  'syndicate wars': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2kt9.jpg',
+  'tyrian 2000': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2zg1.jpg',
+  'flight of the amazon queen': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2i9b.jpg',
+  'lure of the temptress': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+  'doomdark\'s revenge': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co6q0g.jpg',
+  'doomdarks revenge': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co6q0g.jpg',
+  'd&d stronghold: kingdom simulator': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3cr6.jpg',
+  'fate': 'https://images.igdb.com/igdb/image/upload/t_cover_big/cob5w5.jpg',
+  'shadow warrior classic complete': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pqn.jpg',
+  'shadow warrior classic': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pqn.jpg',
+
   // Wildgate
   'wildgate': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
 };
+
+/**
+ * Checks whether an image URL represents an unsuitable horizontal banner,
+ * wide capsule, or broken asset that should not be displayed in a 2:3 portrait card.
+ */
+export function isUnsuitableCoverUrl(url?: string | null): boolean {
+  if (!url) return true;
+  const lower = url.toLowerCase();
+
+  // 1. Known horizontal banner URL dimensions / names
+  if (
+    lower.includes('231x87') ||
+    lower.includes('467x181') ||
+    lower.includes('616x353') ||
+    lower.includes('header.jpg') ||
+    lower.includes('mobile_slider') ||
+    lower.includes('sbicon') ||
+    lower.includes('avatars/default.png') ||
+    lower.includes('egs-badge') ||
+    lower.includes('wide') ||
+    lower.includes('landscape')
+  ) {
+    return true;
+  }
+
+  // 2. Dead Steam App IDs returning 404
+  for (const deadId of KNOWN_DEAD_STEAM_COVER_APP_IDS) {
+    if (lower.includes(`apps/${deadId}/library_600x900`)) return true;
+  }
+
+  return false;
+}
 
 function normalizeKey(str: string): string {
   return str

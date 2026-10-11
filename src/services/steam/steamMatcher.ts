@@ -43,6 +43,8 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'doom eternal': 782330,
   'doom 3': 9050,
   'doom ii': 2300,
+  'doom + doom ii': 2280,
+  'doom + doom 2': 2280,
   'dishonored': 205100,
   'dishonored - definitive edition': 205100,
   'dishonored 2': 403640,
@@ -294,8 +296,6 @@ export function extractSequelIdentifier(words: string[]): string | null {
 export const KNOWN_NON_STEAM_TITLES = new Set([
   'blood omen legacy of kain',
   'blood omen: legacy of kain',
-  'doom + doom ii',
-  'doom + doom 2',
   'total annihilation kingdoms',
   'total annihilation: kingdoms',
   'total annihilation: kingdoms + iron plague',

@@ -24,7 +24,7 @@ import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
-import { igdbCoverService, isKnownDeadSteamCover } from '../../services/igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../../services/igdb/igdbCoverService';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
@@ -120,63 +120,51 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
 const HOVER_DELAY_MS = 400;
 
 function getPortraitCoverUrl(game: CanonicalGame): string | null {
-  // 1. Instant verified IGDB portrait cover if known or cached
+  // 1. Instant verified IGDB portrait box art if known or cached
   const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
   if (igdbCover) {
     return igdbCover;
   }
 
-  // 2. If game has an explicitly designated vertical portrait cover, use it
-  if (game.capsuleImage) {
-    let cap = game.capsuleImage;
-    if (cap.includes('gog-statics.com') && !cap.includes('_glx_vertical_cover')) {
-      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
-    }
-    const lower = cap.toLowerCase();
-    const isExplicitPortrait =
-      lower.includes('library_600x900') ||
-      lower.includes('glx_vertical_cover') ||
-      lower.includes('offerimagetall') ||
-      lower.includes('dieselstorefronttall') ||
-      lower.includes('vertical') ||
-      lower.includes('portrait') ||
-      lower.includes('t_cover_big');
-    if (isExplicitPortrait) {
-      const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
-      if (lower.includes('library_600x900') && targetSteamId && isKnownDeadSteamCover(targetSteamId)) {
-        // Skip dead Steam asset
-      } else {
-        return cap;
-      }
-    }
-  }
-
-  // 3. Next, if there is a Steam App ID (direct or matched) and it is NOT a known dead 600x900 asset, use Steam's official 600x900 2:3 portrait poster
+  // 2. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404)
   const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
     return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
   }
 
-  // 4. Fallback: check if capsuleImage is not a horizontal banner
+  // 3. Official Epic tall posters (1200x1600) or IGDB big covers
   if (game.capsuleImage) {
-    let cap = game.capsuleImage;
-    if (cap.includes('gog-statics.com') && !cap.includes('_glx_vertical_cover')) {
-      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
-    }
-    const lower = cap.toLowerCase();
-    const isHorizontal =
-      lower.includes('231x87') ||
-      lower.includes('616x353') ||
-      lower.includes('467x181') ||
-      lower.includes('header') ||
-      lower.includes('wide') ||
-      lower.includes('landscape');
-    if (!isHorizontal) {
-      return cap;
+    const lower = game.capsuleImage.toLowerCase();
+    if (
+      lower.includes('offerimagetall') ||
+      lower.includes('dieselstorefronttall') ||
+      lower.includes('t_cover_big')
+    ) {
+      return game.capsuleImage;
     }
   }
 
-  return game.headerImage || game.capsuleImage || null;
+  // 4. For GOG games with glx_vertical_cover:
+  // Return GOG cover provisionally, BUT immediately trigger IGDB background lookup
+  // so authentic uncropped retail box art replaces any center-cropped GOG logo!
+  if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com')) {
+    let cap = game.capsuleImage;
+    if (!cap.includes('_glx_vertical_cover')) {
+      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
+    }
+    // Proactively fetch authentic IGDB portrait cover
+    igdbCoverService.fetchIgdbCover(game.title);
+    return cap;
+  }
+
+  // 5. Check if capsuleImage is not an unsuitable horizontal banner
+  if (game.capsuleImage && !isUnsuitableCoverUrl(game.capsuleImage)) {
+    return game.capsuleImage;
+  }
+
+  // If only horizontal banners exist, trigger background IGDB fetch and return null
+  igdbCoverService.fetchIgdbCover(game.title);
+  return null;
 }
 
 
@@ -670,6 +658,29 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       src={coverArtUrl}
                       alt={game.title}
                       loading="lazy"
+                      onLoad={(e) => {
+                        const target = e.currentTarget;
+                        if (target.naturalWidth && target.naturalHeight) {
+                          const ratio = target.naturalWidth / target.naturalHeight;
+                          // If loaded image is square or landscape (aspect ratio > 0.82), it is not a suitable portrait poster!
+                          if (ratio > 0.82) {
+                            // Automatically trigger dynamic IGDB lookup to fetch authentic 2:3 portrait art
+                            igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+                              if (resolvedCover && target) {
+                                target.src = resolvedCover;
+                                target.style.display = 'block';
+                                const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
+                                if (fallback) fallback.style.display = 'none';
+                              }
+                            });
+
+                            // Hide the distorted landscape image and display the clean branded card until portrait art loads
+                            target.style.display = 'none';
+                            const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
+                            if (fallback) fallback.style.display = 'flex';
+                          }
+                        }
+                      }}
                       onError={(e) => {
                         const target = e.currentTarget;
                         const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);

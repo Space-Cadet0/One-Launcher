@@ -3,7 +3,7 @@ import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
-import { igdbCoverService, isKnownDeadSteamCover } from '../igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../igdb/igdbCoverService';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -508,6 +508,44 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       };
     }
 
+    // Disambiguate / normalize Akalabeth: World of Doom (authentic portrait box art)
+    if (
+      currentTitleLower.includes('akalabeth') ||
+      normTitle.includes('akalabeth')
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Broken Sword: Director's Cut (authentic portrait box art)
+    if (
+      currentTitleLower.includes('broken sword') &&
+      (currentTitleLower.includes('director') || currentTitleLower.includes('templar') || currentTitleLower.includes('shadow'))
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Citadel Remonstered / Cytadela (authentic portrait box art)
+    if (
+      currentTitleLower.includes('citadel remonstered') ||
+      currentTitleLower.includes('cytadela') ||
+      normTitle.includes('citadel remonstered') ||
+      normTitle.includes('cytadela')
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+        iconUrl: game.iconUrl || 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+      };
+    }
+
     // Disambiguate / normalize DEATH STRANDING 2: ON THE BEACH (hashed Steam assets)
     if (
       currentTitleLower.includes('death stranding 2') ||
@@ -681,14 +719,16 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       }
     }
 
-    // Attach verified IGDB portrait cover if game lacks vertical art or has known dead Steam art
+    // Attach verified IGDB portrait cover if game lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
     const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
     if (instantIgdbCover) {
       if (
         !game.capsuleImage ||
         isKnownDeadSteamCover(game.steamAppId) ||
+        isUnsuitableCoverUrl(game.capsuleImage) ||
         game.capsuleImage.includes('231x87') ||
-        game.capsuleImage.includes('616x353')
+        game.capsuleImage.includes('616x353') ||
+        game.capsuleImage.includes('gog-statics.com')
       ) {
         game = {
           ...game,

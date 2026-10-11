@@ -232,7 +232,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/56262850671fd7232b8ff46deba530007ff7a437fab0ddd67147f8d41aa6bca0_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/56262850671fd7232b8ff46deba530007ff7a437fab0ddd67147f8d41aa6bca0_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "1980-01-01",
     "developers": [
@@ -1745,7 +1746,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/5b0d3da8074c8dafb7c129fe4eac9feb47dce1f15fcaa325c1b420e21adc4273_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/5b0d3da8074c8dafb7c129fe4eac9feb47dce1f15fcaa325c1b420e21adc4273_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2008-08-26",
     "developers": [
@@ -2147,7 +2149,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13_glx_vertical_cover.jpg",
+    "capsuleImage": "https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg",
+    "iconUrl": "https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "2026-04-30",
     "developers": [
