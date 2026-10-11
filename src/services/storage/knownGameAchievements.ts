@@ -31,30 +31,7 @@ export const KNOWN_USER_GOG_ACHIEVEMENTS: Record<string, StoreAchievementSummary
     total: 35,
     percentage: 71,
     isMastered: false,
-  },
-  '1423049311': {
-    unlocked: 25,
-    total: 57,
-    percentage: 44,
-    isMastered: false,
-  },
-  'cyberpunk 2077': {
-    unlocked: 25,
-    total: 57,
-    percentage: 44,
-    isMastered: false,
-  },
-  '1207664643': {
-    unlocked: 35,
-    total: 78,
-    percentage: 45,
-    isMastered: false,
-  },
-  'the witcher 3: wild hunt': {
-    unlocked: 35,
-    total: 78,
-    percentage: 45,
-    isMastered: false,
+    source: 'live_cloud_xml',
   },
 };
 

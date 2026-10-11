@@ -161,6 +161,18 @@ function sanitizeGameCatalog(catalog) {
       };
     }
 
+    // Disambiguate / normalize Cyberpunk 2077 (Steam base game) vs Cyberpunk 2077 Digital Goodies (GOG promo pack)
+    if (
+      currentTitleLower === 'cyberpunk 2077' ||
+      game.title.toLowerCase().trim() === 'cyberpunk 2077' ||
+      game.steamAppId === 1091500
+    ) {
+      game = {
+        ...game,
+        platforms: game.platforms.filter((p) => p.platformId !== 'gog'),
+      };
+    }
+
     let normTitle = normalizeCanonicalTitle(game.title);
 
     // 6. GOG platform ownership validation
