@@ -20,6 +20,32 @@ export const KNOWN_DEAD_STEAM_COVER_APP_IDS = new Set<number>([
   3764200, // Resident Evil Requiem (uses hashed library_capsule.jpg)
   3280350, // Death Stranding 2: On The Beach (uses hashed library_capsule.jpg)
   235900,  // RPG Maker XP (no unhashed library_600x900)
+  1904520, // Curse of the Azure Bonds
+  1904600, // Dark Sun: Shattered Lands
+  1904601, // Dark Sun: Wake of the Ravager
+  2350512, // Dragons of Flame
+  1904551, // Dungeon Hack
+  1882261, // Eye of the Beholder II: The Legend of Darkmoon
+  1882262, // Eye of the Beholder III: Assault on Myth Drannor
+  1904523, // Gateway to the Savage Frontier
+  2350511, // Heroes of the Lance
+  1904525, // Hillsfar
+  946660,  // Loria
+  1904550, // Menzoberranzan
+  431650,  // Phoning Home
+  1882370, // Pool of Radiance
+  1904522, // Pools of Darkness
+  227220,  // Sang-Froid: Tales of Werewolves
+  1904521, // Secret of the Silver Blades
+  2350510, // Shadow Sorcerer
+  32380,   // STAR WARS™ Jedi Knight: Dark Forces II
+  1904524, // Treasures of the Savage Frontier
+  2350513, // War of the Lance
+  537520,  // SYMMETRY
+  242700,  // Injustice: Gods Among Us Ultimate Edition
+  293180,  // Overcast - Walden and the Werewolf
+  1309,    // SiN Multiplayer
+  285570,  // STAR WARS™ Rebellion
 ]);
 
 export function isKnownDeadSteamCover(appId?: number | null): boolean {
@@ -134,6 +160,91 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
 
   // RPG Maker XP
   'rpg maker xp': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
+
+  // SNEG & D&D Gold Box Classics
+  'war of the lance': 'https://images.igdb.com/igdb/image/upload/t_cover_big/c5ebwbjcndr79evxabjq.jpg',
+  'treasures of the savage frontier': 'https://images.igdb.com/igdb/image/upload/t_cover_big/yueo852gaefw6e76c9cc.jpg',
+  'gateway to the savage frontier': 'https://images.igdb.com/igdb/image/upload/t_cover_big/ezuoi1vqt7icnjtnfjaa.jpg',
+  'pool of radiance': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2pdu.jpg',
+  'curse of the azure bonds': 'https://images.igdb.com/igdb/image/upload/t_cover_big/t9bbkwevt4ykbj51zxeu.jpg',
+  'secret of the silver blades': 'https://images.igdb.com/igdb/image/upload/t_cover_big/wgdcvuxvzkoes5l2jigv.jpg',
+  'pools of darkness': 'https://images.igdb.com/igdb/image/upload/t_cover_big/k03wye0gysy3utbvrexr.jpg',
+  'hillsfar': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1xub.jpg',
+  'dragons of flame': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1qm2.jpg',
+  'heroes of the lance': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3o6v.jpg',
+  'shadow sorcerer': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co78tc.jpg',
+  'dungeon hack': 'https://images.igdb.com/igdb/image/upload/t_cover_big/ej1k1t0inmsebismdrrp.jpg',
+  'eye of the beholder ii the legend of darkmoon': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co28s8.jpg',
+  'eye of the beholder ii: the legend of darkmoon': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co28s8.jpg',
+  'eye of the beholder iii assault on myth drannor': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co28s9.jpg',
+  'eye of the beholder iii: assault on myth drannor': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co28s9.jpg',
+  'menzoberranzan': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2hkg.jpg',
+  'dark sun shattered lands': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2hki.jpg',
+  'dark sun: shattered lands': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2hki.jpg',
+  'dark sun wake of the ravager': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3izp.jpg',
+  'dark sun: wake of the ravager': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3izp.jpg',
+  'fantasy general': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2jkd.jpg',
+
+  // Dead Steam Classics
+  'loria': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co6aqi.jpg',
+  'phoning home': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co21fx.jpg',
+  'sang froid tales of werewolves': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2211.jpg',
+  'sang-froid: tales of werewolves': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2211.jpg',
+  'star wars jedi knight dark forces ii': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co25xt.jpg',
+  'star wars jedi knight: dark forces ii': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co25xt.jpg',
+  'star wars jedi knight dark forces ii mysteries of the sith': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co25zg.jpg',
+  'star wars jedi knight: dark forces ii - mysteries of the sith': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co25zg.jpg',
+  'star wars rebellion': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2jp7.jpg',
+  'symmetry': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co237w.jpg',
+  'injustice gods among us ultimate edition': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1mym.jpg',
+  'injustice: gods among us ultimate edition': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1mym.jpg',
+  'overcast walden and the werewolf': 'https://images.igdb.com/igdb/image/upload/t_cover_big/a6totrsausiushi3gumd.jpg',
+  'overcast - walden and the werewolf': 'https://images.igdb.com/igdb/image/upload/t_cover_big/a6totrsausiushi3gumd.jpg',
+  'sin multiplayer': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2ch6.jpg',
+
+  // Thief series & Predator
+  'thief 2 the metal age': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211740/library_600x900_2x.jpg',
+  'thief 2: the metal age': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211740/library_600x900_2x.jpg',
+  'thief ii the metal age': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211740/library_600x900_2x.jpg',
+  'thief ii: the metal age': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211740/library_600x900_2x.jpg',
+  'thief 3 deadly shadows': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6980/library_600x900_2x.jpg',
+  'thief 3: deadly shadows': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6980/library_600x900_2x.jpg',
+  'thief: deadly shadows': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6980/library_600x900_2x.jpg',
+  'predator hunting grounds': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1556200/library_600x900_2x.jpg',
+  'predator: hunting grounds': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1556200/library_600x900_2x.jpg',
+  'predator hunting grounds standard edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1556200/library_600x900_2x.jpg',
+  'predator: hunting grounds standard edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1556200/library_600x900_2x.jpg',
+
+  // Ultima & GOG Classics
+  'ultima underworld the stygian abyss': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq5.jpg',
+  'ultima underworld: the stygian abyss': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq5.jpg',
+  'ultima underworld i': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq5.jpg',
+  'ultima underworld ii labyrinth of worlds': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq2.jpg',
+  'ultima underworld ii: labyrinth of worlds': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq2.jpg',
+  'ultima underworld ii': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cq2.jpg',
+  'ultima iv quest of the avatar': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cqa.jpg',
+  'ultima iv: quest of the avatar': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2cqa.jpg',
+  'ultima worlds of adventure 2 martian dreams': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co4atv.jpg',
+  'ultima worlds of adventure 2: martian dreams': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co4atv.jpg',
+  'worlds of ultima the savage empire': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co4atz.jpg',
+  'worlds of ultima: the savage empire': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co4atz.jpg',
+  'teenagent': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2dkg.jpg',
+  'the lords of midnight': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2e2l.jpg',
+  'the whispered world special edition': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2thc.jpg',
+  'the whispered world: special edition': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2thc.jpg',
+  'sin slayers the first sin': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2m8i.jpg',
+  'sin slayers: the first sin': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2m8i.jpg',
+  'dink smallwood hd': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pko.jpg',
+  'dink smallwood': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pko.jpg',
+  'fall of porcupine': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3mlj.jpg',
+  'fall of porcupine prologue': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3mlj.jpg',
+  'fall of porcupine: prologue': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3mlj.jpg',
+  'jill of the jungle the complete trilogy': 'https://images.igdb.com/igdb/image/upload/t_cover_big/sttz0lxyhx7bwmgu02cx.jpg',
+  'jill of the jungle: the complete trilogy': 'https://images.igdb.com/igdb/image/upload/t_cover_big/sttz0lxyhx7bwmgu02cx.jpg',
+  'jill of the jungle': 'https://images.igdb.com/igdb/image/upload/t_cover_big/sttz0lxyhx7bwmgu02cx.jpg',
+  'grim fandango remastered': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co27pj.jpg',
+  'chivalry 2 public testing': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1824220/library_600x900_2x.jpg',
+  'chivalry 2 - public testing': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1824220/library_600x900_2x.jpg',
 };
 
 /**

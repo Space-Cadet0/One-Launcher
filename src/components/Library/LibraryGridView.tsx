@@ -119,56 +119,139 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
 
 const HOVER_DELAY_MS = 400;
 
-function getPortraitCoverUrl(game: CanonicalGame): string | null {
-  // 1. Instant verified IGDB portrait box art if known or cached
-  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-  if (igdbCover) {
-    return igdbCover;
+function getCoverCandidates(game: CanonicalGame, overrideCoverUrl?: string | null): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (url?: string | null) => {
+    if (!url) return;
+    const trimmed = url.trim();
+    if (!trimmed || seen.has(trimmed) || isUnsuitableCoverUrl(trimmed)) return;
+    seen.add(trimmed);
+    candidates.push(trimmed);
+  };
+
+  // 1. Explicit dynamic override if set
+  if (overrideCoverUrl) {
+    add(overrideCoverUrl);
   }
 
-  // 2. Official Steam / Epic tall vertical posters already attached to the game entity
-  // Handles modern Steam games with hashed library_capsule.jpg as well as Epic tall posters
-  if (game.capsuleImage) {
-    const lower = game.capsuleImage.toLowerCase();
-    if (
-      lower.includes('library_capsule.jpg') ||
-      lower.includes('library_600x900') ||
-      lower.includes('offerimagetall') ||
-      lower.includes('dieselstorefronttall') ||
-      lower.includes('t_cover_big')
-    ) {
-      return game.capsuleImage;
-    }
-  }
+  // 2. Instant verified IGDB portrait box art if known or cached
+  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+  add(igdbCover);
 
   // 3. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404/hashed)
   const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
-    return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
+    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
   }
 
-  // 4. For GOG games with glx_vertical_cover:
-  // Return GOG cover provisionally, BUT immediately trigger IGDB background lookup
-  // so authentic uncropped retail box art replaces any center-cropped GOG logo!
+  // 4. Official Steam / Epic tall vertical posters already attached to the game entity (non-GOG)
+  if (game.capsuleImage) {
+    const lower = game.capsuleImage.toLowerCase();
+    const isGog = lower.includes('gog-statics.com');
+    if (
+      !isGog &&
+      (lower.includes('library_capsule.jpg') ||
+        lower.includes('offerimagetall') ||
+        lower.includes('dieselstorefronttall') ||
+        lower.includes('t_cover_big') ||
+        lower.includes('1200x1600') ||
+        lower.includes('portrait'))
+    ) {
+      add(game.capsuleImage);
+    }
+  }
+
+  // 5. Official Steam 600x900 1x poster
+  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
+    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+  }
+
+  // 6. For GOG games with glx_vertical_cover
   if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com')) {
     let cap = game.capsuleImage;
     if (!cap.includes('_glx_vertical_cover')) {
       cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
     }
-    // Proactively fetch authentic IGDB portrait cover
-    igdbCoverService.fetchIgdbCover(game.title);
-    return cap;
+    add(cap);
   }
 
-  // 5. Check if capsuleImage is not an unsuitable horizontal banner
-  if (game.capsuleImage && !isUnsuitableCoverUrl(game.capsuleImage)) {
-    return game.capsuleImage;
+  // 7. General capsule image if not an unsuitable wide banner
+  if (game.capsuleImage) {
+    add(game.capsuleImage);
   }
 
-  // If only horizontal banners exist, trigger background IGDB fetch and return null
-  igdbCoverService.fetchIgdbCover(game.title);
-  return null;
+  return candidates;
 }
+
+interface GameCardCoverProps {
+  game: CanonicalGame;
+  overrideCoverUrl?: string | null;
+  onNeedCoverLookup?: (game: CanonicalGame) => void;
+}
+
+export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
+  ({ game, overrideCoverUrl, onNeedCoverLookup }) => {
+    const candidates = useMemo(() => {
+      if (overrideCoverUrl === null) return [];
+      return getCoverCandidates(game, overrideCoverUrl);
+    }, [game, overrideCoverUrl]);
+
+    const [candidateIndex, setCandidateIndex] = useState(0);
+
+    // Reset candidate progression when game or explicit override changes
+    useEffect(() => {
+      setCandidateIndex(0);
+    }, [game.id, overrideCoverUrl]);
+
+    const currentSrc = candidateIndex < candidates.length ? candidates[candidateIndex] : null;
+
+    useEffect(() => {
+      if (!currentSrc && onNeedCoverLookup) {
+        onNeedCoverLookup(game);
+      }
+    }, [currentSrc, game, onNeedCoverLookup]);
+
+    if (!currentSrc) {
+      return (
+        <div className="grid-cover-fallback w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
+          <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
+          <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
+            {game.title}
+          </span>
+        </div>
+      );
+    }
+
+    return (
+      <img
+        key={currentSrc}
+        src={currentSrc}
+        alt={game.title}
+        loading="lazy"
+        onLoad={(e) => {
+          const { naturalWidth, naturalHeight } = e.currentTarget;
+          if (naturalWidth && naturalHeight) {
+            const ratio = naturalWidth / naturalHeight;
+            // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
+            // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
+            // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
+            if (ratio > 0.94) {
+              setCandidateIndex((prev) => prev + 1);
+              if (onNeedCoverLookup) onNeedCoverLookup(game);
+            }
+          }
+        }}
+        onError={() => {
+          // Declaratively advance to the next candidate without mutating the DOM
+          setCandidateIndex((prev) => prev + 1);
+        }}
+        className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
+      />
+    );
+  }
+);
 
 
 interface LibraryGridViewProps {
@@ -230,6 +313,17 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
   const [coverOverrides, setCoverOverrides] = useState<Record<string, string | null>>({});
   const attemptedCoverLookupsRef = useRef<Set<string>>(new Set());
+
+  const handleNeedCoverLookup = useCallback((game: CanonicalGame) => {
+    if (attemptedCoverLookupsRef.current.has(game.id)) return;
+    attemptedCoverLookupsRef.current.add(game.id);
+
+    igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+      if (resolvedCover) {
+        setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+      }
+    });
+  }, []);
 
   useEffect(() => {
     const handleCoverUpdate = (e: any) => {
@@ -656,8 +750,6 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
           {sortedGames.map((game) => {
             const isInstalled = game.platforms.some((p) => p.installed);
-            const activeCoverUrl = coverOverrides[game.id] !== undefined ? coverOverrides[game.id] : getPortraitCoverUrl(game);
-
             return (
               <div
                 key={game.id}
@@ -669,88 +761,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               >
                 {/* 2:3 Portrait Capsule Viewport */}
                 <div className="relative aspect-[2/3] w-full bg-black/60 overflow-hidden flex items-center justify-center">
-                  {activeCoverUrl ? (
-                    <img
-                      src={activeCoverUrl}
-                      alt={game.title}
-                      loading="lazy"
-                      onLoad={(e) => {
-                        const target = e.currentTarget;
-                        if (target.naturalWidth && target.naturalHeight) {
-                          const ratio = target.naturalWidth / target.naturalHeight;
-                          // If loaded image is square or landscape (aspect ratio > 0.82), it is not a suitable portrait poster!
-                          if (ratio > 0.82) {
-                            setCoverOverrides((prev) => ({ ...prev, [game.id]: null }));
-                            if (!attemptedCoverLookupsRef.current.has(game.id)) {
-                              attemptedCoverLookupsRef.current.add(game.id);
-                              igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
-                                if (resolvedCover) {
-                                  setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
-                                }
-                              });
-                            }
-                          }
-                        }
-                      }}
-                      onError={(e) => {
-                        const target = e.currentTarget;
-                        const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
-                        const instantIgdb = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-
-                        let gogVertical: string | null = null;
-                        if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com')) {
-                          gogVertical = game.capsuleImage.replace(/_glx_vertical_cover\.jpg|\.jpg$/, '_glx_vertical_cover.jpg');
-                        }
-
-                        if (instantIgdb && target.src !== instantIgdb) {
-                          target.src = instantIgdb;
-                        } else if (gogVertical && target.src !== gogVertical) {
-                          target.src = gogVertical;
-                        } else if (
-                          targetSteamId &&
-                          !isKnownDeadSteamCover(targetSteamId) &&
-                          target.src.includes('library_600x900_2x.jpg')
-                        ) {
-                          target.src = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`;
-                        } else if (
-                          game.capsuleImage &&
-                          target.src !== game.capsuleImage &&
-                          !isUnsuitableCoverUrl(game.capsuleImage)
-                        ) {
-                          target.src = game.capsuleImage;
-                        } else {
-                          // All candidates exhausted: switch card to clean branded title card
-                          setCoverOverrides((prev) => ({ ...prev, [game.id]: null }));
-                          if (!attemptedCoverLookupsRef.current.has(game.id)) {
-                            attemptedCoverLookupsRef.current.add(game.id);
-                            igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
-                              if (resolvedCover) {
-                                setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
-                              }
-                            });
-                          }
-                        }
-                      }}
-                      className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
-                    />
-                  ) : (() => {
-                    if (!attemptedCoverLookupsRef.current.has(game.id)) {
-                      attemptedCoverLookupsRef.current.add(game.id);
-                      igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
-                        if (resolvedCover) {
-                          setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
-                        }
-                      });
-                    }
-                    return (
-                      <div className="grid-cover-fallback w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
-                        <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
-                        <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
-                          {game.title}
-                        </span>
-                      </div>
-                    );
-                  })()}
+                  <GameCardCover
+                    game={game}
+                    overrideCoverUrl={coverOverrides[game.id]}
+                    onNeedCoverLookup={handleNeedCoverLookup}
+                  />
 
                   {/* Gradient bottom shadow to ensure overlays pop */}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20 pointer-events-none" />

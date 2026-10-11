@@ -3,7 +3,7 @@ import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
-import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, KNOWN_IGDB_COVERS, normalizeKey } from '../igdb/igdbCoverService';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -799,7 +799,9 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
     // Attach verified IGDB portrait cover if game lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
     const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
     if (instantIgdbCover) {
+      const isCuratedKnown = Boolean(KNOWN_IGDB_COVERS[normTitle] || KNOWN_IGDB_COVERS[normalizeKey(game.id)]);
       if (
+        isCuratedKnown ||
         !game.capsuleImage ||
         isKnownDeadSteamCover(game.steamAppId) ||
         isUnsuitableCoverUrl(game.capsuleImage) ||
@@ -854,7 +856,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         headerImage: (game.headerImage && (!existing.headerImage || existing.headerImage.includes('egs-badge.png') || existing.headerImage.includes('1225270') || existing.headerImage.endsWith('/3286930/header.jpg') || existing.headerImage.endsWith('/3783210/header.jpg') || existing.headerImage.endsWith('/3280350/header.jpg') || existing.headerImage.endsWith('/2149010/header.jpg') || existing.headerImage.endsWith('/3751260/header.jpg') || existing.headerImage.endsWith('/3504780/header.jpg') || existing.headerImage.endsWith('/480/header.jpg'))) ? game.headerImage : (existing.headerImage || game.headerImage),
         capsuleImage: (() => {
           const igdb = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId || existing.steamAppId, game.id || existing.id);
-          if (igdb && (isKnownDeadSteamCover(existing.steamAppId) || isKnownDeadSteamCover(game.steamAppId))) {
+          if (igdb && (isKnownDeadSteamCover(existing.steamAppId) || isKnownDeadSteamCover(game.steamAppId) || isUnsuitableCoverUrl(existing.capsuleImage) || isUnsuitableCoverUrl(game.capsuleImage))) {
             return igdb;
           }
           if (
@@ -864,16 +866,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
               existing.capsuleImage.includes('1225270') ||
               existing.capsuleImage.includes('231x87') ||
               isKnownDeadSteamCover(existing.steamAppId) ||
-              existing.capsuleImage.includes('/3783210/library_') ||
-              existing.capsuleImage.includes('/3280350/library_') ||
-              existing.capsuleImage.includes('/2149010/library_') ||
-              existing.capsuleImage.includes('/3751260/library_') ||
-              existing.capsuleImage.includes('/3504780/library_') ||
-              existing.capsuleImage.includes('/1904620/library_') ||
-              existing.capsuleImage.includes('/1904621/library_') ||
-              existing.capsuleImage.includes('/1904622/library_') ||
-              existing.capsuleImage.includes('/1018010/library_') ||
-              existing.capsuleImage.includes('/480/'))
+              isUnsuitableCoverUrl(existing.capsuleImage))
           ) {
             return game.capsuleImage;
           }
