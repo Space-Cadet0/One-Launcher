@@ -48,6 +48,19 @@ function saveTokens(storefrontId, tokenData) {
   }
 }
 
+function clearTokens(storefrontId) {
+  try {
+    const filePath = getTokensFilePath();
+    const existing = loadSavedTokens();
+    if (existing[storefrontId]) {
+      delete existing[storefrontId];
+      fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf-8');
+    }
+  } catch (err) {
+    console.warn('Failed to clear tokens:', err.message);
+  }
+}
+
 const KNOWN_STEAM_MAPPINGS = {
   'cyberpunk 2077': 1091500,
   'the witcher 3: wild hunt': 292030,
@@ -960,4 +973,5 @@ module.exports = {
   fetchEpicAchievements,
   loadSavedTokens,
   saveTokens,
+  clearTokens,
 };

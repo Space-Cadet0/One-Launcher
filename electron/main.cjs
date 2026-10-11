@@ -153,16 +153,17 @@ async function processStoreAuth(storefrontId, code) {
   let accountName = 'Verified User';
   let avatarUrl = undefined;
   let games = [];
+  let tokenData = null;
 
   try {
     if (storefrontId === 'gog') {
-      const tokenData = await storeSync.exchangeGogCode(code);
+      tokenData = await storeSync.exchangeGogCode(code);
       const account = await storeSync.fetchGogAccount(tokenData.access_token);
       accountName = account.username || 'mike.stokes85';
       avatarUrl = account.avatarUrl;
       games = await storeSync.fetchGogOwnedGames(tokenData.access_token, accountName);
     } else if (storefrontId === 'epic') {
-      const tokenData = await storeSync.exchangeEpicCode(code);
+      tokenData = await storeSync.exchangeEpicCode(code);
       accountName = tokenData.displayName || tokenData.account_id || 'Epic Games User';
       games = await storeSync.fetchEpicOwnedGames(tokenData.access_token, tokenData.account_id);
     }
@@ -174,6 +175,7 @@ async function processStoreAuth(storefrontId, code) {
       accountName,
       avatarUrl,
       games,
+      tokenData,
     };
   } catch (err) {
     console.warn(`Post-login sync warning for ${storefrontId}:`, err.message);
@@ -185,6 +187,7 @@ async function processStoreAuth(storefrontId, code) {
       avatarUrl,
       games: [],
       syncError: err.message,
+      tokenData,
     };
   }
 }
@@ -390,6 +393,15 @@ ipcMain.handle('store:sync', async (_event, storefrontId) => {
   } catch (err) {
     return { success: false, error: err.message };
   }
+});
+
+ipcMain.handle('store:get-tokens', async () => {
+  return storeSync.loadSavedTokens();
+});
+
+ipcMain.handle('store:clear-tokens', async (_event, storefrontId) => {
+  storeSync.clearTokens(storefrontId);
+  return { success: true };
 });
 
 ipcMain.handle('epic:fetch-achievements', async (_event, { accountId, accessToken }) => {

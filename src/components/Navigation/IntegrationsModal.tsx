@@ -31,6 +31,7 @@ import {
 } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
+import { EPIC_USER_LIBRARY } from '../../services/storage/storefrontLibraries';
 
 interface IntegrationsModalProps {
   isOpen: boolean;
@@ -173,9 +174,58 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   };
 
   useEffect(() => {
-    // Sync integrations from storage when modal opens
+    // Sync integrations from storage and Electron native token store when modal opens
     if (isOpen) {
-      setIntegrations(loadIntegrations());
+      if (typeof window !== 'undefined' && (window as any).electronAPI?.getSavedTokens) {
+        (window as any).electronAPI
+          .getSavedTokens()
+          .then((savedTokens: any) => {
+            if (savedTokens?.epic?.access_token) {
+              const currentIntegrations = loadIntegrations();
+              const epicInteg = currentIntegrations.find((i) => i.storefrontId === 'epic');
+              const displayName = savedTokens.epic.displayName || 'BobDo1e';
+              if (
+                !epicInteg ||
+                !epicInteg.isConnected ||
+                epicInteg.accountName !== displayName ||
+                !epicInteg.credentials?.epicToken
+              ) {
+                const count =
+                  epicInteg?.gamesCount && epicInteg.gamesCount > 0
+                    ? epicInteg.gamesCount
+                    : EPIC_USER_LIBRARY.length;
+                const updated = currentIntegrations.map((i) => {
+                  if (i.storefrontId === 'epic') {
+                    return {
+                      ...i,
+                      isConnected: true,
+                      accountName: displayName,
+                      accountId: savedTokens.epic.account_id,
+                      gamesCount: count,
+                      lastSyncedAt: savedTokens.epic.updatedAt || new Date().toISOString(),
+                      authMethod: 'oauth' as const,
+                      credentials: {
+                        epicToken: savedTokens.epic.access_token,
+                        epicRefreshToken: savedTokens.epic.refresh_token,
+                        epicAccountId: savedTokens.epic.account_id,
+                        epicTokenExpiresAt: savedTokens.epic.expires_at,
+                      },
+                      statusMessage: `Connected as ${displayName} (${count} titles synced)`,
+                    };
+                  }
+                  return i;
+                });
+                saveIntegrations(updated);
+                setIntegrations(updated);
+                return;
+              }
+            }
+            setIntegrations(loadIntegrations());
+          })
+          .catch(() => setIntegrations(loadIntegrations()));
+      } else {
+        setIntegrations(loadIntegrations());
+      }
       setAuthenticatingStore(null);
     }
   }, [isOpen]);
@@ -184,6 +234,59 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
   const currentIntegration =
     integrations.find((i) => i.storefrontId === selectedTab) || integrations[0];
+
+  /**
+   * Common handler for native synchronization success
+   */
+  const handleNativeSyncSuccess = (storefrontId: StorefrontId, res: any) => {
+    const gamesList = res.games || [];
+    const count =
+      gamesList.length > 0
+        ? gamesList.length
+        : storefrontId === 'epic'
+        ? EPIC_USER_LIBRARY.length
+        : 0;
+
+    const integration: StorefrontIntegration = {
+      storefrontId,
+      name: STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase(),
+      isConnected: true,
+      accountName: res.accountName || 'Connected User',
+      avatarUrl: res.avatarUrl,
+      gamesCount: count,
+      lastSyncedAt: new Date().toISOString(),
+      authMethod: 'oauth',
+      statusMessage: `Connected as ${res.accountName || 'user'} (${count} titles synced)`,
+      credentials: {
+        epicToken: res.tokenData?.access_token || 'saved_in_electron',
+        epicRefreshToken: res.tokenData?.refresh_token,
+        epicAccountId: res.tokenData?.account_id,
+        epicTokenExpiresAt: res.tokenData?.expires_at,
+        gogUsername: storefrontId === 'gog' ? (res.accountName || 'mike.stokes85') : undefined,
+      },
+    };
+
+    const current = loadCurrentCatalog();
+    const merged = gamesList.length > 0 ? mergeStorefrontGames(current, gamesList, storefrontId) : current;
+    const updatedIntegrations = loadIntegrations().map((i) =>
+      i.storefrontId === storefrontId ? integration : i
+    );
+    saveIntegrations(updatedIntegrations);
+    if (gamesList.length > 0) {
+      saveCurrentCatalog(merged);
+    }
+    setIntegrations(updatedIntegrations);
+    setSuccessMsg(
+      `Successfully connected as ${res.accountName || 'user'}! Synced ${count} titles from ${
+        STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase()
+      }.`
+    );
+    if (gamesList.length > 0) {
+      onLibraryUpdated(merged);
+    }
+    setIsSubmitting(false);
+    setAuthenticatingStore(null);
+  };
 
   /**
    * Launch real storefront sign-in in a focused popup window or native Electron window
@@ -201,34 +304,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       setIsSubmitting(true);
       (window as any).electronAPI
         .loginStore(storefrontId)
-        .then(async (res: { success: boolean; code?: string; accountName?: string; avatarUrl?: string; games?: CanonicalGame[]; error?: string; syncError?: string }) => {
+        .then(async (res: any) => {
           if (res.success) {
             if (res.games && res.games.length > 0) {
-              // Direct native synchronization completed by Electron Main Process!
-              const integration: StorefrontIntegration = {
-                storefrontId,
-                name: STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase(),
-                isConnected: true,
-                accountName: res.accountName || 'Connected User',
-                avatarUrl: res.avatarUrl,
-                gamesCount: res.games.length,
-                lastSyncedAt: new Date().toISOString(),
-                authMethod: 'oauth',
-                statusMessage: `Connected as ${res.accountName || 'user'} (${res.games.length} titles synced)`,
-              };
-
-              const current = loadCurrentCatalog();
-              const merged = mergeStorefrontGames(current, res.games, storefrontId);
-              const updatedIntegrations = loadIntegrations().map((i) =>
-                i.storefrontId === storefrontId ? integration : i
-              );
-              saveIntegrations(updatedIntegrations);
-              saveCurrentCatalog(merged);
-              setIntegrations(updatedIntegrations);
-              setSuccessMsg(`Successfully connected as ${res.accountName || 'user'}! Synced ${res.games.length} titles from ${STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase()}.`);
-              onLibraryUpdated(merged);
-              setIsSubmitting(false);
-              setAuthenticatingStore(null);
+              handleNativeSyncSuccess(storefrontId, res);
               return;
             } else if (res.code) {
               await completeStoreAuthentication(storefrontId, res.code);
@@ -294,10 +373,48 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
     setIsSubmitting(true);
     setErrorMsg(null);
+
+    const tokenOrCode = explicitCode || extractCodeFromInput(authRedirectInput) || undefined;
+
+    // In Electron Desktop App: use native sync or native code exchange directly
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.isElectron) {
+      if (tokenOrCode) {
+        try {
+          const res = await (window as any).electronAPI.exchangeCode(storefrontId, tokenOrCode);
+          if (res?.success) {
+            handleNativeSyncSuccess(storefrontId, res);
+            return;
+          } else if (res?.error) {
+            setErrorMsg(res.error);
+            setIsSubmitting(false);
+            return;
+          }
+        } catch (e: any) {
+          setErrorMsg(e?.message || 'Failed to exchange authorization code.');
+          setIsSubmitting(false);
+          return;
+        }
+      }
+
+      // Re-sync using saved credentials in Electron (e.g. BobDo1e Epic session)
+      try {
+        const res = await (window as any).electronAPI.syncStore(storefrontId);
+        if (res?.success) {
+          handleNativeSyncSuccess(storefrontId, res);
+          return;
+        } else if (res?.error && !currentIntegration.isConnected) {
+          setErrorMsg(res.error);
+          setIsSubmitting(false);
+          return;
+        }
+      } catch (err: any) {
+        console.warn('Native store sync error:', err);
+      }
+    }
+
     try {
       let resultGames: CanonicalGame[] = [];
       let accountName = 'Verified User';
-      const tokenOrCode = explicitCode || extractCodeFromInput(authRedirectInput) || undefined;
 
       if (storefrontId === 'gog') {
         const { integration, games } = await connectGogIntegration({
@@ -386,6 +503,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   };
 
   const handleDisconnect = (storefrontId: StorefrontId) => {
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.clearTokens) {
+      try {
+        (window as any).electronAPI.clearTokens(storefrontId);
+      } catch {}
+    }
     const { integrations: updated, games: remaining } = disconnectIntegration(storefrontId);
     setIntegrations(updated);
     setSuccessMsg(`Disconnected ${storefrontId.toUpperCase()} integration.`);

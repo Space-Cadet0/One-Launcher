@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loginStore: (storefrontId) => ipcRenderer.invoke('auth:storefront', storefrontId),
   syncStore: (storefrontId) => ipcRenderer.invoke('store:sync', storefrontId),
   exchangeCode: (storefrontId, code) => ipcRenderer.invoke('store:exchange-code', { storefrontId, code }),
+  getSavedTokens: () => ipcRenderer.invoke('store:get-tokens'),
+  clearTokens: (storefrontId) => ipcRenderer.invoke('store:clear-tokens', storefrontId),
   scanLocalGames: () => ipcRenderer.invoke('scan:steam-installed'),
   scanSteamAchievements: () => ipcRenderer.invoke('scan:steam-achievements'),
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),

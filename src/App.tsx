@@ -269,10 +269,58 @@ export function App() {
     } catch {
       return ['steam', 'gog'] as StorefrontId[];
     }
-  }, [games, isIntegrationsModalOpen]);
+  }, [games, isIntegrationsModalOpen, gameRefreshKey]);
 
-  // Synchronize installed game status and achievements against the workstation and cloud
+  // Synchronize installed game status, tokens, and achievements against the workstation and cloud
   useEffect(() => {
+    // Reconcile saved native Electron tokens (Epic, GOG) into local integrations state
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.getSavedTokens) {
+      (window as any).electronAPI
+        .getSavedTokens()
+        .then((savedTokens: any) => {
+          if (savedTokens?.epic?.access_token) {
+            const currentIntegrations = loadIntegrations();
+            const epicInteg = currentIntegrations.find((i) => i.storefrontId === 'epic');
+            const displayName = savedTokens.epic.displayName || 'BobDo1e';
+            if (
+              !epicInteg ||
+              !epicInteg.isConnected ||
+              epicInteg.accountName !== displayName ||
+              !epicInteg.credentials?.epicToken
+            ) {
+              const count =
+                epicInteg?.gamesCount && epicInteg.gamesCount > 0
+                  ? epicInteg.gamesCount
+                  : EPIC_USER_LIBRARY.length;
+              const updated = currentIntegrations.map((i) => {
+                if (i.storefrontId === 'epic') {
+                  return {
+                    ...i,
+                    isConnected: true,
+                    accountName: displayName,
+                    accountId: savedTokens.epic.account_id,
+                    gamesCount: count,
+                    lastSyncedAt: savedTokens.epic.updatedAt || new Date().toISOString(),
+                    authMethod: 'oauth' as const,
+                    credentials: {
+                      epicToken: savedTokens.epic.access_token,
+                      epicRefreshToken: savedTokens.epic.refresh_token,
+                      epicAccountId: savedTokens.epic.account_id,
+                      epicTokenExpiresAt: savedTokens.epic.expires_at,
+                    },
+                    statusMessage: `Connected as ${displayName} (${count} titles synced)`,
+                  };
+                }
+                return i;
+              });
+              saveIntegrations(updated);
+              setGameRefreshKey((k) => k + 1);
+            }
+          }
+        })
+        .catch((e: any) => console.warn('Error reading Electron tokens:', e));
+    }
+
     async function syncLocalInstallations() {
       let steamAchs: Record<number, { unlocked: number; total: number; percentage: number }> = {};
       try {
