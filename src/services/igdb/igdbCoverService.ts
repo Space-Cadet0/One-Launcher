@@ -15,6 +15,11 @@ export const KNOWN_DEAD_STEAM_COVER_APP_IDS = new Set<number>([
   3783210, // 60 Minutes to Extinction: Escape Room
   3751260, // The Blood of Dawnwalker
   2149010, // Little Nightmares Enhanced Edition
+  2700,    // RollerCoaster Tycoon 3: Platinum (delisted, active is 1368820)
+  3286930, // Heretic + Hexen (uses hashed library_capsule.jpg)
+  3764200, // Resident Evil Requiem (uses hashed library_capsule.jpg)
+  3280350, // Death Stranding 2: On The Beach (uses hashed library_capsule.jpg)
+  235900,  // RPG Maker XP (no unhashed library_600x900)
 ]);
 
 export function isKnownDeadSteamCover(appId?: number | null): boolean {
@@ -56,8 +61,8 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'blood omen: legacy of kain': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2jds.jpg',
 
   // The Blood of Dawnwalker / Dawnwalker
-  'the blood of dawnwalker': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co7mva.jpg',
-  'dawnwalker': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co7mva.jpg',
+  'the blood of dawnwalker': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
+  'dawnwalker': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
 
   // Little Nightmares Enhanced Edition
   'little nightmares enhanced edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
@@ -101,6 +106,34 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
 
   // Wildgate
   'wildgate': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
+
+  // Heretic + Hexen
+  'heretic + hexen': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
+  'heretic hexen': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
+
+  // RollerCoaster Tycoon 3: Complete Edition
+  'rollercoaster tycoon 3 complete edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+  'rollercoaster tycoon 3: complete edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+  'rollercoaster tycoon 3': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+
+  // Higurashi When They Cry Hou - Ch.1 Onikakushi
+  'higurashi when they cry hou ch 1 onikakushi': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+  'higurashi when they cry hou - ch.1 onikakushi': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+  'higurashi when they cry hou ch.1 onikakushi': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+
+  // Lure of the Temptress (1992)
+  'lure of the temptress (1992)': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+  'lure of the temptress 1992': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+
+  // Resident Evil Requiem
+  'resident evil requiem': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
+
+  // Death Stranding 2: On The Beach
+  'death stranding 2 on the beach': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+  'death stranding 2': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+
+  // RPG Maker XP
+  'rpg maker xp': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
 };
 
 /**
@@ -135,10 +168,12 @@ export function isUnsuitableCoverUrl(url?: string | null): boolean {
   return false;
 }
 
-function normalizeKey(str: string): string {
+export function normalizeKey(str: string): string {
   return str
     .toLowerCase()
     .replace(/[™®©]/g, '')
+    .replace(/['’]/g, '')
+    .replace(/\s*\((?:19|20)\d{2}\)/g, '')
     .replace(/[:\-–—]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

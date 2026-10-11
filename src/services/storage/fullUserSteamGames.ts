@@ -1765,8 +1765,8 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6e07f61e2585bae97d2406d45666a7ee70543792/capsule_231x87.jpg?t=1774022345",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6e07f61e2585bae97d2406d45666a7ee70543792/capsule_231x87.jpg?t=1774022345",
+    "capsuleImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg",
+    "iconUrl": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg",
     "shortDescription": "",
     "releaseDate": "TBA",
     "developers": [],
@@ -3479,7 +3479,7 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/af11a57f074bf3f1b901bb96f9ea519a0928c80c/header.jpg?t=1756918167",
-    "capsuleImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/a0b0d3447b8101ee6aa75c72fd9fd8c918df7470/capsule_616x353.jpg",
+    "capsuleImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg",
     "iconUrl": "https://shared.fastly.steamstatic.com/community_assets/images/apps/3286930/3392b11331bc4855f803ca939720fa94e3a01bdd.jpg",
     "shortDescription": "",
     "releaseDate": "TBA",
@@ -6209,6 +6209,8 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172",
+    "capsuleImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg",
+    "iconUrl": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg",
     "shortDescription": "Requiem for the dead. Nightmare for the living. Prepare to escape death in a heart-stopping experience that will chill you to your core.",
     "releaseDate": "26 Feb, 2026",
     "developers": [
@@ -6376,8 +6378,8 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/235900/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/235900/capsule_231x87.jpg",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/235900/header.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg",
     "shortDescription": "",
     "releaseDate": "TBA",
     "developers": [],
@@ -7578,8 +7580,8 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/512cea7b8d6470681fc081ab933290bf14a8f956/capsule_231x87.jpg?t=1791298326",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/512cea7b8d6470681fc081ab933290bf14a8f956/capsule_231x87.jpg?t=1791298326",
+    "capsuleImage": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg",
+    "iconUrl": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg",
     "shortDescription": "",
     "releaseDate": "TBA",
     "developers": [],

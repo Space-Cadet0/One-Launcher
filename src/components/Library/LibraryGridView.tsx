@@ -24,7 +24,7 @@ import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
-import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../../services/igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, normalizeKey } from '../../services/igdb/igdbCoverService';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
@@ -126,22 +126,25 @@ function getPortraitCoverUrl(game: CanonicalGame): string | null {
     return igdbCover;
   }
 
-  // 2. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404)
-  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
-  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
-    return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
-  }
-
-  // 3. Official Epic tall posters (1200x1600) or IGDB big covers
+  // 2. Official Steam / Epic tall vertical posters already attached to the game entity
+  // Handles modern Steam games with hashed library_capsule.jpg as well as Epic tall posters
   if (game.capsuleImage) {
     const lower = game.capsuleImage.toLowerCase();
     if (
+      lower.includes('library_capsule.jpg') ||
+      lower.includes('library_600x900') ||
       lower.includes('offerimagetall') ||
       lower.includes('dieselstorefronttall') ||
       lower.includes('t_cover_big')
     ) {
       return game.capsuleImage;
     }
+  }
+
+  // 3. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404/hashed)
+  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
+    return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`;
   }
 
   // 4. For GOG games with glx_vertical_cover:
@@ -225,11 +228,24 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const scrollEndTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
-  const [, setCoverUpdateNonce] = useState(0);
+  const [coverOverrides, setCoverOverrides] = useState<Record<string, string | null>>({});
+  const attemptedCoverLookupsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    const handleCoverUpdate = () => {
-      setCoverUpdateNonce((prev) => prev + 1);
+    const handleCoverUpdate = (e: any) => {
+      const { title, coverUrl } = e.detail || {};
+      if (title && coverUrl) {
+        setCoverOverrides((prev) => {
+          const next = { ...prev };
+          const normTitle = normalizeKey(title);
+          for (const g of gamesRef.current) {
+            if (normalizeKey(g.title) === normTitle) {
+              next[g.id] = coverUrl;
+            }
+          }
+          return next;
+        });
+      }
     };
     window.addEventListener('antigravity:igdb-cover-updated', handleCoverUpdate);
     return () => {
@@ -640,7 +656,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
           {sortedGames.map((game) => {
             const isInstalled = game.platforms.some((p) => p.installed);
-            const coverArtUrl = getPortraitCoverUrl(game);
+            const activeCoverUrl = coverOverrides[game.id] !== undefined ? coverOverrides[game.id] : getPortraitCoverUrl(game);
 
             return (
               <div
@@ -653,9 +669,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               >
                 {/* 2:3 Portrait Capsule Viewport */}
                 <div className="relative aspect-[2/3] w-full bg-black/60 overflow-hidden flex items-center justify-center">
-                  {coverArtUrl ? (
+                  {activeCoverUrl ? (
                     <img
-                      src={coverArtUrl}
+                      src={activeCoverUrl}
                       alt={game.title}
                       loading="lazy"
                       onLoad={(e) => {
@@ -664,20 +680,15 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                           const ratio = target.naturalWidth / target.naturalHeight;
                           // If loaded image is square or landscape (aspect ratio > 0.82), it is not a suitable portrait poster!
                           if (ratio > 0.82) {
-                            // Automatically trigger dynamic IGDB lookup to fetch authentic 2:3 portrait art
-                            igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
-                              if (resolvedCover && target) {
-                                target.src = resolvedCover;
-                                target.style.display = 'block';
-                                const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
-                                if (fallback) fallback.style.display = 'none';
-                              }
-                            });
-
-                            // Hide the distorted landscape image and display the clean branded card until portrait art loads
-                            target.style.display = 'none';
-                            const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
-                            if (fallback) fallback.style.display = 'flex';
+                            setCoverOverrides((prev) => ({ ...prev, [game.id]: null }));
+                            if (!attemptedCoverLookupsRef.current.has(game.id)) {
+                              attemptedCoverLookupsRef.current.add(game.id);
+                              igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+                                if (resolvedCover) {
+                                  setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+                                }
+                              });
+                            }
                           }
                         }
                       }}
@@ -704,53 +715,42 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                         } else if (
                           game.capsuleImage &&
                           target.src !== game.capsuleImage &&
-                          !game.capsuleImage.includes('231x87') &&
-                          !game.capsuleImage.includes('616x353')
+                          !isUnsuitableCoverUrl(game.capsuleImage)
                         ) {
                           target.src = game.capsuleImage;
                         } else {
-                          // Dynamic IGDB fetch for newly synced or unknown titles
-                          igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
-                            if (resolvedCover && target) {
-                              target.src = resolvedCover;
-                              target.style.display = 'block';
-                              const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
-                              if (fallback) fallback.style.display = 'none';
-                            }
-                          });
-
-                          const steamHeader = targetSteamId
-                            ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/header.jpg`
-                            : null;
-                          if (steamHeader && target.src !== steamHeader) {
-                            target.src = steamHeader;
-                          } else if (game.headerImage && target.src !== game.headerImage) {
-                            target.src = game.headerImage;
-                          } else {
-                            target.style.display = 'none';
-                            const fallback = target.parentElement?.querySelector('.grid-cover-fallback') as HTMLElement | null;
-                            if (fallback) fallback.style.display = 'flex';
+                          // All candidates exhausted: switch card to clean branded title card
+                          setCoverOverrides((prev) => ({ ...prev, [game.id]: null }));
+                          if (!attemptedCoverLookupsRef.current.has(game.id)) {
+                            attemptedCoverLookupsRef.current.add(game.id);
+                            igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+                              if (resolvedCover) {
+                                setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+                              }
+                            });
                           }
                         }
                       }}
                       className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
                     />
                   ) : (() => {
-                    // Trigger dynamic IGDB background fetch if game has no cover art yet
-                    igdbCoverService.fetchIgdbCover(game.title);
-                    return null;
+                    if (!attemptedCoverLookupsRef.current.has(game.id)) {
+                      attemptedCoverLookupsRef.current.add(game.id);
+                      igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+                        if (resolvedCover) {
+                          setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+                        }
+                      });
+                    }
+                    return (
+                      <div className="grid-cover-fallback w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
+                        <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
+                        <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
+                          {game.title}
+                        </span>
+                      </div>
+                    );
                   })()}
-
-                  {/* Fallback branded card if image unavailable or failed */}
-                  <div
-                    className="grid-cover-fallback w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none"
-                    style={{ display: coverArtUrl ? 'none' : 'flex' }}
-                  >
-                    <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
-                    <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
-                      {game.title}
-                    </span>
-                  </div>
 
                   {/* Gradient bottom shadow to ensure overlays pop */}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20 pointer-events-none" />

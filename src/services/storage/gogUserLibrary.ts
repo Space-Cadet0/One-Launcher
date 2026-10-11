@@ -3406,7 +3406,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/82a7cd303997644e10450fad1be3a3666f5cb0cfbc1fa44b38b429e607e64426_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/82a7cd303997644e10450fad1be3a3666f5cb0cfbc1fa44b38b429e607e64426_glx_vertical_cover.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/379720/library_600x900_2x.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "2016-05-13",
     "developers": [
@@ -6150,8 +6150,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://images-3.gog-statics.com/3699de957c16c9d8e442243f81edde06b9356d0a27e8aa9f3b1ad82ede6e01ea_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/3699de957c16c9d8e442243f81edde06b9356d0a27e8aa9f3b1ad82ede6e01ea_glx_vertical_cover.jpg",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2015-05-16",
     "developers": [
@@ -7479,7 +7479,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/c142bc01845e073ea337341303cee07a8e9e980434cd1d148bf1f43e8634c734_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/c142bc01845e073ea337341303cee07a8e9e980434cd1d148bf1f43e8634c734_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "1992-04-12",
     "developers": [

@@ -5105,22 +5105,22 @@ export const KNOWN_EPIC_APP_NAMES: Record<string, EpicCodenameMapping> = {
     "description": "Enter an inexplicable, abstract mansion to rescue a loved one in this fast-paced, brutal, and dark roguelite filled with precise but savage gunplay and time-bending slow motion. Face your inner demons and unveil the secrets of the Mansion."
   },
   "roller coaster tycoon 3: complete edition": {
-    "title": "RollerCoaster Tycoon' 3: Complete Edition",
-    "steamAppId": 2700,
+    "title": "RollerCoaster Tycoon 3: Complete Edition",
+    "steamAppId": 1368820,
     "developer": "Atari",
-    "description": "RollerCoaster Tycoon? 3: Complete Edition"
+    "description": "RollerCoaster Tycoon 3: Complete Edition"
   },
   "281a47e363284108b82bf05c1a612145": {
-    "title": "RollerCoaster Tycoon' 3: Complete Edition",
-    "steamAppId": 2700,
+    "title": "RollerCoaster Tycoon 3: Complete Edition",
+    "steamAppId": 1368820,
     "developer": "Atari",
-    "description": "RollerCoaster Tycoon? 3: Complete Edition"
+    "description": "RollerCoaster Tycoon 3: Complete Edition"
   },
   "df38ad3ac22e45c98182b6830730aedf": {
-    "title": "RollerCoaster Tycoon' 3: Complete Edition",
-    "steamAppId": 2700,
+    "title": "RollerCoaster Tycoon 3: Complete Edition",
+    "steamAppId": 1368820,
     "developer": "Atari",
-    "description": "RollerCoaster Tycoon? 3: Complete Edition"
+    "description": "RollerCoaster Tycoon 3: Complete Edition"
   },
   "4b58646b26614946880ab2c7364d16fd": {
     "title": "Project First Contact",

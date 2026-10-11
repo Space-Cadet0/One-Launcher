@@ -7961,10 +7961,10 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ]
   },
   {
-    "id": "steam-2700",
-    "title": "RollerCoaster Tycoon' 3: Complete Edition",
-    "sortTitle": "RollerCoaster Tycoon' 3: Complete Edition",
-    "steamAppId": 2700,
+    "id": "steam-1368820",
+    "title": "RollerCoaster Tycoon 3: Complete Edition",
+    "sortTitle": "RollerCoaster Tycoon 3: Complete Edition",
+    "steamAppId": 1368820,
     "platforms": [
       {
         "platformId": "epic",
@@ -7973,9 +7973,9 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2700/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2700/library_600x900_2x.jpg",
-    "shortDescription": "RollerCoaster Tycoon? 3: Complete Edition",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg",
+    "shortDescription": "RollerCoaster Tycoon 3: Complete Edition",
     "releaseDate": "2026-06-11",
     "developers": [
       "Atari"

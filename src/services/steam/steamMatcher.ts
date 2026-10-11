@@ -218,6 +218,19 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'buffalo': 40800,
   'brill': 381210,
   'sunbird': 230050,
+
+  // Additional Store Matches
+  'rollercoaster tycoon 3: complete edition': 1368820,
+  'rollercoaster tycoon 3 complete edition': 1368820,
+  'rollercoaster tycoon 3': 1368820,
+  'higurashi when they cry hou - ch.1 onikakushi': 310360,
+  'higurashi when they cry hou ch.1 onikakushi': 310360,
+  'higurashi when they cry hou ch 1 onikakushi': 310360,
+  'doom (2016)': 379720,
+  'rpg maker xp': 235900,
+  'resident evil requiem': 3764200,
+  'heretic + hexen': 3286930,
+  'heretic hexen': 3286930,
 };
 
 /**
@@ -228,6 +241,8 @@ export function normalizeGameTitle(rawTitle: string): string {
 
   let title = rawTitle
     .replace(/[™®©]/g, '')
+    .replace(/['’]/g, '')
+    .replace(/\s*\((?:19|20)\d{2}\)/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 

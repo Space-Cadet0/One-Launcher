@@ -105,6 +105,8 @@ export function normalizeCanonicalTitle(title: string): string {
   return title
     .toLowerCase()
     .replace(/[™®©]/g, '')
+    .replace(/['’]/g, '')
+    .replace(/\s*\((?:19|20)\d{2}\)/g, '')
     .replace(/\biii\b/g, '3')
     .replace(/\bii\b/g, '2')
     .replace(/\biv\b/g, '4')
@@ -441,7 +443,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         id: 'steam-3286930',
         steamAppId: 3286930,
         headerImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/af11a57f074bf3f1b901bb96f9ea519a0928c80c/header.jpg?t=1756918167',
-        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/a0b0d3447b8101ee6aa75c72fd9fd8c918df7470/capsule_616x353.jpg',
+        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
         iconUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/3286930/3392b11331bc4855f803ca939720fa94e3a01bdd.jpg',
       };
     }
@@ -557,8 +559,8 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         id: 'steam-3280350',
         steamAppId: 3280350,
         headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6e07f61e2585bae97d2406d45666a7ee70543792/capsule_231x87.jpg?t=1774022345',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6e07f61e2585bae97d2406d45666a7ee70543792/capsule_231x87.jpg?t=1774022345',
+        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
       };
     }
 
@@ -573,8 +575,8 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         id: 'steam-2149010',
         steamAppId: 2149010,
         headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/8f1da102713653906647c5024843479395be3394/header.jpg?t=1760951366',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/87b7d077139d1f8fa48aee66960288c639409e74/capsule_231x87.jpg?t=1760951366',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/87b7d077139d1f8fa48aee66960288c639409e74/capsule_231x87.jpg?t=1760951366',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
       };
     }
 
@@ -589,8 +591,83 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         id: 'steam-3751260',
         steamAppId: 3751260,
         headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/512cea7b8d6470681fc081ab933290bf14a8f956/capsule_231x87.jpg?t=1791298326',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/512cea7b8d6470681fc081ab933290bf14a8f956/capsule_231x87.jpg?t=1791298326',
+        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
+        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Resident Evil Requiem (hashed Steam assets)
+    if (
+      currentTitleLower.includes('resident evil requiem') ||
+      normTitle.includes('resident evil requiem') ||
+      game.steamAppId === 3764200
+    ) {
+      game = {
+        ...game,
+        id: 'steam-3764200',
+        steamAppId: 3764200,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172',
+        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
+        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
+      };
+    }
+
+    // Disambiguate / normalize RollerCoaster Tycoon 3: Complete Edition
+    if (
+      currentTitleLower.includes('rollercoaster tycoon') &&
+      (currentTitleLower.includes('3') || currentTitleLower.includes('complete'))
+    ) {
+      game = {
+        ...game,
+        id: 'steam-1368820',
+        title: 'RollerCoaster Tycoon 3: Complete Edition',
+        sortTitle: 'RollerCoaster Tycoon 3: Complete Edition',
+        steamAppId: 1368820,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Higurashi When They Cry Hou - Ch.1 Onikakushi
+    if (
+      currentTitleLower.includes('higurashi') &&
+      (currentTitleLower.includes('onikakushi') || currentTitleLower.includes('ch.1') || currentTitleLower.includes('ch 1'))
+    ) {
+      game = {
+        ...game,
+        id: 'steam-310360',
+        title: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
+        sortTitle: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
+        steamAppId: 310360,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+      };
+    }
+
+    // Disambiguate / normalize Lure of the Temptress (1992)
+    if (
+      currentTitleLower.includes('lure of the temptress') ||
+      normTitle.includes('lure of the temptress')
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+      };
+    }
+
+    // Disambiguate / normalize RPG Maker XP
+    if (
+      currentTitleLower === 'rpg maker xp' ||
+      normTitle === 'rpg maker xp' ||
+      game.steamAppId === 235900
+    ) {
+      game = {
+        ...game,
+        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
+        iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
       };
     }
 
