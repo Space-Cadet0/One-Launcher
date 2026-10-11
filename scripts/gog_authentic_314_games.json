@@ -1,0 +1,3138 @@
+[
+  {
+    "game": {
+      "id": "1901367087",
+      "title": "A Plague Tale: Innocence",
+      "url": "/en/game/a_plague_tale_innocence",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/3987d42ccbd6c61f8a4881f3f48e40913f75e0254ed794653f6b8972d964b6dc.png"
+    },
+    "stats": {
+      "49681274475932275": {
+        "achievementsPercentage": 71,
+        "playtime": 955,
+        "lastSession": "2024-11-20T21:50:54+00:00"
+      }
+    }
+  },
+  {
+    "game": {
+      "id": "1075439258",
+      "title": "Hot Brass",
+      "url": "/en/game/hot_brass",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/34f7ddacedcc30b56baea1f80da40ec1bb3d6d45629f925fe1787be7b4eee94e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1075740587",
+      "title": "Vambrace: Cold Soul",
+      "url": "/en/game/vambrace_cold_soul",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e4bd4829fe05534671abd1e5c7b315c3fbf64f9e7f6109ec4ae79545463eec91.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1083619800",
+      "title": "The Evil Within 2",
+      "url": "/en/game/the_evil_within_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/a516f57bcb67a8abd90322cdf49f1586526f913ce41e35c5d334abd73c23bf7d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1090734724",
+      "title": "Betrayer",
+      "url": "/en/game/betrayer",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/798b87f729fa965e96455dff61c7983d54eb86a450675e05de2583b78b134973.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1097893768",
+      "title": "Neverwinter Nights: Enhanced Edition",
+      "url": "/en/game/neverwinter_nights_enhanced_edition_pack",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8706f7fb87a4a41bc34254f3b49f59f96cf13d067b2c8bbfd8d41c327392052a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1104084973",
+      "title": "Shogun Showdown",
+      "url": "/en/game/shogun_showdown",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ad74a0a49ca2356fe9d5e7dc46ed76e40a0fffddf2de2f01506b99b138575fc1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1111421371",
+      "title": "Leap of Love",
+      "url": "/en/game/leap_of_love",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/958daf19e29f7ca7eaa2c5c7d6b0c6f0e3469c07f0dade7e6e0d2fe809b93673.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1128601888",
+      "title": "FATE: Undiscovered Realms",
+      "url": "/en/game/fate_undiscovered_realms",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/4cce3b447df5d4bd2be0f958e76cd7917f44bd3acaa474ce0fd1900884a02e5b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1129701343",
+      "title": "Jill of the Jungle: The Complete Trilogy",
+      "url": "/en/game/jill_of_the_jungle_the_complete_trilogy",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b6184bdfe32a6b50777057d0b599c4e00758a68e31ebdaad2d737839b0fb170d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1132748633",
+      "title": "Dagon: by H. P. Lovecraft",
+      "url": "/en/game/dagon_by_h_p_lovecraft",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0b9f83b1914cb4c8a131d5ece0a77e873ae167d7f12d33e96a23ac8d0288a428.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1135892318",
+      "title": "DOOM 3: BFG Edition",
+      "url": "/en/game/doom_3",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f4d1eb73497af65e68515b5eaded352dd40c254b12a8cc6ee386d02f5936872c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1137712636",
+      "title": "Crusader Kings II",
+      "url": "/en/game/crusader_kings_ii",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/213d787841d1878be7e0c3bbf8cfb953ceace118e19c2b6861bbfe09f9fab779.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1139279216",
+      "title": "Lacuna – A Sci-Fi Noir Adventure",
+      "url": "/en/game/lacuna_a_scifi_noir_adventure",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2d11a18cae6d1b130c9af66b5f83baab54f198be694e8d05976543c21d54d487.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1150150052",
+      "title": "God's Trigger",
+      "url": "/en/game/gods_trigger",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/63814bbdb5f790e7e6dc3de7de9180d848cc514e8f474d7214d69643bf46775d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1158493447",
+      "title": "Prey",
+      "url": "/en/game/prey",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/ed7a5f0cba0e3ee80bc5dd10683f6ce6fe692bb2b1764c4987aa97fbaaf142d1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1158717618",
+      "title": "STAR WARS™: Bounty Hunter™",
+      "url": "/en/game/star_wars_bounty_hunter",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2a415a46492cb67b52e93504ed0a0bc48ae76194411aafc0e60faf4fb8896452.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1159146122",
+      "title": "Destroy All Humans! Clone Carnage",
+      "url": "/en/game/destroy_all_humans_clone_carnage",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/f754949194b349a717f2c02085acb27105fd2548813b910900ee4e10071adc32.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1166262945",
+      "title": "Ozymandias: Bronze Age Empire Sim",
+      "url": "/en/game/ozymandias_bronze_age_empire_sim",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/7426c0ef1d26927e8190ab432314a105af915b03083b1f548a077f3d770aead5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1167911806",
+      "title": "Phoning Home",
+      "url": "/en/game/phoning_home",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c07fb6821411546195400a7b0be5985168f1fde1af54edacd2d6db0284681869.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1176525525",
+      "title": "Blade of Darkness",
+      "url": "/en/game/blade_of_darkness_1602462782",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/be131050ec6ad7ba49c6873957e4543a481d7b0c8a0453c3a50b4ed8c2aa3486.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1181224050",
+      "title": "Being a DIK - Season 1",
+      "url": "/en/game/being_a_dik",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b896c4e69f4c1f67b85a27309d3447c812e31ee07d6558364f602f077477510e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1197512724",
+      "title": "Urbek City Builder Prologue",
+      "url": "/en/game/urbek_city_builder_prologue",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/358ed0dc866c43c5904ca082c5c737945e59ba48e61f210cef1fe0eb926e5507.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1202885143",
+      "title": "Tomb Raider: Anniversary",
+      "url": "/en/game/tomb_raider_anniversary",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/70db6adcba1b0c8347da80beeae413d56ce27475dbd69d1435e0ee1d0bf52011.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658694",
+      "title": "Lure of the Temptress (1992)",
+      "url": "/en/game/lure_of_the_temptress",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c142bc01845e073ea337341303cee07a8e9e980434cd1d148bf1f43e8634c734.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658695",
+      "title": "Beneath a Steel Sky (1994)",
+      "url": "/en/game/beneath_a_steel_sky",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8c9562087850f4f0bc5cbb073e2207e75cb016d7b1632800db3e36c8e85d79d2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658705",
+      "title": "Oddworld: Abe's Oddysee",
+      "url": "/en/game/oddworld_abes_oddysee",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ce9e579b57077b3c86ae73db8d1aa6634b523a72fed5d574369e9ce43d4ad0d9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658753",
+      "title": "Teenagent",
+      "url": "/en/game/teenagent",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/83440dfe39a478e559a6c71d70ba33b66a28796a822d6c4d7f8de28368339b62.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658754",
+      "title": "POSTAL: Classic and Uncut",
+      "url": "/en/game/postal_classic_and_uncut",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d916d3bbf261e1548ade8e92b20f207886cf7483a9c360f998ad491b695a0332.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658755",
+      "title": "POSTAL 2",
+      "url": "/en/game/postal_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d852a13d79875678614aee8b5f534cd391eafcc51d443053d42b8210f1cb1d2a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658845",
+      "title": "Another World: 20th Anniversary Edition",
+      "url": "/en/game/another_world_20th_anniversary_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2cff003da730f1d47d120967a623abc24a15c7dfe2fb9adcda22a7dafd65acbe.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658848",
+      "title": "Syberia",
+      "url": "/en/game/syberia",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/562431b824d67e15a3b04930a4534292f7b60ac31cdd10f64a38f809d09e7aed.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658849",
+      "title": "Syberia II",
+      "url": "/en/game/syberia_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0cdfa04271c7b1c5bea9e0b4d6cccb2111a5aa601337697ce9bd0c4f96a01e64.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658890",
+      "title": "Neverwinter Nights Diamond",
+      "url": "/en/game/neverwinter_nights_enhanced_edition_pack",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/690e76916523b140d297f86906c67e2816b27005ee1b6743b53332c9583b2654.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658900",
+      "title": "Broken Sword: Director's Cut",
+      "url": "/en/game/broken_sword_directors_cut",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5b0d3da8074c8dafb7c129fe4eac9feb47dce1f15fcaa325c1b420e21adc4273.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658901",
+      "title": "Tyrian 2000",
+      "url": "/en/game/tyrian_2000",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/346da67f4079d2d4e64ab0e7c310ee81218734d4bde4d74d3a3f074510cf6fa5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658920",
+      "title": "XIII",
+      "url": "/en/game/xiii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c961f804cf039a4a1aecb56acbf51788f2cc0f7c5bc04fa1283ac37eceff89fc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658924",
+      "title": "The Witcher: Enhanced Edition",
+      "url": "/en/game/the_witcher",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/37d4a208d1f5bb0e163da540ac894ba46a7d566ede31aaaefc74bbcd46ebd190.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658962",
+      "title": "Ultima™ IV: Quest of the Avatar",
+      "url": "/en/game/ultima_iv_quest_of_the_avatar",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cb10216b4721fc46db91a79af4bee55dc90123c13ebcc11a50980d384ca1a4a1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658992",
+      "title": "Syndicate Plus™",
+      "url": "/en/game/syndicate",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/73599010340e1630b66dadcdbf922049c99deeeb40eeaf2fc83ace6c3792e05a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658995",
+      "title": "Deus Ex™ GOTY Edition",
+      "url": "/en/game/deus_ex",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/79429e097ac499290497415f13c0a1747a07659fc7b53f8cc07f1b0afd569333.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207658997",
+      "title": "Thief™ Gold",
+      "url": "/en/game/thief_gold",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ad68a58a4dcc05edbe97edc0370cc4865ba09327cf47a68e47d214c6e4f4a1d4.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659001",
+      "title": "Thief™ 2: The Metal Age",
+      "url": "/en/game/thief_2_the_metal_age",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/9fee86856dec591d46e81ee8eba47c4945a980ce9730549581eae646330629d5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659013",
+      "title": "Treasure Adventure Game",
+      "url": "/en/game/treasure_adventure_game",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e966b44b9f146d21bc835a2f0785693116422778e4e112020d3add98046141c9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659019",
+      "title": "The Whispered World: Special Edition",
+      "url": "/en/game/the_whispered_world_special_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/edb6a64af4bf97e540bfce7cca178b11a05b7f15572d369a577d54046e220f2c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659036",
+      "title": "Thief™ 3: Deadly Shadows",
+      "url": "/en/game/thief_3",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/30c6d68f5d0c8bbe9c2eb47f8781ec621a2f0ce40704c7dfe510533ca3a29f9e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659061",
+      "title": "Worlds of Ultima™: The Savage Empire",
+      "url": "/en/game/worlds_of_ultima_the_savage_empire",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/07c86c0a10902cd350ff5476ed7f27f5290246016bd1a3ab3d52cda5759663ce.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659062",
+      "title": "Ultima™ Worlds of Adventure 2: Martian Dreams",
+      "url": "/en/game/ultima_worlds_of_adventure_2_martian_dreams",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/10f120bcf0bf4b9bbd7552a413c084f891ed3cd5f7e3e562f9e856271fd98bc2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659068",
+      "title": "Deus Ex 2: Invisible War",
+      "url": "/en/game/deus_ex_invisible_war",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3f580ea4bcf6f4df3b9a1a460c056a6a83420b07298751d65771f424d823068a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659080",
+      "title": "Nexus: The Jupiter Incident",
+      "url": "/en/game/nexus_the_jupiter_incident",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/4b6319ff49eebd71f908ff622a83f3c68f28bf80999a53e0224f0678865439f3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659088",
+      "title": "Legacy of Kain: Defiance (2003)",
+      "url": "/en/game/legacy_of_kain_defiance",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6170378108ebc443e2d5befd470d000c70552b0941144df9c0107ac204acb4ac.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659089",
+      "title": "Tomb Raider: The Angel of Darkness",
+      "url": "/en/game/tomb_raider_the_angel_of_darkness",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d9f28c44542c77c794694b57234ce93e63c277db12bffd837aaa02db0c75c4af.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659101",
+      "title": "Legacy of Kain: Blood Omen 2",
+      "url": "/en/game/legacy_of_kain_blood_omen_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/7ac78966e4f6ff659e56b8847c9e146c0624526542a2db57f734d865b768b83c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659133",
+      "title": "The Dark Eye: Chains of Satinav",
+      "url": "/en/game/the_dark_eye_chains_of_satinav",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0328bcc4508ca255268ffd457d439ec1cc99db0faf52edab788fddda09bbc3cb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659142",
+      "title": "Shadow Warrior Classic Complete",
+      "url": "/en/game/shadow_warrior_complete",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/68242319701d590dce72be3f0e2fe7fd716c98e958e69dda7ea9f9c8eb6e09f2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659193",
+      "title": "Syndicate Wars™",
+      "url": "/en/game/syndicate_wars",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6385eb91c19cdb3df180903dcfd570657cef6a7ea58bf1fd725aaa94f72aecc3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659221",
+      "title": "Eschalon: Book I",
+      "url": "/en/game/eschalon_book_i",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cf9a191ba37d07a3a932ef2568a8e1bc81c88eaedcc343e3a02b5fa8c4ad125c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659257",
+      "title": "Spelunky",
+      "url": "/en/game/spelunky",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/f907b55b7d0a98b9c0c5ae1c82cd52a4b4fd6b2cf9a38dfd25e69bf8fc9a00f5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659333",
+      "title": "The Lords of Midnight",
+      "url": "/en/game/the_lords_of_midnight",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0cc8a987884c525bd57c5ac9f3fefc4eb85a6ec11d2ecfc618be5b100269ec5f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659443",
+      "title": "Amnesia: A Machine For Pigs",
+      "url": "/en/game/amnesia_a_machine_for_pigs",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b6a69dfb11bb12ba5f9c75d9c3be6f3801c2ba3a4beefeab58fefb3b32f51996.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659693",
+      "title": "Stargunner",
+      "url": "/en/game/stargunner",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8921d6e3d1a8aed517fa5fc183a2d09c3f44339b54458125c2e293d02a9ecbb6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207659723",
+      "title": "Flight of the Amazon Queen",
+      "url": "/en/game/flight_of_the_amazon_queen",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/23f2b3ea51d94d412516374660aa231561f5d25bd99947c5b49e8f255119a185.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660203",
+      "title": "Sang-Froid: Tales of Werewolves",
+      "url": "/en/game/sangfroid_tales_of_werewolves",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2fac31a23345078c613285fcd4e0a9cb3bba931d0eade3656a8ad099f292e3ec.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660413",
+      "title": "Shadowrun Returns",
+      "url": "/en/game/shadowrun_returns",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6c35ecb988f57725cc0f385acf860241082da16eda9fab66115f4da883dae3d1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660693",
+      "title": "Doomdark's Revenge",
+      "url": "/en/game/doomdarks_revenge",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/43b050c658e5c7c9757b15eee9b94f5800c27561aebd030e6a01e5b99ee83570.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660913",
+      "title": "Shadowrun: Dragonfall - Director's Cut",
+      "url": "/en/game/shadowrun_dragonfall_directors_cut",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3151b8deaeff59ad905af2bf37cfca592d615cd1615fbe48d893ac6f797140ad.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660923",
+      "title": "Alone in the Dark 1",
+      "url": "/en/game/alone_in_the_dark_the_trilogy_123",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cc3623efccf2d4be01bb3364b23bb8710a4bdc323710ef72af6d7c1d72077b6c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660963",
+      "title": "Alone in the Dark 2",
+      "url": "/en/game/alone_in_the_dark_the_trilogy_123",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/fbeb7abd02b2582026d94dd029d70a915e0894fdf636e8fd7a83adbf754d4a39.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207660973",
+      "title": "Alone in the Dark 3",
+      "url": "/en/game/alone_in_the_dark_the_trilogy_123",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/92a2cbda2d08f3d411c65a22173d8dbe261aa0a69d70f6eeb3493884a0879556.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207662463",
+      "title": "Ultima™  Underworld I",
+      "url": "/en/game/ultima_underworld_1_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/aded25b118381e697e520542c45de23766a71425646db6a72b0e19ac574dd79d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207662473",
+      "title": "Ultima™  Underworld II",
+      "url": "/en/game/ultima_underworld_1_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ccb50e17fe3af2ab43892f1821265020f962f33144c87d23446099cd00b2146f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207663513",
+      "title": "Tomb Raider - The Last Revelation",
+      "url": "/en/game/tomb_raider_the_last_revelation_chronicles",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d0c69608e1023e8dc4eb4c7e5aaa453406a9fe59e3ddf7b71909706854d88dc9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207663523",
+      "title": "Tomb Raider Chronicles",
+      "url": "/en/game/tomb_raider_the_last_revelation_chronicles",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/05750641e3178b5a22c93e756c9efbf08a4356b48ef01f576122fad567acec01.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207664543",
+      "title": "Ascendant",
+      "url": "/en/game/ascendant",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3d01fb154f70418e15db31139f2b51ecad8f145c61dcd5b9cb216eb02a5be40e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207666073",
+      "title": "Akalabeth: World of Doom",
+      "url": "/en/game/akalabeth_world_of_doom",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/56262850671fd7232b8ff46deba530007ff7a437fab0ddd67147f8d41aa6bca0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207666353",
+      "title": "Baldur's Gate: Enhanced Edition",
+      "url": "/en/game/baldurs_gate_enhanced_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/90ba7463dae94110fd495957a6311648a6e1999bab1a0fcc2d5176b3f46141e8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207666373",
+      "title": "Baldur's Gate II: Enhanced Edition",
+      "url": "/en/game/baldurs_gate_2_enhanced_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/865e412024677b4594a91ea7cc3da75077ce8114adc26d5b92cb82c7f9b4509f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1207667183",
+      "title": "Grim Fandango Remastered",
+      "url": "/en/game/grim_fandango_remastered",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/95910410e5529a2355205f99a459c2c5ef1186cb741d40eb41bf7dcaa9690823.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1213371691",
+      "title": "The Lullaby of Life",
+      "url": "/en/game/the_lullaby_of_life",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/322f58bfddc8aad4d64a804eab7ad3b0b8aef57118c59d50811fdaa9aaeb1653.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1213448387",
+      "title": "Agony UNRATED",
+      "url": "/en/game/freedom_to_buy_games",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/66dafe436e16ab1392096fb510e1c4e7b6ba1ce430a398b4a5f6a5889b881ec7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1213504814",
+      "title": "Middle-earth™: Shadow of Mordor™ Game of the Year Edition",
+      "url": "/en/game/middleearth_shadow_of_mordor",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/455ff8097ca01fe893703d38b20f46bc9a539765256f9755ea9e592f48938763.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1223053864",
+      "title": "Overcooked: Gourmet Edition",
+      "url": "/en/game/overcooked_gourmet_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3de511f611d938f1a877fb2d244e1c9403ce41bc6007263fc440c80ecb75df9b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1237982317",
+      "title": "Helping the Hotties",
+      "url": "/en/game/helping_the_hotties",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0292391a16a63fb1d5dc41bd18671d6d0c455306bfaa053990209c053584d046.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1242541569",
+      "title": "The Outer Worlds",
+      "url": "/en/game/the_outer_worlds_spacers_choice_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b063c46a7e35ba1925653cefcea5014728f1cc0c54880b2f5978eff8f488e9d7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1245077743",
+      "title": "Overload - Playable Teaser",
+      "url": "/en/game/overload_playable_teaser",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b7272e6bb4022f3838c91a37cc403d99673fb657d57fad34f53dfa2dd4a2cafd.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1250071528",
+      "title": "Delores: A Thimbleweed Park Mini-Adventure",
+      "url": "/en/game/delores_a_thimbleweed_park_miniadventure",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/f76171d53c548400e95a4c1f31ca70f92ae482ba57a0906a3a0fa981fb3b4ce1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1254359050",
+      "title": "The Pale Beyond",
+      "url": "/en/game/the_pale_beyond",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/db4e16dc43f196b3641b0f69158fa480bf77748439f82fb611d24034e19f42dc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1263855454",
+      "title": "DeathKeep",
+      "url": "/en/game/deathkeep",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b96e318b030e8142933e3ec9e8d7dbb4fe880c6ebc432cc78a2eff269027f98c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1265338731",
+      "title": "Golf With Your Friends",
+      "url": "/en/game/golf_with_your_friends",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/26d0653c63f6996ad5f85ed2fdb53005aeeae1d1ae89ef0eeadbbeb89ba0c70b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1272977612",
+      "title": "Remothered: Broken Porcelain",
+      "url": "/en/game/remothered_broken_porcelain",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c44e00de456253ab2fc18f19e8f460b8518677977dea497a7e3e25c2352ffb47.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1293297882",
+      "title": "OpenTTD",
+      "url": "/en/game/openttd",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/664b8ec67726af0163c7a3f8c40e935bfaa572abfcd66ef4db4eb6bbb265c39b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1293807013",
+      "title": "Captain Blood",
+      "url": "/en/game/captain_blood",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/bdcc8d0f4115a791a28d26347814f50b8540802ea0857a8fb4bc85aa7ee23460.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1296690054",
+      "title": "Deus Ex: Mankind Divided",
+      "url": "/en/game/deus_ex_mankind_divided",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/d7e55f1cfeb9990addbeb5badae0789952e37d30d02b323dd98945d32ab62f23.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1297352383",
+      "title": "Thronebreaker: The Witcher Tales",
+      "url": "/en/game/thronebreaker_the_witcher_tales",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/8ad695136c08bc4ebb229bb7ed8b29b05a00aab72400329f8bd3592c7e41682a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1297999995",
+      "title": "Overcooked! 2",
+      "url": "/en/game/overcooked_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/a6018412f72922cd6d3832bab269361ce098f45b04749048c58d57cc04f49aad.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1302753134",
+      "title": "Chasm: The Rift",
+      "url": "/en/game/chasmtherift",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b0d4bf8b4f0bbf25b9246f8a6dde38c2fdfb3992d2fb6d9540dcea6fee8e7529.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1321890219",
+      "title": "Dragons of Flame",
+      "url": "/en/game/silver_box_classics_1081970496",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0afee7037efb61023ff7440fbbe22db08ab946ca4ff048152aa330ca6abed3ae.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1324471032",
+      "title": "Middle-earth™: Shadow of War™",
+      "url": "/en/game/middleearth_shadow_of_war",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0b84cdf69f54427b8e3a68165a390bb93e88c082b8d51c6657cd15776a63282c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1337063899",
+      "title": "Our Life: Beginnings & Always",
+      "url": "/en/game/our_life_beginnings_always",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5928663c7967e63901fb18dd5ffd8d3b37b09411cdc7fc477e1296a91450da5c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1339662209",
+      "title": "Tested on Humans: Escape Room",
+      "url": "/en/game/tested_on_humans_escape_room",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f613ce55581341a95274ff8fed14f6d2318de998daf92d6c2ba8eace3cfa4e12.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1339695996",
+      "title": "Rebel Galaxy Outlaw",
+      "url": "/en/game/rebel_galaxy_outlaw",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0847b39c1816051386c0302a040160c9a24758e093652df64585e23c93e5bece.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1340051324",
+      "title": "Whispering Willows",
+      "url": "/en/game/whispering_willows",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e35c7174d84993eaf0d5a6108e78dd7fc427e01a2f57bdfe8862fb87d609f509.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1341028548",
+      "title": "The Beast Inside",
+      "url": "/en/game/the_beast_inside",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/9d7844741c2e98d156d9c0b8b2b7b90e21a9c743fd962b4c00ea53b023dc221b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1342466874",
+      "title": "GRIP",
+      "url": "/en/game/grip",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/dc021a1d14c25002ea4eaae039810aa48ce4f6626bd562b939e1cdbb28c8cbd2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1345516108",
+      "title": "Hard West 2",
+      "url": "/en/game/hard_west_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/97e1dfa97f73a647130f0a18931ad6a771c1852a638983013fcc8fd1201630bd.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1358213898",
+      "title": "The Darkest Tales - Into the Nightmare",
+      "url": "/en/game/the_darkest_tales_into_the_nightmare",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/849f9229f0fac0c74fa8e8b32c111b96632e31260eed9d152fab2aafb5d2f972.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1370227705",
+      "title": "Deus Ex: Human Revolution - Director’s Cut",
+      "url": "/en/game/deus_ex_human_revolution_directors_cut",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/42c6aec0e9ae93304d487ebb9ec40eb5fd221d6c174f54b752a1d20915bde11f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1372090895",
+      "title": "Berserk Boy",
+      "url": "/en/game/berserk_boy",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cdc15199d03ced5f8b584d346c42de9a0de9409413f4786014a03f50023b71c9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1384091612",
+      "title": "Summer's Gone - Season 1",
+      "url": "/en/game/summers_gone_season_1",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ea1c64b772b7f5fd3e1a16ccf182c5c1319e7765b088529759cff3117af4ee85.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1390579243",
+      "title": "DOOM (2016)",
+      "url": "/en/game/doom_2016",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/82a7cd303997644e10450fad1be3a3666f5cb0cfbc1fa44b38b429e607e64426.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1407750955",
+      "title": "Tomb Raider I-III Remastered Starring Lara Croft",
+      "url": "/en/game/tomb_raider_i_to_iii_remastered",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b9cd9d9552ef18b5f3ee87a9dd0617fc596204e693225b0bbf6dee8dc5a2c593.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1411626324",
+      "title": "Tower of Time",
+      "url": "/en/game/tower_of_time",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c3ef2332c0b7274735c0c75239a49f22fd42bff695b9457ecb6ca792c0c16c05.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1413291984",
+      "title": "DOOM + DOOM II",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/eaad5d1fce93e36d33b9983fba7edc623e23793e138667aafff6b7a305717c84.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1421309312",
+      "title": "Worms Revolution Gold Edition",
+      "url": "/en/game/worms_revolution",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f3f88804947ca5f684f2b7547c6ae2f35fde5aaa71cdfdc24dec27e9e192d76c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1421404646",
+      "title": "STAR WARS™ Galactic Battlegrounds Saga",
+      "url": "/en/game/star_wars_galactic_battlegrounds_saga",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/59602aacf196b109d70801ed36fded6dbe9305b8ad56041d8712cb05ed2f9f26.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1421404701",
+      "title": "STAR WARS™ Battlefront™ II (Classic, 2005)",
+      "url": "/en/game/star_wars_battlefront_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/458d6b963755ce3b0afa93f9976e2c05360f569826b00f0c91442f8a892f19a9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1421404828",
+      "title": "STAR WARS™ Rebellion",
+      "url": "/en/game/star_wars_rebellion_1657527221",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/4d7f5160a916c856a85ece512235dbe4ec4612ba1ef1bf6207e2b97028f24c67.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1422285784",
+      "title": "STAR WARS™ Jedi Knight: Dark Forces II - Mysteries of the Sith",
+      "url": "/en/game/star_wars_jedi_knight_dark_forces_ii_2034259767",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/9167e6c841f5a5803e0876454dd2fb0bf0a42d9564edd69a19fea409b0674da9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1422286819",
+      "title": "STAR WARS™ Jedi Knight: Dark Forces II",
+      "url": "/en/game/star_wars_jedi_knight_dark_forces_ii_2034259767",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/59e36f6eebad61a5dc10c5c385767d7f564bad4f5d76ea2b46a5615f01cc4aae.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1424856371",
+      "title": "Hotline Miami 2: Wrong Number - Digital Comics",
+      "url": "/en/game/hotline_miami_2_wrong_number_digital_comics",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/47d5b333fcd3736cd52e997b0b00c04b1cab1d1a3469720761234d7359c49ddf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1426071866",
+      "title": "DOOM II Enhanced",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b8a290c8e8e0315715851722306c3494e67c58c1b928d07dcc233959d9c759ee.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1426240474",
+      "title": "The Whisperer",
+      "url": "/en/game/the_whisperer",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/15331c001fcb518c3a145e1828223ea8196aa25ba6dbc2b1834fc74aed8f42c8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1429864849",
+      "title": "Kerbal Space Program",
+      "url": "/en/game/kerbal_space_program",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6d049200e23f35fd288419ab16955a63f2b749cd1a80e8121c4737ffdc4848c1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1430136345",
+      "title": "Fantasy General",
+      "url": "/en/game/fantasy_general",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ae0dd2346e947205e49491fa53915906789cd83a1e537eadd616677becfde044.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1430740172",
+      "title": "Metro: Last Light Redux",
+      "url": "/en/game/metro_last_light_redux",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/278c4ae8d21c5a975fedabcfadc739ed46ca308d6dfb7ea56484d2b82aa22612.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1430740458",
+      "title": "Saints Row 2",
+      "url": "/en/game/saints_row_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e5054aacbe4d66cc91783dfe5d2eb996e49d08523f8ed6f2cb07bd9cc747aed2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1431426311",
+      "title": "Dishonored 2",
+      "url": "/en/game/dishonored_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/65811050eda91f39725b29a46ca7c7e68bdd7ec515ab4ef127dc96d77fab0c44.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432575012",
+      "title": "Eye of the Beholder",
+      "url": "/en/game/forgotten_realms_the_archives_collection_one",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/41913e60dc67ff1e17ca631592d1531ec378fdcc2299289ea3bf2ccf3f998197.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432576039",
+      "title": "Eye of the Beholder II: The Legend of Darkmoon",
+      "url": "/en/game/forgotten_realms_the_archives_collection_one",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/04d1dcc7c9fd3bfd123d08e4b117092092cba625899ac38512f52b3cfc3f13bb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432576327",
+      "title": "Eye of the Beholder III: Assault on Myth Drannor",
+      "url": "/en/game/forgotten_realms_the_archives_collection_one",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/93aa23a0b7cfa99814760dfd7484aceb503a239bd5fd005f4ffceddc24f811bf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432578339",
+      "title": "Menzoberranzan",
+      "url": "/en/game/forgotten_realms_the_archives_collection_three_1209599383",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ec5385d33a4330ed58b26171ae34d0edc6fd3f0d3c5caa2880c8c416de49d635.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432579019",
+      "title": "Dungeon Hack",
+      "url": "/en/game/forgotten_realms_the_archives_collection_three",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/95ffd3349a00875ec3dd087657db604c617e3db65d2fe04c2b33931352aadfef.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432640506",
+      "title": "Hillsfar",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d54661e1bf956f972c42aa50671b75a347d8720289e69d0cd90396e2f76b8775.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432640961",
+      "title": "Pool of Radiance",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/63f00fc319f2c57cf69639a9ff4d62c31c39289f5e7c2aa48e005c233da3e2fc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432641528",
+      "title": "Secret of the Silver Blades",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/4611082fa4785b46f2b5888fdecd7d379ce766f41d24235da27dbe47c2b98840.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432641771",
+      "title": "Treasures of the Savage Frontier",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cb09bdc9f733431c9720c79d2d4275ac4d4e0738760fe02554531cbf9ff129e1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432642138",
+      "title": "Curse of the Azure Bonds",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/157c1915e528261987c0f711a19cd87c3042f3c51c85b6127d4bb150dbfa05db.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432643408",
+      "title": "Pools of Darkness",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/bd5c81114998eb0cccdd5ea9bb056356cab68f96337b9d0cdc8596b5ee4d3af3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432649588",
+      "title": "Gateway to the Savage Frontier",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/493b8f4cdd1ac3b9b53bbc80014989904a3a17b52bb31c7f47def0578ff9bed9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432650732",
+      "title": "Forgotten Realms - Unlimited Adventures",
+      "url": "/en/game/forgotten_realms_the_archives_collection_two",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/105315d52a96ac2dc98c9de77c99f90734a30cd9f02b64b4d035906613c8a4d3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432722131",
+      "title": "Champions of Krynn",
+      "url": "/en/game/dungeons_dragons_krynn_series",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/54760d35b31ec401a4ab899eb8c92c79647e9f330d92e4df752ca13a86a20806.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432722599",
+      "title": "Death Knights of Krynn",
+      "url": "/en/game/dungeons_dragons_krynn_series",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/70e15aed710a57bbee44ce39d30e946ae382f6f50de2d8e213d459d9a3f26943.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432722998",
+      "title": "The Dark Queen of Krynn",
+      "url": "/en/game/dungeons_dragons_krynn_series",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e02607a5dc050231b78c4dc2088e252de1f1884f65e35b45656f035cf246b8eb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432723859",
+      "title": "Dark Sun: Shattered Lands",
+      "url": "/en/game/dungeons_dragons_dark_sun_series",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/9bedd2361677c7daa67f0d84307db761027444cfd1b03ae48ed71eaf92850591.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1432903719",
+      "title": "Dark Sun: Wake of the Ravager",
+      "url": "/en/game/dungeons_dragons_dark_sun_series_1193264383",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/32e51fa3fa24965946aaf3fc69034fb5cc995ba8fad86d9a5bdaeb998a463956.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1433027987",
+      "title": "Nomads of Driftland",
+      "url": "/en/game/nomads_of_driftland",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/639db451490d29c5b1a2644307939ce47a23e13e4428db58153540685b3424d6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1434021265",
+      "title": "Shadow Warrior 2",
+      "url": "/en/game/shadow_warrior_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/dd878390cb16f2cac44bdf79cfbbfe28b26239ae0524bfaf45dba3686e124ef4.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435582019",
+      "title": "Rebel Galaxy",
+      "url": "/en/game/rebel_galaxy",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e2184c0e8b86417e319c9a2154fab725abc46d04febcb5b6135916bb2eb37fd4.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435738629",
+      "title": "Saints Row®: The Third™ Remastered",
+      "url": "/en/game/saints_row_the_third_remastered",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/7446a767111ec3f834723baa67380f20934de322fc73651d14e3edb2db66fbc8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435827232",
+      "title": "The Ultimate Doom",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5175cf9ebd744a41f9ba0a2cca30ece6ba20281cafe72cce9fcf09e937f6867f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435828767",
+      "title": "The Elder Scrolls III: Morrowind GOTY Edition",
+      "url": "/en/game/the_elder_scrolls_iii_morrowind_goty_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e19e2055ee1d083793a4ea093872f15b749e3d75384bf8c0f3d81002a4a4fd47.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435828982",
+      "title": "The Elder Scrolls: Arena",
+      "url": "/en/game/the_elder_scrolls_arena",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8d44338ce97551e378650caa1bd7ce4a25fe115f3b46bd6845dae4a18c186512.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435829353",
+      "title": "The Elder Scrolls II: Daggerfall",
+      "url": "/en/game/the_elder_scrolls_chapter_ii_daggerfall",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/89dbf9cbf36f1f68194b3384042828320f80a75ac506e411f1b52c370abb9858.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435848742",
+      "title": "Final Doom",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/366a67d13a260dbafbc0b07d7080b148825bde15814547ae38a631ccace111c0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1435848814",
+      "title": "DOOM II + Master Levels",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c1f0858b5d431d7ff13ea7e577d52959e8f832ea8066d66035f86cb5bd8c80ff.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1436499377",
+      "title": "TOEM",
+      "url": "/en/game/toem",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/ec2493f50e8945e04ccf2f5708fced7bd38606cc47bc68ced58d410fff21b120.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1436866438",
+      "title": "Shadowrun Hong Kong - Extended Edition",
+      "url": "/en/game/shadowrun_hong_kong_extended_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/fcc90f964947d19b0bc49825d55cd181fea2389cd1312a5619ac731fc1c64208.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1438861093",
+      "title": "Meganoid",
+      "url": "/en/game/meganoid",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/bb9a6eb70959be4aa69aecb6bb2dc10f153756c994564dd95fdccb15252d6510.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1439548178",
+      "title": "STASIS",
+      "url": "/en/game/stasis",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2470f1b7f6a94b35303ee395e859a00954790bea38049423c06f201979166852.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1439656515",
+      "title": "BioShock™ Remastered",
+      "url": "/en/game/bioshock_remastered_1157510446",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/a8e79b7c19e3a2c6f8502f7011ffbbdbe8dd740137b4a1cd3a9944fcd1bbf2bf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1440148836",
+      "title": "Fallout",
+      "url": "/en/game/fallout",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0584f7fbcb480d39f317067ba81e78c76f6735d41c3d281b8db8b1bbe8d715d4.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1440151285",
+      "title": "Fallout 2",
+      "url": "/en/game/fallout_2",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e1fb495117c3c3c5b50c30db055acdc7545893b842111058d49c5039f2014680.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1440152063",
+      "title": "Fallout Tactics",
+      "url": "/en/game/fallout_tactics_amazon_prime",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/4970369a94834801c5b15def214e62a281f495b665261a39b6de5d52a9d04735.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1441096928",
+      "title": "D&D Stronghold: Kingdom Simulator",
+      "url": "/en/game/dd_stronghold_kingdom_simulator",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e329f224694547ec95f6bcb67b8148ff16eae0c939d9daf1495922246fb016f5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1441704824",
+      "title": "Quake II (Original)",
+      "url": "/en/game/quake_ii_quad_damage",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/319eb7a1947f6623c2069251c83236df7b90805434910b0c27b3e9447062ba26.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1442285576",
+      "title": "Shadows: Awakening",
+      "url": "/en/game/shadows_awakening",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/5f8cba7a7a088af20ece417986347b40b3e9d0ada4d0972335702d06aa6e642e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1443428641",
+      "title": "HuniePop",
+      "url": "/en/game/huniepop",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/890d64606d943c000f47b7a028346cd3e863995eeb96628b8b724125a404d7f5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1446830366",
+      "title": "THIEF: Definitive Edition",
+      "url": "/en/game/thief_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/91d81e2647863f0ded3a83c1492dedcd8e37f06645f20e540c88dd0cab8f699c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1447412730",
+      "title": "Iratus: Lord of the Dead",
+      "url": "/en/game/iratus_lord_of_the_dead",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/30fabe91d99d79b7da4d69d9b4ed2451b42bc18c277a02ce5762a2f878266044.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1449569170",
+      "title": "Bio Menace",
+      "url": "/en/game/bio_menace",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2d0cd253f7d22db29fd4c2e411f5ef39c9347771b58f385158a8ac58f198560d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1449710114",
+      "title": "Mafia II: Definitive Edition",
+      "url": "/en/game/mafia_ii_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/ec9894ec739bdfd6a68b6cf2d8a51138272f75a382fd703ece336bb89e7c49a9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1451215361",
+      "title": "Beholder 2",
+      "url": "/en/game/beholder_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/d2b1530325d7853986a1869829303ea38eb3879edd24053450fb43c719028573.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1454315831",
+      "title": "Fallout 3: Game of the Year Edition",
+      "url": "/en/game/fallout_3_game_of_the_year_edition_amazon_prime",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/290240ae4e689bd7d016344d2d98d2ceac0c49d966bfb6c0736e6c6f76b456fd.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1454587428",
+      "title": "Fallout: New Vegas Ultimate Edition",
+      "url": "/en/game/fallout_new_vegas_ultimate_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/74d5fb286ceae7fb8c424c8deb0812faabcc14ec596ef49cd6b23e2d020fb96e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1455545518",
+      "title": "War Wind ",
+      "url": "/en/game/war_wind",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/fb04b8c1e4536da657ab043b92c9199d57338297bfbca5f6f6079db115745fb2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1457519353",
+      "title": "Oxenfree",
+      "url": "/en/game/oxenfree",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/321b7922b42e5c88f91b34dbf09d09eedd455bfc3380872d438aff5913a3eb1e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1459769749",
+      "title": "Dark Envoy",
+      "url": "/en/game/dark_envoy",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2b7e404180170833a8825f023fe1aecd0f3c684c42cb1b361902baee119465f9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1471405734",
+      "title": "Sid Meier's Civilization® III Complete",
+      "url": "/en/game/sid_meiers_civilization_iii_complete",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/65ca82dd9ec2282c864330530a3dfdf777f07759783ecddf9ed31e4560d11a2f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1482002159",
+      "title": "XCOM® 2",
+      "url": "/en/game/xcom_2",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/7c1632de7498519c33b422fd7e4af30a33db1ee84529b4a5cd6c708684d56099.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1482265668",
+      "title": "BioShock™ 2 Remastered",
+      "url": "/en/game/bioshock_2_remastered_1271128013",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/fd04cc3c1c94ac17e3b566e4ff4c361f1b0f93db9a3e2cca5725606539e42a0c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1485235422",
+      "title": "War of the Lance",
+      "url": "/en/game/silver_box_classics_1081970496",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2f90b29ef5a7d32ee318f3140930aed110710e3434c73a912202d925a9e1e94f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1485834662",
+      "title": "Ashworld",
+      "url": "/en/game/ashworld",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b07b80f483dfc3ea281a4fd62a541eee58e3c17a38e6c73e78a36b6c51279921.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1490213242",
+      "title": "Harold Halibut",
+      "url": "/en/game/harold_halibut",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/537bbe39696df7e650547d185d55d6e4dfe9b7d190a1b573213baecf733258b6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1491728574",
+      "title": "Fallout: London",
+      "url": "/en/game/fallout_london",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/40a45333c40f66a48c507c23590ade8c64e64c7786e135e2e2ab9933e373b9d9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1492054092",
+      "title": "DOOM 3",
+      "url": "/en/game/doom_3",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/e52cc157b419e2a3b21a4e4d54420cedd5dd3b7514cc231850a52c87d894577c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1503950763",
+      "title": "Hellpoint",
+      "url": "/en/game/hellpoint",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/48d663a17cd97b2eba06e0d23fb1ecc51c6a4d38c64189bbd92d7321547525d5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1511366207",
+      "title": "Showgunners",
+      "url": "/en/game/showgunners",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c4a1bdbae4ac24f9258f4b21a5dba9f84bd7ec813c6358ac142bb8369de78c2a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1532671653",
+      "title": "Higurashi When They Cry Hou - Ch.1 Onikakushi",
+      "url": "/en/game/higurashi_when_they_cry_hou_ch1_onikakushi",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3699de957c16c9d8e442243f81edde06b9356d0a27e8aa9f3b1ad82ede6e01ea.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1538951699",
+      "title": "Space Grunts",
+      "url": "/en/game/space_grunts",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/3f6bb17671a9939620eb8a23cb04d52d3b73f9d870db7169874191a236eb9c13.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1542190742",
+      "title": "Bloody Hell",
+      "url": "/en/game/bloody_hell",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/d7b910245cf6152d606e0f8fd1a42c4d51a923e7fdd6ccbc9e4bc99c03a2b881.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1547269859",
+      "title": "Hero's Hour",
+      "url": "/en/game/heros_hour",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d51409c1e18777f459f6e96c6b840bac4102639f064eeae7c2783bad702732c1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1547541023",
+      "title": "Necroking",
+      "url": "/en/game/necroking",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/a3dec7c1173edffd98d7674b2d8fd4922cfa168b7ee840621738d53a863d398c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1548764757",
+      "title": "Cyberpunk 2077 Digital Goodies",
+      "url": "/en/game/cyberpunk_2077_digital_goodies",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0a12c6d08925b4e567dd56bd3cd70b3a0667ea484539bada5b8698f4add72dcf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1558688142",
+      "title": "XCOM: Enemy Unknown Complete Pack",
+      "url": "/en/game/xcom_enemy_unknown_complete_pack",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/a4b4a072ce88cb4c8b8a34a45ed283e1a773955c1992f03a83531a66223c15cb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1559996859",
+      "title": "Return of the Phantom",
+      "url": "/en/game/return_of_the_phantom",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/7952937934c8c45b4d4f81d1bc144ffb2d068cab8a3db4bb86459d65e1f12204.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1566969207",
+      "title": "Death Squared",
+      "url": "/en/game/death_squared",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/90b09296910a3b8b4f2a2bec16d16bcd711a190ea064780d658b4238779dee10.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1577265251",
+      "title": "The Talos Principle: Gold Edition",
+      "url": "/en/game/the_talos_principle_gold_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f3ba07480f127105d3560598bd99c3fd4dbc0ee423d75f006c225b9e251d178e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1578751750",
+      "title": "Mafia III: Definitive Edition",
+      "url": "/en/game/mafia_iii_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/675f7bf7c242b6c80cb8e91834d01cfc2bc0ac1bb47c7184c8ccf4966ca22423.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1582333296",
+      "title": "Lust Theory - Season 1",
+      "url": "/en/game/lust_theory_season_1",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/21c5c15dcd6cff7b33d052cb4b70d4076fc1ccdb544b13b4446c8e3659bf25af.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1582445378",
+      "title": "Spelljammer: Pirates of Realmspace",
+      "url": "/en/game/spelljammer_pirates_of_realmspace",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/53ae24063c8580cf646c9fa47a8b799167019e22eb38a87b615d4d7957029cba.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1592693763",
+      "title": "Treasure of Nadia",
+      "url": "/en/game/treasure_of_nadia",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/a31ed6a1be0bb9c362650bbf2cf39fc0a66985b538d16c8cc000ce60b9db17de.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1603513052",
+      "title": "Jupiter Hell",
+      "url": "/en/game/jupiter_hell",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/52c0e973c6ebe97026433f5c59d73d38ec7302b1f87bcf45e35b390ced4c9a5b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1603656118",
+      "title": "Sin Slayers: The First Sin",
+      "url": "/en/game/sin_slayers_the_first_sin",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b356d14cf18812bfa70d1d6cf23139434d71e89a92eae68b88170fcdfc015cfb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1604161214",
+      "title": "Loria",
+      "url": "/en/game/loria",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/91b710cf819d08c5d33dca07579d21aa13459a1258ad64f3ff38ea600a22d9e0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1604634952",
+      "title": "Warhammer 40,000: Gladius - Relics of War",
+      "url": "/en/game/warhammer_40000_gladius_relics_of_war",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/fe0fa01266af131e0bc03535f070087a08f194e4bdcbb005e6315a4a1b075266.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1620735257",
+      "title": "Scorn",
+      "url": "/en/game/scorn",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/6949ee85e9757ed036da280fa9cd60558a9d73c022f6405b1917c9370fe02de6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1621558174",
+      "title": "Mutazione",
+      "url": "/en/game/mutazione",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2393a7bbfe6088998add494e90f79bf44d93e2eef1c1dd79ed94379135426644.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1624007757",
+      "title": "Stray Gods: The Roleplaying Musical",
+      "url": "/en/game/stray_gods_the_roleplaying_musical",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/1140412a07a23a518e75127102e01a4bef6e1aeb968fd6931c4531207249f70e.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1629258827",
+      "title": "Deep Sky Derelicts",
+      "url": "/en/game/deep_sky_derelicts",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/460e4b7f2d73d6dbe4c3993e76a28b1dc3401a2e028966e9f99c41b810b83eb3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1635210189",
+      "title": "GreedFall",
+      "url": "/en/game/greedfall",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c069ce7b58dd63d6fe363aca4efa7105b6c7b182015c2f01042b56ef504cf869.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1640863824",
+      "title": "Dink Smallwood HD",
+      "url": "/en/game/dink_smallwood_hd",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/fa31881af39436b62bef91cb325f462c8f288d6af2090a256d0f8a1e991ffa88.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1645177204",
+      "title": "Arcade Paradise",
+      "url": "/en/game/arcade_paradise",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c5c8bddfb60ab0c9dd248c5d3c3cf6d14a37975833a39e9546c0dc96c7d5aae7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1654462894",
+      "title": "Fetish Locator Week One",
+      "url": "/en/game/fetish_locator_week_one",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/8fe8969df92d72fd59d496a167e07df3484181a29dd5718396a30e698e913784.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1654564600",
+      "title": "Fort Solis",
+      "url": "/en/game/fort_solis",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0f028e6686a0603b11e31b4fd570b7ce6334e7ceba0b2d6c3cce9ffa018768a5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1655492231",
+      "title": "The Town of Light",
+      "url": "/en/game/the_town_of_light",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/bb4907beed163eb684519438e9167c3f6be79160bd16daf0e4c126688e46d90f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1656945959",
+      "title": "The Life and Suffering of Sir Brante - Chapter 1 & 2",
+      "url": "/en/game/the_life_and_suffering_of_sir_brante_chapter_12",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/84909822081b1427ec628ebcd589e216258d838b50569a8b39e2ddbfd49e8a49.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1659763953",
+      "title": "CyClones",
+      "url": "/en/game/cyclones",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5d41de29d3410ba7cf13fff7d724f8fceeaf33eed214a2cf0e5aa024675ac8ed.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1663581818",
+      "title": "State of Mind",
+      "url": "/en/game/state_of_mind",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/948360d0e110622fdbdab367732dc1a3004fd51bad991bada0e95a1f9acb8ccf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1668986402",
+      "title": "SteamWorld Heist",
+      "url": "/en/game/steamworld_heist",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/47e9483bf0fa6c44395c55ac29a44a6e28db8332c27ac665890c6c08a5b1305d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1669531175",
+      "title": "Neo Cab",
+      "url": "/en/game/neo_cab",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b5a65acb6b398b21d74647ce67a47b8826dfcd8833ad72e62483e72952bbbfeb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1669882559",
+      "title": "Oaken",
+      "url": "/en/game/oaken",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0e92ab2da64177f6358a1bb02b1f6f289a64e45a4fcb0f9836a657c7040801f8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1688702977",
+      "title": "Residual",
+      "url": "/en/game/residual",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/945b6fec6fdbd15945d44e643972751d043b7f24dea6767fca597c3a8056adc3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1689019552",
+      "title": "Shores Unknown: Arrival",
+      "url": "/en/game/shores_unknown_demo",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/aa485936254a93b3a2ed0f780d3e64609413aee0ebe23c40b3e10e91b947e0ef.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1692939089",
+      "title": "Martial Law",
+      "url": "/en/game/martial_law",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/8089085fc8eeb452abd97ef1288f8581b2352efc0878dfd6de59ccbb2dbea396.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1701063787",
+      "title": "Dishonored - Definitive Edition",
+      "url": "/en/game/dishonored_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/059f24a27dd530a1390c368bfd276b60615bb73f10dd7e3051432640f28e712b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1719140891",
+      "title": "Hellpoint: The Thespian Feast",
+      "url": "/en/game/hellpoint_the_thespian_feast",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8d90cac7acaf45d29c2640f2e06ccf0077803df07e1cce012b14c51c015e9098.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1719675091",
+      "title": "True Fear: Forsaken Souls Part 1",
+      "url": "/en/game/true_fear_forsaken_souls",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/8232c34724cdf71ecbd551c401c680558097391a961b2ade1bc5aa1f08335149.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1724969043",
+      "title": "Tomb Raider GOTY",
+      "url": "/en/game/tomb_raider_goty",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/74ef44a280dd89f7764b2e31a3356cb7fa90f89a0227038191e2714ccfd3cbdb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1731318270",
+      "title": "LEGO® Star Wars™ - The Complete Saga",
+      "url": "/en/game/lego_star_wars_the_complete_saga",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/de223675d11d6298a77cbc289c56096577f3fde8eb40a3f1a5a04ed319f61e95.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1731334260",
+      "title": "Syberia: The World Before",
+      "url": "/en/game/syberia_the_world_before_1592941638",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/2f47f4c85b8b4e33615e560f35c3e47372cf9e4e12d624982091dc5bccaa05f6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1732383191",
+      "title": "ELDERBORN",
+      "url": "/en/game/elderborn",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/60cc5813a427ac0546012d997f34f9a2bafe81b0cd5b82901816ce122a7c92e3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1743464065",
+      "title": "Alien Breed 3: Descent",
+      "url": "/en/game/alien_breed_3_descent",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/91bd41b2375f2edd90589866b2891b7169839effdf294d015835a81e2f5c6ea7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1744110647",
+      "title": "DREDGE",
+      "url": "/en/game/dredge",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f9a9116a2daac1825518785a055a6b9ae4141b9f1d39b02a1bd51718edab586f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1748855533",
+      "title": "Sunrider: Mask of Arcadius",
+      "url": "/en/game/sunrider_mask_of_arcadius",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5ef5c4127eeade8aa1e26b878c05108b5e9b7fd338c2af88f0ece7dbbb99bdbb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1748947415",
+      "title": "Ambition: A Minuet in Power",
+      "url": "/en/game/ambition_a_minuet_in_power",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/47c73e61144609a6422034038e8b292b2fb7ecd758c1526ee212b3823c56757d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1751965389",
+      "title": "Ancient Enemy",
+      "url": "/en/game/ancient_enemy",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/1165e0d391121888bbbd7e9f6986bf067c412c46a8b63d7a8501bb8be56330eb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1752654506",
+      "title": "BioShock Infinite Complete Edition",
+      "url": "/en/game/bioshock_infinite",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/35cd661ed60c46beb5a99a744f6e70ab12c0b4055a92028ef0b2460ff09e6962.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1753068551",
+      "title": "LEGO® The Hobbit™",
+      "url": "/en/game/lego_the_hobbit",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/123f5f62c302c8e5c59970da626e38a4471b6514eaf235a58c3d42e5a4d32196.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1757179626",
+      "title": "Hitman: Absolution",
+      "url": "/en/game/hitman_absolution",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6f11f7a9ddfa5aca0cdbdeaaa4200e691f2560432d6e9ab555007d0125ac8e77.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1760534591",
+      "title": "Sid Meier's Civilization IV®: The Complete Edition",
+      "url": "/en/game/sid_meiers_civilization_iv_the_complete_edition",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/37ac843afc2b6d5f3b3b600483948cfc0f849a7c20a95adfcefe5c2b73caa4e7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1766046223",
+      "title": "Hiveswap Friendsim",
+      "url": "/en/game/hiveswap_friendsim",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/1dffba9c4471ca706d8d567ffc58818b804f9f30b351628a9f9062abeb3372c6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1779703219",
+      "title": "Shadow Sorcerer",
+      "url": "/en/game/silver_box_classics_1081970496",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2b7bb4c191c04d4f9594159f3e20de1608fc6f3019d5ffb178e1eb49feae65aa.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1785804341",
+      "title": "Close To The Sun",
+      "url": "/en/game/close_to_the_sun",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/75ea1e65b093978cdec5d13ed3cf4f95292f43c8202b55faa237108d0e091ec2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1786501441",
+      "title": "Citadel Remonstered",
+      "url": "/en/game/citadel_remonstered",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1786995757",
+      "title": "Alien Breed 2: Assault",
+      "url": "/en/game/alien_breed_2_assault",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b8943761bb647bf63a2329c0ccc4d834ce15602034050356e06f0fe4f92c2f71.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1787058795",
+      "title": "South of the Circle",
+      "url": "/en/game/south_of_the_circle",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/cabb893540e2c31c08fcfd1c3df0b92edfa675f73506aeeb604ba615820c11bf.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1787109378",
+      "title": "Leap of Faith + Official Walkthrough",
+      "url": "/en/game/leap_of_faith",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/f68062ce060563f1a0fb50657d4bea367992d53d0884bec5ffa8da15b1b079c4.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1790237640",
+      "title": "60 Minutes to Extinction: Escape Room",
+      "url": "/en/game/60_minutes_to_extinction_escape_room",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/c6e2d2635913aeca2753ad5a42ccc046283fa84b91f802cef963feb2b4528a22.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1804122723",
+      "title": "INDUSTRIA",
+      "url": "/en/game/industria",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6ef9a9e6b7a7a59dbe48a3ae8f4e7a921a451ec204173eda57f1793563c088cc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1804860967",
+      "title": "Sapphire Safari",
+      "url": "/en/game/sapphire_safari",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/9124fd4678edcca90f7bbdcd7c63cc71ef9271dbbfdf917bd4c878c296f63537.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1806891286",
+      "title": "BioShock® 2",
+      "url": "/en/game/bioshock_2_remastered_1271128013",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/9ac4ef2b9091a1a79c6d40a05d81bb1def1e04590e5fb2283e375adadc305197.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1807214820",
+      "title": "Helium Rain",
+      "url": "/en/game/helium_rain",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/dca7d9d55eb53b17b1cbe5efa14af5ec7f6de294eb29fcff6bd3fa02ac4aa28a.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1810841502",
+      "title": "Tomb Raider: Legend",
+      "url": "/en/game/tomb_raider_legend",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/098594caa6f1353366914f80006c997b7e3ffb0ef99c00824adcd5ccc559cec9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1812138501",
+      "title": "Planet of Lana",
+      "url": "/en/game/planet_of_lana",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/015a405c56e48665bf9f4eda64ede22b3cfcbf3b598af8baadd3ffe292864005.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1813565692",
+      "title": "Janosik",
+      "url": "/en/game/janosik",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cf43ca3d02bd9b9e2f142de1e5be662430657aae0ce1d75d45b5ef216d579883.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1816059595",
+      "title": "Mafia II (Classic)",
+      "url": "/en/game/mafia_ii_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/dc14f7c4609bd284835bf7dfab0e547ca4c93bca7c0326274ba1c46e97351772.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1825786806",
+      "title": "Quake II RTX",
+      "url": "/en/game/quake_ii_rtx",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c36ed20220e95cb260b5ecf8e68c94ad0135040092dbea1ca38f4c9b6ae3aafc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1832934376",
+      "title": "EMPTY SHELL",
+      "url": "/en/game/empty_shell",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e8590b99c96397881226fc2db1ff5c1aec078baeee2bcdac9df6f0df05d8b5b0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1836059896",
+      "title": "Quake 4",
+      "url": "/en/game/quake_4_amazon_prime",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c8de8f635e5c4e6f70b4626b44f6425504da8bd96ba0cdb03dd8e2203f8a1d97.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1837805079",
+      "title": "Blood Omen: Legacy of Kain",
+      "url": "/en/game/blood_omen_legacy_of_kain",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1848744423",
+      "title": "Mordheim: City of the Damned",
+      "url": "/en/game/mordheim_city_of_the_damned",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/883e6d09daaf73b4ed7fa623273204c4af18d8a408ae31b556920cd6c0459ed0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1862671058",
+      "title": "Palindrome Syndrome: Escape Room",
+      "url": "/en/game/palindrome_syndrome_escape_room",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/81c5444585a4f3d35fb78f504cca216ac11b5d2c48f92220567c9f708296a5fc.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1863535689",
+      "title": "Hello Neighbor Alpha Version",
+      "url": "/en/game/hello_neighbor_demo",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/818658294fc9ed5ce966acf2792e93aa8cb6d4776813071c6774b93c73d0f6f5.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1872608764",
+      "title": "Pyramids and Aliens: Escape Room",
+      "url": "/en/game/pyramids_and_aliens_escape_room",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/8ea07b9edf7d22c527847bca331a463387f016fe52b83ea2bb59fc1f41746c48.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1876546888",
+      "title": "Fall of Porcupine: Prologue",
+      "url": "/en/game/fall_of_porcupine_prologue",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/255c13273d77d9791bec1c2a63a36b0aeb40bb865a6ae2db21c3a5f90eee80d2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1882554410",
+      "title": "Bō: Path of the Teal Lotus",
+      "url": "/en/game/bo_path_of_the_teal_lotus",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/67eb4ad80e07a0f3279be128523d2a6c0d5abeeaa32f1a67516303ad04b916f6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1896039326",
+      "title": "Space Hulk: Deathwing - Enhanced Edition",
+      "url": "/en/game/space_hulk_deathwing_enhanced_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/4b861d6e5a0ab352cae8572e27b62859e8a3e2b8659a7ab47ab1dcaad5c71567.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1900745791",
+      "title": "Tomb Raider: Underworld",
+      "url": "/en/game/tomb_raider_underworld",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/93ed2f65c201ee3bb0323de19946175bb0c4e4abda5b637574064c89c0cd12af.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1905791638",
+      "title": "Alien Breed: Impact",
+      "url": "/en/game/alien_breed_impact",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0fb186d525423f2c4d3ab5d071540278108226102bf76700625ed8c4d599ec12.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1906330252",
+      "title": "Haven Park",
+      "url": "/en/game/haven_park",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0c9dc9e333dc626b528af27505690a879439a1c729d1e7a69a53c57ccb8366a6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1909524379",
+      "title": "Call of Juarez",
+      "url": "/en/game/call_of_juarez",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/78a1dceebceefb8e407755c05bc3c2f1201bff3d5934b73128c6b769dc7e5d32.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1914671919",
+      "title": "XCOM®: Chimera Squad",
+      "url": "/en/game/xcom_chimera_squad",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/8ec88f51b7d94debcea299b199b66aa20ddc6d56d031421424f989965a71aec8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1919929332",
+      "title": "Phantasie Memorial Set",
+      "url": "/en/game/phantasie_memorial_set",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/17f517fcd967b2c4884528b856ca7a8c40028ca9e9054c2825a7110c3e68b25c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1921398290",
+      "title": "Gamedec - Definitive Edition",
+      "url": "/en/game/gamedec_1671062352",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/409843a41bcb1ccaa7a6124299395526714aa598cd281e526fcdba0cfe0fb548.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1939715083",
+      "title": "Hypnospace Outlaw",
+      "url": "/en/game/hypnospace_outlaw",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/4a2faf2abe0a25b392041c4b775d3445821fe2fc66b2662be41711bd84bda543.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1941294775",
+      "title": "SteamWorld Quest: Hand of Gilgamech",
+      "url": "/en/game/steamworld_quest_hand_of_gilgamech",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0dad23afc161fe0ad33cca31f6188751bb5b6841bc64ff4396a6a47a32b8dad8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1943729964",
+      "title": "Wolfenstein: The New Order",
+      "url": "/en/game/wolfenstein_the_new_order",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b2c4a0bae46c1432da6eddfd2783bfdb5ec91c04c72f712eb1b236aaf0d98519.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1947927225",
+      "title": "Quake II",
+      "url": "/en/game/quake_ii_quad_damage_1112936378",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/eaad37826db129a6477669a4fecae58e8507578eda7ede7c775622240f9146be.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1957528513",
+      "title": "Ghostrunner",
+      "url": "/en/game/ghostrunner",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/7df7cd41c64162bb09794f5c6811b4e99d3613eb5caddf5171ed8dd170aac5a7.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1969775197",
+      "title": "Fruitbus",
+      "url": "/en/game/fruitbus",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/764e8c108138e7a3cb9801f19d2f181df5aa57b3e24999d9ea0bf54f39f57597.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1971477531",
+      "title": "GWENT: The Witcher Card Game",
+      "url": "/en/game/gwent_the_witcher_card_game",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/934e329b61f010fb039c7a6d82b477ad254bf70a5e0a0709b4c43524645f2a42.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1974250642",
+      "title": "FRAMED Collection",
+      "url": "/en/game/framed_collection",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/911f07fd06069a082c09302a459d14c7b45ca47f6ce24d107c41e3d3b8eb0471.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1976780992",
+      "title": "Zoria: Age of Shattering",
+      "url": "/en/game/zoria_age_of_shattering",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/6414da59971a1633632044ff401a8827ad1dd43db8b3cfac82f062370f56a304.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1978178686",
+      "title": "Saints Row: Gat out of Hell",
+      "url": "/en/game/saints_row_gat_out_of_hell",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/622522f4593afcffde8bf2daf00c3c7acdb2d464c8e4e3a9d7d4404c40ffe9c2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1986509485",
+      "title": "The Outer Worlds: Spacer’s Choice Edition",
+      "url": "/en/game/the_outer_worlds_spacers_choice_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/b632eaccd51b3d1a8b18e63663b30dd61642d7ef90bd7da90bd6f26c5b99cdd2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1993411830",
+      "title": "Weakless",
+      "url": "/en/game/weakless",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e94cde457905f664d248215e1b59f1788ab3c729ca36dd48b0c1e0faa03b2b9f.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "1993581340",
+      "title": "Mafia: Definitive Edition",
+      "url": "/en/game/mafia_definitive_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/7c0c8c9f4679cb22b49703c9fdc6a798ff291688d2b765cf5c27cf685cefcbd1.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2006298293",
+      "title": "Samorost 1",
+      "url": "/en/game/samorost_1",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/ed8121351be7442a1a0f46ee2f82d6986e8d5163620d58a306149a0064445a48.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2015389384",
+      "title": "Call of Juarez: Gunslinger",
+      "url": "/en/game/call_of_juarez_gunslinger",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/e22a3300003c8df631fd5b7970adc1735b71af2177528a8d575a52ebd24bce99.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2015545325",
+      "title": "DOOM I Enhanced",
+      "url": "/en/game/doom_doom_ii",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/2cbe0fc4f6726cbbd35bc3578bcefc6d33fe7138ca5bfc35c795087d738dfbd0.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2016844216",
+      "title": "CAYNE",
+      "url": "/en/game/cayne",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/cbcce9d6ab1b18f8c4a8630fa9b6f566b5fa61ac7e316ec2d39042377bc0e8eb.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2022341186",
+      "title": "BioShock™",
+      "url": "/en/game/bioshock_remastered_1157510446",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/68f8517c8391d0af43e3d219f387b04f50b1281d300696aedd08a160627d8166.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2028023186",
+      "title": "Agony",
+      "url": "/en/game/agony",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2037198195",
+      "title": "Fantasy Empires",
+      "url": "/en/game/fantasy_empires",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/94825f75829308a1c7aeca14b7380ba1422b84fa25dbb0f98d373645708b103d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2037689757",
+      "title": "Saints Row IV: Re-Elected",
+      "url": "/en/game/saints_row_iv_reelected",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/07f31cc8922f2b0f1a879ac01f7b6901174e46c7f71fc51ee567654e9c2de959.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2038001955",
+      "title": "Styx: Master of Shadows",
+      "url": "/en/game/styx_master_of_shadows",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/87c2bd831e65e36a46ae52a047d233674266da04c66502b0136a3ab0b285d932.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2049187585",
+      "title": "Control Ultimate Edition",
+      "url": "/en/game/control_ultimate_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/6e6dbbd1637253394627e72c2b99f39d5c89e160ef07ca0d7823ad7603062496.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2050639399",
+      "title": "FATE",
+      "url": "/en/game/fate",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/6eab5cbbc9ecb873792c7f6d6e42e732b7cfbd270927a41660fc15266c5c1d69.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2056019722",
+      "title": "House Party",
+      "url": "/en/game/house_party",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/0aeeb92fc8b8002ddddb9836c7d1df6f05dc81393a8f38b86938d17a07301c12.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2069516170",
+      "title": "Symphonia (Student Project, 2020)",
+      "url": "/en/game/symphonia_2020",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/b3e0bc00ddf8d56fbdf5c60189bd04d2d152dc2b65cf185933b10f9e448117b3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2081410845",
+      "title": "The Last Spell",
+      "url": "/en/game/the_last_spell",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f647c8876dd970c4c051922637f542b8df7e577698d599a05a7f50bd765e13f2.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2085372274",
+      "title": "Siege of Avalon: Anthology",
+      "url": "/en/game/siege_of_avalon_anthology",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f449033cc14903a26073176222b1b109716f5d8e00b4989d7281c048047c4e2d.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2085685147",
+      "title": "DragonStrike",
+      "url": "/en/game/dragonstrike",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/6f36176c7b28a8db6bd4d23925a3d55ffb136e450228dece7c59b5d520d886a8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2089001920",
+      "title": "Immortal Redneck",
+      "url": "/en/game/immortal_redneck",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/f8387855fa8cadfccb422a584e079f00fec37380adba91a47c72a6d06c8fb8ef.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2090261953",
+      "title": "Styx: Shards of Darkness",
+      "url": "/en/game/styx_shards_of_darkness",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/11b4528bbb6454703c0a0ac95e711acce476f0b98cccd71d1fa744d9a4c671f3.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2095741221",
+      "title": "LEGO® The Lord of the Rings™",
+      "url": "/en/game/lego_the_lord_of_the_rings",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/7820c4b577553997327cf5919e1628fc052062e1c4af421992b3d35a7944c7b6.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2105995113",
+      "title": "Veil of Darkness",
+      "url": "/en/game/veil_of_darkness",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/5732e3926bb088833b84f5c67657ae7cecc63639f2f0cb8c1f70062ce4eb8bd8.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2114035213",
+      "title": "THE KING OF FIGHTERS 2002",
+      "url": "/en/game/the_king_of_fighters_2002",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/bbba2ce5901fe222dc2493997192189215e5c8e3b576dc37ed1c1023764ee995.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2119193622",
+      "title": "LEGO® Star Wars™ III - The Clone Wars™",
+      "url": "/en/game/lego_star_wars_the_clone_wars",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/835a0947eda2ed8f1d6b6d6f656c2cbe21da54857376fcdb279989bd5b89fc9c.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2121320116",
+      "title": "Pinball Spire",
+      "url": "/en/game/pinball_spire",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/c1c095aa9760c31002088b35a853c3346e8395c216f85eba33f5102833f85514.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2121564020",
+      "title": "Flashout 3D: Enhanced Edition",
+      "url": "/en/game/flashout_3d_enhanced_edition",
+      "achievementSupport": true,
+      "image": "https://images.gog-statics.com/09011753df7ead3ab93e9d0fbaaad9f4fe3ceb31f09b130742b35af300780150.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2125877931",
+      "title": "Heroes of the Lance",
+      "url": "/en/game/silver_box_classics_1081970496",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/0728b346eb5e5cebc8f334357440030f4f35b4cef6ea0919ab795062b8fff14b.png"
+    },
+    "stats": []
+  },
+  {
+    "game": {
+      "id": "2147483047",
+      "title": "Moonlighter",
+      "url": "/en/game/moonlighter",
+      "achievementSupport": false,
+      "image": "https://images.gog-statics.com/d932080bc0bcec83e1fec96bda27caa6a576949b627bfe035b9d62ae7c63c1ad.png"
+    },
+    "stats": []
+  }
+]
