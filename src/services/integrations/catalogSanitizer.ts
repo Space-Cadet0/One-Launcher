@@ -2,6 +2,7 @@ import { CanonicalGame } from '../../contracts/game';
 import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
+import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -126,6 +127,66 @@ for (const g of EPIC_USER_LIBRARY) {
     }
   }
 }
+
+const validSteamAppIds = new Set<number>();
+const validSteamTitles = new Set<string>();
+for (const g of FULL_USER_STEAM_GAMES) {
+  if (g.steamAppId) validSteamAppIds.add(g.steamAppId);
+  validSteamTitles.add(normalizeCanonicalTitle(g.title));
+}
+
+/**
+ * Blacklist of unowned promotional artwork, free trials, and EA Play marketing AppIDs
+ * that bleed into local Steam client librarycache but are not owned entitlements.
+ */
+export const UNOWNED_STEAM_PROMO_APP_IDS = new Set<number>([
+  1222680, // Need for Speed™ Heat
+  1222700, // A Way Out
+  1385510, // Back 4 Blood Beta
+  1238820, // Battlefield 3™
+  1238860, // Battlefield 4™
+  1238840, // Battlefield™ 1
+  1238880, // Battlefield™ Hardline
+  368900,  // Brilliant Bob
+  2398450, // Classic Marathon
+  1213210, // Command & Conquer™ Remastered Collection
+  17300,   // Crysis (2007)
+  108800,  // Crysis 2 Maximum Edition
+  1282690, // Crysis® 3
+  17470,   // Dead Space (2008)
+  47780,   // Dead Space 2
+  1238060, // Dead Space™ 3
+  1872550, // Destroy All Humans! – Clone Carnage
+  570,     // Dota 2
+  1238040, // Dragon Age II: Ultimate Edition
+  47810,   // Dragon Age: Origins - Ultimate Edition
+  1222690, // Dragon Age™ Inquisition
+  1225580, // Fe
+  397620,  // GooCubelets
+  2477290, // Half-Life 2 RTX
+  7110,    // Jade Empire: Special Edition
+  17460,   // Mass Effect (2007)
+  24980,   // Mass Effect 2 (2010)
+  2362420, // Mass Effect 2 (2010) Edition
+  1238020, // Mass Effect 3 (2012)
+  1238000, // Mass Effect™: Andromeda
+  17410,   // Mirror's Edge (2008)
+  1233570, // Mirror's Edge™ Catalyst
+  2215490, // Project Borealis: Prologue
+  1225590, // Sea of Solitude
+  480,     // Spacewar
+  17390,   // Spore
+  1172380, // STAR WARS Jedi: Fallen Order™
+  1237980, // STAR WARS™ Battlefront™
+  440,     // Team Fortress 2
+  298180,  // The Desolate Hope
+  1237970, // Titanfall® 2
+  1454890, // Titanfall™
+  1225560, // Unravel
+  1225570, // Unravel Two
+  331710,  // Why So Evil
+  354850,  // Why So Evil 2: Dystopia
+]);
 
 /**
  * Sanitizes the catalog:
@@ -327,6 +388,23 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       };
     }
 
+    // Disambiguate / normalize Prey (fix wrong steamAppId 474960 -> 480490)
+    if (
+      currentTitleLower === 'prey' ||
+      normTitle === 'prey' ||
+      game.steamAppId === 474960 ||
+      game.id === 'steam-474960'
+    ) {
+      game = {
+        ...game,
+        id: 'steam-480490',
+        steamAppId: 480490,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
+      };
+    }
+
     // Disambiguate / normalize Heretic + Hexen (newer hashed Steam assets)
     if (
       currentTitleLower === 'heretic + hexen' ||
@@ -513,14 +591,45 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       }
     }
 
+    // 8. Purge false Steam platform presence from unowned Steam titles, demos, and promo cache
+    if (game.platforms.some((p) => p.platformId === 'steam')) {
+      const steamPlatform = game.platforms.find((p) => p.platformId === 'steam');
+      const appId =
+        game.steamAppId ||
+        (steamPlatform?.platformGameId && !isNaN(Number(steamPlatform.platformGameId))
+          ? Number(steamPlatform.platformGameId)
+          : undefined);
+
+      const isUnownedPromo = appId ? UNOWNED_STEAM_PROMO_APP_IDS.has(appId) : false;
+      const isRealSteamGame = appId ? validSteamAppIds.has(appId) : validSteamTitles.has(normTitle);
+
+      if (isUnownedPromo || !isRealSteamGame) {
+        game = {
+          ...game,
+          steamAppId: undefined,
+          platforms: game.platforms.filter((p) => p.platformId !== 'steam'),
+        };
+        if (game.platforms.length === 0) continue;
+      }
+    }
+
     normTitle = normalizeCanonicalTitle(game.title);
 
-    // 8. Intelligent cross-store deduplication by Steam App ID and Normalized Title
+    // 9. Intelligent cross-store deduplication by Steam App ID and Normalized Title
     const existingIndex =
       (game.steamAppId && steamIdToIndex.has(game.steamAppId)
         ? steamIdToIndex.get(game.steamAppId)
         : undefined) ??
-      (normTitle && titleToIndex.has(normTitle) ? titleToIndex.get(normTitle) : undefined);
+      (normTitle && titleToIndex.has(normTitle)
+        ? (() => {
+            const idx = titleToIndex.get(normTitle)!;
+            const existing = cleaned[idx];
+            if (existing && existing.steamAppId && game.steamAppId && existing.steamAppId !== game.steamAppId) {
+              return undefined;
+            }
+            return idx;
+          })()
+        : undefined);
 
     if (existingIndex !== undefined && cleaned[existingIndex]) {
       // Merge platforms across duplicates

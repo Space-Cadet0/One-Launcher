@@ -3,6 +3,7 @@ import { CanonicalGame } from './contracts/game';
 import { StorefrontId } from './contracts/platform';
 import { GameCollection } from './contracts/collection';
 import { mergeScannedSteamGames } from './services/storage/librarySync';
+import { FULL_USER_STEAM_GAMES } from './services/storage/fullUserSteamGames';
 import { loadCollections, saveCollections } from './services/storage/collectionStorage';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
 import { cacheUserSteamAchievements, getKnownSteamAchievements } from './services/storage/knownGameAchievements';
@@ -55,6 +56,11 @@ export function App() {
               platforms: g.platforms.map((p) => ({ ...p, installed: false })),
             }));
           let sanitized = sanitizeGameCatalog(mergeScannedSteamGames(cleaned));
+
+          const steamCount = sanitized.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'steam')).length;
+          if (steamCount !== FULL_USER_STEAM_GAMES.length) {
+            sanitized = sanitizeGameCatalog(mergeScannedSteamGames(sanitized));
+          }
 
           const gogCount = sanitized.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'gog')).length;
           if (gogCount !== GOG_USER_LIBRARY.length) {

@@ -62,6 +62,21 @@ for (const g of epicGames) {
   }
 }
 
+const validSteamAppIds = new Set();
+const validSteamTitles = new Set();
+for (const g of steamGames) {
+  if (g.steamAppId) validSteamAppIds.add(g.steamAppId);
+  validSteamTitles.add(normalizeCanonicalTitle(g.title));
+}
+
+const UNOWNED_STEAM_PROMO_APP_IDS = new Set([
+  1222680, 1222700, 1385510, 1238820, 1238860, 1238840, 1238880, 368900, 2398450,
+  1213210, 17300, 108800, 1282690, 17470, 47780, 1238060, 1872550, 570, 1238040,
+  47810, 1222690, 1225580, 397620, 2477290, 7110, 17460, 24980, 2362420, 1238020,
+  1238000, 17410, 1233570, 2215490, 1225590, 480, 17390, 1172380, 1237980, 440,
+  298180, 1237970, 1454890, 1225560, 1225570, 331710, 354850
+]);
+
 function sanitizeGameCatalog(catalog) {
   if (!Array.isArray(catalog)) return [];
   const cleaned = [];
@@ -143,6 +158,20 @@ function sanitizeGameCatalog(catalog) {
       if (game.platforms.length === 0) continue;
     }
 
+    // Disambiguate / normalize Prey (fix wrong steamAppId 474960 -> 480490)
+    if (
+      currentTitleLower === 'prey' ||
+      normTitle === 'prey' ||
+      game.steamAppId === 474960 ||
+      game.id === 'steam-474960'
+    ) {
+      game = {
+        ...game,
+        id: 'steam-480490',
+        steamAppId: 480490,
+      };
+    }
+
     // 6. GOG platform ownership validation
     if (game.platforms.some(p => p.platformId === 'gog')) {
       const gogPlat = game.platforms.find(p => p.platformId === 'gog');
@@ -182,12 +211,43 @@ function sanitizeGameCatalog(catalog) {
       }
     }
 
+    // Purge false Steam platform presence from unowned Steam titles, demos, and promo cache
+    if (game.platforms.some((p) => p.platformId === 'steam')) {
+      const steamPlatform = game.platforms.find((p) => p.platformId === 'steam');
+      const appId =
+        game.steamAppId ||
+        (steamPlatform?.platformGameId && !isNaN(Number(steamPlatform.platformGameId))
+          ? Number(steamPlatform.platformGameId)
+          : undefined);
+
+      const isUnownedPromo = appId ? UNOWNED_STEAM_PROMO_APP_IDS.has(appId) : false;
+      const isRealSteamGame = appId ? validSteamAppIds.has(appId) : validSteamTitles.has(normTitle);
+
+      if (isUnownedPromo || !isRealSteamGame) {
+        game = {
+          ...game,
+          steamAppId: undefined,
+          platforms: game.platforms.filter((p) => p.platformId !== 'steam'),
+        };
+        if (game.platforms.length === 0) continue;
+      }
+    }
+
     normTitle = normalizeCanonicalTitle(game.title);
 
     // 8. Deduplication
     const existingIndex =
       (game.steamAppId && steamIdToIndex.has(game.steamAppId) ? steamIdToIndex.get(game.steamAppId) : undefined) ??
-      (normTitle && titleToIndex.has(normTitle) ? titleToIndex.get(normTitle) : undefined);
+      (normTitle && titleToIndex.has(normTitle)
+        ? (() => {
+            const idx = titleToIndex.get(normTitle);
+            const existing = cleaned[idx];
+            if (existing && existing.steamAppId && game.steamAppId && existing.steamAppId !== game.steamAppId) {
+              return undefined;
+            }
+            return idx;
+          })()
+        : undefined);
 
     if (existingIndex !== undefined && cleaned[existingIndex]) {
       const existing = cleaned[existingIndex];

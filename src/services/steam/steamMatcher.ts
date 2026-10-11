@@ -47,7 +47,7 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'dishonored - definitive edition': 205100,
   'dishonored 2': 403640,
   'dishonored: death of the outsider': 614570,
-  'prey': 474960,
+  'prey': 480490,
 
   // Epic / Remedy / 505
   'doki doki literature club plus!': 1388880,

@@ -12,10 +12,18 @@ function loadExportedArray(filePath, exportName) {
 
 const gogGames = loadExportedArray('./src/services/storage/gogUserLibrary.ts', 'GOG_USER_LIBRARY');
 const epicGames = loadExportedArray('./src/services/storage/epicUserLibrary.ts', 'EPIC_USER_LIBRARY');
+const steamGames = loadExportedArray('./src/services/storage/fullUserSteamGames.ts', 'FULL_USER_STEAM_GAMES');
 
 console.log('--- RAW LIBRARIES ---');
 console.log(`GOG_USER_LIBRARY length: ${gogGames.length}`);
 console.log(`EPIC_USER_LIBRARY length: ${epicGames.length}`);
+console.log(`FULL_USER_STEAM_GAMES length: ${steamGames.length}`);
+
+// Test Steam games integrity
+const nfsHeatInSteam = steamGames.filter(g => g.steamAppId === 1222680 || g.title.toLowerCase().includes('need for speed'));
+console.log(`Need for Speed Heat in Steam library: ${nfsHeatInSteam.length} (Expected: 0)`);
+const bfInSteam = steamGames.filter(g => g.title.toLowerCase().includes('battlefield'));
+console.log(`Battlefield in Steam library: ${bfInSteam.length} (Expected: 0)`);
 
 // Test duplicate titles within GOG
 const gogTitles = new Set();

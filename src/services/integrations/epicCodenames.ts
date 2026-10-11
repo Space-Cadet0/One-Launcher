@@ -1083,13 +1083,13 @@ export const KNOWN_EPIC_APP_NAMES: Record<string, EpicCodenameMapping> = {
   },
   "52d88e9a6df248da913c8e99f1e4c526": {
     "title": "PREY",
-    "steamAppId": 474960,
+    "steamAppId": 480490,
     "developer": "Bethesda Softworks LLC",
     "description": "PREY"
   },
   "ebaf29e138a446d3a2d523668ab05ddc": {
     "title": "PREY",
-    "steamAppId": 474960,
+    "steamAppId": 480490,
     "developer": "Bethesda Softworks LLC",
     "description": "PREY"
   },

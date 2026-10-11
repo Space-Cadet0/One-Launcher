@@ -175,6 +175,11 @@ export function loadCurrentCatalog(): CanonicalGame[] {
         // Automatically sanitize stored catalog (purges hex hashes like c5109bdceb3a453bb38c2fdc964ddee8 and Fortnite DLCs)
         let cleaned = sanitizeGameCatalog(parsed);
 
+        const steamCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'steam')).length;
+        if (steamCount !== FULL_USER_STEAM_GAMES.length) {
+          cleaned = sanitizeGameCatalog(mergeScannedSteamGames(cleaned));
+        }
+
         const gogCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'gog')).length;
         if (gogCount !== GOG_USER_LIBRARY.length) {
           cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, GOG_USER_LIBRARY, 'gog'));
