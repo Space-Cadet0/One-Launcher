@@ -282,10 +282,30 @@ ipcMain.handle('auth:storefront', async (_event, storefrontId) => {
       if (storefrontId === 'epic' && url.includes('/id/api/redirect')) {
         try {
           const pageSource = await authWindow.webContents.executeJavaScript('document.body.innerText');
-          if (pageSource && pageSource.includes('authorizationCode')) {
-            const json = JSON.parse(pageSource);
-            if (json.authorizationCode) {
-              handleAuthCodeFound(json.authorizationCode);
+          if (pageSource) {
+            const match = pageSource.match(/"authorizationCode"\s*:\s*"([a-fA-F0-9]{32})"/i)
+              || pageSource.match(/\b([a-fA-F0-9]{32})\b/);
+            if (match) {
+              handleAuthCodeFound(match[1]);
+              return;
+            }
+          }
+        } catch {}
+      }
+    });
+
+    authWindow.webContents.on('did-finish-load', async () => {
+      const currentUrl = authWindow.webContents.getURL();
+      checkUrlForCode(currentUrl);
+
+      if (storefrontId === 'epic' && currentUrl.includes('/id/api/redirect')) {
+        try {
+          const pageSource = await authWindow.webContents.executeJavaScript('document.body.innerText');
+          if (pageSource) {
+            const match = pageSource.match(/"authorizationCode"\s*:\s*"([a-fA-F0-9]{32})"/i)
+              || pageSource.match(/\b([a-fA-F0-9]{32})\b/);
+            if (match) {
+              handleAuthCodeFound(match[1]);
               return;
             }
           }
