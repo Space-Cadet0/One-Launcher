@@ -9434,7 +9434,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     }
   },
   {
-    "id": "steam-474960",
+    "id": "steam-480490",
     "title": "Prey",
     "sortTitle": "Prey",
     "platforms": [
@@ -9445,8 +9445,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/474960/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/474960/library_600x900_2x.jpg",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg",
     "shortDescription": "Action on GOG.com (DRM-Free)",
     "releaseDate": "2017-05-04",
     "developers": [
@@ -9477,7 +9477,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       "Survival Horror",
       "Psychological Horror"
     ],
-    "steamAppId": 474960,
+    "steamAppId": 480490,
     "reviewSummary": {
       "reviewScore": 4,
       "reviewScoreDesc": "Positive",

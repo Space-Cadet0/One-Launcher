@@ -7338,10 +7338,10 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ]
   },
   {
-    "id": "steam-474960",
+    "id": "steam-480490",
     "title": "PREY",
     "sortTitle": "PREY",
-    "steamAppId": 474960,
+    "steamAppId": 480490,
     "platforms": [
       {
         "platformId": "epic",
@@ -7350,8 +7350,8 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/474960/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/474960/library_600x900_2x.jpg",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg",
     "shortDescription": "PREY",
     "releaseDate": "2024-10-17",
     "developers": [
