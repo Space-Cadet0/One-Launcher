@@ -250,6 +250,7 @@ export function App() {
   const [installedOnly, setInstalledOnly] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isSyncingCurrentGame, setIsSyncingCurrentGame] = useState(false);
+  const [isSyncingAllMedia, setIsSyncingAllMedia] = useState(false);
   const [gameRefreshKey, setGameRefreshKey] = useState(0);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
@@ -826,6 +827,81 @@ export function App() {
     }
   };
 
+  // Synchronize official store media (screenshots, trailers, movies, descriptions) across library titles
+  const handleSyncAllMedia = async () => {
+    if (isSyncingAllMedia) return;
+    setIsSyncingAllMedia(true);
+    setSyncNotice('Starting store media sync (trailers, screenshots & descriptions)...');
+
+    try {
+      const eligibleGames = games.filter((g) => {
+        return Boolean(g.steamAppId || steamMatcher.matchGameToSteamInstant(g.title));
+      });
+
+      const totalEligible = eligibleGames.length;
+      setSyncNotice(`Syncing store media for ${totalEligible} library titles...`);
+
+      let updatedCount = 0;
+      const chunkSize = 5;
+      let updatedCatalog = [...games];
+
+      for (let i = 0; i < eligibleGames.length; i += chunkSize) {
+        const chunk = eligibleGames.slice(i, i + chunkSize);
+
+        await Promise.all(
+          chunk.map(async (game) => {
+            const targetAppId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+            if (!targetAppId) return;
+
+            try {
+              const refreshed = await steamApi.fetchGameMetadata(targetAppId);
+              if (refreshed) {
+                const idx = updatedCatalog.findIndex((g) => g.id === game.id);
+                if (idx >= 0) {
+                  const g = updatedCatalog[idx];
+                  updatedCatalog[idx] = {
+                    ...g,
+                    steamAppId: targetAppId,
+                    enrichedMetadata: refreshed || g.enrichedMetadata,
+                    headerImage: refreshed.headerImage || g.headerImage,
+                    capsuleImage: refreshed.capsuleImage || g.capsuleImage,
+                    shortDescription: refreshed.shortDescription || g.shortDescription,
+                    developers: refreshed.developers?.length ? refreshed.developers : g.developers,
+                    publishers: refreshed.publishers?.length ? refreshed.publishers : g.publishers,
+                    genres: refreshed.genres?.length ? refreshed.genres : g.genres,
+                    tags: refreshed.tags?.length ? refreshed.tags : g.tags,
+                    reviewSummary: refreshed.reviewSummary || g.reviewSummary,
+                  };
+                  updatedCount++;
+                }
+              }
+            } catch (err) {
+              console.warn(`Media sync failed for ${game.title}:`, err);
+            }
+          })
+        );
+
+        if (steamApi.isStoreRateLimited()) {
+          console.warn('Steam Store API rate limit reached, finishing with available cached media.');
+          break;
+        }
+      }
+
+      setGames(updatedCatalog);
+      saveCurrentCatalog(updatedCatalog);
+      setGameRefreshKey((prev) => prev + 1);
+
+      setSyncNotice(
+        `Store media sync complete! Refreshed trailers, screenshots & descriptions for ${updatedCount} titles.`
+      );
+    } catch (err: any) {
+      setSyncNotice(`Media sync notice: ${err?.message || 'Finished media sync'}`);
+    } finally {
+      setIsSyncingAllMedia(false);
+      setTimeout(() => setSyncNotice(null), 6000);
+    }
+  };
+
   const handleGameUpdated = (updatedGame: CanonicalGame) => {
     setGames((prev) => {
       const updated = prev.map((g) => (g.id === updatedGame.id ? updatedGame : g));
@@ -907,6 +983,8 @@ export function App() {
         canSyncCurrentGame={canSyncCurrentGame}
         isSyncingCurrentGame={isSyncingCurrentGame}
         onSyncCurrentGame={handleSyncCurrentGame}
+        isSyncingAllMedia={isSyncingAllMedia}
+        onSyncAllMedia={handleSyncAllMedia}
       />
 
       {/* Sync Status Banner */}

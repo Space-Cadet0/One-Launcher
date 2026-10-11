@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Menu,
+  Film,
 } from 'lucide-react';
 
 interface TopNavBarProps {
@@ -34,6 +35,8 @@ interface TopNavBarProps {
   canSyncCurrentGame?: boolean;
   isSyncingCurrentGame?: boolean;
   onSyncCurrentGame?: () => void;
+  isSyncingAllMedia?: boolean;
+  onSyncAllMedia?: () => void;
 }
 
 export const TopNavBar: React.FC<TopNavBarProps> = ({
@@ -57,6 +60,8 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   canSyncCurrentGame = false,
   isSyncingCurrentGame = false,
   onSyncCurrentGame,
+  isSyncingAllMedia = false,
+  onSyncAllMedia,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -136,14 +141,14 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               aria-expanded={isMenuOpen}
             >
               <Menu className="w-4 h-4" />
-              {isSyncing && (
+              {(isSyncing || isSyncingAllMedia || isSyncingCurrentGame) && (
                 <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
               )}
             </button>
 
             {/* Burger Dropdown Menu */}
             {isMenuOpen && (
-              <div className="absolute left-0 top-full mt-2 w-56 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-150">
+              <div className="absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-150">
                 {/* Brand Header */}
                 <div className="px-3.5 py-1.5 border-b border-steam-border/60 mb-1 flex items-center justify-between">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-steam-accent">One Launcher</span>
@@ -200,7 +205,40 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   )}
                 </button>
 
-                {/* Sync Current Game from Steam (Visible only when applicable) */}
+                {/* Sync Store Media (All Games) */}
+                {onSyncAllMedia && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onSyncAllMedia();
+                    }}
+                    disabled={isSyncingAllMedia}
+                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                    title="Sync trailers, high-res screenshots, movies & store descriptions from Steam across your library"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Film
+                        className={`w-4 h-4 ${
+                          isSyncingAllMedia
+                            ? 'animate-spin text-steam-accent'
+                            : 'text-purple-400 group-hover:scale-110 transition-transform'
+                        }`}
+                      />
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-white">
+                          {isSyncingAllMedia ? 'Syncing Media...' : 'Sync Store Media (All Games)'}
+                        </span>
+                        <span className="text-[10px] text-steam-subtext">Trailers, screenshots & descriptions</span>
+                      </div>
+                    </div>
+                    {isSyncingAllMedia && (
+                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    )}
+                  </button>
+                )}
+
+                {/* Sync Store Media (This Game) (Visible only when applicable) */}
                 {canSyncCurrentGame && onSyncCurrentGame && (
                   <button
                     type="button"
@@ -210,19 +248,19 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     }}
                     disabled={isSyncingCurrentGame}
                     className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
-                    title={`Re-sync ${currentGameTitle || 'current game'} from Steam`}
+                    title={`Re-sync trailers, screenshots, descriptions & achievements for ${currentGameTitle || 'current game'} from Steam`}
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <RefreshCw
+                      <Film
                         className={`w-4 h-4 shrink-0 ${
                           isSyncingCurrentGame
                             ? 'animate-spin text-steam-accent'
-                            : 'text-sky-400 group-hover:rotate-45 transition-transform'
+                            : 'text-sky-400 group-hover:scale-110 transition-transform'
                         }`}
                       />
                       <div className="flex flex-col min-w-0">
                         <span className="font-semibold text-white truncate">
-                          {isSyncingCurrentGame ? 'Syncing Steam...' : 'Sync from Steam'}
+                          {isSyncingCurrentGame ? 'Syncing Media...' : 'Sync Store Media (This Game)'}
                         </span>
                         <span className="text-[10px] text-steam-subtext truncate">
                           {currentGameTitle || 'Current game'}
