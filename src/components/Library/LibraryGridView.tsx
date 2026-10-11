@@ -1,6 +1,7 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
+import { StorefrontId } from '../../contracts/platform';
 import {
   Gamepad2,
   Clock,
@@ -13,6 +14,7 @@ import {
   X,
   Sliders,
   Award,
+  AlertCircle,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { ActiveGameFilter } from '../../contracts/filter';
@@ -28,6 +30,7 @@ interface LibraryGridViewProps {
   onClearGroupFilter?: () => void;
   activeFilter?: ActiveGameFilter | null;
   onClearActiveFilter?: () => void;
+  connectedStorefronts?: StorefrontId[];
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -40,8 +43,16 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   onClearGroupFilter,
   activeFilter,
   onClearActiveFilter,
+  connectedStorefronts,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const connectedSet = useMemo(() => {
+    if (connectedStorefronts && connectedStorefronts.length > 0) {
+      return new Set<StorefrontId>(connectedStorefronts);
+    }
+    return new Set<StorefrontId>(['steam', 'gog']);
+  }, [connectedStorefronts]);
   const [hoveredGame, setHoveredGame] = useState<CanonicalGame | null>(null);
   const [previewPos, setPreviewPos] = useState<{ x: number; y: number; align: 'left' | 'right' }>({
     x: 0,
@@ -327,11 +338,36 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
                   {/* Top Header: Installed status badge if installed */}
                   {isInstalled && (
-                    <div className="absolute top-2 left-2 flex items-center gap-1 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow">
+                    <div className="absolute top-2 left-2 flex items-center gap-1 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow z-10">
                       <CheckCircle2 className="w-2.5 h-2.5" />
                       <span>Ready</span>
                     </div>
                   )}
+
+                  {/* Top-Left: Storefront Not Connected Badge */}
+                  {(() => {
+                    const isAllDisconnected =
+                      game.platforms.length > 0 &&
+                      game.platforms.every((p) => !connectedSet.has(p.platformId));
+                    if (!isAllDisconnected) return null;
+                    const storeName =
+                      game.platforms.length === 1
+                        ? getStorefrontDisplayName(game.platforms[0].platformId)
+                        : 'Store';
+                    return (
+                      <div
+                        className={`absolute ${
+                          isInstalled ? 'top-8' : 'top-2'
+                        } left-2 flex items-center gap-1 bg-amber-950/90 border border-amber-500/70 text-amber-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow-lg backdrop-blur-sm z-10`}
+                        title={`Storefront account not connected (${game.platforms
+                          .map((p) => getStorefrontDisplayName(p.platformId))
+                          .join(', ')})`}
+                      >
+                        <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+                        <span>{storeName} (Not Connected)</span>
+                      </div>
+                    );
+                  })()}
 
                   {/* Top-Right: OpenCritic Score Pill */}
                   {(() => {
@@ -360,16 +396,34 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
                   {/* Overlayed Bottom-Right: Storefront Icons Game is Owned On */}
                   <div
-                    className="absolute bottom-2 right-2 flex items-center gap-1 bg-black/85 backdrop-blur-md px-2 py-1 rounded border border-white/20 shadow-lg pointer-events-none group-hover:border-steam-accent/60 transition-colors"
-                    title={`Owned on: ${game.platforms.map((p) => getStorefrontDisplayName(p.platformId)).join(', ')}`}
+                    className="absolute bottom-2 right-2 flex items-center gap-1.5 bg-black/85 backdrop-blur-md px-2 py-1 rounded border border-white/20 shadow-lg pointer-events-none group-hover:border-steam-accent/60 transition-colors z-10"
+                    title={`Owned on: ${game.platforms
+                      .map((p) => {
+                        const name = getStorefrontDisplayName(p.platformId);
+                        const isConn = connectedSet.has(p.platformId);
+                        return isConn ? name : `${name} (Not Connected)`;
+                      })
+                      .join(', ')}`}
                   >
-                    {game.platforms.map((p) => (
-                      <StorefrontIcon
-                        key={p.platformId}
-                        storefrontId={p.platformId}
-                        className="w-3.5 h-3.5 text-white/90 drop-shadow"
-                      />
-                    ))}
+                    {game.platforms.map((p) => {
+                      const isPlatConnected = connectedSet.has(p.platformId);
+                      return (
+                        <div key={p.platformId} className="relative flex items-center">
+                          <StorefrontIcon
+                            storefrontId={p.platformId}
+                            className={`w-3.5 h-3.5 drop-shadow ${
+                              isPlatConnected ? 'text-white/90' : 'text-amber-200/80'
+                            }`}
+                          />
+                          {!isPlatConnected && (
+                            <span
+                              className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-amber-400 ring-1 ring-black"
+                              title="Not Connected"
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
 
                   {/* Hover Quick Action Indicator */}
@@ -431,6 +485,20 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               </span>
             </div>
           </div>
+
+          {/* Disconnected Storefront Notice Banner */}
+          {hoveredGame.platforms.some((p) => !connectedSet.has(p.platformId)) && (
+            <div className="px-3 py-1.5 bg-amber-950/70 border-b border-amber-600/40 text-[11px] text-amber-300 flex items-center gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span>
+                {hoveredGame.platforms
+                  .filter((p) => !connectedSet.has(p.platformId))
+                  .map((p) => getStorefrontDisplayName(p.platformId))
+                  .join(', ')}{' '}
+                (Not Connected)
+              </span>
+            </div>
+          )}
 
           {/* Details Body */}
           <div className="p-3.5 space-y-3 text-xs">
@@ -506,16 +574,29 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               <span className="text-steam-subtext text-[10px] uppercase font-bold tracking-wider">
                 Owned on:
               </span>
-              <div className="flex items-center gap-1.5">
-                {hoveredGame.platforms.map((p) => (
-                  <div
-                    key={p.platformId}
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/50 border border-white/10 text-[10px] text-white"
-                  >
-                    <StorefrontIcon storefrontId={p.platformId} className="w-3 h-3 text-sky-400" />
-                    <span>{getStorefrontDisplayName(p.platformId)}</span>
-                  </div>
-                ))}
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                {hoveredGame.platforms.map((p) => {
+                  const isConnected = connectedSet.has(p.platformId);
+                  return (
+                    <div
+                      key={p.platformId}
+                      className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] ${
+                        isConnected
+                          ? 'bg-black/50 border-white/10 text-white'
+                          : 'bg-amber-950/40 border-amber-500/40 text-amber-200'
+                      }`}
+                    >
+                      <StorefrontIcon
+                        storefrontId={p.platformId}
+                        className={`w-3 h-3 ${isConnected ? 'text-sky-400' : 'text-amber-400'}`}
+                      />
+                      <span>{getStorefrontDisplayName(p.platformId)}</span>
+                      {!isConnected && (
+                        <span className="text-[9px] text-amber-400 font-semibold">(Not Connected)</span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
 

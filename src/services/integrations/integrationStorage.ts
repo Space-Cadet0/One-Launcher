@@ -50,8 +50,8 @@ export const DEFAULT_INTEGRATIONS: StorefrontIntegration[] = [
     storefrontId: 'epic',
     name: 'Epic Games Store',
     isConnected: false,
-    gamesCount: 0,
-    statusMessage: 'Ready to connect via official Epic Games sign-in',
+    gamesCount: EPIC_USER_LIBRARY.length,
+    statusMessage: 'Not Connected (Baseline catalog in library)',
   },
   {
     storefrontId: 'xbox',
@@ -98,7 +98,9 @@ export function loadIntegrations(): StorefrontIntegration[] {
         if (item.storefrontId === 'epic') {
           const hasOAuth = Boolean(item.credentials?.epicToken || item.credentials?.epicRefreshToken);
           if (!hasOAuth) {
-            if (item.isConnected || item.gamesCount > 0) {
+            const isExplicitlyDisconnected = item.statusMessage === 'Disconnected';
+            const count = isExplicitlyDisconnected ? 0 : (item.gamesCount || EPIC_USER_LIBRARY.length);
+            if (item.isConnected) {
               changed = true;
             }
             return {
@@ -107,11 +109,13 @@ export function loadIntegrations(): StorefrontIntegration[] {
               accountName: undefined,
               accountId: undefined,
               avatarUrl: undefined,
-              gamesCount: 0,
+              gamesCount: count,
               lastSyncedAt: undefined,
               credentials: undefined,
               authMethod: 'oauth' as const,
-              statusMessage: 'Ready to connect via official Epic Games sign-in',
+              statusMessage: isExplicitlyDisconnected
+                ? 'Disconnected'
+                : 'Not Connected (Baseline catalog in library)',
             };
           }
         }
@@ -124,8 +128,8 @@ export function loadIntegrations(): StorefrontIntegration[] {
           storefrontId: 'epic',
           name: 'Epic Games Store',
           isConnected: false,
-          gamesCount: 0,
-          statusMessage: 'Ready to connect via official Epic Games sign-in',
+          gamesCount: EPIC_USER_LIBRARY.length,
+          statusMessage: 'Not Connected (Baseline catalog in library)',
         });
       }
 
@@ -150,15 +154,13 @@ export function saveIntegrations(integrations: StorefrontIntegration[]): void {
 }
 
 export function loadCurrentCatalog(): CanonicalGame[] {
-  const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
-  const epicConnected = epicInteg ? epicInteg.isConnected : false;
-
   let defaultBase = sanitizeGameCatalog(
-    mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog')
+    mergeStorefrontGames(
+      mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
+      EPIC_USER_LIBRARY,
+      'epic'
+    )
   );
-  if (epicConnected) {
-    defaultBase = sanitizeGameCatalog(mergeStorefrontGames(defaultBase, EPIC_USER_LIBRARY, 'epic'));
-  }
 
   if (typeof window === 'undefined') return defaultBase;
   try {
@@ -179,13 +181,14 @@ export function loadCurrentCatalog(): CanonicalGame[] {
           cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, GOG_USER_LIBRARY, 'gog'));
         }
 
+        // Only restore Epic baseline if Epic was not explicitly disconnected by the user
+        const integrations = loadIntegrations();
+        const epicInteg = integrations.find((i) => i.storefrontId === 'epic');
+        const isExplicitlyDisconnected = epicInteg?.statusMessage === 'Disconnected';
+
         const epicCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'epic')).length;
-        if (epicConnected) {
-          if (epicCount < EPIC_USER_LIBRARY.length) {
-            cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
-          }
-        } else if (epicCount > 0) {
-          cleaned = sanitizeGameCatalog(removeStorefrontGames(cleaned, 'epic'));
+        if (!isExplicitlyDisconnected && epicCount < EPIC_USER_LIBRARY.length) {
+          cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
         }
 
         saveCurrentCatalog(cleaned);

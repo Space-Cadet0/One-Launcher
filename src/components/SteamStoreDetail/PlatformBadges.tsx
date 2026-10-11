@@ -95,6 +95,7 @@ interface PlatformBadgesProps {
   size?: 'sm' | 'md' | 'lg';
   layout?: 'horizontal' | 'vertical-stacked';
   iconOnly?: boolean;
+  connectedStorefronts?: StorefrontId[];
 }
 
 export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
@@ -105,9 +106,17 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
   size = 'md',
   layout = 'horizontal',
   iconOnly = false,
+  connectedStorefronts,
 }) => {
   const effectiveTitle = gameTitle || game?.title;
   const effectiveSteamAppId = steamAppId || game?.steamAppId;
+
+  const connectedSet = React.useMemo(() => {
+    if (connectedStorefronts && connectedStorefronts.length > 0) {
+      return new Set<StorefrontId>(connectedStorefronts);
+    }
+    return new Set<StorefrontId>(['steam', 'gog']);
+  }, [connectedStorefronts]);
 
   const handleBadgeClick = (url: string | null, e: React.MouseEvent) => {
     if (!url) return;
@@ -128,6 +137,7 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
         {platforms.map((p) => {
           const name = getStorefrontDisplayName(p.platformId);
           const isInstalled = Boolean(p.installed);
+          const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
           const targetUrl = getStorefrontUrl(
             p.platformId,
             effectiveTitle,
@@ -149,12 +159,14 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
               } ${
                 isInstalled
                   ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:border-emerald-400'
-                  : 'border-[#2a475e] bg-[#16202d] text-slate-300 hover:border-sky-500/60 hover:text-white'
+                  : isPlatConnected
+                  ? 'border-[#2a475e] bg-[#16202d] text-slate-300 hover:border-sky-500/60 hover:text-white'
+                  : 'border-amber-600/50 bg-amber-950/30 text-amber-200 hover:border-amber-500'
               }`}
               title={
                 targetUrl
-                  ? `Open on ${name} • ${isInstalled ? 'Installed locally' : 'In Cloud Library'}${p.installPath ? ` (${p.installPath})` : ''}`
-                  : `${name} • ${isInstalled ? 'Installed locally' : 'In Cloud Library'}${p.installPath ? ` (${p.installPath})` : ''}`
+                  ? `Open on ${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${p.installPath ? ` (${p.installPath})` : ''}`
+                  : `${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${p.installPath ? ` (${p.installPath})` : ''}`
               }
             >
               <StorefrontIcon storefrontId={p.platformId} className="w-3.5 h-3.5 group-hover:scale-110 transition-transform" />
@@ -162,6 +174,12 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
                 <span
                   className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-400 ring-1 ring-[#101822]"
                   title="Installed locally"
+                />
+              )}
+              {!isPlatConnected && (
+                <span
+                  className="absolute -top-0.5 -left-0.5 w-2 h-2 rounded-full bg-amber-400 ring-1 ring-[#101822]"
+                  title="Storefront account not connected"
                 />
               )}
             </div>
@@ -176,6 +194,7 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
       <div className="flex flex-wrap items-center gap-2.5">
         {platforms.map((p) => {
           const name = getStorefrontDisplayName(p.platformId);
+          const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
           const targetUrl = getStorefrontUrl(
             p.platformId,
             effectiveTitle,
@@ -190,13 +209,15 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
               onKeyDown={(e) => handleKeyDown(targetUrl, e)}
               role={targetUrl ? 'button' : undefined}
               tabIndex={targetUrl ? 0 : undefined}
-              className={`flex flex-col items-center justify-center p-1.5 rounded bg-[#16202d]/90 hover:bg-[#1f2c3d] border border-steam-border/80 hover:border-steam-accent/70 transition-all shadow-sm group min-w-[54px] ${
+              className={`flex flex-col items-center justify-center p-1.5 rounded bg-[#16202d]/90 hover:bg-[#1f2c3d] border ${
+                isPlatConnected ? 'border-steam-border/80 hover:border-steam-accent/70' : 'border-amber-500/60'
+              } transition-all shadow-sm group min-w-[54px] ${
                 targetUrl ? 'cursor-pointer active:scale-95' : 'cursor-default'
               }`}
               title={
                 targetUrl
-                  ? `Open on ${name} • ${p.installed ? 'Installed locally' : 'In Cloud Library'}`
-                  : `${name} • ${p.installed ? 'Installed locally' : 'In Cloud Library'}`
+                  ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}`
+                  : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}`
               }
             >
               <div className="w-6 h-6 rounded flex items-center justify-center text-white/90 group-hover:text-steam-accent group-hover:scale-110 transition-all">
@@ -205,17 +226,23 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
               <span className="text-[10px] font-semibold text-steam-text/90 group-hover:text-white transition-colors text-center leading-tight mt-0.5">
                 {name}
               </span>
-              <div className="flex items-center gap-1 mt-0.5">
-                {p.installed ? (
-                  <span className="text-[9px] text-emerald-400 font-medium flex items-center gap-0.5">
-                    <CheckCircle2 className="w-2.5 h-2.5" /> Installed
-                  </span>
-                ) : (
-                  <span className="text-[9px] text-sky-400/80 font-medium flex items-center gap-0.5">
-                    <Cloud className="w-2.5 h-2.5" /> Cloud
-                  </span>
-                )}
-              </div>
+              {!isPlatConnected ? (
+                <span className="text-[9px] text-amber-400 font-semibold mt-0.5">
+                  Not Connected
+                </span>
+              ) : (
+                <div className="flex items-center gap-1 mt-0.5">
+                  {p.installed ? (
+                    <span className="text-[9px] text-emerald-400 font-medium flex items-center gap-0.5">
+                      <CheckCircle2 className="w-2.5 h-2.5" /> Installed
+                    </span>
+                  ) : (
+                    <span className="text-[9px] text-sky-400/80 font-medium flex items-center gap-0.5">
+                      <Cloud className="w-2.5 h-2.5" /> Cloud
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -226,6 +253,7 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {platforms.map((p) => {
+        const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
         const meta = STOREFRONT_REGISTRY[p.platformId as StorefrontId] || {
           name: p.platformId.toUpperCase(),
           badgeBg: 'bg-zinc-800 border-zinc-700',
@@ -260,12 +288,17 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
             }`}
             title={
               targetUrl
-                ? `Open on ${name} • ${p.installed ? 'Installed locally' : 'In Cloud Library'}${p.installPath ? ` (${p.installPath})` : ''}`
-                : `${name} • ${p.installed ? 'Installed locally' : 'In Cloud Library'}${p.installPath ? ` (${p.installPath})` : ''}`
+                ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${p.installPath ? ` (${p.installPath})` : ''}`
+                : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${p.installPath ? ` (${p.installPath})` : ''}`
             }
           >
             <StorefrontIcon storefrontId={p.platformId} className="w-3 h-3 group-hover:scale-110 transition-transform" />
             <span>{name}</span>
+            {!isPlatConnected && (
+              <span className="text-[9px] px-1 py-0.2 rounded bg-amber-950/70 text-amber-300 border border-amber-500/50 font-semibold">
+                Not Connected
+              </span>
+            )}
             {p.installed ? (
               <span className="flex items-center text-emerald-400" title="Installed">
                 <CheckCircle2 className="w-2.5 h-2.5" />

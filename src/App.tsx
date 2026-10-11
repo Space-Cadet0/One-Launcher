@@ -24,7 +24,6 @@ import {
   loadIntegrations,
   saveIntegrations,
   mergeStorefrontGames,
-  removeStorefrontGames,
   saveCurrentCatalog,
   connectGogIntegration,
   connectEpicIntegration,
@@ -75,16 +74,13 @@ export function App() {
             sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, GOG_USER_LIBRARY, 'gog'));
           }
 
-          const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
-          const epicConnected = epicInteg ? epicInteg.isConnected : false;
+          const integrations = loadIntegrations();
+          const epicInteg = integrations.find((i) => i.storefrontId === 'epic');
+          const isExplicitlyDisconnected = epicInteg?.statusMessage === 'Disconnected';
 
           const epicCount = sanitized.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'epic')).length;
-          if (epicConnected) {
-            if (epicCount < EPIC_USER_LIBRARY.length) {
-              sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, EPIC_USER_LIBRARY, 'epic'));
-            }
-          } else if (epicCount > 0) {
-            sanitized = sanitizeGameCatalog(removeStorefrontGames(sanitized, 'epic'));
+          if (!isExplicitlyDisconnected && epicCount < EPIC_USER_LIBRARY.length) {
+            sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, EPIC_USER_LIBRARY, 'epic'));
           }
 
           try {
@@ -96,15 +92,13 @@ export function App() {
         console.error('Failed to parse cached games:', e);
       }
     }
-    const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
-    const epicConnected = epicInteg ? epicInteg.isConnected : false;
-
-    let defaultCatalog = sanitizeGameCatalog(
-      mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog')
+    const defaultCatalog = sanitizeGameCatalog(
+      mergeStorefrontGames(
+        mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
+        EPIC_USER_LIBRARY,
+        'epic'
+      )
     );
-    if (epicConnected) {
-      defaultCatalog = sanitizeGameCatalog(mergeStorefrontGames(defaultCatalog, EPIC_USER_LIBRARY, 'epic'));
-    }
     try {
       localStorage.setItem('universal_game_library_catalog', JSON.stringify(defaultCatalog));
     } catch {}
@@ -267,21 +261,13 @@ export function App() {
   // Integrations modal state
   const [isIntegrationsModalOpen, setIsIntegrationsModalOpen] = useState(false);
 
-  // Connected storefronts based on integration state & library games
+  // Connected storefronts based strictly on authenticated integration state
   const connectedStorefronts = useMemo(() => {
     try {
       const integrations = loadIntegrations();
-      const connected = new Set<StorefrontId>(
-        integrations.filter((i) => i.isConnected).map((i) => i.storefrontId)
-      );
-      for (const game of games) {
-        for (const p of game.platforms) {
-          connected.add(p.platformId);
-        }
-      }
-      return Array.from(connected);
+      return integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
     } catch {
-      return ['steam', 'gog', 'epic'] as StorefrontId[];
+      return ['steam', 'gog'] as StorefrontId[];
     }
   }, [games, isIntegrationsModalOpen]);
 
@@ -992,6 +978,7 @@ export function App() {
         onGoForward={goForward}
         forwardTitle={forwardTitle}
         connectedStorefronts={connectedStorefronts}
+        games={games}
         currentGameTitle={!isGridView && selectedGame ? selectedGame.title : undefined}
         canSyncCurrentGame={canSyncCurrentGame}
         isSyncingCurrentGame={isSyncingCurrentGame}
@@ -1034,6 +1021,7 @@ export function App() {
           isGridView={isGridView}
           activeFilter={activeFilter}
           onClearActiveFilter={navigateClearFilter}
+          connectedStorefronts={connectedStorefronts}
         />
 
         {/* Right Main Pane: Steam Storefront Detail Layout OR Group/Whole Library Grid View */}
@@ -1087,6 +1075,7 @@ export function App() {
               onClearGroupFilter={activeGroupId ? navigateHome : undefined}
               activeFilter={activeFilter}
               onClearActiveFilter={navigateClearFilter}
+              connectedStorefronts={connectedStorefronts}
             />
           ) : (
             <SteamStorePage
@@ -1100,6 +1089,8 @@ export function App() {
                 navigateApplyFilter(filter);
               }}
               onGameUpdated={handleGameUpdated}
+              connectedStorefronts={connectedStorefronts}
+              onOpenIntegrations={() => setIsIntegrationsModalOpen(true)}
             />
           )}
         </main>

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
+import { CanonicalGame } from '../../contracts/game';
 import {
   RefreshCw,
   Layers,
@@ -31,6 +32,7 @@ interface TopNavBarProps {
   onGoForward?: () => void;
   forwardTitle?: string | null;
   connectedStorefronts?: StorefrontId[];
+  games?: CanonicalGame[];
   currentGameTitle?: string;
   canSyncCurrentGame?: boolean;
   isSyncingCurrentGame?: boolean;
@@ -56,6 +58,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onGoForward,
   forwardTitle,
   connectedStorefronts,
+  games,
   currentGameTitle,
   canSyncCurrentGame = false,
   isSyncingCurrentGame = false,
@@ -112,14 +115,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
         integrations.filter((i) => i.isConnected).map((i) => i.storefrontId)
       );
     } catch {
-      return new Set<StorefrontId>(['steam', 'gog', 'epic']);
+      return new Set<StorefrontId>(['steam', 'gog']);
     }
   }, [connectedStorefronts]);
 
-  // Only display 'all' and connected storefronts
+  // Set of storefronts with cataloged games in user's library
+  const storesInLibrary = useMemo(() => {
+    const set = new Set<StorefrontId>();
+    if (games) {
+      for (const g of games) {
+        for (const p of g.platforms) {
+          set.add(p.platformId);
+        }
+      }
+    }
+    return set;
+  }, [games]);
+
+  // Display 'all' and storefronts that are either connected OR present in library
   const visiblePlatforms: (StorefrontId | 'all')[] = useMemo(() => {
-    return ['all', ...allPlatforms.filter((p) => connectedSet.has(p))];
-  }, [connectedSet]);
+    return [
+      'all',
+      ...allPlatforms.filter((p) => connectedSet.has(p) || storesInLibrary.has(p)),
+    ];
+  }, [connectedSet, storesInLibrary]);
 
   return (
     <header className="sticky top-0 z-40 bg-[#171a21]/95 backdrop-blur-md border-b border-steam-border shadow-md select-none">
@@ -309,10 +328,11 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
           </div>
         </div>
 
-        {/* Center Section: Merged Storefront Filter Pills (Only Connected Storefronts) */}
+        {/* Center Section: Merged Storefront Filter Pills */}
         <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none min-w-0 flex-1 justify-start md:justify-center px-1">
           {visiblePlatforms.map((p) => {
             const isSelected = selectedPlatform === p;
+            const isConnected = p === 'all' || connectedSet.has(p);
             const meta = p === 'all' ? null : STOREFRONT_REGISTRY[p];
             const name = p === 'all' ? 'All Libraries' : meta?.name || p.toUpperCase();
 
@@ -320,13 +340,21 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               <button
                 key={p}
                 onClick={() => onSelectPlatform(p)}
-                className={`px-3 py-1 rounded text-xs whitespace-nowrap font-medium transition-all cursor-pointer ${
+                className={`px-3 py-1 rounded text-xs whitespace-nowrap font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
                   isSelected
                     ? 'bg-steam-accent text-black font-bold shadow-md shadow-steam-accent/20'
                     : 'bg-[#1b222d] text-steam-text hover:text-white hover:bg-[#253040] border border-steam-border/40'
                 }`}
               >
-                {name}
+                <span>{name}</span>
+                {!isConnected && (
+                  <span
+                    className="text-[9px] px-1 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-semibold"
+                    title="Storefront account not connected"
+                  >
+                    Not Connected
+                  </span>
+                )}
               </button>
             );
           })}

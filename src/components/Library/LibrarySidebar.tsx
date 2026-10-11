@@ -48,6 +48,7 @@ interface LibrarySidebarProps {
   isGridView?: boolean;
   activeFilter?: ActiveGameFilter | null;
   onClearActiveFilter?: () => void;
+  connectedStorefronts?: StorefrontId[];
 }
 
 export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
@@ -69,6 +70,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   isGridView = false,
   activeFilter,
   onClearActiveFilter,
+  connectedStorefronts,
 }) => {
   const [groupByCollections, setGroupByCollections] = useState(true);
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>(() => {
@@ -97,6 +99,13 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
   }, [isStoresDropdownOpen]);
+
+  const connectedSet = useMemo(() => {
+    if (connectedStorefronts && connectedStorefronts.length > 0) {
+      return new Set<StorefrontId>(connectedStorefronts);
+    }
+    return new Set<StorefrontId>(['steam', 'gog']);
+  }, [connectedStorefronts]);
 
   const platforms: (StorefrontId | 'all')[] = [
     'all',
@@ -234,6 +243,12 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                 title="Installed Locally"
               />
             )}
+            {game.platforms.length > 0 && game.platforms.every((p) => !connectedSet.has(p.platformId)) && (
+              <span
+                className="w-1.5 h-1.5 rounded-full bg-amber-400/90 flex-shrink-0"
+                title={`Storefront account not connected (${game.platforms.map((p) => STOREFRONT_REGISTRY[p.platformId]?.name || p.platformId).join(', ')})`}
+              />
+            )}
           </div>
         </div>
 
@@ -329,6 +344,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                 <div className="max-h-64 overflow-y-auto">
                   {platforms.map((p) => {
                     const isSelected = selectedPlatform === p;
+                    const isConnected = p === 'all' || connectedSet.has(p);
                     const name =
                       p === 'all'
                         ? 'All Stores'
@@ -345,15 +361,20 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                           isSelected ? 'text-steam-accent font-bold bg-[#141b24]' : 'text-steam-text'
                         }`}
                       >
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
                           {p !== 'all' ? (
-                            <StorefrontIcon storefrontId={p} className="w-3.5 h-3.5" />
+                            <StorefrontIcon storefrontId={p} className="w-3.5 h-3.5 shrink-0" />
                           ) : (
-                            <Filter className="w-3.5 h-3.5 text-steam-accent opacity-70" />
+                            <Filter className="w-3.5 h-3.5 text-steam-accent opacity-70 shrink-0" />
                           )}
-                          <span>{name}</span>
+                          <span className="truncate">{name}</span>
+                          {!isConnected && (
+                            <span className="text-[10px] text-amber-400 font-normal shrink-0">
+                              (Not Connected)
+                            </span>
+                          )}
                         </div>
-                        {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-steam-accent" />}
+                        {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-steam-accent shrink-0 ml-1.5" />}
                       </button>
                     );
                   })}
