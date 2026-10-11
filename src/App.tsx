@@ -121,12 +121,7 @@ export function App() {
     return 0;
   }, []);
 
-  // Navigation history & state stack with scroll restoration
-  const initialGame = useMemo(() => {
-    const initialGames = sanitizeGameCatalog(mergeScannedSteamGames([]));
-    return initialGames.find((g) => g.steamAppId === 1086940) || initialGames[0] || null;
-  }, []);
-
+  // Navigation history & state stack with scroll restoration: defaults to All Games gridview
   const {
     currentEntry,
     canGoBack,
@@ -140,11 +135,11 @@ export function App() {
     getLastAllGamesScrollY,
   } = useNavigationHistory(
     {
-      view: 'game',
-      selectedGameId: initialGame?.id || 'steam-1086940',
+      view: 'grid',
+      selectedGameId: null,
       activeFilter: null,
       activeGroupId: null,
-      title: initialGame?.title || "Baldur's Gate 3",
+      title: 'All Games',
       scrollY: 0,
     },
     getCurrentScroll
