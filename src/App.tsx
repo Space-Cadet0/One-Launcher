@@ -24,6 +24,7 @@ import {
   loadIntegrations,
   saveIntegrations,
   mergeStorefrontGames,
+  removeStorefrontGames,
   saveCurrentCatalog,
   connectGogIntegration,
   connectEpicIntegration,
@@ -74,9 +75,16 @@ export function App() {
             sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, GOG_USER_LIBRARY, 'gog'));
           }
 
+          const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
+          const epicConnected = epicInteg ? epicInteg.isConnected : false;
+
           const epicCount = sanitized.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'epic')).length;
-          if (epicCount < EPIC_USER_LIBRARY.length) {
-            sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, EPIC_USER_LIBRARY, 'epic'));
+          if (epicConnected) {
+            if (epicCount < EPIC_USER_LIBRARY.length) {
+              sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, EPIC_USER_LIBRARY, 'epic'));
+            }
+          } else if (epicCount > 0) {
+            sanitized = sanitizeGameCatalog(removeStorefrontGames(sanitized, 'epic'));
           }
 
           try {
@@ -88,13 +96,15 @@ export function App() {
         console.error('Failed to parse cached games:', e);
       }
     }
-    const defaultCatalog = sanitizeGameCatalog(
-      mergeStorefrontGames(
-        mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
-        EPIC_USER_LIBRARY,
-        'epic'
-      )
+    const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
+    const epicConnected = epicInteg ? epicInteg.isConnected : false;
+
+    let defaultCatalog = sanitizeGameCatalog(
+      mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog')
     );
+    if (epicConnected) {
+      defaultCatalog = sanitizeGameCatalog(mergeStorefrontGames(defaultCatalog, EPIC_USER_LIBRARY, 'epic'));
+    }
     try {
       localStorage.setItem('universal_game_library_catalog', JSON.stringify(defaultCatalog));
     } catch {}
@@ -736,11 +746,16 @@ export function App() {
           `Sync complete! Detected ${newGamesDetected} newly added title${newGamesDetected === 1 ? '' : 's'} across your storefronts! (${currentCatalog.length} total titles)`
         );
       } else {
-        const epicItem = updatedIntegrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
-        const epicHasOAuth = Boolean(epicItem?.credentials?.epicToken || epicItem?.credentials?.epicRefreshToken);
-        const epicLabel = epicHasOAuth ? `${epicCount} Epic` : `${epicCount} Epic (cached baseline; link in Accounts to sync new purchases)`;
+        const connectedStores = updatedIntegrations.filter((i) => i.isConnected);
+        const storeParts = connectedStores.map((i) => {
+          if (i.storefrontId === 'steam') return `${steamCount} Steam`;
+          if (i.storefrontId === 'gog') return `${gogCount} GOG`;
+          if (i.storefrontId === 'epic') return `${epicCount} Epic`;
+          if (i.storefrontId === 'xbox') return `${xboxCount} Xbox`;
+          return `${i.gamesCount} ${i.name}`;
+        });
         setSyncNotice(
-          `All connected storefronts up to date: ${epicLabel}, ${gogCount} GOG, ${steamCount} Steam titles (trophies & playtime refreshed)`
+          `All connected storefronts up to date: ${storeParts.join(', ')} titles (trophies & playtime refreshed)`
         );
       }
     } catch (err: any) {

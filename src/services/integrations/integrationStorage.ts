@@ -49,17 +49,9 @@ export const DEFAULT_INTEGRATIONS: StorefrontIntegration[] = [
   {
     storefrontId: 'epic',
     name: 'Epic Games Store',
-    isConnected: true,
-    accountName: 'BobDo1e',
-    accountId: '8aaea3405ecc4c7b8786012029e98d6a',
-    avatarUrl: 'https://cdn2.unrealengine.com/egs-badge.png',
-    gamesCount: EPIC_USER_LIBRARY.length,
-    lastSyncedAt: new Date().toISOString(),
-    authMethod: 'public_profile',
-    credentials: {
-      epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a',
-    },
-    statusMessage: `Cached Baseline (${EPIC_USER_LIBRARY.length} Epic titles cataloged)`,
+    isConnected: false,
+    gamesCount: 0,
+    statusMessage: 'Ready to connect via official Epic Games sign-in',
   },
   {
     storefrontId: 'xbox',
@@ -105,22 +97,21 @@ export function loadIntegrations(): StorefrontIntegration[] {
         }
         if (item.storefrontId === 'epic') {
           const hasOAuth = Boolean(item.credentials?.epicToken || item.credentials?.epicRefreshToken);
-          if (!item.isConnected || item.gamesCount < EPIC_USER_LIBRARY.length || (!hasOAuth && item.authMethod === 'oauth')) {
-            changed = true;
-            const targetCount = Math.max(item.gamesCount || 0, EPIC_USER_LIBRARY.length);
+          if (!hasOAuth) {
+            if (item.isConnected || item.gamesCount > 0) {
+              changed = true;
+            }
             return {
               ...item,
-              isConnected: true,
-              accountName: item.accountName || 'BobDo1e',
-              accountId: item.accountId || '8aaea3405ecc4c7b8786012029e98d6a',
-              avatarUrl: item.avatarUrl || 'https://cdn2.unrealengine.com/egs-badge.png',
-              gamesCount: targetCount,
-              lastSyncedAt: item.lastSyncedAt || new Date().toISOString(),
-              authMethod: hasOAuth ? ('oauth' as const) : ('public_profile' as const),
-              credentials: item.credentials || { epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a' },
-              statusMessage: hasOAuth
-                ? `Connected as ${item.accountName || 'BobDo1e'} (${targetCount} Epic titles synced)`
-                : `Cached Baseline (${targetCount} Epic titles cataloged)`,
+              isConnected: false,
+              accountName: undefined,
+              accountId: undefined,
+              avatarUrl: undefined,
+              gamesCount: 0,
+              lastSyncedAt: undefined,
+              credentials: undefined,
+              authMethod: 'oauth' as const,
+              statusMessage: 'Ready to connect via official Epic Games sign-in',
             };
           }
         }
@@ -132,15 +123,9 @@ export function loadIntegrations(): StorefrontIntegration[] {
         updated.push({
           storefrontId: 'epic',
           name: 'Epic Games Store',
-          isConnected: true,
-          accountName: 'BobDo1e',
-          accountId: '8aaea3405ecc4c7b8786012029e98d6a',
-          avatarUrl: 'https://cdn2.unrealengine.com/egs-badge.png',
-          gamesCount: EPIC_USER_LIBRARY.length,
-          lastSyncedAt: new Date().toISOString(),
-          authMethod: 'public_profile',
-          credentials: { epicAccountId: '8aaea3405ecc4c7b8786012029e98d6a' },
-          statusMessage: `Cached Baseline (${EPIC_USER_LIBRARY.length} Epic titles cataloged)`,
+          isConnected: false,
+          gamesCount: 0,
+          statusMessage: 'Ready to connect via official Epic Games sign-in',
         });
       }
 
@@ -165,13 +150,16 @@ export function saveIntegrations(integrations: StorefrontIntegration[]): void {
 }
 
 export function loadCurrentCatalog(): CanonicalGame[] {
-  const defaultBase = sanitizeGameCatalog(
-    mergeStorefrontGames(
-      mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
-      EPIC_USER_LIBRARY,
-      'epic'
-    )
+  const epicInteg = loadIntegrations().find((i) => i.storefrontId === 'epic');
+  const epicConnected = epicInteg ? epicInteg.isConnected : false;
+
+  let defaultBase = sanitizeGameCatalog(
+    mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog')
   );
+  if (epicConnected) {
+    defaultBase = sanitizeGameCatalog(mergeStorefrontGames(defaultBase, EPIC_USER_LIBRARY, 'epic'));
+  }
+
   if (typeof window === 'undefined') return defaultBase;
   try {
     const raw = localStorage.getItem(STORAGE_KEY_MAIN_CATALOG);
@@ -192,8 +180,12 @@ export function loadCurrentCatalog(): CanonicalGame[] {
         }
 
         const epicCount = cleaned.filter((g: CanonicalGame) => g.platforms?.some((p) => p.platformId === 'epic')).length;
-        if (epicCount < EPIC_USER_LIBRARY.length) {
-          cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
+        if (epicConnected) {
+          if (epicCount < EPIC_USER_LIBRARY.length) {
+            cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
+          }
+        } else if (epicCount > 0) {
+          cleaned = sanitizeGameCatalog(removeStorefrontGames(cleaned, 'epic'));
         }
 
         saveCurrentCatalog(cleaned);

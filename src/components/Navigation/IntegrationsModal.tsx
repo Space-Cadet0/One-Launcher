@@ -617,15 +617,9 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                       <h3 className="text-base font-bold text-white">
                         {currentIntegration.accountName || `${STORE_AUTH_CONFIGS[selectedTab]?.storeName} User`}
                       </h3>
-                      {selectedTab === 'epic' && !currentIntegration.credentials?.epicToken && !currentIntegration.credentials?.epicRefreshToken ? (
-                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
-                          <AlertCircle className="w-3 h-3" /> Cached Baseline
-                        </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                          <ShieldCheck className="w-3 h-3" /> Connected
-                        </span>
-                      )}
+                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
+                        <ShieldCheck className="w-3 h-3" /> Connected
+                      </span>
                     </div>
                     {currentIntegration.accountId && (
                       <p className="text-xs text-steam-subtext font-mono mt-0.5">
@@ -648,39 +642,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 </button>
               </div>
 
-              {/* Action Banner for Epic Games when running on cached baseline */}
-              {selectedTab === 'epic' && !currentIntegration.credentials?.epicToken && !currentIntegration.credentials?.epicRefreshToken && (
-                <div className="p-3.5 bg-blue-950/40 border border-blue-500/40 rounded text-blue-200 text-xs space-y-2.5">
-                  <div className="flex items-start gap-2.5">
-                    <Sparkles className="w-4 h-4 text-sky-400 flex-shrink-0 mt-0.5" />
-                    <div>
-                      <span className="font-bold text-sky-300">Link Live Account to Sync New Purchases</span>
-                      <p className="text-[11px] text-blue-200/85 mt-0.5 leading-relaxed">
-                        Currently displaying the cataloged 402 baseline titles for BobDo1e. To pull newly purchased games and real-time achievements from your Epic Games Store account, link your live session below.
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleLaunchStoreSignIn('epic')}
-                    className="w-full py-2.5 px-4 rounded bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow"
-                  >
-                    <Lock className="w-3.5 h-3.5" />
-                    <span>Sign In with Epic Games to Link Live Purchases</span>
-                    <ExternalLink className="w-3 h-3 opacity-80" />
-                  </button>
-                </div>
-              )}
-
               <div className="flex items-center justify-between pt-1">
                 <div className="text-[11px] text-steam-subtext">
                   Sync Method:{' '}
                   <span className="text-white font-medium">
-                    {selectedTab === 'epic'
-                      ? currentIntegration.credentials?.epicToken || currentIntegration.credentials?.epicRefreshToken
-                        ? 'Live Cloud OAuth (Auto-renewing)'
-                        : 'Cached Baseline Catalog'
-                      : 'Cloud Web API'}
+                    {selectedTab === 'epic' ? 'Live Cloud OAuth (Auto-renewing)' : 'Cloud Web API'}
                   </span>
                 </div>
                 <button
