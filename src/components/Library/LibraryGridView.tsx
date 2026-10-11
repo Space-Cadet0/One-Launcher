@@ -927,7 +927,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       ) : (
                         <div className="flex items-center gap-1 text-sky-300 text-[11px]">
                           <Cloud className="w-3 h-3" />
-                          <span>Cloud Library</span>
+                          <span>In Library</span>
                         </div>
                       )}
                     </div>
