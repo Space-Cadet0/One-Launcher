@@ -149,7 +149,7 @@ export class EpicIntegrationService {
   /**
    * Exchanges an authorization code for an Epic Games access token
    */
-  async exchangeCodeForToken(authorizationCode: string): Promise<{ accessToken: string; displayName?: string; accountId?: string } | null> {
+  async exchangeCodeForToken(authorizationCode: string): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number; displayName?: string; accountId?: string } | null> {
     try {
       const cleanCode = authorizationCode.trim();
       const body = new URLSearchParams({
@@ -173,12 +173,53 @@ export class EpicIntegrationService {
       if (res.data?.access_token) {
         return {
           accessToken: res.data.access_token,
+          refreshToken: res.data.refresh_token,
+          expiresIn: res.data.expires_in,
           displayName: res.data.displayName,
           accountId: res.data.account_id,
         };
       }
     } catch (err: any) {
       console.warn('Epic token exchange failed:', err?.response?.data || err?.message);
+    }
+    return null;
+  }
+
+  /**
+   * Renews an expired Epic Games access token using a refresh token
+   */
+  async renewAccessToken(refreshToken: string): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number; displayName?: string; accountId?: string } | null> {
+    try {
+      const cleanToken = refreshToken.trim();
+      const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: cleanToken,
+        token_type: 'eg1',
+      });
+
+      const res = await axios.post(
+        `${this.getOAuthBaseUrl()}/account/api/oauth/token`,
+        body.toString(),
+        {
+          headers: {
+            Authorization: 'basic MzRhMDJjZjhmNDQxNGUyOWIxNTkyMTg3NmRhMzZmOWE6ZGFhZmJjY2M3Mzc3NDUwMzlkZmZlNTNkOTRmYzc2Y2Y=',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          timeout: 10000,
+        }
+      );
+
+      if (res.data?.access_token) {
+        return {
+          accessToken: res.data.access_token,
+          refreshToken: res.data.refresh_token || cleanToken,
+          expiresIn: res.data.expires_in,
+          displayName: res.data.displayName,
+          accountId: res.data.account_id,
+        };
+      }
+    } catch (err: any) {
+      console.warn('Epic token renewal failed:', err?.response?.data || err?.message);
     }
     return null;
   }
@@ -385,17 +426,39 @@ export class EpicIntegrationService {
    */
   async connectAccount(
     credentials: StorefrontCredentials
-  ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[] }> {
+  ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[]; updatedCredentials?: StorefrontCredentials }> {
     let accountName = credentials.epicAccountId?.trim() || 'BobDo1e';
     let targetAccountId = this.extractEpicAccountId(credentials.epicAccountId) || '8aaea3405ecc4c7b8786012029e98d6a';
     const avatarUrl = 'https://cdn2.unrealengine.com/egs-badge.png';
     let accessToken: string | undefined = undefined;
+    const updatedCredentials: StorefrontCredentials = { ...credentials };
 
-    if (credentials.epicToken) {
+    // 1. If we have a refresh token, check if access token needs renewal
+    if (credentials.epicRefreshToken) {
+      const isExpired = credentials.epicTokenExpiresAt
+        ? Date.now() > new Date(credentials.epicTokenExpiresAt).getTime() - 60000
+        : false;
+
+      if (!credentials.epicToken || isExpired) {
+        const renewed = await this.renewAccessToken(credentials.epicRefreshToken);
+        if (renewed?.accessToken) {
+          accessToken = renewed.accessToken;
+          if (renewed.displayName) accountName = renewed.displayName;
+          if (renewed.accountId) targetAccountId = renewed.accountId;
+          updatedCredentials.epicToken = renewed.accessToken;
+          if (renewed.refreshToken) updatedCredentials.epicRefreshToken = renewed.refreshToken;
+          if (renewed.expiresIn) {
+            updatedCredentials.epicTokenExpiresAt = new Date(Date.now() + renewed.expiresIn * 1000).toISOString();
+          }
+        }
+      } else {
+        accessToken = credentials.epicToken.trim();
+      }
+    } else if (credentials.epicToken) {
       accessToken = credentials.epicToken.trim();
 
       // If token looks like an authorization code, exchange it
-      if (accessToken.length > 25 && !accessToken.toLowerCase().startsWith('bearer ')) {
+      if (accessToken.length > 25 && !accessToken.toLowerCase().startsWith('bearer ') && !accessToken.startsWith('eg1~')) {
         const tokenRes = await this.exchangeCodeForToken(accessToken);
         if (tokenRes?.accessToken) {
           accessToken = tokenRes.accessToken;
@@ -404,6 +467,11 @@ export class EpicIntegrationService {
           }
           if (tokenRes.accountId) {
             targetAccountId = tokenRes.accountId;
+          }
+          updatedCredentials.epicToken = tokenRes.accessToken;
+          if (tokenRes.refreshToken) updatedCredentials.epicRefreshToken = tokenRes.refreshToken;
+          if (tokenRes.expiresIn) {
+            updatedCredentials.epicTokenExpiresAt = new Date(Date.now() + tokenRes.expiresIn * 1000).toISOString();
           }
         }
       }
@@ -418,7 +486,26 @@ export class EpicIntegrationService {
       try {
         liveGames = await this.fetchOwnedGames(accessToken);
       } catch (err) {
-        console.warn('Live Epic games fetch failed, using baseline catalog:', err);
+        // If 401 and refresh token is available, try one renewal attempt
+        if (updatedCredentials.epicRefreshToken) {
+          try {
+            const renewed = await this.renewAccessToken(updatedCredentials.epicRefreshToken);
+            if (renewed?.accessToken) {
+              accessToken = renewed.accessToken;
+              updatedCredentials.epicToken = renewed.accessToken;
+              if (renewed.refreshToken) updatedCredentials.epicRefreshToken = renewed.refreshToken;
+              if (renewed.expiresIn) {
+                updatedCredentials.epicTokenExpiresAt = new Date(Date.now() + renewed.expiresIn * 1000).toISOString();
+              }
+              liveGames = await this.fetchOwnedGames(accessToken);
+            }
+          } catch (renewErr) {
+            console.warn('Epic token renewal fallback failed:', renewErr);
+          }
+        }
+        if (liveGames.length === 0) {
+          console.warn('Live Epic games fetch failed, using baseline catalog:', err);
+        }
       }
     }
     const baseGames = liveGames.length > 0 ? liveGames : EPIC_USER_LIBRARY;
@@ -455,7 +542,7 @@ export class EpicIntegrationService {
       return game;
     });
 
-    return { accountName, avatarUrl, games: gamesWithAchievements };
+    return { accountName, avatarUrl, games: gamesWithAchievements, updatedCredentials };
   }
 }
 

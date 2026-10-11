@@ -17,6 +17,8 @@ export interface StorefrontCredentials {
   gogToken?: string;
   epicAccountId?: string;
   epicToken?: string;
+  epicRefreshToken?: string;
+  epicTokenExpiresAt?: string;
 }
 
 export interface StorefrontIntegration {

@@ -390,7 +390,8 @@ export async function connectEpicIntegration(
     ...credentials,
     epicAccountId: cleanAccountId || credentials.epicAccountId,
   };
-  const { accountName, avatarUrl, games: epicGames } = await epicIntegration.connectAccount(normalizedCredentials);
+  const { accountName, avatarUrl, games: epicGames, updatedCredentials } = await epicIntegration.connectAccount(normalizedCredentials);
+  const finalCredentials = updatedCredentials || normalizedCredentials;
 
   const integration: StorefrontIntegration = {
     storefrontId: 'epic',
@@ -401,8 +402,8 @@ export async function connectEpicIntegration(
     avatarUrl,
     gamesCount: epicGames.length,
     lastSyncedAt: new Date().toISOString(),
-    authMethod: credentials.epicToken ? 'oauth' : 'public_profile',
-    credentials: normalizedCredentials,
+    authMethod: finalCredentials.epicToken ? 'oauth' : 'public_profile',
+    credentials: finalCredentials,
     statusMessage: `Connected as ${accountName} (${epicGames.length} Epic titles synced)`,
   };
 
