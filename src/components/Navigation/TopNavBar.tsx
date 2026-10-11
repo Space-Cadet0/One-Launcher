@@ -115,7 +115,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
         integrations.filter((i) => i.isConnected).map((i) => i.storefrontId)
       );
     } catch {
-      return new Set<StorefrontId>(['steam', 'gog']);
+      return new Set<StorefrontId>(['steam', 'gog', 'epic']);
     }
   }, [connectedStorefronts]);
 

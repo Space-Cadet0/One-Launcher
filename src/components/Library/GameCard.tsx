@@ -3,12 +3,15 @@ import { CanonicalGame } from '../../contracts/game';
 import { PlatformBadges } from '../SteamStoreDetail/PlatformBadges';
 import { ReviewSentimentBadge } from '../SteamStoreDetail/ReviewSentimentBadge';
 
+import { StorefrontId } from '../../contracts/platform';
+
 interface GameCardProps {
   game: CanonicalGame;
   onSelect: (game: CanonicalGame) => void;
+  connectedStorefronts?: StorefrontId[];
 }
 
-export const GameCard: React.FC<GameCardProps> = ({ game, onSelect }) => {
+export const GameCard: React.FC<GameCardProps> = ({ game, onSelect, connectedStorefronts }) => {
   const isInstalled = game.platforms.some((p) => p.installed);
 
   return (
@@ -55,7 +58,7 @@ export const GameCard: React.FC<GameCardProps> = ({ game, onSelect }) => {
 
         {/* Multi-Store Ownership Badges */}
         <div className="pt-2 border-t border-steam-border/40">
-          <PlatformBadges platforms={game.platforms} game={game} size="sm" />
+          <PlatformBadges platforms={game.platforms} game={game} size="sm" connectedStorefronts={connectedStorefronts} />
         </div>
       </div>
     </div>

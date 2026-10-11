@@ -80,6 +80,7 @@ interface SteamLibraryActionBarProps {
   onManageCollections?: () => void;
   onToggleInstallStatus?: () => void;
   onApplyFilter?: (filter: ActiveGameFilter) => void;
+  connectedStorefronts?: StorefrontId[];
 }
 
 export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
@@ -89,6 +90,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onManageCollections,
   onToggleInstallStatus,
   onApplyFilter,
+  connectedStorefronts,
 }) => {
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
   const isInstalled = game.platforms.some((p) => p.installed);
@@ -368,6 +370,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 platforms={game.platforms}
                 game={game}
                 steamAppId={metadata?.appId || game.steamAppId}
+                connectedStorefronts={connectedStorefronts}
                 iconOnly
               />
             </div>

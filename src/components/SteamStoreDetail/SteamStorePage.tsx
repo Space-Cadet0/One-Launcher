@@ -6,7 +6,7 @@ import { getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { steamApi } from '../../services/steam/steamApi';
 import { steamMatcher } from '../../services/steam/steamMatcher';
 import { fallbackMetadataProvider } from '../../services/steam/fallbackMetadataProvider';
-import { loadCurrentCatalog, saveCurrentCatalog } from '../../services/integrations/integrationStorage';
+import { loadCurrentCatalog, saveCurrentCatalog, loadIntegrations } from '../../services/integrations/integrationStorage';
 import { MediaGallery } from './MediaGallery';
 import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
@@ -67,7 +67,16 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     if (connectedStorefronts && connectedStorefronts.length > 0) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
-    return new Set<StorefrontId>(['steam', 'gog']);
+    try {
+      const integrations = loadIntegrations();
+      const connected = integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
+      if (connected.length > 0) {
+        return new Set<StorefrontId>(connected);
+      }
+    } catch {
+      // Fallback
+    }
+    return new Set<StorefrontId>(['steam', 'gog', 'epic']);
   }, [connectedStorefronts]);
 
   const disconnectedPlatforms = currentGame.platforms.filter(
@@ -328,6 +337,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           onManageCollections={onManageCollections}
           onToggleInstallStatus={onToggleInstallStatus}
           onApplyFilter={onApplyFilter}
+          connectedStorefronts={connectedStorefronts}
         />
 
         {/* Main Steam Highlight Showcase (1:1 Steam 2-Column Split: Media Player + Details) */}

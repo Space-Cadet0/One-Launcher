@@ -23,6 +23,7 @@ import steamBlurbCache from '../../services/storage/steamBlurbCache.json';
 import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
+import { loadIntegrations } from '../../services/integrations/integrationStorage';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
@@ -188,7 +189,16 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     if (connectedStorefronts && connectedStorefronts.length > 0) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
-    return new Set<StorefrontId>(['steam', 'gog']);
+    try {
+      const integrations = loadIntegrations();
+      const connected = integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
+      if (connected.length > 0) {
+        return new Set<StorefrontId>(connected);
+      }
+    } catch {
+      // Fallback
+    }
+    return new Set<StorefrontId>(['steam', 'gog', 'epic']);
   }, [connectedStorefronts]);
   const [hoveredGame, setHoveredGame] = useState<CanonicalGame | null>(null);
   const [previewPos, setPreviewPos] = useState<{ x: number; y: number; align: 'left' | 'right' }>({

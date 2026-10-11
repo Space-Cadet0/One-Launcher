@@ -3,6 +3,7 @@ import { GamePlatformOwnership, CanonicalGame } from '../../contracts/game';
 import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { CheckCircle2, Cloud } from 'lucide-react';
+import { loadIntegrations } from '../../services/integrations/integrationStorage';
 
 export function getStorefrontUrl(
   platformId: string,
@@ -115,7 +116,16 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
     if (connectedStorefronts && connectedStorefronts.length > 0) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
-    return new Set<StorefrontId>(['steam', 'gog']);
+    try {
+      const integrations = loadIntegrations();
+      const connected = integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
+      if (connected.length > 0) {
+        return new Set<StorefrontId>(connected);
+      }
+    } catch {
+      // Fallback if localStorage or integration system unavailable
+    }
+    return new Set<StorefrontId>(['steam', 'gog', 'epic']);
   }, [connectedStorefronts]);
 
   const handleBadgeClick = (url: string | null, e: React.MouseEvent) => {

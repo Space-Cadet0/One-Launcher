@@ -267,7 +267,7 @@ export function App() {
       const integrations = loadIntegrations();
       return integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
     } catch {
-      return ['steam', 'gog'] as StorefrontId[];
+      return ['steam', 'gog', 'epic'] as StorefrontId[];
     }
   }, [games, isIntegrationsModalOpen, gameRefreshKey]);
 

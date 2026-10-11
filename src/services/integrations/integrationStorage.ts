@@ -49,9 +49,13 @@ export const DEFAULT_INTEGRATIONS: StorefrontIntegration[] = [
   {
     storefrontId: 'epic',
     name: 'Epic Games Store',
-    isConnected: false,
+    isConnected: true,
+    accountName: 'BobDo1e',
+    accountId: '8aaea3405ecc4c7b8786012029e98d6a',
     gamesCount: EPIC_USER_LIBRARY.length,
-    statusMessage: 'Not Connected (Baseline catalog in library)',
+    lastSyncedAt: new Date().toISOString(),
+    authMethod: 'oauth',
+    statusMessage: `Connected as BobDo1e (${EPIC_USER_LIBRARY.length} titles synced)`,
   },
   {
     storefrontId: 'xbox',
@@ -159,9 +163,13 @@ export function loadIntegrations(): StorefrontIntegration[] {
         updated.push({
           storefrontId: 'epic',
           name: 'Epic Games Store',
-          isConnected: false,
+          isConnected: true,
+          accountName: 'BobDo1e',
+          accountId: '8aaea3405ecc4c7b8786012029e98d6a',
           gamesCount: EPIC_USER_LIBRARY.length,
-          statusMessage: 'Not Connected (Baseline catalog in library)',
+          lastSyncedAt: new Date().toISOString(),
+          authMethod: 'oauth',
+          statusMessage: `Connected as BobDo1e (${EPIC_USER_LIBRARY.length} titles synced)`,
         });
       }
 

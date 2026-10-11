@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 
 import { ActiveGameFilter } from '../../contracts/filter';
+import { loadIntegrations } from '../../services/integrations/integrationStorage';
 
 const COLLAPSED_STORAGE_KEY = 'antigravity_library_collapsed_groups';
 
@@ -104,7 +105,16 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     if (connectedStorefronts && connectedStorefronts.length > 0) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
-    return new Set<StorefrontId>(['steam', 'gog']);
+    try {
+      const integrations = loadIntegrations();
+      const connected = integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
+      if (connected.length > 0) {
+        return new Set<StorefrontId>(connected);
+      }
+    } catch {
+      // Fallback
+    }
+    return new Set<StorefrontId>(['steam', 'gog', 'epic']);
   }, [connectedStorefronts]);
 
   const platforms: (StorefrontId | 'all')[] = [
