@@ -1,6 +1,7 @@
 export interface LocalSystemScanResult {
   success: boolean;
   installedSteamAppIds: number[];
+  installedGames?: { appId: number; name?: string; installPath?: string }[];
   scannedAt?: string;
   error?: string;
 }
@@ -28,6 +29,7 @@ export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult |
         return {
           success: true,
           installedSteamAppIds: Array.isArray(electronRes.installedSteamAppIds) ? electronRes.installedSteamAppIds : [],
+          installedGames: Array.isArray(electronRes.installedGames) ? electronRes.installedGames : [],
           scannedAt: new Date().toISOString(),
         };
       }

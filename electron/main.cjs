@@ -427,6 +427,7 @@ ipcMain.handle('scan:steam-installed', async () => {
     ];
 
     const installedSteamAppIds = [];
+    const installedGames = [];
     for (const dir of steamDirs) {
       if (fs.existsSync(dir)) {
         try {
@@ -435,17 +436,28 @@ ipcMain.handle('scan:steam-installed', async () => {
             const match = file.match(/^appmanifest_(\d+)\.acf$/);
             if (match) {
               const appId = parseInt(match[1], 10);
+              let gameName = undefined;
+              let installDir = undefined;
+              try {
+                const manifestContent = fs.readFileSync(path.join(dir, file), 'utf-8');
+                const nameMatch = manifestContent.match(/"name"\s+"([^"]+)"/i);
+                if (nameMatch) gameName = nameMatch[1];
+                const dirMatch = manifestContent.match(/"installdir"\s+"([^"]+)"/i);
+                if (dirMatch) installDir = path.join(dir, 'common', dirMatch[1]);
+              } catch {}
+
               if (!installedSteamAppIds.includes(appId)) {
                 installedSteamAppIds.push(appId);
+                installedGames.push({ appId, name: gameName, installPath: installDir });
               }
             }
           }
         } catch {}
       }
     }
-    return { success: true, installedSteamAppIds };
+    return { success: true, installedSteamAppIds, installedGames };
   } catch (err) {
-    return { success: false, error: err.message, installedSteamAppIds: [] };
+    return { success: false, error: err.message, installedSteamAppIds: [], installedGames: [] };
   }
 });
 

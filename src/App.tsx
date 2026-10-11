@@ -347,10 +347,14 @@ export function App() {
       }
 
       let installedSteamAppIds: Set<number> | null = null;
+      let installedGamesList: { appId: number; name?: string; installPath?: string }[] = [];
       try {
         const scanResult = await scanLocalInstalledGames();
         if (scanResult) {
           installedSteamAppIds = new Set(scanResult.installedSteamAppIds);
+          if (scanResult.installedGames) {
+            installedGamesList = scanResult.installedGames;
+          }
         }
       } catch (e) {
         console.warn('Local installed games scan failed:', e);
@@ -358,6 +362,17 @@ export function App() {
 
       setGames((prevGames) => {
         let changed = false;
+        const existingAppIds = new Set<number>();
+        for (const g of prevGames) {
+          if (g.steamAppId) existingAppIds.add(g.steamAppId);
+          for (const p of g.platforms) {
+            if (p.platformId === 'steam' && p.platformGameId) {
+              const num = parseInt(p.platformGameId, 10);
+              if (!isNaN(num)) existingAppIds.add(num);
+            }
+          }
+        }
+
         const updated = prevGames.map((game) => {
           let gameChanged = false;
           const targetAppId = game.steamAppId;
@@ -459,6 +474,38 @@ export function App() {
           }
           return game;
         });
+
+        // Add any newly installed Steam games detected on disk that weren't in the catalog
+        if (installedGamesList && installedGamesList.length > 0) {
+          for (const item of installedGamesList) {
+            if (!existingAppIds.has(item.appId)) {
+              existingAppIds.add(item.appId);
+              const title = item.name || `Steam App ${item.appId}`;
+              updated.push({
+                id: `steam-${item.appId}`,
+                title,
+                sortTitle: title,
+                steamAppId: item.appId,
+                platforms: [
+                  {
+                    platformId: 'steam',
+                    platformGameId: String(item.appId),
+                    installed: true,
+                    installPath: item.installPath,
+                  },
+                ],
+                headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${item.appId}/header.jpg`,
+                shortDescription: '',
+                releaseDate: 'TBA',
+                developers: [],
+                publishers: [],
+                genres: [],
+                tags: [],
+              });
+              changed = true;
+            }
+          }
+        }
 
         if (changed) {
           localStorage.setItem('universal_game_library_catalog', JSON.stringify(updated));
