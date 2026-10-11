@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { StorefrontId } from '../../contracts/platform';
@@ -6,7 +6,6 @@ import {
   Gamepad2,
   Clock,
   ThumbsUp,
-  ArrowRight,
   Layers,
   CheckCircle2,
   Cloud,
@@ -17,8 +16,68 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
+import { getHowLongToBeat } from '../../services/hltb/howLongToBeat';
+import { steamMatcher } from '../../services/steam/steamMatcher';
+import steamEnrichedCache from '../../services/storage/steamEnrichedCache.json';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
+
+function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
+  if (!desc) return true;
+  const trimmed = desc.trim();
+  if (trimmed.length <= 3) return true;
+  const lower = trimmed.toLowerCase();
+  if (title && lower === title.trim().toLowerCase()) return true;
+  if (lower.includes('on gog.com')) return true;
+  if (lower.includes('drm-free')) return true;
+  if (lower.includes('epic games store')) return true;
+  if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
+  return false;
+}
+
+function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): string | null {
+  // 1. Steam enriched cache
+  if (targetAppId) {
+    const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
+    if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) {
+      return cached.shortDescription.trim();
+    }
+  }
+
+  // 2. Enriched metadata on game
+  if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
+    return game.enrichedMetadata.shortDescription.trim();
+  }
+
+  // 3. Game shortDescription
+  if (game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
+    return game.shortDescription.trim();
+  }
+
+  // 4. Clean summary from genres and developers
+  if (game.genres && game.genres.length > 0) {
+    const cleanGenres = game.genres
+      .map((g) => g.replace(/\s*on GOG\.com.*$/i, '').replace(/\s*\(DRM-Free\)/i, '').trim())
+      .filter((g) => g.length > 0 && !g.toLowerCase().includes('drm-free') && !g.toLowerCase().includes('gog'));
+    if (cleanGenres.length > 0) {
+      const dev = game.developers?.[0] ? ` developed by ${game.developers[0]}` : '';
+      return `${cleanGenres.slice(0, 3).join(', ')} experience${dev}.`;
+    }
+  }
+
+  return null;
+}
+
+function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): string | null {
+  let dateStr = game.releaseDate;
+  if ((!dateStr || dateStr === 'TBA') && targetAppId) {
+    const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
+    if (cached?.releaseDate) dateStr = cached.releaseDate;
+  }
+  if (!dateStr || dateStr === 'TBA') return null;
+  const match = dateStr.match(/\b(19\d{2}|20\d{2})\b/);
+  return match ? match[1] : null;
+}
 
 interface LibraryGridViewProps {
   games: CanonicalGame[];
@@ -61,6 +120,60 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   });
   const [sortBy, setSortBy] = useState<'alphabetical' | 'rating' | 'playtime' | 'recent'>('alphabetical');
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const popoutRef = useRef<HTMLDivElement | null>(null);
+  const activeCardRef = useRef<HTMLDivElement | null>(null);
+
+  // Fast auto-dismiss on scroll, wheel, window blur, resize, or pointer leave
+  useEffect(() => {
+    const handleDismiss = () => {
+      if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+      setHoveredGame(null);
+      activeCardRef.current = null;
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!activeCardRef.current && !popoutRef.current) return;
+
+      const x = e.clientX;
+      const y = e.clientY;
+
+      let inCard = false;
+      let inPopout = false;
+
+      if (activeCardRef.current) {
+        const r = activeCardRef.current.getBoundingClientRect();
+        // Generous 12px bridge between card and popout
+        if (x >= r.left - 12 && x <= r.right + 12 && y >= r.top - 12 && y <= r.bottom + 12) {
+          inCard = true;
+        }
+      }
+
+      if (popoutRef.current) {
+        const r = popoutRef.current.getBoundingClientRect();
+        if (x >= r.left - 6 && x <= r.right + 6 && y >= r.top - 6 && y <= r.bottom + 6) {
+          inPopout = true;
+        }
+      }
+
+      if (!inCard && !inPopout) {
+        handleDismiss();
+      }
+    };
+
+    window.addEventListener('scroll', handleDismiss, true);
+    window.addEventListener('wheel', handleDismiss, { passive: true });
+    window.addEventListener('resize', handleDismiss, { passive: true });
+    window.addEventListener('blur', handleDismiss);
+    window.addEventListener('mousemove', handleMouseMove, { passive: true });
+
+    return () => {
+      window.removeEventListener('scroll', handleDismiss, true);
+      window.removeEventListener('wheel', handleDismiss, true);
+      window.removeEventListener('resize', handleDismiss);
+      window.removeEventListener('blur', handleDismiss);
+      window.removeEventListener('mousemove', handleMouseMove);
+    };
+  }, []);
 
   const handleSortChange = (newSort: 'alphabetical' | 'rating' | 'playtime' | 'recent') => {
     setSortBy(newSort);
@@ -104,24 +217,47 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
     if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
 
-    const rect = e.currentTarget.getBoundingClientRect();
-    const alignRight = rect.right + 340 > window.innerWidth;
+    const cardEl = e.currentTarget;
+    activeCardRef.current = cardEl;
 
     hoverTimeoutRef.current = setTimeout(() => {
+      const currentRect = cardEl.getBoundingClientRect();
+      const isRight = currentRect.right + 340 > window.innerWidth;
       setPreviewPos({
-        x: alignRight ? rect.left - 330 : rect.right + 12,
-        y: Math.max(80, Math.min(rect.top - 20, window.innerHeight - 440)),
-        align: alignRight ? 'right' : 'left',
+        x: isRight ? Math.max(12, currentRect.left - 330) : currentRect.right + 12,
+        y: Math.max(80, Math.min(currentRect.top - 20, window.innerHeight - 440)),
+        align: isRight ? 'right' : 'left',
       });
       setHoveredGame(game);
-    }, 280);
+    }, 220);
   };
 
-  const handleMouseLeave = () => {
+  const handleCardMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
     if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+
+    const nextEl = e.relatedTarget as Node | null;
+    if (popoutRef.current && nextEl && popoutRef.current.contains(nextEl)) {
+      return;
+    }
+
     hoverTimeoutRef.current = setTimeout(() => {
       setHoveredGame(null);
-    }, 150);
+      activeCardRef.current = null;
+    }, 60);
+  };
+
+  const handlePopoutMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+
+    const nextEl = e.relatedTarget as Node | null;
+    if (activeCardRef.current && nextEl && activeCardRef.current.contains(nextEl)) {
+      return;
+    }
+
+    hoverTimeoutRef.current = setTimeout(() => {
+      setHoveredGame(null);
+      activeCardRef.current = null;
+    }, 60);
   };
 
   const formatPlaytime = (game: CanonicalGame) => {
@@ -293,7 +429,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                 key={game.id}
                 onClick={() => onSelectGame(game)}
                 onMouseEnter={(e) => handleMouseEnter(game, e)}
-                onMouseLeave={handleMouseLeave}
+                onMouseLeave={handleCardMouseLeave}
                 className="group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-all duration-200 cursor-pointer shadow-md hover:shadow-2xl hover:scale-[1.03] active:scale-[0.99]"
               >
                 {/* 2:3 Portrait Capsule Viewport */}
@@ -433,6 +569,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       {/* Floating Hover Preview Pane (Steam Popover Style) */}
       {hoveredGame && (
         <div
+          ref={popoutRef}
           style={{
             position: 'fixed',
             left: `${previewPos.x}px`,
@@ -442,159 +579,226 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
           onMouseEnter={() => {
             if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
           }}
-          onMouseLeave={handleMouseLeave}
+          onMouseLeave={handlePopoutMouseLeave}
           onClick={() => onSelectGame(hoveredGame)}
           className="w-80 rounded-lg overflow-hidden bg-[#16202d]/95 backdrop-blur-xl border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer animate-in fade-in zoom-in-95 duration-150 text-steam-text"
         >
-          {/* Header Image Banner */}
-          <div className="relative aspect-video w-full bg-black/60 overflow-hidden">
-            <img
-              src={hoveredGame.headerImage || hoveredGame.capsuleImage}
-              alt={hoveredGame.title}
-              className="w-full h-full object-cover"
-            />
-            <div className="absolute inset-0 bg-gradient-to-t from-[#16202d] via-transparent to-black/30" />
-            <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between">
-              <span className="text-sm font-bold text-white drop-shadow truncate">
-                {hoveredGame.title}
-              </span>
-            </div>
-          </div>
+          {(() => {
+            const targetAppId =
+              hoveredGame.steamAppId ||
+              steamMatcher.matchGameToSteamInstant(hoveredGame.title) ||
+              undefined;
+            const releaseYear = getReleaseYear(hoveredGame, targetAppId);
+            const cleanSynopsis = getCleanSynopsis(hoveredGame, targetAppId);
 
-          {/* Disconnected Storefront Notice Banner */}
-          {hoveredGame.platforms.some((p) => !connectedSet.has(p.platformId)) && (
-            <div className="px-3 py-1.5 bg-amber-950/70 border-b border-amber-600/40 text-[11px] text-amber-300 flex items-center gap-1.5">
-              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span>
-                {hoveredGame.platforms
-                  .filter((p) => !connectedSet.has(p.platformId))
-                  .map((p) => getStorefrontDisplayName(p.platformId))
-                  .join(', ')}{' '}
-                (Not Connected)
-              </span>
-            </div>
-          )}
-
-          {/* Details Body */}
-          <div className="p-3.5 space-y-3 text-xs">
-            {/* Review Sentiment & Playtime Row */}
-            <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
-              {hoveredGame.reviewSummary ? (
-                <div className="flex items-center gap-1.5">
-                  <ThumbsUp className="w-3.5 h-3.5 text-steam-accent" />
-                  <span className="text-steam-accent font-semibold text-[11px]">
-                    {hoveredGame.reviewSummary.reviewScoreDesc}
-                  </span>
-                  <span className="text-steam-subtext text-[10px]">
-                    ({hoveredGame.reviewSummary.positivePercent}%)
-                  </span>
-                </div>
-              ) : (
-                <span className="text-steam-subtext text-[11px] italic">Verified in Library</span>
-              )}
-
-              {formatPlaytime(hoveredGame) ? (
-                <div className="flex items-center gap-1 text-white font-medium text-[11px]">
-                  <Clock className="w-3 h-3 text-sky-400" />
-                  <span>{formatPlaytime(hoveredGame)}</span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1 text-sky-300 text-[11px]">
-                  <Cloud className="w-3 h-3" />
-                  <span>Cloud Library</span>
-                </div>
-              )}
-            </div>
-
-            {/* OpenCritic Rating Row */}
-            {(() => {
-              const oc = getOpenCriticData(
-                hoveredGame.steamAppId,
-                hoveredGame.title,
-                hoveredGame.reviewSummary?.positivePercent
-              );
-              const ocColors = getTierColor(oc.tier);
-              return (
-                <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1">
-                      <span className={`w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center ${ocColors.scoreBg}`}>
-                        OC
+            return (
+              <>
+                {/* Header Image Banner */}
+                <div className="relative aspect-video w-full bg-black/60 overflow-hidden">
+                  <img
+                    src={hoveredGame.headerImage || hoveredGame.capsuleImage}
+                    alt={hoveredGame.title}
+                    className="w-full h-full object-cover"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-[#16202d] via-transparent to-black/30" />
+                  <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-2">
+                    <span className="text-sm font-bold text-white drop-shadow truncate">
+                      {hoveredGame.title}
+                    </span>
+                    {releaseYear && (
+                      <span className="text-[11px] font-bold text-white/90 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-white/20 shrink-0 shadow">
+                        {releaseYear}
                       </span>
-                      OpenCritic
-                    </span>
-                    <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold border ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}>
-                      {oc.score}
-                    </span>
-                    <span className={`text-[10px] font-bold ${ocColors.accentText}`}>
-                      {oc.tier}
+                    )}
+                  </div>
+                </div>
+
+                {/* Disconnected Storefront Notice Banner */}
+                {hoveredGame.platforms.some((p) => !connectedSet.has(p.platformId)) && (
+                  <div className="px-3 py-1.5 bg-amber-950/70 border-b border-amber-600/40 text-[11px] text-amber-300 flex items-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>
+                      {hoveredGame.platforms
+                        .filter((p) => !connectedSet.has(p.platformId))
+                        .map((p) => getStorefrontDisplayName(p.platformId))
+                        .join(', ')}{' '}
+                      (Not Connected)
                     </span>
                   </div>
-                  <span className="text-[10px] text-steam-subtext">
-                    {oc.percentRecommended}% Rec.
-                  </span>
-                </div>
-              );
-            })()}
+                )}
 
-            {/* Synopsis Snippet */}
-            {hoveredGame.shortDescription && (
-              <p className="text-[11px] text-steam-subtext leading-relaxed line-clamp-3">
-                {hoveredGame.shortDescription}
-              </p>
-            )}
+                {/* Details Body */}
+                <div className="p-3.5 space-y-3 text-xs">
+                  {/* Review Sentiment & Playtime Row */}
+                  <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
+                    {hoveredGame.reviewSummary ? (
+                      <div className="flex items-center gap-1.5">
+                        <ThumbsUp className="w-3.5 h-3.5 text-steam-accent" />
+                        <span className="text-steam-accent font-semibold text-[11px]">
+                          {hoveredGame.reviewSummary.reviewScoreDesc}
+                        </span>
+                        <span className="text-steam-subtext text-[10px]">
+                          ({hoveredGame.reviewSummary.positivePercent}%)
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-steam-subtext text-[11px] italic">Verified in Library</span>
+                    )}
 
-            {/* Owned On Storefronts Row */}
-            <div className="flex items-center justify-between pt-1 text-[11px]">
-              <span className="text-steam-subtext text-[10px] uppercase font-bold tracking-wider">
-                Owned on:
-              </span>
-              <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                {hoveredGame.platforms.map((p) => {
-                  const isConnected = connectedSet.has(p.platformId);
-                  return (
-                    <div
-                      key={p.platformId}
-                      className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] ${
-                        isConnected
-                          ? 'bg-black/50 border-white/10 text-white'
-                          : 'bg-amber-950/40 border-amber-500/40 text-amber-200'
-                      }`}
-                    >
-                      <StorefrontIcon
-                        storefrontId={p.platformId}
-                        className={`w-3 h-3 ${isConnected ? 'text-sky-400' : 'text-amber-400'}`}
-                      />
-                      <span>{getStorefrontDisplayName(p.platformId)}</span>
-                      {!isConnected && (
-                        <span className="text-[9px] text-amber-400 font-semibold">(Not Connected)</span>
+                    <div className="flex items-center gap-2">
+                      {formatPlaytime(hoveredGame) ? (
+                        <div className="flex items-center gap-1 text-white font-medium text-[11px]">
+                          <Clock className="w-3 h-3 text-sky-400" />
+                          <span>{formatPlaytime(hoveredGame)}</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1 text-sky-300 text-[11px]">
+                          <Cloud className="w-3 h-3" />
+                          <span>Cloud Library</span>
+                        </div>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            </div>
+                  </div>
 
-            {/* Tags Pills */}
-            {hoveredGame.tags && hoveredGame.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1 pt-1">
-                {hoveredGame.tags.slice(0, 4).map((tag) => (
-                  <span
-                    key={tag}
-                    className="px-2 py-0.5 rounded text-[10px] bg-[#223042] text-steam-accent border border-steam-border/60"
-                  >
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            )}
+                  {/* OpenCritic Rating Row */}
+                  {(() => {
+                    const oc = getOpenCriticData(
+                      targetAppId,
+                      hoveredGame.title,
+                      hoveredGame.reviewSummary?.positivePercent
+                    );
+                    const ocColors = getTierColor(oc.tier);
+                    return (
+                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1">
+                            <span className={`w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center ${ocColors.scoreBg}`}>
+                              OC
+                            </span>
+                            OpenCritic
+                          </span>
+                          <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold border ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}>
+                            {oc.score}
+                          </span>
+                          <span className={`text-[10px] font-bold ${ocColors.accentText}`}>
+                            {oc.tier}
+                          </span>
+                        </div>
+                        <span className="text-[10px] text-steam-subtext">
+                          {oc.percentRecommended}% Rec.
+                        </span>
+                      </div>
+                    );
+                  })()}
 
-            {/* Click to Open Prompt */}
-            <div className="pt-2 border-t border-steam-border/40 flex items-center justify-between text-[11px] text-steam-accent font-semibold group">
-              <span>View 1:1 Steam Store Page</span>
-              <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-1 transition-transform" />
-            </div>
-          </div>
+                  {/* HowLongToBeat Row */}
+                  {(() => {
+                    const hltb = getHowLongToBeat(
+                      hoveredGame.title,
+                      targetAppId,
+                      hoveredGame.genres,
+                      hoveredGame.tags
+                    );
+                    if (!hltb || (!hltb.mainStoryHours && !hltb.allStylesHours)) return null;
+
+                    const formatHours = (h: number): string => {
+                      if (!h || h <= 0) return '--';
+                      if (h % 1 === 0.5) return `${Math.floor(h)}½h`;
+                      return `${Math.round(h)}h`;
+                    };
+
+                    return (
+                      <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1">
+                            <span className="w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center bg-[#29435c]">
+                              HL
+                            </span>
+                            HowLongToBeat
+                          </span>
+                          {hltb.isAccurate ? (
+                            <span className="px-1.5 py-0.2 rounded text-[9px] font-semibold bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
+                              Verified
+                            </span>
+                          ) : (
+                            <span className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-white/5 border border-white/10 text-white/50">
+                              Estimate
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2.5 text-[10px]">
+                          {hltb.mainStoryHours > 0 && (
+                            <span className="flex items-center gap-1 text-white/90">
+                              <span className="text-steam-subtext">Main:</span>
+                              <strong className="text-sky-300 font-bold">{formatHours(hltb.mainStoryHours)}</strong>
+                            </span>
+                          )}
+                          {hltb.completionistHours > 0 && (
+                            <span className="flex items-center gap-1 text-white/90">
+                              <span className="text-steam-subtext">100%:</span>
+                              <strong className="text-amber-300 font-bold">{formatHours(hltb.completionistHours)}</strong>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Synopsis Snippet */}
+                  {cleanSynopsis && (
+                    <p className="text-[11px] text-steam-subtext leading-relaxed line-clamp-3">
+                      {cleanSynopsis}
+                    </p>
+                  )}
+
+                  {/* Owned On Storefronts Row */}
+                  <div className="flex items-center justify-between pt-1 text-[11px]">
+                    <span className="text-steam-subtext text-[10px] uppercase font-bold tracking-wider">
+                      Owned on:
+                    </span>
+                    <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                      {hoveredGame.platforms.map((p) => {
+                        const isConnected = connectedSet.has(p.platformId);
+                        return (
+                          <div
+                            key={p.platformId}
+                            className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] ${
+                              isConnected
+                                ? 'bg-black/50 border-white/10 text-white'
+                                : 'bg-amber-950/40 border-amber-500/40 text-amber-200'
+                            }`}
+                          >
+                            <StorefrontIcon
+                              storefrontId={p.platformId}
+                              className={`w-3 h-3 ${isConnected ? 'text-sky-400' : 'text-amber-400'}`}
+                            />
+                            <span>{getStorefrontDisplayName(p.platformId)}</span>
+                            {!isConnected && (
+                              <span className="text-[9px] text-amber-400 font-semibold">(Not Connected)</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Tags Pills */}
+                  {hoveredGame.tags && hoveredGame.tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {hoveredGame.tags.slice(0, 4).map((tag) => (
+                        <span
+                          key={tag}
+                          className="px-2 py-0.5 rounded text-[10px] bg-[#223042] text-steam-accent border border-steam-border/60"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            );
+          })()}
         </div>
       )}
     </div>

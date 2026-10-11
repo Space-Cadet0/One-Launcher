@@ -17,6 +17,19 @@ export function isHexOrGuidString(str: string): boolean {
   return false;
 }
 
+export function isPlaceholderDesc(desc?: string, title?: string): boolean {
+  if (!desc) return true;
+  const trimmed = desc.trim();
+  if (trimmed.length <= 3) return true;
+  const lower = trimmed.toLowerCase();
+  if (title && lower === title.trim().toLowerCase()) return true;
+  if (lower.includes('on gog.com')) return true;
+  if (lower.includes('drm-free')) return true;
+  if (lower.includes('epic games store')) return true;
+  if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
+  return false;
+}
+
 /**
  * Detects whether an item is a non-game item (Fortnite microtransactions, DLC packs, add-on assets)
  */
@@ -627,6 +640,10 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
 
     normTitle = normalizeCanonicalTitle(game.title);
 
+    if (isPlaceholderDesc(game.shortDescription, game.title)) {
+      game = { ...game, shortDescription: '' };
+    }
+
     // 9. Intelligent cross-store deduplication by Steam App ID and Normalized Title
     const existingIndex =
       (game.steamAppId && steamIdToIndex.has(game.steamAppId)
@@ -666,7 +683,11 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         headerImage: (game.headerImage && (!existing.headerImage || existing.headerImage.includes('egs-badge.png') || existing.headerImage.includes('1225270') || existing.headerImage.endsWith('/3286930/header.jpg') || existing.headerImage.endsWith('/3783210/header.jpg') || existing.headerImage.endsWith('/3280350/header.jpg') || existing.headerImage.endsWith('/2149010/header.jpg') || existing.headerImage.endsWith('/3751260/header.jpg') || existing.headerImage.endsWith('/3504780/header.jpg') || existing.headerImage.endsWith('/480/header.jpg'))) ? game.headerImage : (existing.headerImage || game.headerImage),
         capsuleImage: (game.capsuleImage && (!existing.capsuleImage || existing.capsuleImage.includes('egs-badge.png') || existing.capsuleImage.includes('1225270') || existing.capsuleImage.includes('/3783210/library_') || existing.capsuleImage.includes('/3280350/library_') || existing.capsuleImage.includes('/2149010/library_') || existing.capsuleImage.includes('/3751260/library_') || existing.capsuleImage.includes('/3504780/library_') || existing.capsuleImage.includes('/480/'))) ? game.capsuleImage : (existing.capsuleImage || game.capsuleImage),
         iconUrl: (game.iconUrl && (!existing.iconUrl || existing.iconUrl.includes('egs-badge.png') || existing.iconUrl.includes('1225270'))) ? game.iconUrl : (existing.iconUrl || game.iconUrl || game.capsuleImage),
-        shortDescription: existing.shortDescription || game.shortDescription,
+        shortDescription: (!isPlaceholderDesc(existing.shortDescription, existing.title))
+          ? existing.shortDescription
+          : (!isPlaceholderDesc(game.shortDescription, game.title))
+          ? game.shortDescription
+          : '',
         developers: existing.developers && existing.developers.length > 0 ? existing.developers : game.developers,
         publishers: existing.publishers && existing.publishers.length > 0 ? existing.publishers : game.publishers,
       };

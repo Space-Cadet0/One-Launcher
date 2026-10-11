@@ -16,7 +16,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
     "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/2a4236503b98fd2ffba0e0dd73d9d39ade99b7e1/capsule_231x87.jpg?t=1759856432",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2025-10-07",
     "developers": [
       "mc2games"
@@ -72,7 +72,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/752590/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2019-05-14",
     "developers": [
       "Asobo Studio"
@@ -126,7 +126,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2018-05-29",
     "developers": [
       "Madmind Studio"
@@ -179,7 +179,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2018-10-30",
     "developers": [
       "Madmind Studio"
@@ -233,7 +233,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/56262850671fd7232b8ff46deba530007ff7a437fab0ddd67147f8d41aa6bca0_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/56262850671fd7232b8ff46deba530007ff7a437fab0ddd67147f8d41aa6bca0_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1980-01-01",
     "developers": [
       "Richard Garriot"
@@ -277,7 +277,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22650/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2010-09-22",
     "developers": [
       "Team17 Software"
@@ -325,7 +325,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22670/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2010-11-17",
     "developers": [
       "Team17 Software"
@@ -373,7 +373,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22610/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22610/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2010-06-03",
     "developers": [
       "Team17 Software"
@@ -423,7 +423,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548090/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548090/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1992-01-02",
     "developers": [
       "Pieces Interactive"
@@ -477,7 +477,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548890/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548890/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1992-01-02",
     "developers": [
       "Infogrames"
@@ -519,7 +519,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548900/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1992-01-02",
     "developers": [
       "Infogrames"
@@ -561,7 +561,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/949200/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/949200/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2021-08-18",
     "developers": [
       "Joy Manufacturing Co."
@@ -668,7 +668,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/993790/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-04-09",
     "developers": [
       "Grey Alien Games"
@@ -719,7 +719,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/2cff003da730f1d47d120967a623abc24a15c7dfe2fb9adcda22a7dafd65acbe_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/2cff003da730f1d47d120967a623abc24a15c7dfe2fb9adcda22a7dafd65acbe_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2013-04-04",
     "developers": [
       "Eric Chahi"
@@ -769,7 +769,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388870/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2022-08-11",
     "developers": [
       "Nosebleed Interactive"
@@ -868,7 +868,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/580320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/580320/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2017-09-19",
     "developers": [
       "Orangepixel"
@@ -1026,7 +1026,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/761620/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/761620/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2018-12-05",
     "developers": [
       "Warm Lamp Games"
@@ -1080,7 +1080,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/b896c4e69f4c1f67b85a27309d3447c812e31ee07d6558364f602f077477510e_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/b896c4e69f4c1f67b85a27309d3447c812e31ee07d6558364f602f077477510e_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-02-14",
     "developers": [
       "Dr PinkCake"
@@ -1126,7 +1126,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368340/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368340/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1994-04-11",
     "developers": [
       "Revolution Software"
@@ -1177,7 +1177,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1561340/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1561340/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2024-03-06",
     "developers": [
       "BerserkBoy Games"
@@ -1224,7 +1224,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/798b87f729fa965e96455dff61c7983d54eb86a450675e05de2583b78b134973_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/798b87f729fa965e96455dff61c7983d54eb86a450675e05de2583b78b134973_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-03-24",
     "developers": [
       "Blackpowder Games"
@@ -1280,7 +1280,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/2d0cd253f7d22db29fd4c2e411f5ef39c9347771b58f385158a8ac58f198560d_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/2d0cd253f7d22db29fd4c2e411f5ef39c9347771b58f385158a8ac58f198560d_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1993-08-03",
     "developers": [
       "Apogee Entertainment"
@@ -1327,7 +1327,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8870/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2013-03-25",
     "developers": [
       "Irrational Games"
@@ -1375,7 +1375,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8850/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8850/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2010-02-09",
     "developers": [
       "2K Marin",
@@ -1431,7 +1431,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7670/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2007-08-21",
     "developers": [
       "2K Marin",
@@ -1487,7 +1487,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409720/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2016-09-16",
     "developers": [
       "2K Marin",
@@ -1543,7 +1543,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/409710/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2016-09-16",
     "developers": [
       "2K Marin",
@@ -1599,7 +1599,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1710170/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1710170/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2021-10-07",
     "developers": [
       "Rebel Act Studios",
@@ -1649,7 +1649,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1996-11-11",
     "developers": [
       "Crystal Dynamics"
@@ -1694,7 +1694,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2056220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2056220/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2023-01-27",
     "developers": [
       "Pun Intended"
@@ -1746,7 +1746,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/5b0d3da8074c8dafb7c129fe4eac9feb47dce1f15fcaa325c1b420e21adc4273_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/5b0d3da8074c8dafb7c129fe4eac9feb47dce1f15fcaa325c1b420e21adc4273_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2008-08-26",
     "developers": [
       "Revolution Software"
@@ -1799,7 +1799,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1614440/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1614440/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2024-07-17",
     "developers": [
       "Squid Shock Studios",
@@ -1849,7 +1849,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3020/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3020/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2006-09-07",
     "developers": [
       "Techland"
@@ -1901,7 +1901,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/204450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/204450/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2013-05-22",
     "developers": [
       "Techland"
@@ -1952,7 +1952,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3040220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3040220/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2025-05-06",
     "developers": [
       "Seawolf Studio",
@@ -2002,7 +2002,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/532840/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/532840/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2017-01-24",
     "developers": [
       "The Brotherhood"
@@ -2054,7 +2054,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904620/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1990-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2097,7 +2097,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2061230/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2061230/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2022-10-10",
     "developers": [
       "Action Forms",
@@ -2148,7 +2148,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2026-04-30",
     "developers": [
       "Virtual Design"
@@ -2195,7 +2195,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/968870/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/968870/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2020-05-05",
     "developers": [
       "Storm in a Teacup"
@@ -2245,7 +2245,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-09-10",
     "developers": [
       "Remedy Entertainment"
@@ -2296,7 +2296,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203770/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203770/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2012-02-14",
     "developers": [
       "Paradox Development Studio"
@@ -2344,7 +2344,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904520/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1989-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2387,7 +2387,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/0a12c6d08925b4e567dd56bd3cd70b3a0667ea484539bada5b8698f4add72dcf_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/0a12c6d08925b4e567dd56bd3cd70b3a0667ea484539bada5b8698f4add72dcf_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "",
     "developers": [
       "CD PROJEKT RED"
@@ -2428,7 +2428,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2464690/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2464690/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1994-11-01",
     "developers": [
       "Raven Software"
@@ -2477,7 +2477,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/e329f224694547ec95f6bcb67b8148ff16eae0c939d9daf1495922246fb016f5_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/e329f224694547ec95f6bcb67b8148ff16eae0c939d9daf1495922246fb016f5_glx_vertical_cover.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "1993-01-01",
     "developers": [
       "Stormfront Studios"
@@ -2524,7 +2524,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/0878e7c7a9c1bcce30c589a715f09c13785da1539615e73b27a15fd463b6ef7b_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/0878e7c7a9c1bcce30c589a715f09c13785da1539615e73b27a15fd463b6ef7b_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2022-06-15",
     "developers": [
       "Daggerfall Workshop"
@@ -2566,7 +2566,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1481400/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1481400/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-09-24",
     "developers": [
       "Bit Golem"
@@ -2620,7 +2620,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945770/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/945770/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2023-10-24",
     "developers": [
       "Event Horizon"
@@ -2670,7 +2670,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904600/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1993-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2713,7 +2713,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904601/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904601/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1994-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2756,7 +2756,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904621/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-01-01",
     "developers": [
       "Strategic Simulations"
@@ -2799,7 +2799,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/471810/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/471810/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2017-03-14",
     "developers": [
       "SMG Studio"
@@ -2847,7 +2847,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350540/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350540/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1995-11-01",
     "developers": [
       "Lion Entertainment"
@@ -2894,7 +2894,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698640/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2018-09-26",
     "developers": [
       "Snowhound Games"
@@ -2948,7 +2948,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1305720/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2020-05-09",
     "developers": [
       "Terrible Toybox"
@@ -3045,7 +3045,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/3f580ea4bcf6f4df3b9a1a460c056a6a83420b07298751d65771f424d823068a_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/3f580ea4bcf6f4df3b9a1a460c056a6a83420b07298751d65771f424d823068a_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2003-12-02",
     "developers": [
       "Ion Storm Inc."
@@ -3095,7 +3095,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/42c6aec0e9ae93304d487ebb9ec40eb5fd221d6c174f54b752a1d20915bde11f_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/42c6aec0e9ae93304d487ebb9ec40eb5fd221d6c174f54b752a1d20915bde11f_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2013-10-25",
     "developers": [
       "Eidos Montreal"
@@ -3198,7 +3198,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/79429e097ac499290497415f13c0a1747a07659fc7b53f8cc07f1b0afd569333_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/79429e097ac499290497415f13c0a1747a07659fc7b53f8cc07f1b0afd569333_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2000-06-22",
     "developers": [
       "Ion Storm Inc."
@@ -3249,7 +3249,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/fa31881af39436b62bef91cb325f462c8f288d6af2090a256d0f8a1e991ffa88_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/fa31881af39436b62bef91cb325f462c8f288d6af2090a256d0f8a1e991ffa88_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1997-01-01",
     "developers": [
       "Robinson Technologies"
@@ -3294,7 +3294,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/205100/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2012-10-12",
     "developers": [
       "Arkane Studios"
@@ -3348,7 +3348,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/403640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/403640/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2016-11-11",
     "developers": [
       "Arkane Studios"
@@ -3404,7 +3404,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/82a7cd303997644e10450fad1be3a3666f5cb0cfbc1fa44b38b429e607e64426_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/82a7cd303997644e10450fad1be3a3666f5cb0cfbc1fa44b38b429e607e64426_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2016-05-13",
     "developers": [
       "id Software"
@@ -3563,7 +3563,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/f4d1eb73497af65e68515b5eaded352dd40c254b12a8cc6ee386d02f5936872c_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/f4d1eb73497af65e68515b5eaded352dd40c254b12a8cc6ee386d02f5936872c_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2012-10-09",
     "developers": [
       "id Software"
@@ -3605,7 +3605,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/2cbe0fc4f6726cbbd35bc3578bcefc6d33fe7138ca5bfc35c795087d738dfbd0_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/2cbe0fc4f6726cbbd35bc3578bcefc6d33fe7138ca5bfc35c795087d738dfbd0_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "",
     "developers": [
       "id Software"
@@ -3647,7 +3647,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/c1f0858b5d431d7ff13ea7e577d52959e8f832ea8066d66035f86cb5bd8c80ff_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/c1f0858b5d431d7ff13ea7e577d52959e8f832ea8066d66035f86cb5bd8c80ff_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1994-05-05",
     "developers": [
       "id Software"
@@ -3689,7 +3689,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/b8a290c8e8e0315715851722306c3494e67c58c1b928d07dcc233959d9c759ee_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/b8a290c8e8e0315715851722306c3494e67c58c1b928d07dcc233959d9c759ee_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "",
     "developers": [
       "id Software"
@@ -3731,7 +3731,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/43b050c658e5c7c9757b15eee9b94f5800c27561aebd030e6a01e5b99ee83570_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/43b050c658e5c7c9757b15eee9b94f5800c27561aebd030e6a01e5b99ee83570_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2014-02-17",
     "developers": [
       "Mike Singleton and Chris Wild"
@@ -3781,7 +3781,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350512/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350512/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "",
     "developers": [
       "Westwood Studios"
@@ -3823,7 +3823,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350520/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1990-01-01",
     "developers": [
       "Westwood Associates",
@@ -3870,7 +3870,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1562430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1562430/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2023-03-30",
     "developers": [
       "Black Salt Games"
@@ -3921,7 +3921,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904551/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904551/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1993-01-01",
     "developers": [
       "DreamForge Intertainment"
@@ -3964,7 +3964,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/727850/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/727850/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-01-30",
     "developers": [
       "Hyperstrange"
@@ -4019,7 +4019,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2243110/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2243110/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2023-10-16",
     "developers": [
       "CC ARTS"
@@ -4061,7 +4061,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/25600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/25600/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2006-11-17",
     "developers": [
       "Basilisk Games"
@@ -4108,7 +4108,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1425330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1425330/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-01-01",
     "developers": [
       "Westwood Associates"
@@ -4151,7 +4151,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882261/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882261/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-12-01",
     "developers": [
       "Westwood Associates"
@@ -4194,7 +4194,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882262/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882262/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1993-01-01",
     "developers": [
       "Strategic Simulations"
@@ -4237,7 +4237,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/255c13273d77d9791bec1c2a63a36b0aeb40bb865a6ae2db21c3a5f90eee80d2_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/255c13273d77d9791bec1c2a63a36b0aeb40bb865a6ae2db21c3a5f90eee80d2_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2022-08-24",
     "developers": [
       "Critical Rabbit"
@@ -4285,7 +4285,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/0584f7fbcb480d39f317067ba81e78c76f6735d41c3d281b8db8b1bbe8d715d4_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/0584f7fbcb480d39f317067ba81e78c76f6735d41c3d281b8db8b1bbe8d715d4_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1997-09-30",
     "developers": [
       "Interplay"
@@ -4340,7 +4340,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/e1fb495117c3c3c5b50c30db055acdc7545893b842111058d49c5039f2014680_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/e1fb495117c3c3c5b50c30db055acdc7545893b842111058d49c5039f2014680_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1998-09-30",
     "developers": [
       "Interplay"
@@ -4393,7 +4393,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22370/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2009-10-13",
     "developers": [
       "Bethesda Game Studios"
@@ -4444,7 +4444,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/4970369a94834801c5b15def214e62a281f495b665261a39b6de5d52a9d04735_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/4970369a94834801c5b15def214e62a281f495b665261a39b6de5d52a9d04735_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2001-03-15",
     "developers": [
       "14° East"
@@ -4496,7 +4496,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/40a45333c40f66a48c507c23590ade8c64e64c7786e135e2e2ab9933e373b9d9_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/40a45333c40f66a48c507c23590ade8c64e64c7786e135e2e2ab9933e373b9d9_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2024-07-25",
     "developers": [
       "Team FOLON®"
@@ -4606,7 +4606,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350530/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350530/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1993-10-01",
     "developers": [
       "Silicon Knights"
@@ -4658,7 +4658,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741120/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741120/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "1996-03-01",
     "developers": [
       "Strategic Simulations"
@@ -4705,7 +4705,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/6eab5cbbc9ecb873792c7f6d6e42e732b7cfbd270927a41660fc15266c5c1d69_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/6eab5cbbc9ecb873792c7f6d6e42e732b7cfbd270927a41660fc15266c5c1d69_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2005-05-18",
     "developers": [
       "Pendulo Studios"
@@ -4748,7 +4748,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2008-08-08",
     "developers": [
       "WildTangent"
@@ -4801,7 +4801,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1360980/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1360980/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2020-07-27",
     "developers": [
       "ViNovella Games"
@@ -4851,7 +4851,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/366a67d13a260dbafbc0b07d7080b148825bde15814547ae38a631ccace111c0_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/366a67d13a260dbafbc0b07d7080b148825bde15814547ae38a631ccace111c0_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1996-05-31",
     "developers": [
       "id Software"
@@ -4893,7 +4893,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/09011753df7ead3ab93e9d0fbaaad9f4fe3ceb31f09b130742b35af300780150_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/09011753df7ead3ab93e9d0fbaaad9f4fe3ceb31f09b130742b35af300780150_glx_vertical_cover.jpg",
-    "shortDescription": "Racing on GOG.com (DRM-Free)",
+    "shortDescription": "Racing experience",
     "releaseDate": "2022-09-02",
     "developers": [
       "Jujubee S.A."
@@ -4938,7 +4938,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/23f2b3ea51d94d412516374660aa231561f5d25bd99947c5b49e8f255119a185_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/23f2b3ea51d94d412516374660aa231561f5d25bd99947c5b49e8f255119a185_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1995-10-25",
     "developers": [
       "Interactive Binary Illusions"
@@ -4986,7 +4986,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/105315d52a96ac2dc98c9de77c99f90734a30cd9f02b64b4d035906613c8a4d3_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/105315d52a96ac2dc98c9de77c99f90734a30cd9f02b64b4d035906613c8a4d3_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1993-01-01",
     "developers": [
       "MicroMagic"
@@ -5027,7 +5027,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1931730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1931730/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2023-08-22",
     "developers": [
       "Fallen Leaf",
@@ -5079,7 +5079,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322450/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2018-05-17",
     "developers": [
       "Loveshack Entertainment"
@@ -5128,7 +5128,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2484130/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2484130/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2024-10-08",
     "developers": [
       "Krillbite Studio"
@@ -5178,7 +5178,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/409843a41bcb1ccaa7a6124299395526714aa598cd281e526fcdba0cfe0fb548_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/409843a41bcb1ccaa7a6124299395526714aa598cd281e526fcdba0cfe0fb548_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2021-09-16",
     "developers": [
       "Anshar Studios"
@@ -5233,7 +5233,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904523/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904523/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-01-01",
     "developers": [
       "Beyond Software"
@@ -5276,7 +5276,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
     "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-10-27",
     "developers": [
       "One More Level"
@@ -5326,7 +5326,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/488730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/488730/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2019-04-19",
     "developers": [
       "One More Level"
@@ -5381,7 +5381,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431240/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431240/library_600x900_2x.jpg",
-    "shortDescription": "Sports on GOG.com (DRM-Free)",
+    "shortDescription": "Sports experience",
     "releaseDate": "2020-05-19",
     "developers": [
       "Blacklight Interactive",
@@ -5433,7 +5433,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606880/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606880/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2019-09-10",
     "developers": [
       "Spiders"
@@ -5486,7 +5486,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/316790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/316790/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2015-01-27",
     "developers": [
       "Double Fine Productions"
@@ -5539,7 +5539,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/dc021a1d14c25002ea4eaae039810aa48ce4f6626bd562b939e1cdbb28c8cbd2_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/dc021a1d14c25002ea4eaae039810aa48ce4f6626bd562b939e1cdbb28c8cbd2_glx_vertical_cover.jpg",
-    "shortDescription": "Racing on GOG.com (DRM-Free)",
+    "shortDescription": "Racing experience",
     "releaseDate": "2018-11-06",
     "developers": [
       "Caged Element Inc."
@@ -5585,7 +5585,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1284410/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1284410/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2018-10-23",
     "developers": [
       "CD PROJEKT RED"
@@ -5632,7 +5632,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1282410/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1282410/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2022-08-04",
     "developers": [
       "Ice Code Games"
@@ -5676,7 +5676,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/924750/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/924750/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2024-04-16",
     "developers": [
       "Slow Bros."
@@ -5732,7 +5732,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1549550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1549550/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2021-08-05",
     "developers": [
       "Fabien Weibel"
@@ -5784,7 +5784,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/681330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/681330/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2018-10-11",
     "developers": [
       "Deimos Games"
@@ -5830,7 +5830,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/818658294fc9ed5ce966acf2792e93aa8cb6d4776813071c6774b93c73d0f6f5_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/818658294fc9ed5ce966acf2792e93aa8cb6d4776813071c6774b93c73d0f6f5_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-08-29",
     "developers": [
       "Dynamic Pixels"
@@ -5886,7 +5886,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/628670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/628670/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-07-30",
     "developers": [
       "Cradle Games"
@@ -5942,7 +5942,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1243140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1243140/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-02-20",
     "developers": [
       "Cradle Games"
@@ -5998,7 +5998,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1590730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1590730/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2023-08-31",
     "developers": [
       "xRedGames"
@@ -6054,7 +6054,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1656780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1656780/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2022-03-01",
     "developers": [
       "Benjamin \"ThingOnItsOwn\" Hauer"
@@ -6107,7 +6107,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350511/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350511/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "",
     "developers": [
       "Strategic Simulations"
@@ -6149,7 +6149,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/3699de957c16c9d8e442243f81edde06b9356d0a27e8aa9f3b1ad82ede6e01ea_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/3699de957c16c9d8e442243f81edde06b9356d0a27e8aa9f3b1ad82ede6e01ea_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2015-05-16",
     "developers": [
       "07th Expansion"
@@ -6202,7 +6202,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904525/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904525/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1989-01-01",
     "developers": [
       "Westwood Studios"
@@ -6244,7 +6244,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203140/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2012-11-20",
     "developers": [
       "Io-Interactive"
@@ -6293,7 +6293,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/833040/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/833040/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2018-04-13",
     "developers": [
       "What Pumpkin Games, Inc."
@@ -6344,7 +6344,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/892860/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/892860/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2021-02-26",
     "developers": [
       "Walk with Kings"
@@ -6396,7 +6396,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/47d5b333fcd3736cd52e997b0b00c04b1cab1d1a3469720761234d7359c49ddf_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/47d5b333fcd3736cd52e997b0b00c04b1cab1d1a3469720761234d7359c49ddf_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2015-02-18",
     "developers": [
       "Dennaton Games"
@@ -6448,7 +6448,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/611790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/611790/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2022-07-16",
     "developers": [
       "Eek! Games, LLC"
@@ -6502,7 +6502,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/339800/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/339800/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2015-01-19",
     "developers": [
       "HuniePot"
@@ -6557,7 +6557,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/844590/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/844590/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2019-03-12",
     "developers": [
       "Tendershoot",
@@ -6614,7 +6614,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/595140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/595140/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2017-04-25",
     "developers": [
       "Crema Games"
@@ -6665,7 +6665,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1172650/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2021-09-30",
     "developers": [
       "Gaming Minds Studios"
@@ -6707,7 +6707,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/807120/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/807120/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-04-23",
     "developers": [
       "Unfrozen"
@@ -6759,7 +6759,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1412170/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1412170/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-09-25",
     "developers": [
       "Onix Games"
@@ -6808,7 +6808,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/b6184bdfe32a6b50777057d0b599c4e00758a68e31ebdaad2d737839b0fb170d_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/b6184bdfe32a6b50777057d0b599c4e00758a68e31ebdaad2d737839b0fb170d_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1992-01-01",
     "developers": [
       "Epic Games"
@@ -6854,7 +6854,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/811320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/811320/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2019-08-01",
     "developers": [
       "ChaosForge "
@@ -6904,7 +6904,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/220200/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2015-04-27",
     "developers": [
       "Squad"
@@ -6956,7 +6956,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/2d11a18cae6d1b130c9af66b5f83baab54f198be694e8d05976543c21d54d487_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/2d11a18cae6d1b130c9af66b5f83baab54f198be694e8d05976543c21d54d487_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-05-20",
     "developers": [
       "DigiTales Interactive"
@@ -7010,7 +7010,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/f68062ce060563f1a0fb50657d4bea367992d53d0884bec5ffa8da15b1b079c4_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/f68062ce060563f1a0fb50657d4bea367992d53d0884bec5ffa8da15b1b079c4_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2022-02-11",
     "developers": [
       "DriftyGames"
@@ -7061,7 +7061,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1469300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1469300/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-12-31",
     "developers": [
       "Andrealphus Games"
@@ -7114,7 +7114,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242960/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242960/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2002-03-20",
     "developers": [
       "Crystal Dynamics"
@@ -7159,7 +7159,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/224300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/224300/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2003-12-17",
     "developers": [
       "Crystal Dynamics"
@@ -7210,7 +7210,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/de223675d11d6298a77cbc289c56096577f3fde8eb40a3f1a5a04ed319f61e95_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/de223675d11d6298a77cbc289c56096577f3fde8eb40a3f1a5a04ed319f61e95_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2009-11-13",
     "developers": [
       "Traveller's Tales"
@@ -7262,7 +7262,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/835a0947eda2ed8f1d6b6d6f656c2cbe21da54857376fcdb279989bd5b89fc9c_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/835a0947eda2ed8f1d6b6d6f656c2cbe21da54857376fcdb279989bd5b89fc9c_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2011-03-22",
     "developers": [
       "Traveller's Tales"
@@ -7315,7 +7315,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/285160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/285160/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-04-10",
     "developers": [
       "Traveller's Tales"
@@ -7368,7 +7368,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/214510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/214510/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2012-11-27",
     "developers": [
       "Traveller's Tales"
@@ -7424,7 +7424,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/946660/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/946660/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2018-11-27",
     "developers": [
       "Black Eye Games"
@@ -7477,7 +7477,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/c142bc01845e073ea337341303cee07a8e9e980434cd1d148bf1f43e8634c734_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/c142bc01845e073ea337341303cee07a8e9e980434cd1d148bf1f43e8634c734_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1992-04-12",
     "developers": [
       "Revolution Software"
@@ -7524,7 +7524,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/21c5c15dcd6cff7b33d052cb4b70d4076fc1ccdb544b13b4446c8e3659bf25af_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/21c5c15dcd6cff7b33d052cb4b70d4076fc1ccdb544b13b4446c8e3659bf25af_glx_vertical_cover.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2022-03-19",
     "developers": [
       "Inceton games"
@@ -7574,7 +7574,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/50130/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/50130/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2011-03-22",
     "developers": [
       "2K Czech"
@@ -7617,7 +7617,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/ec9894ec739bdfd6a68b6cf2d8a51138272f75a382fd703ece336bb89e7c49a9_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/ec9894ec739bdfd6a68b6cf2d8a51138272f75a382fd703ece336bb89e7c49a9_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-05-19",
     "developers": [
       "Hangar 13"
@@ -7668,7 +7668,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/675f7bf7c242b6c80cb8e91834d01cfc2bc0ac1bb47c7184c8ccf4966ca22423_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/675f7bf7c242b6c80cb8e91834d01cfc2bc0ac1bb47c7184c8ccf4966ca22423_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-05-19",
     "developers": [
       "Hangar 13"
@@ -7773,7 +7773,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1712390/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-12-23",
     "developers": [
       "FIXER"
@@ -7818,7 +7818,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606030/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/606030/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-03-29",
     "developers": [
       "Orangepixel"
@@ -7873,7 +7873,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904550/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1994-01-01",
     "developers": [
       "DreamForge Intertainment"
@@ -7972,7 +7972,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/241930/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/241930/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-09-30",
     "developers": [
       "Monolith Productions"
@@ -8025,7 +8025,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356190/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-10-10",
     "developers": [
       "Monolith Productions"
@@ -8129,7 +8129,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276810/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276810/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2015-11-19",
     "developers": [
       "Rogue Factor"
@@ -8179,7 +8179,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1080750/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1080750/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2019-09-19",
     "developers": [
       "Die Gute Fabrik"
@@ -8235,7 +8235,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2852980/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2852980/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2024-09-04",
     "developers": [
       "KORO.GAMES"
@@ -8290,7 +8290,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/794540/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/794540/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2019-10-03",
     "developers": [
       "Chance Agency"
@@ -8340,7 +8340,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/690e76916523b140d297f86906c67e2816b27005ee1b6743b53332c9583b2654_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/690e76916523b140d297f86906c67e2816b27005ee1b6743b53332c9583b2654_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2005-11-03",
     "developers": [
       "BioWare"
@@ -8381,7 +8381,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/704450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/704450/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2018-03-27",
     "developers": [
       "Beamdog"
@@ -8431,7 +8431,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6420/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2004-11-05",
     "developers": [
       "Mithis Entertainment"
@@ -8480,7 +8480,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1400520/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1400520/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2020-12-07",
     "developers": [
       "Star Drifters"
@@ -8529,7 +8529,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1348690/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1348690/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2022-05-03",
     "developers": [
       "Laki Studios"
@@ -8631,7 +8631,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1536610/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1536610/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2004-03-14",
     "developers": [
       "OpenTTD"
@@ -8683,7 +8683,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1129190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1129190/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2020-11-16",
     "developers": [
       "GB Patch Games"
@@ -8734,7 +8734,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2018-08-07",
     "developers": [
       "Ghost Town Games Ltd.",
@@ -8786,7 +8786,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/3de511f611d938f1a877fb2d244e1c9403ce41bc6007263fc440c80ecb75df9b_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/3de511f611d938f1a877fb2d244e1c9403ce41bc6007263fc440c80ecb75df9b_glx_vertical_cover.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2016-08-03",
     "developers": [
       "Ghost Town Games Ltd."
@@ -8837,7 +8837,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/b7272e6bb4022f3838c91a37cc403d99673fb657d57fad34f53dfa2dd4a2cafd_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/b7272e6bb4022f3838c91a37cc403d99673fb657d57fad34f53dfa2dd4a2cafd_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2016-03-08",
     "developers": [
       "Revival Productions, LLC"
@@ -8885,7 +8885,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/388880/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/388880/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2016-01-15",
     "developers": [
       "Night School Studios"
@@ -8944,7 +8944,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1768280/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1768280/library_600x900_2x.jpg",
-    "shortDescription": "Simulation on GOG.com (DRM-Free)",
+    "shortDescription": "Simulation experience",
     "releaseDate": "2022-10-11",
     "developers": [
       "The Secret Games Company"
@@ -8995,7 +8995,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1374290/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1374290/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2020-10-14",
     "developers": [
       "mc2games"
@@ -9047,7 +9047,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2702050/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2702050/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2023-12-19",
     "developers": [
       "Strategic Simulations",
@@ -9097,7 +9097,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/431650/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2017-02-07",
     "developers": [
       "ION LANDS"
@@ -9153,7 +9153,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2601940/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2601940/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2024-10-02",
     "developers": [
       "Apparition Games"
@@ -9206,7 +9206,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1608230/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1608230/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2023-05-23",
     "developers": [
       "Wishfully"
@@ -9258,7 +9258,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882370/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1882370/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1988-01-01",
     "developers": [
       "Stormfront Studios"
@@ -9305,7 +9305,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904522/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904522/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-01-01",
     "developers": [
       "Strategic Simulations"
@@ -9347,7 +9347,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/223470/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/223470/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2003-04-14",
     "developers": [
       "Running With Scissors"
@@ -9395,7 +9395,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/d916d3bbf261e1548ade8e92b20f207886cf7483a9c360f998ad491b695a0332_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/d916d3bbf261e1548ade8e92b20f207886cf7483a9c360f998ad491b695a0332_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2003-08-29",
     "developers": [
       "Running With Scissors"
@@ -9447,7 +9447,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-05-04",
     "developers": [
       "Arkane Studios"
@@ -9501,7 +9501,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2833640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2833640/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2024-12-05",
     "developers": [
       "mc2games"
@@ -9550,7 +9550,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2210/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2210/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2005-10-18",
     "developers": [
       "RavenSoft",
@@ -9644,7 +9644,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/319eb7a1947f6623c2069251c83236df7b90805434910b0c27b3e9447062ba26_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/319eb7a1947f6623c2069251c83236df7b90805434910b0c27b3e9447062ba26_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1997-12-09",
     "developers": [
       "id Software"
@@ -9729,7 +9729,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/290300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/290300/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2015-10-20",
     "developers": [
       "Double Damage Games"
@@ -9780,7 +9780,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/910830/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/910830/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-09-22",
     "developers": [
       "Double Damage Games"
@@ -9829,7 +9829,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1142390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1142390/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-10-13",
     "developers": [
       "Stormind Games"
@@ -9876,7 +9876,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1290780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1290780/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2021-09-09",
     "developers": [
       "Orangepixel"
@@ -9925,7 +9925,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1299710/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1299710/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1993-09-01",
     "developers": [
       "MPS Labs"
@@ -9974,7 +9974,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/9480/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/9480/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2009-01-07",
     "developers": [
       "Volition"
@@ -10024,7 +10024,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/206420/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2013-08-22",
     "developers": [
       "Deep Silver Volition"
@@ -10067,7 +10067,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/301910/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/301910/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2015-01-22",
     "developers": [
       "Deep Silver Volition",
@@ -10118,7 +10118,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/978300/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2021-05-22",
     "developers": [
       "Deep Silver Volition",
@@ -10162,7 +10162,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1580970/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1580970/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-05-20",
     "developers": [
       "Amanita Design"
@@ -10212,7 +10212,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/227220/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/227220/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2013-03-15",
     "developers": [
       "Artifice Studio"
@@ -10263,7 +10263,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1526900/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1526900/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2023-10-06",
     "developers": [
       "Kinky Fridays"
@@ -10311,7 +10311,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/698670/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2022-10-14",
     "developers": [
       "Ebb Software"
@@ -10367,7 +10367,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904521/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904521/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1990-01-01",
     "developers": [
       "Strategic Simulations"
@@ -10409,7 +10409,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350510/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "",
     "developers": [
       "U.S. Gold"
@@ -10443,7 +10443,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/324800/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/324800/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2016-10-13",
     "developers": [
       "Flying Wild Hog"
@@ -10495,7 +10495,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/68242319701d590dce72be3f0e2fe7fd716c98e958e69dda7ea9f9c8eb6e09f2_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/68242319701d590dce72be3f0e2fe7fd716c98e958e69dda7ea9f9c8eb6e09f2_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1997-05-13",
     "developers": [
       "3D Realms Entertainment"
@@ -10544,7 +10544,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/fcc90f964947d19b0bc49825d55cd181fea2389cd1312a5619ac731fc1c64208_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/fcc90f964947d19b0bc49825d55cd181fea2389cd1312a5619ac731fc1c64208_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2015-08-20",
     "developers": [
       "Harebrained Schemes"
@@ -10650,7 +10650,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/3151b8deaeff59ad905af2bf37cfca592d615cd1615fbe48d893ac6f797140ad_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/3151b8deaeff59ad905af2bf37cfca592d615cd1615fbe48d893ac6f797140ad_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2014-09-18",
     "developers": [
       "Harebrained Schemes"
@@ -10702,7 +10702,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/585450/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/585450/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2018-08-31",
     "developers": [
       "Games Farm"
@@ -10744,7 +10744,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2084000/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2024-09-05",
     "developers": [
       "Roboatino"
@@ -10792,7 +10792,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/aa485936254a93b3a2ed0f780d3e64609413aee0ebe23c40b3e10e91b947e0ef_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/aa485936254a93b3a2ed0f780d3e64609413aee0ebe23c40b3e10e91b947e0ef_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2021-03-22",
     "developers": [
       "Vallynne"
@@ -10835,7 +10835,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1155330/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1155330/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2023-05-02",
     "developers": [
       "Artificer"
@@ -10883,7 +10883,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/37ac843afc2b6d5f3b3b600483948cfc0f849a7c20a95adfcefe5c2b73caa4e7_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/37ac843afc2b6d5f3b3b600483948cfc0f849a7c20a95adfcefe5c2b73caa4e7_glx_vertical_cover.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2005-10-20",
     "developers": [
       "Firaxis Games"
@@ -10925,7 +10925,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3910/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3910/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2001-10-30",
     "developers": [
       "Firaxis Games"
@@ -10977,7 +10977,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1558990/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1558990/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2001-09-17",
     "developers": [
       "Digital Tome",
@@ -11029,7 +11029,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/b356d14cf18812bfa70d1d6cf23139434d71e89a92eae68b88170fcdfc015cfb_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/b356d14cf18812bfa70d1d6cf23139434d71e89a92eae68b88170fcdfc015cfb_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2019-04-11",
     "developers": [
       "goonswarm"
@@ -11070,7 +11070,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1811040/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1811040/library_600x900_2x.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "2022-08-03",
     "developers": [
       "State of Play Games"
@@ -11115,7 +11115,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/371430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/371430/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2016-01-12",
     "developers": [
       "Orangepixel"
@@ -11169,7 +11169,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/4b861d6e5a0ab352cae8572e27b62859e8a3e2b8659a7ab47ab1dcaad5c71567_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/4b861d6e5a0ab352cae8572e27b62859e8a3e2b8659a7ab47ab1dcaad5c71567_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2018-05-22",
     "developers": [
       "Streum On Studio"
@@ -11222,7 +11222,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350550/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350550/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1992-01-01",
     "developers": [
       "Cybertech"
@@ -11273,7 +11273,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239350/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239350/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2013-08-08",
     "developers": [
       "Mossmouth"
@@ -11326,7 +11326,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6060/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6060/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2005-10-31",
     "developers": [
       "Lucasfilm"
@@ -11377,7 +11377,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356500/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/356500/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2001-11-09",
     "developers": [
       "Lucasfilm"
@@ -11426,7 +11426,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/32380/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/32380/library_600x900_2x.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "1997-09-30",
     "developers": [
       "Lucasfilm"
@@ -11471,7 +11471,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/9167e6c841f5a5803e0876454dd2fb0bf0a42d9564edd69a19fea409b0674da9_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/9167e6c841f5a5803e0876454dd2fb0bf0a42d9564edd69a19fea409b0674da9_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "1997-09-30",
     "developers": [
       "LucasArts"
@@ -11512,7 +11512,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/4d7f5160a916c856a85ece512235dbe4ec4612ba1ef1bf6207e2b97028f24c67_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/4d7f5160a916c856a85ece512235dbe4ec4612ba1ef1bf6207e2b97028f24c67_glx_vertical_cover.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "1998-02-28",
     "developers": [
       "Coolhand Interactive"
@@ -11553,7 +11553,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2419090/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2419090/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2024-08-01",
     "developers": [
       "Aspyr"
@@ -11599,7 +11599,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/358390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/358390/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1996-11-19",
     "developers": [
       "Apogee Entertainment"
@@ -11646,7 +11646,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/380150/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/380150/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2015-08-31",
     "developers": [
       "The Brotherhood"
@@ -11701,7 +11701,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/437630/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/437630/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2018-08-15",
     "developers": [
       "Daedalic Entertainment"
@@ -11756,7 +11756,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322190/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/322190/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2016-06-07",
     "developers": [
       "Image and Form"
@@ -11808,7 +11808,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/804010/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/804010/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2019-05-31",
     "developers": [
       "Image and Form"
@@ -11861,7 +11861,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920780/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2023-08-10",
     "developers": [
       "Summerfall Studios"
@@ -11915,7 +11915,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/242640/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-10-07",
     "developers": [
       "Cyanide Studio"
@@ -11969,7 +11969,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/355790/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/355790/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-03-14",
     "developers": [
       "Cyanide Studio"
@@ -12016,7 +12016,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/ea1c64b772b7f5fd3e1a16ccf182c5c1319e7765b088529759cff3117af4ee85_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/ea1c64b772b7f5fd3e1a16ccf182c5c1319e7765b088529759cff3117af4ee85_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2024-05-10",
     "developers": [
       "OceanAVN"
@@ -12071,7 +12071,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/313730/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/313730/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2014-07-02",
     "developers": [
       "Love in Space"
@@ -12229,7 +12229,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1410640/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1410640/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "",
     "developers": [
       "Microids Studio Paris"
@@ -12280,7 +12280,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/b3e0bc00ddf8d56fbdf5c60189bd04d2d152dc2b65cf185933b10f9e448117b3_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/b3e0bc00ddf8d56fbdf5c60189bd04d2d152dc2b65cf185933b10f9e448117b3_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-05-30",
     "developers": [
       "ISART Digital"
@@ -12321,7 +12321,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/73599010340e1630b66dadcdbf922049c99deeeb40eeaf2fc83ace6c3792e05a_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/73599010340e1630b66dadcdbf922049c99deeeb40eeaf2fc83ace6c3792e05a_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1993-06-06",
     "developers": [
       "Bullfrog Productions"
@@ -12364,7 +12364,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/6385eb91c19cdb3df180903dcfd570657cef6a7ea58bf1fd725aaa94f72aecc3_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/6385eb91c19cdb3df180903dcfd570657cef6a7ea58bf1fd725aaa94f72aecc3_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1996-10-31",
     "developers": [
       "Bullfrog Productions"
@@ -12407,7 +12407,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/83440dfe39a478e559a6c71d70ba33b66a28796a822d6c4d7f8de28368339b62_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/83440dfe39a478e559a6c71d70ba33b66a28796a822d6c4d7f8de28368339b62_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "1994-02-26",
     "developers": [
       "Metropolis Software"
@@ -12452,7 +12452,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1483780/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1483780/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-02-24",
     "developers": [
       "mc2games"
@@ -12504,7 +12504,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/792300/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/792300/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2019-10-17",
     "developers": [
       "Illusion Ray Studio"
@@ -12562,7 +12562,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203830/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/203830/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2012-06-22",
     "developers": [
       "Daedalic Entertainment"
@@ -12610,7 +12610,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904622/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1992-01-01",
     "developers": [
       "Strategic Simulations"
@@ -12652,7 +12652,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/849f9229f0fac0c74fa8e8b32c111b96632e31260eed9d152fab2aafb5d2f972_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/849f9229f0fac0c74fa8e8b32c111b96632e31260eed9d152fab2aafb5d2f972_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2021-10-14",
     "developers": [
       "Trinity Team"
@@ -12694,7 +12694,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812390/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812390/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1996-08-31",
     "developers": [
       "Bethesda Softworks"
@@ -12739,7 +12739,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/22320/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2003-11-07",
     "developers": [
       "Bethesda Softworks"
@@ -12789,7 +12789,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812290/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1812290/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1994-03-01",
     "developers": [
       "Bethesda Softworks"
@@ -12833,7 +12833,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/601430/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2017-10-12",
     "developers": [
       "Tango Gameworks"
@@ -12884,7 +12884,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/bbba2ce5901fe222dc2493997192189215e5c8e3b576dc37ed1c1023764ee995_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/bbba2ce5901fe222dc2493997192189215e5c8e3b576dc37ed1c1023764ee995_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2002-01-01",
     "developers": [
       "SNK CORPORATION"
@@ -12926,7 +12926,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1105670/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1105670/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2023-03-09",
     "developers": [
       "Ishtar Games"
@@ -12984,7 +12984,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/84909822081b1427ec628ebcd589e216258d838b50569a8b39e2ddbfd49e8a49_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/84909822081b1427ec628ebcd589e216258d838b50569a8b39e2ddbfd49e8a49_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2020-12-01",
     "developers": [
       "Sever"
@@ -13034,7 +13034,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/0cc8a987884c525bd57c5ac9f3fefc4eb85a6ec11d2ecfc618be5b100269ec5f_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/0cc8a987884c525bd57c5ac9f3fefc4eb85a6ec11d2ecfc618be5b100269ec5f_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2013-07-12",
     "developers": [
       "Mike Singleton and Chris Wild"
@@ -13078,7 +13078,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2493180/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2493180/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2024-04-30",
     "developers": [
       "1 Simple Game"
@@ -13124,7 +13124,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/578650/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2020-10-23",
     "developers": [
       "Obsidian Entertainment",
@@ -13176,7 +13176,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1920490/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2023-03-07",
     "developers": [
       "Obsidian Entertainment",
@@ -13228,7 +13228,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1266030/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1266030/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2023-02-24",
     "developers": [
       "Bellular Studios"
@@ -13278,7 +13278,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/257510/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/257510/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-12-11",
     "developers": [
       "Croteam"
@@ -13324,7 +13324,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/433100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/433100/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2016-02-26",
     "developers": [
       "LKA"
@@ -13381,7 +13381,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/5175cf9ebd744a41f9ba0a2cca30ece6ba20281cafe72cce9fcf09e937f6867f_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/5175cf9ebd744a41f9ba0a2cca30ece6ba20281cafe72cce9fcf09e937f6867f_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1995-04-30",
     "developers": [
       "id Software"
@@ -13423,7 +13423,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/edb6a64af4bf97e540bfce7cca178b11a05b7f15572d369a577d54046e220f2c_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/edb6a64af4bf97e540bfce7cca178b11a05b7f15572d369a577d54046e220f2c_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2014-05-06",
     "developers": [
       "Daedalic Entertainment"
@@ -13470,7 +13470,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2329580/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2329580/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-12-16",
     "developers": [
       "Studio Chien d'Or"
@@ -13582,7 +13582,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239160/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2014-02-28",
     "developers": [
       "Eidos Montreal"
@@ -13625,7 +13625,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/9fee86856dec591d46e81ee8eba47c4945a980ce9730549581eae646330629d5_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/9fee86856dec591d46e81ee8eba47c4945a980ce9730549581eae646330629d5_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2000-03-23",
     "developers": [
       "Looking Glass Studios"
@@ -13677,7 +13677,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/30c6d68f5d0c8bbe9c2eb47f8781ec621a2f0ce40704c7dfe510533ca3a29f9e_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/30c6d68f5d0c8bbe9c2eb47f8781ec621a2f0ce40704c7dfe510533ca3a29f9e_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2004-05-25",
     "developers": [
       "Ion Storm Inc."
@@ -13730,7 +13730,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211600/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/211600/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1998-11-30",
     "developers": [
       "Looking Glass Studios"
@@ -13783,7 +13783,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/973760/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/973760/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2018-10-23",
     "developers": [
       "CD PROJEKT RED"
@@ -13839,7 +13839,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/ec2493f50e8945e04ccf2f5708fced7bd38606cc47bc68ced58d410fff21b120_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/ec2493f50e8945e04ccf2f5708fced7bd38606cc47bc68ced58d410fff21b120_glx_vertical_cover.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2021-09-17",
     "developers": [
       "Something We Made"
@@ -13881,7 +13881,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/d0c69608e1023e8dc4eb4c7e5aaa453406a9fe59e3ddf7b71909706854d88dc9_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/d0c69608e1023e8dc4eb4c7e5aaa453406a9fe59e3ddf7b71909706854d88dc9_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "1999-11-24",
     "developers": [
       "Core Design"
@@ -13923,7 +13923,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/05750641e3178b5a22c93e756c9efbf08a4356b48ef01f576122fad567acec01_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/05750641e3178b5a22c93e756c9efbf08a4356b48ef01f576122fad567acec01_glx_vertical_cover.jpg",
-    "shortDescription": " on GOG.com (DRM-Free)",
+    "shortDescription": "Classic title",
     "releaseDate": "1999-11-24",
     "developers": [
       "Core Design"
@@ -13964,7 +13964,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/74ef44a280dd89f7764b2e31a3356cb7fa90f89a0227038191e2714ccfd3cbdb_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/74ef44a280dd89f7764b2e31a3356cb7fa90f89a0227038191e2714ccfd3cbdb_glx_vertical_cover.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2013-03-05",
     "developers": [
       "Crystal Dynamics"
@@ -14008,7 +14008,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2478970/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2478970/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2024-02-14",
     "developers": [
       "Aspyr",
@@ -14057,7 +14057,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8000/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2007-06-05",
     "developers": [
       "Crystal Dynamics"
@@ -14102,7 +14102,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7000/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7000/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2006-04-07",
     "developers": [
       "Crystal Dynamics"
@@ -14146,7 +14146,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/225020/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/225020/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2003-06-20",
     "developers": [
       "Core Design"
@@ -14190,7 +14190,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/8140/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "2008-11-21",
     "developers": [
       "Crystal Dynamics"
@@ -14235,7 +14235,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/617480/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/617480/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2018-04-12",
     "developers": [
       "Event Horizon"
@@ -14287,7 +14287,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/863940/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/863940/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2011-11-26",
     "developers": [
       "Robit Studios"
@@ -14338,7 +14338,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1737100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1737100/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2022-02-16",
     "developers": [
       "NLT Media"
@@ -14390,7 +14390,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904524/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1904524/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1992-01-01",
     "developers": [
       "Beyond Software"
@@ -14432,7 +14432,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/440420/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/440420/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2016-10-19",
     "developers": [
       "Goblinz Enterprises Ltd"
@@ -14487,7 +14487,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/346da67f4079d2d4e64ab0e7c310ee81218734d4bde4d74d3a3f074510cf6fa5_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/346da67f4079d2d4e64ab0e7c310ee81218734d4bde4d74d3a3f074510cf6fa5_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "1999-11-30",
     "developers": [
       "Eclipse Productions"
@@ -14532,7 +14532,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/aded25b118381e697e520542c45de23766a71425646db6a72b0e19ac574dd79d_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/aded25b118381e697e520542c45de23766a71425646db6a72b0e19ac574dd79d_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1992-03-01",
     "developers": [
       "Blue Sky Productions"
@@ -14573,7 +14573,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-3.gog-statics.com/ccb50e17fe3af2ab43892f1821265020f962f33144c87d23446099cd00b2146f_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-3.gog-statics.com/ccb50e17fe3af2ab43892f1821265020f962f33144c87d23446099cd00b2146f_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1992-03-01",
     "developers": [
       "Looking Glass Studios"
@@ -14614,7 +14614,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/cb10216b4721fc46db91a79af4bee55dc90123c13ebcc11a50980d384ca1a4a1_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/cb10216b4721fc46db91a79af4bee55dc90123c13ebcc11a50980d384ca1a4a1_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1985-09-16",
     "developers": [
       "Origin Systems"
@@ -14658,7 +14658,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-1.gog-statics.com/10f120bcf0bf4b9bbd7552a413c084f891ed3cd5f7e3e562f9e856271fd98bc2_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-1.gog-statics.com/10f120bcf0bf4b9bbd7552a413c084f891ed3cd5f7e3e562f9e856271fd98bc2_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1991-12-31",
     "developers": [
       "Origin Systems"
@@ -14704,7 +14704,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1785820/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1785820/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2022-03-10",
     "developers": [
       "Estudios Kremlinois"
@@ -14750,7 +14750,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/904380/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/904380/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2019-05-28",
     "developers": [
       "Devespresso Games"
@@ -14804,7 +14804,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2414320/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2414320/library_600x900_2x.jpg",
-    "shortDescription": "Action on GOG.com (DRM-Free)",
+    "shortDescription": "Action experience",
     "releaseDate": "1993-03-01",
     "developers": [
       "Event Horizon Software"
@@ -14856,7 +14856,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350513/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2350513/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "",
     "developers": [
       "Strategic Simulations"
@@ -14898,7 +14898,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741140/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1741140/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "1996-09-23",
     "developers": [
       "DreamForge Intertainment"
@@ -14998,7 +14998,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1072620/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1072620/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2020-03-04",
     "developers": [
       "Punk Notion"
@@ -15047,7 +15047,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/288060/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/288060/library_600x900_2x.jpg",
-    "shortDescription": "Adventure on GOG.com (DRM-Free)",
+    "shortDescription": "Adventure experience",
     "releaseDate": "2014-07-09",
     "developers": [
       "Night Light Interactive"
@@ -15096,7 +15096,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/201810/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/201810/library_600x900_2x.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2014-05-20",
     "developers": [
       "Machine Games"
@@ -15142,7 +15142,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/07c86c0a10902cd350ff5476ed7f27f5290246016bd1a3ab3d52cda5759663ce_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/07c86c0a10902cd350ff5476ed7f27f5290246016bd1a3ab3d52cda5759663ce_glx_vertical_cover.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "1990-12-30",
     "developers": [
       "Origin Systems"
@@ -15187,7 +15187,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/200170/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/200170/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2012-10-12",
     "developers": [
       "Team17 Digital Ltd."
@@ -15234,7 +15234,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-2.gog-statics.com/a4b4a072ce88cb4c8b8a34a45ed283e1a773955c1992f03a83531a66223c15cb_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-2.gog-statics.com/a4b4a072ce88cb4c8b8a34a45ed283e1a773955c1992f03a83531a66223c15cb_glx_vertical_cover.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2014-03-07",
     "developers": [
       "Firaxis Games"
@@ -15321,7 +15321,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/882100/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/882100/library_600x900_2x.jpg",
-    "shortDescription": "Strategy on GOG.com (DRM-Free)",
+    "shortDescription": "Strategy experience",
     "releaseDate": "2020-04-24",
     "developers": [
       "Firaxis Games"
@@ -15364,7 +15364,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://images-4.gog-statics.com/c961f804cf039a4a1aecb56acbf51788f2cc0f7c5bc04fa1283ac37eceff89fc_product_card_v2_mobile_slider_639.jpg",
     "capsuleImage": "https://images-4.gog-statics.com/c961f804cf039a4a1aecb56acbf51788f2cc0f7c5bc04fa1283ac37eceff89fc_glx_vertical_cover.jpg",
-    "shortDescription": "Shooter on GOG.com (DRM-Free)",
+    "shortDescription": "Shooter experience",
     "releaseDate": "2003-10-09",
     "developers": [
       "Ubisoft Paris Studios"
@@ -15410,7 +15410,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1159090/header.jpg",
     "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1159090/library_600x900_2x.jpg",
-    "shortDescription": "Role-playing on GOG.com (DRM-Free)",
+    "shortDescription": "Role-playing experience",
     "releaseDate": "2024-03-07",
     "developers": [
       "Tiny Trinket Games"

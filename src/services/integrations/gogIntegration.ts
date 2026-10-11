@@ -348,12 +348,12 @@ export class GogIntegrationService {
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
             capsuleImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            shortDescription: 'GOG.com DRM-Free Title',
+            shortDescription: '',
             releaseDate: '',
             developers: [],
             publishers: [],
             genres: ['Action'],
-            tags: ['GOG', 'DRM-Free'],
+            tags: ['GOG'],
           });
         }
 
@@ -411,12 +411,12 @@ export class GogIntegrationService {
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
             capsuleImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            shortDescription: p.category ? `${p.category} on GOG.com` : 'GOG.com DRM-Free Title',
+            shortDescription: p.category ? `${p.category} title` : '',
             releaseDate: '',
             developers: [],
             publishers: [],
             genres: p.category ? [p.category] : ['Action'],
-            tags: ['GOG', 'DRM-Free'],
+            tags: ['GOG'],
           });
         }
 
