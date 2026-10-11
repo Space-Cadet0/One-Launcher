@@ -124,6 +124,8 @@ export class EpicIntegrationService {
           percentage,
           xp: { earned: earnedXP, total: totalXP },
           isMastered,
+          source: 'live_cloud_graphql',
+          syncedAt: new Date().toISOString(),
         };
 
         if (item.sandboxId) achievementsMap[item.sandboxId.toLowerCase()] = summary;

@@ -9,6 +9,10 @@ export interface SteamAchievementRecord {
   unlocked: number;
   total: number;
   percentage: number;
+  source?: 'local_client_cache';
+  syncedAt?: string;
+  hasConflict?: boolean;
+  conflictDetails?: string;
 }
 
 /**

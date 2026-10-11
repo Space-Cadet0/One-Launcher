@@ -7,6 +7,7 @@ import { FULL_USER_STEAM_GAMES } from './services/storage/fullUserSteamGames';
 import { loadCollections, saveCollections } from './services/storage/collectionStorage';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
 import { cacheUserSteamAchievements, getKnownSteamAchievements } from './services/storage/knownGameAchievements';
+import { reconcileAchievementSummaries } from './services/storage/achievementReconciliation';
 import { steamAchievementsService } from './services/steam/steamAchievementsService';
 import { TopNavBar } from './components/Navigation/TopNavBar';
 import { LibrarySidebar } from './components/Library/LibrarySidebar';
@@ -318,15 +319,28 @@ export function App() {
                 }
               }
               if (ach && ach.total > 0) {
-                const curU = p.achievements?.unlocked;
-                const curT = p.achievements?.total;
-                if (curU !== ach.unlocked || curT !== ach.total) {
-                  newP.achievements = {
+                const reconciled = reconcileAchievementSummaries(
+                  p.achievements,
+                  {
                     unlocked: ach.unlocked,
                     total: ach.total,
                     percentage: ach.percentage,
                     isMastered: ach.percentage >= 100 || (ach.total > 0 && ach.unlocked >= ach.total),
-                  };
+                    source: (ach as any).source || 'local_client_cache',
+                    syncedAt: (ach as any).syncedAt,
+                    hasConflict: (ach as any).hasConflict,
+                    conflictDetails: (ach as any).conflictDetails,
+                  },
+                  { title: game.title, appId: targetAppId, store: 'steam' }
+                );
+                if (
+                  reconciled &&
+                  (!p.achievements ||
+                    p.achievements.unlocked !== reconciled.unlocked ||
+                    p.achievements.total !== reconciled.total ||
+                    p.achievements.hasConflict !== reconciled.hasConflict)
+                ) {
+                  newP.achievements = reconciled;
                   pChanged = true;
                 }
               }

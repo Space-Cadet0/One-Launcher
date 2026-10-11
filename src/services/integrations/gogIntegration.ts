@@ -190,6 +190,8 @@ export class GogIntegrationService {
           total,
           percentage,
           isMastered: total > 0 && unlocked >= total,
+          source: 'live_cloud_xml',
+          syncedAt: new Date().toISOString(),
         };
       }
     } catch (err: any) {
@@ -205,6 +207,8 @@ export class GogIntegrationService {
         total: knownTotal,
         percentage: fallbackPercentage,
         isMastered: knownTotal > 0 && unlocked >= knownTotal,
+        source: 'live_cloud_xml',
+        syncedAt: new Date().toISOString(),
       };
     }
 

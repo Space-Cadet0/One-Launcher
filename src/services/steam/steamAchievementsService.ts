@@ -2,6 +2,7 @@ import axios from 'axios';
 import { CanonicalGame, StoreAchievementSummary } from '../../contracts/game';
 import { loadIntegrations } from '../integrations/integrationStorage';
 import { KNOWN_USER_STEAM_ACHIEVEMENTS } from '../storage/knownGameAchievements';
+import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
 export class SteamAchievementsService {
   private inMemoryCache = new Map<number, StoreAchievementSummary>();
@@ -58,6 +59,10 @@ export class SteamAchievementsService {
               total: found.total,
               percentage: found.percentage ?? (found.total > 0 ? Math.round((found.unlocked / found.total) * 100) : 0),
               isMastered: found.total > 0 && found.unlocked >= found.total,
+              source: found.source || 'local_client_cache',
+              syncedAt: found.syncedAt,
+              hasConflict: found.hasConflict,
+              conflictDetails: found.conflictDetails,
             };
             this.inMemoryCache.set(appId, summary);
             return summary;
@@ -74,6 +79,7 @@ export class SteamAchievementsService {
         total: b.total,
         percentage: b.percentage,
         isMastered: b.total > 0 && b.unlocked >= b.total,
+        source: 'baseline_fallback',
       };
       this.inMemoryCache.set(appId, summary);
       return summary;
@@ -110,13 +116,22 @@ export class SteamAchievementsService {
     let changed = false;
     const updatedPlatforms = game.platforms.map((p) => {
       if (p.platformId === 'steam') {
-        const currentUnlocked = p.achievements?.unlocked;
-        const currentTotal = p.achievements?.total;
-        if (currentUnlocked !== cached.unlocked || currentTotal !== cached.total) {
+        const reconciled = reconcileAchievementSummaries(p.achievements, cached, {
+          appId: targetAppId,
+          title: game.title,
+          store: 'steam',
+        });
+        if (
+          reconciled &&
+          (!p.achievements ||
+            p.achievements.unlocked !== reconciled.unlocked ||
+            p.achievements.total !== reconciled.total ||
+            p.achievements.hasConflict !== reconciled.hasConflict)
+        ) {
           changed = true;
           return {
             ...p,
-            achievements: cached,
+            achievements: reconciled,
           };
         }
       }
@@ -139,6 +154,7 @@ export class SteamAchievementsService {
     const creds = this.getActiveSteamCredentials();
     const steamId = explicitSteamId || creds.steamId;
     const apiKey = explicitApiKey || creds.apiKey;
+    const existingCached = this.getCachedAchievements(appId) || undefined;
 
     // 1. If Steam Web API key is configured, try ISteamUserStats/GetPlayerAchievements
     if (apiKey && steamId) {
@@ -150,14 +166,21 @@ export class SteamAchievementsService {
           const total = list.length;
           const unlocked = list.filter((a: any) => a.achieved === 1).length;
           const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-          const summary: StoreAchievementSummary = {
+          const liveSummary: StoreAchievementSummary = {
             unlocked,
             total,
             percentage,
             isMastered: total > 0 && unlocked >= total,
+            source: 'live_cloud_api',
+            syncedAt: new Date().toISOString(),
           };
-          this.setCachedAchievement(appId, summary);
-          return summary;
+          const reconciled =
+            reconcileAchievementSummaries(existingCached, liveSummary, {
+              appId,
+              store: 'steam',
+            }) || liveSummary;
+          this.setCachedAchievement(appId, reconciled);
+          return reconciled;
         }
       } catch (err: any) {
         // Fall back to community XML
@@ -179,16 +202,24 @@ export class SteamAchievementsService {
           const total = allMatches.length;
           const unlocked = unlockedMatches.length;
 
+          // Note: total > 0 is valid authoritative data even if unlocked is 0
           if (total > 0 || unlocked > 0) {
             const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-            const summary: StoreAchievementSummary = {
+            const liveSummary: StoreAchievementSummary = {
               unlocked,
               total,
               percentage,
               isMastered: total > 0 && unlocked >= total,
+              source: 'live_cloud_xml',
+              syncedAt: new Date().toISOString(),
             };
-            this.setCachedAchievement(appId, summary);
-            return summary;
+            const reconciled =
+              reconcileAchievementSummaries(existingCached, liveSummary, {
+                appId,
+                store: 'steam',
+              }) || liveSummary;
+            this.setCachedAchievement(appId, reconciled);
+            return reconciled;
           }
         }
       } catch (err: any) {
@@ -197,7 +228,7 @@ export class SteamAchievementsService {
     }
 
     // 3. Fallback to cached or verified baseline
-    return this.getCachedAchievements(appId);
+    return existingCached || this.getCachedAchievements(appId);
   }
 
   /**

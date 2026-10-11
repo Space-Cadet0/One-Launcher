@@ -9,6 +9,7 @@ import { xboxIntegration } from './xboxIntegration';
 import { mergeScannedSteamGames } from '../storage/librarySync';
 import { GOG_USER_LIBRARY, EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
 import { sanitizeGameCatalog, normalizeCanonicalTitle } from './catalogSanitizer';
+import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
 const STORAGE_KEY_INTEGRATIONS = 'antigravity_storefront_integrations';
 const STORAGE_KEY_CUSTOM_GAMES = 'antigravity_synced_user_games';
@@ -248,10 +249,11 @@ export function mergeStorefrontGames(
                     platformOwnership.playtimeMinutes !== undefined && platformOwnership.playtimeMinutes > 0
                       ? platformOwnership.playtimeMinutes
                       : p.playtimeMinutes,
-                  achievements:
-                    platformOwnership.achievements && (platformOwnership.achievements.unlocked > (p.achievements?.unlocked ?? 0) || platformOwnership.achievements.total > (p.achievements?.total ?? 0))
-                      ? platformOwnership.achievements
-                      : (p.achievements || platformOwnership.achievements),
+                  achievements: reconcileAchievementSummaries(
+                    p.achievements,
+                    platformOwnership.achievements,
+                    { title: newGame.title, appId: newGame.steamAppId, store: storefrontId }
+                  ),
                 }
               : p
           )

@@ -1,6 +1,7 @@
 import { CanonicalGame } from '../../contracts/game';
 import { FULL_USER_STEAM_GAMES } from './fullUserSteamGames';
 import { USER_SCANNED_STEAM_GAMES } from './userScannedLibrary';
+import { reconcileAchievementSummaries } from './achievementReconciliation';
 
 export function mergeScannedSteamGames(existingGames: CanonicalGame[]): CanonicalGame[] {
   const merged = [...existingGames];
@@ -30,10 +31,11 @@ export function mergeScannedSteamGames(existingGames: CanonicalGame[]): Canonica
               playtimeMinutes: Math.max(p.playtimeMinutes || 0, scannedSteam.playtimeMinutes || 0),
               lastPlayed: scannedSteam.lastPlayed || p.lastPlayed,
               installed: p.installed || scannedSteam.installed,
-              achievements:
-                scannedSteam.achievements && (scannedSteam.achievements.unlocked > (p.achievements?.unlocked ?? 0) || scannedSteam.achievements.total > (p.achievements?.total ?? 0))
-                  ? scannedSteam.achievements
-                  : (p.achievements || scannedSteam.achievements),
+              achievements: reconcileAchievementSummaries(
+                p.achievements,
+                scannedSteam.achievements,
+                { title: scanned.title, appId: scanned.steamAppId, store: 'steam' }
+              ),
             };
           }
         }

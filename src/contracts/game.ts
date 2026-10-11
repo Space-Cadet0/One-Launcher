@@ -1,6 +1,13 @@
 import { StorefrontId } from './platform';
 import { SteamEnrichedMetadata, SteamReviewSummary } from './steam';
 
+export type AchievementDataSource =
+  | 'live_cloud_api'
+  | 'live_cloud_xml'
+  | 'live_cloud_graphql'
+  | 'local_client_cache'
+  | 'baseline_fallback';
+
 export interface StoreAchievementSummary {
   unlocked: number;
   total: number;
@@ -9,6 +16,10 @@ export interface StoreAchievementSummary {
   xp?: { earned: number; total: number };         // For Epic Games (e.g. 600 / 1000 XP)
   isMastered?: boolean;                           // 100% unlocked
   lastUnlockedAt?: string;
+  source?: AchievementDataSource;
+  syncedAt?: string;                              // ISO 8601 timestamp
+  hasConflict?: boolean;
+  conflictDetails?: string;
 }
 
 export interface GamePlatformOwnership {

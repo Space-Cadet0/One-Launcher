@@ -82,7 +82,7 @@ function localSystemScannerPlugin(): Plugin {
             'C:\\Program Files (x86)\\Steam\\userdata',
           ];
 
-          const achievements: Record<number, { unlocked: number; total: number; percentage: number }> = {};
+          const achievements: Record<number, { unlocked: number; total: number; percentage: number; source: string; syncedAt: string }> = {};
 
           for (const base of steamUserDirs) {
             if (!fs.existsSync(base)) continue;
@@ -103,6 +103,8 @@ function localSystemScannerPlugin(): Plugin {
                             unlocked: data.unlocked,
                             total: data.total,
                             percentage: data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0,
+                            source: 'local_client_cache',
+                            syncedAt: new Date().toISOString(),
                           };
                         }
                       }
@@ -128,6 +130,8 @@ function localSystemScannerPlugin(): Plugin {
                             unlocked,
                             total: total > 0 ? total : (achievements[appId]?.total || unlocked),
                             percentage: total > 0 ? Math.round((unlocked / total) * 100) : 0,
+                            source: 'local_client_cache',
+                            syncedAt: new Date().toISOString(),
                           };
                         }
                       }

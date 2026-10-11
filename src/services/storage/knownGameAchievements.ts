@@ -1,5 +1,6 @@
 import knownAchievementsRaw from './knownGameAchievements.json';
 import { StoreAchievementSummary } from '../../contracts/game';
+import { reconcileAchievementSummaries } from './achievementReconciliation';
 
 const SPECIAL_NON_STEAM_ACHIEVEMENTS: Record<string, number> = {
   'alan wake 2': 88,
@@ -219,10 +220,10 @@ export function getKnownAchievementTotal(
 export function getKnownSteamAchievements(
   steamAppId?: number,
   _title?: string
-): { unlocked: number; total: number; percentage: number } | undefined {
+): StoreAchievementSummary | undefined {
   if (!steamAppId) return undefined;
 
-  let best: { unlocked: number; total: number; percentage: number } | undefined = undefined;
+  let best: StoreAchievementSummary | undefined = undefined;
 
   // 1. Live scanned achievements from localStorage
   if (typeof window !== 'undefined') {
@@ -231,7 +232,17 @@ export function getKnownSteamAchievements(
       if (cached) {
         const parsed = JSON.parse(cached);
         if (parsed[steamAppId] && typeof parsed[steamAppId].unlocked === 'number') {
-          best = parsed[steamAppId];
+          const raw = parsed[steamAppId];
+          best = {
+            unlocked: raw.unlocked,
+            total: raw.total,
+            percentage: raw.percentage ?? (raw.total > 0 ? Math.round((raw.unlocked / raw.total) * 100) : 0),
+            isMastered: raw.isMastered ?? (raw.total > 0 && raw.unlocked >= raw.total),
+            source: raw.source || 'local_client_cache',
+            syncedAt: raw.syncedAt,
+            hasConflict: raw.hasConflict,
+            conflictDetails: raw.conflictDetails,
+          };
         }
       }
     } catch {
@@ -240,22 +251,50 @@ export function getKnownSteamAchievements(
   }
 
   // 2. Verified built-in user achievements baseline
-  const baseline = KNOWN_USER_STEAM_ACHIEVEMENTS[steamAppId];
-  if (baseline) {
-    if (!best || baseline.unlocked > best.unlocked || (baseline.total > 0 && best.total === 0)) {
-      best = baseline;
-    }
+  const rawBaseline = KNOWN_USER_STEAM_ACHIEVEMENTS[steamAppId];
+  if (rawBaseline) {
+    const baseline: StoreAchievementSummary = {
+      unlocked: rawBaseline.unlocked,
+      total: rawBaseline.total,
+      percentage: rawBaseline.percentage,
+      isMastered: rawBaseline.total > 0 && rawBaseline.unlocked >= rawBaseline.total,
+      source: 'baseline_fallback',
+    };
+    best = reconcileAchievementSummaries(best, baseline, { appId: steamAppId, store: 'steam' });
   }
 
   return best;
 }
 
-export function cacheUserSteamAchievements(map: Record<number, { unlocked: number; total: number; percentage: number }>): void {
+export function cacheUserSteamAchievements(
+  map: Record<number, StoreAchievementSummary | { unlocked: number; total: number; percentage: number; source?: any }>
+): void {
   if (typeof window === 'undefined') return;
   try {
     const existingRaw = localStorage.getItem('antigravity_steam_achievements');
-    const existing = existingRaw ? JSON.parse(existingRaw) : {};
-    const merged = { ...existing, ...map };
+    const existing: Record<string, StoreAchievementSummary> = existingRaw ? JSON.parse(existingRaw) : {};
+    const merged: Record<number, StoreAchievementSummary> = {};
+
+    for (const [k, v] of Object.entries(existing)) {
+      merged[Number(k)] = v;
+    }
+
+    for (const [key, inc] of Object.entries(map)) {
+      const appId = Number(key);
+      const incSummary: StoreAchievementSummary = {
+        unlocked: inc.unlocked,
+        total: inc.total,
+        percentage: inc.percentage ?? (inc.total > 0 ? Math.round((inc.unlocked / inc.total) * 100) : 0),
+        isMastered: (inc as any).isMastered ?? (inc.total > 0 && inc.unlocked >= inc.total),
+        source: (inc as any).source || 'local_client_cache',
+        syncedAt: (inc as any).syncedAt || new Date().toISOString(),
+        hasConflict: (inc as any).hasConflict,
+        conflictDetails: (inc as any).conflictDetails,
+      };
+      merged[appId] =
+        reconcileAchievementSummaries(merged[appId], incSummary, { appId, store: 'steam' }) || incSummary;
+    }
+
     localStorage.setItem('antigravity_steam_achievements', JSON.stringify(merged));
   } catch (err) {
     console.warn('Failed to cache Steam achievements to localStorage:', err);
