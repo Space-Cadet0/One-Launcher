@@ -158,7 +158,13 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       }
     }
 
-    // Pure authorization code (Epic codes are 32-char hex, GOG codes are alphanumeric)
+    // Epic 32-character hex authorization code
+    const hex32Match = trimmed.match(/\b([a-fA-F0-9]{32})\b/);
+    if (hex32Match) {
+      return hex32Match[1];
+    }
+
+    // Pure authorization code (GOG codes or other alphanumeric tokens)
     if (/^[a-zA-Z0-9_\-]{28,64}$/.test(trimmed)) {
       return trimmed;
     }
