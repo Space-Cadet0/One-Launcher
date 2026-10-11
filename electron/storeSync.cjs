@@ -193,9 +193,18 @@ const KNOWN_STEAM_MAPPINGS = {
   'herring': 383270,
   'limbo': 48000,
   'hue': 383270,
+  'out of sight': 2526310,
+  'lego star wars: the skywalker saga': 920210,
+  'the outerworlds': 578650,
+  'the outer worlds': 578650,
+  'pillars of eternity': 291650,
+  'tyranny': 362960,
+  'kingdom come: deliverance': 379430,
 };
 
 const KNOWN_EPIC_APP_NAMES = {
+  '4a611c60218d4e84bcdcb821d1038ebb': { title: 'Out of Sight', steamAppId: 2526310, developer: 'The Gang Studio AB' },
+  'ad6a817e51b349619f51957b229520cf': { title: 'Out of Sight', steamAppId: 2526310, developer: 'The Gang Studio AB' },
   boga: { title: 'Death Stranding', steamAppId: 1190460, developer: 'Kojima Productions' },
   blobfish: { title: 'Into The Breach', steamAppId: 590380, developer: 'Subset Games' },
   barbet: { title: 'HITMAN', steamAppId: 236870, developer: 'IO Interactive' },
@@ -733,9 +742,13 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
     achievementsMap = await fetchEpicAchievements(accessToken, accountId);
   }
 
-  // If authoritative base games catalog is available, return verified base games with live playtime & achievements
+  // 3. Initialize with authoritative base games catalog if available
+  const gamesMap = new Map();
+  const knownAppIds = new Set();
+  const knownTitles = new Set();
+
   if (EPIC_BASE_GAMES && EPIC_BASE_GAMES.length > 0) {
-    return EPIC_BASE_GAMES.map((baseGame) => {
+    for (const baseGame of EPIC_BASE_GAMES) {
       const epicPlat = baseGame.platforms.find((p) => p.platformId === 'epic');
       const gameId = epicPlat?.platformGameId;
       const pt = (gameId ? (playtimeMap.get(gameId) || playtimeMap.get(gameId.toLowerCase())) : null) || {};
@@ -748,7 +761,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
         (gameId ? achievementsMap[gameId.toLowerCase()] : null) ||
         achievementsMap[baseGame.id.toLowerCase()];
 
-      return {
+      const gameObj = {
         ...baseGame,
         platforms: baseGame.platforms.map((p) =>
           p.platformId === 'epic'
@@ -761,10 +774,17 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
             : p
         ),
       };
-    });
+
+      gamesMap.set(gameObj.id, gameObj);
+      knownTitles.add(titleLower);
+      knownTitles.add(normTitle);
+      if (gameId) {
+        knownAppIds.add(gameId.toLowerCase());
+      }
+    }
   }
 
-  // 2. Fetch items from Library Service with cursor pagination
+  // 4. Fetch live items from Library Service with cursor pagination to discover new purchases
   try {
     let cursor = undefined;
     let hasMore = true;
@@ -791,10 +811,10 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
       const records = data.records || [];
 
       for (const item of records) {
-        // 1. Skip non-game records & private sandboxes
+        // Skip non-game records & private sandboxes
         if (!item.appName || item.appName === '1' || item.sandboxType === 'PRIVATE') continue;
 
-        // 2. Skip Unreal Engine Marketplace assets
+        // Skip Unreal Engine Marketplace assets
         if (
           item.namespace === 'ue' ||
           item.namespace === '89efe5924d3d467c839449ab6ab52e7f' ||
@@ -803,20 +823,18 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           continue;
         }
 
-        // 3. Skip real DLCs & add-ons (only if mainGameItem has an actual id/namespace)
+        // Skip real DLCs & add-ons (if mainGameItem is populated)
         const hasRealMainGame = Boolean(
           (item.metadata?.mainGameItem && (item.metadata.mainGameItem.id || item.metadata.mainGameItem.namespace)) ||
           (item.mainGameItem && (item.mainGameItem.id || item.mainGameItem.namespace))
         );
         if (hasRealMainGame) continue;
 
-        // 4. Skip non-application item types
         const itemType = (item.metadata?.itemType || '').toUpperCase();
         if (['ADD_ON', 'DLC', 'CONSUMABLE', 'WALLET', 'SUBSCRIPTION', 'PLUGIN', 'EXTRA', 'CURRENCY'].includes(itemType)) {
           continue;
         }
 
-        // 5. Skip non-game category paths
         const categories = item.metadata?.categories || [];
         const isAddonCategory = categories.some((c) =>
           ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
@@ -825,51 +843,77 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
         );
         if (isAddonCategory) continue;
 
-        // 6. Skip Fortnite microtransactions / item shop add-ons
         if (item.appName?.startsWith('Fortnite_')) continue;
 
         const appNameLower = (item.appName || '').toLowerCase().trim();
         const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
+
+        // Check if item already exists in catalog by app ID
+        if (knownAppIds.has(appNameLower) || knownAppIds.has(catalogIdLower)) {
+          continue;
+        }
+
         let rawTitle = (item.metadata?.title || item.sandboxName || '').trim();
         const titleLower = rawTitle.toLowerCase().trim();
 
-        // Check if item matches a known Epic codename / unlisted app
+        if (knownTitles.has(titleLower)) {
+          continue;
+        }
+
+        // Check curated codenames
         const codename =
           KNOWN_EPIC_APP_NAMES[appNameLower] ||
           KNOWN_EPIC_APP_NAMES[catalogIdLower] ||
           KNOWN_EPIC_APP_NAMES[titleLower];
 
         let title = codename ? codename.title : rawTitle;
+        let description = item.metadata?.description || '';
+        let developer = item.metadata?.developer || '';
+        let keyImages = item.metadata?.keyImages || [];
 
-        // If title is missing, pure hex hash, or UUID, NEVER allow as a game entry
+        // If title is "Live", empty, or hex, query official Epic catalog service
+        if (title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
+          try {
+            const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
+            const cRes = await fetch(catUrl, {
+              headers: {
+                Authorization: `bearer ${accessToken}`,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+              },
+            });
+            if (cRes.ok) {
+              const cData = await cRes.json();
+              const meta = cData[item.catalogItemId];
+              if (meta) {
+                const isDlc = meta.categories?.some((c) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
+                if (isDlc) continue;
+                title = meta.title || title;
+                description = meta.description || description;
+                developer = meta.developer || developer;
+                keyImages = meta.keyImages || keyImages;
+              }
+            }
+          } catch {}
+        }
+
+        // Skip if still unresolvable
         if (
           !title ||
+          title === 'Live' ||
           /^[0-9a-f]{20,}$/i.test(title) ||
           /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)
         ) {
           continue;
         }
 
-        // Reject raw codenames that aren't mapped
-        if (['bobcat', 'boxfish', 'calluna', 'catnip', 'cormorant'].includes(title.toLowerCase())) {
+        const lower = title.toLowerCase().trim();
+        if (knownTitles.has(lower)) {
           continue;
         }
 
-        // Filter out Fortnite cosmetic bundles / V-Bucks packs
-        const lower = title.toLowerCase();
-        if (lower.includes('fortnite') && lower !== 'fortnite') {
-          const isFortniteDlc = [
-            'pack', 'bundle', 'v-bucks', 'vbucks', 'skin', 'battle pass',
-            'outfit', 'drop', 'chapter', 'season', 'crew', 'starter', 'quest'
-          ].some((kw) => lower.includes(kw));
-          if (isFortniteDlc) continue;
-        }
-
-        const keyImages = item.metadata?.keyImages || [];
         const tallCover = keyImages.find((img) => img.type === 'DieselGameBoxTall')?.url;
         const wideBanner = keyImages.find((img) => img.type === 'DieselGameBox')?.url || tallCover;
 
-        const appId = item.catalogItemId || item.appName;
         const pt = playtimeMap.get(item.appName) || playtimeMap.get(item.catalogItemId) || {};
 
         const steamAppId = (codename && codename.steamAppId) ? codename.steamAppId : await matchSteamAppId(title);
@@ -882,25 +926,18 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
           : (codename && codename.capsuleImage) || tallCover || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
-        const iconImg = (codename && codename.iconUrl) ? codename.iconUrl : undefined;
+        const finalDev = (codename && codename.developer) ? codename.developer : developer;
+        const gameId = steamAppId ? `steam-${steamAppId}` : `epic-${item.appName}`;
 
-        const developer = (codename && codename.developer)
-          ? codename.developer
-          : (item.metadata?.developer || '');
-
-        const shortDescription = (codename && codename.description)
-          ? codename.description
-          : (item.metadata?.description || 'Epic Games Store Title');
-
-        games.push({
-          id: steamAppId ? `steam-${steamAppId}` : `epic-${appId}`,
+        const newGame = {
+          id: gameId,
           title,
           sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
           steamAppId,
           platforms: [
             {
               platformId: 'epic',
-              platformGameId: appId,
+              platformGameId: item.appName,
               installed: false,
               playtimeMinutes: pt.totalTime || 0,
               lastPlayed: pt.lastPlayed || undefined,
@@ -908,14 +945,18 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           ],
           headerImage: headerImg,
           capsuleImage: capsuleImg,
-          iconUrl: iconImg,
-          shortDescription,
-          releaseDate: item.metadata?.releaseDate || '',
-          developers: developer ? [developer] : [],
-          publishers: item.metadata?.publisher ? [item.metadata.publisher] : [],
+          shortDescription: description || `${title} on Epic Games Store`,
+          releaseDate: item.acquisitionDate ? item.acquisitionDate.split('T')[0] : (item.metadata?.releaseDate || ''),
+          developers: finalDev ? [finalDev] : [],
+          publishers: item.metadata?.publisher ? [item.metadata.publisher] : ['Epic Games Store'],
           genres: ['Action'],
           tags: ['Epic Games Store'],
-        });
+        };
+
+        gamesMap.set(gameId, newGame);
+        knownTitles.add(lower);
+        knownAppIds.add(appNameLower);
+        if (catalogIdLower) knownAppIds.add(catalogIdLower);
       }
 
       cursor = data.responseMetadata?.nextCursor;
@@ -926,7 +967,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
     console.error('Error fetching Epic library items:', err.message);
   }
 
-  return games;
+  return Array.from(gamesMap.values());
 }
 
 /**

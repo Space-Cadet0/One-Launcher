@@ -62,6 +62,7 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'ghostrunner': 1139900,
   'ghostrunner 2': 2144740,
   'second extinction': 1024380,
+  'out of sight': 2526310,
   'a plague tale: innocence': 752590,
   'a plague tale: requiem': 1182900,
   'sifu': 2138710,

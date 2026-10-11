@@ -12022,5 +12022,41 @@
     "tags": [
       "Epic Games Store"
     ]
+  },
+  {
+    "id": "steam-2526310",
+    "title": "Out of Sight",
+    "sortTitle": "Out of Sight",
+    "steamAppId": 2526310,
+    "platforms": [
+      {
+        "platformId": "epic",
+        "platformGameId": "4a611c60218d4e84bcdcb821d1038ebb",
+        "installed": false,
+        "playtimeMinutes": 0
+      }
+    ],
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2526310/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2526310/library_600x900_2x.jpg",
+    "shortDescription": "You’re Sophie, a young blind girl who sees through her teddy bear’s eyes. Escape your captors and uncover the evil history of the dark mansion you desperately seek to escape in this unique, atmospheric horror puzzle/adventure game.",
+    "releaseDate": "2026-10-11",
+    "developers": [
+      "The Gang Studio AB"
+    ],
+    "publishers": [
+      "The Gang Studio AB"
+    ],
+    "genres": [
+      "Adventure",
+      "Puzzle",
+      "Horror"
+    ],
+    "tags": [
+      "Horror",
+      "Puzzle",
+      "Adventure",
+      "Atmospheric",
+      "Epic Games Store"
+    ]
   }
 ]

@@ -316,6 +316,19 @@ export function App() {
               saveIntegrations(updated);
               setGameRefreshKey((k) => k + 1);
             }
+
+            // Sync live Epic games in background to ensure newly purchased games appear immediately
+            if ((window as any).electronAPI?.syncStore) {
+              (window as any).electronAPI.syncStore('epic').then((syncRes: any) => {
+                if (syncRes?.success && syncRes.games?.length > 0) {
+                  setGames((prev) => {
+                    const merged = mergeStorefrontGames(prev, syncRes.games, 'epic');
+                    saveCurrentCatalog(merged);
+                    return merged;
+                  });
+                }
+              }).catch(() => {});
+            }
           }
         })
         .catch((e: any) => console.warn('Error reading Electron tokens:', e));
