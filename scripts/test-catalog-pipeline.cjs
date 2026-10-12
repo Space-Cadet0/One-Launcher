@@ -330,7 +330,7 @@ const finalSteamCount = afterEpic.filter(g => g.platforms.some(p => p.platformId
 
 console.log(`\n=== FINAL FILTER COUNTS ===`);
 console.log(`GOG Filter Count:   ${finalGogCount} (Expected: 314) -> ${finalGogCount === 314 ? 'PASS' : 'FAIL'}`);
-console.log(`Epic Filter Count:  ${finalEpicCount} (Expected: 402) -> ${finalEpicCount === 402 ? 'PASS' : 'FAIL'}`);
+console.log(`Epic Filter Count:  ${finalEpicCount} (Expected: 403) -> ${finalEpicCount === 403 ? 'PASS' : 'FAIL'}`);
 console.log(`Steam Filter Count: ${finalSteamCount}`);
 console.log(`Total Unique Games: ${afterEpic.length}`);
 
@@ -385,7 +385,7 @@ const nfsHeatExists = cleanedCorrupt.filter(g => g.title.toLowerCase().includes(
 const bf4Exists = cleanedCorrupt.filter(g => g.title.toLowerCase().includes('battlefield') || g.steamAppId === 1238860).length;
 
 console.log(`Corrupt test - GOG Count: ${corruptGogCount} (Expected: 314) -> ${corruptGogCount === 314 ? 'PASS' : 'FAIL'}`);
-console.log(`Corrupt test - Epic Count: ${corruptEpicCount} (Expected: 402) -> ${corruptEpicCount === 402 ? 'PASS' : 'FAIL'}`);
+console.log(`Corrupt test - Epic Count: ${corruptEpicCount} (Expected: 403) -> ${corruptEpicCount === 403 ? 'PASS' : 'FAIL'}`);
 console.log(`Corrupt test - Steam Count: ${corruptSteamCount} (Expected: 168) -> ${corruptSteamCount === 168 ? 'PASS' : 'FAIL'}`);
 console.log(`Corrupt test - Hades on Epic: ${hadesEpic} (Expected: 0) -> ${hadesEpic === 0 ? 'PASS' : 'FAIL'}`);
 console.log(`Corrupt test - Hazlenut title: ${hazlenutExists} (Expected: 0) -> ${hazlenutExists === 0 ? 'PASS' : 'FAIL'}`);

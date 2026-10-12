@@ -3,7 +3,10 @@ import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
-import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, KNOWN_IGDB_COVERS, normalizeKey } from '../igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../igdb/igdbCoverService';
+import { steamMatcher } from '../steam/steamMatcher';
+import steamBlurbCache from '../storage/steamBlurbCache.json';
+import { GOG_SPECIAL_DESCRIPTIONS } from '../steam/fallbackMetadataProvider';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -27,6 +30,10 @@ export function isPlaceholderDesc(desc?: string, title?: string): boolean {
   if (lower.includes('on gog.com')) return true;
   if (lower.includes('drm-free')) return true;
   if (lower.includes('epic games store')) return true;
+  if (lower.includes('store exclusive')) return true;
+  if (lower.endsWith(' experience') && trimmed.split(' ').length <= 4) return true;
+  if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
+  if (lower === 'classic title') return true;
   if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
   return false;
 }
@@ -432,6 +439,53 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       };
     }
 
+    // Disambiguate / normalize Agony (ensure official Steam App ID 487720 & high-res portrait cover)
+    if (
+      currentTitleLower === 'agony' ||
+      normTitle === 'agony' ||
+      game.steamAppId === 487720 ||
+      game.id === 'gog-2028023186' ||
+      game.id === 'steam-487720'
+    ) {
+      game = {
+        ...game,
+        id: 'steam-487720',
+        title: 'Agony',
+        sortTitle: 'Agony',
+        steamAppId: 487720,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
+        shortDescription:
+          game.shortDescription && !isPlaceholderDesc(game.shortDescription, game.title)
+            ? game.shortDescription
+            : 'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
+      };
+    }
+
+    // Disambiguate / normalize Agony UNRATED (ensure official Steam App ID 879420 & high-res portrait cover)
+    if (
+      currentTitleLower === 'agony unrated' ||
+      normTitle === 'agony unrated' ||
+      game.steamAppId === 879420 ||
+      game.id === 'steam-879420'
+    ) {
+      game = {
+        ...game,
+        id: 'steam-879420',
+        title: 'Agony UNRATED',
+        sortTitle: 'Agony UNRATED',
+        steamAppId: 879420,
+        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg',
+        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
+        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
+        shortDescription:
+          game.shortDescription && !isPlaceholderDesc(game.shortDescription, game.title)
+            ? game.shortDescription
+            : 'Agony UNRATED is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
+      };
+    }
+
     // Disambiguate / normalize Heretic + Hexen (newer hashed Steam assets)
     if (
       currentTitleLower === 'heretic + hexen' ||
@@ -781,8 +835,29 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
 
     normTitle = normalizeCanonicalTitle(game.title);
 
+    // Match Steam App ID for non-Steam catalog entries if available
+    if (!game.steamAppId) {
+      const matchedAppId = steamMatcher.matchGameToSteamInstant(game.title);
+      if (matchedAppId) {
+        game = {
+          ...game,
+          steamAppId: matchedAppId,
+        };
+      }
+    }
+
     if (isPlaceholderDesc(game.shortDescription, game.title)) {
-      game = { ...game, shortDescription: '' };
+      const blurb = game.steamAppId ? (steamBlurbCache as Record<string, string>)[String(game.steamAppId)] : null;
+      const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
+      const gogSpecial = gogPlat?.platformGameId ? GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId]?.lead : null;
+
+      if (blurb && !isPlaceholderDesc(blurb, game.title)) {
+        game = { ...game, shortDescription: blurb };
+      } else if (gogSpecial && !isPlaceholderDesc(gogSpecial, game.title)) {
+        game = { ...game, shortDescription: gogSpecial };
+      } else {
+        game = { ...game, shortDescription: '' };
+      }
     }
 
     // Normalize GOG image covers to official high-quality vertical cover format
@@ -799,9 +874,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
     // Attach verified IGDB portrait cover if game lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
     const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
     if (instantIgdbCover) {
-      const isCuratedKnown = Boolean(KNOWN_IGDB_COVERS[normTitle] || KNOWN_IGDB_COVERS[normalizeKey(game.id)]);
       if (
-        isCuratedKnown ||
         !game.capsuleImage ||
         isKnownDeadSteamCover(game.steamAppId) ||
         isUnsuitableCoverUrl(game.capsuleImage) ||

@@ -12,11 +12,91 @@ function ensureHttps(url?: string): string {
   return trimmed;
 }
 
-const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string }> = {
+export function extractFirstParagraph(rawText?: string, maxLength = 260): string | null {
+  if (!rawText) return null;
+  const clean = rawText
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\[\/?(b|i|u|url|quote|img)[^\]]*\]/gi, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .trim();
+
+  if (!clean) return null;
+
+  const paragraphs = clean.split(/\r?\n+/).map((p) => p.trim()).filter((p) => p.length > 0);
+  if (paragraphs.length === 0) return null;
+
+  let firstPara = paragraphs[0];
+  if (firstPara.length < 30 && paragraphs.length > 1 && /^(about|overview|story|description|features)/i.test(firstPara)) {
+    firstPara = paragraphs[1];
+  }
+
+  if (firstPara.length > maxLength) {
+    const truncated = firstPara.substring(0, maxLength);
+    const lastSpace = truncated.lastIndexOf(' ');
+    if (lastSpace > maxLength * 0.7) {
+      firstPara = truncated.substring(0, lastSpace).trim() + '...';
+    } else {
+      firstPara = truncated.trim() + '...';
+    }
+  }
+  return firstPara.trim();
+}
+
+export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boolean {
+  if (!desc) return true;
+  const trimmed = desc.trim();
+  if (trimmed.length <= 3) return true;
+  const lower = trimmed.toLowerCase();
+  if (title && lower === title.trim().toLowerCase()) return true;
+  if (lower.includes('drm-free')) return true;
+  if (lower.includes('store exclusive')) return true;
+  if (lower.includes('on gog.com')) return true;
+  if (lower.includes('epic games store')) return true;
+  if (lower.endsWith(' experience') && trimmed.split(' ').length <= 4) return true;
+  if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
+  if (lower === 'classic title') return true;
+  if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
+  return false;
+}
+
+export const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string; headerImage?: string }> = {
   '1413291984': {
     lead: 'Developed by id Software, and originally released in 1993, DOOM pioneered and popularized the first-person shooter, setting a standard for all FPS games. The critically acclaimed sequel, DOOM II, followed in 1994. Now the definitive, newly enhanced versions of DOOM + DOOM II are available as a combined product.',
     full: `Developed by id Software, and originally released in 1993, DOOM pioneered and popularized the first-person shooter, setting a standard for all FPS games. The critically acclaimed sequel, DOOM II, followed in 1994. Now the definitive, newly enhanced versions of DOOM + DOOM II are available as a combined product.<br><br><b>Owners Receive:</b><br>- DOOM<br>- DOOM II<br>- TNT: Evilution<br>- The Plutonia Experiment<br>- Master Levels for DOOM II<br>- No Rest for the Living<br>- Sigil<br>- Sigil II<br>- Legacy of Rust (a new episode created in collaboration by id Software, Nightdive Studios and MachineGames)<br>- A new Deathmatch map pack featuring 25 maps<br><br>Altogether, there are a total of 187 mission maps and 43 deathmatch maps in DOOM + DOOM II.<br><br><b>New Enhancements:</b><br>- Online, cross-platform deathmatch and co-op for up to 16 players<br>- Community-published mod support with an in-game mod browser<br>- Choose between the original midi DOOM and DOOM II soundtracks or the modern IDKFA versions by Andrew Hulshult<br>- Improved performance with multithreaded rendering supporting up to 4K resolution<br>- Now on the KEX engine<br>- 60 FPS and native 16:9 support<br>- Restored original in-game music using original hardware<br>- Quick Save/Load support`,
     releaseDate: '2024-08-08',
+  },
+  '1837805079': {
+    lead: 'Cast out into the night as a vampire, seek vengeance on your murderers and discover the dark plot threatening the land of Nosgoth in this classic dark fantasy action-adventure.',
+    full: `Cast out into the night as a vampire, seek vengeance on your murderers and discover the dark plot threatening the land of Nosgoth in this classic dark fantasy action-adventure.<br><br>Take the role of Kain, a nobleman murdered and revived as a vampire, as you traverse the expansive world of Nosgoth. Slaughter enemies, drink their blood to sustain your life, cast devastating spells, and wield legendary weapons in an epic quest for vengeance and power.<br><br><b>Features:</b><br>- Over 60 hours of dark, open-ended gameplay<br>- Transform into a bat, wolf, mist, or disguise yourself as a human<br>- Epic storyline with cinematic voice acting and rich lore`,
+    releaseDate: '1996-11-15',
+  },
+  '1782995089': {
+    lead: 'Experience the vast open world of The Elder Scrolls: Daggerfall reimagined in the Unity engine, featuring modernized controls, enhanced visuals, bug fixes, and pre-installed community mods.',
+    full: `Experience the vast open world of The Elder Scrolls: Daggerfall reimagined in the Unity engine, featuring modernized controls, enhanced visuals, bug fixes, and pre-installed community mods.<br><br>Explore thousands of cities, dungeons, and hamlets across the Iliac Bay in one of the most ambitious fantasy RPGs ever created. The GOG Cut includes high-resolution terrain, remastered textures, improved lighting, and refined gameplay systems ready to play out of the box.<br><br><b>Features:</b><br>- Modernized first-person controls with smooth mouse-look and customizable keybindings<br>- Enhanced visuals with widescreen and 4K resolution support<br>- Massive roster of curated community mods including DREAM, Warm Ashes, and Archaeologists Guild<br>- Full classic character creation and endless procedural quests`,
+    releaseDate: '2022-06-15',
+  },
+  '1491728574': {
+    lead: 'Fallout: London is an ambitious total conversion mod for Fallout 4 that takes players out of America and drops them into a post-apocalyptic United Kingdom, exploring a brand new wasteland filled with unique factions and storylines.',
+    full: `Fallout: London is an ambitious total conversion mod for Fallout 4 that takes players out of America and drops them into a post-apocalyptic United Kingdom, exploring a brand new wasteland filled with unique factions and storylines.<br><br>Set fifty years before Fallout 4, Fallout: London lets you experience the events of Nuclear Apocalypse in a completely distinct cultural setting. From stuffy parliamentary aristocrats to a resurrection of the Knights of the Round Table and an uncompromising cult of revolutionaries, experience an all-new gritty post-war epic.<br><br><b>Features:</b><br>- A completely new map encompassing a detailed London metropolis with diverse boroughs<br>- Fully voiced storyline with original characters, factions, and companions<br>- Unique British weaponry, retro-futuristic technology, and cultural lore`,
+    releaseDate: '2024-07-25',
+  },
+  '2028023186': {
+    lead: 'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
+    full: `Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.<br><br>By exploring hostile environments and interacting with other souls of the hellscape, the hero will soon understand that there is only one way to escape from Hell, and it requires a meeting of the mystical Red Goddess.<br><br><b>Features:</b><br>- Non-linear survival horror in the depths of hell<br>- Possess lesser and greater demons and control people to survive<br>- Hostile, grotesque underworld environment inspired by Dante's Inferno<br>- Agony Mode featuring procedural survival labyrinth challenges`,
+    releaseDate: '2018-05-29',
+  },
+  '1213448387': {
+    lead: 'Agony UNRATED is the definitive, uncensored first-person survival horror experience set in the grotesque depths of hell.',
+    full: `Agony UNRATED is the definitive, uncensored first-person survival horror experience set in the grotesque depths of hell.<br><br>This unrated edition features completely uncensored cinematics and gameplay scenes, enhanced lighting and high-resolution textures, additional character models and animations, newly designed forest and torture chamber environments, and refined stealth and combat systems.<br><br><b>Features:</b><br>- Completely uncensored story, cinematics, and environments<br>- High-resolution textures, volumetric lighting, and upgraded graphics engine<br>- Additional game modes including Succubus Mode and procedural Agony Mode<br>- Full map and fast-travel system, hard difficulty mode, and expanded demon roster`,
+    releaseDate: '2018-10-30',
   },
 };
 
@@ -114,14 +194,15 @@ export class FallbackMetadataProvider {
    */
   async fetchGogProductMetadata(gogId: string): Promise<Partial<SteamEnrichedMetadata> | null> {
     const cached = (gogEnrichedCache as Record<string, any>)[gogId];
+    const special = GOG_SPECIAL_DESCRIPTIONS[gogId];
 
     let screenshots: SteamScreenshot[] = [];
     let movies: SteamMovie[] = [];
-    let headerImage = cached?.coverHorizontal || cached?.coverVertical || '';
+    let headerImage = special?.headerImage || cached?.coverHorizontal || cached?.coverVertical || '';
     let capsuleImage = cached?.coverVertical || cached?.coverHorizontal || '';
-    let descriptionFull = cached?.aboutTheGame || cached?.detailedDescription || '';
-    let descriptionLead = cached?.shortDescription || '';
-    let releaseDate = cached?.releaseDate || 'TBA';
+    let descriptionFull = special?.full || cached?.aboutTheGame || cached?.detailedDescription || '';
+    let descriptionLead = special?.lead || cached?.shortDescription || '';
+    let releaseDate = special?.releaseDate || cached?.releaseDate || 'TBA';
 
     try {
       const url = `${this.getGogBaseUrl()}/products/${encodeURIComponent(gogId)}?expand=description,screenshots,videos`;
@@ -163,14 +244,21 @@ export class FallbackMetadataProvider {
         const apiDescFull = data.description?.full || data.description?.lead || '';
         const apiDescLead = data.description?.lead || '';
 
-        // Check if GOG returned raw localization placeholders (e.g. product_description_1413291984)
-        const isPlaceholderDesc =
-          apiDescFull.includes('product_description_') ||
-          apiDescFull.includes('product_feature_') ||
-          !apiDescFull.trim();
+        // Clean out raw localization placeholders (e.g. product_description_1413291984 or product_feature_2028023186)
+        const cleanedDescFull = apiDescFull
+          .replace(/<li[^>]*>\s*product_feature_\d+\s*<\/li>/gi, '')
+          .replace(/<ul[^>]*>\s*<\/ul>/gi, '')
+          .replace(/product_feature_\d+/gi, '')
+          .replace(/product_description_\d+/gi, '')
+          .trim();
 
-        if (!isPlaceholderDesc && apiDescFull) {
-          descriptionFull = apiDescFull;
+        const isPlaceholderDesc =
+          !cleanedDescFull ||
+          cleanedDescFull.length < 30 ||
+          cleanedDescFull.includes('product_description_');
+
+        if (!isPlaceholderDesc && cleanedDescFull) {
+          descriptionFull = cleanedDescFull;
           descriptionLead = apiDescLead || descriptionLead;
         } else if (GOG_SPECIAL_DESCRIPTIONS[gogId]) {
           descriptionLead = GOG_SPECIAL_DESCRIPTIONS[gogId].lead;
@@ -461,12 +549,37 @@ export class FallbackMetadataProvider {
             },
           ];
 
+    const firstParaDesc =
+      extractFirstParagraph(storeMetadata?.detailedDescription) ||
+      extractFirstParagraph(storeMetadata?.aboutTheGame) ||
+      extractFirstParagraph(game.shortDescription);
+
+    const cleanSummary =
+      genres.length > 0 && genres[0] !== 'Store Exclusive'
+        ? `${game.title} is a ${genres.slice(0, 3).join(', ')} title${devs.length > 0 ? ` developed by ${devs[0]}` : ''}.`
+        : `${game.title} is a single-player title${devs.length > 0 ? ` developed by ${devs[0]}` : ''}.`;
+
+    const shortDescription =
+      storeMetadata?.shortDescription && !isGenericPlaceholderSynopsis(storeMetadata.shortDescription, game.title)
+        ? storeMetadata.shortDescription.trim()
+        : game.shortDescription && !isGenericPlaceholderSynopsis(game.shortDescription, game.title)
+        ? game.shortDescription.trim()
+        : firstParaDesc && !isGenericPlaceholderSynopsis(firstParaDesc, game.title)
+        ? firstParaDesc
+        : cleanSummary;
+
+    const detailedDescription =
+      storeMetadata?.detailedDescription ||
+      storeMetadata?.aboutTheGame ||
+      (game.shortDescription && !isGenericPlaceholderSynopsis(game.shortDescription, game.title) ? game.shortDescription : '') ||
+      cleanSummary;
+
     return {
       appId: 0,
       name: game.title,
-      shortDescription: storeMetadata?.shortDescription || game.shortDescription || 'DRM-Free / Store Exclusive Title',
-      detailedDescription: storeMetadata?.detailedDescription || storeMetadata?.aboutTheGame || game.shortDescription || '',
-      aboutTheGame: storeMetadata?.aboutTheGame || storeMetadata?.detailedDescription || game.shortDescription || '',
+      shortDescription,
+      detailedDescription,
+      aboutTheGame: detailedDescription,
       headerImage: ensureHttps(storeMetadata?.headerImage || game.headerImage),
       capsuleImage: ensureHttps(storeMetadata?.capsuleImage || game.capsuleImage || storeMetadata?.headerImage || game.headerImage),
       iconUrl: ensureHttps(storeMetadata?.iconUrl || game.iconUrl || ''),

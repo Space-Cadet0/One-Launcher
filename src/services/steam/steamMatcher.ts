@@ -242,7 +242,52 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'resident evil requiem': 3764200,
   'heretic + hexen': 3286930,
   'heretic hexen': 3286930,
+
+  // Curated Store Matches
+  'agony': 487720,
+  'agony unrated': 879420,
+  'grip': 396900,
+  'grip: combat racing': 396900,
+  'grip combat racing': 396900,
+  'fate': 246840,
+  'fate: undiscovered realms': 276890,
+  'fate undiscovered realms': 276890,
+  'gamedec': 917720,
+  'gamedec: definitive edition': 917720,
+  'gamedec definitive edition': 917720,
+  'shadowrun: hong kong': 346940,
+  'shadowrun hong kong': 346940,
+  'shadowrun hong kong - extended edition': 346940,
+  'shadowrun hong kong extended edition': 346940,
+  'deus ex: invisible war': 6920,
+  'deus ex invisible war': 6920,
+  'deus ex 2: invisible war': 6920,
+  'deus ex 2 invisible war': 6920,
+  'deus ex: human revolution - director’s cut': 238010,
+  'deus ex human revolution director\'s cut': 238010,
+  'deus ex human revolution directors cut': 238010,
+  'deus ex: human revolution': 238010,
+  'deus ex human revolution': 238010,
+  'lacuna': 1365860,
+  'lacuna – a sci-fi noir adventure': 1365860,
+  'lacuna: a sci-fi noir adventure': 1365860,
+  'lacuna a sci fi noir adventure': 1365860,
 };
+
+/**
+ * Canonicalizes title strings by stripping punctuation, trademark symbols, and whitespace.
+ */
+export function canonicalizeTitleKey(str: string): string {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .replace(/[™®©]/g, '')
+    .replace(/['’]/g, '')
+    .replace(/[:\-–—]/g, ' ')
+    .replace(/\s*\((?:19|20)\d{2}\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 /**
  * Normalizes title string by stripping edition noise, trademark symbols, and punctuation.
@@ -252,18 +297,17 @@ export function normalizeGameTitle(rawTitle: string): string {
 
   let title = rawTitle
     .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
     .replace(/\s*\((?:19|20)\d{2}\)/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Strip store and edition suffixes
+  // Strip store and edition suffixes (allowing optional curly/straight apostrophes)
   const suffixes = [
     / - Digital Deluxe Edition/i,
     / \(Digital Deluxe Edition\)/i,
     / - Deluxe Edition/i,
     / \(Deluxe Edition\)/i,
-    / - Enhanced Edition Director's Cut/i,
+    / - Enhanced Edition Director['’]?s Cut/i,
     / - Enhanced Edition/i,
     / \(Enhanced Edition\)/i,
     / - Game of the Year Edition/i,
@@ -272,8 +316,10 @@ export function normalizeGameTitle(rawTitle: string): string {
     / - GOTY/i,
     / - Definitive Edition/i,
     / \(Definitive Edition\)/i,
-    / - Director's Cut/i,
-    / \(Director's Cut\)/i,
+    / - Extended Edition/i,
+    / \(Extended Edition\)/i,
+    / - Director['’]?s Cut/i,
+    / \(Director['’]?s Cut\)/i,
     / - Complete Edition/i,
     / \(Complete Edition\)/i,
     / \[Complete Edition\]/i,
@@ -287,13 +333,36 @@ export function normalizeGameTitle(rawTitle: string): string {
     / - Royal Edition/i,
     / - Ultimate Edition/i,
     / \(Ultimate Edition\)/i,
+    / - The Final Cut/i,
+    / \(The Final Cut\)/i,
+    / - Emperor Edition/i,
+    / - Gold Edition/i,
+    / \(Gold Edition\)/i,
+    / - GOG Cut/i,
+    / \(GOG Cut\)/i,
   ];
 
   for (const pattern of suffixes) {
     title = title.replace(pattern, '').trim();
   }
 
+  // Normalize quotes and spaces
+  title = title
+    .replace(/['’]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   return title;
+}
+
+// Canonical lookup map pre-populated for fast O(1) matching across all variations
+export const CANONICAL_KNOWN_STORE_STEAM_MAPPINGS = new Map<string, number>();
+
+for (const [key, appId] of Object.entries(KNOWN_STORE_STEAM_MAPPINGS)) {
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(key.toLowerCase().trim(), appId);
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(canonicalizeTitleKey(key), appId);
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(normalizeGameTitle(key).toLowerCase(), appId);
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(canonicalizeTitleKey(normalizeGameTitle(key)), appId);
 }
 
 const ROMAN_NUMERALS: Record<string, string> = {
@@ -458,11 +527,17 @@ export class SteamMatcherService {
       return this.cache.get(lowerKey) || null;
     }
 
-    if (KNOWN_STORE_STEAM_MAPPINGS[lowerKey]) {
-      return KNOWN_STORE_STEAM_MAPPINGS[lowerKey];
-    }
-    if (KNOWN_STORE_STEAM_MAPPINGS[normalized]) {
-      return KNOWN_STORE_STEAM_MAPPINGS[normalized];
+    const canonicalKey = canonicalizeTitleKey(cleanRaw);
+    const canonicalNorm = canonicalizeTitleKey(normalized);
+
+    const directMatch =
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(lowerKey) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalized) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalKey) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
+
+    if (directMatch) {
+      return directMatch;
     }
 
     for (const [idStr, data] of Object.entries(steamEnrichedCache as Record<string, any>)) {
@@ -495,18 +570,20 @@ export class SteamMatcherService {
       return this.cache.get(lowerKey)!;
     }
 
-    // 2. Check curated instant dictionary
-    if (KNOWN_STORE_STEAM_MAPPINGS[lowerKey]) {
-      const id = KNOWN_STORE_STEAM_MAPPINGS[lowerKey];
-      this.cache.set(lowerKey, id);
+    // 2. Check curated canonical instant dictionary
+    const canonicalKey = canonicalizeTitleKey(cleanRaw);
+    const canonicalNorm = canonicalizeTitleKey(normalized);
+
+    const directMatch =
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(lowerKey) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalized) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalKey) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
+
+    if (directMatch) {
+      this.cache.set(lowerKey, directMatch);
       this.savePersistentCache();
-      return id;
-    }
-    if (KNOWN_STORE_STEAM_MAPPINGS[normalized]) {
-      const id = KNOWN_STORE_STEAM_MAPPINGS[normalized];
-      this.cache.set(lowerKey, id);
-      this.savePersistentCache();
-      return id;
+      return directMatch;
     }
 
     // 3. Check existing local steamEnrichedCache.json

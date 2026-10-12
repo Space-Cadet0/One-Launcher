@@ -165,6 +165,9 @@ export default defineConfig({
         target: 'https://store.steampowered.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/steam-store/, ''),
+        headers: {
+          Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+        },
       },
       '/api/steam-api': {
         target: 'https://api.steampowered.com',

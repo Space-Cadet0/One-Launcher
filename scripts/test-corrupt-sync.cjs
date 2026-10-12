@@ -371,7 +371,7 @@ if (missing.length > 0) {
 
 console.log('\n=== FINAL VERIFICATION RESULTS ===');
 console.log(`GOG Count:  ${finalGog}  (Expected: 314) -> ${finalGog === 314 ? 'PASS' : 'FAIL'}`);
-console.log(`Epic Count: ${finalEpic} (Expected: 402) -> ${finalEpic === 402 ? 'PASS' : 'FAIL'}`);
+console.log(`Epic Count: ${finalEpic} (Expected: 403) -> ${finalEpic === 403 ? 'PASS' : 'FAIL'}`);
 
 // Test codenames
 const badNames = [
@@ -400,5 +400,5 @@ syncCatalog = sanitizeGameCatalog(syncCatalog);
 const syncGog = syncCatalog.filter(g => g.platforms.some(p => p.platformId === 'gog')).length;
 const syncEpic = syncCatalog.filter(g => g.platforms.some(p => p.platformId === 'epic')).length;
 console.log(`Sync GOG Count:  ${syncGog}  (Expected: 314) -> ${syncGog === 314 ? 'PASS' : 'FAIL'}`);
-console.log(`Sync Epic Count: ${syncEpic} (Expected: 402) -> ${syncEpic === 402 ? 'PASS' : 'FAIL'}`);
+console.log(`Sync Epic Count: ${syncEpic} (Expected: 403) -> ${syncEpic === 403 ? 'PASS' : 'FAIL'}`);
 

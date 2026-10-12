@@ -114,7 +114,12 @@ export class SteamApiService {
     try {
       const baseUrl = this.getBaseUrl();
       const [detailsRes, reviewsRes] = await Promise.all([
-        axios.get(`${baseUrl}/api/appdetails?appids=${appId}&l=english`, { timeout: 8000 }),
+        axios.get(`${baseUrl}/api/appdetails?appids=${appId}&l=english`, {
+          timeout: 8000,
+          headers: {
+            Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+          },
+        }),
         axios.get(`${baseUrl}/appreviews/${appId}?json=1&language=all`, { timeout: 6000 }).catch(() => null),
       ]);
 

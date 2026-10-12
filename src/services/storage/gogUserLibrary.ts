@@ -124,9 +124,10 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://images-1.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9_glx_vertical_cover.jpg",
-    "shortDescription": "Action experience",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg",
+    "shortDescription": "Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.",
+    "steamAppId": 487720,
     "releaseDate": "2018-05-29",
     "developers": [
       "Madmind Studio"

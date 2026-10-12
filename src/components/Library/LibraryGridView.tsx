@@ -25,22 +25,19 @@ import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, normalizeKey } from '../../services/igdb/igdbCoverService';
+import {
+  extractFirstParagraph,
+  isGenericPlaceholderSynopsis,
+  GOG_SPECIAL_DESCRIPTIONS,
+} from '../../services/steam/fallbackMetadataProvider';
+import gogEnrichedCache from '../../services/storage/gogEnrichedCache.json';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
-  if (!desc) return true;
-  const trimmed = desc.trim();
-  if (trimmed.length <= 3) return true;
-  const lower = trimmed.toLowerCase();
-  if (title && lower === title.trim().toLowerCase()) return true;
-  if (lower.includes('on gog.com')) return true;
-  if (lower.includes('drm-free')) return true;
-  if (lower.includes('epic games store')) return true;
-  if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
-  return false;
+  return isGenericPlaceholderSynopsis(desc, title);
 }
 
 function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): string | null {
-  // 1. Steam blurb cache (curated store blurbs for 379+ matched catalog titles)
+  // 1. Steam blurb cache (curated store blurbs for 387+ matched catalog titles)
   if (targetAppId) {
     const blurb = (steamBlurbCache as Record<string, string>)[String(targetAppId)];
     if (blurb && !isPlaceholderSynopsis(blurb, game.title)) {
@@ -64,21 +61,47 @@ function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): str
     }
   }
 
-  // 4. Enriched metadata on game
+  // 4. Curated GOG special descriptions (Blood Omen, Daggerfall Unity, Fallout: London, etc.)
+  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+  if (gogPlat?.platformGameId) {
+    const special = GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId];
+    if (special?.lead && !isPlaceholderSynopsis(special.lead, game.title)) {
+      return special.lead.trim();
+    }
+    const gogCached = (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId];
+    if (gogCached?.shortDescription && !isPlaceholderSynopsis(gogCached.shortDescription, game.title)) {
+      return gogCached.shortDescription.trim();
+    }
+  }
+
+  // 5. Enriched metadata on game
   if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
     return game.enrichedMetadata.shortDescription.trim();
   }
 
-  // 5. Game shortDescription (if not a placeholder)
+  // 6. Game shortDescription (if not a placeholder)
   if (game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
     return game.shortDescription.trim();
   }
 
-  // 6. Clean summary from genres and developers
+  // 7. First paragraph of game description (truncated with ... if needed)
+  const gogCachedData = gogPlat?.platformGameId ? (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId] : null;
+  const firstPara =
+    extractFirstParagraph(game.enrichedMetadata?.detailedDescription) ||
+    extractFirstParagraph(game.enrichedMetadata?.aboutTheGame) ||
+    extractFirstParagraph(gogCachedData?.aboutTheGame) ||
+    extractFirstParagraph(gogCachedData?.detailedDescription) ||
+    extractFirstParagraph(game.shortDescription);
+
+  if (firstPara && !isPlaceholderSynopsis(firstPara, game.title)) {
+    return firstPara;
+  }
+
+  // 8. Clean summary from genres and developers
   if (game.genres && game.genres.length > 0) {
     const cleanGenres = game.genres
       .map((g) => g.replace(/\s*on GOG\.com.*$/i, '').replace(/\s*\(DRM-Free\)/i, '').trim())
-      .filter((g) => g.length > 0 && !g.toLowerCase().includes('drm-free') && !g.toLowerCase().includes('gog'));
+      .filter((g) => g.length > 0 && !g.toLowerCase().includes('drm-free') && !g.toLowerCase().includes('gog') && !g.toLowerCase().includes('store exclusive'));
     if (cleanGenres.length > 0) {
       const dev = game.developers?.[0] ? ` developed by ${game.developers[0]}` : '';
       return `${game.title} is a ${cleanGenres.slice(0, 3).join(', ')} title${dev}.`;
@@ -96,6 +119,13 @@ function hasStoreSynopsis(game: CanonicalGame, targetAppId?: number | null): boo
     if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) return true;
     const live = steamApi.getCachedMetadata(targetAppId);
     if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) return true;
+  }
+  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+  if (gogPlat?.platformGameId) {
+    const special = GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId];
+    if (special?.lead && !isPlaceholderSynopsis(special.lead, game.title)) return true;
+    const gogCached = (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId];
+    if (gogCached?.shortDescription && !isPlaceholderSynopsis(gogCached.shortDescription, game.title)) return true;
   }
   if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
     return true;

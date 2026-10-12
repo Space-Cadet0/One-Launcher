@@ -46,6 +46,7 @@ export const KNOWN_DEAD_STEAM_COVER_APP_IDS = new Set<number>([
   293180,  // Overcast - Walden and the Werewolf
   1309,    // SiN Multiplayer
   285570,  // STAR WARS™ Rebellion
+  1365860, // Lacuna (no unhashed library_600x900)
 ]);
 
 export function isKnownDeadSteamCover(appId?: number | null): boolean {
@@ -126,7 +127,37 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'doomdark\'s revenge': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co6q0g.jpg',
   'doomdarks revenge': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co6q0g.jpg',
   'd&d stronghold: kingdom simulator': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co3cr6.jpg',
-  'fate': 'https://images.igdb.com/igdb/image/upload/t_cover_big/cob5w5.jpg',
+  'fate': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/246840/library_600x900_2x.jpg',
+  'fate: undiscovered realms': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg',
+  'fate undiscovered realms': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg',
+  'fallout london': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co8j9u.webp',
+  'fallout: london': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co8j9u.webp',
+  'agony': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
+  'agony unrated': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
+  'grip': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
+  'grip: combat racing': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
+  'grip combat racing': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
+  'gamedec': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/917720/library_600x900_2x.jpg',
+  'gamedec: definitive edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/917720/library_600x900_2x.jpg',
+  'gamedec definitive edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/917720/library_600x900_2x.jpg',
+  'shadowrun hong kong': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/346940/library_600x900_2x.jpg',
+  'shadowrun: hong kong - extended edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/346940/library_600x900_2x.jpg',
+  'shadowrun hong kong - extended edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/346940/library_600x900_2x.jpg',
+  'shadowrun hong kong extended edition': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/346940/library_600x900_2x.jpg',
+  'deus ex 2: invisible war': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6920/library_600x900_2x.jpg',
+  'deus ex: invisible war': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6920/library_600x900_2x.jpg',
+  'deus ex 2 invisible war': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6920/library_600x900_2x.jpg',
+  'deus ex invisible war': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6920/library_600x900_2x.jpg',
+  'deus ex: human revolution - director\'s cut': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'deus ex: human revolution - director’s cut': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'deus ex human revolution director\'s cut': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'deus ex human revolution directors cut': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'deus ex: human revolution': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'deus ex human revolution': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/238010/library_600x900_2x.jpg',
+  'lacuna – a sci-fi noir adventure': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co38sl.jpg',
+  'lacuna: a sci-fi noir adventure': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co38sl.jpg',
+  'lacuna a sci fi noir adventure': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co38sl.jpg',
+  'lacuna': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co38sl.jpg',
   'shadow warrior classic complete': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pqn.jpg',
   'shadow warrior classic': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1pqn.jpg',
 
@@ -247,6 +278,13 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'chivalry 2 - public testing': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1824220/library_600x900_2x.jpg',
 };
 
+export const NORMALIZED_KNOWN_IGDB_COVERS = new Map<string, string>();
+
+for (const [k, v] of Object.entries(KNOWN_IGDB_COVERS)) {
+  NORMALIZED_KNOWN_IGDB_COVERS.set(k.toLowerCase().trim(), v);
+  NORMALIZED_KNOWN_IGDB_COVERS.set(normalizeKey(k), v);
+}
+
 /**
  * Checks whether an image URL represents an unsuitable horizontal banner,
  * wide capsule, or broken asset that should not be displayed in a 2:3 portrait card.
@@ -347,28 +385,48 @@ export class IgdbCoverService {
     if (!title && !steamAppId && !gameId) return null;
 
     if (title) {
-      const norm = normalizeKey(title);
+      const cleanRaw = title.trim();
+      const lower = cleanRaw.toLowerCase();
+      const norm = normalizeKey(cleanRaw);
+
       if (this.cache.has(norm)) {
         return this.cache.get(norm) || null;
       }
-      if (KNOWN_IGDB_COVERS[norm]) {
-        return KNOWN_IGDB_COVERS[norm];
+      if (this.cache.has(lower)) {
+        return this.cache.get(lower) || null;
       }
 
-      // Check stripped subtitles
-      const baseTitle = norm.split(' ')[0];
-      if (baseTitle && KNOWN_IGDB_COVERS[baseTitle]) {
-        return KNOWN_IGDB_COVERS[baseTitle];
+      const match =
+        NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
+        NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
+        KNOWN_IGDB_COVERS[lower] ||
+        KNOWN_IGDB_COVERS[norm];
+
+      if (match) {
+        return match;
       }
     }
 
     if (gameId) {
-      const normId = normalizeKey(gameId);
+      const cleanId = gameId.trim();
+      const lowerId = cleanId.toLowerCase();
+      const normId = normalizeKey(cleanId);
+
       if (this.cache.has(normId)) {
         return this.cache.get(normId) || null;
       }
-      if (KNOWN_IGDB_COVERS[normId]) {
-        return KNOWN_IGDB_COVERS[normId];
+      if (this.cache.has(lowerId)) {
+        return this.cache.get(lowerId) || null;
+      }
+
+      const match =
+        NORMALIZED_KNOWN_IGDB_COVERS.get(lowerId) ||
+        NORMALIZED_KNOWN_IGDB_COVERS.get(normId) ||
+        KNOWN_IGDB_COVERS[lowerId] ||
+        KNOWN_IGDB_COVERS[normId];
+
+      if (match) {
+        return match;
       }
     }
 
