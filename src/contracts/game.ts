@@ -42,6 +42,7 @@ export interface CanonicalGame {
   capsuleImage?: string;
   iconUrl?: string;
   shortDescription?: string;
+  detailedDescription?: string;
   releaseDate?: string;
   developers: string[];
   publishers: string[];

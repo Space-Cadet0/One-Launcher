@@ -23,7 +23,7 @@ function createMainWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
-      webSecurity: false, // Allows cross-origin store APIs in native app without browser CORS blocking
+      webSecurity: true, // Secure webSecurity enabled; cross-origin requests handled via IPC and onHeadersReceived
     },
   });
 
@@ -81,6 +81,20 @@ if (!gotTheLock) {
       '*://*.fast.wistia.net/*',
     ];
 
+    // Store API domains requiring CORS headers for renderer fetch/axios calls with webSecurity enabled
+    const storeApiFilters = [
+      '*://*.steampowered.com/*',
+      '*://*.steamcommunity.com/*',
+      '*://*.steamstatic.com/*',
+      '*://*.gog.com/*',
+      '*://*.gog-statics.com/*',
+      '*://*.epicgames.com/*',
+      '*://*.howlongtobeat.com/*',
+      '*://howlongtobeat.com/*',
+      '*://*.lutris.net/*',
+      '*://*.opencritic.com/*',
+    ];
+
     session.defaultSession.webRequest.onBeforeSendHeaders(
       { urls: embedFilters },
       (details, callback) => {
@@ -99,11 +113,18 @@ if (!gotTheLock) {
     );
 
     session.defaultSession.webRequest.onHeadersReceived(
-      { urls: embedFilters },
+      { urls: [...embedFilters, ...storeApiFilters] },
       (details, callback) => {
         const responseHeaders = { ...details.responseHeaders };
         delete responseHeaders['x-frame-options'];
         delete responseHeaders['X-Frame-Options'];
+
+        // Provide permissive CORS headers for store API domains and embeds
+        responseHeaders['Access-Control-Allow-Origin'] = ['*'];
+        responseHeaders['Access-Control-Allow-Methods'] = ['GET, POST, PUT, DELETE, OPTIONS, HEAD'];
+        responseHeaders['Access-Control-Allow-Headers'] = ['*'];
+        responseHeaders['Access-Control-Expose-Headers'] = ['*'];
+
         callback({ responseHeaders });
       }
     );

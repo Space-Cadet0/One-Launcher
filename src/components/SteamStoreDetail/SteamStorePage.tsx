@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
+import DOMPurify from 'dompurify';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { StorefrontId } from '../../contracts/platform';
@@ -22,6 +23,7 @@ import {
   getEffectiveTags,
 } from '../../services/steam/steamFeatureNormalizer';
 import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
+import { getUserOverrideForGame } from '../../services/storage/userOverrideStorage';
 import {
   Sparkles,
   ArrowLeft,
@@ -40,6 +42,7 @@ interface SteamStorePageProps {
   onGameUpdated?: (updated: CanonicalGame) => void;
   connectedStorefronts?: StorefrontId[];
   onOpenIntegrations?: () => void;
+  onFixMatch?: () => void;
 }
 
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
@@ -52,6 +55,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   onGameUpdated,
   connectedStorefronts,
   onOpenIntegrations,
+  onFixMatch,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
@@ -101,10 +105,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     }
 
     async function loadData() {
+      const userOverride = getUserOverrideForGame(game);
       let targetAppId = game.steamAppId;
 
+      // If user explicitly unlinked from Steam (steamAppId === null), do NOT match to Steam!
+      const isExplicitNonSteam = userOverride?.steamAppId === null;
+
       // If no Steam App ID is set, intelligently search Steam Store for match
-      if (!targetAppId) {
+      if (!targetAppId && !isExplicitNonSteam) {
         try {
           const matched = await steamMatcher.matchGameToSteam(game.title);
           if (matched && isMounted) {
@@ -221,18 +229,29 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     };
   }, [game.id, game.steamAppId]);
 
+  const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
+
   const screenshots = metadata?.screenshots || [];
   const movies = metadata?.movies || [];
   const reviewSummary = metadata?.reviewSummary || game.reviewSummary;
-  const shortDescription = metadata?.shortDescription || game.shortDescription;
-  const developers = (metadata?.developers && metadata.developers.length > 0) ? metadata.developers : (game.developers || []);
-  const publishers = (metadata?.publishers && metadata.publishers.length > 0) ? metadata.publishers : (game.publishers || []);
-  const releaseDate = metadata?.releaseDate || game.releaseDate || 'TBA';
-  const tags = (metadata?.tags && metadata.tags.length > 0) ? metadata.tags : (game.tags || []);
-  const genres = (metadata?.genres && metadata.genres.length > 0) ? metadata.genres : (game.genres || []);
+  const shortDescription = userOverride?.shortDescription || metadata?.shortDescription || game.shortDescription;
+  const developers = (userOverride?.developers && userOverride.developers.length > 0)
+    ? userOverride.developers
+    : ((metadata?.developers && metadata.developers.length > 0) ? metadata.developers : (game.developers || []));
+  const publishers = (userOverride?.publishers && userOverride.publishers.length > 0)
+    ? userOverride.publishers
+    : ((metadata?.publishers && metadata.publishers.length > 0) ? metadata.publishers : (game.publishers || []));
+  const releaseDate = userOverride?.releaseDate || metadata?.releaseDate || game.releaseDate || 'TBA';
+  const tags = (userOverride?.tags && userOverride.tags.length > 0)
+    ? userOverride.tags
+    : ((metadata?.tags && metadata.tags.length > 0) ? metadata.tags : (game.tags || []));
+  const genres = (userOverride?.genres && userOverride.genres.length > 0)
+    ? userOverride.genres
+    : ((metadata?.genres && metadata.genres.length > 0) ? metadata.genres : (game.genres || []));
   const isOwnedOnSteam = isGameOwnedOnSteam(game.platforms);
   const effectiveTags = getEffectiveTags(tags, isOwnedOnSteam);
   const detailedDescription =
+    userOverride?.detailedDescription ||
     metadata?.aboutTheGame ||
     metadata?.detailedDescription ||
     game.enrichedMetadata?.aboutTheGame ||
@@ -250,7 +269,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       <div
         className="absolute top-0 left-0 right-0 h-96 opacity-15 pointer-events-none bg-cover bg-center filter blur-3xl"
         style={{
-          backgroundImage: `url(${metadata?.headerImage || game.headerImage})`,
+          backgroundImage: `url(${userOverride?.headerImage || metadata?.headerImage || game.headerImage})`,
         }}
       />
 
@@ -338,6 +357,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           onToggleInstallStatus={onToggleInstallStatus}
           onApplyFilter={onApplyFilter}
           connectedStorefronts={connectedStorefronts}
+          onFixMatch={onFixMatch}
         />
 
         {/* Main Steam Highlight Showcase (1:1 Steam 2-Column Split: Media Player + Details) */}
@@ -353,14 +373,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               <MediaGallery
                 screenshots={screenshots}
                 movies={movies}
-                headerImage={metadata?.headerImage || game.headerImage}
+                headerImage={userOverride?.headerImage || metadata?.headerImage || game.headerImage}
               />
             )}
           </div>
 
           {/* Right Column: 1:1 Steam Details (Fixed 324px Width) */}
           <SteamHeroDetails
-            headerImage={metadata?.headerImage || game.headerImage}
+            headerImage={userOverride?.headerImage || metadata?.headerImage || game.headerImage}
             title={game.title}
             shortDescription={shortDescription}
             reviewSummary={reviewSummary}
@@ -394,7 +414,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               {detailedDescription ? (
                 <div
                   className="steam-description-content text-sm space-y-3 leading-relaxed"
-                  dangerouslySetInnerHTML={{ __html: detailedDescription }}
+                  dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(detailedDescription) }}
                 />
               ) : shortDescription ? (
                 <div className="steam-description-content text-sm space-y-3 leading-relaxed text-[#acb2b8]">

@@ -81,8 +81,8 @@ export function openExternalStorefrontUrl(url: string, e?: React.MouseEvent) {
     e.preventDefault();
   }
   if (!url) return;
-  if (typeof window !== 'undefined' && (window as any).electronAPI?.openExternal) {
-    (window as any).electronAPI.openExternal(url);
+  if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+    window.electronAPI.openExternal(url);
   } else {
     window.open(url, '_blank', 'noreferrer,noopener');
   }

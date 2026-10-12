@@ -22,9 +22,9 @@ export interface SteamAchievementRecord {
  */
 export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult | null> {
   // First check if running inside native Electron application
-  if (typeof window !== 'undefined' && (window as any).electronAPI?.scanLocalGames) {
+  if (typeof window !== 'undefined' && window.electronAPI?.scanLocalGames) {
     try {
-      const electronRes = await (window as any).electronAPI.scanLocalGames();
+      const electronRes = await window.electronAPI.scanLocalGames();
       if (electronRes && electronRes.success) {
         return {
           success: true,
@@ -61,9 +61,9 @@ export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult |
  */
 export async function scanLocalSteamAchievements(): Promise<Record<number, SteamAchievementRecord> | null> {
   // First check if running inside native Electron application
-  if (typeof window !== 'undefined' && (window as any).electronAPI?.scanSteamAchievements) {
+  if (typeof window !== 'undefined' && window.electronAPI?.scanSteamAchievements) {
     try {
-      const electronRes = await (window as any).electronAPI.scanSteamAchievements();
+      const electronRes = await window.electronAPI.scanSteamAchievements();
       if (electronRes && electronRes.success && electronRes.achievements) {
         return electronRes.achievements;
       }
@@ -81,7 +81,7 @@ export async function scanLocalSteamAchievements(): Promise<Record<number, Steam
       }
     }
   } catch (err) {
-    // Ignore fetch error in static builds
+    console.warn('Local steam achievements endpoint unavailable:', err);
   }
   return null;
 }

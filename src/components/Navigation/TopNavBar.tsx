@@ -10,6 +10,7 @@ import {
   ChevronRight,
   Menu,
   Film,
+  Wand,
 } from 'lucide-react';
 
 interface TopNavBarProps {
@@ -39,6 +40,8 @@ interface TopNavBarProps {
   onSyncCurrentGame?: () => void;
   isSyncingAllMedia?: boolean;
   onSyncAllMedia?: () => void;
+  onOpenFixMatch?: () => void;
+  defaultMenuOpen?: boolean;
 }
 
 export const TopNavBar: React.FC<TopNavBarProps> = ({
@@ -65,8 +68,10 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onSyncCurrentGame,
   isSyncingAllMedia = false,
   onSyncAllMedia,
+  onOpenFixMatch,
+  defaultMenuOpen = false,
 }) => {
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isMenuOpen, setIsMenuOpen] = useState(defaultMenuOpen);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // Close burger menu on outside click or escape
@@ -289,6 +294,31 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     {isSyncingCurrentGame && (
                       <span className="text-[10px] text-steam-accent font-semibold ml-2 shrink-0">Active</span>
                     )}
+                  </button>
+                )}
+
+                {/* Fix Match & Metadata (Visible when viewing individual game) */}
+                {currentGameTitle && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      if (onOpenFixMatch) onOpenFixMatch();
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group border-t border-steam-border/40"
+                    title={`Fix canonical match, cover poster, and metadata for ${currentGameTitle}`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Wand className="w-4 h-4 shrink-0 text-[#66c0f4] group-hover:scale-110 transition-transform" />
+                      <div className="flex flex-col min-w-0">
+                        <span className="font-semibold text-white truncate">
+                          Fix Match & Metadata...
+                        </span>
+                        <span className="text-[10px] text-steam-subtext truncate">
+                          {currentGameTitle}
+                        </span>
+                      </div>
+                    </div>
                   </button>
                 )}
               </div>

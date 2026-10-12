@@ -4227,8 +4227,8 @@ export const FULL_USER_STEAM_GAMES: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/8f1da102713653906647c5024843479395be3394/header.jpg?t=1760951366",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/87b7d077139d1f8fa48aee66960288c639409e74/capsule_231x87.jpg?t=1760951366",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/87b7d077139d1f8fa48aee66960288c639409e74/capsule_231x87.jpg?t=1760951366",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg",
+    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg",
     "shortDescription": "",
     "releaseDate": "TBA",
     "developers": [],

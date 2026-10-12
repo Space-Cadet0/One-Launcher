@@ -2110,9 +2110,10 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
     ]
   },
   {
-    "id": "epic-015cbe4368dc449b961988c7434d9195",
-    "title": "DARQ",
-    "sortTitle": "DARQ",
+    "id": "steam-433550",
+    "title": "DARQ: Complete Edition",
+    "sortTitle": "DARQ: Complete Edition",
+    "steamAppId": 433550,
     "platforms": [
       {
         "platformId": "epic",
@@ -2122,20 +2123,30 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S1_2560x1440_2560x1440-15e5dda133bae02a6b9cdf6086ec03f3",
-    "capsuleImage": "https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S2_1200x1600_1200x1600-d53e44ba5b0dc0e019ee698f02b6d300",
-    "shortDescription": "DARQ",
-    "releaseDate": "2024-05-21",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/433550/library_600x900_2x.jpg",
+    "shortDescription": "DARQ tells the story of Lloyd, a boy who finds himself in the middle of a lucid nightmare. Unable to wake up, Lloyd has to face his fears and decipher the meaning of the dream.",
+    "releaseDate": "2020-12-04",
     "developers": [
-      "Unfold Games, LLC"
+      "Unfold Games"
     ],
     "publishers": [
-      "Unfold Games, LLC"
+      "Unfold Games",
+      "Feardemic"
     ],
     "genres": [
-      "Action"
+      "Action",
+      "Adventure",
+      "Indie",
+      "Puzzle"
     ],
     "tags": [
-      "Epic Games Store"
+      "Atmospheric",
+      "Psychological Horror",
+      "Puzzle",
+      "Dark",
+      "Horror",
+      "Surreal",
+      "Singleplayer"
     ]
   },
   {
@@ -11680,8 +11691,8 @@ export const EPIC_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/95f1381dac57ce601d5260de3c792f8a2ee2bc93/header.jpg?t=1787942042",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/22488e2f7358b27d1ccff845bc5bd02e72a1494e/capsule_231x87.jpg?t=1787942042",
-    "iconUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/22488e2f7358b27d1ccff845bc5bd02e72a1494e/capsule_231x87.jpg?t=1787942042",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg",
     "shortDescription": "Wildgate is a crew-based PVP multiplayer shooter that blends tactical ship-to-ship combat with fast-paced first-person action. Evade deadly environmental hazards, search for powerful weapons and ship upgrades, and be the first crew to escape with the Artifact.",
     "releaseDate": "2025-12-30",
     "developers": [

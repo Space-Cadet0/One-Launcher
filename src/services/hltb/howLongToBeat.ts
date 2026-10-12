@@ -326,8 +326,8 @@ export async function fetchAndCacheHltb(
     let rawResults: any[] = [];
 
     // Option 1: Native Electron IPC
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.searchHltb) {
-      const res = await (window as any).electronAPI.searchHltb(gameTitle);
+    if (typeof window !== 'undefined' && window.electronAPI?.searchHltb) {
+      const res = await window.electronAPI.searchHltb(gameTitle);
       if (res && res.success && Array.isArray(res.data)) {
         rawResults = res.data;
       }

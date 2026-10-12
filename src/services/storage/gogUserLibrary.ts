@@ -720,7 +720,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/2cff003da730f1d47d120967a623abc24a15c7dfe2fb9adcda22a7dafd65acbe_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/2cff003da730f1d47d120967a623abc24a15c7dfe2fb9adcda22a7dafd65acbe_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/034c66c9a008afad66f9cd3bb543c5ed80a8a760b8165e7d9655e1fb80587973.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2013-04-04",
     "developers": [
@@ -1081,7 +1081,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/b896c4e69f4c1f67b85a27309d3447c812e31ee07d6558364f602f077477510e_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/b896c4e69f4c1f67b85a27309d3447c812e31ee07d6558364f602f077477510e_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/e76f30d983be5ef1bf6a253298f9409f44146930d7ba1345965cb390d37f205e.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2020-02-14",
     "developers": [
@@ -1225,7 +1225,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/798b87f729fa965e96455dff61c7983d54eb86a450675e05de2583b78b134973_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/798b87f729fa965e96455dff61c7983d54eb86a450675e05de2583b78b134973_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/72165fff4a872f240b780c24ec7239c7080493743ad60fd59aaeefb3a2eb0fe6.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2014-03-24",
     "developers": [
@@ -1281,7 +1281,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/2d0cd253f7d22db29fd4c2e411f5ef39c9347771b58f385158a8ac58f198560d_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/2d0cd253f7d22db29fd4c2e411f5ef39c9347771b58f385158a8ac58f198560d_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/735914ad8392a8e733016db8e554a66e939a543a0e53f6717a1df085065668fc.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "1993-08-03",
     "developers": [
@@ -1650,7 +1650,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/7d8cd4109d3b05bec944569d32971c499e07b5352873acbe5d1f0e7acf0f5d9a.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "1996-11-11",
     "developers": [
@@ -2150,8 +2150,8 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/5f4bcd273836fff17a71097190ad800f3ddd3f221950b7d7f199f715015d3e13_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg",
-    "iconUrl": "https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg",
+    "capsuleImage": "https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp",
+    "iconUrl": "https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp",
     "shortDescription": "Shooter experience",
     "releaseDate": "2026-04-30",
     "developers": [
@@ -2480,7 +2480,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/e329f224694547ec95f6bcb67b8148ff16eae0c939d9daf1495922246fb016f5_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/e329f224694547ec95f6bcb67b8148ff16eae0c939d9daf1495922246fb016f5_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/7731adad5a34c2762a30084c9741396c0ee3abb44089902ce36510b70cf062da.jpg",
     "shortDescription": "Strategy experience",
     "releaseDate": "1993-01-01",
     "developers": [
@@ -3048,7 +3048,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/3f580ea4bcf6f4df3b9a1a460c056a6a83420b07298751d65771f424d823068a_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/3f580ea4bcf6f4df3b9a1a460c056a6a83420b07298751d65771f424d823068a_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/a77b65bb4b15325a47935a63e15d742e63fccafb52d35e1f63b41185a0214233.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2003-12-02",
     "developers": [
@@ -3098,7 +3098,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/42c6aec0e9ae93304d487ebb9ec40eb5fd221d6c174f54b752a1d20915bde11f_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/42c6aec0e9ae93304d487ebb9ec40eb5fd221d6c174f54b752a1d20915bde11f_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/a7cb5f7a496d12631e3920ac18d8e51c77d5f3ade505a12a2715b5900e560051.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2013-10-25",
     "developers": [
@@ -3201,7 +3201,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/79429e097ac499290497415f13c0a1747a07659fc7b53f8cc07f1b0afd569333_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/79429e097ac499290497415f13c0a1747a07659fc7b53f8cc07f1b0afd569333_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/f4e24b54b79818389e2b0bcb835039626789ec340a9ac307a440126c1ebe54bc.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2000-06-22",
     "developers": [
@@ -3252,7 +3252,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/fa31881af39436b62bef91cb325f462c8f288d6af2090a256d0f8a1e991ffa88_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/fa31881af39436b62bef91cb325f462c8f288d6af2090a256d0f8a1e991ffa88_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/ee1097773f413f1467e9ff3e85ecf12beb8b60500ba7c23ddc40873ae79f1df5.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "1997-01-01",
     "developers": [
@@ -3734,7 +3734,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/43b050c658e5c7c9757b15eee9b94f5800c27561aebd030e6a01e5b99ee83570_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/43b050c658e5c7c9757b15eee9b94f5800c27561aebd030e6a01e5b99ee83570_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/07fc5588b001c4d9462fdbe9b93345c5ce59a4587340e32c5398ccb1694edd64.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2014-02-17",
     "developers": [
@@ -4240,7 +4240,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/255c13273d77d9791bec1c2a63a36b0aeb40bb865a6ae2db21c3a5f90eee80d2_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/255c13273d77d9791bec1c2a63a36b0aeb40bb865a6ae2db21c3a5f90eee80d2_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/57e3d234410159a4d3ee4c028682c1c557a99f8c50f18d0289aa7953719c3d03.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2022-08-24",
     "developers": [
@@ -4499,7 +4499,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/40a45333c40f66a48c507c23590ade8c64e64c7786e135e2e2ab9933e373b9d9_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/40a45333c40f66a48c507c23590ade8c64e64c7786e135e2e2ab9933e373b9d9_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2024-07-25",
     "developers": [
@@ -4896,7 +4896,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/09011753df7ead3ab93e9d0fbaaad9f4fe3ceb31f09b130742b35af300780150_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/09011753df7ead3ab93e9d0fbaaad9f4fe3ceb31f09b130742b35af300780150_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/d213b584b9e33ccb43b001fe252ab29ee2b2ab7292bfb745e3b36ec27405038f.jpg",
     "shortDescription": "Racing experience",
     "releaseDate": "2022-09-02",
     "developers": [
@@ -4941,7 +4941,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/23f2b3ea51d94d412516374660aa231561f5d25bd99947c5b49e8f255119a185_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/23f2b3ea51d94d412516374660aa231561f5d25bd99947c5b49e8f255119a185_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/b0ca36c4583e27fd68b964055bfd9a72fbb8ef7c40253a3bb0aba94a93a822d2.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "1995-10-25",
     "developers": [
@@ -5833,7 +5833,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/818658294fc9ed5ce966acf2792e93aa8cb6d4776813071c6774b93c73d0f6f5_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/818658294fc9ed5ce966acf2792e93aa8cb6d4776813071c6774b93c73d0f6f5_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/dbe8b39edb1a21c095cfa8d2dcb4219236c1a13780e253ef75bbc394392a5369.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2017-08-29",
     "developers": [
@@ -6399,7 +6399,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/47d5b333fcd3736cd52e997b0b00c04b1cab1d1a3469720761234d7359c49ddf_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/47d5b333fcd3736cd52e997b0b00c04b1cab1d1a3469720761234d7359c49ddf_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/303f61b53e17309cb4ffa0df07daf48929a1d76d7db4fc62f19280cadce71463.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2015-02-18",
     "developers": [
@@ -6811,7 +6811,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/b6184bdfe32a6b50777057d0b599c4e00758a68e31ebdaad2d737839b0fb170d_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/b6184bdfe32a6b50777057d0b599c4e00758a68e31ebdaad2d737839b0fb170d_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/a16981d9cdb3801a4ace1192a9c8c98e2100eda55fbaedebc0384513ea984680.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "1992-01-01",
     "developers": [
@@ -7013,7 +7013,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/f68062ce060563f1a0fb50657d4bea367992d53d0884bec5ffa8da15b1b079c4_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/f68062ce060563f1a0fb50657d4bea367992d53d0884bec5ffa8da15b1b079c4_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/e8258e4a75ba4cdd232e5514e37647da148a2a8f464f124f6e83408df6cb22dd.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2022-02-11",
     "developers": [
@@ -7213,7 +7213,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/de223675d11d6298a77cbc289c56096577f3fde8eb40a3f1a5a04ed319f61e95_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/de223675d11d6298a77cbc289c56096577f3fde8eb40a3f1a5a04ed319f61e95_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/15f2fcf1b61dc2e2fb46b9d1fca7350fedbb3b2470c9b36e2f0d9de417da7ae2.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2009-11-13",
     "developers": [
@@ -7265,7 +7265,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/835a0947eda2ed8f1d6b6d6f656c2cbe21da54857376fcdb279989bd5b89fc9c_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/835a0947eda2ed8f1d6b6d6f656c2cbe21da54857376fcdb279989bd5b89fc9c_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/aa6919acb23824fd8d1198e98fbc0bd6f5e9053de7eec31ae6ec6ad8b27fd191.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2011-03-22",
     "developers": [
@@ -7527,7 +7527,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/21c5c15dcd6cff7b33d052cb4b70d4076fc1ccdb544b13b4446c8e3659bf25af_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/21c5c15dcd6cff7b33d052cb4b70d4076fc1ccdb544b13b4446c8e3659bf25af_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/3273dfa79c6d53e5084de1c9c08022c6a5be7dad62237f479f517077d64531c6.jpg",
     "shortDescription": "Simulation experience",
     "releaseDate": "2022-03-19",
     "developers": [
@@ -7620,7 +7620,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/ec9894ec739bdfd6a68b6cf2d8a51138272f75a382fd703ece336bb89e7c49a9_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/ec9894ec739bdfd6a68b6cf2d8a51138272f75a382fd703ece336bb89e7c49a9_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/578fa6a9f14f7a01f18576bc33b9965f972361320446f5eddda6241aa8aa9e0b.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2020-05-19",
     "developers": [
@@ -7671,7 +7671,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/675f7bf7c242b6c80cb8e91834d01cfc2bc0ac1bb47c7184c8ccf4966ca22423_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/675f7bf7c242b6c80cb8e91834d01cfc2bc0ac1bb47c7184c8ccf4966ca22423_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/e3c711f79deb108d033d7928149310f60eedbb98e3ce071584c90d230f692887.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2020-05-19",
     "developers": [
@@ -8789,7 +8789,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/3de511f611d938f1a877fb2d244e1c9403ce41bc6007263fc440c80ecb75df9b_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/3de511f611d938f1a877fb2d244e1c9403ce41bc6007263fc440c80ecb75df9b_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/5931b18c5e12a2674235bee2bf1606ea884f6f25de53cbac4cc6059448f8094d.jpg",
     "shortDescription": "Simulation experience",
     "releaseDate": "2016-08-03",
     "developers": [
@@ -8840,7 +8840,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/b7272e6bb4022f3838c91a37cc403d99673fb657d57fad34f53dfa2dd4a2cafd_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/b7272e6bb4022f3838c91a37cc403d99673fb657d57fad34f53dfa2dd4a2cafd_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/ce6ec56dd03fa52aa0087ab77ff9594927d60b66b1fb70e9a4e4839c955e0948.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2016-03-08",
     "developers": [
@@ -9398,7 +9398,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/d916d3bbf261e1548ade8e92b20f207886cf7483a9c360f998ad491b695a0332_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/d916d3bbf261e1548ade8e92b20f207886cf7483a9c360f998ad491b695a0332_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/dba0ecc90a04d138aaf5eb7caf4dedb0823dbbae088ad0ccd0ed43ff380cb845.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "2003-08-29",
     "developers": [
@@ -10498,7 +10498,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/68242319701d590dce72be3f0e2fe7fd716c98e958e69dda7ea9f9c8eb6e09f2_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/68242319701d590dce72be3f0e2fe7fd716c98e958e69dda7ea9f9c8eb6e09f2_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/b7498626a2b6083ba3c56d798d6015d364e9ddf30b625ed702f9e5b34a198c9b.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "1997-05-13",
     "developers": [
@@ -10547,7 +10547,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/fcc90f964947d19b0bc49825d55cd181fea2389cd1312a5619ac731fc1c64208_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/fcc90f964947d19b0bc49825d55cd181fea2389cd1312a5619ac731fc1c64208_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/dc74068447104920058af1ca9f5f9aaaeb35cefc31af0f97a8ac2341ba969b3b.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2015-08-20",
     "developers": [
@@ -10653,7 +10653,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/3151b8deaeff59ad905af2bf37cfca592d615cd1615fbe48d893ac6f797140ad_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/3151b8deaeff59ad905af2bf37cfca592d615cd1615fbe48d893ac6f797140ad_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/22a484c9964e974bd8702258f486de022938c0aed68b42521b9f1e57b996e513.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2014-09-18",
     "developers": [
@@ -10795,7 +10795,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/aa485936254a93b3a2ed0f780d3e64609413aee0ebe23c40b3e10e91b947e0ef_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/aa485936254a93b3a2ed0f780d3e64609413aee0ebe23c40b3e10e91b947e0ef_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/f33b67e0e2d7b1e964bd27c75ba24951fab8af16b0c5c528e83a4e9f5b95f4f8.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2021-03-22",
     "developers": [
@@ -10886,7 +10886,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/37ac843afc2b6d5f3b3b600483948cfc0f849a7c20a95adfcefe5c2b73caa4e7_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/37ac843afc2b6d5f3b3b600483948cfc0f849a7c20a95adfcefe5c2b73caa4e7_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/db093f6cd2c841b4d0365b8d3f3e7346cecdd8724d41d8759227fd4fc8b08bc1.jpg",
     "shortDescription": "Strategy experience",
     "releaseDate": "2005-10-20",
     "developers": [
@@ -11172,7 +11172,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/4b861d6e5a0ab352cae8572e27b62859e8a3e2b8659a7ab47ab1dcaad5c71567_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/4b861d6e5a0ab352cae8572e27b62859e8a3e2b8659a7ab47ab1dcaad5c71567_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/f0100ab0878dec87de94c7fbb773d5ec8b82220610a6133fc437a11099c37223.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2018-05-22",
     "developers": [
@@ -12019,7 +12019,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/ea1c64b772b7f5fd3e1a16ccf182c5c1319e7765b088529759cff3117af4ee85_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/ea1c64b772b7f5fd3e1a16ccf182c5c1319e7765b088529759cff3117af4ee85_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/754d59c26ea2a81d688ef36948f9a53aa036154f42c21ea3aa3a2bcc71e1b097.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2024-05-10",
     "developers": [
@@ -12324,7 +12324,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/73599010340e1630b66dadcdbf922049c99deeeb40eeaf2fc83ace6c3792e05a_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/73599010340e1630b66dadcdbf922049c99deeeb40eeaf2fc83ace6c3792e05a_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/4f8bd485d3edf019e24c8645763600a742ac3cb3d8584300e66e291455e296dd.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "1993-06-06",
     "developers": [
@@ -12367,7 +12367,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/6385eb91c19cdb3df180903dcfd570657cef6a7ea58bf1fd725aaa94f72aecc3_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/6385eb91c19cdb3df180903dcfd570657cef6a7ea58bf1fd725aaa94f72aecc3_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/f45a78257b8d8d11c5b037a639462b31f334df01aa60e9620c89742de692ef66.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "1996-10-31",
     "developers": [
@@ -12410,7 +12410,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/83440dfe39a478e559a6c71d70ba33b66a28796a822d6c4d7f8de28368339b62_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/83440dfe39a478e559a6c71d70ba33b66a28796a822d6c4d7f8de28368339b62_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/cd679800ca6fa6351cee3c24bf5f652fe92f2e3cf515386e9aa6ddb977d4f006.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "1994-02-26",
     "developers": [
@@ -12655,7 +12655,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/849f9229f0fac0c74fa8e8b32c111b96632e31260eed9d152fab2aafb5d2f972_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/849f9229f0fac0c74fa8e8b32c111b96632e31260eed9d152fab2aafb5d2f972_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/0c66e6b2e4fc581c138041b6c9aa974c5595aefa7d3675583e33782c11aafc12.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2021-10-14",
     "developers": [
@@ -12887,7 +12887,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/bbba2ce5901fe222dc2493997192189215e5c8e3b576dc37ed1c1023764ee995_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/bbba2ce5901fe222dc2493997192189215e5c8e3b576dc37ed1c1023764ee995_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/9fca5b1db3ab41fec9911bc6e84f12809bf87b73522335a60ef50a0dac5a8b8b.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2002-01-01",
     "developers": [
@@ -12987,7 +12987,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/84909822081b1427ec628ebcd589e216258d838b50569a8b39e2ddbfd49e8a49_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/84909822081b1427ec628ebcd589e216258d838b50569a8b39e2ddbfd49e8a49_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/86eadf4412ddfe8e5e244195e8d06b93c8166a14104dc4bde58b29312cb52a9b.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2020-12-01",
     "developers": [
@@ -13037,7 +13037,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/0cc8a987884c525bd57c5ac9f3fefc4eb85a6ec11d2ecfc618be5b100269ec5f_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/0cc8a987884c525bd57c5ac9f3fefc4eb85a6ec11d2ecfc618be5b100269ec5f_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/1d59c3d8587120bdfe2bcdbcab81f6e82e3a7743559bb3162de980b4a06e2c52.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "2013-07-12",
     "developers": [
@@ -13426,7 +13426,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-3.gog-statics.com/edb6a64af4bf97e540bfce7cca178b11a05b7f15572d369a577d54046e220f2c_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-3.gog-statics.com/edb6a64af4bf97e540bfce7cca178b11a05b7f15572d369a577d54046e220f2c_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/5c919ec2805339042eaf9952bd982f240b9205bf01c42abf39d34001f65bcc16.jpg",
     "shortDescription": "Adventure experience",
     "releaseDate": "2014-05-06",
     "developers": [
@@ -13628,7 +13628,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/9fee86856dec591d46e81ee8eba47c4945a980ce9730549581eae646330629d5_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/9fee86856dec591d46e81ee8eba47c4945a980ce9730549581eae646330629d5_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/ed3aac74035d218f5412ed74051f366338baa0bb2de3070664439c025cdb7df5.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2000-03-23",
     "developers": [
@@ -13680,7 +13680,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/30c6d68f5d0c8bbe9c2eb47f8781ec621a2f0ce40704c7dfe510533ca3a29f9e_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/30c6d68f5d0c8bbe9c2eb47f8781ec621a2f0ce40704c7dfe510533ca3a29f9e_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/bacd89ff9bc238ce5a63705e31c41c9571a8bff5e09285c15be3082414af0d2f.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2004-05-25",
     "developers": [
@@ -13967,7 +13967,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/74ef44a280dd89f7764b2e31a3356cb7fa90f89a0227038191e2714ccfd3cbdb_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/74ef44a280dd89f7764b2e31a3356cb7fa90f89a0227038191e2714ccfd3cbdb_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/754dd55607aecdc8a2989a9e4a280d0caa3875fe88c1974ba6e10dd1b9a3b1d6.jpg",
     "shortDescription": "Action experience",
     "releaseDate": "2013-03-05",
     "developers": [
@@ -14490,7 +14490,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/346da67f4079d2d4e64ab0e7c310ee81218734d4bde4d74d3a3f074510cf6fa5_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/346da67f4079d2d4e64ab0e7c310ee81218734d4bde4d74d3a3f074510cf6fa5_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/a81c4734f15103f94496a608c747bf4791971465a06187455019807e4c905dc5.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "1999-11-30",
     "developers": [
@@ -14617,7 +14617,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/cb10216b4721fc46db91a79af4bee55dc90123c13ebcc11a50980d384ca1a4a1_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/cb10216b4721fc46db91a79af4bee55dc90123c13ebcc11a50980d384ca1a4a1_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/ef42da4b4e060962145eafa9225c948f727a0e67e622ec9f82cd653120ffd6bd.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "1985-09-16",
     "developers": [
@@ -14661,7 +14661,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-1.gog-statics.com/10f120bcf0bf4b9bbd7552a413c084f891ed3cd5f7e3e562f9e856271fd98bc2_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-1.gog-statics.com/10f120bcf0bf4b9bbd7552a413c084f891ed3cd5f7e3e562f9e856271fd98bc2_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/13d0d6cf52cb13c66eddeab7050e26e0d0fb2c03bb91512186cd58ed1e3d079c.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "1991-12-31",
     "developers": [
@@ -15145,7 +15145,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/07c86c0a10902cd350ff5476ed7f27f5290246016bd1a3ab3d52cda5759663ce_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/07c86c0a10902cd350ff5476ed7f27f5290246016bd1a3ab3d52cda5759663ce_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/cd2030ffec5a5c98e7bdd5b90624f9e6539cc5c65c0c9ab25715e9caab16240e.jpg",
     "shortDescription": "Role-playing experience",
     "releaseDate": "1990-12-30",
     "developers": [
@@ -15237,7 +15237,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-2.gog-statics.com/a4b4a072ce88cb4c8b8a34a45ed283e1a773955c1992f03a83531a66223c15cb_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-2.gog-statics.com/a4b4a072ce88cb4c8b8a34a45ed283e1a773955c1992f03a83531a66223c15cb_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/e4cd9c73f2875a621baf7b556b04c3fb00416f8858184af21378376ccb20972e.jpg",
     "shortDescription": "Strategy experience",
     "releaseDate": "2014-03-07",
     "developers": [
@@ -15367,7 +15367,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       }
     ],
     "headerImage": "https://images-4.gog-statics.com/c961f804cf039a4a1aecb56acbf51788f2cc0f7c5bc04fa1283ac37eceff89fc_product_card_v2_mobile_slider_639.jpg",
-    "capsuleImage": "https://images-4.gog-statics.com/c961f804cf039a4a1aecb56acbf51788f2cc0f7c5bc04fa1283ac37eceff89fc_glx_vertical_cover.jpg",
+    "capsuleImage": "https://images.gog-statics.com/7b7eba4d436bc29342654a206d85a16f3408ac6f405988523803aea643d67b94.jpg",
     "shortDescription": "Shooter experience",
     "releaseDate": "2003-10-09",
     "developers": [

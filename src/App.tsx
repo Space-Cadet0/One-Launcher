@@ -20,6 +20,14 @@ import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
 import { LibraryGridView } from './components/Library/LibraryGridView';
 import { ManageCollectionsModal } from './components/Library/ManageCollectionsModal';
 import { IntegrationsModal } from './components/Navigation/IntegrationsModal';
+import { FixMatchWizardModal } from './components/Library/FixMatchWizardModal';
+import { UserGameOverride } from './contracts/override';
+import {
+  saveUserOverride,
+  removeUserOverride,
+  getUserOverrideForGame,
+  applyUserOverrideToGame,
+} from './services/storage/userOverrideStorage';
 import {
   loadIntegrations,
   saveIntegrations,
@@ -261,6 +269,10 @@ export function App() {
   // Integrations modal state
   const [isIntegrationsModalOpen, setIsIntegrationsModalOpen] = useState(false);
 
+  // Fix Match & User Override modal state
+  const [isFixMatchModalOpen, setIsFixMatchModalOpen] = useState(false);
+  const [fixMatchGame, setFixMatchGame] = useState<CanonicalGame | null>(null);
+
   // Connected storefronts based strictly on authenticated integration state
   const connectedStorefronts = useMemo(() => {
     try {
@@ -274,8 +286,8 @@ export function App() {
   // Synchronize installed game status, tokens, and achievements against the workstation and cloud
   useEffect(() => {
     // Reconcile saved native Electron tokens (Epic, GOG) into local integrations state
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.getSavedTokens) {
-      (window as any).electronAPI
+    if (typeof window !== 'undefined' && window.electronAPI?.getSavedTokens) {
+      window.electronAPI
         .getSavedTokens()
         .then((savedTokens: any) => {
           if (savedTokens?.epic?.access_token) {
@@ -318,8 +330,8 @@ export function App() {
             }
 
             // Sync live Epic games in background to ensure newly purchased games appear immediately
-            if ((window as any).electronAPI?.syncStore) {
-              (window as any).electronAPI.syncStore('epic').then((syncRes: any) => {
+            if (window.electronAPI?.syncStore) {
+              window.electronAPI.syncStore('epic').then((syncRes: any) => {
                 if (syncRes?.success && syncRes.games?.length > 0) {
                   setGames((prev) => {
                     const merged = mergeStorefrontGames(prev, syncRes.games, 'epic');
@@ -683,9 +695,9 @@ export function App() {
       const gogInteg = integrations.find((i) => i.storefrontId === 'gog' && i.isConnected);
       if (gogInteg) {
         try {
-          if (typeof window !== 'undefined' && (window as any).electronAPI?.syncStore) {
-            const gogRes = await (window as any).electronAPI.syncStore('gog');
-            if (gogRes?.success && gogRes.games?.length > 0) {
+          if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+            const gogRes = await window.electronAPI.syncStore('gog');
+            if (gogRes?.success && gogRes.games && gogRes.games.length > 0) {
               currentCatalog = mergeStorefrontGames(currentCatalog, gogRes.games, 'gog');
             }
           } else {
@@ -701,9 +713,9 @@ export function App() {
       const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
       if (epicInteg) {
         try {
-          if (typeof window !== 'undefined' && (window as any).electronAPI?.syncStore) {
-            const epicRes = await (window as any).electronAPI.syncStore('epic');
-            if (epicRes?.success && epicRes.games?.length > 0) {
+          if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+            const epicRes = await window.electronAPI.syncStore('epic');
+            if (epicRes?.success && epicRes.games && epicRes.games.length > 0) {
               currentCatalog = mergeStorefrontGames(currentCatalog, epicRes.games, 'epic');
             }
           } else {
@@ -863,14 +875,15 @@ export function App() {
     return Boolean(matched);
   }, [isGridView, selectedGame]);
 
-  // Synchronize official Steam metadata, achievements, and media for the current game
-  const handleSyncCurrentGame = async () => {
-    if (!selectedGame || isSyncingCurrentGame) return;
-    const targetAppId = selectedGame.steamAppId || steamMatcher.matchGameToSteamInstant(selectedGame.title);
+  // Synchronize official Steam metadata, achievements, and media for a game
+  const handleSyncCurrentGame = async (gameToSync?: CanonicalGame) => {
+    const target = gameToSync || selectedGame;
+    if (!target || isSyncingCurrentGame) return;
+    const targetAppId = target.steamAppId || steamMatcher.matchGameToSteamInstant(target.title);
     if (!targetAppId) return;
 
     setIsSyncingCurrentGame(true);
-    setSyncNotice(`Syncing ${selectedGame.title} from Steam...`);
+    setSyncNotice(`Syncing ${target.title} from Steam...`);
 
     try {
       try {
@@ -888,7 +901,7 @@ export function App() {
       if (refreshed || liveAchs) {
         setGames((prevGames) => {
           const updated = prevGames.map((g) => {
-            if (g.id === selectedGame.id) {
+            if (g.id === target.id) {
               const updatedPlatforms = g.platforms.map((p) => {
                 if (p.platformId === 'steam' && liveAchs) {
                   return {
@@ -922,9 +935,9 @@ export function App() {
           return updated;
         });
         setGameRefreshKey((prev) => prev + 1);
-        setSyncNotice(`Successfully synced ${selectedGame.title} from Steam!`);
+        setSyncNotice(`Successfully synced ${target.title} from Steam!`);
       } else {
-        setSyncNotice(`No new updates found on Steam for ${selectedGame.title}.`);
+        setSyncNotice(`No new updates found on Steam for ${target.title}.`);
       }
     } catch (err: any) {
       setSyncNotice(`Steam sync notice: ${err?.message || 'Error syncing game'}`);
@@ -1019,6 +1032,65 @@ export function App() {
     });
   };
 
+  // User Game Override & Fix Match Handlers
+  const handleOpenFixMatch = useCallback((gameToFix?: CanonicalGame) => {
+    const targetGame = gameToFix || selectedGame;
+    if (targetGame) {
+      setFixMatchGame(targetGame);
+      setIsFixMatchModalOpen(true);
+    }
+  }, [selectedGame]);
+
+  const handleApplyOverride = useCallback((override: UserGameOverride) => {
+    saveUserOverride(override);
+
+    setGames((prevGames) => {
+      const updatedGames = prevGames.map((g) => {
+        const isMatch =
+          g.id === override.gameId ||
+          Boolean(
+            override.platformGameId &&
+              g.platforms?.some(
+                (p) =>
+                  p.platformGameId === override.platformGameId &&
+                  (!override.platformId || p.platformId === override.platformId)
+              )
+          );
+        if (isMatch) {
+          return applyUserOverrideToGame(g, override);
+        }
+        return g;
+      });
+      try {
+        saveCurrentCatalog(updatedGames);
+      } catch (err) {
+        console.error('Failed to save updated catalog after override:', err);
+      }
+      return updatedGames;
+    });
+
+    setGameRefreshKey((prev) => prev + 1);
+    setSyncNotice(`Applied metadata & cover match for "${override.title || 'game'}"!`);
+    setTimeout(() => {
+      setSyncNotice((prev) => (prev?.includes(override.title || 'game') ? null : prev));
+    }, 5000);
+  }, []);
+
+  const handleResetOverride = useCallback((gameId: string) => {
+    removeUserOverride(gameId);
+    setGames((prevGames) => {
+      const sanitized = sanitizeGameCatalog(prevGames);
+      try {
+        saveCurrentCatalog(sanitized);
+      } catch {}
+      return sanitized;
+    });
+
+    setGameRefreshKey((prev) => prev + 1);
+    setSyncNotice('Reverted game match & metadata to default store settings.');
+    setTimeout(() => setSyncNotice(null), 5000);
+  }, []);
+
   // Collection Management Handlers
   const handleOpenManageCollections = (game?: CanonicalGame) => {
     setCollectionModalGame(game || null);
@@ -1093,6 +1165,7 @@ export function App() {
         onSyncCurrentGame={handleSyncCurrentGame}
         isSyncingAllMedia={isSyncingAllMedia}
         onSyncAllMedia={handleSyncAllMedia}
+        onOpenFixMatch={() => handleOpenFixMatch()}
       />
 
       {/* Sync Status Banner */}
@@ -1184,6 +1257,11 @@ export function App() {
               activeFilter={activeFilter}
               onClearActiveFilter={navigateClearFilter}
               connectedStorefronts={connectedStorefronts}
+              onFixMatch={handleOpenFixMatch}
+              onSyncGameMedia={handleSyncCurrentGame}
+              collections={collections}
+              onToggleGameInCollection={handleToggleGameInCollection}
+              onOpenManageCollectionsModal={handleOpenManageCollections}
             />
           ) : (
             <SteamStorePage
@@ -1199,6 +1277,7 @@ export function App() {
               onGameUpdated={handleGameUpdated}
               connectedStorefronts={connectedStorefronts}
               onOpenIntegrations={() => setIsIntegrationsModalOpen(true)}
+              onFixMatch={() => handleOpenFixMatch(selectedGame)}
             />
           )}
         </main>
@@ -1228,8 +1307,21 @@ export function App() {
           }
         }}
       />
+
+      {/* Modal: Fix Match & Metadata Override Wizard */}
+      <FixMatchWizardModal
+        isOpen={isFixMatchModalOpen}
+        game={fixMatchGame}
+        onClose={() => {
+          setIsFixMatchModalOpen(false);
+          setFixMatchGame(null);
+        }}
+        onApplyOverride={handleApplyOverride}
+        onResetOverride={handleResetOverride}
+        existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
+      />
     </div>
   );
-}
+};
 
 export default App;

@@ -10,6 +10,12 @@ import { mergeScannedSteamGames } from '../storage/librarySync';
 import { GOG_USER_LIBRARY, EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
 import { sanitizeGameCatalog, normalizeCanonicalTitle } from './catalogSanitizer';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
+import {
+  loadUserOverrides,
+  getUserOverrideForGame,
+  applyUserOverrideToGame,
+  applyUserOverridesToCatalog,
+} from '../storage/userOverrideStorage';
 
 const STORAGE_KEY_INTEGRATIONS = 'antigravity_storefront_integrations';
 const STORAGE_KEY_CUSTOM_GAMES = 'antigravity_synced_user_games';
@@ -179,7 +185,8 @@ export function loadIntegrations(): StorefrontIntegration[] {
       return updated;
     }
     return DEFAULT_INTEGRATIONS;
-  } catch {
+  } catch (err) {
+    console.warn('Failed to load storefront integrations from localStorage:', err);
     return DEFAULT_INTEGRATIONS;
   }
 }
@@ -194,6 +201,7 @@ export function saveIntegrations(integrations: StorefrontIntegration[]): void {
 }
 
 export function loadCurrentCatalog(): CanonicalGame[] {
+  const userOverrides = loadUserOverrides();
   let defaultBase = sanitizeGameCatalog(
     mergeStorefrontGames(
       mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
@@ -201,6 +209,7 @@ export function loadCurrentCatalog(): CanonicalGame[] {
       'epic'
     )
   );
+  defaultBase = applyUserOverridesToCatalog(defaultBase, userOverrides);
 
   if (typeof window === 'undefined') return defaultBase;
   try {
@@ -231,22 +240,57 @@ export function loadCurrentCatalog(): CanonicalGame[] {
           cleaned = sanitizeGameCatalog(mergeStorefrontGames(cleaned, EPIC_USER_LIBRARY, 'epic'));
         }
 
+        cleaned = applyUserOverridesToCatalog(cleaned, userOverrides);
         saveCurrentCatalog(cleaned);
         return cleaned;
       }
     }
-  } catch {
-    // Ignore read errors
+    // Merge any custom games if stored in custom games delta
+    const customRaw = localStorage.getItem(STORAGE_KEY_CUSTOM_GAMES);
+    if (customRaw) {
+      try {
+        const customParsed = JSON.parse(customRaw);
+        if (Array.isArray(customParsed) && customParsed.length > 0) {
+          const customOnly = customParsed.filter(
+            (g: CanonicalGame) =>
+              g.platforms?.some((p) => p.platformId === 'custom') ||
+              !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
+          );
+          for (const cg of customOnly) {
+            if (!defaultBase.some((g: CanonicalGame) => g.id === cg.id)) {
+              defaultBase.push(cg);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to parse custom games cache:', err);
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to load cached universal catalog:', err);
   }
-  return defaultBase;
+  return applyUserOverridesToCatalog(defaultBase, userOverrides);
 }
 
 export function saveCurrentCatalog(games: CanonicalGame[]): void {
   if (typeof window === 'undefined') return;
   try {
-    const cleaned = sanitizeGameCatalog(games);
+    const userOverrides = loadUserOverrides();
+    const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
+    const cleaned = sanitizeGameCatalog(withOverrides);
     localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, JSON.stringify(cleaned));
-    localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(cleaned));
+
+    // Save only custom games delta to STORAGE_KEY_CUSTOM_GAMES, NOT the duplicate copy of all 811 master games
+    const customGames = cleaned.filter(
+      (g) =>
+        g.platforms?.some((p) => p.platformId === 'custom') ||
+        !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
+    );
+    if (customGames.length > 0) {
+      localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(customGames));
+    } else {
+      localStorage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
+    }
   } catch (err) {
     console.error('Failed to save universal catalog', err);
   }
@@ -257,17 +301,24 @@ export function mergeStorefrontGames(
   newGames: CanonicalGame[],
   storefrontId: StorefrontId
 ): CanonicalGame[] {
+  const userOverrides = loadUserOverrides();
   const sanitizedNew = sanitizeGameCatalog(newGames);
   const merged = [...currentCatalog];
 
   for (const newGame of sanitizedNew) {
     const newNorm = normalizeCanonicalTitle(newGame.title);
-    const existingIndex = merged.findIndex(
-      (g) =>
-        (g.steamAppId && newGame.steamAppId && g.steamAppId === newGame.steamAppId) ||
-        g.title.toLowerCase().trim() === newGame.title.toLowerCase().trim() ||
-        (newNorm && normalizeCanonicalTitle(g.title) === newNorm)
-    );
+    const existingIndex = merged.findIndex((g) => {
+      if (g.steamAppId && newGame.steamAppId && g.steamAppId === newGame.steamAppId) return true;
+      if (g.id && newGame.id && g.id === newGame.id) return true;
+      if (g.title.toLowerCase().trim() === newGame.title.toLowerCase().trim()) return true;
+      if (newNorm && normalizeCanonicalTitle(g.title) === newNorm) return true;
+      const ov = getUserOverrideForGame(g, userOverrides);
+      if (ov) {
+        if (ov.gameId && (ov.gameId === newGame.id || (newGame.steamAppId && ov.gameId === `steam-${newGame.steamAppId}`))) return true;
+        if (newGame.steamAppId && ov.steamAppId && ov.steamAppId === newGame.steamAppId) return true;
+      }
+      return false;
+    });
 
     const platformOwnership = newGame.platforms.find((p) => p.platformId === storefrontId) || {
       platformId: storefrontId,
@@ -277,6 +328,7 @@ export function mergeStorefrontGames(
 
     if (existingIndex >= 0) {
       const existing = merged[existingIndex];
+      const existingOverride = getUserOverrideForGame(existing, userOverrides);
       const hasPlatform = existing.platforms.some((p) => p.platformId === storefrontId);
       const updatedPlatforms = hasPlatform
         ? existing.platforms.map((p) =>
@@ -319,6 +371,10 @@ export function mergeStorefrontGames(
         shortDescription: existing.shortDescription || newGame.shortDescription,
         releaseDate: existing.releaseDate || newGame.releaseDate,
       };
+
+      if (existingOverride) {
+        merged[existingIndex] = applyUserOverrideToGame(merged[existingIndex], existingOverride);
+      }
     } else {
       merged.push({
         ...newGame,
@@ -328,7 +384,8 @@ export function mergeStorefrontGames(
   }
 
   const finalCatalog = sanitizeGameCatalog(merged);
-  return finalCatalog.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+  const withOverrides = applyUserOverridesToCatalog(finalCatalog, userOverrides);
+  return withOverrides.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
 }
 
 export function removeStorefrontGames(
@@ -498,10 +555,12 @@ export async function connectXboxIntegration(
 export function disconnectIntegration(
   storefrontId: StorefrontId
 ): { integrations: StorefrontIntegration[]; games: CanonicalGame[] } {
-  if (typeof window !== 'undefined' && (window as any).electronAPI?.clearTokens) {
+  if (typeof window !== 'undefined' && window.electronAPI?.clearTokens) {
     try {
-      (window as any).electronAPI.clearTokens(storefrontId);
-    } catch {}
+      window.electronAPI.clearTokens(storefrontId);
+    } catch (err) {
+      console.warn(`Failed to clear tokens for ${storefrontId}:`, err);
+    }
   }
   const integrations = loadIntegrations().map((i) => {
     if (i.storefrontId === storefrontId) {

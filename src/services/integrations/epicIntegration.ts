@@ -53,8 +53,8 @@ export class EpicIntegrationService {
 
     try {
       // 1. In Electron desktop runtime, delegate to native IPC if available
-      if (typeof window !== 'undefined' && (window as any).electronAPI?.fetchEpicAchievements) {
-        const nativeMap = await (window as any).electronAPI.fetchEpicAchievements(cleanAccountId, accessToken);
+      if (typeof window !== 'undefined' && window.electronAPI?.fetchEpicAchievements) {
+        const nativeMap = await window.electronAPI.fetchEpicAchievements(cleanAccountId, accessToken);
         if (nativeMap && Object.keys(nativeMap).length > 0) {
           cacheUserEpicAchievements(nativeMap);
           return nativeMap;

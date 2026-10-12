@@ -3,10 +3,17 @@ import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
 import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
-import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl } from '../igdb/igdbCoverService';
+import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, KNOWN_IGDB_COVERS } from '../igdb/igdbCoverService';
 import { steamMatcher } from '../steam/steamMatcher';
 import steamBlurbCache from '../storage/steamBlurbCache.json';
+import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { GOG_SPECIAL_DESCRIPTIONS } from '../steam/fallbackMetadataProvider';
+import {
+  loadUserOverrides,
+  getUserOverrideForGame,
+  applyUserOverrideToGame,
+  applyUserOverridesToCatalog,
+} from '../storage/userOverrideStorage';
 
 /**
  * Checks if a string is a 20+ hex hash or UUID
@@ -35,6 +42,10 @@ export function isPlaceholderDesc(desc?: string, title?: string): boolean {
   if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
   if (lower === 'classic title') return true;
   if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
+  if (/^dlcs?\s+(included|available)/i.test(trimmed)) return true;
+  if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
+  if (/^bonus\s+content/i.test(trimmed)) return true;
+  if (/^this\s+package\s+includes/i.test(trimmed)) return true;
   return false;
 }
 
@@ -113,7 +124,6 @@ export function normalizeCanonicalTitle(title: string): string {
     .toLowerCase()
     .replace(/[™®©]/g, '')
     .replace(/['’]/g, '')
-    .replace(/\s*\((?:19|20)\d{2}\)/g, '')
     .replace(/\biii\b/g, '3')
     .replace(/\bii\b/g, '2')
     .replace(/\biv\b/g, '4')
@@ -211,6 +221,529 @@ export const UNOWNED_STEAM_PROMO_APP_IDS = new Set<number>([
   354850,  // Why So Evil 2: Dystopia
 ]);
 
+export interface CatalogGamePatch {
+  targetId?: string;
+  title?: string;
+  sortTitle?: string;
+  steamAppId?: number | null;
+  headerImage?: string;
+  capsuleImage?: string;
+  iconUrl?: string;
+  preserveExistingIcon?: boolean;
+  shortDescription?: string;
+  releaseDate?: string;
+  developers?: string[];
+  publishers?: string[];
+  genres?: string[];
+  tags?: string[];
+  platformFilters?: {
+    excludePlatformId?: string;
+    setPlatformGameId?: { platformId: string; gameId: string };
+  };
+}
+
+/**
+ * Curated declarative game overrides and asset patches.
+ * Replaces dozens of sequential hardcoded if-statements with an O(1) table.
+ */
+export const KNOWN_GAME_PATCHES: Record<string, CatalogGamePatch> = {
+  'death stranding': {
+    targetId: 'steam-1190460',
+    title: 'Death Stranding',
+    sortTitle: 'Death Stranding',
+    steamAppId: 1190460,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/library_600x900_2x.jpg',
+    shortDescription: 'From legendary game creator Hideo Kojima comes an all-new, genre-defying experience. Sam Bridges must brave a world utterly transformed by the Death Stranding.',
+    releaseDate: '14 Jul, 2020',
+    developers: ['KOJIMA PRODUCTIONS'],
+    publishers: ['505 Games'],
+    genres: ['Action', 'Adventure'],
+    tags: ['Open World', 'Story Rich', 'Atmospheric', 'Sci-fi', 'Post-apocalyptic'],
+    platformFilters: {
+      setPlatformGameId: { platformId: 'epic', gameId: '761fe09295aa422e8199cebaacf51675' },
+    },
+  },
+  'doki doki literature club plus!': {
+    targetId: 'steam-1388880',
+    title: 'Doki Doki Literature Club Plus!',
+    sortTitle: 'Doki Doki Literature Club Plus!',
+    steamAppId: 1388880,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/library_600x900_2x.jpg',
+    shortDescription: 'Welcome to a terrifying world of poetry and romance! Write poems for your crush and erase any mistakes along the way to ensure your perfect ending.',
+    releaseDate: '30 Jun, 2021',
+    developers: ['Team Salvato'],
+    publishers: ['Serenity Forge'],
+    genres: ['Psychological Horror', 'Visual Novel', 'Anime'],
+    tags: ['Psychological Horror', 'Visual Novel', 'Anime', 'Story Rich', 'Singleplayer'],
+    platformFilters: {
+      setPlatformGameId: { platformId: 'epic', gameId: 'c5109bdceb3a453bb38c2fdc964ddee8' },
+    },
+  },
+  'blood omen: legacy of kain': {
+    targetId: 'gog-1837805079',
+    steamAppId: null,
+    headerImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_product_card_v2_mobile_slider_639.jpg',
+    capsuleImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_glx_vertical_cover.jpg',
+    platformFilters: {
+      setPlatformGameId: { platformId: 'gog', gameId: '1837805079' },
+    },
+  },
+  'doom + doom ii': {
+    targetId: 'gog-1413291984',
+    steamAppId: null,
+    platformFilters: {
+      setPlatformGameId: { platformId: 'gog', gameId: '1413291984' },
+    },
+  },
+  'alan wake 2': {
+    targetId: 'epic-93f2a8c3547846eda966cb3c152a026e',
+    headerImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s1-2560x1440-309c7412b7bc.jpg',
+    capsuleImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s2-1200x1600-0ebb9a566b72.jpg',
+    iconUrl: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-ic1-400x400-5366b10d0f67.png',
+  },
+  'fortnite': {
+    targetId: 'epic-4fe75bbc5a674f4f9b356b5c90567da5',
+    headerImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-logo-egs-launcher-blade-2560x1440-2560x1440-00f5395fc1e7.jpg',
+    capsuleImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
+    iconUrl: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
+  },
+  'ghostrunner': {
+    targetId: 'steam-1139900',
+    steamAppId: 1139900,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
+  },
+  'prey': {
+    targetId: 'steam-480490',
+    steamAppId: 480490,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
+  },
+  'cyberpunk 2077': {
+    platformFilters: {
+      excludePlatformId: 'gog',
+    },
+  },
+  'agony': {
+    targetId: 'steam-487720',
+    title: 'Agony',
+    sortTitle: 'Agony',
+    steamAppId: 487720,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
+    shortDescription:
+      'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
+  },
+  'agony unrated': {
+    targetId: 'steam-879420',
+    title: 'Agony UNRATED',
+    sortTitle: 'Agony UNRATED',
+    steamAppId: 879420,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
+    shortDescription:
+      'Agony UNRATED is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
+  },
+  'heretic + hexen': {
+    targetId: 'steam-3286930',
+    steamAppId: 3286930,
+    headerImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/af11a57f074bf3f1b901bb96f9ea519a0928c80c/header.jpg?t=1756918167',
+    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
+    iconUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/3286930/3392b11331bc4855f803ca939720fa94e3a01bdd.jpg',
+  },
+  'second extinction': {
+    targetId: 'steam-1024380',
+    title: 'Second Extinction',
+    sortTitle: 'Second Extinction',
+    steamAppId: 1024380,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
+    shortDescription:
+      'Second Extinction is a relentless 3-player cooperative FPS where you wipe out mutated dinosaurs that have taken over the Earth.',
+  },
+  '60 minutes to extinction': {
+    targetId: 'steam-3783210',
+    steamAppId: 3783210,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432',
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
+  },
+  'champions of krynn': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
+    preserveExistingIcon: true,
+  },
+  'castlevania anniversary collection': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
+    preserveExistingIcon: true,
+  },
+  'akalabeth': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
+    preserveExistingIcon: true,
+  },
+  'broken sword': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
+    preserveExistingIcon: true,
+  },
+  'citadel remonstered': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
+    preserveExistingIcon: true,
+  },
+  'death stranding 2': {
+    targetId: 'steam-3280350',
+    steamAppId: 3280350,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345',
+    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+    iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+  },
+  'little nightmares enhanced': {
+    targetId: 'steam-2149010',
+    steamAppId: 2149010,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/8f1da102713653906647c5024843479395be3394/header.jpg?t=1760951366',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
+  },
+  'blood of dawnwalker': {
+    targetId: 'steam-3751260',
+    steamAppId: 3751260,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326',
+    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
+    iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
+  },
+  'resident evil requiem': {
+    targetId: 'steam-3764200',
+    steamAppId: 3764200,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172',
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/cobmj0.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/cobmj0.jpg',
+  },
+  'grip': {
+    targetId: 'steam-396900',
+    steamAppId: 396900,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
+    shortDescription:
+      'GRIP is a high octane, hardcore combat racer, packing ferocious speed and an arsenal of heavy weapons. Harness the laws of gravity as you race up walls and ceilings across exotic worlds.',
+  },
+  'fallout: london': {
+    capsuleImage: 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
+    iconUrl: 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
+  },
+  'eschalon: book i': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
+  },
+  'deus ex': {
+    targetId: 'steam-6910',
+    steamAppId: 6910,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/library_600x900_2x.jpg',
+  },
+  'tomb raider goty': {
+    capsuleImage: 'https://images.gog-statics.com/754dd55607aecdc8a2989a9e4a280d0caa3875fe88c1974ba6e10dd1b9a3b1d6.jpg',
+    iconUrl: 'https://images.gog-statics.com/754dd55607aecdc8a2989a9e4a280d0caa3875fe88c1974ba6e10dd1b9a3b1d6.jpg',
+  },
+  'summers gone season 1': {
+    capsuleImage: 'https://images.gog-statics.com/754d59c26ea2a81d688ef36948f9a53aa036154f42c21ea3aa3a2bcc71e1b097.jpg',
+    iconUrl: 'https://images.gog-statics.com/754d59c26ea2a81d688ef36948f9a53aa036154f42c21ea3aa3a2bcc71e1b097.jpg',
+  },
+  'rollercoaster tycoon 3': {
+    targetId: 'steam-1368820',
+    title: 'RollerCoaster Tycoon 3: Complete Edition',
+    sortTitle: 'RollerCoaster Tycoon 3: Complete Edition',
+    steamAppId: 1368820,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
+  },
+  'higurashi': {
+    targetId: 'steam-310360',
+    title: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
+    sortTitle: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
+    steamAppId: 310360,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/header.jpg',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
+  },
+  'lure of the temptress': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
+    preserveExistingIcon: true,
+  },
+  'rpg maker xp': {
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
+  },
+  'wildgate': {
+    targetId: 'steam-3504780',
+    steamAppId: 3504780,
+    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/95f1381dac57ce601d5260de3c792f8a2ee2bc93/header.jpg?t=1787942042',
+    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
+    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
+  },
+  'spacewar': {
+    targetId: 'steam-480',
+    steamAppId: 480,
+    headerImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
+    capsuleImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
+    iconUrl: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
+  },
+  'darq': {
+    targetId: 'steam-433550',
+    title: 'DARQ: Complete Edition',
+    sortTitle: 'DARQ: Complete Edition',
+    steamAppId: 433550,
+    headerImage: 'https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S1_2560x1440_2560x1440-15e5dda133bae02a6b9cdf6086ec03f3',
+    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/433550/library_600x900_2x.jpg',
+    iconUrl: 'https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S2_1200x1600_1200x1600-d53e44ba5b0dc0e019ee698f02b6d300',
+    shortDescription:
+      'DARQ tells the story of Lloyd, a boy who finds himself in the middle of a lucid nightmare. Unable to wake up, Lloyd has to face his fears and decipher the meaning of the dream.',
+    releaseDate: '2020-12-04',
+    developers: ['Unfold Games'],
+    publishers: ['Unfold Games', 'Feardemic'],
+    genres: ['Action', 'Adventure', 'Indie', 'Puzzle'],
+    tags: ['Atmospheric', 'Psychological Horror', 'Puzzle', 'Dark', 'Horror', 'Surreal', 'Singleplayer'],
+  },
+};
+
+// Aliases for O(1) direct matching across various key formats
+KNOWN_GAME_PATCHES['darq: complete edition'] = KNOWN_GAME_PATCHES['darq'];
+KNOWN_GAME_PATCHES['darq complete edition'] = KNOWN_GAME_PATCHES['darq'];
+KNOWN_GAME_PATCHES['boga'] = KNOWN_GAME_PATCHES['death stranding'];
+KNOWN_GAME_PATCHES['path of the bogatyr'] = KNOWN_GAME_PATCHES['death stranding'];
+KNOWN_GAME_PATCHES['c5109bdceb3a453bb38c2fdc964ddee8'] = KNOWN_GAME_PATCHES['doki doki literature club plus!'];
+KNOWN_GAME_PATCHES['blood omen legacy of kain'] = KNOWN_GAME_PATCHES['blood omen: legacy of kain'];
+KNOWN_GAME_PATCHES['doom + doom 2'] = KNOWN_GAME_PATCHES['doom + doom ii'];
+KNOWN_GAME_PATCHES['doom doom 2'] = KNOWN_GAME_PATCHES['doom + doom ii'];
+KNOWN_GAME_PATCHES['heretic hexen'] = KNOWN_GAME_PATCHES['heretic + hexen'];
+KNOWN_GAME_PATCHES['cytadela'] = KNOWN_GAME_PATCHES['citadel remonstered'];
+KNOWN_GAME_PATCHES['rollercoaster tycoon 3: complete edition'] = KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
+KNOWN_GAME_PATCHES['higurashi when they cry hou - ch.1 onikakushi'] = KNOWN_GAME_PATCHES['higurashi'];
+KNOWN_GAME_PATCHES['grip: combat racing'] = KNOWN_GAME_PATCHES['grip'];
+KNOWN_GAME_PATCHES['grip combat racing'] = KNOWN_GAME_PATCHES['grip'];
+KNOWN_GAME_PATCHES['fallout london'] = KNOWN_GAME_PATCHES['fallout: london'];
+KNOWN_GAME_PATCHES['eschalon book i'] = KNOWN_GAME_PATCHES['eschalon: book i'];
+KNOWN_GAME_PATCHES['eschalon: book 1'] = KNOWN_GAME_PATCHES['eschalon: book i'];
+KNOWN_GAME_PATCHES['eschalon book 1'] = KNOWN_GAME_PATCHES['eschalon: book i'];
+KNOWN_GAME_PATCHES['deus ex goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['deus ex: goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['deus ex: game of the year edition'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['deus ex game of the year edition'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['deus ex goty'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['deus ex™ goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['tomb raider: goty'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES['tomb raider: game of the year edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES['tomb raider game of the year edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES['tomb raider goty edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES["summer's gone - season 1"] = KNOWN_GAME_PATCHES['summers gone season 1'];
+KNOWN_GAME_PATCHES["summer's gone: season 1"] = KNOWN_GAME_PATCHES['summers gone season 1'];
+KNOWN_GAME_PATCHES['summers gone - season 1'] = KNOWN_GAME_PATCHES['summers gone season 1'];
+
+// ID and AppID aliases
+KNOWN_GAME_PATCHES['epic-4fe75bbc5a674f4f9b356b5c90567da5'] = KNOWN_GAME_PATCHES['fortnite'];
+KNOWN_GAME_PATCHES['steam-1225270'] = KNOWN_GAME_PATCHES['ghostrunner'];
+KNOWN_GAME_PATCHES['app-1225270'] = KNOWN_GAME_PATCHES['ghostrunner'];
+KNOWN_GAME_PATCHES['steam-474960'] = KNOWN_GAME_PATCHES['prey'];
+KNOWN_GAME_PATCHES['app-474960'] = KNOWN_GAME_PATCHES['prey'];
+KNOWN_GAME_PATCHES['app-1091500'] = KNOWN_GAME_PATCHES['cyberpunk 2077'];
+KNOWN_GAME_PATCHES['gog-2028023186'] = KNOWN_GAME_PATCHES['agony'];
+KNOWN_GAME_PATCHES['steam-487720'] = KNOWN_GAME_PATCHES['agony'];
+KNOWN_GAME_PATCHES['app-487720'] = KNOWN_GAME_PATCHES['agony'];
+KNOWN_GAME_PATCHES['steam-879420'] = KNOWN_GAME_PATCHES['agony unrated'];
+KNOWN_GAME_PATCHES['app-879420'] = KNOWN_GAME_PATCHES['agony unrated'];
+KNOWN_GAME_PATCHES['app-3286930'] = KNOWN_GAME_PATCHES['heretic + hexen'];
+KNOWN_GAME_PATCHES['epic-9c48bdf0c65b45cc9e64aa43e7e740b0'] = KNOWN_GAME_PATCHES['second extinction'];
+KNOWN_GAME_PATCHES['app-1024380'] = KNOWN_GAME_PATCHES['second extinction'];
+KNOWN_GAME_PATCHES['app-3783210'] = KNOWN_GAME_PATCHES['60 minutes to extinction'];
+KNOWN_GAME_PATCHES['app-1904620'] = KNOWN_GAME_PATCHES['champions of krynn'];
+KNOWN_GAME_PATCHES['app-1018010'] = KNOWN_GAME_PATCHES['castlevania anniversary collection'];
+KNOWN_GAME_PATCHES['app-3280350'] = KNOWN_GAME_PATCHES['death stranding 2'];
+KNOWN_GAME_PATCHES['app-2149010'] = KNOWN_GAME_PATCHES['little nightmares enhanced'];
+KNOWN_GAME_PATCHES['app-3751260'] = KNOWN_GAME_PATCHES['blood of dawnwalker'];
+KNOWN_GAME_PATCHES['app-3764200'] = KNOWN_GAME_PATCHES['resident evil requiem'];
+KNOWN_GAME_PATCHES['steam-3764200'] = KNOWN_GAME_PATCHES['resident evil requiem'];
+KNOWN_GAME_PATCHES['app-1368820'] = KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
+KNOWN_GAME_PATCHES['app-310360'] = KNOWN_GAME_PATCHES['higurashi'];
+KNOWN_GAME_PATCHES['app-235900'] = KNOWN_GAME_PATCHES['rpg maker xp'];
+KNOWN_GAME_PATCHES['app-3504780'] = KNOWN_GAME_PATCHES['wildgate'];
+KNOWN_GAME_PATCHES['app-480'] = KNOWN_GAME_PATCHES['spacewar'];
+KNOWN_GAME_PATCHES['app-396900'] = KNOWN_GAME_PATCHES['grip'];
+KNOWN_GAME_PATCHES['steam-396900'] = KNOWN_GAME_PATCHES['grip'];
+KNOWN_GAME_PATCHES['gog-1342466874'] = KNOWN_GAME_PATCHES['grip'];
+KNOWN_GAME_PATCHES['gog-1491728574'] = KNOWN_GAME_PATCHES['fallout: london'];
+KNOWN_GAME_PATCHES['app-25600'] = KNOWN_GAME_PATCHES['eschalon: book i'];
+KNOWN_GAME_PATCHES['steam-25600'] = KNOWN_GAME_PATCHES['eschalon: book i'];
+KNOWN_GAME_PATCHES['app-6910'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['steam-6910'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['gog-1207658995'] = KNOWN_GAME_PATCHES['deus ex'];
+KNOWN_GAME_PATCHES['app-203160'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES['steam-203160'] = KNOWN_GAME_PATCHES['tomb raider goty'];
+KNOWN_GAME_PATCHES['gog-1384091612'] = KNOWN_GAME_PATCHES['summers gone season 1'];
+KNOWN_GAME_PATCHES['app-433550'] = KNOWN_GAME_PATCHES['darq'];
+KNOWN_GAME_PATCHES['steam-433550'] = KNOWN_GAME_PATCHES['darq'];
+KNOWN_GAME_PATCHES['epic-015cbe4368dc449b961988c7434d9195'] = KNOWN_GAME_PATCHES['darq'];
+KNOWN_GAME_PATCHES['epic-ee96375fac2f47de978170a24398e581'] = KNOWN_GAME_PATCHES['darq'];
+
+export function applyCatalogPatch(game: CanonicalGame, patch: CatalogGamePatch): CanonicalGame {
+  const updated: CanonicalGame = { ...game };
+
+  if (patch.targetId) updated.id = patch.targetId;
+  if (patch.title) updated.title = patch.title;
+  if (patch.sortTitle) updated.sortTitle = patch.sortTitle;
+
+  if (patch.steamAppId === null) {
+    updated.steamAppId = undefined;
+  } else if (patch.steamAppId !== undefined) {
+    updated.steamAppId = patch.steamAppId;
+  }
+
+  if (patch.headerImage) updated.headerImage = patch.headerImage;
+  if (patch.capsuleImage) updated.capsuleImage = patch.capsuleImage;
+
+  if (patch.iconUrl) {
+    updated.iconUrl = patch.preserveExistingIcon && updated.iconUrl ? updated.iconUrl : patch.iconUrl;
+  }
+
+  if (patch.shortDescription) {
+    if (!updated.shortDescription || isPlaceholderDesc(updated.shortDescription, updated.title)) {
+      updated.shortDescription = patch.shortDescription;
+    }
+  }
+
+  if (patch.releaseDate) updated.releaseDate = patch.releaseDate;
+  if (patch.developers) updated.developers = patch.developers;
+  if (patch.publishers) updated.publishers = patch.publishers;
+  if (patch.genres) updated.genres = patch.genres;
+  if (patch.tags) updated.tags = patch.tags;
+
+  if (patch.platformFilters) {
+    if (patch.platformFilters.excludePlatformId) {
+      updated.platforms = updated.platforms.filter(
+        (p) => p.platformId !== patch.platformFilters!.excludePlatformId
+      );
+    }
+    if (patch.platformFilters.setPlatformGameId) {
+      const { platformId, gameId } = patch.platformFilters.setPlatformGameId;
+      updated.platforms = updated.platforms.map((p) =>
+        p.platformId === platformId ? { ...p, platformGameId: gameId } : p
+      );
+    }
+  }
+
+  return updated;
+}
+
+export function findGamePatch(
+  game: CanonicalGame,
+  lowerTitle?: string,
+  normTitle?: string
+): CatalogGamePatch | undefined {
+  const currentTitleLower = lowerTitle ?? (game.title || '').toLowerCase().trim();
+  const currentNorm = normTitle ?? normalizeCanonicalTitle(game.title);
+
+  // 1. Direct key lookups
+  if (KNOWN_GAME_PATCHES[currentTitleLower]) return KNOWN_GAME_PATCHES[currentTitleLower];
+  if (KNOWN_GAME_PATCHES[currentNorm]) return KNOWN_GAME_PATCHES[currentNorm];
+  if (game.id && KNOWN_GAME_PATCHES[game.id.toLowerCase()]) return KNOWN_GAME_PATCHES[game.id.toLowerCase()];
+  if (game.steamAppId && KNOWN_GAME_PATCHES[`app-${game.steamAppId}`]) {
+    return KNOWN_GAME_PATCHES[`app-${game.steamAppId}`];
+  }
+
+  // 2. Curated pattern checks
+  if (
+    (currentNorm === 'blood omen legacy of kain' || currentTitleLower.includes('blood omen')) &&
+    !currentTitleLower.includes('2') &&
+    !currentTitleLower.includes('ii')
+  ) {
+    return KNOWN_GAME_PATCHES['blood omen: legacy of kain'];
+  }
+
+  if (currentTitleLower.includes('60 minutes to extinction') || currentNorm.includes('60 minutes to extinction')) {
+    return KNOWN_GAME_PATCHES['60 minutes to extinction'];
+  }
+
+  if (currentTitleLower.includes('champions of krynn') || currentNorm.includes('champions of krynn')) {
+    return KNOWN_GAME_PATCHES['champions of krynn'];
+  }
+
+  if (currentTitleLower.includes('castlevania anniversary collection') || currentNorm.includes('castlevania anniversary collection')) {
+    return KNOWN_GAME_PATCHES['castlevania anniversary collection'];
+  }
+
+  if (currentTitleLower.includes('akalabeth') || currentNorm.includes('akalabeth')) {
+    return KNOWN_GAME_PATCHES['akalabeth'];
+  }
+
+  if (
+    currentTitleLower.includes('broken sword') &&
+    (currentTitleLower.includes('director') || currentTitleLower.includes('templar') || currentTitleLower.includes('shadow'))
+  ) {
+    return KNOWN_GAME_PATCHES['broken sword'];
+  }
+
+  if (
+    currentTitleLower.includes('citadel remonstered') ||
+    currentTitleLower.includes('cytadela') ||
+    currentNorm.includes('citadel remonstered') ||
+    currentNorm.includes('cytadela')
+  ) {
+    return KNOWN_GAME_PATCHES['citadel remonstered'];
+  }
+
+  if (currentTitleLower.includes('death stranding 2') || currentNorm.includes('death stranding 2')) {
+    return KNOWN_GAME_PATCHES['death stranding 2'];
+  }
+
+  if (currentTitleLower.includes('little nightmares enhanced') || currentNorm.includes('little nightmares enhanced')) {
+    return KNOWN_GAME_PATCHES['little nightmares enhanced'];
+  }
+
+  if (currentTitleLower.includes('blood of dawnwalker') || currentNorm.includes('blood of dawnwalker')) {
+    return KNOWN_GAME_PATCHES['blood of dawnwalker'];
+  }
+
+  if (currentTitleLower.includes('resident evil requiem') || currentNorm.includes('resident evil requiem')) {
+    return KNOWN_GAME_PATCHES['resident evil requiem'];
+  }
+
+  if (
+    currentTitleLower.includes('rollercoaster tycoon') &&
+    (currentTitleLower.includes('3') || currentTitleLower.includes('complete'))
+  ) {
+    return KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
+  }
+
+  if (
+    currentTitleLower.includes('higurashi') &&
+    (currentTitleLower.includes('onikakushi') || currentTitleLower.includes('ch.1') || currentTitleLower.includes('ch 1'))
+  ) {
+    return KNOWN_GAME_PATCHES['higurashi'];
+  }
+
+  if (currentTitleLower.includes('lure of the temptress') || currentNorm.includes('lure of the temptress')) {
+    return KNOWN_GAME_PATCHES['lure of the temptress'];
+  }
+
+  if (currentTitleLower.startsWith('second extinction') || currentNorm === 'second extinction') {
+    return KNOWN_GAME_PATCHES['second extinction'];
+  }
+
+  return undefined;
+}
+
 /**
  * Sanitizes the catalog:
  * 1. Renames known Epic codenames (Boga, Blobfish, Barbet, Basil, Batfish, etc.) to their official game titles and covers
@@ -221,6 +754,7 @@ export const UNOWNED_STEAM_PROMO_APP_IDS = new Set<number>([
 export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
   if (!Array.isArray(catalog)) return [];
 
+  const userOverrides = loadUserOverrides();
   const cleaned: CanonicalGame[] = [];
   const titleToIndex = new Map<string, number>();
   const steamIdToIndex = new Map<number, number>();
@@ -244,24 +778,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         ));
 
     if (isFalseBogaMatch || lowerTitle === 'boga') {
-      game = {
-        ...game,
-        id: 'steam-1190460',
-        title: 'Death Stranding',
-        sortTitle: 'Death Stranding',
-        steamAppId: 1190460,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/library_600x900_2x.jpg',
-        shortDescription: 'From legendary game creator Hideo Kojima comes an all-new, genre-defying experience. Sam Bridges must brave a world utterly transformed by the Death Stranding.',
-        releaseDate: '14 Jul, 2020',
-        developers: ['KOJIMA PRODUCTIONS'],
-        publishers: ['505 Games'],
-        genres: ['Action', 'Adventure'],
-        tags: ['Open World', 'Story Rich', 'Atmospheric', 'Sci-fi', 'Post-apocalyptic'],
-        platforms: game.platforms.map((p) =>
-          p.platformId === 'epic' ? { ...p, platformGameId: '761fe09295aa422e8199cebaacf51675' } : p
-        ),
-      };
+      game = applyCatalogPatch(game, KNOWN_GAME_PATCHES['death stranding']);
     }
 
     // 2. Resolve known Epic codenames to their official game entities
@@ -298,24 +815,7 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       game.id.includes('c5109bdceb3a453bb38c2fdc964ddee8') ||
       game.title === 'c5109bdceb3a453bb38c2fdc964ddee8'
     ) {
-      game = {
-        ...game,
-        id: 'steam-1388880',
-        title: 'Doki Doki Literature Club Plus!',
-        sortTitle: 'Doki Doki Literature Club Plus!',
-        steamAppId: 1388880,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/library_600x900_2x.jpg',
-        shortDescription: 'Welcome to a terrifying world of poetry and romance! Write poems for your crush and erase any mistakes along the way to ensure your perfect ending.',
-        releaseDate: '30 Jun, 2021',
-        developers: ['Team Salvato'],
-        publishers: ['Serenity Forge'],
-        genres: ['Psychological Horror', 'Visual Novel', 'Anime'],
-        tags: ['Psychological Horror', 'Visual Novel', 'Anime', 'Story Rich', 'Singleplayer'],
-        platforms: game.platforms.map((p) =>
-          p.platformId === 'epic' ? { ...p, platformGameId: 'c5109bdceb3a453bb38c2fdc964ddee8' } : p
-        ),
-      };
+      game = applyCatalogPatch(game, KNOWN_GAME_PATCHES['doki doki literature club plus!']);
     }
 
     // 4. Filter out junk, pure hex hashes, Fortnite DLC, and unmapped codenames
@@ -333,428 +833,19 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       continue;
     }
 
-    // Disambiguate Blood Omen: Legacy of Kain (1996 original) from Blood Omen 2
-    if (
-      (normTitle === 'blood omen legacy of kain' || currentTitleLower.includes('blood omen')) &&
-      !currentTitleLower.includes('2') &&
-      !currentTitleLower.includes('ii')
-    ) {
-      game = {
-        ...game,
-        id: 'gog-1837805079',
-        steamAppId: undefined,
-        headerImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_product_card_v2_mobile_slider_639.jpg',
-        capsuleImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_glx_vertical_cover.jpg',
-        platforms: game.platforms.map((p) => p.platformId === 'gog' ? { ...p, platformGameId: '1837805079' } : p),
-      };
+    // Curated game patches declarative lookup
+    const patch = findGamePatch(game, currentTitleLower, normTitle);
+    if (patch) {
+      game = applyCatalogPatch(game, patch);
+      if (game.platforms.length === 0) continue;
+      normTitle = normalizeCanonicalTitle(game.title);
     }
 
-    // Disambiguate DOOM + DOOM II (not on Steam)
-    if (
-      currentTitleLower === 'doom + doom ii' ||
-      currentTitleLower === 'doom + doom 2' ||
-      normTitle === 'doom + doom 2' ||
-      normTitle === 'doom doom 2'
-    ) {
-      game = {
-        ...game,
-        id: 'gog-1413291984',
-        steamAppId: undefined,
-        platforms: game.platforms.map((p) => p.platformId === 'gog' ? { ...p, platformGameId: '1413291984' } : p),
-      };
-    }
-
-    // Disambiguate / normalize Alan Wake 2 (Epic exclusive)
-    if (
-      currentTitleLower === 'alan wake 2' ||
-      normTitle === 'alan wake 2'
-    ) {
-      game = {
-        ...game,
-        id: 'epic-93f2a8c3547846eda966cb3c152a026e',
-        headerImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s1-2560x1440-309c7412b7bc.jpg',
-        capsuleImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s2-1200x1600-0ebb9a566b72.jpg',
-        iconUrl: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-ic1-400x400-5366b10d0f67.png',
-      };
-    }
-
-    // Disambiguate / normalize Fortnite (Epic exclusive)
-    if (
-      currentTitleLower === 'fortnite' ||
-      normTitle === 'fortnite' ||
-      game.id === 'epic-4fe75bbc5a674f4f9b356b5c90567da5'
-    ) {
-      game = {
-        ...game,
-        id: 'epic-4fe75bbc5a674f4f9b356b5c90567da5',
-        headerImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-logo-egs-launcher-blade-2560x1440-2560x1440-00f5395fc1e7.jpg',
-        capsuleImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
-        iconUrl: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Ghostrunner (fix wrong steamAppId 1225270 -> 1139900)
-    if (
-      currentTitleLower === 'ghostrunner' ||
-      normTitle === 'ghostrunner' ||
-      game.steamAppId === 1225270 ||
-      game.id === 'steam-1225270'
-    ) {
-      game = {
-        ...game,
-        id: 'steam-1139900',
-        steamAppId: 1139900,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Prey (fix wrong steamAppId 474960 -> 480490)
-    if (
-      currentTitleLower === 'prey' ||
-      normTitle === 'prey' ||
-      game.steamAppId === 474960 ||
-      game.id === 'steam-474960'
-    ) {
-      game = {
-        ...game,
-        id: 'steam-480490',
-        steamAppId: 480490,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Cyberpunk 2077 (Steam base game, 100% Mastered) vs Cyberpunk 2077 Digital Goodies (GOG promo pack)
-    if (
-      currentTitleLower === 'cyberpunk 2077' ||
-      normTitle === 'cyberpunk 2077' ||
-      game.steamAppId === 1091500
-    ) {
-      game = {
-        ...game,
-        platforms: game.platforms.filter((p) => p.platformId !== 'gog'),
-      };
-    }
-
-    // Disambiguate / normalize Agony (ensure official Steam App ID 487720 & high-res portrait cover)
-    if (
-      currentTitleLower === 'agony' ||
-      normTitle === 'agony' ||
-      game.steamAppId === 487720 ||
-      game.id === 'gog-2028023186' ||
-      game.id === 'steam-487720'
-    ) {
-      game = {
-        ...game,
-        id: 'steam-487720',
-        title: 'Agony',
-        sortTitle: 'Agony',
-        steamAppId: 487720,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
-        shortDescription:
-          game.shortDescription && !isPlaceholderDesc(game.shortDescription, game.title)
-            ? game.shortDescription
-            : 'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
-      };
-    }
-
-    // Disambiguate / normalize Agony UNRATED (ensure official Steam App ID 879420 & high-res portrait cover)
-    if (
-      currentTitleLower === 'agony unrated' ||
-      normTitle === 'agony unrated' ||
-      game.steamAppId === 879420 ||
-      game.id === 'steam-879420'
-    ) {
-      game = {
-        ...game,
-        id: 'steam-879420',
-        title: 'Agony UNRATED',
-        sortTitle: 'Agony UNRATED',
-        steamAppId: 879420,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
-        shortDescription:
-          game.shortDescription && !isPlaceholderDesc(game.shortDescription, game.title)
-            ? game.shortDescription
-            : 'Agony UNRATED is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
-      };
-    }
-
-    // Disambiguate / normalize Heretic + Hexen (newer hashed Steam assets)
-    if (
-      currentTitleLower === 'heretic + hexen' ||
-      normTitle === 'heretic hexen' ||
-      game.steamAppId === 3286930
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3286930',
-        steamAppId: 3286930,
-        headerImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/af11a57f074bf3f1b901bb96f9ea519a0928c80c/header.jpg?t=1756918167',
-        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
-        iconUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/3286930/3392b11331bc4855f803ca939720fa94e3a01bdd.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Second Extinction (delisted, fix trailing quote typo, add Steam ID 1024380)
-    if (
-      currentTitleLower.startsWith('second extinction') ||
-      normTitle === 'second extinction' ||
-      game.id === 'epic-9c48bdf0c65b45cc9e64aa43e7e740b0' ||
-      game.steamAppId === 1024380
-    ) {
-      game = {
-        ...game,
-        id: 'steam-1024380',
-        title: 'Second Extinction',
-        sortTitle: 'Second Extinction',
-        steamAppId: 1024380,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
-        shortDescription: 'Second Extinction is a relentless 3-player cooperative FPS where you wipe out mutated dinosaurs that have taken over the Earth.',
-      };
-    }
-
-    // Disambiguate / normalize 60 Minutes to Extinction: Escape Room (hashed Steam assets -> IGDB portrait)
-    if (
-      currentTitleLower.includes('60 minutes to extinction') ||
-      normTitle.includes('60 minutes to extinction') ||
-      game.steamAppId === 3783210
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3783210',
-        steamAppId: 3783210,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432',
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
-        iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Champions of Krynn (Steam 600x900 404s, GOG lacks vertical -> IGDB portrait)
-    if (
-      currentTitleLower.includes('champions of krynn') ||
-      normTitle.includes('champions of krynn') ||
-      game.steamAppId === 1904620
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
-        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
-      };
-    }
-
-    // Disambiguate / normalize Castlevania Anniversary Collection (Steam 600x900 404s -> IGDB portrait)
-    if (
-      currentTitleLower.includes('castlevania anniversary collection') ||
-      normTitle.includes('castlevania anniversary collection') ||
-      game.steamAppId === 1018010
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
-        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Akalabeth: World of Doom (authentic portrait box art)
-    if (
-      currentTitleLower.includes('akalabeth') ||
-      normTitle.includes('akalabeth')
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
-        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Broken Sword: Director's Cut (authentic portrait box art)
-    if (
-      currentTitleLower.includes('broken sword') &&
-      (currentTitleLower.includes('director') || currentTitleLower.includes('templar') || currentTitleLower.includes('shadow'))
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
-        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Citadel Remonstered / Cytadela (authentic portrait box art)
-    if (
-      currentTitleLower.includes('citadel remonstered') ||
-      currentTitleLower.includes('cytadela') ||
-      normTitle.includes('citadel remonstered') ||
-      normTitle.includes('cytadela')
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
-        iconUrl: game.iconUrl || 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
-      };
-    }
-
-    // Disambiguate / normalize DEATH STRANDING 2: ON THE BEACH (hashed Steam assets)
-    if (
-      currentTitleLower.includes('death stranding 2') ||
-      normTitle.includes('death stranding 2') ||
-      game.steamAppId === 3280350
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3280350',
-        steamAppId: 3280350,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345',
-        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
-        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Little Nightmares Enhanced Edition (hashed Steam assets)
-    if (
-      currentTitleLower.includes('little nightmares enhanced') ||
-      normTitle.includes('little nightmares enhanced') ||
-      game.steamAppId === 2149010
-    ) {
-      game = {
-        ...game,
-        id: 'steam-2149010',
-        steamAppId: 2149010,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/8f1da102713653906647c5024843479395be3394/header.jpg?t=1760951366',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
-      };
-    }
-
-    // Disambiguate / normalize The Blood of Dawnwalker (hashed Steam assets)
-    if (
-      currentTitleLower.includes('blood of dawnwalker') ||
-      normTitle.includes('blood of dawnwalker') ||
-      game.steamAppId === 3751260
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3751260',
-        steamAppId: 3751260,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326',
-        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
-        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Resident Evil Requiem (hashed Steam assets)
-    if (
-      currentTitleLower.includes('resident evil requiem') ||
-      normTitle.includes('resident evil requiem') ||
-      game.steamAppId === 3764200
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3764200',
-        steamAppId: 3764200,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172',
-        capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
-        iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
-      };
-    }
-
-    // Disambiguate / normalize RollerCoaster Tycoon 3: Complete Edition
-    if (
-      currentTitleLower.includes('rollercoaster tycoon') &&
-      (currentTitleLower.includes('3') || currentTitleLower.includes('complete'))
-    ) {
-      game = {
-        ...game,
-        id: 'steam-1368820',
-        title: 'RollerCoaster Tycoon 3: Complete Edition',
-        sortTitle: 'RollerCoaster Tycoon 3: Complete Edition',
-        steamAppId: 1368820,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Higurashi When They Cry Hou - Ch.1 Onikakushi
-    if (
-      currentTitleLower.includes('higurashi') &&
-      (currentTitleLower.includes('onikakushi') || currentTitleLower.includes('ch.1') || currentTitleLower.includes('ch 1'))
-    ) {
-      game = {
-        ...game,
-        id: 'steam-310360',
-        title: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
-        sortTitle: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
-        steamAppId: 310360,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/header.jpg',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Lure of the Temptress (1992)
-    if (
-      currentTitleLower.includes('lure of the temptress') ||
-      normTitle.includes('lure of the temptress')
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
-        iconUrl: game.iconUrl || 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
-      };
-    }
-
-    // Disambiguate / normalize RPG Maker XP
-    if (
-      currentTitleLower === 'rpg maker xp' ||
-      normTitle === 'rpg maker xp' ||
-      game.steamAppId === 235900
-    ) {
-      game = {
-        ...game,
-        capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
-        iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
-      };
-    }
-
-    // Disambiguate / normalize Wildgate (hashed Steam assets)
-    if (
-      currentTitleLower === 'wildgate' ||
-      normTitle === 'wildgate' ||
-      game.steamAppId === 3504780
-    ) {
-      game = {
-        ...game,
-        id: 'steam-3504780',
-        steamAppId: 3504780,
-        headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/95f1381dac57ce601d5260de3c792f8a2ee2bc93/header.jpg?t=1787942042',
-        capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/22488e2f7358b27d1ccff845bc5bd02e72a1494e/capsule_231x87.jpg?t=1787942042',
-        iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/22488e2f7358b27d1ccff845bc5bd02e72a1494e/capsule_231x87.jpg?t=1787942042',
-      };
-    }
-
-    // Disambiguate / normalize Spacewar (archival assets)
-    if (
-      currentTitleLower === 'spacewar' ||
-      normTitle === 'spacewar' ||
-      game.steamAppId === 480
-    ) {
-      game = {
-        ...game,
-        id: 'steam-480',
-        steamAppId: 480,
-        headerImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-        capsuleImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-        iconUrl: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-      };
+    // Curated user override lookup (explicit user intent takes highest priority)
+    const userOverride = getUserOverrideForGame(game, userOverrides);
+    if (userOverride) {
+      game = applyUserOverrideToGame(game, userOverride);
+      normTitle = normalizeCanonicalTitle(game.title);
     }
 
     // 5. Remove erroneous 'epic' platform presence from non-Epic titles
@@ -770,8 +861,10 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
     if (game.platforms.some((p) => p.platformId === 'gog')) {
       const gogPlatform = game.platforms.find((p) => p.platformId === 'gog');
       const isRealGogGame =
+        userOverride !== undefined ||
         (gogPlatform?.platformGameId && validGogProductIds.has(gogPlatform.platformGameId.trim())) ||
-        validGogTitles.has(normTitle);
+        validGogTitles.has(normTitle) ||
+        validGogTitles.has(normalizeCanonicalTitle(rawGame.title));
 
       if (!isRealGogGame) {
         game = {
@@ -800,7 +893,10 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
 
       const updatedNormTitle = normalizeCanonicalTitle(game.title);
       // Whitelist: every authentic Epic game must match one of the 402 verified titles
-      const isRealEpicGame = validEpicTitles.has(updatedNormTitle);
+      const isRealEpicGame =
+        userOverride !== undefined ||
+        validEpicTitles.has(updatedNormTitle) ||
+        validEpicTitles.has(normalizeCanonicalTitle(rawGame.title));
 
       if (!isRealEpicGame) {
         game = {
@@ -821,7 +917,11 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
           : undefined);
 
       const isUnownedPromo = appId ? UNOWNED_STEAM_PROMO_APP_IDS.has(appId) : false;
-      const isRealSteamGame = appId ? validSteamAppIds.has(appId) : validSteamTitles.has(normTitle);
+      const isRealSteamGame =
+        userOverride !== undefined ||
+        (appId
+          ? validSteamAppIds.has(appId)
+          : validSteamTitles.has(normTitle) || validSteamTitles.has(normalizeCanonicalTitle(rawGame.title)));
 
       if (isUnownedPromo || !isRealSteamGame) {
         game = {
@@ -835,19 +935,14 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
 
     normTitle = normalizeCanonicalTitle(game.title);
 
-    // Match Steam App ID for non-Steam catalog entries if available
-    if (!game.steamAppId) {
-      const matchedAppId = steamMatcher.matchGameToSteamInstant(game.title);
-      if (matchedAppId) {
-        game = {
-          ...game,
-          steamAppId: matchedAppId,
-        };
-      }
-    }
+    // Look up Steam App ID for blurb / cover enrichment without altering game's canonical identity
+    const matchedAppIdForBlurb =
+      userOverride?.steamAppId === null
+        ? undefined
+        : (game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title));
 
-    if (isPlaceholderDesc(game.shortDescription, game.title)) {
-      const blurb = game.steamAppId ? (steamBlurbCache as Record<string, string>)[String(game.steamAppId)] : null;
+    if (!userOverride?.shortDescription && isPlaceholderDesc(game.shortDescription, game.title)) {
+      const blurb = matchedAppIdForBlurb ? (steamBlurbCache as Record<string, string>)[String(matchedAppIdForBlurb)] : null;
       const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
       const gogSpecial = gogPlat?.platformGameId ? GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId]?.lead : null;
 
@@ -860,27 +955,42 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       }
     }
 
-    // Normalize GOG image covers to official high-quality vertical cover format
-    if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com') && !game.capsuleImage.includes('glx_vertical_cover')) {
-      const gogMatch = game.capsuleImage.match(/^(https?:\/\/images-\d+\.gog-statics\.com\/[a-f0-9]+)/i);
-      if (gogMatch) {
-        game = {
-          ...game,
-          capsuleImage: `${gogMatch[1]}_glx_vertical_cover.jpg`,
-        };
+    // Systemic resolution of GOG official vertical covers from verified enriched cache
+    const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
+    if (!userOverride?.capsuleImage && gogPlat && gogPlat.platformGameId) {
+      const enrichedGog = (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId];
+      if (enrichedGog?.coverVertical) {
+        const hHash = enrichedGog.coverHorizontal ? enrichedGog.coverHorizontal.match(/\/([a-f0-9]{64})/i)?.[1] : null;
+        if (
+          !game.capsuleImage ||
+          (hHash && game.capsuleImage.includes(hHash)) ||
+          game.capsuleImage.includes('_glx_vertical_cover') ||
+          isUnsuitableCoverUrl(game.capsuleImage)
+        ) {
+          game = {
+            ...game,
+            capsuleImage: enrichedGog.coverVertical,
+            iconUrl: game.iconUrl || enrichedGog.coverVertical,
+          };
+        }
       }
     }
 
-    // Attach verified IGDB portrait cover if game lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
-    const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-    if (instantIgdbCover) {
+    // Attach verified IGDB portrait cover if game is curated in KNOWN_IGDB_COVERS, lacks vertical art, has unsuitable/cropped covers, or known dead Steam art
+    const instantIgdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId || matchedAppIdForBlurb || undefined, game.id);
+    if (!userOverride?.capsuleImage && instantIgdbCover) {
+      const isCuratedIgdb = Boolean(
+        KNOWN_IGDB_COVERS[game.title.toLowerCase().trim()] ||
+        KNOWN_IGDB_COVERS[normalizeCanonicalTitle(game.title)] ||
+        (game.id && KNOWN_IGDB_COVERS[game.id.toLowerCase().trim()])
+      );
       if (
+        isCuratedIgdb ||
         !game.capsuleImage ||
         isKnownDeadSteamCover(game.steamAppId) ||
         isUnsuitableCoverUrl(game.capsuleImage) ||
         game.capsuleImage.includes('231x87') ||
-        game.capsuleImage.includes('616x353') ||
-        game.capsuleImage.includes('gog-statics.com')
+        game.capsuleImage.includes('616x353')
       ) {
         game = {
           ...game,
@@ -955,6 +1065,12 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         publishers: existing.publishers && existing.publishers.length > 0 ? existing.publishers : game.publishers,
       };
 
+      const existingOv = getUserOverrideForGame(existing, userOverrides);
+      const effectiveOv = userOverride || existingOv;
+      if (effectiveOv) {
+        cleaned[existingIndex] = applyUserOverrideToGame(cleaned[existingIndex], effectiveOv);
+      }
+
       if (cleaned[existingIndex].steamAppId) {
         steamIdToIndex.set(cleaned[existingIndex].steamAppId!, existingIndex);
       }
@@ -966,5 +1082,6 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
     }
   }
 
-  return cleaned.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+  const finalCatalog = applyUserOverridesToCatalog(cleaned, userOverrides);
+  return finalCatalog.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
 }

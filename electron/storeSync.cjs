@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { app } = require('electron');
+const { app, safeStorage } = require('electron');
 
 const GOG_CLIENT_ID = '46899977096215655';
 const GOG_CLIENT_SECRET = '9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9';
@@ -22,27 +22,132 @@ function getTokensFilePath() {
   }
 }
 
+function isSafeStorageAvailable() {
+  try {
+    return Boolean(
+      typeof safeStorage !== 'undefined' &&
+      safeStorage &&
+      typeof safeStorage.isEncryptionAvailable === 'function' &&
+      safeStorage.isEncryptionAvailable()
+    );
+  } catch {
+    return false;
+  }
+}
+
+function writeTokensFile(tokens) {
+  const filePath = getTokensFilePath();
+  const jsonStr = JSON.stringify(tokens, null, 2);
+
+  if (isSafeStorageAvailable()) {
+    try {
+      const encryptedBuffer = safeStorage.encryptString(jsonStr);
+      const encryptedPayload = {
+        _encrypted: true,
+        data: encryptedBuffer.toString('base64'),
+      };
+      fs.writeFileSync(filePath, JSON.stringify(encryptedPayload, null, 2), 'utf-8');
+      return;
+    } catch (encErr) {
+      console.warn('Failed to encrypt tokens with safeStorage, falling back to plaintext:', encErr.message);
+    }
+  }
+
+  // Graceful fallback if safeStorage is not available or encryption failed
+  fs.writeFileSync(filePath, jsonStr, 'utf-8');
+}
+
 function loadSavedTokens() {
   try {
     const filePath = getTokensFilePath();
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    if (!fs.existsSync(filePath)) {
+      return {};
     }
+
+    const rawContent = fs.readFileSync(filePath);
+    if (!rawContent || rawContent.length === 0) {
+      return {};
+    }
+
+    // Try parsing as JSON first
+    let parsed;
+    try {
+      parsed = JSON.parse(rawContent.toString('utf-8'));
+    } catch {
+      // If not JSON, it might be a raw binary buffer encrypted by safeStorage
+      if (isSafeStorageAvailable()) {
+        try {
+          const decrypted = safeStorage.decryptString(rawContent);
+          return JSON.parse(decrypted);
+        } catch (rawDecErr) {
+          console.warn('Failed to decrypt raw binary tokens buffer:', rawDecErr.message);
+        }
+      }
+      return {};
+    }
+
+    // Handle encrypted payload format: { _encrypted: true, data: "base64..." }
+    if (parsed && parsed._encrypted === true && typeof parsed.data === 'string') {
+      if (isSafeStorageAvailable()) {
+        try {
+          const buffer = Buffer.from(parsed.data, 'base64');
+          const decrypted = safeStorage.decryptString(buffer);
+          return JSON.parse(decrypted);
+        } catch (decErr) {
+          console.warn('Failed to decrypt tokens payload with safeStorage:', decErr.message);
+          return {};
+        }
+      } else {
+        console.warn('safeStorage is not available to decrypt tokens; unable to read encrypted tokens.');
+        return {};
+      }
+    }
+
+    // Handle per-token encrypted format if present: { gog: { _encrypted: true, data: "..." } }
+    if (parsed && typeof parsed === 'object') {
+      let containsPerTokenEncryption = false;
+      const decryptedTokens = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (value && typeof value === 'object' && value._encrypted === true && typeof value.data === 'string') {
+          containsPerTokenEncryption = true;
+          if (isSafeStorageAvailable()) {
+            try {
+              const buffer = Buffer.from(value.data, 'base64');
+              const decrypted = safeStorage.decryptString(buffer);
+              decryptedTokens[key] = JSON.parse(decrypted);
+            } catch (err) {
+              console.warn(`Failed to decrypt token for ${key}:`, err.message);
+            }
+          }
+        } else {
+          decryptedTokens[key] = value;
+        }
+      }
+      if (containsPerTokenEncryption) {
+        return decryptedTokens;
+      }
+
+      // Legacy plaintext JSON backward compatibility:
+      // Return parsed plaintext directly. Next time saveTokens is called,
+      // it will be migrated to the encrypted format via writeTokensFile.
+      return parsed;
+    }
+
+    return {};
   } catch (err) {
     console.warn('Failed to load saved tokens:', err.message);
+    return {};
   }
-  return {};
 }
 
 function saveTokens(storefrontId, tokenData) {
   try {
-    const filePath = getTokensFilePath();
     const existing = loadSavedTokens();
     existing[storefrontId] = {
       ...tokenData,
       updatedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf-8');
+    writeTokensFile(existing);
   } catch (err) {
     console.warn('Failed to save tokens:', err.message);
   }
@@ -50,11 +155,10 @@ function saveTokens(storefrontId, tokenData) {
 
 function clearTokens(storefrontId) {
   try {
-    const filePath = getTokensFilePath();
     const existing = loadSavedTokens();
     if (existing[storefrontId]) {
       delete existing[storefrontId];
-      fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf-8');
+      writeTokensFile(existing);
     }
   } catch (err) {
     console.warn('Failed to clear tokens:', err.message);
@@ -62,74 +166,200 @@ function clearTokens(storefrontId) {
 }
 
 const KNOWN_STEAM_MAPPINGS = {
+  // CD PROJEKT RED
   'cyberpunk 2077': 1091500,
+  'cyberpunk 2077: phantom liberty': 1091500,
   'the witcher 3: wild hunt': 292030,
+  'the witcher 3: wild hunt - complete edition': 292030,
+  'the witcher 3: wild hunt - game of the year edition': 292030,
   'the witcher 2: assassins of kings enhanced edition': 20920,
   'the witcher: enhanced edition': 20900,
   'the witcher: enhanced edition director\'s cut': 20900,
+
+  // Larian Studios
   'baldur\'s gate 3': 1086940,
   'baldur\'s gate: enhanced edition': 228280,
   'baldur\'s gate ii: enhanced edition': 257350,
   'divinity: original sin 2': 435150,
   'divinity: original sin 2 - definitive edition': 435150,
+  'divinity: original sin enhanced edition': 373420,
+
+  // Bethesda / Obsidian / id
   'fallout': 38400,
   'fallout 2': 38410,
   'fallout tactics': 38420,
   'fallout: new vegas': 22380,
+  'fallout: new vegas ultimate edition': 22380,
   'fallout 3': 22370,
+  'fallout 3: game of the year edition': 22370,
   'fallout 4': 377160,
+  'fallout 4: game of the year edition': 377160,
   'the elder scrolls v: skyrim': 72850,
   'the elder scrolls v: skyrim special edition': 489830,
+  'the elder scrolls iv: oblivion': 22330,
+  'the elder scrolls iii: morrowind': 22320,
+  'doom': 379720,
+  'doom eternal': 782330,
+  'doom 3': 9050,
+  'doom 3: bfg edition': 208200,
+  'doom 3 bfg edition': 208200,
+  'final doom': 2290,
+  'doom ii': 2300,
+  'doom (2016)': 379720,
+  'dishonored': 205100,
+  'dishonored - definitive edition': 205100,
+  'dishonored 2': 403640,
+  'dishonored: death of the outsider': 614570,
+  'prey': 480490,
+
+  // Epic / Remedy / 505
   'doki doki literature club plus!': 1388880,
   'control': 870780,
   'control ultimate edition': 870780,
   'death stranding': 1190460,
   'death stranding director\'s cut': 1850570,
+  'hades': 1145360,
   'hollow knight': 367520,
   'disco elysium': 632470,
   'disco elysium - the final cut': 632470,
   'ghostrunner': 1139900,
+  'ghostrunner 2': 2144740,
   'second extinction': 1024380,
+  'out of sight': 2526310,
+  'a plague tale: innocence': 752590,
+  'a plague tale: requiem': 1182900,
+  'sifu': 2138710,
+  'chivalry 2': 1824220,
+
+  // Rockstar & 2K
   'grand theft auto v': 271590,
+  'grand theft auto iv: the complete edition': 12210,
   'red dead redemption 2': 1174180,
-  'dishonored': 205100,
-  'dishonored 2': 403640,
-  'prey': 474960,
-  'doom': 379720,
-  'doom eternal': 782330,
+  'borderlands 2': 49520,
+  'borderlands 3': 397540,
+  'bioshock remastered': 409710,
+  'bioshock 2 remastered': 409720,
+  'bioshock infinite': 8870,
+  'sid meier\'s civilization vi': 289070,
+  'civilization vi': 289070,
+  'xcom 2': 268500,
+
+  // Warner Bros
+  'batman: arkham knight': 208650,
+  'batman: arkham city': 200260,
+  'batman: arkham city - goty edition': 200260,
+  'batman: arkham asylum': 35140,
+  'batman: arkham asylum game of the year edition': 35140,
+  'mad max': 234140,
+  'middle-earth: shadow of mordor': 241930,
+  'middle-earth: shadow of war': 356190,
+
+  // Square Enix / Eidos
+  'deus ex: human revolution - director\'s cut': 238010,
+  'deus ex: human revolution - director’s cut': 238010,
+  'deus ex human revolution director\'s cut': 238010,
+  'deus ex human revolution directors cut': 238010,
+  'deus ex: human revolution': 238010,
+  'deus ex human revolution': 238010,
+  'deus ex: mankind divided': 337000,
+  'deus ex: game of the year edition': 6910,
+  'deus ex: invisible war': 6920,
+  'deus ex invisible war': 6920,
+  'deus ex 2: invisible war': 6920,
+  'deus ex 2 invisible war': 6920,
+  'tomb raider': 203160,
+  'rise of the tomb raider': 391220,
+  'shadow of the tomb raider': 750920,
+  'shadow of the tomb raider: definitive edition': 750920,
+  'sleeping dogs: definitive edition': 307690,
+  'thief': 239160,
+  'thief gold': 211600,
+  'thief 2: the metal age': 211740,
+  'thief 2 the metal age': 211740,
+  'thief ii: the metal age': 211740,
+  'thief ii the metal age': 211740,
+  'thief 3: deadly shadows': 6980,
+  'thief 3 deadly shadows': 6980,
+  'thief: deadly shadows': 6980,
+  'thief deadly shadows': 6980,
+  'predator: hunting grounds': 1556200,
+  'predator hunting grounds': 1556200,
+  'predator: hunting grounds standard edition': 1556200,
+  'predator hunting grounds standard edition': 1556200,
+
+  // Deep Silver / 4A Games
   'metro 2033 redux': 286690,
   'metro: last light redux': 287390,
   'metro exodus': 412020,
-  'bioshock remastered': 409710,
-  'bioshock infinite': 8870,
+  'saints row: the third remastered': 978300,
+  'saints row iv: re-elected': 206420,
+  'dead island definitive edition': 383150,
+
+  // GOG Classics & Indie Gems
   's.t.a.l.k.e.r.: shadow of chernobyl': 4500,
   's.t.a.l.k.e.r.: clear sky': 20510,
   's.t.a.l.k.e.r.: call of pripyat': 41700,
   'heroes of might and magic 3 - hd edition': 297000,
   'heroes of might & magic iii - hd edition': 297000,
-  'deus ex: human revolution - director\'s cut': 238010,
-  'deus ex: mankind divided': 337000,
-  'tomb raider': 203160,
-  'rise of the tomb raider': 391220,
-  'shadow of the tomb raider': 750920,
-  'batman: arkham knight': 208650,
-  'batman: arkham city': 200260,
-  'batman: arkham asylum': 35140,
-  'alien: isolation': 214490,
-  'amnesia: the dark descent': 57300,
-  'soma': 282140,
+  'vampire: the masquerade - bloodlines': 2600,
+  'star wars: knights of the old republic': 32370,
+  'star wars: knights of the old republic ii': 208580,
+  'dragon age: origins - ultimate edition': 47810,
+  'mass effect legendary edition': 1328670,
+  'frostpunk': 323190,
+  'this war of mine': 282070,
   'subnautica': 264710,
+  'subnautica: below zero': 848450,
+  'outer wilds': 753640,
+  'the outer worlds': 578650,
+  'the outerworlds': 578650,
   'slay the spire': 646570,
   'dead cells': 588650,
   'celeste': 504230,
+  'inside': 304430,
+  'limbo': 48000,
   'stardew valley': 413150,
   'terraria': 105600,
+  'cuphead': 268910,
+  'risk of rain 2': 632360,
+  'deep rock galactic': 548430,
+  'no man\'s sky': 275850,
+  'remnant: from the ashes': 617290,
+  'remnant ii': 1282100,
+  'darksiders warmastered edition': 462780,
+  'darksiders ii deathinitive edition': 388410,
+  'darksiders iii': 606280,
+  'shadowrun returns': 234650,
+  'shadowrun: dragonfall - director\'s cut': 300550,
+  'shadowrun: hong kong': 346940,
+  'shadowrun hong kong': 346940,
+  'shadowrun: hong kong - extended edition': 346940,
+  'shadowrun hong kong - extended edition': 346940,
+  'shadowrun hong kong extended edition': 346940,
+  'wasteland 2: director\'s cut': 240760,
+  'wasteland 3': 770300,
+  'pillars of eternity': 291650,
+  'pillars of eternity ii: deadfire': 560130,
+  'tyranny': 362960,
+  'torment: tides of numenera': 272270,
+  'neverwinter nights: enhanced edition': 704450,
+  'planescape: torment: enhanced edition': 466300,
+  'icewind dale: enhanced edition': 321800,
+  'system shock: enhanced edition': 410710,
   'system shock 2': 238210,
   'system shock': 482400,
-  'vampire: the masquerade - bloodlines': 2600,
+  'kingdom come: deliverance': 379430,
+  'kingdom come: deliverance royal edition': 379430,
+  'alien: isolation': 214490,
+  'amnesia: the dark descent': 57300,
+  'amnesia: a machine for pigs': 239200,
+  'amnesia: rebirth': 999220,
+  'amnesia: the bunker': 1944430,
+  'soma': 282140,
+  'outlast': 238320,
+  'outlast 2': 414700,
 
   // Epic Codenames & Exclusives
-  'death stranding': 1190460,
   'into the breach': 590380,
   'hitman': 236870,
   'human resource machine': 375820,
@@ -140,19 +370,16 @@ const KNOWN_STEAM_MAPPINGS = {
   'telltale batman season 2': 675260,
   'batman: the enemy within': 675260,
   'batman: the enemy within - the telltale series': 675260,
-  'doki doki literature club plus!': 1388880,
   'world war z': 699130,
   'rocket league': 252950,
   'overcooked! 2': 448510,
   'yooka-laylee and the impossible lair': 1084600,
   'minit': 609490,
   'brothers - a tale of two sons': 225080,
-  'borderlands 2': 49520,
   'mutant year zero: road to eden': 760060,
   'tacoma': 643880,
   'farming simulator 19': 787860,
   'dragon age: inquisition': 1222690,
-  'chivalry 2': 1824220,
   'super meat boy': 40800,
   'dead by daylight': 381210,
   'the bridge': 230050,
@@ -185,21 +412,59 @@ const KNOWN_STEAM_MAPPINGS = {
   'cormorant': 742420,
   'star wars: squadrons': 1222730,
   'star wars™: squadrons': 1222730,
-  'predator: hunting grounds': 1556200,
-  'borderlands 3': 397540,
   'saints row': 742420,
   'hazelnut': 48000,
   'hazlenut': 48000,
   'herring': 383270,
-  'limbo': 48000,
   'hue': 383270,
-  'out of sight': 2526310,
   'lego star wars: the skywalker saga': 920210,
-  'the outerworlds': 578650,
-  'the outer worlds': 578650,
-  'pillars of eternity': 291650,
-  'tyranny': 362960,
-  'kingdom come: deliverance': 379430,
+
+  // Additional Store Matches
+  'rollercoaster tycoon 3: complete edition': 1368820,
+  'rollercoaster tycoon 3 complete edition': 1368820,
+  'rollercoaster tycoon 3': 1368820,
+  'higurashi when they cry hou - ch.1 onikakushi': 310360,
+  'higurashi when they cry hou ch.1 onikakushi': 310360,
+  'higurashi when they cry hou ch 1 onikakushi': 310360,
+  'rpg maker xp': 235900,
+  'resident evil requiem': 3764200,
+  'heretic + hexen': 3286930,
+  'heretic hexen': 3286930,
+
+  // Curated Store Matches
+  'agony': 487720,
+  'agony unrated': 879420,
+  'darq': 433550,
+  'darq: complete edition': 433550,
+  'darq complete edition': 433550,
+  'grip': 396900,
+  'grip: combat racing': 396900,
+  'grip combat racing': 396900,
+  'deus ex goty edition': 6910,
+  'deus ex: goty edition': 6910,
+  'deus ex: game of the year edition': 6910,
+  'deus ex game of the year edition': 6910,
+  'deus ex goty': 6910,
+  'deus ex': 6910,
+  'tomb raider goty': 203160,
+  'tomb raider: goty': 203160,
+  'tomb raider goty edition': 203160,
+  'tomb raider: game of the year edition': 203160,
+  'tomb raider game of the year edition': 203160,
+  'eschalon: book i': 25600,
+  'eschalon book i': 25600,
+  'eschalon book 1': 25600,
+  'eschalon: book 1': 25600,
+  'fate': 246840,
+  'fate: undiscovered realms': 276890,
+  'fate undiscovered realms': 276890,
+  'gamedec': 917720,
+  'gamedec: definitive edition': 917720,
+  'gamedec definitive edition': 917720,
+  'lacuna': 1365860,
+  'lacuna – a sci-fi noir adventure': 1365860,
+  'lacuna: a sci-fi noir adventure': 1365860,
+  'lacuna a sci fi noir adventure': 1365860,
 };
 
 const KNOWN_EPIC_APP_NAMES = {
@@ -258,9 +523,46 @@ const KNOWN_EPIC_APP_NAMES = {
   crossbill: { title: 'TowerFall Ascension', steamAppId: 251470, developer: 'Maddy Makes Games' },
 };
 
+const EDITION_WORDS = new Set([
+  'complete',
+  'definitive',
+  'enhanced',
+  'goty',
+  'deluxe',
+  'gold',
+  'standard',
+  'remastered',
+  'remaster',
+  'directors',
+  'director',
+  'cut',
+  'edition',
+  'collectors',
+  'collector',
+  'anniversary',
+  'special',
+  'ultimate',
+  'extended',
+  'game',
+  'year',
+  'final',
+  'royal',
+  'emperor',
+  'classics',
+  'classic',
+  'plus',
+  'bundle',
+  'pack',
+  'package',
+  'collection',
+  'upgrade',
+  'vr',
+  'hd',
+]);
+
 function computeTokenSimilarity(source, candidate) {
-  const s1 = source.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-  const s2 = candidate.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s1 = source.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s2 = candidate.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
   if (!s1 || !s2) return 0;
   if (s1 === s2) return 1.0;
@@ -287,6 +589,32 @@ function computeTokenSimilarity(source, candidate) {
   }
   if (words2.length === 1 && !tokens1.has(words2[0])) {
     return 0;
+  }
+
+  // Intelligent Edition Variant Matching (e.g. "DARQ" <-> "DARQ: Complete Edition")
+  const [shorterWords, longerWords] = words1.length <= words2.length ? [words1, words2] : [words2, words1];
+  const shorterSet = new Set(shorterWords);
+  const longerSet = new Set(longerWords);
+
+  let allShorterInLonger = true;
+  for (const w of shorterWords) {
+    if (!longerSet.has(w)) {
+      allShorterInLonger = false;
+      break;
+    }
+  }
+
+  if (allShorterInLonger) {
+    let onlyEditionTokensRemaining = true;
+    for (const w of longerWords) {
+      if (!shorterSet.has(w) && !EDITION_WORDS.has(w) && w !== 'the' && w !== 'of' && w !== 'a' && w !== 'an') {
+        onlyEditionTokensRemaining = false;
+        break;
+      }
+    }
+    if (onlyEditionTokensRemaining) {
+      return 0.92;
+    }
   }
 
   // Exact multi-word phrase containment
@@ -488,6 +816,16 @@ async function fetchGogOwnedGames(accessToken, username) {
 
   // 2. Fetch paginated products from getFilteredProducts
   try {
+    let gogEnriched = {};
+    try {
+      const enrichedPath = path.join(__dirname, '../src/services/storage/gogEnrichedCache.json');
+      if (fs.existsSync(enrichedPath)) {
+        gogEnriched = JSON.parse(fs.readFileSync(enrichedPath, 'utf8'));
+      }
+    } catch {
+      // Optional cache
+    }
+
     let currentPage = 1;
     let totalPages = 1;
 
@@ -522,13 +860,16 @@ async function fetchGogOwnedGames(accessToken, username) {
         const stats = playtimeMap.get(String(p.id)) || {};
         const steamAppId = await matchSteamAppId(title);
 
-        const verticalGogCover = p.image
+        const enrichedEntry = gogEnriched[String(p.id)];
+        const verticalGogCover = enrichedEntry?.coverVertical
+          ? enrichedEntry.coverVertical
+          : p.image
           ? p.image.startsWith('http')
             ? p.image.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
             : `https:${p.image}_glx_vertical_cover.jpg`
           : null;
 
-        const DEAD_STEAM_COVERS = new Set([1904620, 1904621, 1904622, 1018010, 3783210]);
+        const DEAD_STEAM_COVERS = new Set([1904620, 1904621, 1904622, 1018010, 3783210, 3764200]);
         const hasSteamVertical = steamAppId && !DEAD_STEAM_COVERS.has(steamAppId);
 
         const headerImg = steamAppId
@@ -1026,18 +1367,26 @@ async function fetchIgdbCover(gameTitle) {
     if (items.length === 0) return null;
 
     const normTarget = cleanTitle.toLowerCase();
+    let bestCover = null;
+    let bestScore = -1;
+
     for (const item of items) {
       if (!item.coverart) continue;
       const candNorm = (item.name || '').toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-      const sim = computeTokenSimilarity(normTarget, candNorm);
-      if (sim >= 0.5 || candNorm.includes(normTarget) || normTarget.includes(candNorm)) {
+      let score = computeTokenSimilarity(normTarget, candNorm) * 100;
+      if (candNorm === normTarget) score += 100;
+
+      if (score > bestScore && score >= 50) {
+        bestScore = score;
         const m = item.coverart.match(/\/([a-zA-Z0-9_-]+)\.(?:jpg|png|webp)/i);
-        if (m) {
-          return `https://images.igdb.com/igdb/image/upload/t_cover_big/${m[1]}.jpg`;
+        if (m && !m[1].startsWith('library_capsule_') && !m[1].startsWith('banner_')) {
+          bestCover = `https://images.igdb.com/igdb/image/upload/t_cover_big/${m[1]}.jpg`;
+        } else if (!item.coverart.includes('default') && !item.coverart.includes('placeholder')) {
+          bestCover = item.coverart;
         }
-        return item.coverart;
       }
     }
+    return bestCover;
   } catch (err) {
     console.warn('IGDB cover fetch warning:', err.message);
   }

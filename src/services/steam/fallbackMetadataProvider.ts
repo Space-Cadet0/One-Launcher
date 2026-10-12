@@ -60,10 +60,13 @@ export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boo
   if (lower.includes('store exclusive')) return true;
   if (lower.includes('on gog.com')) return true;
   if (lower.includes('epic games store')) return true;
-  if (lower.endsWith(' experience') && trimmed.split(' ').length <= 4) return true;
   if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
   if (lower === 'classic title') return true;
   if (/^[a-z\s-]+ on gog\.com/i.test(trimmed)) return true;
+  if (/^dlcs?\s+(included|available)/i.test(trimmed)) return true;
+  if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
+  if (/^bonus\s+content\s+included/i.test(trimmed)) return true;
+  if (/^this\s+(package|edition|version)\s+includes/i.test(trimmed)) return true;
   return false;
 }
 

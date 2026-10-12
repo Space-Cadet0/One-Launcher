@@ -42,9 +42,10 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   'doom': 379720,
   'doom eternal': 782330,
   'doom 3': 9050,
+  'doom 3: bfg edition': 208200,
+  'doom 3 bfg edition': 208200,
+  'final doom': 2290,
   'doom ii': 2300,
-  'doom + doom ii': 2280,
-  'doom + doom 2': 2280,
   'dishonored': 205100,
   'dishonored - definitive edition': 205100,
   'dishonored 2': 403640,
@@ -246,9 +247,26 @@ export const KNOWN_STORE_STEAM_MAPPINGS: Record<string, number> = {
   // Curated Store Matches
   'agony': 487720,
   'agony unrated': 879420,
+  'darq': 433550,
+  'darq: complete edition': 433550,
+  'darq complete edition': 433550,
   'grip': 396900,
   'grip: combat racing': 396900,
   'grip combat racing': 396900,
+  'deus ex goty edition': 6910,
+  'deus ex: goty edition': 6910,
+  'deus ex game of the year edition': 6910,
+  'deus ex goty': 6910,
+  'deus ex': 6910,
+  'tomb raider goty': 203160,
+  'tomb raider: goty': 203160,
+  'tomb raider goty edition': 203160,
+  'tomb raider: game of the year edition': 203160,
+  'tomb raider game of the year edition': 203160,
+  'eschalon: book i': 25600,
+  'eschalon book i': 25600,
+  'eschalon book 1': 25600,
+  'eschalon: book 1': 25600,
   'fate': 246840,
   'fate: undiscovered realms': 276890,
   'fate undiscovered realms': 276890,
@@ -301,45 +319,10 @@ export function normalizeGameTitle(rawTitle: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Strip store and edition suffixes (allowing optional curly/straight apostrophes)
+  // Strip store and edition suffixes (allowing optional colon/hyphen/brackets/parens and optional curly/straight apostrophes)
   const suffixes = [
-    / - Digital Deluxe Edition/i,
-    / \(Digital Deluxe Edition\)/i,
-    / - Deluxe Edition/i,
-    / \(Deluxe Edition\)/i,
-    / - Enhanced Edition Director['’]?s Cut/i,
-    / - Enhanced Edition/i,
-    / \(Enhanced Edition\)/i,
-    / - Game of the Year Edition/i,
-    / \(Game of the Year Edition\)/i,
-    / - GOTY Edition/i,
-    / - GOTY/i,
-    / - Definitive Edition/i,
-    / \(Definitive Edition\)/i,
-    / - Extended Edition/i,
-    / \(Extended Edition\)/i,
-    / - Director['’]?s Cut/i,
-    / \(Director['’]?s Cut\)/i,
-    / - Complete Edition/i,
-    / \(Complete Edition\)/i,
-    / \[Complete Edition\]/i,
-    / - Standard Edition/i,
-    / \(Standard Edition\)/i,
-    /\s+Standard Edition/i,
-    / - Remastered/i,
-    / \(Remastered\)/i,
-    / - DRM-Free/i,
-    / \(DRM-Free\)/i,
-    / - Royal Edition/i,
-    / - Ultimate Edition/i,
-    / \(Ultimate Edition\)/i,
-    / - The Final Cut/i,
-    / \(The Final Cut\)/i,
-    / - Emperor Edition/i,
-    / - Gold Edition/i,
-    / \(Gold Edition\)/i,
-    / - GOG Cut/i,
-    / \(GOG Cut\)/i,
+    /(?::|\s+-|\s+–|\s+—|\s+)?\s*(?:\(|\[)?\s*(?:Digital Deluxe|Deluxe|Enhanced Edition Director['’]?s Cut|Enhanced|Game of the Year|GOTY|Definitive|Extended|Director['’]?s Cut|Complete|Standard|Remastered|DRM-Free|Royal|Ultimate|The Final Cut|Emperor|Gold|Collector['’]?s|Anniversary)\s+Edition(?:\)|\])?/gi,
+    /(?::|\s+-|\s+–|\s+—|\s+)?\s*(?:\(|\[)?\s*(?:Director['’]?s Cut|The Final Cut|GOG Cut|Remastered|GOTY)(?:\)|\])?/gi,
   ];
 
   for (const pattern of suffixes) {
@@ -392,17 +375,62 @@ export function extractSequelIdentifier(words: string[]): string | null {
 export const KNOWN_NON_STEAM_TITLES = new Set([
   'blood omen legacy of kain',
   'blood omen: legacy of kain',
+  'cyberpunk 2077 digital goodies',
+  'doom + doom ii',
+  'doom + doom 2',
+  'doom doom 2',
+  'quake ii (original)',
+  'quake ii original',
+  'quake 2 original',
+  'quake 2 (original)',
   'total annihilation kingdoms',
   'total annihilation: kingdoms',
   'total annihilation: kingdoms + iron plague',
+]);
+
+export const EDITION_WORDS = new Set([
+  'complete',
+  'definitive',
+  'enhanced',
+  'goty',
+  'deluxe',
+  'gold',
+  'standard',
+  'remastered',
+  'remaster',
+  'directors',
+  'director',
+  'cut',
+  'edition',
+  'collectors',
+  'collector',
+  'anniversary',
+  'special',
+  'ultimate',
+  'extended',
+  'game',
+  'year',
+  'final',
+  'royal',
+  'emperor',
+  'classics',
+  'classic',
+  'plus',
+  'bundle',
+  'pack',
+  'package',
+  'collection',
+  'upgrade',
+  'vr',
+  'hd',
 ]);
 
 /**
  * Computes token similarity between two game names (Jaccard coefficient + phrase check)
  */
 export function computeTitleSimilarity(source: string, candidate: string): number {
-  const s1 = source.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-  const s2 = candidate.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s1 = source.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const s2 = candidate.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
   if (!s1 || !s2) return 0;
   if (s1 === s2) return 1.0;
@@ -438,6 +466,32 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
   }
   if (words2.length === 1 && !tokens1.has(words2[0])) {
     return 0;
+  }
+
+  // Intelligent Edition Variant Matching (e.g. "DARQ" <-> "DARQ: Complete Edition", "Control" <-> "Control Ultimate Edition")
+  const [shorterWords, longerWords] = words1.length <= words2.length ? [words1, words2] : [words2, words1];
+  const shorterSet = new Set(shorterWords);
+  const longerSet = new Set(longerWords);
+
+  let allShorterInLonger = true;
+  for (const w of shorterWords) {
+    if (!longerSet.has(w)) {
+      allShorterInLonger = false;
+      break;
+    }
+  }
+
+  if (allShorterInLonger) {
+    let onlyEditionTokensRemaining = true;
+    for (const w of longerWords) {
+      if (!shorterSet.has(w) && !EDITION_WORDS.has(w) && w !== 'the' && w !== 'of' && w !== 'a' && w !== 'an') {
+        onlyEditionTokensRemaining = false;
+        break;
+      }
+    }
+    if (onlyEditionTokensRemaining) {
+      return 0.92;
+    }
   }
 
   // Exact multi-word phrase containment
@@ -523,10 +577,7 @@ export class SteamMatcherService {
       return null;
     }
 
-    if (this.cache.has(lowerKey)) {
-      return this.cache.get(lowerKey) || null;
-    }
-
+    // 1. Authoritative curated dictionary check FIRST (overrides any stale negative cache)
     const canonicalKey = canonicalizeTitleKey(cleanRaw);
     const canonicalNorm = canonicalizeTitleKey(normalized);
 
@@ -537,7 +588,13 @@ export class SteamMatcherService {
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
 
     if (directMatch) {
+      this.cache.set(lowerKey, directMatch);
       return directMatch;
+    }
+
+    // 2. Check in-memory / persistent cache
+    if (this.cache.has(lowerKey)) {
+      return this.cache.get(lowerKey) || null;
     }
 
     for (const [idStr, data] of Object.entries(steamEnrichedCache as Record<string, any>)) {
@@ -565,12 +622,7 @@ export class SteamMatcherService {
       return null;
     }
 
-    // 1. Check in-memory / persistent cache
-    if (this.cache.has(lowerKey)) {
-      return this.cache.get(lowerKey)!;
-    }
-
-    // 2. Check curated canonical instant dictionary
+    // 1. Authoritative curated dictionary check FIRST (overrides any stale negative cache)
     const canonicalKey = canonicalizeTitleKey(cleanRaw);
     const canonicalNorm = canonicalizeTitleKey(normalized);
 
@@ -579,6 +631,17 @@ export class SteamMatcherService {
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalized) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalKey) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
+
+    if (directMatch) {
+      this.cache.set(lowerKey, directMatch);
+      this.savePersistentCache();
+      return directMatch;
+    }
+
+    // 2. Check in-memory / persistent cache
+    if (this.cache.has(lowerKey)) {
+      return this.cache.get(lowerKey)!;
+    }
 
     if (directMatch) {
       this.cache.set(lowerKey, directMatch);

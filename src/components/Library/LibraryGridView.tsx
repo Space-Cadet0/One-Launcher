@@ -31,31 +31,54 @@ import {
   GOG_SPECIAL_DESCRIPTIONS,
 } from '../../services/steam/fallbackMetadataProvider';
 import gogEnrichedCache from '../../services/storage/gogEnrichedCache.json';
+import { GameContextMenu } from './GameContextMenu';
+import { GameCollection } from '../../contracts/collection';
+import {
+  getUserOverrideForGame,
+  loadUserOverrides,
+} from '../../services/storage/userOverrideStorage';
+import { UserGameOverride } from '../../contracts/override';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   return isGenericPlaceholderSynopsis(desc, title);
 }
 
-function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): string | null {
+function getCleanSynopsis(
+  game: CanonicalGame,
+  targetAppId?: number | null,
+  userOverride?: UserGameOverride | null
+): string | null {
+  // 0. User manual override ALWAYS takes priority #1
+  const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
+  if (effectiveOverride?.shortDescription && !isPlaceholderSynopsis(effectiveOverride.shortDescription, game.title)) {
+    return effectiveOverride.shortDescription.trim();
+  }
+  if (effectiveOverride && game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
+    return game.shortDescription.trim();
+  }
+
+  // If user explicitly unlinked from Steam, targetAppId should be ignored
+  const effectiveAppId = effectiveOverride?.steamAppId === null ? null : targetAppId;
+
   // 1. Steam blurb cache (curated store blurbs for 387+ matched catalog titles)
-  if (targetAppId) {
-    const blurb = (steamBlurbCache as Record<string, string>)[String(targetAppId)];
+  if (effectiveAppId) {
+    const blurb = (steamBlurbCache as Record<string, string>)[String(effectiveAppId)];
     if (blurb && !isPlaceholderSynopsis(blurb, game.title)) {
       return blurb.trim();
     }
   }
 
   // 2. Steam enriched cache
-  if (targetAppId) {
-    const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
+  if (effectiveAppId) {
+    const cached = (steamEnrichedCache as Record<string, any>)[String(effectiveAppId)];
     if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) {
       return cached.shortDescription.trim();
     }
   }
 
   // 3. Steam API live memory cache
-  if (targetAppId) {
-    const live = steamApi.getCachedMetadata(targetAppId);
+  if (effectiveAppId) {
+    const live = steamApi.getCachedMetadata(effectiveAppId);
     if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) {
       return live.shortDescription.trim();
     }
@@ -111,13 +134,22 @@ function getCleanSynopsis(game: CanonicalGame, targetAppId?: number | null): str
   return null;
 }
 
-function hasStoreSynopsis(game: CanonicalGame, targetAppId?: number | null): boolean {
-  if (targetAppId) {
-    const blurb = (steamBlurbCache as Record<string, string>)[String(targetAppId)];
+function hasStoreSynopsis(
+  game: CanonicalGame,
+  targetAppId?: number | null,
+  userOverride?: UserGameOverride | null
+): boolean {
+  const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
+  if (effectiveOverride?.shortDescription && !isPlaceholderSynopsis(effectiveOverride.shortDescription, game.title)) {
+    return true;
+  }
+  const effectiveAppId = effectiveOverride?.steamAppId === null ? null : targetAppId;
+  if (effectiveAppId) {
+    const blurb = (steamBlurbCache as Record<string, string>)[String(effectiveAppId)];
     if (blurb && !isPlaceholderSynopsis(blurb, game.title)) return true;
-    const cached = (steamEnrichedCache as Record<string, any>)[String(targetAppId)];
+    const cached = (steamEnrichedCache as Record<string, any>)[String(effectiveAppId)];
     if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) return true;
-    const live = steamApi.getCachedMetadata(targetAppId);
+    const live = steamApi.getCachedMetadata(effectiveAppId);
     if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) return true;
   }
   const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
@@ -149,21 +181,33 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
 
 const HOVER_DELAY_MS = 400;
 
-function getCoverCandidates(game: CanonicalGame, overrideCoverUrl?: string | null): string[] {
+export function getCoverCandidates(
+  game: CanonicalGame,
+  overrideCoverUrl?: string | null,
+  userOverride?: UserGameOverride | null
+): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
 
-  const add = (url?: string | null) => {
+  const add = (url?: string | null, force: boolean = false) => {
     if (!url) return;
     const trimmed = url.trim();
-    if (!trimmed || seen.has(trimmed) || isUnsuitableCoverUrl(trimmed)) return;
+    if (!trimmed || seen.has(trimmed)) return;
+    if (!force && isUnsuitableCoverUrl(trimmed)) return;
     seen.add(trimmed);
     candidates.push(trimmed);
   };
 
-  // 1. Explicit dynamic override if set
+  // 1. Authoritative user manual override ALWAYS takes absolute priority #1
+  const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
+  if (effectiveOverride?.capsuleImage) {
+    add(effectiveOverride.capsuleImage, true);
+  }
   if (overrideCoverUrl) {
-    add(overrideCoverUrl);
+    add(overrideCoverUrl, true);
+  }
+  if (effectiveOverride && game.capsuleImage) {
+    add(game.capsuleImage, true);
   }
 
   // 2. Instant verified IGDB portrait box art if known or cached
@@ -171,23 +215,29 @@ function getCoverCandidates(game: CanonicalGame, overrideCoverUrl?: string | nul
   add(igdbCover);
 
   // 3. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404/hashed)
-  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+  // If user explicitly unlinked from Steam (effectiveOverride?.steamAppId === null), do NOT match to Steam!
+  const isExplicitNonSteam = effectiveOverride?.steamAppId === null;
+  const targetSteamId = !isExplicitNonSteam
+    ? (game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title))
+    : null;
+
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
     add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
   }
 
-  // 4. Official Steam / Epic tall vertical posters already attached to the game entity (non-GOG)
+  // 4. Official Steam / Epic / GOG tall vertical posters already attached to the game entity
   if (game.capsuleImage) {
     const lower = game.capsuleImage.toLowerCase();
     const isGog = lower.includes('gog-statics.com');
     if (
-      !isGog &&
-      (lower.includes('library_capsule.jpg') ||
-        lower.includes('offerimagetall') ||
-        lower.includes('dieselstorefronttall') ||
-        lower.includes('t_cover_big') ||
-        lower.includes('1200x1600') ||
-        lower.includes('portrait'))
+      (!isGog &&
+        (lower.includes('library_capsule.jpg') ||
+          lower.includes('offerimagetall') ||
+          lower.includes('dieselstorefronttall') ||
+          lower.includes('t_cover_big') ||
+          lower.includes('1200x1600') ||
+          lower.includes('portrait'))) ||
+      (isGog && lower.includes('_glx_vertical_cover'))
     ) {
       add(game.capsuleImage);
     }
@@ -198,16 +248,7 @@ function getCoverCandidates(game: CanonicalGame, overrideCoverUrl?: string | nul
     add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
   }
 
-  // 6. For GOG games with glx_vertical_cover
-  if (game.capsuleImage && game.capsuleImage.includes('gog-statics.com')) {
-    let cap = game.capsuleImage;
-    if (!cap.includes('_glx_vertical_cover')) {
-      cap = cap.replace(/\.jpg$/, '_glx_vertical_cover.jpg');
-    }
-    add(cap);
-  }
-
-  // 7. General capsule image if not an unsuitable wide banner
+  // 6. Primary capsule image if valid
   if (game.capsuleImage) {
     add(game.capsuleImage);
   }
@@ -218,22 +259,22 @@ function getCoverCandidates(game: CanonicalGame, overrideCoverUrl?: string | nul
 interface GameCardCoverProps {
   game: CanonicalGame;
   overrideCoverUrl?: string | null;
+  userOverride?: UserGameOverride | null;
   onNeedCoverLookup?: (game: CanonicalGame) => void;
 }
 
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
-  ({ game, overrideCoverUrl, onNeedCoverLookup }) => {
+  ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup }) => {
     const candidates = useMemo(() => {
-      if (overrideCoverUrl === null) return [];
-      return getCoverCandidates(game, overrideCoverUrl);
-    }, [game, overrideCoverUrl]);
+      return getCoverCandidates(game, overrideCoverUrl || undefined, userOverride);
+    }, [game, overrideCoverUrl, userOverride]);
 
     const [candidateIndex, setCandidateIndex] = useState(0);
 
     // Reset candidate progression when game or explicit override changes
     useEffect(() => {
       setCandidateIndex(0);
-    }, [game.id, overrideCoverUrl]);
+    }, [game.id, game.capsuleImage, overrideCoverUrl, userOverride?.capsuleImage]);
 
     const currentSrc = candidateIndex < candidates.length ? candidates[candidateIndex] : null;
 
@@ -254,6 +295,11 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       );
     }
 
+    const isUserExplicitCover = Boolean(
+      (userOverride?.capsuleImage && currentSrc === userOverride.capsuleImage) ||
+      (overrideCoverUrl && currentSrc === overrideCoverUrl)
+    );
+
     return (
       <img
         key={currentSrc}
@@ -262,7 +308,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         loading="lazy"
         onLoad={(e) => {
           const { naturalWidth, naturalHeight } = e.currentTarget;
-          if (naturalWidth && naturalHeight) {
+          if (naturalWidth && naturalHeight && !isUserExplicitCover) {
             const ratio = naturalWidth / naturalHeight;
             // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
             // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
@@ -295,6 +341,11 @@ interface LibraryGridViewProps {
   activeFilter?: ActiveGameFilter | null;
   onClearActiveFilter?: () => void;
   connectedStorefronts?: StorefrontId[];
+  onFixMatch?: (game: CanonicalGame) => void;
+  onSyncGameMedia?: (game: CanonicalGame) => void;
+  collections?: GameCollection[];
+  onToggleGameInCollection?: (collectionId: string, gameId: string) => void;
+  onOpenManageCollectionsModal?: (game?: CanonicalGame) => void;
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -308,8 +359,40 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   activeFilter,
   onClearActiveFilter,
   connectedStorefronts,
+  onFixMatch,
+  onSyncGameMedia,
+  collections,
+  onToggleGameInCollection,
+  onOpenManageCollectionsModal,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const [contextMenu, setContextMenu] = useState<{
+    isOpen: boolean;
+    x: number;
+    y: number;
+    game: CanonicalGame | null;
+  }>({
+    isOpen: false,
+    x: 0,
+    y: 0,
+    game: null,
+  });
+
+  const handleContextMenu = (game: CanonicalGame, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setHoveredGame(null);
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+    }
+    setContextMenu({
+      isOpen: true,
+      x: e.clientX,
+      y: e.clientY,
+      game,
+    });
+  };
 
   const connectedSet = useMemo(() => {
     if (connectedStorefronts && connectedStorefronts.length > 0) {
@@ -343,6 +426,20 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
   const [coverOverrides, setCoverOverrides] = useState<Record<string, string | null>>({});
   const attemptedCoverLookupsRef = useRef<Set<string>>(new Set());
+
+  // Listen for user override additions / modifications to reactively update the grid
+  const [overrideVersion, setOverrideVersion] = useState(0);
+  useEffect(() => {
+    const handleOverrideUpdate = () => {
+      setOverrideVersion((v) => v + 1);
+    };
+    window.addEventListener('antigravity:user-override-updated', handleOverrideUpdate);
+    return () => {
+      window.removeEventListener('antigravity:user-override-updated', handleOverrideUpdate);
+    };
+  }, []);
+
+  const userOverridesMap = useMemo(() => loadUserOverrides(), [games, overrideVersion]);
 
   const handleNeedCoverLookup = useCallback((game: CanonicalGame) => {
     if (attemptedCoverLookupsRef.current.has(game.id)) return;
@@ -784,18 +881,49 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
               <div
                 key={game.id}
                 data-game-id={game.id}
-                onClick={() => onSelectGame(game)}
+                onClick={(e) => {
+                  if (contextMenu.isOpen) {
+                    setContextMenu((prev) => ({ ...prev, isOpen: false, game: null }));
+                    return;
+                  }
+                  if (e.button === 0 && !e.ctrlKey) {
+                    onSelectGame(game);
+                  }
+                }}
                 onMouseEnter={(e) => handleMouseEnter(game, e)}
                 onMouseLeave={handleCardMouseLeave}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleContextMenu(game, e);
+                }}
+                style={{
+                  contentVisibility: 'auto',
+                  containIntrinsicSize: '200px 300px',
+                }}
                 className="group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-all duration-200 cursor-pointer shadow-md hover:shadow-2xl hover:scale-[1.03] active:scale-[0.99]"
               >
                 {/* 2:3 Portrait Capsule Viewport */}
-                <div className="relative aspect-[2/3] w-full bg-black/60 overflow-hidden flex items-center justify-center">
-                  <GameCardCover
-                    game={game}
-                    overrideCoverUrl={coverOverrides[game.id]}
-                    onNeedCoverLookup={handleNeedCoverLookup}
-                  />
+                <div
+                  className="relative aspect-[2/3] w-full bg-black/60 overflow-hidden flex items-center justify-center"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleContextMenu(game, e);
+                  }}
+                >
+                  {(() => {
+                    const cardUserOverride = userOverridesMap[game.id] || getUserOverrideForGame(game, userOverridesMap);
+                    const cardOverrideCover = cardUserOverride?.capsuleImage || coverOverrides[game.id];
+                    return (
+                      <GameCardCover
+                        game={game}
+                        overrideCoverUrl={cardOverrideCover}
+                        userOverride={cardUserOverride}
+                        onNeedCoverLookup={handleNeedCoverLookup}
+                      />
+                    );
+                  })()}
 
                   {/* Gradient bottom shadow to ensure overlays pop */}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20 pointer-events-none" />
@@ -910,22 +1038,29 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
           }}
           onMouseLeave={handlePopoutMouseLeave}
           onClick={() => onSelectGame(hoveredGame)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handleContextMenu(hoveredGame, e);
+          }}
           className="w-80 rounded-lg overflow-hidden bg-[#16202d]/95 backdrop-blur-xl border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer animate-in fade-in zoom-in-95 duration-150 text-steam-text"
         >
           {(() => {
-            const targetAppId =
-              hoveredGame.steamAppId ||
-              steamMatcher.matchGameToSteamInstant(hoveredGame.title) ||
-              undefined;
+            const hoveredOverride = userOverridesMap[hoveredGame.id] || getUserOverrideForGame(hoveredGame, userOverridesMap);
+            const targetAppId = hoveredOverride?.steamAppId === null
+              ? undefined
+              : (hoveredGame.steamAppId ||
+                steamMatcher.matchGameToSteamInstant(hoveredGame.title) ||
+                undefined);
             const releaseYear = getReleaseYear(hoveredGame, targetAppId);
-            const cleanSynopsis = getCleanSynopsis(hoveredGame, targetAppId);
+            const cleanSynopsis = getCleanSynopsis(hoveredGame, targetAppId, hoveredOverride);
 
             return (
               <>
                 {/* Header Image Banner */}
                 <div className="relative aspect-video w-full bg-black/60 overflow-hidden">
                   <img
-                    src={hoveredGame.headerImage || hoveredGame.capsuleImage}
+                    src={hoveredOverride?.headerImage || hoveredGame.headerImage || hoveredGame.capsuleImage}
                     alt={hoveredGame.title}
                     className="w-full h-full object-cover"
                   />
@@ -1121,6 +1256,28 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
           })()}
         </div>
       )}
+
+      {/* Branching Game Context Menu */}
+      <GameContextMenu
+        isOpen={contextMenu.isOpen}
+        x={contextMenu.x}
+        y={contextMenu.y}
+        game={contextMenu.game}
+        collections={collections || []}
+        onClose={() => setContextMenu((prev) => ({ ...prev, isOpen: false, game: null }))}
+        onFixMatch={(game) => {
+          if (onFixMatch) onFixMatch(game);
+        }}
+        onSyncStoreMedia={(game) => {
+          if (onSyncGameMedia) onSyncGameMedia(game);
+        }}
+        onToggleCollection={(colId, gameId) => {
+          if (onToggleGameInCollection) onToggleGameInCollection(colId, gameId);
+        }}
+        onManageCollections={(game) => {
+          if (onOpenManageCollectionsModal) onOpenManageCollectionsModal(game);
+        }}
+      />
     </div>
   );
 };

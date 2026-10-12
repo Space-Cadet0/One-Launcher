@@ -176,8 +176,8 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   useEffect(() => {
     // Sync integrations from storage and Electron native token store when modal opens
     if (isOpen) {
-      if (typeof window !== 'undefined' && (window as any).electronAPI?.getSavedTokens) {
-        (window as any).electronAPI
+      if (typeof window !== 'undefined' && window.electronAPI?.getSavedTokens) {
+        window.electronAPI
           .getSavedTokens()
           .then((savedTokens: any) => {
             if (savedTokens?.epic?.access_token) {
@@ -299,10 +299,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     setSuccessMsg(null);
 
     // Native Electron Desktop Environment Support (Playnite/Heroic style)
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.isElectron) {
+    if (typeof window !== 'undefined' && window.electronAPI?.isElectron) {
       setAuthenticatingStore(storefrontId);
       setIsSubmitting(true);
-      (window as any).electronAPI
+      window.electronAPI
         .loginStore(storefrontId)
         .then(async (res: any) => {
           if (res.success) {
@@ -377,10 +377,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     const tokenOrCode = explicitCode || extractCodeFromInput(authRedirectInput) || undefined;
 
     // In Electron Desktop App: use native sync or native code exchange directly
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.isElectron) {
+    if (typeof window !== 'undefined' && window.electronAPI?.isElectron) {
       if (tokenOrCode) {
         try {
-          const res = await (window as any).electronAPI.exchangeCode(storefrontId, tokenOrCode);
+          const res = await window.electronAPI.exchangeCode(storefrontId, tokenOrCode);
           if (res?.success) {
             handleNativeSyncSuccess(storefrontId, res);
             return;
@@ -398,7 +398,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
       // Re-sync using saved credentials in Electron (e.g. BobDo1e Epic session)
       try {
-        const res = await (window as any).electronAPI.syncStore(storefrontId);
+        const res = await window.electronAPI.syncStore(storefrontId);
         if (res?.success) {
           handleNativeSyncSuccess(storefrontId, res);
           return;
@@ -503,10 +503,12 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   };
 
   const handleDisconnect = (storefrontId: StorefrontId) => {
-    if (typeof window !== 'undefined' && (window as any).electronAPI?.clearTokens) {
+    if (typeof window !== 'undefined' && window.electronAPI?.clearTokens) {
       try {
-        (window as any).electronAPI.clearTokens(storefrontId);
-      } catch {}
+        window.electronAPI.clearTokens(storefrontId);
+      } catch (err) {
+        console.warn(`Failed to clear tokens for ${storefrontId}:`, err);
+      }
     }
     const { integrations: updated, games: remaining } = disconnectIntegration(storefrontId);
     setIntegrations(updated);

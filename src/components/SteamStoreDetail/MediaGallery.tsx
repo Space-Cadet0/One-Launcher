@@ -58,8 +58,8 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
 
     const handleOpenExternal = (e: React.MouseEvent) => {
       e.stopPropagation();
-      if (typeof window !== 'undefined' && (window as any).electronAPI?.openExternal) {
-        (window as any).electronAPI.openExternal(watchUrl);
+      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+        window.electronAPI.openExternal(watchUrl);
       } else {
         window.open(watchUrl, '_blank', 'noopener,noreferrer');
       }

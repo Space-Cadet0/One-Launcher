@@ -1242,14 +1242,16 @@ export const KNOWN_EPIC_APP_NAMES: Record<string, EpicCodenameMapping> = {
     "description": "KID A MNESIA EXHIBITION"
   },
   "ee96375fac2f47de978170a24398e581": {
-    "title": "DARQ",
-    "developer": "Unfold Games, LLC",
-    "description": "DARQ"
+    "title": "DARQ: Complete Edition",
+    "steamAppId": 433550,
+    "developer": "Unfold Games",
+    "description": "DARQ tells the story of Lloyd, a boy who finds himself in the middle of a lucid nightmare. Unable to wake up, Lloyd has to face his fears and decipher the meaning of the dream."
   },
   "015cbe4368dc449b961988c7434d9195": {
-    "title": "DARQ",
-    "developer": "Unfold Games, LLC",
-    "description": "DARQ"
+    "title": "DARQ: Complete Edition",
+    "steamAppId": 433550,
+    "developer": "Unfold Games",
+    "description": "DARQ tells the story of Lloyd, a boy who finds himself in the middle of a lucid nightmare. Unable to wake up, Lloyd has to face his fears and decipher the meaning of the dream."
   },
   "38c0129b680e4843b4807b98bad67027": {
     "title": "Verdun",

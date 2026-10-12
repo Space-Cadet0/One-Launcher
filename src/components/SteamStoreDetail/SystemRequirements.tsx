@@ -1,4 +1,5 @@
 import React from 'react';
+import DOMPurify from 'dompurify';
 import { SteamSystemRequirements } from '../../contracts/steam';
 import { Cpu } from 'lucide-react';
 
@@ -20,7 +21,7 @@ export const SystemRequirements: React.FC<SystemRequirementsProps> = ({ requirem
     return (
       <div
         className="text-xs leading-relaxed text-[#acb2b8] space-y-1 [&_strong]:text-white [&_ul]:space-y-1 [&_li]:list-none [&_li]:pl-0 [&_h2]:text-sm [&_h2]:text-steam-accent [&_h2]:font-bold [&_h2]:mb-2"
-        dangerouslySetInnerHTML={{ __html: htmlContent }}
+        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(htmlContent) }}
       />
     );
   };

@@ -157,6 +157,51 @@ function localSystemScannerPlugin(): Plugin {
 export default defineConfig({
   base: './',
   plugins: [react(), localSystemScannerPlugin()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          const normalizedId = id.replace(/\\/g, '/');
+
+          if (normalizedId.includes('/node_modules/')) {
+            if (
+              normalizedId.includes('/node_modules/react/') ||
+              normalizedId.includes('/node_modules/react-dom/') ||
+              normalizedId.includes('/node_modules/scheduler/')
+            ) {
+              return 'vendor-react';
+            }
+            if (normalizedId.includes('/node_modules/lucide-react/')) {
+              return 'vendor-icons';
+            }
+            if (
+              normalizedId.includes('/node_modules/axios/') ||
+              normalizedId.includes('/node_modules/cheerio/') ||
+              normalizedId.includes('/node_modules/parse5/') ||
+              normalizedId.includes('/node_modules/htmlparser2/') ||
+              normalizedId.includes('/node_modules/domhandler/') ||
+              normalizedId.includes('/node_modules/domutils/') ||
+              normalizedId.includes('/node_modules/dom-serializer/') ||
+              normalizedId.includes('/node_modules/cheerio-select/') ||
+              normalizedId.includes('/node_modules/entities/')
+            ) {
+              return 'vendor-network';
+            }
+          }
+
+          if (normalizedId.includes('steamEnrichedCache') || normalizedId.includes('fullUserSteamGames')) {
+            return 'store-steam-enriched';
+          }
+          if (normalizedId.includes('gogEnrichedCache') || normalizedId.includes('gogUserLibrary')) {
+            return 'store-gog-enriched';
+          }
+          if (normalizedId.includes('epicUserLibrary')) {
+            return 'store-epic-library';
+          }
+        },
+      },
+    },
+  },
   server: {
     port: 3000,
     open: true,

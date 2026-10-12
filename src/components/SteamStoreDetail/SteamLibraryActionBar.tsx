@@ -19,6 +19,7 @@ import {
   X,
   ExternalLink,
   Sparkles,
+  Wand,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { parseTimestampMs, formatLastPlayedDate, formatPlaytime } from '../../utils/dateUtils';
@@ -81,6 +82,7 @@ interface SteamLibraryActionBarProps {
   onToggleInstallStatus?: () => void;
   onApplyFilter?: (filter: ActiveGameFilter) => void;
   connectedStorefronts?: StorefrontId[];
+  onFixMatch?: () => void;
 }
 
 export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
@@ -91,6 +93,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onToggleInstallStatus,
   onApplyFilter,
   connectedStorefronts,
+  onFixMatch,
 }) => {
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
   const isInstalled = game.platforms.some((p) => p.installed);
@@ -346,6 +349,17 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     : 'text-steam-subtext hover:text-white'
                 }`}
               />
+            </button>
+          )}
+
+          {/* Fix Match & Metadata Shortcut Button */}
+          {onFixMatch && (
+            <button
+              onClick={onFixMatch}
+              className="p-2 xl:p-2.5 rounded text-steam-subtext hover:text-white bg-[#16202d] hover:bg-[#1f2c3d] border border-steam-border/80 transition-colors shrink-0 group"
+              title="Fix match, cover poster & scraped metadata..."
+            >
+              <Wand className="w-4 h-4 text-steam-subtext group-hover:text-[#66c0f4] transition-colors" />
             </button>
           )}
 

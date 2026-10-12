@@ -108,9 +108,9 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'broken sword shadow of the templars': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
 
   // Citadel Remonstered / Cytadela
-  'citadel remonstered': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
-  'citadel: remonstered': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
-  'cytadela': 'https://upload.wikimedia.org/wikipedia/en/6/63/Cytadela_cover.jpg',
+  'citadel remonstered': 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
+  'citadel: remonstered': 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
+  'cytadela': 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
 
   // DOOM + DOOM II
   'doom + doom ii': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2280/library_600x900_2x.jpg',
@@ -130,8 +130,12 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'fate': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/246840/library_600x900_2x.jpg',
   'fate: undiscovered realms': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg',
   'fate undiscovered realms': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/276890/library_600x900_2x.jpg',
-  'fallout london': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co8j9u.webp',
-  'fallout: london': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co8j9u.webp',
+  'fallout london': 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
+  'fallout: london': 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
+  'eschalon: book i': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
+  'eschalon book i': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
+  'eschalon: book 1': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
+  'eschalon book 1': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
   'agony': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
   'agony unrated': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
   'grip': 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
@@ -183,7 +187,7 @@ export const KNOWN_IGDB_COVERS: Record<string, string> = {
   'lure of the temptress 1992': 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
 
   // Resident Evil Requiem
-  'resident evil requiem': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3764200/ed3b2cae7d15f598f41006f5f1e605ec5517b5e4/library_capsule.jpg',
+  'resident evil requiem': 'https://images.igdb.com/igdb/image/upload/t_cover_big/cobmj0.jpg',
 
   // Death Stranding 2: On The Beach
   'death stranding 2 on the beach': 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
@@ -303,6 +307,7 @@ export function isUnsuitableCoverUrl(url?: string | null): boolean {
     lower.includes('sbicon') ||
     lower.includes('avatars/default.png') ||
     lower.includes('egs-badge') ||
+    lower.includes('co8j9u') ||
     lower.includes('wide') ||
     lower.includes('landscape')
   ) {
@@ -328,10 +333,74 @@ export function normalizeKey(str: string): string {
     .trim();
 }
 
+const EDITION_WORDS = new Set([
+  'complete',
+  'definitive',
+  'enhanced',
+  'goty',
+  'deluxe',
+  'gold',
+  'standard',
+  'remastered',
+  'remaster',
+  'directors',
+  'director',
+  'cut',
+  'edition',
+  'collectors',
+  'collector',
+  'anniversary',
+  'special',
+  'ultimate',
+  'extended',
+  'game',
+  'year',
+  'final',
+  'royal',
+  'emperor',
+  'classics',
+  'classic',
+  'plus',
+  'bundle',
+  'pack',
+  'package',
+  'collection',
+  'upgrade',
+  'vr',
+  'hd',
+]);
+
 function computeTokenSimilarity(t1: string, t2: string): number {
-  const words1 = new Set(t1.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
-  const words2 = new Set(t2.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+  const cleanT1 = t1.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '');
+  const cleanT2 = t2.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '');
+  const list1 = cleanT1.split(/\s+/).filter((w) => w.length > 2);
+  const list2 = cleanT2.split(/\s+/).filter((w) => w.length > 2);
+  const words1 = new Set(list1);
+  const words2 = new Set(list2);
   if (words1.size === 0 || words2.size === 0) return 0;
+
+  // Intelligent Edition Variant Matching
+  const [shorterSet, longerList] = words1.size <= words2.size ? [words1, list2] : [words2, list1];
+  let allShorterInLonger = true;
+  for (const w of shorterSet) {
+    if (!longerList.includes(w)) {
+      allShorterInLonger = false;
+      break;
+    }
+  }
+  if (allShorterInLonger) {
+    let onlyEditionTokensRemaining = true;
+    for (const w of longerList) {
+      if (!shorterSet.has(w) && !EDITION_WORDS.has(w)) {
+        onlyEditionTokensRemaining = false;
+        break;
+      }
+    }
+    if (onlyEditionTokensRemaining) {
+      return 0.92;
+    }
+  }
+
   let intersection = 0;
   for (const w of words1) {
     if (words2.has(w)) intersection++;
@@ -389,13 +458,7 @@ export class IgdbCoverService {
       const lower = cleanRaw.toLowerCase();
       const norm = normalizeKey(cleanRaw);
 
-      if (this.cache.has(norm)) {
-        return this.cache.get(norm) || null;
-      }
-      if (this.cache.has(lower)) {
-        return this.cache.get(lower) || null;
-      }
-
+      // 1. Curated official covers take precedence over dynamic / local cache
       const match =
         NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
         NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
@@ -405,6 +468,14 @@ export class IgdbCoverService {
       if (match) {
         return match;
       }
+
+      // 2. Dynamic cache
+      if (this.cache.has(norm)) {
+        return this.cache.get(norm) || null;
+      }
+      if (this.cache.has(lower)) {
+        return this.cache.get(lower) || null;
+      }
     }
 
     if (gameId) {
@@ -412,13 +483,7 @@ export class IgdbCoverService {
       const lowerId = cleanId.toLowerCase();
       const normId = normalizeKey(cleanId);
 
-      if (this.cache.has(normId)) {
-        return this.cache.get(normId) || null;
-      }
-      if (this.cache.has(lowerId)) {
-        return this.cache.get(lowerId) || null;
-      }
-
+      // 1. Curated official covers take precedence over dynamic / local cache
       const match =
         NORMALIZED_KNOWN_IGDB_COVERS.get(lowerId) ||
         NORMALIZED_KNOWN_IGDB_COVERS.get(normId) ||
@@ -427,6 +492,14 @@ export class IgdbCoverService {
 
       if (match) {
         return match;
+      }
+
+      // 2. Dynamic cache
+      if (this.cache.has(normId)) {
+        return this.cache.get(normId) || null;
+      }
+      if (this.cache.has(lowerId)) {
+        return this.cache.get(lowerId) || null;
       }
     }
 
@@ -453,9 +526,9 @@ export class IgdbCoverService {
 
     const fetchPromise = (async (): Promise<string | null> => {
       // 1. Try Electron native IPC if in desktop app
-      if (typeof window !== 'undefined' && (window as any).electronAPI?.fetchIgdbCover) {
+      if (typeof window !== 'undefined' && window.electronAPI?.fetchIgdbCover) {
         try {
-          const cover = await (window as any).electronAPI.fetchIgdbCover(cleanRaw);
+          const cover = await window.electronAPI.fetchIgdbCover(cleanRaw);
           if (cover && typeof cover === 'string') {
             this.cache.set(norm, cover);
             this.savePersistentCache();
@@ -495,9 +568,9 @@ export class IgdbCoverService {
               if (score > bestScore && score >= 50) {
                 bestScore = score;
                 const m = item.coverart.match(/\/([a-zA-Z0-9_-]+)\.(?:jpg|png|webp)/i);
-                if (m) {
+                if (m && !m[1].startsWith('banner_') && !m[1].startsWith('library_capsule') && !m[1].startsWith('header_')) {
                   bestCover = `https://images.igdb.com/igdb/image/upload/t_cover_big/${m[1]}.jpg`;
-                } else {
+                } else if (item.coverart.startsWith('http') && !isUnsuitableCoverUrl(item.coverart)) {
                   bestCover = item.coverart;
                 }
               }
