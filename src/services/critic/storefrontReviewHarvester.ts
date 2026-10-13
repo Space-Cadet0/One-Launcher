@@ -192,7 +192,7 @@ export class StorefrontReviewHarvester {
     const known = KNOWN_CRITIC_SCORES[steamAppId];
     if (known && known.source === 'metacritic' && known.url) {
       const slug = extractMetacriticSlugFromUrl(known.url);
-      const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : (known.url.startsWith('http://') ? known.url.replace(/^http:\/\//, 'https://') : known.url);
+      const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : (known.url?.startsWith('http://') ? known.url.replace(/^http:\/\//, 'https://') : known.url);
       const anchor: StorefrontReviewAnchor = {
         storefront: 'steam',
         metacriticUrl: canonicalMcUrl,

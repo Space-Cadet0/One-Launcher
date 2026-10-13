@@ -52,17 +52,20 @@ export function getSteamCategoryIconUrl(id: number): string {
 }
 
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
+import { requestScheduler, RequestPriority } from '../network/requestScheduler';
 
 export class SteamApiService {
   private cache = new Map<number, SteamEnrichedMetadata>();
   private rateLimitedUntil = 0;
 
   isStoreRateLimited(): boolean {
-    return Date.now() < this.rateLimitedUntil;
+    return Date.now() < this.rateLimitedUntil || requestScheduler.isRateLimited('store.steampowered.com');
   }
 
   getCooldownRemainingSeconds(): number {
-    return Math.max(0, Math.ceil((this.rateLimitedUntil - Date.now()) / 1000));
+    const internalRemaining = Math.max(0, Math.ceil((this.rateLimitedUntil - Date.now()) / 1000));
+    const schedulerRemaining = requestScheduler.getCooldownRemaining('store.steampowered.com');
+    return Math.max(internalRemaining, schedulerRemaining);
   }
 
   private getBaseUrl(): string {
@@ -79,7 +82,10 @@ export class SteamApiService {
     return null;
   }
 
-  async fetchGameMetadata(appId: number): Promise<SteamEnrichedMetadata | null> {
+  async fetchGameMetadata(
+    appId: number,
+    priority: number = RequestPriority.P1_VIEWPORT
+  ): Promise<SteamEnrichedMetadata | null> {
     if (this.cache.has(appId)) {
       return this.cache.get(appId)!;
     }
@@ -111,173 +117,195 @@ export class SteamApiService {
       return null;
     }
 
-    try {
-      const baseUrl = this.getBaseUrl();
-      const [detailsRes, reviewsRes] = await Promise.all([
-        axios.get(`${baseUrl}/api/appdetails?appids=${appId}&l=english`, {
-          timeout: 8000,
-          headers: {
-            Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
-          },
-        }),
-        axios.get(`${baseUrl}/appreviews/${appId}?json=1&language=all`, { timeout: 6000 }).catch(() => null),
-      ]);
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/appdetails?appids=${appId}&l=english`;
 
-      const appData = detailsRes.data?.[appId];
-      if (!appData || !appData.success || !appData.data) {
-        return null;
-      }
+    return requestScheduler
+      .schedule(
+        url,
+        async () => {
+          const [detailsRes, reviewsRes] = await Promise.all([
+            axios.get(url, {
+              timeout: 8000,
+              headers: {
+                Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+              },
+            }),
+            axios.get(`${baseUrl}/appreviews/${appId}?json=1&language=all`, { timeout: 6000 }).catch(() => null),
+          ]);
 
-      const data = appData.data;
+          const appData = detailsRes.data?.[appId];
+          if (!appData || !appData.success || !appData.data) {
+            return null;
+          }
 
-      // Extract screenshots
-      const screenshots: SteamScreenshot[] = (data.screenshots || []).map((s: any) => ({
-        id: s.id,
-        pathThumbnail: s.path_thumbnail,
-        pathFull: s.path_full,
-      }));
+          const data = appData.data;
 
-      // Extract movies / trailers
-      const rawMovies: SteamMovie[] = (data.movies || []).map((m: any) => {
-        const hlsUrl = m.hls_h264 || m.hls || '';
-        const rawMp4Max = m.mp4?.max && !m.mp4.max.includes('.mpd') && !m.mp4.max.includes('.m3u8') ? m.mp4.max : '';
-        const rawMp4Low = m.mp4?.['480'] && !m.mp4['480'].includes('.mpd') && !m.mp4['480'].includes('.m3u8') ? m.mp4['480'] : '';
+          // Extract screenshots
+          const screenshots: SteamScreenshot[] = (data.screenshots || []).map((s: any) => ({
+            id: s.id,
+            pathThumbnail: s.path_thumbnail,
+            pathFull: s.path_full,
+          }));
 
-        return {
-          id: m.id,
-          name: m.name,
-          thumbnail: m.thumbnail,
-          hls: hlsUrl,
-          webm: {
-            480: m.webm?.['480'] || '',
-            max: m.webm?.max || '',
-          },
-          mp4: {
-            480: rawMp4Low,
-            max: rawMp4Max,
-          },
-        };
-      });
+          // Extract movies / trailers
+          const rawMovies: SteamMovie[] = (data.movies || []).map((m: any) => {
+            const hlsUrl = m.hls_h264 || m.hls || '';
+            const rawMp4Max = m.mp4?.max && !m.mp4.max.includes('.mpd') && !m.mp4.max.includes('.m3u8') ? m.mp4.max : '';
+            const rawMp4Low = m.mp4?.['480'] && !m.mp4['480'].includes('.mpd') && !m.mp4['480'].includes('.m3u8') ? m.mp4['480'] : '';
 
-      // Filter out regional non-English trailers (e.g. CJK dubs) when English/international trailers exist
-      const hasEnglishMovies = rawMovies.some((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name));
-      const movies = hasEnglishMovies
-        ? rawMovies.filter((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name))
-        : rawMovies;
+            return {
+              id: m.id,
+              name: m.name,
+              thumbnail: m.thumbnail,
+              hls: hlsUrl,
+              webm: {
+                480: m.webm?.['480'] || '',
+                max: m.webm?.max || '',
+              },
+              mp4: {
+                480: rawMp4Low,
+                max: rawMp4Max,
+              },
+            };
+          });
 
-      // Extract review summary
-      let reviewSummary: SteamReviewSummary = {
-        reviewScore: 0,
-        reviewScoreDesc: 'No User Reviews',
-        totalPositive: 0,
-        totalNegative: 0,
-        totalReviews: 0,
-        positivePercent: 0,
-      };
+          // Filter out regional non-English trailers (e.g. CJK dubs) when English/international trailers exist
+          const hasEnglishMovies = rawMovies.some((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name));
+          const movies = hasEnglishMovies
+            ? rawMovies.filter((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name))
+            : rawMovies;
 
-      if (reviewsRes?.data?.query_summary) {
-        const qs = reviewsRes.data.query_summary;
-        const total = qs.total_reviews || 0;
-        const positive = qs.total_positive || 0;
-        const negative = qs.total_negative || 0;
-        const percent = total > 0 ? Math.round((positive / total) * 100) : 0;
+          // Extract review summary
+          let reviewSummary: SteamReviewSummary = {
+            reviewScore: 0,
+            reviewScoreDesc: 'No User Reviews',
+            totalPositive: 0,
+            totalNegative: 0,
+            totalReviews: 0,
+            positivePercent: 0,
+          };
 
-        reviewSummary = {
-          reviewScore: qs.review_score || 0,
-          reviewScoreDesc: qs.review_score_desc || (total > 0 ? `${percent}% Positive` : 'No User Reviews'),
-          totalPositive: positive,
-          totalNegative: negative,
-          totalReviews: total,
-          positivePercent: percent,
-        };
-      }
+          if (reviewsRes?.data?.query_summary) {
+            const qs = reviewsRes.data.query_summary;
+            const total = qs.total_reviews || 0;
+            const positive = qs.total_positive || 0;
+            const negative = qs.total_negative || 0;
+            const percent = total > 0 ? Math.round((positive / total) * 100) : 0;
 
-      // Extract categories (features)
-      const categories: SteamCategory[] = (data.categories || []).map((c: any) => ({
-        id: c.id,
-        description: c.description,
-        icon: getSteamCategoryIconUrl(c.id),
-      }));
+            reviewSummary = {
+              reviewScore: qs.review_score || 0,
+              reviewScoreDesc: qs.review_score_desc || (total > 0 ? `${percent}% Positive` : 'No User Reviews'),
+              totalPositive: positive,
+              totalNegative: negative,
+              totalReviews: total,
+              positivePercent: percent,
+            };
+          }
 
-      // Extract genres & tags
-      const genres: string[] = (data.genres || []).map((g: any) => g.description);
-      const tags: string[] = (data.categories || []).map((c: any) => c.description).slice(0, 10);
+          // Extract categories (features)
+          const categories: SteamCategory[] = (data.categories || []).map((c: any) => ({
+            id: c.id,
+            description: c.description,
+            icon: getSteamCategoryIconUrl(c.id),
+          }));
 
-      // Extract achievements
-      let achievements: { total: number; highlighted?: any[] } | undefined = undefined;
-      if (data.achievements && typeof data.achievements.total === 'number') {
-        achievements = {
-          total: data.achievements.total,
-          highlighted: (data.achievements.highlighted || []).map((h: any) => ({
-            name: h.name || h.localized_name || '',
-            path: h.path || '',
-          })),
-        };
-      }
+          // Extract genres & tags
+          const genres: string[] = (data.genres || []).map((g: any) => g.description);
+          const tags: string[] = (data.categories || []).map((c: any) => c.description).slice(0, 10);
 
-      const metadata: SteamEnrichedMetadata = {
-        appId,
-        name: data.name,
-        shortDescription: data.short_description || '',
-        detailedDescription: data.detailed_description || '',
-        aboutTheGame: data.about_the_game || '',
-        headerImage: data.header_image || '',
-        capsuleImage: data.capsule_image,
-        developers: data.developers || [],
-        publishers: data.publishers || [],
-        releaseDate: data.release_date?.date || (data.release_date?.coming_soon ? 'Coming Soon' : 'TBA'),
-        genres,
-        tags,
-        categories,
-        screenshots,
-        movies,
-        systemRequirements: {
-          minimum: typeof data.pc_requirements?.minimum === 'string' ? data.pc_requirements.minimum : undefined,
-          recommended: typeof data.pc_requirements?.recommended === 'string' ? data.pc_requirements.recommended : undefined,
+          // Extract achievements
+          let achievements: { total: number; highlighted?: any[] } | undefined = undefined;
+          if (data.achievements && typeof data.achievements.total === 'number') {
+            achievements = {
+              total: data.achievements.total,
+              highlighted: (data.achievements.highlighted || []).map((h: any) => ({
+                name: h.name || h.localized_name || '',
+                path: h.path || '',
+              })),
+            };
+          }
+
+          const metadata: SteamEnrichedMetadata = {
+            appId,
+            name: data.name,
+            shortDescription: data.short_description || '',
+            detailedDescription: data.detailed_description || '',
+            aboutTheGame: data.about_the_game || '',
+            headerImage: data.header_image || '',
+            capsuleImage: data.capsule_image,
+            developers: data.developers || [],
+            publishers: data.publishers || [],
+            releaseDate: data.release_date?.date || (data.release_date?.coming_soon ? 'Coming Soon' : 'TBA'),
+            genres,
+            tags,
+            categories,
+            screenshots,
+            movies,
+            systemRequirements: {
+              minimum: typeof data.pc_requirements?.minimum === 'string' ? data.pc_requirements.minimum : undefined,
+              recommended: typeof data.pc_requirements?.recommended === 'string' ? data.pc_requirements.recommended : undefined,
+            },
+            reviewSummary,
+            supportedLanguages: data.supported_languages,
+            legalNotice: data.legal_notice,
+            drmNotice: data.drm_notice,
+            controllerSupport: data.controller_support,
+            pcRequirementsHtml: data.pc_requirements?.minimum || undefined,
+            achievements,
+            metacritic:
+              data.metacritic && typeof data.metacritic.score === 'number'
+                ? {
+                    score: data.metacritic.score,
+                    url: data.metacritic.url || '',
+                  }
+                : undefined,
+          };
+
+          this.cache.set(appId, metadata);
+
+          return metadata;
         },
-        reviewSummary,
-        supportedLanguages: data.supported_languages,
-        legalNotice: data.legal_notice,
-        drmNotice: data.drm_notice,
-        controllerSupport: data.controller_support,
-        pcRequirementsHtml: data.pc_requirements?.minimum || undefined,
-        achievements,
-        metacritic:
-          data.metacritic && typeof data.metacritic.score === 'number'
-            ? {
-                score: data.metacritic.score,
-                url: data.metacritic.url || '',
-              }
-            : undefined,
-      };
-
-      this.cache.set(appId, metadata);
-
-      return metadata;
-    } catch (err: any) {
-      if (err?.response?.status === 403 || err?.response?.status === 429) {
-        // Akamai CDN edge rate limit: pause storefront web requests for 15 minutes to let the cooldown reset cleanly
-        this.rateLimitedUntil = Date.now() + 15 * 60 * 1000;
-        console.warn(`[Steam API] Akamai edge cooldown encountered (${err.response.status}). Pausing web requests to store.steampowered.com for 15 minutes to allow IP cooldown to clear.`);
-      } else {
-        console.warn(`Failed to fetch Steam metadata for appId ${appId}:`, err);
-      }
-      return null;
-    }
+        priority,
+        'store.steampowered.com'
+      )
+      .catch((err: any) => {
+        if (err?.response?.status === 403 || err?.response?.status === 429 || err?.isRateLimited) {
+          // Akamai CDN edge rate limit: pause storefront web requests for 15 minutes to let the cooldown reset cleanly
+          this.rateLimitedUntil = Date.now() + 15 * 60 * 1000;
+          requestScheduler.setCooldown('store.steampowered.com', 900);
+          console.warn(
+            `[Steam API] Akamai edge cooldown encountered (${err.response?.status || 429}). Pausing web requests to store.steampowered.com for 15 minutes to allow IP cooldown to clear.`
+          );
+        } else {
+          console.warn(`Failed to fetch Steam metadata for appId ${appId}:`, err);
+        }
+        return null;
+      });
   }
 
-  async searchAppId(term: string): Promise<number | null> {
+  async searchAppId(
+    term: string,
+    priority: number = RequestPriority.P0_INTERACTIVE
+  ): Promise<number | null> {
     if (this.isStoreRateLimited()) return null;
-    try {
-      const baseUrl = this.getBaseUrl();
-      const res = await axios.get(`${baseUrl}/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`);
-      if (res.data?.items?.length > 0) {
-        return res.data.items[0].id;
-      }
-      return null;
-    } catch {
-      return null;
-    }
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`;
+
+    return requestScheduler
+      .schedule(
+        url,
+        async () => {
+          const res = await axios.get(url);
+          if (res.data?.items?.length > 0) {
+            return res.data.items[0].id;
+          }
+          return null;
+        },
+        priority,
+        'store.steampowered.com'
+      )
+      .catch(() => null);
   }
 }
 

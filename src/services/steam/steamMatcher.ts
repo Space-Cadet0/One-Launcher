@@ -9,6 +9,7 @@ import {
   ROMAN_TO_ARABIC,
   EDITION_TOKENS,
 } from '../common/titleUtils';
+import { TIER_TTLS } from '../storage/stagedCacheService';
 
 /**
  * Curated high-confidence mapping for hundreds of popular multi-store & cross-platform titles.
@@ -493,9 +494,11 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
 }
 
 const STORAGE_KEY_MATCHED_APP_IDS = 'antigravity_steam_matched_app_ids';
+const NEGATIVE_MATCH_TTL_MS = TIER_TTLS.negative; // 7 days = 604,800,000 ms
 
 export class SteamMatcherService {
   private cache = new Map<string, number | null>();
+  private negativeTimestamps = new Map<string, number>();
 
   constructor() {
     this.loadPersistentCache();
@@ -522,7 +525,20 @@ export class SteamMatcherService {
           ) {
             continue;
           }
-          this.cache.set(lk, typeof v === 'number' ? v : null);
+
+          if (typeof v === 'number' && v > 0) {
+            // Positive match is immutable
+            this.cache.set(lk, v);
+          } else if (v === null) {
+            // Legacy null without timestamp: treat as expired
+          } else if (typeof v === 'object' && v !== null) {
+            const cachedAt = (v as any).cachedAt || 0;
+            const isExpired = Date.now() - cachedAt >= NEGATIVE_MATCH_TTL_MS;
+            if (!isExpired && ((v as any).appId === null || (v as any).id === null)) {
+              this.cache.set(lk, null);
+              this.negativeTimestamps.set(lk, cachedAt);
+            }
+          }
         }
       }
     } catch {
@@ -533,13 +549,34 @@ export class SteamMatcherService {
   private savePersistentCache() {
     if (typeof window === 'undefined') return;
     try {
-      const obj: Record<string, number | null> = {};
+      const obj: Record<string, any> = {};
       for (const [k, v] of this.cache.entries()) {
-        obj[k] = v;
+        if (typeof v === 'number' && v > 0) {
+          obj[k] = v;
+        } else if (v === null) {
+          const cachedAt = this.negativeTimestamps.get(k) || Date.now();
+          obj[k] = { appId: null, cachedAt };
+        }
       }
       localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
     } catch {
       // Ignore write errors
+    }
+  }
+
+  private recordNegativeMatch(key: string, timestamp: number = Date.now()): void {
+    this.cache.set(key, null);
+    this.negativeTimestamps.set(key, timestamp);
+    this.savePersistentCache();
+  }
+
+  public clearCache(): void {
+    this.cache.clear();
+    this.negativeTimestamps.clear();
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem(STORAGE_KEY_MATCHED_APP_IDS);
+      } catch {}
     }
   }
 
@@ -582,7 +619,18 @@ export class SteamMatcherService {
 
     // 2. Check in-memory / persistent cache
     if (this.cache.has(lowerKey)) {
-      return this.cache.get(lowerKey) || null;
+      const val = this.cache.get(lowerKey);
+      if (typeof val === 'number' && val > 0) {
+        return val;
+      }
+      if (val === null) {
+        const cachedAt = this.negativeTimestamps.get(lowerKey);
+        if (cachedAt && Date.now() - cachedAt < NEGATIVE_MATCH_TTL_MS) {
+          return null;
+        }
+        this.cache.delete(lowerKey);
+        this.negativeTimestamps.delete(lowerKey);
+      }
     }
 
     for (const [idStr, data] of Object.entries(steamEnrichedCache as Record<string, any>)) {
@@ -605,8 +653,7 @@ export class SteamMatcherService {
 
     const normalized = normalizeGameTitle(cleanRaw).toLowerCase();
     if (KNOWN_NON_STEAM_TITLES.has(lowerKey) || KNOWN_NON_STEAM_TITLES.has(normalized)) {
-      this.cache.set(lowerKey, null);
-      this.savePersistentCache();
+      this.recordNegativeMatch(lowerKey);
       return null;
     }
 
@@ -630,7 +677,18 @@ export class SteamMatcherService {
 
     // 2. Check in-memory / persistent cache
     if (this.cache.has(lowerKey)) {
-      return this.cache.get(lowerKey)!;
+      const val = this.cache.get(lowerKey);
+      if (typeof val === 'number' && val > 0) {
+        return val;
+      }
+      if (val === null) {
+        const cachedAt = this.negativeTimestamps.get(lowerKey);
+        if (cachedAt && Date.now() - cachedAt < NEGATIVE_MATCH_TTL_MS) {
+          return null;
+        }
+        this.cache.delete(lowerKey);
+        this.negativeTimestamps.delete(lowerKey);
+      }
     }
 
     if (directMatch) {
@@ -716,8 +774,7 @@ export class SteamMatcherService {
     }
 
     // Game does not exist on Steam (or is store exclusive)
-    this.cache.set(lowerKey, null);
-    this.savePersistentCache();
+    this.recordNegativeMatch(lowerKey);
     return null;
   }
 

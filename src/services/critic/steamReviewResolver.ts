@@ -7,7 +7,7 @@ function isViteBrowserDev(): boolean {
   return (
     typeof window !== 'undefined' &&
     typeof window.location !== 'undefined' &&
-    window.location.protocol.startsWith('http') &&
+    window.location.protocol?.startsWith('http') &&
     (window.location.port === '3000' || window.location.port === '5173') &&
     typeof navigator !== 'undefined' &&
     !navigator.userAgent?.includes('jsdom') &&

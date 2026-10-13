@@ -96,12 +96,29 @@ if (!gotTheLock) {
       '*://*.metacritic.com/*',
     ];
 
+    const beforeSendFilters = [
+      ...embedFilters,
+      '*://*.steampowered.com/*',
+      '*://*.lutris.net/*',
+    ];
+
+    const STANDARD_CHROME_UA =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
     session.defaultSession.webRequest.onBeforeSendHeaders(
-      { urls: embedFilters },
+      { urls: beforeSendFilters },
       (details, callback) => {
+        const url = details.url || '';
+
         // Crucial: Only rewrite headers for the frame document request itself (subFrame / mainFrame).
         // Preserving original headers for XHR/fetch/chunks prevents YouTube's internal player API from stalling at 0:00.
-        if (details.resourceType === 'subFrame' || details.resourceType === 'mainFrame') {
+        if (
+          (details.resourceType === 'subFrame' || details.resourceType === 'mainFrame') &&
+          embedFilters.some((f) => {
+            const host = f.replace(/^\*:\/\/(\*\.)?/, '').replace(/\/\*$/, '');
+            return url.includes(host);
+          })
+        ) {
           delete details.requestHeaders['origin'];
           delete details.requestHeaders['Origin'];
           delete details.requestHeaders['referer'];
@@ -109,6 +126,28 @@ if (!gotTheLock) {
           details.requestHeaders['Origin'] = 'https://www.gog.com';
           details.requestHeaders['Referer'] = 'https://www.gog.com/';
         }
+
+        // Steam age-gate cookies: ensure Chromium cannot strip mature content cookies
+        if (url.includes('steampowered.com')) {
+          const existingCookie = details.requestHeaders['Cookie'] || details.requestHeaders['cookie'] || '';
+          delete details.requestHeaders['cookie'];
+          const steamMature = 'birthtime=568022401; mature_content=1; wants_mature_content=1';
+          if (!existingCookie) {
+            details.requestHeaders['Cookie'] = steamMature;
+          } else {
+            let updated = existingCookie;
+            if (!updated.includes('birthtime=')) updated += '; birthtime=568022401';
+            if (!updated.includes('mature_content=')) updated += '; mature_content=1';
+            if (!updated.includes('wants_mature_content=')) updated += '; wants_mature_content=1';
+            details.requestHeaders['Cookie'] = updated;
+          }
+        }
+
+        // Lutris bot-protection: ensure standard Chrome User-Agent
+        if (url.includes('lutris.net')) {
+          details.requestHeaders['User-Agent'] = STANDARD_CHROME_UA;
+        }
+
         callback({ requestHeaders: details.requestHeaders });
       }
     );

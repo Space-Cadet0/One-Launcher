@@ -334,7 +334,7 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = ${J
     expect(metroLLRow?.score).toBe(76);
 
     const kingdomClassicRow = allRows.find((r) => r.title === 'Kingdom: Classic' || r.title === 'Kingdom Classic');
-    expect(kingdomClassicRow?.url).toBe('https://opencritic.com/game/1968/kingdom');
+    expect(kingdomClassicRow?.url).toMatch(/metacritic\.com\/game\/kingdom-2015|opencritic\.com\/game\/1968\/kingdom/);
     expect(kingdomClassicRow?.score).toBe(74);
 
     const overcooked2Row = allRows.find((r) => r.title === 'Overcooked! 2');

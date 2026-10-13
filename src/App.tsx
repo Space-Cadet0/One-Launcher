@@ -22,6 +22,8 @@ import { ManageCollectionsModal } from './components/Library/ManageCollectionsMo
 import { IntegrationsModal } from './components/Navigation/IntegrationsModal';
 import { FixMatchWizardModal } from './components/Library/FixMatchWizardModal';
 import { GameAchievementsModal } from './components/Achievements/GameAchievementsModal';
+import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
+import { syncJobManager } from './services/network/syncJobManager';
 import { UserGameOverride } from './contracts/override';
 import {
   saveUserOverride,
@@ -280,6 +282,20 @@ export function App() {
   const [isAchievementsModalOpen, setIsAchievementsModalOpen] = useState(false);
   const [achievementsModalGame, setAchievementsModalGame] = useState<CanonicalGame | null>(null);
   const [achievementsInitialStorefrontId, setAchievementsInitialStorefrontId] = useState<StorefrontId | undefined>(undefined);
+
+  // Subscribe to background sync job updates
+  useEffect(() => {
+    const unsub = syncJobManager.subscribe((state) => {
+      const active = Boolean(
+        state &&
+          (state.status === 'running' ||
+            state.status === 'paused' ||
+            state.status === 'rate_limited')
+      );
+      setIsSyncingAllMedia(active);
+    });
+    return unsub;
+  }, []);
 
   // Connected storefronts based strictly on authenticated integration state
   const connectedStorefronts = useMemo(() => {
@@ -594,7 +610,8 @@ export function App() {
 
     let isCancelled = false;
     let index = 0;
-    const CHUNK_SIZE = 5;
+    const CHUNK_SIZE = 2;
+    let delayTimer: ReturnType<typeof setTimeout> | null = null;
 
     const processNextChunk = async () => {
       if (isCancelled || index >= unrated.length) return;
@@ -611,11 +628,7 @@ export function App() {
       );
 
       if (!isCancelled && index < unrated.length) {
-        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-          (window as any).requestIdleCallback(() => processNextChunk(), { timeout: 1000 });
-        } else {
-          setTimeout(processNextChunk, 200);
-        }
+        delayTimer = setTimeout(processNextChunk, 1500);
       }
     };
 
@@ -626,6 +639,7 @@ export function App() {
     return () => {
       isCancelled = true;
       clearTimeout(timer);
+      if (delayTimer) clearTimeout(delayTimer);
     };
   }, [games.length]);
 
@@ -1004,79 +1018,33 @@ export function App() {
   };
 
   // Synchronize official store media (screenshots, trailers, movies, descriptions) across library titles
-  const handleSyncAllMedia = async () => {
+  const handleSyncStoreMedia = async () => {
     if (isSyncingAllMedia) return;
     setIsSyncingAllMedia(true);
     setSyncNotice('Starting store media sync (trailers, screenshots & descriptions)...');
 
     try {
-      const eligibleGames = games.filter((g) => {
-        return Boolean(steamMatcher.getEffectiveSteamAppId(g));
+      await syncJobManager.startStoreMediaSync(games, (updatedGame) => {
+        setGames((prev) => {
+          const idx = prev.findIndex((g) => g.id === updatedGame.id);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = updatedGame;
+          saveCurrentCatalog(next);
+          return next;
+        });
+        setGameRefreshKey((prev) => prev + 1);
       });
-
-      const totalEligible = eligibleGames.length;
-      setSyncNotice(`Syncing store media for ${totalEligible} library titles...`);
-
-      let updatedCount = 0;
-      const chunkSize = 5;
-      let updatedCatalog = [...games];
-
-      for (let i = 0; i < eligibleGames.length; i += chunkSize) {
-        const chunk = eligibleGames.slice(i, i + chunkSize);
-
-        await Promise.all(
-          chunk.map(async (game) => {
-            const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
-            if (!targetAppId) return;
-
-            try {
-              const refreshed = await steamApi.fetchGameMetadata(targetAppId);
-              if (refreshed) {
-                const idx = updatedCatalog.findIndex((g) => g.id === game.id);
-                if (idx >= 0) {
-                  const g = updatedCatalog[idx];
-                  updatedCatalog[idx] = {
-                    ...g,
-                    steamAppId: targetAppId,
-                    enrichedMetadata: refreshed || g.enrichedMetadata,
-                    headerImage: refreshed.headerImage || g.headerImage,
-                    capsuleImage: refreshed.capsuleImage || g.capsuleImage,
-                    shortDescription: refreshed.shortDescription || g.shortDescription,
-                    developers: refreshed.developers?.length ? refreshed.developers : g.developers,
-                    publishers: refreshed.publishers?.length ? refreshed.publishers : g.publishers,
-                    genres: refreshed.genres?.length ? refreshed.genres : g.genres,
-                    tags: refreshed.tags?.length ? refreshed.tags : g.tags,
-                    reviewSummary: refreshed.reviewSummary || g.reviewSummary,
-                  };
-                  updatedCount++;
-                }
-              }
-            } catch (err) {
-              console.warn(`Media sync failed for ${game.title}:`, err);
-            }
-          })
-        );
-
-        if (steamApi.isStoreRateLimited()) {
-          console.warn('Steam Store API rate limit reached, finishing with available cached media.');
-          break;
-        }
-      }
-
-      setGames(updatedCatalog);
-      saveCurrentCatalog(updatedCatalog);
-      setGameRefreshKey((prev) => prev + 1);
-
-      setSyncNotice(
-        `Store media sync complete! Refreshed trailers, screenshots & descriptions for ${updatedCount} titles.`
-      );
+      setSyncNotice('Store media sync complete! Refreshed trailers, screenshots & descriptions.');
     } catch (err: any) {
       setSyncNotice(`Media sync notice: ${err?.message || 'Finished media sync'}`);
     } finally {
       setIsSyncingAllMedia(false);
-      setTimeout(() => setSyncNotice(null), 6000);
+      setTimeout(() => setSyncNotice(null), 5000);
     }
   };
+
+  const handleSyncAllMedia = handleSyncStoreMedia;
 
   // Refresh and verify critic ratings across library titles
   const handleRefreshScores = async () => {
@@ -1448,6 +1416,9 @@ export function App() {
           setAchievementsInitialStorefrontId(undefined);
         }}
       />
+
+      {/* Global Sync Progress Bar Dock */}
+      <GlobalSyncProgressBar />
     </div>
   );
 };

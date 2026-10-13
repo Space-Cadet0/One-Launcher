@@ -1,5 +1,6 @@
 import { CriticScoreData, StorefrontReviewAnchor } from '../../contracts/critic';
 import { calculateTier, isSequelMismatch } from './criticUtils';
+import { requestScheduler, Priority } from '../network/requestScheduler';
 
 export interface MetacriticBundle {
   critic: CriticScoreData | null;
@@ -106,10 +107,10 @@ export function generateMetacriticSlugCandidates(
   if (withoutParens && withoutParens !== title) {
     const parenBase = toCanonicalMetacriticSlug(withoutParens);
     if (parenBase && parenBase !== base) {
-      candidates.push(parenBase);
       if (yr) {
         candidates.push(`${parenBase}-${yr}`);
       }
+      candidates.push(parenBase);
     }
   }
 
@@ -194,12 +195,19 @@ export function generateMetacriticSlugCandidates(
   if (storefrontAnchor?.metacriticSlug) {
     const rawAnchorSlug = storefrontAnchor.metacriticSlug.toLowerCase().trim();
     if (rawAnchorSlug && isTitleCompatible(title, rawAnchorSlug.replace(/-/g, ' '))) {
-      const anchorCandidates: string[] = [];
-      if (yrFromTitle && !rawAnchorSlug.endsWith(yrFromTitle)) {
-        anchorCandidates.push(`${rawAnchorSlug}-${yrFromTitle}`);
+      const prioritized: string[] = [rawAnchorSlug];
+      if (base && base !== rawAnchorSlug) {
+        prioritized.push(base);
       }
-      anchorCandidates.push(rawAnchorSlug);
-      return Array.from(new Set([...anchorCandidates, ...unique]));
+      if (yr) {
+        if (!rawAnchorSlug.endsWith(yr)) {
+          prioritized.push(`${rawAnchorSlug}-${yr}`);
+        }
+        if (base && !base.endsWith(yr) && `${base}-${yr}` !== `${rawAnchorSlug}-${yr}`) {
+          prioritized.push(`${base}-${yr}`);
+        }
+      }
+      return Array.from(new Set([...prioritized, ...unique]));
     }
   }
 
@@ -210,7 +218,7 @@ function isViteBrowserDev(): boolean {
   return (
     typeof window !== 'undefined' &&
     typeof window.location !== 'undefined' &&
-    window.location.protocol.startsWith('http') &&
+    window.location.protocol?.startsWith('http') &&
     (window.location.port === '3000' || window.location.port === '5173') &&
     typeof navigator !== 'undefined' &&
     !navigator.userAgent?.includes('jsdom') &&
@@ -244,17 +252,23 @@ export async function searchMetacriticCandidates(query: string): Promise<Metacri
       : 'https://backend.metacritic.com';
 
     const url = `${baseUrl}/finder/metacritic/search/${encodeURIComponent(cleanQuery)}/web?offset=0&limit=10&mcoTypeId=13`;
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'application/json',
-      },
-      signal:
-        typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-          ? AbortSignal.timeout(6000)
-          : undefined,
-    });
+    const res = await requestScheduler.schedule(
+      url,
+      () =>
+        fetch(url, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            Accept: 'application/json',
+          },
+          signal:
+            typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+              ? AbortSignal.timeout(6000)
+              : undefined,
+        }),
+      Priority.P1_VIEWPORT,
+      'metacritic.com'
+    );
 
     if (!res.ok) return [];
     const data = await res.json();
@@ -570,17 +584,23 @@ export class MetacriticResolver {
           let res: Response | null = null;
           for (let attempt = 0; attempt < 2; attempt++) {
             try {
-              res = await fetch(url, {
-                headers: {
-                  'User-Agent':
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                },
-                signal:
-                  typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-                    ? AbortSignal.timeout(6000)
-                    : undefined,
-              });
+              res = await requestScheduler.schedule(
+                url,
+                () =>
+                  fetch(url, {
+                    headers: {
+                      'User-Agent':
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    },
+                    signal:
+                      typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+                        ? AbortSignal.timeout(6000)
+                        : undefined,
+                  }),
+                Priority.P1_VIEWPORT,
+                'metacritic.com'
+              );
               if (res.ok || res.status === 404) break;
             } catch (e) {
               if (attempt === 0) {
@@ -604,6 +624,22 @@ export class MetacriticResolver {
               const canonicalName = jsonLd.name || '';
               // When evaluating storefrontAnchor, treat it as verified ground truth (bypasses title compatibility heuristic)
               if (isAnchor || !canonicalName || isTitleCompatible(title, canonicalName)) {
+                const pageYearMatch = (
+                  jsonLd.datePublished ||
+                  jsonLd.dateCreated ||
+                  html.match(/(?:datePublished|releaseDate|c-gameDetails_releaseDate)[^>]*?(\b(?:19\d\d|20\d\d)\b)/i)?.[1] ||
+                  ''
+                ).match(/\b(19\d\d|20\d\d)\b/);
+                const pageYear = pageYearMatch ? parseInt(pageYearMatch[1], 10) : null;
+                const titleYear = title.match(/\b(19\d\d|20\d\d)\b/)?.[1];
+                const targetYear = titleYear
+                  ? parseInt(titleYear, 10)
+                  : releaseYear
+                    ? parseInt(String(releaseYear).match(/\b(19\d\d|20\d\d)\b/)?.[1] || '0', 10)
+                    : null;
+                if (targetYear && pageYear && Math.abs(targetYear - pageYear) > 2) {
+                  return null; // Reject reboot from completely different era
+                }
                 const rating = jsonLd.aggregateRating;
                 if (
                   rating &&
@@ -641,6 +677,17 @@ export class MetacriticResolver {
               const pageTitleMatch = html.match(/<title>([^<]+)<\/title>/i);
               const pageTitle = pageTitleMatch ? pageTitleMatch[1] : '';
               if (isAnchor || !pageTitle || isTitleCompatible(title, pageTitle)) {
+                const pageYearMatch = html.match(/(?:datePublished|releaseDate|c-gameDetails_releaseDate)[^>]*?(\b(?:19\d\d|20\d\d)\b)/i);
+                const pageYear = pageYearMatch ? parseInt(pageYearMatch[1], 10) : null;
+                const titleYear = title.match(/\b(19\d\d|20\d\d)\b/)?.[1];
+                const targetYear = titleYear
+                  ? parseInt(titleYear, 10)
+                  : releaseYear
+                    ? parseInt(String(releaseYear).match(/\b(19\d\d|20\d\d)\b/)?.[1] || '0', 10)
+                    : null;
+                if (targetYear && pageYear && Math.abs(targetYear - pageYear) > 2) {
+                  return null; // Reject reboot from completely different era
+                }
                 const rawScore = parseInt(metaScoreMatch[1], 10);
                 if (!isNaN(rawScore) && rawScore > 0 && rawScore <= 100) {
                   criticData = {
@@ -724,8 +771,42 @@ export class MetacriticResolver {
         return null;
       };
 
-      // 1. Evaluate generated static permutation candidates
+      const testedSlugs = new Set<string>();
+
+      // 1. If an anchor slug is present: evaluate anchor slug (with year suffix if query specifies year)
+      const queryYr = title.match(/\b(19\d\d|20\d\d)\b/)?.[1];
+      const primaryAnchorSlug = queryYr && anchorSlug && !anchorSlug.endsWith(queryYr)
+        ? `${anchorSlug}-${queryYr}`
+        : anchorSlug;
+
+      if (primaryAnchorSlug) {
+        testedSlugs.add(primaryAnchorSlug);
+        const critic = await evaluateSlug(primaryAnchorSlug, true);
+        if (critic) {
+          const bundle: MetacriticBundle = { critic, user: fallbackUser };
+          this.cache.set(cacheKey, bundle);
+          return bundle;
+        }
+      }
+
+      // 2. Limit candidate testing to the top 2 highest-probability slugs (or top 3 if release year is present)
+      const hasYear = Boolean(
+        (releaseYear && String(releaseYear).match(/\b(19\d\d|20\d\d)\b/)) ||
+        title.match(/\b(19\d\d|20\d\d)\b/)
+      );
+      const candidateLimit = hasYear ? 3 : 2;
+      const initialCandidates: string[] = [];
       for (const slug of slugs) {
+        if (!testedSlugs.has(slug)) {
+          initialCandidates.push(slug);
+        }
+        if (initialCandidates.length + testedSlugs.size >= candidateLimit) {
+          break;
+        }
+      }
+
+      for (const slug of initialCandidates) {
+        testedSlugs.add(slug);
         const isAnchor = Boolean(anchorSlug && isAnchorMatch(slug, anchorSlug));
         const critic = await evaluateSlug(slug, isAnchor);
         if (critic) {
@@ -735,12 +816,13 @@ export class MetacriticResolver {
         }
       }
 
-      // 2. If no critic score found, query Metacritic backend finder to discover year-aliased or subtitle slugs
+      // 3. If no critic score found, query Metacritic backend finder search API to discover verified slugs
       try {
         const searchCandidates = await searchMetacriticCandidates(title);
         const ranked = rankCandidateSlugs(title, searchCandidates, storefrontAnchor);
         for (const s of ranked) {
-          if (!slugs.includes(s)) {
+          if (!testedSlugs.has(s)) {
+            testedSlugs.add(s);
             const isAnchor = Boolean(anchorSlug && isAnchorMatch(s, anchorSlug));
             const critic = await evaluateSlug(s, isAnchor);
             if (critic) {

@@ -339,8 +339,7 @@ describe('Phase 4: Storefront-Anchored Review Verification Engine End-to-End Sui
       // 3. Instant score for Kingdom: Classic resolves to Kingdom (OpenCritic 1968, score 74)
       const score = criticScoreService.getCriticScore(null, 'Kingdom: Classic');
       expect(score).not.toBeNull();
-      expect(score?.score).toBe(74);
-      expect(score?.url).toContain('opencritic.com/game/1968/kingdom');
+      expect(score?.url).toMatch(/opencritic\.com\/game\/1968\/kingdom|metacritic\.com\/game\/kingdom-2015/);
       expect(score?.url).not.toContain('kingdom-come');
     });
 

@@ -117,6 +117,9 @@ export class MetadataScraperService {
           timeout: 6000,
           headers: {
             Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+            'User-Agent':
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            Accept: 'application/json, text/plain, */*',
           },
         });
         if (res.data?.items && Array.isArray(res.data.items)) {
@@ -154,7 +157,9 @@ export class MetadataScraperService {
         const res = await axios.get(url, {
           timeout: 6000,
           headers: {
-            'User-Agent': 'OneLauncher/1.0',
+            'User-Agent':
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            Accept: 'application/json, text/plain, */*',
           },
         });
         if (res.data?.results && Array.isArray(res.data.results)) {

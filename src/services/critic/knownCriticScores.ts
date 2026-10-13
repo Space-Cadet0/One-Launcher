@@ -375,9 +375,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 86,
     "percentRecommended": 90,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 4838,
     "url": "https://store.steampowered.com/app/4560",
-    "summary": "Based on Steam community player reviews (93% positive).",
+    "summary": "Based on Steam community player reviews (93% positive across 4,838 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -570,9 +570,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 84,
     "percentRecommended": 86,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 2240,
     "url": "https://store.steampowered.com/app/15700",
-    "summary": "Based on Steam community player reviews (90% positive).",
+    "summary": "Based on Steam community player reviews (90% positive across 2,240 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -1347,16 +1347,16 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "211740": {
-    "id": "steam-211740",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/211740",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "id": "gog-thief_2_the_metal_age",
+    "source": "gog",
+    "score": 98,
+    "starRatingRaw": 4.9,
+    "tier": "Mighty",
+    "numReviews": 1581,
+    "url": "https://www.gog.com/en/game/thief_2_the_metal_age",
+    "summary": "GOG player rating (4.9/5 stars based on 1,581 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "213670": {
     "source": "metacritic",
@@ -2879,14 +2879,13 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "368230": {
-    "id": 1968,
-    "source": "opencritic",
+    "id": "mc-kingdom-2015",
+    "source": "metacritic",
     "score": 74,
     "tier": "Strong",
-    "numReviews": 35,
-    "percentRecommended": 60,
-    "url": "https://opencritic.com/game/1968/kingdom",
-    "summary": "A 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern retro pixel art aesthetic.",
+    "numReviews": 17,
+    "url": "https://www.metacritic.com/game/kingdom-2015/critic-reviews/",
+    "summary": "Kingdom is a 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern pixel art aesthetic. ",
     "isVerified": true,
     "isSynthetic": false
   },
@@ -6363,16 +6362,16 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "percentRecommended": 52
   },
   "1243140": {
-    "id": "steam-1243140",
-    "source": "steam",
-    "score": 55,
-    "percentRecommended": 50,
-    "tier": "Weak",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1243140",
-    "summary": "Based on Steam community player reviews (60% positive).",
+    "id": "gog-hellpoint_the_thespian_feast",
+    "source": "gog",
+    "score": 72,
+    "starRatingRaw": 3.6,
+    "tier": "Fair",
+    "numReviews": 24,
+    "url": "https://www.gog.com/en/game/hellpoint_the_thespian_feast",
+    "summary": "GOG player rating (3.6/5 stars based on 24 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "1243690": {
     "id": "mc-gods-will-fall",
@@ -7185,16 +7184,16 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "1558990": {
-    "id": "steam-1558990",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
+    "id": "gog-siege_of_avalon_anthology",
+    "source": "gog",
+    "score": 82,
+    "starRatingRaw": 4.1,
     "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1558990",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "numReviews": 124,
+    "url": "https://www.gog.com/en/game/siege_of_avalon_anthology",
+    "summary": "GOG player rating (4.1/5 stars based on 124 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "1561340": {
     "id": "mc-berserk-boy",
@@ -8773,7 +8772,7 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "tier": "Strong",
     "numReviews": 180,
     "url": "https://store.steampowered.com/app/2658030",
-    "summary": "Based on Steam community player reviews (76% positive).",
+    "summary": "Based on Steam community player reviews (76% positive across 180 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -11251,9 +11250,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 86,
     "percentRecommended": 90,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 4838,
     "url": "https://store.steampowered.com/app/4560",
-    "summary": "Based on Steam community player reviews (93% positive).",
+    "summary": "Based on Steam community player reviews (93% positive across 4,838 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -11271,9 +11270,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 86,
     "percentRecommended": 90,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 4838,
     "url": "https://store.steampowered.com/app/4560",
-    "summary": "Based on Steam community player reviews (93% positive).",
+    "summary": "Based on Steam community player reviews (93% positive across 4,838 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -14825,28 +14824,28 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "hellpoint the thespian feast": {
-    "id": "steam-1243140",
-    "source": "steam",
-    "score": 55,
-    "percentRecommended": 50,
-    "tier": "Weak",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1243140",
-    "summary": "Based on Steam community player reviews (60% positive).",
+    "id": "gog-hellpoint_the_thespian_feast",
+    "source": "gog",
+    "score": 72,
+    "starRatingRaw": 3.6,
+    "tier": "Fair",
+    "numReviews": 24,
+    "url": "https://www.gog.com/en/game/hellpoint_the_thespian_feast",
+    "summary": "GOG player rating (3.6/5 stars based on 24 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "hellpoint: the thespian feast": {
-    "id": "steam-1243140",
-    "source": "steam",
-    "score": 55,
-    "percentRecommended": 50,
-    "tier": "Weak",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1243140",
-    "summary": "Based on Steam community player reviews (60% positive).",
+    "id": "gog-hellpoint_the_thespian_feast",
+    "source": "gog",
+    "score": 72,
+    "starRatingRaw": 3.6,
+    "tier": "Fair",
+    "numReviews": 24,
+    "url": "https://www.gog.com/en/game/hellpoint_the_thespian_feast",
+    "summary": "GOG player rating (3.6/5 stars based on 24 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "helping the hotties": {
     "id": "gog-helping_the_hotties",
@@ -15924,14 +15923,13 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "kingdom classic": {
-    "id": 1968,
-    "source": "opencritic",
+    "id": "mc-kingdom-2015",
+    "source": "metacritic",
     "score": 74,
     "tier": "Strong",
-    "numReviews": 35,
-    "percentRecommended": 60,
-    "url": "https://opencritic.com/game/1968/kingdom",
-    "summary": "A 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern retro pixel art aesthetic.",
+    "numReviews": 17,
+    "url": "https://www.metacritic.com/game/kingdom-2015/critic-reviews/",
+    "summary": "Kingdom is a 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern pixel art aesthetic. ",
     "isVerified": true,
     "isSynthetic": false
   },
@@ -15980,14 +15978,13 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "kingdom: classic": {
-    "id": 1968,
-    "source": "opencritic",
+    "id": "mc-kingdom-2015",
+    "source": "metacritic",
     "score": 74,
     "tier": "Strong",
-    "numReviews": 35,
-    "percentRecommended": 60,
-    "url": "https://opencritic.com/game/1968/kingdom",
-    "summary": "A 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern retro pixel art aesthetic.",
+    "numReviews": 17,
+    "url": "https://www.metacritic.com/game/kingdom-2015/critic-reviews/",
+    "summary": "Kingdom is a 2D sidescrolling strategy/resource management hybrid with a minimalist feel wrapped in a beautiful, modern pixel art aesthetic. ",
     "isVerified": true,
     "isSynthetic": false
   },
@@ -17525,16 +17522,12 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isVerified": true
   },
   "neverwinter nights diamond": {
-    "id": "mc-user-neverwinter-nights-diamond",
-    "source": "metacritic_user",
-    "score": 83,
-    "userScoreRaw": 8.3,
+    "source": "metacritic",
+    "score": 80,
     "tier": "Strong",
-    "numReviews": 12,
-    "url": "https://www.metacritic.com/game/neverwinter-nights-diamond/",
-    "summary": "Metacritic user score (8.3/10 based on 12 user reviews).",
-    "isVerified": false,
-    "isSynthetic": false
+    "numReviews": 32,
+    "url": "https://www.metacritic.com/game/neverwinter-nights-enhanced-edition/critic-reviews/",
+    "isVerified": true
   },
   "neverwinter nights enhanced edition": {
     "source": "metacritic",
@@ -17750,9 +17743,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 84,
     "percentRecommended": 86,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 2240,
     "url": "https://store.steampowered.com/app/15700",
-    "summary": "Based on Steam community player reviews (90% positive).",
+    "summary": "Based on Steam community player reviews (90% positive across 2,240 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -17770,9 +17763,9 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "score": 84,
     "percentRecommended": 86,
     "tier": "Mighty",
-    "numReviews": 50,
+    "numReviews": 2240,
     "url": "https://store.steampowered.com/app/15700",
-    "summary": "Based on Steam community player reviews (90% positive).",
+    "summary": "Based on Steam community player reviews (90% positive across 2,240 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -17949,26 +17942,28 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "overcooked gourmet edition": {
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=Overcooked%3A%20Gourmet%20Edition",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "id": "gog-overcooked_gourmet_edition",
+    "source": "gog",
+    "score": 90,
+    "starRatingRaw": 4.5,
+    "tier": "Mighty",
+    "numReviews": 210,
+    "url": "https://www.gog.com/en/game/overcooked_gourmet_edition",
+    "summary": "GOG player rating (4.5/5 stars based on 210 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "overcooked: gourmet edition": {
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=Overcooked%3A%20Gourmet%20Edition",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "id": "gog-overcooked_gourmet_edition",
+    "source": "gog",
+    "score": 90,
+    "starRatingRaw": 4.5,
+    "tier": "Mighty",
+    "numReviews": 210,
+    "url": "https://www.gog.com/en/game/overcooked_gourmet_edition",
+    "summary": "GOG player rating (4.5/5 stars based on 210 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "overcooked!": {
     "id": "mc-overcooked",
@@ -19255,26 +19250,26 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "rustler - grand theft horse": {
-    "id": "mc-user-rustler",
-    "source": "metacritic_user",
-    "score": 53,
-    "userScoreRaw": 5.3,
-    "tier": "Weak",
-    "numReviews": 14,
-    "url": "https://www.metacritic.com/game/rustler/",
-    "summary": "Metacritic user score (5.3/10 based on 14 user reviews).",
+    "id": "gog-rustler_grand_theft_horse",
+    "source": "gog",
+    "score": 66,
+    "starRatingRaw": 3.3,
+    "tier": "Fair",
+    "numReviews": 28,
+    "url": "https://www.gog.com/en/game/rustler_grand_theft_horse",
+    "summary": "GOG player rating (3.3/5 stars based on 28 ratings).",
     "isVerified": false,
     "isSynthetic": false
   },
   "rustler grand theft horse": {
-    "id": "mc-user-rustler",
-    "source": "metacritic_user",
-    "score": 53,
-    "userScoreRaw": 5.3,
-    "tier": "Weak",
-    "numReviews": 14,
-    "url": "https://www.metacritic.com/game/rustler/",
-    "summary": "Metacritic user score (5.3/10 based on 14 user reviews).",
+    "id": "gog-rustler_grand_theft_horse",
+    "source": "gog",
+    "score": 66,
+    "starRatingRaw": 3.3,
+    "tier": "Fair",
+    "numReviews": 28,
+    "url": "https://www.gog.com/en/game/rustler_grand_theft_horse",
+    "summary": "GOG player rating (3.3/5 stars based on 28 ratings).",
     "isVerified": false,
     "isSynthetic": false
   },
@@ -20065,28 +20060,28 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "siege of avalon anthology": {
-    "id": "steam-1558990",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
+    "id": "gog-siege_of_avalon_anthology",
+    "source": "gog",
+    "score": 82,
+    "starRatingRaw": 4.1,
     "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1558990",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "numReviews": 124,
+    "url": "https://www.gog.com/en/game/siege_of_avalon_anthology",
+    "summary": "GOG player rating (4.1/5 stars based on 124 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "siege of avalon: anthology": {
-    "id": "steam-1558990",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
+    "id": "gog-siege_of_avalon_anthology",
+    "source": "gog",
+    "score": 82,
+    "starRatingRaw": 4.1,
     "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/1558990",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "numReviews": 124,
+    "url": "https://www.gog.com/en/game/siege_of_avalon_anthology",
+    "summary": "GOG player rating (4.1/5 stars based on 124 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "sifu": {
     "id": "mc-sifu",
@@ -21672,26 +21667,28 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "the darkest tales - into the nightmare": {
-    "source": "steam",
-    "score": 55,
-    "percentRecommended": 50,
-    "tier": "Weak",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=The%20Darkest%20Tales%20-%20Into%20the%20Nightmare",
-    "summary": "Based on Steam community player reviews (60% positive).",
+    "id": "gog-the_darkest_tales_into_the_nightmare",
+    "source": "gog",
+    "score": 68,
+    "starRatingRaw": 3.4,
+    "tier": "Fair",
+    "numReviews": 33,
+    "url": "https://www.gog.com/en/game/the_darkest_tales_into_the_nightmare",
+    "summary": "GOG player rating (3.4/5 stars based on 33 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "the darkest tales into the nightmare": {
-    "source": "steam",
-    "score": 55,
-    "percentRecommended": 50,
-    "tier": "Weak",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=The%20Darkest%20Tales%20-%20Into%20the%20Nightmare",
-    "summary": "Based on Steam community player reviews (60% positive).",
+    "id": "gog-the_darkest_tales_into_the_nightmare",
+    "source": "gog",
+    "score": 68,
+    "starRatingRaw": 3.4,
+    "tier": "Fair",
+    "numReviews": 33,
+    "url": "https://www.gog.com/en/game/the_darkest_tales_into_the_nightmare",
+    "summary": "GOG player rating (3.4/5 stars based on 33 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "the darkside detective": {
     "id": "mc-the-darkside-detective",
@@ -21982,24 +21979,26 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isSynthetic": false
   },
   "the life and suffering of sir brante - chapter 1 & 2": {
+    "id": "steam-1460090",
     "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=The%20Life%20and%20Suffering%20of%20Sir%20Brante%20-%20Chapter%201%20%26%202",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "score": 89,
+    "percentRecommended": 93,
+    "tier": "Mighty",
+    "numReviews": 2039,
+    "url": "https://store.steampowered.com/app/1460090",
+    "summary": "Based on Steam community player reviews (96% positive across 2,039 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
   "the life and suffering of sir brante chapter 1 2": {
+    "id": "steam-1460090",
     "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/search/?term=The%20Life%20and%20Suffering%20of%20Sir%20Brante%20-%20Chapter%201%20%26%202",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "score": 89,
+    "percentRecommended": 93,
+    "tier": "Mighty",
+    "numReviews": 2039,
+    "url": "https://store.steampowered.com/app/1460090",
+    "summary": "Based on Steam community player reviews (96% positive across 2,039 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -22539,16 +22538,16 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isVerified": true
   },
   "thief 2 the metal age": {
-    "id": "steam-211740",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/211740",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "id": "gog-thief_2_the_metal_age",
+    "source": "gog",
+    "score": 98,
+    "starRatingRaw": 4.9,
+    "tier": "Mighty",
+    "numReviews": 1581,
+    "url": "https://www.gog.com/en/game/thief_2_the_metal_age",
+    "summary": "GOG player rating (4.9/5 stars based on 1,581 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "thief 3 deadly shadows": {
     "id": "mc-thief-deadly-shadows",
@@ -22605,16 +22604,16 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "isVerified": true
   },
   "thief™ 2: the metal age": {
-    "id": "steam-211740",
-    "source": "steam",
-    "score": 77,
-    "percentRecommended": 74,
-    "tier": "Strong",
-    "numReviews": 50,
-    "url": "https://store.steampowered.com/app/211740",
-    "summary": "Based on Steam community player reviews (80% positive).",
+    "id": "gog-thief_2_the_metal_age",
+    "source": "gog",
+    "score": 98,
+    "starRatingRaw": 4.9,
+    "tier": "Mighty",
+    "numReviews": 1581,
+    "url": "https://www.gog.com/en/game/thief_2_the_metal_age",
+    "summary": "GOG player rating (4.9/5 stars based on 1,581 ratings).",
     "isVerified": false,
-    "isSynthetic": true
+    "isSynthetic": false
   },
   "thief™ 3: deadly shadows": {
     "id": "mc-thief-deadly-shadows",
@@ -23668,7 +23667,7 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "tier": "Strong",
     "numReviews": 180,
     "url": "https://store.steampowered.com/app/2658030",
-    "summary": "Based on Steam community player reviews (76% positive).",
+    "summary": "Based on Steam community player reviews (76% positive across 180 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
@@ -23688,7 +23687,7 @@ export const KNOWN_CRITIC_SCORES: Record<string | number, CriticScoreData> = {
     "tier": "Strong",
     "numReviews": 180,
     "url": "https://store.steampowered.com/app/2658030",
-    "summary": "Based on Steam community player reviews (76% positive).",
+    "summary": "Based on Steam community player reviews (76% positive across 180 reviews).",
     "isVerified": false,
     "isSynthetic": true
   },
