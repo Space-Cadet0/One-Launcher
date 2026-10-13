@@ -4,7 +4,7 @@
  */
 
 export type CriticTier = 'Mighty' | 'Strong' | 'Fair' | 'Weak';
-export type CriticSource = 'opencritic' | 'metacritic' | 'metacritic_user' | 'steam' | 'gog' | 'epic';
+export type CriticSource = 'opencritic' | 'metacritic' | 'metacritic_user' | 'steam' | 'gog' | 'epic' | 'custom';
 
 export interface CriticScoreData {
   /** Optional provider ID (e.g. OpenCritic numeric ID 8450 or Metacritic/GOG slug) */

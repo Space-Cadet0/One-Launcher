@@ -31,6 +31,8 @@ export const MUTABILITY_TIERS = {
   TIER_4C_TRANSIENT_ERROR: 'transient_error' as MutabilityTier,
 } as const;
 
+export const MutabilityTier = MUTABILITY_TIERS;
+
 export const TIER_0_USER_OVERRIDE: MutabilityTier = 'override';
 export const TIER_1_IMMUTABLE: MutabilityTier = 'immutable';
 export const TIER_2_MATURE: MutabilityTier = 'mature';
@@ -376,8 +378,14 @@ export function loadStagedCache<T>(
     }
 
     let entry: StagedCacheEntry<T>;
-    if (typeof parsed.cachedAt === 'number' && typeof parsed.ttlMs === 'number') {
+    if (
+      typeof parsed.cachedAt === 'number' &&
+      (typeof parsed.ttlMs === 'number' || (parsed.tier === 'override' && (parsed.ttlMs === null || parsed.ttlMs === undefined)))
+    ) {
       entry = parsed as StagedCacheEntry<T>;
+      if (entry.tier === 'override') {
+        entry.ttlMs = Infinity;
+      }
     } else {
       // Legacy unversioned entry adapter
       const legacyData = parsed as T;

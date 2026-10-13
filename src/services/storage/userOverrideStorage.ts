@@ -41,6 +41,11 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
       ...override,
       updatedAt: override.updatedAt || new Date().toISOString(),
     };
+    if (override.reviewScoreOverride !== undefined) {
+      updatedOverride.reviewScoreOverride = override.reviewScoreOverride;
+    } else if (current[override.gameId]?.reviewScoreOverride !== undefined) {
+      updatedOverride.reviewScoreOverride = current[override.gameId].reviewScoreOverride;
+    }
     current[override.gameId] = updatedOverride;
 
     // Also index platform key if available (e.g., 'epic:boga' or 'gog:1837805079')
@@ -87,6 +92,7 @@ export function removeUserOverride(gameId: string): void {
   if (!gameId) return;
   try {
     const current = loadUserOverrides();
+    const existing = current[gameId];
     let deleted = false;
     if (current[gameId]) {
       delete current[gameId];
@@ -109,7 +115,7 @@ export function removeUserOverride(gameId: string): void {
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
         window.dispatchEvent(
-          new CustomEvent('antigravity:user-override-removed', { detail: { gameId } })
+          new CustomEvent('antigravity:user-override-removed', { detail: { gameId, oldOverride: existing } })
         );
       } catch {}
     }
@@ -252,6 +258,9 @@ export function applyUserOverrideToGame(
   }
   if (override.releaseDate !== undefined) {
     updated.releaseDate = override.releaseDate;
+  }
+  if (override.reviewScoreOverride !== undefined) {
+    updated.reviewScoreOverride = override.reviewScoreOverride;
   }
 
   return updated;

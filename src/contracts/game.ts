@@ -1,5 +1,6 @@
 import { StorefrontId } from './platform';
 import { SteamEnrichedMetadata, SteamReviewSummary } from './steam';
+import type { CriticScoreData } from './critic';
 
 export type AchievementDataSource =
   | 'live_cloud_api'
@@ -51,5 +52,6 @@ export interface CanonicalGame {
   tags: string[];
   reviewSummary?: SteamReviewSummary;
   enrichedMetadata?: SteamEnrichedMetadata;
+  reviewScoreOverride?: CriticScoreData | null;
   lastSyncedAt?: string;
 }

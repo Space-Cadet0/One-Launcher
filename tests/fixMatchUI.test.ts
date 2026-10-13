@@ -124,7 +124,8 @@ describe('Fix Match & Context Menu UI Components', () => {
     expect(openHtml).toContain('Fix Match &amp; Metadata');
     expect(openHtml).toContain('1. Match Discovery');
     expect(openHtml).toContain('2. Cover Art');
-    expect(openHtml).toContain('3. Review &amp; Apply');
+    expect(openHtml).toContain('3. Review Score &amp; Source');
+    expect(openHtml).toContain('4. Metadata &amp; Confirm');
     expect(openHtml).toContain('Game is not on Steam (IGDB/GOG only)');
   });
 

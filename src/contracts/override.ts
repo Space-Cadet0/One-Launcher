@@ -1,4 +1,4 @@
-import type { StorefrontReviewAnchor } from './critic';
+import type { StorefrontReviewAnchor, CriticScoreData } from './critic';
 
 export interface SearchMatchCandidate {
   id: string | number;
@@ -41,6 +41,7 @@ export interface ScrapedMetadataBundle {
   tags?: string[];
   releaseDate?: string;
   storefrontAnchor?: StorefrontReviewAnchor;
+  reviewScoreOverride?: CriticScoreData | null;
 }
 
 export interface UserGameOverride {
@@ -65,6 +66,7 @@ export interface UserGameOverride {
   tags?: string[];
   releaseDate?: string;
   storefrontAnchor?: StorefrontReviewAnchor;
+  reviewScoreOverride?: CriticScoreData | null;
   updatedAt: string;
 }
 

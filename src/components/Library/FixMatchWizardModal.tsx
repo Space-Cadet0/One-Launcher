@@ -7,6 +7,12 @@ import {
 } from '../../contracts/override';
 import { metadataScraperService } from '../../services/scraper/metadataScraperService';
 import {
+  reviewCandidateService,
+  ReviewCandidateOption,
+} from '../../services/scraper/reviewCandidateService';
+import { CriticScoreData, CriticSource } from '../../contracts/critic';
+import { calculateTier, getTierColor } from '../../services/critic/criticUtils';
+import {
   X,
   Search,
   Wand,
@@ -22,6 +28,11 @@ import {
   Calendar,
   Tag,
   Building,
+  Award,
+  ExternalLink,
+  EyeOff,
+  Edit3,
+  ShieldCheck,
 } from 'lucide-react';
 
 export interface FixMatchWizardModalProps {
@@ -31,9 +42,20 @@ export interface FixMatchWizardModalProps {
   onApplyOverride: (override: UserGameOverride) => void;
   onResetOverride?: (gameId: string) => void;
   existingOverride?: UserGameOverride;
+  initialStep?: WizardStep;
+  initialCandidate?: SearchMatchCandidate | null;
+  initialScrapedBundle?: ScrapedMetadataBundle | null;
+  initialReviewCandidates?: ReviewCandidateOption[];
+  initialSelectedReviewOptionId?: string;
+  initialSelectedReviewData?: CriticScoreData | null;
+  initialCustomScoreValue?: number | string;
+  initialCustomScoreSource?: CriticSource;
+  initialCustomScoreUrl?: string;
+  initialCustomScoreSummary?: string;
+  initialCustomScoreNumReviews?: number | string;
 }
 
-type WizardStep = 1 | 2 | 3;
+type WizardStep = 1 | 2 | 3 | 4;
 type SourceFilterTab = 'All' | 'Steam' | 'IGDB' | 'GOG' | 'Epic';
 
 /**
@@ -54,8 +76,19 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   onApplyOverride,
   onResetOverride,
   existingOverride,
+  initialStep,
+  initialCandidate,
+  initialScrapedBundle,
+  initialReviewCandidates,
+  initialSelectedReviewOptionId,
+  initialSelectedReviewData,
+  initialCustomScoreValue,
+  initialCustomScoreSource,
+  initialCustomScoreUrl,
+  initialCustomScoreSummary,
+  initialCustomScoreNumReviews,
 }) => {
-  const [step, setStep] = useState<WizardStep>(1);
+  const [step, setStep] = useState<WizardStep>(initialStep || 1);
   const [searchTerm, setSearchTerm] = useState('');
   const [sourceTab, setSourceTab] = useState<SourceFilterTab>('All');
   const [notOnSteamOnly, setNotOnSteamOnly] = useState(false);
@@ -63,30 +96,51 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   // Step 1: Candidate discovery state
   const [candidates, setCandidates] = useState<SearchMatchCandidate[]>([]);
   const [isLoadingCandidates, setIsLoadingCandidates] = useState(false);
-  const [selectedCandidate, setSelectedCandidate] = useState<SearchMatchCandidate | null>(null);
+  const [selectedCandidate, setSelectedCandidate] = useState<SearchMatchCandidate | null>(
+    initialCandidate || null
+  );
 
-  // Step 2 & 3: Scraped metadata bundle state
+  // Step 2 & 4: Scraped metadata bundle state
   const [isScrapingDetails, setIsScrapingDetails] = useState(false);
-  const [scrapedBundle, setScrapedBundle] = useState<ScrapedMetadataBundle | null>(null);
-  const [selectedCoverUrl, setSelectedCoverUrl] = useState<string>('');
-  const [selectedBlurb, setSelectedBlurb] = useState<string>('');
-  const [customTitle, setCustomTitle] = useState<string>('');
+  const [scrapedBundle, setScrapedBundle] = useState<ScrapedMetadataBundle | null>(
+    initialScrapedBundle || null
+  );
+  const [selectedCoverUrl, setSelectedCoverUrl] = useState<string>(
+    initialScrapedBundle?.capsuleImage || ''
+  );
+  const [selectedBlurb, setSelectedBlurb] = useState<string>(
+    initialScrapedBundle?.shortDescription || ''
+  );
+  const [customTitle, setCustomTitle] = useState<string>(
+    initialScrapedBundle?.title || game?.title || ''
+  );
 
-  // Reset wizard state whenever modal is opened with a new or existing game
-  useEffect(() => {
-    if (isOpen && game) {
-      setStep(1);
-      setSearchTerm(game.title);
-      setSourceTab('All');
-      setNotOnSteamOnly(false);
-      setSelectedCandidate(null);
-      setScrapedBundle(null);
-      setSelectedCoverUrl('');
-      setSelectedBlurb('');
-      setCustomTitle(game.title);
-      loadCandidates(game.title, 'All', false);
-    }
-  }, [isOpen, game]);
+  // Step 3: Review score & source candidate discovery state
+  const [reviewCandidates, setReviewCandidates] = useState<ReviewCandidateOption[]>(
+    initialReviewCandidates || []
+  );
+  const [isLoadingReviews, setIsLoadingReviews] = useState(false);
+  const [selectedReviewOptionId, setSelectedReviewOptionId] = useState<string>(
+    initialSelectedReviewOptionId || ''
+  );
+  const [selectedReviewData, setSelectedReviewData] = useState<CriticScoreData | null>(
+    initialSelectedReviewData || null
+  );
+
+  // Custom score input state
+  const [customScoreValue, setCustomScoreValue] = useState<number | string>(
+    initialCustomScoreValue ?? ''
+  );
+  const [customScoreSource, setCustomScoreSource] = useState<CriticSource>(
+    initialCustomScoreSource || 'custom'
+  );
+  const [customScoreUrl, setCustomScoreUrl] = useState<string>(initialCustomScoreUrl || '');
+  const [customScoreSummary, setCustomScoreSummary] = useState<string>(
+    initialCustomScoreSummary || ''
+  );
+  const [customScoreNumReviews, setCustomScoreNumReviews] = useState<number | string>(
+    initialCustomScoreNumReviews ?? ''
+  );
 
   // Load candidate matches from metadata scraper service
   const loadCandidates = useCallback(
@@ -111,6 +165,163 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     [game]
   );
 
+  // Load review score candidates from reviewCandidateService
+  const loadReviews = useCallback(
+    async (
+      targetGame: CanonicalGame,
+      targetCandidate: SearchMatchCandidate | null,
+      targetBundle: ScrapedMetadataBundle | null
+    ) => {
+      setIsLoadingReviews(true);
+      try {
+        const result = await reviewCandidateService.discoverReviews(
+          targetGame,
+          targetCandidate,
+          targetBundle
+        );
+        const discovered = result.candidates || [];
+        setReviewCandidates(discovered);
+
+        // Check if existing override has reviewScoreOverride
+        if (existingOverride && existingOverride.reviewScoreOverride !== undefined) {
+          if (existingOverride.reviewScoreOverride === null) {
+            setSelectedReviewOptionId('unrated');
+            setSelectedReviewData(null);
+            return;
+          }
+          const activeOpt = discovered.find((c) => c.id === 'active-override');
+          if (activeOpt) {
+            setSelectedReviewOptionId(activeOpt.id);
+            setSelectedReviewData({
+              id: activeOpt.id,
+              source: activeOpt.source,
+              score: activeOpt.score,
+              tier: activeOpt.tier,
+              url: activeOpt.url || '',
+              summary: activeOpt.summary,
+              numReviews: activeOpt.numReviews,
+              userScoreRaw: activeOpt.userScoreRaw,
+              starRatingRaw: activeOpt.starRatingRaw,
+              percentRecommended: activeOpt.percentRecommended,
+              isVerified: activeOpt.isVerified,
+              isSynthetic: activeOpt.isSynthetic,
+            });
+            return;
+          } else {
+            const ex = existingOverride.reviewScoreOverride;
+            setSelectedReviewOptionId('custom');
+            setCustomScoreValue(ex.score);
+            setCustomScoreSource(ex.source);
+            setCustomScoreUrl(ex.url || '');
+            setCustomScoreSummary(ex.summary || '');
+            setCustomScoreNumReviews(ex.numReviews ?? '');
+            setSelectedReviewData(ex);
+            return;
+          }
+        }
+
+        // Active override from candidates if game already had one
+        const activeCand = discovered.find((c) => c.id === 'active-override');
+        if (activeCand) {
+          setSelectedReviewOptionId(activeCand.id);
+          setSelectedReviewData({
+            id: activeCand.id,
+            source: activeCand.source,
+            score: activeCand.score,
+            tier: activeCand.tier,
+            url: activeCand.url || '',
+            summary: activeCand.summary,
+            numReviews: activeCand.numReviews,
+            userScoreRaw: activeCand.userScoreRaw,
+            starRatingRaw: activeCand.starRatingRaw,
+            percentRecommended: activeCand.percentRecommended,
+            isVerified: activeCand.isVerified,
+            isSynthetic: activeCand.isSynthetic,
+          });
+          return;
+        }
+
+        // Auto-select recommended candidate
+        const recommendedId = result.recommendedCandidateId;
+        const recommended =
+          (recommendedId ? discovered.find((c) => c.id === recommendedId) : null) ||
+          discovered.find((c) => c.isRecommended) ||
+          discovered[0];
+
+        if (recommended) {
+          setSelectedReviewOptionId(recommended.id);
+          setSelectedReviewData({
+            id: recommended.id,
+            source: recommended.source,
+            score: recommended.score,
+            tier: recommended.tier,
+            url: recommended.url || '',
+            summary: recommended.summary,
+            numReviews: recommended.numReviews,
+            userScoreRaw: recommended.userScoreRaw,
+            starRatingRaw: recommended.starRatingRaw,
+            percentRecommended: recommended.percentRecommended,
+            isVerified: recommended.isVerified,
+            isSynthetic: recommended.isSynthetic,
+          });
+        } else {
+          setSelectedReviewOptionId('unrated');
+          setSelectedReviewData(null);
+        }
+      } catch (err) {
+        console.error('Failed to discover review candidates:', err);
+        setReviewCandidates([]);
+        setSelectedReviewOptionId('unrated');
+        setSelectedReviewData(null);
+      } finally {
+        setIsLoadingReviews(false);
+      }
+    },
+    [existingOverride]
+  );
+
+  // Reset wizard state whenever modal is opened with a new or existing game
+  useEffect(() => {
+    if (isOpen && game) {
+      setStep(initialStep || 1);
+      setSearchTerm(game.title);
+      setSourceTab('All');
+      setNotOnSteamOnly(false);
+      setSelectedCandidate(initialCandidate || null);
+      setScrapedBundle(initialScrapedBundle || null);
+      setSelectedCoverUrl(initialScrapedBundle?.capsuleImage || '');
+      setSelectedBlurb(initialScrapedBundle?.shortDescription || '');
+      setCustomTitle(initialScrapedBundle?.title || game.title);
+      setReviewCandidates(initialReviewCandidates || []);
+      setIsLoadingReviews(false);
+      setSelectedReviewOptionId(initialSelectedReviewOptionId || '');
+      setSelectedReviewData(initialSelectedReviewData || null);
+      setCustomScoreValue(initialCustomScoreValue ?? '');
+      setCustomScoreSource(initialCustomScoreSource || 'custom');
+      setCustomScoreUrl(initialCustomScoreUrl || '');
+      setCustomScoreSummary(initialCustomScoreSummary || '');
+      setCustomScoreNumReviews(initialCustomScoreNumReviews ?? '');
+      if (!initialCandidate) {
+        loadCandidates(game.title, 'All', false);
+      }
+    }
+  }, [
+    isOpen,
+    game,
+    initialStep,
+    initialCandidate,
+    initialScrapedBundle,
+    initialReviewCandidates,
+    initialSelectedReviewOptionId,
+    initialSelectedReviewData,
+    initialCustomScoreValue,
+    initialCustomScoreSource,
+    initialCustomScoreUrl,
+    initialCustomScoreSummary,
+    initialCustomScoreNumReviews,
+    loadCandidates,
+  ]);
+
   // Trigger search on query change or tab switch
   const handleSearchSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -133,6 +344,9 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   // Select candidate -> proceed to Step 2 & scrape details
   const handleSelectCandidate = async (candidate: SearchMatchCandidate) => {
     setSelectedCandidate(candidate);
+    setReviewCandidates([]);
+    setSelectedReviewOptionId('');
+    setSelectedReviewData(null);
     setStep(2);
     setIsScrapingDetails(true);
     try {
@@ -141,10 +355,131 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       setSelectedCoverUrl(bundle.capsuleImage);
       setSelectedBlurb(bundle.shortDescription || '');
       setCustomTitle(bundle.title);
+      // Pre-warm reviews in background so Step 3 is ready immediately
+      if (game) {
+        loadReviews(game, candidate, bundle);
+      }
     } catch (err) {
       console.error('Failed to scrape candidate details:', err);
     } finally {
       setIsScrapingDetails(false);
+    }
+  };
+
+  // Proceed to Step 3 and trigger discovery if not yet loaded
+  const handleGoToReviewStep = () => {
+    setStep(3);
+    if (game && reviewCandidates.length === 0 && !isLoadingReviews) {
+      loadReviews(game, selectedCandidate, scrapedBundle);
+    }
+  };
+
+  const handleSelectCandidateOption = (cand: ReviewCandidateOption) => {
+    setSelectedReviewOptionId(cand.id);
+    setSelectedReviewData({
+      id: cand.id,
+      source: cand.source,
+      score: cand.score,
+      tier: cand.tier,
+      url: cand.url || '',
+      summary: cand.summary,
+      numReviews: cand.numReviews,
+      userScoreRaw: cand.userScoreRaw,
+      starRatingRaw: cand.starRatingRaw,
+      percentRecommended: cand.percentRecommended,
+      isVerified: cand.isVerified,
+      isSynthetic: cand.isSynthetic,
+    });
+  };
+
+  const handleSelectUnrated = () => {
+    setSelectedReviewOptionId('unrated');
+    setSelectedReviewData(null);
+  };
+
+  const updateCustomReviewData = (
+    val: string | number,
+    src: CriticSource,
+    url: string,
+    summary: string,
+    numReviews: string | number
+  ) => {
+    const rawVal = typeof val === 'string' ? val.trim() : String(val);
+    const parsedScore = parseInt(rawVal, 10);
+    if (!isNaN(parsedScore) && parsedScore >= 0 && parsedScore <= 100) {
+      const tier = calculateTier(parsedScore);
+      const parsedReviews =
+        typeof numReviews === 'string' ? parseInt(numReviews.trim(), 10) : numReviews;
+      const count = !isNaN(parsedReviews) && parsedReviews > 0 ? parsedReviews : undefined;
+      setSelectedReviewData({
+        source: src,
+        score: parsedScore,
+        tier,
+        url: url.trim(),
+        summary: summary.trim() || undefined,
+        numReviews: count,
+        isVerified: src === 'metacritic' || src === 'opencritic',
+        isSynthetic: src === 'steam',
+      });
+    } else {
+      setSelectedReviewData(null);
+    }
+  };
+
+  const handleSelectCustomCard = () => {
+    setSelectedReviewOptionId('custom');
+    if (customScoreValue === '' && selectedReviewData) {
+      setCustomScoreValue(selectedReviewData.score);
+      setCustomScoreSource(selectedReviewData.source);
+      setCustomScoreUrl(selectedReviewData.url || '');
+      setCustomScoreSummary(selectedReviewData.summary || '');
+      setCustomScoreNumReviews(selectedReviewData.numReviews ?? '');
+    } else {
+      updateCustomReviewData(
+        customScoreValue,
+        customScoreSource,
+        customScoreUrl,
+        customScoreSummary,
+        customScoreNumReviews
+      );
+    }
+  };
+
+  const handleCustomScoreChange = (val: string) => {
+    setCustomScoreValue(val);
+    updateCustomReviewData(val, customScoreSource, customScoreUrl, customScoreSummary, customScoreNumReviews);
+  };
+
+  const handleCustomSourceChange = (src: CriticSource) => {
+    setCustomScoreSource(src);
+    updateCustomReviewData(customScoreValue, src, customScoreUrl, customScoreSummary, customScoreNumReviews);
+  };
+
+  const handleCustomUrlChange = (url: string) => {
+    setCustomScoreUrl(url);
+    updateCustomReviewData(customScoreValue, customScoreSource, url, customScoreSummary, customScoreNumReviews);
+  };
+
+  const handleCustomSummaryChange = (summary: string) => {
+    setCustomScoreSummary(summary);
+    updateCustomReviewData(customScoreValue, customScoreSource, customScoreUrl, summary, customScoreNumReviews);
+  };
+
+  const handleCustomReviewsChange = (reviews: string) => {
+    setCustomScoreNumReviews(reviews);
+    updateCustomReviewData(customScoreValue, customScoreSource, customScoreUrl, customScoreSummary, reviews);
+  };
+
+  const handleOpenExternal = (url?: string, e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+    if (!url) return;
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.openExternal) {
+      (window as any).electronAPI.openExternal(url);
+    } else if (typeof window !== 'undefined') {
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
   };
 
@@ -160,7 +495,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Step 3: Handle final apply override
+  // Step 4: Handle final apply override
   const handleApply = () => {
     if (!game || !scrapedBundle) return;
 
@@ -189,6 +524,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       tags: scrapedBundle.tags,
       releaseDate: scrapedBundle.releaseDate,
       storefrontAnchor: scrapedBundle.storefrontAnchor,
+      reviewScoreOverride: selectedReviewData,
       updatedAt: new Date().toISOString(),
     };
 
@@ -243,7 +579,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
           </button>
         </div>
 
-        {/* 3-Step Wizard Navigation Stepper */}
+        {/* 4-Step Wizard Navigation Stepper */}
         <div className="px-6 py-3 border-b border-[#2a475e]/50 bg-[#16202d] flex items-center justify-between text-xs">
           <div className="flex items-center gap-2 flex-1">
             {/* Step 1 Pill */}
@@ -284,10 +620,29 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             {/* Step 3 Pill */}
             <button
               type="button"
-              onClick={() => scrapedBundle && setStep(3)}
-              disabled={!scrapedBundle}
+              onClick={() => selectedCandidate && handleGoToReviewStep()}
+              disabled={!selectedCandidate}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-md font-semibold transition-all ${
                 step === 3
+                  ? 'bg-[#66c0f4] text-slate-950 shadow'
+                  : selectedCandidate
+                  ? 'text-slate-400 hover:text-white hover:bg-[#1b2838]'
+                  : 'text-slate-600 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <Award className="w-3.5 h-3.5" />
+              <span>3. Review Score &amp; Source</span>
+            </button>
+
+            <ChevronRight className="w-4 h-4 text-slate-600 shrink-0" />
+
+            {/* Step 4 Pill */}
+            <button
+              type="button"
+              onClick={() => scrapedBundle && setStep(4)}
+              disabled={!scrapedBundle}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-md font-semibold transition-all ${
+                step === 4
                   ? 'bg-[#66c0f4] text-slate-950 shadow'
                   : scrapedBundle
                   ? 'text-slate-400 hover:text-white hover:bg-[#1b2838]'
@@ -295,12 +650,12 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               }`}
             >
               <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>3. Review & Apply</span>
+              <span>4. Metadata &amp; Confirm</span>
             </button>
           </div>
 
           <div className="text-[11px] text-slate-400 font-mono">
-            Step {step} of 3
+            {`Step ${step} of 4`}
           </div>
         </div>
 
@@ -632,17 +987,397 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             </div>
           )}
 
-          {/* ================= STEP 3: REVIEW & CONFIRM ================= */}
-          {step === 3 && scrapedBundle && (
+          {/* ================= STEP 3: REVIEW SCORE & SOURCE ================= */}
+          {step === 3 && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between border-b border-[#2a475e]/60 pb-3">
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Award className="w-4 h-4 text-[#66c0f4]" />
+                    <span>Select Review Score &amp; Source</span>
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Select verified press review consensus, player community rating, or enter a custom score
+                  </p>
+                </div>
+
+                {selectedCandidate && (
+                  <div className="flex items-center gap-2 bg-[#16202d] px-3 py-1 rounded-md border border-[#2a475e]">
+                    <span className="text-[10px] uppercase font-bold text-slate-400">Selected Candidate:</span>
+                    <span className="text-xs font-semibold text-white truncate max-w-[200px]">{selectedCandidate.title}</span>
+                  </div>
+                )}
+              </div>
+
+              {isLoadingReviews ? (
+                <div className="py-20 flex flex-col items-center justify-center gap-3 text-slate-400">
+                  <Loader2 className="w-8 h-8 animate-spin text-[#66c0f4]" />
+                  <span className="text-xs font-medium">
+                    Discovering reviews from Metacritic, OpenCritic, Steam &amp; storefront anchors...
+                  </span>
+                </div>
+              ) : (
+                <div className="space-y-3 max-h-[52vh] overflow-y-auto pr-1 custom-scrollbar">
+                  {/* Notice if no candidates discovered */}
+                  {reviewCandidates.length === 0 && (
+                    <div className="p-3 rounded-lg bg-[#16202d] border border-dashed border-[#2a475e] text-center text-xs text-slate-400">
+                      No external review scores were discovered automatically for this title. You can specify a manual score or keep it unrated below.
+                    </div>
+                  )}
+
+                  {/* Discovered Candidates */}
+                  {reviewCandidates.map((cand) => {
+                    const isSelected = selectedReviewOptionId === cand.id;
+                    const colors = getTierColor(cand.tier);
+
+                    let sourceBadgeColor = 'bg-yellow-950/80 text-yellow-300 border-yellow-500/50';
+                    if (cand.source === 'opencritic') {
+                      sourceBadgeColor = 'bg-purple-950/80 text-purple-300 border-purple-500/50';
+                    } else if (cand.source === 'steam') {
+                      sourceBadgeColor = 'bg-sky-950/80 text-sky-300 border-sky-500/50';
+                    } else if (cand.source === 'gog') {
+                      sourceBadgeColor = 'bg-indigo-950/80 text-indigo-300 border-indigo-500/50';
+                    } else if (cand.source === 'epic') {
+                      sourceBadgeColor = 'bg-zinc-800 text-zinc-200 border-zinc-600';
+                    }
+
+                    return (
+                      <div
+                        key={cand.id}
+                        onClick={() => handleSelectCandidateOption(cand)}
+                        className={`p-3.5 rounded-lg border cursor-pointer transition-all duration-150 flex items-start gap-3.5 relative ${
+                          isSelected
+                            ? 'bg-[#1b2838] border-[#66c0f4] shadow-lg shadow-[#66c0f4]/15 ring-1 ring-[#66c0f4]/50'
+                            : 'bg-[#16202d] border-[#2a475e]/80 hover:border-[#66c0f4]/60 hover:bg-[#1b2838]/80'
+                        }`}
+                      >
+                        {/* Radio selection ring */}
+                        <div
+                          className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 mt-1 transition-all ${
+                            isSelected
+                              ? 'border-[#66c0f4] bg-[#66c0f4]'
+                              : 'border-slate-500 bg-transparent'
+                          }`}
+                        >
+                          {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />}
+                        </div>
+
+                        {/* Tier Score Pill */}
+                        <div
+                          className={`flex items-center justify-center px-3 py-1.5 rounded font-black text-sm text-white ${colors.scoreBg} shadow-sm shrink-0 min-w-[42px] mt-0.5`}
+                        >
+                          {cand.score}
+                        </div>
+
+                        {/* Details */}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap mb-1">
+                            {/* Source Pill */}
+                            <span
+                              className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded border ${sourceBadgeColor}`}
+                            >
+                              {cand.source.replace('_', ' ')}
+                            </span>
+
+                            {/* Source Label */}
+                            <span className="text-xs font-bold text-white">
+                              {cand.sourceLabel}
+                            </span>
+
+                            {/* Tier Badge */}
+                            <span className={`text-[11px] font-bold ${colors.accentText}`}>
+                              {cand.tier}
+                            </span>
+
+                            {/* Recommended / Ground Truth Badge */}
+                            {(cand.isRecommended || cand.groundTruthSource) && (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-300 bg-emerald-950/70 border border-emerald-500/40 px-2 py-0.5 rounded shadow-sm">
+                                <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                                <span>{cand.groundTruthSource || 'Recommended'}</span>
+                              </span>
+                            )}
+
+                            {/* Badge text (if distinct) */}
+                            {cand.badgeText && !cand.isRecommended && !cand.groundTruthSource && (
+                              <span className="text-[10px] text-slate-400 bg-[#131c27] px-1.5 py-0.5 rounded border border-[#2a475e]/60">
+                                {cand.badgeText}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Extra info row: review count, percent recommended, user score */}
+                          <div className="flex items-center gap-3 text-[11px] text-slate-400 flex-wrap">
+                            {cand.numReviews != null && (
+                              <span>{`${cand.numReviews.toLocaleString()} reviews`}</span>
+                            )}
+                            {cand.percentRecommended != null && (
+                              <span>{`• ${cand.percentRecommended}% recommended`}</span>
+                            )}
+                            {cand.userScoreRaw != null && (
+                              <span>{`• User Score: ${cand.userScoreRaw}/10`}</span>
+                            )}
+                            {cand.starRatingRaw != null && (
+                              <span>{`• Rating: ${cand.starRatingRaw}/5`}</span>
+                            )}
+                            {cand.url && (
+                              <button
+                                type="button"
+                                onClick={(e) => handleOpenExternal(cand.url, e)}
+                                className="inline-flex items-center gap-1 text-[11px] text-[#66c0f4] hover:text-white hover:underline transition-colors ml-auto"
+                                title="Open review page in browser"
+                              >
+                                <span>Source</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+
+                          {/* Summary blurb */}
+                          {cand.summary && (
+                            <p className="text-xs text-slate-300/90 mt-1.5 line-clamp-2 leading-relaxed italic">
+                              "{cand.summary}"
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {/* Manual / Custom Score Card */}
+                  {(() => {
+                    const isCustomSelected = selectedReviewOptionId === 'custom';
+                    const parsedScore = parseInt(String(customScoreValue), 10);
+                    const isValidScore = !isNaN(parsedScore) && parsedScore >= 0 && parsedScore <= 100;
+                    const liveTier = isValidScore ? calculateTier(parsedScore) : null;
+                    const liveColors = liveTier ? getTierColor(liveTier) : null;
+
+                    return (
+                      <div
+                        onClick={handleSelectCustomCard}
+                        className={`p-3.5 rounded-lg border transition-all duration-150 flex flex-col gap-3 cursor-pointer ${
+                          isCustomSelected
+                            ? 'bg-[#1b2838] border-[#66c0f4] shadow-lg shadow-[#66c0f4]/15 ring-1 ring-[#66c0f4]/50'
+                            : 'bg-[#16202d] border-[#2a475e]/80 hover:border-[#66c0f4]/60 hover:bg-[#1b2838]/80'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3">
+                            <div
+                              className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 transition-all ${
+                                isCustomSelected
+                                  ? 'border-[#66c0f4] bg-[#66c0f4]'
+                                  : 'border-slate-500 bg-transparent'
+                              }`}
+                            >
+                              {isCustomSelected && <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />}
+                            </div>
+
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold text-white">Manual / Custom Score</span>
+                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-950/70 border border-amber-500/40 text-amber-300">
+                                  Custom
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-400 mt-0.5">
+                                Specify your own custom score, rating source, review count, and blurb
+                              </p>
+                            </div>
+                          </div>
+
+                          {/* Live Tier Preview in Header if valid */}
+                          {isValidScore && liveTier && liveColors && (
+                            <div className="flex items-center gap-2 shrink-0">
+                              <div
+                                className={`flex items-center justify-center px-2.5 py-1 rounded font-black text-xs text-white ${liveColors.scoreBg} shadow-sm`}
+                              >
+                                {parsedScore}
+                              </div>
+                              <span className={`text-xs font-bold ${liveColors.accentText}`}>
+                                {liveTier}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Inline Form - visible when selected */}
+                        {isCustomSelected && (
+                          <div
+                            className="mt-2 pt-3 border-t border-[#2a475e]/70 space-y-3 cursor-default"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {/* Score Input with Live Tier Badge */}
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                                  Score (0 - 100) <span className="text-rose-400">*</span>
+                                </label>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max="100"
+                                    value={customScoreValue}
+                                    onChange={(e) => handleCustomScoreChange(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') e.preventDefault();
+                                    }}
+                                    placeholder="e.g. 88"
+                                    className="w-24 px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-sm text-white font-mono focus:outline-none focus:border-[#66c0f4]"
+                                  />
+                                  {isValidScore && liveTier && liveColors ? (
+                                    <div
+                                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-bold text-white ${liveColors.scoreBg} shadow-sm`}
+                                    >
+                                      <span>{liveTier}</span>
+                                    </div>
+                                  ) : (
+                                    <span className="text-[11px] text-slate-500 font-mono">
+                                      Enter 0-100
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Source Selector Dropdown */}
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                                  Rating Source
+                                </label>
+                                <select
+                                  value={customScoreSource}
+                                  onChange={(e) =>
+                                    handleCustomSourceChange(e.target.value as CriticSource)
+                                  }
+                                  className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white focus:outline-none focus:border-[#66c0f4]"
+                                >
+                                  <option value="metacritic">Metacritic</option>
+                                  <option value="opencritic">OpenCritic</option>
+                                  <option value="steam">Steam</option>
+                                  <option value="gog">GOG</option>
+                                  <option value="epic">Epic Games</option>
+                                  <option value="custom">Custom / Other</option>
+                                </select>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {/* Optional Number of Reviews */}
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                                  Number of Reviews (Optional)
+                                </label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={customScoreNumReviews}
+                                  onChange={(e) => handleCustomReviewsChange(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') e.preventDefault();
+                                  }}
+                                  placeholder="e.g. 120"
+                                  className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white font-mono focus:outline-none focus:border-[#66c0f4]"
+                                />
+                              </div>
+
+                              {/* Optional Canonical URL */}
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                                  Canonical URL (Optional)
+                                </label>
+                                <input
+                                  type="url"
+                                  value={customScoreUrl}
+                                  onChange={(e) => handleCustomUrlChange(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') e.preventDefault();
+                                  }}
+                                  placeholder="https://..."
+                                  className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white focus:outline-none focus:border-[#66c0f4]"
+                                />
+                              </div>
+                            </div>
+
+                            {/* Optional Summary Blurb */}
+                            <div>
+                              <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                                Summary Consensus / Blurb (Optional)
+                              </label>
+                              <input
+                                type="text"
+                                value={customScoreSummary}
+                                onChange={(e) => handleCustomSummaryChange(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') e.preventDefault();
+                                }}
+                                placeholder="e.g. Universal acclaim based on critic reviews."
+                                className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white focus:outline-none focus:border-[#66c0f4]"
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Unrated / Hide Review Score Card */}
+                  {(() => {
+                    const isUnratedSelected = selectedReviewOptionId === 'unrated';
+                    return (
+                      <div
+                        onClick={handleSelectUnrated}
+                        className={`p-3.5 rounded-lg border transition-all duration-150 flex items-center justify-between gap-3 cursor-pointer ${
+                          isUnratedSelected
+                            ? 'bg-[#1b2838] border-[#66c0f4] shadow-lg shadow-[#66c0f4]/15 ring-1 ring-[#66c0f4]/50'
+                            : 'bg-[#16202d] border-[#2a475e]/80 hover:border-[#66c0f4]/60 hover:bg-[#1b2838]/80'
+                        }`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <div
+                            className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 transition-all ${
+                              isUnratedSelected
+                                ? 'border-[#66c0f4] bg-[#66c0f4]'
+                                : 'border-slate-500 bg-transparent'
+                            }`}
+                          >
+                            {isUnratedSelected && <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <EyeOff className="w-4 h-4 text-slate-400" />
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold text-white">Unrated / Hide Review Score</span>
+                              </div>
+                              <p className="text-[11px] text-slate-400 mt-0.5">
+                                Suppress review score pill and critic badge for this game in your library
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+
+                        <span className="text-[10px] text-slate-500 uppercase font-mono px-2 py-0.5 rounded border border-[#2a475e]">
+                          No Score
+                        </span>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ================= STEP 4: REVIEW & CONFIRM ================= */}
+          {step === 4 && scrapedBundle && (
             <div className="space-y-4">
               <div className="flex items-center justify-between border-b border-[#2a475e]/60 pb-3">
                 <div>
                   <h3 className="text-sm font-bold text-white flex items-center gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>Review & Confirm Game Metadata Override</span>
+                    <span>Review &amp; Confirm Game Metadata Override</span>
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Review scraped metadata, select your preferred blurb synopsis, and apply to catalog
+                    Review scraped metadata, review score override, select your preferred blurb synopsis, and apply to catalog
                   </p>
                 </div>
 
@@ -694,6 +1429,68 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                       onChange={(e) => setCustomTitle(e.target.value)}
                       className="w-full px-3 py-1.5 rounded bg-[#16202d] border border-[#2a475e] text-sm text-white font-medium focus:outline-none focus:border-[#66c0f4]"
                     />
+                  </div>
+
+                  {/* Dedicated Review Score Badge Preview */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1">
+                      Review Score &amp; Source Override
+                    </label>
+                    <div className="p-3 rounded-lg bg-[#16202d] border border-[#2a475e]/80 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        {selectedReviewData ? (
+                          <>
+                            {(() => {
+                              const colors = getTierColor(selectedReviewData.tier);
+                              return (
+                                <div
+                                  className={`flex items-center justify-center px-2.5 py-1 rounded font-black text-sm text-white ${colors.scoreBg} shadow-sm shrink-0 min-w-[36px]`}
+                                >
+                                  {selectedReviewData.score}
+                                </div>
+                              );
+                            })()}
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-bold text-white">
+                                  {selectedReviewData.tier}
+                                </span>
+                                <span className="text-[11px] text-slate-300 capitalize font-medium">
+                                  {`• ${selectedReviewData.source.replace('_', ' ')}`}
+                                </span>
+                                {selectedReviewData.numReviews ? (
+                                  <span className="text-[11px] text-slate-400">
+                                    {`(${selectedReviewData.numReviews.toLocaleString()} reviews)`}
+                                  </span>
+                                ) : null}
+                              </div>
+                              {selectedReviewData.summary && (
+                                <p className="text-[11px] text-slate-400 truncate max-w-md mt-0.5">
+                                  {selectedReviewData.summary}
+                                </p>
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          <div className="flex items-center gap-2 text-slate-400 text-xs py-1">
+                            <EyeOff className="w-4 h-4 text-slate-500 shrink-0" />
+                            <span className="font-medium text-slate-300">
+                              Unrated (Review badge hidden)
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setStep(3)}
+                        className="px-2.5 py-1.5 rounded bg-[#1b2838] border border-[#2a475e] text-xs text-[#66c0f4] hover:text-white hover:border-[#66c0f4] transition-colors flex items-center gap-1.5 shrink-0 font-medium cursor-pointer"
+                        title="Navigate to Step 3 to change review score"
+                      >
+                        <Edit3 className="w-3.5 h-3.5" />
+                        <span>Edit</span>
+                      </button>
+                    </div>
                   </div>
 
                   {/* Badges / Meta row */}
@@ -839,11 +1636,11 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             {step === 2 && (
               <button
                 type="button"
-                disabled={!selectedCoverUrl}
-                onClick={() => setStep(3)}
+                disabled={!selectedCoverUrl || isScrapingDetails}
+                onClick={handleGoToReviewStep}
                 className="px-4 py-2 rounded-md bg-[#66c0f4] text-slate-950 font-bold hover:brightness-110 transition-all text-xs flex items-center gap-1.5 shadow cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <span>Next: Review Metadata</span>
+                <span>Next: Review Score &amp; Source</span>
                 <ChevronRight className="w-3.5 h-3.5" />
               </button>
             )}
@@ -851,11 +1648,22 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             {step === 3 && (
               <button
                 type="button"
+                onClick={() => setStep(4)}
+                className="px-4 py-2 rounded-md bg-[#66c0f4] text-slate-950 font-bold hover:brightness-110 transition-all text-xs flex items-center gap-1.5 shadow cursor-pointer"
+              >
+                <span>Next: Metadata &amp; Confirm</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            )}
+
+            {step === 4 && (
+              <button
+                type="button"
                 onClick={handleApply}
                 className="px-4 py-2 rounded-md bg-[#66c0f4] text-slate-950 font-bold hover:brightness-110 transition-all text-xs flex items-center gap-2 shadow-lg shadow-[#66c0f4]/20 cursor-pointer"
               >
                 <Sparkles className="w-4 h-4 fill-slate-950" />
-                <span>Apply Match & Scrape Data</span>
+                <span>Apply Match &amp; Scrape Data</span>
               </button>
             )}
           </div>

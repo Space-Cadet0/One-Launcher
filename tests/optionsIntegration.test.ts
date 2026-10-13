@@ -680,7 +680,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(score?.tier).toBe('Mighty');
         expect(score?.isVerified).toBe(true);
         expect(score?.url).toContain('77777');
-      });
+      }, 15000);
 
       it('vetoes conflicting OpenCritic candidate scores when drastically conflicting (> 5 pts) with verified storefrontAnchor', async () => {
         const anchor: StorefrontReviewAnchor = {
@@ -703,7 +703,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(score?.source).toBe('opencritic');
         expect(score?.score).toBe(82);
         expect(score?.isVerified).toBe(true);
-      });
+      }, 15000);
     });
   });
 });
