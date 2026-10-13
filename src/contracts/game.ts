@@ -54,4 +54,8 @@ export interface CanonicalGame {
   enrichedMetadata?: SteamEnrichedMetadata;
   reviewScoreOverride?: CriticScoreData | null;
   lastSyncedAt?: string;
+  matchConfidence?: number;
+  needsMatchReview?: boolean;
+  isVerifiedEntitlement?: boolean;
 }
+

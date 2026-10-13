@@ -25,6 +25,7 @@ import { metacriticResolver, isTitleCompatible } from './metacriticResolver';
 import { steamReviewResolver } from './steamReviewResolver';
 import { storefrontStarResolver } from './storefrontStarResolver';
 import { storefrontReviewHarvester } from './storefrontReviewHarvester';
+import { requestScheduler, Priority } from '../network/requestScheduler';
 
 // Re-export master dataset, utilities and exclusions for consumers and tests
 export {
@@ -840,7 +841,12 @@ class CriticScoreService {
             Referer: 'https://opencritic.com/',
           };
 
-          const searchRes = await fetch(searchUrl, { headers });
+          const searchRes = await requestScheduler.schedule(
+            searchUrl,
+            () => fetch(searchUrl, { headers }),
+            Priority.P1_VIEWPORT,
+            'api.opencritic.com'
+          );
           if (searchRes.ok) {
             const candidates: Array<{ id: number; name: string; dist?: number }> = await searchRes.json();
             if (Array.isArray(candidates) && candidates.length > 0) {
@@ -857,7 +863,10 @@ class CriticScoreService {
               if (!best) {
                 for (const c of candidates) {
                   if (typeof c.dist === 'number' && c.dist <= 0.35) {
-                    if (!isSequelMismatch(cleanTitle || title, c.name)) {
+                    if (
+                      !isSequelMismatch(cleanTitle || title, c.name) &&
+                      isTitleCompatible(cleanTitle || title, c.name)
+                    ) {
                       best = c;
                       break;
                     }
@@ -866,10 +875,39 @@ class CriticScoreService {
               }
 
               if (best) {
-                const detailsRes = await fetch(`${baseUrl}/api/game/${best.id}`, { headers });
+                const detailsUrl = `${baseUrl}/api/game/${best.id}`;
+                const detailsRes = await requestScheduler.schedule(
+                  detailsUrl,
+                  () => fetch(detailsUrl, { headers }),
+                  Priority.P1_VIEWPORT,
+                  'api.opencritic.com'
+                );
                 if (detailsRes.ok) {
                   const data = await detailsRes.json();
-                  if (data && typeof data.topCriticScore === 'number' && data.topCriticScore > 0) {
+                  const candidateTitle = data?.name || best.name;
+                  const titleCompatible = isTitleCompatible(cleanTitle || title, candidateTitle);
+
+                  // Release Year Reboot Guard
+                  let yearRejected = false;
+                  if (year && data?.firstReleaseDate) {
+                    const yrMatch = String(data.firstReleaseDate).match(/\b(19\d\d|20\d\d)\b/);
+                    const ocYear = yrMatch ? parseInt(yrMatch[1], 10) : null;
+                    const isRemaster =
+                      /\b(remastered|remaster|definitive|enhanced|anniversary|complete|goty|director'?s cut|redux)\b/i.test(
+                        title
+                      );
+                    if (ocYear && Math.abs(Number(year) - ocYear) >= 4 && !isRemaster) {
+                      yearRejected = true;
+                    }
+                  }
+
+                  if (
+                    data &&
+                    titleCompatible &&
+                    !yearRejected &&
+                    typeof data.topCriticScore === 'number' &&
+                    data.topCriticScore > 0
+                  ) {
                     const apiScore = Math.round(data.topCriticScore);
 
                     // Rule 4: Corroborate OpenCritic live API candidate with storefrontAnchor.openCriticScore
@@ -886,7 +924,7 @@ class CriticScoreService {
                           ? Math.round(data.percentRecommended)
                           : undefined;
                       const tier = (data.tier as CriticTier) || calculateTier(score, percentRecommended);
-                      const slug = (data.name || best.name)
+                      const slug = candidateTitle
                         .toLowerCase()
                         .replace(/[^a-z0-9]+/g, '-')
                         .replace(/^-|-$/g, '');
@@ -941,9 +979,30 @@ class CriticScoreService {
         }
 
         // ==========================================
-        // TIER 3: Metacritic User Score Resolution
+        // TIER 3 & 4: Metacritic User Score & Steam Live Community Reviews
+        // Sample-Size Weighting: High-sample verified Steam consensus beats tiny (<25) Metacritic user ratings
         // ==========================================
         if (mcBundle?.user && mcBundle.user.score > 0) {
+          const mcUserCount = mcBundle.user.numReviews || 0;
+          if (mcUserCount >= 25 || !steamAppId) {
+            broadcastUpdate(mcBundle.user);
+            return mcBundle.user;
+          }
+
+          try {
+            const steamResult = await steamReviewResolver.resolveScore(title, steamAppId);
+            if (
+              steamResult &&
+              steamResult.score > 0 &&
+              (steamResult.numReviews || 0) >= Math.max(100, mcUserCount * 5)
+            ) {
+              broadcastUpdate(steamResult);
+              return steamResult;
+            }
+          } catch (steamErr: any) {
+            console.warn(`[CriticScoreService] Steam live reviews check warning for "${title}":`, steamErr?.message);
+          }
+
           broadcastUpdate(mcBundle.user);
           return mcBundle.user;
         }

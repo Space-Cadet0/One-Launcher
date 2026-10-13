@@ -565,6 +565,46 @@ const EDITION_WORDS = new Set([
   'hd',
 ]);
 
+const ROMAN_TO_ARABIC = {
+  ii: '2',
+  iii: '3',
+  iv: '4',
+  v: '5',
+  vi: '6',
+  vii: '7',
+  viii: '8',
+  ix: '9',
+  x: '10',
+  xi: '11',
+  xii: '12',
+  xiii: '13',
+  xiv: '14',
+  xv: '15',
+  xvi: '16',
+  xvii: '17',
+  xviii: '18',
+  xix: '19',
+  xx: '20',
+};
+
+const NUMERIC_SEQUELS = new Set([
+  '2', '3', '4', '5', '6', '7', '8', '9', '10',
+  '11', '12', '13', '14', '15', '16', '17', '18', '19', '20',
+]);
+
+function extractSequelIdentifier(words) {
+  if (!Array.isArray(words)) return null;
+  for (const word of words) {
+    if (NUMERIC_SEQUELS.has(word) || /^[2-9]$|^1[0-9]$|^20$/.test(word)) {
+      return word;
+    }
+    if (ROMAN_TO_ARABIC[word]) {
+      return ROMAN_TO_ARABIC[word];
+    }
+  }
+  return null;
+}
+
 function computeTokenSimilarity(source, candidate) {
   const s1 = source.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
   const s2 = candidate.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -574,6 +614,13 @@ function computeTokenSimilarity(source, candidate) {
 
   const words1 = s1.split(' ').filter(Boolean);
   const words2 = s2.split(' ').filter(Boolean);
+
+  // Strict sequel verification: prevent "Game 2" from matching "Game" or "Game 3"
+  const seq1 = extractSequelIdentifier(words1);
+  const seq2 = extractSequelIdentifier(words2);
+  if (seq1 !== seq2) {
+    return 0;
+  }
 
   const tokens1 = new Set(words1);
   const tokens2 = new Set(words2);
@@ -890,6 +937,7 @@ async function fetchGogOwnedGames(accessToken, username) {
           title,
           sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
           steamAppId,
+          isVerifiedEntitlement: true,
           platforms: [
             {
               platformId: 'gog',
@@ -1118,6 +1166,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
 
       const gameObj = {
         ...baseGame,
+        isVerifiedEntitlement: true,
         platforms: baseGame.platforms.map((p) =>
           p.platformId === 'epic'
             ? {
@@ -1289,6 +1338,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           title,
           sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
           steamAppId,
+          isVerifiedEntitlement: true,
           platforms: [
             {
               platformId: 'epic',
@@ -1411,4 +1461,6 @@ module.exports = {
   saveTokens,
   clearTokens,
   fetchIgdbCover,
+  computeTokenSimilarity,
 };
+

@@ -1,10 +1,8 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { CanonicalGame } from './contracts/game';
 import { StorefrontId } from './contracts/platform';
-import { GameCollection } from './contracts/collection';
 import { mergeScannedSteamGames } from './services/storage/librarySync';
 import { FULL_USER_STEAM_GAMES } from './services/storage/fullUserSteamGames';
-import { loadCollections, saveCollections } from './services/storage/collectionStorage';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
 import {
   cacheUserSteamAchievements,
@@ -59,6 +57,8 @@ import {
 import { ActiveGameFilter } from './contracts/filter';
 import { matchesGameFilter } from './services/filter/gameFilterService';
 import { useNavigationHistory } from './hooks/useNavigationHistory';
+import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
+import { useCollectionsManager } from './hooks/useCollectionsManager';
 
 export function App() {
   const [games, setGames] = useState<CanonicalGame[]>(() => {
@@ -227,6 +227,19 @@ export function App() {
     });
   };
 
+  // Collections state & handlers
+  const {
+    collections,
+    isManageCollectionsOpen,
+    collectionModalGame,
+    handleOpenManageCollections,
+    handleCloseManageCollections,
+    handleCreateCollection,
+    handleRenameCollection,
+    handleDeleteCollection,
+    handleToggleGameInCollection,
+  } = useCollectionsManager();
+
   const navigateSelectGroup = (groupId: string | null) => {
     if (!groupId) {
       navigateHome();
@@ -265,11 +278,6 @@ export function App() {
   const [isSyncingScores, setIsSyncingScores] = useState(false);
   const [gameRefreshKey, setGameRefreshKey] = useState(0);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
-
-  // Collections state
-  const [collections, setCollections] = useState<GameCollection[]>(() => loadCollections());
-  const [isManageCollectionsOpen, setIsManageCollectionsOpen] = useState(false);
-  const [collectionModalGame, setCollectionModalGame] = useState<CanonicalGame | null>(null);
 
   // Integrations modal state
   const [isIntegrationsModalOpen, setIsIntegrationsModalOpen] = useState(false);
@@ -522,6 +530,7 @@ export function App() {
                 title,
                 sortTitle: title,
                 steamAppId: item.appId,
+                isVerifiedEntitlement: true,
                 platforms: [
                   {
                     platformId: 'steam',
@@ -597,51 +606,7 @@ export function App() {
   }, []);
 
   // Proactive Background Critic Score Warm-Up & Automatic Hydration
-  useEffect(() => {
-    criticScoreService.purgeStaleNullScores();
-
-    const unrated = games.filter((g) => {
-      const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
-      const score = getOpenCriticData(targetSteamId || undefined, g.title, g.reviewSummary?.positivePercent);
-      return !score || score.score <= 0;
-    });
-
-    if (unrated.length === 0) return;
-
-    let isCancelled = false;
-    let index = 0;
-    const CHUNK_SIZE = 2;
-    let delayTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const processNextChunk = async () => {
-      if (isCancelled || index >= unrated.length) return;
-      const chunk = unrated.slice(index, index + CHUNK_SIZE);
-      index += CHUNK_SIZE;
-
-      await Promise.all(
-        chunk.map(async (g) => {
-          try {
-            const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
-            await criticScoreService.resolveDynamicScore(g.title, targetSteamId);
-          } catch {}
-        })
-      );
-
-      if (!isCancelled && index < unrated.length) {
-        delayTimer = setTimeout(processNextChunk, 1500);
-      }
-    };
-
-    const timer = setTimeout(() => {
-      processNextChunk();
-    }, 400);
-
-    return () => {
-      isCancelled = true;
-      clearTimeout(timer);
-      if (delayTimer) clearTimeout(delayTimer);
-    };
-  }, [games.length]);
+  useCriticScoreWarmup(games);
 
   const handleToggleInstallStatus = (gameToToggle?: CanonicalGame | null) => {
     const target = gameToToggle || selectedGame;
@@ -1170,50 +1135,6 @@ export function App() {
     }
   }, [selectedGame]);
 
-  // Collection Management Handlers
-  const handleOpenManageCollections = (game?: CanonicalGame) => {
-    setCollectionModalGame(game || null);
-    setIsManageCollectionsOpen(true);
-  };
-
-  const handleCreateCollection = (name: string) => {
-    const newCol: GameCollection = {
-      id: `col-${Date.now()}`,
-      name,
-      gameIds: collectionModalGame ? [collectionModalGame.id] : [],
-    };
-    const updated = [...collections, newCol];
-    setCollections(updated);
-    saveCollections(updated);
-  };
-
-  const handleRenameCollection = (id: string, newName: string) => {
-    const updated = collections.map((c) => (c.id === id ? { ...c, name: newName } : c));
-    setCollections(updated);
-    saveCollections(updated);
-  };
-
-  const handleDeleteCollection = (id: string) => {
-    const updated = collections.filter((c) => c.id !== id);
-    setCollections(updated);
-    saveCollections(updated);
-  };
-
-  const handleToggleGameInCollection = (collectionId: string, gameId: string) => {
-    const updated = collections.map((c) => {
-      if (c.id === collectionId) {
-        const has = c.gameIds.includes(gameId);
-        return {
-          ...c,
-          gameIds: has ? c.gameIds.filter((id) => id !== gameId) : [...c.gameIds, gameId],
-        };
-      }
-      return c;
-    });
-    setCollections(updated);
-    saveCollections(updated);
-  };
-
   return (
     <div className="h-screen w-screen bg-[#0e141b] text-steam-text flex flex-col font-steam overflow-hidden">
       {/* Top Navigation Bar */}
@@ -1370,7 +1291,7 @@ export function App() {
       {/* Modal: Manage Collections */}
       <ManageCollectionsModal
         isOpen={isManageCollectionsOpen}
-        onClose={() => setIsManageCollectionsOpen(false)}
+        onClose={handleCloseManageCollections}
         collections={collections}
         game={collectionModalGame}
         onCreateCollection={handleCreateCollection}

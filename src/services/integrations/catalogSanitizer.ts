@@ -751,7 +751,10 @@ export function findGamePatch(
  * 3. Purges raw GUIDs, Fortnite microtransaction items, invalid DLC entries, and unmapped codenames
  * 4. Deduplicates games by normalized title and Steam App ID, merging multi-storefront ownership cleanly
  */
-export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
+export function sanitizeGameCatalog(
+  catalog: CanonicalGame[],
+  options?: { allowNewPurchases?: boolean }
+): CanonicalGame[] {
   if (!Array.isArray(catalog)) return [];
 
   const userOverrides = loadUserOverrides();
@@ -857,14 +860,24 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       if (game.platforms.length === 0) continue;
     }
 
+    const isAuthenticNew =
+      game.isVerifiedEntitlement === true ||
+      options?.allowNewPurchases === true ||
+      game.platforms.some((p) => p.installed === true);
+
     // 6. Purge false GOG platform presence from unowned GOG titles (e.g. old bestselling catalog items like Anno 1404)
     if (game.platforms.some((p) => p.platformId === 'gog')) {
       const gogPlatform = game.platforms.find((p) => p.platformId === 'gog');
+      const isMockOrUnownedGog =
+        game.id.startsWith('mock-') ||
+        (gogPlatform?.platformGameId || '').startsWith('unowned-');
       const isRealGogGame =
-        userOverride !== undefined ||
-        (gogPlatform?.platformGameId && validGogProductIds.has(gogPlatform.platformGameId.trim())) ||
-        validGogTitles.has(normTitle) ||
-        validGogTitles.has(normalizeCanonicalTitle(rawGame.title));
+        !isMockOrUnownedGog &&
+        (userOverride !== undefined ||
+          isAuthenticNew ||
+          (gogPlatform?.platformGameId && validGogProductIds.has(gogPlatform.platformGameId.trim())) ||
+          validGogTitles.has(normTitle) ||
+          validGogTitles.has(normalizeCanonicalTitle(rawGame.title)));
 
       if (!isRealGogGame) {
         game = {
@@ -885,6 +898,9 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
         const baseGame = validEpicBaseGameByCatalogId.get(epicGameId)!;
         game = {
           ...baseGame,
+          isVerifiedEntitlement: game.isVerifiedEntitlement || baseGame.isVerifiedEntitlement,
+          matchConfidence: game.matchConfidence ?? baseGame.matchConfidence,
+          needsMatchReview: game.needsMatchReview ?? baseGame.needsMatchReview,
           platforms: game.platforms.map((p) =>
             p.platformId === 'epic' ? { ...p, platformGameId: epicGameId } : p
           ),
@@ -892,11 +908,17 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
       }
 
       const updatedNormTitle = normalizeCanonicalTitle(game.title);
-      // Whitelist: every authentic Epic game must match one of the 402 verified titles
+      const isMockOrInvalidEpic =
+        game.id.startsWith('mock-') ||
+        (epicPlatform?.platformGameId || '').startsWith('epic-hades') ||
+        isEpicNonGameEntry(game);
+      // Whitelist: every authentic Epic game must match one of the verified titles or be an authentic new purchase
       const isRealEpicGame =
-        userOverride !== undefined ||
-        validEpicTitles.has(updatedNormTitle) ||
-        validEpicTitles.has(normalizeCanonicalTitle(rawGame.title));
+        !isMockOrInvalidEpic &&
+        (userOverride !== undefined ||
+          isAuthenticNew ||
+          validEpicTitles.has(updatedNormTitle) ||
+          validEpicTitles.has(normalizeCanonicalTitle(rawGame.title)));
 
       if (!isRealEpicGame) {
         game = {
@@ -918,10 +940,13 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
 
       const isUnownedPromo = appId ? UNOWNED_STEAM_PROMO_APP_IDS.has(appId) : false;
       const isRealSteamGame =
-        userOverride !== undefined ||
-        (appId
-          ? validSteamAppIds.has(appId)
-          : validSteamTitles.has(normTitle) || validSteamTitles.has(normalizeCanonicalTitle(rawGame.title)));
+        !isUnownedPromo &&
+        !game.id.startsWith('mock-') &&
+        (userOverride !== undefined ||
+          isAuthenticNew ||
+          (appId
+            ? validSteamAppIds.has(appId)
+            : validSteamTitles.has(normTitle) || validSteamTitles.has(normalizeCanonicalTitle(rawGame.title))));
 
       if (isUnownedPromo || !isRealSteamGame) {
         game = {
@@ -1063,6 +1088,9 @@ export function sanitizeGameCatalog(catalog: CanonicalGame[]): CanonicalGame[] {
           : '',
         developers: existing.developers && existing.developers.length > 0 ? existing.developers : game.developers,
         publishers: existing.publishers && existing.publishers.length > 0 ? existing.publishers : game.publishers,
+        isVerifiedEntitlement: existing.isVerifiedEntitlement || game.isVerifiedEntitlement,
+        matchConfidence: existing.matchConfidence ?? game.matchConfidence,
+        needsMatchReview: existing.needsMatchReview ?? game.needsMatchReview,
       };
 
       const existingOv = getUserOverrideForGame(existing, userOverrides);

@@ -166,6 +166,7 @@ export class SteamIntegrationService {
               title,
               sortTitle: title,
               steamAppId: appId,
+              isVerifiedEntitlement: true,
               platforms: [
                 {
                   platformId: 'steam',

@@ -316,6 +316,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
 
     describe('Custom event dispatching antigravity:user-override-updated and antigravity:user-override-removed', () => {
       it('saveUserOverride dispatches antigravity:user-override-updated with override and oldGame payload', () => {
+        vi.spyOn(criticScoreService, 'resolveDynamicScore').mockResolvedValue(null);
         const updateListener = vi.fn();
         window.addEventListener('antigravity:user-override-updated', updateListener as EventListener);
 
@@ -367,6 +368,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
       });
 
       it('criticScoreService receives window event antigravity:user-override-updated and triggers cache invalidation', () => {
+        vi.spyOn(criticScoreService, 'resolveDynamicScore').mockResolvedValue(null);
         const handleOverrideSpy = vi.spyOn(criticScoreService, 'handleUserOverride');
 
         const override: UserGameOverride = {
@@ -569,7 +571,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
 
         const steamHarvesterSpy = vi
           .spyOn(storefrontReviewHarvester, 'getSteamAnchor')
-          .mockResolvedValueOnce(mockSteamAnchor);
+          .mockResolvedValue(mockSteamAnchor);
 
         const candidate = {
           id: 813780,
@@ -599,7 +601,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
 
         const gogHarvesterSpy = vi
           .spyOn(storefrontReviewHarvester, 'getGogAnchor')
-          .mockResolvedValueOnce(mockGogAnchor);
+          .mockResolvedValue(mockGogAnchor);
 
         const candidate = {
           id: 'gog-1837805079',

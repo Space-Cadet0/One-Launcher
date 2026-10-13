@@ -341,6 +341,7 @@ export class GogIntegrationService {
             id: `gog-${g.id}`,
             title: g.title.trim(),
             sortTitle: g.title.trim().replace(/^(The|A|An)\s+/i, ''),
+            isVerifiedEntitlement: true,
             platforms: [
               {
                 platformId: 'gog',
@@ -411,6 +412,7 @@ export class GogIntegrationService {
             id: `gog-${p.id}`,
             title: gameTitle,
             sortTitle: gameTitle.replace(/^(The|A|An)\s+/i, ''),
+            isVerifiedEntitlement: true,
             platforms: [
               {
                 platformId: 'gog',

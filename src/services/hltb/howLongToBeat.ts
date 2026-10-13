@@ -1,3 +1,6 @@
+import { isSequelMismatch, normalizeTitleKey, stripEditionSuffix } from '../common/titleUtils';
+import { requestScheduler, Priority } from '../network/requestScheduler';
+
 export interface HltbData {
   mainStoryHours: number;
   mainExtraHours: number;
@@ -241,8 +244,13 @@ function estimateHltbFromGenres(genres: string[] = [], tags: string[] = []): Hlt
   return { mainStoryHours: 12, mainExtraHours: 18, completionistHours: 30, allStylesHours: 15, gameplayType: 'Action-Adventure', isAccurate: false };
 }
 
-function findBestHltbMatch(gameTitle: string, results: any[]): any | null {
-  if (!results || results.length === 0) return null;
+export function findBestHltbMatch(gameTitle: string, results: any[]): any | null {
+  if (!results || results.length === 0 || !gameTitle) return null;
+
+  const compatibleResults = results.filter(
+    (r) => r?.game_name && typeof r.game_name === 'string' && !isSequelMismatch(gameTitle, r.game_name)
+  );
+  if (compatibleResults.length === 0) return null;
 
   const normalize = (s: string) =>
     s
@@ -251,20 +259,59 @@ function findBestHltbMatch(gameTitle: string, results: any[]): any | null {
       .trim();
 
   const targetNorm = normalize(gameTitle);
+  if (!targetNorm) return null;
 
   // 1. Exact normalized match (e.g. "Betrayer", "Alan Wake 2", "Blood Omen: Legacy of Kain")
-  const exact = results.find((r) => normalize(r.game_name) === targetNorm);
+  const exact = compatibleResults.find((r) => normalize(r.game_name) === targetNorm);
   if (exact) return exact;
 
-  // 2. Subtitle / prefix match
-  const prefix = results.find((r) => {
-    const rNorm = normalize(r.game_name);
-    return targetNorm.startsWith(rNorm) || rNorm.startsWith(targetNorm);
-  });
-  if (prefix) return prefix;
+  // 2. Token overlap similarity and base-title prefix check
+  const targetTokens = normalizeTitleKey(gameTitle).split(' ').filter(Boolean);
+  const strippedTargetTokens = normalizeTitleKey(stripEditionSuffix(gameTitle)).split(' ').filter(Boolean);
+  const targetBaseTokens = normalizeTitleKey(gameTitle.split(':')[0]).split(' ').filter(Boolean);
 
-  // 3. Fallback to first result (highest relevance on HLTB)
-  return results[0];
+  const calcOverlap = (a: string[], b: string[]): number => {
+    if (a.length === 0 || b.length === 0) return 0;
+    const setB = new Set(b);
+    const shared = a.filter((t) => setB.has(t)).length;
+    return shared / Math.max(a.length, b.length);
+  };
+
+  let bestCandidate: any | null = null;
+  let bestSimilarity = 0;
+  let bestHasPrefixMatch = false;
+
+  for (const r of compatibleResults) {
+    const candTokens = normalizeTitleKey(r.game_name).split(' ').filter(Boolean);
+    const strippedCandTokens = normalizeTitleKey(stripEditionSuffix(r.game_name)).split(' ').filter(Boolean);
+    const candBaseTokens = normalizeTitleKey(r.game_name.split(':')[0]).split(' ').filter(Boolean);
+
+    const rawSim = calcOverlap(targetTokens, candTokens);
+    const strippedSim = calcOverlap(
+      strippedTargetTokens.length > 0 ? strippedTargetTokens : targetTokens,
+      strippedCandTokens.length > 0 ? strippedCandTokens : candTokens
+    );
+    const similarity = Math.max(rawSim, strippedSim);
+
+    const hasColon = gameTitle.includes(':') || r.game_name.includes(':');
+    const isBasePrefixMatch =
+      hasColon &&
+      targetBaseTokens.length > 0 &&
+      targetBaseTokens.length === candBaseTokens.length &&
+      targetBaseTokens.every((t, i) => candBaseTokens[i] === t);
+
+    if (similarity > bestSimilarity || (!bestCandidate && isBasePrefixMatch)) {
+      bestSimilarity = similarity;
+      bestCandidate = r;
+      bestHasPrefixMatch = isBasePrefixMatch;
+    }
+  }
+
+  if (bestCandidate && (bestSimilarity >= 0.6 || bestHasPrefixMatch)) {
+    return bestCandidate;
+  }
+
+  return null;
 }
 
 /**
@@ -344,7 +391,12 @@ export async function fetchAndCacheHltb(
           ? '/api/hltb/api/search/site'
           : 'https://howlongtobeat.com/api/search/site';
 
-        const initRes = await fetch(initUrl);
+        const initRes = await requestScheduler.schedule(
+          initUrl,
+          () => fetch(initUrl),
+          Priority.P2_BACKGROUND,
+          'howlongtobeat.com'
+        );
         if (initRes.ok) {
           const { token } = await initRes.json();
           if (token) {
@@ -354,37 +406,43 @@ export async function fetchAndCacheHltb(
               .split(/\s+/)
               .filter(Boolean);
 
-            const sRes = await fetch(searchUrl, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-auth-token': token,
-              },
-              body: JSON.stringify({
-                searchType: 'games',
-                searchTerms: cleanTerms,
-                searchPage: 1,
-                size: 10,
-                searchOptions: {
-                  games: {
-                    userId: 0,
-                    platform: '',
-                    sortCategory: 'popular',
-                    rangeCategory: 'main',
-                    rangeTime: { min: 0, max: 0 },
-                    gameplay: { perspective: '', flow: '', genre: '' },
-                    year: '',
-                    modifier: '',
+            const sRes = await requestScheduler.schedule(
+              searchUrl,
+              () =>
+                fetch(searchUrl, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'x-auth-token': token,
                   },
-                  users: { sortCategory: 'postcount' },
-                  lists: { sortCategory: 'follows' },
-                  filter: '',
-                  sort: 0,
-                  randomizer: 0,
-                },
-                useCache: true,
-              }),
-            });
+                  body: JSON.stringify({
+                    searchType: 'games',
+                    searchTerms: cleanTerms,
+                    searchPage: 1,
+                    size: 10,
+                    searchOptions: {
+                      games: {
+                        userId: 0,
+                        platform: '',
+                        sortCategory: 'popular',
+                        rangeCategory: 'main',
+                        rangeTime: { min: 0, max: 0 },
+                        gameplay: { perspective: '', flow: '', genre: '' },
+                        year: '',
+                        modifier: '',
+                      },
+                      users: { sortCategory: 'postcount' },
+                      lists: { sortCategory: 'follows' },
+                      filter: '',
+                      sort: 0,
+                      randomizer: 0,
+                    },
+                    useCache: true,
+                  }),
+                }),
+              Priority.P2_BACKGROUND,
+              'howlongtobeat.com'
+            );
 
             if (sRes.ok) {
               const sData = await sRes.json();

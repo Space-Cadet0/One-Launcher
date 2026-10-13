@@ -9,6 +9,8 @@ import {
   ROMAN_TO_ARABIC,
   EDITION_TOKENS,
 } from '../common/titleUtils';
+import { computeEntityMatchConfidence } from '../common/entityResolver';
+import { requestScheduler, Priority } from '../network/requestScheduler';
 import { TIER_TTLS } from '../storage/stagedCacheService';
 
 /**
@@ -646,7 +648,10 @@ export class SteamMatcherService {
    * Intelligently matches any game title to its official Steam App ID.
    * Returns Steam App ID if found, or null if game does not exist on Steam.
    */
-  async matchGameToSteam(title: string): Promise<number | null> {
+  async matchGameToSteam(
+    title: string,
+    options?: { releaseYear?: number | string | null; developers?: string[] }
+  ): Promise<number | null> {
     if (!title || !title.trim()) return null;
     const cleanRaw = title.trim();
     const lowerKey = cleanRaw.toLowerCase();
@@ -708,11 +713,19 @@ export class SteamMatcherService {
     }
 
     // 4. Dynamic Multi-Strategy Steam Store Search
+    const hasCorroboratingMetadata = Boolean(
+      options?.releaseYear || (options?.developers && options.developers.length > 0)
+    );
+
     const searchStrategies = [
       normalized,                                     // Strategy 1: Normalized clean title
       cleanRaw,                                       // Strategy 2: Exact raw title
-      normalized.split(':')[0].trim(),                 // Strategy 3: Base title without subtitle
-      normalized.split('-')[0].trim(),                 // Strategy 4: Base title before dash
+      ...(hasCorroboratingMetadata
+        ? [
+            normalized.split(':')[0].trim(),          // Strategy 3: Base title without subtitle (corroborated)
+            normalized.split('-')[0].trim(),          // Strategy 4: Base title before dash (corroborated)
+          ]
+        : []),
       normalized.replace(/^(the|a|an)\s+/i, '').trim(), // Strategy 5: Without leading article
     ];
 
@@ -721,9 +734,12 @@ export class SteamMatcherService {
     for (const term of uniqueTerms) {
       try {
         const baseUrl = this.getStoreSearchBaseUrl();
-        const res = await axios.get(
-          `${baseUrl}/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`,
-          { timeout: 7000 }
+        const url = `${baseUrl}/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=US`;
+        const res = await requestScheduler.schedule(
+          url,
+          () => axios.get(url, { timeout: 7000 }),
+          Priority.P2_BACKGROUND,
+          'store.steampowered.com'
         );
 
         const items = res.data?.items;
@@ -750,13 +766,24 @@ export class SteamMatcherService {
               continue;
             }
 
-            const sim = computeTitleSimilarity(normalized, candidateName);
+            const evaluation = computeEntityMatchConfidence(
+              {
+                title: normalized,
+                releaseYear: options?.releaseYear,
+                developers: options?.developers,
+              },
+              {
+                title: candidateName,
+              }
+            );
 
             // Give bonus for matching base keywords
-            let score = sim * 100;
-            if (candLower === normalized) score += 20;
+            let score = evaluation.confidence;
+            if (candLower === normalized && !evaluation.isRebootCollision) {
+              score = Math.min(100, score + 20);
+            }
 
-            if (score >= 68 && (!bestCandidate || score > bestCandidate.score)) {
+            if (evaluation.isAccepted && score >= 68 && (!bestCandidate || score > bestCandidate.score)) {
               bestCandidate = { id: item.id, score };
             }
           }
@@ -784,7 +811,10 @@ export class SteamMatcherService {
   async enrichGameWithSteamMatch(game: CanonicalGame): Promise<CanonicalGame> {
     if (game.steamAppId) return game;
 
-    const matchedId = await this.matchGameToSteam(game.title);
+    const matchedId = await this.matchGameToSteam(game.title, {
+      releaseYear: game.releaseDate,
+      developers: game.developers,
+    });
     if (!matchedId) return game;
 
     return {

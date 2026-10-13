@@ -253,6 +253,17 @@ export function getCoverCandidates(
     add(game.capsuleImage);
   }
 
+  // 7. Enriched metadata or cached Steam API capsule fallback (e.g. hashed CDN paths)
+  if (game.enrichedMetadata?.capsuleImage) {
+    add(game.enrichedMetadata.capsuleImage);
+  }
+  if (targetSteamId) {
+    const cachedMeta = steamApi.getCachedMetadata(targetSteamId);
+    if (cachedMeta?.capsuleImage) {
+      add(cachedMeta.capsuleImage);
+    }
+  }
+
   return candidates;
 }
 
@@ -270,11 +281,16 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     }, [game, overrideCoverUrl, userOverride]);
 
     const [candidateIndex, setCandidateIndex] = useState(0);
+    const [headerFallbackFailed, setHeaderFallbackFailed] = useState(false);
 
     // Reset candidate progression when game or explicit override changes
     useEffect(() => {
       setCandidateIndex(0);
     }, [game.id, game.capsuleImage, overrideCoverUrl, userOverride?.capsuleImage]);
+
+    useEffect(() => {
+      setHeaderFallbackFailed(false);
+    }, [game.id, game.headerImage]);
 
     const currentSrc = candidateIndex < candidates.length ? candidates[candidateIndex] : null;
 
@@ -284,13 +300,56 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       }
     }, [currentSrc, game, onNeedCoverLookup]);
 
+    const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
+    const matchReviewBadge =
+      game.needsMatchReview === true && !effectiveOverride ? (
+        <div
+          className="absolute bottom-2 left-2 z-20 flex items-center gap-1 bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[9px] font-semibold px-1.5 py-0.5 rounded shadow backdrop-blur-sm"
+          title="Low-confidence automatic match — click Fix Match to verify"
+        >
+          <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+          <span>Verify</span>
+        </div>
+      ) : null;
+
     if (!currentSrc) {
+      if (
+        game.headerImage &&
+        !headerFallbackFailed &&
+        !game.headerImage.includes('default.png') &&
+        !game.headerImage.includes('egs-badge.png')
+      ) {
+        return (
+          <div className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] overflow-hidden select-none">
+            <img
+              src={game.headerImage}
+              alt=""
+              aria-hidden="true"
+              className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
+              onError={() => setHeaderFallbackFailed(true)}
+            />
+            <img
+              src={game.headerImage}
+              alt={game.title}
+              loading="lazy"
+              className="relative z-10 w-full aspect-[460/215] object-cover shadow-lg border-y border-white/10"
+              onError={() => setHeaderFallbackFailed(true)}
+            />
+            <span className="relative z-10 mt-2 text-[11px] font-semibold text-slate-200 line-clamp-2 leading-tight px-2 drop-shadow">
+              {game.title}
+            </span>
+            {matchReviewBadge}
+          </div>
+        );
+      }
+
       return (
-        <div className="grid-cover-fallback w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
+        <div className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
           <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
           <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
             {game.title}
           </span>
+          {matchReviewBadge}
         </div>
       );
     }
@@ -301,30 +360,33 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     );
 
     return (
-      <img
-        key={currentSrc}
-        src={currentSrc}
-        alt={game.title}
-        loading="lazy"
-        onLoad={(e) => {
-          const { naturalWidth, naturalHeight } = e.currentTarget;
-          if (naturalWidth && naturalHeight && !isUserExplicitCover) {
-            const ratio = naturalWidth / naturalHeight;
-            // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
-            // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
-            // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
-            if (ratio > 0.94) {
-              setCandidateIndex((prev) => prev + 1);
-              if (onNeedCoverLookup) onNeedCoverLookup(game);
+      <>
+        <img
+          key={currentSrc}
+          src={currentSrc}
+          alt={game.title}
+          loading="lazy"
+          onLoad={(e) => {
+            const { naturalWidth, naturalHeight } = e.currentTarget;
+            if (naturalWidth && naturalHeight && !isUserExplicitCover) {
+              const ratio = naturalWidth / naturalHeight;
+              // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
+              // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
+              // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
+              if (ratio > 0.94) {
+                setCandidateIndex((prev) => prev + 1);
+                if (onNeedCoverLookup) onNeedCoverLookup(game);
+              }
             }
-          }
-        }}
-        onError={() => {
-          // Declaratively advance to the next candidate without mutating the DOM
-          setCandidateIndex((prev) => prev + 1);
-        }}
-        className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
-      />
+          }}
+          onError={() => {
+            // Declaratively advance to the next candidate without mutating the DOM
+            setCandidateIndex((prev) => prev + 1);
+          }}
+          className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
+        />
+        {matchReviewBadge}
+      </>
     );
   }
 );
@@ -456,7 +518,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     if (attemptedCoverLookupsRef.current.has(game.id)) return;
     attemptedCoverLookupsRef.current.add(game.id);
 
-    igdbCoverService.fetchIgdbCover(game.title).then((resolvedCover) => {
+    const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
+    const releaseYear = getReleaseYear(game, targetAppId);
+    igdbCoverService.fetchIgdbCover(game.title, releaseYear).then((resolvedCover) => {
       if (resolvedCover) {
         setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
       }

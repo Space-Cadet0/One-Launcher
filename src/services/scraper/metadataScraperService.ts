@@ -21,6 +21,8 @@ import { storefrontReviewHarvester } from '../critic/storefrontReviewHarvester';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
+import { requestScheduler, Priority } from '../network/requestScheduler';
+import { computeEntityMatchConfidence } from '../common/entityResolver';
 
 /**
  * Cleans a user or game search query by stripping punctuation and trademark noise.
@@ -113,15 +115,20 @@ export class MetadataScraperService {
 
     for (const url of urls) {
       try {
-        const res = await axios.get(url, {
-          timeout: 6000,
-          headers: {
-            Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'application/json, text/plain, */*',
-          },
-        });
+        const res = await requestScheduler.schedule(
+          url,
+          () =>
+            axios.get(url, {
+              timeout: 6000,
+              headers: {
+                Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+                'User-Agent':
+                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                Accept: 'application/json, text/plain, */*',
+              },
+            }),
+          Priority.P0_INTERACTIVE
+        );
         if (res.data?.items && Array.isArray(res.data.items)) {
           return res.data.items;
         }
@@ -154,14 +161,19 @@ export class MetadataScraperService {
 
     for (const url of urls) {
       try {
-        const res = await axios.get(url, {
-          timeout: 6000,
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'application/json, text/plain, */*',
-          },
-        });
+        const res = await requestScheduler.schedule(
+          url,
+          () =>
+            axios.get(url, {
+              timeout: 6000,
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                Accept: 'application/json, text/plain, */*',
+              },
+            }),
+          Priority.P0_INTERACTIVE
+        );
         if (res.data?.results && Array.isArray(res.data.results)) {
           return res.data.results;
         }
@@ -287,14 +299,25 @@ export class MetadataScraperService {
       if (seen.has(key)) continue;
       seen.add(key);
 
-      // Similarity calculation against original game title
-      const sim = computeTitleSimilarity(effectiveTitle, cand.title);
-      let score = Math.round(sim * 100);
+      // Multi-vector entity confidence evaluation (title + release year + developers)
+      const evaluation = computeEntityMatchConfidence(
+        {
+          title: effectiveTitle,
+          releaseYear: game.releaseDate,
+          developers: game.developers,
+        },
+        {
+          title: cand.title,
+          releaseYear: cand.year,
+        }
+      );
+
+      let score = evaluation.confidence;
 
       const normGame = canonicalizeTitleKey(effectiveTitle);
       const normCand = canonicalizeTitleKey(cand.title);
 
-      if (normGame === normCand) {
+      if (normGame === normCand && !evaluation.isRebootCollision) {
         score = Math.max(score, 96);
       }
 
@@ -304,18 +327,22 @@ export class MetadataScraperService {
       }
 
       // Bonus if candidate source matches a platform owned by user
-      if (game.platforms?.some((p) => p.platformId === cand.source)) {
+      if (!evaluation.isRebootCollision && game.platforms?.some((p) => p.platformId === cand.source)) {
         score = Math.min(100, score + 8);
       }
 
       // Bonus if candidate has a valid cover image
-      if (cand.capsuleImage) {
+      if (!evaluation.isRebootCollision && cand.capsuleImage) {
         score = Math.min(100, score + 2);
       }
 
+      const finalConfidence = evaluation.isRebootCollision
+        ? score
+        : Math.max(cand.confidenceScore || 0, score);
+
       scoredCandidates.push({
         ...cand,
-        confidenceScore: Math.max(cand.confidenceScore || 0, score),
+        confidenceScore: finalConfidence,
       });
     }
 

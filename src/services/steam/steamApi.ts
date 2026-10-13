@@ -103,6 +103,11 @@ export class SteamApiService {
 
       const enriched: SteamEnrichedMetadata = {
         ...preCached,
+        capsuleImage:
+          preCached.capsuleImage ||
+          preCached.library_capsule ||
+          preCached.capsule_imagev5 ||
+          preCached.capsule_image,
         movies: normalizedMovies,
         categories: (preCached.categories || []).map((c: any) => ({
           ...c,
@@ -226,6 +231,12 @@ export class SteamApiService {
             };
           }
 
+          const resolvedCapsuleImage =
+            (typeof data.library_capsule === 'string' && data.library_capsule) ||
+            (typeof data.capsule_imagev5 === 'string' && data.capsule_imagev5) ||
+            (typeof data.capsule_image === 'string' && data.capsule_image) ||
+            undefined;
+
           const metadata: SteamEnrichedMetadata = {
             appId,
             name: data.name,
@@ -233,7 +244,7 @@ export class SteamApiService {
             detailedDescription: data.detailed_description || '',
             aboutTheGame: data.about_the_game || '',
             headerImage: data.header_image || '',
-            capsuleImage: data.capsule_image,
+            capsuleImage: resolvedCapsuleImage,
             developers: data.developers || [],
             publishers: data.publishers || [],
             releaseDate: data.release_date?.date || (data.release_date?.coming_soon ? 'Coming Soon' : 'TBA'),

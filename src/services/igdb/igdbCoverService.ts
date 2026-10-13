@@ -4,6 +4,10 @@
  * portrait covers hosted on images.igdb.com.
  */
 
+import { isSequelMismatch, normalizeTitleKey, EDITION_TOKENS } from '../common/titleUtils';
+import { requestScheduler, Priority } from '../network/requestScheduler';
+import { isTitleCompatible } from '../critic/metacriticResolver';
+
 const STORAGE_KEY_IGDB_COVERS = 'antigravity_igdb_covers';
 
 // Steam App IDs verified to not host standard unhashed library_600x900 assets on Steam CDN
@@ -370,11 +374,18 @@ const EDITION_WORDS = new Set([
   'hd',
 ]);
 
-function computeTokenSimilarity(t1: string, t2: string): number {
-  const cleanT1 = t1.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '');
-  const cleanT2 = t2.toLowerCase().replace(/[™®©]/g, '').replace(/['’]/g, '');
-  const list1 = cleanT1.split(/\s+/).filter((w) => w.length > 2);
-  const list2 = cleanT2.split(/\s+/).filter((w) => w.length > 2);
+export function computeTokenSimilarity(t1: string, t2: string): number {
+  if (isSequelMismatch(t1, t2)) return 0;
+  if (!isTitleCompatible(t1, t2)) return 0;
+
+  const cleanT1 = normalizeTitleKey(t1);
+  const cleanT2 = normalizeTitleKey(t2);
+  const list1 = cleanT1
+    .split(/\s+/)
+    .filter((w) => w.length > 0 && !['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'a', 'an'].includes(w));
+  const list2 = cleanT2
+    .split(/\s+/)
+    .filter((w) => w.length > 0 && !['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'a', 'an'].includes(w));
   const words1 = new Set(list1);
   const words2 = new Set(list2);
   if (words1.size === 0 || words2.size === 0) return 0;
@@ -391,7 +402,7 @@ function computeTokenSimilarity(t1: string, t2: string): number {
   if (allShorterInLonger) {
     let onlyEditionTokensRemaining = true;
     for (const w of longerList) {
-      if (!shorterSet.has(w) && !EDITION_WORDS.has(w)) {
+      if (!shorterSet.has(w) && !EDITION_TOKENS.has(w) && !EDITION_WORDS.has(w)) {
         onlyEditionTokensRemaining = false;
         break;
       }
@@ -414,6 +425,11 @@ export class IgdbCoverService {
 
   constructor() {
     this.loadPersistentCache();
+  }
+
+  public clearCache(): void {
+    this.cache.clear();
+    this.pendingFetches.clear();
   }
 
   private loadPersistentCache() {
@@ -510,18 +526,45 @@ export class IgdbCoverService {
    * Asynchronous dynamic lookup against IGDB/Lutris metadata.
    * Caches results persistently and dispatches an update event for reactive UI re-renders.
    */
-  async fetchIgdbCover(title: string): Promise<string | null> {
+  async fetchIgdbCover(title: string, releaseYear?: number | string | null): Promise<string | null> {
     if (!title || !title.trim()) return null;
     const cleanRaw = title.trim();
     const norm = normalizeKey(cleanRaw);
 
-    // Check instant cache
-    const instant = this.getIgdbCoverInstant(cleanRaw);
-    if (instant) return instant;
+    const parsedParamYear =
+      releaseYear !== undefined && releaseYear !== null && releaseYear !== ''
+        ? Number(String(releaseYear).match(/\b(19\d{2}|20\d{2})\b/)?.[1] ?? releaseYear)
+        : NaN;
+    const titleYearMatch = cleanRaw.match(/\b(19\d{2}|20[0-2]\d)\b/);
+    const effectiveReleaseYear =
+      !Number.isNaN(parsedParamYear) && parsedParamYear > 0
+        ? parsedParamYear
+        : titleYearMatch
+          ? Number(titleYearMatch[1])
+          : null;
+
+    const cacheKey = effectiveReleaseYear ? `${norm}:${effectiveReleaseYear}` : norm;
+
+    // Check instant cache (curated always applies; dynamic cache keyed by cacheKey when year is specified)
+    if (!effectiveReleaseYear) {
+      const instant = this.getIgdbCoverInstant(cleanRaw);
+      if (instant) return instant;
+    } else {
+      const lower = cleanRaw.toLowerCase();
+      const curated =
+        NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
+        NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
+        KNOWN_IGDB_COVERS[lower] ||
+        KNOWN_IGDB_COVERS[norm];
+      if (curated) return curated;
+      if (this.cache.has(cacheKey)) {
+        return this.cache.get(cacheKey) || null;
+      }
+    }
 
     // Deduplicate in-flight requests
-    if (this.pendingFetches.has(norm)) {
-      return this.pendingFetches.get(norm)!;
+    if (this.pendingFetches.has(cacheKey)) {
+      return this.pendingFetches.get(cacheKey)!;
     }
 
     const fetchPromise = (async (): Promise<string | null> => {
@@ -530,6 +573,7 @@ export class IgdbCoverService {
         try {
           const cover = await window.electronAPI.fetchIgdbCover(cleanRaw);
           if (cover && typeof cover === 'string') {
+            this.cache.set(cacheKey, cover);
             this.cache.set(norm, cover);
             this.savePersistentCache();
             this.notifyCoverUpdated(cleanRaw, cover);
@@ -548,13 +592,19 @@ export class IgdbCoverService {
             ? `/api/lutris/api/games?search=${encodeURIComponent(query)}`
             : `https://lutris.net/api/games?search=${encodeURIComponent(query)}`;
 
-        const res = await fetch(searchUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'application/json, text/plain, */*',
-          },
-        });
+        const res = await requestScheduler.schedule(
+          searchUrl,
+          () =>
+            fetch(searchUrl, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                Accept: 'application/json, text/plain, */*',
+              },
+            }),
+          Priority.P2_BACKGROUND,
+          'lutris.net'
+        );
 
         if (res.ok) {
           const data = await res.json();
@@ -565,11 +615,38 @@ export class IgdbCoverService {
 
             for (const item of items) {
               if (!item.coverart) continue;
-              const candNorm = normalizeKey(item.name || '');
-              let score = computeTokenSimilarity(norm, candNorm) * 100;
-              if (candNorm === norm) score += 50;
+              const itemName = item.name || '';
+              if (isSequelMismatch(cleanRaw, itemName) || !isTitleCompatible(cleanRaw, itemName)) {
+                continue;
+              }
 
-              if (score > bestScore && score >= 50) {
+              const candNorm = normalizeKey(itemName);
+              let score = computeTokenSimilarity(norm, candNorm) * 100;
+
+              const itemYear =
+                item.year !== undefined && item.year !== null && item.year !== ''
+                  ? Number(item.year)
+                  : null;
+              const hasEraMismatch =
+                effectiveReleaseYear !== null &&
+                itemYear !== null &&
+                !Number.isNaN(itemYear) &&
+                Math.abs(effectiveReleaseYear - itemYear) >= 4;
+
+              if (candNorm === norm && !hasEraMismatch) {
+                score += 50;
+              }
+
+              if (effectiveReleaseYear !== null && itemYear !== null && !Number.isNaN(itemYear)) {
+                const yearDiff = Math.abs(effectiveReleaseYear - itemYear);
+                if (yearDiff <= 1) {
+                  score += 15;
+                } else if (yearDiff >= 4) {
+                  score -= 35;
+                }
+              }
+
+              if (score > bestScore && score >= 65) {
                 bestScore = score;
                 const m = item.coverart.match(/\/([a-zA-Z0-9_-]+)\.(?:jpg|png|webp)/i);
                 if (m && !m[1].startsWith('banner_') && !m[1].startsWith('library_capsule') && !m[1].startsWith('header_')) {
@@ -581,6 +658,7 @@ export class IgdbCoverService {
             }
 
             if (bestCover) {
+              this.cache.set(cacheKey, bestCover);
               this.cache.set(norm, bestCover);
               this.savePersistentCache();
               this.notifyCoverUpdated(cleanRaw, bestCover);
@@ -593,16 +671,19 @@ export class IgdbCoverService {
       }
 
       // Mark negative cache to avoid infinite retries
-      this.cache.set(norm, null);
+      this.cache.set(cacheKey, null);
+      if (!effectiveReleaseYear) {
+        this.cache.set(norm, null);
+      }
       return null;
     })();
 
-    this.pendingFetches.set(norm, fetchPromise);
+    this.pendingFetches.set(cacheKey, fetchPromise);
     try {
       const res = await fetchPromise;
       return res;
     } finally {
-      this.pendingFetches.delete(norm);
+      this.pendingFetches.delete(cacheKey);
     }
   }
 

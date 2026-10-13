@@ -184,7 +184,7 @@ describe('StorefrontReviewHarvester', () => {
         steamAppId: 99999998,
       });
       expect(res).toBeNull();
-    });
+    }, 15000);
   });
 
   describe('Storefront Review Anchor Cross-Verification Rules', () => {

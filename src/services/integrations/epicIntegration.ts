@@ -386,6 +386,7 @@ export class EpicIntegrationService {
             title,
             sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
             steamAppId,
+            isVerifiedEntitlement: true,
             platforms: [
               {
                 platformId: 'epic',

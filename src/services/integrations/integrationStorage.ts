@@ -370,6 +370,9 @@ export function mergeStorefrontGames(
         tags: (existing.tags && existing.tags.length > 0) ? existing.tags : newGame.tags,
         shortDescription: existing.shortDescription || newGame.shortDescription,
         releaseDate: existing.releaseDate || newGame.releaseDate,
+        isVerifiedEntitlement: existing.isVerifiedEntitlement || newGame.isVerifiedEntitlement,
+        matchConfidence: existing.matchConfidence ?? newGame.matchConfidence,
+        needsMatchReview: existing.needsMatchReview ?? newGame.needsMatchReview,
       };
 
       if (existingOverride) {

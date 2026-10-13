@@ -71,6 +71,10 @@ export const DOMAIN_CONFIGS: Record<string, DomainConfig> = {
     requestsPerSecond: 1.0,
     burst: 2,
   },
+  'howlongtobeat.com': {
+    requestsPerSecond: 1.0,
+    burst: 2,
+  },
   default: {
     requestsPerSecond: 2.0,
     burst: 2,
@@ -132,6 +136,7 @@ export class RequestScheduler {
     if (clean.includes('/api/lutris')) return 'lutris.net';
     if (clean.includes('/api/gog')) return 'catalog.gog.com';
     if (clean.includes('/api/epic')) return 'launcher.store.epicgames.com';
+    if (clean.includes('/api/hltb') || clean.includes('howlongtobeat.com')) return 'howlongtobeat.com';
 
     // Check domain string containment
     if (clean.includes('store.steampowered.com')) return 'store.steampowered.com';
