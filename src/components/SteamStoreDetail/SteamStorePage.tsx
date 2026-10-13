@@ -260,7 +260,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     game.enrichedMetadata?.aboutTheGame ||
     game.enrichedMetadata?.detailedDescription;
 
-  const effectiveSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+  const effectiveSteamId = steamMatcher.getEffectiveSteamAppId(game);
 
   const [openCriticData, setOpenCriticData] = useState<any>(() =>
     getOpenCriticData(effectiveSteamId || undefined, game.title, reviewSummary?.positivePercent)

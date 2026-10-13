@@ -585,7 +585,7 @@ export function App() {
     criticScoreService.purgeStaleNullScores();
 
     const unrated = games.filter((g) => {
-      const targetSteamId = g.steamAppId || steamMatcher.matchGameToSteamInstant(g.title);
+      const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
       const score = getOpenCriticData(targetSteamId || undefined, g.title, g.reviewSummary?.positivePercent);
       return !score || score.score <= 0;
     });
@@ -604,7 +604,7 @@ export function App() {
       await Promise.all(
         chunk.map(async (g) => {
           try {
-            const targetSteamId = g.steamAppId || steamMatcher.matchGameToSteamInstant(g.title);
+            const targetSteamId = steamMatcher.getEffectiveSteamAppId(g);
             await criticScoreService.resolveDynamicScore(g.title, targetSteamId);
           } catch {}
         })
@@ -797,8 +797,8 @@ export function App() {
 
       // 5. Intelligent Steam Match Pass for Non-Steam Titles
       currentCatalog = currentCatalog.map((g) => {
-        if (g.steamAppId) return g;
-        const matched = steamMatcher.matchGameToSteamInstant(g.title);
+        if (g.steamAppId || g.isExplicitNonSteam) return g;
+        const matched = steamMatcher.getEffectiveSteamAppId(g);
         if (matched) {
           return {
             ...g,
@@ -927,8 +927,7 @@ export function App() {
   // Check if syncing the currently viewed game from Steam is applicable
   const canSyncCurrentGame = useMemo(() => {
     if (isGridView || !selectedGame) return false;
-    if (selectedGame.steamAppId) return true;
-    const matched = steamMatcher.matchGameToSteamInstant(selectedGame.title);
+    const matched = steamMatcher.getEffectiveSteamAppId(selectedGame);
     return Boolean(matched);
   }, [isGridView, selectedGame]);
 
@@ -936,7 +935,7 @@ export function App() {
   const handleSyncCurrentGame = async (gameToSync?: CanonicalGame) => {
     const target = gameToSync || selectedGame;
     if (!target || isSyncingCurrentGame) return;
-    const targetAppId = target.steamAppId || steamMatcher.matchGameToSteamInstant(target.title);
+    const targetAppId = steamMatcher.getEffectiveSteamAppId(target);
     if (!targetAppId) return;
 
     setIsSyncingCurrentGame(true);
@@ -1012,7 +1011,7 @@ export function App() {
 
     try {
       const eligibleGames = games.filter((g) => {
-        return Boolean(g.steamAppId || steamMatcher.matchGameToSteamInstant(g.title));
+        return Boolean(steamMatcher.getEffectiveSteamAppId(g));
       });
 
       const totalEligible = eligibleGames.length;
@@ -1027,7 +1026,7 @@ export function App() {
 
         await Promise.all(
           chunk.map(async (game) => {
-            const targetAppId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+            const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
             if (!targetAppId) return;
 
             try {
@@ -1097,7 +1096,7 @@ export function App() {
 
         await Promise.all(
           chunk.map(async (game) => {
-            const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+            const targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
             const immediate = getOpenCriticData(targetSteamId || undefined, game.title, game.reviewSummary?.positivePercent);
             if (!immediate || immediate.score <= 0) {
               await criticScoreService.resolveDynamicScore(game.title, targetSteamId);

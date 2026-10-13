@@ -17,6 +17,7 @@ import {
   extractFirstParagraph,
 } from '../steam/fallbackMetadataProvider';
 import { igdbCoverService } from '../igdb/igdbCoverService';
+import { storefrontReviewHarvester } from '../critic/storefrontReviewHarvester';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
@@ -688,6 +689,13 @@ export class MetadataScraperService {
 
       const availableDescriptions = deduplicateDescriptions(rawDescriptions);
 
+      let steamAnchor = undefined;
+      try {
+        steamAnchor = (await storefrontReviewHarvester.getSteamAnchor(steamAppId)) || undefined;
+      } catch (err: any) {
+        console.warn(`[MetadataScraperService] Failed to harvest Steam anchor for ${steamAppId}:`, err?.message);
+      }
+
       return {
         matchedStore: 'steam',
         matchedId: steamAppId,
@@ -713,6 +721,7 @@ export class MetadataScraperService {
         genres: meta?.genres?.length ? meta.genres : originalGame?.genres || [],
         tags: meta?.tags?.length ? meta.tags : originalGame?.tags || [],
         releaseDate: meta?.releaseDate || originalGame?.releaseDate || '',
+        storefrontAnchor: steamAnchor,
       };
     }
 
@@ -788,6 +797,13 @@ export class MetadataScraperService {
 
       const availableDescriptions = deduplicateDescriptions(rawDescriptions);
 
+      let gogAnchor = undefined;
+      try {
+        gogAnchor = (await storefrontReviewHarvester.getGogAnchor(gogId, candidate.title)) || undefined;
+      } catch (err: any) {
+        console.warn(`[MetadataScraperService] Failed to harvest GOG anchor for ${gogId}:`, err?.message);
+      }
+
       return {
         matchedStore: 'gog',
         matchedId: gogId,
@@ -811,6 +827,7 @@ export class MetadataScraperService {
         genres: storeMeta?.genres || cached?.genres || originalGame?.genres || [],
         tags: storeMeta?.tags || cached?.tags || originalGame?.tags || [],
         releaseDate: storeMeta?.releaseDate || cached?.releaseDate || originalGame?.releaseDate || '',
+        storefrontAnchor: gogAnchor,
       };
     }
 

@@ -33,7 +33,7 @@ export function loadUserOverrides(): UserGameOverridesMap {
 /**
  * Persists a user-defined game override into localStorage (and native Electron if available).
  */
-export function saveUserOverride(override: UserGameOverride): void {
+export function saveUserOverride(override: UserGameOverride, oldGame?: CanonicalGame): void {
   if (!override || !override.gameId) return;
   try {
     const current = loadUserOverrides();
@@ -58,7 +58,7 @@ export function saveUserOverride(override: UserGameOverride): void {
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
         window.dispatchEvent(
-          new CustomEvent('antigravity:user-override-updated', { detail: updatedOverride })
+          new CustomEvent('antigravity:user-override-updated', { detail: { override: updatedOverride, oldGame } })
         );
       } catch {}
     }
@@ -109,7 +109,7 @@ export function removeUserOverride(gameId: string): void {
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       try {
         window.dispatchEvent(
-          new CustomEvent('antigravity:user-override-updated', { detail: { gameId } })
+          new CustomEvent('antigravity:user-override-removed', { detail: { gameId } })
         );
       } catch {}
     }
@@ -211,8 +211,14 @@ export function applyUserOverrideToGame(
   // Steam App ID: null explicitly means unlinked from Steam
   if (override.steamAppId === null) {
     updated.steamAppId = undefined;
-  } else if (override.steamAppId !== undefined) {
+    updated.isExplicitNonSteam = true;
+  } else if (typeof override.steamAppId === 'number') {
     updated.steamAppId = override.steamAppId;
+    updated.isExplicitNonSteam = false;
+  }
+
+  if (override.isExplicitNonSteam !== undefined) {
+    updated.isExplicitNonSteam = override.isExplicitNonSteam;
   }
 
   if (override.capsuleImage !== undefined && override.capsuleImage.trim() !== '') {

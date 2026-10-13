@@ -1,4 +1,6 @@
 import { CriticScoreData, CriticTier, OpenCriticData, StorefrontReviewAnchor } from '../../contracts/critic';
+import type { CanonicalGame } from '../../contracts/game';
+import type { UserGameOverride } from '../../contracts/override';
 import { KNOWN_CRITIC_SCORES, KNOWN_UNRATED_TITLES } from './knownCriticScores';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import {
@@ -51,6 +53,69 @@ class CriticScoreService {
   constructor() {
     this.purgeLegacyScores();
     this.purgeStaleNullScores();
+    this.initEventListeners();
+  }
+
+  public initEventListeners(): void {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('antigravity:user-override-updated', ((e: CustomEvent) => {
+        const detail = e.detail;
+        if (detail) {
+          const override = detail.override || detail;
+          const oldGame = detail.oldGame;
+          this.handleUserOverride(override, oldGame);
+        }
+      }) as EventListener);
+      window.addEventListener('antigravity:user-override-removed', ((e: CustomEvent) => {
+        const gameId = e.detail?.gameId;
+        if (gameId) {
+          this.clearCache();
+        }
+      }) as EventListener);
+    }
+  }
+
+  /**
+   * Responds to user game overrides by evicting stale cached entries across memory and localStorage,
+   * invalidating storefrontReviewHarvester cache, and proactively initiating dynamic score resolution.
+   */
+  public handleUserOverride(override: UserGameOverride, oldGame?: CanonicalGame): void {
+    const keysToEvict = new Set<string>();
+
+    if (override.title) {
+      keysToEvict.add(`title:${override.title.toLowerCase().trim()}`);
+    }
+    if (typeof override.steamAppId === 'number' && override.steamAppId > 0) {
+      keysToEvict.add(`id:${override.steamAppId}`);
+    }
+
+    if (oldGame) {
+      if (oldGame.title) {
+        keysToEvict.add(`title:${oldGame.title.toLowerCase().trim()}`);
+      }
+      if (typeof oldGame.steamAppId === 'number' && oldGame.steamAppId > 0) {
+        keysToEvict.add(`id:${oldGame.steamAppId}`);
+      }
+    }
+
+    for (const key of keysToEvict) {
+      this.inMemoryCache.delete(key);
+      this.attemptedDynamicResolutions.delete(key);
+      this.inFlightResolutions.delete(key);
+      if (typeof localStorage !== 'undefined') {
+        try {
+          localStorage.removeItem(`${STORAGE_PREFIX}${key}`);
+        } catch {}
+      }
+    }
+
+    storefrontReviewHarvester.clearCache();
+
+    const targetTitle = (override.title || oldGame?.title || '').trim();
+    if (targetTitle) {
+      const targetSteamId = typeof override.steamAppId === 'number' ? override.steamAppId : undefined;
+      this.resolveDynamicScore(targetTitle, targetSteamId, undefined, override.storefrontAnchor).catch(() => {});
+    }
   }
 
   /**
@@ -159,6 +224,7 @@ class CriticScoreService {
     metacriticResolver.clearCache();
     steamReviewResolver.clearCache();
     storefrontStarResolver.clearCache();
+    storefrontReviewHarvester.clearCache();
     this.purgeStaleNullScores();
   }
 

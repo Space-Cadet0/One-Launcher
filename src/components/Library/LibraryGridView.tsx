@@ -216,9 +216,9 @@ export function getCoverCandidates(
 
   // 3. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404/hashed)
   // If user explicitly unlinked from Steam (effectiveOverride?.steamAppId === null), do NOT match to Steam!
-  const isExplicitNonSteam = effectiveOverride?.steamAppId === null;
+  const isExplicitNonSteam = effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
   const targetSteamId = !isExplicitNonSteam
-    ? (game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title))
+    ? steamMatcher.getEffectiveSteamAppId(game)
     : null;
 
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
@@ -645,7 +645,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   // Live dynamic blurb fetching for newly synced games without a cached description
   useEffect(() => {
     if (!hoveredGame) return;
-    const targetAppId = hoveredGame.steamAppId || steamMatcher.matchGameToSteamInstant(hoveredGame.title);
+    const targetAppId = steamMatcher.getEffectiveSteamAppId(hoveredGame);
     if (!targetAppId) return;
 
     if (!hasStoreSynopsis(hoveredGame, targetAppId)) {
@@ -671,8 +671,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   // Sorting
   const sortedGames = [...games].sort((a, b) => {
     if (sortBy === 'rating') {
-      const targetSteamIdA = a.steamAppId || steamMatcher.matchGameToSteamInstant(a.title);
-      const targetSteamIdB = b.steamAppId || steamMatcher.matchGameToSteamInstant(b.title);
+      const targetSteamIdA = steamMatcher.getEffectiveSteamAppId(a);
+      const targetSteamIdB = steamMatcher.getEffectiveSteamAppId(b);
       const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent);
       const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent);
       const scoreA = ocA?.score ?? -1;
@@ -955,7 +955,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
                   {/* Top-Right: Critic Score Pill */}
                   {(() => {
-                    const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+                    const targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
                     const oc = getOpenCriticData(
                       targetSteamId || undefined,
                       game.title,
@@ -1094,9 +1094,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
             const hoveredOverride = userOverridesMap[hoveredGame.id] || getUserOverrideForGame(hoveredGame, userOverridesMap);
             const targetAppId = hoveredOverride?.steamAppId === null
               ? undefined
-              : (hoveredGame.steamAppId ||
-                steamMatcher.matchGameToSteamInstant(hoveredGame.title) ||
-                undefined);
+              : steamMatcher.getEffectiveSteamAppId(hoveredGame);
             const releaseYear = getReleaseYear(hoveredGame, targetAppId);
             const cleanSynopsis = getCleanSynopsis(hoveredGame, targetAppId, hoveredOverride);
 

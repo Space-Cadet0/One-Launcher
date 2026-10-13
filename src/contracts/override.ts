@@ -1,3 +1,5 @@
+import type { StorefrontReviewAnchor } from './critic';
+
 export interface SearchMatchCandidate {
   id: string | number;
   source: 'steam' | 'igdb' | 'gog' | 'epic';
@@ -38,6 +40,7 @@ export interface ScrapedMetadataBundle {
   genres?: string[];
   tags?: string[];
   releaseDate?: string;
+  storefrontAnchor?: StorefrontReviewAnchor;
 }
 
 export interface UserGameOverride {
@@ -49,6 +52,7 @@ export interface UserGameOverride {
   title?: string;
   sortTitle?: string;
   steamAppId?: number | null; // null if explicitly unlinked from Steam
+  isExplicitNonSteam?: boolean;
   igdbId?: number | string;
   capsuleImage?: string;
   headerImage?: string;
@@ -60,6 +64,7 @@ export interface UserGameOverride {
   genres?: string[];
   tags?: string[];
   releaseDate?: string;
+  storefrontAnchor?: StorefrontReviewAnchor;
   updatedAt: string;
 }
 

@@ -176,6 +176,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       title: customTitle.trim() || scrapedBundle.title,
       sortTitle: (customTitle.trim() || scrapedBundle.title).replace(/^(The|A|An)\s+/i, '').trim(),
       steamAppId: isExplicitNonSteam ? null : scrapedBundle.steamAppId ?? null,
+      isExplicitNonSteam,
       igdbId: scrapedBundle.igdbId,
       capsuleImage: selectedCoverUrl || scrapedBundle.capsuleImage,
       headerImage: scrapedBundle.headerImage,
@@ -187,6 +188,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       genres: scrapedBundle.genres,
       tags: scrapedBundle.tags,
       releaseDate: scrapedBundle.releaseDate,
+      storefrontAnchor: scrapedBundle.storefrontAnchor,
       updatedAt: new Date().toISOString(),
     };
 

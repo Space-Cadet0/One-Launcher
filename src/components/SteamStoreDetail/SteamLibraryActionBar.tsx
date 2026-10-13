@@ -276,7 +276,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const isAnyMastered = platformAchievements.some((p) => p.isMastered || p.percentage >= 100);
 
   // Critic consensus rating
-  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+  const targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
   const openCritic = getOpenCriticData(
     targetSteamId || undefined,
     game.title,

@@ -37,6 +37,7 @@ export interface CanonicalGame {
   title: string;
   sortTitle: string;
   steamAppId?: number;
+  isExplicitNonSteam?: boolean;
   platforms: GamePlatformOwnership[];
   headerImage: string;
   capsuleImage?: string;

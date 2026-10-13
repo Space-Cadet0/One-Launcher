@@ -97,151 +97,33 @@ export function getTierColor(tier?: CriticTier) {
   }
 }
 
+import {
+  normalizeTitleKey,
+  stripEditionSuffix as commonStripEditionSuffix,
+  isSequelMismatch as commonIsSequelMismatch,
+  ROMAN_TO_ARABIC,
+} from '../common/titleUtils';
+
+export { ROMAN_TO_ARABIC };
+
 /**
  * Normalizes title string for robust aggregator matching.
  */
 export function normalizeCriticTitleKey(title: string): string {
-  if (!title) return '';
-  return title
-    .toLowerCase()
-    .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
-    .replace(/[^a-z0-9]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return normalizeTitleKey(title);
 }
 
 /**
  * Strips edition suffixes (e.g. Definitive Edition, Deluxe, Gold, Remastered) for base title fallback.
  */
 export function stripEditionSuffix(title: string): string {
-  if (!title) return '';
-  return title
-    .toLowerCase()
-    .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
-    .replace(
-      /\b(digital\s+)?(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|director'?s cut|goty|game of the year|remastered|remake)\b.*$/i,
-      ''
-    )
-    .replace(/[^a-z0-9]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return commonStripEditionSuffix(title);
 }
-
-const ROMAN_TO_ARABIC: Record<string, string> = {
-  ii: '2',
-  iii: '3',
-  iv: '4',
-  v: '5',
-  vi: '6',
-  vii: '7',
-  viii: '8',
-  ix: '9',
-  x: '10',
-  xi: '11',
-  xii: '12',
-  xiii: '13',
-  xiv: '14',
-  xv: '15',
-  xvi: '16',
-  xvii: '17',
-  xviii: '18',
-  xix: '19',
-  xx: '20',
-};
-
-const NUMERIC_SEQUELS = new Set([
-  '2', '3', '4', '5', '6', '7', '8', '9', '10',
-  '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'
-]);
 
 /**
  * Detects whether a search candidate is a numbered or Roman numeral sequel to prevent false-positive matching.
- * Handles both hyphenated/spaced ('MDK 2', 'Quake 2') and concatenated ('MDK2', 'Quake2') numeral boundaries.
- * Correctly permits mid-numeral subtitle omissions (e.g. 'Deus Ex 2: Invisible War' vs 'Deus Ex: Invisible War')
- * while strictly preventing true franchise sequel mismatches (e.g. 'Doom' vs 'Doom 2', 'Left 4 Dead' vs 'Left 4 Dead 2').
  */
 export function isSequelMismatch(query: string, candidateName: string): boolean {
-  const normalize = (str: string) =>
-    str
-      .toLowerCase()
-      .replace(/(\d),(\d)/g, '$1$2')
-      .replace(/([a-z])(\d)/g, '$1 $2')
-      .replace(/(\d)([a-z])/g, '$1 $2')
-      .replace(/[^a-z0-9]/g, ' ')
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((token) => ROMAN_TO_ARABIC[token] || token);
-
-  const qTokens = normalize(query);
-  const cTokens = normalize(candidateName);
-
-  const otherVariants = new Set(['new', 'vr']);
-  const stopWords = new Set(['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'edition', 'game', 'classic', 'standard', 'deluxe']);
-
-  for (const num of NUMERIC_SEQUELS) {
-    const qHas = qTokens.includes(num);
-    const cHas = cTokens.includes(num);
-    if ((!qHas && cHas) || (qHas && !cHas)) {
-      // If the number is part of an anniversary/celebration (e.g. '20 Year Celebration'), ignore
-      if (num === '20' && (qTokens.includes('year') || cTokens.includes('year'))) continue;
-
-      // Check if this is an intermediate numeral before a distinctive subtitle
-      const hasNumeral = qHas ? qTokens : cTokens;
-      const noNumeral = qHas ? cTokens : qTokens;
-      const numIdx = hasNumeral.indexOf(num);
-      const afterNum = hasNumeral.slice(numIdx + 1).filter((t) => !stopWords.has(t) && !NUMERIC_SEQUELS.has(t));
-
-      const hasSubtitleSyntax =
-        query.includes(':') ||
-        query.includes(' - ') ||
-        candidateName.includes(':') ||
-        candidateName.includes(' - ');
-
-      const subtitleMatches =
-        afterNum.length >= (hasSubtitleSyntax ? 1 : 2) && afterNum.every((t) => noNumeral.includes(t));
-
-      if (subtitleMatches) {
-        continue; // Permitted subtitle match (e.g. Deus Ex 2: Invisible War vs Deus Ex: Invisible War)
-      }
-      return true;
-    }
-  }
-
-  // Distinct numbers mismatch (e.g. 'THE KING OF FIGHTERS 2002' vs 'The King of Fighters-i 2012')
-  const qAllNums = qTokens.filter((t) => /^\d+$/.test(t));
-  const cAllNums = cTokens.filter((t) => /^\d+$/.test(t));
-  if (qAllNums.length > 0 && cAllNums.length > 0) {
-    const qHasDiff = qAllNums.some((n) => !cAllNums.includes(n));
-    const cHasDiff = cAllNums.some((n) => !qAllNums.includes(n));
-    if (qHasDiff && cHasDiff) {
-      return true;
-    }
-  }
-
-  for (const variant of otherVariants) {
-    const qHas = qTokens.includes(variant);
-    const cHas = cTokens.includes(variant);
-    if ((!qHas && cHas) || (qHas && !cHas)) {
-      return true;
-    }
-  }
-
-  // Edition mismatch: prevent distinct remaster/remake releases from adopting original game reviews
-  const editions = new Set(['remastered', 'remake']);
-  for (const ed of editions) {
-    const qHas = qTokens.includes(ed);
-    const cHas = cTokens.includes(ed);
-    if (qHas && !cHas) return true;
-  }
-
-  // Compilation/bundle mismatch: prevent dual game compilations (e.g. 'DOOM + DOOM II')
-  // from erroneously resolving to a single component game (e.g. 'Doom II')
-  if (/\s\+\s/.test(query) && !candidateName.toLowerCase().includes('+') && !candidateName.toLowerCase().includes('plus')) {
-    return true;
-  }
-  return false;
-
+  return commonIsSequelMismatch(query, candidateName);
 }
 

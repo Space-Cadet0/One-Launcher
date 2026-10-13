@@ -1,6 +1,14 @@
 import axios from 'axios';
 import { CanonicalGame } from '../../contracts/game';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
+import {
+  normalizeTitleKey,
+  stripEditionSuffix,
+  extractSequelIdentifier as commonExtractSequelIdentifier,
+  isSequelMismatch as commonIsSequelMismatch,
+  ROMAN_TO_ARABIC,
+  EDITION_TOKENS,
+} from '../common/titleUtils';
 
 /**
  * Curated high-confidence mapping for hundreds of popular multi-store & cross-platform titles.
@@ -370,27 +378,12 @@ for (const [key, appId] of Object.entries(KNOWN_STORE_STEAM_MAPPINGS)) {
   CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(canonicalizeTitleKey(key), appId);
   CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(normalizeGameTitle(key).toLowerCase(), appId);
   CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(canonicalizeTitleKey(normalizeGameTitle(key)), appId);
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(normalizeTitleKey(key), appId);
+  CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set(stripEditionSuffix(key), appId);
 }
 
-const ROMAN_NUMERALS: Record<string, string> = {
-  i: '1',
-  ii: '2',
-  iii: '3',
-  iv: '4',
-  v: '5',
-  vi: '6',
-  vii: '7',
-  viii: '8',
-  ix: '9',
-  x: '10',
-};
-
-export function extractSequelIdentifier(words: string[]): string | null {
-  for (const w of words) {
-    if (/^[2-9]$|^10$/.test(w)) return w;
-    if (ROMAN_NUMERALS[w] && w !== 'i') return ROMAN_NUMERALS[w];
-  }
-  return null;
+export function extractSequelIdentifier(words: string[] | string): string | null {
+  return commonExtractSequelIdentifier(words);
 }
 
 /**
@@ -412,42 +405,7 @@ export const KNOWN_NON_STEAM_TITLES = new Set([
   'total annihilation: kingdoms + iron plague',
 ]);
 
-export const EDITION_WORDS = new Set([
-  'complete',
-  'definitive',
-  'enhanced',
-  'goty',
-  'deluxe',
-  'gold',
-  'standard',
-  'remastered',
-  'remaster',
-  'directors',
-  'director',
-  'cut',
-  'edition',
-  'collectors',
-  'collector',
-  'anniversary',
-  'special',
-  'ultimate',
-  'extended',
-  'game',
-  'year',
-  'final',
-  'royal',
-  'emperor',
-  'classics',
-  'classic',
-  'plus',
-  'bundle',
-  'pack',
-  'package',
-  'collection',
-  'upgrade',
-  'vr',
-  'hd',
-]);
+export const EDITION_WORDS: Set<string> = EDITION_TOKENS;
 
 /**
  * Computes token similarity between two game names (Jaccard coefficient + phrase check)
@@ -468,6 +426,10 @@ export function computeTitleSimilarity(source: string, candidate: string): numbe
   const seq1 = extractSequelIdentifier(words1);
   const seq2 = extractSequelIdentifier(words2);
   if (seq1 !== seq2) {
+    return 0;
+  }
+
+  if (commonIsSequelMismatch(source, candidate)) {
     return 0;
   }
 
@@ -609,7 +571,9 @@ export class SteamMatcherService {
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(lowerKey) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalized) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalKey) ||
-      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalizeTitleKey(cleanRaw)) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(stripEditionSuffix(cleanRaw));
 
     if (directMatch) {
       this.cache.set(lowerKey, directMatch);
@@ -654,7 +618,9 @@ export class SteamMatcherService {
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(lowerKey) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalized) ||
       CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalKey) ||
-      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm);
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(canonicalNorm) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(normalizeTitleKey(cleanRaw)) ||
+      CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.get(stripEditionSuffix(cleanRaw));
 
     if (directMatch) {
       this.cache.set(lowerKey, directMatch);
@@ -772,6 +738,52 @@ export class SteamMatcherService {
       capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedId}/library_600x900_2x.jpg`,
     };
   }
+
+  /**
+   * Resolves the authoritative Steam App ID for a game, respecting explicit non-Steam flags
+   * and manual null overrides, falling back to instant high-confidence matching.
+   */
+  getEffectiveSteamAppId(game?: {
+    steamAppId?: number | null;
+    isExplicitNonSteam?: boolean;
+    title?: string;
+  } | null): number | undefined {
+    if (!game) return undefined;
+    if (game.isExplicitNonSteam === true) return undefined;
+    if (typeof game.steamAppId === 'number' && game.steamAppId > 0) return game.steamAppId;
+    if (game.steamAppId === null) return undefined;
+    if (game.title) {
+      return this.matchGameToSteamInstant(game.title) || undefined;
+    }
+    return undefined;
+  }
+
+  normalizeTitleKey(title: string): string {
+    return normalizeTitleKey(title);
+  }
+
+  stripEditionSuffix(title: string): string {
+    return stripEditionSuffix(title);
+  }
 }
 
 export const steamMatcher = new SteamMatcherService();
+
+/**
+ * Resolves the authoritative Steam App ID for a game, respecting explicit non-Steam flags
+ * and manual null overrides, falling back to instant high-confidence matching.
+ */
+export function getEffectiveSteamAppId(game?: {
+  steamAppId?: number | null;
+  isExplicitNonSteam?: boolean;
+  title?: string;
+} | null): number | undefined {
+  return steamMatcher.getEffectiveSteamAppId(game);
+}
+
+export {
+  normalizeTitleKey,
+  stripEditionSuffix,
+  ROMAN_TO_ARABIC,
+  EDITION_TOKENS,
+};
