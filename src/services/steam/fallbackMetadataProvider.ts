@@ -502,16 +502,25 @@ export class FallbackMetadataProvider {
       }
     }
 
-    // Pull OpenCritic review data
-    const ocData = getOpenCriticData(undefined, game.title, undefined);
-    const reviewSummary: SteamReviewSummary = {
-      reviewScore: ocData.score ? Math.round(ocData.score / 10) : 8,
-      reviewScoreDesc: ocData.tier ? `${ocData.tier} (${ocData.score || 85}%)` : 'Critically Acclaimed',
-      totalPositive: ocData.numReviews ? Math.round(ocData.numReviews * 0.9) : 95,
-      totalNegative: ocData.numReviews ? Math.round(ocData.numReviews * 0.1) : 5,
-      totalReviews: ocData.numReviews || 100,
-      positivePercent: ocData.score || 85,
-    };
+    // Pull Critic review data if verified
+    const ocData = getOpenCriticData(undefined, game.title);
+    const reviewSummary: SteamReviewSummary = ocData
+      ? {
+          reviewScore: Math.round(ocData.score / 10),
+          reviewScoreDesc: `${ocData.tier} (${ocData.score}%)`,
+          totalPositive: ocData.numReviews ? Math.round(ocData.numReviews * 0.9) : 95,
+          totalNegative: ocData.numReviews ? Math.round(ocData.numReviews * 0.1) : 5,
+          totalReviews: ocData.numReviews || 100,
+          positivePercent: ocData.score,
+        }
+      : {
+          reviewScore: 8,
+          reviewScoreDesc: 'Positive',
+          totalPositive: 80,
+          totalNegative: 20,
+          totalReviews: 100,
+          positivePercent: 80,
+        };
 
     const devs =
       (storeMetadata?.developers && storeMetadata.developers.length > 0)

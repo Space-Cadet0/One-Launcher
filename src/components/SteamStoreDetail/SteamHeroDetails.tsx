@@ -9,7 +9,7 @@ interface SteamHeroDetailsProps {
   title: string;
   shortDescription?: string;
   reviewSummary?: SteamReviewSummary;
-  openCritic?: OpenCriticData;
+  openCritic?: OpenCriticData | null;
   releaseDate?: string;
   developers?: string[];
   publishers?: string[];
@@ -89,38 +89,52 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
           )}
         </div>
 
-        {/* OpenCritic Rating Row */}
+        {/* Critic Consensus Rating Row */}
         {openCritic && (
           <div className="flex items-center">
             <span className="w-[94px] flex-shrink-0 text-[10px] uppercase text-[#556772] font-normal tracking-wider">
-              OpenCritic:
+              {openCritic.source === 'metacritic'
+                ? 'Metacritic:'
+                : openCritic.source === 'metacritic_user'
+                ? 'MC User Score:'
+                : openCritic.source === 'steam'
+                ? 'Steam Rating:'
+                : openCritic.source === 'gog'
+                ? 'GOG Rating:'
+                : openCritic.source === 'epic'
+                ? 'Epic Rating:'
+                : 'OpenCritic:'}
             </span>
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
                 onClick={() =>
                   onApplyFilter?.({
-                    type: 'opencritic',
-                    label: 'OpenCritic',
+                    type: 'rating',
+                    label: 'Rating',
                     value: openCritic.tier,
                   })
                 }
                 className={`px-1.5 py-0.2 rounded text-[10px] font-bold border hover:brightness-125 cursor-pointer ${getTierColor(openCritic.tier).badgeBg} ${getTierColor(openCritic.tier).badgeBorder} ${getTierColor(openCritic.tier).badgeText}`}
-                title={`Filter library for ${openCritic.tier} OpenCritic games`}
+                title={`Filter library for ${openCritic.tier} games`}
               >
-                {openCritic.score}
+                {openCritic.source === 'metacritic_user' && openCritic.userScoreRaw !== undefined
+                  ? `${openCritic.userScoreRaw}/10`
+                  : (openCritic.source === 'gog' || openCritic.source === 'epic') && openCritic.starRatingRaw !== undefined
+                  ? `${openCritic.starRatingRaw}★`
+                  : openCritic.score}
               </button>
               <button
                 type="button"
                 onClick={() =>
                   onApplyFilter?.({
-                    type: 'opencritic',
-                    label: 'OpenCritic',
+                    type: 'rating',
+                    label: 'Rating',
                     value: openCritic.tier,
                   })
                 }
                 className={`font-bold hover:underline cursor-pointer ${getTierColor(openCritic.tier).accentText}`}
-                title={`Filter library for ${openCritic.tier} OpenCritic games`}
+                title={`Filter library for ${openCritic.tier} games`}
               >
                 {openCritic.tier}
               </button>
@@ -128,14 +142,41 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
                 href={openCritic.url}
                 target="_blank"
                 rel="noreferrer"
-                className="text-[#556772] hover:text-[#c6d4df] transition-colors ml-0.5"
-                title={`View ${title} on OpenCritic.com`}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+                    window.electronAPI.openExternal(openCritic.url);
+                  } else {
+                    window.open(openCritic.url, '_blank', 'noreferrer,noopener');
+                  }
+                }}
+                className="text-[#556772] hover:text-[#c6d4df] transition-colors ml-0.5 cursor-pointer"
+                title={
+                  openCritic.source === 'metacritic'
+                    ? `View ${title} on Metacritic.com`
+                    : openCritic.source === 'metacritic_user'
+                    ? `View ${title} User Reviews on Metacritic.com`
+                    : openCritic.source === 'steam'
+                    ? `View ${title} on Steam Store`
+                    : openCritic.source === 'gog'
+                    ? `View ${title} on GOG.com`
+                    : openCritic.source === 'epic'
+                    ? `View ${title} on Epic Games Store`
+                    : `View ${title} on OpenCritic.com`
+                }
               >
                 <ExternalLink className="w-2.5 h-2.5" />
               </a>
-              <span className="text-[#556772] font-normal text-[11px]">
-                ({openCritic.percentRecommended}% rec)
-              </span>
+              {openCritic.percentRecommended !== undefined ? (
+                <span className="text-[#556772] font-normal text-[11px]">
+                  ({openCritic.percentRecommended}% {openCritic.source === 'steam' ? 'positive' : 'rec'})
+                </span>
+              ) : (openCritic.source === 'gog' || openCritic.source === 'epic') && (
+                <span className="text-[#556772] font-normal text-[11px]">
+                  ({openCritic.score}/100)
+                </span>
+              )}
             </div>
           </div>
         )}

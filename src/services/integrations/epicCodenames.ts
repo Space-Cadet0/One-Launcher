@@ -155,22 +155,23 @@ export const KNOWN_EPIC_APP_NAMES: Record<string, EpicCodenameMapping> = {
   },
   "overcooked 2": {
     "title": "Overcooked! 2",
-    "steamAppId": 448510,
+    "steamAppId": 728880,
     "developer": "Team17 Digital Ltd",
     "description": "Overcooked! 2"
   },
   "potoo": {
     "title": "Overcooked! 2",
-    "steamAppId": 448510,
+    "steamAppId": 728880,
     "developer": "Team17 Digital Ltd",
     "description": "Overcooked! 2"
   },
   "08addee88a7a400c940c9db6263b61db": {
     "title": "Overcooked! 2",
-    "steamAppId": 448510,
+    "steamAppId": 728880,
     "developer": "Team17 Digital Ltd",
     "description": "Overcooked! 2"
   },
+
   "8fceb562623c430db9bb6abf0549c43e": {
     "title": "Pathway",
     "steamAppId": 546430,

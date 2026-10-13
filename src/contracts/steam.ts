@@ -77,4 +77,9 @@ export interface SteamEnrichedMetadata {
       path: string;
     }>;
   };
+  metacritic?: {
+    score: number;
+    url: string;
+  };
 }
+

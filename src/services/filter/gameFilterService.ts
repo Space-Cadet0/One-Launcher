@@ -18,13 +18,9 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   if (!filter || !filter.value) return true;
   const target = filter.value.trim().toLowerCase();
 
-  if (filter.type === 'opencritic') {
-    const pos =
-      game.reviewSummary?.positivePercent ??
-      game.enrichedMetadata?.reviewSummary?.positivePercent ??
-      (game.steamAppId ? cache[game.steamAppId.toString()]?.reviewSummary?.positivePercent : undefined);
-
-    const oc = getOpenCriticData(game.steamAppId, game.title, pos);
+  if (filter.type === 'opencritic' || filter.type === 'rating' || filter.type === 'critic') {
+    const oc = getOpenCriticData(game.steamAppId, game.title, game.reviewSummary?.positivePercent);
+    if (!oc) return false;
     const tier = oc.tier.toLowerCase();
     return tier === target || target.includes(tier) || tier.includes(target);
   }

@@ -11,6 +11,8 @@ import {
   Menu,
   Film,
   Wand,
+  Trophy,
+  Award,
 } from 'lucide-react';
 
 interface TopNavBarProps {
@@ -40,8 +42,11 @@ interface TopNavBarProps {
   onSyncCurrentGame?: () => void;
   isSyncingAllMedia?: boolean;
   onSyncAllMedia?: () => void;
+  isSyncingScores?: boolean;
+  onRefreshScores?: () => void;
   onOpenFixMatch?: () => void;
   defaultMenuOpen?: boolean;
+  onOpenAchievements?: () => void;
 }
 
 export const TopNavBar: React.FC<TopNavBarProps> = ({
@@ -68,8 +73,11 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onSyncCurrentGame,
   isSyncingAllMedia = false,
   onSyncAllMedia,
+  isSyncingScores = false,
+  onRefreshScores,
   onOpenFixMatch,
   defaultMenuOpen = false,
+  onOpenAchievements,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(defaultMenuOpen);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -165,7 +173,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               aria-expanded={isMenuOpen}
             >
               <Menu className="w-4 h-4" />
-              {(isSyncing || isSyncingAllMedia || isSyncingCurrentGame) && (
+              {(isSyncing || isSyncingAllMedia || isSyncingCurrentGame || isSyncingScores) && (
                 <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
               )}
             </button>
@@ -262,6 +270,39 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   </button>
                 )}
 
+                {/* Refresh Critic Scores */}
+                {onRefreshScores && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onRefreshScores();
+                    }}
+                    disabled={isSyncingScores}
+                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
+                    title="Refresh and sync ratings from Metacritic, OpenCritic, and Steam across all games"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Award
+                        className={`w-4 h-4 ${
+                          isSyncingScores
+                            ? 'animate-spin text-steam-accent'
+                            : 'text-amber-400 group-hover:scale-110 transition-transform'
+                        }`}
+                      />
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-white">
+                          {isSyncingScores ? 'Syncing Scores...' : 'Refresh Critic Scores'}
+                        </span>
+                        <span className="text-[10px] text-steam-subtext">Metacritic, OpenCritic & Steam</span>
+                      </div>
+                    </div>
+                    {isSyncingScores && (
+                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    )}
+                  </button>
+                )}
+
                 {/* Sync Store Media (This Game) (Visible only when applicable) */}
                 {canSyncCurrentGame && onSyncCurrentGame && (
                   <button
@@ -313,6 +354,31 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                       <div className="flex flex-col min-w-0">
                         <span className="font-semibold text-white truncate">
                           Fix Match & Metadata...
+                        </span>
+                        <span className="text-[10px] text-steam-subtext truncate">
+                          {currentGameTitle}
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+                )}
+
+                {/* View Achievements (Visible when viewing individual game) */}
+                {currentGameTitle && onOpenAchievements && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onOpenAchievements();
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group border-t border-steam-border/40"
+                    title={`View detailed achievements, icons & unlock dates for ${currentGameTitle}`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Trophy className="w-4 h-4 shrink-0 text-amber-400 group-hover:scale-110 transition-transform" />
+                      <div className="flex flex-col min-w-0">
+                        <span className="font-semibold text-white truncate">
+                          View Achievements...
                         </span>
                         <span className="text-[10px] text-steam-subtext truncate">
                           {currentGameTitle}

@@ -9,6 +9,7 @@ import {
   Check,
   Folder,
   Sliders,
+  Trophy,
 } from 'lucide-react';
 
 export interface GameContextMenuProps {
@@ -22,6 +23,7 @@ export interface GameContextMenuProps {
   onSyncStoreMedia: (game: CanonicalGame) => void;
   onToggleCollection: (collectionId: string, gameId: string) => void;
   onManageCollections: (game: CanonicalGame) => void;
+  onViewAchievements?: (game: CanonicalGame) => void;
 }
 
 export const GameContextMenu: React.FC<GameContextMenuProps> = ({
@@ -35,6 +37,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
   onSyncStoreMedia,
   onToggleCollection,
   onManageCollections,
+  onViewAchievements,
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const submenuRef = useRef<HTMLDivElement | null>(null);
@@ -167,6 +170,22 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
         <Film className="w-4 h-4 text-purple-400 group-hover:scale-110 transition-transform" />
         <span>Sync Store Media (This Game)</span>
       </button>
+
+      {/* Action 3: View Achievements */}
+      {onViewAchievements && (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            onClose();
+            onViewAchievements(game);
+          }}
+          className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-amber-400 transition-colors cursor-pointer group"
+        >
+          <Trophy className="w-4 h-4 text-amber-400 group-hover:scale-110 transition-transform" />
+          <span>View Achievements...</span>
+        </button>
+      )}
 
       {/* Action 3: Assign to Collection (Branching Submenu) */}
       <div

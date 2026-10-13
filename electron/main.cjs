@@ -93,6 +93,7 @@ if (!gotTheLock) {
       '*://howlongtobeat.com/*',
       '*://*.lutris.net/*',
       '*://*.opencritic.com/*',
+      '*://*.metacritic.com/*',
     ];
 
     session.defaultSession.webRequest.onBeforeSendHeaders(

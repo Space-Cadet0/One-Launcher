@@ -242,9 +242,17 @@ export class SteamApiService {
         controllerSupport: data.controller_support,
         pcRequirementsHtml: data.pc_requirements?.minimum || undefined,
         achievements,
+        metacritic:
+          data.metacritic && typeof data.metacritic.score === 'number'
+            ? {
+                score: data.metacritic.score,
+                url: data.metacritic.url || '',
+              }
+            : undefined,
       };
 
       this.cache.set(appId, metadata);
+
       return metadata;
     } catch (err: any) {
       if (err?.response?.status === 403 || err?.response?.status === 429) {

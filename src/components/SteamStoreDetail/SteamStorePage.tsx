@@ -13,6 +13,7 @@ import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
 import { HowLongToBeatCard } from './HowLongToBeatCard';
 import { getOpenCriticData } from '../../services/opencritic/openCritic';
+import { OpenCriticCard } from './OpenCriticCard';
 import { SystemRequirements } from './SystemRequirements';
 import { PlatformBadges } from './PlatformBadges';
 import { SteamLanguagesTable } from './SteamLanguagesTable';
@@ -43,6 +44,7 @@ interface SteamStorePageProps {
   connectedStorefronts?: StorefrontId[];
   onOpenIntegrations?: () => void;
   onFixMatch?: () => void;
+  onViewAchievements?: (storefrontId?: StorefrontId) => void;
 }
 
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
@@ -56,6 +58,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   connectedStorefronts,
   onOpenIntegrations,
   onFixMatch,
+  onViewAchievements,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
@@ -257,11 +260,29 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     game.enrichedMetadata?.aboutTheGame ||
     game.enrichedMetadata?.detailedDescription;
 
-  const openCriticData = getOpenCriticData(
-    game.steamAppId,
-    game.title,
-    reviewSummary?.positivePercent
+  const effectiveSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
+
+  const [openCriticData, setOpenCriticData] = useState<any>(() =>
+    getOpenCriticData(effectiveSteamId || undefined, game.title, reviewSummary?.positivePercent)
   );
+
+  useEffect(() => {
+    setOpenCriticData(getOpenCriticData(effectiveSteamId || undefined, game.title, reviewSummary?.positivePercent));
+
+    const handleCriticUpdate = (e: any) => {
+      const detail = e.detail;
+      if (
+        detail &&
+        (detail.title?.toLowerCase() === game.title.toLowerCase() ||
+          (detail.steamAppId && (detail.steamAppId === game.steamAppId || detail.steamAppId === effectiveSteamId)))
+      ) {
+        setOpenCriticData(detail.data);
+      }
+    };
+
+    window.addEventListener('antigravity_critic_updated', handleCriticUpdate);
+    return () => window.removeEventListener('antigravity_critic_updated', handleCriticUpdate);
+  }, [game.steamAppId, game.title, reviewSummary?.positivePercent, effectiveSteamId]);
 
   return (
     <div ref={containerRef} className="w-full min-h-full bg-[#0e141b] text-steam-text pb-24 relative">
@@ -358,6 +379,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           onApplyFilter={onApplyFilter}
           connectedStorefronts={connectedStorefronts}
           onFixMatch={onFixMatch}
+          onViewAchievements={onViewAchievements}
         />
 
         {/* Main Steam Highlight Showcase (1:1 Steam 2-Column Split: Media Player + Details) */}
@@ -399,6 +421,12 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           appId={currentSteamAppId || game.steamAppId}
           genres={game.genres}
           tags={game.tags}
+        />
+
+        {/* Critic Consensus Dashboard (OpenCritic / Metacritic) */}
+        <OpenCriticCard
+          gameTitle={game.title}
+          openCritic={openCriticData}
         />
 
         {/* Content Section: Description & Technical Specs */}

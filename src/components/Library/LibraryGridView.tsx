@@ -346,6 +346,7 @@ interface LibraryGridViewProps {
   collections?: GameCollection[];
   onToggleGameInCollection?: (collectionId: string, gameId: string) => void;
   onOpenManageCollectionsModal?: (game?: CanonicalGame) => void;
+  onViewAchievements?: (game: CanonicalGame) => void;
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -364,6 +365,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   collections,
   onToggleGameInCollection,
   onOpenManageCollectionsModal,
+  onViewAchievements,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -378,6 +380,15 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     y: 0,
     game: null,
   });
+
+  const [, setCriticUpdateTick] = useState(0);
+  useEffect(() => {
+    const handleUpdate = () => {
+      setCriticUpdateTick((t) => t + 1);
+    };
+    window.addEventListener('antigravity_critic_updated', handleUpdate);
+    return () => window.removeEventListener('antigravity_critic_updated', handleUpdate);
+  }, []);
 
   const handleContextMenu = (game: CanonicalGame, e: React.MouseEvent) => {
     e.preventDefault();
@@ -660,13 +671,19 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   // Sorting
   const sortedGames = [...games].sort((a, b) => {
     if (sortBy === 'rating') {
-      const ocA = getOpenCriticData(a.steamAppId, a.title, a.reviewSummary?.positivePercent);
-      const ocB = getOpenCriticData(b.steamAppId, b.title, b.reviewSummary?.positivePercent);
-      if (ocB.score !== ocA.score) {
-        return ocB.score - ocA.score; // Highest OpenCritic score first
+      const targetSteamIdA = a.steamAppId || steamMatcher.matchGameToSteamInstant(a.title);
+      const targetSteamIdB = b.steamAppId || steamMatcher.matchGameToSteamInstant(b.title);
+      const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent);
+      const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent);
+      const scoreA = ocA?.score ?? -1;
+      const scoreB = ocB?.score ?? -1;
+      if (scoreB !== scoreA) {
+        return scoreB - scoreA; // Highest verified critic score first
       }
-      if (ocB.percentRecommended !== ocA.percentRecommended) {
-        return ocB.percentRecommended - ocA.percentRecommended;
+      const recA = ocA?.percentRecommended ?? -1;
+      const recB = ocB?.percentRecommended ?? -1;
+      if (recB !== recA) {
+        return recB - recA;
       }
       return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
     }
@@ -802,7 +819,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     ? 'bg-steam-accent text-black shadow-sm'
                     : 'text-steam-text hover:text-white'
                 }`}
-                title="Sort by OpenCritic rating (highest score first)"
+                title="Sort by Review Score (highest score first)"
               >
                 <Award className="w-3.5 h-3.5" />
                 <span>Rating</span>
@@ -936,7 +953,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     </div>
                   )}
 
-                  {/* Top-Right: OpenCritic Score Pill */}
+                  {/* Top-Right: Critic Score Pill */}
                   {(() => {
                     const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
                     const oc = getOpenCriticData(
@@ -944,19 +961,47 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       game.title,
                       game.reviewSummary?.positivePercent
                     );
+                    if (!oc) return null;
                     const ocColors = getTierColor(oc.tier);
+                    const isMetacritic = oc.source === 'metacritic';
+                    const isMetacriticUser = oc.source === 'metacritic_user';
+                    const isSteam = oc.source === 'steam';
+                    const isGog = oc.source === 'gog';
+                    const isEpic = oc.source === 'epic';
+                    const sourceTag = isMetacritic
+                      ? 'MC'
+                      : isMetacriticUser
+                      ? 'MCU'
+                      : isSteam
+                      ? 'STM'
+                      : isGog
+                      ? 'GOG'
+                      : isEpic
+                      ? 'EGS'
+                      : 'OC';
+                    const sourceName = isMetacritic
+                      ? 'Metacritic Metascore'
+                      : isMetacriticUser
+                      ? 'Metacritic User Score'
+                      : isSteam
+                      ? 'Steam Community'
+                      : isGog
+                      ? 'GOG Player Rating'
+                      : isEpic
+                      ? 'Epic Store Rating'
+                      : 'OpenCritic';
                     return (
                       <div
-                        className={`absolute top-2 right-2 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md backdrop-blur-md transition-all ${
+                        className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md backdrop-blur-md transition-all ${
                           ocColors.badgeBg
                         } ${ocColors.badgeBorder} ${ocColors.badgeText} ${
                           sortBy === 'rating'
                             ? 'ring-2 ring-purple-400 shadow-[0_0_10px_rgba(168,85,247,0.55)] scale-105'
                             : ''
                         }`}
-                        title={`OpenCritic: ${oc.score}/100 • ${oc.tier} (${oc.percentRecommended}% recommended)`}
+                        title={`${sourceName}: ${oc.score}/100 • ${oc.tier}${oc.starRatingRaw !== undefined ? ` (${oc.starRatingRaw}★)` : ''}${oc.userScoreRaw ? ` (${oc.userScoreRaw}/10 user rating)` : ''}${oc.percentRecommended !== undefined ? ` (${oc.percentRecommended}% recommended)` : ''}`}
                       >
-                        <span className="text-[9px] opacity-75">OC</span>
+                        <span className="text-[9px] opacity-75">{sourceTag}</span>
                         <span>{oc.score}</span>
                       </div>
                     );
@@ -1124,22 +1169,64 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     </div>
                   </div>
 
-                  {/* OpenCritic Rating Row */}
+                  {/* Critic Rating Row */}
                   {(() => {
                     const oc = getOpenCriticData(
                       targetAppId,
                       hoveredGame.title,
                       hoveredGame.reviewSummary?.positivePercent
                     );
+                    if (!oc) return null;
                     const ocColors = getTierColor(oc.tier);
+                    const isMetacritic = oc.source === 'metacritic';
+                    const isMetacriticUser = oc.source === 'metacritic_user';
+                    const isSteam = oc.source === 'steam';
+                    const isGog = oc.source === 'gog';
+                    const isEpic = oc.source === 'epic';
+                    const sourceTag = isMetacritic
+                      ? 'MC'
+                      : isMetacriticUser
+                      ? 'MCU'
+                      : isSteam
+                      ? 'STM'
+                      : isGog
+                      ? 'GOG'
+                      : isEpic
+                      ? 'EGS'
+                      : 'OC';
+                    const sourceName = isMetacritic
+                      ? 'Metacritic'
+                      : isMetacriticUser
+                      ? 'MC User Score'
+                      : isSteam
+                      ? 'Steam Rating'
+                      : isGog
+                      ? 'GOG Rating'
+                      : isEpic
+                      ? 'Epic Rating'
+                      : 'OpenCritic';
                     return (
                       <div className="flex items-center justify-between bg-black/40 px-2.5 py-1.5 rounded border border-white/5 text-[10px]">
                         <div className="flex items-center gap-1.5 text-white/70">
-                          <span className={`w-3.5 h-3.5 rounded text-[8px] font-black text-white flex items-center justify-center shrink-0 ${ocColors.scoreBg}`}>
-                            OC
+                          <span
+                            className={`w-3.5 h-3.5 rounded text-[8px] font-black flex items-center justify-center shrink-0 ${
+                              isMetacritic
+                                ? 'bg-amber-400 text-black font-extrabold'
+                                : isMetacriticUser
+                                ? 'bg-emerald-500 text-black font-extrabold'
+                                : isSteam
+                                ? 'bg-sky-600 text-white font-extrabold'
+                                : isGog
+                                ? 'bg-purple-600 text-white font-extrabold'
+                                : isEpic
+                                ? 'bg-zinc-700 text-white font-extrabold'
+                                : `${ocColors.scoreBg} text-white`
+                            }`}
+                          >
+                            {sourceTag}
                           </span>
                           <span className="font-semibold uppercase tracking-wider text-[9px] text-white/60">
-                            OpenCritic
+                            {sourceName}
                           </span>
                         </div>
                         <div className="flex items-center gap-2">
@@ -1149,9 +1236,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                           <span className={`text-[10px] font-bold ${ocColors.accentText}`}>
                             {oc.tier}
                           </span>
-                          <span className="text-[10px] text-steam-subtext">
-                            ({oc.percentRecommended}% rec)
-                          </span>
+                          {oc.percentRecommended !== undefined && (
+                            <span className="text-[10px] text-steam-subtext">
+                              ({oc.percentRecommended}% rec)
+                            </span>
+                          )}
                         </div>
                       </div>
                     );
@@ -1276,6 +1365,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         }}
         onManageCollections={(game) => {
           if (onOpenManageCollectionsModal) onOpenManageCollectionsModal(game);
+        }}
+        onViewAchievements={(game) => {
+          if (onViewAchievements) onViewAchievements(game);
         }}
       />
     </div>

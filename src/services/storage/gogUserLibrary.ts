@@ -8725,7 +8725,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
     }
   },
   {
-    "id": "steam-448510",
+    "id": "steam-728880",
     "title": "Overcooked! 2",
     "sortTitle": "Overcooked! 2",
     "platforms": [
@@ -8736,9 +8736,9 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
         "playtimeMinutes": 0
       }
     ],
-    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/header.jpg",
-    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/448510/library_600x900_2x.jpg",
-    "shortDescription": "Overcooked is a chaotic couch co-op cooking game for one to four players. Working as a team, you and your fellow chefs must prepare, cook and serve up a variety of tasty orders before the baying customers storm out in a huff.",
+    "headerImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/728880/header.jpg",
+    "capsuleImage": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/728880/library_600x900_2x.jpg",
+    "shortDescription": "Overcooked returns with a brand-new helping of chaotic cooking action! Journey back to the Onion Kingdom and assemble your team of chefs in classic couch co-op or online play for up to four players.",
     "releaseDate": "2018-08-07",
     "developers": [
       "Ghost Town Games Ltd.",
@@ -8766,7 +8766,7 @@ export const GOG_USER_LIBRARY: CanonicalGame[] = [
       "Comedy",
       "Cooking"
     ],
-    "steamAppId": 448510,
+    "steamAppId": 728880,
     "reviewSummary": {
       "reviewScore": 4,
       "reviewScoreDesc": "Positive",

@@ -20,8 +20,10 @@ import {
   ExternalLink,
   Sparkles,
   Wand,
+  ChevronRight,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
+import { steamMatcher } from '../../services/steam/steamMatcher';
 import { parseTimestampMs, formatLastPlayedDate, formatPlaytime } from '../../utils/dateUtils';
 import {
   getKnownAchievementTotal,
@@ -83,6 +85,7 @@ interface SteamLibraryActionBarProps {
   onApplyFilter?: (filter: ActiveGameFilter) => void;
   connectedStorefronts?: StorefrontId[];
   onFixMatch?: () => void;
+  onViewAchievements?: (storefrontId?: StorefrontId) => void;
 }
 
 export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
@@ -94,6 +97,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onApplyFilter,
   connectedStorefronts,
   onFixMatch,
+  onViewAchievements,
 }) => {
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
   const isInstalled = game.platforms.some((p) => p.installed);
@@ -271,13 +275,14 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   const isAnyMastered = platformAchievements.some((p) => p.isMastered || p.percentage >= 100);
 
-  // OpenCritic rating
+  // Critic consensus rating
+  const targetSteamId = game.steamAppId || steamMatcher.matchGameToSteamInstant(game.title);
   const openCritic = getOpenCriticData(
-    game.steamAppId,
+    targetSteamId || undefined,
     game.title,
-    metadata?.reviewSummary?.positivePercent || game.reviewSummary?.positivePercent
+    game.reviewSummary?.positivePercent
   );
-  const ocColors = getTierColor(openCritic.tier);
+  const ocColors = openCritic ? getTierColor(openCritic.tier) : null;
 
   return (
     <div className="bg-[#101822] border border-[#2a475e] rounded p-3.5 xl:p-4 shadow-xl text-steam-text select-none">
@@ -446,21 +451,23 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
           {/* Achievements */}
           <div
-            onClick={
-              platformAchievements.length > 1
-                ? () => setShowAchievementPopover((prev) => !prev)
-                : undefined
-            }
+            onClick={() => {
+              if (onViewAchievements && hasAchievements && bestAchievement.total > 0) {
+                onViewAchievements(bestAchievement.platformId);
+              } else if (platformAchievements.length > 1) {
+                setShowAchievementPopover((prev) => !prev);
+              }
+            }}
             className={`flex flex-col min-w-0 ${
-              platformAchievements.length > 1
+              (hasAchievements && bestAchievement.total > 0) || platformAchievements.length > 1
                 ? 'cursor-pointer group select-none'
                 : ''
             }`}
             title={
-              platformAchievements.length > 1
-                ? showAchievementPopover
-                  ? 'Click to hide per-store achievements breakdown'
-                  : 'Click to view per-store achievements breakdown'
+              hasAchievements && bestAchievement.total > 0
+                ? 'Click to view full achievements browser, icons & unlock dates'
+                : platformAchievements.length > 1
+                ? 'Click to view per-store achievements breakdown'
                 : undefined
             }
           >
@@ -542,44 +549,85 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
             )}
           </div>
 
-          {/* OpenCritic Score */}
-          <div className="flex flex-col min-w-0">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-[#8f98a0] flex items-center gap-1 whitespace-nowrap">
-              <Award className="w-3 h-3 text-purple-400" />
-              OpenCritic
-            </span>
-            <div className="flex items-center gap-1.5 mt-0.5 whitespace-nowrap">
-              <span className={`text-sm font-black ${ocColors.accentText}`}>
-                {openCritic.score}
+          {/* Critic Score */}
+          {openCritic && ocColors && (
+            <div className="flex flex-col min-w-0">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-[#8f98a0] flex items-center gap-1 whitespace-nowrap">
+                <Award className="w-3 h-3 text-purple-400" />
+                {openCritic.source === 'metacritic'
+                  ? 'Metacritic'
+                  : openCritic.source === 'metacritic_user'
+                  ? 'MC User Score'
+                  : openCritic.source === 'steam'
+                  ? 'Steam Community'
+                  : openCritic.source === 'gog'
+                  ? 'GOG Rating'
+                  : openCritic.source === 'epic'
+                  ? 'Epic Rating'
+                  : 'OpenCritic'}
               </span>
-              <button
-                type="button"
-                onClick={() =>
-                  onApplyFilter?.({
-                    type: 'opencritic',
-                    label: 'OpenCritic',
-                    value: openCritic.tier,
-                  })
-                }
-                className={`text-[10px] font-bold px-1.5 py-0.2 rounded border hover:underline hover:brightness-125 cursor-pointer ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}
-                title={`Filter library for ${openCritic.tier} OpenCritic games`}
-              >
-                {openCritic.tier}
-              </button>
-              <a
-                href={openCritic.url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-steam-subtext hover:text-white transition-colors"
-                title={`View ${game.title} on OpenCritic.com`}
-              >
-                <ExternalLink className="w-2.5 h-2.5" />
-              </a>
+              <div className="flex items-center gap-1.5 mt-0.5 whitespace-nowrap">
+                <span className={`text-sm font-black ${ocColors.accentText}`}>
+                  {openCritic.source === 'metacritic_user' && openCritic.userScoreRaw !== undefined
+                    ? `${openCritic.userScoreRaw}/10`
+                    : (openCritic.source === 'gog' || openCritic.source === 'epic') && openCritic.starRatingRaw !== undefined
+                    ? `${openCritic.starRatingRaw}★ (${openCritic.score})`
+                    : openCritic.score}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onApplyFilter?.({
+                      type: 'rating',
+                      label: 'Rating',
+                      value: openCritic.tier,
+                    })
+                  }
+                  className={`text-[10px] font-bold px-1.5 py-0.2 rounded border hover:underline hover:brightness-125 cursor-pointer ${ocColors.badgeBg} ${ocColors.badgeBorder} ${ocColors.badgeText}`}
+                  title={`Filter library for ${openCritic.tier} games`}
+                >
+                  {openCritic.tier}
+                </button>
+                <a
+                  href={openCritic.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+                      window.electronAPI.openExternal(openCritic.url);
+                    } else {
+                      window.open(openCritic.url, '_blank', 'noreferrer,noopener');
+                    }
+                  }}
+                  className="text-steam-subtext hover:text-white transition-colors cursor-pointer"
+                  title={
+                    openCritic.source === 'metacritic'
+                      ? `View ${game.title} on Metacritic.com`
+                      : openCritic.source === 'metacritic_user'
+                      ? `View ${game.title} User Reviews on Metacritic.com`
+                      : openCritic.source === 'steam'
+                      ? `View ${game.title} on Steam Store`
+                      : openCritic.source === 'gog'
+                      ? `View ${game.title} on GOG.com`
+                      : openCritic.source === 'epic'
+                      ? `View ${game.title} on Epic Games Store`
+                      : `View ${game.title} on OpenCritic.com`
+                  }
+                >
+                  <ExternalLink className="w-2.5 h-2.5" />
+                </a>
+              </div>
+              <span className="text-[10px] text-[#8f98a0] mt-0.5 truncate">
+                {openCritic.percentRecommended !== undefined
+                  ? `${openCritic.percentRecommended}% ${openCritic.source === 'steam' ? 'Positive' : 'Recommended'}`
+                  : (openCritic.source === 'gog' || openCritic.source === 'epic') && openCritic.starRatingRaw !== undefined
+                  ? `${openCritic.starRatingRaw}/5 Stars (${openCritic.numReviews ? openCritic.numReviews.toLocaleString() : ''} ratings)`
+                  : `${openCritic.tier} Consensus`}
+              </span>
             </div>
-            <span className="text-[10px] text-[#8f98a0] mt-0.5 truncate">
-              {openCritic.percentRecommended}% Recommended
-            </span>
-          </div>
+          )}
         </div>
       </div>
 
@@ -596,15 +644,27 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 ({platformAchievements.length} connected storefronts)
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setShowAchievementPopover(false)}
-              className="text-steam-subtext hover:text-white px-2 py-0.5 rounded hover:bg-white/10 text-xs flex items-center gap-1 cursor-pointer transition-colors"
-              title="Close storefront achievements"
-            >
-              <span className="text-[11px]">Close</span>
-              <X className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-2">
+              {onViewAchievements && (
+                <button
+                  type="button"
+                  onClick={() => onViewAchievements()}
+                  className="px-2.5 py-1 rounded bg-[#1b2838] hover:bg-[#25394e] text-xs font-semibold text-steam-accent border border-steam-accent/40 flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Trophy className="w-3.5 h-3.5 text-amber-400" />
+                  <span>View All Achievements...</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAchievementPopover(false)}
+                className="text-steam-subtext hover:text-white px-2 py-0.5 rounded hover:bg-white/10 text-xs flex items-center gap-1 cursor-pointer transition-colors"
+                title="Close storefront achievements"
+              >
+                <span className="text-[11px]">Close</span>
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -663,6 +723,18 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                       style={{ width: `${Math.min(100, plat.percentage)}%` }}
                     />
                   </div>
+                )}
+
+                {/* View Achievements Button */}
+                {plat.total > 0 && onViewAchievements && (
+                  <button
+                    type="button"
+                    onClick={() => onViewAchievements(plat.platformId)}
+                    className="mt-3 w-full py-1.5 px-2 rounded bg-[#1b2838] hover:bg-[#25394e] text-xs font-semibold text-steam-accent flex items-center justify-center gap-1 transition-colors cursor-pointer border border-[#2a475e]/60"
+                  >
+                    <span>View Achievements</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
                 )}
               </div>
             ))}
