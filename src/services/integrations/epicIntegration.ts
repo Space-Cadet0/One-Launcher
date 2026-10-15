@@ -317,8 +317,8 @@ export class EpicIntegrationService {
             continue;
           }
 
-          let rawTitle = (item.metadata?.title || item.sandboxName || '').trim();
-          const titleLower = rawTitle.toLowerCase().trim();
+          let rawTitle = (item.metadata?.title || '').trim();
+          const titleLower = (rawTitle || item.sandboxName || '').toLowerCase().trim();
 
           // Check if item matches a known Epic codename
           const codename =
@@ -327,10 +327,42 @@ export class EpicIntegrationService {
             KNOWN_EPIC_APP_NAMES[titleLower];
 
           let title = codename ? codename.title : rawTitle;
+          let keyImages = item.metadata?.keyImages || [];
+          let metaDescription = item.metadata?.description || '';
+          let metaDeveloper = item.metadata?.developer || '';
+
+          if ((!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) && item.namespace && item.catalogItemId) {
+            let resolvedFromCatalog = false;
+            try {
+              const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
+              const cRes = await axios.get(catUrl, {
+                headers: { Authorization: `Bearer ${accessToken}` },
+                timeout: 6000,
+              });
+              const meta = cRes.data?.[item.catalogItemId];
+              if (meta) {
+                const isDlc = meta.categories?.some((c: any) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
+                if (isDlc) continue;
+                if (meta.title) {
+                  title = meta.title;
+                  resolvedFromCatalog = true;
+                }
+                metaDescription = meta.description || metaDescription;
+                metaDeveloper = meta.developer || metaDeveloper;
+                keyImages = meta.keyImages || keyImages;
+              }
+            } catch {
+              // Ignore catalog lookup error
+            }
+            if (!resolvedFromCatalog && !codename && !item.metadata?.title) {
+              continue;
+            }
+          }
 
           // If title is missing, pure hex hash, or raw UUID, NEVER allow as a game entry
           if (
             !title ||
+            title === 'Live' ||
             /^[0-9a-f]{20,}$/i.test(title) ||
             /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)
           ) {
@@ -352,7 +384,6 @@ export class EpicIntegrationService {
             if (isFortniteDlc) continue;
           }
 
-          const keyImages = item.metadata?.keyImages || [];
           const tallCover = keyImages.find((img: any) => img.type === 'DieselGameBoxTall')?.url;
           const wideBanner = keyImages.find((img: any) => img.type === 'DieselGameBox')?.url || tallCover;
 
@@ -375,11 +406,11 @@ export class EpicIntegrationService {
 
           const developer = (codename && codename.developer)
             ? codename.developer
-            : (item.metadata?.developer || '');
+            : (metaDeveloper || '');
 
           const shortDescription = (codename && codename.description)
             ? codename.description
-            : (item.metadata?.description || 'Epic Games Store Title');
+            : (metaDescription || 'Epic Games Store Title');
 
           const constructedGame: CanonicalGame = {
             id: steamAppId ? `steam-${steamAppId}` : `epic-${appId}`,
@@ -431,8 +462,8 @@ export class EpicIntegrationService {
   async connectAccount(
     credentials: StorefrontCredentials
   ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[]; updatedCredentials?: StorefrontCredentials }> {
-    let accountName = credentials.epicAccountId?.trim() || 'BobDo1e';
-    let targetAccountId = this.extractEpicAccountId(credentials.epicAccountId) || '8aaea3405ecc4c7b8786012029e98d6a';
+    let accountName = credentials.epicAccountId?.trim() || 'Epic Games User';
+    let targetAccountId = this.extractEpicAccountId(credentials.epicAccountId) || '';
     const avatarUrl = 'https://cdn2.unrealengine.com/egs-badge.png';
     let accessToken: string | undefined = undefined;
     const updatedCredentials: StorefrontCredentials = { ...credentials };

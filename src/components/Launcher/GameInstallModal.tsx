@@ -1,0 +1,672 @@
+import React, { useState, useEffect } from 'react';
+import { CanonicalGame } from '../../contracts/game';
+import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
+import {
+  DiskSpaceInfo,
+  DownloadTaskState,
+  GameInstallInfo,
+} from '../../contracts/launcher';
+import { launcherService } from '../../services/launcher/launcherService';
+import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
+import {
+  Download,
+  FolderOpen,
+  HardDrive,
+  X,
+  AlertCircle,
+  Cpu,
+  Info,
+  Loader2,
+  CheckCircle2,
+} from 'lucide-react';
+
+export interface GameInstallModalProps {
+  isOpen: boolean;
+  game: CanonicalGame;
+  initialPlatformId?: StorefrontId;
+  onClose: () => void;
+  onInstallStarted?: (task?: DownloadTaskState) => void;
+}
+
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return 'Unknown';
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) {
+    return `${gb.toFixed(1)} GB`;
+  }
+  const mb = bytes / (1024 * 1024);
+  return `${Math.max(1, Math.round(mb))} MB`;
+}
+
+function formatVersion(v?: string): string {
+  if (!v) return '';
+  const cleaned = String(v).trim().replace(/^[vV]+/, '');
+  return cleaned ? `v${cleaned}` : '';
+}
+
+type InstallerItem = NonNullable<GameInstallInfo['availableInstallers']>[number];
+
+function deduplicateInstallers(
+  installers?: GameInstallInfo['availableInstallers'],
+  winHost = false
+): InstallerItem[] {
+  if (!installers || installers.length === 0) return [];
+
+  let filtered = installers;
+  if (winHost) {
+    const winOnly = installers.filter((i) => i.os === 'windows');
+    if (winOnly.length > 0) filtered = winOnly;
+  } else {
+    const nonLinux = installers.filter((i) => i.os !== 'linux');
+    if (nonLinux.length > 0) filtered = nonLinux;
+  }
+
+  const byOs = new Map<InstallerItem['os'], InstallerItem[]>();
+  for (const ins of filtered) {
+    const list = byOs.get(ins.os) || [];
+    list.push(ins);
+    byOs.set(ins.os, list);
+  }
+
+  const bestPerOs: InstallerItem[] = [];
+  for (const [, candidates] of byOs.entries()) {
+    const sorted = [...candidates].sort((a, b) => {
+      const langDiff =
+        (/^en/i.test(a.language || '') ? 0 : 1) - (/^en/i.test(b.language || '') ? 0 : 1);
+      if (langDiff !== 0) return langDiff;
+      return (b.totalSizeBytes || 0) - (a.totalSizeBytes || 0);
+    });
+    bestPerOs.push(sorted[0]);
+  }
+
+  const osOrder: Record<InstallerItem['os'], number> = winHost
+    ? { windows: 0, mac: 1, linux: 2 }
+    : { mac: 0, windows: 1, linux: 2 };
+
+  return bestPerOs.sort((a, b) => (osOrder[a.os] ?? 99) - (osOrder[b.os] ?? 99));
+}
+
+export const GameInstallModal: React.FC<GameInstallModalProps> = ({
+  isOpen,
+  game,
+  initialPlatformId,
+  onClose,
+  onInstallStarted,
+}) => {
+  const [selectedPlatformId, setSelectedPlatformId] = useState<StorefrontId>(() => {
+    return (
+      initialPlatformId ||
+      launcherService.getEffectivePlatformForGame(game)?.platformId ||
+      game.platforms[0]?.platformId ||
+      'steam'
+    );
+  });
+
+  const [installInfo, setInstallInfo] = useState<GameInstallInfo | null>(null);
+  const [isLoadingInfo, setIsLoadingInfo] = useState<boolean>(false);
+  const [installDir, setInstallDir] = useState<string>('');
+  const [selectedInstallerId, setSelectedInstallerId] = useState<string | undefined>(undefined);
+  const [selectedOs, setSelectedOs] = useState<'mac' | 'windows' | 'linux'>(() =>
+    (typeof (launcherService as any).isWindowsHost === 'function' &&
+      (launcherService as any).isWindowsHost()) ||
+    (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32')
+      ? 'windows'
+      : 'mac'
+  );
+  const [diskSpace, setDiskSpace] = useState<DiskSpaceInfo | null>(null);
+  const [createShortcut, setCreateShortcut] = useState<boolean>(true);
+  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const isWindowsHost =
+    (installInfo as any)?.hostPlatform === 'win32' ||
+    (typeof (launcherService as any).isWindowsHost === 'function' &&
+      (launcherService as any).isWindowsHost()) ||
+    (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32') ||
+    /^[A-Za-z]:\\/.test(installDir || installInfo?.defaultInstallDir || '');
+
+  useEffect(() => {
+    if (isOpen) {
+      const targetPlat =
+        initialPlatformId ||
+        launcherService.getEffectivePlatformForGame(game)?.platformId ||
+        game.platforms[0]?.platformId ||
+        'steam';
+      setSelectedPlatformId(targetPlat);
+      setErrorMsg(null);
+    }
+  }, [isOpen, game.id, initialPlatformId]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    setIsLoadingInfo(true);
+    setErrorMsg(null);
+
+    launcherService
+      .getGameInstallInfo(game, selectedPlatformId)
+      .then((info) => {
+        if (!active) return;
+        const winHost =
+          (info as any)?.hostPlatform === 'win32' ||
+          (typeof (launcherService as any).isWindowsHost === 'function' &&
+            (launcherService as any).isWindowsHost()) ||
+          (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32') ||
+          /^[A-Za-z]:\\/.test(info.defaultInstallDir || '');
+
+        setInstallInfo(info);
+        setInstallDir(
+          info.defaultInstallDir || (winHost ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher')
+        );
+        if (info.diskSpace) {
+          setDiskSpace(info.diskSpace);
+        } else {
+          launcherService.getDiskSpace(info.defaultInstallDir).then((ds) => {
+            if (active && ds) setDiskSpace(ds);
+          });
+        }
+
+        const deduped = deduplicateInstallers(info.availableInstallers, winHost);
+        if (deduped.length > 0) {
+          const preferredInstaller = winHost
+            ? deduped.find((i) => i.os === 'windows')
+            : deduped.find((i) => i.os === 'mac');
+          const chosen = preferredInstaller || deduped[0];
+          setSelectedInstallerId(chosen.id);
+          setSelectedOs(winHost ? 'windows' : chosen.os);
+        } else {
+          setSelectedInstallerId(undefined);
+          setSelectedOs(winHost ? 'windows' : 'mac');
+        }
+      })
+      .catch((err) => {
+        if (!active) return;
+        setErrorMsg(err?.message || 'Could not load installation details.');
+      })
+      .finally(() => {
+        if (active) setIsLoadingInfo(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [isOpen, game, selectedPlatformId]);
+
+  if (!isOpen) return null;
+
+  const handleDirectoryChange = async (newDir: string) => {
+    setInstallDir(newDir);
+    const ds = await launcherService.getDiskSpace(newDir);
+    if (ds) {
+      setDiskSpace(ds);
+    }
+  };
+
+  const handleBrowseFolder = async () => {
+    const chosen = await launcherService.selectFolder(installDir);
+    if (chosen) {
+      await handleDirectoryChange(chosen);
+    }
+  };
+
+  const uniqueInstallers = deduplicateInstallers(installInfo?.availableInstallers, isWindowsHost);
+  const selectedInstaller =
+    uniqueInstallers.find((i) => i.id === selectedInstallerId) || uniqueInstallers[0];
+  const estimatedSizeBytes =
+    selectedInstaller?.totalSizeBytes || installInfo?.estimatedSizeBytes || 0;
+
+  const freeBytes = diskSpace?.freeBytes || 0;
+  const totalBytes = diskSpace?.totalBytes || 1;
+  const usedBytes = diskSpace?.usedBytes || Math.max(0, totalBytes - freeBytes);
+  const usedPercent = Math.min(100, Math.round((usedBytes / totalBytes) * 100));
+  const installPercent =
+    estimatedSizeBytes > 0
+      ? Math.min(100 - usedPercent, Math.max(1, Math.round((estimatedSizeBytes / totalBytes) * 100)))
+      : 0;
+  const hasEnoughSpace =
+    estimatedSizeBytes === 0 || freeBytes === 0 || freeBytes >= estimatedSizeBytes;
+
+  const activePlatformObj =
+    game.platforms.find((p) => p.platformId === selectedPlatformId) || game.platforms[0];
+
+  const handleStartInstall = async () => {
+    if (isStarting) return;
+    setIsStarting(true);
+    setErrorMsg(null);
+
+    try {
+      const res = await launcherService.startInstall({
+        gameId: game.id,
+        title: game.title,
+        platformId: selectedPlatformId,
+        platformGameId:
+          installInfo?.platformGameId ||
+          activePlatformObj?.platformGameId ||
+          String(game.steamAppId || game.id),
+        steamAppId: game.steamAppId,
+        headerImage: game.headerImage,
+        installDir:
+          installDir.trim() || (isWindowsHost ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher'),
+        installerId: selectedInstallerId,
+        os: isWindowsHost ? 'windows' : selectedOs,
+        createShortcut,
+      });
+
+      if (res.success) {
+        onInstallStarted?.(res.task);
+        onClose();
+      } else {
+        setErrorMsg(res.error || 'Failed to start installation.');
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Unexpected error starting installation.');
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const getMethodDescription = (platId: StorefrontId) => {
+    switch (platId) {
+      case 'gog':
+        return {
+          title: 'Native gogdl CLI + GOG Direct Installer Pipeline',
+          desc: isWindowsHost
+            ? 'Downloads official DRM-free Windows game files directly from GOG CDN via bundled gogdl with automatic credential bridging.'
+            : 'Installs via native gogdl integration with automatic credential bridging from your authenticated GOG session, or downloads and extracts DRM-free offline installer packages (.pkg / .dmg / .exe) directly into your target directory.',
+        };
+      case 'epic':
+        return {
+          title: 'Native Legendary CLI / Epic Games Store Pipeline',
+          desc: isWindowsHost
+            ? 'Downloads and verifies native Windows game files directly from Epic Games CDN via bundled Legendary CLI.'
+            : 'Installs directly via native legendary integration with automatic credential bridging from your authenticated Epic session (or Heroic / Epic Games Launcher fallback) while monitoring real-time manifest progress.',
+        };
+      case 'steam':
+        return {
+          title: 'Steam Client Protocol + Live ACF Progress Monitor',
+          desc: isWindowsHost
+            ? 'Triggers Steam Client installation (steam://install/) and monitors real-time download progress via steamapps/appmanifest_*.acf.'
+            : 'Triggers native Steam installation (`steam://install`) and tracks real-time `BytesDownloaded` / `BytesToDownload` directly from local `appmanifest_*.acf` files.',
+        };
+      default:
+        return {
+          title: 'Universal Game Installer',
+          desc: 'Downloads and configures game files in your selected installation directory.',
+        };
+    }
+  };
+
+  const methodInfo = getMethodDescription(selectedPlatformId);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in duration-150 select-none"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-xl rounded-xl bg-[#131b26] border border-[#2a475e] shadow-[0_20px_60px_rgba(0,0,0,0.9)] overflow-hidden text-steam-text"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Top Game Banner Header */}
+        <div className="relative h-36 w-full bg-[#0b1017] overflow-hidden">
+          {game.headerImage && (
+            <img
+              src={game.headerImage}
+              alt={game.title}
+              className="w-full h-full object-cover opacity-55"
+            />
+          )}
+          <div className="absolute inset-0 bg-gradient-to-t from-[#131b26] via-[#131b26]/60 to-transparent" />
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="absolute top-3 right-3 p-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-steam-subtext hover:text-white border border-white/10 transition-colors cursor-pointer"
+            aria-label="Close install modal"
+          >
+            <X className="w-4 h-4" />
+          </button>
+
+          <div className="absolute bottom-3 left-5 right-5 flex items-end justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-sky-400">
+                <Download className="w-3.5 h-3.5" />
+                <span>Install Game</span>
+              </div>
+              <h2 className="text-xl font-extrabold text-white truncate drop-shadow">
+                {game.title}
+              </h2>
+            </div>
+
+            {/* Single Storefront Badge if owned on 1 platform */}
+            {game.platforms.length <= 1 && (
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-black/70 border border-white/15 text-xs font-semibold text-white shrink-0">
+                <StorefrontIcon storefrontId={selectedPlatformId} className="w-3.5 h-3.5 text-sky-400" />
+                <span>{getStorefrontDisplayName(selectedPlatformId)}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Modal Body */}
+        <div className="p-5 space-y-5 max-h-[75vh] overflow-y-auto">
+          {/* Storefront Selector if owned on > 1 platform */}
+          {game.platforms.length > 1 && (
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                Select Storefront Source ({game.platforms.length} Owned)
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {game.platforms.map((plat) => {
+                  const isSelected = plat.platformId === selectedPlatformId;
+                  const reg = STOREFRONT_REGISTRY[plat.platformId];
+                  return (
+                    <button
+                      key={plat.platformId}
+                      type="button"
+                      onClick={() => setSelectedPlatformId(plat.platformId)}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                        isSelected
+                          ? 'bg-sky-500/20 border-sky-400 text-white shadow-[0_0_12px_rgba(56,189,248,0.25)]'
+                          : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white hover:bg-[#1d2a3a]'
+                      }`}
+                    >
+                      <StorefrontIcon
+                        storefrontId={plat.platformId}
+                        className={`w-4 h-4 ${isSelected ? 'text-sky-400' : 'text-steam-subtext'}`}
+                      />
+                      <span className="truncate">
+                        {reg?.name || getStorefrontDisplayName(plat.platformId)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Available Installer / OS Selector (hidden on Windows host since Windows builds are always native) */}
+          {!isWindowsHost && (
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                Platform & Installer Build
+              </label>
+              {isLoadingInfo ? (
+                <div className="flex items-center gap-2 text-xs text-steam-subtext bg-[#17212e] border border-[#26384d] rounded-lg px-3.5 py-2.5">
+                  <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+                  <span>Querying {getStorefrontDisplayName(selectedPlatformId)} build manifest...</span>
+                </div>
+              ) : uniqueInstallers.length === 1 ? (
+                <div className="space-y-2">
+                  {selectedOs === 'mac' ? (
+                    <div className="rounded-lg bg-emerald-950/40 border border-emerald-500/40 p-3 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>★ AUTO-DETECTED • NATIVE MACOS BUILD</span>
+                      </div>
+                      <p className="text-xs text-emerald-100/90 leading-relaxed">
+                        {`Official macOS build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${selectedInstaller?.totalSizeBytes ? ` • ${formatBytes(selectedInstaller.totalSizeBytes)}` : ''} — runs natively on your Mac without translation layers.`}
+                      </p>
+                    </div>
+                  ) : selectedOs === 'windows' ? (
+                    <div className="rounded-lg bg-amber-950/50 border border-amber-500/40 p-3 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-amber-400">
+                        <Cpu className="w-3.5 h-3.5 shrink-0" />
+                        <span>AUTO-DETECTED • WINDOWS BUILD (CROSSOVER / WINE)</span>
+                      </div>
+                      <p className="text-xs text-amber-100/90 leading-relaxed">
+                        {`No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will automatically install the Windows build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${selectedInstaller?.totalSizeBytes ? ` • ${formatBytes(selectedInstaller.totalSizeBytes)}` : ''} and run it via CrossOver / Wine.`}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg bg-sky-950/40 border border-sky-500/40 p-3 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-400">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>AUTO-DETECTED • LINUX BUILD</span>
+                      </div>
+                      <p className="text-xs text-sky-100/90 leading-relaxed">
+                        {`Linux build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${selectedInstaller?.totalSizeBytes ? ` • ${formatBytes(selectedInstaller.totalSizeBytes)}` : ''}.`}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ) : uniqueInstallers.length > 1 ? (
+                <div className="space-y-2">
+                  <select
+                    aria-label="Installer Build"
+                    value={selectedInstallerId || ''}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setSelectedInstallerId(id);
+                      const found = uniqueInstallers.find((i) => i.id === id);
+                      if (found) setSelectedOs(found.os);
+                    }}
+                    className="w-full rounded-lg bg-[#17212e] border border-[#2a475e] px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-400"
+                  >
+                    {uniqueInstallers.map((ins) => {
+                      const ver = formatVersion(ins.version);
+                      return (
+                        <option key={ins.id} value={ins.id}>
+                          {ins.os === 'mac'
+                            ? `★ Recommended: Native macOS Build${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`
+                            : ins.os === 'windows'
+                            ? `Alternative: Windows Build via CrossOver / Wine${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`
+                            : `Linux Build${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {selectedOs === 'mac' && (
+                    <div className="flex items-start gap-2 text-[11px] text-emerald-300 bg-emerald-950/40 border border-emerald-500/40 rounded-lg px-3 py-2 leading-relaxed">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
+                      <span>
+                        ✓ Recommended: Official macOS build is available and auto-selected. Only choose the Windows (CrossOver / Wine) alternative if this game is an older 32-bit Mac port that won&apos;t launch on Apple Silicon.
+                      </span>
+                    </div>
+                  )}
+                  {selectedOs === 'windows' && (
+                    <div className="flex items-start gap-2 text-[11px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-3 py-2 leading-relaxed">
+                      <Cpu className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <span>
+                        Windows Compatibility Mode selected: Will install the Windows x64 build and run it through CrossOver / Wine instead of the native macOS build.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOs('mac')}
+                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                      selectedOs === 'mac'
+                        ? 'bg-sky-500/20 border-sky-400 text-white'
+                        : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
+                    }`}
+                  >
+                    <span>macOS / Auto-Detect</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOs('windows')}
+                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                      selectedOs === 'windows'
+                        ? 'bg-amber-500/20 border-amber-400 text-amber-200'
+                        : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
+                    }`}
+                  >
+                    <Cpu className="w-3.5 h-3.5" />
+                    <span>Windows (via CrossOver / Wine)</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Target Installation Directory */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                Installation Directory
+              </label>
+              {installInfo?.availableInstallDirs && installInfo.availableInstallDirs.length > 1 && (
+                <select
+                  value={
+                    installInfo.availableInstallDirs.includes(installDir) ? installDir : ''
+                  }
+                  onChange={(e) => {
+                    if (e.target.value) handleDirectoryChange(e.target.value);
+                  }}
+                  className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none"
+                >
+                  <option value="" disabled>
+                    Preset Locations...
+                  </option>
+                  {installInfo.availableInstallDirs.map((dir) => (
+                    <option key={dir} value={dir}>
+                      {dir}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={installDir}
+                onChange={(e) => handleDirectoryChange(e.target.value)}
+                placeholder="~/Games/OneLauncher"
+                className="flex-1 rounded-lg bg-[#0e151f] border border-[#2a475e] px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+              />
+              <button
+                type="button"
+                onClick={handleBrowseFolder}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+                <span>Browse...</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Live Disk Space Indicator Bar */}
+          <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2">
+            <div className="flex items-center justify-between text-xs">
+              <div className="flex items-center gap-1.5 text-steam-subtext font-medium">
+                <HardDrive className="w-3.5 h-3.5 text-sky-400" />
+                <span>Disk Space</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-steam-subtext">
+                  Estimated Size:{' '}
+                  <strong className="text-white">
+                    {estimatedSizeBytes > 0 ? formatBytes(estimatedSizeBytes) : 'Store Managed'}
+                  </strong>
+                </span>
+                <span className="text-steam-subtext">
+                  Free Space:{' '}
+                  <strong className={hasEnoughSpace ? 'text-emerald-400' : 'text-red-400'}>
+                    {diskSpace ? formatBytes(diskSpace.freeBytes) : 'Checking...'}
+                  </strong>
+                </span>
+              </div>
+            </div>
+
+            {/* Storage Progress Bar */}
+            <div className="w-full h-2 rounded-full bg-[#1b2838] overflow-hidden flex">
+              <div
+                className="h-full bg-slate-600 transition-all"
+                style={{ width: `${usedPercent}%` }}
+                title={`Used Space: ${usedPercent}%`}
+              />
+              {installPercent > 0 && (
+                <div
+                  className={`h-full transition-all ${
+                    hasEnoughSpace ? 'bg-sky-400' : 'bg-red-500'
+                  }`}
+                  style={{ width: `${installPercent}%` }}
+                  title={`Required for Install: ${formatBytes(estimatedSizeBytes)}`}
+                />
+              )}
+            </div>
+
+            {!hasEnoughSpace && (
+              <div className="flex items-center gap-1.5 text-[11px] text-red-400 pt-0.5">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>Insufficient disk space on target volume for this installation.</span>
+              </div>
+            )}
+          </div>
+
+          {/* Installation Method Notice */}
+          <div className="rounded-lg bg-[#162231]/90 border border-[#2a475e]/70 p-3 flex items-start gap-2.5 text-xs">
+            <Info className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <div className="font-semibold text-white flex items-center gap-1.5">
+                <span>{methodInfo.title}</span>
+                {selectedPlatformId === 'gog' && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
+                    DRM-Free Direct
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-steam-subtext leading-relaxed">{methodInfo.desc}</p>
+            </div>
+          </div>
+
+          {/* Options Checkbox */}
+          <label className="flex items-center gap-2 text-xs text-steam-text cursor-pointer">
+            <input
+              type="checkbox"
+              checked={createShortcut}
+              onChange={(e) => setCreateShortcut(e.target.checked)}
+              className="rounded border-steam-border bg-[#0e151f] text-sky-500 focus:ring-0"
+            />
+            <span>Automatically register executable & launch configuration on completion</span>
+          </label>
+
+          {errorMsg && (
+            <div className="rounded-lg bg-red-950/70 border border-red-500/50 p-3 text-xs text-red-200 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Footer Actions */}
+        <div className="px-5 py-3.5 bg-[#0e151f] border-t border-[#223447] flex items-center justify-end gap-2.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleStartInstall}
+            disabled={isStarting || !hasEnoughSpace}
+            className="inline-flex items-center gap-2 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-all shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer"
+            style={{
+              background: 'linear-gradient(to right, #0ea5e9 0%, #2563eb 100%)',
+              boxShadow: '0 0 18px rgba(14, 165, 233, 0.4)',
+            }}
+          >
+            {isStarting ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Starting...</span>
+              </>
+            ) : (
+              <>
+                <Download className="w-4 h-4" />
+                <span>Start Download & Install</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};

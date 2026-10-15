@@ -6,6 +6,7 @@ import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, KNOWN_IGDB_COVERS } from '../igdb/igdbCoverService';
 import { steamMatcher } from '../steam/steamMatcher';
 import steamBlurbCache from '../storage/steamBlurbCache.json';
+import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { GOG_SPECIAL_DESCRIPTIONS } from '../steam/fallbackMetadataProvider';
 import {
@@ -28,12 +29,18 @@ export function isHexOrGuidString(str: string): boolean {
   return false;
 }
 
+export function sanitizeShortDescriptionText(desc?: string): string {
+  if (!desc) return '';
+  return desc.replace(/\[\/?[a-z0-9_=]+\]/gi, '').replace(/\s+/g, ' ').trim();
+}
+
 export function isPlaceholderDesc(desc?: string, title?: string): boolean {
   if (!desc) return true;
-  const trimmed = desc.trim();
+  const trimmed = sanitizeShortDescriptionText(desc);
   if (trimmed.length <= 3) return true;
   const lower = trimmed.toLowerCase();
   if (title && lower === title.trim().toLowerCase()) return true;
+  if (lower.includes('description is not set')) return true;
   if (lower.includes('on gog.com')) return true;
   if (lower.includes('drm-free')) return true;
   if (lower.includes('epic games store')) return true;
@@ -46,15 +53,49 @@ export function isPlaceholderDesc(desc?: string, title?: string): boolean {
   if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
   if (/^bonus\s+content/i.test(trimmed)) return true;
   if (/^this\s+package\s+includes/i.test(trimmed)) return true;
+
+  // Reject unlocalized CJK blurbs on purely non-CJK game titles (e.g. Japanese store blurb on English strategy title)
+  if (
+    title &&
+    !/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(title.trim()) &&
+    /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  // Reject cross-game publisher copy-paste bleed where an ALL-CAPS game subject ("..., LUNARK is a 2D...") contradicts the title
+  if (title) {
+    const bleedMatch = trimmed.match(/,\s+([A-Z][A-Z0-9]{3,})\s+is\s+(?:a|an|the)\b/);
+    if (bleedMatch && bleedMatch[1] && !title.toUpperCase().includes(bleedMatch[1])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export const NON_GAME_CATALOG_TITLE_REGEX =
+  /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|alpha version|legacy mode|pre-game editor|resource archiver|digital goodies|digital comics|playable teaser|prologue)\b|\bcontent$|killingfloor2beta|^sin multiplayer$/i;
+
+export function isNonGameCatalogEntry(game: CanonicalGame): boolean {
+  const title = (game.title || '').trim();
+  if (!title) return true;
+  if (NON_GAME_CATALOG_TITLE_REGEX.test(title)) {
+    return true;
+  }
   return false;
 }
 
 /**
- * Detects whether an item is a non-game item (Fortnite microtransactions, DLC packs, add-on assets)
+ * Detects whether an item is a non-game item (Fortnite microtransactions, DLC packs, add-on assets, betas, editors, prologues)
  */
 export function isEpicNonGameEntry(game: CanonicalGame): boolean {
   const title = (game.title || '').trim().toLowerCase();
   const id = (game.id || '').toLowerCase();
+
+  if (!game.isVerifiedEntitlement && isNonGameCatalogEntry(game)) {
+    return true;
+  }
 
   // Pure hex or UUID titles
   if (isHexOrGuidString(game.title)) {
@@ -94,7 +135,9 @@ export function isEpicNonGameEntry(game: CanonicalGame): boolean {
     title.includes('unreal engine') ||
     title.includes('megascans') ||
     id.includes('ue-') ||
-    id.includes('unreal')
+    id.includes('unreal-engine') ||
+    id.includes('unreal_engine') ||
+    id.includes('unrealengine')
   ) {
     return true;
   }
@@ -117,21 +160,47 @@ export function isEpicNonGameEntry(game: CanonicalGame): boolean {
 
 /**
  * Normalizes title for robust cross-storefront game deduplication
+ * Preserves distinct remake/remaster/enhanced/definitive/classic/gold editions while normalizing
+ * packaging/DLC bundle suffixes across storefronts.
  */
 export function normalizeCanonicalTitle(title: string): string {
   if (!title) return '';
   return title
     .toLowerCase()
     .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
+    .replace(/['’ʼ`]/g, '')
+    .replace(/\s*\+\s*official walkthrough$/i, '')
     .replace(/\biii\b/g, '3')
     .replace(/\bii\b/g, '2')
     .replace(/\biv\b/g, '4')
     .replace(/[:\-–—]/g, ' ')
-    .replace(/\s+(complete|definitive|enhanced|game of the year|goty|remastered|deluxe|gold|standard)\s+edition/g, '')
-    .replace(/\s+edition$/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(
+      /\s+(the\s+)?(complete|extended|game of the year|goty|deluxe|standard|ultimate|20 year celebration|classic and uncut)\s*(edition|pack|bundle|collection)?$/g,
+      ''
+    )
+    .replace(/\s+(goty|complete pack)$/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Prevents collapsing two distinct game entitlements that belong to the SAME storefront
+ * (e.g. Metro Exodus vs Metro Exodus Enhanced Edition on Steam, BioShock vs BioShock Remastered on GOG,
+ * or Grand Theft Auto V vs Grand Theft Auto V Enhanced on Epic).
+ */
+export function hasSameStorefrontConflict(existing: CanonicalGame, incoming: CanonicalGame): boolean {
+  if (existing.steamAppId && incoming.steamAppId && existing.steamAppId !== incoming.steamAppId) {
+    return true;
+  }
+  for (const ep of existing.platforms || []) {
+    if (!ep.platformId || !ep.platformGameId) continue;
+    const ip = (incoming.platforms || []).find((p) => p.platformId === ep.platformId);
+    if (ip && ip.platformGameId && String(ep.platformGameId).trim() !== String(ip.platformGameId).trim()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const validGogProductIds = new Set<string>();
@@ -169,56 +238,11 @@ for (const g of FULL_USER_STEAM_GAMES) {
 }
 
 /**
- * Blacklist of unowned promotional artwork, free trials, and EA Play marketing AppIDs
- * that bleed into local Steam client librarycache but are not owned entitlements.
+ * Blacklist of non-game SDK test AppIDs (e.g. Spacewar 480).
  */
 export const UNOWNED_STEAM_PROMO_APP_IDS = new Set<number>([
-  1222680, // Need for Speed™ Heat
-  1222700, // A Way Out
-  1385510, // Back 4 Blood Beta
-  1238820, // Battlefield 3™
-  1238860, // Battlefield 4™
-  1238840, // Battlefield™ 1
-  1238880, // Battlefield™ Hardline
-  368900,  // Brilliant Bob
-  2398450, // Classic Marathon
-  1213210, // Command & Conquer™ Remastered Collection
-  17300,   // Crysis (2007)
-  108800,  // Crysis 2 Maximum Edition
-  1282690, // Crysis® 3
-  17470,   // Dead Space (2008)
-  47780,   // Dead Space 2
-  1238060, // Dead Space™ 3
-  1872550, // Destroy All Humans! – Clone Carnage
-  570,     // Dota 2
-  1238040, // Dragon Age II: Ultimate Edition
-  47810,   // Dragon Age: Origins - Ultimate Edition
-  1222690, // Dragon Age™ Inquisition
-  1225580, // Fe
-  397620,  // GooCubelets
-  2477290, // Half-Life 2 RTX
-  7110,    // Jade Empire: Special Edition
-  17460,   // Mass Effect (2007)
-  24980,   // Mass Effect 2 (2010)
-  2362420, // Mass Effect 2 (2010) Edition
-  1238020, // Mass Effect 3 (2012)
-  1238000, // Mass Effect™: Andromeda
-  17410,   // Mirror's Edge (2008)
-  1233570, // Mirror's Edge™ Catalyst
-  2215490, // Project Borealis: Prologue
-  1225590, // Sea of Solitude
-  480,     // Spacewar
-  17390,   // Spore
-  1172380, // STAR WARS Jedi: Fallen Order™
-  1237980, // STAR WARS™ Battlefront™
-  440,     // Team Fortress 2
-  298180,  // The Desolate Hope
-  1237970, // Titanfall® 2
-  1454890, // Titanfall™
-  1225560, // Unravel
-  1225570, // Unravel Two
-  331710,  // Why So Evil
-  354850,  // Why So Evil 2: Dystopia
+  480, // Spacewar (Steamworks SDK test app)
+  228980, // Steamworks Common Redistributables
 ]);
 
 export interface CatalogGamePatch {
@@ -243,359 +267,9 @@ export interface CatalogGamePatch {
 }
 
 /**
- * Curated declarative game overrides and asset patches.
- * Replaces dozens of sequential hardcoded if-statements with an O(1) table.
+ * Curated declarative game overrides and asset patches (empty by default for universal dynamic resolution).
  */
-export const KNOWN_GAME_PATCHES: Record<string, CatalogGamePatch> = {
-  'death stranding': {
-    targetId: 'steam-1190460',
-    title: 'Death Stranding',
-    sortTitle: 'Death Stranding',
-    steamAppId: 1190460,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1190460/library_600x900_2x.jpg',
-    shortDescription: 'From legendary game creator Hideo Kojima comes an all-new, genre-defying experience. Sam Bridges must brave a world utterly transformed by the Death Stranding.',
-    releaseDate: '14 Jul, 2020',
-    developers: ['KOJIMA PRODUCTIONS'],
-    publishers: ['505 Games'],
-    genres: ['Action', 'Adventure'],
-    tags: ['Open World', 'Story Rich', 'Atmospheric', 'Sci-fi', 'Post-apocalyptic'],
-    platformFilters: {
-      setPlatformGameId: { platformId: 'epic', gameId: '761fe09295aa422e8199cebaacf51675' },
-    },
-  },
-  'doki doki literature club plus!': {
-    targetId: 'steam-1388880',
-    title: 'Doki Doki Literature Club Plus!',
-    sortTitle: 'Doki Doki Literature Club Plus!',
-    steamAppId: 1388880,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1388880/library_600x900_2x.jpg',
-    shortDescription: 'Welcome to a terrifying world of poetry and romance! Write poems for your crush and erase any mistakes along the way to ensure your perfect ending.',
-    releaseDate: '30 Jun, 2021',
-    developers: ['Team Salvato'],
-    publishers: ['Serenity Forge'],
-    genres: ['Psychological Horror', 'Visual Novel', 'Anime'],
-    tags: ['Psychological Horror', 'Visual Novel', 'Anime', 'Story Rich', 'Singleplayer'],
-    platformFilters: {
-      setPlatformGameId: { platformId: 'epic', gameId: 'c5109bdceb3a453bb38c2fdc964ddee8' },
-    },
-  },
-  'blood omen: legacy of kain': {
-    targetId: 'gog-1837805079',
-    steamAppId: null,
-    headerImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_product_card_v2_mobile_slider_639.jpg',
-    capsuleImage: 'https://images-2.gog-statics.com/5374e38e8d5ca1aaf331ab33ae048b9a6212f8c278003d5cad1ba9efde543639_glx_vertical_cover.jpg',
-    platformFilters: {
-      setPlatformGameId: { platformId: 'gog', gameId: '1837805079' },
-    },
-  },
-  'doom + doom ii': {
-    targetId: 'gog-1413291984',
-    steamAppId: null,
-    platformFilters: {
-      setPlatformGameId: { platformId: 'gog', gameId: '1413291984' },
-    },
-  },
-  'alan wake 2': {
-    targetId: 'epic-93f2a8c3547846eda966cb3c152a026e',
-    headerImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s1-2560x1440-309c7412b7bc.jpg',
-    capsuleImage: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-s2-1200x1600-0ebb9a566b72.jpg',
-    iconUrl: 'https://cdn2.unrealengine.com/egs-alanwake2-remedyentertainment-ic1-400x400-5366b10d0f67.png',
-  },
-  'fortnite': {
-    targetId: 'epic-4fe75bbc5a674f4f9b356b5c90567da5',
-    headerImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-logo-egs-launcher-blade-2560x1440-2560x1440-00f5395fc1e7.jpg',
-    capsuleImage: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
-    iconUrl: 'https://cdn2.unrealengine.com/fnbr-42-00-c7s4-hacking-egs-launcher-blade-1200x1600-1200x1600-0138e7df7bb0.jpg',
-  },
-  'ghostrunner': {
-    targetId: 'steam-1139900',
-    steamAppId: 1139900,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1139900/library_600x900_2x.jpg',
-  },
-  'prey': {
-    targetId: 'steam-480490',
-    steamAppId: 480490,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/480490/library_600x900_2x.jpg',
-  },
-  'cyberpunk 2077': {
-    platformFilters: {
-      excludePlatformId: 'gog',
-    },
-  },
-  'agony': {
-    targetId: 'steam-487720',
-    title: 'Agony',
-    sortTitle: 'Agony',
-    steamAppId: 487720,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/487720/library_600x900_2x.jpg',
-    shortDescription:
-      'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
-  },
-  'agony unrated': {
-    targetId: 'steam-879420',
-    title: 'Agony UNRATED',
-    sortTitle: 'Agony UNRATED',
-    steamAppId: 879420,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/879420/library_600x900_2x.jpg',
-    shortDescription:
-      'Agony UNRATED is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
-  },
-  'heretic + hexen': {
-    targetId: 'steam-3286930',
-    steamAppId: 3286930,
-    headerImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/af11a57f074bf3f1b901bb96f9ea519a0928c80c/header.jpg?t=1756918167',
-    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3286930/dbdad6a66e6a076d138b9ce8bd81dbdf159bccb2/library_capsule.jpg',
-    iconUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/3286930/3392b11331bc4855f803ca939720fa94e3a01bdd.jpg',
-  },
-  'second extinction': {
-    targetId: 'steam-1024380',
-    title: 'Second Extinction',
-    sortTitle: 'Second Extinction',
-    steamAppId: 1024380,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1024380/library_600x900_2x.jpg',
-    shortDescription:
-      'Second Extinction is a relentless 3-player cooperative FPS where you wipe out mutated dinosaurs that have taken over the Earth.',
-  },
-  '60 minutes to extinction': {
-    targetId: 'steam-3783210',
-    steamAppId: 3783210,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3783210/1055e2e14c7eadb6b7f444db978c8c85b3a84eab/header.jpg?t=1759856432',
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coak2y.jpg',
-  },
-  'champions of krynn': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co5xot.webp',
-    preserveExistingIcon: true,
-  },
-  'castlevania anniversary collection': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co24a1.jpg',
-    preserveExistingIcon: true,
-  },
-  'akalabeth': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co26ea.jpg',
-    preserveExistingIcon: true,
-  },
-  'broken sword': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2mmq.jpg',
-    preserveExistingIcon: true,
-  },
-  'citadel remonstered': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/coc0q5.webp',
-    preserveExistingIcon: true,
-  },
-  'death stranding 2': {
-    targetId: 'steam-3280350',
-    steamAppId: 3280350,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345',
-    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
-    iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
-  },
-  'little nightmares enhanced': {
-    targetId: 'steam-2149010',
-    steamAppId: 2149010,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2149010/8f1da102713653906647c5024843479395be3394/header.jpg?t=1760951366',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/424840/library_600x900_2x.jpg',
-  },
-  'blood of dawnwalker': {
-    targetId: 'steam-3751260',
-    steamAppId: 3751260,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3751260/a7062f3b59d491c2678e3fd7ce2672858e480641/header.jpg?t=1791298326',
-    capsuleImage: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
-    iconUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3751260/82769ab631e6e68b4a38bbba9fb5b74eb0d7db8d/library_capsule.jpg',
-  },
-  'resident evil requiem': {
-    targetId: 'steam-3764200',
-    steamAppId: 3764200,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3764200/ce5437442768e38eb575f205ab9397d0264017b0/header.jpg?t=1779840172',
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/cobmj0.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/cobmj0.jpg',
-  },
-  'grip': {
-    targetId: 'steam-396900',
-    steamAppId: 396900,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/396900/library_600x900_2x.jpg',
-    shortDescription:
-      'GRIP is a high octane, hardcore combat racer, packing ferocious speed and an arsenal of heavy weapons. Harness the laws of gravity as you race up walls and ceilings across exotic worlds.',
-  },
-  'fallout: london': {
-    capsuleImage: 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
-    iconUrl: 'https://images.gog-statics.com/b9a00e7d9a9d8cb5d17ec67aa41dc8d392358e0340d679f855fa113c444c11ee.jpg',
-  },
-  'eschalon: book i': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co214q.webp',
-  },
-  'deus ex': {
-    targetId: 'steam-6910',
-    steamAppId: 6910,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6910/library_600x900_2x.jpg',
-  },
-  'tomb raider goty': {
-    capsuleImage: 'https://images.gog-statics.com/754dd55607aecdc8a2989a9e4a280d0caa3875fe88c1974ba6e10dd1b9a3b1d6.jpg',
-    iconUrl: 'https://images.gog-statics.com/754dd55607aecdc8a2989a9e4a280d0caa3875fe88c1974ba6e10dd1b9a3b1d6.jpg',
-  },
-  'summers gone season 1': {
-    capsuleImage: 'https://images.gog-statics.com/754d59c26ea2a81d688ef36948f9a53aa036154f42c21ea3aa3a2bcc71e1b097.jpg',
-    iconUrl: 'https://images.gog-statics.com/754d59c26ea2a81d688ef36948f9a53aa036154f42c21ea3aa3a2bcc71e1b097.jpg',
-  },
-  'rollercoaster tycoon 3': {
-    targetId: 'steam-1368820',
-    title: 'RollerCoaster Tycoon 3: Complete Edition',
-    sortTitle: 'RollerCoaster Tycoon 3: Complete Edition',
-    steamAppId: 1368820,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1368820/library_600x900_2x.jpg',
-  },
-  'higurashi': {
-    targetId: 'steam-310360',
-    title: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
-    sortTitle: 'Higurashi When They Cry Hou - Ch.1 Onikakushi',
-    steamAppId: 310360,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/header.jpg',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
-    iconUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/310360/library_600x900_2x.jpg',
-  },
-  'lure of the temptress': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co1npy.jpg',
-    preserveExistingIcon: true,
-  },
-  'rpg maker xp': {
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co2r75.jpg',
-  },
-  'wildgate': {
-    targetId: 'steam-3504780',
-    steamAppId: 3504780,
-    headerImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3504780/95f1381dac57ce601d5260de3c792f8a2ee2bc93/header.jpg?t=1787942042',
-    capsuleImage: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
-    iconUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9kqs.jpg',
-  },
-  'spacewar': {
-    targetId: 'steam-480',
-    steamAppId: 480,
-    headerImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-    capsuleImage: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-    iconUrl: 'https://thumb.wikimedia.org/wikipedia/commons/thumb/2/23/Spacewar%21-PDP-1-20070512.jpg/960px-Spacewar%21-PDP-1-20070512.jpg',
-  },
-  'darq': {
-    targetId: 'steam-433550',
-    title: 'DARQ: Complete Edition',
-    sortTitle: 'DARQ: Complete Edition',
-    steamAppId: 433550,
-    headerImage: 'https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S1_2560x1440_2560x1440-15e5dda133bae02a6b9cdf6086ec03f3',
-    capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/433550/library_600x900_2x.jpg',
-    iconUrl: 'https://cdn1.epicgames.com/salesEvent/salesEvent/EGS_DARQCompleteEdition_UnfoldGames_S2_1200x1600_1200x1600-d53e44ba5b0dc0e019ee698f02b6d300',
-    shortDescription:
-      'DARQ tells the story of Lloyd, a boy who finds himself in the middle of a lucid nightmare. Unable to wake up, Lloyd has to face his fears and decipher the meaning of the dream.',
-    releaseDate: '2020-12-04',
-    developers: ['Unfold Games'],
-    publishers: ['Unfold Games', 'Feardemic'],
-    genres: ['Action', 'Adventure', 'Indie', 'Puzzle'],
-    tags: ['Atmospheric', 'Psychological Horror', 'Puzzle', 'Dark', 'Horror', 'Surreal', 'Singleplayer'],
-  },
-};
-
-// Aliases for O(1) direct matching across various key formats
-KNOWN_GAME_PATCHES['darq: complete edition'] = KNOWN_GAME_PATCHES['darq'];
-KNOWN_GAME_PATCHES['darq complete edition'] = KNOWN_GAME_PATCHES['darq'];
-KNOWN_GAME_PATCHES['boga'] = KNOWN_GAME_PATCHES['death stranding'];
-KNOWN_GAME_PATCHES['path of the bogatyr'] = KNOWN_GAME_PATCHES['death stranding'];
-KNOWN_GAME_PATCHES['c5109bdceb3a453bb38c2fdc964ddee8'] = KNOWN_GAME_PATCHES['doki doki literature club plus!'];
-KNOWN_GAME_PATCHES['blood omen legacy of kain'] = KNOWN_GAME_PATCHES['blood omen: legacy of kain'];
-KNOWN_GAME_PATCHES['doom + doom 2'] = KNOWN_GAME_PATCHES['doom + doom ii'];
-KNOWN_GAME_PATCHES['doom doom 2'] = KNOWN_GAME_PATCHES['doom + doom ii'];
-KNOWN_GAME_PATCHES['heretic hexen'] = KNOWN_GAME_PATCHES['heretic + hexen'];
-KNOWN_GAME_PATCHES['cytadela'] = KNOWN_GAME_PATCHES['citadel remonstered'];
-KNOWN_GAME_PATCHES['rollercoaster tycoon 3: complete edition'] = KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
-KNOWN_GAME_PATCHES['higurashi when they cry hou - ch.1 onikakushi'] = KNOWN_GAME_PATCHES['higurashi'];
-KNOWN_GAME_PATCHES['grip: combat racing'] = KNOWN_GAME_PATCHES['grip'];
-KNOWN_GAME_PATCHES['grip combat racing'] = KNOWN_GAME_PATCHES['grip'];
-KNOWN_GAME_PATCHES['fallout london'] = KNOWN_GAME_PATCHES['fallout: london'];
-KNOWN_GAME_PATCHES['eschalon book i'] = KNOWN_GAME_PATCHES['eschalon: book i'];
-KNOWN_GAME_PATCHES['eschalon: book 1'] = KNOWN_GAME_PATCHES['eschalon: book i'];
-KNOWN_GAME_PATCHES['eschalon book 1'] = KNOWN_GAME_PATCHES['eschalon: book i'];
-KNOWN_GAME_PATCHES['deus ex goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['deus ex: goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['deus ex: game of the year edition'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['deus ex game of the year edition'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['deus ex goty'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['deus ex™ goty edition'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['tomb raider: goty'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES['tomb raider: game of the year edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES['tomb raider game of the year edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES['tomb raider goty edition'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES["summer's gone - season 1"] = KNOWN_GAME_PATCHES['summers gone season 1'];
-KNOWN_GAME_PATCHES["summer's gone: season 1"] = KNOWN_GAME_PATCHES['summers gone season 1'];
-KNOWN_GAME_PATCHES['summers gone - season 1'] = KNOWN_GAME_PATCHES['summers gone season 1'];
-
-// ID and AppID aliases
-KNOWN_GAME_PATCHES['epic-4fe75bbc5a674f4f9b356b5c90567da5'] = KNOWN_GAME_PATCHES['fortnite'];
-KNOWN_GAME_PATCHES['steam-1225270'] = KNOWN_GAME_PATCHES['ghostrunner'];
-KNOWN_GAME_PATCHES['app-1225270'] = KNOWN_GAME_PATCHES['ghostrunner'];
-KNOWN_GAME_PATCHES['steam-474960'] = KNOWN_GAME_PATCHES['prey'];
-KNOWN_GAME_PATCHES['app-474960'] = KNOWN_GAME_PATCHES['prey'];
-KNOWN_GAME_PATCHES['app-1091500'] = KNOWN_GAME_PATCHES['cyberpunk 2077'];
-KNOWN_GAME_PATCHES['gog-2028023186'] = KNOWN_GAME_PATCHES['agony'];
-KNOWN_GAME_PATCHES['steam-487720'] = KNOWN_GAME_PATCHES['agony'];
-KNOWN_GAME_PATCHES['app-487720'] = KNOWN_GAME_PATCHES['agony'];
-KNOWN_GAME_PATCHES['steam-879420'] = KNOWN_GAME_PATCHES['agony unrated'];
-KNOWN_GAME_PATCHES['app-879420'] = KNOWN_GAME_PATCHES['agony unrated'];
-KNOWN_GAME_PATCHES['app-3286930'] = KNOWN_GAME_PATCHES['heretic + hexen'];
-KNOWN_GAME_PATCHES['epic-9c48bdf0c65b45cc9e64aa43e7e740b0'] = KNOWN_GAME_PATCHES['second extinction'];
-KNOWN_GAME_PATCHES['app-1024380'] = KNOWN_GAME_PATCHES['second extinction'];
-KNOWN_GAME_PATCHES['app-3783210'] = KNOWN_GAME_PATCHES['60 minutes to extinction'];
-KNOWN_GAME_PATCHES['app-1904620'] = KNOWN_GAME_PATCHES['champions of krynn'];
-KNOWN_GAME_PATCHES['app-1018010'] = KNOWN_GAME_PATCHES['castlevania anniversary collection'];
-KNOWN_GAME_PATCHES['app-3280350'] = KNOWN_GAME_PATCHES['death stranding 2'];
-KNOWN_GAME_PATCHES['app-2149010'] = KNOWN_GAME_PATCHES['little nightmares enhanced'];
-KNOWN_GAME_PATCHES['app-3751260'] = KNOWN_GAME_PATCHES['blood of dawnwalker'];
-KNOWN_GAME_PATCHES['app-3764200'] = KNOWN_GAME_PATCHES['resident evil requiem'];
-KNOWN_GAME_PATCHES['steam-3764200'] = KNOWN_GAME_PATCHES['resident evil requiem'];
-KNOWN_GAME_PATCHES['app-1368820'] = KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
-KNOWN_GAME_PATCHES['app-310360'] = KNOWN_GAME_PATCHES['higurashi'];
-KNOWN_GAME_PATCHES['app-235900'] = KNOWN_GAME_PATCHES['rpg maker xp'];
-KNOWN_GAME_PATCHES['app-3504780'] = KNOWN_GAME_PATCHES['wildgate'];
-KNOWN_GAME_PATCHES['app-480'] = KNOWN_GAME_PATCHES['spacewar'];
-KNOWN_GAME_PATCHES['app-396900'] = KNOWN_GAME_PATCHES['grip'];
-KNOWN_GAME_PATCHES['steam-396900'] = KNOWN_GAME_PATCHES['grip'];
-KNOWN_GAME_PATCHES['gog-1342466874'] = KNOWN_GAME_PATCHES['grip'];
-KNOWN_GAME_PATCHES['gog-1491728574'] = KNOWN_GAME_PATCHES['fallout: london'];
-KNOWN_GAME_PATCHES['app-25600'] = KNOWN_GAME_PATCHES['eschalon: book i'];
-KNOWN_GAME_PATCHES['steam-25600'] = KNOWN_GAME_PATCHES['eschalon: book i'];
-KNOWN_GAME_PATCHES['app-6910'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['steam-6910'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['gog-1207658995'] = KNOWN_GAME_PATCHES['deus ex'];
-KNOWN_GAME_PATCHES['app-203160'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES['steam-203160'] = KNOWN_GAME_PATCHES['tomb raider goty'];
-KNOWN_GAME_PATCHES['gog-1384091612'] = KNOWN_GAME_PATCHES['summers gone season 1'];
-KNOWN_GAME_PATCHES['app-433550'] = KNOWN_GAME_PATCHES['darq'];
-KNOWN_GAME_PATCHES['steam-433550'] = KNOWN_GAME_PATCHES['darq'];
-KNOWN_GAME_PATCHES['epic-015cbe4368dc449b961988c7434d9195'] = KNOWN_GAME_PATCHES['darq'];
-KNOWN_GAME_PATCHES['epic-ee96375fac2f47de978170a24398e581'] = KNOWN_GAME_PATCHES['darq'];
+export const KNOWN_GAME_PATCHES: Record<string, CatalogGamePatch> = {};
 
 export function applyCatalogPatch(game: CanonicalGame, patch: CatalogGamePatch): CanonicalGame {
   const updated: CanonicalGame = { ...game };
@@ -654,7 +328,6 @@ export function findGamePatch(
   const currentTitleLower = lowerTitle ?? (game.title || '').toLowerCase().trim();
   const currentNorm = normTitle ?? normalizeCanonicalTitle(game.title);
 
-  // 1. Direct key lookups
   if (KNOWN_GAME_PATCHES[currentTitleLower]) return KNOWN_GAME_PATCHES[currentTitleLower];
   if (KNOWN_GAME_PATCHES[currentNorm]) return KNOWN_GAME_PATCHES[currentNorm];
   if (game.id && KNOWN_GAME_PATCHES[game.id.toLowerCase()]) return KNOWN_GAME_PATCHES[game.id.toLowerCase()];
@@ -662,129 +335,49 @@ export function findGamePatch(
     return KNOWN_GAME_PATCHES[`app-${game.steamAppId}`];
   }
 
-  // 2. Curated pattern checks
-  if (
-    (currentNorm === 'blood omen legacy of kain' || currentTitleLower.includes('blood omen')) &&
-    !currentTitleLower.includes('2') &&
-    !currentTitleLower.includes('ii')
-  ) {
-    return KNOWN_GAME_PATCHES['blood omen: legacy of kain'];
-  }
-
-  if (currentTitleLower.includes('60 minutes to extinction') || currentNorm.includes('60 minutes to extinction')) {
-    return KNOWN_GAME_PATCHES['60 minutes to extinction'];
-  }
-
-  if (currentTitleLower.includes('champions of krynn') || currentNorm.includes('champions of krynn')) {
-    return KNOWN_GAME_PATCHES['champions of krynn'];
-  }
-
-  if (currentTitleLower.includes('castlevania anniversary collection') || currentNorm.includes('castlevania anniversary collection')) {
-    return KNOWN_GAME_PATCHES['castlevania anniversary collection'];
-  }
-
-  if (currentTitleLower.includes('akalabeth') || currentNorm.includes('akalabeth')) {
-    return KNOWN_GAME_PATCHES['akalabeth'];
-  }
-
-  if (
-    currentTitleLower.includes('broken sword') &&
-    (currentTitleLower.includes('director') || currentTitleLower.includes('templar') || currentTitleLower.includes('shadow'))
-  ) {
-    return KNOWN_GAME_PATCHES['broken sword'];
-  }
-
-  if (
-    currentTitleLower.includes('citadel remonstered') ||
-    currentTitleLower.includes('cytadela') ||
-    currentNorm.includes('citadel remonstered') ||
-    currentNorm.includes('cytadela')
-  ) {
-    return KNOWN_GAME_PATCHES['citadel remonstered'];
-  }
-
-  if (currentTitleLower.includes('death stranding 2') || currentNorm.includes('death stranding 2')) {
-    return KNOWN_GAME_PATCHES['death stranding 2'];
-  }
-
-  if (currentTitleLower.includes('little nightmares enhanced') || currentNorm.includes('little nightmares enhanced')) {
-    return KNOWN_GAME_PATCHES['little nightmares enhanced'];
-  }
-
-  if (currentTitleLower.includes('blood of dawnwalker') || currentNorm.includes('blood of dawnwalker')) {
-    return KNOWN_GAME_PATCHES['blood of dawnwalker'];
-  }
-
-  if (currentTitleLower.includes('resident evil requiem') || currentNorm.includes('resident evil requiem')) {
-    return KNOWN_GAME_PATCHES['resident evil requiem'];
-  }
-
-  if (
-    currentTitleLower.includes('rollercoaster tycoon') &&
-    (currentTitleLower.includes('3') || currentTitleLower.includes('complete'))
-  ) {
-    return KNOWN_GAME_PATCHES['rollercoaster tycoon 3'];
-  }
-
-  if (
-    currentTitleLower.includes('higurashi') &&
-    (currentTitleLower.includes('onikakushi') || currentTitleLower.includes('ch.1') || currentTitleLower.includes('ch 1'))
-  ) {
-    return KNOWN_GAME_PATCHES['higurashi'];
-  }
-
-  if (currentTitleLower.includes('lure of the temptress') || currentNorm.includes('lure of the temptress')) {
-    return KNOWN_GAME_PATCHES['lure of the temptress'];
-  }
-
-  if (currentTitleLower.startsWith('second extinction') || currentNorm === 'second extinction') {
-    return KNOWN_GAME_PATCHES['second extinction'];
-  }
-
   return undefined;
 }
 
 /**
  * Sanitizes the catalog:
- * 1. Renames known Epic codenames (Boga, Blobfish, Barbet, Basil, Batfish, etc.) to their official game titles and covers
- * 2. Corrects the false match where "Path of the Bogatyr" was assigned to Epic's "Boga" (Death Stranding)
- * 3. Purges raw GUIDs, Fortnite microtransaction items, invalid DLC entries, and unmapped codenames
+ * 1. Resolves any mapped Epic codenames if present
+ * 2. Purges raw GUIDs, Fortnite microtransaction items, invalid DLC entries, and unmapped codenames
+ * 3. Applies user overrides (from Fix Match Wizard)
  * 4. Deduplicates games by normalized title and Steam App ID, merging multi-storefront ownership cleanly
  */
 export function sanitizeGameCatalog(
   catalog: CanonicalGame[],
-  options?: { allowNewPurchases?: boolean }
+  optionsOrOverrides?: { allowNewPurchases?: boolean } | Record<string, any>,
+  maybeOptions?: { allowNewPurchases?: boolean }
 ): CanonicalGame[] {
   if (!Array.isArray(catalog)) return [];
 
+  const options =
+    maybeOptions ??
+    (optionsOrOverrides && 'allowNewPurchases' in optionsOrOverrides
+      ? (optionsOrOverrides as { allowNewPurchases?: boolean })
+      : undefined);
   const userOverrides = loadUserOverrides();
   const cleaned: CanonicalGame[] = [];
   const titleToIndex = new Map<string, number>();
   const steamIdToIndex = new Map<number, number>();
+  const idToIndex = new Map<string, number>();
 
   for (const rawGame of catalog) {
     if (!rawGame || !rawGame.title) continue;
 
     let game = { ...rawGame };
-    const lowerTitle = game.title.toLowerCase().trim();
-    const hasEpicPlatform = game.platforms.some((p) => p.platformId === 'epic');
-
-    // 1. Correct false match: "Path of the Bogatyr" matched from Epic codename "Boga"
-    const isFalseBogaMatch =
-      hasEpicPlatform &&
-      (lowerTitle === 'path of the bogatyr' ||
-        game.platforms.some(
-          (p) =>
-            p.platformId === 'epic' &&
-            ((p.platformGameId || '').toLowerCase() === 'boga' ||
-              p.platformGameId === '761fe09295aa422e8199cebaacf51675')
-        ));
-
-    if (isFalseBogaMatch || lowerTitle === 'boga') {
-      game = applyCatalogPatch(game, KNOWN_GAME_PATCHES['death stranding']);
+    if (/\s*\+\s*Official Walkthrough$/i.test(game.title)) {
+      const strippedTitle = game.title.replace(/\s*\+\s*Official Walkthrough$/i, '').trim();
+      game = {
+        ...game,
+        title: strippedTitle,
+        sortTitle: strippedTitle.replace(/^(The|A|An)\s+/i, ''),
+      };
     }
+    const lowerTitle = game.title.toLowerCase().trim();
 
-    // 2. Resolve known Epic codenames to their official game entities
+    // 1. Resolve Epic codenames to their official game entities if present
     const epicPlatform = game.platforms.find((p) => p.platformId === 'epic');
     const epicPlatformId = (epicPlatform?.platformGameId || '').toLowerCase().trim();
     const gameIdClean = game.id.replace(/^epic-/, '').toLowerCase().trim();
@@ -813,15 +406,7 @@ export function sanitizeGameCatalog(
       };
     }
 
-    // 3. Resolve raw Doki Doki Literature Club Plus! if present as hex ID
-    if (
-      game.id.includes('c5109bdceb3a453bb38c2fdc964ddee8') ||
-      game.title === 'c5109bdceb3a453bb38c2fdc964ddee8'
-    ) {
-      game = applyCatalogPatch(game, KNOWN_GAME_PATCHES['doki doki literature club plus!']);
-    }
-
-    // 4. Filter out junk, pure hex hashes, Fortnite DLC, and unmapped codenames
+    // 2. Filter out junk, pure hex hashes, Fortnite DLC, and unmapped codenames
     if (isEpicNonGameEntry(game)) {
       continue;
     }
@@ -831,7 +416,8 @@ export function sanitizeGameCatalog(
     if ([
       'bobcat', 'boxfish', 'calluna', 'catnip', 'cormorant',
       'hazelnut', 'hazlenut', 'herring', 'boga', 'barbet', 'basil', 'batfish', 'batfishs2', 'blobfish',
-      'speedwell', 'wombat'
+      'speedwell', 'wombat', 'blackcoral', 'blunderbuss', 'boysenberry', 'brilliantrose',
+      'cadmiumred', 'capsicum', 'alabaster', 'kingletaztec'
     ].includes(currentTitleLower)) {
       continue;
     }
@@ -851,15 +437,6 @@ export function sanitizeGameCatalog(
       normTitle = normalizeCanonicalTitle(game.title);
     }
 
-    // 5. Remove erroneous 'epic' platform presence from non-Epic titles
-    if (currentTitleLower.includes('gwent') || currentTitleLower.includes('heroes of might and magic')) {
-      game = {
-        ...game,
-        platforms: game.platforms.filter((p) => p.platformId !== 'epic'),
-      };
-      if (game.platforms.length === 0) continue;
-    }
-
     const isAuthenticNew =
       game.isVerifiedEntitlement === true ||
       options?.allowNewPurchases === true ||
@@ -875,6 +452,7 @@ export function sanitizeGameCatalog(
         !isMockOrUnownedGog &&
         (userOverride !== undefined ||
           isAuthenticNew ||
+          validGogProductIds.size === 0 ||
           (gogPlatform?.platformGameId && validGogProductIds.has(gogPlatform.platformGameId.trim())) ||
           validGogTitles.has(normTitle) ||
           validGogTitles.has(normalizeCanonicalTitle(rawGame.title)));
@@ -917,6 +495,7 @@ export function sanitizeGameCatalog(
         !isMockOrInvalidEpic &&
         (userOverride !== undefined ||
           isAuthenticNew ||
+          validEpicTitles.size === 0 ||
           validEpicTitles.has(updatedNormTitle) ||
           validEpicTitles.has(normalizeCanonicalTitle(rawGame.title)));
 
@@ -926,12 +505,26 @@ export function sanitizeGameCatalog(
           platforms: game.platforms.filter((p) => p.platformId !== 'epic'),
         };
         if (game.platforms.length === 0) continue;
+      } else if (
+        !userOverride?.releaseDate &&
+        game.platforms.length === 1 &&
+        game.platforms[0].platformId === 'epic' &&
+        game.releaseDate &&
+        /^\d{4}-\d{2}-\d{2}$/.test(game.releaseDate)
+      ) {
+        // Epic's library entitlement API previously mapped item.acquisitionDate (YYYY-MM-DD) into releaseDate.
+        // Strip cached YYYY-MM-DD acquisition dates from Epic-only entries so they never poison year-based matching.
+        game = {
+          ...game,
+          releaseDate: undefined,
+        };
       }
     }
 
-    // 8. Purge false Steam platform presence from unowned Steam titles, demos, and promo cache
+    // 8. Purge false Steam platform presence from unowned Steam titles, demos, promo cache, and non-Steam installations
     if (game.platforms.some((p) => p.platformId === 'steam')) {
       const steamPlatform = game.platforms.find((p) => p.platformId === 'steam');
+      const gogPlatformForCheck = game.platforms.find((p) => p.platformId === 'gog');
       const appId =
         game.steamAppId ||
         (steamPlatform?.platformGameId && !isNaN(Number(steamPlatform.platformGameId))
@@ -939,22 +532,95 @@ export function sanitizeGameCatalog(
           : undefined);
 
       const isUnownedPromo = appId ? UNOWNED_STEAM_PROMO_APP_IDS.has(appId) : false;
-      const isRealSteamGame =
-        !isUnownedPromo &&
-        !game.id.startsWith('mock-') &&
-        (userOverride !== undefined ||
-          isAuthenticNew ||
-          (appId
-            ? validSteamAppIds.has(appId)
-            : validSteamTitles.has(normTitle) || validSteamTitles.has(normalizeCanonicalTitle(rawGame.title))));
+      const isBaselineSteamOwned =
+        validSteamAppIds.size === 0 ||
+        (appId
+          ? validSteamAppIds.has(appId)
+          : validSteamTitles.has(normTitle) ||
+            validSteamTitles.has(normalizeCanonicalTitle(rawGame.title)));
+
+      const hasNonSteamRunnerPath = Boolean(
+        steamPlatform?.installPath &&
+          /[/\\](?:epic|gog|legendary|heroic)[/\\]/i.test(steamPlatform.installPath)
+      );
+      const hasRealSteamappsPath = Boolean(
+        steamPlatform?.installPath && /steamapps/i.test(steamPlatform.installPath)
+      );
+      const isKnownNonSteamGame =
+        game.platforms.some((p) => p.platformId !== 'steam') ||
+        validEpicTitles.has(normTitle) ||
+        validGogTitles.has(normTitle) ||
+        (gogPlatformForCheck?.platformGameId
+          ? validGogProductIds.has(gogPlatformForCheck.platformGameId.trim())
+          : false);
+
+      let isRealSteamGame: boolean;
+      if (!isBaselineSteamOwned) {
+        if (hasNonSteamRunnerPath) {
+          isRealSteamGame = false;
+        } else if (isKnownNonSteamGame && !hasRealSteamappsPath) {
+          isRealSteamGame = false;
+        } else {
+          isRealSteamGame =
+            !isUnownedPromo &&
+            !game.id.startsWith('mock-') &&
+            (userOverride?.matchedStore === 'steam' || isAuthenticNew);
+        }
+      } else {
+        isRealSteamGame =
+          !isUnownedPromo && !game.id.startsWith('mock-') && !hasNonSteamRunnerPath;
+      }
 
       if (isUnownedPromo || !isRealSteamGame) {
+        const remainingPlatforms = game.platforms.filter((p) => p.platformId !== 'steam');
+        if (remainingPlatforms.length === 0) {
+          if ((steamPlatform?.playtimeMinutes || 0) > 0) {
+            const existingIdx =
+              (appId && steamIdToIndex.has(appId) ? steamIdToIndex.get(appId) : undefined) ??
+              (normTitle && titleToIndex.has(normTitle) ? titleToIndex.get(normTitle) : undefined);
+            if (
+              existingIdx !== undefined &&
+              cleaned[existingIdx] &&
+              cleaned[existingIdx].platforms.length > 0
+            ) {
+              const target = cleaned[existingIdx];
+              const firstPlat = target.platforms[0];
+              cleaned[existingIdx] = {
+                ...target,
+                platforms: [
+                  {
+                    ...firstPlat,
+                    playtimeMinutes:
+                      (firstPlat.playtimeMinutes || 0) + (steamPlatform?.playtimeMinutes || 0),
+                    lastPlayed: firstPlat.lastPlayed || steamPlatform?.lastPlayed,
+                  },
+                  ...target.platforms.slice(1),
+                ],
+              };
+            }
+          }
+          continue;
+        }
+        if ((steamPlatform?.playtimeMinutes || 0) > 0) {
+          remainingPlatforms[0] = {
+            ...remainingPlatforms[0],
+            playtimeMinutes:
+              (remainingPlatforms[0].playtimeMinutes || 0) + (steamPlatform?.playtimeMinutes || 0),
+            lastPlayed: remainingPlatforms[0].lastPlayed || steamPlatform?.lastPlayed,
+          };
+        }
         game = {
           ...game,
-          steamAppId: undefined,
-          platforms: game.platforms.filter((p) => p.platformId !== 'steam'),
+          steamAppId: isUnownedPromo ? undefined : game.steamAppId,
+          platforms: remainingPlatforms,
         };
-        if (game.platforms.length === 0) continue;
+      } else if (game.steamAppId && steamPlatform && steamPlatform.platformGameId !== String(game.steamAppId)) {
+        game = {
+          ...game,
+          platforms: game.platforms.map((p) =>
+            p.platformId === 'steam' ? { ...p, platformGameId: String(game.steamAppId) } : p
+          ),
+        };
       }
     }
 
@@ -972,12 +638,14 @@ export function sanitizeGameCatalog(
       const gogSpecial = gogPlat?.platformGameId ? GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId]?.lead : null;
 
       if (blurb && !isPlaceholderDesc(blurb, game.title)) {
-        game = { ...game, shortDescription: blurb };
+        game = { ...game, shortDescription: sanitizeShortDescriptionText(blurb) };
       } else if (gogSpecial && !isPlaceholderDesc(gogSpecial, game.title)) {
-        game = { ...game, shortDescription: gogSpecial };
+        game = { ...game, shortDescription: sanitizeShortDescriptionText(gogSpecial) };
       } else {
         game = { ...game, shortDescription: '' };
       }
+    } else if (game.shortDescription) {
+      game = { ...game, shortDescription: sanitizeShortDescriptionText(game.shortDescription) };
     }
 
     // Systemic resolution of GOG official vertical covers from verified enriched cache
@@ -1026,71 +694,105 @@ export function sanitizeGameCatalog(
     }
 
     // 9. Intelligent cross-store deduplication by Steam App ID and Normalized Title
-    const existingIndex =
+    const idMatchIndex = game.id && idToIndex.has(game.id) ? idToIndex.get(game.id)! : -1;
+    const candidateIndex =
       (game.steamAppId && steamIdToIndex.has(game.steamAppId)
         ? steamIdToIndex.get(game.steamAppId)
         : undefined) ??
       (normTitle && titleToIndex.has(normTitle)
-        ? (() => {
-            const idx = titleToIndex.get(normTitle)!;
-            const existing = cleaned[idx];
-            if (existing && existing.steamAppId && game.steamAppId && existing.steamAppId !== game.steamAppId) {
-              return undefined;
-            }
-            return idx;
-          })()
-        : undefined);
+        ? titleToIndex.get(normTitle)
+        : undefined) ??
+      (idMatchIndex >= 0 ? idMatchIndex : undefined);
+    const existingIndex =
+      candidateIndex !== undefined &&
+      cleaned[candidateIndex] &&
+      !hasSameStorefrontConflict(cleaned[candidateIndex], game)
+        ? candidateIndex
+        : undefined;
 
     if (existingIndex !== undefined && cleaned[existingIndex]) {
       // Merge platforms across duplicates
       const existing = cleaned[existingIndex];
-      const mergedPlatforms = [...existing.platforms];
-      for (const p of game.platforms) {
+      const existingIsParenClassic = /\s*\((?:original|classic)\)$/i.test(existing.title);
+      const incomingIsParenClassic = /\s*\((?:original|classic)\)$/i.test(game.title);
+      const preferIncomingEdition = existingIsParenClassic && !incomingIsParenClassic;
+      const primary = preferIncomingEdition ? game : existing;
+      const secondary = preferIncomingEdition ? existing : game;
+
+      let mergedPlatforms = [...primary.platforms];
+      for (const p of secondary.platforms) {
         const found = mergedPlatforms.some((ep) => ep.platformId === p.platformId);
         if (!found) {
           mergedPlatforms.push(p);
         }
       }
 
+      if (
+        mergedPlatforms.some((p) => p.platformId === 'steam') &&
+        mergedPlatforms.some((p) => p.platformId !== 'steam') &&
+        validSteamAppIds.size > 0
+      ) {
+        const steamP = mergedPlatforms.find((p) => p.platformId === 'steam');
+        const resolvedAppId =
+          Number(steamP?.platformGameId) || primary.steamAppId || secondary.steamAppId || 0;
+        const isPhantomSteam =
+          !validSteamAppIds.has(resolvedAppId) &&
+          !validSteamTitles.has(normTitle) &&
+          !/steamapps/i.test(steamP?.installPath || '');
+        if (isPhantomSteam) {
+          const nonSteamPlatforms = mergedPlatforms.filter((p) => p.platformId !== 'steam');
+          if (nonSteamPlatforms.length > 0 && (steamP?.playtimeMinutes || 0) > 0) {
+            nonSteamPlatforms[0] = {
+              ...nonSteamPlatforms[0],
+              playtimeMinutes:
+                (nonSteamPlatforms[0].playtimeMinutes || 0) + (steamP?.playtimeMinutes || 0),
+              lastPlayed: nonSteamPlatforms[0].lastPlayed || steamP?.lastPlayed,
+            };
+          }
+          mergedPlatforms = nonSteamPlatforms;
+        }
+      }
+
       cleaned[existingIndex] = {
-        ...existing,
-        steamAppId: existing.steamAppId || game.steamAppId,
-        id: existing.steamAppId
-          ? `steam-${existing.steamAppId}`
-          : game.steamAppId
-          ? `steam-${game.steamAppId}`
-          : existing.id,
+        ...primary,
+        steamAppId: primary.steamAppId || secondary.steamAppId,
+        id: primary.steamAppId
+          ? `steam-${primary.steamAppId}`
+          : secondary.steamAppId
+          ? `steam-${secondary.steamAppId}`
+          : primary.id,
         platforms: mergedPlatforms,
-        headerImage: (game.headerImage && (!existing.headerImage || existing.headerImage.includes('egs-badge.png') || existing.headerImage.includes('1225270') || existing.headerImage.endsWith('/3286930/header.jpg') || existing.headerImage.endsWith('/3783210/header.jpg') || existing.headerImage.endsWith('/3280350/header.jpg') || existing.headerImage.endsWith('/2149010/header.jpg') || existing.headerImage.endsWith('/3751260/header.jpg') || existing.headerImage.endsWith('/3504780/header.jpg') || existing.headerImage.endsWith('/480/header.jpg'))) ? game.headerImage : (existing.headerImage || game.headerImage),
+        headerImage: (secondary.headerImage && (!primary.headerImage || primary.headerImage.includes('egs-badge.png') || primary.headerImage.includes('1225270') || primary.headerImage.endsWith('/3286930/header.jpg') || primary.headerImage.endsWith('/3783210/header.jpg') || primary.headerImage.endsWith('/3280350/header.jpg') || primary.headerImage.endsWith('/2149010/header.jpg') || primary.headerImage.endsWith('/3751260/header.jpg') || primary.headerImage.endsWith('/3504780/header.jpg') || primary.headerImage.endsWith('/480/header.jpg'))) ? secondary.headerImage : (primary.headerImage || secondary.headerImage),
         capsuleImage: (() => {
-          const igdb = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId || existing.steamAppId, game.id || existing.id);
-          if (igdb && (isKnownDeadSteamCover(existing.steamAppId) || isKnownDeadSteamCover(game.steamAppId) || isUnsuitableCoverUrl(existing.capsuleImage) || isUnsuitableCoverUrl(game.capsuleImage))) {
+          const igdb = igdbCoverService.getIgdbCoverInstant(primary.title, primary.steamAppId || secondary.steamAppId, primary.id || secondary.id);
+          if (igdb && (isKnownDeadSteamCover(primary.steamAppId) || isKnownDeadSteamCover(secondary.steamAppId) || isUnsuitableCoverUrl(primary.capsuleImage) || isUnsuitableCoverUrl(secondary.capsuleImage))) {
             return igdb;
           }
           if (
-            game.capsuleImage &&
-            (!existing.capsuleImage ||
-              existing.capsuleImage.includes('egs-badge.png') ||
-              existing.capsuleImage.includes('1225270') ||
-              existing.capsuleImage.includes('231x87') ||
-              isKnownDeadSteamCover(existing.steamAppId) ||
-              isUnsuitableCoverUrl(existing.capsuleImage))
+            secondary.capsuleImage &&
+            (!primary.capsuleImage ||
+              primary.capsuleImage.includes('egs-badge.png') ||
+              primary.capsuleImage.includes('1225270') ||
+              primary.capsuleImage.includes('231x87') ||
+              isKnownDeadSteamCover(primary.steamAppId) ||
+              isUnsuitableCoverUrl(primary.capsuleImage))
           ) {
-            return game.capsuleImage;
+            return secondary.capsuleImage;
           }
-          return existing.capsuleImage || game.capsuleImage;
+          return primary.capsuleImage || secondary.capsuleImage;
         })(),
-        iconUrl: (game.iconUrl && (!existing.iconUrl || existing.iconUrl.includes('egs-badge.png') || existing.iconUrl.includes('1225270'))) ? game.iconUrl : (existing.iconUrl || game.iconUrl || game.capsuleImage),
-        shortDescription: (!isPlaceholderDesc(existing.shortDescription, existing.title))
-          ? existing.shortDescription
-          : (!isPlaceholderDesc(game.shortDescription, game.title))
-          ? game.shortDescription
+        iconUrl: (secondary.iconUrl && (!primary.iconUrl || primary.iconUrl.includes('egs-badge.png') || primary.iconUrl.includes('1225270'))) ? secondary.iconUrl : (primary.iconUrl || secondary.iconUrl || secondary.capsuleImage),
+        shortDescription: (!isPlaceholderDesc(primary.shortDescription, primary.title))
+          ? sanitizeShortDescriptionText(primary.shortDescription)
+          : (!isPlaceholderDesc(secondary.shortDescription, secondary.title))
+          ? sanitizeShortDescriptionText(secondary.shortDescription)
           : '',
-        developers: existing.developers && existing.developers.length > 0 ? existing.developers : game.developers,
-        publishers: existing.publishers && existing.publishers.length > 0 ? existing.publishers : game.publishers,
-        isVerifiedEntitlement: existing.isVerifiedEntitlement || game.isVerifiedEntitlement,
-        matchConfidence: existing.matchConfidence ?? game.matchConfidence,
-        needsMatchReview: existing.needsMatchReview ?? game.needsMatchReview,
+        developers: primary.developers && primary.developers.length > 0 ? primary.developers : secondary.developers,
+        publishers: primary.publishers && primary.publishers.length > 0 ? primary.publishers : secondary.publishers,
+        releaseDate: primary.releaseDate || secondary.releaseDate,
+        isVerifiedEntitlement: primary.isVerifiedEntitlement || secondary.isVerifiedEntitlement,
+        matchConfidence: primary.matchConfidence ?? secondary.matchConfidence,
+        needsMatchReview: primary.needsMatchReview ?? secondary.needsMatchReview,
       };
 
       const existingOv = getUserOverrideForGame(existing, userOverrides);
@@ -1102,14 +804,188 @@ export function sanitizeGameCatalog(
       if (cleaned[existingIndex].steamAppId) {
         steamIdToIndex.set(cleaned[existingIndex].steamAppId!, existingIndex);
       }
+      if (cleaned[existingIndex].id) {
+        idToIndex.set(cleaned[existingIndex].id, existingIndex);
+      }
     } else {
+      if (
+        candidateIndex !== undefined &&
+        cleaned[candidateIndex] &&
+        hasSameStorefrontConflict(cleaned[candidateIndex], game)
+      ) {
+        const existing = cleaned[candidateIndex];
+        const prevExistingId = existing.id;
+
+        // A. Self-Heal Stale Overwritten Remastered/Enhanced Titles on Same-Storefront Pairs
+        if (
+          normalizeCanonicalTitle(existing.title) === normalizeCanonicalTitle(game.title) &&
+          /\b(remastered|remaster|enhanced)\b/i.test(existing.title)
+        ) {
+          let baseTarget: CanonicalGame;
+          if (existing.platforms.length < game.platforms.length) {
+            baseTarget = existing;
+          } else if (game.platforms.length < existing.platforms.length) {
+            baseTarget = game;
+          } else if (
+            !existing.platforms.some((p) => p.platformId === 'steam') &&
+            game.platforms.some((p) => p.platformId === 'steam')
+          ) {
+            baseTarget = existing;
+          } else if (
+            !game.platforms.some((p) => p.platformId === 'steam') &&
+            existing.platforms.some((p) => p.platformId === 'steam')
+          ) {
+            baseTarget = game;
+          } else {
+            baseTarget = existing;
+          }
+
+          const restoredTitle = baseTarget.title
+            .replace(/\s*[-–—:]?\s*\b(remastered|remaster|enhanced(?:\s+edition)?)\b/gi, '')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+          const collidingAppId = baseTarget.steamAppId;
+          baseTarget.title = restoredTitle;
+          baseTarget.sortTitle = restoredTitle.replace(/^(The|A|An)\s+/i, '');
+          baseTarget.steamAppId = undefined;
+          (baseTarget as any).enrichedMetadata = undefined;
+          const primaryPlat = baseTarget.platforms?.[0];
+          if (primaryPlat?.platformId && primaryPlat?.platformGameId) {
+            baseTarget.id = `${primaryPlat.platformId}-${primaryPlat.platformGameId}`;
+          }
+          if (collidingAppId) {
+            const appIdToken = `/steam/apps/${collidingAppId}/`;
+            if (baseTarget.headerImage?.includes(appIdToken)) baseTarget.headerImage = '';
+            if (baseTarget.capsuleImage?.includes(appIdToken)) baseTarget.capsuleImage = '';
+            if (baseTarget.iconUrl?.includes(appIdToken)) baseTarget.iconUrl = undefined;
+            const igdbRestored = igdbCoverService.getIgdbCoverInstant(
+              restoredTitle,
+              undefined,
+              baseTarget.id
+            );
+            if (igdbRestored) {
+              baseTarget.capsuleImage = igdbRestored;
+              baseTarget.iconUrl = baseTarget.iconUrl || igdbRestored;
+            }
+          }
+          if (baseTarget === existing) {
+            titleToIndex.set(normalizeCanonicalTitle(existing.title), candidateIndex);
+            if (collidingAppId && steamIdToIndex.get(collidingAppId) === candidateIndex) {
+              steamIdToIndex.delete(collidingAppId);
+            }
+            if (prevExistingId && idToIndex.get(prevExistingId) === candidateIndex) {
+              idToIndex.delete(prevExistingId);
+            }
+            if (existing.id) {
+              idToIndex.set(existing.id, candidateIndex);
+            }
+          } else {
+            normTitle = normalizeCanonicalTitle(game.title);
+          }
+        }
+
+        // B. Disambiguate Shared steamAppId / id Between Same-Storefront Editions
+        if (
+          (existing.steamAppId && game.steamAppId && existing.steamAppId === game.steamAppId) ||
+          existing.id === game.id
+        ) {
+          const sharedAppId = existing.steamAppId || game.steamAppId;
+          const existingHasSteam = existing.platforms.some((p) => p.platformId === 'steam');
+          const gameHasSteam = game.platforms.some((p) => p.platformId === 'steam');
+          const existingHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(existing.title);
+          const gameHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(game.title);
+
+          let targetToDemote: CanonicalGame = game;
+          if (existingHasSteam !== gameHasSteam) {
+            targetToDemote = existingHasSteam ? game : existing;
+          } else if (existingHasEdition !== gameHasEdition) {
+            const steamCachedName = sharedAppId
+              ? (steamEnrichedCache as Record<string, any>)[String(sharedAppId)]?.name || ''
+              : '';
+            const steamCacheHasEdition = steamCachedName
+              ? /\b(remastered|remaster|remake|enhanced)\b/i.test(steamCachedName)
+              : true;
+            if (steamCacheHasEdition) {
+              targetToDemote = existingHasEdition ? game : existing;
+            } else {
+              targetToDemote = existingHasEdition ? existing : game;
+            }
+          }
+
+          const plat = targetToDemote.platforms?.[0];
+          if (plat?.platformId && plat?.platformGameId) {
+            const oldId = targetToDemote.id;
+            targetToDemote.id = `${plat.platformId}-${plat.platformGameId}`;
+            targetToDemote.steamAppId = undefined;
+            if (targetToDemote === existing) {
+              if (sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
+                steamIdToIndex.delete(sharedAppId);
+              }
+              if (oldId && idToIndex.get(oldId) === candidateIndex) {
+                idToIndex.delete(oldId);
+              }
+              idToIndex.set(existing.id, candidateIndex);
+            }
+          }
+        }
+      }
+
       const newIndex = cleaned.length;
       cleaned.push(game);
       if (normTitle) titleToIndex.set(normTitle, newIndex);
       if (game.steamAppId) steamIdToIndex.set(game.steamAppId, newIndex);
+      if (game.id) idToIndex.set(game.id, newIndex);
     }
   }
 
   const finalCatalog = applyUserOverridesToCatalog(cleaned, userOverrides);
+
+  // C. Final Strict Unique game.id & Same-Storefront Steam AppID Guarantee Pass
+  const seenIds = new Set<string>();
+  const seenSteamAppIds = new Map<number, CanonicalGame>();
+  for (let idx = 0; idx < finalCatalog.length; idx++) {
+    const g = finalCatalog[idx];
+    if (g.steamAppId) {
+      const prevWithAppId = seenSteamAppIds.get(g.steamAppId);
+      if (prevWithAppId && hasSameStorefrontConflict(prevWithAppId, g)) {
+        // Two distinct same-storefront editions still share the same steamAppId
+        const prevHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(prevWithAppId.title);
+        const currHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(g.title);
+        // Demote the base non-Steam entry (or current entry) to its native storefront ID
+        const targetToDemote =
+          !prevWithAppId.platforms.some((p) => p.platformId === 'steam') &&
+          prevWithAppId.platforms.length <= g.platforms.length &&
+          !prevHasEdition &&
+          currHasEdition
+            ? prevWithAppId
+            : g;
+        const plat = targetToDemote.platforms?.[0];
+        if (plat?.platformId && plat?.platformGameId) {
+          if (targetToDemote === prevWithAppId) {
+            seenIds.delete(prevWithAppId.id);
+            prevWithAppId.id = `${plat.platformId}-${plat.platformGameId}`;
+            prevWithAppId.steamAppId = undefined;
+            seenIds.add(prevWithAppId.id);
+            seenSteamAppIds.set(g.steamAppId, g);
+          } else {
+            g.id = `${plat.platformId}-${plat.platformGameId}`;
+            g.steamAppId = undefined;
+          }
+        }
+      } else {
+        seenSteamAppIds.set(g.steamAppId, g);
+      }
+    }
+    if (seenIds.has(g.id)) {
+      const primaryPlat = g.platforms?.[0];
+      const fallbackId =
+        primaryPlat?.platformId && primaryPlat?.platformGameId
+          ? `${primaryPlat.platformId}-${primaryPlat.platformGameId}`
+          : `${g.id}-${idx}`;
+      g.id = !seenIds.has(fallbackId) ? fallbackId : `${fallbackId}-${idx}`;
+    }
+    seenIds.add(g.id);
+  }
+
   return finalCatalog.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
 }

@@ -1,11 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { metadataScraperService, cleanSearchQuery } from '../src/services/scraper/metadataScraperService';
+import { KNOWN_EPIC_APP_NAMES } from '../src/services/integrations/epicCodenames';
+import gogEnrichedCache from '../src/services/storage/gogEnrichedCache.json';
 import { CanonicalGame } from '../src/contracts/game';
 import { SearchMatchCandidate } from '../src/contracts/override';
 
 describe('MetadataScraperService', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    KNOWN_EPIC_APP_NAMES['world-war-z'] = {
+      title: 'World War Z',
+      capsuleImage: 'https://example.com/wwz-cover.jpg',
+      headerImage: 'https://example.com/wwz-header.jpg',
+      description: 'World War Z is a heart-pounding coop third-person shooter.',
+    };
+    (gogEnrichedCache as Record<string, any>)['1837805079'] = {
+      title: 'Blood Omen: Legacy of Kain',
+      releaseDate: '1996-11-15',
+      coverVertical: 'https://images.gog.com/blood-omen-vertical.jpg',
+      coverHorizontal: 'https://images.gog.com/blood-omen-horizontal.jpg',
+      shortDescription: 'Dark fantasy action adventure featuring Kain.',
+    };
   });
 
   describe('cleanSearchQuery', () => {

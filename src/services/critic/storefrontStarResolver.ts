@@ -1,5 +1,7 @@
 import { CriticScoreData } from '../../contracts/critic';
 import { calculateTier, isSequelMismatch, normalizeCriticTitleKey } from './criticUtils';
+import { isTitleCompatible } from './metacriticResolver';
+import { requestScheduler, Priority } from '../network/requestScheduler';
 
 export class StorefrontStarResolver {
   private cache = new Map<string, CriticScoreData | null>();
@@ -27,55 +29,70 @@ export class StorefrontStarResolver {
       try {
         const cleanTitle = rawTitle
           .replace(/[®™©]/g, '')
+          .replace(/['’ʼ`]/g, '')
           .replace(/[:\-–—_+]/g, ' ')
           .replace(
-            /\b(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|directors-cut|director'?s cut|goty|game of the year|remastered|remake)( edition| pack| bundle| collection)?\b/gi,
+            /\b(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|extended|enchanted|anniversary|directors-cut|director'?s cut|goty|game of the year|remastered|remake)( edition| pack| bundle| collection)?\b/gi,
             ''
           )
           .replace(/\s+/g, ' ')
           .trim();
 
         const queryUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(cleanTitle)}&limit=5`;
-        const res = await fetch(queryUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'application/json',
-          },
-          signal:
-            typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-              ? AbortSignal.timeout(6000)
-              : undefined,
-        });
+        const res = await requestScheduler.schedule(
+          queryUrl,
+          () =>
+            fetch(queryUrl, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                Accept: 'application/json',
+              },
+              signal:
+                typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+                  ? AbortSignal.timeout(6000)
+                  : undefined,
+            }),
+          Priority.P1_VIEWPORT,
+          'catalog.gog.com'
+        );
 
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data?.products) && data.products.length > 0) {
             const normalizedQuery = normalizeCriticTitleKey(cleanTitle);
+            const rawWithoutParenYear = rawTitle.replace(/\s*\((?:19|20)\d{2}\)/g, '').trim();
+            const queryHasExplicitFirstInstallment = /\b(?:1|i)\b/i.test(rawWithoutParenYear);
 
             for (const product of data.products) {
               const productTitle = product.title || '';
+              const productSlug = String(product.slug || '');
               const normalizedProduct = normalizeCriticTitleKey(productTitle);
 
-              // Strict title compatibility check: require token overlap and no sequel mismatch
-              let isMatch = false;
-              if (normalizedQuery === normalizedProduct) {
-                isMatch = true;
-              } else if (!isSequelMismatch(cleanTitle, productTitle)) {
-                if (normalizedProduct.includes(normalizedQuery) || normalizedQuery.includes(normalizedProduct)) {
-                  isMatch = true;
-                } else {
-                  const qTokens = normalizedQuery.split(' ').filter((t) => t.length > 1);
-                  const pTokens = normalizedProduct.split(' ').filter((t) => t.length > 1);
-                  if (qTokens.length > 0 && pTokens.length > 0) {
-                    const shared = qTokens.filter((t) => pTokens.includes(t));
-                    const ratio = shared.length / Math.min(qTokens.length, pTokens.length);
-                    if (ratio >= 0.6) {
-                      isMatch = true;
-                    }
-                  }
-                }
+              // Reject GOG demos, prologues, soundtracks, or DLCs when query is a full game
+              const nonGamePattern = /\b(demo|prologue|soundtrack|ost|artbook|dlc|upgrade|walkthrough)\b/i;
+              if (
+                nonGamePattern.test(`${productTitle} ${productSlug.replace(/_/g, ' ')}`) &&
+                !nonGamePattern.test(rawTitle)
+              ) {
+                continue;
               }
+
+              // Reject modern unnumbered reboot slugs (e.g. 'doom_2016') when query explicitly specifies installment 1/I ('DOOM I Enhanced')
+              if (
+                queryHasExplicitFirstInstallment &&
+                !/\b(?:1|i)\b/i.test(productTitle) &&
+                /_(201\d|202\d)\b/i.test(productSlug)
+              ) {
+                continue;
+              }
+
+              // Strict bidirectional title compatibility and sequel check
+              const isMatch =
+                normalizedQuery === normalizedProduct ||
+                (!isSequelMismatch(rawTitle, productTitle) &&
+                  isTitleCompatible(rawTitle, productTitle) &&
+                  isTitleCompatible(productTitle, rawTitle));
 
               if (isMatch) {
                 const reviewsRating = typeof product.reviewsRating === 'number' ? product.reviewsRating : 0;
@@ -123,6 +140,13 @@ export class StorefrontStarResolver {
     return promise;
   }
 
+  async resolveScore(
+    input: string | { title: string; gogId?: string; epicId?: string }
+  ): Promise<CriticScoreData | null> {
+    const title = typeof input === 'string' ? input : input?.title || '';
+    return this.resolveStorefrontScore(title);
+  }
+
   clearCache(): void {
     this.cache.clear();
     this.inFlight.clear();
@@ -130,3 +154,4 @@ export class StorefrontStarResolver {
 }
 
 export const storefrontStarResolver = new StorefrontStarResolver();
+

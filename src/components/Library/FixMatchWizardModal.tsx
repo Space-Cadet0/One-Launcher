@@ -1,9 +1,13 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import {
   UserGameOverride,
   SearchMatchCandidate,
   ScrapedMetadataBundle,
+  ScrapedCoverOption,
+  MetadataSourceOption,
+  MetadataSourceRoute,
+  ReviewScoreRoute,
 } from '../../contracts/override';
 import { metadataScraperService } from '../../services/scraper/metadataScraperService';
 import {
@@ -12,6 +16,7 @@ import {
 } from '../../services/scraper/reviewCandidateService';
 import { CriticScoreData, CriticSource } from '../../contracts/critic';
 import { calculateTier, getTierColor } from '../../services/critic/criticUtils';
+import { syncJobManager } from '../../services/network/syncJobManager';
 import {
   X,
   Search,
@@ -100,7 +105,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     initialCandidate || null
   );
 
-  // Step 2 & 4: Scraped metadata bundle state
+  // Step 2: Cover art state & independent cover search
   const [isScrapingDetails, setIsScrapingDetails] = useState(false);
   const [scrapedBundle, setScrapedBundle] = useState<ScrapedMetadataBundle | null>(
     initialScrapedBundle || null
@@ -108,12 +113,51 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   const [selectedCoverUrl, setSelectedCoverUrl] = useState<string>(
     initialScrapedBundle?.capsuleImage || ''
   );
+  const [coverSearchTerm, setCoverSearchTerm] = useState<string>(
+    initialScrapedBundle?.title || initialCandidate?.title || game?.title || ''
+  );
+  const [coverSourceTab, setCoverSourceTab] = useState<SourceFilterTab>('All');
+  const [extraCovers, setExtraCovers] = useState<ScrapedCoverOption[]>([]);
+  const [isSearchingCovers, setIsSearchingCovers] = useState<boolean>(false);
+
+  // Step 4: Metadata switcher & active metadata fields
   const [selectedBlurb, setSelectedBlurb] = useState<string>(
     initialScrapedBundle?.shortDescription || ''
   );
   const [customTitle, setCustomTitle] = useState<string>(
     initialScrapedBundle?.title || game?.title || ''
   );
+  const [metadataSources, setMetadataSources] = useState<MetadataSourceOption[]>(
+    initialScrapedBundle?.availableMetadataSources || []
+  );
+  const [selectedMetadataSourceId, setSelectedMetadataSourceId] = useState<string>(
+    initialScrapedBundle?.availableMetadataSources?.[0]?.id || ''
+  );
+  const [metadataSearchTerm, setMetadataSearchTerm] = useState<string>(
+    initialScrapedBundle?.title || game?.title || ''
+  );
+  const [isSearchingMetadataSources, setIsSearchingMetadataSources] = useState<boolean>(false);
+  const [activeReleaseDate, setActiveReleaseDate] = useState<string>(
+    initialScrapedBundle?.releaseDate || ''
+  );
+  const [activeDevelopers, setActiveDevelopers] = useState<string[]>(
+    initialScrapedBundle?.developers || []
+  );
+  const [activePublishers, setActivePublishers] = useState<string[]>(
+    initialScrapedBundle?.publishers || []
+  );
+  const [activeGenres, setActiveGenres] = useState<string[]>(
+    initialScrapedBundle?.genres || []
+  );
+  const [activeTags, setActiveTags] = useState<string[]>(
+    initialScrapedBundle?.tags || []
+  );
+  const [activeHeaderImage, setActiveHeaderImage] = useState<string>(
+    initialScrapedBundle?.headerImage || ''
+  );
+  const [activeAvailableDescriptions, setActiveAvailableDescriptions] = useState<
+    { source: string; text: string }[]
+  >(initialScrapedBundle?.availableDescriptions || []);
 
   // Step 3: Review score & source candidate discovery state
   const [reviewCandidates, setReviewCandidates] = useState<ReviewCandidateOption[]>(
@@ -125,6 +169,12 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   );
   const [selectedReviewData, setSelectedReviewData] = useState<CriticScoreData | null>(
     initialSelectedReviewData || null
+  );
+  const [reviewSearchTerm, setReviewSearchTerm] = useState<string>(
+    initialScrapedBundle?.title || initialCandidate?.title || game?.title || ''
+  );
+  const [selectedReviewRoute, setSelectedReviewRoute] = useState<ReviewScoreRoute | undefined>(
+    undefined
   );
 
   // Custom score input state
@@ -142,17 +192,31 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     initialCustomScoreNumReviews ?? ''
   );
 
-  // Load candidate matches from metadata scraper service
+  // Ensure priority scopes are always ended on close or unmount
+  const handleCloseWizard = useCallback(() => {
+    syncJobManager.endAllPriorityScopes();
+    onClose();
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      syncJobManager.endAllPriorityScopes();
+    }
+    return () => {
+      syncJobManager.endAllPriorityScopes();
+    };
+  }, [isOpen]);
+
+  // Load candidate matches from metadata scraper service (On-Demand Priority)
   const loadCandidates = useCallback(
     async (query: string, tab: SourceFilterTab, nonSteam: boolean) => {
       if (!game) return;
       setIsLoadingCandidates(true);
       try {
-        const matches = await metadataScraperService.getSuggestedMatches(
-          game,
-          query,
-          tab,
-          nonSteam
+        const matches = await syncJobManager.runPriorityAction(
+          'Matching Game Metadata',
+          game.title,
+          () => metadataScraperService.getSuggestedMatches(game, query, tab, nonSteam)
         );
         setCandidates(matches);
       } catch (err) {
@@ -165,28 +229,36 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     [game]
   );
 
-  // Load review score candidates from reviewCandidateService
+  // Load review score candidates from reviewCandidateService (On-Demand Priority)
   const loadReviews = useCallback(
     async (
       targetGame: CanonicalGame,
       targetCandidate: SearchMatchCandidate | null,
-      targetBundle: ScrapedMetadataBundle | null
+      targetBundle: ScrapedMetadataBundle | null,
+      customQuery?: string
     ) => {
       setIsLoadingReviews(true);
       try {
-        const result = await reviewCandidateService.discoverReviews(
-          targetGame,
-          targetCandidate,
-          targetBundle
+        const result = await syncJobManager.runPriorityAction(
+          'Matching Review Scores',
+          customQuery?.trim() || targetBundle?.title || targetGame.title,
+          () =>
+            reviewCandidateService.discoverReviews(
+              targetGame,
+              targetCandidate,
+              targetBundle,
+              customQuery
+            )
         );
         const discovered = result.candidates || [];
         setReviewCandidates(discovered);
 
-        // Check if existing override has reviewScoreOverride
-        if (existingOverride && existingOverride.reviewScoreOverride !== undefined) {
+        // If user triggered an explicit custom search query, prioritize discovered results from that search
+        if (!customQuery && existingOverride && existingOverride.reviewScoreOverride !== undefined) {
           if (existingOverride.reviewScoreOverride === null) {
             setSelectedReviewOptionId('unrated');
             setSelectedReviewData(null);
+            setSelectedReviewRoute({ mode: 'unrated' });
             return;
           }
           const activeOpt = discovered.find((c) => c.id === 'active-override');
@@ -206,6 +278,14 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               isVerified: activeOpt.isVerified,
               isSynthetic: activeOpt.isSynthetic,
             });
+            setSelectedReviewRoute(
+              activeOpt.reviewRoute || {
+                mode: 'routed',
+                source: activeOpt.source,
+                url: activeOpt.url,
+                targetTitle: targetBundle?.title || targetGame.title,
+              }
+            );
             return;
           } else {
             const ex = existingOverride.reviewScoreOverride;
@@ -216,29 +296,46 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             setCustomScoreSummary(ex.summary || '');
             setCustomScoreNumReviews(ex.numReviews ?? '');
             setSelectedReviewData(ex);
+            setSelectedReviewRoute(
+              existingOverride.reviewRoute || {
+                mode: 'static',
+                source: ex.source,
+                url: ex.url,
+              }
+            );
             return;
           }
         }
 
-        // Active override from candidates if game already had one
-        const activeCand = discovered.find((c) => c.id === 'active-override');
-        if (activeCand) {
-          setSelectedReviewOptionId(activeCand.id);
-          setSelectedReviewData({
-            id: activeCand.id,
-            source: activeCand.source,
-            score: activeCand.score,
-            tier: activeCand.tier,
-            url: activeCand.url || '',
-            summary: activeCand.summary,
-            numReviews: activeCand.numReviews,
-            userScoreRaw: activeCand.userScoreRaw,
-            starRatingRaw: activeCand.starRatingRaw,
-            percentRecommended: activeCand.percentRecommended,
-            isVerified: activeCand.isVerified,
-            isSynthetic: activeCand.isSynthetic,
-          });
-          return;
+        // Active override from candidates if game already had one (and not custom searching)
+        if (!customQuery) {
+          const activeCand = discovered.find((c) => c.id === 'active-override');
+          if (activeCand) {
+            setSelectedReviewOptionId(activeCand.id);
+            setSelectedReviewData({
+              id: activeCand.id,
+              source: activeCand.source,
+              score: activeCand.score,
+              tier: activeCand.tier,
+              url: activeCand.url || '',
+              summary: activeCand.summary,
+              numReviews: activeCand.numReviews,
+              userScoreRaw: activeCand.userScoreRaw,
+              starRatingRaw: activeCand.starRatingRaw,
+              percentRecommended: activeCand.percentRecommended,
+              isVerified: activeCand.isVerified,
+              isSynthetic: activeCand.isSynthetic,
+            });
+            setSelectedReviewRoute(
+              activeCand.reviewRoute || {
+                mode: 'routed',
+                source: activeCand.source,
+                url: activeCand.url,
+                targetTitle: targetBundle?.title || targetGame.title,
+              }
+            );
+            return;
+          }
         }
 
         // Auto-select recommended candidate
@@ -264,15 +361,25 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             isVerified: recommended.isVerified,
             isSynthetic: recommended.isSynthetic,
           });
+          setSelectedReviewRoute(
+            recommended.reviewRoute || {
+              mode: 'routed',
+              source: recommended.source,
+              url: recommended.url,
+              targetTitle: customQuery?.trim() || targetBundle?.title || targetGame.title,
+            }
+          );
         } else {
           setSelectedReviewOptionId('unrated');
           setSelectedReviewData(null);
+          setSelectedReviewRoute({ mode: 'unrated' });
         }
       } catch (err) {
         console.error('Failed to discover review candidates:', err);
         setReviewCandidates([]);
         setSelectedReviewOptionId('unrated');
         setSelectedReviewData(null);
+        setSelectedReviewRoute({ mode: 'unrated' });
       } finally {
         setIsLoadingReviews(false);
       }
@@ -283,6 +390,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   // Reset wizard state whenever modal is opened with a new or existing game
   useEffect(() => {
     if (isOpen && game) {
+      const baseTitle = initialScrapedBundle?.title || initialCandidate?.title || game.title || '';
       setStep(initialStep || 1);
       setSearchTerm(game.title);
       setSourceTab('All');
@@ -290,12 +398,29 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       setSelectedCandidate(initialCandidate || null);
       setScrapedBundle(initialScrapedBundle || null);
       setSelectedCoverUrl(initialScrapedBundle?.capsuleImage || '');
+      setCoverSearchTerm(baseTitle);
+      setCoverSourceTab('All');
+      setExtraCovers([]);
+      setIsSearchingCovers(false);
       setSelectedBlurb(initialScrapedBundle?.shortDescription || '');
       setCustomTitle(initialScrapedBundle?.title || game.title);
+      setMetadataSources(initialScrapedBundle?.availableMetadataSources || []);
+      setSelectedMetadataSourceId(initialScrapedBundle?.availableMetadataSources?.[0]?.id || '');
+      setMetadataSearchTerm(initialScrapedBundle?.title || game.title);
+      setIsSearchingMetadataSources(false);
+      setActiveReleaseDate(initialScrapedBundle?.releaseDate || '');
+      setActiveDevelopers(initialScrapedBundle?.developers || []);
+      setActivePublishers(initialScrapedBundle?.publishers || []);
+      setActiveGenres(initialScrapedBundle?.genres || []);
+      setActiveTags(initialScrapedBundle?.tags || []);
+      setActiveHeaderImage(initialScrapedBundle?.headerImage || '');
+      setActiveAvailableDescriptions(initialScrapedBundle?.availableDescriptions || []);
       setReviewCandidates(initialReviewCandidates || []);
       setIsLoadingReviews(false);
       setSelectedReviewOptionId(initialSelectedReviewOptionId || '');
       setSelectedReviewData(initialSelectedReviewData || null);
+      setReviewSearchTerm(baseTitle);
+      setSelectedReviewRoute(undefined);
       setCustomScoreValue(initialCustomScoreValue ?? '');
       setCustomScoreSource(initialCustomScoreSource || 'custom');
       setCustomScoreUrl(initialCustomScoreUrl || '');
@@ -322,7 +447,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     loadCandidates,
   ]);
 
-  // Trigger search on query change or tab switch
+  // Trigger search on query change or tab switch in Stage 1
   const handleSearchSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     loadCandidates(searchTerm, sourceTab, notOnSteamOnly);
@@ -341,30 +466,98 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     loadCandidates(searchTerm, nextTab, nextVal);
   };
 
-  // Select candidate -> proceed to Step 2 & scrape details
+  // Select candidate -> proceed to Step 2 & scrape details (Non-overlapping priority scopes)
   const handleSelectCandidate = async (candidate: SearchMatchCandidate) => {
     setSelectedCandidate(candidate);
     setReviewCandidates([]);
     setSelectedReviewOptionId('');
     setSelectedReviewData(null);
+    setSelectedReviewRoute(undefined);
+    setExtraCovers([]);
+    setCoverSourceTab('All');
+    setCoverSearchTerm(candidate.title || game?.title || '');
+    setReviewSearchTerm(candidate.title || game?.title || '');
     setStep(2);
     setIsScrapingDetails(true);
+    let resolvedBundle: ScrapedMetadataBundle | null = null;
     try {
-      const bundle = await metadataScraperService.scrapeMatchDetails(candidate, game);
+      const bundle = await syncJobManager.runPriorityAction(
+        'Scraping Match Metadata',
+        candidate.title || game?.title,
+        () =>
+          metadataScraperService.scrapeMatchDetails(candidate, game, {
+            nonSteamOnly: notOnSteamOnly,
+          })
+      );
+      resolvedBundle = bundle;
       setScrapedBundle(bundle);
       setSelectedCoverUrl(bundle.capsuleImage);
+      setCoverSearchTerm(bundle.title || candidate.title || game?.title || '');
+      setReviewSearchTerm(bundle.title || candidate.title || game?.title || '');
       setSelectedBlurb(bundle.shortDescription || '');
       setCustomTitle(bundle.title);
-      // Pre-warm reviews in background so Step 3 is ready immediately
-      if (game) {
-        loadReviews(game, candidate, bundle);
-      }
+      setMetadataSources(bundle.availableMetadataSources || []);
+      setSelectedMetadataSourceId(bundle.availableMetadataSources?.[0]?.id || '');
+      setMetadataSearchTerm(bundle.title || game?.title || '');
+      setActiveReleaseDate(bundle.releaseDate || '');
+      setActiveDevelopers(bundle.developers || []);
+      setActivePublishers(bundle.publishers || []);
+      setActiveGenres(bundle.genres || []);
+      setActiveTags(bundle.tags || []);
+      setActiveHeaderImage(bundle.headerImage || '');
+      setActiveAvailableDescriptions(bundle.availableDescriptions || []);
     } catch (err) {
       console.error('Failed to scrape candidate details:', err);
     } finally {
       setIsScrapingDetails(false);
     }
+
+    // Pre-warm reviews AFTER 'Scraping Match Metadata' priority scope has closed
+    if (game && resolvedBundle) {
+      loadReviews(game, candidate, resolvedBundle);
+    }
   };
+
+  // Stage 2: Search cover options across storefronts independently
+  const handleSearchCovers = async (e?: React.FormEvent, overrideTab?: SourceFilterTab) => {
+    if (e) e.preventDefault();
+    if (!game) return;
+    const activeTab = overrideTab || coverSourceTab;
+    const query = coverSearchTerm.trim() || game.title;
+    if (typeof metadataScraperService.searchCoverOptions !== 'function') return;
+    setIsSearchingCovers(true);
+    try {
+      const results = await syncJobManager.runPriorityAction(
+        'Searching Cover Art',
+        query,
+        () => metadataScraperService.searchCoverOptions(query, activeTab, game)
+      );
+      setExtraCovers(results || []);
+      if (!selectedCoverUrl && results && results.length > 0) {
+        setSelectedCoverUrl(results[0].url);
+      }
+    } catch (err) {
+      console.error('Failed to search cover art:', err);
+    } finally {
+      setIsSearchingCovers(false);
+    }
+  };
+
+  const combinedCovers = useMemo(() => {
+    const raw = [...extraCovers, ...(scrapedBundle?.availableCovers || [])];
+    const seen = new Set<string>();
+    const deduped: ScrapedCoverOption[] = [];
+    for (const cov of raw) {
+      if (!cov || !cov.url || seen.has(cov.url)) continue;
+      seen.add(cov.url);
+      deduped.push(cov);
+    }
+    if (coverSourceTab === 'All') return deduped;
+    const targetSource = coverSourceTab.toLowerCase();
+    return deduped.filter(
+      (c) => c.source.toLowerCase() === targetSource || c.url === selectedCoverUrl
+    );
+  }, [extraCovers, scrapedBundle, coverSourceTab, selectedCoverUrl]);
 
   // Proceed to Step 3 and trigger discovery if not yet loaded
   const handleGoToReviewStep = () => {
@@ -372,6 +565,12 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     if (game && reviewCandidates.length === 0 && !isLoadingReviews) {
       loadReviews(game, selectedCandidate, scrapedBundle);
     }
+  };
+
+  const handleReviewSearchSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!game) return;
+    loadReviews(game, selectedCandidate, scrapedBundle, reviewSearchTerm);
   };
 
   const handleSelectCandidateOption = (cand: ReviewCandidateOption) => {
@@ -390,11 +589,20 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       isVerified: cand.isVerified,
       isSynthetic: cand.isSynthetic,
     });
+    setSelectedReviewRoute(
+      cand.reviewRoute || {
+        mode: 'routed',
+        source: cand.source,
+        url: cand.url,
+        targetTitle: reviewSearchTerm || scrapedBundle?.title || game?.title || '',
+      }
+    );
   };
 
   const handleSelectUnrated = () => {
     setSelectedReviewOptionId('unrated');
     setSelectedReviewData(null);
+    setSelectedReviewRoute({ mode: 'unrated' });
   };
 
   const updateCustomReviewData = (
@@ -424,16 +632,23 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     } else {
       setSelectedReviewData(null);
     }
+    setSelectedReviewRoute({ mode: 'static', source: src, url: url.trim() });
   };
 
   const handleSelectCustomCard = () => {
     setSelectedReviewOptionId('custom');
+    setSelectedReviewRoute({ mode: 'static', source: customScoreSource, url: customScoreUrl });
     if (customScoreValue === '' && selectedReviewData) {
       setCustomScoreValue(selectedReviewData.score);
       setCustomScoreSource(selectedReviewData.source);
       setCustomScoreUrl(selectedReviewData.url || '');
       setCustomScoreSummary(selectedReviewData.summary || '');
       setCustomScoreNumReviews(selectedReviewData.numReviews ?? '');
+      setSelectedReviewRoute({
+        mode: 'static',
+        source: selectedReviewData.source,
+        url: selectedReviewData.url,
+      });
     } else {
       updateCustomReviewData(
         customScoreValue,
@@ -470,6 +685,59 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     updateCustomReviewData(customScoreValue, customScoreSource, customScoreUrl, customScoreSummary, reviews);
   };
 
+  // Stage 4: Multi-Source Metadata Switcher & Independent Search
+  const handleSelectMetadataSource = (srcOpt: MetadataSourceOption) => {
+    setSelectedMetadataSourceId(srcOpt.id);
+    setCustomTitle(srcOpt.title || customTitle);
+    setSelectedBlurb(
+      srcOpt.shortDescription || srcOpt.availableDescriptions?.[0]?.text || selectedBlurb
+    );
+    setActiveAvailableDescriptions(
+      srcOpt.availableDescriptions?.length
+        ? srcOpt.availableDescriptions
+        : srcOpt.shortDescription
+        ? [{ source: srcOpt.sourceLabel, text: srcOpt.shortDescription }]
+        : activeAvailableDescriptions
+    );
+    setActiveReleaseDate(srcOpt.releaseDate || activeReleaseDate);
+    setActiveDevelopers(srcOpt.developers?.length ? srcOpt.developers : activeDevelopers);
+    setActivePublishers(srcOpt.publishers?.length ? srcOpt.publishers : activePublishers);
+    setActiveGenres(srcOpt.genres?.length ? srcOpt.genres : activeGenres);
+    setActiveTags(srcOpt.tags?.length ? srcOpt.tags : activeTags);
+    setActiveHeaderImage(srcOpt.headerImage || activeHeaderImage);
+  };
+
+  const handleSearchMetadataSources = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!game) return;
+    const query = metadataSearchTerm.trim() || game.title;
+    if (typeof metadataScraperService.searchMetadataSources !== 'function') return;
+    setIsSearchingMetadataSources(true);
+    try {
+      const results = await syncJobManager.runPriorityAction(
+        'Searching Storefront Metadata',
+        query,
+        () => metadataScraperService.searchMetadataSources(query, 'All', game)
+      );
+      if (results && results.length > 0) {
+        setMetadataSources((prev) => {
+          const combined = [...results, ...prev];
+          const seen = new Set<string>();
+          return combined.filter((item) => {
+            if (!item || seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          });
+        });
+        handleSelectMetadataSource(results[0]);
+      }
+    } catch (err) {
+      console.error('Failed to search storefront metadata sources:', err);
+    } finally {
+      setIsSearchingMetadataSources(false);
+    }
+  };
+
   const handleOpenExternal = (url?: string, e?: React.MouseEvent) => {
     if (e) {
       e.stopPropagation();
@@ -488,19 +756,76 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     if (!isOpen) return;
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
-        onClose();
+        handleCloseWizard();
       }
     }
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, handleCloseWizard]);
 
   // Step 4: Handle final apply override
   const handleApply = () => {
     if (!game || !scrapedBundle) return;
 
+    const activeMetaOpt = metadataSources.find((s) => s.id === selectedMetadataSourceId);
     const matchedStore = scrapedBundle.matchedStore;
-    const isExplicitNonSteam = notOnSteamOnly || matchedStore !== 'steam';
+    const hasValidMetaSteamId =
+      typeof activeMetaOpt?.steamAppId === 'number' && !notOnSteamOnly;
+    const isExplicitNonSteam =
+      notOnSteamOnly ||
+      (matchedStore !== 'steam' &&
+        !hasValidMetaSteamId &&
+        typeof scrapedBundle.steamAppId !== 'number');
+
+    const reviewRoute: ReviewScoreRoute =
+      !selectedReviewData || selectedReviewOptionId === 'unrated'
+        ? { mode: 'unrated' }
+        : selectedReviewOptionId === 'custom' || selectedReviewData.source === 'custom'
+        ? {
+            mode: 'static',
+            source: selectedReviewData.source,
+            url: selectedReviewData.url,
+          }
+        : selectedReviewRoute || {
+            mode: 'routed',
+            source: selectedReviewData.source,
+            url: selectedReviewData.url,
+            targetTitle: customTitle.trim() || scrapedBundle.title,
+          };
+
+    const activeSource = activeMetaOpt?.source || scrapedBundle.matchedStore;
+    const availableDescs = activeAvailableDescriptions.length
+      ? activeAvailableDescriptions
+      : scrapedBundle.availableDescriptions || [];
+    const isSynopsisFromStoreOption =
+      availableDescs.some((d) => d.text.trim() === selectedBlurb.trim()) ||
+      selectedBlurb.trim() ===
+        (activeMetaOpt?.shortDescription || scrapedBundle.shortDescription || '').trim();
+
+    const metadataRoute: MetadataSourceRoute = {
+      mode: activeSource === 'original' ? 'custom' : 'routed',
+      source: activeSource,
+      matchedId: activeMetaOpt?.matchedId ?? scrapedBundle.matchedId,
+      steamAppId:
+        activeMetaOpt?.steamAppId ??
+        (typeof scrapedBundle.steamAppId === 'number' ? scrapedBundle.steamAppId : undefined),
+      gogId:
+        activeMetaOpt?.gogId ??
+        (activeSource === 'gog' && scrapedBundle.matchedId
+          ? String(scrapedBundle.matchedId).replace(/^gog-/, '')
+          : undefined),
+      epicSlug:
+        activeMetaOpt?.epicSlug ??
+        (activeSource === 'epic' && scrapedBundle.matchedId
+          ? String(scrapedBundle.matchedId).replace(/^epic-/, '')
+          : undefined),
+      igdbId: activeMetaOpt?.igdbId ?? scrapedBundle.igdbId,
+      targetTitle: activeMetaOpt?.title || scrapedBundle.title,
+      customTitleEdited: customTitle.trim() !== (activeMetaOpt?.title || scrapedBundle.title),
+      customSynopsisEdited: !isSynopsisFromStoreOption && selectedBlurb.trim().length > 0,
+    };
+
+    const finalTitle = customTitle.trim() || scrapedBundle.title;
 
     const override: UserGameOverride = {
       gameId: game.id,
@@ -508,28 +833,32 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       platformGameId: game.platforms?.[0]?.platformGameId,
       matchedStore,
       matchedId: scrapedBundle.matchedId,
-      title: customTitle.trim() || scrapedBundle.title,
-      sortTitle: (customTitle.trim() || scrapedBundle.title).replace(/^(The|A|An)\s+/i, '').trim(),
-      steamAppId: isExplicitNonSteam ? null : scrapedBundle.steamAppId ?? null,
+      title: finalTitle,
+      sortTitle: finalTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+      steamAppId: isExplicitNonSteam
+        ? null
+        : scrapedBundle.steamAppId ?? activeMetaOpt?.steamAppId ?? null,
       isExplicitNonSteam,
-      igdbId: scrapedBundle.igdbId,
+      igdbId: activeMetaOpt?.igdbId ?? scrapedBundle.igdbId,
       capsuleImage: selectedCoverUrl || scrapedBundle.capsuleImage,
-      headerImage: scrapedBundle.headerImage,
+      headerImage: activeHeaderImage || scrapedBundle.headerImage,
       iconUrl: selectedCoverUrl || scrapedBundle.iconUrl,
       shortDescription: selectedBlurb || scrapedBundle.shortDescription,
-      detailedDescription: scrapedBundle.detailedDescription,
-      developers: scrapedBundle.developers,
-      publishers: scrapedBundle.publishers,
-      genres: scrapedBundle.genres,
-      tags: scrapedBundle.tags,
-      releaseDate: scrapedBundle.releaseDate,
+      detailedDescription: activeMetaOpt?.detailedDescription || scrapedBundle.detailedDescription,
+      developers: activeDevelopers.length ? activeDevelopers : scrapedBundle.developers,
+      publishers: activePublishers.length ? activePublishers : scrapedBundle.publishers,
+      genres: activeGenres.length ? activeGenres : scrapedBundle.genres,
+      tags: activeTags.length ? activeTags : scrapedBundle.tags,
+      releaseDate: activeReleaseDate || scrapedBundle.releaseDate,
       storefrontAnchor: scrapedBundle.storefrontAnchor,
       reviewScoreOverride: selectedReviewData,
+      reviewRoute,
+      metadataRoute,
       updatedAt: new Date().toISOString(),
     };
 
     onApplyOverride(override);
-    onClose();
+    handleCloseWizard();
   };
 
   if (!isOpen || !game) return null;
@@ -539,7 +868,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
-      onClick={onClose}
+      onClick={handleCloseWizard}
     >
       <div
         className="bg-[#16202d] border border-[#2a475e] rounded-lg shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden text-slate-200 animate-in zoom-in-95 duration-150 select-none"
@@ -571,7 +900,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleCloseWizard}
             className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-[#1b2838] transition-colors"
             title="Close Wizard (Esc)"
           >
@@ -888,7 +1217,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                     <span>Select 2:3 Vertical Cover Art</span>
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Choose from official high-resolution storefront posters or verified portrait box art
+                    Choose from official high-resolution storefront posters or search across all stores
                   </p>
                 </div>
 
@@ -900,16 +1229,87 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                 )}
               </div>
 
-              {isScrapingDetails ? (
+              {/* Independent Cover Art Search Bar & Source Filter Pills */}
+              <div className="space-y-2.5 bg-[#131c27] p-3 rounded-lg border border-[#2a475e]/70">
+                <form onSubmit={(e) => handleSearchCovers(e)} className="flex flex-col sm:flex-row gap-2.5">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={coverSearchTerm}
+                      onChange={(e) => setCoverSearchTerm(e.target.value)}
+                      placeholder="Search cover art by game title across Steam, IGDB, GOG, Epic..."
+                      className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+                    />
+                    {coverSearchTerm && (
+                      <button
+                        type="button"
+                        onClick={() => setCoverSearchTerm('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isSearchingCovers || isScrapingDetails}
+                    className="px-3.5 py-1.5 rounded-md bg-[#1b2838] border border-[#2a475e] text-slate-200 hover:text-white hover:border-[#66c0f4] transition-colors font-semibold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow shrink-0"
+                  >
+                    {isSearchingCovers ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#66c0f4]" />
+                    ) : (
+                      <Search className="w-3.5 h-3.5 text-[#66c0f4]" />
+                    )}
+                    <span>Search Covers</span>
+                  </button>
+                </form>
+
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-1 p-1 rounded-md bg-[#16202d] border border-[#2a475e]/70">
+                    {sourceTabs.map((tab) => {
+                      const isTabActive = coverSourceTab === tab;
+                      return (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => {
+                            setCoverSourceTab(tab);
+                            handleSearchCovers(undefined, tab);
+                          }}
+                          className={`px-2.5 py-1 rounded text-[11px] font-semibold transition-all cursor-pointer ${
+                            isTabActive
+                              ? 'bg-[#66c0f4] text-slate-950 shadow-sm'
+                              : 'text-slate-400 hover:text-white hover:bg-[#1b2838]'
+                          }`}
+                        >
+                          {tab}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span className="text-[11px] text-slate-400">
+                    {`${combinedCovers.length} cover option${combinedCovers.length === 1 ? '' : 's'} shown`}
+                  </span>
+                </div>
+              </div>
+
+              {isScrapingDetails || (isSearchingCovers && combinedCovers.length === 0) ? (
                 <div className="py-20 flex flex-col items-center justify-center gap-3 text-slate-400">
                   <Loader2 className="w-8 h-8 animate-spin text-[#66c0f4]" />
                   <span className="text-xs font-medium">
-                    Scraping high-resolution storefront box art, screenshots & blurbs...
+                    {isSearchingCovers
+                      ? 'Searching cover art across storefronts...'
+                      : 'Scraping high-resolution storefront box art, screenshots & blurbs...'}
                   </span>
                 </div>
-              ) : !scrapedBundle || scrapedBundle.availableCovers.length === 0 ? (
+              ) : combinedCovers.length === 0 ? (
                 <div className="py-16 text-center text-slate-500 border border-dashed border-[#2a475e] rounded-lg">
                   <p className="text-sm font-medium text-slate-400">No cover art options available</p>
+                  <p className="text-xs mt-1">
+                    Use the cover search bar above to find vertical box art from Steam, IGDB, GOG, or Epic.
+                  </p>
                   <button
                     type="button"
                     onClick={() => setStep(1)}
@@ -919,8 +1319,8 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                   </button>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[52vh] overflow-y-auto pr-1 custom-scrollbar">
-                  {scrapedBundle.availableCovers.map((cover, idx) => {
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[44vh] overflow-y-auto pr-1 custom-scrollbar">
+                  {combinedCovers.map((cover, idx) => {
                     const isSelected = selectedCoverUrl === cover.url;
 
                     let sourceBadgeColor = 'bg-sky-950/80 text-sky-300 border-sky-500/50';
@@ -1009,6 +1409,45 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                 )}
               </div>
 
+              {/* Independent Review Score Search Bar */}
+              <form
+                onSubmit={handleReviewSearchSubmit}
+                className="flex flex-col sm:flex-row gap-2.5 bg-[#131c27] p-3 rounded-lg border border-[#2a475e]/70"
+              >
+                <div className="relative flex-1">
+                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={reviewSearchTerm}
+                    onChange={(e) => setReviewSearchTerm(e.target.value)}
+                    placeholder="Search review scores by title across Metacritic, OpenCritic, Steam & GOG..."
+                    className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+                  />
+                  {reviewSearchTerm && (
+                    <button
+                      type="button"
+                      onClick={() => setReviewSearchTerm('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isLoadingReviews}
+                  className="px-3.5 py-1.5 rounded-md bg-[#1b2838] border border-[#2a475e] text-slate-200 hover:text-white hover:border-[#66c0f4] transition-colors font-semibold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow shrink-0"
+                >
+                  {isLoadingReviews ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-[#66c0f4]" />
+                  ) : (
+                    <Search className="w-3.5 h-3.5 text-[#66c0f4]" />
+                  )}
+                  <span>Search Reviews</span>
+                </button>
+              </form>
+
               {isLoadingReviews ? (
                 <div className="py-20 flex flex-col items-center justify-center gap-3 text-slate-400">
                   <Loader2 className="w-8 h-8 animate-spin text-[#66c0f4]" />
@@ -1017,11 +1456,11 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                   </span>
                 </div>
               ) : (
-                <div className="space-y-3 max-h-[52vh] overflow-y-auto pr-1 custom-scrollbar">
+                <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-1 custom-scrollbar">
                   {/* Notice if no candidates discovered */}
                   {reviewCandidates.length === 0 && (
                     <div className="p-3 rounded-lg bg-[#16202d] border border-dashed border-[#2a475e] text-center text-xs text-slate-400">
-                      No external review scores were discovered automatically for this title. You can specify a manual score or keep it unrated below.
+                      No external review scores were discovered automatically for this title. You can search another title above, specify a manual score, or keep it unrated below.
                     </div>
                   )}
 
@@ -1088,6 +1527,13 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                             <span className={`text-[11px] font-bold ${colors.accentText}`}>
                               {cand.tier}
                             </span>
+
+                            {/* Live Route Badge for storefront/critic sources */}
+                            {cand.source !== 'custom' && (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-sky-300 bg-sky-950/70 border border-sky-500/40 px-2 py-0.5 rounded">
+                                <span>Live Route • Auto-updates on sync</span>
+                              </span>
+                            )}
 
                             {/* Recommended / Ground Truth Badge */}
                             {(cand.isRecommended || cand.groundTruthSource) && (
@@ -1377,7 +1823,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                     <span>Review &amp; Confirm Game Metadata Override</span>
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Review scraped metadata, review score override, select your preferred blurb synopsis, and apply to catalog
+                    Review scraped metadata, switch storefront metadata sources, select your preferred blurb synopsis, and apply to catalog
                   </p>
                 </div>
 
@@ -1391,6 +1837,89 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                     </span>
                   ) : null}
                 </div>
+              </div>
+
+              {/* Metadata Source & Storefront Search Section */}
+              <div className="p-3.5 rounded-lg bg-[#131c27] border border-[#2a475e]/80 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h4 className="text-xs font-bold text-white">
+                        Metadata Source &amp; Storefront Search
+                      </h4>
+                      <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-sky-300 bg-sky-950/70 border border-sky-500/40 px-2 py-0.5 rounded">
+                        <span>Live Route • Auto-updates main page &amp; media on sync</span>
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Routes &ldquo;About This Game&rdquo;, screenshots, trailers, system requirements, developer &amp; synopsis to the selected storefront (custom text edits stay pinned)
+                    </p>
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={(e) => handleSearchMetadataSources(e)}
+                  className="flex flex-col sm:flex-row gap-2.5"
+                >
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={metadataSearchTerm}
+                      onChange={(e) => setMetadataSearchTerm(e.target.value)}
+                      placeholder="Search game metadata across Steam, GOG, Epic & IGDB..."
+                      className="w-full pl-9 pr-8 py-1.5 rounded-md bg-[#16202d] border border-[#2a475e] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#66c0f4] transition-colors"
+                    />
+                    {metadataSearchTerm && (
+                      <button
+                        type="button"
+                        onClick={() => setMetadataSearchTerm('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isSearchingMetadataSources}
+                    className="px-3.5 py-1.5 rounded-md bg-[#1b2838] border border-[#2a475e] text-slate-200 hover:text-white hover:border-[#66c0f4] transition-colors font-semibold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow shrink-0"
+                  >
+                    {isSearchingMetadataSources ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#66c0f4]" />
+                    ) : (
+                      <Search className="w-3.5 h-3.5 text-[#66c0f4]" />
+                    )}
+                    <span>Search Metadata</span>
+                  </button>
+                </form>
+
+                {metadataSources.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {metadataSources.map((srcOpt) => {
+                      const isActive = selectedMetadataSourceId === srcOpt.id;
+                      return (
+                        <button
+                          key={srcOpt.id}
+                          type="button"
+                          onClick={() => handleSelectMetadataSource(srcOpt)}
+                          className={`px-3 py-1.5 rounded-md border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer ${
+                            isActive
+                              ? 'bg-[#66c0f4] text-slate-950 border-[#66c0f4] shadow-md'
+                              : 'bg-[#16202d] border-[#2a475e] text-slate-300 hover:text-white hover:border-[#66c0f4]/60'
+                          }`}
+                        >
+                          <span className="uppercase text-[10px] font-bold opacity-80">
+                            {srcOpt.source}
+                          </span>
+                          <span>•</span>
+                          <span>{srcOpt.sourceLabel}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -1463,6 +1992,13 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                                     {`(${selectedReviewData.numReviews.toLocaleString()} reviews)`}
                                   </span>
                                 ) : null}
+                                {selectedReviewOptionId !== 'custom' &&
+                                  selectedReviewOptionId !== 'unrated' &&
+                                  selectedReviewData.source !== 'custom' && (
+                                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-sky-300 bg-sky-950/70 border border-sky-500/40 px-2 py-0.5 rounded">
+                                      <span>Live Route • Auto-updates on sync</span>
+                                    </span>
+                                  )}
                               </div>
                               {selectedReviewData.summary && (
                                 <p className="text-[11px] text-slate-400 truncate max-w-md mt-0.5">
@@ -1494,46 +2030,60 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                   </div>
 
                   {/* Badges / Meta row */}
-                  <div className="grid grid-cols-2 gap-3 text-xs">
-                    {scrapedBundle.releaseDate && (
-                      <div className="p-2 rounded bg-[#16202d] border border-[#2a475e]/70">
-                        <span className="text-[10px] text-slate-400 flex items-center gap-1 mb-0.5">
-                          <Calendar className="w-3 h-3" /> Release Date
-                        </span>
-                        <span className="font-semibold text-slate-200">{scrapedBundle.releaseDate}</span>
-                      </div>
-                    )}
+                  {(() => {
+                    const displayReleaseDate = activeReleaseDate || scrapedBundle.releaseDate;
+                    const displayDevelopers = activeDevelopers.length
+                      ? activeDevelopers
+                      : scrapedBundle.developers || [];
+                    return (
+                      <div className="grid grid-cols-2 gap-3 text-xs">
+                        {displayReleaseDate && (
+                          <div className="p-2 rounded bg-[#16202d] border border-[#2a475e]/70">
+                            <span className="text-[10px] text-slate-400 flex items-center gap-1 mb-0.5">
+                              <Calendar className="w-3 h-3" /> Release Date
+                            </span>
+                            <span className="font-semibold text-slate-200">{displayReleaseDate}</span>
+                          </div>
+                        )}
 
-                    {scrapedBundle.developers && scrapedBundle.developers.length > 0 && (
-                      <div className="p-2 rounded bg-[#16202d] border border-[#2a475e]/70">
-                        <span className="text-[10px] text-slate-400 flex items-center gap-1 mb-0.5">
-                          <Building className="w-3 h-3" /> Developer
-                        </span>
-                        <span className="font-semibold text-slate-200 truncate block">
-                          {scrapedBundle.developers.join(', ')}
-                        </span>
+                        {displayDevelopers.length > 0 && (
+                          <div className="p-2 rounded bg-[#16202d] border border-[#2a475e]/70">
+                            <span className="text-[10px] text-slate-400 flex items-center gap-1 mb-0.5">
+                              <Building className="w-3 h-3" /> Developer
+                            </span>
+                            <span className="font-semibold text-slate-200 truncate block">
+                              {displayDevelopers.join(', ')}
+                            </span>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    );
+                  })()}
 
                   {/* Genres & Tags */}
-                  {scrapedBundle.genres && scrapedBundle.genres.length > 0 && (
-                    <div>
-                      <span className="text-xs font-semibold text-slate-400 mb-1 flex items-center gap-1">
-                        <Tag className="w-3 h-3" /> Genres & Categories
-                      </span>
-                      <div className="flex flex-wrap gap-1.5 mt-1">
-                        {scrapedBundle.genres.map((g) => (
-                          <span
-                            key={g}
-                            className="px-2 py-0.5 rounded bg-[#16202d] border border-[#2a475e] text-[10px] text-slate-300"
-                          >
-                            {g}
-                          </span>
-                        ))}
+                  {(() => {
+                    const displayGenres = activeGenres.length
+                      ? activeGenres
+                      : scrapedBundle.genres || [];
+                    if (displayGenres.length === 0) return null;
+                    return (
+                      <div>
+                        <span className="text-xs font-semibold text-slate-400 mb-1 flex items-center gap-1">
+                          <Tag className="w-3 h-3" /> Genres &amp; Categories
+                        </span>
+                        <div className="flex flex-wrap gap-1.5 mt-1">
+                          {displayGenres.map((g) => (
+                            <span
+                              key={g}
+                              className="px-2 py-0.5 rounded bg-[#16202d] border border-[#2a475e] text-[10px] text-slate-300"
+                            >
+                              {g}
+                            </span>
+                          ))}
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   {/* Blurb Synopsis Selector */}
                   <div>
@@ -1541,44 +2091,50 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                       Storefront Synopsis / Blurb
                     </label>
 
-                    {scrapedBundle.availableDescriptions && scrapedBundle.availableDescriptions.length > 1 ? (
-                      <div className="space-y-2 mb-2">
-                        {scrapedBundle.availableDescriptions.map((desc, i) => {
-                          const isBlurbSelected = selectedBlurb === desc.text;
-                          return (
-                            <div
-                              key={i}
-                              onClick={() => setSelectedBlurb(desc.text)}
-                              className={`p-2 rounded-md border text-xs cursor-pointer transition-colors ${
-                                isBlurbSelected
-                                  ? 'bg-[#1b2838] border-[#66c0f4] text-white'
-                                  : 'bg-[#16202d] border-[#2a475e]/60 text-slate-400 hover:border-slate-500'
-                              }`}
-                            >
-                              <div className="flex items-center gap-2 font-semibold text-[11px] mb-1">
-                                <div
-                                  className={`w-3 h-3 rounded-full border flex items-center justify-center ${
-                                    isBlurbSelected
-                                      ? 'border-[#66c0f4] bg-[#66c0f4]'
-                                      : 'border-slate-500'
-                                  }`}
-                                >
-                                  {isBlurbSelected && (
-                                    <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />
-                                  )}
+                    {(() => {
+                      const displayDescriptions = activeAvailableDescriptions.length
+                        ? activeAvailableDescriptions
+                        : scrapedBundle.availableDescriptions || [];
+                      if (displayDescriptions.length <= 1) return null;
+                      return (
+                        <div className="space-y-2 mb-2">
+                          {displayDescriptions.map((desc, i) => {
+                            const isBlurbSelected = selectedBlurb === desc.text;
+                            return (
+                              <div
+                                key={i}
+                                onClick={() => setSelectedBlurb(desc.text)}
+                                className={`p-2 rounded-md border text-xs cursor-pointer transition-colors ${
+                                  isBlurbSelected
+                                    ? 'bg-[#1b2838] border-[#66c0f4] text-white'
+                                    : 'bg-[#16202d] border-[#2a475e]/60 text-slate-400 hover:border-slate-500'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2 font-semibold text-[11px] mb-1">
+                                  <div
+                                    className={`w-3 h-3 rounded-full border flex items-center justify-center ${
+                                      isBlurbSelected
+                                        ? 'border-[#66c0f4] bg-[#66c0f4]'
+                                        : 'border-slate-500'
+                                    }`}
+                                  >
+                                    {isBlurbSelected && (
+                                      <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />
+                                    )}
+                                  </div>
+                                  <span className={isBlurbSelected ? 'text-[#66c0f4]' : 'text-slate-300'}>
+                                    {desc.source}
+                                  </span>
                                 </div>
-                                <span className={isBlurbSelected ? 'text-[#66c0f4]' : 'text-slate-300'}>
-                                  {desc.source}
-                                </span>
+                                <p className="line-clamp-2 text-[11px] leading-relaxed pl-5">
+                                  {desc.text}
+                                </p>
                               </div>
-                              <p className="line-clamp-2 text-[11px] leading-relaxed pl-5">
-                                {desc.text}
-                              </p>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : null}
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
 
                     <textarea
                       value={selectedBlurb}
@@ -1602,7 +2158,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                 type="button"
                 onClick={() => {
                   onResetOverride(game.id);
-                  onClose();
+                  handleCloseWizard();
                 }}
                 className="px-3.5 py-2 rounded-md border border-rose-500/50 bg-rose-950/30 text-rose-300 hover:bg-rose-900/50 hover:text-white transition-colors text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-sm"
                 title="Discard user match overrides and revert to original catalog metadata"
@@ -1627,7 +2183,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleCloseWizard}
               className="px-4 py-2 rounded-md border border-transparent text-slate-400 hover:text-white hover:bg-[#1b2838] transition-colors text-xs font-semibold cursor-pointer"
             >
               Cancel

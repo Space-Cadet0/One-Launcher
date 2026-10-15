@@ -2,19 +2,26 @@ import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { CanonicalGame } from '../src/contracts/game';
-import { GOG_USER_LIBRARY } from '../src/services/storage/gogUserLibrary';
-import { EPIC_USER_LIBRARY } from '../src/services/storage/epicUserLibrary';
-import { FULL_USER_STEAM_GAMES } from '../src/services/storage/fullUserSteamGames';
 import { sanitizeGameCatalog } from '../src/services/integrations/catalogSanitizer';
-import { mergeStorefrontGames } from '../src/services/integrations/integrationStorage';
 
 describe('Corrupt Sync Recovery & DLC Purging', () => {
-  it('purges unowned EA Play/promo AppIDs and stale DLC injections', () => {
-    let catalog = sanitizeGameCatalog(FULL_USER_STEAM_GAMES);
-    catalog = mergeStorefrontGames(catalog, GOG_USER_LIBRARY, 'gog');
-    catalog = mergeStorefrontGames(catalog, EPIC_USER_LIBRARY, 'epic');
+  it('purges SDK/redistributable AppIDs, mock entries, and stale codename/beta injections', () => {
+    const validGames: CanonicalGame[] = [
+      {
+        id: 'steam-1145360',
+        title: 'Hades',
+        steamAppId: 1145360,
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'steam', platformGameId: '1145360' }],
+      },
+      {
+        id: 'gog-1207658924',
+        title: 'Blood Omen: Legacy of Kain',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'gog', platformGameId: '1207658924' }],
+      },
+    ];
 
-    // Inject corrupt and unowned entries
     const corruptInjections: CanonicalGame[] = [
       {
         id: 'mock-hades',
@@ -38,26 +45,26 @@ describe('Corrupt Sync Recovery & DLC Purging', () => {
         platforms: [{ platformId: 'gog', platformGameId: 'unowned-anno' }],
       },
       {
-        id: 'steam-1222680',
-        title: 'Need for Speed™ Heat',
-        steamAppId: 1222680,
-        platforms: [{ platformId: 'steam', platformGameId: '1222680' }],
+        id: 'steam-480',
+        title: 'Spacewar',
+        steamAppId: 480,
+        platforms: [{ platformId: 'steam', platformGameId: '480' }],
       },
       {
-        id: 'steam-1238860',
-        title: 'Battlefield 4™',
-        steamAppId: 1238860,
-        platforms: [{ platformId: 'steam', platformGameId: '1238860' }],
+        id: 'steam-228980',
+        title: 'Steamworks Common Redistributables',
+        steamAppId: 228980,
+        platforms: [{ platformId: 'steam', platformGameId: '228980' }],
       },
     ];
 
-    const cleaned = sanitizeGameCatalog([...catalog, ...corruptInjections]);
+    const cleaned = sanitizeGameCatalog([...validGames, ...corruptInjections]);
 
-    // Check that unowned EA promo titles are purged
-    expect(cleaned.some((g) => g.steamAppId === 1222680)).toBe(false);
-    expect(cleaned.some((g) => g.steamAppId === 1238860)).toBe(false);
+    // Check that SDK / redistributable AppIDs are purged
+    expect(cleaned.some((g) => g.steamAppId === 480)).toBe(false);
+    expect(cleaned.some((g) => g.steamAppId === 228980)).toBe(false);
 
-    // Check that corrupt/fake titles are purged
+    // Check that corrupt/fake codename titles are purged
     expect(cleaned.some((g) => g.title.toLowerCase() === 'hazlenut')).toBe(false);
     expect(cleaned.some((g) => g.title.toLowerCase() === 'herring')).toBe(false);
 
@@ -72,14 +79,7 @@ describe('Corrupt Sync Recovery & DLC Purging', () => {
     );
     expect(annoGog).toHaveLength(0);
 
-    // Final filter counts remain strictly intact
-    const steamCount = cleaned.filter((g) => g.platforms.some((p) => p.platformId === 'steam')).length;
-    const gogCount = cleaned.filter((g) => g.platforms.some((p) => p.platformId === 'gog')).length;
-    const epicCount = cleaned.filter((g) => g.platforms.some((p) => p.platformId === 'epic')).length;
-
-    expect(steamCount).toBe(168);
-    expect(gogCount).toBe(314);
-    expect(epicCount).toBe(403);
+    expect(cleaned).toHaveLength(2);
   });
 
   it('correctly cleans raw Epic records, hex hashes, and unmapped codenames', () => {
@@ -88,12 +88,19 @@ describe('Corrupt Sync Recovery & DLC Purging', () => {
 
     const rawRecords = JSON.parse(fs.readFileSync(rawRecordsPath, 'utf-8'));
 
-    // Corrupt cached games with raw Epic entitlements & false Blood Omen SteamAppId
     const corruptCachedGames: CanonicalGame[] = [
-      ...FULL_USER_STEAM_GAMES,
-      ...GOG_USER_LIBRARY.map((g) =>
-        g.title === 'Blood Omen: Legacy of Kain' ? { ...g, steamAppId: 242960 } : g
-      ),
+      {
+        id: 'gog-blood-omen',
+        title: 'Blood Omen: Legacy of Kain',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'gog', platformGameId: '1207658924' }],
+      },
+      {
+        id: 'gog-doom-combo',
+        title: 'DOOM + DOOM II',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'gog', platformGameId: '1413291984' }],
+      },
       ...rawRecords.map((r: any) => ({
         id: 'epic-' + (r.catalogItemId || r.appName),
         title: (r.metadata?.title || r.sandboxName || '').trim(),
@@ -101,19 +108,7 @@ describe('Corrupt Sync Recovery & DLC Purging', () => {
       })),
     ];
 
-    let sanitized = sanitizeGameCatalog(corruptCachedGames);
-
-    // Self-healing: restore GOG baseline if missing
-    const gogCount = sanitized.filter((g) => g.platforms.some((p) => p.platformId === 'gog')).length;
-    if (gogCount !== GOG_USER_LIBRARY.length) {
-      sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, GOG_USER_LIBRARY, 'gog'));
-    }
-
-    // Self-healing: restore Epic baseline if missing
-    const epicCount = sanitized.filter((g) => g.platforms.some((p) => p.platformId === 'epic')).length;
-    if (epicCount !== EPIC_USER_LIBRARY.length) {
-      sanitized = sanitizeGameCatalog(mergeStorefrontGames(sanitized, EPIC_USER_LIBRARY, 'epic'));
-    }
+    const sanitized = sanitizeGameCatalog(corruptCachedGames);
 
     // Verify raw codenames are purged
     const badNames = [
@@ -140,11 +135,5 @@ describe('Corrupt Sync Recovery & DLC Purging', () => {
     const doomCombo = sanitized.find((g) => g.title === 'DOOM + DOOM II');
     expect(doomCombo).toBeDefined();
     expect(doomCombo?.steamAppId).toBeUndefined();
-
-    // Final verified counts
-    const finalGog = sanitized.filter((g) => g.platforms.some((p) => p.platformId === 'gog')).length;
-    const finalEpic = sanitized.filter((g) => g.platforms.some((p) => p.platformId === 'epic')).length;
-    expect(finalGog).toBe(314);
-    expect(finalEpic).toBe(403);
   });
 });

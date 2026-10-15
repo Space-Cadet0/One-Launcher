@@ -1,4 +1,51 @@
-import type { StorefrontReviewAnchor, CriticScoreData } from './critic';
+import type { StorefrontReviewAnchor, CriticScoreData, CriticSource } from './critic';
+
+export interface ReviewScoreRoute {
+  mode: 'routed' | 'static' | 'unrated';
+  source?: CriticSource;
+  url?: string;
+  metacriticSlug?: string;
+  openCriticId?: number;
+  steamAppId?: number;
+  gogId?: string;
+  epicId?: string;
+  targetTitle?: string;
+}
+
+export interface MetadataSourceOption {
+  id: string; // e.g. 'steam-1966900', 'gog-12345', 'epic-...', 'igdb-...'
+  source: 'steam' | 'gog' | 'epic' | 'igdb' | 'original';
+  sourceLabel: string; // e.g. 'Steam Store Metadata', 'GOG.com Metadata', 'Epic Games Store', 'IGDB Metadata'
+  matchedId: string | number;
+  steamAppId?: number;
+  gogId?: string;
+  epicSlug?: string;
+  igdbId?: string | number;
+  title: string;
+  shortDescription?: string;
+  detailedDescription?: string;
+  availableDescriptions?: { source: string; text: string }[];
+  releaseDate?: string;
+  developers?: string[];
+  publishers?: string[];
+  genres?: string[];
+  tags?: string[];
+  headerImage?: string;
+  capsuleImage?: string;
+}
+
+export interface MetadataSourceRoute {
+  mode?: 'routed' | 'custom';
+  source: 'steam' | 'gog' | 'epic' | 'igdb' | 'original' | 'custom';
+  matchedId?: string | number;
+  steamAppId?: number;
+  gogId?: string;
+  epicSlug?: string;
+  igdbId?: string | number;
+  targetTitle?: string;
+  customTitleEdited?: boolean;
+  customSynopsisEdited?: boolean;
+}
 
 export interface SearchMatchCandidate {
   id: string | number;
@@ -35,6 +82,7 @@ export interface ScrapedMetadataBundle {
   shortDescription?: string;
   detailedDescription?: string;
   availableDescriptions?: { source: string; text: string }[];
+  availableMetadataSources?: MetadataSourceOption[];
   developers?: string[];
   publishers?: string[];
   genres?: string[];
@@ -42,6 +90,8 @@ export interface ScrapedMetadataBundle {
   releaseDate?: string;
   storefrontAnchor?: StorefrontReviewAnchor;
   reviewScoreOverride?: CriticScoreData | null;
+  reviewRoute?: ReviewScoreRoute;
+  metadataRoute?: MetadataSourceRoute;
 }
 
 export interface UserGameOverride {
@@ -67,7 +117,10 @@ export interface UserGameOverride {
   releaseDate?: string;
   storefrontAnchor?: StorefrontReviewAnchor;
   reviewScoreOverride?: CriticScoreData | null;
+  reviewRoute?: ReviewScoreRoute;
+  metadataRoute?: MetadataSourceRoute;
   updatedAt: string;
 }
 
 export type UserGameOverridesMap = Record<string, UserGameOverride>;
+

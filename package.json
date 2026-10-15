@@ -12,7 +12,8 @@
     "electron": "electron electron/main.cjs",
     "desktop": "electron electron/main.cjs",
     "build:mac": "npm run build && electron-builder --mac dir",
-    "dist:mac": "npm run build && electron-builder --mac"
+    "dist:mac": "npm run build && electron-builder --mac",
+    "build:win": "npm run build && electron-builder --win --x64"
   },
   "build": {
     "appId": "com.onelauncher.app",
@@ -20,16 +21,32 @@
     "mac": {
       "category": "public.app-category.games",
       "target": [
-        "dir",
-        "dmg"
+        { "target": "dmg", "arch": ["arm64"] },
+        { "target": "dir", "arch": ["arm64"] }
       ],
       "hardenedRuntime": false,
       "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "dir", "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": true,
+      "include": "build/installer.nsh"
     },
     "files": [
       "dist/**/*",
       "electron/**/*",
       "package.json"
+    ],
+    "asarUnpack": [
+      "electron/bin/**/*"
     ],
     "directories": {
       "output": "release"

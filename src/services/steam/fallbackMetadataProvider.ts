@@ -1,7 +1,13 @@
 import axios from 'axios';
 import { CanonicalGame } from '../../contracts/game';
+import { UserGameOverride } from '../../contracts/override';
 import { SteamEnrichedMetadata, SteamScreenshot, SteamMovie, SteamReviewSummary, SteamCategory } from '../../contracts/steam';
 import { getOpenCriticData } from '../opencritic/openCritic';
+import {
+  getUserOverrideForGame,
+  inferMetadataRouteFromOverride,
+  updateRoutedMetadataSnapshot,
+} from '../storage/userOverrideStorage';
 import { getSteamCategoryIconUrl } from './steamApi';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 
@@ -70,38 +76,7 @@ export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boo
   return false;
 }
 
-export const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string; headerImage?: string }> = {
-  '1413291984': {
-    lead: 'Developed by id Software, and originally released in 1993, DOOM pioneered and popularized the first-person shooter, setting a standard for all FPS games. The critically acclaimed sequel, DOOM II, followed in 1994. Now the definitive, newly enhanced versions of DOOM + DOOM II are available as a combined product.',
-    full: `Developed by id Software, and originally released in 1993, DOOM pioneered and popularized the first-person shooter, setting a standard for all FPS games. The critically acclaimed sequel, DOOM II, followed in 1994. Now the definitive, newly enhanced versions of DOOM + DOOM II are available as a combined product.<br><br><b>Owners Receive:</b><br>- DOOM<br>- DOOM II<br>- TNT: Evilution<br>- The Plutonia Experiment<br>- Master Levels for DOOM II<br>- No Rest for the Living<br>- Sigil<br>- Sigil II<br>- Legacy of Rust (a new episode created in collaboration by id Software, Nightdive Studios and MachineGames)<br>- A new Deathmatch map pack featuring 25 maps<br><br>Altogether, there are a total of 187 mission maps and 43 deathmatch maps in DOOM + DOOM II.<br><br><b>New Enhancements:</b><br>- Online, cross-platform deathmatch and co-op for up to 16 players<br>- Community-published mod support with an in-game mod browser<br>- Choose between the original midi DOOM and DOOM II soundtracks or the modern IDKFA versions by Andrew Hulshult<br>- Improved performance with multithreaded rendering supporting up to 4K resolution<br>- Now on the KEX engine<br>- 60 FPS and native 16:9 support<br>- Restored original in-game music using original hardware<br>- Quick Save/Load support`,
-    releaseDate: '2024-08-08',
-  },
-  '1837805079': {
-    lead: 'Cast out into the night as a vampire, seek vengeance on your murderers and discover the dark plot threatening the land of Nosgoth in this classic dark fantasy action-adventure.',
-    full: `Cast out into the night as a vampire, seek vengeance on your murderers and discover the dark plot threatening the land of Nosgoth in this classic dark fantasy action-adventure.<br><br>Take the role of Kain, a nobleman murdered and revived as a vampire, as you traverse the expansive world of Nosgoth. Slaughter enemies, drink their blood to sustain your life, cast devastating spells, and wield legendary weapons in an epic quest for vengeance and power.<br><br><b>Features:</b><br>- Over 60 hours of dark, open-ended gameplay<br>- Transform into a bat, wolf, mist, or disguise yourself as a human<br>- Epic storyline with cinematic voice acting and rich lore`,
-    releaseDate: '1996-11-15',
-  },
-  '1782995089': {
-    lead: 'Experience the vast open world of The Elder Scrolls: Daggerfall reimagined in the Unity engine, featuring modernized controls, enhanced visuals, bug fixes, and pre-installed community mods.',
-    full: `Experience the vast open world of The Elder Scrolls: Daggerfall reimagined in the Unity engine, featuring modernized controls, enhanced visuals, bug fixes, and pre-installed community mods.<br><br>Explore thousands of cities, dungeons, and hamlets across the Iliac Bay in one of the most ambitious fantasy RPGs ever created. The GOG Cut includes high-resolution terrain, remastered textures, improved lighting, and refined gameplay systems ready to play out of the box.<br><br><b>Features:</b><br>- Modernized first-person controls with smooth mouse-look and customizable keybindings<br>- Enhanced visuals with widescreen and 4K resolution support<br>- Massive roster of curated community mods including DREAM, Warm Ashes, and Archaeologists Guild<br>- Full classic character creation and endless procedural quests`,
-    releaseDate: '2022-06-15',
-  },
-  '1491728574': {
-    lead: 'Fallout: London is an ambitious total conversion mod for Fallout 4 that takes players out of America and drops them into a post-apocalyptic United Kingdom, exploring a brand new wasteland filled with unique factions and storylines.',
-    full: `Fallout: London is an ambitious total conversion mod for Fallout 4 that takes players out of America and drops them into a post-apocalyptic United Kingdom, exploring a brand new wasteland filled with unique factions and storylines.<br><br>Set fifty years before Fallout 4, Fallout: London lets you experience the events of Nuclear Apocalypse in a completely distinct cultural setting. From stuffy parliamentary aristocrats to a resurrection of the Knights of the Round Table and an uncompromising cult of revolutionaries, experience an all-new gritty post-war epic.<br><br><b>Features:</b><br>- A completely new map encompassing a detailed London metropolis with diverse boroughs<br>- Fully voiced storyline with original characters, factions, and companions<br>- Unique British weaponry, retro-futuristic technology, and cultural lore`,
-    releaseDate: '2024-07-25',
-  },
-  '2028023186': {
-    lead: 'Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.',
-    full: `Agony is a first-person, survival horror set in hell. You will begin your journey as a tormented soul within the depths of hell without any memories about your past. The special ability to control people on your path, and possess demons, gives you the measures to survive.<br><br>By exploring hostile environments and interacting with other souls of the hellscape, the hero will soon understand that there is only one way to escape from Hell, and it requires a meeting of the mystical Red Goddess.<br><br><b>Features:</b><br>- Non-linear survival horror in the depths of hell<br>- Possess lesser and greater demons and control people to survive<br>- Hostile, grotesque underworld environment inspired by Dante's Inferno<br>- Agony Mode featuring procedural survival labyrinth challenges`,
-    releaseDate: '2018-05-29',
-  },
-  '1213448387': {
-    lead: 'Agony UNRATED is the definitive, uncensored first-person survival horror experience set in the grotesque depths of hell.',
-    full: `Agony UNRATED is the definitive, uncensored first-person survival horror experience set in the grotesque depths of hell.<br><br>This unrated edition features completely uncensored cinematics and gameplay scenes, enhanced lighting and high-resolution textures, additional character models and animations, newly designed forest and torture chamber environments, and refined stealth and combat systems.<br><br><b>Features:</b><br>- Completely uncensored story, cinematics, and environments<br>- High-resolution textures, volumetric lighting, and upgraded graphics engine<br>- Additional game modes including Succubus Mode and procedural Agony Mode<br>- Full map and fast-travel system, hard difficulty mode, and expanded demon roster`,
-    releaseDate: '2018-10-30',
-  },
-};
+export const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string; headerImage?: string }> = {};
 
 export function formatDescriptionToHtml(rawDesc: string): string {
   if (!rawDesc) return '';
@@ -206,11 +181,60 @@ export class FallbackMetadataProvider {
     let descriptionFull = special?.full || cached?.aboutTheGame || cached?.detailedDescription || '';
     let descriptionLead = special?.lead || cached?.shortDescription || '';
     let releaseDate = special?.releaseDate || cached?.releaseDate || 'TBA';
+    let v2Devs: string[] | undefined = cached?.developers?.length ? cached.developers : undefined;
+    let v2Pubs: string[] | undefined = cached?.publishers?.length ? cached.publishers : undefined;
+    let v2Genres: string[] | undefined = cached?.genres?.length ? cached.genres : undefined;
+    let v2Tags: string[] | undefined = cached?.tags?.length ? cached.tags : undefined;
+
+    const cleanGogId = String(gogId).replace(/^gog-/, '').trim();
 
     try {
-      const url = `${this.getGogBaseUrl()}/products/${encodeURIComponent(gogId)}?expand=description,screenshots,videos`;
-      const res = await axios.get(url, { timeout: 8000 });
-      const data = res.data;
+      const urlV1 = `${this.getGogBaseUrl()}/products/${encodeURIComponent(cleanGogId)}?expand=description,screenshots,videos`;
+      const urlV2 = `${this.getGogBaseUrl()}/v2/games/${encodeURIComponent(cleanGogId)}`;
+      const [resV1Settled, resV2Settled] = await Promise.allSettled([
+        axios.get(urlV1, { timeout: 8000 }),
+        axios.get(urlV2, { timeout: 6000 }),
+      ]);
+
+      const data = resV1Settled.status === 'fulfilled' ? resV1Settled.value?.data : null;
+      const v2Data = resV2Settled.status === 'fulfilled' ? resV2Settled.value?.data : null;
+
+      if (v2Data) {
+        const boxArt = ensureHttps(v2Data._links?.boxArtImage?.href || '');
+        if (boxArt) {
+          capsuleImage = boxArt;
+        }
+        const v2Bg = ensureHttps(
+          v2Data._links?.galaxyBackgroundImage?.href || v2Data._links?.backgroundImage?.href || ''
+        );
+        if (v2Bg && !headerImage) {
+          headerImage = v2Bg;
+        }
+        if (Array.isArray(v2Data._embedded?.developers)) {
+          const devs = v2Data._embedded.developers.map((d: any) => d?.name).filter(Boolean);
+          if (devs.length > 0) v2Devs = devs;
+        }
+        if (Array.isArray(v2Data._embedded?.publishers)) {
+          const pubs = v2Data._embedded.publishers.map((p: any) => p?.name).filter(Boolean);
+          if (pubs.length > 0) v2Pubs = pubs;
+        }
+        if (Array.isArray(v2Data._embedded?.tags)) {
+          const tags = v2Data._embedded.tags.map((t: any) => t?.name).filter(Boolean);
+          if (tags.length > 0) {
+            if (!v2Genres) v2Genres = tags;
+            if (!v2Tags) v2Tags = tags;
+          }
+        }
+        const globalRel = v2Data._embedded?.product?.globalReleaseDate;
+        if (globalRel && typeof globalRel === 'string' && releaseDate === 'TBA') {
+          releaseDate = globalRel.substring(0, 10);
+        }
+        if (v2Data.description && typeof v2Data.description === 'string' && !descriptionFull) {
+          descriptionFull = v2Data.description.trim();
+          descriptionLead = extractFirstParagraph(descriptionFull) || descriptionLead;
+        }
+      }
+
       if (data) {
         if (data.screenshots && Array.isArray(data.screenshots)) {
           screenshots = data.screenshots.map((s: any, idx: number) => {
@@ -262,11 +286,11 @@ export class FallbackMetadataProvider {
 
         if (!isPlaceholderDesc && cleanedDescFull) {
           descriptionFull = cleanedDescFull;
-          descriptionLead = apiDescLead || descriptionLead;
+          descriptionLead = apiDescLead || descriptionLead || extractFirstParagraph(cleanedDescFull) || '';
         } else if (GOG_SPECIAL_DESCRIPTIONS[gogId]) {
           descriptionLead = GOG_SPECIAL_DESCRIPTIONS[gogId].lead;
           descriptionFull = GOG_SPECIAL_DESCRIPTIONS[gogId].full;
-        } else if (data.slug) {
+        } else if (data.slug && !descriptionFull) {
           try {
             const pageUrl =
               typeof window !== 'undefined' && window.location.hostname === 'localhost'
@@ -325,19 +349,19 @@ export class FallbackMetadataProvider {
       screenshots,
       movies,
       releaseDate: GOG_SPECIAL_DESCRIPTIONS[gogId]?.releaseDate || releaseDate,
-      developers: (cached?.developers && cached.developers.length > 0) ? cached.developers : undefined,
-      publishers: (cached?.publishers && cached.publishers.length > 0) ? cached.publishers : undefined,
-      genres: (cached?.genres && cached.genres.length > 0) ? cached.genres : undefined,
-      tags: (cached?.tags && cached.tags.length > 0) ? cached.tags : undefined,
+      developers: v2Devs,
+      publishers: v2Pubs,
+      genres: v2Genres,
+      tags: v2Tags,
       categories,
       supportedLanguages: cached?.supportedLanguages || 'English<strong>*</strong>',
       systemRequirements: sysReqs,
-      achievements: gogId === '1413291984' ? { total: 34 } : (cached?.features?.includes('Achievements') ? { total: 20 } : undefined),
+      achievements: cached?.features?.includes('Achievements') ? { total: 20 } : undefined,
     };
   }
 
   /**
-   * Fetches rich metadata directly from Epic Games Store Content API (e.g. for Epic exclusives like Alan Wake 2)
+   * Fetches rich metadata directly from Epic Games Store Content API (e.g. for Epic exclusives)
    */
   async fetchEpicProductMetadata(slugOrTitle: string): Promise<Partial<SteamEnrichedMetadata> | null> {
     try {
@@ -467,7 +491,7 @@ export class FallbackMetadataProvider {
         releaseDate: d.meta?.releaseDate ? d.meta.releaseDate.substring(0, 10) : '',
         developers: d.about?.developerAttribution ? [d.about.developerAttribution] : undefined,
         publishers: d.about?.publisherAttribution ? [d.about.publisherAttribution] : undefined,
-        achievements: cleanSlug === 'alan-wake-2' ? { total: 88 } : undefined,
+        achievements: undefined,
       };
     } catch (err: any) {
       console.warn(`[Fallback Provider] Epic product content lookup failed for ${slugOrTitle}:`, err?.message);
@@ -476,30 +500,91 @@ export class FallbackMetadataProvider {
   }
 
   /**
-   * Builds high-quality enriched metadata for games that DO NOT exist on Steam.
+   * Builds high-quality enriched metadata for games that DO NOT exist on Steam
+   * or are explicitly routed to a non-Steam storefront via metadataRoute.
    */
-  async getEnrichedMetadataForNonSteamGame(game: CanonicalGame): Promise<SteamEnrichedMetadata> {
+  async getEnrichedMetadataForNonSteamGame(
+    game: CanonicalGame,
+    explicitOverride?: UserGameOverride
+  ): Promise<SteamEnrichedMetadata> {
     const gogPlatform = game.platforms?.find((p) => p.platformId === 'gog');
     const epicPlatform = game.platforms?.find((p) => p.platformId === 'epic');
+    const override = explicitOverride ?? getUserOverrideForGame(game);
+    const route = inferMetadataRouteFromOverride(override);
 
     let storeMetadata: Partial<SteamEnrichedMetadata> | null = null;
 
-    if (gogPlatform?.platformGameId) {
-      storeMetadata = await this.fetchGogProductMetadata(gogPlatform.platformGameId);
-    }
-
-    if (!storeMetadata && epicPlatform) {
-      // First try slug derived from game title (e.g. "Alan Wake 2" -> "alan-wake-2")
-      const titleSlug = game.title
+    // 1. Honor explicit Step 4 MetadataSourceRoute first (allows routing any game to GOG or Epic)
+    if (route?.source === 'gog') {
+      const targetGogId =
+        route.gogId ||
+        (route.matchedId ? String(route.matchedId).replace(/^gog-/, '') : undefined) ||
+        gogPlatform?.platformGameId;
+      if (targetGogId) {
+        storeMetadata = await this.fetchGogProductMetadata(String(targetGogId));
+      }
+    } else if (route?.source === 'epic') {
+      const explicitSlug =
+        route.epicSlug ||
+        (route.matchedId && !/^[0-9a-f]{20,}$/i.test(String(route.matchedId))
+          ? String(route.matchedId).replace(/^epic-/, '')
+          : undefined);
+      const titleSlug = (route.targetTitle || override?.title || game.title)
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
-      storeMetadata = await this.fetchEpicProductMetadata(titleSlug);
 
-      // If not found and platformGameId is not a raw hex hash, try platformGameId
-      if (!storeMetadata && epicPlatform.platformGameId && !/^[0-9a-f]{20,}$/i.test(epicPlatform.platformGameId)) {
+      if (explicitSlug) {
+        storeMetadata = await this.fetchEpicProductMetadata(explicitSlug);
+      }
+      if (!storeMetadata && titleSlug) {
+        storeMetadata = await this.fetchEpicProductMetadata(titleSlug);
+      }
+      if (
+        !storeMetadata &&
+        epicPlatform?.platformGameId &&
+        !/^[0-9a-f]{20,}$/i.test(epicPlatform.platformGameId)
+      ) {
         storeMetadata = await this.fetchEpicProductMetadata(epicPlatform.platformGameId);
       }
+    }
+
+    // 2. Fallback to platform-based or cross-store GOG/Epic IDs if not yet resolved
+    if (!storeMetadata) {
+      const fallbackGogId = route?.gogId || gogPlatform?.platformGameId;
+      if (fallbackGogId) {
+        storeMetadata = await this.fetchGogProductMetadata(String(fallbackGogId));
+      }
+    }
+
+    if (!storeMetadata && (epicPlatform || route?.epicSlug)) {
+      const titleSlug = (route?.targetTitle || game.title)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '');
+      storeMetadata = await this.fetchEpicProductMetadata(route?.epicSlug || titleSlug);
+
+      if (
+        !storeMetadata &&
+        epicPlatform?.platformGameId &&
+        !/^[0-9a-f]{20,}$/i.test(epicPlatform.platformGameId)
+      ) {
+        storeMetadata = await this.fetchEpicProductMetadata(epicPlatform.platformGameId);
+      }
+    }
+
+    if (storeMetadata && override && route?.mode === 'routed') {
+      updateRoutedMetadataSnapshot(game.id, {
+        title: storeMetadata.name,
+        shortDescription: storeMetadata.shortDescription,
+        detailedDescription: storeMetadata.detailedDescription || storeMetadata.aboutTheGame,
+        headerImage: storeMetadata.headerImage,
+        developers: storeMetadata.developers,
+        publishers: storeMetadata.publishers,
+        genres: storeMetadata.genres,
+        tags: storeMetadata.tags,
+        releaseDate: storeMetadata.releaseDate,
+      });
     }
 
     // Pull Critic review data if verified

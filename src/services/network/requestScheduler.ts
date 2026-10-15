@@ -55,6 +55,10 @@ export const DOMAIN_CONFIGS: Record<string, DomainConfig> = {
     requestsPerSecond: 0.33,
     burst: 1,
   },
+  'backend.metacritic.com': {
+    requestsPerSecond: 2.0,
+    burst: 4,
+  },
   'api.opencritic.com': {
     requestsPerSecond: 2.0,
     burst: 5,
@@ -85,9 +89,41 @@ export class RequestScheduler {
   private buckets = new Map<string, TokenBucket>();
   private readonly maxRetries = 2;
   private enforceDelays: boolean = typeof process !== 'undefined' ? !process.env.VITEST : true;
+  private interactiveScopes = new Set<string>();
+  private inFlightP0Count = 0;
 
   constructor() {
     this.initBuckets();
+  }
+
+  /**
+   * Begins an interactive priority scope (e.g. Fix & Match Wizard or On-Demand Game Sync).
+   * While any interactive scope is active, P2_BACKGROUND tasks are paused across all domains
+   * so on-demand user actions have uncontested network priority.
+   */
+  public beginInteractiveScope(scopeId?: string): string {
+    const id = scopeId || `interactive-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this.interactiveScopes.add(id);
+    return id;
+  }
+
+  /**
+   * Ends an interactive priority scope and resumes queued background requests.
+   */
+  public endInteractiveScope(scopeId: string): void {
+    if (this.interactiveScopes.delete(scopeId)) {
+      this.resumeAllQueues();
+    }
+  }
+
+  public isInteractivePreempted(): boolean {
+    return this.interactiveScopes.size > 0 || this.inFlightP0Count > 0;
+  }
+
+  private resumeAllQueues(): void {
+    for (const domain of this.buckets.keys()) {
+      this.processQueue(domain);
+    }
   }
 
   /**
@@ -131,6 +167,7 @@ export class RequestScheduler {
     // Check Vite proxy endpoints
     if (clean.includes('/api/steam-store')) return 'store.steampowered.com';
     if (clean.includes('/api/steam-community')) return 'steamcommunity.com';
+    if (clean.includes('/api/metacritic-backend')) return 'backend.metacritic.com';
     if (clean.includes('/api/metacritic')) return 'metacritic.com';
     if (clean.includes('/api/opencritic')) return 'api.opencritic.com';
     if (clean.includes('/api/lutris')) return 'lutris.net';
@@ -141,6 +178,7 @@ export class RequestScheduler {
     // Check domain string containment
     if (clean.includes('store.steampowered.com')) return 'store.steampowered.com';
     if (clean.includes('steamcommunity.com')) return 'steamcommunity.com';
+    if (clean.includes('backend.metacritic.com')) return 'backend.metacritic.com';
     if (clean.includes('metacritic.com')) return 'metacritic.com';
     if (clean.includes('opencritic.com')) return 'api.opencritic.com';
     if (clean.includes('lutris.net')) return 'lutris.net';
@@ -293,13 +331,23 @@ export class RequestScheduler {
 
     this.refill(bucket);
 
-    while (bucket.queue.length > 0 && bucket.tokens >= 1) {
-      bucket.tokens -= 1;
-      // Sort queue: lowest priority number first (P0 < P1 < P2), then FIFO
+    while (bucket.queue.length > 0) {
       bucket.queue.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt);
-      const item = bucket.queue.shift();
-      if (!item) break;
+      const nextCandidate = bucket.queue[0];
+      if (!nextCandidate) break;
 
+      // Fast-lane for P0_INTERACTIVE: grant an immediate priority token boost so on-demand user actions
+      // never stall behind background token depletion.
+      if (nextCandidate.priority === RequestPriority.P0_INTERACTIVE && bucket.tokens < 1) {
+        bucket.tokens = 1;
+      }
+
+      if (bucket.tokens < 1) {
+        break;
+      }
+
+      bucket.tokens -= 1;
+      const item = bucket.queue.shift()!;
       this.executeItem(domain, bucket, item);
     }
 
@@ -310,7 +358,32 @@ export class RequestScheduler {
     }
   }
 
+  /**
+   * Promotes any queued requests matching the given URL or domain to P0_INTERACTIVE
+   * so interactive callers awaiting a deduplicated in-flight promise never wait behind background queues.
+   */
+  public promoteToInteractive(urlOrDomain: string): void {
+    const domain = this.resolveDomain(urlOrDomain);
+    const bucket = this.getBucket(domain);
+    let promoted = false;
+    for (const item of bucket.queue) {
+      if (item.url === urlOrDomain || item.domain === domain) {
+        if (item.priority > RequestPriority.P0_INTERACTIVE) {
+          item.priority = RequestPriority.P0_INTERACTIVE;
+          promoted = true;
+        }
+      }
+    }
+    if (promoted) {
+      this.processQueue(domain);
+    }
+  }
+
   private async executeItem(domain: string, bucket: TokenBucket, item: QueueItem<any>): Promise<void> {
+    const isP0 = item.priority === RequestPriority.P0_INTERACTIVE;
+    if (isP0) {
+      this.inFlightP0Count++;
+    }
     try {
       const result = await item.fn();
       item.resolve(result);
@@ -339,6 +412,12 @@ export class RequestScheduler {
 
       item.reject(err);
     } finally {
+      if (isP0) {
+        this.inFlightP0Count = Math.max(0, this.inFlightP0Count - 1);
+        if (this.inFlightP0Count === 0 && this.interactiveScopes.size === 0) {
+          this.resumeAllQueues();
+        }
+      }
       this.processQueue(domain);
     }
   }
@@ -355,6 +434,8 @@ export class RequestScheduler {
       bucket.queue = [];
       bucket.cooldownUntil = 0;
     }
+    this.interactiveScopes.clear();
+    this.inFlightP0Count = 0;
     this.buckets.clear();
     this.initBuckets();
   }
@@ -372,6 +453,25 @@ export class RequestScheduler {
       total += b.queue.length;
     }
     return total;
+  }
+
+  /**
+   * Flushes queued P2_BACKGROUND items across all domains so a newly started or cancelled sync
+   * does not stall behind stale background requests.
+   */
+  public clearBackgroundQueues(): void {
+    for (const [domain, bucket] of this.buckets.entries()) {
+      const remaining: QueueItem<any>[] = [];
+      for (const item of bucket.queue) {
+        if (item.priority >= RequestPriority.P2_BACKGROUND) {
+          item.reject(new Error('Cancelled stale background request'));
+        } else {
+          remaining.push(item);
+        }
+      }
+      bucket.queue = remaining;
+      this.processQueue(domain);
+    }
   }
 }
 

@@ -403,7 +403,10 @@ describe('Phase 4 Option B: Staged Cache Service & Tiered Data Mutability', () =
   describe('7. SteamMatcher Negative Cache Expiration Integration', () => {
     it('positive Steam App ID matches remain immutable', () => {
       const matcher = new SteamMatcherService();
-      // Curated or instant match
+      (matcher as any).cache.set('cyberpunk 2077', 1091500);
+      (matcher as any).savePersistentCache();
+
+      // Instant match from persisted positive cache
       const appId = matcher.matchGameToSteamInstant('Cyberpunk 2077');
       expect(appId).toBe(1091500);
 

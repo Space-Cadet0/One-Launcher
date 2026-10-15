@@ -439,6 +439,11 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
         matchedStore: 'steam',
         title: 'Cyberpunk 2077',
         reviewScoreOverride: customScore,
+        reviewRoute: {
+          mode: 'static',
+          source: 'opencritic',
+          url: 'https://opencritic.com/game/8525/cyberpunk-2077',
+        },
         updatedAt: new Date().toISOString(),
       };
 
@@ -509,6 +514,11 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
         title: 'Cyberpunk 2077',
         matchedStore: 'steam',
         reviewScoreOverride: customScore,
+        reviewRoute: {
+          mode: 'static',
+          source: 'metacritic',
+          url: 'https://www.metacritic.com/custom',
+        },
         updatedAt: new Date().toISOString(),
       };
 
@@ -548,6 +558,11 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
         title: 'Cyberpunk 2077',
         matchedStore: 'steam',
         reviewScoreOverride: customScore,
+        reviewRoute: {
+          mode: 'static',
+          source: 'opencritic',
+          url: 'https://opencritic.com/custom',
+        },
         updatedAt: new Date().toISOString(),
       };
 
@@ -700,25 +715,32 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
     it('routes all interactive candidate discovery network calls through requestScheduler with Priority.P0_INTERACTIVE', async () => {
       const schedulerSpy = vi.spyOn(requestScheduler, 'schedule');
 
-      // Mock resolvers to return valid bundles
-      vi.spyOn(metacriticResolver, 'resolveMetacritic').mockResolvedValue({
-        critic: {
-          id: 'mc-metascore',
-          source: 'metacritic',
-          score: 86,
-          tier: 'Mighty',
-          url: 'https://www.metacritic.com/game/cyberpunk-2077/',
-          isVerified: true,
-        },
-        user: {
-          id: 'mc-userscore',
-          source: 'metacritic_user',
-          score: 72,
-          tier: 'Fair',
-          url: 'https://www.metacritic.com/game/cyberpunk-2077/',
-          isVerified: false,
-        },
-      });
+      // Mock resolvers to schedule via requestScheduler with P0_INTERACTIVE as the real implementation does
+      vi.spyOn(metacriticResolver, 'resolveMetacritic').mockImplementation(async (_title, _yr, _anchor, priority = Priority.P0_INTERACTIVE) =>
+        requestScheduler.schedule(
+          'metacritic.com',
+          async () => ({
+            critic: {
+              id: 'mc-metascore',
+              source: 'metacritic',
+              score: 86,
+              tier: 'Mighty',
+              url: 'https://www.metacritic.com/game/cyberpunk-2077/',
+              isVerified: true,
+            },
+            user: {
+              id: 'mc-userscore',
+              source: 'metacritic_user',
+              score: 72,
+              tier: 'Fair',
+              url: 'https://www.metacritic.com/game/cyberpunk-2077/',
+              isVerified: false,
+            },
+          }),
+          priority,
+          'metacritic.com'
+        )
+      );
 
       vi.spyOn(steamReviewResolver, 'resolveScore').mockResolvedValue({
         id: 'steam-1091500',
@@ -749,16 +771,17 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
       }
 
       // Verify domains scheduled
-      const scheduledDomains = schedulerSpy.mock.calls.map((c) => c[0]);
+      const scheduledDomains = schedulerSpy.mock.calls.map((c) => c[3] || c[0]);
       expect(scheduledDomains).toContain('metacritic.com');
       expect(scheduledDomains).toContain('api.opencritic.com');
     });
 
     it('isolates per-domain queues in requestScheduler for review candidate queries', async () => {
       const executedDomains: string[] = [];
+      metacriticResolver.clearCache();
 
-      vi.spyOn(requestScheduler, 'schedule').mockImplementation(async (domain, task, priority) => {
-        executedDomains.push(domain);
+      vi.spyOn(requestScheduler, 'schedule').mockImplementation(async (domain, task, priority, domainKey) => {
+        executedDomains.push(domainKey || domain);
         expect(priority).toBe(Priority.P0_INTERACTIVE);
         return task();
       });
@@ -859,7 +882,18 @@ describe('Phase 4: Comprehensive QA & End-to-End Regression Audit for Review Sco
       expect(anchored?.groundTruthSource).toContain('GOG Store Link');
     });
 
-    it('reverts back to default score cascade when user override is removed', () => {
+    it('reverts back to default score cascade when user override is removed', async () => {
+      const { KNOWN_CRITIC_SCORES } = await import('../src/services/critic/knownCriticScores');
+      KNOWN_CRITIC_SCORES[813780] = {
+        id: 813780,
+        source: 'metacritic',
+        score: 84,
+        tier: 'Mighty',
+        numReviews: 56,
+        url: 'https://www.metacritic.com/game/age-of-empires-ii-definitive-edition/critic-reviews/',
+        isVerified: true,
+      };
+
       // 1. Setup user override for Age of Empires II
       const customOverride: UserGameOverride = {
         gameId: 'steam-813780',

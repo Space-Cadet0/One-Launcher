@@ -24,7 +24,11 @@ import {
   getEffectiveTags,
 } from '../../services/steam/steamFeatureNormalizer';
 import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
-import { getUserOverrideForGame } from '../../services/storage/userOverrideStorage';
+import {
+  getUserOverrideForGame,
+  inferMetadataRouteFromOverride,
+  updateRoutedMetadataSnapshot,
+} from '../../services/storage/userOverrideStorage';
 import {
   Sparkles,
   ArrowLeft,
@@ -70,6 +74,13 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const isCooldown = steamApi.isStoreRateLimited();
   const activeGameIdRef = useRef<string>(game.id);
 
+  const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
+  const metadataRoute = useMemo(
+    () => inferMetadataRouteFromOverride(userOverride),
+    [userOverride]
+  );
+  const activeOverrideStampRef = useRef<string | undefined>(userOverride?.updatedAt);
+
   const connectedSet = useMemo(() => {
     if (connectedStorefronts && connectedStorefronts.length > 0) {
       return new Set<StorefrontId>(connectedStorefronts);
@@ -97,9 +108,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   useEffect(() => {
     let isMounted = true;
     const isNewGame = activeGameIdRef.current !== game.id;
+    const isOverrideUpdated = activeOverrideStampRef.current !== userOverride?.updatedAt;
     activeGameIdRef.current = game.id;
+    activeOverrideStampRef.current = userOverride?.updatedAt;
 
-    if (isNewGame) {
+    if (isNewGame || isOverrideUpdated) {
       setMetadata(game.enrichedMetadata || null);
       setCurrentSteamAppId(game.steamAppId);
       if (!game.enrichedMetadata) {
@@ -108,11 +121,22 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     }
 
     async function loadData() {
-      const userOverride = getUserOverrideForGame(game);
-      let targetAppId = game.steamAppId;
+      const currentOverride = getUserOverrideForGame(game);
+      const route = inferMetadataRouteFromOverride(currentOverride);
+      const isRoutedToNonSteamStore =
+        route?.source === 'gog' || route?.source === 'epic';
 
-      // If user explicitly unlinked from Steam (steamAppId === null), do NOT match to Steam!
-      const isExplicitNonSteam = userOverride?.steamAppId === null;
+      let targetAppId =
+        route?.source === 'steam' && route.steamAppId
+          ? route.steamAppId
+          : game.steamAppId;
+
+      // If user explicitly unlinked from Steam (steamAppId === null) or routed metadata to a non-Steam source
+      const isExplicitNonSteam =
+        currentOverride?.steamAppId === null ||
+        currentOverride?.isExplicitNonSteam === true ||
+        isRoutedToNonSteamStore ||
+        route?.source === 'igdb';
 
       // If no Steam App ID is set, intelligently search Steam Store for match
       if (!targetAppId && !isExplicitNonSteam) {
@@ -141,8 +165,48 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         }
       }
 
-      // If matched to Steam, fetch full official Steam Store metadata, media & player achievements
-      if (targetAppId) {
+      // Case A: User explicitly routed Step 4 metadata to GOG or Epic
+      if (isRoutedToNonSteamStore) {
+        const [fallbackData, liveAchs] = await Promise.all([
+          fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, currentOverride),
+          game.steamAppId
+            ? steamAchievementsService.fetchPlayerGameAchievements(game.steamAppId)
+            : Promise.resolve(null),
+        ]);
+
+        if (isMounted && fallbackData) {
+          setMetadata(fallbackData);
+          let updatedPlatforms = game.platforms;
+          let hasChanges = !game.enrichedMetadata || isOverrideUpdated;
+
+          if (liveAchs) {
+            const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
+            const curAch = currentSteamPlat?.achievements;
+            const achChanged =
+              !curAch ||
+              curAch.unlocked !== liveAchs.unlocked ||
+              curAch.total !== liveAchs.total ||
+              curAch.source !== liveAchs.source;
+            if (achChanged) {
+              hasChanges = true;
+              updatedPlatforms = game.platforms.map((p) =>
+                p.platformId === 'steam' ? { ...p, achievements: liveAchs } : p
+              );
+            }
+          }
+
+          if (hasChanges) {
+            const updatedGame: CanonicalGame = {
+              ...game,
+              platforms: updatedPlatforms,
+              enrichedMetadata: fallbackData,
+            };
+            setCurrentGame(updatedGame);
+            onGameUpdated?.(updatedGame);
+          }
+        }
+      } else if (targetAppId) {
+        // Case B: Matched or routed to Steam
         const [liveData, liveAchs] = await Promise.all([
           steamApi.fetchGameMetadata(targetAppId),
           steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
@@ -153,8 +217,24 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           if (liveData) {
             resolvedMetadata = liveData;
             setMetadata(liveData);
+            if (currentOverride && route?.mode === 'routed' && route.source === 'steam') {
+              updateRoutedMetadataSnapshot(game.id, {
+                title: liveData.name,
+                shortDescription: liveData.shortDescription,
+                detailedDescription: liveData.detailedDescription || liveData.aboutTheGame,
+                headerImage: liveData.headerImage,
+                developers: liveData.developers,
+                publishers: liveData.publishers,
+                genres: liveData.genres,
+                tags: liveData.tags,
+                releaseDate: liveData.releaseDate,
+              });
+            }
           } else {
-            const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game);
+            const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
+              game,
+              currentOverride
+            );
             if (isMounted) {
               resolvedMetadata = fallbackData;
               setMetadata(fallbackData);
@@ -191,7 +271,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             hasChanges = true;
           }
 
-          if (resolvedMetadata && !game.enrichedMetadata) {
+          if (resolvedMetadata && (!game.enrichedMetadata || isOverrideUpdated)) {
             hasChanges = true;
           }
 
@@ -207,11 +287,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           }
         }
       } else {
-        // Game does not exist on Steam (e.g. Total Annihilation: Kingdoms, Alan Wake 2, store exclusive)
-        const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game);
+        // Case C: Non-Steam game (e.g. GOG, Epic, IGDB exclusive)
+        const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
+          game,
+          currentOverride
+        );
         if (isMounted && fallbackData) {
           setMetadata(fallbackData);
-          if (!game.enrichedMetadata) {
+          if (!game.enrichedMetadata || isOverrideUpdated) {
             const updatedGame: CanonicalGame = {
               ...game,
               enrichedMetadata: fallbackData,
@@ -230,35 +313,105 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [game.id, game.steamAppId]);
+  }, [
+    game.id,
+    game.steamAppId,
+    userOverride?.updatedAt,
+    metadataRoute?.source,
+    metadataRoute?.matchedId,
+    metadataRoute?.steamAppId,
+    metadataRoute?.gogId,
+  ]);
 
-  const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
+  const isDynamicRouted =
+    Boolean(userOverride) &&
+    metadataRoute?.mode === 'routed' &&
+    (metadataRoute.source === 'steam' ||
+      metadataRoute.source === 'gog' ||
+      metadataRoute.source === 'epic');
 
   const screenshots = metadata?.screenshots || [];
   const movies = metadata?.movies || [];
   const reviewSummary = metadata?.reviewSummary || game.reviewSummary;
-  const shortDescription = userOverride?.shortDescription || metadata?.shortDescription || game.shortDescription;
-  const developers = (userOverride?.developers && userOverride.developers.length > 0)
+  const effectiveHeaderImage =
+    (isDynamicRouted
+      ? metadata?.headerImage || userOverride?.headerImage
+      : userOverride?.headerImage || metadata?.headerImage) || game.headerImage;
+
+  const shortDescription =
+    isDynamicRouted && !metadataRoute?.customSynopsisEdited
+      ? metadata?.shortDescription || userOverride?.shortDescription || game.shortDescription
+      : userOverride?.shortDescription || metadata?.shortDescription || game.shortDescription;
+
+  const developers = isDynamicRouted
+    ? metadata?.developers?.length
+      ? metadata.developers
+      : userOverride?.developers?.length
+      ? userOverride.developers
+      : game.developers || []
+    : userOverride?.developers?.length
     ? userOverride.developers
-    : ((metadata?.developers && metadata.developers.length > 0) ? metadata.developers : (game.developers || []));
-  const publishers = (userOverride?.publishers && userOverride.publishers.length > 0)
+    : metadata?.developers?.length
+    ? metadata.developers
+    : game.developers || [];
+
+  const publishers = isDynamicRouted
+    ? metadata?.publishers?.length
+      ? metadata.publishers
+      : userOverride?.publishers?.length
+      ? userOverride.publishers
+      : game.publishers || []
+    : userOverride?.publishers?.length
     ? userOverride.publishers
-    : ((metadata?.publishers && metadata.publishers.length > 0) ? metadata.publishers : (game.publishers || []));
-  const releaseDate = userOverride?.releaseDate || metadata?.releaseDate || game.releaseDate || 'TBA';
-  const tags = (userOverride?.tags && userOverride.tags.length > 0)
+    : metadata?.publishers?.length
+    ? metadata.publishers
+    : game.publishers || [];
+
+  const releaseDate = isDynamicRouted
+    ? (metadata?.releaseDate && metadata.releaseDate !== 'TBA' ? metadata.releaseDate : undefined) ||
+      userOverride?.releaseDate ||
+      game.releaseDate ||
+      'TBA'
+    : userOverride?.releaseDate || metadata?.releaseDate || game.releaseDate || 'TBA';
+
+  const tags = isDynamicRouted
+    ? metadata?.tags?.length
+      ? metadata.tags
+      : userOverride?.tags?.length
+      ? userOverride.tags
+      : game.tags || []
+    : userOverride?.tags?.length
     ? userOverride.tags
-    : ((metadata?.tags && metadata.tags.length > 0) ? metadata.tags : (game.tags || []));
-  const genres = (userOverride?.genres && userOverride.genres.length > 0)
+    : metadata?.tags?.length
+    ? metadata.tags
+    : game.tags || [];
+
+  const genres = isDynamicRouted
+    ? metadata?.genres?.length
+      ? metadata.genres
+      : userOverride?.genres?.length
+      ? userOverride.genres
+      : game.genres || []
+    : userOverride?.genres?.length
     ? userOverride.genres
-    : ((metadata?.genres && metadata.genres.length > 0) ? metadata.genres : (game.genres || []));
+    : metadata?.genres?.length
+    ? metadata.genres
+    : game.genres || [];
+
   const isOwnedOnSteam = isGameOwnedOnSteam(game.platforms);
   const effectiveTags = getEffectiveTags(tags, isOwnedOnSteam);
-  const detailedDescription =
-    userOverride?.detailedDescription ||
-    metadata?.aboutTheGame ||
-    metadata?.detailedDescription ||
-    game.enrichedMetadata?.aboutTheGame ||
-    game.enrichedMetadata?.detailedDescription;
+
+  const detailedDescription = isDynamicRouted
+    ? metadata?.aboutTheGame ||
+      metadata?.detailedDescription ||
+      userOverride?.detailedDescription ||
+      game.enrichedMetadata?.aboutTheGame ||
+      game.enrichedMetadata?.detailedDescription
+    : userOverride?.detailedDescription ||
+      metadata?.aboutTheGame ||
+      metadata?.detailedDescription ||
+      game.enrichedMetadata?.aboutTheGame ||
+      game.enrichedMetadata?.detailedDescription;
 
   const effectiveSteamId = steamMatcher.getEffectiveSteamAppId(game);
 
@@ -290,7 +443,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       <div
         className="absolute top-0 left-0 right-0 h-96 opacity-15 pointer-events-none bg-cover bg-center filter blur-3xl"
         style={{
-          backgroundImage: `url(${userOverride?.headerImage || metadata?.headerImage || game.headerImage})`,
+          backgroundImage: `url(${effectiveHeaderImage})`,
         }}
       />
 
@@ -395,14 +548,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               <MediaGallery
                 screenshots={screenshots}
                 movies={movies}
-                headerImage={userOverride?.headerImage || metadata?.headerImage || game.headerImage}
+                headerImage={effectiveHeaderImage}
               />
             )}
           </div>
 
           {/* Right Column: 1:1 Steam Details (Fixed 324px Width) */}
           <SteamHeroDetails
-            headerImage={userOverride?.headerImage || metadata?.headerImage || game.headerImage}
+            headerImage={effectiveHeaderImage}
             title={game.title}
             shortDescription={shortDescription}
             reviewSummary={reviewSummary}

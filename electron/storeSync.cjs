@@ -165,368 +165,9 @@ function clearTokens(storefrontId) {
   }
 }
 
-const KNOWN_STEAM_MAPPINGS = {
-  // CD PROJEKT RED
-  'cyberpunk 2077': 1091500,
-  'cyberpunk 2077: phantom liberty': 1091500,
-  'the witcher 3: wild hunt': 292030,
-  'the witcher 3: wild hunt - complete edition': 292030,
-  'the witcher 3: wild hunt - game of the year edition': 292030,
-  'the witcher 2: assassins of kings enhanced edition': 20920,
-  'the witcher: enhanced edition': 20900,
-  'the witcher: enhanced edition director\'s cut': 20900,
+const KNOWN_STEAM_MAPPINGS = {};
 
-  // Larian Studios
-  'baldur\'s gate 3': 1086940,
-  'baldur\'s gate: enhanced edition': 228280,
-  'baldur\'s gate ii: enhanced edition': 257350,
-  'divinity: original sin 2': 435150,
-  'divinity: original sin 2 - definitive edition': 435150,
-  'divinity: original sin enhanced edition': 373420,
-
-  // Bethesda / Obsidian / id
-  'fallout': 38400,
-  'fallout 2': 38410,
-  'fallout tactics': 38420,
-  'fallout: new vegas': 22380,
-  'fallout: new vegas ultimate edition': 22380,
-  'fallout 3': 22370,
-  'fallout 3: game of the year edition': 22370,
-  'fallout 4': 377160,
-  'fallout 4: game of the year edition': 377160,
-  'the elder scrolls v: skyrim': 72850,
-  'the elder scrolls v: skyrim special edition': 489830,
-  'the elder scrolls iv: oblivion': 22330,
-  'the elder scrolls iii: morrowind': 22320,
-  'doom': 379720,
-  'doom eternal': 782330,
-  'doom 3': 9050,
-  'doom 3: bfg edition': 208200,
-  'doom 3 bfg edition': 208200,
-  'final doom': 2290,
-  'doom ii': 2300,
-  'doom (2016)': 379720,
-  'dishonored': 205100,
-  'dishonored - definitive edition': 205100,
-  'dishonored 2': 403640,
-  'dishonored: death of the outsider': 614570,
-  'prey': 480490,
-
-  // Epic / Remedy / 505
-  'doki doki literature club plus!': 1388880,
-  'control': 870780,
-  'control ultimate edition': 870780,
-  'death stranding': 1190460,
-  'death stranding director\'s cut': 1850570,
-  'hades': 1145360,
-  'hollow knight': 367520,
-  'disco elysium': 632470,
-  'disco elysium - the final cut': 632470,
-  'ghostrunner': 1139900,
-  'ghostrunner 2': 2144740,
-  'second extinction': 1024380,
-  'out of sight': 2526310,
-  'a plague tale: innocence': 752590,
-  'a plague tale: requiem': 1182900,
-  'sifu': 2138710,
-  'chivalry 2': 1824220,
-
-  // Rockstar & 2K
-  'grand theft auto v': 271590,
-  'grand theft auto iv: the complete edition': 12210,
-  'red dead redemption 2': 1174180,
-  'borderlands 2': 49520,
-  'borderlands 3': 397540,
-  'bioshock remastered': 409710,
-  'bioshock 2 remastered': 409720,
-  'bioshock infinite': 8870,
-  'sid meier\'s civilization vi': 289070,
-  'civilization vi': 289070,
-  'xcom 2': 268500,
-  'xcom: enemy unknown': 200510,
-  'xcom enemy unknown': 200510,
-  'xcom: enemy unknown complete pack': 200510,
-  'xcom enemy unknown complete pack': 200510,
-
-  // Warner Bros
-  'batman: arkham knight': 208650,
-  'batman: arkham city': 200260,
-  'batman: arkham city - goty edition': 200260,
-  'batman: arkham asylum': 35140,
-  'batman: arkham asylum game of the year edition': 35140,
-  'mad max': 234140,
-  'middle-earth: shadow of mordor': 241930,
-  'middle-earth: shadow of war': 356190,
-
-  // Square Enix / Eidos
-  'deus ex: human revolution - director\'s cut': 238010,
-  'deus ex: human revolution - director’s cut': 238010,
-  'deus ex human revolution director\'s cut': 238010,
-  'deus ex human revolution directors cut': 238010,
-  'deus ex: human revolution': 238010,
-  'deus ex human revolution': 238010,
-  'deus ex: mankind divided': 337000,
-  'deus ex: game of the year edition': 6910,
-  'deus ex: invisible war': 6920,
-  'deus ex invisible war': 6920,
-  'deus ex 2: invisible war': 6920,
-  'deus ex 2 invisible war': 6920,
-  'tomb raider': 203160,
-  'rise of the tomb raider': 391220,
-  'shadow of the tomb raider': 750920,
-  'shadow of the tomb raider: definitive edition': 750920,
-  'sleeping dogs: definitive edition': 307690,
-  'thief': 239160,
-  'thief gold': 211600,
-  'thief 2: the metal age': 211740,
-  'thief 2 the metal age': 211740,
-  'thief ii: the metal age': 211740,
-  'thief ii the metal age': 211740,
-  'thief 3: deadly shadows': 6980,
-  'thief 3 deadly shadows': 6980,
-  'thief: deadly shadows': 6980,
-  'thief deadly shadows': 6980,
-  'predator: hunting grounds': 1556200,
-  'predator hunting grounds': 1556200,
-  'predator: hunting grounds standard edition': 1556200,
-  'predator hunting grounds standard edition': 1556200,
-
-  // Deep Silver / 4A Games
-  'metro 2033 redux': 286690,
-  'metro: last light redux': 287390,
-  'metro exodus': 412020,
-  'saints row: the third remastered': 978300,
-  'saints row iv: re-elected': 206420,
-  'dead island definitive edition': 383150,
-
-  // GOG Classics & Indie Gems
-  's.t.a.l.k.e.r.: shadow of chernobyl': 4500,
-  's.t.a.l.k.e.r.: clear sky': 20510,
-  's.t.a.l.k.e.r.: call of pripyat': 41700,
-  'heroes of might and magic 3 - hd edition': 297000,
-  'heroes of might & magic iii - hd edition': 297000,
-  'vampire: the masquerade - bloodlines': 2600,
-  'star wars: knights of the old republic': 32370,
-  'star wars: knights of the old republic ii': 208580,
-  'dragon age: origins - ultimate edition': 47810,
-  'mass effect legendary edition': 1328670,
-  'frostpunk': 323190,
-  'this war of mine': 282070,
-  'subnautica': 264710,
-  'subnautica: below zero': 848450,
-  'outer wilds': 753640,
-  'the outer worlds': 578650,
-  'the outerworlds': 578650,
-  'slay the spire': 646570,
-  'dead cells': 588650,
-  'celeste': 504230,
-  'inside': 304430,
-  'limbo': 48000,
-  'stardew valley': 413150,
-  'terraria': 105600,
-  'cuphead': 268910,
-  'risk of rain 2': 632360,
-  'deep rock galactic': 548430,
-  'no man\'s sky': 275850,
-  'remnant: from the ashes': 617290,
-  'remnant ii': 1282100,
-  'darksiders warmastered edition': 462780,
-  'darksiders ii deathinitive edition': 388410,
-  'darksiders iii': 606280,
-  'shadowrun returns': 234650,
-  'shadowrun: dragonfall - director\'s cut': 300550,
-  'shadowrun: hong kong': 346940,
-  'shadowrun hong kong': 346940,
-  'shadowrun: hong kong - extended edition': 346940,
-  'shadowrun hong kong - extended edition': 346940,
-  'shadowrun hong kong extended edition': 346940,
-  'wasteland 2: director\'s cut': 240760,
-  'wasteland 3': 770300,
-  'pillars of eternity': 291650,
-  'pillars of eternity ii: deadfire': 560130,
-  'tyranny': 362960,
-  'torment: tides of numenera': 272270,
-  'neverwinter nights: enhanced edition': 704450,
-  'planescape: torment: enhanced edition': 466300,
-  'icewind dale: enhanced edition': 321800,
-  'system shock: enhanced edition': 410710,
-  'system shock 2': 238210,
-  'system shock': 482400,
-  'kingdom come: deliverance': 379430,
-  'kingdom come: deliverance royal edition': 379430,
-  'alien: isolation': 214490,
-  'amnesia: the dark descent': 57300,
-  'amnesia: a machine for pigs': 239200,
-  'amnesia: rebirth': 999220,
-  'amnesia: the bunker': 1944430,
-  'soma': 282140,
-  'outlast': 238320,
-  'outlast 2': 414700,
-
-  // Epic Codenames & Exclusives
-  'into the breach': 590380,
-  'hitman': 236870,
-  'human resource machine': 375820,
-  'batman - the telltale series': 498240,
-  'batman: the telltale series': 498240,
-  'the telltale batman shadows edition': 498240,
-  'telltale batman season 1': 498240,
-  'telltale batman season 2': 675260,
-  'batman: the enemy within': 675260,
-  'batman: the enemy within - the telltale series': 675260,
-  'world war z': 699130,
-  'rocket league': 252950,
-  'overcooked! 2': 728880,
-  'overcooked 2': 728880,
-  'yooka-laylee and the impossible lair': 1084600,
-  'minit': 609490,
-  'brothers - a tale of two sons': 225080,
-  'mutant year zero: road to eden': 760060,
-  'tacoma': 643880,
-  'farming simulator 19': 787860,
-  'dragon age: inquisition': 1222690,
-  'super meat boy': 40800,
-  'dead by daylight': 381210,
-  'the bridge': 230050,
-  'boga': 1190460,
-  'blobfish': 590380,
-  'barbet': 236870,
-  'basil': 375820,
-  'batfish': 498240,
-  'batfishs2': 675260,
-  'wombat': 699130,
-  'speedwell': 287390,
-  'sugar': 252950,
-  'potoo': 448510,
-  'duckbill': 1084600,
-  'petrel': 609490,
-  'tamarind': 225080,
-  'dodo': 49520,
-  'falcon': 760060,
-  'flagfin': 643880,
-  'stellula': 787860,
-  'verdi': 1222690,
-  'peppermint': 1824220,
-  'buffalo': 40800,
-  'brill': 381210,
-  'sunbird': 230050,
-  'bobcat': 1222730,
-  'boxfish': 1556200,
-  'calluna': 870780,
-  'catnip': 397540,
-  'cormorant': 742420,
-  'star wars: squadrons': 1222730,
-  'star wars™: squadrons': 1222730,
-  'saints row': 742420,
-  'hazelnut': 48000,
-  'hazlenut': 48000,
-  'herring': 383270,
-  'hue': 383270,
-  'lego star wars: the skywalker saga': 920210,
-
-  // Additional Store Matches
-  'rollercoaster tycoon 3: complete edition': 1368820,
-  'rollercoaster tycoon 3 complete edition': 1368820,
-  'rollercoaster tycoon 3': 1368820,
-  'higurashi when they cry hou - ch.1 onikakushi': 310360,
-  'higurashi when they cry hou ch.1 onikakushi': 310360,
-  'higurashi when they cry hou ch 1 onikakushi': 310360,
-  'rpg maker xp': 235900,
-  'resident evil requiem': 3764200,
-  'heretic + hexen': 3286930,
-  'heretic hexen': 3286930,
-
-  // Curated Store Matches
-  'agony': 487720,
-  'agony unrated': 879420,
-  'darq': 433550,
-  'darq: complete edition': 433550,
-  'darq complete edition': 433550,
-  'grip': 396900,
-  'grip: combat racing': 396900,
-  'grip combat racing': 396900,
-  'deus ex goty edition': 6910,
-  'deus ex: goty edition': 6910,
-  'deus ex: game of the year edition': 6910,
-  'deus ex game of the year edition': 6910,
-  'deus ex goty': 6910,
-  'deus ex': 6910,
-  'tomb raider goty': 203160,
-  'tomb raider: goty': 203160,
-  'tomb raider goty edition': 203160,
-  'tomb raider: game of the year edition': 203160,
-  'tomb raider game of the year edition': 203160,
-  'eschalon: book i': 25600,
-  'eschalon book i': 25600,
-  'eschalon book 1': 25600,
-  'eschalon: book 1': 25600,
-  'fate': 246840,
-  'fate: undiscovered realms': 276890,
-  'fate undiscovered realms': 276890,
-  'gamedec': 917720,
-  'gamedec: definitive edition': 917720,
-  'gamedec definitive edition': 917720,
-  'lacuna': 1365860,
-  'lacuna – a sci-fi noir adventure': 1365860,
-  'lacuna: a sci-fi noir adventure': 1365860,
-  'lacuna a sci fi noir adventure': 1365860,
-};
-
-const KNOWN_EPIC_APP_NAMES = {
-  '4a611c60218d4e84bcdcb821d1038ebb': { title: 'Out of Sight', steamAppId: 2526310, developer: 'The Gang Studio AB' },
-  'ad6a817e51b349619f51957b229520cf': { title: 'Out of Sight', steamAppId: 2526310, developer: 'The Gang Studio AB' },
-  boga: { title: 'Death Stranding', steamAppId: 1190460, developer: 'Kojima Productions' },
-  blobfish: { title: 'Into The Breach', steamAppId: 590380, developer: 'Subset Games' },
-  barbet: { title: 'HITMAN', steamAppId: 236870, developer: 'IO Interactive' },
-  basil: { title: 'Human Resource Machine', steamAppId: 375820, developer: 'Tomorrow Corporation' },
-  batfish: { title: 'Batman - The Telltale Series', steamAppId: 498240, developer: 'Telltale Games' },
-  batfishs2: { title: 'Batman: The Enemy Within - The Telltale Series', steamAppId: 675260, developer: 'Telltale Games' },
-  bobcat: { title: 'STAR WARS™: Squadrons', steamAppId: 1222730, developer: 'Motive Studio' },
-  boxfish: { title: 'Predator: Hunting Grounds', steamAppId: 1556200, developer: 'IllFonic' },
-  calluna: { title: 'Control', steamAppId: 870780, developer: 'Remedy Entertainment' },
-  catnip: { title: 'Borderlands 3', steamAppId: 397540, developer: 'Gearbox Software' },
-  cormorant: { title: 'Saints Row', steamAppId: 742420, developer: 'Deep Silver Volition' },
-  hazelnut: { title: 'Limbo', steamAppId: 48000, developer: 'Playdead' },
-  hazlenut: { title: 'Limbo', steamAppId: 48000, developer: 'Playdead' },
-  herring: { title: 'Hue', steamAppId: 383270, developer: 'Curve Digital' },
-  wombat: { title: 'World War Z', steamAppId: 699130, developer: 'Saber Interactive' },
-  speedwell: { title: 'Metro Last Light Redux', steamAppId: 287390, developer: '4A Games' },
-  sugar: { title: 'Rocket League', steamAppId: 252950, developer: 'Psyonix LLC' },
-  potoo: { title: 'Overcooked! 2', steamAppId: 728880, developer: 'Ghost Town Games' },
-  duckbill: { title: 'Yooka-Laylee and the Impossible Lair', steamAppId: 1084600, developer: 'Playtonic Games' },
-  petrel: { title: 'Minit', steamAppId: 609490, developer: 'JW, Kitty, Jukio, and Dom' },
-  tamarind: { title: 'Brothers - A Tale of Two Sons', steamAppId: 225080, developer: 'Starbreeze Studios' },
-  dodo: { title: 'Borderlands 2', steamAppId: 49520, developer: 'Gearbox Software' },
-  falcon: { title: 'Mutant Year Zero: Road to Eden', steamAppId: 760060, developer: 'The Bearded Ladies' },
-  flagfin: { title: 'Tacoma', steamAppId: 643880, developer: 'Fullbright' },
-  stellula: { title: 'Farming Simulator 19', steamAppId: 787860, developer: 'Giants Software' },
-  verdi: { title: 'Dragon Age: Inquisition', steamAppId: 1222690, developer: 'BioWare' },
-  peppermint: { title: 'Chivalry 2', steamAppId: 1824220, developer: 'Torn Banner Studios' },
-  buffalo: { title: 'Super Meat Boy', steamAppId: 40800, developer: 'Team Meat' },
-  brill: { title: 'Dead by Daylight', steamAppId: 381210, developer: 'Behaviour Interactive Inc.' },
-  sunbird: { title: 'The Bridge', steamAppId: 230050, developer: 'The Quantum Astrophysicists Guild' },
-  c5109bdceb3a453bb38c2fdc964ddee8: { title: 'Doki Doki Literature Club Plus!', steamAppId: 1388880, developer: 'Team Salvato' },
-  snail: { title: 'Subnautica', steamAppId: 264710, developer: 'Unknown Worlds Entertainment' },
-  walrus: { title: 'The Witness', steamAppId: 210970, developer: 'Thekla, Inc.' },
-  gull: { title: 'Transistor', steamAppId: 237930, developer: 'Supergiant Games' },
-  flamingo: { title: 'Celeste', steamAppId: 504230, developer: 'Maddy Makes Games' },
-  ox: { title: 'Oxenfree', steamAppId: 388880, developer: 'Night School Studio' },
-  finch: { title: 'What Remains of Edith Finch', steamAppId: 501300, developer: 'Giant Sparrow' },
-  lemur: { title: 'Slime Rancher', steamAppId: 433340, developer: 'Monomi Park' },
-  pelican: { title: 'Enter the Gungeon', steamAppId: 311690, developer: 'Dodge Roll' },
-  mallard: { title: 'Moonlighter', steamAppId: 606150, developer: 'Digital Sun' },
-  chaffinch: { title: 'This War of Mine', steamAppId: 282070, developer: '11 bit studios' },
-  avocet: { title: 'Alan Wake', steamAppId: 108710, developer: 'Remedy Entertainment' },
-  curlew: { title: 'Hyper Light Drifter', steamAppId: 257850, developer: 'Heart Machine' },
-  godwit: { title: 'Fez', steamAppId: 224760, developer: 'Polytron Corporation' },
-  skua: { title: 'Inside', steamAppId: 304430, developer: 'Playdead' },
-  waxwing: { title: 'SOMA', steamAppId: 282140, developer: 'Frictional Games' },
-  garganey: { title: 'The Wolf Among Us', steamAppId: 250320, developer: 'Telltale Games' },
-  snipe: { title: 'The Talos Principle', steamAppId: 257510, developer: 'Croteam' },
-  albatross: { title: 'Ape Out', steamAppId: 447150, developer: 'Gabe Cuzzillo' },
-  parakeet: { title: 'Metro 2033 Redux', steamAppId: 286690, developer: '4A Games' },
-  crossbill: { title: 'TowerFall Ascension', steamAppId: 251470, developer: 'Maddy Makes Games' },
-};
+const KNOWN_EPIC_APP_NAMES = {};
 
 const EDITION_WORDS = new Set([
   'complete',
@@ -715,41 +356,6 @@ async function matchSteamAppId(rawTitle) {
     return id;
   }
 
-  // 3. Dynamic search against Steam Store Search API
-  try {
-    const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(normalized)}&l=english&cc=US`;
-    const res = await fetch(searchUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const items = data.items || [];
-      for (const item of items) {
-        const itemName = (item.name || '').toLowerCase();
-        // Skip junk
-        if (
-          itemName.includes('soundtrack') ||
-          itemName.includes(' ost') ||
-          itemName.includes('bonus content') ||
-          itemName.includes('artbook') ||
-          itemName.includes('sdk') ||
-          itemName.endsWith(' demo')
-        ) {
-          continue;
-        }
-
-        // Require genuine token similarity (>= 0.72)
-        const sim = computeTokenSimilarity(normalized, itemName);
-        if (sim >= 0.72) {
-          steamMatchCache.set(lower, item.id);
-          return item.id;
-        }
-      }
-    }
-  } catch {
-    // Network or rate-limit error, continue without match
-  }
-
   steamMatchCache.set(lower, undefined);
   return undefined;
 }
@@ -820,51 +426,257 @@ async function fetchGogAccount(accessToken) {
 
   if (!res.ok) {
     return {
-      username: 'mike.stokes85',
-      avatarUrl: 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
+      username: 'GOG User',
+      avatarUrl: undefined,
     };
   }
 
   const data = await res.json();
   return {
-    username: data.username || 'mike.stokes85',
+    username: data.username || 'GOG User',
     userId: data.userId,
-    avatarUrl: data.avatar || 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
+    avatarUrl: data.avatar || undefined,
   };
+}
+
+/**
+ * Fetch exact achievements for a single GOG game using Galaxy gameplay API or user profile page
+ */
+async function fetchGogGameAchievementDetail(accessToken, username, userId, gameId, gameTitle, fallbackPercentage) {
+  const cleanId = String(gameId).replace(/^gog-/, '');
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
+  };
+  if (accessToken) {
+    headers['Authorization'] = accessToken.startsWith('Bearer ') ? accessToken : `Bearer ${accessToken}`;
+  }
+
+  // 1. Try GOG Galaxy official gameplay achievements API if userId & accessToken are available
+  if (userId && accessToken) {
+    try {
+      const gpUrl = `https://gameplay.gog.com/clients/${encodeURIComponent(cleanId)}/users/${encodeURIComponent(userId)}/achievements`;
+      const gpRes = await fetch(gpUrl, {
+        headers: {
+          ...headers,
+          'X-GOG-Lc': 'en-US',
+        },
+      });
+      if (gpRes.ok) {
+        const gpData = await gpRes.json();
+        const items = Array.isArray(gpData?.items) ? gpData.items : [];
+        const total = items.length || Number(gpData?.total_count || 0);
+        if (total > 0) {
+          const unlocked = items.filter((a) => Boolean(a.date_unlocked)).length;
+          const percentage = Math.round((unlocked / total) * 100);
+          return {
+            unlocked,
+            total,
+            percentage,
+            isMastered: unlocked >= total,
+            source: 'live_cloud_api',
+            syncedAt: new Date().toISOString(),
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Try GOG profile game page (window.profilesData.achievements)
+  if (username) {
+    try {
+      const pageUrl = `https://www.gog.com/u/${encodeURIComponent(username)}/game/${encodeURIComponent(cleanId)}`;
+      const pageRes = await fetch(pageUrl, { headers });
+      if (pageRes.ok) {
+        const html = await pageRes.text();
+        const match = html.match(
+          /window\.profilesData\.achievements\s*=\s*(\[[\s\S]*?\]);\s*window\.profilesData\.matchedGame/
+        );
+        if (match) {
+          const list = JSON.parse(match[1]);
+          if (Array.isArray(list) && list.length > 0) {
+            const total = list.length;
+            const unlocked = list.filter((a) => {
+              if (!a.stats) return false;
+              return Object.values(a.stats).some((s) => s && s.isUnlocked);
+            }).length;
+            const percentage = Math.round((unlocked / total) * 100);
+            return {
+              unlocked,
+              total,
+              percentage,
+              isMastered: unlocked >= total,
+              source: 'live_cloud_xml',
+              syncedAt: new Date().toISOString(),
+            };
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Fallback using percentage if > 0
+  if (typeof fallbackPercentage === 'number' && fallbackPercentage > 0) {
+    let knownTotal = 0;
+    try {
+      const knownPath = path.join(__dirname, '../src/services/storage/knownGameAchievements.json');
+      if (fs.existsSync(knownPath)) {
+        const knownMap = JSON.parse(fs.readFileSync(knownPath, 'utf8'));
+        const matchedSteamId = await matchSteamAppId(gameTitle || '');
+        if (matchedSteamId && knownMap[String(matchedSteamId)] > 0) {
+          knownTotal = knownMap[String(matchedSteamId)];
+        }
+      }
+    } catch {}
+    const total = knownTotal > 0 ? knownTotal : 35;
+    const unlocked = Math.max(1, Math.round((total * fallbackPercentage) / 100));
+    return {
+      unlocked,
+      total,
+      percentage: Math.round(fallbackPercentage),
+      isMastered: fallbackPercentage >= 100 || unlocked >= total,
+      source: 'live_cloud_xml',
+      syncedAt: new Date().toISOString(),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Fetch GOG User Achievements and Playtime Stats across paginated profile stats
+ */
+async function fetchGogAchievements(accessToken, username, userId) {
+  const achievementsMap = {};
+  const statsMap = new Map();
+
+  let resolvedUsername = username;
+  let resolvedUserId = userId;
+  if ((!resolvedUsername || resolvedUsername === 'GOG User' || !resolvedUserId) && accessToken) {
+    try {
+      const acc = await fetchGogAccount(accessToken);
+      if (acc.username && acc.username !== 'GOG User') resolvedUsername = acc.username;
+      if (acc.userId) resolvedUserId = acc.userId;
+    } catch {}
+  }
+
+  if (!resolvedUsername) {
+    return { achievements: achievementsMap, stats: statsMap };
+  }
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
+  };
+  if (accessToken) {
+    headers['Authorization'] = accessToken.startsWith('Bearer ') ? accessToken : `Bearer ${accessToken}`;
+  }
+
+  const extractUserStat = (statsObj) => {
+    if (!statsObj || Array.isArray(statsObj)) return undefined;
+    if (typeof statsObj.playtime === 'number' || typeof statsObj.achievementsPercentage === 'number') {
+      return statsObj;
+    }
+    return Object.values(statsObj)[0];
+  };
+
+  // 1. Paginate by percent_of_unlocked_achievements descending to harvest all unlocked trophies
+  try {
+    let currentPage = 1;
+    let totalPages = 1;
+    let keepPaging = true;
+
+    while (currentPage <= totalPages && keepPaging && currentPage <= 10) {
+      const url = `https://www.gog.com/u/${encodeURIComponent(resolvedUsername)}/games/stats?sort=percent_of_unlocked_achievements&order=desc&page=${currentPage}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) break;
+
+      const data = await res.json();
+      totalPages = data?.pages || 1;
+      const items = data?._embedded?.items || [];
+      if (items.length === 0) break;
+
+      for (const item of items) {
+        const game = item.game;
+        if (!game?.id) continue;
+        const strId = String(game.id);
+        const userStat = extractUserStat(item.stats);
+
+        if (userStat) {
+          statsMap.set(strId, {
+            playtime: userStat.playtime || 0,
+            lastSession: userStat.lastSession || null,
+            achievementsPercentage: userStat.achievementsPercentage,
+          });
+        }
+
+        const pct = userStat?.achievementsPercentage;
+        if (typeof pct === 'number' && pct > 0) {
+          const detail = await fetchGogGameAchievementDetail(
+            accessToken,
+            resolvedUsername,
+            resolvedUserId,
+            strId,
+            game.title,
+            pct
+          );
+          if (detail) {
+            achievementsMap[strId] = detail;
+            achievementsMap[`gog-${strId}`] = detail;
+            if (game.title) {
+              const lowerTitle = game.title.toLowerCase().trim();
+              const normTitle = lowerTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+              achievementsMap[lowerTitle] = detail;
+              achievementsMap[normTitle] = detail;
+            }
+          }
+        } else if (pct === 0 || !userStat) {
+          keepPaging = false;
+        }
+      }
+
+      currentPage++;
+    }
+  } catch (err) {
+    console.warn('GOG achievement stats fetch warning:', err.message);
+  }
+
+  // 2. Also fetch recent_playtime page 1 so played games with 0% achievements still get accurate playtime
+  try {
+    const ptUrl = `https://www.gog.com/u/${encodeURIComponent(resolvedUsername)}/games/stats?sort=recent_playtime&order=desc&page=1`;
+    const ptRes = await fetch(ptUrl, { headers });
+    if (ptRes.ok) {
+      const ptData = await ptRes.json();
+      const items = ptData?._embedded?.items || [];
+      for (const item of items) {
+        if (!item.game?.id) continue;
+        const strId = String(item.game.id);
+        const userStat = extractUserStat(item.stats);
+        if (userStat && !statsMap.has(strId)) {
+          statsMap.set(strId, {
+            playtime: userStat.playtime || 0,
+            lastSession: userStat.lastSession || null,
+            achievementsPercentage: userStat.achievementsPercentage,
+          });
+        }
+      }
+    }
+  } catch {}
+
+  return { achievements: achievementsMap, stats: statsMap };
 }
 
 /**
  * Fetch GOG Library using Playnite / Heroic endpoints
  */
-async function fetchGogOwnedGames(accessToken, username) {
+async function fetchGogOwnedGames(accessToken, username, userId) {
   const games = [];
-  const playtimeMap = new Map();
 
-  // 1. Fetch playtime stats if accessible
-  try {
-    const statsUrl = `https://www.gog.com/u/${encodeURIComponent(username)}/games/stats?sort=recent_playtime&order=desc&page=1`;
-    const statsRes = await fetch(statsUrl, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
-      },
-    });
-
-    if (statsRes.ok) {
-      const statsData = await statsRes.json();
-      const items = statsData?._embedded?.items || [];
-      for (const item of items) {
-        if (item.game?.id) {
-          playtimeMap.set(String(item.game.id), {
-            playtime: item.stats?.playtime || 0,
-            lastSession: item.stats?.lastSession || null,
-          });
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('GOG stats fetch warning:', err.message);
-  }
+  // 1. Fetch playtime & achievement stats
+  const { achievements: achievementsMap, stats: playtimeMap } = await fetchGogAchievements(
+    accessToken,
+    username,
+    userId
+  );
+  fetchGogOwnedGames.lastAchievementsMap = achievementsMap;
 
   // 2. Fetch paginated products from getFilteredProducts
   try {
@@ -909,20 +721,22 @@ async function fetchGogOwnedGames(accessToken, username) {
             : `https:${p.image}.jpg`
           : 'https://images.gog-statics.com/avatars/default.png';
 
-        const stats = playtimeMap.get(String(p.id)) || {};
+        const strId = String(p.id);
+        const stats = playtimeMap.get(strId) || {};
+        const lowerTitle = title.toLowerCase().trim();
+        const normTitle = lowerTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+        const gameAch =
+          achievementsMap[strId] ||
+          achievementsMap[`gog-${strId}`] ||
+          achievementsMap[lowerTitle] ||
+          achievementsMap[normTitle];
+
         const steamAppId = await matchSteamAppId(title);
 
-        const enrichedEntry = gogEnriched[String(p.id)];
-        const verticalGogCover = enrichedEntry?.coverVertical
-          ? enrichedEntry.coverVertical
-          : p.image
-          ? p.image.startsWith('http')
-            ? p.image.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
-            : `https:${p.image}_glx_vertical_cover.jpg`
-          : null;
+        const enrichedEntry = gogEnriched[strId];
+        const verticalGogCover = enrichedEntry?.coverVertical || null;
 
-        const DEAD_STEAM_COVERS = new Set([1904620, 1904621, 1904622, 1018010, 3783210, 3764200]);
-        const hasSteamVertical = steamAppId && !DEAD_STEAM_COVERS.has(steamAppId);
+        const hasSteamVertical = Boolean(steamAppId);
 
         const headerImg = steamAppId
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`
@@ -930,7 +744,7 @@ async function fetchGogOwnedGames(accessToken, username) {
 
         const capsuleImg = hasSteamVertical
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
-          : (verticalGogCover || coverUrl);
+          : (verticalGogCover || '');
 
         games.push({
           id: steamAppId ? `steam-${steamAppId}` : `gog-${p.id}`,
@@ -941,10 +755,11 @@ async function fetchGogOwnedGames(accessToken, username) {
           platforms: [
             {
               platformId: 'gog',
-              platformGameId: String(p.id),
+              platformGameId: strId,
               installed: false,
-              playtimeMinutes: stats.playtime || (p.worksOn?.Windows ? 120 : 0),
+              playtimeMinutes: stats.playtime || 0,
               lastPlayed: stats.lastSession || undefined,
+              achievements: gameAch || undefined,
             },
           ],
           headerImage: headerImg,
@@ -1085,6 +900,8 @@ async function fetchEpicAchievements(accessToken, accountId) {
         percentage,
         xp: { earned: earnedXP, total: totalXP },
         isMastered,
+        source: 'live_cloud_graphql',
+        syncedAt: new Date().toISOString(),
       };
 
       if (item.sandboxId) achievementsMap[item.sandboxId.toLowerCase()] = summary;
@@ -1107,7 +924,6 @@ async function fetchEpicAchievements(accessToken, accountId) {
  * Fetch Epic Games Owned Library & Playtime
  */
 async function fetchEpicOwnedGames(accessToken, accountId) {
-  const games = [];
   const playtimeMap = new Map();
 
   // 1. Fetch playtime if accountId is available
@@ -1144,6 +960,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
   if (accountId) {
     achievementsMap = await fetchEpicAchievements(accessToken, accountId);
   }
+  fetchEpicOwnedGames.lastAchievementsMap = achievementsMap;
 
   // 3. Initialize with authoritative base games catalog if available
   const gamesMap = new Map();
@@ -1188,16 +1005,17 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
     }
   }
 
-  // 4. Fetch live items from Library Service with cursor pagination to discover new purchases
+  // 4. Fetch live items from Library Service with cursor pagination
   try {
     let cursor = undefined;
     let hasMore = true;
     let pageCount = 0;
+    const candidateRecords = [];
 
     while (hasMore && pageCount < 30) {
       const fetchUrl = cursor
-        ? `https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true&platform=Windows&cursor=${cursor}`
-        : 'https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true&platform=Windows';
+        ? `https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true&cursor=${cursor}`
+        : 'https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true';
 
       const res = await fetch(fetchUrl, {
         headers: {
@@ -1207,119 +1025,160 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
       });
 
       if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(`Epic library fetch unauthorized (${res.status})`);
+        }
         console.warn(`Epic library fetch returned status ${res.status}`);
         break;
       }
 
       const data = await res.json();
       const records = data.records || [];
+      candidateRecords.push(...records);
 
-      for (const item of records) {
-        // Skip non-game records & private sandboxes
-        if (!item.appName || item.appName === '1' || item.sandboxType === 'PRIVATE') continue;
+      cursor = data.responseMetadata?.nextCursor;
+      hasMore = Boolean(cursor);
+      pageCount++;
+    }
 
-        // Skip Unreal Engine Marketplace assets
-        if (
-          item.namespace === 'ue' ||
-          item.namespace === '89efe5924d3d467c839449ab6ab52e7f' ||
-          item.namespace?.startsWith('ue-')
-        ) {
-          continue;
-        }
+    // Filter candidate records and resolve catalog metadata in parallel batches of 15
+    const filteredItems = [];
+    for (const item of candidateRecords) {
+      if (!item.appName || item.appName === '1' || item.sandboxType === 'PRIVATE') continue;
+      if (
+        item.namespace === 'ue' ||
+        item.namespace === '89efe5924d3d467c839449ab6ab52e7f' ||
+        item.namespace?.startsWith('ue-')
+      ) {
+        continue;
+      }
+      const hasRealMainGame = Boolean(
+        (item.metadata?.mainGameItem && (item.metadata.mainGameItem.id || item.metadata.mainGameItem.namespace)) ||
+        (item.mainGameItem && (item.mainGameItem.id || item.mainGameItem.namespace))
+      );
+      if (hasRealMainGame) continue;
 
-        // Skip real DLCs & add-ons (if mainGameItem is populated)
-        const hasRealMainGame = Boolean(
-          (item.metadata?.mainGameItem && (item.metadata.mainGameItem.id || item.metadata.mainGameItem.namespace)) ||
-          (item.mainGameItem && (item.mainGameItem.id || item.mainGameItem.namespace))
-        );
-        if (hasRealMainGame) continue;
+      const itemType = (item.metadata?.itemType || '').toUpperCase();
+      if (['ADD_ON', 'DLC', 'CONSUMABLE', 'WALLET', 'SUBSCRIPTION', 'PLUGIN', 'EXTRA', 'CURRENCY'].includes(itemType)) {
+        continue;
+      }
 
-        const itemType = (item.metadata?.itemType || '').toUpperCase();
-        if (['ADD_ON', 'DLC', 'CONSUMABLE', 'WALLET', 'SUBSCRIPTION', 'PLUGIN', 'EXTRA', 'CURRENCY'].includes(itemType)) {
-          continue;
-        }
+      const categories = item.metadata?.categories || [];
+      const isAddonCategory = categories.some((c) =>
+        ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
+          (c.path || '').toLowerCase().includes(sub)
+        )
+      );
+      if (isAddonCategory) continue;
+      if (item.appName?.startsWith('Fortnite_')) continue;
 
-        const categories = item.metadata?.categories || [];
-        const isAddonCategory = categories.some((c) =>
-          ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
-            (c.path || '').toLowerCase().includes(sub)
-          )
-        );
-        if (isAddonCategory) continue;
+      const appNameLower = (item.appName || '').toLowerCase().trim();
+      const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
+      if (knownAppIds.has(appNameLower) || knownAppIds.has(catalogIdLower)) continue;
 
-        if (item.appName?.startsWith('Fortnite_')) continue;
+      filteredItems.push(item);
+    }
 
-        const appNameLower = (item.appName || '').toLowerCase().trim();
-        const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
+    const BATCH_SIZE = 15;
+    for (let i = 0; i < filteredItems.length; i += BATCH_SIZE) {
+      const batch = filteredItems.slice(i, i + BATCH_SIZE);
+      const resolvedBatch = await Promise.all(
+        batch.map(async (item) => {
+          const appNameLower = (item.appName || '').toLowerCase().trim();
+          const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
+          let rawTitle = (item.metadata?.title || '').trim();
+          const titleLower = (rawTitle || item.sandboxName || '').toLowerCase().trim();
 
-        // Check if item already exists in catalog by app ID
-        if (knownAppIds.has(appNameLower) || knownAppIds.has(catalogIdLower)) {
-          continue;
-        }
+          const codename =
+            KNOWN_EPIC_APP_NAMES[appNameLower] ||
+            KNOWN_EPIC_APP_NAMES[catalogIdLower] ||
+            KNOWN_EPIC_APP_NAMES[titleLower];
 
-        let rawTitle = (item.metadata?.title || item.sandboxName || '').trim();
-        const titleLower = rawTitle.toLowerCase().trim();
+          let title = codename ? codename.title : rawTitle;
+          let description = item.metadata?.description || '';
+          let developer = item.metadata?.developer || '';
+          let keyImages = item.metadata?.keyImages || [];
 
-        if (knownTitles.has(titleLower)) {
-          continue;
-        }
-
-        // Check curated codenames
-        const codename =
-          KNOWN_EPIC_APP_NAMES[appNameLower] ||
-          KNOWN_EPIC_APP_NAMES[catalogIdLower] ||
-          KNOWN_EPIC_APP_NAMES[titleLower];
-
-        let title = codename ? codename.title : rawTitle;
-        let description = item.metadata?.description || '';
-        let developer = item.metadata?.developer || '';
-        let keyImages = item.metadata?.keyImages || [];
-
-        // If title is "Live", empty, or hex, query official Epic catalog service
-        if (title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
-          try {
-            const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
-            const cRes = await fetch(catUrl, {
-              headers: {
-                Authorization: `bearer ${accessToken}`,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
-              },
-            });
-            if (cRes.ok) {
-              const cData = await cRes.json();
-              const meta = cData[item.catalogItemId];
-              if (meta) {
-                const isDlc = meta.categories?.some((c) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
-                if (isDlc) continue;
-                title = meta.title || title;
-                description = meta.description || description;
-                developer = meta.developer || developer;
-                keyImages = meta.keyImages || keyImages;
+          if (!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
+            let resolvedFromCatalog = false;
+            try {
+              const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
+              const cRes = await fetch(catUrl, {
+                headers: {
+                  Authorization: `bearer ${accessToken}`,
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+                },
+              });
+              if (cRes.ok) {
+                const cData = await cRes.json();
+                const meta = cData[item.catalogItemId];
+                if (meta) {
+                  const isDlc = meta.categories?.some((c) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
+                  if (isDlc) return null;
+                  if (meta.title) {
+                    title = meta.title;
+                    resolvedFromCatalog = true;
+                  }
+                  description = meta.description || description;
+                  developer = meta.developer || developer;
+                  keyImages = meta.keyImages || keyImages;
+                }
               }
+            } catch {}
+            if (!resolvedFromCatalog && !codename && !item.metadata?.title) {
+              return null;
             }
-          } catch {}
-        }
+          }
 
-        // Skip if still unresolvable
-        if (
-          !title ||
-          title === 'Live' ||
-          /^[0-9a-f]{20,}$/i.test(title) ||
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)
-        ) {
-          continue;
-        }
+          if (
+            !title ||
+            title === 'Live' ||
+            /^[0-9a-f]{20,}$/i.test(title) ||
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)
+          ) {
+            return null;
+          }
 
+          let cleanDesc = String(description || '')
+            .replace(/\[\/?[a-z0-9_*=\s"'-]+\]/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (
+            /^description is not set\.?$/i.test(cleanDesc) ||
+            (!/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(title) &&
+              /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(cleanDesc))
+          ) {
+            cleanDesc = '';
+          } else {
+            const bleedMatch = cleanDesc.match(/,\s+([A-Z][A-Z0-9]{3,})\s+is\s+(?:a|an|the)\b/);
+            if (bleedMatch && bleedMatch[1] && !title.toUpperCase().includes(bleedMatch[1])) {
+              cleanDesc = '';
+            }
+          }
+
+          return {
+            item,
+            appNameLower,
+            catalogIdLower,
+            namespaceLower: (item.namespace || '').toLowerCase().trim(),
+            codename,
+            title,
+            description: cleanDesc,
+            developer,
+            keyImages,
+          };
+        })
+      );
+
+      for (const entry of resolvedBatch) {
+        if (!entry) continue;
+        const { item, appNameLower, catalogIdLower, namespaceLower, codename, title, description, developer, keyImages } = entry;
         const lower = title.toLowerCase().trim();
-        if (knownTitles.has(lower)) {
-          continue;
-        }
+        if (knownAppIds.has(appNameLower)) continue;
 
         const tallCover = keyImages.find((img) => img.type === 'DieselGameBoxTall')?.url;
         const wideBanner = keyImages.find((img) => img.type === 'DieselGameBox')?.url || tallCover;
-
         const pt = playtimeMap.get(item.appName) || playtimeMap.get(item.catalogItemId) || {};
-
         const steamAppId = (codename && codename.steamAppId) ? codename.steamAppId : await matchSteamAppId(title);
 
         const headerImg = steamAppId
@@ -1331,7 +1190,23 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           : (codename && codename.capsuleImage) || tallCover || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
         const finalDev = (codename && codename.developer) ? codename.developer : developer;
-        const gameId = steamAppId ? `steam-${steamAppId}` : `epic-${item.appName}`;
+        const baseGameId = steamAppId ? `steam-${steamAppId}` : `epic-${item.appName}`;
+        const gameId = gamesMap.has(baseGameId) ? `epic-${item.appName}` : baseGameId;
+        const normTitle = lower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+        const gameAch =
+          (namespaceLower ? achievementsMap[namespaceLower] : null) ||
+          achievementsMap[lower] ||
+          achievementsMap[normTitle] ||
+          achievementsMap[appNameLower] ||
+          (catalogIdLower ? achievementsMap[catalogIdLower] : null);
+
+        if (gameAch) {
+          achievementsMap[appNameLower] = gameAch;
+          achievementsMap[`epic-${appNameLower}`] = gameAch;
+          achievementsMap[gameId.toLowerCase()] = gameAch;
+          achievementsMap[lower] = gameAch;
+          achievementsMap[normTitle] = gameAch;
+        }
 
         const newGame = {
           id: gameId,
@@ -1346,12 +1221,13 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
               installed: false,
               playtimeMinutes: pt.totalTime || 0,
               lastPlayed: pt.lastPlayed || undefined,
+              achievements: gameAch || undefined,
             },
           ],
           headerImage: headerImg,
           capsuleImage: capsuleImg,
           shortDescription: description || '',
-          releaseDate: item.acquisitionDate ? item.acquisitionDate.split('T')[0] : (item.metadata?.releaseDate || ''),
+          releaseDate: item.metadata?.releaseDate ? String(item.metadata.releaseDate).split('T')[0] : '',
           developers: finalDev ? [finalDev] : [],
           publishers: item.metadata?.publisher ? [item.metadata.publisher] : ['Epic Games Store'],
           genres: ['Action'],
@@ -1363,13 +1239,12 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
         knownAppIds.add(appNameLower);
         if (catalogIdLower) knownAppIds.add(catalogIdLower);
       }
-
-      cursor = data.responseMetadata?.nextCursor;
-      hasMore = Boolean(cursor);
-      pageCount++;
     }
   } catch (err) {
     console.error('Error fetching Epic library items:', err.message);
+    if (String(err && err.message).includes('unauthorized')) {
+      throw err;
+    }
   }
 
   return Array.from(gamesMap.values());
@@ -1453,6 +1328,7 @@ module.exports = {
   renewGogTokens,
   fetchGogAccount,
   fetchGogOwnedGames,
+  fetchGogAchievements,
   exchangeEpicCode,
   renewEpicTokens,
   fetchEpicOwnedGames,

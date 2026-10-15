@@ -6,6 +6,7 @@ import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
 import { KNOWN_CRITIC_SCORES } from './knownCriticScores';
 import { isTitleCompatible } from './metacriticResolver';
+import { requestScheduler, Priority } from '../network/requestScheduler';
 
 const GOG_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -153,34 +154,43 @@ export class StorefrontReviewHarvester {
           }
         }
 
-        // Direct fetch from Steam API if cached metadata lacked metacritic
-        const baseUrl = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
-          ? '/api/steam-store'
-          : 'https://store.steampowered.com';
-        const res = await axios.get(`${baseUrl}/api/appdetails?appids=${steamAppId}&l=english`, {
-          timeout: 6000,
-          headers: {
-            Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
-          },
-        });
-        const appData = res.data?.[steamAppId]?.data;
-        if (appData?.metacritic) {
-          const score = typeof appData.metacritic.score === 'number' ? appData.metacritic.score : undefined;
-          const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
-          const slug = extractMetacriticSlugFromUrl(url);
+        // Only fire fallback direct fetch if liveMeta was null (e.g. mocked/bypassed steamApi in tests)
+        if (!liveMeta) {
+          const baseUrl = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
+            ? '/api/steam-store'
+            : 'https://store.steampowered.com';
+          const appDetailsUrl = `${baseUrl}/api/appdetails?appids=${steamAppId}&l=english`;
+          const res = await requestScheduler.schedule(
+            appDetailsUrl,
+            () =>
+              axios.get(appDetailsUrl, {
+                timeout: 6000,
+                headers: {
+                  Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+                },
+              }),
+            Priority.P1_VIEWPORT,
+            'store.steampowered.com'
+          );
+          const appData = res.data?.[steamAppId]?.data;
+          if (appData?.metacritic) {
+            const score = typeof appData.metacritic.score === 'number' ? appData.metacritic.score : undefined;
+            const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
+            const slug = extractMetacriticSlugFromUrl(url);
 
-          if ((score !== undefined || url) && (!slug || !appData.name || isTitleCompatible(appData.name, slug.replace(/-/g, ' ')))) {
-            const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-            const anchor: StorefrontReviewAnchor = {
-              storefront: 'steam',
-              metacriticUrl: canonicalMcUrl,
-              metacriticScore: score,
-              metacriticSlug: slug,
-              rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-              isVerifiedGroundTruth: true,
-            };
-            this.anchorCache.set(cacheKey, anchor);
-            return anchor;
+            if ((score !== undefined || url) && (!slug || !appData.name || isTitleCompatible(appData.name, slug.replace(/-/g, ' ')))) {
+              const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
+              const anchor: StorefrontReviewAnchor = {
+                storefront: 'steam',
+                metacriticUrl: canonicalMcUrl,
+                metacriticScore: score,
+                metacriticSlug: slug,
+                rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
+                isVerifiedGroundTruth: true,
+              };
+              this.anchorCache.set(cacheKey, anchor);
+              return anchor;
+            }
           }
         }
       } catch {
@@ -278,10 +288,17 @@ export class StorefrontReviewHarvester {
         slug = rawTarget.toLowerCase();
       } else if (rawTarget && /^\d+$/.test(rawTarget)) {
         try {
-          const apiRes = await axios.get(`${getGogApiBaseUrl()}/products/${rawTarget}`, {
-            headers: { 'User-Agent': GOG_USER_AGENT },
-            timeout: 6000,
-          });
+          const prodApiUrl = `${getGogApiBaseUrl()}/products/${rawTarget}`;
+          const apiRes = await requestScheduler.schedule(
+            prodApiUrl,
+            () =>
+              axios.get(prodApiUrl, {
+                headers: { 'User-Agent': GOG_USER_AGENT },
+                timeout: 6000,
+              }),
+            Priority.P1_VIEWPORT,
+            'api.gog.com'
+          );
           if (apiRes.data?.slug) {
             slug = apiRes.data.slug;
           }
@@ -302,12 +319,16 @@ export class StorefrontReviewHarvester {
         .replace(/\s+/g, ' ')
         .trim();
       try {
-        const catalogRes = await axios.get(
-          `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(cleanTitle)}&limit=1`,
-          {
-            headers: { 'User-Agent': GOG_USER_AGENT },
-            timeout: 6000,
-          }
+        const catalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(cleanTitle)}&limit=1`;
+        const catalogRes = await requestScheduler.schedule(
+          catalogUrl,
+          () =>
+            axios.get(catalogUrl, {
+              headers: { 'User-Agent': GOG_USER_AGENT },
+              timeout: 6000,
+            }),
+          Priority.P1_VIEWPORT,
+          'catalog.gog.com'
         );
         if (Array.isArray(catalogRes.data?.products) && catalogRes.data.products.length > 0) {
           const prod = catalogRes.data.products[0];
@@ -325,10 +346,16 @@ export class StorefrontReviewHarvester {
     if (slug) {
       try {
         const productUrl = `${getGogWebBaseUrl()}/en/game/${slug}`;
-        const pageRes = await axios.get(productUrl, {
-          headers: { 'User-Agent': GOG_USER_AGENT },
-          timeout: 7000,
-        });
+        const pageRes = await requestScheduler.schedule(
+          productUrl,
+          () =>
+            axios.get(productUrl, {
+              headers: { 'User-Agent': GOG_USER_AGENT },
+              timeout: 7000,
+            }),
+          Priority.P1_VIEWPORT,
+          'www.gog.com'
+        );
         const html = typeof pageRes.data === 'string' ? pageRes.data : '';
 
         // Extract OpenCritic Top Critic Average
@@ -462,16 +489,23 @@ export class StorefrontReviewHarvester {
 
     for (const sku of candidateSkus) {
       try {
-        const res = await axios.post(
-          getEpicGraphQLBaseUrl(),
-          { query: graphqlQuery, variables: { sku } },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              'User-Agent': EPIC_LAUNCHER_USER_AGENT,
-            },
-            timeout: 6000,
-          }
+        const gqlUrl = getEpicGraphQLBaseUrl();
+        const res = await requestScheduler.schedule(
+          gqlUrl,
+          () =>
+            axios.post(
+              gqlUrl,
+              { query: graphqlQuery, variables: { sku } },
+              {
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': EPIC_LAUNCHER_USER_AGENT,
+                },
+                timeout: 6000,
+              }
+            ),
+          Priority.P1_VIEWPORT,
+          'launcher.store.epicgames.com'
         );
 
         const rev = res.data?.data?.OpenCritic?.productReviews;
@@ -506,10 +540,16 @@ export class StorefrontReviewHarvester {
       const primarySlug = candidateSkus[0].replace(/^EPIC_/i, '');
       try {
         const contentUrl = `${getEpicContentBaseUrl()}/api/en-US/content/products/${primarySlug}`;
-        const contentRes = await axios.get(contentUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          timeout: 6000,
-        });
+        const contentRes = await requestScheduler.schedule(
+          contentUrl,
+          () =>
+            axios.get(contentUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+              timeout: 6000,
+            }),
+          Priority.P1_VIEWPORT,
+          'store-content.ak.epicgames.com'
+        );
         const contentStr = JSON.stringify(contentRes.data || '');
         const mcMatch = contentStr.match(/https:\/\/(?:www\.)?metacritic\.com\/game\/[a-z0-9\/\-_]+/i);
         if (mcMatch) {
@@ -642,8 +682,8 @@ export class StorefrontReviewHarvester {
         }
       }
 
-      // 4. Fallback search by title across GOG and Epic if available
-      if (game.title) {
+      // 4. Fallback search by title across GOG and Epic if available (only when not already a Steam game with a known Steam App ID)
+      if (game.title && !effectiveSteamAppId) {
         if (!gogId) {
           const gogTitleAnchor = await this.getGogAnchor('', game.title);
           if (gogTitleAnchor) {

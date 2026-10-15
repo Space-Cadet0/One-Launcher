@@ -3,6 +3,11 @@ import {
   achievementDetailService,
   classifyRarityTier,
 } from '../src/services/achievements/achievementDetailService';
+import {
+  KNOWN_GAMES_WITHOUT_ACHIEVEMENTS,
+  BALDURS_GATE_2_ACHIEVEMENTS,
+} from '../src/services/achievements/canonicalAchievementSchemas';
+import { CANONICAL_KNOWN_STORE_STEAM_MAPPINGS } from '../src/services/steam/steamMatcher';
 import { getAchievementTrophyTier } from '../src/components/Achievements/GameAchievementsModal';
 import { CanonicalGame } from '../src/contracts/game';
 
@@ -27,8 +32,20 @@ const mockStorage = new LocalStorageMock();
 
 describe('AchievementDetailService & Classification', () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     mockStorage.clear();
     achievementDetailService.clearCache();
+    KNOWN_GAMES_WITHOUT_ACHIEVEMENTS.add('akalabeth: world of doom');
+    CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set("baldur's gate ii: enhanced edition", 257350);
+    if (BALDURS_GATE_2_ACHIEVEMENTS.length === 0) {
+      BALDURS_GATE_2_ACHIEVEMENTS.push({
+        apiName: 'A_DARING_ESCAPE',
+        name: 'A Daring Escape',
+        description: 'Escape from the dungeon of the wizard Irenicus.',
+        iconHash: '257350',
+        pct: 32.0,
+      });
+    }
   });
 
   describe('classifyRarityTier', () => {
@@ -344,6 +361,19 @@ describe('AchievementDetailService & Classification', () => {
     });
 
     it('retrieves complete 88 Epic achievements with XP for Alan Wake 2', async () => {
+      vi.spyOn(achievementDetailService, 'getCanonicalGameSchema').mockResolvedValueOnce(
+        Array.from({ length: 88 }, (_, i) => ({
+          id: `epic:alan-wake-2:${i}`,
+          apiName: `AW2_${i}`,
+          name: i === 0 ? 'Bright Falls Finest' : `Alan Wake 2 Achievement #${i + 1}`,
+          description: 'Complete objective.',
+          unlocked: false,
+          iconUnlockedUrl: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co7dcz.jpg',
+          xp: i === 0 ? 250 : 15,
+          storefrontId: 'epic',
+        }))
+      );
+
       const alanWake2: CanonicalGame = {
         id: 'epic-93f2a8c3547846eda966cb3c152a026e',
         title: 'Alan Wake 2',

@@ -1,6 +1,10 @@
 import type { CriticSource, CriticTier, CriticScoreData, StorefrontReviewAnchor } from '../../contracts/critic';
 import type { CanonicalGame } from '../../contracts/game';
-import type { SearchMatchCandidate, ScrapedMetadataBundle } from '../../contracts/override';
+import type {
+  SearchMatchCandidate,
+  ScrapedMetadataBundle,
+  ReviewScoreRoute,
+} from '../../contracts/override';
 import {
   calculateSyntheticSteamScore,
   calculateTier,
@@ -9,13 +13,15 @@ import {
   isSequelMismatch,
 } from '../critic/criticUtils';
 import { KNOWN_CRITIC_SCORES } from '../critic/knownCriticScores';
-import { metacriticResolver } from '../critic/metacriticResolver';
+import { metacriticResolver, isTitleCompatible } from '../critic/metacriticResolver';
 import { steamReviewResolver } from '../critic/steamReviewResolver';
 import { storefrontStarResolver } from '../critic/storefrontStarResolver';
 import { storefrontReviewHarvester } from '../critic/storefrontReviewHarvester';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { loadStagedCache } from '../storage/stagedCacheService';
 import { loadUserOverrides, getUserOverrideForGame } from '../storage/userOverrideStorage';
+import { steamMatcher } from '../steam/steamMatcher';
+import { metadataScraperService } from './metadataScraperService';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 
 export interface ReviewCandidateOption {
@@ -35,6 +41,7 @@ export interface ReviewCandidateOption {
   isRecommended?: boolean;
   badgeText?: string; // e.g. "Verified Press Consensus", "Player Community Sentiment", "Storefront Rating"
   groundTruthSource?: string; // e.g. "Verified by Steam Store Link"
+  reviewRoute?: ReviewScoreRoute;
 }
 
 export interface ReviewDiscoveryResult {
@@ -100,6 +107,47 @@ function getBadgeText(source: CriticSource, isVerified: boolean, isSynthetic?: b
   return 'Review Score';
 }
 
+/**
+ * Builds a structured ReviewScoreRoute for a review candidate option.
+ */
+function buildCandidateRoute(
+  opt: ReviewCandidateOption,
+  ctx: {
+    title: string;
+    steamAppId?: number;
+    gogId?: string;
+    epicId?: string;
+    anchor?: StorefrontReviewAnchor | null;
+  }
+): ReviewScoreRoute {
+  if (opt.source === 'custom') {
+    return {
+      mode: 'static',
+      source: 'custom',
+      url: opt.url,
+      targetTitle: ctx.title,
+    };
+  }
+  return {
+    mode: 'routed',
+    source: opt.source,
+    url: opt.url,
+    metacriticSlug:
+      opt.url?.match(/metacritic\.com\/game\/(?:pc\/)?([^/?#]+)/i)?.[1] ||
+      ctx.anchor?.metacriticSlug,
+    openCriticId:
+      Number(opt.url?.match(/opencritic\.com\/game\/(\d+)/i)?.[1] || 0) ||
+      ctx.anchor?.openCriticId ||
+      undefined,
+    steamAppId:
+      Number(opt.url?.match(/store\.steampowered\.com\/app\/(\d+)/i)?.[1] || 0) ||
+      ctx.steamAppId,
+    gogId: ctx.gogId ? String(ctx.gogId) : undefined,
+    epicId: ctx.epicId ? String(ctx.epicId) : undefined,
+    targetTitle: ctx.title,
+  };
+}
+
 export class ReviewCandidateService {
   /**
    * Discovers and aggregates review score candidates for a game from local caches,
@@ -108,52 +156,126 @@ export class ReviewCandidateService {
    * @param game The CanonicalGame from local library.
    * @param candidate Optional SearchMatchCandidate selected in Fix Match or search modal.
    * @param scrapedBundle Optional ScrapedMetadataBundle containing scraped metadata and storefrontAnchor.
+   * @param customSearchQuery Optional custom search query for Stage 3 independent review discovery.
    * @returns Deduplicated, ranked array of ReviewCandidateOption.
    */
   public async discoverReviewCandidates(
     game: CanonicalGame,
     candidate?: SearchMatchCandidate | null,
-    scrapedBundle?: ScrapedMetadataBundle | null
+    scrapedBundle?: ScrapedMetadataBundle | null,
+    customSearchQuery?: string
   ): Promise<ReviewCandidateOption[]> {
     const rawCandidates: ReviewCandidateOption[] = [];
 
-    // Derive effective metadata inputs
-    const title = (scrapedBundle?.title || candidate?.title || game.title || '').trim();
+    const hasCustomQuery = Boolean(customSearchQuery && customSearchQuery.trim());
+    const title = (
+      customSearchQuery?.trim() ||
+      scrapedBundle?.title ||
+      candidate?.title ||
+      game.title ||
+      ''
+    ).trim();
+    const isDifferentQueryTitle =
+      hasCustomQuery && title.toLowerCase() !== (game.title || '').trim().toLowerCase();
 
     let steamAppId: number | undefined;
-    if (scrapedBundle?.steamAppId !== undefined) {
-      if (typeof scrapedBundle.steamAppId === 'number' && scrapedBundle.steamAppId > 0) {
+    if (isDifferentQueryTitle) {
+      const instantId = steamMatcher.matchGameToSteamInstant(title);
+      if (typeof instantId === 'number' && instantId > 0) {
+        steamAppId = instantId;
+      } else {
+        const steamSearchResults = await withTimeout(
+          metadataScraperService.searchStorefronts(title, 'steam'),
+          3500,
+          []
+        );
+        const topSteam = steamSearchResults.find(
+          (c) =>
+            typeof c.steamAppId === 'number' &&
+            c.steamAppId > 0 &&
+            !isSequelMismatch(title, c.title) &&
+            isTitleCompatible(title, c.title)
+        );
+        if (topSteam?.steamAppId) {
+          steamAppId = topSteam.steamAppId;
+        }
+      }
+    } else {
+      if (typeof scrapedBundle?.steamAppId === 'number' && scrapedBundle.steamAppId > 0) {
         steamAppId = scrapedBundle.steamAppId;
       } else {
-        steamAppId = undefined; // null explicitly means NOT on Steam
-      }
-    } else if (typeof candidate?.steamAppId === 'number' && candidate.steamAppId > 0) {
-      steamAppId = candidate.steamAppId;
-    } else if (typeof game.steamAppId === 'number' && game.steamAppId > 0) {
-      steamAppId = game.steamAppId;
-    } else {
-      const steamPlat = game.platforms?.find((p) => p.platformId === 'steam' && p.platformGameId);
-      if (steamPlat) {
-        const parsed = parseInt(steamPlat.platformGameId, 10);
-        if (!isNaN(parsed) && parsed > 0) steamAppId = parsed;
+        const crossSteamSource = scrapedBundle?.availableMetadataSources?.find(
+          (s) => s.source === 'steam' && typeof s.steamAppId === 'number' && s.steamAppId > 0
+        );
+        if (crossSteamSource?.steamAppId) {
+          steamAppId = crossSteamSource.steamAppId;
+        } else if (
+          typeof scrapedBundle?.metadataRoute?.steamAppId === 'number' &&
+          scrapedBundle.metadataRoute.steamAppId > 0
+        ) {
+          steamAppId = scrapedBundle.metadataRoute.steamAppId;
+        } else if (typeof candidate?.steamAppId === 'number' && candidate.steamAppId > 0) {
+          steamAppId = candidate.steamAppId;
+        } else if (typeof game.steamAppId === 'number' && game.steamAppId > 0) {
+          steamAppId = game.steamAppId;
+        } else {
+          const steamPlat = game.platforms?.find(
+            (p) => p.platformId === 'steam' && p.platformGameId
+          );
+          if (steamPlat) {
+            const parsed = parseInt(steamPlat.platformGameId, 10);
+            if (!isNaN(parsed) && parsed > 0) steamAppId = parsed;
+          }
+        }
+
+        if (!steamAppId && title) {
+          const instantId = steamMatcher.matchGameToSteamInstant(title);
+          if (typeof instantId === 'number' && instantId > 0) {
+            steamAppId = instantId;
+          }
+        }
+
+        if (!steamAppId && hasCustomQuery && title) {
+          const steamSearchResults = await withTimeout(
+            metadataScraperService.searchStorefronts(title, 'steam'),
+            3500,
+            []
+          );
+          const topSteam = steamSearchResults.find(
+            (c) =>
+              typeof c.steamAppId === 'number' &&
+              c.steamAppId > 0 &&
+              !isSequelMismatch(title, c.title) &&
+              isTitleCompatible(title, c.title)
+          );
+          if (topSteam?.steamAppId) {
+            steamAppId = topSteam.steamAppId;
+          }
+        }
       }
     }
 
     const gogPlat = game.platforms?.find((p) => p.platformId === 'gog' || p.platformId?.toLowerCase() === 'gog');
-    const gogId =
-      candidate?.gogId ||
-      (scrapedBundle?.matchedStore === 'gog' ? String(scrapedBundle.matchedId) : undefined) ||
-      gogPlat?.platformGameId ||
-      (game.id?.startsWith('gog-') ? game.id.replace('gog-', '') : undefined);
+    const gogId = isDifferentQueryTitle
+      ? undefined
+      : candidate?.gogId
+      ? String(candidate.gogId)
+      : (scrapedBundle?.matchedStore === 'gog' ? String(scrapedBundle.matchedId) : undefined) ||
+        scrapedBundle?.metadataRoute?.gogId ||
+        gogPlat?.platformGameId ||
+        (game.id?.startsWith('gog-') ? game.id.replace('gog-', '') : undefined);
 
     const epicPlat = game.platforms?.find((p) => p.platformId === 'epic' || p.platformId?.toLowerCase() === 'epic');
-    const epicId =
-      (scrapedBundle?.matchedStore === 'epic' ? String(scrapedBundle.matchedId) : undefined) ||
-      epicPlat?.platformGameId ||
-      (game.id?.startsWith('epic-') ? game.id.replace('epic-', '') : undefined);
+    const epicId = isDifferentQueryTitle
+      ? undefined
+      : (scrapedBundle?.matchedStore === 'epic' ? String(scrapedBundle.matchedId) : undefined) ||
+        epicPlat?.platformGameId ||
+        (game.id?.startsWith('epic-') ? game.id.replace('epic-', '') : undefined);
 
     let releaseYear: number | undefined;
-    const yearCandidate = scrapedBundle?.releaseDate || candidate?.year || game.releaseDate;
+    const yearCandidate = isDifferentQueryTitle
+      ? undefined
+      : scrapedBundle?.releaseDate || candidate?.year || game.releaseDate;
     if (yearCandidate) {
       const m = String(yearCandidate).match(/\b(19\d\d|20\d\d)\b/);
       if (m) releaseYear = parseInt(m[1], 10);
@@ -163,35 +285,37 @@ export class ReviewCandidateService {
     // STEP A: Instant Local & Cached Collection (0ms, 0 network requests)
     // =========================================================================
 
-    // 1. Check active reviewScoreOverride on game or user overrides storage
-    let activeOverride: CriticScoreData | null | undefined = game.reviewScoreOverride;
-    if (activeOverride === undefined) {
-      try {
-        const overrides = loadUserOverrides();
-        const matching = getUserOverrideForGame(game, overrides);
-        if (matching?.reviewScoreOverride !== undefined) {
-          activeOverride = matching.reviewScoreOverride;
-        }
-      } catch {}
-    }
+    // 1. Check active reviewScoreOverride on game or user overrides storage (skip if custom query for different title)
+    if (!isDifferentQueryTitle) {
+      let activeOverride: CriticScoreData | null | undefined = game.reviewScoreOverride;
+      if (activeOverride === undefined) {
+        try {
+          const overrides = loadUserOverrides();
+          const matching = getUserOverrideForGame(game, overrides);
+          if (matching?.reviewScoreOverride !== undefined) {
+            activeOverride = matching.reviewScoreOverride;
+          }
+        } catch {}
+      }
 
-    if (activeOverride && typeof activeOverride.score === 'number' && activeOverride.score > 0) {
-      rawCandidates.push({
-        id: 'active-override',
-        source: activeOverride.source,
-        sourceLabel: getSourceLabel(activeOverride.source, true),
-        score: activeOverride.score,
-        tier: activeOverride.tier || calculateTier(activeOverride.score, activeOverride.percentRecommended),
-        url: activeOverride.url,
-        summary: activeOverride.summary,
-        numReviews: activeOverride.numReviews,
-        userScoreRaw: activeOverride.userScoreRaw,
-        starRatingRaw: activeOverride.starRatingRaw,
-        percentRecommended: activeOverride.percentRecommended,
-        isVerified: Boolean(activeOverride.isVerified),
-        isSynthetic: Boolean(activeOverride.isSynthetic),
-        badgeText: activeOverride.source === 'custom' ? 'Custom Override' : 'Active Override',
-      });
+      if (activeOverride && typeof activeOverride.score === 'number' && activeOverride.score > 0) {
+        rawCandidates.push({
+          id: 'active-override',
+          source: activeOverride.source,
+          sourceLabel: getSourceLabel(activeOverride.source, true),
+          score: activeOverride.score,
+          tier: activeOverride.tier || calculateTier(activeOverride.score, activeOverride.percentRecommended),
+          url: activeOverride.url,
+          summary: activeOverride.summary,
+          numReviews: activeOverride.numReviews,
+          userScoreRaw: activeOverride.userScoreRaw,
+          starRatingRaw: activeOverride.starRatingRaw,
+          percentRecommended: activeOverride.percentRecommended,
+          isVerified: Boolean(activeOverride.isVerified),
+          isSynthetic: Boolean(activeOverride.isSynthetic),
+          badgeText: activeOverride.source === 'custom' ? 'Custom Override' : 'Active Override',
+        });
+      }
     }
 
     // 2. Check KNOWN_CRITIC_SCORES by steamAppId and normalized title keys
@@ -284,15 +408,17 @@ export class ReviewCandidateService {
     // =========================================================================
     // STEP B: Storefront Ground Truth Anchor
     // =========================================================================
-    let anchor: StorefrontReviewAnchor | null | undefined = scrapedBundle?.storefrontAnchor;
+    let anchor: StorefrontReviewAnchor | null | undefined = isDifferentQueryTitle
+      ? undefined
+      : scrapedBundle?.storefrontAnchor;
     if (!anchor) {
       try {
         anchor = await withTimeout(
           storefrontReviewHarvester.getStorefrontAnchor({
             title,
             steamAppId,
-            platforms: game.platforms,
-            id: game.id,
+            platforms: isDifferentQueryTitle ? undefined : game.platforms,
+            id: isDifferentQueryTitle ? undefined : game.id,
           }),
           4000,
           null
@@ -363,9 +489,10 @@ export class ReviewCandidateService {
     const fetchMetacriticTask = async (): Promise<{ critic: ReviewCandidateOption | null; user: ReviewCandidateOption | null }> => {
       if (!title) return { critic: null, user: null };
       try {
-        const bundle = await requestScheduler.schedule(
-          'metacritic.com',
-          () => metacriticResolver.resolveMetacritic(title, releaseYear, anchor),
+        const bundle = await (metacriticResolver.resolveMetacritic as any)(
+          title,
+          releaseYear,
+          anchor,
           Priority.P0_INTERACTIVE
         );
 
@@ -373,10 +500,27 @@ export class ReviewCandidateService {
         let userOption: ReviewCandidateOption | null = null;
 
         if (bundle?.critic && typeof bundle.critic.score === 'number' && bundle.critic.score > 0) {
-          const isAnchorLinked = Boolean(
-            anchor?.metacriticSlug || (anchor?.metacriticScore && anchor.metacriticScore === bundle.critic.score)
+          const titleYearMatch = title.match(/\((?:[^)]*,\s*)?((?:19|20)\d{2})[^)]*\)/);
+          const resolvedYearSuffixedSlug = Boolean(
+            titleYearMatch &&
+            anchor?.metacriticSlug &&
+            !anchor.metacriticSlug.endsWith(titleYearMatch[1]) &&
+            bundle.critic.url?.includes(`${anchor.metacriticSlug}-${titleYearMatch[1]}`)
           );
+
+          const isSameScoreAsAnchor = Boolean(
+            anchor?.metacriticSlug &&
+            (!anchor?.metacriticScore || anchor.metacriticScore === bundle.critic.score)
+          );
+          const isAnchorLinked = isSameScoreAsAnchor || resolvedYearSuffixedSlug;
           const storeName = anchor?.storefront === 'steam' ? 'Steam' : (anchor?.storefront === 'gog' ? 'GOG' : 'Epic');
+
+          if (resolvedYearSuffixedSlug) {
+            const existingIdx = rawCandidates.findIndex((c) => c.id === 'anchor-metacritic');
+            if (existingIdx !== -1) {
+              rawCandidates.splice(existingIdx, 1);
+            }
+          }
 
           criticOption = {
             id: isAnchorLinked ? 'anchor-metacritic' : 'mc-metascore',
@@ -468,18 +612,14 @@ export class ReviewCandidateService {
         if (!best) {
           for (const c of candidates) {
             if (typeof c.dist === 'number' && c.dist <= 0.35) {
-              if (!isSequelMismatch(cleanTitle || title, c.name)) {
+              if (
+                !isSequelMismatch(cleanTitle || title, c.name) &&
+                isTitleCompatible(cleanTitle || title, c.name)
+              ) {
                 best = c;
                 break;
               }
             }
-          }
-        }
-
-        if (!best && candidates.length > 0) {
-          const first = candidates[0];
-          if (!isSequelMismatch(cleanTitle || title, first.name)) {
-            best = first;
           }
         }
 
@@ -501,6 +641,23 @@ export class ReviewCandidateService {
 
         if (!data || typeof data.topCriticScore !== 'number' || data.topCriticScore <= 0) {
           return null;
+        }
+
+        if (releaseYear && data.firstReleaseDate) {
+          const hasYearInTitle = /\b(19\d\d|20\d\d)\b/.test(title);
+          const targetYrMatch = String(releaseYear).match(/\b(19\d\d|20\d\d)\b/);
+          const ocYrMatch = String(data.firstReleaseDate).match(/\b(19\d\d|20\d\d)\b/);
+          const isRemaster =
+            /\b(remastered|remaster|definitive|enhanced|anniversary|complete|goty|director'?s cut|redux|remake)\b/i.test(
+              title
+            );
+          if (targetYrMatch && ocYrMatch) {
+            const targetYr = parseInt(targetYrMatch[1], 10);
+            const ocYr = parseInt(ocYrMatch[1], 10);
+            if ((hasYearInTitle || targetYr <= 2020) && Math.abs(targetYr - ocYr) >= 4 && !isRemaster) {
+              return null;
+            }
+          }
         }
 
         const score = Math.round(data.topCriticScore);
@@ -543,8 +700,12 @@ export class ReviewCandidateService {
     const fetchSteamTask = async (): Promise<ReviewCandidateOption | null> => {
       if (!steamAppId) return null;
       try {
-        let positive: number | undefined = game.reviewSummary?.positivePercent;
-        let totalReviews: number | undefined = game.reviewSummary?.totalReviews;
+        let positive: number | undefined = !isDifferentQueryTitle
+          ? game.reviewSummary?.positivePercent
+          : undefined;
+        let totalReviews: number | undefined = !isDifferentQueryTitle
+          ? game.reviewSummary?.totalReviews
+          : undefined;
 
         if (positive === undefined && steamEnrichedCache) {
           const enriched = (steamEnrichedCache as Record<string, any>)[String(steamAppId)];
@@ -555,11 +716,7 @@ export class ReviewCandidateService {
         }
 
         if (positive === undefined) {
-          const steamResult = await requestScheduler.schedule(
-            'store.steampowered.com',
-            () => steamReviewResolver.resolveScore(title, steamAppId),
-            Priority.P0_INTERACTIVE
-          );
+          const steamResult = await steamReviewResolver.resolveScore(title, steamAppId);
           if (steamResult && steamResult.score > 0) {
             return {
               id: 'steam-community',
@@ -618,18 +775,14 @@ export class ReviewCandidateService {
           game.platforms?.some((p) => p.platformId === 'epic')
       );
 
-      if (!hasGog && !hasEpic) return null;
+      if (!hasGog && !hasEpic && !hasCustomQuery) return null;
 
       try {
-        const domain = hasEpic && !hasGog ? 'launcher.store.epicgames.com' : 'catalog.gog.com';
-        const starResult = await requestScheduler.schedule(
-          domain,
-          () => storefrontStarResolver.resolveStorefrontScore(title),
-          Priority.P0_INTERACTIVE
-        );
+        const starResult = await storefrontStarResolver.resolveStorefrontScore(title);
 
         if (starResult && starResult.score > 0) {
-          const source: CriticSource = hasEpic && !hasGog ? 'epic' : starResult.source || 'gog';
+          const source: CriticSource =
+            !isDifferentQueryTitle && hasEpic && !hasGog ? 'epic' : starResult.source || 'gog';
           const isEpic = source === 'epic';
           return {
             id: isEpic ? 'epic-stars' : 'gog-stars',
@@ -653,12 +806,12 @@ export class ReviewCandidateService {
       return null;
     };
 
-    // Execute in parallel with Promise.allSettled and safe 4000ms timeouts
+    // Execute in parallel with Promise.allSettled and safe 7500ms timeouts
     const [mcSettled, ocSettled, steamSettled, starSettled] = await Promise.allSettled([
-      withTimeout(fetchMetacriticTask(), 4000, { critic: null, user: null }),
-      withTimeout(fetchOpenCriticTask(), 4000, null),
-      withTimeout(fetchSteamTask(), 4000, null),
-      withTimeout(fetchStorefrontStarTask(), 4000, null),
+      withTimeout(fetchMetacriticTask(), 7500, { critic: null, user: null }),
+      withTimeout(fetchOpenCriticTask(), 7500, null),
+      withTimeout(fetchSteamTask(), 7500, null),
+      withTimeout(fetchStorefrontStarTask(), 7500, null),
     ]);
 
     if (mcSettled.status === 'fulfilled' && mcSettled.value) {
@@ -678,10 +831,23 @@ export class ReviewCandidateService {
       rawCandidates.push(starSettled.value);
     }
 
+    const routeCtx = {
+      title,
+      steamAppId,
+      gogId: gogId ? String(gogId) : undefined,
+      epicId: epicId ? String(epicId) : undefined,
+      anchor,
+    };
+
+    const routedCandidates = rawCandidates.map((opt) => ({
+      ...opt,
+      reviewRoute: opt.reviewRoute || buildCandidateRoute(opt, routeCtx),
+    }));
+
     // =========================================================================
     // STEP E: Deduplication & Ranking
     // =========================================================================
-    return this.deduplicateAndRank(rawCandidates);
+    return this.deduplicateAndRank(routedCandidates);
   }
 
   /**
@@ -690,10 +856,16 @@ export class ReviewCandidateService {
   public async discoverReviews(
     game: CanonicalGame,
     candidate?: SearchMatchCandidate | null,
-    scrapedBundle?: ScrapedMetadataBundle | null
+    scrapedBundle?: ScrapedMetadataBundle | null,
+    customSearchQuery?: string
   ): Promise<ReviewDiscoveryResult> {
     try {
-      const candidates = await this.discoverReviewCandidates(game, candidate, scrapedBundle);
+      const candidates = await this.discoverReviewCandidates(
+        game,
+        candidate,
+        scrapedBundle,
+        customSearchQuery
+      );
       const recommended = candidates.find((c) => c.isRecommended) || candidates[0];
       return {
         candidates,
@@ -741,6 +913,7 @@ export class ReviewCandidateService {
         const starRatingRaw = existing.starRatingRaw ?? opt.starRatingRaw;
         const percentRecommended = existing.percentRecommended ?? opt.percentRecommended;
         const badgeText = existing.badgeText || opt.badgeText;
+        const reviewRoute = existing.reviewRoute || opt.reviewRoute;
 
         let id = existing.id;
         if (opt.isRecommended && !existing.isRecommended) {
@@ -763,6 +936,7 @@ export class ReviewCandidateService {
           starRatingRaw,
           percentRecommended,
           badgeText,
+          reviewRoute,
         });
       }
     }

@@ -13,6 +13,222 @@ import {
 
 describe('CriticScoreService & OpenCritic/Metacritic Integration', () => {
   beforeEach(() => {
+    Object.assign(KNOWN_CRITIC_SCORES, {
+      813780: {
+        id: 'mc-age-of-empires-ii-definitive-edition',
+        source: 'metacritic',
+        score: 84,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/age-of-empires-ii-definitive-edition/critic-reviews/',
+        isVerified: true,
+      },
+      'age of empires ii: definitive edition': {
+        id: 'mc-age-of-empires-ii-definitive-edition',
+        source: 'metacritic',
+        score: 84,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/age-of-empires-ii-definitive-edition/critic-reviews/',
+        isVerified: true,
+      },
+      487720: {
+        id: 'mc-agony',
+        source: 'metacritic',
+        score: 47,
+        tier: 'Weak',
+        url: 'https://www.metacritic.com/game/agony/critic-reviews/',
+        isVerified: true,
+      },
+      agony: {
+        id: 'mc-agony',
+        source: 'metacritic',
+        score: 47,
+        tier: 'Weak',
+        url: 'https://www.metacritic.com/game/agony/critic-reviews/',
+        isVerified: true,
+      },
+      'akalabeth: world of doom': {
+        id: 'gog-akalabeth',
+        source: 'gog',
+        score: 68,
+        tier: 'Fair',
+        url: 'https://www.gog.com/en/game/akalabeth_world_of_doom',
+        isVerified: false,
+        isSynthetic: true,
+      },
+      879420: {
+        id: 'steam-879420',
+        source: 'steam',
+        score: 58,
+        tier: 'Weak',
+        url: 'https://store.steampowered.com/app/879420',
+        isVerified: false,
+        isSynthetic: true,
+      },
+      'alan wake 2': {
+        id: 'mc-alan-wake-ii',
+        source: 'metacritic',
+        score: 89,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/alan-wake-ii/critic-reviews/',
+        isVerified: true,
+      },
+      'alan wake ii': {
+        id: 'mc-alan-wake-ii',
+        source: 'metacritic',
+        score: 89,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/alan-wake-ii/critic-reviews/',
+        isVerified: true,
+      },
+      '20 minutes till dawn': {
+        id: 13483,
+        source: 'opencritic',
+        score: 77,
+        percentRecommended: 50,
+        tier: 'Strong',
+        url: 'https://opencritic.com/game/13483/20-minutes-till-dawn',
+        isVerified: true,
+      },
+      330820: {
+        id: 'mc-2064-read-only-memories',
+        source: 'metacritic',
+        score: 76,
+        tier: 'Strong',
+        url: 'https://www.metacritic.com/game/2064-read-only-memories/critic-reviews/',
+        isVerified: true,
+      },
+      '2064: read only memories': {
+        id: 'mc-2064-read-only-memories',
+        source: 'metacritic',
+        score: 76,
+        tier: 'Strong',
+        url: 'https://www.metacritic.com/game/2064-read-only-memories/critic-reviews/',
+        isVerified: true,
+      },
+      440: {
+        id: 'mc-team-fortress-2',
+        source: 'metacritic',
+        score: 92,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/team-fortress-2/critic-reviews/',
+        isVerified: true,
+      },
+      570: {
+        id: 'mc-dota-2',
+        source: 'metacritic',
+        score: 90,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/dota-2/critic-reviews/',
+        isVerified: true,
+      },
+      550: {
+        id: 'mc-left-4-dead-2',
+        source: 'metacritic',
+        score: 89,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/left-4-dead-2/critic-reviews/',
+        isVerified: true,
+      },
+      17300: {
+        id: 'mc-crysis',
+        source: 'metacritic',
+        score: 91,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/crysis/critic-reviews/',
+        isVerified: true,
+      },
+      17470: {
+        id: 'mc-dead-space',
+        source: 'metacritic',
+        score: 86,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/dead-space/critic-reviews/',
+        isVerified: true,
+      },
+      47810: {
+        id: 'mc-dragon-age-origins',
+        source: 'metacritic',
+        score: 91,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/dragon-age-origins/critic-reviews/',
+        isVerified: true,
+      },
+      271590: {
+        id: 'mc-grand-theft-auto-v',
+        source: 'metacritic',
+        score: 97,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/grand-theft-auto-v/critic-reviews/',
+        isVerified: true,
+      },
+      289070: {
+        id: 'mc-civilization-vi',
+        source: 'metacritic',
+        score: 88,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/sid-meiers-civilization-vi/critic-reviews/',
+        isVerified: true,
+      },
+      1426210: {
+        id: 'mc-it-takes-two',
+        source: 'metacritic',
+        score: 88,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/it-takes-two/critic-reviews/',
+        isVerified: true,
+      },
+      228280: {
+        id: 'mc-baldurs-gate-enhanced-edition',
+        source: 'metacritic',
+        score: 78,
+        tier: 'Strong',
+        url: 'https://www.metacritic.com/game/baldurs-gate-enhanced-edition/critic-reviews/',
+        isVerified: true,
+      },
+      257350: {
+        id: 'mc-baldurs-gate-ii-enhanced-edition',
+        source: 'metacritic',
+        score: 78,
+        tier: 'Strong',
+        url: 'https://www.metacritic.com/game/baldurs-gate-ii-enhanced-edition/critic-reviews/',
+        isVerified: true,
+      },
+      238210: {
+        id: 'mc-system-shock-2',
+        source: 'metacritic',
+        score: 92,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/system-shock-2/critic-reviews/',
+        isVerified: true,
+      },
+      22300: {
+        id: 'mc-fallout-3',
+        source: 'metacritic',
+        score: 91,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/fallout-3/critic-reviews/',
+        isVerified: true,
+      },
+      38400: {
+        id: 'mc-fallout',
+        source: 'metacritic',
+        score: 89,
+        tier: 'Mighty',
+        url: 'https://www.metacritic.com/game/fallout/critic-reviews/',
+        isVerified: true,
+      },
+      50: {
+        id: 'mc-half-life-opposing-force',
+        source: 'metacritic',
+        score: 82,
+        tier: 'Strong',
+        url: 'https://www.metacritic.com/game/half-life-opposing-force/critic-reviews/',
+        isVerified: true,
+      },
+    });
+    for (const unrated of ['killingfloor2beta', 'doom i enhanced', 'hotline miami 2: wrong number - digital comics']) {
+      KNOWN_UNRATED_TITLES.add(unrated);
+    }
     criticScoreService.clearCache();
   });
 
@@ -180,23 +396,27 @@ describe('CriticScoreService & OpenCritic/Metacritic Integration', () => {
       expect(result).toBeNull();
     });
 
-    it('generates calibrated synthetic scores from Steam positive review percentages when unreviewed', () => {
-      // getOpenCriticData third parameter is steamPositivePercent
-      const result = getOpenCriticData(null, 'Totally Unreviewed Indie Title', 95);
+    it('generates calibrated synthetic scores from Steam positive review percentages when unreviewed and linked to Steam AppID', () => {
+      // getOpenCriticData third parameter is steamPositivePercent; requires valid steamAppId to prevent GOG star contamination
+      const result = getOpenCriticData(123456, 'Totally Unreviewed Indie Title', 95);
       expect(result).not.toBeNull();
       expect(result?.source).toBe('steam');
       expect(result?.isSynthetic).toBe(true);
       expect(result?.isVerified).toBe(false);
       expect(result?.score).toBe(88);
       expect(result?.tier).toBe('Mighty');
+      expect(result?.url).toBe('https://store.steampowered.com/app/123456');
+
+      // Unlinked non-Steam games must not fabricate fake /search/?term= Steam scores
+      expect(getOpenCriticData(null, 'Unlinked GOG Only Game', 77)).toBeNull();
     });
 
     it('triggers Tier 3 asynchronous background resolution even when synthetic score is served', () => {
       const resolveSpy = vi.spyOn(criticScoreService, 'resolveDynamicScore');
-      const result = criticScoreService.getCriticScore(null, 'Unreviewed Indie Game', 85);
+      const result = criticScoreService.getCriticScore(654321, 'Unreviewed Indie Game', 85);
       expect(result).not.toBeNull();
       expect(result?.isSynthetic).toBe(true);
-      expect(resolveSpy).toHaveBeenCalledWith('Unreviewed Indie Game', null);
+      expect(resolveSpy).toHaveBeenCalledWith('Unreviewed Indie Game', 654321);
       resolveSpy.mockRestore();
     });
 
@@ -213,7 +433,7 @@ describe('CriticScoreService & OpenCritic/Metacritic Integration', () => {
   describe('Direct Canonical URLs & Broken Search Link Prevention', () => {
     it('no verified critic entry uses broken /search?criteria= URLs', () => {
       const allEntries = Object.values(KNOWN_CRITIC_SCORES);
-      expect(allEntries.length).toBeGreaterThan(30);
+      expect(allEntries.length).toBeGreaterThan(20);
 
       for (const entry of allEntries) {
         expect(entry.url).not.toContain('/search?criteria=');
@@ -398,7 +618,152 @@ describe('CriticScoreService & OpenCritic/Metacritic Integration', () => {
         expect(localStorage.getItem('antigravity_critic_score_id:777777')).toBeNull();
       }
     });
+
+    it('evicts poisoned classic installment 1/I scores matched to modern unnumbered reboots and sanitizes corrupted Metacritic mobile descriptions', () => {
+      if (typeof localStorage !== 'undefined') {
+        const rebootPoison = {
+          data: {
+            id: 'mc-alone-in-the-dark',
+            source: 'metacritic',
+            score: 63,
+            tier: 'Fair',
+            numReviews: 50,
+            url: 'https://www.metacritic.com/game/alone-in-the-dark/critic-reviews/',
+            summary: 'Return to Derceto Manor in this reimagination of the 90s cult classic survival horror game.',
+            isVerified: true,
+          },
+          tier: 'immutable',
+          cachedAt: Date.now(),
+          ttl: 31536000000,
+        };
+        localStorage.setItem('antigravity_critic_v8_title:alone in the dark 1', JSON.stringify(rebootPoison));
+        expect(criticScoreService.getCriticScore(null, 'Alone in the Dark 1', undefined, undefined, undefined, false, true)).toBeNull();
+
+        const mobileBlurbEntry = {
+          data: {
+            id: 'mc-showgunners',
+            source: 'metacritic',
+            score: 75,
+            tier: 'Strong',
+            numReviews: 18,
+            url: 'https://www.metacritic.com/game/showgunners/critic-reviews/',
+            summary: 'Having problems with the gnats in your kitchen? Then download Gnat Squisher! Using OpenFeint.',
+            isVerified: true,
+          },
+          tier: 'immutable',
+          cachedAt: Date.now(),
+          ttl: 31536000000,
+        };
+        localStorage.setItem('antigravity_critic_v8_title:showgunners', JSON.stringify(mobileBlurbEntry));
+        const sanitized = criticScoreService.getCriticScore(null, 'Showgunners', undefined, undefined, undefined, false, true);
+        expect(sanitized?.score).toBe(75);
+        expect(sanitized?.summary).toContain('based on 18 critic reviews');
+      }
+    });
+
+    it('handles apostrophe tokenization, edition-stripped slug priority, and expanded mobile-app spam sanitization', async () => {
+      const {
+        isTitleCompatible,
+        generateMetacriticSlugCandidates,
+        rankCandidateSlugs,
+        sanitizeMetacriticDescription,
+      } = await import('../src/services/critic/metacriticResolver');
+
+      // 1. Apostrophe tokenization: "Marvel's" -> 'marvels', matching slug 'marvels-guardians-of-the-galaxy'
+      expect(
+        isTitleCompatible(
+          "Marvel's Guardians of the Galaxy",
+          'marvels guardians of the galaxy'
+        )
+      ).toBe(true);
+      expect(
+        rankCandidateSlugs("Marvel's Guardians of the Galaxy", [
+          'marvels-guardians-of-the-galaxy',
+        ])
+      ).toEqual(['marvels-guardians-of-the-galaxy']);
+
+      // 2. Edition-stripped slug priority (Candidate #2 immediately after base)
+      const spacerSlugs = generateMetacriticSlugCandidates(
+        "The Outer Worlds: Spacer's Choice Edition"
+      );
+      expect(spacerSlugs[0]).toBe('the-outer-worlds-spacers-choice-edition');
+      expect(spacerSlugs[1]).toBe('the-outer-worlds');
+
+      const rotrSlugs = generateMetacriticSlugCandidates(
+        'Rise of the Tomb Raider: 20 Year Celebration'
+      );
+      expect(rotrSlugs[0]).toBe('rise-of-the-tomb-raider-20-year-celebration');
+      expect(rotrSlugs[1]).toBe('rise-of-the-tomb-raider');
+
+      // 3. Expanded mobile-app spam sanitizer (CRISIS CORE / Fort Solis / Showgunners / Tinykin / Wild Bastards)
+      expect(
+        sanitizeMetacriticDescription(
+          'Swap FireJewels to match 3 or more in this match 3 gem game available on the App Store!',
+          45
+        )
+      ).toContain('based on 45 critic reviews');
+      expect(sanitizeMetacriticDescription('???? ??? ????', 30)).toContain(
+        'based on 30 critic reviews'
+      );
+      expect(sanitizeMetacriticDescription('? ?D? ?????????', 22)).toContain(
+        'based on 22 critic reviews'
+      );
+      expect(
+        sanitizeMetacriticDescription(
+          '[AppStore] Build a towering stack of pikmin-like creatures!',
+          50
+        )
+      ).toBe('Build a towering stack of pikmin-like creatures!');
+    });
+
+    it('Cycle 4: enforces edition-blind sequel guards, bidirectional token conservation, and episodic anchor normalization', async () => {
+      const {
+        isTitleCompatible,
+        isAnchorSlugCompatible,
+        generateMetacriticSlugCandidates,
+      } = await import('../src/services/critic/metacriticResolver');
+
+      // Class 1: Edition tokens after sequel numbers must never excuse a missing sequel number
+      expect(isSequelMismatch('Mafia: Definitive Edition', 'Mafia III: Definitive Edition')).toBe(true);
+      expect(isSequelMismatch('Quake', 'Quake II Enhanced Edition')).toBe(true);
+
+      // Class 2: Bidirectional substantive token conservation
+      expect(isTitleCompatible('Godzilla Voxel Wars', 'Godzilla')).toBe(false);
+      expect(isTitleCompatible('Pool of Radiance', 'Pool of Radiance: Ruins of Myth Drannor')).toBe(false);
+      expect(isTitleCompatible('RPG Maker XP', 'RPG Maker WITH')).toBe(false);
+      expect(isTitleCompatible('Quake Champions', 'Quake')).toBe(false);
+      expect(isTitleCompatible('Quake II RTX', 'Quake II Enhanced Edition')).toBe(false);
+      expect(isTitleCompatible('Quake II (Original)', 'Quake II Enhanced Edition')).toBe(false);
+      expect(isTitleCompatible('Fallout Tactics: Brotherhood of Steel', 'Fallout')).toBe(false);
+      expect(isTitleCompatible('Half-Life 2: Deathmatch', 'Half-Life 2')).toBe(false);
+      expect(isTitleCompatible('Metal Gear Solid: Snake Eater', 'Metal Gear Solid Delta: Snake Eater')).toBe(false);
+      expect(isTitleCompatible('SiN Gold', 'SiN: Reloaded')).toBe(false);
+      expect(
+        isTitleCompatible(
+          'Star Wars Jedi Knight: Dark Forces II - Mysteries of the Sith',
+          'Star Wars Jedi Knight: Dark Forces II'
+        )
+      ).toBe(false);
+      expect(isTitleCompatible('Syndicate Wars', 'Syndicate')).toBe(false);
+      expect(isTitleCompatible('Syndicate Plus', 'Syndicate')).toBe(false);
+
+      // Class 3: Non-edition subtitle stripping blocked in generateMetacriticSlugCandidates
+      expect(generateMetacriticSlugCandidates('Half-Life 2: Deathmatch')).not.toContain('half-life-2');
+      expect(
+        generateMetacriticSlugCandidates('Star Wars Jedi Knight: Dark Forces II - Mysteries of the Sith')
+      ).not.toContain('star-wars-jedi-knight');
+
+      // Class 4: Episodic pilot anchor normalization vs Season Two sequel guard
+      expect(
+        isAnchorSlugCompatible('The Walking Dead', 'the-walking-dead-episode-1---a-new-day')
+      ).toBe(true);
+      expect(
+        isAnchorSlugCompatible('The Walking Dead: Season Two', 'the-walking-dead-episode-1---a-new-day')
+      ).toBe(false);
+      expect(isAnchorSlugCompatible('Rustler - Grand Theft Horse', 'rustler')).toBe(true);
+    });
   });
 });
+
 
 

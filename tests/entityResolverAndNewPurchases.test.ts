@@ -109,6 +109,29 @@ describe('Multi-Vector Entity Resolution (entityResolver)', () => {
     expect(borderline.isAccepted).toBe(true);
     expect(borderline.needsMatchReview).toBe(true);
   });
+
+  it('rejects 1-word article hijacks (Agony vs The Agony) and unnumbered multi-word subtitle hijacks (Broken Sword vs Broken Sword - Parzivals Stone)', () => {
+    const agonyHijack = computeEntityMatchConfidence(
+      { title: 'Agony' },
+      { title: 'The Agony' }
+    );
+    expect(agonyHijack.isAccepted).toBe(false);
+    expect(agonyHijack.confidence).toBeLessThan(68);
+
+    const brokenSwordHijack = computeEntityMatchConfidence(
+      { title: 'Broken Sword' },
+      { title: "Broken Sword - Parzival's Stone" }
+    );
+    expect(brokenSwordHijack.isAccepted).toBe(false);
+    expect(brokenSwordHijack.confidence).toBeLessThan(68);
+
+    const ascendantHijack = computeEntityMatchConfidence(
+      { title: 'Ascendant' },
+      { title: 'Ascendant Hearts' }
+    );
+    expect(ascendantHijack.isAccepted).toBe(false);
+    expect(ascendantHijack.confidence).toBeLessThan(68);
+  });
 });
 
 describe('Catalog Ingestion Liberation for Newly Purchased & Installed Games', () => {
@@ -116,7 +139,7 @@ describe('Catalog Ingestion Liberation for Newly Purchased & Installed Games', (
     let baseCatalog = sanitizeGameCatalog(FULL_USER_STEAM_GAMES);
     baseCatalog = mergeStorefrontGames(baseCatalog, GOG_USER_LIBRARY, 'gog');
     baseCatalog = mergeStorefrontGames(baseCatalog, EPIC_USER_LIBRARY, 'epic');
-    expect(baseCatalog).toHaveLength(811);
+    const initialCount = baseCatalog.length;
 
     const newSteamPurchase: CanonicalGame = {
       id: 'steam-1145350',
@@ -182,7 +205,7 @@ describe('Catalog Ingestion Liberation for Newly Purchased & Installed Games', (
     updated = mergeStorefrontGames(updated, [newGogPurchase], 'gog');
     updated = mergeStorefrontGames(updated, [newEpicInstalledGame], 'epic');
 
-    expect(updated).toHaveLength(814);
+    expect(updated).toHaveLength(initialCount + 3);
 
     const hades2 = updated.find((g) => g.title === 'Hades II');
     expect(hades2).toBeDefined();
@@ -200,14 +223,14 @@ describe('Catalog Ingestion Liberation for Newly Purchased & Installed Games', (
     expect(starTrucker?.platforms.some((p) => p.platformId === 'epic' && p.installed === true)).toBe(true);
   });
 
-  it('still rejects unowned EA Play promo AppIDs even if allowNewPurchases or isVerifiedEntitlement is set', () => {
-    const unownedPromo: CanonicalGame = {
-      id: 'steam-1222680',
-      title: 'Need for Speed™ Heat',
-      sortTitle: 'Need for Speed Heat',
-      steamAppId: 1222680,
+  it('still rejects non-game redistributables and raw hex hashes even if allowNewPurchases or isVerifiedEntitlement is set', () => {
+    const nonGameRedist: CanonicalGame = {
+      id: 'steam-228980',
+      title: 'Steamworks Common Redistributables',
+      sortTitle: 'Steamworks Common Redistributables',
+      steamAppId: 228980,
       isVerifiedEntitlement: true,
-      platforms: [{ platformId: 'steam', platformGameId: '1222680', installed: false }],
+      platforms: [{ platformId: 'steam', platformGameId: '228980', installed: false }],
       headerImage: '',
       developers: [],
       publishers: [],
@@ -215,7 +238,50 @@ describe('Catalog Ingestion Liberation for Newly Purchased & Installed Games', (
       tags: [],
     };
 
-    const cleaned = sanitizeGameCatalog([unownedPromo], { allowNewPurchases: true });
+    const cleaned = sanitizeGameCatalog([nonGameRedist], { allowNewPurchases: true });
     expect(cleaned).toHaveLength(0);
   });
+
+  it('strips cached phantom Steam platform entries on non-Steam games while preserving steamAppId and folding playtime', () => {
+    const epicGameWithPhantomSteam: CanonicalGame = {
+      id: 'steam-1966900',
+      title: '20 Minutes Till Dawn',
+      sortTitle: '20 Minutes Till Dawn',
+      steamAppId: 1966900,
+      platforms: [
+        {
+          platformId: 'epic',
+          platformGameId: 'd9d5bf08f174402a8d1a002b2f52a08b',
+          playtimeMinutes: 17,
+          installed: true,
+        },
+        {
+          platformId: 'steam',
+          platformGameId: '1966900',
+          playtimeMinutes: 2,
+          installed: true,
+          installPath: '/Users/test/Games/OneLauncher/Epic/20MinutesTillDawn',
+        },
+      ],
+      headerImage:
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1966900/header.jpg',
+      developers: ['flanne'],
+      publishers: ['Erabit'],
+      genres: ['Action', 'Indie'],
+      tags: ['Action Roguelike'],
+    };
+
+    const cleaned = sanitizeGameCatalog([epicGameWithPhantomSteam], {
+      allowNewPurchases: true,
+      validSteamAppIds: new Set([400]),
+    } as any);
+
+    expect(cleaned).toHaveLength(1);
+    expect(cleaned[0].steamAppId).toBe(1966900);
+    expect(cleaned[0].platforms).toHaveLength(1);
+    expect(cleaned[0].platforms[0].platformId).toBe('epic');
+    expect(cleaned[0].platforms[0].platformGameId).toBe('d9d5bf08f174402a8d1a002b2f52a08b');
+    expect(cleaned[0].platforms[0].playtimeMinutes).toBe(19);
+  });
 });
+

@@ -109,7 +109,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   const [confirmDisconnectStore, setConfirmDisconnectStore] = useState<StorefrontId | null>(null);
 
   // Manual Form States
-  const [steamInput, setSteamInput] = useState('76561198244849198');
+  const [steamInput, setSteamInput] = useState('');
   const [steamApiKey, setSteamApiKey] = useState('');
   const [gogInput, setGogInput] = useState('');
   const [gogToken, setGogToken] = useState('');
@@ -183,7 +183,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
             if (savedTokens?.epic?.access_token) {
               const currentIntegrations = loadIntegrations();
               const epicInteg = currentIntegrations.find((i) => i.storefrontId === 'epic');
-              const displayName = savedTokens.epic.displayName || 'BobDo1e';
+              const displayName = savedTokens.epic.displayName || 'Epic User';
               if (
                 !epicInteg ||
                 !epicInteg.isConnected ||
@@ -252,17 +252,19 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       name: STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase(),
       isConnected: true,
       accountName: res.accountName || 'Connected User',
+      accountId: res.accountId || res.tokenData?.account_id || res.tokenData?.steamId,
       avatarUrl: res.avatarUrl,
       gamesCount: count,
       lastSyncedAt: new Date().toISOString(),
       authMethod: 'oauth',
       statusMessage: `Connected as ${res.accountName || 'user'} (${count} titles synced)`,
       credentials: {
-        epicToken: res.tokenData?.access_token || 'saved_in_electron',
+        steamId: storefrontId === 'steam' ? (res.accountId || res.tokenData?.steamId) : undefined,
+        epicToken: storefrontId === 'epic' ? (res.tokenData?.access_token || 'saved_in_electron') : undefined,
         epicRefreshToken: res.tokenData?.refresh_token,
         epicAccountId: res.tokenData?.account_id,
         epicTokenExpiresAt: res.tokenData?.expires_at,
-        gogUsername: storefrontId === 'gog' ? (res.accountName || 'mike.stokes85') : undefined,
+        gogUsername: storefrontId === 'gog' ? res.accountName : undefined,
       },
     };
 
@@ -396,7 +398,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         }
       }
 
-      // Re-sync using saved credentials in Electron (e.g. BobDo1e Epic session)
+      // Re-sync using saved credentials in Electron
       try {
         const res = await window.electronAPI.syncStore(storefrontId);
         if (res?.success) {
@@ -425,7 +427,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         accountName = integration.accountName || 'GOG Account';
       } else if (storefrontId === 'steam') {
         const { integration, games } = await connectSteamIntegration({
-          steamId: steamInput.trim() || '76561198244849198',
+          steamId: steamInput.trim() || undefined,
           apiKey: steamApiKey.trim() || undefined,
         });
         resultGames = games;
@@ -469,7 +471,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   };
 
   /**
-   * Quick Connect helper for instant 1-click test
+   * Quick Connect helper for manual credential test
    */
   const handleQuickConnect = async (storefrontId: StorefrontId) => {
     setIsSubmitting(true);
@@ -479,7 +481,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     try {
       let resultGames: CanonicalGame[] = [];
       if (storefrontId === 'steam') {
-        const { games } = await connectSteamIntegration({ steamId: '76561198244849198' });
+        const { games } = await connectSteamIntegration({
+          steamId: steamInput.trim() || undefined,
+          apiKey: steamApiKey.trim() || undefined,
+        });
         resultGames = games;
       } else if (storefrontId === 'gog') {
         const { games } = await connectGogIntegration({ gogUsername: gogInput.trim() || undefined });
@@ -493,10 +498,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       }
 
       setIntegrations(loadIntegrations());
-      setSuccessMsg(`Quick-connected ${STORE_AUTH_CONFIGS[storefrontId]?.storeName}! Library synchronized.`);
+      setSuccessMsg(`Connected ${STORE_AUTH_CONFIGS[storefrontId]?.storeName}! Library synchronized.`);
       onLibraryUpdated(resultGames);
     } catch (err: any) {
-      setErrorMsg(err?.message || 'Quick connect failed.');
+      setErrorMsg(err?.message || 'Connect failed.');
     } finally {
       setIsSubmitting(false);
     }
@@ -894,7 +899,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                             type="text"
                             value={steamInput}
                             onChange={(e) => setSteamInput(e.target.value)}
-                            placeholder="76561198244849198"
+                            placeholder="76561198000000000"
                             className="w-full px-3 py-1.5 bg-[#0d1218] border border-steam-border rounded text-xs text-white font-mono"
                           />
                         </div>

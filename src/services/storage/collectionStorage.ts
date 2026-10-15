@@ -7,43 +7,25 @@ export const DEFAULT_COLLECTIONS: GameCollection[] = [
     id: 'favorites',
     name: 'Favorites',
     isDefault: true,
-    gameIds: [
-      'steam-1086940', // Baldur's Gate 3
-      'steam-1091500', // Cyberpunk 2077
-      'steam-292030',  // The Witcher 3
-      'steam-782330',  // DOOM Eternal
-    ],
+    gameIds: [],
   },
   {
     id: 'currently-playing',
     name: 'Currently Playing',
     isDefault: true,
-    gameIds: [
-      'steam-228280',  // Baldur's Gate: Enhanced Edition
-      'steam-257350',  // Baldur's Gate II: Enhanced Edition
-    ],
+    gameIds: [],
   },
   {
     id: 'backlog',
     name: 'Backlog',
     isDefault: false,
-    gameIds: [
-      'steam-1174180', // Red Dead Redemption 2
-      'steam-814380',  // Sekiro: Shadows Die Twice
-      'steam-374320',  // Dark Souls III
-      'steam-1687950', // Persona 5 Royal
-      'steam-1190460', // Death Stranding
-    ],
+    gameIds: [],
   },
   {
     id: 'completed',
     name: 'Completed',
     isDefault: false,
-    gameIds: [
-      'steam-400',     // Portal
-      'steam-620',     // Portal 2
-      'steam-220',     // Half-Life 2
-    ],
+    gameIds: [],
   },
 ];
 

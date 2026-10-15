@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
+import { launcherService } from '../../services/launcher/launcherService';
 import {
   RefreshCw,
   Layers,
@@ -13,6 +14,7 @@ import {
   Wand,
   Trophy,
   Award,
+  Download,
 } from 'lucide-react';
 
 interface TopNavBarProps {
@@ -44,9 +46,12 @@ interface TopNavBarProps {
   onSyncAllMedia?: () => void;
   isSyncingScores?: boolean;
   onRefreshScores?: () => void;
+  isSyncingTrophies?: boolean;
+  onSyncTrophies?: () => void;
   onOpenFixMatch?: () => void;
   defaultMenuOpen?: boolean;
   onOpenAchievements?: () => void;
+  onOpenDownloads?: () => void;
 }
 
 export const TopNavBar: React.FC<TopNavBarProps> = ({
@@ -75,12 +80,41 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onSyncAllMedia,
   isSyncingScores = false,
   onRefreshScores,
+  isSyncingTrophies = false,
+  onSyncTrophies,
   onOpenFixMatch,
   defaultMenuOpen = false,
   onOpenAchievements,
+  onOpenDownloads,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(defaultMenuOpen);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
+
+  useEffect(() => {
+    const unsub = launcherService.subscribe(() => {
+      setDownloadQueue([...launcherService.getDownloadQueue()]);
+    });
+    return unsub;
+  }, []);
+
+  const activeDownloads = useMemo(
+    () =>
+      downloadQueue.filter(
+        (t) =>
+          t.status === 'downloading' ||
+          t.status === 'extracting' ||
+          t.status === 'verifying' ||
+          t.status === 'queued'
+      ),
+    [downloadQueue]
+  );
+
+  const avgDownloadProgress = useMemo(() => {
+    if (activeDownloads.length === 0) return 0;
+    const sum = activeDownloads.reduce((acc, t) => acc + (t.progressPercent || 0), 0);
+    return Math.round(sum / activeDownloads.length);
+  }, [activeDownloads]);
 
   // Close burger menu on outside click or escape
   useEffect(() => {
@@ -173,7 +207,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               aria-expanded={isMenuOpen}
             >
               <Menu className="w-4 h-4" />
-              {(isSyncing || isSyncingAllMedia || isSyncingCurrentGame || isSyncingScores) && (
+              {(isSyncing || isSyncingAllMedia || isSyncingCurrentGame || isSyncingScores || isSyncingTrophies) && (
                 <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
               )}
             </button>
@@ -236,6 +270,39 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     <span className="text-[10px] text-steam-accent font-semibold">Active</span>
                   )}
                 </button>
+
+                {/* Sync Trophies (All Storefronts) */}
+                {onSyncTrophies && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onSyncTrophies();
+                    }}
+                    disabled={isSyncingTrophies}
+                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
+                    title="Synchronize unlocked trophies & achievements across Steam, GOG.com, and Epic Games Store"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Trophy
+                        className={`w-4 h-4 ${
+                          isSyncingTrophies
+                            ? 'animate-bounce text-amber-400'
+                            : 'text-amber-400 group-hover:scale-110 transition-transform'
+                        }`}
+                      />
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-white">
+                          {isSyncingTrophies ? 'Syncing Trophies...' : 'Sync Trophies'}
+                        </span>
+                        <span className="text-[10px] text-steam-subtext">Steam, GOG & Epic achievements</span>
+                      </div>
+                    </div>
+                    {isSyncingTrophies && (
+                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    )}
+                  </button>
+                )}
 
                 {/* Sync Store Media (All Games) */}
                 {onSyncAllMedia && (
@@ -456,8 +523,44 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
           })}
         </div>
 
-        {/* Right Section: Installed Only Filter & Games Counter */}
-        <div className="flex items-center gap-3 text-xs shrink-0">
+        {/* Right Section: Downloads, Installed Only Filter & Games Counter */}
+        <div className="flex items-center gap-2.5 text-xs shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              if (onOpenDownloads) {
+                onOpenDownloads();
+              } else {
+                launcherService.openDownloadDrawer();
+              }
+            }}
+            aria-label="Downloads"
+            title="Open Downloads & Installations Manager"
+            className={`relative overflow-hidden px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
+              activeDownloads.length > 0
+                ? 'bg-sky-950/80 border-sky-400/70 text-sky-300 font-semibold shadow-[0_0_10px_rgba(56,189,248,0.2)]'
+                : 'bg-steam-card border-steam-border text-steam-subtext hover:text-white'
+            }`}
+          >
+            {activeDownloads.length > 0 && (
+              <div
+                className="absolute inset-y-0 left-0 bg-sky-500/20 pointer-events-none transition-all duration-300"
+                style={{ width: `${avgDownloadProgress}%` }}
+              />
+            )}
+            <Download
+              className={`w-3.5 h-3.5 relative z-10 ${
+                activeDownloads.length > 0 ? 'text-sky-400 animate-bounce' : ''
+              }`}
+            />
+            <span className="relative z-10">Downloads</span>
+            {activeDownloads.length > 0 && (
+              <span className="relative z-10 px-1.5 py-0.2 rounded-full bg-sky-500/30 border border-sky-400/50 text-[10px] font-bold text-white">
+                {activeDownloads.length} • {avgDownloadProgress}%
+              </span>
+            )}
+          </button>
+
           <button
             onClick={onToggleInstalledOnly}
             className={`px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
@@ -479,3 +582,4 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     </header>
   );
 };
+

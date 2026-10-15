@@ -147,15 +147,32 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
 
   // Group games into collections + uncategorized
   const groupedData = useMemo(() => {
+    const seenGameIds = new Set<string>();
+    const seenPlatformSigs = new Set<string>();
+    const uniqueSortedGames = games
+      .filter((g) => {
+        if (!g || seenGameIds.has(g.id)) return false;
+        const platSig = g.platforms
+          ?.map((p) => `${p.platformId}:${p.platformGameId}`)
+          .sort()
+          .join('|');
+        if (platSig && seenPlatformSigs.has(platSig)) return false;
+        seenGameIds.add(g.id);
+        if (platSig) seenPlatformSigs.add(platSig);
+        return true;
+      })
+      .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+
     const gameMap = new Map<string, CanonicalGame>();
-    games.forEach((g) => gameMap.set(g.id, g));
+    uniqueSortedGames.forEach((g) => gameMap.set(g.id, g));
 
     const categorizedGameIds = new Set<string>();
 
     const colGroups = collections.map((col) => {
-      const colGames = col.gameIds
+      const colGames = Array.from(new Set(col.gameIds))
         .map((id) => gameMap.get(id))
-        .filter((g): g is CanonicalGame => !!g);
+        .filter((g): g is CanonicalGame => !!g)
+        .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
 
       colGames.forEach((g) => categorizedGameIds.add(g.id));
 
@@ -165,23 +182,29 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       };
     });
 
-    // Uncategorized: games in the filtered list not in any collection
-    const uncategorizedGames = games.filter((g) => !categorizedGameIds.has(g.id));
+    // Uncategorized: games in the filtered list not in any collection (already sorted alphabetically)
+    const uncategorizedGames = uniqueSortedGames.filter((g) => !categorizedGameIds.has(g.id));
 
     return {
       collections: colGroups,
+      groups: colGroups,
       uncategorized: uncategorizedGames,
+      uncategorizedGames,
+      allSorted: uniqueSortedGames,
     };
   }, [games, collections]);
 
-  const renderGameRow = (game: CanonicalGame) => {
+  const renderGameRow = (game: CanonicalGame, idx?: number) => {
     const isSelected = game.id === selectedGameId;
     const isInstalled = game.platforms.some((p) => p.installed);
     const isFav = collections.find((c) => c.id === 'favorites')?.gameIds.includes(game.id) || false;
+    const platformSig =
+      game.platforms?.map((p) => `${p.platformId}:${p.platformGameId}`).join('|') || '';
+    const rowKey = `${game.id}::${platformSig || idx || 0}`;
 
     return (
       <div
-        key={game.id}
+        key={rowKey}
         onClick={() => onSelectGame(game)}
         className={`relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-all group select-none ${
           isSelected
@@ -575,7 +598,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                           No games in this collection.
                         </div>
                       ) : (
-                        col.games.map(renderGameRow)
+                        col.games.map((g, i) => renderGameRow(g, i))
                       )}
                     </div>
                   )}
@@ -634,7 +657,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
 
                 {!collapsedCollections['uncategorized'] && (
                   <div className="divide-y divide-steam-border/10 pl-1">
-                    {groupedData.uncategorized.map(renderGameRow)}
+                    {groupedData.uncategorized.map((g, i) => renderGameRow(g, i))}
                   </div>
                 )}
               </div>
@@ -643,7 +666,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         ) : (
           /* Flat Alphabetical Mode */
           <div className="divide-y divide-steam-border/20">
-            {games.map(renderGameRow)}
+            {groupedData.allSorted.map((g, i) => renderGameRow(g, i))}
           </div>
         )}
       </div>

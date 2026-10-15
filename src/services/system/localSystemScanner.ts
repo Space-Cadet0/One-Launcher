@@ -1,7 +1,15 @@
+import type { InstalledGameRecord } from '../../contracts/launcher';
+
+export type ScannedInstalledGameItem = InstalledGameRecord & {
+  appId: number;
+  name?: string;
+  installPath: string;
+};
+
 export interface LocalSystemScanResult {
   success: boolean;
   installedSteamAppIds: number[];
-  installedGames?: { appId: number; name?: string; installPath?: string }[];
+  installedGames?: ScannedInstalledGameItem[];
   scannedAt?: string;
   error?: string;
 }
@@ -16,22 +24,49 @@ export interface SteamAchievementRecord {
   conflictDetails?: string;
 }
 
+function normalizeInstalledGamesList(rawList: any[]): ScannedInstalledGameItem[] {
+  if (!Array.isArray(rawList)) return [];
+  return rawList.map((item) => {
+    const platId = item.platformId || 'steam';
+    const numAppId = platId === 'steam' ? Number(item.appId ?? item.platformGameId ?? 0) : 0;
+    return {
+      platformId: platId,
+      platformGameId: String(item.platformGameId ?? item.appId ?? ''),
+      appId: Number.isNaN(numAppId) ? 0 : numAppId,
+      title: item.title || item.name,
+      name: item.name || item.title,
+      installPath: item.installPath || '',
+      executablePath: item.executablePath,
+      installSize: item.installSize,
+      version: item.version,
+      manifestPath: item.manifestPath,
+      runner: item.runner,
+      isWindowsBinaryOnMac: item.isWindowsBinaryOnMac,
+    };
+  });
+}
+
 /**
- * Scans the local workstation for installed Steam, Heroic, and PC storefront games.
- * Returns the exact list of verified local installed AppIDs.
+ * Scans the local workstation for installed Steam, GOG, Epic, Heroic, and One Launcher games.
+ * Returns the exact list of verified local installed games and Steam AppIDs.
  */
 export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult | null> {
-  // First check if running inside native Electron application
-  if (typeof window !== 'undefined' && window.electronAPI?.scanLocalGames) {
+  if (typeof window !== 'undefined' && window.electronAPI) {
     try {
-      const electronRes = await window.electronAPI.scanLocalGames();
-      if (electronRes && electronRes.success) {
-        return {
-          success: true,
-          installedSteamAppIds: Array.isArray(electronRes.installedSteamAppIds) ? electronRes.installedSteamAppIds : [],
-          installedGames: Array.isArray(electronRes.installedGames) ? electronRes.installedGames : [],
-          scannedAt: new Date().toISOString(),
-        };
+      const scanFn =
+        window.electronAPI.scanAllInstalledGames || window.electronAPI.scanLocalGames;
+      if (scanFn) {
+        const electronRes = await scanFn();
+        if (electronRes && electronRes.success) {
+          return {
+            success: true,
+            installedSteamAppIds: Array.isArray(electronRes.installedSteamAppIds)
+              ? electronRes.installedSteamAppIds
+              : [],
+            installedGames: normalizeInstalledGamesList(electronRes.installedGames || []),
+            scannedAt: new Date().toISOString(),
+          };
+        }
       }
     } catch (e) {
       console.warn('Native Electron scanner call failed:', e);
@@ -47,6 +82,7 @@ export async function scanLocalInstalledGames(): Promise<LocalSystemScanResult |
     return {
       success: !!data.success,
       installedSteamAppIds: Array.isArray(data.installedSteamAppIds) ? data.installedSteamAppIds : [],
+      installedGames: normalizeInstalledGamesList(data.installedGames || []),
       scannedAt: data.scannedAt,
     };
   } catch (err) {

@@ -160,19 +160,24 @@ export class GogIntegrationService {
   }
 
   /**
-   * Fetches exact achievements for a single GOG game from user's public profile page
+   * Fetches exact achievements for a single GOG game from user's profile page
    */
   async fetchGameAchievements(
     username: string,
     gameId: string | number,
     gameTitle?: string,
-    fallbackPercentage?: number
+    fallbackPercentage?: number,
+    accessToken?: string
   ): Promise<StoreAchievementSummary | null> {
     try {
       const cleanId = String(gameId).replace(/^gog-/, '');
+      const headers: Record<string, string> = {};
+      if (accessToken) {
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
       const res = await axios.get(
         `${this.getProfileBaseUrl()}/u/${encodeURIComponent(username)}/game/${encodeURIComponent(cleanId)}`,
-        { timeout: 10000 }
+        { timeout: 10000, headers }
       );
       const html = typeof res.data === 'string' ? res.data : '';
       const match = html.match(
@@ -217,10 +222,12 @@ export class GogIntegrationService {
   }
 
   /**
-   * Dynamic scanner: fetches public achievements and play statistics for any user's GOG username
+   * Dynamic scanner: fetches achievements and play statistics for any user's GOG account
    */
   async fetchUserAchievementsAndStats(
-    username: string
+    username: string,
+    accessToken?: string,
+    userId?: string
   ): Promise<{
     achievements: Record<string, StoreAchievementSummary>;
     stats: Record<string, { playtime?: number; lastSession?: string }>;
@@ -228,15 +235,45 @@ export class GogIntegrationService {
     const achievementsMap: Record<string, StoreAchievementSummary> = {};
     const statsMap: Record<string, { playtime?: number; lastSession?: string }> = {};
 
+    // 1. In Electron, delegate to native main-process GOG achievement fetcher (avoids CORS & 403 and uses gameplay.gog.com API)
+    if (typeof window !== 'undefined' && window.electronAPI?.fetchGogAchievements) {
+      try {
+        const ipcAch = await window.electronAPI.fetchGogAchievements(username, accessToken, userId);
+        if (ipcAch && typeof ipcAch === 'object' && Object.keys(ipcAch).length > 0) {
+          const nowIso = new Date().toISOString();
+          for (const [k, val] of Object.entries(ipcAch)) {
+            if (val && typeof val.unlocked === 'number' && typeof val.total === 'number') {
+              achievementsMap[k] = {
+                unlocked: val.unlocked,
+                total: val.total,
+                percentage: val.percentage ?? (val.total > 0 ? Math.round((val.unlocked / val.total) * 100) : 0),
+                isMastered: Boolean(val.isMastered) || (val.total > 0 && val.unlocked >= val.total),
+                source: 'live_cloud_api',
+                syncedAt: nowIso,
+              };
+            }
+          }
+          cacheUserGogAchievements(achievementsMap);
+          return { achievements: achievementsMap, stats: statsMap };
+        }
+      } catch (err) {
+        console.warn('Electron GOG achievement fetch fallback:', err);
+      }
+    }
+
     try {
       let currentPage = 1;
       let totalPages = 1;
       let keepPaging = true;
+      const headers: Record<string, string> = {};
+      if (accessToken) {
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
 
       while (currentPage <= totalPages && keepPaging && currentPage <= 10) {
         const res = await axios.get(
           `${this.getProfileBaseUrl()}/u/${encodeURIComponent(username)}/games/stats?sort=percent_of_unlocked_achievements&order=desc&page=${currentPage}`,
-          { timeout: 10000 }
+          { timeout: 10000, headers }
         );
 
         totalPages = res.data?.pages || 1;
@@ -266,7 +303,7 @@ export class GogIntegrationService {
 
           const pct = userStat?.achievementsPercentage;
           if (pct !== undefined && pct > 0) {
-            const detail = await this.fetchGameAchievements(username, game.id, game.title, pct);
+            const detail = await this.fetchGameAchievements(username, game.id, game.title, pct, accessToken);
             if (detail) {
               const strId = String(game.id);
               achievementsMap[strId] = detail;
@@ -333,10 +370,6 @@ export class GogIntegrationService {
               : `https:${g.image}`
             : undefined;
 
-          const verticalCover = coverUrl
-            ? coverUrl.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
-            : undefined;
-
           games.push({
             id: `gog-${g.id}`,
             title: g.title.trim(),
@@ -352,7 +385,7 @@ export class GogIntegrationService {
               },
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            capsuleImage: verticalCover || coverUrl || 'https://images.gog-statics.com/avatars/default.png',
+            capsuleImage: '',
             shortDescription: '',
             releaseDate: '',
             developers: [],
@@ -402,12 +435,6 @@ export class GogIntegrationService {
               : `https:${p.image}.jpg`
             : undefined;
 
-          const verticalCover = p.image
-            ? p.image.startsWith('http')
-              ? p.image.replace(/_[a-z0-9_]+\.jpg$/i, '_glx_vertical_cover.jpg').replace(/(\.jpg)?$/, '_glx_vertical_cover.jpg')
-              : `https:${p.image}_glx_vertical_cover.jpg`
-            : undefined;
-
           games.push({
             id: `gog-${p.id}`,
             title: gameTitle,
@@ -422,7 +449,7 @@ export class GogIntegrationService {
               },
             ],
             headerImage: coverUrl || 'https://images.gog-statics.com/avatars/default.png',
-            capsuleImage: verticalCover || coverUrl || 'https://images.gog-statics.com/avatars/default.png',
+            capsuleImage: '',
             shortDescription: p.category ? `${p.category} title` : '',
             releaseDate: '',
             developers: [],
@@ -448,8 +475,8 @@ export class GogIntegrationService {
     credentials: StorefrontCredentials
   ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[] }> {
     let rawInput = (credentials.gogUsername || '').trim();
-    let accountName = 'mike.stokes85';
-    let avatarUrl = 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg';
+    let accountName = 'GOG User';
+    let avatarUrl: string | undefined = undefined;
 
     // Parse GOG username or profile link if provided
     if (rawInput) {

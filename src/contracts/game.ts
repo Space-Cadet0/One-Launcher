@@ -28,6 +28,11 @@ export interface GamePlatformOwnership {
   platformGameId: string;
   installed: boolean;
   installPath?: string;
+  executablePath?: string;
+  installSize?: number;
+  version?: string;
+  runner?: string;
+  isWindowsBinaryOnMac?: boolean;
   lastPlayed?: string;
   playtimeMinutes?: number;
   achievements?: StoreAchievementSummary;

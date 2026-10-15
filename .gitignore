@@ -5,7 +5,9 @@ node_modules/
 
 # Build output
 dist/
-build/
+build/*
+!build/*.nsh
+!build/*.nsi
 out/
 release/
 *.dmg

@@ -172,7 +172,9 @@ export function isSequelMismatch(query: string, candidateName: string): boolean 
       const hasNumeral = qHas ? qTokens : cTokens;
       const noNumeral = qHas ? cTokens : qTokens;
       const numIdx = hasNumeral.indexOf(num);
-      const afterNum = hasNumeral.slice(numIdx + 1).filter((t) => !stopWords.has(t) && !NUMERIC_SEQUELS.has(t));
+      const afterNum = hasNumeral
+        .slice(numIdx + 1)
+        .filter((t) => !stopWords.has(t) && !EDITION_TOKENS.has(t) && !NUMERIC_SEQUELS.has(t));
 
       const hasSubtitleSyntax =
         query.includes(':') ||

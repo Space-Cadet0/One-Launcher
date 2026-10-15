@@ -129,27 +129,65 @@ describe('Fix Match & Context Menu UI Components', () => {
     expect(openHtml).toContain('Game is not on Steam (IGDB/GOG only)');
   });
 
-  it('audits all 811 games to identify which games were blocked by canSyncCurrentGame', async () => {
-    const { FULL_USER_STEAM_GAMES } = await import('../src/services/storage/fullUserSteamGames');
-    const { GOG_USER_LIBRARY } = await import('../src/services/storage/gogUserLibrary');
-    const { EPIC_USER_LIBRARY } = await import('../src/services/storage/epicUserLibrary');
+  it('audits catalog games to identify which games are matched vs non-Steam for canSyncCurrentGame', async () => {
     const { sanitizeGameCatalog } = await import('../src/services/integrations/catalogSanitizer');
     const { mergeStorefrontGames } = await import('../src/services/integrations/integrationStorage');
     const { steamMatcher } = await import('../src/services/steam/steamMatcher');
 
-    let catalog = sanitizeGameCatalog(FULL_USER_STEAM_GAMES);
-    catalog = mergeStorefrontGames(catalog, GOG_USER_LIBRARY, 'gog');
-    catalog = mergeStorefrontGames(catalog, EPIC_USER_LIBRARY, 'epic');
+    const steamFixture: CanonicalGame[] = [
+      {
+        id: 'steam-1091500',
+        title: 'Cyberpunk 2077',
+        sortTitle: 'Cyberpunk 2077',
+        steamAppId: 1091500,
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'steam', platformGameId: '1091500', installed: true }],
+        headerImage: '',
+        developers: ['CD PROJEKT RED'],
+        publishers: ['CD PROJEKT RED'],
+        genres: ['RPG'],
+        tags: [],
+      },
+    ];
+    const gogFixture: CanonicalGame[] = [
+      {
+        id: 'gog-1',
+        title: 'DOOM I Enhanced',
+        sortTitle: 'DOOM I Enhanced',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'gog', platformGameId: '1', installed: false }],
+        headerImage: '',
+        developers: ['id Software'],
+        publishers: ['Bethesda'],
+        genres: ['Action'],
+        tags: [],
+      },
+    ];
+    const epicFixture: CanonicalGame[] = [
+      {
+        id: 'epic-1',
+        title: 'Alan Wake 2',
+        sortTitle: 'Alan Wake 2',
+        isVerifiedEntitlement: true,
+        platforms: [{ platformId: 'epic', platformGameId: '1', installed: false }],
+        headerImage: '',
+        developers: ['Remedy'],
+        publishers: ['Epic Games'],
+        genres: ['Action'],
+        tags: [],
+      },
+    ];
+
+    let catalog = sanitizeGameCatalog(steamFixture);
+    catalog = mergeStorefrontGames(catalog, gogFixture, 'gog');
+    catalog = mergeStorefrontGames(catalog, epicFixture, 'epic');
 
     const blockedGames = catalog.filter((g) => !g.steamAppId && !steamMatcher.matchGameToSteamInstant(g.title));
     const matchedGames = catalog.filter((g) => g.steamAppId || steamMatcher.matchGameToSteamInstant(g.title));
 
-    console.log(`[AUDIT] Total games in catalog: ${catalog.length}`);
-    console.log(`[AUDIT] Games with Steam match (previously allowed): ${matchedGames.length}`);
-    console.log(`[AUDIT] Games WITHOUT Steam match (previously BLOCKED in burger menu): ${blockedGames.length}`);
-    console.log(`[AUDIT] ALL 105 BLOCKED GAMES:`, JSON.stringify(blockedGames.map(g => g.title), null, 2));
-
-    expect(catalog).toHaveLength(811);
+    expect(catalog).toHaveLength(3);
+    expect(matchedGames.length + blockedGames.length).toBe(catalog.length);
+    expect(blockedGames.length).toBeGreaterThanOrEqual(1);
   });
 
   it('renders Fix Match & Metadata in TopNavBar burger menu for DOOM I/II games even when canSyncCurrentGame is false', async () => {
@@ -182,18 +220,75 @@ describe('Fix Match & Context Menu UI Components', () => {
     }
   });
 
-  it('renders Wand button in SteamLibraryActionBar when onFixMatch prop is supplied', async () => {
+  it('renders Match & Metadata Wizard inside SteamLibraryActionBar Manage Game menu when onFixMatch prop is supplied', async () => {
     const { SteamLibraryActionBar } = await import('../src/components/SteamStoreDetail/SteamLibraryActionBar');
 
-    const html = renderToString(
-      React.createElement(SteamLibraryActionBar, {
-        game: mockGame,
-        collections: mockCollections,
-        onFixMatch: vi.fn(),
-      })
-    );
+    const states: any[] = [];
+    const refs: { current: any }[] = [];
+    const findElements = (node: any, predicate: (el: any) => boolean, acc: any[] = []): any[] => {
+      if (!node || typeof node !== 'object') return acc;
+      if (Array.isArray(node)) {
+        for (const child of node) findElements(child, predicate, acc);
+        return acc;
+      }
+      if (predicate(node)) acc.push(node);
+      if (node.props && node.props.children) findElements(node.props.children, predicate, acc);
+      return acc;
+    };
 
-    expect(html).toContain('Fix match, cover poster &amp; scraped metadata...');
+    const renderBar = () => {
+      let stateIdx = 0;
+      let refIdx = 0;
+      const internals = (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+      const prevH = internals.H;
+      internals.H = {
+        useState(initial: any) {
+          const idx = stateIdx++;
+          if (idx >= states.length) {
+            states.push(typeof initial === 'function' ? initial() : initial);
+          }
+          const setState = (updater: any) => {
+            states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+          };
+          return [states[idx], setState];
+        },
+        useRef(initial: any) {
+          const idx = refIdx++;
+          if (idx >= refs.length) refs.push({ current: initial });
+          return refs[idx];
+        },
+        useEffect() {},
+        useMemo(fn: () => any) {
+          return fn();
+        },
+        useCallback(fn: any) {
+          return fn;
+        },
+      };
+      try {
+        const vnode = (SteamLibraryActionBar as any)({
+          game: mockGame,
+          collections: mockCollections,
+          onFixMatch: vi.fn(),
+        });
+        return { vnode, html: renderToString(vnode) };
+      } finally {
+        internals.H = prevH;
+      }
+    };
+
+    const closed = renderBar();
+    expect(closed.html).not.toContain('Fix match, cover poster &amp; scraped metadata...');
+
+    const manageCogBtn = findElements(
+      closed.vnode,
+      (el) => el.type === 'button' && el.props?.['aria-label'] === 'Manage Game'
+    )[0];
+    expect(manageCogBtn).toBeDefined();
+    manageCogBtn.props.onClick();
+
+    const open = renderBar();
+    expect(open.html).toContain('Match &amp; Metadata Wizard...');
   });
 
   it('cleans special punctuation such as plus signs from search queries', async () => {

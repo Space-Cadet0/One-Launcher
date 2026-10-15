@@ -100,6 +100,24 @@ function extractOrgTokens(orgs?: string[]): Set<string> {
   return tokens;
 }
 
+const DISJOINT_STOP_WORDS = new Set<string>([
+  'the',
+  'a',
+  'an',
+  'of',
+  'in',
+  'on',
+  'at',
+  'to',
+  'for',
+  'and',
+  'or',
+  'is',
+  'with',
+  'from',
+  'by',
+]);
+
 function computeBaseTitleSimilarity(source: string, candidate: string): number {
   const s1 = normalizeTitleKey(source);
   const s2 = normalizeTitleKey(candidate);
@@ -125,6 +143,18 @@ function computeBaseTitleSimilarity(source: string, candidate: string): number {
 
   const tokens1 = new Set(words1);
   const tokens2 = new Set(words2);
+
+  // Prevent distinct subtitled franchise entries with mutually exclusive non-edition substantive words
+  // (e.g. 'Vampire: The Masquerade - Reckoning of New York' vs 'Vampire: The Masquerade - Coteries of New York')
+  if (/[:\-–—]/.test(source) || /[:\-–—]/.test(candidate)) {
+    const substantive1 = words1.filter((w) => !/^\d+$/.test(w) && !EDITION_TOKENS.has(w) && !DISJOINT_STOP_WORDS.has(w));
+    const substantive2 = words2.filter((w) => !/^\d+$/.test(w) && !EDITION_TOKENS.has(w) && !DISJOINT_STOP_WORDS.has(w));
+    const disjoint1 = substantive1.filter((w) => !tokens2.has(w));
+    const disjoint2 = substantive2.filter((w) => !tokens1.has(w));
+    if (disjoint1.length >= 1 && disjoint2.length >= 1) {
+      return 0;
+    }
+  }
 
   let intersection = 0;
   for (const t of tokens1) {
@@ -158,19 +188,24 @@ function computeBaseTitleSimilarity(source: string, candidate: string): number {
 
   if (allShorterInLonger) {
     let onlyEditionTokensRemaining = true;
+    let hasEditionToken = false;
     for (const w of longerWords) {
-      if (!shorterSet.has(w) && !EDITION_TOKENS.has(w) && w !== 'the' && w !== 'of' && w !== 'a' && w !== 'an') {
-        onlyEditionTokensRemaining = false;
-        break;
+      if (!shorterSet.has(w)) {
+        if (EDITION_TOKENS.has(w)) {
+          hasEditionToken = true;
+        } else if (w !== 'the' && w !== 'of' && w !== 'a' && w !== 'an') {
+          onlyEditionTokensRemaining = false;
+          break;
+        }
       }
     }
-    if (onlyEditionTokensRemaining) {
+    if (onlyEditionTokensRemaining && (hasEditionToken || shorterWords.length >= 2)) {
       return 0.92;
     }
   }
 
-  // Exact multi-word phrase containment
-  if (words1.length >= 2 && (s1.includes(s2) || s2.includes(s1))) {
+  // Exact multi-word phrase containment (only when sharing an explicit sequel number or article/edition-only tokens)
+  if (seq1 !== null && seq1 === seq2 && words1.length >= 2 && (s1.includes(s2) || s2.includes(s1))) {
     const minWords = Math.min(words1.length, words2.length);
     const maxWords = Math.max(words1.length, words2.length);
     if (minWords / maxWords >= 0.5 && intersection >= minWords) {

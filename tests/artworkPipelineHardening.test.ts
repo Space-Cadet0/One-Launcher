@@ -5,7 +5,7 @@ import axios from 'axios';
 import { igdbCoverService, computeTokenSimilarity } from '../src/services/igdb/igdbCoverService';
 import { requestScheduler, Priority } from '../src/services/network/requestScheduler';
 import { steamApi } from '../src/services/steam/steamApi';
-import { GameCardCover } from '../src/components/Library/LibraryGridView';
+import { GameCardCover, getCoverCandidates } from '../src/components/Library/LibraryGridView';
 import { CanonicalGame } from '../src/contracts/game';
 
 describe('Phase 3A: Artwork & Media Pipeline Hardening', () => {
@@ -225,6 +225,59 @@ describe('Phase 3A: Artwork & Media Pipeline Hardening', () => {
         })
       );
       expect(htmlWithOverride).not.toContain('Low-confidence automatic match — click Fix Match to verify');
+    });
+
+    it('prefers confirmed Steam 600x900 portrait cover over storefront and IGDB covers for non-Steam games', () => {
+      const gogGameWithSteamMatch: CanonicalGame = {
+        id: 'gog-12345',
+        title: 'Control Ultimate Edition',
+        sortTitle: 'Control Ultimate Edition',
+        steamAppId: 870780,
+        platforms: [{ platformId: 'gog', platformGameId: '12345', installed: false }],
+        capsuleImage: 'https://images.gog-statics.com/77873a93caeab4889e3f032f58687f25f9c6277d0e71182127812f21ac62e005.jpg',
+        developers: ['Remedy Entertainment'],
+        publishers: ['505 Games'],
+        genres: ['Action'],
+        tags: [],
+      };
+
+      const candidates = getCoverCandidates(
+        gogGameWithSteamMatch,
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co_control.jpg',
+        null
+      );
+
+      expect(candidates[0]).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg'
+      );
+      expect(candidates[1]).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900.jpg'
+      );
+      expect(candidates[2]).toBe(
+        'https://images.gog-statics.com/77873a93caeab4889e3f032f58687f25f9c6277d0e71182127812f21ac62e005.jpg'
+      );
+      expect(candidates[3]).toBe('https://images.igdb.com/igdb/image/upload/t_cover_big/co_control.jpg');
+    });
+
+    it('rejects GOG server-cropped horizontal covers (_glx_vertical_cover or shared horizontal hash)', () => {
+      const gogGameWithCroppedHorizontal: CanonicalGame = {
+        id: 'gog-1436499377',
+        title: 'TOEM',
+        sortTitle: 'TOEM',
+        isExplicitNonSteam: true,
+        platforms: [{ platformId: 'gog', platformGameId: '1436499377', installed: false }],
+        headerImage:
+          'https://images.gog-statics.com/ec2493f50e8945e04ccf2f5708fced7bd38606cc47bc68ced58d410fff21b120.jpg',
+        capsuleImage:
+          'https://images.gog-statics.com/ec2493f50e8945e04ccf2f5708fced7bd38606cc47bc68ced58d410fff21b120_glx_vertical_cover.jpg',
+        developers: ['Something We Made'],
+        publishers: ['Something We Made'],
+        genres: ['Adventure'],
+        tags: [],
+      };
+
+      const candidates = getCoverCandidates(gogGameWithCroppedHorizontal, undefined, null);
+      expect(candidates).toHaveLength(0);
     });
   });
 });

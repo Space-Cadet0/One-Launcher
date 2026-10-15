@@ -1,7 +1,106 @@
 import type { CanonicalGame } from '../../contracts/game';
-import type { UserGameOverride, UserGameOverridesMap } from '../../contracts/override';
+import type {
+  UserGameOverride,
+  UserGameOverridesMap,
+  ReviewScoreRoute,
+  MetadataSourceRoute,
+} from '../../contracts/override';
 
 export const STORAGE_KEY_USER_OVERRIDES = 'universal_game_library_user_overrides';
+
+/**
+ * Infers a structured MetadataSourceRoute from a UserGameOverride (including legacy overrides).
+ */
+export function inferMetadataRouteFromOverride(
+  override?: UserGameOverride | null
+): MetadataSourceRoute | undefined {
+  if (!override) return undefined;
+  if (override.metadataRoute) {
+    const inferredMode: 'routed' | 'custom' =
+      override.metadataRoute.mode ||
+      (override.metadataRoute.source === 'custom' || override.metadataRoute.source === 'original'
+        ? 'custom'
+        : 'routed');
+    return {
+      ...override.metadataRoute,
+      mode: inferredMode,
+    };
+  }
+  const source = override.matchedStore || 'custom';
+  const mode: 'routed' | 'custom' = source === 'custom' ? 'custom' : 'routed';
+  const steamAppId =
+    typeof override.steamAppId === 'number' && override.steamAppId > 0
+      ? override.steamAppId
+      : source === 'steam' && override.matchedId && !isNaN(Number(override.matchedId))
+      ? Number(override.matchedId)
+      : undefined;
+  const gogId =
+    source === 'gog' && override.matchedId
+      ? String(override.matchedId).replace(/^gog-/, '')
+      : undefined;
+  const epicSlug =
+    source === 'epic' && override.matchedId
+      ? String(override.matchedId).replace(/^epic-/, '')
+      : undefined;
+
+  return {
+    mode,
+    source,
+    matchedId: override.matchedId,
+    steamAppId,
+    gogId,
+    epicSlug,
+    igdbId: override.igdbId,
+    targetTitle: override.title,
+  };
+}
+
+/**
+ * Infers a structured ReviewScoreRoute from a UserGameOverride (including legacy overrides).
+ */
+export function inferReviewRouteFromOverride(override?: UserGameOverride | null): ReviewScoreRoute | undefined {
+  if (!override) return undefined;
+  if (override.reviewRoute) return override.reviewRoute;
+  if (override.reviewScoreOverride === null) {
+    return { mode: 'unrated' };
+  }
+  if (override.reviewScoreOverride) {
+    if (override.reviewScoreOverride.source === 'custom') {
+      return {
+        mode: 'static',
+        source: 'custom',
+        url: override.reviewScoreOverride.url,
+      };
+    }
+    const metacriticSlug =
+      override.reviewScoreOverride.url?.match(/metacritic\.com\/game\/(?:pc\/)?([^/?#]+)/i)?.[1] ||
+      override.storefrontAnchor?.metacriticSlug;
+    const openCriticId =
+      Number(override.reviewScoreOverride.url?.match(/opencritic\.com\/game\/(\d+)/i)?.[1] || 0) ||
+      override.storefrontAnchor?.openCriticId ||
+      undefined;
+    const steamAppId =
+      Number(override.reviewScoreOverride.url?.match(/store\.steampowered\.com\/app\/(\d+)/i)?.[1] || 0) ||
+      (typeof override.steamAppId === 'number' && override.steamAppId > 0 ? override.steamAppId : undefined);
+    const gogId =
+      override.matchedStore === 'gog' && override.matchedId ? String(override.matchedId) : undefined;
+    const epicId =
+      override.matchedStore === 'epic' && override.matchedId ? String(override.matchedId) : undefined;
+
+    return {
+      mode: 'routed',
+      source: override.reviewScoreOverride.source,
+      url: override.reviewScoreOverride.url,
+      metacriticSlug,
+      openCriticId,
+      steamAppId,
+      gogId,
+      epicId,
+      targetTitle: override.title,
+    };
+  }
+  return undefined;
+}
 
 function getStorage(): Storage | null {
   if (typeof window !== 'undefined' && window.localStorage) {
@@ -13,6 +112,10 @@ function getStorage(): Storage | null {
   return null;
 }
 
+let cachedOverridesRaw: string | null = null;
+let cachedOverridesMap: UserGameOverridesMap = {};
+let cachedStorageRef: Storage | null = null;
+
 /**
  * Loads all user-defined game overrides from localStorage (and native Electron if available).
  */
@@ -21,9 +124,21 @@ export function loadUserOverrides(): UserGameOverridesMap {
   if (!storage) return {};
   try {
     const raw = storage.getItem(STORAGE_KEY_USER_OVERRIDES);
-    if (!raw) return {};
+    if (!raw) {
+      cachedStorageRef = storage;
+      cachedOverridesRaw = null;
+      cachedOverridesMap = {};
+      return {};
+    }
+    if (storage === cachedStorageRef && raw === cachedOverridesRaw) {
+      return cachedOverridesMap;
+    }
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? (parsed as UserGameOverridesMap) : {};
+    const map = parsed && typeof parsed === 'object' ? (parsed as UserGameOverridesMap) : {};
+    cachedStorageRef = storage;
+    cachedOverridesRaw = raw;
+    cachedOverridesMap = map;
+    return map;
   } catch (err) {
     console.warn('Failed to load user game overrides from localStorage:', err);
     return {};
@@ -36,7 +151,7 @@ export function loadUserOverrides(): UserGameOverridesMap {
 export function saveUserOverride(override: UserGameOverride, oldGame?: CanonicalGame): void {
   if (!override || !override.gameId) return;
   try {
-    const current = loadUserOverrides();
+    const current: UserGameOverridesMap = { ...loadUserOverrides() };
     const updatedOverride: UserGameOverride = {
       ...override,
       updatedAt: override.updatedAt || new Date().toISOString(),
@@ -46,6 +161,25 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
     } else if (current[override.gameId]?.reviewScoreOverride !== undefined) {
       updatedOverride.reviewScoreOverride = current[override.gameId].reviewScoreOverride;
     }
+
+    if (override.reviewRoute !== undefined) {
+      updatedOverride.reviewRoute = override.reviewRoute;
+    } else if (override.reviewScoreOverride === undefined && current[override.gameId]?.reviewRoute !== undefined) {
+      updatedOverride.reviewRoute = current[override.gameId].reviewRoute;
+    }
+
+    if (updatedOverride.reviewScoreOverride !== undefined && updatedOverride.reviewRoute === undefined) {
+      updatedOverride.reviewRoute = inferReviewRouteFromOverride(updatedOverride);
+    }
+
+    if (override.metadataRoute !== undefined) {
+      updatedOverride.metadataRoute = inferMetadataRouteFromOverride(updatedOverride);
+    } else if (current[override.gameId]?.metadataRoute !== undefined) {
+      updatedOverride.metadataRoute = current[override.gameId].metadataRoute;
+    } else {
+      updatedOverride.metadataRoute = inferMetadataRouteFromOverride(updatedOverride);
+    }
+
     current[override.gameId] = updatedOverride;
 
     // Also index platform key if available (e.g., 'epic:boga' or 'gog:1837805079')
@@ -56,7 +190,11 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
 
     const storage = getStorage();
     if (storage) {
-      storage.setItem(STORAGE_KEY_USER_OVERRIDES, JSON.stringify(current));
+      const serialized = JSON.stringify(current);
+      storage.setItem(STORAGE_KEY_USER_OVERRIDES, serialized);
+      cachedStorageRef = storage;
+      cachedOverridesRaw = serialized;
+      cachedOverridesMap = current;
     }
 
     // Notify window listeners reactively
@@ -91,7 +229,7 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
 export function removeUserOverride(gameId: string): void {
   if (!gameId) return;
   try {
-    const current = loadUserOverrides();
+    const current: UserGameOverridesMap = { ...loadUserOverrides() };
     const existing = current[gameId];
     let deleted = false;
     if (current[gameId]) {
@@ -108,7 +246,11 @@ export function removeUserOverride(gameId: string): void {
 
     const storage = getStorage();
     if (deleted && storage) {
-      storage.setItem(STORAGE_KEY_USER_OVERRIDES, JSON.stringify(current));
+      const serialized = JSON.stringify(current);
+      storage.setItem(STORAGE_KEY_USER_OVERRIDES, serialized);
+      cachedStorageRef = storage;
+      cachedOverridesRaw = serialized;
+      cachedOverridesMap = current;
     }
 
     // Notify window listeners reactively
@@ -193,17 +335,86 @@ export function getUserOverrideForGame(
 }
 
 /**
+ * Updates the cached metadata snapshot on a routed UserGameOverride without overwriting
+ * user-pinned custom fields (such as customTitleEdited, customSynopsisEdited, or Step 2 capsuleImage).
+ */
+export function updateRoutedMetadataSnapshot(
+  gameId: string,
+  refreshed: Partial<UserGameOverride>
+): void {
+  if (!gameId || !refreshed) return;
+  try {
+    const current: UserGameOverridesMap = { ...loadUserOverrides() };
+    const existing = current[gameId];
+    if (!existing) return;
+
+    const route = inferMetadataRouteFromOverride(existing);
+    if (!route || route.mode === 'custom') return;
+
+    const next: UserGameOverride = { ...existing };
+
+    if (!route.customTitleEdited && refreshed.title && refreshed.title.trim()) {
+      next.title = refreshed.title.trim();
+      next.sortTitle = refreshed.title.replace(/^(The|A|An)\s+/i, '').trim();
+    }
+    if (!route.customSynopsisEdited && refreshed.shortDescription && refreshed.shortDescription.trim()) {
+      next.shortDescription = refreshed.shortDescription.trim();
+    }
+    if (refreshed.detailedDescription && refreshed.detailedDescription.trim()) {
+      next.detailedDescription = refreshed.detailedDescription;
+    }
+    if (refreshed.headerImage && refreshed.headerImage.trim()) {
+      next.headerImage = refreshed.headerImage.trim();
+    }
+    if (Array.isArray(refreshed.developers) && refreshed.developers.length > 0) {
+      next.developers = [...refreshed.developers];
+    }
+    if (Array.isArray(refreshed.publishers) && refreshed.publishers.length > 0) {
+      next.publishers = [...refreshed.publishers];
+    }
+    if (Array.isArray(refreshed.genres) && refreshed.genres.length > 0) {
+      next.genres = [...refreshed.genres];
+    }
+    if (Array.isArray(refreshed.tags) && refreshed.tags.length > 0) {
+      next.tags = [...refreshed.tags];
+    }
+    if (refreshed.releaseDate && refreshed.releaseDate.trim() && refreshed.releaseDate !== 'TBA') {
+      next.releaseDate = refreshed.releaseDate.trim();
+    }
+
+    current[gameId] = next;
+    if (existing.platformId && existing.platformGameId) {
+      current[`${existing.platformId}:${existing.platformGameId}`] = next;
+    }
+
+    const storage = getStorage();
+    if (storage) {
+      const serialized = JSON.stringify(current);
+      storage.setItem(STORAGE_KEY_USER_OVERRIDES, serialized);
+      cachedStorageRef = storage;
+      cachedOverridesRaw = serialized;
+      cachedOverridesMap = current;
+    }
+  } catch (err) {
+    console.warn('Failed to update routed metadata snapshot:', err);
+  }
+}
+
+/**
  * Applies a user-defined override to a CanonicalGame.
  * User intent has absolute authority:
  * - If override.steamAppId === null, sets steamAppId = undefined so it is treated as non-Steam.
  * - Explicit fields overwrite incoming metadata.
+ * - Stale enrichedMetadata from an old/unmatched storefront is automatically invalidated.
  */
 export function applyUserOverrideToGame(
   game: CanonicalGame,
-  override: UserGameOverride
+  override: UserGameOverride,
+  options?: { invalidateEnrichedCache?: boolean }
 ): CanonicalGame {
   if (!game || !override) return game;
   const updated: CanonicalGame = { ...game };
+  const route = inferMetadataRouteFromOverride(override);
 
   if (override.title !== undefined && override.title.trim() !== '') {
     updated.title = override.title.trim();
@@ -221,10 +432,31 @@ export function applyUserOverrideToGame(
   } else if (typeof override.steamAppId === 'number') {
     updated.steamAppId = override.steamAppId;
     updated.isExplicitNonSteam = false;
+  } else if (route?.source === 'steam' && typeof route.steamAppId === 'number' && route.steamAppId > 0) {
+    updated.steamAppId = route.steamAppId;
+    updated.isExplicitNonSteam = false;
   }
 
   if (override.isExplicitNonSteam !== undefined) {
     updated.isExplicitNonSteam = override.isExplicitNonSteam;
+  }
+
+  // Invalidate stale enrichedMetadata if explicitly requested (e.g. wizard apply)
+  // or if existing enrichedMetadata came from a mismatched Steam App ID / different store route
+  if (options?.invalidateEnrichedCache) {
+    updated.enrichedMetadata = undefined;
+  } else if (updated.enrichedMetadata) {
+    const existingEnrichedAppId = updated.enrichedMetadata.appId;
+    if (
+      (updated.isExplicitNonSteam && existingEnrichedAppId > 0) ||
+      (typeof updated.steamAppId === 'number' &&
+        existingEnrichedAppId > 0 &&
+        existingEnrichedAppId !== updated.steamAppId) ||
+      ((route?.source === 'gog' || route?.source === 'epic' || route?.source === 'igdb') &&
+        existingEnrichedAppId > 0)
+    ) {
+      updated.enrichedMetadata = undefined;
+    }
   }
 
   if (override.capsuleImage !== undefined && override.capsuleImage.trim() !== '') {

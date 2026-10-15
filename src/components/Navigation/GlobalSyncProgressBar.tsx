@@ -7,6 +7,7 @@ import {
   X,
   AlertTriangle,
   CheckCircle2,
+  Zap,
 } from 'lucide-react';
 
 export function GlobalSyncProgressBar() {
@@ -33,7 +34,7 @@ export function GlobalSyncProgressBar() {
     if (job.status === 'completed') {
       const timer = setTimeout(() => {
         setVisible(false);
-      }, 4000);
+      }, 3500);
       return () => clearTimeout(timer);
     }
 
@@ -49,7 +50,23 @@ export function GlobalSyncProgressBar() {
     return null;
   }
 
-  const percent = job.total > 0 ? Math.min(100, Math.round((job.current / job.total) * 100)) : 0;
+  const isStandalonePriority = job.id.startsWith('priority-');
+  const isPreemptedBackground = Boolean(job.isPreempted && !isStandalonePriority);
+  const percent = isStandalonePriority
+    ? job.status === 'completed'
+      ? 100
+      : 65
+    : job.total > 0
+      ? Math.min(100, Math.round((job.current / job.total) * 100))
+      : 0;
+
+  const displayHeadline = isPreemptedBackground && job.priorityHeadline
+    ? `${job.priorityHeadline} (Priority)`
+    : job.headline || job.title;
+
+  const displayItemName = isPreemptedBackground && job.priorityItemName
+    ? job.priorityItemName
+    : job.currentItemName;
 
   const handlePause = () => {
     if (job) syncJobManager.pauseJob(job.id);
@@ -60,10 +77,18 @@ export function GlobalSyncProgressBar() {
   };
 
   const handleCancel = () => {
-    if (job) syncJobManager.cancelJob(job.id);
+    if (job?.id.startsWith('priority-') || job?.isPreempted) {
+      syncJobManager.endAllPriorityScopes();
+    }
+    if (job && !job.id.startsWith('priority-')) {
+      syncJobManager.cancelJob(job.id);
+    }
   };
 
   const handleDismiss = () => {
+    if (job?.id.startsWith('priority-') || job?.isPreempted) {
+      syncJobManager.endAllPriorityScopes();
+    }
     setVisible(false);
   };
 
@@ -84,33 +109,41 @@ export function GlobalSyncProgressBar() {
       {/* Top Header Row */}
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 min-w-0">
-          {job.status === 'running' && (
-            <RefreshCw className="w-4 h-4 text-cyan-400 shrink-0 animate-spin" />
-          )}
-          {job.status === 'paused' && (
-            <Pause className="w-4 h-4 text-amber-400 shrink-0" />
-          )}
-          {job.status === 'rate_limited' && (
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 animate-pulse" />
-          )}
-          {job.status === 'completed' && (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-          )}
-          {job.status === 'cancelled' && (
-            <X className="w-4 h-4 text-zinc-400 shrink-0" />
+          {job.isPreempted ? (
+            <Zap className="w-4 h-4 text-amber-400 shrink-0 animate-pulse" />
+          ) : (
+            <>
+              {job.status === 'running' && (
+                <RefreshCw className="w-4 h-4 text-cyan-400 shrink-0 animate-spin" />
+              )}
+              {job.status === 'paused' && (
+                <Pause className="w-4 h-4 text-amber-400 shrink-0" />
+              )}
+              {job.status === 'rate_limited' && (
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 animate-pulse" />
+              )}
+              {job.status === 'completed' && (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              )}
+              {job.status === 'cancelled' && (
+                <X className="w-4 h-4 text-zinc-400 shrink-0" />
+              )}
+            </>
           )}
 
-          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-200 truncate">
-            {job.title}
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-100 truncate">
+            {displayHeadline}
           </span>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          <span className="text-xs font-mono font-bold text-cyan-400">
-            {percent}%
-          </span>
+          {!isStandalonePriority && (
+            <span className="text-xs font-mono font-bold text-cyan-400">
+              {percent}%
+            </span>
+          )}
 
-          {job.status === 'running' && (
+          {!isStandalonePriority && job.status === 'running' && !job.isPreempted && (
             <button
               onClick={handlePause}
               title="Pause sync"
@@ -120,7 +153,7 @@ export function GlobalSyncProgressBar() {
             </button>
           )}
 
-          {job.status === 'paused' && (
+          {!isStandalonePriority && job.status === 'paused' && (
             <button
               onClick={handleResume}
               title="Resume sync"
@@ -130,17 +163,18 @@ export function GlobalSyncProgressBar() {
             </button>
           )}
 
-          {(job.status === 'running' || job.status === 'paused' || job.status === 'rate_limited') && (
-            <button
-              onClick={handleCancel}
-              title="Cancel sync"
-              className="p-1 rounded text-zinc-400 hover:text-rose-400 hover:bg-zinc-800 transition-colors"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          )}
+          {!isStandalonePriority &&
+            (job.status === 'running' || job.status === 'paused' || job.status === 'rate_limited') && (
+              <button
+                onClick={handleCancel}
+                title="Cancel sync"
+                className="p-1 rounded text-zinc-400 hover:text-rose-400 hover:bg-zinc-800 transition-colors"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
 
-          {(job.status === 'completed' || job.status === 'cancelled') && (
+          {(job.status === 'completed' || job.status === 'cancelled' || isStandalonePriority) && (
             <button
               onClick={handleDismiss}
               title="Dismiss"
@@ -152,12 +186,28 @@ export function GlobalSyncProgressBar() {
         </div>
       </div>
 
+      {/* Active Category Pills (when syncing multiple streams or showing headline tags) */}
+      {job.activeCategories && job.activeCategories.length > 1 && job.status === 'running' && (
+        <div className="flex flex-wrap items-center gap-1.5 mb-2">
+          {job.activeCategories.map((cat) => (
+            <span
+              key={cat}
+              className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-cyan-950/70 text-cyan-300 border border-cyan-700/40"
+            >
+              {cat}
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* Progress Track */}
       <div className="w-full bg-zinc-800/80 rounded-full h-1.5 overflow-hidden mb-2">
         <div
           className={`h-full rounded-full transition-all duration-300 ${
             job.status === 'completed'
               ? 'bg-emerald-500'
+              : job.isPreempted
+              ? 'bg-amber-400 animate-pulse'
               : job.status === 'rate_limited'
               ? 'bg-amber-500'
               : job.status === 'paused'
@@ -173,30 +223,40 @@ export function GlobalSyncProgressBar() {
       {/* Detail / Status Description Row */}
       <div className="flex items-center justify-between text-[11px] text-zinc-400">
         <div className="truncate pr-2">
-          {job.status === 'running' && job.currentItemName && (
-            <span className="truncate">
-              Processing: <span className="text-zinc-200">{job.currentItemName}</span>
+          {isPreemptedBackground ? (
+            <span className="text-amber-300/90 font-medium truncate">
+              Background sync paused {displayItemName ? `for ${displayItemName}` : ''} — will auto-resume
             </span>
-          )}
-          {job.status === 'paused' && (
-            <span className="text-amber-400/90 font-medium">Sync paused</span>
-          )}
-          {job.status === 'rate_limited' && (
-            <span className="text-amber-400 font-medium">
-              Rate limited: Cooldown {formatCooldown(job.cooldownSecondsRemaining)}
-            </span>
-          )}
-          {job.status === 'completed' && (
-            <span className="text-emerald-400 font-medium">Sync complete!</span>
-          )}
-          {job.status === 'cancelled' && (
-            <span className="text-zinc-400 font-medium">Sync cancelled</span>
+          ) : (
+            <>
+              {job.status === 'running' && displayItemName && (
+                <span className="truncate">
+                  Processing: <span className="text-zinc-200">{displayItemName}</span>
+                </span>
+              )}
+              {job.status === 'paused' && (
+                <span className="text-amber-400/90 font-medium">Sync paused</span>
+              )}
+              {job.status === 'rate_limited' && (
+                <span className="text-amber-400 font-medium">
+                  Rate limited: Cooldown {formatCooldown(job.cooldownSecondsRemaining)}
+                </span>
+              )}
+              {job.status === 'completed' && (
+                <span className="text-emerald-400 font-medium">Sync complete!</span>
+              )}
+              {job.status === 'cancelled' && (
+                <span className="text-zinc-400 font-medium">Sync cancelled</span>
+              )}
+            </>
           )}
         </div>
 
-        <span className="font-mono text-zinc-400 shrink-0">
-          {job.current} / {job.total}
-        </span>
+        {!isStandalonePriority && job.total > 0 && (
+          <span className="font-mono text-zinc-400 shrink-0">
+            {job.current} / {job.total}
+          </span>
+        )}
       </div>
     </div>
   );

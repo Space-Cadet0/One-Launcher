@@ -14,6 +14,7 @@ import {
   Sliders,
   Award,
   AlertCircle,
+  Activity,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { getHowLongToBeat } from '../../services/hltb/howLongToBeat';
@@ -24,7 +25,13 @@ import { steamApi } from '../../services/steam/steamApi';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
-import { igdbCoverService, isKnownDeadSteamCover, isUnsuitableCoverUrl, normalizeKey } from '../../services/igdb/igdbCoverService';
+import {
+  igdbCoverService,
+  isGogCroppedHorizontalCover,
+  isKnownDeadSteamCover,
+  isUnsuitableCoverUrl,
+  normalizeKey,
+} from '../../services/igdb/igdbCoverService';
 import {
   extractFirstParagraph,
   isGenericPlaceholderSynopsis,
@@ -38,6 +45,7 @@ import {
   loadUserOverrides,
 } from '../../services/storage/userOverrideStorage';
 import { UserGameOverride } from '../../contracts/override';
+import { launcherService } from '../../services/launcher/launcherService';
 
 function isPlaceholderSynopsis(desc?: string, title?: string): boolean {
   return isGenericPlaceholderSynopsis(desc, title);
@@ -203,18 +211,11 @@ export function getCoverCandidates(
   if (effectiveOverride?.capsuleImage) {
     add(effectiveOverride.capsuleImage, true);
   }
-  if (overrideCoverUrl) {
-    add(overrideCoverUrl, true);
-  }
   if (effectiveOverride && game.capsuleImage) {
     add(game.capsuleImage, true);
   }
 
-  // 2. Instant verified IGDB portrait box art if known or cached
-  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-  add(igdbCover);
-
-  // 3. Official Steam 600x900 2:3 Library Poster (for games available on Steam that are not 404/hashed)
+  // 2. Official Steam 600x900 2:3 Library Portrait Cover (preferred whenever a game has a confirmed Steam match)
   // If user explicitly unlinked from Steam (effectiveOverride?.steamAppId === null), do NOT match to Steam!
   const isExplicitNonSteam = effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
   const targetSteamId = !isExplicitNonSteam
@@ -223,10 +224,17 @@ export function getCoverCandidates(
 
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
     add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
+    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
   }
 
-  // 4. Official Steam / Epic / GOG tall vertical posters already attached to the game entity
-  if (game.capsuleImage) {
+  // 3. Official Steam / Epic / GOG tall vertical posters
+  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+  if (gogPlat?.platformGameId) {
+    const gogBoxArt = igdbCoverService.getGogVerticalCoverInstant(gogPlat.platformGameId, game.title);
+    add(gogBoxArt);
+  }
+
+  if (game.capsuleImage && !isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage)) {
     const lower = game.capsuleImage.toLowerCase();
     const isGog = lower.includes('gog-statics.com');
     if (
@@ -237,24 +245,29 @@ export function getCoverCandidates(
           lower.includes('t_cover_big') ||
           lower.includes('1200x1600') ||
           lower.includes('portrait'))) ||
-      (isGog && lower.includes('_glx_vertical_cover'))
+      isGog
     ) {
       add(game.capsuleImage);
     }
   }
 
-  // 5. Official Steam 600x900 1x poster
-  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
-    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+  // 4. Verified IGDB portrait box art fallback (for non-Steam games or legacy Steam titles whose 600x900 cover 404s)
+  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+  add(igdbCover);
+  if (overrideCoverUrl) {
+    add(overrideCoverUrl);
   }
 
-  // 6. Primary capsule image if valid
-  if (game.capsuleImage) {
+  // 5. Primary capsule image if valid and not a server-cropped horizontal GOG banner
+  if (game.capsuleImage && !isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage)) {
     add(game.capsuleImage);
   }
 
-  // 7. Enriched metadata or cached Steam API capsule fallback (e.g. hashed CDN paths)
-  if (game.enrichedMetadata?.capsuleImage) {
+  // 6. Enriched metadata or cached Steam API capsule fallback (e.g. hashed CDN paths)
+  if (
+    game.enrichedMetadata?.capsuleImage &&
+    !isGogCroppedHorizontalCover(game.enrichedMetadata.capsuleImage, game.headerImage)
+  ) {
     add(game.enrichedMetadata.capsuleImage);
   }
   if (targetSteamId) {
@@ -276,31 +289,108 @@ interface GameCardCoverProps {
 
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
   ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup }) => {
+    const [steamMatchVersion, setSteamMatchVersion] = useState(0);
+
+    useEffect(() => {
+      const handleSteamMatch = (e: any) => {
+        const matchedTitle = e.detail?.title;
+        if (!matchedTitle || normalizeKey(matchedTitle) === normalizeKey(game.title)) {
+          setSteamMatchVersion((v) => v + 1);
+        }
+      };
+      const handleGogCover = (e: any) => {
+        const { gogId, title: gogTitle } = e.detail || {};
+        const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+        if (
+          (gogId && gogPlat?.platformGameId && String(gogPlat.platformGameId) === String(gogId)) ||
+          (gogTitle && normalizeKey(gogTitle) === normalizeKey(game.title))
+        ) {
+          setSteamMatchVersion((v) => v + 1);
+        }
+      };
+      window.addEventListener('antigravity:steam-match-updated', handleSteamMatch);
+      window.addEventListener('antigravity:gog-cover-updated', handleGogCover);
+      return () => {
+        window.removeEventListener('antigravity:steam-match-updated', handleSteamMatch);
+        window.removeEventListener('antigravity:gog-cover-updated', handleGogCover);
+      };
+    }, [game.title, game.platforms]);
+
     const candidates = useMemo(() => {
       return getCoverCandidates(game, overrideCoverUrl || undefined, userOverride);
-    }, [game, overrideCoverUrl, userOverride]);
+    }, [game, overrideCoverUrl, userOverride, steamMatchVersion]);
 
     const [candidateIndex, setCandidateIndex] = useState(0);
     const [headerFallbackFailed, setHeaderFallbackFailed] = useState(false);
+    const topCandidate = candidates[0] || '';
 
-    // Reset candidate progression when game or explicit override changes
+    // Reset candidate progression when game, explicit override, or top priority candidate upgrades
     useEffect(() => {
       setCandidateIndex(0);
-    }, [game.id, game.capsuleImage, overrideCoverUrl, userOverride?.capsuleImage]);
+    }, [
+      game.id,
+      game.steamAppId,
+      game.capsuleImage,
+      overrideCoverUrl,
+      userOverride?.capsuleImage,
+      topCandidate,
+    ]);
 
     useEffect(() => {
       setHeaderFallbackFailed(false);
     }, [game.id, game.headerImage]);
 
     const currentSrc = candidateIndex < candidates.length ? candidates[candidateIndex] : null;
+    const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
 
+    // Only invoke IGDB fallback lookup when all primary vertical cover candidates have failed
     useEffect(() => {
       if (!currentSrc && onNeedCoverLookup) {
         onNeedCoverLookup(game);
       }
     }, [currentSrc, game, onNeedCoverLookup]);
 
-    const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
+    // Proactively resolve confirmed Steam matches and official GOG v2 boxArtImage covers for non-Steam games
+    useEffect(() => {
+      if (effectiveOverride?.capsuleImage) return;
+      const isExplicitNonSteam =
+        effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
+      const hasResolvedSteamId = !isExplicitNonSteam && Boolean(steamMatcher.getEffectiveSteamAppId(game));
+
+      if (!hasResolvedSteamId && !isExplicitNonSteam) {
+        steamMatcher
+          .matchGameToSteam(game.title, {
+            releaseYear: game.releaseDate,
+            developers: game.developers,
+          })
+          .catch(() => null);
+      }
+
+      const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+      if (gogPlat?.platformGameId) {
+        const hasGogBoxArt = Boolean(
+          igdbCoverService.getGogVerticalCoverInstant(gogPlat.platformGameId, game.title)
+        );
+        if (
+          !hasGogBoxArt &&
+          (!hasResolvedSteamId || isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage))
+        ) {
+          igdbCoverService
+            .fetchGogVerticalCover(gogPlat.platformGameId, game.title)
+            .catch(() => null);
+        }
+      }
+    }, [
+      game.id,
+      game.title,
+      game.releaseDate,
+      game.developers,
+      game.isExplicitNonSteam,
+      game.capsuleImage,
+      game.headerImage,
+      game.platforms,
+      effectiveOverride,
+    ]);
     const matchReviewBadge =
       game.needsMatchReview === true && !effectiveOverride ? (
         <div
@@ -449,7 +539,13 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       setCriticUpdateTick((t) => t + 1);
     };
     window.addEventListener('antigravity_critic_updated', handleUpdate);
-    return () => window.removeEventListener('antigravity_critic_updated', handleUpdate);
+    const unsubLauncher = launcherService.subscribe(() => {
+      setCriticUpdateTick((t) => t + 1);
+    });
+    return () => {
+      window.removeEventListener('antigravity_critic_updated', handleUpdate);
+      unsubLauncher();
+    };
   }, []);
 
   const handleContextMenu = (game: CanonicalGame, e: React.MouseEvent) => {
@@ -518,8 +614,19 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     if (attemptedCoverLookupsRef.current.has(game.id)) return;
     attemptedCoverLookupsRef.current.add(game.id);
 
-    const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
+    let targetAppId = steamMatcher.getEffectiveSteamAppId(game);
     const releaseYear = getReleaseYear(game, targetAppId);
+    const isExplicitNonSteam = game.isExplicitNonSteam === true;
+
+    if (!targetAppId && !isExplicitNonSteam) {
+      steamMatcher
+        .matchGameToSteam(game.title, {
+          releaseYear: game.releaseDate,
+          developers: game.developers,
+        })
+        .catch(() => null);
+    }
+
     igdbCoverService.fetchIgdbCover(game.title, releaseYear).then((resolvedCover) => {
       if (resolvedCover) {
         setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
@@ -737,8 +844,8 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     if (sortBy === 'rating') {
       const targetSteamIdA = steamMatcher.getEffectiveSteamAppId(a);
       const targetSteamIdB = steamMatcher.getEffectiveSteamAppId(b);
-      const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent);
-      const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent);
+      const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent, undefined, undefined, false, true);
+      const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent, undefined, undefined, false, true);
       const scoreA = ocA?.score ?? -1;
       const scoreB = ocB?.score ?? -1;
       if (scoreB !== scoreA) {
@@ -957,7 +1064,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         {/* Game Covers Grid (Aspect Ratio ~2:3 Portrait Posters) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
           {sortedGames.map((game) => {
-            const isInstalled = game.platforms.some((p) => p.installed);
+            const isRunning = launcherService.isGameRunning(game.id);
+            const isInstalled =
+              game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
             return (
               <div
                 key={game.id}
@@ -1009,13 +1118,18 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   {/* Gradient bottom shadow to ensure overlays pop */}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20 pointer-events-none" />
 
-                  {/* Top Header: Installed status badge if installed */}
-                  {isInstalled && (
+                  {/* Top Header: Running or Installed status badge */}
+                  {isRunning ? (
+                    <div className="absolute top-2 left-2 flex items-center gap-1 bg-amber-950/90 border border-amber-400/70 text-amber-300 text-[10px] font-bold px-1.5 py-0.5 rounded shadow z-10">
+                      <Activity className="w-2.5 h-2.5 text-amber-400 animate-pulse" />
+                      <span>Running</span>
+                    </div>
+                  ) : isInstalled ? (
                     <div className="absolute top-2 left-2 flex items-center gap-1 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow z-10">
                       <CheckCircle2 className="w-2.5 h-2.5" />
                       <span>Ready</span>
                     </div>
-                  )}
+                  ) : null}
 
                   {/* Top-Right: Critic Score Pill */}
                   {(() => {
@@ -1023,7 +1137,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     const oc = getOpenCriticData(
                       targetSteamId || undefined,
                       game.title,
-                      game.reviewSummary?.positivePercent
+                      game.reviewSummary?.positivePercent,
+                      undefined,
+                      undefined,
+                      false,
+                      true
                     );
                     if (!oc) return null;
                     const ocColors = getTierColor(oc.tier);

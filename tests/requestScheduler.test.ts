@@ -409,10 +409,14 @@ describe('SyncJobManager & Navigation Resilience', () => {
 
 describe('GlobalSyncProgressBar Component', () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
+    requestScheduler.reset();
     syncJobManager.reset();
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
+    requestScheduler.reset();
     syncJobManager.reset();
   });
 
@@ -471,4 +475,87 @@ describe('GlobalSyncProgressBar Component', () => {
     expect(html).toContain('100%');
     expect(html).toContain('25 / 25');
   });
+
+  it('aggregates multiple concurrent background sync streams into a clean headline', async () => {
+    let resolveCover!: () => void;
+    let resolveReviews!: () => void;
+
+    const coverPromise = syncJobManager.trackTask(
+      'cover_art',
+      'The Witcher 3',
+      () => new Promise<void>((r) => { resolveCover = r; })
+    );
+
+    expect(syncJobManager.getState()?.headline).toBe('Syncing Cover Art');
+    expect(syncJobManager.getState()?.activeCategories).toEqual(['Cover Art']);
+
+    const reviewPromise = syncJobManager.trackTask(
+      'critic_scores',
+      'Cyberpunk 2077',
+      () => new Promise<void>((r) => { resolveReviews = r; })
+    );
+
+    expect(syncJobManager.getState()?.headline).toBe('Syncing Cover Art & Review Scores');
+    expect(syncJobManager.getState()?.activeCategories).toEqual(['Cover Art', 'Review Scores']);
+    expect(syncJobManager.getState()?.total).toBe(2);
+    expect(syncJobManager.getState()?.current).toBe(0);
+
+    resolveCover();
+    await coverPromise;
+
+    expect(syncJobManager.getState()?.current).toBe(1);
+    expect(syncJobManager.getState()?.headline).toBe('Syncing Review Scores');
+
+    resolveReviews();
+    await reviewPromise;
+
+    expect(syncJobManager.getState()?.status).toBe('completed');
+    expect(syncJobManager.getState()?.current).toBe(2);
+  });
+
+  it('preempts background sync during on-demand runPriorityAction and auto-resumes afterwards', async () => {
+    let resolveBg!: () => void;
+    const bgPromise = syncJobManager.trackTask(
+      'cover_art',
+      'Background Game',
+      () => new Promise<void>((r) => { resolveBg = r; })
+    );
+
+    expect(syncJobManager.getState()?.headline).toBe('Syncing Cover Art');
+    expect(syncJobManager.isPriorityPreempted()).toBe(false);
+    expect(requestScheduler.isInteractivePreempted()).toBe(false);
+
+    let stateDuringPriority: SyncJobState | null = null;
+    let schedulerPreemptedDuringPriority = false;
+    let htmlDuringPriority = '';
+
+    await syncJobManager.runPriorityAction(
+      'Syncing Game Media',
+      'Hades II',
+      async () => {
+        stateDuringPriority = syncJobManager.getState();
+        schedulerPreemptedDuringPriority = requestScheduler.isInteractivePreempted();
+        htmlDuringPriority = renderToString(React.createElement(GlobalSyncProgressBar)).replace(/<!--.*?-->/g, '');
+      }
+    );
+
+    // During the priority action, background sync was preempted
+    expect(schedulerPreemptedDuringPriority).toBe(true);
+    expect(stateDuringPriority).not.toBeNull();
+    expect((stateDuringPriority as any).isPreempted).toBe(true);
+    expect((stateDuringPriority as any).priorityHeadline).toBe('Syncing Game Media');
+    expect((stateDuringPriority as any).priorityItemName).toBe('Hades II');
+    expect(htmlDuringPriority).toContain('Syncing Game Media');
+    expect(htmlDuringPriority).toContain('Background sync paused for Hades II');
+
+    // Immediately after the priority action completes, background sync automatically resumes
+    expect(syncJobManager.isPriorityPreempted()).toBe(false);
+    expect(requestScheduler.isInteractivePreempted()).toBe(false);
+    expect(syncJobManager.getState()?.isPreempted).toBeFalsy();
+    expect(syncJobManager.getState()?.headline).toBe('Syncing Cover Art');
+
+    resolveBg();
+    await bgPromise;
+  });
 });
+

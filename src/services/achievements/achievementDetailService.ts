@@ -18,6 +18,9 @@ import {
   KNOWN_USER_STEAM_ACHIEVEMENTS,
   KNOWN_USER_GOG_ACHIEVEMENTS,
   KNOWN_USER_EPIC_ACHIEVEMENTS,
+  getKnownSteamAchievements,
+  getKnownGogAchievements,
+  getKnownEpicAchievements,
 } from '../storage/knownGameAchievements';
 import knownAchievementsJson from '../storage/knownGameAchievements.json';
 
@@ -307,7 +310,21 @@ export class AchievementDetailService {
 
     try {
       const res = await axios.get(xmlUrl, { timeout: 8000, responseType: 'text' });
-      const xml = typeof res.data === 'string' ? res.data : '';
+      let xml = typeof res.data === 'string' ? res.data : '';
+
+      // Handle older Steam titles with custom Steam Community friendlyURL redirects (e.g. 20920 -> TheWitcher2)
+      if (!xml.includes('<achievement closed=') && !xml.includes('<achievements>')) {
+        const friendlyMatch = xml.match(/steamcommunity\.com\/stats\/([^/"'?]+)\/achievements/i);
+        if (friendlyMatch?.[1]) {
+          try {
+            const friendlyUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${encodeURIComponent(friendlyMatch[1])}/?xml=1`;
+            const friendlyRes = await axios.get(friendlyUrl, { timeout: 8000, responseType: 'text' });
+            if (typeof friendlyRes.data === 'string') {
+              xml = friendlyRes.data;
+            }
+          } catch {}
+        }
+      }
 
       if (xml.includes('<achievement closed=') || xml.includes('<achievements>')) {
         const achievementBlocks = xml.split('<achievement closed="');
@@ -390,8 +407,11 @@ export class AchievementDetailService {
       ? canonicalSchema
       : await this.getCanonicalGameSchema({ title: gameTitle, steamAppId: appId } as CanonicalGame);
 
-    const knownUser = KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
-    const unlockedCount = existingSummary?.unlocked ?? (knownUser ? knownUser.unlocked : 0);
+    const knownUser =
+      getKnownSteamAchievements(appId) ||
+      steamAchievementsService.getCachedAchievements(appId) ||
+      KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
+    const unlockedCount = Math.max(existingSummary?.unlocked ?? 0, knownUser ? knownUser.unlocked : 0);
     const totalCount = schema.length > 0 ? schema.length : (existingSummary?.total ?? (knownUser ? knownUser.total : 0));
 
     if (totalCount > 0) {
@@ -463,7 +483,9 @@ export class AchievementDetailService {
     }
 
     const summary = existingSummary || epicPlatform?.achievements;
+    const cachedUserEpic = getKnownEpicAchievements(targetId, game.title);
     const userEpic =
+      (cachedUserEpic && (!summary || cachedUserEpic.unlocked >= (summary.unlocked || 0)) ? cachedUserEpic : summary) ||
       KNOWN_USER_EPIC_ACHIEVEMENTS[targetId] ||
       KNOWN_USER_EPIC_ACHIEVEMENTS[`epic-${targetId}`] ||
       KNOWN_USER_EPIC_ACHIEVEMENTS[titleLower] ||
@@ -574,7 +596,9 @@ export class AchievementDetailService {
     }
 
     const summary = existingSummary || gogPlatform?.achievements;
+    const cachedUserGog = getKnownGogAchievements(targetId, game.title);
     const userGog =
+      (cachedUserGog && (!summary || cachedUserGog.unlocked >= (summary.unlocked || 0)) ? cachedUserGog : summary) ||
       KNOWN_USER_GOG_ACHIEVEMENTS[targetId] ||
       KNOWN_USER_GOG_ACHIEVEMENTS[`gog-${targetId}`] ||
       KNOWN_USER_GOG_ACHIEVEMENTS[titleLower] ||
@@ -642,11 +666,20 @@ export class AchievementDetailService {
   ): Promise<MultiStoreAchievementsMap> {
     if (!game) return {};
 
-    // Check cached records first
+    const steamPlat = game.platforms.find((p) => p.platformId === 'steam');
+    const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
+    const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
+
+    // Check cached records first, invalidating if any platform has newly unlocked trophies
     if (!forceRefresh) {
       const cached = this.getCachedMultiStoreAchievements(game.id);
       if (cached && Object.keys(cached).length > 0) {
-        return cached;
+        const steamStale = (steamPlat?.achievements?.unlocked || 0) > (cached.steam?.unlocked || 0);
+        const epicStale = (epicPlat?.achievements?.unlocked || 0) > (cached.epic?.unlocked || 0);
+        const gogStale = (gogPlat?.achievements?.unlocked || 0) > (cached.gog?.unlocked || 0);
+        if (!steamStale && !epicStale && !gogStale) {
+          return cached;
+        }
       }
     }
 
@@ -657,7 +690,6 @@ export class AchievementDetailService {
     const schema = await this.getCanonicalGameSchema(game);
 
     // 1. Steam platform
-    const steamPlat = game.platforms.find((p) => p.platformId === 'steam');
     const targetSteamAppId = game.steamAppId || (steamPlat?.platformGameId ? parseInt(steamPlat.platformGameId, 10) : undefined);
 
     if (targetSteamAppId) {
@@ -669,7 +701,6 @@ export class AchievementDetailService {
     }
 
     // 2. Epic platform
-    const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
     if (epicPlat) {
       fetchPromises.push(
         this.fetchEpicDetailedAchievements(game, epicPlat.platformGameId, epicPlat.achievements, schema).then((data) => {
@@ -679,7 +710,6 @@ export class AchievementDetailService {
     }
 
     // 3. GOG platform
-    const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
     if (gogPlat) {
       fetchPromises.push(
         this.fetchGogDetailedAchievements(game, gogPlat.platformGameId, gogPlat.achievements, schema).then((data) => {

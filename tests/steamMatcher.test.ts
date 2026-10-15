@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   steamMatcher,
   getEffectiveSteamAppId,
@@ -15,6 +15,14 @@ import {
 } from '../src/services/steam/steamMatcher';
 
 describe('SteamMatcherService & Shared Title Utilities Integration', () => {
+  beforeEach(() => {
+    KNOWN_STORE_STEAM_MAPPINGS['cyberpunk 2077'] = 1091500;
+    CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set('cyberpunk 2077', 1091500);
+    CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set('the witcher 3 wild hunt', 292030);
+    CANONICAL_KNOWN_STORE_STEAM_MAPPINGS.set('baldurs gate 3', 1086940);
+    KNOWN_NON_STEAM_TITLES.add('doom + doom ii');
+  });
+
   describe('getEffectiveSteamAppId', () => {
     it('returns undefined if isExplicitNonSteam is true', () => {
       expect(

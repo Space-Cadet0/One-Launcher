@@ -17,11 +17,11 @@ export class SteamAchievementsService {
       const steamId =
         steamInteg?.credentials?.steamId ||
         steamInteg?.accountId ||
-        '76561198244849198';
+        '';
       const apiKey = steamInteg?.credentials?.apiKey;
       return { steamId, apiKey };
     } catch {
-      return { steamId: '76561198244849198' };
+      return { steamId: '' };
     }
   }
 
@@ -194,7 +194,48 @@ export class SteamAchievementsService {
         const pathSegment = isNumeric ? `profiles/${steamId}` : `id/${steamId}`;
         const url = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${appId}/?xml=1`;
         const res = await axios.get(url, { timeout: 6000, responseType: 'text' });
-        const xml = typeof res.data === 'string' ? res.data : '';
+        let xml = typeof res.data === 'string' ? res.data : '';
+
+        // Older Steam titles with a custom Steam Community friendlyURL (e.g. 20920 -> TheWitcher2, 223850 -> 3DMark)
+        // HTTP-302 redirect /stats/{appId}/?xml=1 -> /stats/{friendlyName} stripping the ?xml=1 query parameter.
+        if (!xml.includes('<achievements>') && !xml.includes('<achievement closed=')) {
+          const htmlSummaryMatch =
+            xml.match(/id="topSummaryAchievements"[^>]*>\s*(\d+)\s+of\s+(\d+)\s+\(\d+%\)\s+Achievements\s+Earned/i) ||
+            xml.match(/content="(\d+)\s+of\s+(\d+)\s+\(\d+%\)\s+achievements\s+earned/i);
+          if (htmlSummaryMatch) {
+            const unlocked = Number(htmlSummaryMatch[1]);
+            const total = Number(htmlSummaryMatch[2]);
+            if (total > 0 || unlocked > 0) {
+              const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+              const liveSummary: StoreAchievementSummary = {
+                unlocked,
+                total,
+                percentage,
+                isMastered: total > 0 && unlocked >= total,
+                source: 'live_cloud_xml',
+                syncedAt: new Date().toISOString(),
+              };
+              const reconciled =
+                reconcileAchievementSummaries(existingCached, liveSummary, {
+                  appId,
+                  store: 'steam',
+                }) || liveSummary;
+              this.setCachedAchievement(appId, reconciled);
+              return reconciled;
+            }
+          }
+
+          const friendlyMatch = xml.match(/steamcommunity\.com\/stats\/([^/"'?]+)\/achievements/i);
+          if (friendlyMatch?.[1]) {
+            try {
+              const friendlyUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${encodeURIComponent(friendlyMatch[1])}/?xml=1`;
+              const friendlyRes = await axios.get(friendlyUrl, { timeout: 6000, responseType: 'text' });
+              if (typeof friendlyRes.data === 'string') {
+                xml = friendlyRes.data;
+              }
+            } catch {}
+          }
+        }
 
         if (xml.includes('<achievements>') || xml.includes('<achievement closed=')) {
           const allMatches = xml.match(/<achievement closed="/g) || [];
@@ -237,9 +278,15 @@ export class SteamAchievementsService {
    */
   async syncUserLibraryAchievements(
     games: CanonicalGame[],
-    onProgress?: (completed: number, total: number) => void
+    onProgress?: (completed: number, total: number, currentTitle?: string) => void,
+    options?: {
+      forceRefresh?: boolean;
+      includeUnplayed?: boolean;
+      onBatchUpdated?: (partialResults: Record<number, StoreAchievementSummary>) => void;
+    }
   ): Promise<Record<number, StoreAchievementSummary>> {
     const creds = this.getActiveSteamCredentials();
+    let activeSteamId = creds.steamId;
     const results: Record<number, StoreAchievementSummary> = {};
 
     // Filter games that belong to Steam and have steamAppId
@@ -247,12 +294,79 @@ export class SteamAchievementsService {
       Boolean(g.steamAppId && g.platforms.some((p) => p.platformId === 'steam'))
     );
 
-    // Prioritize titles with playtime > 0
-    const prioritized = [...steamGames].sort((a, b) => {
+    if (steamGames.length === 0) return results;
+
+    // 1. Fast Native Batch Sync via Electron (IPlayerService/GetAchievementsProgress/v1 + local Steam librarycache)
+    const batchSolvedAppIds = new Set<number>();
+    if (typeof window !== 'undefined' && window.electronAPI?.fetchSteamBatchAchievements) {
+      try {
+        const allAppIds = steamGames.map((g) => g.steamAppId!).filter((id) => id > 0);
+        const batchRes = await window.electronAPI.fetchSteamBatchAchievements(allAppIds);
+        if (batchRes?.steamId && !activeSteamId) {
+          activeSteamId = batchRes.steamId;
+        }
+        if (batchRes?.success && batchRes.achievements) {
+          const nowIso = new Date().toISOString();
+          for (const [rawId, data] of Object.entries(batchRes.achievements)) {
+            const appId = Number(rawId);
+            if (!appId || !data || typeof data.unlocked !== 'number' || typeof data.total !== 'number') continue;
+            if (data.total <= 0 && data.unlocked <= 0) continue;
+            const existing = this.getCachedAchievements(appId) || undefined;
+            const incoming: StoreAchievementSummary = {
+              unlocked: data.unlocked,
+              total: data.total,
+              percentage: data.percentage ?? (data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0),
+              isMastered: Boolean(data.isMastered) || (data.total > 0 && data.unlocked >= data.total),
+              source: 'live_cloud_api',
+              syncedAt: nowIso,
+            };
+            const reconciled =
+              reconcileAchievementSummaries(existing, incoming, {
+                appId,
+                store: 'steam',
+              }) || incoming;
+            results[appId] = reconciled;
+            this.setCachedAchievement(appId, reconciled);
+            batchSolvedAppIds.add(appId);
+          }
+          if (Object.keys(results).length > 0) {
+            options?.onBatchUpdated?.({ ...results });
+          }
+        }
+      } catch {}
+    }
+
+    // 2. Filter candidate games for Community XML stats verification:
+    // By default, only query games with playtime > 0 or existing unlocked > 0 (avoiding 400+ unplayed 0-min games)
+    const candidatesForXml = steamGames.filter((g) => {
+      const appId = g.steamAppId!;
+      const steamPlat = g.platforms.find((p) => p.platformId === 'steam');
+      const playtime = steamPlat?.playtimeMinutes || 0;
+      const existingUnlocked =
+        results[appId]?.unlocked ||
+        steamPlat?.achievements?.unlocked ||
+        this.getCachedAchievements(appId)?.unlocked ||
+        0;
+      const isPlayed = playtime > 0 || existingUnlocked > 0 || Boolean(options?.includeUnplayed);
+      if (!isPlayed) return false;
+      // If batch API already resolved authoritative total > 0 and not forcing a full XML pass, skip redundant XML fetch
+      if (batchSolvedAppIds.has(appId) && !options?.forceRefresh) {
+        return false;
+      }
+      return true;
+    });
+
+    // Prioritize titles with highest playtime
+    const prioritized = [...candidatesForXml].sort((a, b) => {
       const aPlaytime = a.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
       const bPlaytime = b.platforms.find((p) => p.platformId === 'steam')?.playtimeMinutes || 0;
       return bPlaytime - aPlaytime;
     });
+
+    if (prioritized.length === 0) {
+      onProgress?.(steamGames.length, steamGames.length);
+      return results;
+    }
 
     // Process in concurrent batches of 8 for optimal speed and reliability
     const batchSize = 8;
@@ -260,23 +374,39 @@ export class SteamAchievementsService {
 
     for (let i = 0; i < prioritized.length; i += batchSize) {
       const batch = prioritized.slice(i, i + batchSize);
+      let batchAdded = false;
       await Promise.all(
         batch.map(async (game) => {
           if (!game.steamAppId) return;
           try {
+            const cached = this.getCachedAchievements(game.steamAppId);
+            if (
+              !options?.forceRefresh &&
+              cached &&
+              (cached.source === 'live_cloud_xml' || cached.source === 'live_cloud_api') &&
+              cached.syncedAt &&
+              Date.now() - new Date(cached.syncedAt).getTime() < 6 * 3600 * 1000
+            ) {
+              results[game.steamAppId] = cached;
+              return;
+            }
             const ach = await this.fetchPlayerGameAchievements(
               game.steamAppId,
-              creds.steamId,
+              activeSteamId,
               creds.apiKey
             );
             if (ach) {
               results[game.steamAppId] = ach;
+              batchAdded = true;
             }
           } catch {}
         })
       );
-      completed += batch.length;
-      onProgress?.(completed, prioritized.length);
+      completed = Math.min(prioritized.length, completed + batch.length);
+      onProgress?.(completed, prioritized.length, batch[0]?.title);
+      if (batchAdded) {
+        options?.onBatchUpdated?.({ ...results });
+      }
     }
 
     // Persist full synchronized dictionary to localStorage

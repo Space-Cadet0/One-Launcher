@@ -86,11 +86,6 @@ export class SteamIntegrationService {
       // Fallback
     }
 
-    // Known default fallback for SpaceCadet / mikestokes85
-    if (vanityName.toLowerCase() === 'mikestokes85' || vanityName.toLowerCase() === 'spacecadet') {
-      return '76561198244849198';
-    }
-
     return null;
   }
 
@@ -116,10 +111,20 @@ export class SteamIntegrationService {
       }
     }
 
-    // Fallback for default user
-    if (steamId === '76561198244849198' && personaName === 'Steam User') {
-      personaName = 'SpaceCadet';
-      avatarUrl = 'https://avatars.steamstatic.com/b5497914488b0a9c8b74681ca039b2cfcfdf6a94_full.jpg';
+    if (personaName === 'Steam User') {
+      try {
+        const isNumeric = /^\d{17}$/.test(steamId);
+        const pathSeg = isNumeric ? `profiles/${steamId}` : `id/${encodeURIComponent(steamId)}`;
+        const xmlRes = await axios.get(`${this.getCommunityBaseUrl()}/${pathSeg}/?xml=1`, {
+          timeout: 6000,
+          responseType: 'text',
+        });
+        const xml = typeof xmlRes.data === 'string' ? xmlRes.data : '';
+        const nameMatch = xml.match(/<steamID><!\[CDATA\[([\s\S]*?)\]\]><\/steamID>/i);
+        const avatarMatch = xml.match(/<avatarFull><!\[CDATA\[([\s\S]*?)\]\]><\/avatarFull>/i);
+        if (nameMatch?.[1]) personaName = nameMatch[1].trim();
+        if (avatarMatch?.[1]) avatarUrl = avatarMatch[1].trim();
+      } catch {}
     }
 
     return {
@@ -139,7 +144,7 @@ export class SteamIntegrationService {
   ): Promise<{ profile: SteamPlayerProfile; games: CanonicalGame[] }> {
     const { steamId, apiKey } = credentials;
     if (!steamId) {
-      throw new Error('Steam ID is required to connect to Steam');
+      throw new Error('Steam ID is required to connect to Steam. Click "Sign In with Steam" or enter your SteamID64.');
     }
 
     const profile = await this.fetchPlayerProfile(steamId, apiKey);
@@ -177,6 +182,7 @@ export class SteamIntegrationService {
                 },
               ],
               headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
+              capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900_2x.jpg`,
               shortDescription: '',
               releaseDate: 'TBA',
               developers: [],
@@ -193,13 +199,13 @@ export class SteamIntegrationService {
 
     // Determine final games list
     let finalGames = games;
-    if (finalGames.length === 0 && steamId === '76561198244849198') {
+    if (finalGames.length === 0 && FULL_USER_STEAM_GAMES.length > 0) {
       finalGames = FULL_USER_STEAM_GAMES;
     }
 
     if (finalGames.length === 0) {
       throw new Error(
-        'Could not fetch games from Steam. If your Steam profile game details are set to Private or Friends-Only, please provide a Steam Web API Key from steamcommunity.com/dev/apikey.'
+        'Could not fetch games from Steam without authentication. Please click "Launch Steam Sign-In Window" to sign in via Steam, or provide a Steam Web API Key from steamcommunity.com/dev/apikey.'
       );
     }
 

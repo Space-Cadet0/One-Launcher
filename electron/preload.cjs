@@ -2,8 +2,9 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
+  platform: process.platform,
   loginStore: (storefrontId) => ipcRenderer.invoke('auth:storefront', storefrontId),
-  syncStore: (storefrontId) => ipcRenderer.invoke('store:sync', storefrontId),
+  syncStore: (storefrontId, credentials) => ipcRenderer.invoke('store:sync', storefrontId, credentials),
   exchangeCode: (storefrontId, code) => ipcRenderer.invoke('store:exchange-code', { storefrontId, code }),
   getSavedTokens: () => ipcRenderer.invoke('store:get-tokens'),
   clearTokens: (storefrontId) => ipcRenderer.invoke('store:clear-tokens', storefrontId),
@@ -13,5 +14,40 @@ contextBridge.exposeInMainWorld('electronAPI', {
   searchHltb: (title) => ipcRenderer.invoke('hltb:search', title),
   fetchEpicAchievements: (accountId, accessToken) =>
     ipcRenderer.invoke('epic:fetch-achievements', { accountId, accessToken }),
+  fetchGogAchievements: (username, accessToken, userId) =>
+    ipcRenderer.invoke('gog:fetch-achievements', { username, accessToken, userId }),
+  fetchSteamBatchAchievements: (appIds) =>
+    ipcRenderer.invoke('steam:fetch-achievements', { appIds }),
   fetchIgdbCover: (title) => ipcRenderer.invoke('igdb:fetch-cover', title),
+
+  // Universal Game Launcher & Install Manager IPC
+  scanAllInstalledGames: () => ipcRenderer.invoke('launcher:scan-installed'),
+  detectCompatibilityLayers: () => ipcRenderer.invoke('launcher:detect-compat-layers'),
+  getDiskSpace: (targetPath) => ipcRenderer.invoke('launcher:get-disk-space', targetPath),
+  getGameInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
+  launchGame: (payload) => ipcRenderer.invoke('launcher:launch-game', payload),
+  stopGame: (payload) => ipcRenderer.invoke('launcher:stop-game', payload),
+  getRunningGames: () => ipcRenderer.invoke('launcher:get-running-games'),
+  installGame: (payload) => ipcRenderer.invoke('launcher:install-game', payload),
+  pauseDownload: (taskId) => ipcRenderer.invoke('launcher:pause-download', taskId),
+  resumeDownload: (taskId) => ipcRenderer.invoke('launcher:resume-download', taskId),
+  cancelDownload: (taskId) => ipcRenderer.invoke('launcher:cancel-download', taskId),
+  getDownloadQueue: () => ipcRenderer.invoke('launcher:get-download-queue'),
+  uninstallGame: (payload) => ipcRenderer.invoke('launcher:uninstall-game', payload),
+  verifyGameFiles: (payload) => ipcRenderer.invoke('launcher:verify-game', payload),
+  browseLocalFiles: (targetPath) => ipcRenderer.invoke('launcher:browse-files', targetPath),
+  selectExecutableDialog: (defaultPath) => ipcRenderer.invoke('launcher:select-executable', defaultPath),
+  selectFolderDialog: (defaultPath) => ipcRenderer.invoke('launcher:select-folder', defaultPath),
+  saveGameLaunchConfig: (config) => ipcRenderer.invoke('launcher:save-launch-config', config),
+  getGameLaunchConfigs: () => ipcRenderer.invoke('launcher:get-launch-configs'),
+  onDownloadUpdated: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('launcher:download-updated', handler);
+    return () => ipcRenderer.removeListener('launcher:download-updated', handler);
+  },
+  onSessionUpdated: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('launcher:session-updated', handler);
+    return () => ipcRenderer.removeListener('launcher:session-updated', handler);
+  },
 });
