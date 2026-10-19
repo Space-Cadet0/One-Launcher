@@ -23,9 +23,9 @@
 ![One Launcher Unified Library Overview](docs/screenshots/library-overview.png)
 *Browse your entire collection across Steam, GOG, and Epic Games in a high-density vertical box-art grid with live Metacritic/OpenCritic badges, multi-storefront ownership indicators, instant punctuation-tolerant search, and custom sidebar collections.*
 
-### Rich Game Detail View & Multi-Storefront Switcher
+### Rich Game Detail View
 ![One Launcher Game Detail View — Media Gallery & Multi-Storefront Switcher](docs/screenshots/game-detail.png)
-*Inspect high-resolution screenshot galleries and trailers, playtime, achievement mastery progress, active CrossOver/Wine compatibility pipeline status, and switch between owned storefront editions (`Steam`, `GOG.com`, `Epic Games`) right next to the **PLAY** button.*
+*High-resolution screenshot galleries and trailers, playtime, achievement mastery progress, active CrossOver/Wine compatibility pipeline status, and switch between owned storefront editions (`Steam`, `GOG.com`, `Epic Games`) right next to the **PLAY** button.*
 
 ![One Launcher Game Detail View — About This Game, HowLongToBeat & Critic Consensus](docs/screenshots/game-detail-about.png)
 *Scroll down on any game page for **HowLongToBeat** completion estimates (Main Story, Main + Sides, Completionist, All Styles), **Metacritic & OpenCritic** review consensus cards, rich HTML **About This Game** descriptions with inline media, **System Requirements**, storefront capability badges, and accurate 3-column **Supported Languages** matrices (`Interface`, `Full Audio`, `Subtitles`).*
@@ -36,7 +36,7 @@
 
 ### 4-Step Fix Match & Metadata Override Studio
 ![4-Step Fix Match & Metadata Override Studio](docs/screenshots/match-override-studio.png)
-*Need to re-match a local folder or customize a game's artwork? The 4-step Match & Metadata Wizard searches Steam, GOG, Epic Games, and IGDB simultaneously, lets you cherry-pick capsule art, hero banners, and descriptions, and previews your changes live before saving.*
+*Need to manually correct a game or customize a game's artwork? The 4-step Match & Metadata Wizard searches Steam, GOG, Epic Games, and IGDB simultaneously, lets you cherry-pick capsule art, hero banners, and descriptions, and previews your changes live before saving.*
 
 ### Custom Collections & 24-Icon Library Organizer
 ![Custom Collections and 24-Icon Picker](docs/screenshots/integrations-collections.png)
