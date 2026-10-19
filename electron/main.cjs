@@ -1491,6 +1491,14 @@ ipcMain.handle('launcher:install-compat-layer', async (_event, payload) => {
   return await launcherEngine.installCompatibilityLayer(payload || {});
 });
 
+ipcMain.handle('launcher:check-compat-updates', async (_event, options) => {
+  return await launcherEngine.checkCompatibilityLayerUpdates(options || {});
+});
+
+ipcMain.handle('launcher:update-compat-layer', async (_event, payload) => {
+  return await launcherEngine.updateCompatibilityLayer(payload || {});
+});
+
 ipcMain.handle('launcher:get-disk-space', async (_event, targetPath) => {
   return launcherEngine.getDiskSpace(targetPath);
 });

@@ -7184,4 +7184,465 @@ sleep 1
       }
     });
   });
+
+  // =========================================================================
+  // 29. CROSSOVER PREVIEW BOTTLE COMPATIBILITY & RUNNER VERSION / UPDATE MANAGEMENT
+  // =========================================================================
+  describe('29. CrossOver Preview Bottle Compatibility & Runner Version / Update Management', () => {
+    it('Bug 1 Regression: validates bottles via isValidBottleDirectory, resolves crossover_preview bottlesDir to shared CrossOver/Bottles when CrossOver Preview/Bottles only has an empty OneLauncher folder, and stamps "Preview" = "1" in cxbottle.conf', async () => {
+      const testHome = path.join(tmpRoot, 'preview-bottle-fix-home');
+      const emptyBottleDir = path.join(testHome, 'EmptyBottle');
+      const validBottleDir = path.join(testHome, 'ValidBottle');
+      fs.mkdirSync(emptyBottleDir, { recursive: true });
+      fs.mkdirSync(path.join(validBottleDir, 'drive_c'), { recursive: true });
+
+      // 1. Verify isValidBottleDirectory returns false for empty directory without drive_c, and true when drive_c exists
+      expect(launcherEngine.isValidBottleDirectory(emptyBottleDir, false)).toBe(false);
+      expect(launcherEngine.isValidBottleDirectory(validBottleDir, false)).toBe(true);
+
+      // 2. Verify detectCompatibilityLayers resolves crossover_preview's bottlesDir to ~/Library/Application Support/CrossOver/Bottles
+      // when ~/Library/Application Support/CrossOver Preview/Bottles only contains an empty uninitialized OneLauncher directory,
+      // and cleans up the empty uninitialized OneLauncher folder
+      const crossoverPreviewWine = path.join(
+        testHome,
+        'Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine'
+      );
+      writeTempFile(crossoverPreviewWine, '#!/bin/sh\necho "CrossOver Preview Wine"\n', 0o755);
+
+      const sharedBottlesDir = path.join(
+        testHome,
+        'Library/Application Support/CrossOver/Bottles'
+      );
+      const validSharedOneLauncher = path.join(sharedBottlesDir, 'OneLauncher');
+      fs.mkdirSync(path.join(validSharedOneLauncher, 'drive_c'), { recursive: true });
+
+      const previewBottlesDir = path.join(
+        testHome,
+        'Library/Application Support/CrossOver Preview/Bottles'
+      );
+      const brokenPreviewOneLauncher = path.join(previewBottlesDir, 'OneLauncher');
+      fs.mkdirSync(brokenPreviewOneLauncher, { recursive: true });
+      expect(fs.existsSync(brokenPreviewOneLauncher)).toBe(true);
+
+      const detected = launcherEngine.detectCompatibilityLayers({
+        platform: 'darwin',
+        homedir: testHome,
+      });
+
+      const previewLayer = detected.find((l: any) => l.type === 'crossover_preview');
+      expect(previewLayer).toBeDefined();
+      expect(previewLayer.bottlesDir).toBe(sharedBottlesDir);
+      expect(previewLayer.availableBottles).toContain('OneLauncher');
+      expect(fs.existsSync(brokenPreviewOneLauncher)).toBe(false);
+
+      // 3. Verify applyCrossOverPerGameSettings(bottlePath, config, { isPreviewRunner: true }) writes "Preview" = "1"
+      // into [Bottle] section of <bottlePath>/cxbottle.conf (both when creating [Bottle] and when [Bottle] already exists),
+      // while preserving [CrossOver] settings (Graphics, HighResolution, DLSS)
+      const freshBottleDir = path.join(testHome, 'FreshPreviewBottle');
+      fs.mkdirSync(path.join(freshBottleDir, 'drive_c'), { recursive: true });
+
+      launcherEngine.applyCrossOverPerGameSettings(
+        freshBottleDir,
+        {
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverHighResolutionMode: true,
+          crossoverDlss: true,
+        },
+        { isPreviewRunner: true }
+      );
+
+      const createdConf = fs.readFileSync(path.join(freshBottleDir, 'cxbottle.conf'), 'utf8');
+      expect(createdConf).toContain('[Bottle]');
+      expect(createdConf).toContain('"Preview" = "1"');
+      expect(createdConf).toContain('"CX_GRAPHICS_BACKEND" = "d3dmetal"');
+      expect(createdConf).toContain('"D3DM_ENABLE_METALFX" = "1"');
+
+      // Now test when [Bottle] and [CrossOver] already exist without "Preview" = "1"
+      const existingBottleDir = path.join(testHome, 'ExistingCrossOverBottle');
+      fs.mkdirSync(path.join(existingBottleDir, 'drive_c'), { recursive: true });
+      const existingConfPath = path.join(existingBottleDir, 'cxbottle.conf');
+      fs.writeFileSync(
+        existingConfPath,
+        `[Bottle]\n"WineArch" = "win64"\n\n[CrossOver]\n"Graphics" = "d3dmetal"\n"HighResolution" = "true"\n"DLSS" = "true"\n\n[EnvironmentVariables]\n"WINEMSYNC" = "1"\n`,
+        'utf8'
+      );
+
+      launcherEngine.applyCrossOverPerGameSettings(
+        existingBottleDir,
+        {
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverHighResolutionMode: true,
+          crossoverDlss: true,
+        },
+        { isPreviewRunner: true }
+      );
+
+      const updatedConf = fs.readFileSync(existingConfPath, 'utf8');
+      expect(updatedConf).toMatch(/\[Bottle\][\s\S]*?"Preview"\s*=\s*"1"/);
+      expect(updatedConf).toContain('[CrossOver]');
+      expect(updatedConf).toContain('"Graphics" = "d3dmetal"');
+      expect(updatedConf).toContain('"HighResolution" = "true"');
+      expect(updatedConf).toContain('"DLSS" = "true"');
+
+      // 4. Verify ensureCompatibilityLayerReady with chosenLayer.type === 'crossover_preview' stamps "Preview" = "1"
+      // into <bottlePath>/cxbottle.conf on an existing valid bottle
+      fs.writeFileSync(
+        path.join(validSharedOneLauncher, 'cxbottle.conf'),
+        `[Bottle]\n"WineArch" = "win64"\n\n[EnvironmentVariables]\n"WINEMSYNC" = "1"\n`,
+        'utf8'
+      );
+
+      const env: Record<string, string> = {};
+      await launcherEngine.ensureCompatibilityLayerReady(
+        previewLayer,
+        { wineBottleName: 'OneLauncher', crossoverGraphicsBackend: 'd3dmetal' },
+        env,
+        { homedir: testHome }
+      );
+
+      const readyConf = fs.readFileSync(
+        path.join(validSharedOneLauncher, 'cxbottle.conf'),
+        'utf8'
+      );
+      expect(readyConf).toContain('"Preview" = "1"');
+      expect(env.CX_BOTTLE).toBe('OneLauncher');
+      expect(env.WINEPREFIX).toBe(validSharedOneLauncher);
+    });
+
+    it('Enhancement 1 Unit: extracts runner version/build info from Info.plist, compares semantic versions via compareRunnerVersions, and detects update availability via checkCompatibilityLayerUpdates', async () => {
+      const verHome = path.join(tmpRoot, 'runner-version-unit-home');
+      const appsDir = path.join(verHome, 'Applications');
+
+      // 1. CrossOver.app Info.plist: CFBundleShortVersionString = "26.3", CFBundleVersion = "26.3.0.39832"
+      const cxAppDir = path.join(appsDir, 'CrossOver.app');
+      const cxWineBin = path.join(cxAppDir, 'Contents/SharedSupport/CrossOver/bin/wine');
+      writeTempFile(cxWineBin, '#!/bin/sh\necho "CrossOver Wine"\n', 0o755);
+      writeTempFile(
+        path.join(cxAppDir, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>26.3</string>
+  <key>CFBundleVersion</key>
+  <string>26.3.0.39832</string>
+</dict>
+</plist>`
+      );
+
+      const cxInfo = launcherEngine.extractRunnerVersionInfo('crossover', cxWineBin, {
+        homedir: verHome,
+      });
+      expect(cxInfo).toMatchObject({
+        version: '26.3.0',
+        buildVersion: '26.3.0.39832',
+        displayVersion: '26.3.0 (Build 39832)',
+      });
+
+      // 2. CrossOver Preview.app Info.plist: CFBundleShortVersionString = "20261006", CFBundleVersion = "27.0.0.41069"
+      const cxPreviewAppDir = path.join(appsDir, 'CrossOver Preview.app');
+      const cxPreviewWineBin = path.join(
+        cxPreviewAppDir,
+        'Contents/SharedSupport/CrossOver/bin/wine'
+      );
+      writeTempFile(cxPreviewWineBin, '#!/bin/sh\necho "CrossOver Preview Wine"\n', 0o755);
+      writeTempFile(
+        path.join(cxPreviewAppDir, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>20261006</string>
+  <key>CFBundleVersion</key>
+  <string>27.0.0.41069</string>
+</dict>
+</plist>`
+      );
+
+      const cxPreviewInfo = launcherEngine.extractRunnerVersionInfo(
+        'crossover_preview',
+        cxPreviewWineBin,
+        { homedir: verHome }
+      );
+      expect(cxPreviewInfo).toMatchObject({
+        version: '27.0.0',
+        buildVersion: '27.0.0.41069',
+        displayVersion: '27.0.0 (Preview 20261006)',
+      });
+
+      // 3. Verify compareRunnerVersions
+      expect(launcherEngine.compareRunnerVersions('26.3.0', '26.3.1')).toBeLessThan(0);
+      expect(launcherEngine.compareRunnerVersions('27.0.0', '27.0.1')).toBeLessThan(0);
+      expect(launcherEngine.compareRunnerVersions('26.3.0', '26.3.0')).toBe(0);
+      expect(launcherEngine.compareRunnerVersions('27.0.0', '26.3.0')).toBeGreaterThan(0);
+
+      // 4. Verify checkCompatibilityLayerUpdates({ layers })
+      const layers = launcherEngine.detectCompatibilityLayers({
+        platform: 'darwin',
+        homedir: verHome,
+      });
+      const updates = await launcherEngine.checkCompatibilityLayerUpdates({
+        layers,
+        mockFeeds: {
+          crossover: {
+            latestVersion: '26.4.0',
+            latestDisplayVersion: '26.4.0 (Build 40100)',
+          },
+          crossover_preview: {
+            latestVersion: '27.0.0',
+            latestDisplayVersion: '27.0.0 (Preview 20261006)',
+          },
+        },
+      });
+
+      expect(updates.crossover.installed).toBe(true);
+      expect(updates.crossover.installedVersion).toBe('26.3.0');
+      expect(updates.crossover.latestVersion).toBe('26.4.0');
+      expect(updates.crossover.updateAvailable).toBe(true);
+
+      expect(updates.crossover_preview.installed).toBe(true);
+      expect(updates.crossover_preview.installedVersion).toBe('27.0.0');
+      expect(updates.crossover_preview.latestVersion).toBe('27.0.0');
+      expect(updates.crossover_preview.updateAvailable).toBe(false);
+    });
+
+    it('Enhancement 1 UI: renders runner version & update badges in GameLaunchConfigModal, triggers updateCompatibilityLayer on click, and shows Up to Date badge for crossover_preview', async () => {
+      const winExeOnMacGame: CanonicalGame = {
+        id: 'steam-2320-preview-ui',
+        title: 'Quake II',
+        sortTitle: 'Quake II',
+        steamAppId: 2320,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '2320',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/Quake 2',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common/Quake 2/quake2.exe',
+            isWindowsBinaryOnMac: true,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      const mockLayers: CompatibilityLayerInfo[] = [
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          version: '26.3.0',
+          buildVersion: '26.3.0.39832',
+          displayVersion: '26.3.0 (Build 39832)',
+          bottlesDir: '/Users/test/Library/Application Support/CrossOver/Bottles',
+          availableBottles: ['OneLauncher'],
+        },
+        {
+          id: 'crossover_preview',
+          type: 'crossover_preview',
+          name: 'CrossOver Preview',
+          binaryPath:
+            '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine',
+          version: '27.0.0',
+          buildVersion: '27.0.0.41069',
+          displayVersion: '27.0.0 (Preview 20261006)',
+          bottlesDir: '/Users/test/Library/Application Support/CrossOver/Bottles',
+          availableBottles: ['OneLauncher'],
+        },
+      ];
+
+      const mockUpdates = {
+        crossover: {
+          runnerType: 'crossover' as const,
+          installed: true,
+          installedVersion: '26.3.0',
+          installedBuildVersion: '26.3.0.39832',
+          installedDisplayVersion: '26.3.0 (Build 39832)',
+          latestVersion: '26.4.0',
+          latestDisplayVersion: '26.4.0 (Build 40100)',
+          updateAvailable: true,
+          canAutoUpdate: true,
+          checkedAt: new Date().toISOString(),
+        },
+        crossover_preview: {
+          runnerType: 'crossover_preview' as const,
+          installed: true,
+          installedVersion: '27.0.0',
+          installedBuildVersion: '27.0.0.41069',
+          installedDisplayVersion: '27.0.0 (Preview 20261006)',
+          latestVersion: '27.0.0',
+          latestDisplayVersion: '27.0.0 (Preview 20261006)',
+          updateAvailable: false,
+          canAutoUpdate: true,
+          checkedAt: new Date().toISOString(),
+        },
+      };
+
+      const detectSpy = vi
+        .spyOn(launcherService, 'detectCompatibilityLayers')
+        .mockResolvedValue(mockLayers);
+      const getLayersSpy = vi
+        .spyOn(launcherService, 'getCompatibilityLayers')
+        .mockReturnValue(mockLayers);
+      const getUpdatesSpy = vi
+        .spyOn(launcherService, 'getRunnerUpdates')
+        .mockReturnValue(mockUpdates);
+      const checkUpdatesSpy = vi
+        .spyOn(launcherService, 'checkCompatibilityLayerUpdates')
+        .mockResolvedValue(mockUpdates);
+      const updateRunnerSpy = vi
+        .spyOn(launcherService, 'updateCompatibilityLayer')
+        .mockResolvedValue({
+          success: true,
+          runnerType: 'crossover',
+          updated: true,
+          previousVersion: '26.3.0',
+          newVersion: '26.4.0',
+          message: 'Updated CrossOver to v26.4.0.',
+          detectedLayers: mockLayers,
+        });
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+
+      const findElements = (
+        node: any,
+        predicate: (el: any) => boolean,
+        acc: any[] = []
+      ): any[] => {
+        if (!node || typeof node !== 'object') return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (predicate(node)) acc.push(node);
+        if (node.props && node.props.children) {
+          findElements(node.props.children, predicate, acc);
+        }
+        return acc;
+      };
+
+      const getTextContent = (node: any): string => {
+        if (node === null || node === undefined || typeof node === 'boolean') return '';
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (Array.isArray(node)) return node.map(getTextContent).join('');
+        if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+        return '';
+      };
+
+      const renderModal = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (GameLaunchConfigModal as any)({
+            isOpen: true,
+            game: winExeOnMacGame,
+            initialPlatformId: 'steam',
+            onClose: vi.fn(),
+          });
+          const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderModal();
+        await new Promise((r) => setTimeout(r, 20));
+        const r1 = renderModal();
+
+        // 1. Verify <select data-testid="compat-runner-select"> option labels
+        const runnerSelect = findElements(
+          r1.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        expect(runnerSelect).toBeDefined();
+        const optionTexts = findElements(runnerSelect, (el) => el.type === 'option').map((o) =>
+          getTextContent(o)
+        );
+        expect(optionTexts).toContain(
+          'CrossOver — v26.3.0 Installed (Recommended) • Update Available (v26.4.0)'
+        );
+        expect(optionTexts).toContain('CrossOver Preview — v27.0.0 Installed');
+
+        // 2. Verify runner-version-update-row and runner-installed-version show v26.3.0
+        expect(r1.html).toContain('data-testid="runner-version-update-row"');
+        expect(r1.html).toContain('data-testid="runner-installed-version"');
+        expect(r1.html).toContain('Installed Version: v26.3.0');
+        expect(r1.html).toContain('26.3.0 (Build 39832)');
+
+        // 3. Verify runner-update-available-badge and update-runner-btn render and trigger updateCompatibilityLayer('crossover')
+        expect(r1.html).toContain('data-testid="runner-update-available-badge"');
+        expect(r1.html).toContain('Update Available: v26.4.0');
+        expect(r1.html).toContain('data-testid="update-runner-btn"');
+        expect(r1.html).toContain('Update to v26.4.0');
+
+        const updateBtn = findElements(
+          r1.vnode,
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'update-runner-btn'
+        )[0];
+        expect(updateBtn).toBeDefined();
+        await updateBtn.props.onClick();
+        expect(updateRunnerSpy).toHaveBeenCalledWith('crossover');
+
+        // 4. Switch to crossover_preview -> shows v27.0.0, runner-up-to-date-badge ("Up to Date (v27.0.0)"), and check-runner-updates-btn
+        const runnerSelectAfter = findElements(
+          r1.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        runnerSelectAfter.props.onChange({ target: { value: 'crossover_preview' } });
+
+        const rPreview = renderModal();
+        expect(rPreview.html).toContain('Installed Version: v27.0.0');
+        expect(rPreview.html).toContain('27.0.0 (Preview 20261006)');
+        expect(rPreview.html).toContain('data-testid="runner-up-to-date-badge"');
+        expect(rPreview.html).toContain('Up to Date (v27.0.0)');
+        expect(rPreview.html).toContain('data-testid="check-runner-updates-btn"');
+      } finally {
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        getUpdatesSpy.mockRestore();
+        checkUpdatesSpy.mockRestore();
+        updateRunnerSpy.mockRestore();
+      }
+    });
+  });
 });

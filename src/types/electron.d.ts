@@ -2,6 +2,7 @@ import type { CanonicalGame } from '../contracts/game';
 import type {
   ActiveGameSession,
   CompatibilityLayerInfo,
+  CompatibilityLayerUpdateInfo,
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
@@ -15,6 +16,8 @@ import type {
   LaunchGameRequest,
   StopGameRequest,
   UninstallGameRequest,
+  UpdateCompatibilityLayerPayload,
+  UpdateCompatibilityLayerResult,
   VerifyGameRequest,
 } from '../contracts/launcher';
 
@@ -69,6 +72,8 @@ export interface ElectronAPI {
   }>;
   detectCompatibilityLayers: () => Promise<CompatibilityLayerInfo[]>;
   installCompatibilityLayer: (payload: InstallCompatibilityLayerRequest) => Promise<InstallCompatibilityLayerResult>;
+  checkCompatibilityLayerUpdates: () => Promise<Record<string, CompatibilityLayerUpdateInfo>>;
+  updateCompatibilityLayer: (payload: UpdateCompatibilityLayerPayload) => Promise<UpdateCompatibilityLayerResult>;
   getDiskSpace: (targetPath?: string) => Promise<DiskSpaceInfo | null>;
   getGameInstallInfo: (payload: GameInstallInfoRequest | Record<string, any>) => Promise<GameInstallInfo>;
   launchGame: (payload: LaunchGameRequest | Record<string, any>) => Promise<LauncherActionResult>;

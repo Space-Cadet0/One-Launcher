@@ -3778,18 +3778,208 @@ function unregisterGogFirstPartyLauncher(cleanId, installPath, options = {}) {
 }
 
 /**
+ * Validate whether a bottle directory is properly initialized
+ */
+function isValidBottleDirectory(bottleDir, isMockHomedir = false) {
+  if (!bottleDir || !fs.existsSync(bottleDir)) return false;
+  if (isMockHomedir) return true;
+  if (
+    fs.existsSync(path.join(bottleDir, 'drive_c')) ||
+    fs.existsSync(path.join(bottleDir, 'system.reg'))
+  ) {
+    return true;
+  }
+  const cxbottleConf = path.join(bottleDir, 'cxbottle.conf');
+  if (fs.existsSync(cxbottleConf)) {
+    try {
+      const confText = fs.readFileSync(cxbottleConf, 'utf8');
+      if (/^\[Bottle\]/m.test(confText)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function hasValidInitializedBottles(dirPath, isMockHomedir = false) {
+  if (!dirPath || !fs.existsSync(dirPath)) return false;
+  try {
+    const entries = fs
+      .readdirSync(dirPath, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.'));
+    if (isMockHomedir) return entries.length > 0;
+    return entries.some((d) => isValidBottleDirectory(path.join(dirPath, d.name), false));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Enumerate subdirectory names inside a Wine/CrossOver Bottles directory
  */
-function listBottleSubdirectories(bottlesDir) {
+function listBottleSubdirectories(bottlesDir, options = {}) {
   if (!bottlesDir || !fs.existsSync(bottlesDir)) return [];
+  const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
   try {
     return fs
       .readdirSync(bottlesDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+      .filter(
+        (d) =>
+          d.isDirectory() &&
+          !d.name.startsWith('.') &&
+          isValidBottleDirectory(path.join(bottlesDir, d.name), isMockHomedir)
+      )
       .map((d) => d.name);
   } catch {
     return [];
   }
+}
+
+/**
+ * Extract version, buildVersion, displayVersion, and appPath from a macOS compatibility layer binary or bundle
+ */
+function extractRunnerVersionInfo(runnerTypeOrPath, maybeBinaryPath, maybeOptions = {}) {
+  const isSinglePathArg =
+    typeof maybeBinaryPath !== 'string' &&
+    typeof runnerTypeOrPath === 'string' &&
+    (runnerTypeOrPath.includes('/') ||
+      runnerTypeOrPath.includes('\\') ||
+      runnerTypeOrPath.toLowerCase().endsWith('.app'));
+  const binaryPath = isSinglePathArg ? runnerTypeOrPath : maybeBinaryPath;
+  const options = (isSinglePathArg ? maybeBinaryPath : maybeOptions) || {};
+
+  if (!binaryPath || typeof binaryPath !== 'string') {
+    return {
+      appPath: undefined,
+      version: undefined,
+      buildVersion: undefined,
+      displayVersion: undefined,
+    };
+  }
+
+  const appMatch = binaryPath.match(/^(.*?\.app)(?:[\\/]|$)/i);
+  const contentsMatch = binaryPath.match(/^(.*?)[\\/]Contents[\\/]/i);
+  const appPath = appMatch ? appMatch[1] : contentsMatch ? contentsMatch[1] : undefined;
+
+  let version = undefined;
+  let buildVersion = undefined;
+  let displayVersion = undefined;
+
+  // 1. Inspect <Bundle>/Contents/Info.plist if present
+  if (appPath) {
+    const plistPath = path.join(appPath, 'Contents', 'Info.plist');
+    if (fs.existsSync(plistPath)) {
+      try {
+        const plistText = fs.readFileSync(plistPath, 'utf8');
+        const shortMatch = plistText.match(
+          /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/i
+        );
+        const bundleVerMatch = plistText.match(
+          /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/i
+        );
+        const shortVer = shortMatch ? shortMatch[1].trim() : '';
+        const bundleVer = bundleVerMatch ? bundleVerMatch[1].trim() : '';
+        const semverMatch = bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
+        const semver = semverMatch ? semverMatch[1] : '';
+        const buildNum = semverMatch && semverMatch[2] ? semverMatch[2] : '';
+
+        if (/^\d{8}$/.test(shortVer) && semver) {
+          version = semver;
+          buildVersion = bundleVer || shortVer;
+          displayVersion = `${semver} (Preview ${shortVer})`;
+        } else if (semver) {
+          version = semver;
+          buildVersion = bundleVer || (buildNum ? `Build ${buildNum}` : undefined);
+          displayVersion = buildNum ? `${semver} (Build ${buildNum})` : semver;
+        } else if (shortVer || bundleVer) {
+          version = shortVer || bundleVer;
+          buildVersion = bundleVer && bundleVer !== version ? bundleVer : undefined;
+          displayVersion = buildVersion ? `${version} (${buildVersion})` : version;
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Fallback to Heroic tools folder naming (e.g. Game-Porting-Toolkit-3.0-3 or Wine-CrossOver-23.7.1-2)
+  if (!version) {
+    const normBin = binaryPath.replace(/\\/g, '/');
+    const heroicMatch = normBin.match(/\/tools\/(?:game-porting-toolkit|wine)\/([^/]+)\//i);
+    if (heroicMatch) {
+      const folderName = heroicMatch[1];
+      const verMatch = folderName.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
+      if (verMatch) {
+        const rawVer = verMatch[1];
+        version = rawVer.replace(/[-_]/g, '.');
+        buildVersion = rawVer !== version ? rawVer : undefined;
+        displayVersion = rawVer;
+      }
+    }
+  }
+
+  // 3. Fallback to Homebrew Cellar/Caskroom path (including symlink resolution)
+  if (!version) {
+    let normBin = binaryPath.replace(/\\/g, '/');
+    try {
+      if (fs.existsSync(binaryPath)) {
+        normBin = fs.realpathSync(binaryPath).replace(/\\/g, '/');
+      }
+    } catch {}
+    const brewMatch = normBin.match(/\/(?:Cellar|Caskroom)\/[^/]+\/([^/]+)\//i);
+    if (brewMatch) {
+      const rawBrewVer = brewMatch[1];
+      version = rawBrewVer.replace(/[-_]/g, '.');
+      buildVersion = rawBrewVer !== version ? rawBrewVer : undefined;
+      displayVersion = rawBrewVer;
+    } else if (
+      options.allowVersionSubprocess === true &&
+      !options.homedir &&
+      !options.customApplicationsDir &&
+      /\/wine(?:64)?$/i.test(normBin) &&
+      fs.existsSync(binaryPath)
+    ) {
+      try {
+        const out = execFileSync(binaryPath, ['--version'], {
+          timeout: 1000,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const wineVerMatch = String(out || '').match(/wine-([\d.]+(?:[-_][\w.]+)?)/i);
+        if (wineVerMatch) {
+          const rawVer = wineVerMatch[1];
+          version = rawVer.split(/[-_]/)[0];
+          buildVersion = rawVer !== version ? rawVer : undefined;
+          displayVersion = rawVer;
+        }
+      } catch {}
+    }
+  }
+
+  return {
+    appPath,
+    version,
+    buildVersion,
+    displayVersion,
+  };
+}
+
+/**
+ * Compare two runner version strings numerically segment by segment (-1 if vA < vB, 0 if equal, 1 if vA > vB)
+ */
+function compareRunnerVersions(vA, vB) {
+  const partsA = String(vA || '')
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map(Number);
+  const partsB = String(vB || '')
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map(Number);
+  const maxLen = Math.max(partsA.length, partsB.length);
+  for (let i = 0; i < maxLen; i++) {
+    const a = partsA[i] || 0;
+    const b = partsB[i] || 0;
+    if (a < b) return -1;
+    if (a > b) return 1;
+  }
+  return 0;
 }
 
 /**
@@ -3813,6 +4003,35 @@ function detectCompatibilityLayers(options = {}) {
     }
   }
 
+  const sharedCrossOverBottlesDir = path.join(
+    homedir,
+    'Library/Application Support/CrossOver/Bottles'
+  );
+  const previewSpecBottlesDir = path.join(
+    homedir,
+    'Library/Application Support/CrossOver Preview/Bottles'
+  );
+
+  // Clean up any uninitialized empty directory at ~/Library/Application Support/CrossOver Preview/Bottles/OneLauncher
+  const brokenPreviewBottle = path.join(previewSpecBottlesDir, 'OneLauncher');
+  if (
+    fs.existsSync(brokenPreviewBottle) &&
+    !isValidBottleDirectory(brokenPreviewBottle, false)
+  ) {
+    try {
+      fs.rmSync(brokenPreviewBottle, { recursive: true, force: true });
+    } catch {}
+  }
+
+  const effectivePreviewBottlesDir = hasValidInitializedBottles(
+    previewSpecBottlesDir,
+    isIsolatedTest
+  )
+    ? previewSpecBottlesDir
+    : fs.existsSync(sharedCrossOverBottlesDir)
+      ? sharedCrossOverBottlesDir
+      : previewSpecBottlesDir;
+
   const layers = [];
   const addedTypes = new Set();
 
@@ -3823,14 +4042,14 @@ function detectCompatibilityLayers(options = {}) {
       type: 'crossover',
       name: 'CrossOver',
       appName: 'CrossOver.app',
-      bottlesDir: path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
+      bottlesDir: sharedCrossOverBottlesDir,
     },
     {
       id: 'crossover_preview',
       type: 'crossover_preview',
       name: 'CrossOver Preview',
       appName: 'CrossOver Preview.app',
-      bottlesDir: path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+      bottlesDir: effectivePreviewBottlesDir,
     },
   ];
 
@@ -3845,7 +4064,8 @@ function detectCompatibilityLayers(options = {}) {
         path.join(appPath, 'Contents/SharedSupport/CrossOver/lib64/apple_gptk/wine'),
       ];
       const binaryPath = candidateBins.find((b) => fs.existsSync(b)) || candidateBins[0];
-      const availableBottles = listBottleSubdirectories(variant.bottlesDir);
+      const availableBottles = listBottleSubdirectories(variant.bottlesDir, options);
+      const versionInfo = extractRunnerVersionInfo(variant.type, binaryPath, options);
 
       if (!addedTypes.has(variant.id)) {
         addedTypes.add(variant.id);
@@ -3854,6 +4074,10 @@ function detectCompatibilityLayers(options = {}) {
           type: variant.type,
           name: variant.name,
           binaryPath,
+          appPath: versionInfo.appPath || appPath,
+          version: versionInfo.version,
+          buildVersion: versionInfo.buildVersion,
+          displayVersion: versionInfo.displayVersion,
           bottlesDir: variant.bottlesDir,
           availableBottles,
         });
@@ -3874,11 +4098,16 @@ function detectCompatibilityLayers(options = {}) {
         const foundBin = binCandidates.find((b) => fs.existsSync(b));
         if (foundBin && !addedTypes.has('gptk')) {
           addedTypes.add('gptk');
+          const versionInfo = extractRunnerVersionInfo('gptk', foundBin, options);
           layers.push({
             id: 'gptk',
             type: 'gptk',
             name: `Game Porting Toolkit (${sub})`,
             binaryPath: foundBin,
+            appPath: versionInfo.appPath,
+            version: versionInfo.version,
+            buildVersion: versionInfo.buildVersion,
+            displayVersion: versionInfo.displayVersion,
             availableBottles: [],
           });
         }
@@ -3894,12 +4123,17 @@ function detectCompatibilityLayers(options = {}) {
         path.join(gptkApp, 'Contents/SharedSupport/wine/bin/wine64'),
       ];
       const binaryPath = binCandidates.find((b) => fs.existsSync(b)) || binCandidates[0];
+      const versionInfo = extractRunnerVersionInfo('gptk', binaryPath, options);
       addedTypes.add('gptk');
       layers.push({
         id: 'gptk',
         type: 'gptk',
         name: 'Apple Game Porting Toolkit',
         binaryPath,
+        appPath: versionInfo.appPath || gptkApp,
+        version: versionInfo.version,
+        buildVersion: versionInfo.buildVersion,
+        displayVersion: versionInfo.displayVersion,
         availableBottles: [],
       });
     }
@@ -3971,11 +4205,16 @@ function detectCompatibilityLayers(options = {}) {
   if (foundWineEntry && !addedTypes.has('wine')) {
     addedTypes.add('wine');
     const defaultPrefix = path.join(homedir, '.wine');
+    const versionInfo = extractRunnerVersionInfo('wine', foundWineEntry.binPath, options);
     layers.push({
       id: 'wine',
       type: 'wine',
       name: foundWineEntry.name,
       binaryPath: foundWineEntry.binPath,
+      appPath: versionInfo.appPath,
+      version: versionInfo.version,
+      buildVersion: versionInfo.buildVersion,
+      displayVersion: versionInfo.displayVersion,
       bottlesDir: fs.existsSync(defaultPrefix) ? defaultPrefix : undefined,
       availableBottles: [],
     });
@@ -4003,6 +4242,310 @@ function detectCompatibilityLayers(options = {}) {
   });
 
   return layers;
+}
+
+/**
+ * Check upstream feeds for macOS compatibility layer updates
+ */
+async function checkCompatibilityLayerUpdates(options = {}) {
+  const layers = Array.isArray(options.layers)
+    ? options.layers
+    : detectCompatibilityLayers(options);
+  const runnerTypes = ['crossover', 'crossover_preview', 'gptk', 'wine'];
+  const defaultDownloadUrls = {
+    crossover: 'https://www.codeweavers.com/crossover/download',
+    crossover_preview: 'https://www.codeweavers.com/preview/download_links',
+    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
+    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+  };
+
+  const feedMap = {};
+  if (options.mockFeeds && typeof options.mockFeeds === 'object') {
+    for (const rt of runnerTypes) {
+      if (options.mockFeeds[rt]) {
+        feedMap[rt] = { ...options.mockFeeds[rt] };
+      }
+    }
+  } else if (
+    typeof options.httpGetText === 'function' ||
+    (!options.homedir && !options.skipNetwork)
+  ) {
+    const fetchWithTimeout = async (url, timeoutMs = 4500) => {
+      if (typeof options.httpGetText === 'function') {
+        try {
+          return await options.httpGetText(url);
+        } catch {
+          return null;
+        }
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'OneGameLauncher/1.0' },
+        });
+        if (!res.ok) return null;
+        return await res.text();
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    await Promise.all([
+      // 1. CrossOver Stable Sparkle XML feed
+      (async () => {
+        const xml = await fetchWithTimeout('https://www.codeweavers.com/xml/versions/cxmac.xml');
+        if (xml) {
+          const encMatch = xml.match(/<enclosure\s+([^>]+)>/i);
+          if (encMatch) {
+            const attrs = encMatch[1];
+            const verMatch = attrs.match(/sparkle:version="([^"]+)"/i);
+            const shortMatch = attrs.match(/sparkle:shortVersionString="([^"]+)"/i);
+            const urlMatch = attrs.match(/url="([^"]+)"/i);
+            const rawBundleVer = verMatch ? verMatch[1].trim() : '';
+            const rawShortVer = shortMatch ? shortMatch[1].trim() : '';
+            const semverMatch = rawBundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
+            const latestVersion = semverMatch
+              ? semverMatch[1]
+              : rawShortVer || rawBundleVer || undefined;
+            const latestBuildVersion =
+              semverMatch && semverMatch[2] ? `Build ${semverMatch[2]}` : undefined;
+            const latestDisplayVersion =
+              latestVersion && latestBuildVersion
+                ? `${latestVersion} (${latestBuildVersion})`
+                : latestVersion;
+            if (latestVersion) {
+              feedMap.crossover = {
+                latestVersion,
+                latestBuildVersion,
+                latestDisplayVersion,
+                downloadUrl: urlMatch ? urlMatch[1].trim() : defaultDownloadUrls.crossover,
+                updateMethod: 'direct_download',
+              };
+            }
+          }
+        }
+      })(),
+      // 2. GPTK latest GitHub release
+      (async () => {
+        const txt = await fetchWithTimeout(
+          'https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest'
+        );
+        if (txt) {
+          try {
+            const json = JSON.parse(txt);
+            const tag = String(json.tag_name || '');
+            const m = tag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
+            if (m) {
+              const rawVer = m[1];
+              feedMap.gptk = {
+                latestVersion: rawVer.replace(/[-_]/g, '.'),
+                latestBuildVersion: rawVer,
+                latestDisplayVersion: rawVer,
+                downloadUrl: json.html_url || defaultDownloadUrls.gptk,
+                updateMethod: 'homebrew_cask',
+              };
+            }
+          } catch {}
+        }
+      })(),
+      // 3. Open-Source Wine Homebrew cask JSON
+      (async () => {
+        const txt = await fetchWithTimeout('https://formulae.brew.sh/api/cask/wine-stable.json');
+        if (txt) {
+          try {
+            const json = JSON.parse(txt);
+            if (json && json.version) {
+              const rawVer = String(json.version);
+              feedMap.wine = {
+                latestVersion: rawVer.replace(/[-_]/g, '.'),
+                latestBuildVersion: rawVer,
+                latestDisplayVersion: rawVer,
+                downloadUrl: json.url || defaultDownloadUrls.wine,
+                updateMethod: 'homebrew_cask',
+              };
+            }
+          } catch {}
+        }
+      })(),
+    ]);
+  }
+
+  const checkedAt = new Date().toISOString();
+  const results = {};
+
+  for (const runnerType of runnerTypes) {
+    const layer = layers.find((l) => l.type === runnerType);
+    const feed = feedMap[runnerType] || {};
+    const latestVersion = feed.latestVersion || layer?.version;
+    const latestBuildVersion =
+      feed.latestBuildVersion !== undefined
+        ? feed.latestBuildVersion
+        : feed.latestVersion
+          ? undefined
+          : layer?.buildVersion;
+    const latestDisplayVersion =
+      feed.latestDisplayVersion ||
+      (latestVersion
+        ? latestBuildVersion && !String(latestVersion).includes(String(latestBuildVersion))
+          ? `${latestVersion} (${latestBuildVersion})`
+          : latestVersion
+        : layer?.displayVersion);
+
+    const updateAvailable = Boolean(
+      layer &&
+        layer.version &&
+        feed.latestVersion &&
+        compareRunnerVersions(layer.version, feed.latestVersion) < 0
+    );
+
+    const updateMethod =
+      feed.updateMethod ||
+      (runnerType === 'crossover_preview'
+        ? 'vendor_portal'
+        : runnerType === 'crossover'
+          ? 'direct_download'
+          : 'homebrew_cask');
+
+    const statusMessage = !layer
+      ? 'Not installed'
+      : updateAvailable
+        ? `Update available: ${latestDisplayVersion || latestVersion}`
+        : `Up to date (${layer.displayVersion || layer.version || 'Installed'})`;
+
+    results[runnerType] = {
+      runnerType,
+      installed: Boolean(layer),
+      installedVersion: layer?.version,
+      installedBuildVersion: layer?.buildVersion,
+      installedDisplayVersion: layer?.displayVersion,
+      latestVersion,
+      latestBuildVersion,
+      latestDisplayVersion,
+      updateAvailable,
+      downloadUrl: feed.downloadUrl || defaultDownloadUrls[runnerType],
+      canAutoUpdate: true,
+      updateMethod,
+      statusMessage,
+      checkedAt,
+    };
+  }
+
+  return results;
+}
+
+/**
+ * One-click update for a macOS compatibility layer (via Homebrew Cask, direct Sparkle archive, or official vendor portal)
+ */
+async function updateCompatibilityLayer(payload = {}, options = {}) {
+  const runnerType = String(payload.runnerType || 'crossover')
+    .toLowerCase()
+    .trim();
+  const homedir = options.homedir || os.homedir();
+  const beforeLayers = detectCompatibilityLayers(options);
+  const previousVersion = beforeLayers.find((l) => l.type === runnerType)?.version;
+
+  if (typeof options.mockUpdater === 'function') {
+    const mockRes = (await options.mockUpdater(payload, options)) || {};
+    const detectedLayers = detectCompatibilityLayers(options);
+    const newVersion =
+      mockRes.newVersion || detectedLayers.find((l) => l.type === runnerType)?.version;
+    const updates = await checkCompatibilityLayerUpdates(options);
+    const updated =
+      mockRes.updated !== undefined
+        ? Boolean(mockRes.updated)
+        : Boolean(newVersion && newVersion !== previousVersion);
+    return {
+      success: mockRes.success !== false,
+      runnerType,
+      updated,
+      previousVersion,
+      newVersion,
+      openedExternalUrl: Boolean(mockRes.openedExternalUrl),
+      message:
+        mockRes.message ||
+        (updated
+          ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
+          : 'Runner update check completed.'),
+      detectedLayers,
+      updateInfo: updates[runnerType],
+    };
+  }
+
+  const defaultUpdateUrls = {
+    crossover: 'https://www.codeweavers.com/crossover/download',
+    crossover_preview: 'https://www.codeweavers.com/preview/download_links',
+    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
+    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+  };
+
+  const brewCandidates = [
+    options.brewBinaryPath,
+    path.join(homedir, 'homebrew/bin/brew'),
+    ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
+  ].filter(Boolean);
+  const brewPath = brewCandidates.find((p) => fs.existsSync(p));
+
+  const caskMap = {
+    crossover: 'crossover',
+    wine: 'wine-stable',
+    gptk: 'game-porting-toolkit',
+  };
+  const caskName = caskMap[runnerType];
+  let updatedViaBrew = false;
+
+  if (caskName && (brewPath || typeof options.onExecBrew === 'function')) {
+    const args = [
+      'upgrade',
+      '--cask',
+      ...(runnerType === 'wine' ? ['--no-quarantine'] : []),
+      caskName,
+    ];
+    try {
+      if (typeof options.onExecBrew === 'function') {
+        await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
+      } else {
+        await new Promise((resolve, reject) => {
+          execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
+            if (err) reject(err);
+            else resolve({ stdout, stderr });
+          });
+        });
+      }
+      updatedViaBrew = true;
+    } catch {}
+  }
+
+  let openedExternalUrl = false;
+  if (!updatedViaBrew) {
+    const targetUrl = defaultUpdateUrls[runnerType] || defaultUpdateUrls.crossover;
+    await openExternalUri(targetUrl, options);
+    openedExternalUrl = true;
+  }
+
+  const detectedLayers = detectCompatibilityLayers(options);
+  const newVersion = detectedLayers.find((l) => l.type === runnerType)?.version;
+  const updates = await checkCompatibilityLayerUpdates(options);
+  const updated = Boolean((newVersion && newVersion !== previousVersion) || updatedViaBrew);
+
+  return {
+    success: true,
+    runnerType,
+    updated,
+    previousVersion,
+    newVersion,
+    openedExternalUrl,
+    message: updated
+      ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
+      : openedExternalUrl
+        ? 'Opened official update page in your browser. Click "Re-Scan Runners" once installation finishes.'
+        : 'Runner is already up to date.',
+    detectedLayers,
+    updateInfo: updates[runnerType],
+  };
 }
 
 /**
@@ -4091,12 +4634,30 @@ async function installCompatibilityLayer(payload = {}, options = {}) {
  * to the launch environment, <bottlePath>/cxbottle.conf, and <bottlePath>/user.reg.
  */
 function applyCrossOverPerGameSettings(
-  chosenLayer,
+  chosenLayerOrBottlePath,
   launchConfig = {},
-  env = {},
+  envOrOptions = {},
   bottlePath = '',
   options = {}
 ) {
+  const isStringBottleFirstArg = typeof chosenLayerOrBottlePath === 'string';
+  const effectiveOptions = isStringBottleFirstArg
+    ? envOrOptions && typeof envOrOptions === 'object'
+      ? envOrOptions
+      : {}
+    : options && typeof options === 'object'
+      ? options
+      : {};
+  const chosenLayer = isStringBottleFirstArg
+    ? { type: effectiveOptions.isPreviewRunner ? 'crossover_preview' : 'crossover' }
+    : chosenLayerOrBottlePath;
+  const env = isStringBottleFirstArg
+    ? {}
+    : envOrOptions && typeof envOrOptions === 'object'
+      ? envOrOptions
+      : {};
+  const effectiveBottlePathArg = isStringBottleFirstArg ? chosenLayerOrBottlePath : bottlePath;
+
   const cfg = launchConfig && typeof launchConfig === 'object' ? launchConfig : {};
   const backend =
     typeof cfg.crossoverGraphicsBackend === 'string'
@@ -4153,7 +4714,7 @@ function applyCrossOverPerGameSettings(
     delete env.DXVK_HUD;
   }
 
-  const resolvedBottlePath = bottlePath || env.WINEPREFIX || '';
+  const resolvedBottlePath = effectiveBottlePathArg || env.WINEPREFIX || '';
   let isBottleDir = false;
   if (resolvedBottlePath && fs.existsSync(resolvedBottlePath)) {
     try {
@@ -4161,23 +4722,42 @@ function applyCrossOverPerGameSettings(
     } catch {}
   }
 
-  // 5. Update <bottlePath>/cxbottle.conf [EnvironmentVariables] section
+  // 5. Update <bottlePath>/cxbottle.conf [EnvironmentVariables] & [Bottle] sections
   if (isBottleDir) {
     const cxbottleConfPath = path.join(resolvedBottlePath, 'cxbottle.conf');
+    const isPreviewRunner =
+      chosenLayer?.type === 'crossover_preview' || Boolean(effectiveOptions.isPreviewRunner);
     const hasCrossOverEnvConfig =
       backend !== undefined ||
       typeof cfg.crossoverDlss === 'boolean' ||
       typeof cfg.wineMsync === 'boolean' ||
       typeof cfg.wineEsync === 'boolean' ||
       chosenLayer?.type === 'crossover' ||
-      chosenLayer?.type === 'crossover_preview' ||
+      isPreviewRunner ||
       fs.existsSync(cxbottleConfPath);
 
     if (hasCrossOverEnvConfig) {
       try {
-        const existingConf = fs.existsSync(cxbottleConfPath)
+        let existingConf = fs.existsSync(cxbottleConfPath)
           ? fs.readFileSync(cxbottleConfPath, 'utf8')
           : '';
+
+        // CodeWeavers CrossOver Preview wine wrapper requires "Preview" = "1" inside [Bottle] or it exits with code 1
+        if (isPreviewRunner) {
+          if (/^"Preview"\s*=\s*"[^"]*"/m.test(existingConf)) {
+            existingConf = existingConf.replace(
+              /^"Preview"\s*=\s*"[^"]*"/m,
+              '"Preview" = "1"'
+            );
+          } else if (/^\[Bottle\]\s*$/m.test(existingConf)) {
+            existingConf = existingConf.replace(
+              /^\[Bottle\]\s*$/m,
+              '[Bottle]\n"Preview" = "1"'
+            );
+          } else {
+            existingConf = `[Bottle]\n"WineArch" = "win64"\n"Preview" = "1"\n\n${existingConf}`;
+          }
+        }
 
         const updates = new Map();
         const removals = new Set();
@@ -4406,14 +4986,25 @@ function applyCrossOverPerGameSettings(
 async function ensureCompatibilityLayerReady(chosenLayer, launchConfig = {}, env = {}, options = {}) {
   if (!chosenLayer) return {};
   const homedir = options.homedir || os.homedir();
+  const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
 
   if (chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview') {
-    const defaultBottlesSubdir =
+    const sharedBottlesDir = path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+    const previewBottlesDir = path.join(
+      homedir,
+      'Library/Application Support/CrossOver Preview/Bottles'
+    );
+    const defaultBottlesDir =
       chosenLayer.type === 'crossover_preview'
-        ? 'Library/Application Support/CrossOver Preview/Bottles'
-        : 'Library/Application Support/CrossOver/Bottles';
-    const bottlesDir = chosenLayer.bottlesDir || path.join(homedir, defaultBottlesSubdir);
-    const availableBottles = listBottleSubdirectories(bottlesDir);
+        ? hasValidInitializedBottles(previewBottlesDir, isMockHomedir)
+          ? previewBottlesDir
+          : fs.existsSync(sharedBottlesDir)
+            ? sharedBottlesDir
+            : previewBottlesDir
+        : sharedBottlesDir;
+
+    const bottlesDir = chosenLayer.bottlesDir || defaultBottlesDir;
+    const availableBottles = listBottleSubdirectories(bottlesDir, options);
 
     let targetBottle;
     if (launchConfig && launchConfig.wineBottleName) {
@@ -4429,7 +5020,14 @@ async function ensureCompatibilityLayerReady(chosenLayer, launchConfig = {}, env
     }
 
     const bottlePath = path.join(bottlesDir, targetBottle);
-    if (!fs.existsSync(bottlePath) && !options.skipBottleProvisioning) {
+    const isBottleInitialized = isValidBottleDirectory(bottlePath, isMockHomedir);
+
+    if (!isBottleInitialized && !options.skipBottleProvisioning) {
+      if (!isMockHomedir && fs.existsSync(bottlePath)) {
+        try {
+          fs.rmSync(bottlePath, { recursive: true, force: true });
+        } catch {}
+      }
       if (!options.homedir) {
         const cxbottleCandidates = [
           chosenLayer.binaryPath ? path.join(path.dirname(chosenLayer.binaryPath), 'cxbottle') : null,
@@ -9716,8 +10314,14 @@ module.exports = {
   removeSteamAppFromLibraryFoldersVdf,
 
   // B) Compatibility Layers
+  isValidBottleDirectory,
+  hasValidInitializedBottles,
   detectCompatibilityLayers,
   installCompatibilityLayer,
+  extractRunnerVersionInfo,
+  compareRunnerVersions,
+  checkCompatibilityLayerUpdates,
+  updateCompatibilityLayer,
   ensureCompatibilityLayerReady,
   applyCrossOverPerGameSettings,
 

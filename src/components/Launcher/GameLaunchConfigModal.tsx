@@ -4,6 +4,7 @@ import { StorefrontId } from '../../contracts/platform';
 import {
   CompatibilityLayerInfo,
   CompatibilityLayerType,
+  CompatibilityLayerUpdateInfo,
   CrossOverGraphicsBackend,
   GameLaunchConfig,
   LaunchMethod,
@@ -71,6 +72,42 @@ const COMPAT_LAYER_OPTIONS: { value: Exclude<CompatibilityLayerType, 'native'>; 
     value: d.type,
     label: d.label,
   }));
+
+function formatRunnerOptionLabel(
+  opt: { value: Exclude<CompatibilityLayerType, 'native'>; label: string },
+  layerInfo?: CompatibilityLayerInfo,
+  upd?: CompatibilityLayerUpdateInfo
+): string {
+  if (!layerInfo) {
+    return `${opt.label} (Not Installed)`;
+  }
+  const ver = layerInfo.version || upd?.installedVersion;
+  if (!ver) {
+    return `${opt.label} ✓ (Installed)`;
+  }
+  let baseLabel: string;
+  switch (opt.value) {
+    case 'crossover':
+      baseLabel = `CrossOver — v${ver} Installed (Recommended)`;
+      break;
+    case 'crossover_preview':
+      baseLabel = `CrossOver Preview — v${ver} Installed`;
+      break;
+    case 'gptk':
+      baseLabel = `Apple Game Porting Toolkit (GPTK) — v${ver} Installed`;
+      break;
+    case 'wine':
+      baseLabel = `Open-Source Wine (Wine-CrossOver / Wine Stable) — v${ver} Installed`;
+      break;
+    default:
+      baseLabel = `${opt.label} — v${ver} Installed`;
+      break;
+  }
+  if (upd?.updateAvailable && upd.latestVersion) {
+    return `${baseLabel} • Update Available (v${upd.latestVersion})`;
+  }
+  return baseLabel;
+}
 
 const CROSSOVER_BACKEND_OPTIONS: { value: CrossOverGraphicsBackend; label: string }[] = [
   { value: 'auto', label: 'Auto (Recommended — Best backend per game)' },
@@ -159,6 +196,12 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     tone: 'emerald' | 'amber' | 'sky';
     text: string;
   } | null>(null);
+  const [runnerUpdates, setRunnerUpdates] = useState<Record<string, CompatibilityLayerUpdateInfo>>(
+    () => launcherService.getRunnerUpdates()
+  );
+  const [isCheckingUpdates, setIsCheckingUpdates] = useState<boolean>(false);
+  const [isUpdatingRunner, setIsUpdatingRunner] = useState<boolean>(false);
+  const [runnerUpdateFeedback, setRunnerUpdateFeedback] = useState<string | null>(null);
 
   const loadFormFieldsForPlatform = (
     targetPlatId: StorefrontId,
@@ -218,6 +261,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setPreLaunchCommand(source?.preLaunchCommand || '');
     setPostExitCommand(source?.postExitCommand || '');
     setRunnerActionFeedback(null);
+    setRunnerUpdateFeedback(null);
   };
 
   useEffect(() => {
@@ -241,6 +285,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
     const initialLayers = launcherService.getCompatibilityLayers();
     setDetectedLayers(initialLayers);
+    setRunnerUpdates(launcherService.getRunnerUpdates());
     loadFormFieldsForPlatform(startPlatId, initialDrafts, initialLayers);
 
     launcherService.detectCompatibilityLayers().then((layers) => {
@@ -257,6 +302,26 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         }
       }
     });
+
+    const winHost =
+      (typeof (launcherService as any).isWindowsHost === 'function' &&
+        (launcherService as any).isWindowsHost()) ||
+      (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32');
+
+    if (!winHost) {
+      setIsCheckingUpdates(true);
+      launcherService
+        .checkCompatibilityLayerUpdates()
+        .then((updates) => {
+          if (updates && typeof updates === 'object') {
+            setRunnerUpdates(updates);
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          setIsCheckingUpdates(false);
+        });
+    }
   }, [isOpen, game.id, initialPlatformId]);
 
   if (!isOpen) return null;
@@ -265,7 +330,31 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === compatibilityLayer) ||
     COMPATIBILITY_RUNNER_DESCRIPTORS[0];
   const activeLayer = detectedLayers.find((l) => l.type === compatibilityLayer);
+  const activeUpdateInfo = runnerUpdates[compatibilityLayer];
   const availableBottles = activeLayer?.availableBottles || [];
+
+  const activeInstalledVer = activeLayer?.version || activeUpdateInfo?.installedVersion;
+  const activeInstalledBuild =
+    activeLayer?.buildVersion || activeUpdateInfo?.installedBuildVersion;
+  const activeInstalledDisplay =
+    activeLayer?.displayVersion || activeUpdateInfo?.installedDisplayVersion;
+  const activeSecondaryBuildText = (() => {
+    const parts: string[] = [];
+    if (
+      activeInstalledDisplay &&
+      activeInstalledDisplay !== activeInstalledVer &&
+      activeInstalledDisplay !== `v${activeInstalledVer}`
+    ) {
+      parts.push(activeInstalledDisplay);
+    }
+    if (
+      activeInstalledBuild &&
+      (!activeInstalledDisplay || !activeInstalledDisplay.includes(activeInstalledBuild))
+    ) {
+      parts.push(`Build ${activeInstalledBuild}`);
+    }
+    return parts.join(' • ');
+  })();
 
   const resolvedBottleFolderPath =
     winePrefixPath.trim() ||
@@ -500,6 +589,58 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     }
   };
 
+  const handleCheckRunnerUpdates = async () => {
+    if (isCheckingUpdates) return;
+    setIsCheckingUpdates(true);
+    setRunnerUpdateFeedback(null);
+    try {
+      const [updates, refreshedLayers] = await Promise.all([
+        launcherService.checkCompatibilityLayerUpdates(),
+        launcherService.detectCompatibilityLayers(),
+      ]);
+      if (updates && typeof updates === 'object') {
+        setRunnerUpdates(updates);
+      }
+      if (Array.isArray(refreshedLayers)) {
+        setDetectedLayers(refreshedLayers);
+      }
+      const targetUpd = updates?.[compatibilityLayer];
+      if (targetUpd?.updateAvailable && targetUpd.latestVersion) {
+        setRunnerUpdateFeedback(
+          `Update available for ${selectedRunnerDescriptor.shortLabel}: v${targetUpd.latestVersion}.`
+        );
+      } else if (targetUpd?.statusMessage) {
+        setRunnerUpdateFeedback(targetUpd.statusMessage);
+      } else {
+        setRunnerUpdateFeedback(
+          `${selectedRunnerDescriptor.shortLabel} is up to date${
+            targetUpd?.installedVersion ? ` (v${targetUpd.installedVersion})` : ''
+          }.`
+        );
+      }
+    } finally {
+      setIsCheckingUpdates(false);
+    }
+  };
+
+  const handleUpdateRunner = async () => {
+    if (isUpdatingRunner || compatibilityLayer === 'native') return;
+    setIsUpdatingRunner(true);
+    setRunnerUpdateFeedback(null);
+    try {
+      const res = await launcherService.updateCompatibilityLayer(
+        compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>
+      );
+      const refreshedLayers =
+        res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+      setDetectedLayers(refreshedLayers);
+      setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
+      setRunnerUpdateFeedback(res.message || res.error || null);
+    } finally {
+      setIsUpdatingRunner(false);
+    }
+  };
+
   const handleInstallRunnerViaBrew = async () => {
     if (isInstallingRunner || compatibilityLayer === 'native') return;
     setIsInstallingRunner(true);
@@ -585,6 +726,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setPreLaunchCommand('');
     setPostExitCommand('');
     setRunnerActionFeedback(null);
+    setRunnerUpdateFeedback(null);
   };
 
   const handleSave = async () => {
@@ -1001,14 +1143,16 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     onChange={(e) => {
                       setCompatibilityLayer(e.target.value as CompatibilityLayerType);
                       setRunnerActionFeedback(null);
+                      setRunnerUpdateFeedback(null);
                     }}
                     className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
                   >
                     {COMPAT_LAYER_OPTIONS.map((opt) => {
-                      const isInstalled = detectedLayers.some((l) => l.type === opt.value);
+                      const layerInfo = detectedLayers.find((l) => l.type === opt.value);
+                      const upd = runnerUpdates[opt.value];
                       return (
                         <option key={opt.value} value={opt.value}>
-                          {opt.label} {isInstalled ? '✓ (Installed)' : '(Not Installed)'}
+                          {formatRunnerOptionLabel(opt, layerInfo, upd)}
                         </option>
                       );
                     })}
@@ -1067,13 +1211,112 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                   {activeLayer ? (
                     <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300">
                       <span>✓ Installed &amp; Ready</span>
-                      {activeLayer.version ? <span>({activeLayer.version})</span> : null}
+                      {activeInstalledVer ? <span>(v{activeInstalledVer})</span> : null}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">
                       Not Installed
                     </span>
                   )}
+                </div>
+
+                {/* Version & Update Row */}
+                <div
+                  data-testid="runner-version-update-row"
+                  className="flex flex-wrap items-center justify-between gap-2 rounded bg-[#0e151f] border border-[#223447] px-2.5 py-1.5"
+                >
+                  <div
+                    data-testid="runner-installed-version"
+                    className="flex flex-wrap items-center gap-1.5 text-[11px]"
+                  >
+                    {activeLayer ? (
+                      <>
+                        <span className="font-semibold text-white">
+                          Installed Version: v{activeInstalledVer || 'Detected'}
+                        </span>
+                        {activeSecondaryBuildText && (
+                          <span className="text-[10px] text-steam-subtext">
+                            ({activeSecondaryBuildText})
+                          </span>
+                        )}
+                      </>
+                    ) : activeUpdateInfo?.latestVersion ? (
+                      <span className="font-semibold text-steam-subtext">
+                        Latest Available: v{activeUpdateInfo.latestVersion}
+                      </span>
+                    ) : (
+                      <span className="text-steam-subtext">
+                        Not installed on this Mac
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {isCheckingUpdates ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] text-sky-300">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Checking for updates...</span>
+                      </span>
+                    ) : activeLayer && activeUpdateInfo?.updateAvailable ? (
+                      <>
+                        <span
+                          data-testid="runner-update-available-badge"
+                          className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300"
+                        >
+                          Update Available: v{activeUpdateInfo.latestVersion}
+                        </span>
+                        <button
+                          type="button"
+                          data-testid="update-runner-btn"
+                          onClick={handleUpdateRunner}
+                          disabled={isUpdatingRunner}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-[10px] font-bold text-emerald-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          {isUpdatingRunner ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              <span>Updating Runner...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Download className="w-3 h-3" />
+                              <span>Update to v{activeUpdateInfo.latestVersion}</span>
+                            </>
+                          )}
+                        </button>
+                      </>
+                    ) : activeLayer ? (
+                      <>
+                        <span
+                          data-testid="runner-up-to-date-badge"
+                          className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300"
+                        >
+                          Up to Date{activeInstalledVer ? ` (v${activeInstalledVer})` : ''}
+                        </span>
+                        {compatibilityLayer === 'crossover_preview' && (
+                          <button
+                            type="button"
+                            data-testid="update-runner-btn"
+                            onClick={handleUpdateRunner}
+                            disabled={isUpdatingRunner}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[10px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            {isUpdatingRunner ? 'Updating Runner...' : 'Update Preview Build'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          data-testid="check-runner-updates-btn"
+                          onClick={handleCheckRunnerUpdates}
+                          disabled={isCheckingUpdates}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[10px] font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw className="w-2.5 h-2.5" />
+                          <span>Check for Updates</span>
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
 
                 <p className="text-[11px] text-steam-text leading-relaxed">
@@ -1194,6 +1437,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                         </code>
                       </div>
                     )}
+                  </div>
+                )}
+
+                {runnerUpdateFeedback && (
+                  <div
+                    data-testid="runner-update-feedback"
+                    className="text-[11px] px-2.5 py-1.5 rounded border bg-sky-500/15 text-sky-200 border-sky-500/30"
+                  >
+                    {runnerUpdateFeedback}
                   </div>
                 )}
 

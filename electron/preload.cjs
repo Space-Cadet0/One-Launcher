@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   scanAllInstalledGames: () => ipcRenderer.invoke('launcher:scan-installed'),
   detectCompatibilityLayers: () => ipcRenderer.invoke('launcher:detect-compat-layers'),
   installCompatibilityLayer: (payload) => ipcRenderer.invoke('launcher:install-compat-layer', payload),
+  checkCompatibilityLayerUpdates: () => ipcRenderer.invoke('launcher:check-compat-updates'),
+  updateCompatibilityLayer: (payload) => ipcRenderer.invoke('launcher:update-compat-layer', payload),
   getDiskSpace: (targetPath) => ipcRenderer.invoke('launcher:get-disk-space', targetPath),
   getGameInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
   launchGame: (payload) => ipcRenderer.invoke('launcher:launch-game', payload),

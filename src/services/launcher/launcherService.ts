@@ -3,6 +3,7 @@ import type {
   ActiveGameSession,
   CompatibilityLayerInfo,
   CompatibilityLayerType,
+  CompatibilityLayerUpdateInfo,
   CompatibilityRunnerDescriptor,
   DiskSpaceInfo,
   DownloadTaskState,
@@ -15,6 +16,7 @@ import type {
   LaunchMethod,
   ResolvedLaunchModePreview,
   StorefrontLaunchProfile,
+  UpdateCompatibilityLayerResult,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
 import { steamApi } from '../steam/steamApi';
@@ -95,6 +97,7 @@ export class LauncherService {
   private downloadQueue: DownloadTaskState[] = [];
   private launchConfigs: Record<string, GameLaunchConfig> = {};
   private compatibilityLayers: CompatibilityLayerInfo[] = [];
+  private runnerUpdates: Record<string, CompatibilityLayerUpdateInfo> = {};
   private listeners: Set<() => void> = new Set();
   private initialized = false;
   private unsubscribeDownload?: () => void;
@@ -734,6 +737,82 @@ export class LauncherService {
         success: false,
         runnerType,
         error: err?.message || 'Failed to install compatibility layer.',
+      };
+    }
+  }
+
+  public getRunnerUpdates(): Record<string, CompatibilityLayerUpdateInfo> {
+    return this.runnerUpdates;
+  }
+
+  public async checkCompatibilityLayerUpdates(): Promise<
+    Record<string, CompatibilityLayerUpdateInfo>
+  > {
+    if (
+      typeof window !== 'undefined' &&
+      window.electronAPI?.checkCompatibilityLayerUpdates
+    ) {
+      try {
+        const res = await window.electronAPI.checkCompatibilityLayerUpdates();
+        if (res && typeof res === 'object') {
+          this.runnerUpdates = res;
+          this.notifyStateChanged();
+        }
+      } catch (err) {
+        console.warn('[LauncherService] checkCompatibilityLayerUpdates failed:', err);
+      }
+    }
+    return this.runnerUpdates;
+  }
+
+  public async updateCompatibilityLayer(
+    runnerType: Exclude<CompatibilityLayerType, 'native'>
+  ): Promise<UpdateCompatibilityLayerResult> {
+    const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
+    if (
+      typeof window === 'undefined' ||
+      !window.electronAPI?.updateCompatibilityLayer
+    ) {
+      if (descriptor?.downloadUrl && typeof window !== 'undefined') {
+        if (window.electronAPI?.openExternal) {
+          await window.electronAPI.openExternal(descriptor.downloadUrl);
+        } else if (typeof window.open === 'function') {
+          window.open(descriptor.downloadUrl, '_blank', 'noopener,noreferrer');
+        }
+      }
+      return {
+        success: true,
+        runnerType,
+        updated: false,
+        openedExternalUrl: descriptor?.downloadUrl,
+        message: 'Opened official runner update portal.',
+      };
+    }
+
+    try {
+      const res = await window.electronAPI.updateCompatibilityLayer({ runnerType });
+      if (Array.isArray(res.detectedLayers)) {
+        this.compatibilityLayers = res.detectedLayers;
+      } else {
+        await this.detectCompatibilityLayers();
+      }
+      if (res.updateInfo) {
+        this.runnerUpdates = {
+          ...this.runnerUpdates,
+          [runnerType]: res.updateInfo,
+        };
+      } else {
+        await this.checkCompatibilityLayerUpdates();
+      }
+      this.notifyStateChanged();
+      return res;
+    } catch (err: any) {
+      return {
+        success: false,
+        runnerType,
+        updated: false,
+        message: err?.message || 'Failed to update compatibility layer.',
+        error: err?.message || 'Failed to update compatibility layer.',
       };
     }
   }

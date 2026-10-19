@@ -18,9 +18,47 @@ export interface CompatibilityLayerInfo {
   type: CompatibilityLayerType;
   name: string;
   binaryPath: string;
+  appPath?: string;
   bottlesDir?: string;
   availableBottles?: string[];
   version?: string;
+  buildVersion?: string;
+  displayVersion?: string;
+}
+
+export interface CompatibilityLayerUpdateInfo {
+  runnerType: CompatibilityLayerType;
+  installed: boolean;
+  installedVersion?: string;
+  installedBuildVersion?: string;
+  installedDisplayVersion?: string;
+  latestVersion?: string;
+  latestBuildVersion?: string;
+  latestDisplayVersion?: string;
+  updateAvailable: boolean;
+  downloadUrl?: string;
+  releaseNotesUrl?: string;
+  canAutoUpdate: boolean;
+  updateMethod?: 'brew_upgrade' | 'direct_zip_app' | 'vendor_portal';
+  statusMessage?: string;
+  checkedAt: string;
+}
+
+export interface UpdateCompatibilityLayerPayload {
+  runnerType: Exclude<CompatibilityLayerType, 'native'>;
+}
+
+export interface UpdateCompatibilityLayerResult {
+  success: boolean;
+  runnerType: CompatibilityLayerType;
+  updated: boolean;
+  previousVersion?: string;
+  newVersion?: string;
+  openedExternalUrl?: string;
+  message: string;
+  error?: string;
+  detectedLayers?: CompatibilityLayerInfo[];
+  updateInfo?: CompatibilityLayerUpdateInfo;
 }
 
 export interface CompatibilityRunnerDescriptor {
