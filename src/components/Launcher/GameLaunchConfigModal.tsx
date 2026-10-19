@@ -234,7 +234,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         }
       }
     });
-  }, [isOpen, game, initialPlatformId]);
+  }, [isOpen, game.id, initialPlatformId]);
 
   if (!isOpen) return null;
 

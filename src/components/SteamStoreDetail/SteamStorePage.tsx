@@ -143,6 +143,12 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
   useEffect(() => {
     setCurrentGame(game);
+    if (game.enrichedMetadata) {
+      setMetadata((prev) =>
+        prev ? { ...prev, ...game.enrichedMetadata } : game.enrichedMetadata!
+      );
+      setIsLoading(false);
+    }
   }, [game]);
 
   useEffect(() => {
@@ -155,7 +161,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     if (isNewGame || isOverrideUpdated) {
       setMetadata(game.enrichedMetadata || null);
       setCurrentSteamAppId(game.steamAppId);
-      if (!game.enrichedMetadata) {
+      if (isNewGame && !game.enrichedMetadata) {
         setIsLoading(true);
       }
     }

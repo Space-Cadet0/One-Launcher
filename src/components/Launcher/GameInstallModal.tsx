@@ -198,7 +198,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     return () => {
       active = false;
     };
-  }, [isOpen, game, selectedPlatformId]);
+  }, [isOpen, game.id, selectedPlatformId]);
 
   if (!isOpen) return null;
 

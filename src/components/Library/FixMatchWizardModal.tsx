@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontId } from '../../contracts/platform';
 import {
@@ -214,16 +214,20 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     };
   }, [isOpen]);
 
+  const gameRef = useRef(game);
+  gameRef.current = game;
+
   // Load candidate matches from metadata scraper service (On-Demand Priority)
   const loadCandidates = useCallback(
     async (query: string, tab: SourceFilterTab, nonSteam: boolean) => {
-      if (!game) return;
+      const currentGame = gameRef.current;
+      if (!currentGame) return;
       setIsLoadingCandidates(true);
       try {
         const matches = await syncJobManager.runPriorityAction(
           'Matching Game Metadata',
-          game.title,
-          () => metadataScraperService.getSuggestedMatches(game, query, tab, nonSteam)
+          currentGame.title,
+          () => metadataScraperService.getSuggestedMatches(currentGame, query, tab, nonSteam)
         );
         setCandidates(matches);
       } catch (err) {
@@ -233,7 +237,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         setIsLoadingCandidates(false);
       }
     },
-    [game]
+    [game?.id, game?.title]
   );
 
   // Load review score candidates from reviewCandidateService (On-Demand Priority)
@@ -439,7 +443,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     }
   }, [
     isOpen,
-    game,
+    game?.id,
     initialStep,
     initialCandidate,
     initialScrapedBundle,

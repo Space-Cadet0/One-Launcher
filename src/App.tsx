@@ -171,8 +171,31 @@ export function App() {
     if (!currentEntry.selectedGameId) {
       return games[0] || null;
     }
-    return games.find((g) => g.id === currentEntry.selectedGameId) || games[0] || null;
-  }, [games, currentEntry.selectedGameId]);
+    const targetId = currentEntry.selectedGameId;
+    const directMatch = games.find((g) => g.id === targetId);
+    if (directMatch) return directMatch;
+
+    const platformMatch = games.find((g) =>
+      g.platforms?.some(
+        (p) =>
+          `${p.platformId}-${p.platformGameId}` === targetId ||
+          String(p.platformGameId) === targetId
+      )
+    );
+    if (platformMatch) return platformMatch;
+
+    if (currentEntry.title) {
+      const normTitle = currentEntry.title.toLowerCase().trim();
+      const titleMatch = games.find(
+        (g) =>
+          g.title.toLowerCase().trim() === normTitle ||
+          (g.originalStoreTitle && g.originalStoreTitle.toLowerCase().trim() === normTitle)
+      );
+      if (titleMatch) return titleMatch;
+    }
+
+    return games[0] || null;
+  }, [games, currentEntry.selectedGameId, currentEntry.title]);
 
   // Scroll management: when new page loads, start at top (0); when pressing back/forward, restore previous scroll level
   useEffect(() => {
@@ -472,7 +495,6 @@ export function App() {
 
           if (integrationsChanged) {
             saveIntegrations(updatedIntegrations);
-            setGameRefreshKey((k) => k + 1);
           }
 
           // Sync live storefronts & trophies in background on startup
@@ -497,7 +519,6 @@ export function App() {
                       saveCurrentCatalog(merged);
                       return merged;
                     });
-                    setGameRefreshKey((k) => k + 1);
                   }
                 })
                 .catch(() => {});
@@ -523,7 +544,6 @@ export function App() {
                       saveCurrentCatalog(merged);
                       return merged;
                     });
-                    setGameRefreshKey((k) => k + 1);
                   }
                 })
                 .catch(() => {});
@@ -549,7 +569,6 @@ export function App() {
                       saveCurrentCatalog(merged);
                       return merged;
                     });
-                    setGameRefreshKey((k) => k + 1);
                   }
                 })
                 .catch(() => {});
@@ -1818,7 +1837,6 @@ export function App() {
           saveCurrentCatalog(next);
           return next;
         });
-        setGameRefreshKey((prev) => prev + 1);
       });
       clearTimeout(initialNoticeTimer);
       setSyncNotice('Store media sync complete! Refreshed trailers, screenshots & descriptions.');
@@ -2248,7 +2266,7 @@ export function App() {
             />
           ) : (
             <SteamStorePage
-              key={`${selectedGame.id}-${gameRefreshKey}`}
+              key={currentEntry.selectedGameId || selectedGame.id}
               game={selectedGame}
               collections={collections}
               onBackToLibrary={navigateHome}

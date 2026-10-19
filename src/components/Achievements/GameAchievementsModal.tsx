@@ -96,7 +96,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
           setIsLoading(false);
         });
     }
-  }, [isOpen, game, initialStorefrontId]);
+  }, [isOpen, game?.id, initialStorefrontId]);
 
   // Handle escape key to close modal
   useEffect(() => {
