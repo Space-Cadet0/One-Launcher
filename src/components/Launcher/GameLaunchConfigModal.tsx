@@ -5,6 +5,7 @@ import {
   CompatibilityLayerInfo,
   CompatibilityLayerType,
   CompatibilityLayerUpdateInfo,
+  CrossOverD3DMetalVersion,
   CrossOverGraphicsBackend,
   GameLaunchConfig,
   LaunchMethod,
@@ -121,6 +122,13 @@ const WINDOWS_QUICK_ENV_TOGGLES: { key: string; value: string; label: string; de
   { key: 'DXVK_HUD', value: '1', label: 'DXVK Overlay HUD', desc: 'DXVK_HUD=1' },
 ];
 
+function stripManagedEnvVars(env?: Record<string, string>): Record<string, string> | undefined {
+  if (!env) return undefined;
+  const copy = { ...env };
+  delete copy.CX_GRAPHICS_BACKEND_VERSION;
+  return Object.keys(copy).length > 0 ? copy : undefined;
+}
+
 function serializeEnvVars(env?: Record<string, string>): string {
   if (!env) return '';
   return Object.entries(env)
@@ -168,6 +176,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const [draftsByPlatform, setDraftsByPlatform] = useState<
     Partial<Record<StorefrontId, StorefrontLaunchProfile>>
   >({});
+
   const [launchMethod, setLaunchMethod] = useState<LaunchMethod>('auto');
   const [customExecutablePath, setCustomExecutablePath] = useState<string>('');
   const [workingDirectory, setWorkingDirectory] = useState<string>('');
@@ -177,6 +186,8 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const [winePrefixPath, setWinePrefixPath] = useState<string>('');
   const [crossoverGraphicsBackend, setCrossoverGraphicsBackend] =
     useState<CrossOverGraphicsBackend>('auto');
+  const [crossoverD3DMetalVersion, setCrossoverD3DMetalVersion] =
+    useState<CrossOverD3DMetalVersion>('auto');
   const [crossoverHighResolutionMode, setCrossoverHighResolutionMode] = useState<
     boolean | undefined
   >(undefined);
@@ -228,6 +239,13 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setWineBottleName(source?.wineBottleName || activeLayers[0]?.availableBottles?.[0] || '');
     setWinePrefixPath(source?.winePrefixPath || '');
     setCrossoverGraphicsBackend(source?.crossoverGraphicsBackend || 'auto');
+    setCrossoverD3DMetalVersion(
+      source?.crossoverD3DMetalVersion ||
+        (source?.environmentVariables?.CX_GRAPHICS_BACKEND_VERSION === '3' ||
+        source?.environmentVariables?.CX_GRAPHICS_BACKEND_VERSION === '4'
+          ? source.environmentVariables.CX_GRAPHICS_BACKEND_VERSION
+          : 'auto')
+    );
     setCrossoverHighResolutionMode(source?.crossoverHighResolutionMode);
     setCrossoverDlss(Boolean(source?.crossoverDlss));
     const loadedMsync =
@@ -257,7 +275,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         ? source.dxvkHud
         : Boolean(source?.environmentVariables?.DXVK_HUD)
     );
-    setEnvText(serializeEnvVars(source?.environmentVariables));
+    setEnvText(serializeEnvVars(stripManagedEnvVars(source?.environmentVariables)));
     setPreLaunchCommand(source?.preLaunchCommand || '');
     setPostExitCommand(source?.postExitCommand || '');
     setRunnerActionFeedback(null);
@@ -387,6 +405,19 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     crossoverGraphicsBackend === 'd3dmetal' ||
     crossoverGraphicsBackend === 'dxmt';
 
+  const primaryD3DVer =
+    activeLayer?.availableD3DMetalVersions?.find((v) => v.isDefault || v.id === '4')?.version ||
+    activeLayer?.d3dmetalVersion ||
+    '4.0b3';
+  const fallbackD3DVer =
+    activeLayer?.availableD3DMetalVersions?.find((v) => v.id === '3')?.version || '3.0';
+  const showD3DMetalVersionSelector =
+    (compatibilityLayer === 'crossover_preview' ||
+      Boolean(
+        activeLayer?.availableD3DMetalVersions && activeLayer.availableD3DMetalVersions.length > 1
+      )) &&
+    (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'd3dmetal');
+
   const preview = launcherService.resolveEffectiveLaunchModePreview(
     game,
     preferredPlatformId,
@@ -409,7 +440,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     : 'auto';
 
   const buildProfileFromCurrentState = (): StorefrontLaunchProfile => {
-    const parsedEnv = parseEnvVars(envText);
+    const parsedEnv = stripManagedEnvVars(parseEnvVars(envText)) || {};
     const includeCompatSettings = !isWindowsHost && preview.visibleSections.compatibilityLayer;
     const includeCrossoverOnly =
       includeCompatSettings && preview.visibleSections.crossoverRendering;
@@ -436,6 +467,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       wineBottleName: includeCompatSettings ? wineBottleName.trim() || undefined : undefined,
       winePrefixPath: includeCompatSettings ? winePrefixPath.trim() || undefined : undefined,
       crossoverGraphicsBackend: includeCrossoverOnly ? crossoverGraphicsBackend : undefined,
+      crossoverD3DMetalVersion:
+        includeCrossoverOnly && crossoverD3DMetalVersion !== 'auto'
+          ? crossoverD3DMetalVersion
+          : undefined,
       crossoverHighResolutionMode: includeCompatSettings ? crossoverHighResolutionMode : undefined,
       crossoverDlss: includeCrossoverOnly
         ? isDlssSupportedBackend
@@ -716,6 +751,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setWineBottleName(validLayers[0]?.availableBottles?.[0] || '');
     setWinePrefixPath('');
     setCrossoverGraphicsBackend('auto');
+    setCrossoverD3DMetalVersion('auto');
     setCrossoverHighResolutionMode(undefined);
     setCrossoverDlss(false);
     setWineMsync(true);
@@ -1239,6 +1275,16 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                             ({activeSecondaryBuildText})
                           </span>
                         )}
+                        {activeLayer.d3dmetalVersion && (
+                          <span
+                            data-testid="runner-d3dmetal-version"
+                            className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300"
+                          >
+                            {(activeLayer.availableD3DMetalVersions?.length || 0) > 1
+                              ? `D3DMetal: v${activeLayer.availableD3DMetalVersions![0].version} (Default) / v${activeLayer.availableD3DMetalVersions![1].version}`
+                              : `D3DMetal: v${activeLayer.d3dmetalVersion}`}
+                          </span>
+                        )}
                       </>
                     ) : activeUpdateInfo?.latestVersion ? (
                       <span className="font-semibold text-steam-subtext">
@@ -1526,11 +1572,21 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                         }
                         className="w-full rounded-lg bg-[#0e151f] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
                       >
-                        {CROSSOVER_BACKEND_OPTIONS.map((opt) => (
-                          <option key={opt.value} value={opt.value}>
-                            {opt.label}
-                          </option>
-                        ))}
+                        {CROSSOVER_BACKEND_OPTIONS.map((opt) => {
+                          const dynamicLabel =
+                            opt.value === 'd3dmetal' && activeLayer?.d3dmetalVersion
+                              ? `D3DMetal (v${
+                                  crossoverD3DMetalVersion === '3' && showD3DMetalVersionSelector
+                                    ? fallbackD3DVer
+                                    : activeLayer.d3dmetalVersion
+                                } — Apple GPTK DirectX 11 & 12)`
+                              : opt.label;
+                          return (
+                            <option key={opt.value} value={opt.value}>
+                              {dynamicLabel}
+                            </option>
+                          );
+                        })}
                       </select>
                       <p className="text-[10px] text-steam-subtext leading-snug">
                         Translates DirectX graphics to Apple Metal. Auto selects D3DMetal or DXMT
@@ -1572,6 +1628,77 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     </p>
                   </div>
                 </div>
+
+                {/* Per-Game D3DMetal Version Switcher (CrossOver Preview / Dual-D3DMetal Runners) */}
+                {preview.visibleSections.crossoverRendering && showD3DMetalVersionSelector && (
+                  <div
+                    data-testid="crossover-d3dmetal-version-section"
+                    className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 space-y-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-1">
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                        D3DMetal Engine Version (Per-Game Override)
+                      </label>
+                      <span className="text-[10px] text-steam-subtext">
+                        Dual D3DMetal Bundled: v{primaryD3DVer} &amp; v{fallbackD3DVer}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {[
+                        {
+                          value: 'auto' as CrossOverD3DMetalVersion,
+                          testId: 'd3dmetal-version-auto',
+                          title: `Auto / Default (D3DMetal ${primaryD3DVer})`,
+                          desc: `Uses D3DMetal ${primaryD3DVer} by default while respecting CrossOver compatdb per-game profiles`,
+                        },
+                        {
+                          value: '4' as CrossOverD3DMetalVersion,
+                          testId: 'd3dmetal-version-4',
+                          title: `Force D3DMetal ${primaryD3DVer}`,
+                          desc: `Forces lib/apple_gptk (D3DMetal ${primaryD3DVer}), overriding any compatdb fallback`,
+                        },
+                        {
+                          value: '3' as CrossOverD3DMetalVersion,
+                          testId: 'd3dmetal-version-3',
+                          title: `Force D3DMetal ${fallbackD3DVer} (Fallback)`,
+                          desc: `Switches to lib/apple_gptk3 (D3DMetal ${fallbackD3DVer}) for games with regressions on ${primaryD3DVer}`,
+                        },
+                      ].map((item) => {
+                        const isSelected = crossoverD3DMetalVersion === item.value;
+                        return (
+                          <button
+                            key={item.value}
+                            type="button"
+                            data-testid={item.testId}
+                            onClick={() => setCrossoverD3DMetalVersion(item.value)}
+                            className={`text-left rounded-lg p-2 border transition-all cursor-pointer flex flex-col justify-between gap-1 ${
+                              isSelected
+                                ? 'bg-sky-500/15 border-sky-400 text-white shadow-[0_0_12px_rgba(56,189,248,0.15)]'
+                                : 'bg-[#141d2b] border-[#26384d] text-steam-subtext hover:border-[#385370] hover:text-white'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span
+                                className={`text-[11px] font-bold leading-tight ${
+                                  isSelected ? 'text-sky-300' : 'text-white'
+                                }`}
+                              >
+                                {item.title}
+                              </span>
+                              {isSelected && (
+                                <CheckCircle2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                              )}
+                            </div>
+                            <span className="text-[10px] text-steam-subtext leading-snug">
+                              {item.desc}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* DLSS (MetalFX Upscaling) — CrossOver only */}
                 {preview.visibleSections.crossoverRendering && (

@@ -1627,6 +1627,7 @@ const LAUNCH_PROFILE_KEYS = [
   'wineBottleName',
   'winePrefixPath',
   'crossoverGraphicsBackend',
+  'crossoverD3DMetalVersion',
   'crossoverHighResolutionMode',
   'crossoverDlss',
   'wineMsync',
@@ -3961,6 +3962,233 @@ function extractRunnerVersionInfo(runnerTypeOrPath, maybeBinaryPath, maybeOption
 }
 
 /**
+ * Parse string key-value pairs from a macOS XML or binary (bplist00) Info.plist file
+ */
+function parsePlistStringValues(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return {};
+  try {
+    const buf = fs.readFileSync(filePath);
+    if (buf.length >= 40 && buf.slice(0, 6).toString('ascii') === 'bplist') {
+      const trailer = buf.slice(buf.length - 32);
+      const offsetIntSize = trailer[6];
+      const objectRefSize = trailer[7];
+      const numObjects = Number(trailer.readBigUInt64BE(8));
+      const topObject = Number(trailer.readBigUInt64BE(16));
+      const offsetTableOffset = Number(trailer.readBigUInt64BE(24));
+
+      if (
+        offsetIntSize < 1 ||
+        offsetIntSize > 8 ||
+        objectRefSize < 1 ||
+        objectRefSize > 8 ||
+        numObjects <= 0 ||
+        numObjects > 10000 ||
+        offsetTableOffset < 8 ||
+        offsetTableOffset + numObjects * offsetIntSize > buf.length - 32
+      ) {
+        return {};
+      }
+
+      const readUInt = (offset, byteLen) => {
+        let val = 0;
+        for (let i = 0; i < byteLen; i++) {
+          val = val * 256 + buf[offset + i];
+        }
+        return val;
+      };
+
+      const offsets = [];
+      for (let i = 0; i < numObjects; i++) {
+        offsets.push(readUInt(offsetTableOffset + i * offsetIntSize, offsetIntSize));
+      }
+
+      const readLength = (pos, lowNibble) => {
+        if (lowNibble !== 0x0f) return { len: lowNibble, nextPos: pos };
+        const intMarker = buf[pos];
+        const intBytes = 1 << (intMarker & 0x0f);
+        return { len: readUInt(pos + 1, intBytes), nextPos: pos + 1 + intBytes };
+      };
+
+      const readObject = (objIdx, depth = 0) => {
+        if (depth > 6) return null;
+        const pos = offsets[objIdx];
+        if (pos === undefined || pos >= buf.length) return null;
+        const marker = buf[pos];
+        const type = marker >> 4;
+        const info = marker & 0x0f;
+        if (type === 0x5) {
+          const { len, nextPos } = readLength(pos + 1, info);
+          return buf.slice(nextPos, nextPos + len).toString('utf8');
+        }
+        if (type === 0x6) {
+          const { len, nextPos } = readLength(pos + 1, info);
+          const chars = [];
+          for (let i = 0; i < len; i++) {
+            chars.push(buf.readUInt16BE(nextPos + i * 2));
+          }
+          return String.fromCharCode(...chars);
+        }
+        if (type === 0xd) {
+          const { len, nextPos } = readLength(pos + 1, info);
+          const out = {};
+          for (let i = 0; i < len; i++) {
+            const kRef = readUInt(nextPos + i * objectRefSize, objectRefSize);
+            const vRef = readUInt(nextPos + (len + i) * objectRefSize, objectRefSize);
+            const k = readObject(kRef, depth + 1);
+            const v = readObject(vRef, depth + 1);
+            if (typeof k === 'string' && typeof v === 'string') {
+              out[k] = v;
+            }
+          }
+          return out;
+        }
+        return null;
+      };
+
+      const parsed = readObject(topObject, 0);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    }
+
+    const text = buf.toString('utf8');
+    const out = {};
+    const re = /<key>\s*([^<]+?)\s*<\/key>\s*<string>\s*([^<]+?)\s*<\/string>/gi;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      out[m[1].trim()] = m[2].trim();
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Inspect bundled D3DMetal.framework inside CrossOver / CrossOver Preview / GPTK bundles
+ */
+function detectBundledD3DMetalVersions(runnerType, binaryPath, appPath) {
+  let resolvedAppPath = appPath;
+  if (!resolvedAppPath && binaryPath && typeof binaryPath === 'string') {
+    const appMatch = binaryPath.match(/^(.*?\.app)(?:[\\/]|$)/i);
+    const contentsMatch = binaryPath.match(/^(.*?)[\\/]Contents[\\/]/i);
+    resolvedAppPath = appMatch ? appMatch[1] : contentsMatch ? contentsMatch[1] : undefined;
+  }
+
+  const readFrameworkVersion = (fwDirs) => {
+    for (const fwDir of fwDirs) {
+      if (!fwDir) continue;
+      const plistCandidates = [
+        path.join(fwDir, 'Resources/Info.plist'),
+        path.join(fwDir, 'Versions/Current/Resources/Info.plist'),
+        path.join(fwDir, 'Info.plist'),
+      ];
+      for (const plistPath of plistCandidates) {
+        if (!fs.existsSync(plistPath)) continue;
+        const dict = parsePlistStringValues(plistPath);
+        const ver = String(dict.CFBundleShortVersionString || dict.CFBundleVersion || '').trim();
+        if (ver) return ver;
+      }
+    }
+    return undefined;
+  };
+
+  if (runnerType === 'crossover' || runnerType === 'crossover_preview') {
+    if (!resolvedAppPath) {
+      return { d3dmetalVersion: undefined, availableD3DMetalVersions: undefined };
+    }
+    const primaryDirs = [
+      path.join(
+        resolvedAppPath,
+        'Contents/SharedSupport/CrossOver/lib/apple_gptk/external/D3DMetal.framework'
+      ),
+      path.join(
+        resolvedAppPath,
+        'Contents/SharedSupport/CrossOver/lib64/apple_gptk/external/D3DMetal.framework'
+      ),
+    ];
+    const secondaryDirs = [
+      path.join(
+        resolvedAppPath,
+        'Contents/SharedSupport/CrossOver/lib/apple_gptk3/external/D3DMetal.framework'
+      ),
+      path.join(
+        resolvedAppPath,
+        'Contents/SharedSupport/CrossOver/lib64/apple_gptk3/external/D3DMetal.framework'
+      ),
+    ];
+
+    const primaryVer = readFrameworkVersion(primaryDirs);
+    const secondaryVer = readFrameworkVersion(secondaryDirs);
+
+    if (primaryVer && secondaryVer) {
+      const primaryMajorId = String(primaryVer).split('.')[0] || '4';
+      return {
+        d3dmetalVersion: primaryVer,
+        availableD3DMetalVersions: [
+          {
+            id: primaryMajorId,
+            version: primaryVer,
+            label: `D3DMetal ${primaryVer} (Default)`,
+            isDefault: true,
+          },
+          {
+            id: '3',
+            version: secondaryVer,
+            label: `D3DMetal ${secondaryVer} (Fallback)`,
+            isDefault: false,
+          },
+        ],
+      };
+    }
+
+    if (primaryVer || secondaryVer) {
+      const singleVer = primaryVer || secondaryVer;
+      return {
+        d3dmetalVersion: singleVer,
+        availableD3DMetalVersions: [
+          {
+            id: 'default',
+            version: singleVer,
+            label: `D3DMetal ${singleVer}`,
+            isDefault: true,
+          },
+        ],
+      };
+    }
+  } else if (runnerType === 'gptk') {
+    const gptkDirs = [];
+    if (resolvedAppPath) {
+      gptkDirs.push(
+        path.join(resolvedAppPath, 'Contents/Resources/wine/lib/external/D3DMetal.framework'),
+        path.join(resolvedAppPath, 'Contents/Resources/wine/lib64/external/D3DMetal.framework')
+      );
+    }
+    if (binaryPath && typeof binaryPath === 'string') {
+      const binDir = path.dirname(binaryPath);
+      gptkDirs.push(
+        path.resolve(binDir, '../lib/external/D3DMetal.framework'),
+        path.resolve(binDir, '../lib64/external/D3DMetal.framework')
+      );
+    }
+    const gptkVer = readFrameworkVersion(gptkDirs);
+    if (gptkVer) {
+      return {
+        d3dmetalVersion: gptkVer,
+        availableD3DMetalVersions: [
+          {
+            id: 'default',
+            version: gptkVer,
+            label: `D3DMetal ${gptkVer}`,
+            isDefault: true,
+          },
+        ],
+      };
+    }
+  }
+
+  return { d3dmetalVersion: undefined, availableD3DMetalVersions: undefined };
+}
+
+/**
  * Compare two runner version strings numerically segment by segment (-1 if vA < vB, 0 if equal, 1 if vA > vB)
  */
 function compareRunnerVersions(vA, vB) {
@@ -4066,6 +4294,11 @@ function detectCompatibilityLayers(options = {}) {
       const binaryPath = candidateBins.find((b) => fs.existsSync(b)) || candidateBins[0];
       const availableBottles = listBottleSubdirectories(variant.bottlesDir, options);
       const versionInfo = extractRunnerVersionInfo(variant.type, binaryPath, options);
+      const d3dmInfo = detectBundledD3DMetalVersions(
+        variant.type,
+        binaryPath,
+        versionInfo.appPath || appPath
+      );
 
       if (!addedTypes.has(variant.id)) {
         addedTypes.add(variant.id);
@@ -4078,6 +4311,10 @@ function detectCompatibilityLayers(options = {}) {
           version: versionInfo.version,
           buildVersion: versionInfo.buildVersion,
           displayVersion: versionInfo.displayVersion,
+          ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+          ...(d3dmInfo.availableD3DMetalVersions
+            ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+            : {}),
           bottlesDir: variant.bottlesDir,
           availableBottles,
         });
@@ -4099,6 +4336,11 @@ function detectCompatibilityLayers(options = {}) {
         if (foundBin && !addedTypes.has('gptk')) {
           addedTypes.add('gptk');
           const versionInfo = extractRunnerVersionInfo('gptk', foundBin, options);
+          const d3dmInfo = detectBundledD3DMetalVersions(
+            'gptk',
+            foundBin,
+            versionInfo.appPath || path.join(heroicGptkRoot, sub)
+          );
           layers.push({
             id: 'gptk',
             type: 'gptk',
@@ -4108,6 +4350,10 @@ function detectCompatibilityLayers(options = {}) {
             version: versionInfo.version,
             buildVersion: versionInfo.buildVersion,
             displayVersion: versionInfo.displayVersion,
+            ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+            ...(d3dmInfo.availableD3DMetalVersions
+              ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+              : {}),
             availableBottles: [],
           });
         }
@@ -4124,6 +4370,11 @@ function detectCompatibilityLayers(options = {}) {
       ];
       const binaryPath = binCandidates.find((b) => fs.existsSync(b)) || binCandidates[0];
       const versionInfo = extractRunnerVersionInfo('gptk', binaryPath, options);
+      const d3dmInfo = detectBundledD3DMetalVersions(
+        'gptk',
+        binaryPath,
+        versionInfo.appPath || gptkApp
+      );
       addedTypes.add('gptk');
       layers.push({
         id: 'gptk',
@@ -4134,6 +4385,10 @@ function detectCompatibilityLayers(options = {}) {
         version: versionInfo.version,
         buildVersion: versionInfo.buildVersion,
         displayVersion: versionInfo.displayVersion,
+        ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+        ...(d3dmInfo.availableD3DMetalVersions
+          ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+          : {}),
         availableBottles: [],
       });
     }
@@ -4663,6 +4918,11 @@ function applyCrossOverPerGameSettings(
     typeof cfg.crossoverGraphicsBackend === 'string'
       ? cfg.crossoverGraphicsBackend.toLowerCase().trim()
       : undefined;
+  const d3dmVer =
+    typeof cfg.crossoverD3DMetalVersion === 'string'
+      ? cfg.crossoverD3DMetalVersion.toLowerCase().trim()
+      : undefined;
+  const isD3DMetalEligible = !backend || backend === 'auto' || backend === 'd3dmetal';
 
   // 1. Graphics Backend ('auto' | 'd3dmetal' | 'dxmt' | 'dxvk' | 'wined3d')
   if (
@@ -4680,6 +4940,13 @@ function applyCrossOverPerGameSettings(
   } else if (backend === 'auto') {
     delete env.CX_GRAPHICS_BACKEND;
     delete env.WINED3DMETAL;
+  }
+
+  // 1b. D3DMetal Version ('auto' | '4' | '3') -> CX_GRAPHICS_BACKEND_VERSION
+  if (isD3DMetalEligible && (d3dmVer === '3' || d3dmVer === '4')) {
+    env.CX_GRAPHICS_BACKEND_VERSION = d3dmVer;
+  } else if (!cfg.environmentVariables?.CX_GRAPHICS_BACKEND_VERSION) {
+    delete env.CX_GRAPHICS_BACKEND_VERSION;
   }
 
   // 2. DLSS (only applicable when backend is 'auto'/undefined, 'd3dmetal', or 'dxmt')
@@ -4729,6 +4996,7 @@ function applyCrossOverPerGameSettings(
       chosenLayer?.type === 'crossover_preview' || Boolean(effectiveOptions.isPreviewRunner);
     const hasCrossOverEnvConfig =
       backend !== undefined ||
+      typeof cfg.crossoverD3DMetalVersion === 'string' ||
       typeof cfg.crossoverDlss === 'boolean' ||
       typeof cfg.wineMsync === 'boolean' ||
       typeof cfg.wineEsync === 'boolean' ||
@@ -4771,6 +5039,12 @@ function applyCrossOverPerGameSettings(
           updates.set('CX_GRAPHICS_BACKEND', backend);
         } else if (backend === 'auto') {
           removals.add('CX_GRAPHICS_BACKEND');
+        }
+
+        if (isD3DMetalEligible && (d3dmVer === '3' || d3dmVer === '4')) {
+          updates.set('CX_GRAPHICS_BACKEND_VERSION', d3dmVer);
+        } else {
+          removals.add('CX_GRAPHICS_BACKEND_VERSION');
         }
 
         if (cfg.crossoverDlss === true && !dlssUnsupportedBackend) {
@@ -10319,6 +10593,7 @@ module.exports = {
   detectCompatibilityLayers,
   installCompatibilityLayer,
   extractRunnerVersionInfo,
+  detectBundledD3DMetalVersions,
   compareRunnerVersions,
   checkCompatibilityLayerUpdates,
   updateCompatibilityLayer,

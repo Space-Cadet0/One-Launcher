@@ -13,6 +13,18 @@ export type CompatibilityLayerType =
   | 'gptk'
   | 'wine';
 
+export type CrossOverD3DMetalVersion = 'auto' | '4' | '3';
+
+export interface BundledD3DMetalVersionInfo {
+  /** Selector key used for CX_GRAPHICS_BACKEND_VERSION ('4', '3', or 'default') */
+  id: string;
+  /** Exact version from D3DMetal.framework/Resources/Info.plist (e.g. "4.0b3", "3.0", "3.0b3") */
+  version: string;
+  /** Display label (e.g. "D3DMetal 4.0b3 (Default)", "D3DMetal 3.0 (Fallback)") */
+  label: string;
+  isDefault?: boolean;
+}
+
 export interface CompatibilityLayerInfo {
   id: string;
   type: CompatibilityLayerType;
@@ -24,6 +36,8 @@ export interface CompatibilityLayerInfo {
   version?: string;
   buildVersion?: string;
   displayVersion?: string;
+  d3dmetalVersion?: string;
+  availableD3DMetalVersions?: BundledD3DMetalVersionInfo[];
 }
 
 export interface CompatibilityLayerUpdateInfo {
@@ -127,6 +141,8 @@ export interface StorefrontLaunchProfile {
   winePrefixPath?: string;
   /** CrossOver 26 per-game graphics backend override */
   crossoverGraphicsBackend?: CrossOverGraphicsBackend;
+  /** CrossOver Preview per-game D3DMetal version selector (CX_GRAPHICS_BACKEND_VERSION: 'auto' | '4' | '3') */
+  crossoverD3DMetalVersion?: CrossOverD3DMetalVersion;
   /** CrossOver 26 High Resolution Mode (Retina 192 DPI in HKCU\Software\Wine\Mac Driver) */
   crossoverHighResolutionMode?: boolean;
   /** CrossOver 26 DLSS (MetalFX upscaling for D3DMetal and DXMT) */
@@ -147,6 +163,8 @@ export interface GameLaunchConfig extends StorefrontLaunchProfile {
   gameId: string;
   preferredPlatformId?: StorefrontId;
   launchMethod: LaunchMethod;
+  /** CrossOver Preview per-game D3DMetal version selector (CX_GRAPHICS_BACKEND_VERSION: 'auto' | '4' | '3') */
+  crossoverD3DMetalVersion?: CrossOverD3DMetalVersion;
   /** Per-storefront launch & compatibility profiles keyed by StorefrontId ('steam' | 'gog' | 'epic' | 'custom') */
   platformConfigs?: Partial<Record<StorefrontId, StorefrontLaunchProfile>>;
 }

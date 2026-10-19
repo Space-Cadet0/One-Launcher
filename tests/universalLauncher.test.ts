@@ -7645,4 +7645,463 @@ sleep 1
       }
     });
   });
+
+  // ============================================================================
+  // 30. Bundled D3DMetal Version Detection & Per-Game D3DMetal Version Switching (4.0b3 vs 3.0)
+  // ============================================================================
+  describe('30. Bundled D3DMetal Version Detection & Per-Game D3DMetal Version Switching (4.0b3 vs 3.0)', () => {
+    it('1. detectBundledD3DMetalVersions & detectCompatibilityLayers extract dual D3DMetal versions (4.0b3 Default + 3.0 Fallback) from CrossOver Preview.app and single D3DMetal 3.0 from CrossOver.app', () => {
+      const tempHome = path.join(tmpRoot, 'd3dmetal-detect-home');
+      const appsDir = path.join(tempHome, 'Applications');
+
+      // 1a. CrossOver Preview.app with both lib/apple_gptk (4.0b3) and lib/apple_gptk3 (3.0)
+      const cxPreviewApp = path.join(appsDir, 'CrossOver Preview.app');
+      const cxPreviewBin = path.join(
+        cxPreviewApp,
+        'Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wineloader'
+      );
+      writeTempFile(cxPreviewBin, '#!/bin/sh\nexit 0\n', 0o755);
+      writeTempFile(
+        path.join(cxPreviewApp, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>20261006</string>
+  <key>CFBundleVersion</key>
+  <string>27.0.0.41069</string>
+</dict>
+</plist>`
+      );
+      writeTempFile(
+        path.join(
+          cxPreviewApp,
+          'Contents/SharedSupport/CrossOver/lib/apple_gptk/external/D3DMetal.framework/Resources/Info.plist'
+        ),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>4.0b3</string>
+  <key>CFBundleVersion</key>
+  <string>400.3</string>
+</dict>
+</plist>`
+      );
+      writeTempFile(
+        path.join(
+          cxPreviewApp,
+          'Contents/SharedSupport/CrossOver/lib/apple_gptk3/external/D3DMetal.framework/Resources/Info.plist'
+        ),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>3.0</string>
+  <key>CFBundleVersion</key>
+  <string>300.0</string>
+</dict>
+</plist>`
+      );
+
+      // 1b. CrossOver.app with only lib/apple_gptk (3.0)
+      const cxStableApp = path.join(appsDir, 'CrossOver.app');
+      const cxStableBin = path.join(
+        cxStableApp,
+        'Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wineloader'
+      );
+      writeTempFile(cxStableBin, '#!/bin/sh\nexit 0\n', 0o755);
+      writeTempFile(
+        path.join(cxStableApp, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>26.3.0</string>
+  <key>CFBundleVersion</key>
+  <string>26.3.0.39832</string>
+</dict>
+</plist>`
+      );
+      writeTempFile(
+        path.join(
+          cxStableApp,
+          'Contents/SharedSupport/CrossOver/lib/apple_gptk/external/D3DMetal.framework/Resources/Info.plist'
+        ),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>3.0</string>
+  <key>CFBundleVersion</key>
+  <string>300.0</string>
+</dict>
+</plist>`
+      );
+
+      // Direct unit checks on detectBundledD3DMetalVersions
+      const previewD3D = launcherEngine.detectBundledD3DMetalVersions(
+        'crossover_preview',
+        cxPreviewBin,
+        cxPreviewApp
+      );
+      expect(previewD3D).toEqual({
+        d3dmetalVersion: '4.0b3',
+        availableD3DMetalVersions: [
+          {
+            id: '4',
+            version: '4.0b3',
+            label: 'D3DMetal 4.0b3 (Default)',
+            isDefault: true,
+          },
+          {
+            id: '3',
+            version: '3.0',
+            label: 'D3DMetal 3.0 (Fallback)',
+            isDefault: false,
+          },
+        ],
+      });
+
+      const stableD3D = launcherEngine.detectBundledD3DMetalVersions(
+        'crossover',
+        cxStableBin,
+        cxStableApp
+      );
+      expect(stableD3D).toEqual({
+        d3dmetalVersion: '3.0',
+        availableD3DMetalVersions: [
+          {
+            id: 'default',
+            version: '3.0',
+            label: 'D3DMetal 3.0',
+            isDefault: true,
+          },
+        ],
+      });
+
+      // End-to-end check via detectCompatibilityLayers
+      const layers = launcherEngine.detectCompatibilityLayers({
+        platform: 'darwin',
+        homedir: tempHome,
+        customApplicationsDir: appsDir,
+      });
+      const previewLayer = layers.find((l: any) => l.type === 'crossover_preview');
+      const stableLayer = layers.find((l: any) => l.type === 'crossover');
+
+      expect(previewLayer?.d3dmetalVersion).toBe('4.0b3');
+      expect(previewLayer?.availableD3DMetalVersions).toEqual(previewD3D.availableD3DMetalVersions);
+      expect(stableLayer?.d3dmetalVersion).toBe('3.0');
+      expect(stableLayer?.availableD3DMetalVersions).toEqual(stableD3D.availableD3DMetalVersions);
+    });
+
+    it('2. applyCrossOverPerGameSettings writes CX_GRAPHICS_BACKEND_VERSION ("3" or "4") to env and cxbottle.conf and removes it when set to "auto" or non-D3DMetal backend', () => {
+      const bottlePath = path.join(tmpRoot, 'd3dmetal-bottle-test');
+      fs.mkdirSync(path.join(bottlePath, 'drive_c'), { recursive: true });
+      const cxbottleConfPath = path.join(bottlePath, 'cxbottle.conf');
+      writeTempFile(
+        cxbottleConfPath,
+        `[Bottle]\n"WineArch" = "win64"\n"Preview" = "1"\n\n[EnvironmentVariables]\n"WINEMSYNC" = "1"\n`
+      );
+
+      // 2a. crossoverD3DMetalVersion = '3' with crossoverGraphicsBackend = 'd3dmetal'
+      const env1: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        { type: 'crossover_preview' },
+        {
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverD3DMetalVersion: '3',
+        },
+        env1,
+        bottlePath
+      );
+      expect(env1.CX_GRAPHICS_BACKEND).toBe('d3dmetal');
+      expect(env1.CX_GRAPHICS_BACKEND_VERSION).toBe('3');
+      const confAfter3 = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(confAfter3).toContain('"CX_GRAPHICS_BACKEND" = "d3dmetal"');
+      expect(confAfter3).toContain('"CX_GRAPHICS_BACKEND_VERSION" = "3"');
+
+      // 2b. crossoverD3DMetalVersion = '4' with crossoverGraphicsBackend = 'auto'
+      const env2: Record<string, string> = { ...env1 };
+      launcherEngine.applyCrossOverPerGameSettings(
+        { type: 'crossover_preview' },
+        {
+          crossoverGraphicsBackend: 'auto',
+          crossoverD3DMetalVersion: '4',
+        },
+        env2,
+        bottlePath
+      );
+      expect(env2.CX_GRAPHICS_BACKEND).toBeUndefined();
+      expect(env2.CX_GRAPHICS_BACKEND_VERSION).toBe('4');
+      const confAfter4 = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(confAfter4).not.toContain('CX_GRAPHICS_BACKEND" =');
+      expect(confAfter4).toContain('"CX_GRAPHICS_BACKEND_VERSION" = "4"');
+
+      // 2c. Reset crossoverD3DMetalVersion back to 'auto' -> removes CX_GRAPHICS_BACKEND_VERSION
+      const env3: Record<string, string> = { ...env2 };
+      launcherEngine.applyCrossOverPerGameSettings(
+        { type: 'crossover_preview' },
+        {
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverD3DMetalVersion: 'auto',
+        },
+        env3,
+        bottlePath
+      );
+      expect(env3.CX_GRAPHICS_BACKEND_VERSION).toBeUndefined();
+      const confAfterAuto = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(confAfterAuto).not.toContain('CX_GRAPHICS_BACKEND_VERSION');
+
+      // 2d. Switching backend to 'dxmt' or 'dxvk' even with crossoverD3DMetalVersion = '3' removes CX_GRAPHICS_BACKEND_VERSION
+      const env4: Record<string, string> = { CX_GRAPHICS_BACKEND_VERSION: '3' };
+      launcherEngine.applyCrossOverPerGameSettings(
+        { type: 'crossover_preview' },
+        {
+          crossoverGraphicsBackend: 'dxmt',
+          crossoverD3DMetalVersion: '3',
+        },
+        env4,
+        bottlePath
+      );
+      expect(env4.CX_GRAPHICS_BACKEND).toBe('dxmt');
+      expect(env4.CX_GRAPHICS_BACKEND_VERSION).toBeUndefined();
+      const confAfterDxmt = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(confAfterDxmt).toContain('"CX_GRAPHICS_BACKEND" = "dxmt"');
+      expect(confAfterDxmt).not.toContain('CX_GRAPHICS_BACKEND_VERSION');
+    });
+
+    it('3. GameLaunchConfigModal renders runner-d3dmetal-version badge, crossover-d3dmetal-version-section cards (auto / 4 / 3), and persists crossoverD3DMetalVersion: "3" on save', async () => {
+      const ReactModule = await import('react');
+      const React = ReactModule.default || ReactModule;
+      const { renderToString } = await import('react-dom/server');
+      const { GameLaunchConfigModal } = await import(
+        '../src/components/Launcher/GameLaunchConfigModal'
+      );
+
+      const mockLayers: CompatibilityLayerInfo[] = [
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath:
+            '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wineloader',
+          appPath: '/Applications/CrossOver.app',
+          version: '26.3.0',
+          buildVersion: '26.3.0.39832',
+          displayVersion: '26.3.0 (Build 39832)',
+          d3dmetalVersion: '3.0',
+          availableD3DMetalVersions: [
+            {
+              id: 'default',
+              version: '3.0',
+              label: 'D3DMetal 3.0',
+              isDefault: true,
+            },
+          ],
+          available: true,
+          bottlesDir: '/Users/test/Library/Application Support/CrossOver/Bottles',
+          availableBottles: ['Steam'],
+        },
+        {
+          id: 'crossover_preview',
+          type: 'crossover_preview',
+          name: 'CrossOver Preview',
+          binaryPath:
+            '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wineloader',
+          appPath: '/Applications/CrossOver Preview.app',
+          version: '27.0.0',
+          buildVersion: '27.0.0.41069',
+          displayVersion: '27.0.0 (Preview 20261006)',
+          d3dmetalVersion: '4.0b3',
+          availableD3DMetalVersions: [
+            {
+              id: '4',
+              version: '4.0b3',
+              label: 'D3DMetal 4.0b3 (Default)',
+              isDefault: true,
+            },
+            {
+              id: '3',
+              version: '3.0',
+              label: 'D3DMetal 3.0 (Fallback)',
+              isDefault: false,
+            },
+          ],
+          available: true,
+          bottlesDir: '/Users/test/Library/Application Support/CrossOver/Bottles',
+          availableBottles: ['Steam'],
+        },
+      ];
+
+      const detectSpy = vi
+        .spyOn(launcherService, 'detectCompatibilityLayers')
+        .mockResolvedValue(mockLayers);
+      const getLayersSpy = vi
+        .spyOn(launcherService, 'getCompatibilityLayers')
+        .mockReturnValue(mockLayers);
+      const getUpdatesSpy = vi
+        .spyOn(launcherService, 'getRunnerUpdates')
+        .mockReturnValue({});
+      const checkUpdatesSpy = vi
+        .spyOn(launcherService, 'checkCompatibilityLayerUpdates')
+        .mockResolvedValue([]);
+
+      const gameId = 'steam-d3dmetal-switch-test';
+      const winExeOnMacGame: any = {
+        id: gameId,
+        title: 'Cyberpunk 2077 D3DMetal Test',
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1091500',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe',
+          },
+        ],
+      };
+
+      const findElements = (
+        node: any,
+        predicate: (el: any) => boolean,
+        acc: any[] = []
+      ): any[] => {
+        if (!node) return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (typeof node === 'object') {
+          if (predicate(node)) acc.push(node);
+          if (typeof node.type === 'function') {
+            try {
+              const rendered = node.type(node.props || {});
+              findElements(rendered, predicate, acc);
+            } catch {}
+          }
+          if (node.props && node.props.children) {
+            findElements(node.props.children, predicate, acc);
+          }
+        }
+        return acc;
+      };
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+      const internals =
+        (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE ||
+        (React as any).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
+
+      const onCloseMock = vi.fn();
+      const renderModal = () => {
+        let hookIdx = 0;
+        let effectIdx = 0;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = hookIdx++;
+            if (!(idx in states)) {
+              states[idx] = typeof initial === 'function' ? initial() : initial;
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (GameLaunchConfigModal as any)({
+            isOpen: true,
+            game: winExeOnMacGame,
+            initialPlatformId: 'steam',
+            onClose: onCloseMock,
+          });
+          const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderModal();
+        await new Promise((r) => setTimeout(r, 20));
+        const rStable = renderModal();
+
+        // Standard CrossOver (single D3DMetal 3.0) shows "D3DMetal: v3.0" badge and hides the dual version switcher
+        expect(rStable.html).toContain('data-testid="runner-d3dmetal-version"');
+        expect(rStable.html).toContain('D3DMetal: v3.0');
+        expect(rStable.html).not.toContain('data-testid="crossover-d3dmetal-version-section"');
+
+        // Switch compatibilityLayer to crossover_preview
+        const runnerSelect = findElements(
+          rStable.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        expect(runnerSelect).toBeDefined();
+        runnerSelect.props.onChange({ target: { value: 'crossover_preview' } });
+
+        const rPreview = renderModal();
+
+        // 1. Verify runner-d3dmetal-version badge shows "D3DMetal: v4.0b3 (Default) / v3.0"
+        expect(rPreview.html).toContain('data-testid="runner-d3dmetal-version"');
+        expect(rPreview.html).toContain('D3DMetal: v4.0b3 (Default) / v3.0');
+
+        // 2. Verify crossover-d3dmetal-version-section renders with auto, 4, and 3 buttons
+        expect(rPreview.html).toContain('data-testid="crossover-d3dmetal-version-section"');
+        expect(rPreview.html).toContain('data-testid="d3dmetal-version-auto"');
+        expect(rPreview.html).toContain('data-testid="d3dmetal-version-4"');
+        expect(rPreview.html).toContain('data-testid="d3dmetal-version-3"');
+
+        // 3. Click d3dmetal-version-3 and Save -> persists crossoverD3DMetalVersion: '3'
+        const d3dBtn3 = findElements(
+          rPreview.vnode,
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'd3dmetal-version-3'
+        )[0];
+        expect(d3dBtn3).toBeDefined();
+        d3dBtn3.props.onClick();
+
+        const rAfterSelect3 = renderModal();
+        const saveBtn = findElements(
+          rAfterSelect3.vnode,
+          (el) =>
+            el.type === 'button' &&
+            typeof el.props?.onClick === 'function' &&
+            JSON.stringify(el.props.children || '').includes('Save Configuration')
+        )[0];
+        expect(saveBtn).toBeDefined();
+        await saveBtn.props.onClick();
+
+        const savedCfg = launcherService.getLaunchConfig(gameId, 'steam');
+        expect(savedCfg?.compatibilityLayer).toBe('crossover_preview');
+        expect(savedCfg?.crossoverD3DMetalVersion).toBe('3');
+      } finally {
+        await launcherService.resetLaunchConfig(gameId);
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        getUpdatesSpy.mockRestore();
+        checkUpdatesSpy.mockRestore();
+      }
+    });
+  });
 });
+

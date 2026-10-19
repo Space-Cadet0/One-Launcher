@@ -1756,6 +1756,7 @@ export class LauncherService {
       'wineBottleName',
       'winePrefixPath',
       'crossoverGraphicsBackend',
+      'crossoverD3DMetalVersion',
       'crossoverHighResolutionMode',
       'crossoverDlss',
       'wineMsync',
