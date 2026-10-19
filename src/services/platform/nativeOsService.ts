@@ -42,7 +42,7 @@ function extractExplicitOsFlags(raw?: RawOsFlags | null): { windows: boolean; ma
 
 /**
  * Resolves the operating systems a game is natively available on.
- * Compatibility layers (CrossOver, Wine, Whisky, GPTK) and Windows .exe binaries on macOS
+ * Compatibility layers (CrossOver, Wine, GPTK) and Windows .exe binaries on macOS
  * NEVER count as native macOS availability.
  */
 export function getNativeOsPlatforms(game: CanonicalGame): NativeOsPlatform[] {
@@ -53,8 +53,8 @@ export function getNativeOsPlatforms(game: CanonicalGame): NativeOsPlatform[] {
     if (!p) continue;
     const isCompatOrWinExe =
       p.isWindowsBinaryOnMac === true ||
-      /crossover|bottles|drive_c|whisky|wine|gptk/i.test(p.installPath || '') ||
-      /crossover|bottles|drive_c|whisky|wine|gptk/i.test(p.executablePath || '') ||
+      /crossover|bottles|drive_c|wine|gptk/i.test(p.installPath || '') ||
+      /crossover|bottles|drive_c|wine|gptk/i.test(p.executablePath || '') ||
       /\.exe$/i.test(p.executablePath || '') ||
       /\.exe$/i.test(p.installPath || '');
     const isNativeMacApp =

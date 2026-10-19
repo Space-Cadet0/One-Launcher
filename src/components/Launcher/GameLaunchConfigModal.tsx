@@ -9,7 +9,10 @@ import {
   LaunchMethod,
   StorefrontLaunchProfile,
 } from '../../contracts/launcher';
-import { launcherService } from '../../services/launcher/launcherService';
+import {
+  launcherService,
+  COMPATIBILITY_RUNNER_DESCRIPTORS,
+} from '../../services/launcher/launcherService';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import {
   Settings,
@@ -26,6 +29,10 @@ import {
   Sparkles,
   Monitor,
   Activity,
+  Download,
+  ExternalLink,
+  RefreshCw,
+  Loader2,
 } from 'lucide-react';
 
 export interface GameLaunchConfigModalProps {
@@ -44,13 +51,13 @@ const LAUNCH_MODES: { value: LaunchMethod; label: string; desc: string }[] = [
   },
   {
     value: 'direct',
-    label: 'Direct Executable (.app / binary)',
+    label: 'Direct Executable (.exe / Binary)',
     desc: 'Spawns the local game binary directly and tracks live process exit.',
   },
   {
     value: 'compatibility_layer',
-    label: 'macOS Compatibility Layer (CrossOver / Wine / GPTK)',
-    desc: 'Runs Windows .exe builds through CrossOver, Whisky, Apple GPTK, or Wine.',
+    label: 'Custom Compatibility Runner & Bottle',
+    desc: 'Pin a specific macOS translation runner (CrossOver, Apple GPTK, or Open-Source Wine), target bottle, and per-game graphics overrides.',
   },
   {
     value: 'storefront_uri',
@@ -59,14 +66,11 @@ const LAUNCH_MODES: { value: LaunchMethod; label: string; desc: string }[] = [
   },
 ];
 
-const COMPAT_LAYER_OPTIONS: { value: CompatibilityLayerType; label: string }[] = [
-  { value: 'crossover', label: 'CrossOver macOS' },
-  { value: 'crossover_preview', label: 'CrossOver Preview' },
-  { value: 'whisky', label: 'Whisky (Wine / GPTK)' },
-  { value: 'gptk', label: 'Apple Game Porting Toolkit (GPTK)' },
-  { value: 'wine', label: 'Standard Wine / Homebrew Wine' },
-  { value: 'native', label: 'macOS Native' },
-];
+const COMPAT_LAYER_OPTIONS: { value: Exclude<CompatibilityLayerType, 'native'>; label: string }[] =
+  COMPATIBILITY_RUNNER_DESCRIPTORS.map((d) => ({
+    value: d.type,
+    label: d.label,
+  }));
 
 const CROSSOVER_BACKEND_OPTIONS: { value: CrossOverGraphicsBackend; label: string }[] = [
   { value: 'auto', label: 'Auto (Recommended — Best backend per game)' },
@@ -149,6 +153,12 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const [postExitCommand, setPostExitCommand] = useState<string>('');
   const [detectedLayers, setDetectedLayers] = useState<CompatibilityLayerInfo[]>([]);
   const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [isInstallingRunner, setIsInstallingRunner] = useState<boolean>(false);
+  const [isRescanningRunners, setIsRescanningRunners] = useState<boolean>(false);
+  const [runnerActionFeedback, setRunnerActionFeedback] = useState<{
+    tone: 'emerald' | 'amber' | 'sky';
+    text: string;
+  } | null>(null);
 
   const loadFormFieldsForPlatform = (
     targetPlatId: StorefrontId,
@@ -156,13 +166,22 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     layersOverride?: CompatibilityLayerInfo[]
   ) => {
     const source = drafts?.[targetPlatId] ?? launcherService.getLaunchConfig(game.id, targetPlatId);
-    const activeLayers = layersOverride || detectedLayers;
+    const activeLayers = (layersOverride || detectedLayers).filter((l) =>
+      COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+    );
 
     setLaunchMethod(source?.launchMethod || 'auto');
     setCustomExecutablePath(source?.customExecutablePath || '');
     setWorkingDirectory(source?.workingDirectory || '');
     setLaunchArguments(source?.launchArguments || '');
-    setCompatibilityLayer(source?.compatibilityLayer || activeLayers[0]?.type || 'crossover');
+    const defaultLayer: CompatibilityLayerType =
+      source?.compatibilityLayer &&
+      COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === source.compatibilityLayer)
+        ? source.compatibilityLayer
+        : activeLayers[0]?.type && activeLayers[0].type !== 'native'
+          ? activeLayers[0].type
+          : 'crossover';
+    setCompatibilityLayer(defaultLayer);
     setWineBottleName(source?.wineBottleName || activeLayers[0]?.availableBottles?.[0] || '');
     setWinePrefixPath(source?.winePrefixPath || '');
     setCrossoverGraphicsBackend(source?.crossoverGraphicsBackend || 'auto');
@@ -198,6 +217,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setEnvText(serializeEnvVars(source?.environmentVariables));
     setPreLaunchCommand(source?.preLaunchCommand || '');
     setPostExitCommand(source?.postExitCommand || '');
+    setRunnerActionFeedback(null);
   };
 
   useEffect(() => {
@@ -225,12 +245,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
     launcherService.detectCompatibilityLayers().then((layers) => {
       setDetectedLayers(layers);
+      const validLayers = layers.filter((l) =>
+        COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+      );
       const activeSource =
         initialDrafts[startPlatId] ?? launcherService.getLaunchConfig(game.id, startPlatId);
-      if (!activeSource?.compatibilityLayer && layers.length > 0) {
-        setCompatibilityLayer(layers[0].type);
-        if (!activeSource?.wineBottleName && layers[0].availableBottles?.length) {
-          setWineBottleName(layers[0].availableBottles[0]);
+      if (!activeSource?.compatibilityLayer && validLayers.length > 0) {
+        setCompatibilityLayer(validLayers[0].type);
+        if (!activeSource?.wineBottleName && validLayers[0].availableBottles?.length) {
+          setWineBottleName(validLayers[0].availableBottles[0]);
         }
       }
     });
@@ -238,8 +261,21 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
   if (!isOpen) return null;
 
-  const activeLayerInfo = detectedLayers.find((l) => l.type === compatibilityLayer);
-  const availableBottles = activeLayerInfo?.availableBottles || [];
+  const selectedRunnerDescriptor =
+    COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === compatibilityLayer) ||
+    COMPATIBILITY_RUNNER_DESCRIPTORS[0];
+  const activeLayer = detectedLayers.find((l) => l.type === compatibilityLayer);
+  const availableBottles = activeLayer?.availableBottles || [];
+
+  const resolvedBottleFolderPath =
+    winePrefixPath.trim() ||
+    (activeLayer?.bottlesDir
+      ? wineBottleName.trim() || activeLayer.availableBottles?.[0]
+        ? `${activeLayer.bottlesDir.replace(/\/+$/, '')}/${
+            wineBottleName.trim() || activeLayer.availableBottles![0]
+          }`
+        : activeLayer.bottlesDir
+      : undefined);
 
   const installedRecord = launcherService.getInstalledRecordForGame(game, preferredPlatformId);
 
@@ -279,6 +315,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     preview.detectedBuildType === 'mac_native_app' ||
     preview.detectedBuildType === 'mac_native_bin';
 
+  const activeDisplayMethod: LaunchMethod = preview.availableModes.includes(launchMethod)
+    ? launchMethod
+    : 'auto';
+
   const buildProfileFromCurrentState = (): StorefrontLaunchProfile => {
     const parsedEnv = parseEnvVars(envText);
     const includeCompatSettings = !isWindowsHost && preview.visibleSections.compatibilityLayer;
@@ -288,13 +328,22 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       !isWindowsHost &&
       (preview.visibleSections.compatibilityLayer || preview.visibleSections.nativeMacMetalHud);
 
+    const normalizedMethod: LaunchMethod =
+      isWindowsHost && launchMethod === 'compatibility_layer'
+        ? 'direct'
+        : preview.availableModes.includes(launchMethod)
+          ? launchMethod
+          : 'auto';
+
     return {
-      launchMethod:
-        isWindowsHost && launchMethod === 'compatibility_layer' ? 'direct' : launchMethod,
+      launchMethod: normalizedMethod,
       customExecutablePath: customExecutablePath.trim() || undefined,
       workingDirectory: workingDirectory.trim() || undefined,
       launchArguments: launchArguments.trim() || undefined,
-      compatibilityLayer: includeCompatSettings ? compatibilityLayer : undefined,
+      compatibilityLayer:
+        includeCompatSettings && compatibilityLayer !== 'native'
+          ? compatibilityLayer
+          : undefined,
       wineBottleName: includeCompatSettings ? wineBottleName.trim() || undefined : undefined,
       winePrefixPath: includeCompatSettings ? winePrefixPath.trim() || undefined : undefined,
       crossoverGraphicsBackend: includeCrossoverOnly ? crossoverGraphicsBackend : undefined,
@@ -329,18 +378,45 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const visibleLaunchModes = LAUNCH_MODES.filter((m) =>
     preview.availableModes.includes(m.value)
   ).map((m) => {
-    if (isWindowsHost && m.value === 'direct') {
+    if (m.value === 'auto') {
+      if (preview.detectedBuildType === 'windows_exe_on_mac') {
+        return {
+          ...m,
+          label: 'Auto-Detect Compatibility Pipeline',
+        };
+      }
+      if (!isWindowsHost && isMacNativeBuild) {
+        return {
+          ...m,
+          label: 'Auto-Detect Native macOS Launch',
+        };
+      }
       return {
         ...m,
-        label: 'Direct Executable (.exe)',
-        desc: 'Spawn native Windows game binary directly and track PID session time',
+        label: 'Auto-Detect (Recommended)',
       };
     }
-    if (!isWindowsHost && isMacNativeBuild && m.value === 'direct') {
+    if (m.value === 'compatibility_layer') {
       return {
         ...m,
-        label: 'Direct Application (.app / binary)',
-        desc: 'Launch native macOS application bundle or Mach-O binary directly with PID tracking',
+        label: 'Custom Compatibility Runner & Bottle',
+        desc: 'Pin a specific macOS translation runner (CrossOver, Apple GPTK, or Open-Source Wine), target bottle, and per-game graphics overrides.',
+      };
+    }
+    if (m.value === 'direct') {
+      if (!isWindowsHost && isMacNativeBuild) {
+        return {
+          ...m,
+          label: 'Direct macOS Application (.app / Binary)',
+          desc: 'Launch native macOS application bundle or Mach-O binary directly with PID tracking.',
+        };
+      }
+      return {
+        ...m,
+        label: 'Direct Executable (.exe / Binary)',
+        desc: isWindowsHost
+          ? 'Spawn native Windows game binary directly and track PID session time.'
+          : m.desc,
       };
     }
     return m;
@@ -398,6 +474,89 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     }
   };
 
+  const handleRescanLayers = async () => {
+    setIsRescanningRunners(true);
+    setRunnerActionFeedback(null);
+    try {
+      const refreshed = await launcherService.detectCompatibilityLayers();
+      setDetectedLayers(refreshed);
+      const matched = refreshed.find((l) => l.type === compatibilityLayer);
+      if (matched) {
+        if (!wineBottleName && matched.availableBottles?.length) {
+          setWineBottleName(matched.availableBottles[0]);
+        }
+        setRunnerActionFeedback({
+          tone: 'emerald',
+          text: `Detected ${matched.name}${matched.version ? ` (${matched.version})` : ''} at ${matched.binaryPath}.`,
+        });
+      } else {
+        setRunnerActionFeedback({
+          tone: 'amber',
+          text: `Scan complete (${refreshed.length} runner${refreshed.length === 1 ? '' : 's'} found). ${selectedRunnerDescriptor.shortLabel} is still not detected.`,
+        });
+      }
+    } finally {
+      setIsRescanningRunners(false);
+    }
+  };
+
+  const handleInstallRunnerViaBrew = async () => {
+    if (isInstallingRunner || compatibilityLayer === 'native') return;
+    setIsInstallingRunner(true);
+    setRunnerActionFeedback(null);
+    try {
+      const res = await launcherService.installCompatibilityLayer(
+        compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>,
+        'auto'
+      );
+      const refreshed = res.layers || (await launcherService.detectCompatibilityLayers());
+      setDetectedLayers(refreshed);
+      const matched = refreshed.find((l) => l.type === compatibilityLayer);
+      if (matched && !wineBottleName && matched.availableBottles?.length) {
+        setWineBottleName(matched.availableBottles[0]);
+      }
+      if (res.success) {
+        setRunnerActionFeedback({
+          tone: 'emerald',
+          text:
+            res.message ||
+            `${selectedRunnerDescriptor.shortLabel} installed via Homebrew and ready to use.`,
+        });
+      } else {
+        setRunnerActionFeedback({
+          tone: 'amber',
+          text:
+            res.error ||
+            res.message ||
+            `Could not auto-install ${selectedRunnerDescriptor.shortLabel}. Try the official installer download.`,
+        });
+      }
+    } finally {
+      setIsInstallingRunner(false);
+    }
+  };
+
+  const handleDownloadRunner = async () => {
+    if (compatibilityLayer === 'native') return;
+    const res = await launcherService.installCompatibilityLayer(
+      compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>,
+      'download'
+    );
+    setRunnerActionFeedback({
+      tone: 'sky',
+      text:
+        res.message ||
+        `Opened official ${selectedRunnerDescriptor.shortLabel} download page. Click Re-Scan after installing.`,
+    });
+  };
+
+  const handleOpenBottleFolder = async () => {
+    if (!resolvedBottleFolderPath) return;
+    if (typeof window !== 'undefined' && window.electronAPI?.browseLocalFiles) {
+      await window.electronAPI.browseLocalFiles(resolvedBottleFolderPath);
+    }
+  };
+
   const handleResetDefaults = async () => {
     await launcherService.resetLaunchConfig(game.id, preferredPlatformId);
     setDraftsByPlatform((prev) => {
@@ -405,12 +564,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       delete next[preferredPlatformId];
       return next;
     });
+    const validLayers = detectedLayers.filter((l) =>
+      COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+    );
     setLaunchMethod('auto');
     setCustomExecutablePath('');
     setWorkingDirectory('');
     setLaunchArguments('');
-    setCompatibilityLayer(detectedLayers[0]?.type || 'crossover');
-    setWineBottleName(detectedLayers[0]?.availableBottles?.[0] || '');
+    setCompatibilityLayer(validLayers[0]?.type || 'crossover');
+    setWineBottleName(validLayers[0]?.availableBottles?.[0] || '');
     setWinePrefixPath('');
     setCrossoverGraphicsBackend('auto');
     setCrossoverHighResolutionMode(undefined);
@@ -422,6 +584,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setEnvText('');
     setPreLaunchCommand('');
     setPostExitCommand('');
+    setRunnerActionFeedback(null);
   };
 
   const handleSave = async () => {
@@ -482,7 +645,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const activeModeNote =
     isWindowsHost && launchMethod === 'compatibility_layer'
       ? undefined
-      : preview.modeNotes[launchMethod];
+      : preview.modeNotes[launchMethod] || preview.modeNotes[activeDisplayMethod];
   const activeModeWarning = activeModeNote?.warning;
   const discoveredTargetPath = preview.executablePath || preview.installPath;
 
@@ -642,16 +805,20 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             </label>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {visibleLaunchModes.map((mode) => {
-                const isSelected = launchMethod === mode.value;
+                const isSelected = activeDisplayMethod === mode.value;
                 const modeNote = preview.modeNotes[mode.value];
                 const dynamicDesc =
-                  isWindowsHost && modeNote?.dynamicDesc && /CrossOver/i.test(modeNote.dynamicDesc)
+                  mode.value === 'compatibility_layer'
                     ? mode.desc
-                    : modeNote?.dynamicDesc || mode.desc;
+                    : isWindowsHost && modeNote?.dynamicDesc && /CrossOver/i.test(modeNote.dynamicDesc)
+                      ? mode.desc
+                      : modeNote?.dynamicDesc || mode.desc;
                 return (
                   <button
                     key={mode.value}
                     type="button"
+                    data-launch-mode={mode.value}
+                    aria-pressed={isSelected}
                     onClick={() => setLaunchMethod(mode.value)}
                     className={`p-3 rounded-lg border text-left transition-all cursor-pointer flex flex-col justify-between ${
                       isSelected
@@ -813,11 +980,11 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                 <div className="flex items-center gap-2">
                   <Cpu className="w-4 h-4 text-amber-400" />
                   <span className="text-xs font-bold text-white uppercase tracking-wider">
-                    macOS Compatibility Layer (CrossOver / Whisky / Wine / GPTK)
+                    macOS Compatibility Layer (CrossOver / Apple GPTK / Wine)
                   </span>
                 </div>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-semibold">
-                  {detectedLayers.length} Detected on System
+                  {detectedLayers.filter((l) => l.type !== 'native').length} Detected on System
                 </span>
               </div>
 
@@ -828,18 +995,20 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     Compatibility Runner
                   </label>
                   <select
+                    data-testid="compat-runner-select"
                     aria-label="Compatibility Runner"
                     value={compatibilityLayer}
-                    onChange={(e) =>
-                      setCompatibilityLayer(e.target.value as CompatibilityLayerType)
-                    }
+                    onChange={(e) => {
+                      setCompatibilityLayer(e.target.value as CompatibilityLayerType);
+                      setRunnerActionFeedback(null);
+                    }}
                     className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
                   >
                     {COMPAT_LAYER_OPTIONS.map((opt) => {
                       const isInstalled = detectedLayers.some((l) => l.type === opt.value);
                       return (
                         <option key={opt.value} value={opt.value}>
-                          {opt.label} {isInstalled ? '✓ (Installed)' : ''}
+                          {opt.label} {isInstalled ? '✓ (Installed)' : '(Not Installed)'}
                         </option>
                       );
                     })}
@@ -849,7 +1018,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                 {/* Bottle Selector or Name */}
                 <div className="space-y-1">
                   <label className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
-                    Target Bottle Name
+                    {compatibilityLayer === 'crossover' ||
+                    compatibilityLayer === 'crossover_preview'
+                      ? 'Target CrossOver Bottle'
+                      : 'Target Bottle Name'}
                   </label>
                   {availableBottles.length > 0 ? (
                     <select
@@ -878,11 +1050,175 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                 </div>
               </div>
 
+              {/* Heroic-Inspired Runner Details & Status Card */}
+              <div
+                data-testid="runner-details-card"
+                className="rounded-lg bg-[#141d2b] border border-[#26384d] p-3 space-y-2.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-white">
+                      {selectedRunnerDescriptor.shortLabel}
+                    </span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-steam-subtext">
+                      {selectedRunnerDescriptor.vendor}
+                    </span>
+                  </div>
+                  {activeLayer ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300">
+                      <span>✓ Installed &amp; Ready</span>
+                      {activeLayer.version ? <span>({activeLayer.version})</span> : null}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">
+                      Not Installed
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-[11px] text-steam-text leading-relaxed">
+                  {selectedRunnerDescriptor.description}
+                </p>
+                <p className="text-[10px] text-steam-subtext leading-relaxed">
+                  <span className="font-semibold text-sky-300">Best for: </span>
+                  {selectedRunnerDescriptor.bestFor}
+                </p>
+
+                {activeLayer ? (
+                  <div className="pt-1 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded bg-[#0e151f] border border-[#223447] px-2.5 py-1.5">
+                      <span className="text-[10px] font-mono text-sky-300/90 truncate">
+                        {activeLayer.binaryPath}
+                      </span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {resolvedBottleFolderPath && (
+                          <button
+                            type="button"
+                            data-testid="open-bottle-folder-btn"
+                            onClick={handleOpenBottleFolder}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[10px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer"
+                          >
+                            <FolderOpen className="w-3 h-3" />
+                            <span>Open Bottle Folder</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          data-testid="rescan-runners-btn"
+                          onClick={handleRescanLayers}
+                          disabled={isRescanningRunners}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[10px] font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${isRescanningRunners ? 'animate-spin' : ''}`}
+                          />
+                          <span>Re-Scan Runners</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    data-testid="runner-not-installed-callout"
+                    className="rounded-lg bg-amber-950/40 border border-amber-500/40 p-2.5 space-y-2"
+                  >
+                    <div className="flex items-start gap-2 text-xs text-amber-200">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="font-bold text-amber-300">
+                          Runner Not Installed on This Mac
+                        </div>
+                        <div className="text-[11px] text-amber-100/90 mt-0.5">
+                          {selectedRunnerDescriptor.shortLabel} is not currently detected in{' '}
+                          <code className="font-mono">/Applications</code> or Homebrew. Install it
+                          below or select an installed runner above.
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                      {selectedRunnerDescriptor.canAutoInstallViaBrew && (
+                        <button
+                          type="button"
+                          data-testid="install-runner-brew-btn"
+                          disabled={isInstallingRunner}
+                          onClick={handleInstallRunnerViaBrew}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-[11px] font-bold text-emerald-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          {isInstallingRunner ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              <span>Installing via Homebrew...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Download className="w-3.5 h-3.5" />
+                              <span>
+                                Install {selectedRunnerDescriptor.shortLabel} Automatically
+                                (Homebrew)
+                              </span>
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        data-testid="download-runner-btn"
+                        onClick={handleDownloadRunner}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[11px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>{selectedRunnerDescriptor.downloadLabel} ↗</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid="rescan-runners-btn"
+                        onClick={handleRescanLayers}
+                        disabled={isRescanningRunners}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-[11px] font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${isRescanningRunners ? 'animate-spin' : ''}`}
+                        />
+                        <span>Re-Scan Installed Runners</span>
+                      </button>
+                    </div>
+
+                    {selectedRunnerDescriptor.brewCommandDisplay && (
+                      <div className="flex items-center gap-2 pt-0.5">
+                        <span className="text-[10px] text-amber-200/80">Homebrew CLI:</span>
+                        <code className="text-[10px] font-mono bg-black/40 border border-amber-500/30 text-amber-200 px-2 py-0.5 rounded select-all">
+                          {selectedRunnerDescriptor.brewCommandDisplay}
+                        </code>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {runnerActionFeedback && (
+                  <div
+                    className={`text-[11px] px-2.5 py-1.5 rounded border ${getBadgeToneClasses(
+                      runnerActionFeedback.tone
+                    )}`}
+                  >
+                    {runnerActionFeedback.text}
+                  </div>
+                )}
+              </div>
+
               {/* Custom Wine Prefix Path */}
               <div className="space-y-1">
-                <label className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
-                  Custom WINEPREFIX Path (Optional Override)
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-1">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
+                    Custom WinePrefix Directory (Optional Override)
+                  </label>
+                  <span className="text-[10px] text-steam-subtext">
+                    A self-contained Windows C: drive environment containing the game&apos;s
+                    registry, saves, and DirectX runtime
+                  </span>
+                </div>
                 <div className="flex items-center gap-1.5">
                   <input
                     type="text"
@@ -944,6 +1280,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                           </option>
                         ))}
                       </select>
+                      <p className="text-[10px] text-steam-subtext leading-snug">
+                        Translates DirectX graphics to Apple Metal. Auto selects D3DMetal or DXMT
+                        for DirectX 11/12 and DXVK/WineD3D for older titles.
+                      </p>
                     </div>
                   )}
 
@@ -974,6 +1314,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                       <option value="true">Enabled (192 DPI Retina — Crisp UI/Text)</option>
                       <option value="false">Disabled (96 DPI Standard — Higher FPS)</option>
                     </select>
+                    <p className="text-[10px] text-steam-subtext leading-snug">
+                      Renders game menus and text at full Retina resolution (192 DPI) instead of
+                      upscaled 96 DPI.
+                    </p>
                   </div>
                 </div>
 
@@ -1082,6 +1426,11 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                       <span className="text-[10px] font-bold">{dxvkHud ? 'ON' : 'OFF'}</span>
                     </button>
                   </div>
+                  <p className="text-[10px] text-steam-subtext leading-snug">
+                    MSync (recommended on macOS) and ESync accelerate multi-threaded CPU
+                    synchronization. Metal HUD and DXVK HUD display live FPS and frame-time
+                    overlays.
+                  </p>
                 </div>
               </div>
             </div>

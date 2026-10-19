@@ -13,7 +13,7 @@
 
 ---
 
-**One Launcher** brings all of your PC and Mac games together into a single, fast, cinema-grade desktop application. Whether your library lives across **Steam**, **GOG.com**, **Epic Games Store**, standalone local folders, or **Windows `.exe` games running on macOS via CrossOver 26, Whisky, Wine, Heroic, or Apple Game Porting Toolkit (GPTK)**, One Launcher unifies your collection with automatic artwork, Metacritic & OpenCritic ratings, HowLongToBeat completion times, unified achievement tracking, and one-click launching.
+**One Launcher** brings all of your PC and Mac games together into a single, fast, cinema-grade desktop application. Whether your library lives across **Steam**, **GOG.com**, **Epic Games Store**, standalone local folders, or **Windows `.exe` games running on macOS via CrossOver 26, Apple Game Porting Toolkit (GPTK), or Open-Source Wine**, One Launcher unifies your collection with automatic artwork, Metacritic & OpenCritic ratings, HowLongToBeat completion times, unified achievement tracking, and one-click launching.
 
 ---
 
@@ -32,7 +32,7 @@
 
 ### CrossOver 26 & macOS Compatibility Launch Settings
 ![CrossOver 26 and Launch Compatibility Settings](docs/screenshots/crossover-launch-settings.png)
-*Configure per-game and per-storefront launch profiles. Automatically detects Windows `.exe` installations inside CrossOver, Whisky, Wine, or GPTK bottles and gives you per-game controls for Graphics Backend (`Auto`, `D3DMetal`, `DXMT`, `DXVK`, `WineD3D`), High Resolution Mode (Retina 192 DPI), DLSS (MetalFX Upscaling), MSync / ESync, and Metal / DXVK HUD overlays.*
+*Configure per-game and per-storefront launch profiles. Automatically detects Windows `.exe` installations inside CrossOver 26, Apple Game Porting Toolkit (GPTK), or Open-Source Wine bottles and gives you per-game controls for Graphics Backend (`Auto`, `D3DMetal`, `DXMT`, `DXVK`, `WineD3D`), High Resolution Mode (Retina 192 DPI), DLSS (MetalFX Upscaling), MSync / ESync, and Metal / DXVK HUD overlays.*
 
 ### 4-Step Fix Match & Metadata Override Studio
 ![4-Step Fix Match & Metadata Override Studio](docs/screenshots/match-override-studio.png)
@@ -55,7 +55,7 @@ Stop juggling multiple launchers to remember where you own or installed a game:
 
 ### 2. First-Class macOS & CrossOver 26 Compatibility Engine
 Built from the ground up for Mac gamers running both native Apple Silicon titles and Windows games:
-- **Automatic Bottle & `.exe` Discovery**: Scans CrossOver (`~/Library/Application Support/CrossOver/Bottles`), Whisky, Wine prefixes, Heroic, and custom directories to find installed Windows games automatically.
+- **Automatic Bottle & `.exe` Discovery**: Scans CrossOver 26 (`~/Library/Application Support/CrossOver/Bottles`), Apple Game Porting Toolkit (GPTK), Open-Source Wine prefixes, Heroic, and custom directories to find installed Windows games automatically.
 - **Smart Storefront-in-Bottle Routing**: If a Windows game is installed via a Windows Steam, GOG Galaxy, or Epic Games client inside a CrossOver bottle, One Launcher automatically routes execution through the bottle's storefront client or direct `.exe` without erroneously triggering native macOS `steam://` or `com.epicgames.launcher://` URL schemes.
 - **Per-Game & Per-Storefront Launch Profiles**: Configure distinct executables, working directories, launch arguments, and compatibility runners for each storefront edition of a game (`Steam`, `GOG.com`, `Epic Games`).
 - **CrossOver 26 Rendering & Display Controls**:
@@ -143,13 +143,13 @@ npm run build:win
 
 ### 2. Import Local Games or CrossOver Bottles
 1. Open **Settings -> Local Folders & Compatibility Bottles**.
-2. Add any directory containing native macOS `.app` bundles, Windows `.exe` games, or CrossOver / Whisky / Wine bottles.
+2. Add any directory containing native macOS `.app` bundles, Windows `.exe` games, or CrossOver 26, Apple Game Porting Toolkit (GPTK), or Open-Source Wine bottles.
 3. One Launcher will automatically filter out uninstallers, crash reporters, and redistributables (`UnityCrashHandler64.exe`, `vc_redist.x64.exe`, `DXSETUP.exe`), match your games against Steam/GOG/Epic/IGDB, and populate full artwork and metadata.
 
 ### 3. Configure Per-Game Launch & CrossOver 26 Settings
 1. Open any game in your library and click the **Gear (`⚙`) -> Launch & Compatibility Settings** button next to **PLAY**.
 2. If you own or installed the game on multiple storefronts (e.g., Steam and GOG), select the **Storefront Installation Profile** pill at the top of the modal to configure each installation independently.
-3. Choose **Auto-Detect (Recommended)**, **Direct Executable**, **macOS Compatibility Layer (CrossOver / Wine / GPTK)**, or **Storefront Client Protocol**.
+3. Choose **Auto-Detect (Recommended)**, **Direct Executable**, **Custom Compatibility Runner & Bottle (CrossOver / Apple GPTK / Wine)**, or **Storefront Client Protocol**.
 4. For Windows games on macOS, select your target **CrossOver Bottle**, choose your **Graphics Backend** (`D3DMetal`, `DXMT`, `DXVK`, or `WineD3D`), and toggle **High Resolution Mode (Retina 192 DPI)**, **DLSS (MetalFX Upscaling)**, **MSync**, or **Metal HUD**, then click **Save Configuration**.
 
 ---

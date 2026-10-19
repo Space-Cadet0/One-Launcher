@@ -1419,15 +1419,10 @@ function discoverSteamLocations(options = {}) {
     ...customRoots,
   ];
 
-  // Also check CrossOver and Whisky bottles for Windows Steam installations on macOS
+  // Also check CrossOver bottles for Windows Steam installations on macOS
   const bottleContainers = [
     path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
     path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
-    path.join(homedir, 'Library/Containers/com.isaacmarovitz.Whisky/Bottles'),
-    path.join(
-      homedir,
-      'Library/Containers/com.isaacmarovitz.Whisky/Data/Library/Application Support/com.isaacmarovitz.Whisky/Bottles'
-    ),
   ];
 
   for (const bottlesDir of bottleContainers) {
@@ -1644,28 +1639,33 @@ const LAUNCH_PROFILE_KEYS = [
 
 function resolvePlatformLaunchConfig(rawConfig, platformId) {
   if (!rawConfig || typeof rawConfig !== 'object') return {};
+  let resolved;
   if (platformId && rawConfig.platformConfigs && rawConfig.platformConfigs[platformId]) {
-    return {
+    resolved = {
       gameId: rawConfig.gameId,
       preferredPlatformId: platformId,
       launchMethod: 'auto',
       ...rawConfig.platformConfigs[platformId],
     };
-  }
-  if (
+  } else if (
     platformId &&
     rawConfig.platformConfigs &&
     Object.keys(rawConfig.platformConfigs).length > 0 &&
     rawConfig.preferredPlatformId &&
     rawConfig.preferredPlatformId !== platformId
   ) {
-    return {
+    resolved = {
       gameId: rawConfig.gameId,
       preferredPlatformId: platformId,
       launchMethod: 'auto',
     };
+  } else {
+    resolved = { ...rawConfig };
   }
-  return rawConfig;
+  if (resolved.compatibilityLayer === 'whisky') {
+    resolved.compatibilityLayer = 'crossover';
+  }
+  return resolved;
 }
 
 function getLaunchConfigsFilePath(userDataDir) {
@@ -1679,53 +1679,59 @@ function getGameLaunchConfigs(options = {}) {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       const shouldValidateFs = !options.userDataDir || options.pruneMissingExecutables === true;
-      if (shouldValidateFs) {
-        let modified = false;
-        const archiveAssetRe =
-          /\.(kpf|pak|wad|pk3|pk4|vpk|bsa|ba2|upk|uasset|umap|pck|bundle|assets|ress|resource|zip|7z|rar)$/i;
-        for (const cfg of Object.values(parsed)) {
-          if (!cfg || typeof cfg !== 'object') continue;
-          if (cfg.customExecutablePath) {
-            const localExe = toLocalFsPath(cfg.customExecutablePath, options.customRoots);
-            const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
-            if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
-              delete cfg.customExecutablePath;
+      let modified = false;
+      const archiveAssetRe =
+        /\.(kpf|pak|wad|pk3|pk4|vpk|bsa|ba2|upk|uasset|umap|pck|bundle|assets|ress|resource|zip|7z|rar)$/i;
+      for (const cfg of Object.values(parsed)) {
+        if (!cfg || typeof cfg !== 'object') continue;
+        if (cfg.compatibilityLayer === 'whisky') {
+          cfg.compatibilityLayer = 'crossover';
+          modified = true;
+        }
+        if (shouldValidateFs && cfg.customExecutablePath) {
+          const localExe = toLocalFsPath(cfg.customExecutablePath, options.customRoots);
+          const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
+          if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
+            delete cfg.customExecutablePath;
+            modified = true;
+          }
+        }
+        if (shouldValidateFs && cfg.workingDirectory) {
+          const localDir = toLocalFsPath(cfg.workingDirectory, options.customRoots);
+          if (!localDir || !fs.existsSync(localDir)) {
+            delete cfg.workingDirectory;
+            modified = true;
+          }
+        }
+        if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
+          for (const [, prof] of Object.entries(cfg.platformConfigs)) {
+            if (!prof || typeof prof !== 'object') continue;
+            if (prof.compatibilityLayer === 'whisky') {
+              prof.compatibilityLayer = 'crossover';
               modified = true;
             }
-          }
-          if (cfg.workingDirectory) {
-            const localDir = toLocalFsPath(cfg.workingDirectory, options.customRoots);
-            if (!localDir || !fs.existsSync(localDir)) {
-              delete cfg.workingDirectory;
-              modified = true;
-            }
-          }
-          if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
-            for (const [, prof] of Object.entries(cfg.platformConfigs)) {
-              if (!prof || typeof prof !== 'object') continue;
-              if (prof.customExecutablePath) {
-                const localExe = toLocalFsPath(prof.customExecutablePath, options.customRoots);
-                const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
-                if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
-                  delete prof.customExecutablePath;
-                  modified = true;
-                }
+            if (shouldValidateFs && prof.customExecutablePath) {
+              const localExe = toLocalFsPath(prof.customExecutablePath, options.customRoots);
+              const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
+              if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
+                delete prof.customExecutablePath;
+                modified = true;
               }
-              if (prof.workingDirectory) {
-                const localDir = toLocalFsPath(prof.workingDirectory, options.customRoots);
-                if (!localDir || !fs.existsSync(localDir)) {
-                  delete prof.workingDirectory;
-                  modified = true;
-                }
+            }
+            if (shouldValidateFs && prof.workingDirectory) {
+              const localDir = toLocalFsPath(prof.workingDirectory, options.customRoots);
+              if (!localDir || !fs.existsSync(localDir)) {
+                delete prof.workingDirectory;
+                modified = true;
               }
             }
           }
         }
-        if (modified) {
-          try {
-            fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2), 'utf8');
-          } catch {}
-        }
+      }
+      if (modified) {
+        try {
+          fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2), 'utf8');
+        } catch {}
       }
       return parsed;
     }
@@ -1755,7 +1761,8 @@ function saveGameLaunchConfig(config, options = {}) {
   };
   for (const key of LAUNCH_PROFILE_KEYS) {
     if (config[key] !== undefined && config[key] !== null) {
-      cleanProfile[key] = config[key];
+      cleanProfile[key] =
+        key === 'compatibilityLayer' && config[key] === 'whisky' ? 'crossover' : config[key];
     }
   }
 
@@ -1772,7 +1779,8 @@ function saveGameLaunchConfig(config, options = {}) {
         const cleanPlatProfile = { launchMethod: p.launchMethod || 'auto' };
         for (const key of LAUNCH_PROFILE_KEYS) {
           if (p[key] !== undefined && p[key] !== null) {
-            cleanPlatProfile[key] = p[key];
+            cleanPlatProfile[key] =
+              key === 'compatibilityLayer' && p[key] === 'whisky' ? 'crossover' : p[key];
           }
         }
         mergedPlatformConfigs[platId] = cleanPlatProfile;
@@ -3770,7 +3778,7 @@ function unregisterGogFirstPartyLauncher(cleanId, installPath, options = {}) {
 }
 
 /**
- * Enumerate subdirectory names inside a Wine/CrossOver/Whisky Bottles directory
+ * Enumerate subdirectory names inside a Wine/CrossOver Bottles directory
  */
 function listBottleSubdirectories(bottlesDir) {
   if (!bottlesDir || !fs.existsSync(bottlesDir)) return [];
@@ -3785,7 +3793,7 @@ function listBottleSubdirectories(bottlesDir) {
 }
 
 /**
- * B) macOS Compatibility Layer Detector (CrossOver, Whisky, Apple GPTK, Wine)
+ * B) macOS Compatibility Layer Detector (CrossOver, CrossOver Preview, Apple GPTK, Open-Source Wine)
  */
 function detectCompatibilityLayers(options = {}) {
   const platform = options.platform || process.platform;
@@ -3853,45 +3861,7 @@ function detectCompatibilityLayers(options = {}) {
     }
   }
 
-  // 2. Whisky
-  const whiskyLibWine = path.join(
-    homedir,
-    'Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64'
-  );
-  const whiskyBottlesCandidates = [
-    path.join(homedir, 'Library/Containers/com.isaacmarovitz.Whisky/Bottles'),
-    path.join(
-      homedir,
-      'Library/Containers/com.isaacmarovitz.Whisky/Data/Library/Application Support/com.isaacmarovitz.Whisky/Bottles'
-    ),
-  ];
-  const whiskyBottlesDir =
-    whiskyBottlesCandidates.find((d) => fs.existsSync(d)) || whiskyBottlesCandidates[0];
-
-  for (const appsDir of appsDirs) {
-    const whiskyApp = path.join(appsDir, 'Whisky.app');
-    if (fs.existsSync(whiskyApp) || fs.existsSync(whiskyLibWine)) {
-      const candidateBins = [
-        whiskyLibWine,
-        path.join(whiskyApp, 'Contents/Resources/wine64'),
-        path.join(whiskyApp, 'Contents/SharedSupport/Wine/bin/wine64'),
-      ];
-      const binaryPath = candidateBins.find((b) => fs.existsSync(b)) || candidateBins[0];
-      if (!addedTypes.has('whisky')) {
-        addedTypes.add('whisky');
-        layers.push({
-          id: 'whisky',
-          type: 'whisky',
-          name: 'Whisky',
-          binaryPath,
-          bottlesDir: whiskyBottlesDir,
-          availableBottles: listBottleSubdirectories(whiskyBottlesDir),
-        });
-      }
-    }
-  }
-
-  // 3. Apple Game Porting Toolkit (Heroic GPTK or /Applications/Game Porting Toolkit.app)
+  // 2. Apple Game Porting Toolkit (Heroic GPTK or /Applications/Game Porting Toolkit.app)
   const heroicGptkRoot = path.join(homedir, 'Library/Application Support/heroic/tools/game-porting-toolkit');
   if (fs.existsSync(heroicGptkRoot)) {
     try {
@@ -3935,28 +3905,77 @@ function detectCompatibilityLayers(options = {}) {
     }
   }
 
-  // 4. Standalone / Homebrew Wine
-  const wineBinCandidates = [
-    path.join(homedir, 'bin/wine64'),
-    path.join(homedir, 'bin/wine'),
+  // 3. Open-Source Wine (Wine Crossover.app, Wine Stable.app, Wine Staging.app, Heroic Wine, Homebrew/Standalone Wine)
+  const wineEntryCandidates = [];
+  const wineAppVariants = [
+    { appName: 'Wine Crossover.app', label: 'Open-Source Wine (Wine-CrossOver)' },
+    { appName: 'Wine Stable.app', label: 'Open-Source Wine (Wine Stable)' },
+    { appName: 'Wine Staging.app', label: 'Open-Source Wine (Wine Staging)' },
+    { appName: 'Wine Devel.app', label: 'Open-Source Wine (Wine Devel)' },
   ];
+
+  for (const appsDir of appsDirs) {
+    for (const wv of wineAppVariants) {
+      wineEntryCandidates.push(
+        {
+          binPath: path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine64'),
+          name: wv.label,
+        },
+        {
+          binPath: path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine'),
+          name: wv.label,
+        }
+      );
+    }
+  }
+
+  const heroicWineRoot = path.join(homedir, 'Library/Application Support/heroic/tools/wine');
+  if (fs.existsSync(heroicWineRoot)) {
+    try {
+      const subdirs = fs.readdirSync(heroicWineRoot);
+      for (const sub of subdirs) {
+        if (sub.startsWith('.')) continue;
+        wineEntryCandidates.push(
+          {
+            binPath: path.join(heroicWineRoot, sub, 'bin/wine64'),
+            name: 'Open-Source Wine (Heroic)',
+          },
+          {
+            binPath: path.join(heroicWineRoot, sub, 'Contents/Resources/wine/bin/wine64'),
+            name: 'Open-Source Wine (Heroic)',
+          },
+          {
+            binPath: path.join(heroicWineRoot, sub, 'bin/wine'),
+            name: 'Open-Source Wine (Heroic)',
+          }
+        );
+      }
+    } catch {}
+  }
+
+  wineEntryCandidates.push(
+    { binPath: path.join(homedir, 'bin/wine64'), name: 'Open-Source Wine (wine64)' },
+    { binPath: path.join(homedir, 'bin/wine'), name: 'Open-Source Wine (wine)' }
+  );
+
   if (!isIsolatedTest) {
-    wineBinCandidates.push(
-      '/opt/homebrew/bin/wine64',
-      '/usr/local/bin/wine64',
-      '/opt/homebrew/bin/wine',
-      '/usr/local/bin/wine'
+    wineEntryCandidates.push(
+      { binPath: '/opt/homebrew/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)' },
+      { binPath: '/usr/local/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)' },
+      { binPath: '/opt/homebrew/bin/wine', name: 'Open-Source Wine (Homebrew wine)' },
+      { binPath: '/usr/local/bin/wine', name: 'Open-Source Wine (Homebrew wine)' }
     );
   }
-  const foundWine = wineBinCandidates.find((b) => fs.existsSync(b));
-  if (foundWine && !addedTypes.has('wine')) {
+
+  const foundWineEntry = wineEntryCandidates.find((entry) => fs.existsSync(entry.binPath));
+  if (foundWineEntry && !addedTypes.has('wine')) {
     addedTypes.add('wine');
     const defaultPrefix = path.join(homedir, '.wine');
     layers.push({
       id: 'wine',
       type: 'wine',
-      name: 'Wine (Standalone)',
-      binaryPath: foundWine,
+      name: foundWineEntry.name,
+      binaryPath: foundWineEntry.binPath,
       bottlesDir: fs.existsSync(defaultPrefix) ? defaultPrefix : undefined,
       availableBottles: [],
     });
@@ -3984,6 +4003,87 @@ function detectCompatibilityLayers(options = {}) {
   });
 
   return layers;
+}
+
+/**
+ * Install or open official download page for a macOS Windows compatibility layer (CrossOver, CrossOver Preview, GPTK, Open-Source Wine)
+ */
+async function installCompatibilityLayer(payload = {}, options = {}) {
+  const runnerType = String(payload.runnerType || 'crossover')
+    .toLowerCase()
+    .trim();
+  const mode = String(payload.mode || 'auto')
+    .toLowerCase()
+    .trim();
+  const homedir = options.homedir || os.homedir();
+
+  const downloadUrls = {
+    crossover: 'https://www.codeweavers.com/crossover/download',
+    crossover_preview: 'https://www.codeweavers.com/preview',
+    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
+    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+  };
+  const downloadUrl = downloadUrls[runnerType] || downloadUrls.crossover;
+
+  if (mode === 'download') {
+    await openExternalUri(downloadUrl, options);
+    return {
+      success: true,
+      openedExternalInstaller: true,
+      runnerType,
+      message: 'Opened official download page in your browser.',
+      layers: detectCompatibilityLayers(options),
+    };
+  }
+
+  const brewCandidates = [
+    options.brewBinaryPath,
+    path.join(homedir, 'homebrew/bin/brew'),
+    ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
+  ].filter(Boolean);
+  const brewPath = brewCandidates.find((p) => fs.existsSync(p));
+
+  if (
+    (brewPath || typeof options.onExecBrew === 'function') &&
+    (runnerType === 'crossover' || runnerType === 'wine')
+  ) {
+    const args =
+      runnerType === 'crossover'
+        ? ['install', '--cask', 'crossover']
+        : ['install', '--cask', '--no-quarantine', 'wine-stable'];
+    try {
+      if (typeof options.onExecBrew === 'function') {
+        await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
+      } else {
+        await new Promise((resolve, reject) => {
+          execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
+            if (err) reject(err);
+            else resolve({ stdout, stderr });
+          });
+        });
+      }
+      const layers = detectCompatibilityLayers(options);
+      if (layers.some((l) => l.type === runnerType)) {
+        return {
+          success: true,
+          installed: true,
+          runnerType,
+          message: 'Successfully installed via Homebrew!',
+          layers,
+        };
+      }
+    } catch {}
+  }
+
+  await openExternalUri(downloadUrl, options);
+  return {
+    success: true,
+    openedExternalInstaller: true,
+    runnerType,
+    message:
+      'Opened official installer page in your browser. Click "Re-Scan Runners" once installation finishes.',
+    layers: detectCompatibilityLayers(options),
+  };
 }
 
 /**
@@ -4389,10 +4489,6 @@ async function ensureCompatibilityLayerReady(chosenLayer, launchConfig = {}, env
   let targetPrefix;
   if (launchConfig && launchConfig.winePrefixPath) {
     targetPrefix = launchConfig.winePrefixPath;
-  } else if (chosenLayer.type === 'whisky' && chosenLayer.bottlesDir) {
-    const availableBottles = listBottleSubdirectories(chosenLayer.bottlesDir);
-    const bottle = (launchConfig && launchConfig.wineBottleName) || availableBottles[0] || 'Default';
-    targetPrefix = path.join(chosenLayer.bottlesDir, bottle);
   } else {
     const heroicPfx1 = path.join(homedir, 'Games/Heroic/Prefixes/default/SteamHeroic/pfx');
     const heroicPfx2 = path.join(homedir, 'Games/Heroic/Prefixes/default/SteamHeroic');
@@ -4812,7 +4908,7 @@ async function launchGame(payload = {}, options = {}) {
             return {
               success: false,
               error:
-                'No Windows compatibility layer (CrossOver, Whisky, Game Porting Toolkit, or Wine) detected on macOS to run this Windows executable.',
+                'No Windows compatibility layer (CrossOver, Game Porting Toolkit, or Wine) detected on macOS to run this Windows executable.',
             };
           }
         } else {
@@ -9621,6 +9717,7 @@ module.exports = {
 
   // B) Compatibility Layers
   detectCompatibilityLayers,
+  installCompatibilityLayer,
   ensureCompatibilityLayerReady,
   applyCrossOverPerGameSettings,
 

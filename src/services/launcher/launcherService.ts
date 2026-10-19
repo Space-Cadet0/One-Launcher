@@ -3,10 +3,12 @@ import type {
   ActiveGameSession,
   CompatibilityLayerInfo,
   CompatibilityLayerType,
+  CompatibilityRunnerDescriptor,
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
   GameLaunchConfig,
+  InstallCompatibilityLayerResult,
   InstalledGameRecord,
   InstallGameRequest,
   LauncherActionResult,
@@ -18,6 +20,74 @@ import type { StorefrontId } from '../../contracts/platform';
 import { steamApi } from '../steam/steamApi';
 
 const LAUNCH_CONFIGS_STORAGE_KEY = 'one_launcher_game_configs_v1';
+
+export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] = [
+  {
+    type: 'crossover',
+    label: 'CrossOver (Recommended)',
+    shortLabel: 'CrossOver',
+    vendor: 'CodeWeavers',
+    description:
+      'Commercial Windows compatibility layer for macOS with built-in Bottle management, D3DMetal, DXMT, DXVK, and MetalFX DLSS upscaling.',
+    bestFor:
+      'Best overall compatibility for DirectX 9/10/11/12 Windows games and Windows Steam/GOG/Epic bottles.',
+    downloadUrl: 'https://www.codeweavers.com/crossover/download',
+    downloadLabel: 'Download CrossOver Installer',
+    brewCask: 'crossover',
+    brewCommandDisplay: 'brew install --cask crossover',
+    canAutoInstallViaBrew: true,
+  },
+  {
+    type: 'crossover_preview',
+    label: 'CrossOver Preview',
+    shortLabel: 'CrossOver Preview',
+    vendor: 'CodeWeavers',
+    description:
+      'Early-access preview build of CrossOver featuring the latest experimental Wine, D3DMetal, and DXMT updates.',
+    bestFor:
+      'Testing newly released Windows titles that need bleeding-edge graphics translation fixes.',
+    downloadUrl: 'https://www.codeweavers.com/preview',
+    downloadLabel: 'Open CrossOver Preview Page',
+    canAutoInstallViaBrew: false,
+  },
+  {
+    type: 'gptk',
+    label: 'Apple Game Porting Toolkit (GPTK / D3DMetal)',
+    shortLabel: 'Apple GPTK',
+    vendor: 'Apple',
+    description:
+      'Apple’s DirectX 11/12-to-Metal 3 runtime (D3DMetal), detected from /Applications/Game Porting Toolkit.app or Heroic GPTK tools.',
+    bestFor:
+      'Running DirectX 12 Windows executables on Apple Silicon using Apple’s standalone D3DMetal runtime.',
+    downloadUrl: 'https://developer.apple.com/games/game-porting-toolkit/',
+    downloadLabel: 'Open Apple GPTK Downloads',
+    brewCask: 'game-porting-toolkit',
+    brewCommandDisplay:
+      'brew tap apple/apple http://github.com/apple/homebrew-apple && brew install --cask game-porting-toolkit',
+    canAutoInstallViaBrew: false,
+  },
+  {
+    type: 'wine',
+    label: 'Open-Source Wine (Wine-CrossOver / Wine Stable)',
+    shortLabel: 'Open-Source Wine',
+    vendor: 'WineHQ / Homebrew / Gcenx',
+    description:
+      'Free, open-source Windows API translation layer (wine64) installed via Homebrew, WineHQ (.app), or Heroic Wine-CrossOver builds.',
+    bestFor:
+      'Running DRM-free or standalone DirectX 9/10/11 Windows .exe games without a paid CrossOver license.',
+    downloadUrl: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+    downloadLabel: 'Open Official WineHQ macOS Guide',
+    brewCask: 'wine-stable',
+    brewCommandDisplay: 'brew install --cask --no-quarantine wine-stable',
+    canAutoInstallViaBrew: true,
+  },
+];
+
+function sanitizeLegacyCompatLayer(layer?: any): CompatibilityLayerType | undefined {
+  if (!layer) return undefined;
+  if (layer === 'whisky') return 'crossover';
+  return layer as CompatibilityLayerType;
+}
 
 export class LauncherService {
   private installedRecords: InstalledGameRecord[] = [];
@@ -38,6 +108,31 @@ export class LauncherService {
     this.loadLocalConfigs();
   }
 
+  private sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfig {
+    if (!cfg || typeof cfg !== 'object') return cfg;
+    const nextCfg: GameLaunchConfig = {
+      ...cfg,
+      ...(cfg.compatibilityLayer
+        ? { compatibilityLayer: sanitizeLegacyCompatLayer(cfg.compatibilityLayer) }
+        : {}),
+    };
+    if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
+      const nextPlatCfgs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
+      for (const [platId, p] of Object.entries(cfg.platformConfigs)) {
+        if (p) {
+          nextPlatCfgs[platId as StorefrontId] = {
+            ...p,
+            ...(p.compatibilityLayer
+              ? { compatibilityLayer: sanitizeLegacyCompatLayer(p.compatibilityLayer) }
+              : {}),
+          };
+        }
+      }
+      nextCfg.platformConfigs = nextPlatCfgs;
+    }
+    return nextCfg;
+  }
+
   private loadLocalConfigs(): void {
     if (typeof window === 'undefined' || !window.localStorage) return;
     try {
@@ -45,7 +140,13 @@ export class LauncherService {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') {
-          this.launchConfigs = parsed;
+          const sanitized: Record<string, GameLaunchConfig> = {};
+          for (const [gid, cfg] of Object.entries(parsed)) {
+            if (cfg && typeof cfg === 'object') {
+              sanitized[gid] = this.sanitizeGameLaunchConfig(cfg as GameLaunchConfig);
+            }
+          }
+          this.launchConfigs = sanitized;
         }
       }
     } catch {}
@@ -208,7 +309,7 @@ export class LauncherService {
                   };
                 }
               }
-              nextConfigs[gid] = updatedCfg;
+              nextConfigs[gid] = this.sanitizeGameLaunchConfig(updatedCfg);
             }
           }
           this.launchConfigs = nextConfigs;
@@ -596,6 +697,45 @@ export class LauncherService {
 
   public getCompatibilityLayers(): CompatibilityLayerInfo[] {
     return this.compatibilityLayers;
+  }
+
+  public async installCompatibilityLayer(
+    runnerType: Exclude<CompatibilityLayerType, 'native'>,
+    mode: 'auto' | 'download' = 'auto'
+  ): Promise<InstallCompatibilityLayerResult> {
+    const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
+    if (
+      mode === 'download' ||
+      typeof window === 'undefined' ||
+      !window.electronAPI?.installCompatibilityLayer
+    ) {
+      if (descriptor?.downloadUrl && typeof window !== 'undefined') {
+        if (window.electronAPI?.openExternal) {
+          await window.electronAPI.openExternal(descriptor.downloadUrl);
+        } else if (typeof window.open === 'function') {
+          window.open(descriptor.downloadUrl, '_blank', 'noopener,noreferrer');
+        }
+      }
+      return {
+        success: true,
+        openedExternalInstaller: true,
+        runnerType,
+        message: 'Opened official installer download page.',
+      };
+    }
+
+    try {
+      const res = await window.electronAPI.installCompatibilityLayer({ runnerType, mode });
+      this.compatibilityLayers = res.layers || (await this.detectCompatibilityLayers());
+      this.notifyStateChanged();
+      return res;
+    } catch (err: any) {
+      return {
+        success: false,
+        runnerType,
+        error: err?.message || 'Failed to install compatibility layer.',
+      };
+    }
   }
 
   public getInstalledRecords(): InstalledGameRecord[] {
@@ -1550,7 +1690,8 @@ export class LauncherService {
     for (const key of profileKeys) {
       const val = config[key];
       if (val !== undefined) {
-        (profile as any)[key] = val;
+        (profile as any)[key] =
+          key === 'compatibilityLayer' ? sanitizeLegacyCompatLayer(val) : val;
       }
     }
     if (profile.wineMsync === true && profile.wineEsync === true) {
@@ -1673,8 +1814,9 @@ export class LauncherService {
     gameId: string,
     platformId?: StorefrontId
   ): GameLaunchConfig | undefined {
-    const base = this.launchConfigs[gameId];
-    if (!base) return undefined;
+    const rawBase = this.launchConfigs[gameId];
+    if (!rawBase) return undefined;
+    const base = this.sanitizeGameLaunchConfig(rawBase);
 
     if (!platformId) {
       if (base.preferredPlatformId && base.platformConfigs?.[base.preferredPlatformId]) {
@@ -1791,7 +1933,7 @@ export class LauncherService {
             ? 'goggalaxy://'
             : 'storefront URI';
 
-    const selectedLayerType = mergedDraft.compatibilityLayer;
+    const selectedLayerType = sanitizeLegacyCompatLayer(mergedDraft.compatibilityLayer);
     const activeLayer =
       (selectedLayerType && selectedLayerType !== 'native'
         ? layers.find((l) => l.type === selectedLayerType)
@@ -1803,7 +1945,8 @@ export class LauncherService {
     const layerName =
       activeLayer?.name ||
       (selectedLayerType && selectedLayerType !== 'native'
-        ? selectedLayerType
+        ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === selectedLayerType)?.shortLabel ||
+          selectedLayerType
         : 'CrossOver / Wine');
     const bottleName =
       mergedDraft.wineBottleName || activeLayer?.availableBottles?.[0];
@@ -1862,8 +2005,8 @@ export class LauncherService {
     const effectiveLaunchMethod: LaunchMethod =
       draftConfig?.launchMethod || savedConfig?.launchMethod || 'auto';
     const effectiveCompatLayer: CompatibilityLayerType =
-      draftConfig?.compatibilityLayer ||
-      savedConfig?.compatibilityLayer ||
+      sanitizeLegacyCompatLayer(draftConfig?.compatibilityLayer) ||
+      sanitizeLegacyCompatLayer(savedConfig?.compatibilityLayer) ||
       layers[0]?.type ||
       'crossover';
     const hasExplicitBottleOrCompatConfig = Boolean(
@@ -1891,29 +2034,16 @@ export class LauncherService {
       detectedBuildType === 'mac_native_app' ||
       detectedBuildType === 'mac_native_bin'
     ) {
-      if (effectiveLaunchMethod === 'compatibility_layer') {
-        availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
-        visibleSections = {
-          compatibilityLayer: true,
-          crossoverRendering:
-            effectiveCompatLayer === 'crossover' ||
-            effectiveCompatLayer === 'crossover_preview',
-          nativeMacMetalHud: false,
-          executableAndArgs: true,
-          environmentAndHooks: true,
-        };
-      } else {
-        availableModes = ['auto', 'direct', 'storefront_uri'];
-        visibleSections = {
-          compatibilityLayer: false,
-          crossoverRendering: false,
-          nativeMacMetalHud: true,
-          executableAndArgs: true,
-          environmentAndHooks: true,
-        };
-      }
+      availableModes = ['auto', 'direct', 'storefront_uri'];
+      visibleSections = {
+        compatibilityLayer: false,
+        crossoverRendering: false,
+        nativeMacMetalHud: true,
+        executableAndArgs: true,
+        environmentAndHooks: true,
+      };
     } else if (detectedBuildType === 'windows_exe_on_mac') {
-      availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
+      availableModes = ['auto', 'compatibility_layer'];
       visibleSections = {
         compatibilityLayer: true,
         crossoverRendering:
@@ -1927,7 +2057,10 @@ export class LauncherService {
       const showCompatForUninstalled =
         effectiveLaunchMethod === 'compatibility_layer' ||
         hasExplicitBottleOrCompatConfig;
-      availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
+      availableModes =
+        effectiveLaunchMethod === 'direct'
+          ? ['auto', 'direct', 'compatibility_layer', 'storefront_uri']
+          : ['auto', 'compatibility_layer', 'storefront_uri'];
       visibleSections = {
         compatibilityLayer: showCompatForUninstalled,
         crossoverRendering:
@@ -1960,12 +2093,12 @@ export class LauncherService {
           auto: {
             badge: 'Recommended',
             badgeTone: 'emerald',
-            dynamicDesc: `Automatically detects this Windows .exe build and routes execution through ${layerName}${bottleSuffix}.`,
+            dynamicDesc: `Automatically runs this Windows (.exe) build through ${layerName}${bottleSuffix} with your configured graphics and bottle settings.`,
           },
           compatibility_layer: {
-            badge: 'Active Pipeline',
+            badge: 'Custom Runner & Bottle',
             badgeTone: 'sky',
-            dynamicDesc: `Explicitly runs this Windows .exe through ${layerName} with per-game CrossOver 26 graphics backend, High Resolution Mode, and HUD overrides.`,
+            dynamicDesc: `Explicitly pin a specific compatibility runner (${layerName}), target bottle / WinePrefix, and per-game graphics overrides.`,
           },
           direct: {
             badge: 'Requires Translation',
@@ -2015,12 +2148,12 @@ export class LauncherService {
           auto: {
             badge: 'Recommended',
             badgeTone: 'emerald',
-            dynamicDesc: `Automatically executes this native macOS build (${targetName}) directly with zero translation overhead.`,
+            dynamicDesc: `Automatically launches this native macOS build (${targetName}) directly with zero translation overhead.`,
           },
           direct: {
             badge: 'Native macOS',
             badgeTone: 'emerald',
-            dynamicDesc: `Directly launches the native macOS ${detectedBuildType === 'mac_native_app' ? '.app bundle' : 'binary'} without storefront client overhead.`,
+            dynamicDesc: `Spawns the local macOS ${detectedBuildType === 'mac_native_app' ? '.app bundle' : 'binary'} directly without opening ${storeName}.`,
           },
           compatibility_layer: {
             badge: 'Not Needed',
@@ -2029,9 +2162,9 @@ export class LauncherService {
             warning: `This is already a native macOS build and does not need Wine/CrossOver translation unless you explicitly override the executable to a Windows .exe.`,
           },
           storefront_uri: {
-            badge: 'Supported',
+            badge: 'Store Client',
             badgeTone: 'sky',
-            dynamicDesc: `Launches via native ${storeName} protocol (${storeProtocol}).`,
+            dynamicDesc: `Launches via the ${storeName} desktop client (${storeProtocol}).`,
           },
         },
       };

@@ -10,7 +10,6 @@ export type CompatibilityLayerType =
   | 'native'
   | 'crossover'
   | 'crossover_preview'
-  | 'whisky'
   | 'gptk'
   | 'wine';
 
@@ -22,6 +21,35 @@ export interface CompatibilityLayerInfo {
   bottlesDir?: string;
   availableBottles?: string[];
   version?: string;
+}
+
+export interface CompatibilityRunnerDescriptor {
+  type: Exclude<CompatibilityLayerType, 'native'>;
+  label: string;
+  shortLabel: string;
+  vendor: string;
+  description: string;
+  bestFor: string;
+  downloadUrl: string;
+  downloadLabel: string;
+  brewCask?: string;
+  brewCommandDisplay?: string;
+  canAutoInstallViaBrew?: boolean;
+}
+
+export interface InstallCompatibilityLayerRequest {
+  runnerType: Exclude<CompatibilityLayerType, 'native'>;
+  mode?: 'auto' | 'download';
+}
+
+export interface InstallCompatibilityLayerResult {
+  success: boolean;
+  installed?: boolean;
+  openedExternalInstaller?: boolean;
+  runnerType: string;
+  message?: string;
+  error?: string;
+  layers?: CompatibilityLayerInfo[];
 }
 
 export interface InstalledGameRecord {

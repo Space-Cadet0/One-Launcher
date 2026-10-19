@@ -7,6 +7,8 @@ import type {
   GameInstallInfo,
   GameInstallInfoRequest,
   GameLaunchConfig,
+  InstallCompatibilityLayerRequest,
+  InstallCompatibilityLayerResult,
   InstalledGameRecord,
   InstallGameRequest,
   LauncherActionResult,
@@ -66,6 +68,7 @@ export interface ElectronAPI {
     error?: string;
   }>;
   detectCompatibilityLayers: () => Promise<CompatibilityLayerInfo[]>;
+  installCompatibilityLayer: (payload: InstallCompatibilityLayerRequest) => Promise<InstallCompatibilityLayerResult>;
   getDiskSpace: (targetPath?: string) => Promise<DiskSpaceInfo | null>;
   getGameInstallInfo: (payload: GameInstallInfoRequest | Record<string, any>) => Promise<GameInstallInfo>;
   launchGame: (payload: LaunchGameRequest | Record<string, any>) => Promise<LauncherActionResult>;

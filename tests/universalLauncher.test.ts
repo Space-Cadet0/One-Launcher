@@ -523,8 +523,8 @@ describe('Universal Game Launcher & Cross-Platform Install Manager QA Suite', ()
   // =========================================================================
   // 2. COMPATIBILITY LAYER DETECTION ON macOS
   // =========================================================================
-  describe('2. Compatibility Layer Detection on macOS (CrossOver, Whisky, GPTK)', () => {
-    it('detects simulated CrossOver.app with bottles, Whisky.app with bottles, and game-porting-toolkit on darwin', () => {
+  describe('2. Compatibility Layer Detection on macOS (CrossOver, CrossOver Preview, GPTK, Wine)', () => {
+    it('detects simulated CrossOver.app with bottles, CrossOver Preview.app, game-porting-toolkit, and Wine on darwin while ignoring discontinued Whisky', () => {
       const macHome = path.join(tmpRoot, 'compat-home');
 
       // 1. CrossOver.app + Bottles
@@ -542,15 +542,14 @@ describe('Universal Game Launcher & Cross-Platform Install Manager QA Suite', ()
         { recursive: true }
       );
 
-      // 2. Whisky.app + Bottles
-      const whiskyWineBin = path.join(
+      // 2. CrossOver Preview.app + Bottles
+      const crossoverPreviewWineBin = path.join(
         macHome,
-        'Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64'
+        'Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine'
       );
-      writeTempFile(whiskyWineBin, '#!/bin/sh\necho "Whisky Wine64"\n', 0o755);
-      fs.mkdirSync(path.join(macHome, 'Applications/Whisky.app'), { recursive: true });
+      writeTempFile(crossoverPreviewWineBin, '#!/bin/sh\necho "CrossOver Preview Wine"\n', 0o755);
       fs.mkdirSync(
-        path.join(macHome, 'Library/Containers/com.isaacmarovitz.Whisky/Bottles/CyberpunkBottle'),
+        path.join(macHome, 'Library/Application Support/CrossOver Preview/Bottles/PreviewBottle'),
         { recursive: true }
       );
 
@@ -575,14 +574,17 @@ describe('Universal Game Launcher & Cross-Platform Install Manager QA Suite', ()
         expect.arrayContaining(['Steam', 'GOG Galaxy'])
       );
 
-      const whisky = layers.find((l) => l.type === 'whisky');
-      expect(whisky).toBeDefined();
-      expect(whisky?.binaryPath).toBe(whiskyWineBin);
-      expect(whisky?.availableBottles).toContain('CyberpunkBottle');
+      const crossoverPreview = layers.find((l) => l.type === 'crossover_preview');
+      expect(crossoverPreview).toBeDefined();
+      expect(crossoverPreview?.binaryPath).toBe(crossoverPreviewWineBin);
+      expect(crossoverPreview?.availableBottles).toContain('PreviewBottle');
 
       const gptk = layers.find((l) => l.type === 'gptk');
       expect(gptk).toBeDefined();
       expect(gptk?.binaryPath).toBe(gptkWineBin);
+
+      // Verify discontinued Whisky is never returned as a compatibility layer
+      expect(layers.find((l) => (l as any).type === 'whisky')).toBeUndefined();
 
       // Verify Windows host returns empty compatibility layers list
       const winLayers = launcherEngine.detectCompatibilityLayers({
@@ -1244,7 +1246,7 @@ setTimeout(() => process.exit(0), 40);
         })
       );
       expect(configModalHtml).toContain('Launch &amp; Compatibility Settings');
-      expect(configModalHtml).toContain('macOS Compatibility Layer');
+      expect(configModalHtml).toContain('Custom Compatibility Runner &amp; Bottle');
       expect(configModalHtml).toContain('Save Configuration');
     });
   });
@@ -5197,8 +5199,9 @@ sleep 1
       expect(winOnMacPreview.detectedBuildLabel).toContain('Windows Build (.exe) on macOS');
       expect(winOnMacPreview.autoResolvedMethod).toBe('compatibility_layer');
       expect(winOnMacPreview.autoResolvedSummary).toContain('Bottle: "Steam"');
+      expect(winOnMacPreview.availableModes).toEqual(['auto', 'compatibility_layer']);
       expect(winOnMacPreview.modeNotes.auto.badge).toBe('Recommended');
-      expect(winOnMacPreview.modeNotes.compatibility_layer.badge).toBe('Active Pipeline');
+      expect(winOnMacPreview.modeNotes.compatibility_layer.badge).toBe('Custom Runner & Bottle');
       expect(winOnMacPreview.modeNotes.direct.badge).toBe('Requires Translation');
       expect(winOnMacPreview.modeNotes.direct.warning).toContain(
         'macOS cannot execute Windows .exe binaries natively'
@@ -5449,12 +5452,11 @@ sleep 1
         await new Promise((r) => setTimeout(r, 15));
         const r1 = renderConfigModal();
 
-        // Verify Detected Installation banner and dynamic Launch Mode badges
+        // Verify Detected Installation banner and dynamic Launch Mode badges (only Auto & Custom Runner & Bottle shown for windows_exe_on_mac)
         expect(r1.html).toContain('Detected Installation');
         expect(r1.html).toContain('Windows Build (.exe) on macOS');
-        expect(r1.html).toContain('Active Pipeline');
-        expect(r1.html).toContain('Requires Translation');
-        expect(r1.html).toContain('Caution on macOS');
+        expect(r1.html).toContain('Custom Runner &amp; Bottle');
+        expect(r1.html).not.toContain('Storefront Client Protocol');
         expect(r1.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(r1.html).toContain('aria-label="Graphics Backend"');
         expect(r1.html).toContain('aria-label="High Resolution Mode"');
@@ -5492,18 +5494,18 @@ sleep 1
         expect(getTextContent(getMsyncBtn(rMsync.vnode))).toBe('MSyncON');
         expect(getTextContent(getEsyncBtn(rMsync.vnode))).toBe('ESyncOFF');
 
-        // Switch Launch Mode to 'storefront_uri' -> verify dynamic warning banner appears
-        const storefrontModeBtn = findElements(
+        // Switch Launch Mode to 'compatibility_layer' -> verify Custom Compatibility Runner & Bottle mode selects cleanly
+        const compatModeBtn = findElements(
           rMsync.vnode,
-          (el) => el.type === 'button' && getTextContent(el).includes('Storefront Client Protocol')
+          (el) =>
+            el.type === 'button' &&
+            getTextContent(el).includes('Custom Compatibility Runner & Bottle')
         )[0];
-        expect(storefrontModeBtn).toBeDefined();
-        storefrontModeBtn.props.onClick();
+        expect(compatModeBtn).toBeDefined();
+        compatModeBtn.props.onClick();
 
         const r2 = renderConfigModal();
-        expect(r2.html).toContain(
-          'Native macOS storefront clients (such as macOS Steam) cannot launch Windows-only .exe builds directly'
-        );
+        expect(r2.html).toContain('Custom Compatibility Runner &amp; Bottle');
 
         // Select Graphics Backend = 'dxvk' -> verify DLSS button becomes disabled ('Unavailable')
         const backendSelect = findElements(
@@ -6024,12 +6026,12 @@ sleep 1
           availableBottles: ['Steam', 'Default'],
         },
         {
-          id: 'whisky',
-          type: 'whisky',
-          name: 'Whisky',
+          id: 'gptk',
+          type: 'gptk',
+          name: 'Apple Game Porting Toolkit',
           binaryPath:
-            '/Users/test/Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64',
-          availableBottles: ['WhiskyBottle'],
+            '/Users/test/Library/Application Support/heroic/tools/game-porting-toolkit/GPTK-2.0/bin/wine64',
+          availableBottles: ['GPTKBottle'],
         },
       ];
 
@@ -6065,9 +6067,7 @@ sleep 1
         expect(steamPreview.detectedBuildType).toBe('windows_exe_on_mac');
         expect(steamPreview.availableModes).toEqual([
           'auto',
-          'direct',
           'compatibility_layer',
-          'storefront_uri',
         ]);
         expect(steamPreview.visibleSections).toEqual({
           compatibilityLayer: true,
@@ -6165,7 +6165,7 @@ sleep 1
 
         // Verify GOG native macOS .app does NOT render compatibility layer or CrossOver controls
         expect(gogRender.html).not.toContain(
-          'macOS Compatibility Layer (CrossOver / Whisky / Wine / GPTK)'
+          'macOS Compatibility Layer (CrossOver / Apple GPTK / Wine)'
         );
         expect(gogRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(gogRender.html).not.toContain('aria-label="Graphics Backend"');
@@ -6178,11 +6178,11 @@ sleep 1
         // Verify GOG native macOS .app DOES render native macOS Metal HUD section and only 3 native-relevant launch modes
         expect(gogRender.html).toContain('data-section="native-mac-settings"');
         expect(gogRender.html).toContain('Apple Metal Performance HUD (MTL_HUD_ENABLED=1)');
-        expect(gogRender.html).toContain('Auto-Detect (Recommended)');
-        expect(gogRender.html).toContain('Direct Application (.app / binary)');
+        expect(gogRender.html).toContain('Auto-Detect Native macOS Launch');
+        expect(gogRender.html).toContain('Direct macOS Application (.app / Binary)');
         expect(gogRender.html).toContain('Storefront Client Protocol');
         expect(gogRender.html).not.toContain(
-          'macOS Compatibility Layer (CrossOver / Wine / GPTK)'
+          'Custom Compatibility Runner &amp; Bottle'
         );
 
         // 4. Click the Steam storefront pill (which has Windows .exe installed on macOS)
@@ -6198,7 +6198,7 @@ sleep 1
         expect(steamRender.html).not.toContain('data-section="native-mac-settings"');
         expect(steamRender.html).toContain('data-section="compatibility-layer-settings"');
         expect(steamRender.html).toContain(
-          'macOS Compatibility Layer (CrossOver / Whisky / Wine / GPTK)'
+          'macOS Compatibility Layer (CrossOver / Apple GPTK / Wine)'
         );
         expect(steamRender.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
         expect(steamRender.html).toContain('aria-label="Graphics Backend"');
@@ -6208,27 +6208,27 @@ sleep 1
         expect(steamRender.html).toContain('ESync');
         expect(steamRender.html).toContain('DXVK HUD');
 
-        // 5. Switch Compatibility Runner on the Steam storefront to 'whisky'
+        // 5. Switch Compatibility Runner on the Steam storefront to 'gptk'
         const runnerSelect = findElements(
           steamRender.vnode,
           (el) => el.type === 'select' && el.props?.['aria-label'] === 'Compatibility Runner'
         )[0];
         expect(runnerSelect).toBeDefined();
-        runnerSelect.props.onChange({ target: { value: 'whisky' } });
+        runnerSelect.props.onChange({ target: { value: 'gptk' } });
 
-        const whiskyRender = renderHybridModal();
+        const gptkRender = renderHybridModal();
         // Verify CrossOver-only Graphics Backend and DLSS hide while Wine/GPTK Display & Sync settings remain visible
-        expect(whiskyRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
-        expect(whiskyRender.html).not.toContain('aria-label="Graphics Backend"');
-        expect(whiskyRender.html).not.toContain('DLSS (MetalFX Upscaling)');
-        expect(whiskyRender.html).toContain('Wine / GPTK Display &amp; Synchronization Settings');
-        expect(whiskyRender.html).toContain('aria-label="High Resolution Mode"');
-        expect(whiskyRender.html).toContain('MSync');
-        expect(whiskyRender.html).toContain('ESync');
+        expect(gptkRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
+        expect(gptkRender.html).not.toContain('aria-label="Graphics Backend"');
+        expect(gptkRender.html).not.toContain('DLSS (MetalFX Upscaling)');
+        expect(gptkRender.html).toContain('Wine / GPTK Display &amp; Synchronization Settings');
+        expect(gptkRender.html).toContain('aria-label="High Resolution Mode"');
+        expect(gptkRender.html).toContain('MSync');
+        expect(gptkRender.html).toContain('ESync');
 
         // 6. Switch back to GOG (mac_native_app), toggle native Metal HUD on, and click Save Configuration
         const gogPillBtn2 = findElements(
-          whiskyRender.vnode,
+          gptkRender.vnode,
           (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'gog'
         )[0];
         expect(gogPillBtn2).toBeDefined();
@@ -6267,7 +6267,7 @@ sleep 1
 
         // Verify platformConfigs.steam retains its compatibility layer settings (with MSync/ESync mutual exclusion)
         expect(savedConfig.platformConfigs?.steam).toBeDefined();
-        expect(savedConfig.platformConfigs?.steam?.compatibilityLayer).toBe('whisky');
+        expect(savedConfig.platformConfigs?.steam?.compatibilityLayer).toBe('gptk');
         expect(savedConfig.platformConfigs?.steam?.wineMsync).toBe(true);
         expect(savedConfig.platformConfigs?.steam?.wineEsync).toBe(false);
 
@@ -6835,6 +6835,353 @@ sleep 1
       expect(fs.readFileSync(libraryFoldersVdfPath, 'utf8')).not.toContain('"2320"');
       expect(fs.existsSync(quakeAppDir)).toBe(false);
       expect(fs.existsSync(steamAppDir)).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 30. HOLISTIC LAUNCH & COMPATIBILITY SETTINGS UPGRADE: WHISKY REMOVAL,
+  //     DYNAMIC LAUNCH MODES, & MISSING COMPATIBILITY RUNNER INSTALLER
+  // =========================================================================
+  describe('30. Holistic Launch & Compatibility Settings Upgrade: Whisky Removal, Dynamic Launch Modes & Missing Compatibility Runner Installer', () => {
+    it('1. verifies discontinued Whisky is completely removed from CompatibilityLayerType, detectCompatibilityLayers, GameLaunchConfigModal, and README.md while legacy saved configs normalize whisky -> crossover', () => {
+      const repoRoot = path.resolve(__dirname, '..');
+      const readmeText = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+      const contractText = fs.readFileSync(
+        path.join(repoRoot, 'src/contracts/launcher.ts'),
+        'utf8'
+      );
+      const modalText = fs.readFileSync(
+        path.join(repoRoot, 'src/components/Launcher/GameLaunchConfigModal.tsx'),
+        'utf8'
+      );
+
+      expect(readmeText).not.toMatch(/whisky/i);
+      expect(contractText).not.toMatch(/whisky/i);
+      expect(modalText).not.toMatch(/whisky/i);
+
+      // Verify legacy config migration normalizes 'whisky' -> 'crossover' in both engine and service
+      const legacyDir = path.join(tmpRoot, 'legacy-whisky-migration');
+      fs.mkdirSync(legacyDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(legacyDir, 'one_launcher_configs.json'),
+        JSON.stringify({
+          'steam-1091500': {
+            gameId: 'steam-1091500',
+            compatibilityLayer: 'whisky',
+            platformConfigs: {
+              steam: {
+                launchMethod: 'compatibility_layer',
+                compatibilityLayer: 'whisky',
+              },
+            },
+          },
+        }),
+        'utf8'
+      );
+
+      const migratedDiskConfigs = launcherEngine.getGameLaunchConfigs({ userDataDir: legacyDir });
+      expect(migratedDiskConfigs['steam-1091500'].compatibilityLayer).toBe('crossover');
+      expect(migratedDiskConfigs['steam-1091500'].platformConfigs.steam.compatibilityLayer).toBe(
+        'crossover'
+      );
+    });
+
+    it('2 & 3. verifies compat-runner-select excludes macOS Native and Whisky (offering only crossover, crossover_preview, gptk, wine) and enforces strict dynamic availableModes across windows_exe_on_mac, mac_native_app, and win32', () => {
+      const winExeOnMacGame: CanonicalGame = {
+        id: 'steam-1091500',
+        title: 'Cyberpunk 2077',
+        sortTitle: 'Cyberpunk 2077',
+        steamAppId: 1091500,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1091500',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe',
+            isWindowsBinaryOnMac: true,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      const macNativeAppGame: CanonicalGame = {
+        id: 'gog-baldur3',
+        title: "Baldur's Gate 3",
+        sortTitle: "Baldur's Gate 3",
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: 'bg3',
+            installed: true,
+            installPath: "/Applications/Baldur's Gate 3.app",
+            executablePath: "/Applications/Baldur's Gate 3.app/Contents/MacOS/BaldursGate3",
+            isWindowsBinaryOnMac: false,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      // A. macOS with Windows .exe installed (windows_exe_on_mac) -> ONLY ['auto', 'compatibility_layer']
+      const winOnMacPreview = launcherService.resolveEffectiveLaunchModePreview(
+        winExeOnMacGame,
+        'steam'
+      );
+      expect(winOnMacPreview.detectedBuildType).toBe('windows_exe_on_mac');
+      expect(winOnMacPreview.availableModes).toEqual(['auto', 'compatibility_layer']);
+      expect(winOnMacPreview.availableModes).not.toContain('direct');
+      expect(winOnMacPreview.availableModes).not.toContain('storefront_uri');
+
+      // B. macOS with Native macOS .app installed (mac_native_app) -> ONLY ['auto', 'direct', 'storefront_uri']
+      const macNativePreview = launcherService.resolveEffectiveLaunchModePreview(
+        macNativeAppGame,
+        'gog'
+      );
+      expect(macNativePreview.detectedBuildType).toBe('mac_native_app');
+      expect(macNativePreview.availableModes).toEqual(['auto', 'direct', 'storefront_uri']);
+      expect(macNativePreview.availableModes).not.toContain('compatibility_layer');
+
+      // C. Windows (win32) -> ONLY ['auto', 'direct', 'storefront_uri']
+      (globalThis as any).window.electronAPI = { platform: 'win32' };
+      try {
+        const win32Preview = launcherService.resolveEffectiveLaunchModePreview(
+          winExeOnMacGame,
+          'steam'
+        );
+        expect(win32Preview.detectedBuildType).toBe('windows_native');
+        expect(win32Preview.availableModes).toEqual(['auto', 'direct', 'storefront_uri']);
+        expect(win32Preview.availableModes).not.toContain('compatibility_layer');
+      } finally {
+        delete (globalThis as any).window.electronAPI;
+      }
+    });
+
+    it('4. renders Runner Details & Status Card and Missing Runner Installer Callout in GameLaunchConfigModal and executes installCompatibilityLayer via Homebrew / official download URL', async () => {
+      const winExeOnMacGame: CanonicalGame = {
+        id: 'steam-1091500',
+        title: 'Cyberpunk 2077',
+        sortTitle: 'Cyberpunk 2077',
+        steamAppId: 1091500,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1091500',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe',
+            isWindowsBinaryOnMac: true,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      const onlyCrossoverDetected: CompatibilityLayerInfo[] = [
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['Steam', 'Default'],
+        },
+      ];
+
+      const detectSpy = vi
+        .spyOn(launcherService, 'detectCompatibilityLayers')
+        .mockResolvedValue(onlyCrossoverDetected);
+      const getLayersSpy = vi
+        .spyOn(launcherService, 'getCompatibilityLayers')
+        .mockReturnValue(onlyCrossoverDetected);
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+
+      const findElements = (
+        node: any,
+        predicate: (el: any) => boolean,
+        acc: any[] = []
+      ): any[] => {
+        if (!node || typeof node !== 'object') return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (predicate(node)) acc.push(node);
+        if (node.props && node.props.children) {
+          findElements(node.props.children, predicate, acc);
+        }
+        return acc;
+      };
+
+      const getTextContent = (node: any): string => {
+        if (node === null || node === undefined || typeof node === 'boolean') return '';
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (Array.isArray(node)) return node.map(getTextContent).join('');
+        if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+        return '';
+      };
+
+      const renderModal = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (GameLaunchConfigModal as any)({
+            isOpen: true,
+            game: winExeOnMacGame,
+            initialPlatformId: 'steam',
+            onClose: vi.fn(),
+          });
+          const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderModal();
+        await new Promise((r) => setTimeout(r, 15));
+        const r1 = renderModal();
+
+        // 1. Verify <select data-testid="compat-runner-select"> options:
+        // Must contain ONLY crossover, crossover_preview, gptk, wine (never 'native' or 'whisky')
+        const runnerSelect = findElements(
+          r1.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        expect(runnerSelect).toBeDefined();
+        const optionNodes = findElements(runnerSelect, (el) => el.type === 'option');
+        const optionValues = optionNodes.map((o) => o.props.value);
+        expect(optionValues).toEqual(['crossover', 'crossover_preview', 'gptk', 'wine']);
+        expect(optionValues).not.toContain('native');
+        expect(optionValues).not.toContain('whisky');
+
+        // 2. When 'crossover' (installed) is selected, runner-details-card shows Installed & Ready
+        expect(r1.html).toContain('data-testid="runner-details-card"');
+        expect(r1.html).toContain('Installed &amp; Ready');
+        expect(r1.html).not.toContain('data-testid="runner-not-installed-callout"');
+
+        // 3. Switch runner to uninstalled 'wine' -> renders runner-not-installed-callout + Homebrew installer button + WineHQ guide button
+        runnerSelect.props.onChange({ target: { value: 'wine' } });
+        const rWine = renderModal();
+        expect(rWine.html).toContain('data-testid="runner-details-card"');
+        expect(rWine.html).toContain('data-testid="runner-not-installed-callout"');
+        expect(rWine.html).toContain('Runner Not Installed on This Mac');
+        expect(rWine.html).toContain('Install Open-Source Wine Automatically (Homebrew)');
+        expect(rWine.html).toContain('Open Official WineHQ macOS Guide');
+        expect(rWine.html).toContain('Re-Scan Installed Runners');
+        expect(rWine.html).toContain('brew install --cask --no-quarantine wine-stable');
+
+        // 4. Switch runner to uninstalled 'gptk' -> renders runner-not-installed-callout + Open Apple GPTK Downloads button
+        const runnerSelect2 = findElements(
+          rWine.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        runnerSelect2.props.onChange({ target: { value: 'gptk' } });
+        const rGptk = renderModal();
+        expect(rGptk.html).toContain('data-testid="runner-details-card"');
+        expect(rGptk.html).toContain('data-testid="runner-not-installed-callout"');
+        expect(rGptk.html).toContain('Open Apple GPTK Downloads');
+        expect(rGptk.html).toContain('Re-Scan Installed Runners');
+
+        // 5. Verify launcherEngine.installCompatibilityLayer & launcherService.installCompatibilityLayer
+        const installHome = path.join(tmpRoot, 'runner-install-home');
+        fs.mkdirSync(installHome, { recursive: true });
+        const wineInstalledBin = path.join(
+          installHome,
+          'Applications/Wine Stable.app/Contents/Resources/wine/bin/wine64'
+        );
+        const execBrewCalls: Array<{ bin: string; args: string[] }> = [];
+
+        const engineBrewRes = await launcherEngine.installCompatibilityLayer(
+          { runnerType: 'wine', mode: 'brew' },
+          {
+            platform: 'darwin',
+            homedir: installHome,
+            onExecBrew: async (bin: string, args: string[]) => {
+              execBrewCalls.push({ bin, args });
+              writeTempFile(wineInstalledBin, '#!/bin/sh\necho "Wine 9.0"\n', 0o755);
+            },
+          }
+        );
+
+        expect(execBrewCalls).toHaveLength(1);
+        expect(execBrewCalls[0].args).toEqual([
+          'install',
+          '--cask',
+          '--no-quarantine',
+          'wine-stable',
+        ]);
+        expect(engineBrewRes.success).toBe(true);
+        expect(engineBrewRes.installed).toBe(true);
+        expect(engineBrewRes.layers.some((l: any) => l.type === 'wine')).toBe(true);
+
+        // Verify launcherService.installCompatibilityLayer invokes electronAPI.installCompatibilityLayer and refreshes layers
+        const ipcInstallSpy = vi.fn().mockResolvedValue(engineBrewRes);
+        (globalThis as any).window.electronAPI = {
+          installCompatibilityLayer: ipcInstallSpy,
+        };
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+
+        const svcRes = await launcherService.installCompatibilityLayer('wine', 'brew');
+        expect(ipcInstallSpy).toHaveBeenCalledWith({ runnerType: 'wine', mode: 'brew' });
+        expect(svcRes.success).toBe(true);
+        expect(svcRes.installed).toBe(true);
+        expect(launcherService.getCompatibilityLayers().some((l) => l.type === 'wine')).toBe(
+          true
+        );
+      } finally {
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        delete (globalThis as any).window.electronAPI;
+      }
     });
   });
 });
