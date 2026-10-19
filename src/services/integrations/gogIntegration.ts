@@ -22,6 +22,59 @@ export interface GogProductItem {
   rating?: number;
 }
 
+export function normalizeGogAvatarUrl(rawAvatar?: any, avatarsObj?: any): string | undefined {
+  const candidates: any[] = [];
+  if (avatarsObj && typeof avatarsObj === 'object') {
+    candidates.push(
+      avatarsObj.menu_user_av_big2,
+      avatarsObj.menu_user_av_big,
+      avatarsObj.large_2x,
+      avatarsObj.large,
+      avatarsObj.sdk_img_184,
+      avatarsObj.medium_2x,
+      avatarsObj.medium,
+      avatarsObj.menu_big_2,
+      avatarsObj.menu_big,
+      avatarsObj.menu_user_av_small2,
+      avatarsObj.menu_user_av_small,
+      avatarsObj.small_2x,
+      avatarsObj.small
+    );
+  }
+  if (rawAvatar && typeof rawAvatar === 'object') {
+    candidates.push(
+      rawAvatar.large_2x,
+      rawAvatar.large,
+      rawAvatar.sdk_img_184,
+      rawAvatar.medium_2x,
+      rawAvatar.medium,
+      rawAvatar.menu_big_2,
+      rawAvatar.menu_big,
+      rawAvatar.menu_user_av_big2,
+      rawAvatar.menu_user_av_big,
+      rawAvatar.small_2x,
+      rawAvatar.small
+    );
+  } else if (typeof rawAvatar === 'string' && rawAvatar.trim()) {
+    candidates.push(rawAvatar.trim());
+  }
+
+  for (const cand of candidates) {
+    if (typeof cand !== 'string' || !cand.trim()) continue;
+    let url = cand.trim();
+    if (url.startsWith('//')) {
+      url = `https:${url}`;
+    } else if (url.startsWith('http://')) {
+      url = `https://${url.slice(7)}`;
+    }
+    if (/^https:\/\/images\.gog(-statics)?\.com\/[0-9a-f]{32,64}$/i.test(url)) {
+      url = `${url}_menu_user_av_big2.jpg`;
+    }
+    return url;
+  }
+  return undefined;
+}
+
 export class GogIntegrationService {
   private getEmbedBaseUrl(): string {
     if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
@@ -98,6 +151,14 @@ export class GogIntegrationService {
   }
 
   /**
+   * Normalize GOG avatar URLs (handling protocol-relative //images.gog-statics.com/<hash>
+   * which returns 404 without a size suffix + .jpg extension, as well as avatars maps).
+   */
+  normalizeAvatarUrl(rawAvatar?: any, avatarsObj?: any): string | undefined {
+    return normalizeGogAvatarUrl(rawAvatar, avatarsObj);
+  }
+
+  /**
    * Fetches the user profile details using their bearer token
    */
   async fetchUserData(accessToken: string): Promise<{ username: string; avatarUrl?: string; userId?: string } | null> {
@@ -110,7 +171,9 @@ export class GogIntegrationService {
         return {
           username: res.data.username,
           userId: res.data.userId,
-          avatarUrl: res.data.avatar || 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
+          avatarUrl:
+            normalizeGogAvatarUrl(res.data.avatar, res.data.avatars) ||
+            'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
         };
       }
     } catch {
@@ -124,7 +187,9 @@ export class GogIntegrationService {
           return {
             username: res.data.username,
             userId: res.data.userId,
-            avatarUrl: res.data.avatar || 'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
+            avatarUrl:
+              normalizeGogAvatarUrl(res.data.avatar, res.data.avatars) ||
+              'https://images.gog.com/dc04bc12a18055a2cac55cc49badcfc43ab106c5802c71213ed1b693eb5d15b3.jpg',
           };
         }
       } catch (err) {
@@ -150,7 +215,7 @@ export class GogIntegrationService {
         return {
           username: user.username || cleanUser,
           userId: user.userId,
-          avatarUrl: user.avatar || user.avatars?.large || user.avatars?.medium,
+          avatarUrl: normalizeGogAvatarUrl(user.avatar, user.avatars),
         };
       }
     } catch (err: any) {
@@ -529,11 +594,15 @@ export class GogIntegrationService {
         console.warn('Failed fetching profile games from GOG:', err);
       }
       if (profileGames.length > 0) {
-        const existingIds = new Set(GOG_USER_LIBRARY.map((g) => g.id));
-        const newAdditions = profileGames.filter((g) => !existingIds.has(g.id));
-        games = [...GOG_USER_LIBRARY, ...newAdditions];
+        games = profileGames.map((g) => ({
+          ...g,
+          isVerifiedEntitlement: true,
+        }));
       } else {
-        games = GOG_USER_LIBRARY;
+        games = GOG_USER_LIBRARY.map((g) => ({
+          ...g,
+          isVerifiedEntitlement: true,
+        }));
       }
     }
 

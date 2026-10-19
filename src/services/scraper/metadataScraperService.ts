@@ -9,13 +9,13 @@ import {
 import {
   steamMatcher,
   computeTitleSimilarity,
-  normalizeGameTitle,
   canonicalizeTitleKey,
 } from '../steam/steamMatcher';
 import { steamApi } from '../steam/steamApi';
 import {
   fallbackMetadataProvider,
   extractFirstParagraph,
+  stripHtmlToPlainSynopsis,
 } from '../steam/fallbackMetadataProvider';
 import {
   igdbCoverService,
@@ -23,10 +23,68 @@ import {
 } from '../igdb/igdbCoverService';
 import { storefrontReviewHarvester } from '../critic/storefrontReviewHarvester';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
+import steamEnrichedCache from '../storage/steamEnrichedCache.json';
+import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
+import { GOG_USER_LIBRARY } from '../storage/gogUserLibrary';
 import { EPIC_USER_LIBRARY } from '../storage/epicUserLibrary';
 import { KNOWN_EPIC_APP_NAMES } from '../integrations/epicCodenames';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { computeEntityMatchConfidence } from '../common/entityResolver';
+import { normalizeTitleKey, matchesLooseSearchQuery } from '../common/titleUtils';
+
+/**
+ * Builds a direct or search storefront URL for a candidate or metadata source.
+ */
+export function buildCandidateStoreUrl(params: {
+  source: string;
+  title: string;
+  steamAppId?: number;
+  gogId?: string | number;
+  epicSlug?: string;
+  igdbId?: string | number;
+}): string {
+  const cleanTitle = (params.title || '').trim();
+  const src = (params.source || '').toLowerCase();
+
+  if (src === 'steam') {
+    if (params.steamAppId && Number(params.steamAppId) > 0) {
+      return `https://store.steampowered.com/app/${params.steamAppId}`;
+    }
+    return `https://store.steampowered.com/search/?term=${encodeURIComponent(cleanTitle)}`;
+  }
+
+  if (src === 'gog') {
+    const gogStr =
+      params.gogId !== undefined && params.gogId !== null
+        ? String(params.gogId).replace(/^gog-/, '').trim()
+        : '';
+    if (gogStr && !/^\d+$/.test(gogStr)) {
+      return `https://www.gog.com/en/game/${gogStr}`;
+    }
+    return `https://www.gog.com/en/games?query=${encodeURIComponent(cleanTitle)}`;
+  }
+
+  if (src === 'epic') {
+    const slug = (params.epicSlug || '').replace(/^epic-/, '').trim();
+    if (slug && slug.toLowerCase() !== 'epic' && !/^[0-9a-f]{20,}$/i.test(slug)) {
+      return `https://store.epicgames.com/en-US/p/${slug}`;
+    }
+    return `https://store.epicgames.com/en-US/browse?q=${encodeURIComponent(cleanTitle)}`;
+  }
+
+  if (src === 'igdb') {
+    const igdbStr =
+      params.igdbId !== undefined && params.igdbId !== null
+        ? String(params.igdbId).replace(/^igdb-/, '').trim()
+        : '';
+    if (igdbStr && igdbStr.toLowerCase() !== 'igdb' && !/^\d+$/.test(igdbStr)) {
+      return `https://www.igdb.com/games/${igdbStr}`;
+    }
+    return `https://www.igdb.com/search?type=1&q=${encodeURIComponent(cleanTitle)}`;
+  }
+
+  return `https://www.google.com/search?q=${encodeURIComponent(cleanTitle + ' game')}`;
+}
 
 /**
  * Cleans a user or game search query by stripping punctuation and trademark noise.
@@ -61,7 +119,7 @@ function deduplicateCovers(covers: ScrapedCoverOption[]): ScrapedCoverOption[] {
 }
 
 /**
- * Deduplicates descriptions by normalized text content.
+ * Deduplicates descriptions by normalized plain-text content, stripping any residual HTML tags.
  */
 function deduplicateDescriptions(
   descriptions: { source: string; text: string }[]
@@ -70,10 +128,12 @@ function deduplicateDescriptions(
   const result: { source: string; text: string }[] = [];
   for (const d of descriptions) {
     if (!d.text || !d.text.trim()) continue;
-    const norm = d.text.trim().toLowerCase();
+    const plain = stripHtmlToPlainSynopsis(d.text);
+    if (!plain) continue;
+    const norm = plain.toLowerCase();
     if (seen.has(norm)) continue;
     seen.add(norm);
-    result.push({ source: d.source, text: d.text.trim() });
+    result.push({ source: d.source, text: plain });
   }
   return result;
 }
@@ -146,47 +206,69 @@ export class MetadataScraperService {
   /**
    * Queries Steam Store Search API with fallback support for localhost proxy and direct HTTPS.
    */
-  private async querySteamStore(term: string): Promise<any[]> {
-    const clean = term.trim();
+  private async querySteamStore(query: string): Promise<any[]> {
+    const clean = query.trim();
     if (!clean) return [];
 
-    const isLocal =
-      typeof window !== 'undefined' &&
-      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const fetchStoreItems = async (searchTerm: string): Promise<any[]> => {
+      const isLocal =
+        typeof window !== 'undefined' &&
+        (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
 
-    const urls: string[] = [];
-    if (isLocal) {
-      urls.push(`${this.getSteamBaseUrl()}/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
-      urls.push(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
-    } else {
-      urls.push(`${this.getSteamBaseUrl()}/api/storesearch/?term=${encodeURIComponent(clean)}&l=english&cc=US`);
-    }
-
-    for (const url of urls) {
-      try {
-        const res = await requestScheduler.schedule(
-          url,
-          () =>
-            axios.get(url, {
-              timeout: 6000,
-              headers: {
-                Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
-                'User-Agent':
-                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                Accept: 'application/json, text/plain, */*',
-              },
-            }),
-          Priority.P0_INTERACTIVE
+      const urls: string[] = [];
+      if (isLocal) {
+        urls.push(
+          `${this.getSteamBaseUrl()}/api/storesearch/?term=${encodeURIComponent(searchTerm)}&l=english&cc=US`
         );
-        if (res.data?.items && Array.isArray(res.data.items)) {
-          return res.data.items.filter((item: any) => !isNonGameAddonTitle(item?.name || '', clean));
+        urls.push(
+          `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(searchTerm)}&l=english&cc=US`
+        );
+      } else {
+        urls.push(
+          `${this.getSteamBaseUrl()}/api/storesearch/?term=${encodeURIComponent(searchTerm)}&l=english&cc=US`
+        );
+      }
+
+      for (const url of urls) {
+        try {
+          const res = await requestScheduler.schedule(
+            url,
+            () =>
+              axios.get(url, {
+                timeout: 6000,
+                headers: {
+                  Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+                  'User-Agent':
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  Accept: 'application/json, text/plain, */*',
+                },
+              }),
+            Priority.P0_INTERACTIVE
+          );
+          if (res.data?.items && Array.isArray(res.data.items)) {
+            return res.data.items.filter(
+              (item: any) => !isNonGameAddonTitle(item?.name || '', searchTerm)
+            );
+          }
+        } catch (err: any) {
+          // Fallback to next URL or log warning
+          console.warn(
+            `[MetadataScraperService] Steam store search failed on ${url}:`,
+            err?.message
+          );
         }
-      } catch (err: any) {
-        // Fallback to next URL or log warning
-        console.warn(`[MetadataScraperService] Steam store search failed on ${url}:`, err?.message);
+      }
+      return [];
+    };
+
+    let items = await fetchStoreItems(clean);
+    if (query.includes('+') && (!items || items.length === 0)) {
+      const plusStripped = query.replace(/\+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (plusStripped && plusStripped !== clean) {
+        items = await fetchStoreItems(plusStripped);
       }
     }
-    return [];
+    return items;
   }
 
   /**
@@ -249,8 +331,10 @@ export class MetadataScraperService {
   ): Promise<SearchMatchCandidate[]> {
     if (!game || !game.title) return [];
 
-    const effectiveTitle = customQuery && customQuery.trim() ? customQuery.trim() : game.title;
-    const cleanTitle = normalizeGameTitle(effectiveTitle) || effectiveTitle;
+    const rawSourceTitle =
+      game.originalStoreTitle || game.platforms?.[0]?.originalTitle || game.title;
+    const effectiveTitle =
+      customQuery && customQuery.trim() ? customQuery.trim() : rawSourceTitle;
     const candidates: SearchMatchCandidate[] = [];
 
     // 1. Steam Existing Ownership or Instant Curated Match (skip if nonSteamOnly is active)
@@ -261,11 +345,23 @@ export class MetadataScraperService {
       }
 
       if (matchedSteamAppId) {
+        const steamCandidateTitle =
+          steamApi.getCachedMetadata(matchedSteamAppId)?.name ||
+          (steamEnrichedCache as Record<string, any>)[String(matchedSteamAppId)]?.name ||
+          FULL_USER_STEAM_GAMES.find((g) => g.steamAppId === matchedSteamAppId)?.title ||
+          game.platforms?.find((p) => p.platformId === 'steam')?.originalTitle ||
+          rawSourceTitle;
+
         candidates.push({
           id: `steam-${matchedSteamAppId}`,
           source: 'steam',
-          title: game.title,
+          title: steamCandidateTitle,
           steamAppId: matchedSteamAppId,
+          storeUrl: buildCandidateStoreUrl({
+            source: 'steam',
+            title: steamCandidateTitle,
+            steamAppId: matchedSteamAppId,
+          }),
           capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamAppId}/library_600x900_2x.jpg`,
           headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamAppId}/header.jpg`,
           confidenceScore: 100,
@@ -277,12 +373,30 @@ export class MetadataScraperService {
     const gogPlatform = game.platforms?.find((p) => p.platformId === 'gog');
     if (gogPlatform?.platformGameId) {
       const gogData = (gogEnrichedCache as Record<string, any>)[gogPlatform.platformGameId];
+      const gogCandidateTitle =
+        gogData?.title ||
+        gogPlatform.originalTitle ||
+        GOG_USER_LIBRARY.find(
+          (g) =>
+            g.id === gogPlatform.platformGameId ||
+            g.platforms?.some(
+              (p) => p.platformId === 'gog' && p.platformGameId === gogPlatform.platformGameId
+            )
+        )?.title ||
+        rawSourceTitle;
+      const gogStoreUrl = buildCandidateStoreUrl({
+        source: 'gog',
+        title: gogCandidateTitle,
+        gogId: gogPlatform.platformGameId,
+      });
+
       if (gogData) {
         candidates.push({
           id: `gog-${gogPlatform.platformGameId}`,
           source: 'gog',
-          title: gogData.title || game.title,
+          title: gogCandidateTitle,
           gogId: gogPlatform.platformGameId,
+          storeUrl: gogStoreUrl,
           year: gogData.releaseDate ? gogData.releaseDate.substring(0, 4) : undefined,
           capsuleImage: gogData.coverVertical || gogData.coverHorizontal,
           headerImage: gogData.coverHorizontal || gogData.coverVertical,
@@ -292,7 +406,7 @@ export class MetadataScraperService {
       } else {
         const instantGogBoxArt = igdbCoverService.getGogVerticalCoverInstant(
           gogPlatform.platformGameId,
-          game.title
+          gogCandidateTitle
         );
         const validLocalGogCover =
           game.capsuleImage && !isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage)
@@ -301,8 +415,9 @@ export class MetadataScraperService {
         candidates.push({
           id: `gog-${gogPlatform.platformGameId}`,
           source: 'gog',
-          title: game.title,
+          title: gogCandidateTitle,
           gogId: gogPlatform.platformGameId,
+          storeUrl: gogStoreUrl,
           year: game.releaseDate ? String(game.releaseDate).substring(0, 4) : undefined,
           capsuleImage: instantGogBoxArt || validLocalGogCover || game.headerImage,
           headerImage: game.headerImage || validLocalGogCover,
@@ -320,11 +435,29 @@ export class MetadataScraperService {
         KNOWN_EPIC_APP_NAMES[epicPlatform.platformGameId.toLowerCase()] ||
         KNOWN_EPIC_APP_NAMES[game.title.toLowerCase()];
 
+      const epicCandidateTitle =
+        epicMapping?.title ||
+        epicPlatform.originalTitle ||
+        EPIC_USER_LIBRARY.find(
+          (g) =>
+            g.id === epicPlatform.platformGameId ||
+            g.platforms?.some(
+              (p) => p.platformId === 'epic' && p.platformGameId === epicPlatform.platformGameId
+            )
+        )?.title ||
+        rawSourceTitle;
+      const epicStoreUrl = buildCandidateStoreUrl({
+        source: 'epic',
+        title: epicCandidateTitle,
+        epicSlug: epicPlatform.platformGameId,
+      });
+
       if (epicMapping) {
         candidates.push({
           id: `epic-${epicPlatform.platformGameId}`,
           source: 'epic',
-          title: epicMapping.title || game.title,
+          title: epicCandidateTitle,
+          storeUrl: epicStoreUrl,
           capsuleImage: epicMapping.capsuleImage || epicMapping.headerImage,
           headerImage: epicMapping.headerImage,
           description: epicMapping.description,
@@ -334,7 +467,8 @@ export class MetadataScraperService {
         candidates.push({
           id: `epic-${epicPlatform.platformGameId}`,
           source: 'epic',
-          title: game.title,
+          title: epicCandidateTitle,
+          storeUrl: epicStoreUrl,
           year: game.releaseDate ? String(game.releaseDate).substring(0, 4) : undefined,
           capsuleImage: game.capsuleImage || game.headerImage,
           headerImage: game.headerImage || game.capsuleImage,
@@ -352,10 +486,10 @@ export class MetadataScraperService {
       const shouldQueryEpic = !sourceFilter || sourceFilter.toLowerCase() === 'all' || sourceFilter.toLowerCase() === 'epic';
 
       const searchPromises: Promise<SearchMatchCandidate[]>[] = [];
-      if (shouldQuerySteam) searchPromises.push(this.searchStorefronts(cleanTitle, 'steam').catch(() => []));
-      if (shouldQueryIgdb) searchPromises.push(this.searchStorefronts(cleanTitle, 'igdb').catch(() => []));
-      if (shouldQueryGog) searchPromises.push(this.searchStorefronts(cleanTitle, 'gog').catch(() => []));
-      if (shouldQueryEpic) searchPromises.push(this.searchStorefronts(cleanTitle, 'epic').catch(() => []));
+      if (shouldQuerySteam) searchPromises.push(this.searchStorefronts(effectiveTitle, 'steam').catch(() => []));
+      if (shouldQueryIgdb) searchPromises.push(this.searchStorefronts(effectiveTitle, 'igdb').catch(() => []));
+      if (shouldQueryGog) searchPromises.push(this.searchStorefronts(effectiveTitle, 'gog').catch(() => []));
+      if (shouldQueryEpic) searchPromises.push(this.searchStorefronts(effectiveTitle, 'epic').catch(() => []));
 
       const results = await Promise.all(searchPromises);
       for (const resList of results) {
@@ -392,6 +526,9 @@ export class MetadataScraperService {
         if (cand.year && !existing.year) {
           existing.year = cand.year;
         }
+        if (cand.storeUrl && !existing.storeUrl) {
+          existing.storeUrl = cand.storeUrl;
+        }
         continue;
       }
 
@@ -410,11 +547,13 @@ export class MetadataScraperService {
 
       let score = evaluation.confidence;
 
-      const normGame = canonicalizeTitleKey(effectiveTitle);
-      const normCand = canonicalizeTitleKey(cand.title);
+      const normGame = normalizeTitleKey(effectiveTitle) || canonicalizeTitleKey(effectiveTitle);
+      const normCand = normalizeTitleKey(cand.title) || canonicalizeTitleKey(cand.title);
 
       if (normGame === normCand && !evaluation.isRebootCollision) {
         score = Math.max(score, 96);
+      } else if (matchesLooseSearchQuery(cand.title, effectiveTitle) && !evaluation.isRebootCollision) {
+        score = Math.max(score, 72);
       }
 
       // Bonus if candidate has official SteamAppId matching the game
@@ -444,6 +583,16 @@ export class MetadataScraperService {
 
       const scoredEntry: SearchMatchCandidate = {
         ...cand,
+        storeUrl:
+          cand.storeUrl ||
+          buildCandidateStoreUrl({
+            source: cand.source,
+            title: cand.title,
+            steamAppId: cand.steamAppId,
+            gogId: cand.gogId,
+            epicSlug: cand.source === 'epic' ? String(cand.id) : undefined,
+            igdbId: cand.igdbId || cand.id,
+          }),
         confidenceScore: finalConfidence,
       };
       seenByKey.set(key, scoredEntry);
@@ -459,24 +608,72 @@ export class MetadataScraperService {
   }
 
   /**
+   * Alias for searchStorefronts for multi-store queries with punctuation-tolerant fallback.
+   */
+  async searchMultiStore(
+    query: string,
+    source: 'all' | 'steam' | 'igdb' | 'gog' | 'epic' = 'all'
+  ): Promise<SearchMatchCandidate[]> {
+    return this.searchStorefronts(query, source);
+  }
+
+  /**
    * Searches storefronts (Steam, IGDB, GOG, Epic) for matching games.
+   * Keeps primary outgoing storefront queries raw; if the raw query returns 0 candidates
+   * with confidence >= 60 and normalizeTitleKey(query) differs from query.trim().toLowerCase(),
+   * runs a fallback search with normalizeTitleKey(query) and merges/deduplicates results.
    */
   async searchStorefronts(
     query: string,
     source: 'all' | 'steam' | 'igdb' | 'gog' | 'epic' = 'all'
   ): Promise<SearchMatchCandidate[]> {
-    const rawClean = cleanSearchQuery(query);
-    if (!rawClean) return [];
+    const rawTrimmed = (query || '').trim();
+    if (!rawTrimmed) return [];
+
+    const primaryCandidates = await this.executeStorefrontSearch(rawTrimmed, source);
+    const hasConfidentPrimary = primaryCandidates.some((c) => (c.confidenceScore ?? 0) >= 60);
+    const normalizedFallback = normalizeTitleKey(rawTrimmed);
+
+    if (
+      !hasConfidentPrimary &&
+      normalizedFallback &&
+      normalizedFallback !== rawTrimmed.toLowerCase()
+    ) {
+      const fallbackCandidates = await this.executeStorefrontSearch(normalizedFallback, source);
+      if (fallbackCandidates.length > 0) {
+        const mergedMap = new Map<string, SearchMatchCandidate>();
+        for (const cand of [...primaryCandidates, ...fallbackCandidates]) {
+          const key = `${cand.source}:${cand.id}`;
+          const existing = mergedMap.get(key);
+          if (!existing || (cand.confidenceScore ?? 0) > (existing.confidenceScore ?? 0)) {
+            mergedMap.set(key, cand);
+          }
+        }
+        const merged = Array.from(mergedMap.values());
+        merged.sort((a, b) => (b.confidenceScore || 0) - (a.confidenceScore || 0));
+        return merged;
+      }
+    }
+
+    return primaryCandidates;
+  }
+
+  private async executeStorefrontSearch(
+    query: string,
+    source: 'all' | 'steam' | 'igdb' | 'gog' | 'epic' = 'all'
+  ): Promise<SearchMatchCandidate[]> {
+    const rawQuery = (query || '').trim();
+    if (!rawQuery) return [];
 
     const candidates: SearchMatchCandidate[] = [];
-    const normQuery = canonicalizeTitleKey(rawClean);
+    const normQuery = normalizeTitleKey(rawQuery) || canonicalizeTitleKey(rawQuery);
 
     // --- 1. Steam Search ---
     if (source === 'all' || source === 'steam') {
       try {
         // Direct AppID search if query is purely numeric
-        if (/^\d{3,8}$/.test(rawClean)) {
-          const numId = parseInt(rawClean, 10);
+        if (/^\d{3,8}$/.test(rawQuery)) {
+          const numId = parseInt(rawQuery, 10);
           const meta = await steamApi.fetchGameMetadata(numId, Priority.P0_INTERACTIVE);
           if (meta) {
             candidates.push({
@@ -484,6 +681,11 @@ export class MetadataScraperService {
               source: 'steam',
               title: meta.name,
               steamAppId: numId,
+              storeUrl: buildCandidateStoreUrl({
+                source: 'steam',
+                title: meta.name,
+                steamAppId: numId,
+              }),
               capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${numId}/library_600x900_2x.jpg`,
               headerImage: meta.headerImage || `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${numId}/header.jpg`,
               confidenceScore: 100,
@@ -491,35 +693,55 @@ export class MetadataScraperService {
           }
         }
 
+        // Query Steam storesearch first with the raw query so real store names take precedence
+        const items = await this.querySteamStore(rawQuery);
+
         // Instant matcher check
-        const instantId = steamMatcher.matchGameToSteamInstant(rawClean);
+        const instantId = steamMatcher.matchGameToSteamInstant(rawQuery);
         if (instantId && !candidates.some((c) => c.steamAppId === instantId)) {
+          const instantTitle =
+            items.find((it: any) => Number(it?.id) === instantId)?.name ||
+            steamApi.getCachedMetadata(instantId)?.name ||
+            (steamEnrichedCache as Record<string, any>)[String(instantId)]?.name ||
+            FULL_USER_STEAM_GAMES.find((g) => g.steamAppId === instantId)?.title ||
+            rawQuery;
+
           candidates.push({
             id: `steam-${instantId}`,
             source: 'steam',
-            title: rawClean,
+            title: instantTitle,
             steamAppId: instantId,
+            storeUrl: buildCandidateStoreUrl({
+              source: 'steam',
+              title: instantTitle,
+              steamAppId: instantId,
+            }),
             capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${instantId}/library_600x900_2x.jpg`,
             headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${instantId}/header.jpg`,
             confidenceScore: 95,
           });
         }
 
-        // Query Steam storesearch
-        const items = await this.querySteamStore(rawClean);
         for (const item of items) {
           if (!item.id || !item.name) continue;
           if (candidates.some((c) => c.steamAppId === item.id)) continue;
 
-          const sim = computeTitleSimilarity(rawClean, item.name);
+          const sim = computeTitleSimilarity(rawQuery, item.name);
+          const itemKey = normalizeTitleKey(item.name) || canonicalizeTitleKey(item.name);
           let score = Math.round(sim * 100);
-          if (canonicalizeTitleKey(item.name) === normQuery) score += 20;
+          if (itemKey === normQuery) score += 20;
+          else if (matchesLooseSearchQuery(item.name, rawQuery)) score = Math.max(score, 75);
 
           candidates.push({
             id: `steam-${item.id}`,
             source: 'steam',
             title: item.name,
             steamAppId: item.id,
+            storeUrl: buildCandidateStoreUrl({
+              source: 'steam',
+              title: item.name,
+              steamAppId: item.id,
+            }),
             capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${item.id}/library_600x900_2x.jpg`,
             headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${item.id}/header.jpg`,
             confidenceScore: Math.min(100, score),
@@ -533,7 +755,7 @@ export class MetadataScraperService {
     // --- 2. IGDB / Lutris Search ---
     if (source === 'all' || source === 'igdb') {
       try {
-        const results = await this.queryLutrisGames(rawClean);
+        const results = await this.queryLutrisGames(rawQuery);
         for (const item of results) {
           if (!item.name) continue;
 
@@ -552,9 +774,11 @@ export class MetadataScraperService {
             if (instantCover) capsuleImage = instantCover;
           }
 
-          const sim = computeTitleSimilarity(rawClean, item.name);
+          const sim = computeTitleSimilarity(rawQuery, item.name);
+          const itemKey = normalizeTitleKey(item.name) || canonicalizeTitleKey(item.name);
           let score = Math.round(sim * 100);
-          if (canonicalizeTitleKey(item.name) === normQuery) score += 20;
+          if (itemKey === normQuery) score += 20;
+          else if (matchesLooseSearchQuery(item.name, rawQuery)) score = Math.max(score, 75);
 
           candidates.push({
             id: `igdb-${item.id || item.slug}`,
@@ -562,6 +786,11 @@ export class MetadataScraperService {
             title: item.name,
             year: item.year,
             igdbId: item.id,
+            storeUrl: buildCandidateStoreUrl({
+              source: 'igdb',
+              title: item.name,
+              igdbId: item.slug || item.id,
+            }),
             capsuleImage,
             description: item.description,
             confidenceScore: Math.min(100, score),
@@ -577,25 +806,33 @@ export class MetadataScraperService {
       try {
         for (const [id, entry] of Object.entries(gogEnrichedCache as Record<string, any>)) {
           if (!entry?.title) continue;
-          const sim = computeTitleSimilarity(rawClean, entry.title);
-          const titleKey = canonicalizeTitleKey(entry.title);
+          const sim = computeTitleSimilarity(rawQuery, entry.title);
+          const titleKey = normalizeTitleKey(entry.title) || canonicalizeTitleKey(entry.title);
 
           const isMatch =
             sim >= 0.4 ||
             titleKey.includes(normQuery) ||
             normQuery.includes(titleKey) ||
-            String(id) === rawClean;
+            matchesLooseSearchQuery(entry.title, rawQuery) ||
+            String(id) === rawQuery;
 
           if (isMatch) {
             let score = Math.round(sim * 100);
             if (titleKey === normQuery) score = 100;
-            else if (titleKey.includes(normQuery)) score = Math.max(score, 75);
+            else if (titleKey.includes(normQuery) || matchesLooseSearchQuery(entry.title, rawQuery)) {
+              score = Math.max(score, 75);
+            }
 
             candidates.push({
               id: `gog-${id}`,
               source: 'gog',
               title: entry.title,
               gogId: id,
+              storeUrl: buildCandidateStoreUrl({
+                source: 'gog',
+                title: entry.title,
+                gogId: entry.slug || id,
+              }),
               year: entry.releaseDate ? entry.releaseDate.substring(0, 4) : undefined,
               capsuleImage: entry.coverVertical || entry.coverHorizontal,
               headerImage: entry.coverHorizontal || entry.coverVertical,
@@ -605,8 +842,8 @@ export class MetadataScraperService {
           }
         }
 
-        // Live GOG Catalog API search
-        const gogCatalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(rawClean)}&limit=20&productType=in:game,pack`;
+        // Live GOG Catalog API search with raw query
+        const gogCatalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(rawQuery)}&limit=20&productType=in:game,pack`;
         const gogRes = await requestScheduler.schedule(
           gogCatalogUrl,
           () =>
@@ -625,12 +862,14 @@ export class MetadataScraperService {
           const products = Array.isArray(gogJson?.products) ? gogJson.products : [];
           for (const prod of products) {
             if (!prod?.id || !prod?.title) continue;
-            if (isNonGameAddonTitle(prod.title, rawClean)) continue;
-            const sim = computeTitleSimilarity(rawClean, prod.title);
-            const titleKey = canonicalizeTitleKey(prod.title);
+            if (isNonGameAddonTitle(prod.title, rawQuery)) continue;
+            const sim = computeTitleSimilarity(rawQuery, prod.title);
+            const titleKey = normalizeTitleKey(prod.title) || canonicalizeTitleKey(prod.title);
             let score = Math.round(sim * 100);
             if (titleKey === normQuery) score = 100;
-            else if (titleKey.includes(normQuery)) score = Math.max(score, 75);
+            else if (titleKey.includes(normQuery) || matchesLooseSearchQuery(prod.title, rawQuery)) {
+              score = Math.max(score, 75);
+            }
             if (score < 30) continue;
 
             candidates.push({
@@ -638,6 +877,13 @@ export class MetadataScraperService {
               source: 'gog',
               title: prod.title,
               gogId: String(prod.id),
+              storeUrl:
+                prod.storeLink ||
+                buildCandidateStoreUrl({
+                  source: 'gog',
+                  title: prod.title,
+                  gogId: prod.slug || prod.id,
+                }),
               year: prod.releaseDate ? String(prod.releaseDate).slice(0, 4) : undefined,
               capsuleImage: prod.coverVertical || prod.coverHorizontal,
               headerImage: prod.coverHorizontal || prod.coverVertical,
@@ -658,25 +904,33 @@ export class MetadataScraperService {
         // Search EPIC_USER_LIBRARY
         for (const game of EPIC_USER_LIBRARY) {
           if (!game.title) continue;
-          const titleKey = canonicalizeTitleKey(game.title);
+          const titleKey = normalizeTitleKey(game.title) || canonicalizeTitleKey(game.title);
           if (seenEpicTitles.has(titleKey)) continue;
 
-          const sim = computeTitleSimilarity(rawClean, game.title);
+          const sim = computeTitleSimilarity(rawQuery, game.title);
           const isMatch =
             sim >= 0.4 ||
             titleKey.includes(normQuery) ||
-            normQuery.includes(titleKey);
+            normQuery.includes(titleKey) ||
+            matchesLooseSearchQuery(game.title, rawQuery);
 
           if (isMatch) {
             seenEpicTitles.add(titleKey);
             let score = Math.round(sim * 100);
             if (titleKey === normQuery) score = 100;
-            else if (titleKey.includes(normQuery)) score = Math.max(score, 75);
+            else if (titleKey.includes(normQuery) || matchesLooseSearchQuery(game.title, rawQuery)) {
+              score = Math.max(score, 75);
+            }
 
             candidates.push({
               id: `epic-${game.id}`,
               source: 'epic',
               title: game.title,
+              storeUrl: buildCandidateStoreUrl({
+                source: 'epic',
+                title: game.title,
+                epicSlug: game.id,
+              }),
               year: game.releaseDate ? game.releaseDate.substring(0, 4) : undefined,
               capsuleImage: game.capsuleImage || game.headerImage,
               headerImage: game.headerImage,
@@ -689,25 +943,33 @@ export class MetadataScraperService {
         // Search KNOWN_EPIC_APP_NAMES
         for (const [key, mapping] of Object.entries(KNOWN_EPIC_APP_NAMES)) {
           if (!mapping.title) continue;
-          const titleKey = canonicalizeTitleKey(mapping.title);
+          const titleKey = normalizeTitleKey(mapping.title) || canonicalizeTitleKey(mapping.title);
           if (seenEpicTitles.has(titleKey)) continue;
 
-          const sim = computeTitleSimilarity(rawClean, mapping.title);
+          const sim = computeTitleSimilarity(rawQuery, mapping.title);
           const isMatch =
             sim >= 0.4 ||
             titleKey.includes(normQuery) ||
-            normQuery.includes(titleKey);
+            normQuery.includes(titleKey) ||
+            matchesLooseSearchQuery(mapping.title, rawQuery);
 
           if (isMatch) {
             seenEpicTitles.add(titleKey);
             let score = Math.round(sim * 100);
             if (titleKey === normQuery) score = 100;
-            else if (titleKey.includes(normQuery)) score = Math.max(score, 75);
+            else if (titleKey.includes(normQuery) || matchesLooseSearchQuery(mapping.title, rawQuery)) {
+              score = Math.max(score, 75);
+            }
 
             candidates.push({
               id: `epic-${key}`,
               source: 'epic',
               title: mapping.title,
+              storeUrl: buildCandidateStoreUrl({
+                source: 'epic',
+                title: mapping.title,
+                epicSlug: key,
+              }),
               capsuleImage: mapping.capsuleImage || mapping.headerImage,
               headerImage: mapping.headerImage,
               description: mapping.description,
@@ -728,6 +990,9 @@ export class MetadataScraperService {
       const key = `${cand.source}:${cand.id}`;
       if (seenKeys.has(key)) continue;
       seenKeys.add(key);
+      if (cand.description) {
+        cand.description = stripHtmlToPlainSynopsis(cand.description) || undefined;
+      }
       deduplicated.push(cand);
     }
 
@@ -768,16 +1033,28 @@ export class MetadataScraperService {
       ) {
         return null;
       }
+      const origPlat = originalGame.platforms?.[0];
+      const origSource = origPlat?.platformId || (originalGame.steamAppId ? 'steam' : 'original');
+      const origTitle =
+        originalGame.originalStoreTitle || origPlat?.originalTitle || originalGame.title;
+      const cleanOrigShort = stripHtmlToPlainSynopsis(originalGame.shortDescription);
       return {
         id: `original-${originalGame.id}`,
         source: 'original',
         sourceLabel: 'Original Library Metadata',
         matchedId: originalGame.id,
+        storeUrl: buildCandidateStoreUrl({
+          source: origSource,
+          title: origTitle,
+          steamAppId: originalGame.steamAppId,
+          gogId: origSource === 'gog' ? origPlat?.platformGameId : undefined,
+          epicSlug: origSource === 'epic' ? origPlat?.platformGameId : undefined,
+        }),
         title: originalGame.title,
-        shortDescription: originalGame.shortDescription,
-        detailedDescription: originalGame.detailedDescription || originalGame.shortDescription,
-        availableDescriptions: originalGame.shortDescription
-          ? [{ source: 'Original Library Synopsis', text: originalGame.shortDescription }]
+        shortDescription: cleanOrigShort || undefined,
+        detailedDescription: originalGame.detailedDescription || cleanOrigShort,
+        availableDescriptions: cleanOrigShort
+          ? [{ source: 'Original Library Synopsis', text: cleanOrigShort }]
           : [],
         releaseDate: originalGame.releaseDate,
         developers: originalGame.developers,
@@ -794,25 +1071,32 @@ export class MetadataScraperService {
       steamMeta: any,
       fallbackTitle: string
     ): MetadataSourceOption => {
+      const cleanSteamShort = stripHtmlToPlainSynopsis(steamMeta?.shortDescription);
       const steamFirstPara = extractFirstParagraph(
         steamMeta?.detailedDescription || steamMeta?.aboutTheGame
       );
       const steamDescs = deduplicateDescriptions([
-        ...(steamMeta?.shortDescription
-          ? [{ source: 'Steam Store Synopsis', text: steamMeta.shortDescription }]
+        ...(cleanSteamShort
+          ? [{ source: 'Steam Store Synopsis', text: cleanSteamShort }]
           : []),
-        ...(steamFirstPara && steamFirstPara !== steamMeta?.shortDescription
+        ...(steamFirstPara && steamFirstPara !== cleanSteamShort
           ? [{ source: 'Steam Detailed Overview', text: steamFirstPara }]
           : []),
       ]);
+      const resolvedTitle = steamMeta?.name || fallbackTitle;
       return {
         id: `steam-${appId}`,
         source: 'steam',
         sourceLabel: 'Steam Store Metadata',
         matchedId: appId,
         steamAppId: appId,
-        title: steamMeta?.name || fallbackTitle,
-        shortDescription: steamMeta?.shortDescription || steamDescs[0]?.text,
+        storeUrl: buildCandidateStoreUrl({
+          source: 'steam',
+          title: resolvedTitle,
+          steamAppId: appId,
+        }),
+        title: resolvedTitle,
+        shortDescription: cleanSteamShort || steamDescs[0]?.text,
         detailedDescription: steamMeta?.detailedDescription || steamMeta?.aboutTheGame,
         availableDescriptions: steamDescs,
         releaseDate: steamMeta?.releaseDate,
@@ -834,7 +1118,9 @@ export class MetadataScraperService {
       fallbackTitle: string
     ): MetadataSourceOption | null => {
       if (!gogMeta && !cachedGog) return null;
-      const gogLead = gogMeta?.shortDescription || cachedGog?.shortDescription;
+      const gogLead = stripHtmlToPlainSynopsis(
+        gogMeta?.shortDescription || cachedGog?.shortDescription
+      );
       const gogFirstPara = extractFirstParagraph(
         gogMeta?.detailedDescription || cachedGog?.aboutTheGame
       );
@@ -844,13 +1130,19 @@ export class MetadataScraperService {
           ? [{ source: 'GOG Detailed Overview', text: gogFirstPara }]
           : []),
       ]);
+      const resolvedTitle = cachedGog?.title || fallbackTitle;
       return {
         id: `gog-${gogId}`,
         source: 'gog',
         sourceLabel: 'GOG.com Metadata',
         matchedId: gogId,
         gogId: String(gogId),
-        title: cachedGog?.title || fallbackTitle,
+        storeUrl: buildCandidateStoreUrl({
+          source: 'gog',
+          title: resolvedTitle,
+          gogId,
+        }),
+        title: resolvedTitle,
         shortDescription: gogLead || gogDescs[0]?.text,
         detailedDescription: gogMeta?.detailedDescription || cachedGog?.aboutTheGame || gogLead,
         availableDescriptions: gogDescs,
@@ -915,7 +1207,10 @@ export class MetadataScraperService {
           if (cachedGog?.shortDescription && cachedGog?.coverVertical) return null;
           try {
             return await Promise.race([
-              fallbackMetadataProvider.fetchGogProductMetadata(crossStoreGogId),
+              fallbackMetadataProvider.fetchGogProductMetadata(
+                crossStoreGogId,
+                candidate.title || originalGame?.title
+              ),
               new Promise<null>((r) => setTimeout(() => r(null), 3500)),
             ]);
           } catch {
@@ -1085,11 +1380,12 @@ export class MetadataScraperService {
           candidate.headerImage ||
           `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`,
         iconUrl: meta?.iconUrl || originalGame?.iconUrl || '',
-        shortDescription:
+        shortDescription: stripHtmlToPlainSynopsis(
           meta?.shortDescription ||
-          availableDescriptions[0]?.text ||
-          originalGame?.shortDescription ||
-          '',
+            availableDescriptions[0]?.text ||
+            originalGame?.shortDescription ||
+            ''
+        ),
         detailedDescription: meta?.detailedDescription || meta?.aboutTheGame || '',
         availableDescriptions,
         availableMetadataSources,
@@ -1119,7 +1415,10 @@ export class MetadataScraperService {
         (async () => {
           try {
             return await Promise.race([
-              fallbackMetadataProvider.fetchGogProductMetadata(gogId),
+              fallbackMetadataProvider.fetchGogProductMetadata(
+                gogId,
+                candidate.title || originalGame?.title
+              ),
               new Promise<null>((r) => setTimeout(() => r(null), 4000)),
             ]);
           } catch (err: any) {
@@ -1183,7 +1482,9 @@ export class MetadataScraperService {
       const availableCovers = deduplicateCovers(rawCovers);
 
       const rawDescriptions: { source: string; text: string }[] = [];
-      const gogLead = storeMeta?.shortDescription || cached?.shortDescription;
+      const gogLead = stripHtmlToPlainSynopsis(
+        storeMeta?.shortDescription || cached?.shortDescription
+      );
       if (gogLead) {
         rawDescriptions.push({
           source: 'GOG Store Synopsis',
@@ -1232,6 +1533,11 @@ export class MetadataScraperService {
         sourceLabel: 'GOG.com Metadata',
         matchedId: gogId,
         gogId: String(gogId),
+        storeUrl: buildCandidateStoreUrl({
+          source: 'gog',
+          title: cached?.title || resolvedTitle,
+          gogId,
+        }),
         title: resolvedTitle,
         shortDescription: gogLead || availableDescriptions[0]?.text,
         detailedDescription: storeMeta?.detailedDescription || cached?.aboutTheGame || '',
@@ -1288,8 +1594,9 @@ export class MetadataScraperService {
           originalGame?.headerImage ||
           '',
         iconUrl: originalGame?.iconUrl || '',
-        shortDescription:
-          gogLead || availableDescriptions[0]?.text || originalGame?.shortDescription || '',
+        shortDescription: stripHtmlToPlainSynopsis(
+          gogLead || availableDescriptions[0]?.text || originalGame?.shortDescription || ''
+        ),
         detailedDescription: storeMeta?.detailedDescription || cached?.aboutTheGame || '',
         availableDescriptions,
         availableMetadataSources,
@@ -1318,18 +1625,25 @@ export class MetadataScraperService {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
+      const epicPlatform = originalGame?.platforms?.find((p) => p.platformId === 'epic');
+      const epicFetchOpts = {
+        appName: epicPlatform?.platformGameId || epicId,
+        namespace: (epicPlatform as any)?.namespace,
+        catalogItemId: (epicPlatform as any)?.catalogItemId,
+        title: candidate.title || originalGame?.title,
+      };
 
       const [storeMeta, steamMeta] = await Promise.all([
         (async () => {
           try {
             let meta = await Promise.race([
-              fallbackMetadataProvider.fetchEpicProductMetadata(cleanSlug),
-              new Promise<null>((r) => setTimeout(() => r(null), 3500)),
+              fallbackMetadataProvider.fetchEpicProductMetadata(cleanSlug, epicFetchOpts),
+              new Promise<null>((r) => setTimeout(() => r(null), 4500)),
             ]);
-            if (!meta && !/^[0-9a-f]{20,}$/i.test(epicId)) {
+            if (!meta) {
               meta = await Promise.race([
-                fallbackMetadataProvider.fetchEpicProductMetadata(epicId),
-                new Promise<null>((r) => setTimeout(() => r(null), 3500)),
+                fallbackMetadataProvider.fetchEpicProductMetadata(epicId, epicFetchOpts),
+                new Promise<null>((r) => setTimeout(() => r(null), 4500)),
               ]);
             }
             return meta;
@@ -1405,7 +1719,9 @@ export class MetadataScraperService {
       const availableCovers = deduplicateCovers(rawCovers);
 
       const rawDescriptions: { source: string; text: string }[] = [];
-      const epicShort = storeMeta?.shortDescription || candidate.description;
+      const epicShort = stripHtmlToPlainSynopsis(
+        storeMeta?.shortDescription || candidate.description
+      );
       if (epicShort) {
         rawDescriptions.push({
           source: 'Epic Store Synopsis',
@@ -1455,13 +1771,24 @@ export class MetadataScraperService {
           ? [{ source: 'Epic Detailed Overview', text: firstPara }]
           : []),
       ]);
+      const verifiedEpicSlug =
+        !/^[0-9a-f]{20,}$/i.test(epicId) && !epicId.startsWith('search-') && epicId !== cleanSlug
+          ? epicId
+          : undefined;
       const availableMetadataSources: MetadataSourceOption[] = [
         {
           id: `epic-${epicId}`,
           source: 'epic',
           sourceLabel: 'Epic Games Store',
           matchedId: epicId,
-          epicSlug: cleanSlug || String(epicId),
+          epicSlug: verifiedEpicSlug || cleanSlug || String(epicId),
+          storeUrl:
+            candidate.storeUrl ||
+            buildCandidateStoreUrl({
+              source: 'epic',
+              title: resolvedTitle,
+              epicSlug: verifiedEpicSlug,
+            }),
           title: resolvedTitle,
           shortDescription: epicShort || epicDescs[0]?.text,
           detailedDescription: storeMeta?.detailedDescription || candidate.description || '',
@@ -1504,8 +1831,9 @@ export class MetadataScraperService {
           originalGame?.headerImage ||
           '',
         iconUrl: storeMeta?.iconUrl || originalGame?.iconUrl || '',
-        shortDescription:
-          epicShort || availableDescriptions[0]?.text || originalGame?.shortDescription || '',
+        shortDescription: stripHtmlToPlainSynopsis(
+          epicShort || availableDescriptions[0]?.text || originalGame?.shortDescription || ''
+        ),
         detailedDescription: storeMeta?.detailedDescription || candidate.description || '',
         availableDescriptions,
         availableMetadataSources,
@@ -1611,10 +1939,11 @@ export class MetadataScraperService {
     const availableCovers = deduplicateCovers(rawCovers);
 
     const rawDescriptions: { source: string; text: string }[] = [];
-    if (candidate.description) {
+    const cleanIgdbDesc = stripHtmlToPlainSynopsis(candidate.description);
+    if (cleanIgdbDesc) {
       rawDescriptions.push({
         source: 'IGDB Overview',
-        text: candidate.description,
+        text: cleanIgdbDesc,
       });
     }
 
@@ -1651,11 +1980,18 @@ export class MetadataScraperService {
         sourceLabel: 'IGDB Metadata',
         matchedId: matchedIgdbId,
         igdbId: matchedIgdbId,
+        storeUrl:
+          candidate.storeUrl ||
+          buildCandidateStoreUrl({
+            source: 'igdb',
+            title: candidate.title,
+            igdbId: matchedIgdbId,
+          }),
         title: candidate.title,
-        shortDescription: candidate.description,
+        shortDescription: cleanIgdbDesc || undefined,
         detailedDescription: candidate.description,
-        availableDescriptions: candidate.description
-          ? [{ source: 'IGDB Overview', text: candidate.description }]
+        availableDescriptions: cleanIgdbDesc
+          ? [{ source: 'IGDB Overview', text: cleanIgdbDesc }]
           : [],
         releaseDate: candidate.year ? String(candidate.year) : undefined,
         capsuleImage: igdbCover || candidate.capsuleImage,
@@ -1687,8 +2023,9 @@ export class MetadataScraperService {
       availableCovers,
       headerImage: candidate.headerImage || originalGame?.headerImage || availableCovers[0]?.url || '',
       iconUrl: originalGame?.iconUrl || '',
-      shortDescription:
-        candidate.description || availableDescriptions[0]?.text || originalGame?.shortDescription || '',
+      shortDescription: stripHtmlToPlainSynopsis(
+        cleanIgdbDesc || availableDescriptions[0]?.text || originalGame?.shortDescription || ''
+      ),
       detailedDescription:
         candidate.description || originalGame?.detailedDescription || originalGame?.shortDescription || '',
       availableDescriptions,
@@ -1893,8 +2230,18 @@ export class MetadataScraperService {
             sourceLabel: `Steam Store Metadata — ${resolvedName}`,
             matchedId: appId,
             steamAppId: appId,
+            storeUrl:
+              cand.storeUrl ||
+              buildCandidateStoreUrl({
+                source: 'steam',
+                title: resolvedName,
+                steamAppId: appId,
+              }),
             title: resolvedName,
-            shortDescription: meta?.shortDescription || descs[0]?.text || cand.description,
+            shortDescription:
+              stripHtmlToPlainSynopsis(
+                meta?.shortDescription || descs[0]?.text || cand.description
+              ) || undefined,
             detailedDescription:
               meta?.detailedDescription ||
               meta?.aboutTheGame ||
@@ -1923,7 +2270,10 @@ export class MetadataScraperService {
           if (!cached?.shortDescription) {
             try {
               storeMeta = await Promise.race([
-                fallbackMetadataProvider.fetchGogProductMetadata(gogId),
+                fallbackMetadataProvider.fetchGogProductMetadata(
+                  gogId,
+                  cand.title || game?.title
+                ),
                 new Promise<null>((r) => setTimeout(() => r(null), 3500)),
               ]);
             } catch {
@@ -1931,8 +2281,9 @@ export class MetadataScraperService {
             }
           }
 
-          const gogLead =
-            storeMeta?.shortDescription || cached?.shortDescription || cand.description;
+          const gogLead = stripHtmlToPlainSynopsis(
+            storeMeta?.shortDescription || cached?.shortDescription || cand.description
+          );
           const firstPara = extractFirstParagraph(
             storeMeta?.detailedDescription || cached?.aboutTheGame
           );
@@ -1943,13 +2294,21 @@ export class MetadataScraperService {
               : []),
           ]);
 
+          const resolvedGogTitle = cand.title || cached?.title || '';
           return {
             id: `gog-${gogId}`,
             source: 'gog',
             sourceLabel: `GOG.com Metadata — ${cand.title}`,
             matchedId: gogId,
             gogId,
-            title: cand.title || cached?.title || '',
+            storeUrl:
+              cand.storeUrl ||
+              buildCandidateStoreUrl({
+                source: 'gog',
+                title: resolvedGogTitle,
+                gogId,
+              }),
+            title: resolvedGogTitle,
             shortDescription: gogLead || descs[0]?.text,
             detailedDescription:
               storeMeta?.detailedDescription || cached?.aboutTheGame || gogLead,
@@ -1986,7 +2345,9 @@ export class MetadataScraperService {
             storeMeta = null;
           }
 
-          const epicShort = storeMeta?.shortDescription || cand.description;
+          const epicShort = stripHtmlToPlainSynopsis(
+            storeMeta?.shortDescription || cand.description
+          );
           const firstPara = extractFirstParagraph(
             storeMeta?.detailedDescription || storeMeta?.aboutTheGame
           );
@@ -2003,6 +2364,13 @@ export class MetadataScraperService {
             sourceLabel: `Epic Games Store — ${cand.title}`,
             matchedId: epicId,
             epicSlug: cleanSlug || String(epicId),
+            storeUrl:
+              cand.storeUrl ||
+              buildCandidateStoreUrl({
+                source: 'epic',
+                title: cand.title,
+                epicSlug: cleanSlug || String(epicId),
+              }),
             title: cand.title,
             shortDescription: epicShort || descs[0]?.text,
             detailedDescription: storeMeta?.detailedDescription || epicShort,
@@ -2019,17 +2387,25 @@ export class MetadataScraperService {
         }
 
         // IGDB candidate
+        const cleanCandDesc = stripHtmlToPlainSynopsis(cand.description);
         return {
           id: String(cand.id),
           source: 'igdb',
           sourceLabel: `IGDB Metadata — ${cand.title}`,
           matchedId: cand.igdbId || cand.id,
           igdbId: cand.igdbId || cand.id,
+          storeUrl:
+            cand.storeUrl ||
+            buildCandidateStoreUrl({
+              source: 'igdb',
+              title: cand.title,
+              igdbId: cand.igdbId || cand.id,
+            }),
           title: cand.title,
-          shortDescription: cand.description,
+          shortDescription: cleanCandDesc || undefined,
           detailedDescription: cand.description,
-          availableDescriptions: cand.description
-            ? [{ source: 'IGDB Overview', text: cand.description }]
+          availableDescriptions: cleanCandDesc
+            ? [{ source: 'IGDB Overview', text: cleanCandDesc }]
             : [],
           releaseDate: cand.year ? String(cand.year) : undefined,
           capsuleImage: cand.capsuleImage,
@@ -2053,16 +2429,28 @@ export class MetadataScraperService {
     ) {
       const origId = `original-${game.id}`;
       if (!seenIds.has(origId)) {
+        const origPlat = game.platforms?.[0];
+        const origSource = origPlat?.platformId || (game.steamAppId ? 'steam' : 'original');
+        const origTitle =
+          game.originalStoreTitle || origPlat?.originalTitle || game.title;
+        const cleanGameShort = stripHtmlToPlainSynopsis(game.shortDescription);
         results.push({
           id: origId,
           source: 'original',
           sourceLabel: 'Original Library Metadata',
           matchedId: game.id,
+          storeUrl: buildCandidateStoreUrl({
+            source: origSource,
+            title: origTitle,
+            steamAppId: game.steamAppId,
+            gogId: origSource === 'gog' ? origPlat?.platformGameId : undefined,
+            epicSlug: origSource === 'epic' ? origPlat?.platformGameId : undefined,
+          }),
           title: game.title,
-          shortDescription: game.shortDescription,
-          detailedDescription: game.detailedDescription || game.shortDescription,
-          availableDescriptions: game.shortDescription
-            ? [{ source: 'Original Library Synopsis', text: game.shortDescription }]
+          shortDescription: cleanGameShort || undefined,
+          detailedDescription: game.detailedDescription || cleanGameShort,
+          availableDescriptions: cleanGameShort
+            ? [{ source: 'Original Library Synopsis', text: cleanGameShort }]
             : [],
           releaseDate: game.releaseDate,
           developers: game.developers,

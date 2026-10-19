@@ -35,16 +35,33 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
         <div className="p-2.5 bg-[#171a21] border border-[#2a475e]/60 rounded-sm flex items-center justify-between">
           <div className="flex items-center gap-2">
             <svg
-              className="w-5 h-5 text-white"
+              className="w-5 h-5 text-white shrink-0"
               viewBox="0 0 24 24"
               fill="currentColor"
+              aria-hidden="true"
             >
-              <path d="M6 3C4.34315 3 3 4.34315 3 6V18C3 19.6569 4.34315 21 6 21H18C19.6569 21 21 19.6569 21 18V6C21 4.34315 19.6569 3 18 3H6ZM7 6C7.55228 6 8 6.44772 8 7C8 7.55228 7.55228 8 7 8C6.44772 8 6 7.55228 6 7C6 6.44772 6.44772 6 7 6ZM7 16C7.55228 16 8 16.4477 8 17C8 17.5523 7.55228 18 7 18C6.44772 18 6 17.5523 6 17C6 16.4477 6.44772 16 7 16ZM17 6C17.5523 6 18 6.44772 18 7C18 7.55228 17.5523 8 17 8C16.4477 8 16 7.55228 16 7C16 6.44772 16.4477 6 17 6ZM17 16C17.5523 16 18 16.4477 18 17C18 17.5523 17.5523 18 17 18C16.4477 18 16 17.5523 16 17C16 16.4477 16.4477 16 17 16Z" />
+              <circle cx="9.5" cy="12" r="4.2" />
+              <path d="M9.5 3a9 9 0 0 1 0 18v-2.8a6.2 6.2 0 0 0 0-12.4V3z" />
             </svg>
             <span className="text-xs text-[#acb2b8] font-medium">Steam Deck</span>
           </div>
-          <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/80 border border-emerald-500/50 px-1.5 py-0.5 rounded-sm">
-            VERIFIED
+          <span className="inline-flex items-center gap-1.5 text-[10px] font-bold text-white bg-[#1b2838]/90 border border-[#59bf40]/50 px-2 py-0.5 rounded-sm">
+            <svg
+              className="w-3.5 h-3.5 shrink-0"
+              viewBox="0 0 20 20"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle cx="10" cy="10" r="9" fill="#59bf40" />
+              <path
+                d="M6 10.3L8.6 12.9L14.2 7.3"
+                stroke="#171a21"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <span className="tracking-wide text-[#59bf40]">VERIFIED</span>
           </span>
         </div>
       </div>

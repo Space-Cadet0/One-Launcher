@@ -11,8 +11,6 @@ import { steamMatcher } from '../steam/steamMatcher';
 import {
   KNOWN_GAMES_WITHOUT_ACHIEVEMENTS,
   BALDURS_GATE_2_ACHIEVEMENTS,
-  buildBaldursGate2Achievements,
-  buildAlanWake2Achievements,
 } from './canonicalAchievementSchemas';
 import {
   KNOWN_USER_STEAM_ACHIEVEMENTS,
@@ -194,27 +192,62 @@ export class AchievementDetailService {
       } catch (err: any) {
         console.warn(`[AchievementDetailService] Live public schema fetch warning for AppID ${appId}:`, err?.message);
       }
-    }
 
-    // Curated masterpiece fallbacks for offline resilience or storefront exclusives
-    if (
-      game.steamAppId === 257350 ||
-      titleLower.includes("baldur's gate ii") ||
-      titleLower.includes('baldurs gate ii')
-    ) {
-      const schema = buildBaldursGate2Achievements('steam');
-      this.schemaCache.set(cacheKey, schema);
-      return schema;
-    }
+      // Secondary zero-auth official fallback: ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/
+      try {
+        const url = `${this.getSteamApiBaseUrl()}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid=${appId}`;
+        const apiRes = await axios.get(url, { timeout: 6000 });
+        const apiList = apiRes.data?.achievementpercentages?.achievements;
+        if (Array.isArray(apiList) && apiList.length > 0) {
+          const parsedFromApi: DetailedAchievement[] = apiList.map((item: any, idx: number) => {
+            const rawApiName = String(item.name || `ACH_${idx + 1}`);
+            const strippedApi = rawApiName.replace(/^ACH_/i, '');
+            const knownEntry = BALDURS_GATE_2_ACHIEVEMENTS.find(
+              (b) =>
+                b.apiName.toLowerCase() === rawApiName.toLowerCase() ||
+                b.apiName.toLowerCase() === strippedApi.toLowerCase()
+            );
+            const rawPct = parseFloat(item.percent);
+            const pctVal = !isNaN(rawPct)
+              ? Math.round(rawPct * 10) / 10
+              : knownEntry?.pct;
+            const humanName =
+              knownEntry?.name ||
+              strippedApi
+                .replace(/_/g, ' ')
+                .replace(/([a-z])([A-Z])/g, '$1 $2')
+                .replace(/\b\w/g, (c) => c.toUpperCase());
+            const iconUrl = knownEntry?.iconHash
+              ? `https://steamcdn-a.akamaihd.net/steamcommunity/public/images/apps/${appId}/${knownEntry.iconHash}.jpg`
+              : `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;
 
-    if (titleLower === 'alan wake 2' || game.id.includes('alan-wake-2')) {
-      const schema = buildAlanWake2Achievements();
-      this.schemaCache.set(cacheKey, schema);
-      return schema;
+            return {
+              id: `steam:${appId}:${rawApiName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+              apiName: rawApiName,
+              name: humanName,
+              description: knownEntry?.description || `Unlock ${humanName} in ${game.title}.`,
+              unlocked: false,
+              iconUnlockedUrl: iconUrl,
+              iconLockedUrl: iconUrl,
+              globalPercentage: pctVal,
+              rarityTier: classifyRarityTier(pctVal),
+              isSecret: Boolean(knownEntry?.isSecret),
+              storefrontId: 'steam',
+            };
+          });
+          this.schemaCache.set(cacheKey, parsedFromApi);
+          return parsedFromApi;
+        }
+      } catch {}
     }
 
     if (appId) {
-      const totalCount = (knownAchievementsJson as Record<string, number>)[String(appId)] || 25;
+      const platformMaxTotal = Array.isArray(game.platforms)
+        ? Math.max(0, ...game.platforms.map((p) => p.achievements?.total || 0))
+        : 0;
+      const totalCount =
+        (knownAchievementsJson as Record<string, number>)[String(appId)] ||
+        (platformMaxTotal > 0 ? platformMaxTotal : 25);
       if (totalCount > 0) {
         const generated = this.generateStructuredSchema(game, appId, totalCount);
         this.schemaCache.set(cacheKey, generated);
@@ -238,11 +271,11 @@ export class AchievementDetailService {
       if (nameMatch) {
         const name = nameMatch[1].trim();
         let desc = descMatch ? descMatch[1].trim() : '';
-        if (!desc && appId === 257350) {
-          const knownBg2 = BALDURS_GATE_2_ACHIEVEMENTS.find(
+        if (!desc && BALDURS_GATE_2_ACHIEVEMENTS.length > 0) {
+          const knownEntry = BALDURS_GATE_2_ACHIEVEMENTS.find(
             (b) => b.name.toLowerCase() === name.toLowerCase()
           );
-          if (knownBg2) desc = knownBg2.description;
+          if (knownEntry) desc = knownEntry.description;
         }
 
         const icon = imgMatch ? imgMatch[1].trim() : `https://shared.fastly.steamstatic.com/community_assets/images/apps/${appId}/header.jpg`;

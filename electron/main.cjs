@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, nativeImage } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -11,6 +11,14 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 let mainWindow = null;
 launcherEngine.setMainWindowGetter(() => mainWindow);
 
+function getAppIconPath() {
+  const ext = process.platform === 'win32' ? 'icon.ico' : 'icon.png';
+  const candidate = path.join(__dirname, 'assets', ext);
+  if (fs.existsSync(candidate)) return candidate;
+  const fallback = path.join(__dirname, '../build', ext);
+  return fs.existsSync(fallback) ? fallback : undefined;
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -18,8 +26,12 @@ function createMainWindow() {
     minWidth: 1024,
     minHeight: 700,
     title: 'One Launcher',
+    icon: getAppIconPath(),
     backgroundColor: '#0b0f17',
-    titleBarStyle: 'hiddenInset', // Native sleek macOS titlebar
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    ...(process.platform === 'darwin'
+      ? { trafficLightPosition: { x: 16, y: 19 } }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
@@ -55,6 +67,17 @@ function createMainWindow() {
     return { action: 'allow' };
   });
 
+  mainWindow.on('enter-full-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:fullscreen-changed', true);
+    }
+  });
+  mainWindow.on('leave-full-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:fullscreen-changed', false);
+    }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -73,6 +96,19 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(() => {
+    if (process.platform === 'darwin' && app.dock && !app.isPackaged) {
+      try {
+        const iconPath = getAppIconPath();
+        if (iconPath) {
+          const dockImg = nativeImage.createFromPath(iconPath);
+          if (!dockImg.isEmpty()) {
+            app.dock.setIcon(dockImg);
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to set macOS dock icon:', err.message);
+      }
+    }
     // Intercept YouTube and external video embed requests to allow playback from file:// origins
     const embedFilters = [
       '*://*.youtube.com/*',
@@ -135,15 +171,18 @@ if (!gotTheLock) {
           details.requestHeaders['Referer'] = 'https://www.gog.com/';
         }
 
-        // Steam age-gate cookies for store.steampowered.com only (never api.steampowered.com or login.steampowered.com)
+        // Steam age-gate & English language cookies for store.steampowered.com only (never api.steampowered.com or login.steampowered.com)
         if (url.includes('store.steampowered.com')) {
           const existingCookie = details.requestHeaders['Cookie'] || details.requestHeaders['cookie'] || '';
           delete details.requestHeaders['cookie'];
-          const steamMature = 'birthtime=568022401; mature_content=1; wants_mature_content=1';
+          delete details.requestHeaders['accept-language'];
+          details.requestHeaders['Accept-Language'] = 'en-US,en;q=0.9';
+          const steamMature = 'Steam_Language=english; birthtime=568022401; mature_content=1; wants_mature_content=1';
           if (!existingCookie) {
             details.requestHeaders['Cookie'] = steamMature;
           } else {
-            let updated = existingCookie;
+            let updated = existingCookie.replace(/Steam_Language=[a-zA-Z_-]+/gi, 'Steam_Language=english');
+            if (!/Steam_Language=/i.test(updated)) updated = `Steam_Language=english; ${updated}`;
             if (!updated.includes('birthtime=')) updated += '; birthtime=568022401';
             if (!updated.includes('mature_content=')) updated += '; mature_content=1';
             if (!updated.includes('wants_mature_content=')) updated += '; wants_mature_content=1';
@@ -205,6 +244,12 @@ if (!gotTheLock) {
     });
   });
 }
+
+app.on('before-quit', () => {
+  try {
+    launcherEngine.shutdownLauncherEngine();
+  } catch {}
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -470,6 +515,7 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
   const localPlaytimes = readLocalSteamPlaytimes();
   const localAchievements = scanLocalSteamAchievementsSync();
   const games = [];
+  const suppressedItems = [];
 
   for (const g of rgGames) {
     const appId = Number(g.appid);
@@ -495,9 +541,10 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
         ? g.capsule_filename
         : 'library_600x900_2x.jpg');
 
-    games.push({
+    const gameObj = {
       id: `steam-${appId}`,
       title,
+      originalStoreTitle: title,
       sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
       steamAppId: appId,
       isVerifiedEntitlement: true,
@@ -505,6 +552,7 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
         {
           platformId: 'steam',
           platformGameId: String(appId),
+          originalTitle: title,
           installed: false,
           playtimeMinutes,
           lastPlayed,
@@ -526,7 +574,32 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
       publishers: [],
       genres: [],
       tags: ['Steam'],
-    });
+    };
+
+    const nonGameReason =
+      typeof storeSync.classifyNonGameStorefrontItem === 'function'
+        ? storeSync.classifyNonGameStorefrontItem({
+            title,
+            platformId: 'steam',
+            platformGameId: String(appId),
+            isDlc: false,
+          })
+        : null;
+
+    if (nonGameReason) {
+      suppressedItems.push({
+        id: `steam-${appId}`,
+        rawTitle: title,
+        platformId: 'steam',
+        platformGameId: String(appId),
+        reason: nonGameReason,
+        reasonCategory: 'non_game_filter',
+        rawGame: gameObj,
+      });
+      continue;
+    }
+
+    games.push(gameObj);
   }
 
   return {
@@ -534,6 +607,7 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
     accountId: steamId,
     avatarUrl,
     games,
+    suppressedItems,
   };
 }
 
@@ -977,16 +1051,18 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
               },
             });
 
+            let timer = null;
             const finish = (val) => {
               if (done) return;
               done = true;
+              if (timer) clearTimeout(timer);
               try {
                 if (!bgWin.isDestroyed()) bgWin.destroy();
               } catch {}
               resolveSsr(val);
             };
 
-            const timer = setTimeout(() => finish(null), 12000);
+            timer = setTimeout(() => finish(null), 12000);
 
             bgWin.webContents.on('did-finish-load', async () => {
               if (done || bgWin.isDestroyed()) return;
@@ -1040,14 +1116,12 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
                   })()
                 `);
                 if (extracted && Array.isArray(extracted.rgGames) && extracted.rgGames.length > 0) {
-                  clearTimeout(timer);
                   finish(extracted);
                 }
               } catch {}
             });
 
             bgWin.loadURL('https://steamcommunity.com/my/games/?tab=all').catch(() => {
-              clearTimeout(timer);
               finish(null);
             });
           });
@@ -1082,9 +1156,12 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
           const appId = Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0));
           const localPt = appId ? localPlaytimes[appId] : null;
           const ach = appId ? steamAchMap[appId] : null;
-          if ((!localPt || !localPt.playtimeMinutes) && !ach) return g;
+          if ((!localPt || !localPt.playtimeMinutes) && !ach) {
+            return g.isVerifiedEntitlement === true ? g : { ...g, isVerifiedEntitlement: true };
+          }
           return {
             ...g,
+            isVerifiedEntitlement: true,
             platforms: (g.platforms || []).map((p) => {
               if (p.platformId !== 'steam') return p;
               const mergedPt = localPt && localPt.playtimeMinutes
@@ -1122,6 +1199,10 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
         avatarUrl,
         games,
         achievements: steamAchMap,
+        suppressedItems:
+          typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+            ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'steam')
+            : [],
       };
     } else if (storefrontId === 'gog') {
       let accessToken = tokenData.access_token || fallbackCredentials?.gogToken;
@@ -1146,6 +1227,10 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
           throw err;
         }
       }
+      const localGogSuppressed =
+        typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+          ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'gog')
+          : [];
       return {
         success: true,
         storefrontId,
@@ -1154,6 +1239,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
         avatarUrl,
         games,
         achievements: storeSync.fetchGogOwnedGames.lastAchievementsMap || {},
+        suppressedItems: [...(storeSync.fetchGogOwnedGames.lastSuppressedItems || []), ...localGogSuppressed],
       };
     } else if (storefrontId === 'epic') {
       let accessToken = tokenData.access_token || fallbackCredentials?.epicToken;
@@ -1189,6 +1275,10 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
           }
         }
       }
+      const localEpicSuppressed =
+        typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+          ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'epic')
+          : [];
       return {
         success: true,
         storefrontId,
@@ -1197,6 +1287,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
         avatarUrl,
         games,
         achievements: storeSync.fetchEpicOwnedGames.lastAchievementsMap || {},
+        suppressedItems: [...(storeSync.fetchEpicOwnedGames.lastSuppressedItems || []), ...localEpicSuppressed],
       };
     }
 
@@ -1207,7 +1298,49 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
 });
 
 ipcMain.handle('store:get-tokens', async () => {
-  return storeSync.loadSavedTokens();
+  const saved = storeSync.loadSavedTokens() || {};
+  if (saved.gog && saved.gog.access_token) {
+    const normalizedExisting =
+      typeof storeSync.normalizeGogAvatarUrl === 'function'
+        ? storeSync.normalizeGogAvatarUrl(saved.gog.avatarUrl, saved.gog.avatars)
+        : saved.gog.avatarUrl;
+    if (normalizedExisting && normalizedExisting !== saved.gog.avatarUrl) {
+      saved.gog.avatarUrl = normalizedExisting;
+      storeSync.saveTokens('gog', saved.gog);
+    }
+    if (!saved.gog.avatarUrl || !saved.gog.username) {
+      try {
+        const account = await storeSync.fetchGogAccount(saved.gog.access_token);
+        if (account) {
+          saved.gog.username = account.username || saved.gog.username;
+          saved.gog.avatarUrl = account.avatarUrl || saved.gog.avatarUrl;
+          saved.gog.user_id = account.userId || saved.gog.user_id;
+          storeSync.saveTokens('gog', saved.gog);
+        }
+      } catch {
+        if (saved.gog.refresh_token) {
+          try {
+            const renewed = await storeSync.renewGogTokens(saved.gog.refresh_token);
+            const account = await storeSync.fetchGogAccount(renewed.access_token);
+            saved.gog = {
+              ...saved.gog,
+              ...renewed,
+              username: account?.username || saved.gog.username,
+              avatarUrl: account?.avatarUrl || saved.gog.avatarUrl,
+              user_id: account?.userId || renewed.user_id || saved.gog.user_id,
+            };
+            storeSync.saveTokens('gog', saved.gog);
+          } catch {}
+        }
+      }
+    }
+  }
+  if (typeof storeSync.scanLocalSuppressedStorefrontItems === 'function') {
+    try {
+      saved.suppressedItems = storeSync.scanLocalSuppressedStorefrontItems();
+    } catch {}
+  }
+  return saved;
 });
 
 ipcMain.handle('store:clear-tokens', async (_event, storefrontId) => {
@@ -1234,6 +1367,15 @@ ipcMain.handle('epic:fetch-achievements', async (_event, { accountId, accessToke
   } catch (err) {
     console.warn('IPC epic:fetch-achievements warning:', err.message);
     return {};
+  }
+});
+
+ipcMain.handle('store:fetch-epic-metadata', async (_event, payload = {}) => {
+  try {
+    return await storeSync.fetchEpicProductOfferMetadata(payload);
+  } catch (err) {
+    console.warn('IPC store:fetch-epic-metadata warning:', err.message);
+    return null;
   }
 });
 

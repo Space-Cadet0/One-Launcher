@@ -2,7 +2,7 @@ import axios from 'axios';
 import { CanonicalGame, StoreAchievementSummary } from '../../contracts/game';
 import { StorefrontCredentials } from '../../contracts/integration';
 import { EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
-import { KNOWN_EPIC_APP_NAMES } from './epicCodenames';
+import { KNOWN_EPIC_APP_NAMES, UNMAPPED_EPIC_INTERNAL_CODENAMES } from './epicCodenames';
 import { steamMatcher } from '../steam/steamMatcher';
 import { cacheUserEpicAchievements } from '../storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
@@ -312,7 +312,7 @@ export class EpicIntegrationService {
           if (catalogGame) {
             if (!seenIds.has(catalogGame.id)) {
               seenIds.add(catalogGame.id);
-              games.push(catalogGame);
+              games.push({ ...catalogGame, isVerifiedEntitlement: true });
             }
             continue;
           }
@@ -370,7 +370,7 @@ export class EpicIntegrationService {
           }
 
           // Reject raw codenames that aren't mapped
-          if (['bobcat', 'boxfish', 'calluna', 'catnip', 'cormorant'].includes(title.toLowerCase())) {
+          if (UNMAPPED_EPIC_INTERNAL_CODENAMES.has(title.toLowerCase().trim())) {
             continue;
           }
 
@@ -548,17 +548,15 @@ export class EpicIntegrationService {
 
     let baseGames: CanonicalGame[] = [];
     if (liveGames.length > 0) {
-      // Merge live games with baseline so no previously indexed title is lost
-      const gameMap = new Map<string, CanonicalGame>();
-      for (const g of EPIC_USER_LIBRARY) {
-        gameMap.set(g.id, g);
-      }
-      for (const g of liveGames) {
-        gameMap.set(g.id, g);
-      }
-      baseGames = Array.from(gameMap.values());
+      baseGames = liveGames.map((g) => ({
+        ...g,
+        isVerifiedEntitlement: true,
+      }));
     } else {
-      baseGames = EPIC_USER_LIBRARY;
+      baseGames = EPIC_USER_LIBRARY.map((g) => ({
+        ...g,
+        isVerifiedEntitlement: true,
+      }));
     }
 
     // Apply achievements to the resolved user library

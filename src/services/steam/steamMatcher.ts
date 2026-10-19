@@ -290,6 +290,7 @@ export class SteamMatcherService {
         }
       }
       localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
+      localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
     } catch {
       // Ignore write errors
     }
@@ -323,6 +324,43 @@ export class SteamMatcherService {
       return '/api/steam-store';
     }
     return 'https://store.steampowered.com';
+  }
+
+  /**
+   * Checks whether a Steam match lookup has already been attempted (positively or negatively within TTL).
+   */
+  public hasAttemptedMatch(title: string): boolean {
+    if (!title || !title.trim()) return true;
+    const cleanRaw = title.trim();
+    const lowerKey = cleanRaw.toLowerCase();
+
+    if (this.matchGameToSteamInstant(cleanRaw)) {
+      return true;
+    }
+
+    const normalized = normalizeGameTitle(cleanRaw).toLowerCase();
+    if (
+      NON_GAME_SOURCE_REGEX.test(cleanRaw) ||
+      KNOWN_NON_STEAM_TITLES.has(lowerKey) ||
+      KNOWN_NON_STEAM_TITLES.has(normalized)
+    ) {
+      return true;
+    }
+
+    if (this.cache.has(lowerKey)) {
+      const val = this.cache.get(lowerKey);
+      if (typeof val === 'number' && val > 0) {
+        return true;
+      }
+      if (val === null) {
+        const cachedAt = this.negativeTimestamps.get(lowerKey);
+        if (cachedAt && Date.now() - cachedAt < NEGATIVE_MATCH_TTL_MS) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -475,6 +513,9 @@ export class SteamMatcherService {
     const searchStrategies = [
       normalized,                                     // Strategy 1: Normalized clean title
       cleanRaw,                                       // Strategy 2: Exact raw title
+      ...(cleanRaw.includes('+')
+        ? [normalized.replace(/\+/g, ' ').replace(/\s+/g, ' ').trim()]
+        : []),
       ...(hasCorroboratingMetadata
         ? [
             normalized.split(':')[0].trim(),          // Strategy 3: Base title without subtitle (corroborated)

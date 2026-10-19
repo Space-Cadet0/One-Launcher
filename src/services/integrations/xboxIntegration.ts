@@ -10,7 +10,11 @@ export class XboxIntegrationService {
     const avatarUrl = 'https://assets.xboxservices.com/assets/default-gamerpic.png';
 
     // Synchronize owned Xbox / PC Game Pass library
-    return { accountName, avatarUrl, games: XBOX_USER_LIBRARY };
+    const games = XBOX_USER_LIBRARY.map((g) => ({
+      ...g,
+      isVerifiedEntitlement: true,
+    }));
+    return { accountName, avatarUrl, games };
   }
 }
 

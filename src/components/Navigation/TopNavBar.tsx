@@ -15,6 +15,7 @@ import {
   Trophy,
   Award,
   Download,
+  Sliders,
 } from 'lucide-react';
 
 interface TopNavBarProps {
@@ -49,6 +50,7 @@ interface TopNavBarProps {
   isSyncingTrophies?: boolean;
   onSyncTrophies?: () => void;
   onOpenFixMatch?: () => void;
+  onOpenLibraryMatchManager?: () => void;
   defaultMenuOpen?: boolean;
   onOpenAchievements?: () => void;
   onOpenDownloads?: () => void;
@@ -83,13 +85,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   isSyncingTrophies = false,
   onSyncTrophies,
   onOpenFixMatch,
+  onOpenLibraryMatchManager,
   defaultMenuOpen = false,
   onOpenAchievements,
   onOpenDownloads,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(defaultMenuOpen);
+  const [isFullScreen, setIsFullScreen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
+    if (api?.onFullscreenChanged) {
+      return api.onFullscreenChanged((full: boolean) => setIsFullScreen(Boolean(full)));
+    }
+  }, []);
+
+  const isMacWindow =
+    typeof window !== 'undefined' &&
+    ((window as any).electronAPI?.platform
+      ? (window as any).electronAPI.platform === 'darwin'
+      : Boolean((window as any).electronAPI?.isElectron) &&
+        /Mac|Darwin/i.test(navigator.platform || navigator.userAgent || ''));
+  const needsTrafficLightInset = isMacWindow && !isFullScreen;
 
   useEffect(() => {
     const unsub = launcherService.subscribe(() => {
@@ -188,20 +207,32 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   }, [connectedSet, storesInLibrary]);
 
   return (
-    <header className="sticky top-0 z-40 bg-[#171a21]/95 backdrop-blur-md border-b border-steam-border shadow-md select-none">
-      <div className="max-w-[1700px] mx-auto px-4 py-2.5 flex items-center justify-between gap-3">
+    <header
+      className="app-drag-region sticky top-0 z-40 bg-[#171a21]/95 backdrop-blur-md border-b border-steam-border shadow-md select-none"
+      style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+    >
+      <div
+        data-mac-traffic-inset={needsTrafficLightInset ? 'true' : 'false'}
+        className={`w-full pr-4 ${
+          needsTrafficLightInset ? 'pl-[88px]' : 'pl-4'
+        } py-2.5 flex items-center justify-between gap-3`}
+      >
         {/* Left Section: Burger Menu + History Navigation */}
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div
+          className="app-no-drag flex items-center gap-2.5 shrink-0"
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
           {/* Burger Menu Button with Dropdown */}
           <div className="relative" ref={menuRef}>
             <button
               type="button"
               onClick={() => setIsMenuOpen((prev) => !prev)}
-              className={`p-2 rounded transition-all flex items-center justify-center border shadow-sm cursor-pointer ${
+              className={`app-no-drag p-2 rounded transition-all flex items-center justify-center border shadow-sm cursor-pointer ${
                 isMenuOpen
                   ? 'bg-steam-accent text-black border-steam-accent shadow-[0_0_12px_rgba(102,192,244,0.4)]'
                   : 'bg-[#10141a] text-steam-text hover:text-white hover:bg-[#1a222d] border-steam-border/80'
               }`}
+              style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
               title="Menu (Accounts, Sync All)"
               aria-label="Menu"
               aria-expanded={isMenuOpen}
@@ -214,21 +245,38 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
 
             {/* Burger Dropdown Menu */}
             {isMenuOpen && (
-              <div className="absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-150">
+              <div
+                className="app-no-drag absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-150"
+                style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+              >
                 {/* Brand Header */}
                 <div className="px-3.5 py-1.5 border-b border-steam-border/60 mb-1 flex items-center justify-between">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-steam-accent">One Launcher</span>
+                  <div className="flex items-center gap-1.5">
+                    <img
+                      src="./favicon-32x32.png"
+                      alt="One Launcher"
+                      className="w-4 h-4 rounded-sm object-contain shrink-0"
+                    />
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-steam-accent">
+                      One Launcher
+                    </span>
+                  </div>
                   <span className="text-[10px] text-steam-subtext font-mono">v0.1.0</span>
                 </div>
 
-                {/* Accounts */}
+                {/* Group 1: Accounts & Library Management */}
+                <div className="px-3.5 pt-1 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
+                  Accounts &amp; Library
+                </div>
+
+                {/* 1. Accounts */}
                 <button
                   type="button"
                   onClick={() => {
                     setIsMenuOpen(false);
                     onOpenIntegrations();
                   }}
-                  className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
                 >
                   <div className="flex items-center gap-2.5">
                     <Cloud className="w-4 h-4 text-sky-400 group-hover:scale-110 transition-transform" />
@@ -240,219 +288,260 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
                 </button>
 
-                {/* Sync Integrations */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsMenuOpen(false);
-                    onTriggerSync();
-                  }}
-                  disabled={isSyncing}
-                  className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
-                  title="Sync all connected accounts (owned games, trophies & achievements, playtime)"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <RefreshCw
-                      className={`w-4 h-4 ${
-                        isSyncing
-                          ? 'animate-spin text-steam-accent'
-                          : 'text-emerald-400 group-hover:rotate-45 transition-transform'
-                      }`}
-                    />
-                    <div className="flex flex-col">
-                      <span className="font-semibold text-white">
-                        {isSyncing ? 'Syncing...' : 'Sync Integrations'}
-                      </span>
-                      <span className="text-[10px] text-steam-subtext">Games, trophies & playtime</span>
+                {/* 2. Library Match & Overrides Studio */}
+                {onOpenLibraryMatchManager && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onOpenLibraryMatchManager();
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                    title="Inspect unmatched games, restore suppressed storefront entries, manage manual overrides, and audit multi-storefront merges"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Sliders className="w-4 h-4 shrink-0 text-[#66c0f4] group-hover:scale-110 transition-transform" />
+                      <div className="flex flex-col min-w-0">
+                        <span className="font-semibold text-white truncate">
+                          Library Match &amp; Overrides Studio
+                        </span>
+                        <span className="text-[10px] text-steam-subtext truncate">
+                          Unmatched, suppressed &amp; merged games
+                        </span>
+                      </div>
                     </div>
+                  </button>
+                )}
+
+                {/* Group 2: Library Sync & Refresh */}
+                <div className="mt-1 pt-1.5 border-t border-steam-border/50">
+                  <div className="px-3.5 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
+                    Library Sync &amp; Refresh
                   </div>
-                  {isSyncing && (
-                    <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+
+                  {/* 3. Sync Integrations */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onTriggerSync();
+                    }}
+                    disabled={isSyncing}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                    title="Sync all connected accounts (owned games, trophies & achievements, playtime)"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <RefreshCw
+                        className={`w-4 h-4 ${
+                          isSyncing
+                            ? 'animate-spin text-steam-accent'
+                            : 'text-emerald-400 group-hover:rotate-45 transition-transform'
+                        }`}
+                      />
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-white">
+                          {isSyncing ? 'Syncing...' : 'Sync Integrations'}
+                        </span>
+                        <span className="text-[10px] text-steam-subtext">Games, trophies &amp; playtime</span>
+                      </div>
+                    </div>
+                    {isSyncing && (
+                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    )}
+                  </button>
+
+                  {/* 4. Sync Store Media (All Games) */}
+                  {onSyncAllMedia && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMenuOpen(false);
+                        onSyncAllMedia();
+                      }}
+                      disabled={isSyncingAllMedia}
+                      className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                      title="Sync trailers, high-res screenshots, movies & store descriptions from Steam across your library"
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <Film
+                          className={`w-4 h-4 ${
+                            isSyncingAllMedia
+                              ? 'animate-spin text-steam-accent'
+                              : 'text-purple-400 group-hover:scale-110 transition-transform'
+                          }`}
+                        />
+                        <div className="flex flex-col">
+                          <span className="font-semibold text-white">
+                            {isSyncingAllMedia ? 'Syncing Media...' : 'Sync Store Media (All Games)'}
+                          </span>
+                          <span className="text-[10px] text-steam-subtext">Trailers, screenshots &amp; descriptions</span>
+                        </div>
+                      </div>
+                      {isSyncingAllMedia && (
+                        <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                      )}
+                    </button>
                   )}
-                </button>
 
-                {/* Sync Trophies (All Storefronts) */}
-                {onSyncTrophies && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      onSyncTrophies();
-                    }}
-                    disabled={isSyncingTrophies}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
-                    title="Synchronize unlocked trophies & achievements across Steam, GOG.com, and Epic Games Store"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <Trophy
-                        className={`w-4 h-4 ${
-                          isSyncingTrophies
-                            ? 'animate-bounce text-amber-400'
-                            : 'text-amber-400 group-hover:scale-110 transition-transform'
-                        }`}
-                      />
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-white">
-                          {isSyncingTrophies ? 'Syncing Trophies...' : 'Sync Trophies'}
-                        </span>
-                        <span className="text-[10px] text-steam-subtext">Steam, GOG & Epic achievements</span>
+                  {/* 5. Sync Trophies (All Storefronts) */}
+                  {onSyncTrophies && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMenuOpen(false);
+                        onSyncTrophies();
+                      }}
+                      disabled={isSyncingTrophies}
+                      className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                      title="Synchronize unlocked trophies & achievements across Steam, GOG.com, and Epic Games Store"
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <Trophy
+                          className={`w-4 h-4 ${
+                            isSyncingTrophies
+                              ? 'animate-bounce text-amber-400'
+                              : 'text-amber-400 group-hover:scale-110 transition-transform'
+                          }`}
+                        />
+                        <div className="flex flex-col">
+                          <span className="font-semibold text-white">
+                            {isSyncingTrophies ? 'Syncing Trophies...' : 'Sync Trophies'}
+                          </span>
+                          <span className="text-[10px] text-steam-subtext">Steam, GOG &amp; Epic achievements</span>
+                        </div>
                       </div>
+                      {isSyncingTrophies && (
+                        <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                      )}
+                    </button>
+                  )}
+
+                  {/* 6. Refresh Critic Scores */}
+                  {onRefreshScores && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMenuOpen(false);
+                        onRefreshScores();
+                      }}
+                      disabled={isSyncingScores}
+                      className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                      title="Refresh and sync ratings from Metacritic, OpenCritic, and Steam across all games"
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <Award
+                          className={`w-4 h-4 ${
+                            isSyncingScores
+                              ? 'animate-spin text-steam-accent'
+                              : 'text-amber-400 group-hover:scale-110 transition-transform'
+                          }`}
+                        />
+                        <div className="flex flex-col">
+                          <span className="font-semibold text-white">
+                            {isSyncingScores ? 'Syncing Scores...' : 'Refresh Critic Scores'}
+                          </span>
+                          <span className="text-[10px] text-steam-subtext">Metacritic, OpenCritic &amp; Steam</span>
+                        </div>
+                      </div>
+                      {isSyncingScores && (
+                        <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                      )}
+                    </button>
+                  )}
+                </div>
+
+                {/* Group 3: Current Game (Visible when viewing an individual game) */}
+                {(currentGameTitle || (canSyncCurrentGame && onSyncCurrentGame)) && (
+                  <div className="mt-1 pt-1.5 border-t border-steam-border/50">
+                    <div className="px-3.5 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-accent/90 truncate">
+                      Current Game
                     </div>
-                    {isSyncingTrophies && (
-                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+
+                    {/* 7. Fix Match & Metadata (Consistent #1 per-game item matching GameContextMenu) */}
+                    {currentGameTitle && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMenuOpen(false);
+                          if (onOpenFixMatch) onOpenFixMatch();
+                        }}
+                        className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                        title={`Fix canonical match, cover poster, and metadata for ${currentGameTitle}`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <Wand className="w-4 h-4 shrink-0 text-[#66c0f4] group-hover:scale-110 transition-transform" />
+                          <div className="flex flex-col min-w-0">
+                            <span className="font-semibold text-white truncate">
+                              Fix Match &amp; Metadata...
+                            </span>
+                            <span className="text-[10px] text-steam-subtext truncate">
+                              {currentGameTitle}
+                            </span>
+                          </div>
+                        </div>
+                      </button>
                     )}
-                  </button>
-                )}
 
-                {/* Sync Store Media (All Games) */}
-                {onSyncAllMedia && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      onSyncAllMedia();
-                    }}
-                    disabled={isSyncingAllMedia}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
-                    title="Sync trailers, high-res screenshots, movies & store descriptions from Steam across your library"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <Film
-                        className={`w-4 h-4 ${
-                          isSyncingAllMedia
-                            ? 'animate-spin text-steam-accent'
-                            : 'text-purple-400 group-hover:scale-110 transition-transform'
-                        }`}
-                      />
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-white">
-                          {isSyncingAllMedia ? 'Syncing Media...' : 'Sync Store Media (All Games)'}
-                        </span>
-                        <span className="text-[10px] text-steam-subtext">Trailers, screenshots & descriptions</span>
-                      </div>
-                    </div>
-                    {isSyncingAllMedia && (
-                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    {/* 8. Sync Store Media (This Game) (Consistent #2 per-game item matching GameContextMenu) */}
+                    {canSyncCurrentGame && onSyncCurrentGame && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMenuOpen(false);
+                          onSyncCurrentGame();
+                        }}
+                        disabled={isSyncingCurrentGame}
+                        className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                        title={`Re-sync trailers, screenshots, descriptions & achievements for ${currentGameTitle || 'current game'} from Steam`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <Film
+                            className={`w-4 h-4 shrink-0 ${
+                              isSyncingCurrentGame
+                                ? 'animate-spin text-steam-accent'
+                                : 'text-purple-400 group-hover:scale-110 transition-transform'
+                            }`}
+                          />
+                          <div className="flex flex-col min-w-0">
+                            <span className="font-semibold text-white truncate">
+                              {isSyncingCurrentGame ? 'Syncing Media...' : 'Sync Store Media (This Game)'}
+                            </span>
+                            <span className="text-[10px] text-steam-subtext truncate">
+                              {currentGameTitle || 'Current game'}
+                            </span>
+                          </div>
+                        </div>
+                        {isSyncingCurrentGame && (
+                          <span className="text-[10px] text-steam-accent font-semibold ml-2 shrink-0">Active</span>
+                        )}
+                      </button>
                     )}
-                  </button>
-                )}
 
-                {/* Refresh Critic Scores */}
-                {onRefreshScores && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      onRefreshScores();
-                    }}
-                    disabled={isSyncingScores}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
-                    title="Refresh and sync ratings from Metacritic, OpenCritic, and Steam across all games"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <Award
-                        className={`w-4 h-4 ${
-                          isSyncingScores
-                            ? 'animate-spin text-steam-accent'
-                            : 'text-amber-400 group-hover:scale-110 transition-transform'
-                        }`}
-                      />
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-white">
-                          {isSyncingScores ? 'Syncing Scores...' : 'Refresh Critic Scores'}
-                        </span>
-                        <span className="text-[10px] text-steam-subtext">Metacritic, OpenCritic & Steam</span>
-                      </div>
-                    </div>
-                    {isSyncingScores && (
-                      <span className="text-[10px] text-steam-accent font-semibold">Active</span>
+                    {/* 9. View Achievements (Consistent #3 per-game item matching GameContextMenu) */}
+                    {currentGameTitle && onOpenAchievements && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsMenuOpen(false);
+                          onOpenAchievements();
+                        }}
+                        className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                        title={`View detailed achievements, icons & unlock dates for ${currentGameTitle}`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <Trophy className="w-4 h-4 shrink-0 text-amber-400 group-hover:scale-110 transition-transform" />
+                          <div className="flex flex-col min-w-0">
+                            <span className="font-semibold text-white truncate">
+                              View Achievements...
+                            </span>
+                            <span className="text-[10px] text-steam-subtext truncate">
+                              {currentGameTitle}
+                            </span>
+                          </div>
+                        </div>
+                      </button>
                     )}
-                  </button>
-                )}
-
-                {/* Sync Store Media (This Game) (Visible only when applicable) */}
-                {canSyncCurrentGame && onSyncCurrentGame && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      onSyncCurrentGame();
-                    }}
-                    disabled={isSyncingCurrentGame}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group border-t border-steam-border/40"
-                    title={`Re-sync trailers, screenshots, descriptions & achievements for ${currentGameTitle || 'current game'} from Steam`}
-                  >
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <Film
-                        className={`w-4 h-4 shrink-0 ${
-                          isSyncingCurrentGame
-                            ? 'animate-spin text-steam-accent'
-                            : 'text-sky-400 group-hover:scale-110 transition-transform'
-                        }`}
-                      />
-                      <div className="flex flex-col min-w-0">
-                        <span className="font-semibold text-white truncate">
-                          {isSyncingCurrentGame ? 'Syncing Media...' : 'Sync Store Media (This Game)'}
-                        </span>
-                        <span className="text-[10px] text-steam-subtext truncate">
-                          {currentGameTitle || 'Current game'}
-                        </span>
-                      </div>
-                    </div>
-                    {isSyncingCurrentGame && (
-                      <span className="text-[10px] text-steam-accent font-semibold ml-2 shrink-0">Active</span>
-                    )}
-                  </button>
-                )}
-
-                {/* Fix Match & Metadata (Visible when viewing individual game) */}
-                {currentGameTitle && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      if (onOpenFixMatch) onOpenFixMatch();
-                    }}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group border-t border-steam-border/40"
-                    title={`Fix canonical match, cover poster, and metadata for ${currentGameTitle}`}
-                  >
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <Wand className="w-4 h-4 shrink-0 text-[#66c0f4] group-hover:scale-110 transition-transform" />
-                      <div className="flex flex-col min-w-0">
-                        <span className="font-semibold text-white truncate">
-                          Fix Match & Metadata...
-                        </span>
-                        <span className="text-[10px] text-steam-subtext truncate">
-                          {currentGameTitle}
-                        </span>
-                      </div>
-                    </div>
-                  </button>
-                )}
-
-                {/* View Achievements (Visible when viewing individual game) */}
-                {currentGameTitle && onOpenAchievements && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsMenuOpen(false);
-                      onOpenAchievements();
-                    }}
-                    className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group border-t border-steam-border/40"
-                    title={`View detailed achievements, icons & unlock dates for ${currentGameTitle}`}
-                  >
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <Trophy className="w-4 h-4 shrink-0 text-amber-400 group-hover:scale-110 transition-transform" />
-                      <div className="flex flex-col min-w-0">
-                        <span className="font-semibold text-white truncate">
-                          View Achievements...
-                        </span>
-                        <span className="text-[10px] text-steam-subtext truncate">
-                          {currentGameTitle}
-                        </span>
-                      </div>
-                    </div>
-                  </button>
+                  </div>
                 )}
               </div>
             )}
@@ -502,8 +591,10 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             return (
               <button
                 key={p}
+                type="button"
                 onClick={() => onSelectPlatform(p)}
-                className={`px-3 py-1 rounded text-xs whitespace-nowrap font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                className={`app-no-drag px-3 py-1 rounded text-xs whitespace-nowrap font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
                   isSelected
                     ? 'bg-steam-accent text-black font-bold shadow-md shadow-steam-accent/20'
                     : 'bg-[#1b222d] text-steam-text hover:text-white hover:bg-[#253040] border border-steam-border/40'
@@ -524,7 +615,10 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
         </div>
 
         {/* Right Section: Downloads, Installed Only Filter & Games Counter */}
-        <div className="flex items-center gap-2.5 text-xs shrink-0">
+        <div
+          className="app-no-drag flex items-center gap-2.5 text-xs shrink-0"
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
           <button
             type="button"
             onClick={() => {
@@ -536,7 +630,8 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             }}
             aria-label="Downloads"
             title="Open Downloads & Installations Manager"
-            className={`relative overflow-hidden px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+            className={`app-no-drag relative overflow-hidden px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
               activeDownloads.length > 0
                 ? 'bg-sky-950/80 border-sky-400/70 text-sky-300 font-semibold shadow-[0_0_10px_rgba(56,189,248,0.2)]'
                 : 'bg-steam-card border-steam-border text-steam-subtext hover:text-white'
@@ -562,8 +657,10 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={onToggleInstalledOnly}
-            className={`px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+            className={`app-no-drag px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
               installedOnly
                 ? 'bg-emerald-950/70 border-emerald-500/70 text-emerald-400 font-semibold'
                 : 'bg-steam-card border-steam-border text-steam-subtext hover:text-white'

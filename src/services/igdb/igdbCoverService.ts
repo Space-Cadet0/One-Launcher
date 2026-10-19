@@ -11,6 +11,9 @@ import { isTitleCompatible } from '../critic/metacriticResolver';
 
 const STORAGE_KEY_IGDB_COVERS = 'antigravity_igdb_covers_v2';
 const STORAGE_KEY_GOG_BOXART = 'antigravity_gog_boxart_v1';
+const STORAGE_KEY_DEAD_STEAM_COVERS = 'antigravity_dead_steam_covers_v1';
+const NEGATIVE_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEAD_STEAM_COVER_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // Steam App IDs verified to not host standard unhashed library_600x900 assets on Steam CDN
 export const KNOWN_DEAD_STEAM_COVER_APP_IDS = new Set<number>();
@@ -98,6 +101,28 @@ export function isUnsuitableCoverUrl(url?: string | null): boolean {
   return false;
 }
 
+/**
+ * Checks whether a header/banner or icon URL is a placeholder badge, SDK test asset,
+ * or belongs to a dead Steam CDN asset that should be replaced when merging metadata.
+ */
+export function isUnsuitableHeaderUrl(url?: string | null): boolean {
+  if (!url) return true;
+  const lower = url.toLowerCase();
+  if (
+    lower.includes('egs-badge') ||
+    lower.includes('avatars/default.png') ||
+    lower.includes('/apps/480/') ||
+    lower.endsWith('/480/header.jpg')
+  ) {
+    return true;
+  }
+  for (const deadId of KNOWN_DEAD_STEAM_COVER_APP_IDS) {
+    if (lower.includes(`/${deadId}/`)) return true;
+  }
+  return false;
+}
+
+
 export function normalizeKey(str: string): string {
   return str
     .toLowerCase()
@@ -107,6 +132,17 @@ export function normalizeKey(str: string): string {
     .replace(/[:\-–—]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Normalizes a persistent cover cache key while preserving an explicit `:YYYY` release year suffix.
+ */
+export function normalizeCacheKey(rawKey: string): string {
+  const m = rawKey.match(/^(.*):((?:19|20)\d{2})$/);
+  if (m) {
+    return `${normalizeKey(m[1])}:${m[2]}`;
+  }
+  return normalizeKey(rawKey);
 }
 
 const EDITION_WORDS = new Set([
@@ -193,7 +229,10 @@ export function computeTokenSimilarity(t1: string, t2: string): number {
 
 export class IgdbCoverService {
   private cache = new Map<string, string | null>();
+  private negativeTimestamps = new Map<string, number>();
   private gogBoxArtCache = new Map<string, string | null>();
+  private gogNegativeTimestamps = new Map<string, number>();
+  private deadSteamTimestamps = new Map<number, number>();
   private pendingFetches = new Map<string, Promise<string | null>>();
 
   constructor() {
@@ -202,19 +241,57 @@ export class IgdbCoverService {
 
   public clearCache(): void {
     this.cache.clear();
+    this.negativeTimestamps.clear();
     this.gogBoxArtCache.clear();
+    this.gogNegativeTimestamps.clear();
+    this.deadSteamTimestamps.clear();
     this.pendingFetches.clear();
+    KNOWN_DEAD_STEAM_COVER_APP_IDS.clear();
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.removeItem(STORAGE_KEY_IGDB_COVERS);
+        localStorage.removeItem(STORAGE_KEY_GOG_BOXART);
+        localStorage.removeItem(STORAGE_KEY_DEAD_STEAM_COVERS);
+      } catch {
+        // Ignore storage errors
+      }
+    }
+  }
+
+  public recordDeadSteamCover(appId?: number | null): void {
+    if (!appId || appId <= 0) return;
+    const now = Date.now();
+    KNOWN_DEAD_STEAM_COVER_APP_IDS.add(appId);
+    this.deadSteamTimestamps.set(appId, now);
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const deadObj: Record<string, number> = {};
+        for (const [id, ts] of this.deadSteamTimestamps.entries()) {
+          deadObj[String(id)] = ts;
+        }
+        localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVERS, JSON.stringify(deadObj));
+      } catch {
+        // Ignore storage write error
+      }
+    }
   }
 
   private loadPersistentCache() {
-    if (typeof window === 'undefined') return;
+    if (typeof localStorage === 'undefined') return;
     try {
       const raw = localStorage.getItem(STORAGE_KEY_IGDB_COVERS);
       if (raw) {
         const parsed = JSON.parse(raw);
         for (const [k, v] of Object.entries(parsed)) {
-          if (typeof v === 'string') {
-            this.cache.set(normalizeKey(k), v);
+          const nk = normalizeCacheKey(k);
+          if (typeof v === 'string' && v.trim()) {
+            this.cache.set(nk, v);
+          } else if (v && typeof v === 'object' && (v as any).url === null) {
+            const cachedAt = Number((v as any).cachedAt || 0);
+            if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
+              this.cache.set(nk, null);
+              this.negativeTimestamps.set(nk, cachedAt);
+            }
           }
         }
       }
@@ -222,8 +299,26 @@ export class IgdbCoverService {
       if (rawGog) {
         const parsedGog = JSON.parse(rawGog);
         for (const [k, v] of Object.entries(parsedGog)) {
-          if (typeof v === 'string') {
+          if (typeof v === 'string' && v.trim()) {
             this.gogBoxArtCache.set(k, v);
+          } else if (v && typeof v === 'object' && (v as any).url === null) {
+            const cachedAt = Number((v as any).cachedAt || 0);
+            if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
+              this.gogBoxArtCache.set(k, null);
+              this.gogNegativeTimestamps.set(k, cachedAt);
+            }
+          }
+        }
+      }
+      const rawDeadSteam = localStorage.getItem(STORAGE_KEY_DEAD_STEAM_COVERS);
+      if (rawDeadSteam) {
+        const parsedDead = JSON.parse(rawDeadSteam);
+        for (const [idStr, ts] of Object.entries(parsedDead)) {
+          const appId = Number(idStr);
+          const tsNum = Number(ts || 0);
+          if (appId > 0 && tsNum > 0 && Date.now() - tsNum < DEAD_STEAM_COVER_TTL_MS) {
+            KNOWN_DEAD_STEAM_COVER_APP_IDS.add(appId);
+            this.deadSteamTimestamps.set(appId, tsNum);
           }
         }
       }
@@ -233,22 +328,52 @@ export class IgdbCoverService {
   }
 
   private savePersistentCache() {
-    if (typeof window === 'undefined') return;
+    if (typeof localStorage === 'undefined') return;
     try {
-      const obj: Record<string, string> = {};
+      const obj: Record<string, any> = {};
       for (const [k, v] of this.cache.entries()) {
-        if (v) obj[k] = v;
+        if (typeof v === 'string' && v) {
+          obj[k] = v;
+        } else if (v === null) {
+          obj[k] = { url: null, cachedAt: this.negativeTimestamps.get(k) || Date.now() };
+        }
       }
       localStorage.setItem(STORAGE_KEY_IGDB_COVERS, JSON.stringify(obj));
 
-      const gogObj: Record<string, string> = {};
+      const gogObj: Record<string, any> = {};
       for (const [k, v] of this.gogBoxArtCache.entries()) {
-        if (v) gogObj[k] = v;
+        if (typeof v === 'string' && v) {
+          gogObj[k] = v;
+        } else if (v === null) {
+          gogObj[k] = { url: null, cachedAt: this.gogNegativeTimestamps.get(k) || Date.now() };
+        }
       }
       localStorage.setItem(STORAGE_KEY_GOG_BOXART, JSON.stringify(gogObj));
     } catch {
       // Ignore storage write error
     }
+  }
+
+  /**
+   * Checks whether a GOG vertical cover lookup has already been attempted (positively or negatively within TTL).
+   */
+  public hasAttemptedGogVerticalCover(gogId?: string | number | null, title?: string): boolean {
+    const cleanId = String(gogId || '').replace(/^gog-/, '').trim();
+    if (cleanId && this.gogBoxArtCache.has(`id:${cleanId}`)) {
+      const val = this.gogBoxArtCache.get(`id:${cleanId}`);
+      if (typeof val === 'string' && val) return true;
+      const ts = this.gogNegativeTimestamps.get(`id:${cleanId}`);
+      if (!ts || Date.now() - ts < NEGATIVE_COVER_TTL_MS) return true;
+      this.gogBoxArtCache.delete(`id:${cleanId}`);
+      this.gogNegativeTimestamps.delete(`id:${cleanId}`);
+    }
+    if (title && title.trim()) {
+      const norm = normalizeKey(title);
+      if (this.gogBoxArtCache.has(`title:${norm}`) && typeof this.gogBoxArtCache.get(`title:${norm}`) === 'string') {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -283,11 +408,11 @@ export class IgdbCoverService {
     const cleanId = String(gogId || '').replace(/^gog-/, '').trim();
     if (!cleanId || !/^\d+$/.test(cleanId)) return null;
 
-    const cacheKey = `gog-boxart:${cleanId}`;
-    if (this.gogBoxArtCache.has(`id:${cleanId}`)) {
-      return this.gogBoxArtCache.get(`id:${cleanId}`) || null;
+    if (this.hasAttemptedGogVerticalCover(cleanId, title)) {
+      return this.getGogVerticalCoverInstant(cleanId, title);
     }
 
+    const cacheKey = `gog-boxart:${cleanId}`;
     if (this.pendingFetches.has(cacheKey)) {
       return this.pendingFetches.get(cacheKey)!;
     }
@@ -337,7 +462,10 @@ export class IgdbCoverService {
         console.warn('[IgdbCoverService] GOG v2 boxArtImage fetch error:', cleanId, err?.message);
       }
 
+      const now = Date.now();
       this.gogBoxArtCache.set(`id:${cleanId}`, null);
+      this.gogNegativeTimestamps.set(`id:${cleanId}`, now);
+      this.savePersistentCache();
       return null;
     };
 
@@ -348,6 +476,69 @@ export class IgdbCoverService {
     } finally {
       this.pendingFetches.delete(cacheKey);
     }
+  }
+
+  private resolveCacheKeys(
+    title: string,
+    releaseYear?: number | string | null
+  ): { cleanRaw: string; norm: string; effectiveReleaseYear: number | null; cacheKey: string } {
+    const cleanRaw = title.trim();
+    const norm = normalizeKey(cleanRaw);
+
+    const parsedParamYear =
+      releaseYear !== undefined && releaseYear !== null && releaseYear !== ''
+        ? Number(String(releaseYear).match(/\b(19\d{2}|20\d{2})\b/)?.[1] ?? releaseYear)
+        : NaN;
+    const titleYearMatch = cleanRaw.match(/\b(19\d{2}|20[0-2]\d)\b/);
+    const effectiveReleaseYear =
+      !Number.isNaN(parsedParamYear) && parsedParamYear > 0
+        ? parsedParamYear
+        : titleYearMatch
+          ? Number(titleYearMatch[1])
+          : null;
+
+    const cacheKey = effectiveReleaseYear ? `${norm}:${effectiveReleaseYear}` : norm;
+    return { cleanRaw, norm, effectiveReleaseYear, cacheKey };
+  }
+
+  /**
+   * Checks whether an IGDB cover lookup for (title, releaseYear) has already been attempted
+   * (either resolved positively or cached negatively within TTL).
+   */
+  public hasAttemptedIgdbCover(title?: string, releaseYear?: number | string | null): boolean {
+    if (!title || !title.trim()) return true;
+    const { cleanRaw, norm, effectiveReleaseYear, cacheKey } = this.resolveCacheKeys(title, releaseYear);
+    const lower = cleanRaw.toLowerCase();
+
+    const curated =
+      NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
+      NORMALIZED_KNOWN_IGDB_COVERS.get(norm) ||
+      KNOWN_IGDB_COVERS[lower] ||
+      KNOWN_IGDB_COVERS[norm];
+    if (curated) return true;
+
+    if (this.cache.has(cacheKey)) {
+      const val = this.cache.get(cacheKey);
+      if (typeof val === 'string' && val) return true;
+      const ts = this.negativeTimestamps.get(cacheKey);
+      if (!ts || Date.now() - ts < NEGATIVE_COVER_TTL_MS) return true;
+      this.cache.delete(cacheKey);
+      this.negativeTimestamps.delete(cacheKey);
+    }
+
+    if (!effectiveReleaseYear) {
+      if (this.getIgdbCoverInstant(cleanRaw)) return true;
+      if (this.cache.has(norm)) {
+        const val = this.cache.get(norm);
+        if (typeof val === 'string' && val) return true;
+        const ts = this.negativeTimestamps.get(norm);
+        if (!ts || Date.now() - ts < NEGATIVE_COVER_TTL_MS) return true;
+        this.cache.delete(norm);
+        this.negativeTimestamps.delete(norm);
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -417,31 +608,14 @@ export class IgdbCoverService {
   async fetchIgdbCover(
     title: string,
     releaseYear?: number | string | null,
-    priority: number = Priority.P2_BACKGROUND
+    priority: number = Priority.P2_BACKGROUND,
+    options?: { trackInGlobalBar?: boolean }
   ): Promise<string | null> {
     if (!title || !title.trim()) return null;
-    const cleanRaw = title.trim();
-    const norm = normalizeKey(cleanRaw);
+    const { cleanRaw, norm, effectiveReleaseYear, cacheKey } = this.resolveCacheKeys(title, releaseYear);
 
-    const parsedParamYear =
-      releaseYear !== undefined && releaseYear !== null && releaseYear !== ''
-        ? Number(String(releaseYear).match(/\b(19\d{2}|20\d{2})\b/)?.[1] ?? releaseYear)
-        : NaN;
-    const titleYearMatch = cleanRaw.match(/\b(19\d{2}|20[0-2]\d)\b/);
-    const effectiveReleaseYear =
-      !Number.isNaN(parsedParamYear) && parsedParamYear > 0
-        ? parsedParamYear
-        : titleYearMatch
-          ? Number(titleYearMatch[1])
-          : null;
-
-    const cacheKey = effectiveReleaseYear ? `${norm}:${effectiveReleaseYear}` : norm;
-
-    // Check instant cache (curated always applies; dynamic cache keyed by cacheKey when year is specified)
-    if (!effectiveReleaseYear) {
-      const instant = this.getIgdbCoverInstant(cleanRaw);
-      if (instant) return instant;
-    } else {
+    // Short-circuit both positive and valid negative cache hits before scheduling or tracking any task
+    if (this.hasAttemptedIgdbCover(cleanRaw, releaseYear)) {
       const lower = cleanRaw.toLowerCase();
       const curated =
         NORMALIZED_KNOWN_IGDB_COVERS.get(lower) ||
@@ -450,8 +624,12 @@ export class IgdbCoverService {
         KNOWN_IGDB_COVERS[norm];
       if (curated) return curated;
       if (this.cache.has(cacheKey)) {
-        return this.cache.get(cacheKey) || null;
+        return this.cache.get(cacheKey) ?? null;
       }
+      if (!effectiveReleaseYear) {
+        return this.getIgdbCoverInstant(cleanRaw);
+      }
+      return null;
     }
 
     // Deduplicate in-flight requests
@@ -553,18 +731,22 @@ export class IgdbCoverService {
         console.warn('Dynamic IGDB cover fetch error for', cleanRaw, err?.message);
       }
 
-      // Mark negative cache to avoid infinite retries
+      // Mark negative cache and persist to avoid infinite retries across scrolls and app restarts
+      const now = Date.now();
       this.cache.set(cacheKey, null);
+      this.negativeTimestamps.set(cacheKey, now);
       if (!effectiveReleaseYear) {
         this.cache.set(norm, null);
+        this.negativeTimestamps.set(norm, now);
       }
+      this.savePersistentCache();
       return null;
     };
 
     const fetchPromise =
-      priority === Priority.P0_INTERACTIVE
-        ? executeLookup()
-        : syncJobManager.trackTask('cover_art', cleanRaw, executeLookup);
+      options?.trackInGlobalBar === true && priority !== Priority.P0_INTERACTIVE
+        ? syncJobManager.trackTask('cover_art', cleanRaw, executeLookup)
+        : executeLookup();
 
     this.pendingFetches.set(cacheKey, fetchPromise);
     try {

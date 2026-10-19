@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { SteamScreenshot, SteamMovie } from '../../contracts/steam';
+import { isNonEnglishRegionalMovieName } from '../../services/steam/steamApi';
 import {
   Play,
   ChevronLeft,
@@ -268,10 +269,10 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
   movies,
   headerImage,
 }) => {
-  // Filter out regional non-English trailers (e.g. Chinese/Japanese dubs) when English trailers exist, matching official Steam store
-  const hasEnglishMovies = movies.some((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name));
+  // Filter out regional non-English trailers (e.g. Chinese/Japanese/Italian/French dubs) when English trailers exist, matching official Steam store
+  const hasEnglishMovies = movies.some((m) => !isNonEnglishRegionalMovieName(m.name));
   const visibleMovies = hasEnglishMovies
-    ? movies.filter((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name))
+    ? movies.filter((m) => !isNonEnglishRegionalMovieName(m.name))
     : movies;
 
   // Combine movies and screenshots in typical Steam order (movies first, then screenshots)
@@ -290,12 +291,70 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
 
   const [activeIndex, setActiveIndex] = useState(0);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const [loadedFullUrls, setLoadedFullUrls] = useState<Record<string, boolean>>({});
+  const preloadedSetRef = useRef<Set<string>>(new Set());
   const thumbStripRef = useRef<HTMLDivElement>(null);
   const modalThumbStripRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setActiveIndex(0);
   }, [screenshots, movies]);
+
+  // Eagerly preload all thumbnails + first 4 full-res screenshots + adjacent full-res screenshots
+  useEffect(() => {
+    const preloadFullUrl = (url?: string) => {
+      if (!url || preloadedSetRef.current.has(url)) return;
+      preloadedSetRef.current.add(url);
+      if (typeof Image !== 'undefined') {
+        const img = new Image();
+        img.onload = () => {
+          setLoadedFullUrls((prev) => (prev[url] ? prev : { ...prev, [url]: true }));
+        };
+        img.src = url;
+        if (img.complete) {
+          setLoadedFullUrls((prev) => (prev[url] ? prev : { ...prev, [url]: true }));
+        }
+      }
+    };
+
+    const preloadThumbUrl = (url?: string) => {
+      if (!url || preloadedSetRef.current.has(`thumb:${url}`)) return;
+      preloadedSetRef.current.add(`thumb:${url}`);
+      if (typeof Image !== 'undefined') {
+        const img = new Image();
+        img.src = url;
+      }
+    };
+
+    for (const s of screenshots) {
+      preloadThumbUrl(s.pathThumbnail);
+    }
+
+    // Preload first 4 screenshots immediately on mount/game change
+    for (let i = 0; i < Math.min(4, screenshots.length); i++) {
+      preloadFullUrl(screenshots[i]?.pathFull);
+    }
+
+    // Preload active screenshot + next 3 and previous 2 in primary showcase
+    const currentItem = items[activeIndex];
+    if (currentItem?.type === 'screenshot') {
+      preloadFullUrl(currentItem.screenshot.pathFull);
+    }
+    for (let offset = -2; offset <= 3; offset++) {
+      const target = items[activeIndex + offset];
+      if (target?.type === 'screenshot') {
+        preloadFullUrl(target.screenshot.pathFull);
+      }
+    }
+
+    // Preload active lightbox screenshot + next 3 and previous 2
+    if (lightboxIndex !== null && allScreenshots.length > 0) {
+      for (let offset = -2; offset <= 3; offset++) {
+        const idx = (lightboxIndex + offset + allScreenshots.length) % allScreenshots.length;
+        preloadFullUrl(allScreenshots[idx]?.pathFull);
+      }
+    }
+  }, [screenshots, activeIndex, lightboxIndex, items.length, allScreenshots.length]);
 
   // Keyboard navigation for lightbox
   useEffect(() => {
@@ -362,27 +421,52 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
             key={`movie-${activeItem.movie.id}-${activeItem.movie.name}-${activeIndex}`}
           />
         ) : activeItem?.type === 'screenshot' ? (
-          <div
-            className="relative w-full h-full cursor-pointer overflow-hidden"
-            onClick={openLightbox}
-          >
-            <img
-              src={activeItem.screenshot.pathFull}
-              alt="Screenshot"
-              className="w-full h-full object-cover select-none transition-transform duration-300 group-hover:scale-[1.01]"
-              loading="eager"
-            />
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                openLightbox();
-              }}
-              className="absolute bottom-3 right-3 p-1.5 bg-black/70 hover:bg-black/90 text-white rounded border border-white/20 opacity-0 group-hover:opacity-100 transition-opacity"
-              title="Expand screenshot"
-            >
-              <Maximize2 className="w-4 h-4" />
-            </button>
-          </div>
+          (() => {
+            const thumbSrc = activeItem.screenshot.pathThumbnail || activeItem.screenshot.pathFull;
+            const fullSrc = activeItem.screenshot.pathFull;
+            const isFullReady = Boolean(loadedFullUrls[fullSrc]) || thumbSrc === fullSrc;
+            return (
+              <div
+                className="relative w-full h-full cursor-pointer overflow-hidden"
+                onClick={openLightbox}
+              >
+                {/* Instant 0ms base layer from cached thumbnail */}
+                <img
+                  key={`thumb-${activeItem.screenshot.id}-${thumbSrc}`}
+                  data-testid="media-gallery-screenshot-thumb-base"
+                  src={thumbSrc}
+                  alt="Screenshot preview"
+                  className="w-full h-full object-cover select-none transition-transform duration-300 group-hover:scale-[1.01]"
+                  decoding="sync"
+                />
+                {/* Full-resolution progressive overlay */}
+                <img
+                  key={`full-${activeItem.screenshot.id}-${fullSrc}`}
+                  data-testid="media-gallery-screenshot-full"
+                  src={fullSrc}
+                  alt="Screenshot"
+                  onLoad={() =>
+                    setLoadedFullUrls((prev) => (prev[fullSrc] ? prev : { ...prev, [fullSrc]: true }))
+                  }
+                  className={`absolute inset-0 w-full h-full object-cover select-none transition-all duration-150 group-hover:scale-[1.01] ${
+                    isFullReady ? 'opacity-100' : 'opacity-0'
+                  }`}
+                  loading="eager"
+                  decoding="async"
+                />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openLightbox();
+                  }}
+                  className="absolute bottom-3 right-3 z-10 p-1.5 bg-black/70 hover:bg-black/90 text-white rounded border border-white/20 opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Expand screenshot"
+                >
+                  <Maximize2 className="w-4 h-4" />
+                </button>
+              </div>
+            );
+          })()
         ) : (
           <div
             className={`w-full h-full flex items-center justify-center bg-steam-card ${
@@ -441,7 +525,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     src={thumbUrl}
                     alt={item.type === 'movie' ? item.movie.name : `Thumbnail ${idx}`}
                     className="w-full h-full object-cover"
-                    loading="lazy"
+                    loading="eager"
                   />
                   {item.type === 'movie' && (
                     <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
@@ -533,18 +617,45 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                         prev !== null && prev > 0 ? prev - 1 : allScreenshots.length - 1
                       )
                     }
-                    className="absolute left-3 top-1/2 -translate-y-1/2 z-10 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
+                    className="absolute left-3 top-1/2 -translate-y-1/2 z-20 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
                     title="Previous screenshot (Left arrow)"
                   >
                     <ChevronLeft className="w-7 h-7 text-steam-accent" />
                   </button>
                 )}
 
-                <img
-                  src={allScreenshots[lightboxIndex].pathFull}
-                  alt={`Screenshot ${lightboxIndex + 1}`}
-                  className="max-w-full max-h-full object-contain rounded shadow-2xl"
-                />
+                {(() => {
+                  const currentShot = allScreenshots[lightboxIndex];
+                  const thumbSrc = currentShot.pathThumbnail || currentShot.pathFull;
+                  const fullSrc = currentShot.pathFull;
+                  const isFullReady = Boolean(loadedFullUrls[fullSrc]) || thumbSrc === fullSrc;
+                  return (
+                    <div className="relative w-full h-full flex items-center justify-center">
+                      <img
+                        key={`lightbox-thumb-${currentShot.id}-${thumbSrc}`}
+                        src={thumbSrc}
+                        alt={`Screenshot ${lightboxIndex + 1} preview`}
+                        className="max-w-full max-h-full object-contain rounded shadow-2xl"
+                        decoding="sync"
+                      />
+                      <img
+                        key={`lightbox-full-${currentShot.id}-${fullSrc}`}
+                        src={fullSrc}
+                        alt={`Screenshot ${lightboxIndex + 1}`}
+                        onLoad={() =>
+                          setLoadedFullUrls((prev) =>
+                            prev[fullSrc] ? prev : { ...prev, [fullSrc]: true }
+                          )
+                        }
+                        className={`absolute max-w-full max-h-full object-contain rounded shadow-2xl transition-opacity duration-150 ${
+                          isFullReady ? 'opacity-100' : 'opacity-0'
+                        }`}
+                        loading="eager"
+                        decoding="async"
+                      />
+                    </div>
+                  );
+                })()}
 
                 {allScreenshots.length > 1 && (
                   <button
@@ -553,7 +664,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                         prev !== null && prev < allScreenshots.length - 1 ? prev + 1 : 0
                       )
                     }
-                    className="absolute right-3 top-1/2 -translate-y-1/2 z-10 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 z-20 w-11 h-16 rounded bg-black/60 hover:bg-[#67c1f5]/30 text-white flex items-center justify-center transition-all border border-white/10 hover:border-steam-accent shadow-lg cursor-pointer"
                     title="Next screenshot (Right arrow)"
                   >
                     <ChevronRight className="w-7 h-7 text-steam-accent" />

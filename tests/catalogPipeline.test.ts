@@ -111,16 +111,16 @@ describe('Catalog Pipeline & Merging', () => {
     ];
 
     let catalog = sanitizeGameCatalog(steamGames);
-    // All 4 verified Steam entitlements (including SiN Multiplayer) are preserved
-    expect(catalog).toHaveLength(4);
+    // 3 base Steam games preserved; SiN Multiplayer is suppressed as a non-game sub-client
+    expect(catalog).toHaveLength(3);
 
     catalog = mergeStorefrontGames(catalog, gogGames, 'gog');
-    // Tomb Raider GOTY merges into Tomb Raider; Urbek Prologue, Shadowrun HK & POSTAL added -> 7 unique games
-    expect(catalog).toHaveLength(7);
+    // Tomb Raider GOTY merges into Tomb Raider; Shadowrun HK & POSTAL added; Urbek Prologue suppressed -> 5 unique games
+    expect(catalog).toHaveLength(5);
 
     catalog = mergeStorefrontGames(catalog, epicGames, 'epic');
-    // All 4 cross-storefront Epic games merge into existing Steam/GOG entries; KillingFloor2Beta added -> 8 unique games
-    expect(catalog).toHaveLength(8);
+    // All 4 cross-storefront Epic games merge into existing Steam/GOG entries; KillingFloor2Beta suppressed -> 5 unique games
+    expect(catalog).toHaveLength(5);
 
     const tr = catalog.find((g) => normalizeCanonicalTitle(g.title) === 'tomb raider');
     expect(tr?.platforms.map((p) => p.platformId)).toEqual(expect.arrayContaining(['steam', 'gog']));

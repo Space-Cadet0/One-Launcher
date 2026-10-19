@@ -2,6 +2,7 @@ import { CanonicalGame } from '../../contracts/game';
 import { FULL_USER_STEAM_GAMES } from './fullUserSteamGames';
 import { USER_SCANNED_STEAM_GAMES } from './userScannedLibrary';
 import { reconcileAchievementSummaries } from './achievementReconciliation';
+import { isUnsuitableCoverUrl, isUnsuitableHeaderUrl } from '../igdb/igdbCoverService';
 
 export function mergeScannedSteamGames(existingGames: CanonicalGame[]): CanonicalGame[] {
   const merged = [...existingGames];
@@ -50,9 +51,9 @@ export function mergeScannedSteamGames(existingGames: CanonicalGame[]): Canonica
         ...existing,
         steamAppId: existing.steamAppId || scanned.steamAppId,
         platforms: updatedPlatforms,
-        headerImage: (existing.headerImage && !existing.headerImage.includes('egs-badge.png')) ? existing.headerImage : scanned.headerImage,
-        capsuleImage: (existing.capsuleImage && !existing.capsuleImage.includes('egs-badge.png')) ? existing.capsuleImage : scanned.capsuleImage,
-        iconUrl: (existing.iconUrl && !existing.iconUrl.includes('egs-badge.png')) ? existing.iconUrl : (scanned.iconUrl || scanned.capsuleImage || scanned.headerImage),
+        headerImage: !isUnsuitableHeaderUrl(existing.headerImage) ? existing.headerImage : scanned.headerImage,
+        capsuleImage: !isUnsuitableCoverUrl(existing.capsuleImage) ? existing.capsuleImage : scanned.capsuleImage,
+        iconUrl: !isUnsuitableHeaderUrl(existing.iconUrl) ? existing.iconUrl : (scanned.iconUrl || scanned.capsuleImage || scanned.headerImage),
         shortDescription: existing.shortDescription || scanned.shortDescription,
         reviewSummary: existing.reviewSummary || scanned.reviewSummary,
         tags: existing.tags && existing.tags.length > 0 ? existing.tags : scanned.tags,

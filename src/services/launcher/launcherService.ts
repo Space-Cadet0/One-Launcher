@@ -2,6 +2,7 @@ import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game'
 import type {
   ActiveGameSession,
   CompatibilityLayerInfo,
+  CompatibilityLayerType,
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
@@ -9,8 +10,12 @@ import type {
   InstalledGameRecord,
   InstallGameRequest,
   LauncherActionResult,
+  LaunchMethod,
+  ResolvedLaunchModePreview,
+  StorefrontLaunchProfile,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
+import { steamApi } from '../steam/steamApi';
 
 const LAUNCH_CONFIGS_STORAGE_KEY = 'one_launcher_game_configs_v1';
 
@@ -173,7 +178,40 @@ export class LauncherService {
         ]);
 
         if (configs && typeof configs === 'object') {
-          this.launchConfigs = { ...this.launchConfigs, ...configs };
+          const diskConfigs = configs as Record<string, GameLaunchConfig>;
+          const nextConfigs: Record<string, GameLaunchConfig> = {
+            ...this.launchConfigs,
+            ...diskConfigs,
+          };
+          if (typeof window.electronAPI.getGameLaunchConfigs === 'function') {
+            for (const [gid, localCfg] of Object.entries(nextConfigs)) {
+              let updatedCfg = localCfg;
+              if (updatedCfg?.customExecutablePath && !diskConfigs[gid]?.customExecutablePath) {
+                const { customExecutablePath: _ce, workingDirectory: _wd, ...rest } = updatedCfg;
+                updatedCfg = rest as GameLaunchConfig;
+              }
+              if (updatedCfg?.platformConfigs) {
+                const nextPlatCfgs = { ...updatedCfg.platformConfigs };
+                let platChanged = false;
+                for (const [platId, platProfile] of Object.entries(nextPlatCfgs)) {
+                  const diskPlatProfile = diskConfigs[gid]?.platformConfigs?.[platId as StorefrontId];
+                  if (platProfile?.customExecutablePath && !diskPlatProfile?.customExecutablePath) {
+                    const { customExecutablePath: _ce, workingDirectory: _wd, ...restPlat } = platProfile;
+                    nextPlatCfgs[platId as StorefrontId] = restPlat;
+                    platChanged = true;
+                  }
+                }
+                if (platChanged) {
+                  updatedCfg = {
+                    ...updatedCfg,
+                    platformConfigs: nextPlatCfgs,
+                  };
+                }
+              }
+              nextConfigs[gid] = updatedCfg;
+            }
+          }
+          this.launchConfigs = nextConfigs;
           this.persistLocalConfigs();
         }
 
@@ -391,6 +429,62 @@ export class LauncherService {
             );
             this.lastScanTimestamp = Date.now();
 
+            const hasAnyCustomExe = Object.values(this.launchConfigs).some(
+              (c) =>
+                Boolean(c?.customExecutablePath) ||
+                (c?.platformConfigs &&
+                  Object.values(c.platformConfigs).some((p) => Boolean(p?.customExecutablePath)))
+            );
+            if (
+              typeof window.electronAPI?.getGameLaunchConfigs === 'function' &&
+              hasAnyCustomExe
+            ) {
+              try {
+                const freshConfigs = (await window.electronAPI.getGameLaunchConfigs()) as Record<
+                  string,
+                  GameLaunchConfig
+                >;
+                if (freshConfigs && typeof freshConfigs === 'object') {
+                  let cfgChanged = false;
+                  for (const [gid, localCfg] of Object.entries(this.launchConfigs)) {
+                    if (!localCfg) continue;
+                    const diskCfg = freshConfigs[gid];
+                    let updatedCfg = localCfg;
+                    if (updatedCfg.customExecutablePath && (!diskCfg || !diskCfg.customExecutablePath)) {
+                      const { customExecutablePath: _ce, workingDirectory: _wd, ...rest } = updatedCfg;
+                      updatedCfg = rest as GameLaunchConfig;
+                      cfgChanged = true;
+                    }
+                    if (updatedCfg.platformConfigs) {
+                      const nextPlatCfgs = { ...updatedCfg.platformConfigs };
+                      let platChanged = false;
+                      for (const [platId, platProfile] of Object.entries(nextPlatCfgs)) {
+                        const diskPlatProfile = diskCfg?.platformConfigs?.[platId as StorefrontId];
+                        if (platProfile?.customExecutablePath && !diskPlatProfile?.customExecutablePath) {
+                          const { customExecutablePath: _ce, workingDirectory: _wd, ...restPlat } = platProfile;
+                          nextPlatCfgs[platId as StorefrontId] = restPlat;
+                          platChanged = true;
+                        }
+                      }
+                      if (platChanged) {
+                        updatedCfg = {
+                          ...updatedCfg,
+                          platformConfigs: nextPlatCfgs,
+                        };
+                        cfgChanged = true;
+                      }
+                    }
+                    if (updatedCfg !== localCfg) {
+                      this.launchConfigs[gid] = updatedCfg;
+                    }
+                  }
+                  if (cfgChanged) {
+                    this.persistLocalConfigs();
+                  }
+                }
+              } catch {}
+            }
+
             // 1. Reconcile any active downloads whose game is now detected as installed on disk
             for (let i = 0; i < this.downloadQueue.length; i++) {
               const task = this.downloadQueue[i];
@@ -515,9 +609,8 @@ export class LauncherService {
     if (!game) return undefined;
 
     const cfg = this.getLaunchConfig(game.id);
-    const targetPlatformId = preferredPlatformId || cfg?.preferredPlatformId;
 
-    // 1. Check matching platform records in installedRecords
+    // 1. Helper to check matching platform records in installedRecords
     const matchPlatformRecord = (p: GamePlatformOwnership): InstalledGameRecord | undefined => {
       const exact = this.installedRecords.find(
         (r) =>
@@ -537,6 +630,7 @@ export class LauncherService {
           title: game.title,
           installPath: p.installPath || '',
           executablePath: p.executablePath,
+          launchArguments: p.launchArguments,
           installSize: p.installSize,
           version: p.version,
           isWindowsBinaryOnMac: this.isWindowsHost() ? false : p.isWindowsBinaryOnMac,
@@ -545,6 +639,45 @@ export class LauncherService {
       return undefined;
     };
 
+    // When preferredPlatformId is explicitly provided, strictly scope to that storefront
+    if (preferredPlatformId) {
+      const targetPlat = game.platforms.find((p) => p.platformId === preferredPlatformId);
+      if (targetPlat) {
+        const matched = matchPlatformRecord(targetPlat);
+        if (matched) return matched;
+      }
+
+      if (preferredPlatformId === 'steam' && game.steamAppId) {
+        const bySteamId = this.installedRecords.find(
+          (r) =>
+            r.platformId === 'steam' &&
+            Number(r.appId || r.platformGameId) === Number(game.steamAppId)
+        );
+        if (bySteamId) return bySteamId;
+      }
+
+      const platCfg = this.getLaunchConfig(game.id, preferredPlatformId);
+      if (platCfg?.customExecutablePath) {
+        return {
+          platformId: preferredPlatformId,
+          platformGameId: String(
+            targetPlat?.platformGameId ||
+              (targetPlat as any)?.storefrontAppId ||
+              game.platforms[0]?.platformGameId ||
+              game.id
+          ),
+          title: game.title,
+          installPath: platCfg.workingDirectory || platCfg.customExecutablePath,
+          executablePath: platCfg.customExecutablePath,
+          launchArguments: platCfg.launchArguments || targetPlat?.launchArguments,
+          runner: 'custom',
+        };
+      }
+
+      return undefined;
+    }
+
+    const targetPlatformId = cfg?.preferredPlatformId;
     if (targetPlatformId) {
       const targetPlat = game.platforms.find((p) => p.platformId === targetPlatformId);
       if (targetPlat) {
@@ -568,16 +701,37 @@ export class LauncherService {
       if (bySteamId) return bySteamId;
     }
 
-    // 3. Fallback check by customExecutablePath in LaunchConfig
+    // 3. Fallback check by customExecutablePath in LaunchConfig or platformConfigs
     if (cfg?.customExecutablePath) {
+      const resolvedPlatId = targetPlatformId || game.platforms[0]?.platformId || 'custom';
+      const targetPlat = game.platforms.find((p) => p.platformId === resolvedPlatId);
       return {
-        platformId: targetPlatformId || game.platforms[0]?.platformId || 'custom',
-        platformGameId: game.platforms[0]?.platformGameId || game.id,
+        platformId: resolvedPlatId,
+        platformGameId: targetPlat?.platformGameId || game.platforms[0]?.platformGameId || game.id,
         title: game.title,
         installPath: cfg.workingDirectory || cfg.customExecutablePath,
         executablePath: cfg.customExecutablePath,
+        launchArguments: cfg.launchArguments || targetPlat?.launchArguments,
         runner: 'custom',
       };
+    }
+
+    if (cfg?.platformConfigs) {
+      for (const [platId, platProfile] of Object.entries(cfg.platformConfigs)) {
+        if (platProfile?.customExecutablePath) {
+          const resolvedPlatId = platId as StorefrontId;
+          const targetPlat = game.platforms.find((p) => p.platformId === resolvedPlatId);
+          return {
+            platformId: resolvedPlatId,
+            platformGameId: targetPlat?.platformGameId || game.platforms[0]?.platformGameId || game.id,
+            title: game.title,
+            installPath: platProfile.workingDirectory || platProfile.customExecutablePath,
+            executablePath: platProfile.customExecutablePath,
+            launchArguments: platProfile.launchArguments || targetPlat?.launchArguments,
+            runner: 'custom',
+          };
+        }
+      }
     }
 
     return undefined;
@@ -596,7 +750,22 @@ export class LauncherService {
 
     if (targetId) {
       const found = game.platforms.find((p) => p.platformId === targetId);
-      if (found) return found;
+      if (found) {
+        const rec = this.getInstalledRecordForGame(game, targetId);
+        if (rec) {
+          return {
+            ...found,
+            installed: true,
+            installPath: rec.installPath || found.installPath,
+            executablePath: rec.executablePath || found.executablePath,
+            launchArguments: rec.launchArguments || found.launchArguments,
+            isWindowsBinaryOnMac: this.isWindowsHost()
+              ? false
+              : (rec.isWindowsBinaryOnMac ?? found.isWindowsBinaryOnMac),
+          };
+        }
+        return found;
+      }
     }
 
     // Prefer an installed platform
@@ -611,6 +780,7 @@ export class LauncherService {
           installed: true,
           installPath: installedRecord.installPath || matchingPlat.installPath,
           executablePath: installedRecord.executablePath || matchingPlat.executablePath,
+          launchArguments: installedRecord.launchArguments || matchingPlat.launchArguments,
           isWindowsBinaryOnMac: this.isWindowsHost()
             ? false
             : (installedRecord.isWindowsBinaryOnMac ?? matchingPlat.isWindowsBinaryOnMac),
@@ -626,36 +796,53 @@ export class LauncherService {
 
   public isGameInstalled(game: CanonicalGame, platformId?: StorefrontId): boolean {
     if (!game) return false;
-    const cfg = this.getLaunchConfig(game.id);
-    if (cfg?.customExecutablePath) return true;
 
     if (platformId) {
+      const platCfg = this.getLaunchConfig(game.id, platformId);
+      if (platCfg?.customExecutablePath) {
+        return true;
+      }
+      if (this.getInstalledRecordForGame(game, platformId)) return true;
       const plat = game.platforms.find((p) => p.platformId === platformId);
-      if (plat?.installed) return true;
-      const rec = this.getInstalledRecordForGame(game, platformId);
-      return Boolean(rec && rec.platformId === platformId);
+      return Boolean(plat?.installed);
     }
 
+    const cfg = this.getLaunchConfig(game.id);
+    if (cfg?.customExecutablePath) return true;
+    if (
+      cfg?.platformConfigs &&
+      Object.values(cfg.platformConfigs).some((p) => Boolean(p?.customExecutablePath))
+    ) {
+      return true;
+    }
     if (game.platforms.some((p) => p.installed)) return true;
     return Boolean(this.getInstalledRecordForGame(game));
   }
 
-  public isGameRunning(gameId: string): boolean {
-    return this.activeSessions.has(gameId);
+  public isGameRunning(gameId: string, platformId?: StorefrontId): boolean {
+    const session = this.activeSessions.get(gameId);
+    if (!session) return false;
+    return !platformId || !session.platformId || session.platformId === platformId;
   }
 
-  public getActiveSession(gameId: string): ActiveGameSession | undefined {
-    return this.activeSessions.get(gameId);
+  public getActiveSession(gameId: string, platformId?: StorefrontId): ActiveGameSession | undefined {
+    const session = this.activeSessions.get(gameId);
+    if (!session) return undefined;
+    if (platformId && session.platformId && session.platformId !== platformId) {
+      return undefined;
+    }
+    return session;
   }
 
   public getRunningGames(): ActiveGameSession[] {
     return Array.from(this.activeSessions.values());
   }
 
-  public getActiveDownload(gameId: string): DownloadTaskState | undefined {
+  public getActiveDownload(gameId: string, platformId?: StorefrontId): DownloadTaskState | undefined {
     return this.downloadQueue.find(
       (t) =>
         t.gameId === gameId &&
+        (!platformId || !t.platformId || t.platformId === platformId) &&
         (t.status === 'queued' ||
           t.status === 'downloading' ||
           t.status === 'extracting' ||
@@ -697,6 +884,11 @@ export class LauncherService {
 
     if (typeof window !== 'undefined' && window.electronAPI?.getGameInstallInfo) {
       try {
+        const cachedSteamMeta = game.steamAppId
+          ? steamApi.getCachedMetadata(Number(game.steamAppId))
+          : undefined;
+        const steamPlatforms =
+          cachedSteamMeta?.platforms || game.enrichedMetadata?.platforms;
         const res = await window.electronAPI.getGameInstallInfo({
           gameId: game.id,
           title: game.title,
@@ -704,6 +896,7 @@ export class LauncherService {
           platformGameId: resolvedPlatformGameId,
           steamAppId: game.steamAppId,
           targetInstallDir,
+          steamPlatforms,
         });
         return {
           ...res,
@@ -767,29 +960,34 @@ export class LauncherService {
       };
     }
 
-    const launchConfig = this.getLaunchConfig(game.id);
     const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const installedRecord = this.getInstalledRecordForGame(game, effPlatform?.platformId);
-
     const resolvedPlatformId: StorefrontId =
       platformId ||
-      launchConfig?.preferredPlatformId ||
-      installedRecord?.platformId ||
+      this.getLaunchConfig(game.id)?.preferredPlatformId ||
       effPlatform?.platformId ||
       (game.steamAppId ? 'steam' : 'custom');
 
+    const launchConfig = this.getLaunchConfig(game.id, resolvedPlatformId);
+    const installedRecord = this.getInstalledRecordForGame(game, resolvedPlatformId);
+    const targetPlatformObj =
+      game.platforms.find((p) => p.platformId === resolvedPlatformId) || effPlatform;
+
     const resolvedPlatformGameId =
       installedRecord?.platformGameId ||
-      effPlatform?.platformGameId ||
+      targetPlatformObj?.platformGameId ||
       (game.steamAppId ? String(game.steamAppId) : game.id);
 
-    const installPath = installedRecord?.installPath || effPlatform?.installPath;
+    const installPath = installedRecord?.installPath || targetPlatformObj?.installPath;
     const executablePath =
       launchConfig?.customExecutablePath ||
       installedRecord?.executablePath ||
-      effPlatform?.executablePath;
+      targetPlatformObj?.executablePath;
+    const launchArguments =
+      launchConfig?.launchArguments ||
+      installedRecord?.launchArguments ||
+      targetPlatformObj?.launchArguments;
     const isWindowsBinaryOnMac =
-      installedRecord?.isWindowsBinaryOnMac ?? effPlatform?.isWindowsBinaryOnMac;
+      installedRecord?.isWindowsBinaryOnMac ?? targetPlatformObj?.isWindowsBinaryOnMac;
 
     if (typeof window !== 'undefined' && window.electronAPI?.launchGame) {
       try {
@@ -801,6 +999,7 @@ export class LauncherService {
           steamAppId: game.steamAppId,
           installPath,
           executablePath,
+          launchArguments,
           isWindowsBinaryOnMac,
           launchConfig,
         });
@@ -882,9 +1081,16 @@ export class LauncherService {
   }
 
   public async startInstall(request: InstallGameRequest): Promise<LauncherActionResult> {
+    const resolvedTotalBytes = request.totalBytes || request.estimatedSizeBytes;
+    const payload: InstallGameRequest = {
+      ...request,
+      estimatedSizeBytes: request.estimatedSizeBytes,
+      totalBytes: resolvedTotalBytes,
+    };
+
     if (typeof window !== 'undefined' && window.electronAPI?.installGame) {
       try {
-        const res = await window.electronAPI.installGame(request);
+        const res = await window.electronAPI.installGame(payload);
         if (res.success && res.task) {
           const exists = this.downloadQueue.some((t) => t.taskId === res.task!.taskId);
           if (!exists) {
@@ -916,7 +1122,7 @@ export class LauncherService {
       status: 'downloading',
       progressPercent: 0,
       bytesDownloaded: 0,
-      totalBytes: 250 * 1024 * 1024,
+      totalBytes: resolvedTotalBytes || 250 * 1024 * 1024,
       speedBytesPerSec: 15 * 1024 * 1024,
       etaSeconds: 16,
       statusMessage: `Downloading ${request.title}...`,
@@ -1030,13 +1236,14 @@ export class LauncherService {
       effPlatform?.platformGameId || (game.steamAppId ? String(game.steamAppId) : game.id);
 
     if (installed) {
-      const activeTask = this.getActiveDownload(game.id);
+      const activeTask = this.getActiveDownload(game.id, resolvedPlatformId);
       if (activeTask) {
         if (typeof window !== 'undefined' && window.electronAPI?.cancelDownload) {
           window.electronAPI.cancelDownload(activeTask.taskId).catch(() => {});
         }
         this.downloadQueue = this.downloadQueue.map((t) =>
           t.gameId === game.id &&
+          (!t.platformId || t.platformId === resolvedPlatformId) &&
           (t.status === 'queued' ||
             t.status === 'downloading' ||
             t.status === 'extracting' ||
@@ -1079,6 +1286,19 @@ export class LauncherService {
         this.installedRecords.push(record);
       }
     } else {
+      const cfg = this.getLaunchConfig(game.id, resolvedPlatformId);
+      if (cfg?.customExecutablePath) {
+        const { customExecutablePath: _ce, workingDirectory: _wd, ...rest } = cfg;
+        void this.saveLaunchConfig(
+          {
+            ...rest,
+            gameId: game.id,
+            preferredPlatformId: resolvedPlatformId,
+            launchMethod: rest.launchMethod || 'auto',
+          },
+          resolvedPlatformId
+        );
+      }
       this.installedRecords = this.installedRecords.filter(
         (r) =>
           !(
@@ -1113,7 +1333,7 @@ export class LauncherService {
     platformId?: StorefrontId
   ): Promise<LauncherActionResult> {
     const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const rec = this.getInstalledRecordForGame(game, effPlatform?.platformId);
+    const rec = this.getInstalledRecordForGame(game, platformId || effPlatform?.platformId);
     const resolvedPlatformId: StorefrontId =
       platformId || rec?.platformId || effPlatform?.platformId || 'custom';
     const resolvedPlatformGameId =
@@ -1144,6 +1364,20 @@ export class LauncherService {
             String(r.platformGameId) === String(resolvedPlatformGameId)
           )
       );
+
+      const existingPlatCfg = this.getLaunchConfig(game.id, resolvedPlatformId);
+      if (existingPlatCfg?.customExecutablePath) {
+        const { customExecutablePath: _ce, workingDirectory: _wd, ...restCfg } = existingPlatCfg;
+        await this.saveLaunchConfig(
+          {
+            ...restCfg,
+            gameId: game.id,
+            preferredPlatformId: resolvedPlatformId,
+            launchMethod: restCfg.launchMethod || 'auto',
+          },
+          resolvedPlatformId
+        );
+      }
 
       if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
         window.dispatchEvent(
@@ -1197,9 +1431,10 @@ export class LauncherService {
     game: CanonicalGame,
     platformId?: StorefrontId
   ): Promise<boolean> {
-    const cfg = this.getLaunchConfig(game.id);
     const effPlatform = this.getEffectivePlatformForGame(game, platformId);
-    const rec = this.getInstalledRecordForGame(game, effPlatform?.platformId);
+    const resolvedPlatformId = platformId || effPlatform?.platformId;
+    const cfg = this.getLaunchConfig(game.id, resolvedPlatformId);
+    const rec = this.getInstalledRecordForGame(game, resolvedPlatformId);
     const targetPath =
       rec?.installPath ||
       effPlatform?.installPath ||
@@ -1224,23 +1459,35 @@ export class LauncherService {
     const selectedExe = await this.selectExecutable();
     if (!selectedExe) return null;
 
-    const existingCfg = this.getLaunchConfig(game.id) || {
+    const resolvedPlatformId: StorefrontId =
+      platformId ||
+      this.getLaunchConfig(game.id)?.preferredPlatformId ||
+      game.platforms[0]?.platformId ||
+      'custom';
+
+    const existingCfg = this.getLaunchConfig(game.id, resolvedPlatformId) || {
       gameId: game.id,
-      launchMethod: 'direct',
+      launchMethod: 'direct' as LaunchMethod,
     };
+
+    const normalizedExe = selectedExe.replace(/[\\/]+$/, '');
+    const lastSepIdx = Math.max(normalizedExe.lastIndexOf('/'), normalizedExe.lastIndexOf('\\'));
+    const exeDir = lastSepIdx > 0 ? normalizedExe.slice(0, lastSepIdx) : undefined;
 
     const updatedCfg: GameLaunchConfig = {
       ...existingCfg,
       gameId: game.id,
-      preferredPlatformId: platformId || existingCfg.preferredPlatformId || game.platforms[0]?.platformId,
-      launchMethod: 'direct',
+      preferredPlatformId: resolvedPlatformId,
+      launchMethod:
+        existingCfg.launchMethod && existingCfg.launchMethod !== 'storefront_uri'
+          ? existingCfg.launchMethod
+          : 'direct',
       customExecutablePath: selectedExe,
+      ...(exeDir ? { workingDirectory: exeDir } : {}),
     };
 
-    await this.saveLaunchConfig(updatedCfg);
+    await this.saveLaunchConfig(updatedCfg, resolvedPlatformId);
 
-    const resolvedPlatformId: StorefrontId =
-      updatedCfg.preferredPlatformId || game.platforms[0]?.platformId || 'custom';
     const resolvedPlatformGameId =
       game.platforms.find((p) => p.platformId === resolvedPlatformId)?.platformGameId || game.id;
 
@@ -1251,7 +1498,7 @@ export class LauncherService {
             gameId: game.id,
             platformId: resolvedPlatformId,
             platformGameId: resolvedPlatformGameId,
-            installPath: selectedExe,
+            installPath: exeDir || selectedExe,
             executablePath: selectedExe,
             installed: true,
           },
@@ -1277,17 +1524,86 @@ export class LauncherService {
     return null;
   }
 
-  public async saveLaunchConfig(config: GameLaunchConfig): Promise<void> {
+  public extractStorefrontProfile(
+    config: Partial<GameLaunchConfig | StorefrontLaunchProfile>
+  ): StorefrontLaunchProfile {
+    const profileKeys: (keyof StorefrontLaunchProfile)[] = [
+      'launchMethod',
+      'customExecutablePath',
+      'workingDirectory',
+      'launchArguments',
+      'environmentVariables',
+      'compatibilityLayer',
+      'wineBottleName',
+      'winePrefixPath',
+      'crossoverGraphicsBackend',
+      'crossoverHighResolutionMode',
+      'crossoverDlss',
+      'wineMsync',
+      'wineEsync',
+      'metalHud',
+      'dxvkHud',
+      'preLaunchCommand',
+      'postExitCommand',
+    ];
+    const profile: StorefrontLaunchProfile = {};
+    for (const key of profileKeys) {
+      const val = config[key];
+      if (val !== undefined) {
+        (profile as any)[key] = val;
+      }
+    }
+    if (profile.wineMsync === true && profile.wineEsync === true) {
+      profile.wineEsync = false;
+    }
+    return profile;
+  }
+
+  public async saveLaunchConfig(
+    config: GameLaunchConfig,
+    platformId?: StorefrontId
+  ): Promise<void> {
     if (!config || !config.gameId) return;
-    this.launchConfigs[config.gameId] = {
-      ...this.launchConfigs[config.gameId],
-      ...config,
+    const targetPlatformId = platformId || config.preferredPlatformId;
+    const existing = this.launchConfigs[config.gameId];
+    const profile = this.extractStorefrontProfile(config);
+
+    const mergedPlatformConfigs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {
+      ...(existing?.platformConfigs || {}),
     };
+
+    if (config.platformConfigs) {
+      for (const [platId, p] of Object.entries(config.platformConfigs)) {
+        if (p) {
+          mergedPlatformConfigs[platId as StorefrontId] = this.extractStorefrontProfile(p);
+        }
+      }
+    }
+
+    if (targetPlatformId) {
+      mergedPlatformConfigs[targetPlatformId] = profile;
+    }
+
+    const nextConfig: GameLaunchConfig = {
+      gameId: config.gameId,
+      ...(targetPlatformId
+        ? { preferredPlatformId: targetPlatformId }
+        : existing?.preferredPlatformId
+          ? { preferredPlatformId: existing.preferredPlatformId }
+          : {}),
+      launchMethod: profile.launchMethod || 'auto',
+      ...profile,
+      ...(Object.keys(mergedPlatformConfigs).length > 0
+        ? { platformConfigs: mergedPlatformConfigs }
+        : {}),
+    };
+
+    this.launchConfigs[config.gameId] = nextConfig;
     this.persistLocalConfigs();
 
     if (typeof window !== 'undefined' && window.electronAPI?.saveGameLaunchConfig) {
       try {
-        await window.electronAPI.saveGameLaunchConfig(this.launchConfigs[config.gameId]);
+        await window.electronAPI.saveGameLaunchConfig(nextConfig);
       } catch (err) {
         console.warn('[LauncherService] Failed to save launch config via IPC:', err);
       }
@@ -1296,12 +1612,522 @@ export class LauncherService {
     this.notifyStateChanged();
   }
 
-  public getLaunchConfig(gameId: string): GameLaunchConfig | undefined {
-    return this.launchConfigs[gameId];
+  public async resetLaunchConfig(
+    gameId: string,
+    platformId?: StorefrontId
+  ): Promise<void> {
+    if (!gameId) return;
+
+    if (platformId && this.launchConfigs[gameId]?.platformConfigs) {
+      const nextPlatformConfigs = { ...this.launchConfigs[gameId].platformConfigs };
+      delete nextPlatformConfigs[platformId];
+      const remainingIds = Object.keys(nextPlatformConfigs) as StorefrontId[];
+
+      if (remainingIds.length > 0) {
+        const fallbackPlatId = remainingIds[0];
+        const fallbackProfile = nextPlatformConfigs[fallbackPlatId] || { launchMethod: 'auto' };
+        this.launchConfigs[gameId] = {
+          gameId,
+          preferredPlatformId: fallbackPlatId,
+          launchMethod: fallbackProfile.launchMethod || 'auto',
+          ...fallbackProfile,
+          platformConfigs: nextPlatformConfigs,
+        };
+        this.persistLocalConfigs();
+
+        if (typeof window !== 'undefined' && window.electronAPI?.saveGameLaunchConfig) {
+          try {
+            await window.electronAPI.saveGameLaunchConfig({
+              ...this.launchConfigs[gameId],
+              resetPlatformId: platformId,
+            } as any);
+          } catch (err) {
+            console.warn('[LauncherService] Failed to reset platform launch config via IPC:', err);
+          }
+        }
+
+        this.notifyStateChanged();
+        return;
+      }
+    }
+
+    delete this.launchConfigs[gameId];
+    this.persistLocalConfigs();
+
+    if (typeof window !== 'undefined' && window.electronAPI?.saveGameLaunchConfig) {
+      try {
+        await window.electronAPI.saveGameLaunchConfig({
+          gameId,
+          launchMethod: 'auto',
+          reset: true,
+        } as any);
+      } catch (err) {
+        console.warn('[LauncherService] Failed to reset launch config via IPC:', err);
+      }
+    }
+
+    this.notifyStateChanged();
+  }
+
+  public getLaunchConfig(
+    gameId: string,
+    platformId?: StorefrontId
+  ): GameLaunchConfig | undefined {
+    const base = this.launchConfigs[gameId];
+    if (!base) return undefined;
+
+    if (!platformId) {
+      if (base.preferredPlatformId && base.platformConfigs?.[base.preferredPlatformId]) {
+        const prefProfile = base.platformConfigs[base.preferredPlatformId]!;
+        return {
+          ...base,
+          ...prefProfile,
+          launchMethod: prefProfile.launchMethod || base.launchMethod || 'auto',
+        };
+      }
+      return base;
+    }
+
+    const platProfile = base.platformConfigs?.[platformId];
+    if (platProfile) {
+      return {
+        gameId: base.gameId,
+        preferredPlatformId: platformId,
+        launchMethod: platProfile.launchMethod || 'auto',
+        ...platProfile,
+        platformConfigs: base.platformConfigs,
+      };
+    }
+
+    if (base.platformConfigs && Object.keys(base.platformConfigs).length > 0) {
+      if (base.preferredPlatformId === platformId) {
+        return base;
+      }
+      return undefined;
+    }
+
+    if (!base.preferredPlatformId || base.preferredPlatformId === platformId) {
+      return base;
+    }
+    return undefined;
   }
 
   public getAllLaunchConfigs(): Record<string, GameLaunchConfig> {
     return { ...this.launchConfigs };
+  }
+
+  public resolveEffectiveLaunchModePreview(
+    game: CanonicalGame,
+    preferredPlatformId?: StorefrontId,
+    draftConfig?: Partial<GameLaunchConfig>
+  ): ResolvedLaunchModePreview {
+    const hostPlatform = this.getHostPlatform();
+    const baseConfig = game ? this.getLaunchConfig(game.id) : undefined;
+    const targetPlatformId =
+      preferredPlatformId ||
+      draftConfig?.preferredPlatformId ||
+      baseConfig?.preferredPlatformId;
+    const savedConfig = game
+      ? this.getLaunchConfig(game.id, targetPlatformId)
+      : undefined;
+    const mergedDraft = { ...savedConfig, ...draftConfig };
+
+    const installedRecord = game
+      ? this.getInstalledRecordForGame(game, targetPlatformId)
+      : undefined;
+    const effPlatform = game
+      ? this.getEffectivePlatformForGame(game, targetPlatformId)
+      : undefined;
+    const layers = this.getCompatibilityLayers();
+
+    const hasCustomExecKeyInDraft =
+      draftConfig !== undefined && 'customExecutablePath' in draftConfig;
+    const effectiveRecordExec =
+      installedRecord?.runner === 'custom' &&
+      hasCustomExecKeyInDraft &&
+      !draftConfig?.customExecutablePath
+        ? undefined
+        : installedRecord?.executablePath;
+    const effectiveRecordInstallPath =
+      installedRecord?.runner === 'custom' &&
+      hasCustomExecKeyInDraft &&
+      !draftConfig?.customExecutablePath
+        ? undefined
+        : installedRecord?.installPath;
+
+    const executablePath =
+      (draftConfig?.customExecutablePath?.trim() || undefined) ||
+      (!hasCustomExecKeyInDraft ? savedConfig?.customExecutablePath : undefined) ||
+      effectiveRecordExec ||
+      effPlatform?.executablePath;
+
+    const installPath =
+      effectiveRecordInstallPath || effPlatform?.installPath;
+
+    const isInstalled = Boolean(
+      executablePath || installPath || effPlatform?.installed
+    );
+
+    const platformId: StorefrontId =
+      targetPlatformId ||
+      installedRecord?.platformId ||
+      effPlatform?.platformId ||
+      (game?.steamAppId ? 'steam' : 'custom');
+
+    const storeName =
+      platformId === 'steam'
+        ? 'Steam'
+        : platformId === 'epic'
+          ? 'Epic Games'
+          : platformId === 'gog'
+            ? 'GOG Galaxy'
+            : 'Storefront';
+    const storeProtocol =
+      platformId === 'steam'
+        ? 'steam://'
+        : platformId === 'epic'
+          ? 'com.epicgames.launcher://'
+          : platformId === 'gog'
+            ? 'goggalaxy://'
+            : 'storefront URI';
+
+    const selectedLayerType = mergedDraft.compatibilityLayer;
+    const activeLayer =
+      (selectedLayerType && selectedLayerType !== 'native'
+        ? layers.find((l) => l.type === selectedLayerType)
+        : undefined) ||
+      layers.find(
+        (l) => l.type === 'crossover' || l.type === 'crossover_preview'
+      ) ||
+      layers[0];
+    const layerName =
+      activeLayer?.name ||
+      (selectedLayerType && selectedLayerType !== 'native'
+        ? selectedLayerType
+        : 'CrossOver / Wine');
+    const bottleName =
+      mergedDraft.wineBottleName || activeLayer?.availableBottles?.[0];
+
+    let detectedBuildType: ResolvedLaunchModePreview['detectedBuildType'] =
+      'not_installed';
+    let detectedBuildLabel = 'Not Installed Locally';
+    let detectedBuildDetail =
+      'Install this game first or link an existing executable below.';
+
+    if (!isInstalled) {
+      detectedBuildType = 'not_installed';
+      detectedBuildLabel = 'Not Installed Locally';
+      detectedBuildDetail =
+        'Install this game first or link an existing executable below.';
+    } else if (hostPlatform === 'win32') {
+      detectedBuildType = 'windows_native';
+      detectedBuildLabel = 'Windows Native Build (.exe)';
+      detectedBuildDetail =
+        executablePath || installPath || 'Installed on Windows';
+    } else {
+      const isExplicitAppBundle = Boolean(
+        (executablePath && /\.app(\/|$)/i.test(executablePath)) ||
+          (!executablePath && installPath && /\.app$/i.test(installPath))
+      );
+      const isBottlePath = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
+        String(executablePath || installPath || '')
+      );
+      const isExeOnMac =
+        Boolean(executablePath && /\.exe$/i.test(executablePath)) ||
+        (!isExplicitAppBundle &&
+          (Boolean(
+            installedRecord?.isWindowsBinaryOnMac ||
+              effPlatform?.isWindowsBinaryOnMac
+          ) ||
+            isBottlePath ||
+            Boolean(mergedDraft.wineBottleName || mergedDraft.winePrefixPath)));
+
+      if (isExeOnMac) {
+        detectedBuildType = 'windows_exe_on_mac';
+        detectedBuildLabel = 'Windows Build (.exe) on macOS';
+        detectedBuildDetail =
+          'Requires CrossOver / Wine translation layer on Apple Silicon';
+      } else if (isExplicitAppBundle) {
+        detectedBuildType = 'mac_native_app';
+        detectedBuildLabel = 'macOS Native App Bundle (.app)';
+        detectedBuildDetail =
+          'Runs natively on macOS without translation layers';
+      } else {
+        detectedBuildType = 'mac_native_bin';
+        detectedBuildLabel = 'macOS Native Binary';
+        detectedBuildDetail = 'Runs natively on macOS';
+      }
+    }
+
+    const effectiveLaunchMethod: LaunchMethod =
+      draftConfig?.launchMethod || savedConfig?.launchMethod || 'auto';
+    const effectiveCompatLayer: CompatibilityLayerType =
+      draftConfig?.compatibilityLayer ||
+      savedConfig?.compatibilityLayer ||
+      layers[0]?.type ||
+      'crossover';
+    const hasExplicitBottleOrCompatConfig = Boolean(
+      draftConfig?.wineBottleName ||
+        draftConfig?.winePrefixPath ||
+        savedConfig?.wineBottleName ||
+        savedConfig?.winePrefixPath ||
+        (savedConfig?.crossoverGraphicsBackend &&
+          savedConfig.crossoverGraphicsBackend !== 'auto')
+    );
+
+    let availableModes: LaunchMethod[];
+    let visibleSections: ResolvedLaunchModePreview['visibleSections'];
+
+    if (hostPlatform === 'win32') {
+      availableModes = ['auto', 'direct', 'storefront_uri'];
+      visibleSections = {
+        compatibilityLayer: false,
+        crossoverRendering: false,
+        nativeMacMetalHud: false,
+        executableAndArgs: true,
+        environmentAndHooks: true,
+      };
+    } else if (
+      detectedBuildType === 'mac_native_app' ||
+      detectedBuildType === 'mac_native_bin'
+    ) {
+      if (effectiveLaunchMethod === 'compatibility_layer') {
+        availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
+        visibleSections = {
+          compatibilityLayer: true,
+          crossoverRendering:
+            effectiveCompatLayer === 'crossover' ||
+            effectiveCompatLayer === 'crossover_preview',
+          nativeMacMetalHud: false,
+          executableAndArgs: true,
+          environmentAndHooks: true,
+        };
+      } else {
+        availableModes = ['auto', 'direct', 'storefront_uri'];
+        visibleSections = {
+          compatibilityLayer: false,
+          crossoverRendering: false,
+          nativeMacMetalHud: true,
+          executableAndArgs: true,
+          environmentAndHooks: true,
+        };
+      }
+    } else if (detectedBuildType === 'windows_exe_on_mac') {
+      availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
+      visibleSections = {
+        compatibilityLayer: true,
+        crossoverRendering:
+          effectiveCompatLayer === 'crossover' ||
+          effectiveCompatLayer === 'crossover_preview',
+        nativeMacMetalHud: false,
+        executableAndArgs: true,
+        environmentAndHooks: true,
+      };
+    } else {
+      const showCompatForUninstalled =
+        effectiveLaunchMethod === 'compatibility_layer' ||
+        hasExplicitBottleOrCompatConfig;
+      availableModes = ['auto', 'direct', 'compatibility_layer', 'storefront_uri'];
+      visibleSections = {
+        compatibilityLayer: showCompatForUninstalled,
+        crossoverRendering:
+          showCompatForUninstalled &&
+          (effectiveCompatLayer === 'crossover' ||
+            effectiveCompatLayer === 'crossover_preview'),
+        nativeMacMetalHud: false,
+        executableAndArgs: true,
+        environmentAndHooks: true,
+      };
+    }
+
+    if (detectedBuildType === 'windows_exe_on_mac') {
+      const bottleSuffix = bottleName ? ` (Bottle: "${bottleName}")` : '';
+      return {
+        isInstalled,
+        hostPlatform,
+        platformId,
+        installPath,
+        executablePath,
+        detectedBuildType,
+        detectedBuildLabel,
+        detectedBuildDetail,
+        autoResolvedMethod: 'compatibility_layer',
+        autoResolvedSummary: `Launches Windows executable (.exe) via ${layerName}${bottleSuffix}.`,
+        recommendedModes: ['auto', 'compatibility_layer'],
+        availableModes,
+        visibleSections,
+        modeNotes: {
+          auto: {
+            badge: 'Recommended',
+            badgeTone: 'emerald',
+            dynamicDesc: `Automatically detects this Windows .exe build and routes execution through ${layerName}${bottleSuffix}.`,
+          },
+          compatibility_layer: {
+            badge: 'Active Pipeline',
+            badgeTone: 'sky',
+            dynamicDesc: `Explicitly runs this Windows .exe through ${layerName} with per-game CrossOver 26 graphics backend, High Resolution Mode, and HUD overrides.`,
+          },
+          direct: {
+            badge: 'Requires Translation',
+            badgeTone: 'amber',
+            dynamicDesc: `Targets ${executablePath ? executablePath.split(/[\\/]/).pop() : 'the game executable'} directly.`,
+            warning: `macOS cannot execute Windows .exe binaries natively without Wine/CrossOver, so One Launcher will automatically invoke ${layerName} if selected.`,
+          },
+          storefront_uri: {
+            badge: 'Caution on macOS',
+            badgeTone: 'amber',
+            dynamicDesc: `Delegates launch to ${storeName} (${storeProtocol}).`,
+            warning: `Native macOS storefront clients (such as macOS Steam) cannot launch Windows-only .exe builds directly. Use Auto-Detect or Compatibility Layer instead.`,
+          },
+        },
+      };
+    }
+
+    if (
+      detectedBuildType === 'mac_native_app' ||
+      detectedBuildType === 'mac_native_bin'
+    ) {
+      const targetName =
+        executablePath
+          ?.split(/[\\/]/)
+          .find((part) => /\.app$/i.test(part)) ||
+        executablePath?.split(/[\\/]/).pop() ||
+        'native macOS binary';
+
+      return {
+        isInstalled,
+        hostPlatform,
+        platformId,
+        installPath,
+        executablePath,
+        detectedBuildType,
+        detectedBuildLabel,
+        detectedBuildDetail,
+        autoResolvedMethod: 'direct',
+        autoResolvedSummary:
+          detectedBuildType === 'mac_native_app'
+            ? `Launches native macOS app bundle (${targetName}) directly via macOS LaunchServices (open -a).`
+            : `Launches native macOS binary (${targetName}) directly without translation layers.`,
+        recommendedModes: ['auto', 'direct', 'storefront_uri'],
+        availableModes,
+        visibleSections,
+        modeNotes: {
+          auto: {
+            badge: 'Recommended',
+            badgeTone: 'emerald',
+            dynamicDesc: `Automatically executes this native macOS build (${targetName}) directly with zero translation overhead.`,
+          },
+          direct: {
+            badge: 'Native macOS',
+            badgeTone: 'emerald',
+            dynamicDesc: `Directly launches the native macOS ${detectedBuildType === 'mac_native_app' ? '.app bundle' : 'binary'} without storefront client overhead.`,
+          },
+          compatibility_layer: {
+            badge: 'Not Needed',
+            badgeTone: 'amber',
+            dynamicDesc: `Routes execution through Wine / CrossOver translation.`,
+            warning: `This is already a native macOS build and does not need Wine/CrossOver translation unless you explicitly override the executable to a Windows .exe.`,
+          },
+          storefront_uri: {
+            badge: 'Supported',
+            badgeTone: 'sky',
+            dynamicDesc: `Launches via native ${storeName} protocol (${storeProtocol}).`,
+          },
+        },
+      };
+    }
+
+    if (detectedBuildType === 'windows_native') {
+      const exeName = executablePath?.split(/[\\/]/).pop();
+      const autoMethod: LaunchMethod = executablePath
+        ? 'direct'
+        : 'storefront_uri';
+      return {
+        isInstalled,
+        hostPlatform,
+        platformId,
+        installPath,
+        executablePath,
+        detectedBuildType,
+        detectedBuildLabel,
+        detectedBuildDetail,
+        autoResolvedMethod: autoMethod,
+        autoResolvedSummary: executablePath
+          ? `Launches native Windows executable (${exeName}) directly.`
+          : `Launches via ${storeName} client protocol (${storeProtocol}).`,
+        recommendedModes: ['auto', 'direct', 'storefront_uri'],
+        availableModes,
+        visibleSections,
+        modeNotes: {
+          auto: {
+            badge: 'Recommended',
+            badgeTone: 'emerald',
+            dynamicDesc: executablePath
+              ? `Automatically spawns the native Windows executable (${exeName}) directly.`
+              : `Automatically launches via ${storeName} (${storeProtocol}).`,
+          },
+          direct: {
+            badge: 'Native Windows',
+            badgeTone: 'emerald',
+            dynamicDesc: `Directly spawns the Windows .exe binary with custom launch arguments and environment variables.`,
+          },
+          compatibility_layer: {
+            badge: 'Not Needed',
+            badgeTone: 'slate',
+            dynamicDesc: `Wine / CrossOver translation layer for non-Windows hosts.`,
+            warning: `Compatibility layers are not required on native Windows hosts.`,
+          },
+          storefront_uri: {
+            badge: 'Supported',
+            badgeTone: 'sky',
+            dynamicDesc: `Delegates launch to the ${storeName} desktop client (${storeProtocol}).`,
+          },
+        },
+      };
+    }
+
+    // not_installed
+    return {
+      isInstalled: false,
+      hostPlatform,
+      platformId,
+      installPath,
+      executablePath,
+      detectedBuildType: 'not_installed',
+      detectedBuildLabel,
+      detectedBuildDetail,
+      autoResolvedMethod: 'storefront_uri',
+      autoResolvedSummary:
+        'Game is not installed locally yet. Install via One Launcher or link an existing executable below.',
+      recommendedModes: ['auto', 'storefront_uri'],
+      availableModes,
+      visibleSections,
+      modeNotes: {
+        auto: {
+          badge: 'Recommended',
+          badgeTone: 'emerald',
+          dynamicDesc:
+            'Automatically selects the optimal native or CrossOver pipeline once installed or linked.',
+        },
+        direct: {
+          badge: 'Requires Executable',
+          badgeTone: 'amber',
+          dynamicDesc: 'Spawns a local game binary directly.',
+          warning:
+            'No local installation detected yet. Link a custom executable path below to use Direct Executable mode.',
+        },
+        compatibility_layer: {
+          badge: 'Pre-Configure',
+          badgeTone: 'sky',
+          dynamicDesc: `Pre-configure ${layerName} bottle, CrossOver 26 graphics backend, and HUD settings before installing or linking a Windows .exe.`,
+        },
+        storefront_uri: {
+          badge: 'Store Fallback',
+          badgeTone: 'sky',
+          dynamicDesc: `Opens ${storeName} (${storeProtocol}) to install or launch the game.`,
+        },
+      },
+    };
   }
 
   public openDownloadDrawer(): void {

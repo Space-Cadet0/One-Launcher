@@ -11,8 +11,6 @@ import {
   Clock,
   Calendar,
   Trophy,
-  CheckCircle2,
-  Cloud,
   Bookmark,
   Award,
   ChevronDown,
@@ -29,6 +27,7 @@ import {
   FileSearch,
   Activity,
   Loader2,
+  EyeOff,
 } from 'lucide-react';
 import { getOpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { steamMatcher } from '../../services/steam/steamMatcher';
@@ -48,45 +47,6 @@ import { launcherService } from '../../services/launcher/launcherService';
 import { GameInstallModal } from '../Launcher/GameInstallModal';
 import { GameLaunchConfigModal } from '../Launcher/GameLaunchConfigModal';
 
-// Known install sizes for popular games
-const KNOWN_INSTALL_SIZES: Record<number, string> = {
-  3010850: '90 GB',
-  1091500: '70 GB',
-  292030: '50 GB',
-  1086940: '150 GB',
-  228280: '4.5 GB',
-  257350: '5.2 GB',
-  1174180: '150 GB',
-  814380: '25 GB',
-  374320: '25 GB',
-  211420: '8 GB',
-  782330: '80 GB',
-  379720: '55 GB',
-  1190460: '80 GB',
-  400: '5 GB',
-  620: '8 GB',
-  220: '7 GB',
-  70: '1 GB',
-  22380: '10 GB',
-  377160: '30 GB',
-  412020: '59 GB',
-  286690: '10 GB',
-  287390: '10 GB',
-  632470: '22 GB',
-  435150: '60 GB',
-  1687950: '41 GB',
-  883710: '26 GB',
-  952060: '45 GB',
-  2050650: '67 GB',
-  480490: '42 GB',
-  287700: '28 GB',
-  17460: '12 GB',
-  24980: '15 GB',
-  1238020: '15 GB',
-  1151640: '67 GB',
-  268500: '45 GB',
-};
-
 function formatByteSize(bytes?: number): string | null {
   if (!bytes || bytes <= 0) return null;
   const gb = bytes / (1024 * 1024 * 1024);
@@ -97,15 +57,41 @@ function formatByteSize(bytes?: number): string | null {
   return `${Math.max(1, Math.round(mb))} MB`;
 }
 
+function parseStorageRequirementText(htmlOrText?: string): string | null {
+  if (!htmlOrText || typeof htmlOrText !== 'string') return null;
+  const cleaned = htmlOrText
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const labelFirstMatch = cleaned.match(
+    /(?:storage|hard\s*drive|hard\s*disk|disk\s*space|free\s*space|hd\s*space)\s*(?:space)?\s*[:\-–]?\s*(\d+(?:\.\d+)?)\s*(TB|GB|MB)\b/i
+  );
+  if (labelFirstMatch) {
+    return `${labelFirstMatch[1]} ${labelFirstMatch[2].toUpperCase()}`;
+  }
+
+  const numberFirstMatch = cleaned.match(
+    /(?<!memory\s*:\s*)(?<!ram\s*:\s*)(?<!vram\s*:\s*)\b(\d+(?:\.\d+)?)\s*(TB|GB|MB)\s+(?:available\s+space|free\s+(?:disk\s+)?space|hard\s+(?:drive|disk)\s+space|storage|on\s+hard\s+drive)/i
+  );
+  if (numberFirstMatch) {
+    return `${numberFirstMatch[1]} ${numberFirstMatch[2].toUpperCase()}`;
+  }
+
+  return null;
+}
+
 interface SteamLibraryActionBarProps {
   game: CanonicalGame;
   metadata?: SteamEnrichedMetadata | null;
   collections?: GameCollection[];
   onManageCollections?: () => void;
-  onToggleInstallStatus?: () => void;
+  onToggleInstallStatus?: (platformId?: StorefrontId) => void;
   onApplyFilter?: (filter: ActiveGameFilter) => void;
   connectedStorefronts?: StorefrontId[];
   onFixMatch?: () => void;
+  onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   onViewAchievements?: (storefrontId?: StorefrontId) => void;
 }
 
@@ -117,9 +103,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onToggleInstallStatus,
   onApplyFilter,
   onFixMatch,
+  onHideGame,
   onViewAchievements,
 }) => {
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
+  const [showPlaytimePopover, setShowPlaytimePopover] = useState(false);
   const [, setLauncherTick] = useState(0);
   const [selectedPlatformId, setSelectedPlatformId] = useState<StorefrontId>(() => {
     return (
@@ -132,6 +120,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [isInstallModalOpen, setIsInstallModalOpen] = useState(false);
   const [isLaunchConfigModalOpen, setIsLaunchConfigModalOpen] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+  const [fetchedInstallSize, setFetchedInstallSize] = useState<number | undefined>(undefined);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -141,6 +130,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       'steam';
     setSelectedPlatformId(eff);
     setIsManageMenuOpen(false);
+    setShowPlaytimePopover(false);
+    setShowAchievementPopover(false);
     setActionFeedback(null);
   }, [game.id]);
 
@@ -191,34 +182,30 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     game.platforms[0];
 
   const installedRecord = launcherService.getInstalledRecordForGame(game, selectedPlatformId);
-  const launchConfig = launcherService.getLaunchConfig(game.id);
-  const isRunning = launcherService.isGameRunning(game.id);
-  const activeDownload = launcherService.getActiveDownload(game.id);
+  const launchConfig = launcherService.getLaunchConfig(game.id, selectedPlatformId);
+  const isRunning = launcherService.isGameRunning(game.id, selectedPlatformId);
+  const activeDownload = launcherService.getActiveDownload(game.id, selectedPlatformId);
   const isInstalled =
     launcherService.isGameInstalled(game, selectedPlatformId) ||
-    Boolean(activePlatform?.installed) ||
-    game.platforms.some((p) => p.installed);
+    Boolean(activePlatform?.installed);
 
   const isWindowsHost =
     (typeof (launcherService as any).isWindowsHost === 'function' &&
       (launcherService as any).isWindowsHost()) ||
     (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32');
 
-  const isWindowsBinaryOnMac =
-    !isWindowsHost &&
-    Boolean(
-      installedRecord?.isWindowsBinaryOnMac ||
-        activePlatform?.isWindowsBinaryOnMac ||
-        launchConfig?.launchMethod === 'compatibility_layer' ||
-        launchConfig?.customExecutablePath?.toLowerCase().endsWith('.exe')
-    );
-
   const hasLocalFilesPath = Boolean(
-    isInstalled ||
-      installedRecord?.installPath ||
-      activePlatform?.installPath ||
-      launchConfig?.customExecutablePath ||
-      launchConfig?.workingDirectory
+    isInstalled &&
+      (installedRecord?.installPath ||
+        installedRecord?.executablePath ||
+        activePlatform?.installPath ||
+        activePlatform?.executablePath ||
+        (launchConfig?.customExecutablePath &&
+          (!launchConfig.preferredPlatformId ||
+            launchConfig.preferredPlatformId === selectedPlatformId)) ||
+        (launchConfig?.workingDirectory &&
+          (!launchConfig.preferredPlatformId ||
+            launchConfig.preferredPlatformId === selectedPlatformId)))
   );
 
   // Determine if game belongs to at least 1 user collection
@@ -251,7 +238,6 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   // Playtime calculation (Total aggregated across all owned storefronts)
   const totalPlaytimeMinutes = game.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
-  const platformsWithPlaytime = game.platforms.filter((p) => (p.playtimeMinutes || 0) > 0);
 
   // Last played formatting across all owned storefronts
   const formatLastPlayed = () => {
@@ -269,26 +255,52 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     return formatLastPlayedDate(latestRaw || activePlatform?.lastPlayed);
   };
 
+  const formatPlatformLastPlayed = (raw?: string | number) => {
+    if (!raw) return null;
+    return formatLastPlayedDate(raw);
+  };
+
+  useEffect(() => {
+    setFetchedInstallSize(undefined);
+    if (!installedRecord?.installSize && !activePlatform?.installSize) {
+      let cancelled = false;
+      launcherService
+        .getGameInstallInfo(game, selectedPlatformId)
+        .then((info) => {
+          if (!cancelled && info?.estimatedSizeBytes && info.estimatedSizeBytes > 0) {
+            setFetchedInstallSize(info.estimatedSizeBytes);
+          }
+        })
+        .catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [game.id, selectedPlatformId, isInstalled, installedRecord?.installSize, activePlatform?.installSize]);
+
   // Space Required extraction
   const getSpaceRequired = () => {
-    const realFormatted =
+    const realSize =
       formatByteSize(installedRecord?.installSize) ||
-      formatByteSize(activePlatform?.installSize);
-    if (realFormatted) {
-      return realFormatted;
+      formatByteSize(activePlatform?.installSize) ||
+      formatByteSize(fetchedInstallSize);
+    if (realSize) {
+      return realSize;
     }
-    if (game.steamAppId && KNOWN_INSTALL_SIZES[game.steamAppId]) {
-      return KNOWN_INSTALL_SIZES[game.steamAppId];
-    }
-    // Extract from system requirements text
-    const reqText = metadata?.systemRequirements?.minimum || metadata?.pcRequirementsHtml || '';
-    const match = reqText.match(/(\d+(?:\.\d+)?)\s*(GB|MB)\s*(?:available|free|storage|space)/i);
-    if (match) {
-      return `${match[1]} ${match[2].toUpperCase()}`;
-    }
-    // Generic fallback based on tags
-    const isBig = game.tags.some((t) => ['Open World', 'RPG', 'Action'].includes(t));
-    return isBig ? '65 GB' : '15 GB';
+
+    const fromMin = parseStorageRequirementText(metadata?.systemRequirements?.minimum);
+    if (fromMin) return fromMin;
+
+    const fromRec = parseStorageRequirementText(metadata?.systemRequirements?.recommended);
+    if (fromRec) return fromRec;
+
+    const fromPcHtml = parseStorageRequirementText(metadata?.pcRequirementsHtml);
+    if (fromPcHtml) return fromPcHtml;
+
+    const fromMacHtml = parseStorageRequirementText((metadata as any)?.macRequirementsHtml);
+    if (fromMacHtml) return fromMacHtml;
+
+    return '—';
   };
 
   // Multi-store achievements evaluation
@@ -446,7 +458,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 <button
                   type="button"
                   onClick={() => launcherService.openDownloadDrawer()}
-                  className="relative overflow-hidden inline-flex items-center justify-center gap-2 px-4.5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 shrink-0 cursor-pointer bg-[#17283b] border border-sky-400/70"
+                  className="relative overflow-hidden inline-flex items-center justify-center gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 shrink-0 cursor-pointer bg-[#17283b] border border-sky-400/70"
                   title="Click to open Download Manager"
                 >
                   <div
@@ -475,7 +487,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <button
                 type="button"
                 onClick={handlePlayClick}
-                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-4.5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
+                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
                 style={{
                   background: 'linear-gradient(to right, #75b022 5%, #588a1b 95%)',
                   boxShadow: '0 0 16px rgba(91, 163, 43, 0.45)',
@@ -489,7 +501,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <button
                 type="button"
                 onClick={handleInstallClick}
-                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-4.5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
+                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
                 style={{
                   background: 'linear-gradient(to right, #214b6b 0%, #123049 100%)',
                   border: '1px solid #3878a8',
@@ -520,16 +532,21 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                   title={`Active Storefront: ${getStorefrontDisplayName(selectedPlatformId)} (Click to switch)`}
                   className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 >
-                  {game.platforms.map((plat) => (
-                    <option
-                      key={plat.platformId}
-                      value={plat.platformId}
-                      className="bg-[#131b26] text-white"
-                    >
-                      {getStorefrontDisplayName(plat.platformId)}
-                      {plat.installed ? ' (Installed)' : ''}
-                    </option>
-                  ))}
+                  {game.platforms.map((plat) => {
+                    const platInstalled =
+                      launcherService.isGameInstalled(game, plat.platformId) ||
+                      Boolean(plat.installed);
+                    return (
+                      <option
+                        key={plat.platformId}
+                        value={plat.platformId}
+                        className="bg-[#131b26] text-white"
+                      >
+                        {getStorefrontDisplayName(plat.platformId)}{' '}
+                        {platInstalled ? '• Installed' : '• Not Installed'}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
             )}
@@ -559,6 +576,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     <span className="text-[10px] text-steam-subtext">
                       {getStorefrontDisplayName(selectedPlatformId)}
                     </span>
+                  </div>
+
+                  {/* Group 1: Local Files & Installation */}
+                  <div className="px-3.5 pt-1 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
+                    Local Files &amp; Installation
                   </div>
 
                   {/* 1. Browse Local Files */}
@@ -612,14 +634,14 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     <span>Locate Installed Game...</span>
                   </button>
 
-                  {/* 3b. Mark as Manually Installed / Uninstalled */}
+                  {/* 4. Mark as Manually Installed / Uninstalled */}
                   <button
                     type="button"
                     onClick={async () => {
                       setIsManageMenuOpen(false);
                       const nextState = !isInstalled;
                       await launcherService.setManualInstallStatus(game, nextState, selectedPlatformId);
-                      onToggleInstallStatus?.();
+                      onToggleInstallStatus?.(selectedPlatformId);
                       showTempFeedback(
                         nextState
                           ? 'Marked as manually installed.'
@@ -632,66 +654,121 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     <span>{isInstalled ? 'Mark as Uninstalled (Cloud Only)' : 'Mark as Manually Installed'}</span>
                   </button>
 
-                  {/* 4. Launch & Compatibility Settings... */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsManageMenuOpen(false);
-                      setIsLaunchConfigModalOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer border-t border-[#2a475e]/40"
-                  >
-                    <Cpu className="w-4 h-4 text-purple-400 shrink-0" />
-                    <span>
-                      {isWindowsHost ? 'Launch Settings...' : 'Launch & Compatibility Settings...'}
-                    </span>
-                  </button>
+                  {/* Group 2: Metadata & Launch Configuration */}
+                  <div className="mt-1 pt-1.5 border-t border-[#2a475e]/50">
+                    <div className="px-3.5 pb-0.5 text-[9px] font-bold uppercase tracking-wider text-steam-subtext/75">
+                      Metadata &amp; Settings
+                    </div>
 
-                  {/* 5. Match & Metadata Wizard... */}
-                  {onFixMatch && (
+                    {/* 5. Match & Metadata Wizard... */}
+                    {onFixMatch && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsManageMenuOpen(false);
+                          onFixMatch();
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer"
+                      >
+                        <Wand className="w-4 h-4 text-sky-400 shrink-0" />
+                        <span>Match &amp; Metadata Wizard...</span>
+                      </button>
+                    )}
+
+                    {/* 6. Launch & Compatibility Settings... */}
                     <button
                       type="button"
                       onClick={() => {
                         setIsManageMenuOpen(false);
-                        onFixMatch();
+                        setIsLaunchConfigModalOpen(true);
                       }}
                       className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer"
                     >
-                      <Wand className="w-4 h-4 text-sky-400 shrink-0" />
-                      <span>Match & Metadata Wizard...</span>
+                      <Cpu className="w-4 h-4 text-purple-400 shrink-0" />
+                      <span>
+                        {isWindowsHost ? 'Launch Settings...' : 'Launch & Compatibility Settings...'}
+                      </span>
                     </button>
-                  )}
+                  </div>
 
-                  {/* Cancel Active Install */}
-                  {activeDownload && (
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setIsManageMenuOpen(false);
-                        await launcherService.cancelDownload(activeDownload.taskId);
-                        showTempFeedback('Installation cancelled.');
-                      }}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer border-t border-[#2a475e]/40"
-                    >
-                      <X className="w-4 h-4 text-red-400 shrink-0" />
-                      <span>Cancel Install</span>
-                    </button>
-                  )}
+                  {/* Group 3: Visibility & Removal */}
+                  {(onHideGame || activeDownload || isInstalled) && (
+                    <div className="mt-1 pt-1 border-t border-[#2a475e]/50">
+                      {/* 7. Hide / Suppress Entry or Game */}
+                      {onHideGame &&
+                        (game.platforms.length > 1 ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsManageMenuOpen(false);
+                                onHideGame(game, selectedPlatformId);
+                              }}
+                              className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer"
+                            >
+                              <EyeOff className="w-4 h-4 text-rose-400 shrink-0" />
+                              <span>
+                                Hide {getStorefrontDisplayName(selectedPlatformId)} Entry
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsManageMenuOpen(false);
+                                onHideGame(game);
+                              }}
+                              className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer"
+                            >
+                              <EyeOff className="w-4 h-4 text-rose-400 shrink-0" />
+                              <span>Hide Entire Game from Library</span>
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsManageMenuOpen(false);
+                              onHideGame(game);
+                            }}
+                            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-rose-300 hover:text-white hover:bg-rose-950/50 transition-colors text-left cursor-pointer"
+                          >
+                            <EyeOff className="w-4 h-4 text-rose-400 shrink-0" />
+                            <span>Hide / Suppress Game from Library</span>
+                          </button>
+                        ))}
 
-                  {/* 6. Uninstall Game... */}
-                  {isInstalled && (
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setIsManageMenuOpen(false);
-                        const res = await launcherService.uninstallGame(game, selectedPlatformId);
-                        showTempFeedback(res.message || res.error || 'Game uninstalled.');
-                      }}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer border-t border-[#2a475e]/40"
-                    >
-                      <Trash2 className="w-4 h-4 text-red-400 shrink-0" />
-                      <span>Uninstall Game...</span>
-                    </button>
+                      {/* Cancel Active Install */}
+                      {activeDownload && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setIsManageMenuOpen(false);
+                            await launcherService.cancelDownload(activeDownload.taskId);
+                            showTempFeedback('Installation cancelled.');
+                          }}
+                          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer"
+                        >
+                          <X className="w-4 h-4 text-red-400 shrink-0" />
+                          <span>Cancel Install</span>
+                        </button>
+                      )}
+
+                      {/* 8. Uninstall Game... */}
+                      {isInstalled && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setIsManageMenuOpen(false);
+                            const res = await launcherService.uninstallGame(game, selectedPlatformId);
+                            showTempFeedback(res.message || res.error || 'Game uninstalled.');
+                          }}
+                          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-red-300 hover:text-red-200 hover:bg-red-950/50 transition-colors text-left cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4 text-red-400 shrink-0" />
+                          <span>Uninstall Game...</span>
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
@@ -718,66 +795,56 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               />
             </button>
           )}
-
-          {/* Library Status Indicator */}
-          <div className="flex flex-col justify-center border-l border-[#2a475e]/60 pl-2.5 xl:pl-3.5 py-0.5 shrink-0 min-w-max">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-white whitespace-nowrap">
-              {isRunning ? (
-                <>
-                  <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse shrink-0" />
-                  <span className="text-emerald-400">Active Session</span>
-                </>
-              ) : isInstalled ? (
-                <>
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span className="text-emerald-400">Ready to Play</span>
-                </>
-              ) : (
-                <>
-                  <Cloud className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span className="text-sky-300">In Library</span>
-                </>
-              )}
-            </div>
-            <span className="text-[10px] text-[#8f98a0] mt-0.5 whitespace-nowrap">
-              {isInstalled
-                ? isWindowsBinaryOnMac
-                  ? `CrossOver / Wine • ${getStorefrontDisplayName(selectedPlatformId)}`
-                  : `via ${getStorefrontDisplayName(selectedPlatformId)}`
-                : `Cloud Library • ${getStorefrontDisplayName(selectedPlatformId)}`}
-            </span>
-          </div>
         </div>
 
         {/* Right: Steam Library Stats Matrix */}
-        <div className="flex flex-wrap items-start justify-start lg:justify-end gap-x-5 xl:gap-x-7 gap-y-3 border-t lg:border-t-0 lg:border-l border-[#2a475e]/60 pt-3 lg:pt-0 pl-0 lg:pl-4 xl:pl-6 flex-1 min-w-0">
+        <div className="flex flex-wrap lg:flex-nowrap items-start justify-start lg:justify-end gap-x-5 xl:gap-x-7 gap-y-3 border-t lg:border-t-0 lg:border-l border-[#2a475e]/60 pt-3 lg:pt-0 pl-0 lg:pl-4 xl:pl-6 flex-1 min-w-0">
           {/* Play Time */}
-          <div className="flex flex-col min-w-0 shrink-0">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-[#8f98a0] flex items-center gap-1 whitespace-nowrap">
-              <Clock className="w-3 h-3 text-sky-400" />
-              Play Time
+          <div
+            onClick={() => {
+              if (game.platforms.length > 1) {
+                setShowPlaytimePopover((prev) => {
+                  const next = !prev;
+                  if (next) setShowAchievementPopover(false);
+                  return next;
+                });
+              }
+            }}
+            className={`flex flex-col min-w-0 shrink-0 ${
+              game.platforms.length > 1 ? 'cursor-pointer group select-none' : ''
+            }`}
+            title={
+              game.platforms.length > 1
+                ? 'Click to view per-store playtime breakdown'
+                : undefined
+            }
+          >
+            <span
+              className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 whitespace-nowrap transition-colors ${
+                game.platforms.length > 1
+                  ? showPlaytimePopover
+                    ? 'text-steam-accent'
+                    : 'text-[#8f98a0] group-hover:text-white'
+                  : 'text-[#8f98a0]'
+              }`}
+            >
+              <Clock className="w-3 h-3 text-sky-400 shrink-0" />
+              <span>Play Time</span>
+              {game.platforms.length > 1 && (
+                <ChevronDown
+                  className={`w-2.5 h-2.5 transition-transform duration-200 text-sky-400/80 group-hover:text-sky-300 ${
+                    showPlaytimePopover ? 'rotate-180 text-steam-accent' : ''
+                  }`}
+                />
+              )}
             </span>
-            <span className="text-sm font-bold text-white mt-0.5">
+            <span
+              className={`text-sm font-bold text-white mt-0.5 whitespace-nowrap transition-colors ${
+                game.platforms.length > 1 ? 'group-hover:text-steam-accent' : ''
+              }`}
+            >
               {formatPlaytime(totalPlaytimeMinutes)}
             </span>
-            {/* Multi-store breakdown pills if owned on >1 storefront or multiple have playtime */}
-            {platformsWithPlaytime.length > 1 && (
-              <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
-                {platformsWithPlaytime.map((plat) => {
-                  const reg = STOREFRONT_REGISTRY[plat.platformId];
-                  return (
-                    <span
-                      key={plat.platformId}
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[#16202d] border border-steam-border/60 text-[#c6d4df]"
-                      title={`${reg?.name || plat.platformId}: ${formatPlaytime(plat.playtimeMinutes || 0)}`}
-                    >
-                      <StorefrontIcon storefrontId={plat.platformId} className="w-2.5 h-2.5 text-steam-accent" />
-                      <span>{reg?.name || plat.platformId}: {formatPlaytime(plat.playtimeMinutes || 0)}</span>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
           </div>
 
           {/* Last Played */}
@@ -786,7 +853,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <Calendar className="w-3 h-3 text-sky-400" />
               Last Played
             </span>
-            <span className="text-sm font-bold text-white mt-0.5">
+            <span className="text-sm font-bold text-white mt-0.5 whitespace-nowrap">
               {formatLastPlayed()}
             </span>
           </div>
@@ -797,7 +864,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <HardDrive className="w-3 h-3 text-sky-400" />
               Space Required
             </span>
-            <span className="text-sm font-bold text-white mt-0.5">
+            <span className="text-sm font-bold text-white mt-0.5 whitespace-nowrap">
               {getSpaceRequired()}
             </span>
           </div>
@@ -808,7 +875,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               if (onViewAchievements && hasAchievements && bestAchievement.total > 0) {
                 onViewAchievements(bestAchievement.platformId);
               } else if (platformAchievements.length > 1) {
-                setShowAchievementPopover((prev) => !prev);
+                setShowAchievementPopover((prev) => {
+                  const next = !prev;
+                  if (next) setShowPlaytimePopover(false);
+                  return next;
+                });
               }
             }}
             className={`flex flex-col min-w-0 shrink-0 ${
@@ -984,6 +1055,90 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         </div>
       </div>
 
+      {/* Multi-Store Playtime Breakdown Drawer (Expandable Inline) */}
+      {showPlaytimePopover && game.platforms.length > 1 && (
+        <div className="mt-4 pt-3.5 border-t border-[#2a475e]/70 animate-in fade-in duration-150">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Clock className="w-4 h-4 text-sky-400" />
+              <span className="text-xs font-bold text-white tracking-wide">
+                Storefront Playtime Breakdown
+              </span>
+              <span className="text-[10px] text-steam-subtext font-normal">
+                ({game.platforms.length} connected storefronts)
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowPlaytimePopover(false)}
+              className="text-steam-subtext hover:text-white px-2 py-0.5 rounded hover:bg-white/10 text-xs flex items-center gap-1 cursor-pointer transition-colors"
+              title="Close storefront playtime breakdown"
+            >
+              <span className="text-[11px]">Close</span>
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {game.platforms.map((plat) => {
+              const reg = STOREFRONT_REGISTRY[plat.platformId];
+              const platMinutes = plat.playtimeMinutes || 0;
+              const sharePct =
+                totalPlaytimeMinutes > 0
+                  ? Math.round((platMinutes / totalPlaytimeMinutes) * 100)
+                  : 0;
+              const platLastPlayed = formatPlatformLastPlayed(plat.lastPlayed);
+
+              return (
+                <div
+                  key={plat.platformId}
+                  className="bg-[#141d28] p-3 rounded border border-steam-border/50 flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex items-center justify-between text-xs mb-1.5">
+                      <div className="flex items-center gap-1.5 font-semibold text-white">
+                        <StorefrontIcon
+                          storefrontId={plat.platformId}
+                          className="w-3.5 h-3.5 text-steam-accent"
+                        />
+                        <span>{reg?.name || plat.platformId}</span>
+                      </div>
+                      {plat.installed && (
+                        <span className="text-[10px] font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-1.5 py-0.2 rounded">
+                          Installed
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-sm font-bold text-white">
+                        {formatPlaytime(platMinutes)}
+                      </span>
+                      <span className="text-xs font-semibold text-sky-400">
+                        {sharePct}%
+                      </span>
+                    </div>
+
+                    {platLastPlayed && platLastPlayed !== 'Never' && (
+                      <div className="text-[10px] text-[#8f98a0] mt-1">
+                        Last played: {platLastPlayed}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="w-full bg-[#1b2838] h-1.5 rounded-full mt-2 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all bg-sky-400"
+                      style={{ width: `${Math.min(100, sharePct)}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Multi-Store Achievements Drawer (Expandable Inline to Avoid Obscuring Content Below) */}
       {showAchievementPopover && platformAchievements.length > 1 && (
         <div className="mt-4 pt-3.5 border-t border-[#2a475e]/70 animate-in fade-in duration-150">
@@ -1121,6 +1276,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       <GameLaunchConfigModal
         isOpen={isLaunchConfigModalOpen}
         game={game}
+        initialPlatformId={selectedPlatformId}
         onClose={() => setIsLaunchConfigModalOpen(false)}
         onSaved={(cfg) => {
           if (cfg.preferredPlatformId) {

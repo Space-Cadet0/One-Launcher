@@ -1,7 +1,10 @@
 import { CanonicalGame } from '../../contracts/game';
 import { steamMatcher } from '../steam/steamMatcher';
 import { steamApi } from '../steam/steamApi';
-import { fallbackMetadataProvider } from '../steam/fallbackMetadataProvider';
+import {
+  fallbackMetadataProvider,
+  isGenericPlaceholderSynopsis,
+} from '../steam/fallbackMetadataProvider';
 import { getOpenCriticData, criticScoreService } from '../critic/criticScoreService';
 import { requestScheduler, RequestPriority } from './requestScheduler';
 import {
@@ -556,9 +559,13 @@ export class SyncJobManager {
    */
   public async startCriticScoreSync(
     games: CanonicalGame[],
-    options?: { forceRefresh?: boolean; isBackgroundWarmup?: boolean }
+    options?: { forceRefresh?: boolean; isBackgroundWarmup?: boolean; isBackground?: boolean }
   ): Promise<void> {
-    const isBackground = Boolean(options?.isBackgroundWarmup);
+    const isBackground = Boolean(options?.isBackgroundWarmup || options?.isBackground);
+
+    if (isBackground && this.state?.type === 'critic_scores' && this.state?.status === 'running') {
+      return;
+    }
 
     // If a manual batch job is already running and this is just a passive background warmup, don't overwrite it
     if (
@@ -600,23 +607,34 @@ export class SyncJobManager {
             const staged = loadStagedCache(`antigravity_critic_v8_${cacheKey}`, false);
             if (!staged.valid) return true;
           }
+          if (isBackground && criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
+            return false;
+          }
           const score = getOpenCriticData(
             targetSteamId || undefined,
             g.title,
             g.reviewSummary?.positivePercent,
-            undefined,
+            g.releaseDate,
             undefined,
             false,
             true
           );
-          if (!score || score.score <= 0) return true;
-          if (
-            score.isSynthetic &&
-            !criticScoreService.hasAttemptedDynamicResolution(targetSteamId, g.title)
-          ) {
-            return true;
+          if (isBackground && criticScoreService.hasValidCachedResolution(targetSteamId, g.title)) {
+            return false;
           }
-          return false;
+          if (criticScoreService.hasAttemptedDynamicResolution(targetSteamId, g.title)) {
+            return false;
+          }
+          if (score && score.score > 0) {
+            if (
+              score.isSynthetic &&
+              (!isBackground || !criticScoreService.hasValidCachedResolution(targetSteamId, g.title))
+            ) {
+              return true;
+            }
+            return false;
+          }
+          return true;
         });
 
     if (targetGames.length === 0) {
@@ -684,12 +702,13 @@ export class SyncJobManager {
       if (this.isCancelled || this.criticLoopToken !== myToken) break;
 
       const chunk = targetGames.slice(i, i + chunkSize);
+      const activeTitles = new Set<string>();
       const firstTitle = chunk[0]?.title;
 
       const stat = this.categoryStats.get('critic_scores');
       if (stat) {
         stat.completed = completedCount;
-        stat.lastItemName = firstTitle;
+        if (firstTitle) stat.lastItemName = firstTitle;
       }
 
       if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
@@ -710,6 +729,9 @@ export class SyncJobManager {
           if (this.isCancelled || this.criticLoopToken !== myToken) return;
           await this.waitWhilePausedOrPreempted();
           if (this.isCancelled || this.criticLoopToken !== myToken) return;
+          if (game.title) {
+            activeTitles.add(game.title);
+          }
           try {
             let targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
             if (!targetSteamId && !game.isExplicitNonSteam) {
@@ -730,24 +752,28 @@ export class SyncJobManager {
                 bypassAttempted: Boolean(options?.forceRefresh),
                 platforms: game.platforms,
                 gameId: game.id,
+                genres: game.genres,
               }
             );
           } catch {} finally {
+            activeTitles.delete(game.title);
             if (!this.isCancelled && this.criticLoopToken === myToken) {
               completedCount = Math.min(targetGames.length, completedCount + 1);
+              const nextActiveTitle = activeTitles.values().next().value as string | undefined;
+              const nextItemName = nextActiveTitle ?? (stat?.lastItemName || this.state?.currentItemName);
               if (stat) {
                 stat.completed = completedCount;
-                stat.lastItemName = game.title;
+                if (nextItemName) stat.lastItemName = nextItemName;
               }
               if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
                 const activeCats = this.getActiveCategories();
                 if (activeCats.length > 1) {
-                  this.recomputeAggregateStateFromCategories('critic_scores', game.title);
+                  this.recomputeAggregateStateFromCategories('critic_scores', nextItemName);
                 } else {
                   this.updateState({
                     current: completedCount,
                     total: targetGames.length,
-                    currentItemName: game.title,
+                    currentItemName: nextItemName,
                   });
                 }
               }
@@ -760,7 +786,8 @@ export class SyncJobManager {
         isBackground &&
         completedCount < targetGames.length &&
         !this.isCancelled &&
-        this.criticLoopToken === myToken
+        this.criticLoopToken === myToken &&
+        !(typeof process !== 'undefined' && process.env.VITEST)
       ) {
         await new Promise((r) => setTimeout(r, 300));
       }
@@ -819,6 +846,7 @@ export class SyncJobManager {
 
     const eligibleGames = games.filter((g) => {
       if (steamMatcher.getEffectiveSteamAppId(g)) return true;
+      if (g.platforms?.some((p) => p.platformId === 'gog' || p.platformId === 'epic')) return true;
       const ov = getUserOverrideForGame(g);
       const route = inferMetadataRouteFromOverride(ov);
       return Boolean(
@@ -908,15 +936,19 @@ export class SyncJobManager {
         route?.source === 'steam' && route.steamAppId
           ? route.steamAppId
           : steamMatcher.getEffectiveSteamAppId(game);
+      const hasNonSteamPlatform = Boolean(
+        game.platforms?.some((p) => p.platformId === 'gog' || p.platformId === 'epic')
+      );
 
-      if (isNonSteamRouted || targetAppId) {
+      if (isNonSteamRouted || targetAppId || hasNonSteamPlatform) {
         try {
-          const refreshed = isNonSteamRouted
-            ? await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, ov)
-            : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND);
+          const refreshed =
+            isNonSteamRouted || !targetAppId
+              ? await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, ov)
+              : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND);
 
           if (refreshed) {
-            if (!isNonSteamRouted && ov && route?.mode === 'routed') {
+            if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
               updateRoutedMetadataSnapshot(game.id, {
                 title: refreshed.name,
                 shortDescription: refreshed.shortDescription,
@@ -932,10 +964,19 @@ export class SyncJobManager {
 
             const preservePinnedSynopsis = Boolean(ov && (route?.customSynopsisEdited || route?.mode === 'custom'));
             const preservePinnedCover = Boolean(ov?.capsuleImage);
+            const validRefreshedShort =
+              refreshed.shortDescription &&
+              !isGenericPlaceholderSynopsis(refreshed.shortDescription, game.title)
+                ? refreshed.shortDescription
+                : undefined;
+            const validRefreshedDevs =
+              refreshed.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
+            const validRefreshedPubs =
+              refreshed.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
 
             const updatedGame: CanonicalGame = {
               ...game,
-              steamAppId: isNonSteamRouted ? game.steamAppId : targetAppId,
+              steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
               enrichedMetadata: refreshed || game.enrichedMetadata,
               headerImage: refreshed.headerImage || game.headerImage,
               capsuleImage: preservePinnedCover
@@ -943,13 +984,13 @@ export class SyncJobManager {
                 : refreshed.capsuleImage || game.capsuleImage,
               shortDescription: preservePinnedSynopsis
                 ? ov!.shortDescription || game.shortDescription
-                : refreshed.shortDescription || game.shortDescription,
+                : validRefreshedShort || game.shortDescription,
               detailedDescription:
                 refreshed.detailedDescription ||
                 refreshed.aboutTheGame ||
                 game.detailedDescription,
-              developers: refreshed.developers?.length ? refreshed.developers : game.developers,
-              publishers: refreshed.publishers?.length ? refreshed.publishers : game.publishers,
+              developers: validRefreshedDevs.length ? validRefreshedDevs : game.developers,
+              publishers: validRefreshedPubs.length ? validRefreshedPubs : game.publishers,
               genres: refreshed.genres?.length ? refreshed.genres : game.genres,
               tags: refreshed.tags?.length ? refreshed.tags : game.tags,
               releaseDate:

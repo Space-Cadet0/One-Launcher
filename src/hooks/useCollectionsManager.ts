@@ -21,24 +21,44 @@ export function useCollectionsManager() {
   }, []);
 
   const handleCreateCollection = useCallback(
-    (name: string) => {
+    (name: string, icon?: string): string => {
+      const id = `col-${Date.now()}`;
       setCollections((prev) => {
         const newCol: GameCollection = {
-          id: `col-${Date.now()}`,
-          name,
+          id,
+          name: name.trim() || 'New Collection',
+          icon: icon || 'folder',
           gameIds: collectionModalGame ? [collectionModalGame.id] : [],
         };
         const updated = [...prev, newCol];
         saveCollections(updated);
         return updated;
       });
+      return id;
     },
     [collectionModalGame]
   );
 
-  const handleRenameCollection = useCallback((id: string, newName: string) => {
+  const handleRenameCollection = useCallback((id: string, newName: string, icon?: string) => {
     setCollections((prev) => {
-      const updated = prev.map((c) => (c.id === id ? { ...c, name: newName } : c));
+      const trimmedName = newName.trim();
+      const updated = prev.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              ...(trimmedName ? { name: trimmedName } : {}),
+              ...(icon !== undefined ? { icon } : {}),
+            }
+          : c
+      );
+      saveCollections(updated);
+      return updated;
+    });
+  }, []);
+
+  const handleUpdateCollectionIcon = useCallback((id: string, icon: string) => {
+    setCollections((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, icon } : c));
       saveCollections(updated);
       return updated;
     });
@@ -77,6 +97,7 @@ export function useCollectionsManager() {
     handleCloseManageCollections,
     handleCreateCollection,
     handleRenameCollection,
+    handleUpdateCollectionIcon,
     handleDeleteCollection,
     handleToggleGameInCollection,
   };

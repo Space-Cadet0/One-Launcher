@@ -1,6 +1,6 @@
 import { CriticScoreData, StorefrontReviewAnchor } from '../../contracts/critic';
-import { calculateTier, isSequelMismatch } from './criticUtils';
-import { ROMAN_TO_ARABIC, NUMERIC_SEQUELS } from '../common/titleUtils';
+import { calculateTier, isSequelMismatch, stripEditionSuffix } from './criticUtils';
+import { ROMAN_TO_ARABIC, NUMERIC_SEQUELS, extractSequelIdentifier, normalizeTitleKey } from '../common/titleUtils';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 
 export interface MetacriticBundle {
@@ -148,10 +148,30 @@ export function generateMetacriticSlugCandidates(
   releaseYear?: number | string | null,
   storefrontAnchor?: StorefrontReviewAnchor | null
 ): string[] {
-  const base = toCanonicalMetacriticSlug(title);
+  const clean = (title || '').trim();
+  const base = toCanonicalMetacriticSlug(clean);
   const candidates: string[] = base ? [base] : [];
 
   if (!base && !storefrontAnchor?.metacriticSlug) return [];
+
+  // Collapse dotted single-letter sequences (e.g. "S.T.A.L.K.E.R. 2: Heart of Chornobyl" -> "stalker-2-heart-of-chornobyl")
+  const collapsedAcronym = clean.replace(/\b(?:[a-z]\.){2,}[a-z]?\.?/gi, (m) => m.replace(/\./g, ''));
+  if (collapsedAcronym !== clean) {
+    const collapsedSlug = toCanonicalMetacriticSlug(collapsedAcronym);
+    if (collapsedSlug && collapsedSlug !== base) {
+      candidates.push(collapsedSlug);
+      const strippedCollapsed = stripMetacriticEditionSlug(collapsedSlug);
+      if (strippedCollapsed && strippedCollapsed !== collapsedSlug) {
+        candidates.push(strippedCollapsed);
+      }
+    }
+    if (collapsedAcronym.includes(':')) {
+      const collapsedBaseSlug = toCanonicalMetacriticSlug(collapsedAcronym.split(':')[0].trim());
+      if (collapsedBaseSlug && !candidates.includes(collapsedBaseSlug)) {
+        candidates.push(collapsedBaseSlug);
+      }
+    }
+  }
 
   // 1. Universal Edition suffix stripping (prioritized as Candidate #2 immediately after base)
   const stripped = stripMetacriticEditionSlug(base);
@@ -479,6 +499,46 @@ export function isTitleCompatible(queryTitle: string, canonicalName: string): bo
   }
 
   // 2. Bidirectional substantive token conservation:
+  // Reject if query has extra non-edition substantive words outside parentheticals that are missing from candidate
+  // (e.g. 'Godzilla Voxel Wars' -> 'Godzilla', 'Quake Champions' -> 'Quake', 'Quake II RTX' -> 'Quake II Enhanced Edition', 'Fallout Tactics' -> 'Fallout', 'Syndicate Wars' / 'Syndicate Plus' -> 'Syndicate')
+  const queryWithoutParens = queryTitle
+    .replace(/\s*\([^)]*\)/g, '')
+    .replace(/\b(mega\s+drive\s*(?:&|and)?\s*)/gi, '')
+    .trim();
+  const qSubstantive = norm(queryWithoutParens).filter(
+    (t) =>
+      !PURE_EDITION_WORDS.has(t) &&
+      !NUMERIC_SEQUELS.has(t) &&
+      !/^\d{4}$/.test(t)
+  );
+  const qExtra = qSubstantive.filter((t) => !cTokens.includes(t));
+  if (qExtra.length >= 1) {
+    return false;
+  }
+
+  const qBaseStr =
+    queryTitle.includes(':') || queryTitle.includes(' - ') || /!\s+\S/.test(queryTitle)
+      ? queryTitle.split(/[:\-!]/)[0].trim()
+      : queryTitle.replace(/\s*\([^)]*\)/g, '').trim();
+  const qBase = norm(qBaseStr).filter(
+    (t) => !PURE_EDITION_WORDS.has(t) && !/^\d{4}$/.test(t)
+  );
+  const hasEditionSuffix =
+    stripEditionSuffix(queryTitle).trim().toLowerCase() !== normalizeTitleKey(queryTitle) ||
+    /\b(definitive|complete|goty|game of the year|director'?s cut|ultimate|enhanced|anniversary|remastered|collection|anthology|gold|deluxe|special|royal|legendary|edition)\b/i.test(
+      queryTitle
+    );
+
+  if (
+    hasEditionSuffix &&
+    qBase.length >= 1 &&
+    qTokens.every((t) => cTokens.includes(t)) &&
+    qBase.every((t, idx) => cTokens[idx] === t) &&
+    (qBase.length > 1 || qBase[0].length >= 5 || extractSequelIdentifier(queryTitle) !== null)
+  ) {
+    return true;
+  }
+
   const cBase = canonicalName.includes(':') || canonicalName.includes(' - ') || /!\s+\S/.test(canonicalName)
     ? canonicalName.split(/[:\-!]/)[0].trim()
     : canonicalName;
@@ -509,13 +569,7 @@ export function isTitleCompatible(queryTitle: string, canonicalName: string): bo
       !/^\d{4}$/.test(t) &&
       !(t === 'plus' && queryTitle.includes('+'))
   );
-  const qBase =
-    queryTitle.includes(':') || queryTitle.includes(' - ') || /!\s+\S/.test(queryTitle)
-      ? queryTitle.split(/[:\-!]/)[0].trim()
-      : queryTitle.replace(/\s*\([^)]*\)/g, '').trim();
-  const qBaseTokens = norm(qBase).filter(
-    (t) => !PURE_EDITION_WORDS.has(t) && !NUMERIC_SEQUELS.has(t) && !/^\d{4}$/.test(t)
-  );
+  const qBaseTokens = qBase.filter((t) => !NUMERIC_SEQUELS.has(t));
   const candidateHasSubtitle =
     canonicalName.includes(':') || canonicalName.includes(' - ') || /!\s+\S/.test(canonicalName);
 
@@ -527,23 +581,6 @@ export function isTitleCompatible(queryTitle: string, canonicalName: string): bo
     if (qBaseTokens.length >= 2 && cExtra.length >= 1) {
       return false;
     }
-  }
-
-  // Reject if query has extra non-edition substantive words outside parentheticals that are missing from candidate
-  // (e.g. 'Godzilla Voxel Wars' -> 'Godzilla', 'Quake Champions' -> 'Quake', 'Quake II RTX' -> 'Quake II Enhanced Edition', 'Fallout Tactics' -> 'Fallout', 'Syndicate Wars' / 'Syndicate Plus' -> 'Syndicate')
-  const queryWithoutParens = queryTitle
-    .replace(/\s*\([^)]*\)/g, '')
-    .replace(/\b(mega\s+drive\s*(?:&|and)?\s*)/gi, '')
-    .trim();
-  const qSubstantive = norm(queryWithoutParens).filter(
-    (t) =>
-      !PURE_EDITION_WORDS.has(t) &&
-      !NUMERIC_SEQUELS.has(t) &&
-      !/^\d{4}$/.test(t)
-  );
-  const qExtra = qSubstantive.filter((t) => !cTokens.includes(t));
-  if (qExtra.length >= 1) {
-    return false;
   }
 
   return true;
@@ -844,11 +881,11 @@ export class MetacriticResolver {
                   return null;
                 }
 
-                // Guard against Metacritic's /game/the-walking-dead/ URL (which hosts Terminal Reality's 2013 FPS "The Walking Dead: Survival Instinct") matching Telltale's "The Walking Dead"
+                // Guard against franchise spinoff / studio collisions on base-title review URLs
+                const descText = jsonLd.description || '';
                 if (
-                  slug === 'the-walking-dead' &&
-                  !/survival instinct/i.test(title) &&
-                  /terminal reality/i.test(jsonLd.description || '')
+                  !/\bsurvival instinct\b/i.test(title) &&
+                  (/\bsurvival instinct\b/i.test(descText) || /\bterminal reality\b/i.test(descText))
                 ) {
                   return null;
                 }

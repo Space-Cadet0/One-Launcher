@@ -31,6 +31,8 @@ export interface InstalledGameRecord {
   title?: string;
   installPath: string;
   executablePath?: string;
+  /** Default launch arguments discovered from storefront manifest (appinfo.vdf / goggame.info / Epic .item / engine gameinfo.txt) */
+  launchArguments?: string;
   installSize?: number; // in bytes
   version?: string;
   manifestPath?: string;
@@ -46,10 +48,10 @@ export interface InstalledGameRecord {
   isWindowsBinaryOnMac?: boolean;
 }
 
-export interface GameLaunchConfig {
-  gameId: string;
-  preferredPlatformId?: StorefrontId;
-  launchMethod: LaunchMethod;
+export type CrossOverGraphicsBackend = 'auto' | 'd3dmetal' | 'dxmt' | 'dxvk' | 'wined3d';
+
+export interface StorefrontLaunchProfile {
+  launchMethod?: LaunchMethod;
   customExecutablePath?: string;
   workingDirectory?: string;
   launchArguments?: string;
@@ -57,8 +59,68 @@ export interface GameLaunchConfig {
   compatibilityLayer?: CompatibilityLayerType;
   wineBottleName?: string;
   winePrefixPath?: string;
+  /** CrossOver 26 per-game graphics backend override */
+  crossoverGraphicsBackend?: CrossOverGraphicsBackend;
+  /** CrossOver 26 High Resolution Mode (Retina 192 DPI in HKCU\Software\Wine\Mac Driver) */
+  crossoverHighResolutionMode?: boolean;
+  /** CrossOver 26 DLSS (MetalFX upscaling for D3DMetal and DXMT) */
+  crossoverDlss?: boolean;
+  /** Wine / CrossOver Mach semaphore synchronization (WINEMSYNC) */
+  wineMsync?: boolean;
+  /** Wine / CrossOver eventfd synchronization (WINEESYNC) */
+  wineEsync?: boolean;
+  /** Apple Metal Performance HUD overlay (MTL_HUD_ENABLED=1) */
+  metalHud?: boolean;
+  /** DXVK FPS & frametime HUD overlay (DXVK_HUD=devinfo,fps,frametimes) */
+  dxvkHud?: boolean;
   preLaunchCommand?: string;
   postExitCommand?: string;
+}
+
+export interface GameLaunchConfig extends StorefrontLaunchProfile {
+  gameId: string;
+  preferredPlatformId?: StorefrontId;
+  launchMethod: LaunchMethod;
+  /** Per-storefront launch & compatibility profiles keyed by StorefrontId ('steam' | 'gog' | 'epic' | 'custom') */
+  platformConfigs?: Partial<Record<StorefrontId, StorefrontLaunchProfile>>;
+}
+
+export interface ResolvedLaunchModePreview {
+  isInstalled: boolean;
+  hostPlatform: 'darwin' | 'win32' | 'linux';
+  platformId: StorefrontId;
+  installPath?: string;
+  executablePath?: string;
+  detectedBuildType:
+    | 'mac_native_app'
+    | 'mac_native_bin'
+    | 'windows_exe_on_mac'
+    | 'windows_native'
+    | 'not_installed';
+  detectedBuildLabel: string;
+  detectedBuildDetail: string;
+  autoResolvedMethod: LaunchMethod;
+  autoResolvedSummary: string;
+  recommendedModes: LaunchMethod[];
+  /** Launch modes relevant to this storefront's installation type */
+  availableModes: LaunchMethod[];
+  /** Dynamic visibility flags for modal sections based on host OS, storefront build type, and active runner */
+  visibleSections: {
+    compatibilityLayer: boolean;
+    crossoverRendering: boolean;
+    nativeMacMetalHud: boolean;
+    executableAndArgs: boolean;
+    environmentAndHooks: boolean;
+  };
+  modeNotes: Record<
+    LaunchMethod,
+    {
+      badge?: string;
+      badgeTone?: 'emerald' | 'sky' | 'amber' | 'slate';
+      dynamicDesc: string;
+      warning?: string;
+    }
+  >;
 }
 
 export interface ActiveGameSession {
@@ -152,6 +214,11 @@ export interface GameInstallInfoRequest {
   platformGameId: string;
   steamAppId?: number;
   targetInstallDir?: string;
+  steamPlatforms?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
+  };
 }
 
 export interface LaunchGameRequest {
@@ -162,6 +229,7 @@ export interface LaunchGameRequest {
   steamAppId?: number;
   installPath?: string;
   executablePath?: string;
+  launchArguments?: string;
   isWindowsBinaryOnMac?: boolean;
   launchConfig?: GameLaunchConfig;
 }
@@ -183,6 +251,8 @@ export interface InstallGameRequest {
   installerId?: string;
   os?: 'mac' | 'windows' | 'linux';
   createShortcut?: boolean;
+  estimatedSizeBytes?: number;
+  totalBytes?: number;
 }
 
 export interface UninstallGameRequest {

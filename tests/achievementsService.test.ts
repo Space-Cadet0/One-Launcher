@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import React from 'react';
+import { renderToString } from 'react-dom/server';
 import {
   achievementDetailService,
   classifyRarityTier,
@@ -8,8 +12,9 @@ import {
   BALDURS_GATE_2_ACHIEVEMENTS,
 } from '../src/services/achievements/canonicalAchievementSchemas';
 import { CANONICAL_KNOWN_STORE_STEAM_MAPPINGS } from '../src/services/steam/steamMatcher';
-import { getAchievementTrophyTier } from '../src/components/Achievements/GameAchievementsModal';
 import { CanonicalGame } from '../src/contracts/game';
+import { GameAchievementsModal } from '../src/components/Achievements/GameAchievementsModal';
+import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
 
 class LocalStorageMock {
   private store: Record<string, string> = {};
@@ -479,143 +484,327 @@ describe('AchievementDetailService & Classification', () => {
     });
   });
 
-  describe('PlayStation Trophy Tier Classification', () => {
-    it('classifies platinum trophies for capstone achievements or 250 XP', () => {
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '1',
-            apiName: 'PLAT',
-            name: 'Bright Falls Finest: Unlock All Achievements',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'epic',
-            xp: 250,
-          },
-          88,
-          0
-        )
-      ).toBe('platinum');
+  describe('UI Regression Tests: GameAchievementsModal & SteamLibraryActionBar', () => {
+    const findElement = (node: any, predicate: (el: any) => boolean): any => {
+      if (!node || typeof node !== 'object') return null;
+      if (Array.isArray(node)) {
+        for (const child of node) {
+          const found = findElement(child, predicate);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (predicate(node)) return node;
+      if (node.props && node.props.children) {
+        return findElement(node.props.children, predicate);
+      }
+      return null;
+    };
 
-      expect(
-        getAchievementTrophyTier(
+    const extractText = (node: any): string => {
+      if (node === null || node === undefined || typeof node === 'boolean') return '';
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (Array.isArray(node)) return node.map(extractText).join('');
+      if (node.props && node.props.children) return extractText(node.props.children);
+      return '';
+    };
+
+    it('Test A: GameAchievementsModal uses valid pl-9 pr-8 search input padding and authentic PC achievement filter tabs without PSN trophy tiers', async () => {
+      const modalFilePath = path.resolve(
+        __dirname,
+        '../src/components/Achievements/GameAchievementsModal.tsx'
+      );
+      const modalSource = fs.readFileSync(modalFilePath, 'utf8');
+
+      // Verify absence of invalid Tailwind classes and PSN trophy categorization
+      expect(modalSource).not.toContain('pl-8.5');
+      expect(modalSource).not.toContain('py-4.5');
+      expect(modalSource).not.toContain('getAchievementTrophyTier');
+      expect(modalSource).not.toContain('TrophyTier');
+      expect(modalSource).not.toContain('trophyCounts');
+      expect(modalSource).not.toMatch(/['"]platinum['"]\s*\|\s*['"]gold['"]\s*\|\s*['"]silver['"]\s*\|\s*['"]bronze['"]/);
+
+      // Verify presence of valid pl-9 pr-8 search input padding and authentic PC filter tabs
+      expect(modalSource).toContain('pl-9 pr-8');
+      expect(modalSource).toContain("type FilterTab = 'all' | 'unlocked' | 'locked' | 'secret';");
+
+      // Also verify live rendered HTML of GameAchievementsModal
+      if (typeof (globalThis as any).window === 'undefined') {
+        (globalThis as any).window = {
+          localStorage: mockStorage,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        };
+      }
+
+      const testGame: CanonicalGame = {
+        id: 'steam-1091500',
+        title: 'Cyberpunk 2077',
+        sortTitle: 'Cyberpunk 2077',
+        steamAppId: 1091500,
+        platforms: [
           {
-            id: '2',
-            apiName: 'PLAT2',
-            name: 'All Achievements Unlocked',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'steam',
+            platformId: 'steam',
+            platformGameId: '1091500',
+            installed: true,
+            achievements: {
+              total: 44,
+              unlocked: 22,
+              percentage: 50,
+              isMastered: false,
+            },
           },
-          50,
-          49
-        )
-      ).toBe('platinum');
+        ],
+        capsuleImage: 'https://example.com/cp.jpg',
+        headerImage: 'https://example.com/cp-header.jpg',
+        shortDescription: 'Cyberpunk RPG.',
+        developers: ['CD PROJEKT RED'],
+        publishers: ['CD PROJEKT RED'],
+        genres: ['RPG'],
+        tags: ['Cyberpunk'],
+      };
+
+      const fetchSpy = vi
+        .spyOn(achievementDetailService, 'fetchGameAchievements')
+        .mockResolvedValue({
+          steam: {
+            storefrontId: 'steam',
+            storefrontName: 'Steam',
+            total: 2,
+            unlocked: 1,
+            percentage: 50,
+            isMastered: false,
+            supportsAchievements: true,
+            achievements: [
+              {
+                id: 'steam:1091500:ach1',
+                apiName: 'ACH_1',
+                name: 'The Fool',
+                description: 'Become a mercenary.',
+                unlocked: true,
+                unlockedAt: '2026-10-01T12:00:00Z',
+                iconUnlockedUrl: 'https://example.com/ach1.jpg',
+                globalPercentage: 85.4,
+                rarityTier: 'common',
+                storefrontId: 'steam',
+              },
+              {
+                id: 'steam:1091500:ach2',
+                apiName: 'ACH_2',
+                name: 'Hidden Twist',
+                description: 'Discover the secret ending.',
+                unlocked: false,
+                isSecret: true,
+                iconUnlockedUrl: 'https://example.com/ach2.jpg',
+                globalPercentage: 4.2,
+                rarityTier: 'ultra_rare',
+                storefrontId: 'steam',
+              },
+            ],
+          },
+        });
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+      const renderModal = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          return (GameAchievementsModal as any)({
+            isOpen: true,
+            game: testGame,
+            onClose: vi.fn(),
+          });
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderModal();
+        await new Promise((r) => setTimeout(r, 10));
+        const vnode = renderModal();
+        const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+
+        expect(html).toContain('pl-9 pr-8');
+        expect(html).toContain('All (2)');
+        expect(html).toContain('Unlocked (1)');
+        expect(html).toContain('Locked (1)');
+        expect(html).toContain('Secret (1)');
+        expect(html).not.toContain('Platinum');
+        expect(html).not.toContain('Bronze');
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
 
-    it('classifies gold trophies for ultra-rare achievements or XP >= 100', () => {
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '3',
-            apiName: 'GOLD1',
-            name: 'Dragon Slayer',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'steam',
-            globalPercentage: 5.2,
-          },
-          50,
-          10
-        )
-      ).toBe('gold');
+    it('Test B: SteamLibraryActionBar uses single-line lg:flex-nowrap stats matrix without invalid px-4.5 and toggles expandable Storefront Playtime Breakdown drawer on multi-storefront games', () => {
+      const actionBarFilePath = path.resolve(
+        __dirname,
+        '../src/components/SteamStoreDetail/SteamLibraryActionBar.tsx'
+      );
+      const actionBarSource = fs.readFileSync(actionBarFilePath, 'utf8');
 
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '4',
-            apiName: 'GOLD2',
-            name: 'Master Investigator',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'epic',
-            xp: 100,
-            globalPercentage: 12.0,
-          },
-          88,
-          15
-        )
-      ).toBe('gold');
-    });
+      // Verify no invalid px-4.5 classes and presence of lg:flex-nowrap on the right-side stats container
+      expect(actionBarSource).not.toContain('px-4.5');
+      expect(actionBarSource).toContain('lg:flex-nowrap');
+      expect(actionBarSource).toContain('Storefront Playtime Breakdown');
 
-    it('classifies silver trophies for rare/uncommon achievements (10% - 34.9%) or XP >= 50', () => {
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '5',
-            apiName: 'SILV1',
-            name: 'Planehopper',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'steam',
-            globalPercentage: 18.5,
-          },
-          93,
-          20
-        )
-      ).toBe('silver');
+      if (typeof (globalThis as any).window === 'undefined') {
+        (globalThis as any).window = {
+          localStorage: mockStorage,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        };
+      }
 
-      expect(
-        getAchievementTrophyTier(
+      const multiStoreGame: CanonicalGame = {
+        id: 'steam-257350',
+        title: "Baldur's Gate II: Enhanced Edition",
+        sortTitle: "Baldur's Gate II: Enhanced Edition",
+        steamAppId: 257350,
+        platforms: [
           {
-            id: '6',
-            apiName: 'SILV2',
-            name: 'Coffee Thermos Collector',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'epic',
-            xp: 50,
-            globalPercentage: 42.0,
+            platformId: 'steam',
+            platformGameId: '257350',
+            installed: true,
+            playtimeMinutes: 180, // 3 hrs
+            lastPlayed: '2026-10-12T10:00:00Z',
           },
-          88,
-          25
-        )
-      ).toBe('silver');
-    });
+          {
+            platformId: 'gog',
+            platformGameId: '1207666373',
+            installed: false,
+            playtimeMinutes: 120, // 2 hrs
+            lastPlayed: '2026-10-14T15:00:00Z',
+          },
+        ],
+        capsuleImage: 'https://example.com/bg2.jpg',
+        headerImage: 'https://example.com/bg2-header.jpg',
+        shortDescription: 'Classic RPG.',
+        developers: ['Beamdog'],
+        publishers: ['Beamdog'],
+        genres: ['RPG'],
+        tags: ['CRPG'],
+      };
 
-    it('classifies bronze trophies for common achievements (>= 35%) or XP < 50', () => {
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '7',
-            apiName: 'BRONZ1',
-            name: 'First Steps',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'steam',
-            globalPercentage: 78.4,
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+      const renderActionBar = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
           },
-          50,
-          2
-        )
-      ).toBe('bronze');
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          return (SteamLibraryActionBar as any)({
+            game: multiStoreGame,
+          });
+        } finally {
+          internals.H = prevH;
+        }
+      };
 
-      expect(
-        getAchievementTrophyTier(
-          {
-            id: '8',
-            apiName: 'BRONZ2',
-            name: 'Escape its Grasp',
-            unlocked: false,
-            iconUnlockedUrl: '',
-            storefrontId: 'epic',
-            xp: 20,
-            globalPercentage: 82.4,
-          },
-          88,
-          1
-        )
-      ).toBe('bronze');
+      // Initial render: Storefront Playtime Breakdown drawer is collapsed
+      let vnode = renderActionBar();
+      const initialHtml = renderToString(vnode).replace(/<!--\s*-->/g, '');
+      expect(initialHtml).toContain('lg:flex-nowrap');
+      expect(initialHtml).not.toContain('px-4.5');
+      expect(initialHtml).toContain('5 hrs'); // 180 + 120 = 300 mins = 5 hrs
+      expect(initialHtml).not.toContain('2 storefronts');
+      expect(initialHtml).not.toContain('Storefront Playtime Breakdown');
+
+      // Click the Play Time column to expand Storefront Playtime Breakdown drawer
+      const playTimeCol = findElement(
+        vnode,
+        (el) =>
+          el.type === 'div' &&
+          el.props?.title === 'Click to view per-store playtime breakdown'
+      );
+      expect(playTimeCol).toBeTruthy();
+      playTimeCol.props.onClick();
+
+      vnode = renderActionBar();
+      const expandedHtml = renderToString(vnode).replace(/<!--\s*-->/g, '');
+      expect(expandedHtml).toContain('Storefront Playtime Breakdown');
+      expect(expandedHtml).toContain('3 hrs');
+      expect(expandedHtml).toContain('60%');
+      expect(expandedHtml).toContain('2 hrs');
+      expect(expandedHtml).toContain('40%');
+
+      // Click the Play Time column again to collapse the drawer
+      const playTimeColExpanded = findElement(
+        vnode,
+        (el) =>
+          el.type === 'div' &&
+          el.props?.title === 'Click to view per-store playtime breakdown'
+      );
+      expect(playTimeColExpanded).toBeTruthy();
+      playTimeColExpanded.props.onClick();
+
+      vnode = renderActionBar();
+      const collapsedAgainHtml = renderToString(vnode).replace(/<!--\s*-->/g, '');
+      expect(collapsedAgainHtml).not.toContain('Storefront Playtime Breakdown');
     });
   });
 });
+

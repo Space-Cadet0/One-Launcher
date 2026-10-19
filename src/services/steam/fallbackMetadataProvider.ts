@@ -1,7 +1,15 @@
 import axios from 'axios';
 import { CanonicalGame } from '../../contracts/game';
 import { UserGameOverride } from '../../contracts/override';
-import { SteamEnrichedMetadata, SteamScreenshot, SteamMovie, SteamReviewSummary, SteamCategory } from '../../contracts/steam';
+import {
+  SteamEnrichedMetadata,
+  SteamScreenshot,
+  SteamMovie,
+  SteamReviewSummary,
+  SteamCategory,
+  SteamLanguageOption,
+  LanguageTableSchema,
+} from '../../contracts/steam';
 import { getOpenCriticData } from '../opencritic/openCritic';
 import {
   getUserOverrideForGame,
@@ -18,33 +26,69 @@ function ensureHttps(url?: string): string {
   return trimmed;
 }
 
-export function extractFirstParagraph(rawText?: string, maxLength = 260): string | null {
-  if (!rawText) return null;
+export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): string {
+  if (!rawText || typeof rawText !== 'string') return '';
   const clean = rawText
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/product_(?:description|feature)_\d+/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<\/(?:p|div|li|h[1-6]|tr|blockquote|section|article)>/gi, '\n\n')
     .replace(/<[^>]+>/g, '')
-    .replace(/\[\/?(b|i|u|url|quote|img)[^\]]*\]/gi, '')
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
+    .replace(/\[\/?(?:b|i|u|url|quote|img|h[1-6]|list|code|spoiler|\*)[^\]]*\]/gi, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&mdash;/gi, '—')
+    .replace(/&ndash;/gi, '–')
+    .replace(/&rsquo;|&lsquo;/gi, "'")
+    .replace(/&rdquo;|&ldquo;/gi, '"')
+    .replace(/&trade;/gi, '™')
+    .replace(/&reg;/gi, '®')
+    .replace(/&copy;/gi, '©')
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = parseInt(dec, 10);
+      return !isNaN(code) ? String.fromCharCode(code) : '';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return !isNaN(code) ? String.fromCharCode(code) : '';
+    })
     .trim();
 
-  if (!clean) return null;
+  if (!clean) return '';
 
-  const paragraphs = clean.split(/\r?\n+/).map((p) => p.trim()).filter((p) => p.length > 0);
-  if (paragraphs.length === 0) return null;
+  const paragraphs = clean
+    .split(/\r?\n+/)
+    .map((p) =>
+      p
+        .replace(/^#{1,6}\s+/, '')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/__(.+?)__/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+    .filter((p) => p.length > 0);
+  if (paragraphs.length === 0) return '';
 
-  let firstPara = paragraphs[0];
-  if (firstPara.length < 30 && paragraphs.length > 1 && /^(about|overview|story|description|features)/i.test(firstPara)) {
-    firstPara = paragraphs[1];
+  while (
+    paragraphs.length > 1 &&
+    ((paragraphs[0].length < 40 &&
+      /^(about(?:\s+the\s+game|\s+this\s+game)?|overview|story|description|features|synopsis|summary|key\s+features)\b[:.\s-]*$/i.test(
+        paragraphs[0]
+      )) ||
+      /when you buy this game\b|will be added to your gog\.com account/i.test(paragraphs[0]))
+  ) {
+    paragraphs.shift();
   }
 
-  if (firstPara.length > maxLength) {
+  let firstPara = paragraphs[0];
+
+  if (maxLength > 0 && firstPara.length > maxLength) {
     const truncated = firstPara.substring(0, maxLength);
     const lastSpace = truncated.lastIndexOf(' ');
     if (lastSpace > maxLength * 0.7) {
@@ -56,10 +100,16 @@ export function extractFirstParagraph(rawText?: string, maxLength = 260): string
   return firstPara.trim();
 }
 
+export function extractFirstParagraph(rawText?: string, maxLength = 260): string | null {
+  const result = stripHtmlToPlainSynopsis(rawText, maxLength);
+  return result || null;
+}
+
 export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
   const trimmed = desc.trim();
   if (trimmed.length <= 3) return true;
+  if (/product_(?:description|feature)_\d+/i.test(trimmed)) return true;
   const lower = trimmed.toLowerCase();
   if (title && lower === title.trim().toLowerCase()) return true;
   if (lower.includes('drm-free')) return true;
@@ -73,19 +123,36 @@ export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boo
   if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
   if (/^bonus\s+content\s+included/i.test(trimmed)) return true;
   if (/^this\s+(package|edition|version)\s+includes/i.test(trimmed)) return true;
+  if (/\bis\s+a\s+[\w,\s-]+\s+title(?:\s+developed\s+by\s+.+)?\.?$/i.test(trimmed)) return true;
+  if (/\bstandard\s+steam\s+catalog\s+title\b/i.test(trimmed)) return true;
+  if (/\bis\s+a\s+single-player\s+title\b/i.test(trimmed)) return true;
   return false;
+}
+
+export function cleanGogDescriptionHtml(raw?: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<li[^>]*>\s*product_feature_\d+\s*<\/li>/gi, '')
+    .replace(/<ul[^>]*>\s*<\/ul>/gi, '')
+    .replace(/product_feature_\d+/gi, '')
+    .replace(/product_description_\d+/gi, '')
+    .replace(/^(?:\s*<br\s*\/?>\s*)+/gi, '')
+    .replace(/(?:\s*<br\s*\/?>\s*)+$/gi, '')
+    .trim();
 }
 
 export const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string; headerImage?: string }> = {};
 
 export function formatDescriptionToHtml(rawDesc: string): string {
   if (!rawDesc) return '';
+  const cleanedRaw = rawDesc.replace(/<!--[\s\S]*?-->/g, '').trim();
+  if (!cleanedRaw) return '';
   // If already full HTML with paragraph or heading tags, return as-is
-  if (rawDesc.includes('<p class="bb_paragraph">') || rawDesc.includes('<h2 class="bb_tag">')) {
-    return rawDesc;
+  if (cleanedRaw.includes('<p class="bb_paragraph">') || cleanedRaw.includes('<h2 class="bb_tag">')) {
+    return cleanedRaw;
   }
 
-  const lines = rawDesc.split(/\r?\n/);
+  const lines = cleanedRaw.split(/\r?\n/);
   const htmlParts: string[] = [];
   let currentParagraph: string[] = [];
 
@@ -152,12 +219,172 @@ export function formatGogSystemRequirements(raw?: string): string {
     .replace(/,\s*(Other|Additional Notes):/gi, '<br><strong>Additional Notes:</strong> ');
 }
 
+export function parseGogLocalizations(
+  v2Localizations?: any[],
+  v1Languages?: Record<string, string>
+): {
+  supportedLanguages?: string;
+  languageOptions?: SteamLanguageOption[];
+  languageTableSchema?: LanguageTableSchema;
+} {
+  const byLang = new Map<string, { hasInterface: boolean; hasAudio: boolean }>();
+
+  if (Array.isArray(v2Localizations) && v2Localizations.length > 0) {
+    for (const loc of v2Localizations) {
+      const langName = loc?._embedded?.language?.name;
+      const scope = String(loc?._embedded?.localizationScope?.type || '').toLowerCase();
+      if (!langName || typeof langName !== 'string') continue;
+      const cleanName = langName.trim();
+      if (!cleanName) continue;
+      const entry = byLang.get(cleanName) || { hasInterface: false, hasAudio: false };
+      if (scope === 'audio') {
+        entry.hasAudio = true;
+      } else if (scope === 'text') {
+        entry.hasInterface = true;
+      } else {
+        entry.hasInterface = true;
+      }
+      byLang.set(cleanName, entry);
+    }
+  } else if (v1Languages && typeof v1Languages === 'object') {
+    for (const langName of Object.values(v1Languages)) {
+      if (typeof langName === 'string' && langName.trim()) {
+        const cleanName = langName.trim();
+        const entry = byLang.get(cleanName) || { hasInterface: false, hasAudio: false };
+        entry.hasInterface = true;
+        byLang.set(cleanName, entry);
+      }
+    }
+  }
+
+  if (byLang.size === 0) {
+    return {};
+  }
+
+  const languageOptions: SteamLanguageOption[] = Array.from(byLang.entries()).map(
+    ([name, flags]) => ({
+      name,
+      hasInterface: flags.hasInterface,
+      hasAudio: flags.hasAudio,
+      hasSubtitles: false,
+    })
+  );
+
+  const audioList = languageOptions.filter((l) => l.hasAudio).map((l) => l.name);
+  const textList = languageOptions.filter((l) => l.hasInterface).map((l) => l.name);
+  const parts: string[] = [];
+  if (audioList.length > 0) parts.push(`AUDIO: ${audioList.join(', ')}`);
+  if (textList.length > 0) parts.push(`TEXT: ${textList.join(', ')}`);
+
+  return {
+    supportedLanguages: parts.join(' | '),
+    languageOptions,
+    languageTableSchema: 'audio_text',
+  };
+}
+
+export function normalizeEpicLanguageName(raw: string): string {
+  const trimmed = raw
+    .replace(/^and\s+/i, '')
+    .replace(/\.$/, '')
+    .trim();
+  if (!trimmed) return '';
+  if (/^Portugu[eê]s\s*\(\s*Brasil\s*\)$/i.test(trimmed)) return 'Portuguese (Brazil)';
+  if (/^Brazilian\s*-\s*Portuguese$/i.test(trimmed)) return 'Portuguese (Brazil)';
+  if (/^Portuguese\s*-\s*Brazil$/i.test(trimmed)) return 'Portuguese (Brazil)';
+  if (/^Spanish\s*-\s*Spain$/i.test(trimmed)) return 'Spanish (Spain)';
+  if (/^Spanish\s*-\s*Latin America$/i.test(trimmed)) return 'Spanish (Latin America)';
+  if (/^Chinese\s*-\s*Simplified$/i.test(trimmed)) return 'Chinese (Simplified)';
+  if (/^Chinese\s*-\s*Traditional$/i.test(trimmed)) return 'Chinese (Traditional)';
+  const dashMatch = trimmed.match(/^([A-Za-z]+)\s*-\s*([A-Za-z\s]+)$/);
+  if (dashMatch) {
+    return `${dashMatch[1].trim()} (${dashMatch[2].trim()})`;
+  }
+  return trimmed;
+}
+
+export function parseEpicLanguages(rawLanguages?: string[] | string): {
+  supportedLanguages?: string;
+  languageOptions?: SteamLanguageOption[];
+  languageTableSchema?: LanguageTableSchema;
+} {
+  if (!rawLanguages) return {};
+  const lines = (Array.isArray(rawLanguages) ? rawLanguages : [rawLanguages])
+    .flatMap((entry) => (typeof entry === 'string' ? entry.split(/\r?\n|\|/) : []))
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return {};
+
+  const byLang = new Map<string, { hasInterface: boolean; hasAudio: boolean }>();
+
+  const addLangs = (csv: string, type: 'audio' | 'text' | 'both') => {
+    const tokens = csv.split(/,(?![^(]*\))/);
+    for (const token of tokens) {
+      const name = normalizeEpicLanguageName(token);
+      if (!name || /^(coming\b|tba\b|none\b|n\/a\b)/i.test(name)) continue;
+      const entry = byLang.get(name) || { hasInterface: false, hasAudio: false };
+      if (type === 'audio' || type === 'both') entry.hasAudio = true;
+      if (type === 'text' || type === 'both') entry.hasInterface = true;
+      byLang.set(name, entry);
+    }
+  };
+
+  for (const line of lines) {
+    if (/^coming\b/i.test(line)) continue;
+    const audioMatch = line.match(/^(?:full\s+)?audio\s*(?:&\s*text)?\s*:\s*(.+)$/i);
+    if (audioMatch) {
+      const isBoth = /text/i.test(line.split(':')[0]);
+      addLangs(audioMatch[1], isBoth ? 'both' : 'audio');
+      continue;
+    }
+    const textMatch = line.match(/^(?:text|subtitles?|interface|text\s*&\s*subtitles?)\s*:\s*(.+)$/i);
+    if (textMatch) {
+      addLangs(textMatch[1], 'text');
+      continue;
+    }
+    if (!line.includes(':')) {
+      addLangs(line, 'text');
+    }
+  }
+
+  if (byLang.size === 0) return {};
+
+  const languageOptions: SteamLanguageOption[] = Array.from(byLang.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, flags]) => ({
+      name,
+      hasInterface: flags.hasInterface,
+      hasAudio: flags.hasAudio,
+      hasSubtitles: false,
+    }));
+
+  const audioList = languageOptions.filter((l) => l.hasAudio).map((l) => l.name);
+  const textList = languageOptions.filter((l) => l.hasInterface).map((l) => l.name);
+  const parts: string[] = [];
+  if (audioList.length > 0) parts.push(`AUDIO: ${audioList.join(', ')}`);
+  if (textList.length > 0) parts.push(`TEXT: ${textList.join(', ')}`);
+
+  return {
+    supportedLanguages: parts.join(' | '),
+    languageOptions,
+    languageTableSchema: 'audio_text',
+  };
+}
+
 export class FallbackMetadataProvider {
   private getGogBaseUrl(): string {
     if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
       return '/api/gog-product';
     }
     return 'https://api.gog.com';
+  }
+
+  private getGogCatalogBaseUrl(): string {
+    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+      return '/api/gog-catalog';
+    }
+    return 'https://catalog.gog.com';
   }
 
   private getEpicContentBaseUrl(): string {
@@ -170,7 +397,7 @@ export class FallbackMetadataProvider {
   /**
    * Fetches rich metadata directly from GOG's official product API and enriched catalog
    */
-  async fetchGogProductMetadata(gogId: string): Promise<Partial<SteamEnrichedMetadata> | null> {
+  async fetchGogProductMetadata(gogId: string, gameTitle?: string): Promise<Partial<SteamEnrichedMetadata> | null> {
     const cached = (gogEnrichedCache as Record<string, any>)[gogId];
     const special = GOG_SPECIAL_DESCRIPTIONS[gogId];
 
@@ -178,15 +405,48 @@ export class FallbackMetadataProvider {
     let movies: SteamMovie[] = [];
     let headerImage = special?.headerImage || cached?.coverHorizontal || cached?.coverVertical || '';
     let capsuleImage = cached?.coverVertical || cached?.coverHorizontal || '';
-    let descriptionFull = special?.full || cached?.aboutTheGame || cached?.detailedDescription || '';
-    let descriptionLead = special?.lead || cached?.shortDescription || '';
+    let descriptionFull = cleanGogDescriptionHtml(
+      special?.full || cached?.aboutTheGame || cached?.detailedDescription || ''
+    );
+    let descriptionLead = cleanGogDescriptionHtml(special?.lead || cached?.shortDescription || '');
+    if (isGenericPlaceholderSynopsis(descriptionFull, gameTitle)) descriptionFull = '';
+    if (isGenericPlaceholderSynopsis(descriptionLead, gameTitle)) descriptionLead = '';
+    if (descriptionLead) {
+      descriptionLead = extractFirstParagraph(descriptionLead) || descriptionLead;
+    }
+
     let releaseDate = special?.releaseDate || cached?.releaseDate || 'TBA';
     let v2Devs: string[] | undefined = cached?.developers?.length ? cached.developers : undefined;
     let v2Pubs: string[] | undefined = cached?.publishers?.length ? cached.publishers : undefined;
     let v2Genres: string[] | undefined = cached?.genres?.length ? cached.genres : undefined;
     let v2Tags: string[] | undefined = cached?.tags?.length ? cached.tags : undefined;
+    let v2Localizations: any[] | undefined = undefined;
+    let v1Languages: Record<string, string> | undefined = undefined;
 
     const cleanGogId = String(gogId).replace(/^gog-/, '').trim();
+
+    const mapGogScreenshots = (rawShots: any[]): SteamScreenshot[] =>
+      rawShots
+        .map((s: any, idx: number) => {
+          if (typeof s === 'string') {
+            const url = ensureHttps(s.replace('{formatter}', 'ggvgl_2x'));
+            const thumb = ensureHttps(s.replace('{formatter}', 'ggvgm'));
+            return { id: idx, pathThumbnail: thumb, pathFull: url };
+          }
+          const fullImg =
+            s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgl_2x')?.image_url ||
+            s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgl')?.image_url ||
+            (s.formatter_template_url ? s.formatter_template_url.replace('{formatter}', 'ggvgl_2x') : '');
+          const thumbImg =
+            s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgm')?.image_url || fullImg;
+
+          return {
+            id: idx,
+            pathThumbnail: ensureHttps(thumbImg),
+            pathFull: ensureHttps(fullImg),
+          };
+        })
+        .filter((s) => Boolean(s.pathFull));
 
     try {
       const urlV1 = `${this.getGogBaseUrl()}/products/${encodeURIComponent(cleanGogId)}?expand=description,screenshots,videos`;
@@ -225,32 +485,28 @@ export class FallbackMetadataProvider {
             if (!v2Tags) v2Tags = tags;
           }
         }
+        if (Array.isArray(v2Data._embedded?.localizations) && v2Data._embedded.localizations.length > 0) {
+          v2Localizations = v2Data._embedded.localizations;
+        }
         const globalRel = v2Data._embedded?.product?.globalReleaseDate;
         if (globalRel && typeof globalRel === 'string' && releaseDate === 'TBA') {
           releaseDate = globalRel.substring(0, 10);
         }
         if (v2Data.description && typeof v2Data.description === 'string' && !descriptionFull) {
-          descriptionFull = v2Data.description.trim();
-          descriptionLead = extractFirstParagraph(descriptionFull) || descriptionLead;
+          const cleanedV2 = cleanGogDescriptionHtml(v2Data.description);
+          if (cleanedV2.length >= 30 && !isGenericPlaceholderSynopsis(cleanedV2, gameTitle)) {
+            descriptionFull = cleanedV2;
+            descriptionLead = extractFirstParagraph(cleanedV2) || descriptionLead;
+          }
         }
       }
 
       if (data) {
+        if (data.languages && typeof data.languages === 'object') {
+          v1Languages = data.languages;
+        }
         if (data.screenshots && Array.isArray(data.screenshots)) {
-          screenshots = data.screenshots.map((s: any, idx: number) => {
-            const fullImg =
-              s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgl_2x')?.image_url ||
-              s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgl')?.image_url ||
-              (s.formatter_template_url ? s.formatter_template_url.replace('{formatter}', 'ggvgl_2x') : '');
-            const thumbImg =
-              s.formatted_images?.find((img: any) => img.formatter_name === 'ggvgm')?.image_url || fullImg;
-
-            return {
-              id: idx,
-              pathThumbnail: ensureHttps(thumbImg),
-              pathFull: ensureHttps(fullImg),
-            };
-          });
+          screenshots = mapGogScreenshots(data.screenshots);
         }
 
         if (data.videos && Array.isArray(data.videos)) {
@@ -268,53 +524,166 @@ export class FallbackMetadataProvider {
         );
         if (apiHeader) headerImage = apiHeader;
 
-        const apiDescFull = data.description?.full || data.description?.lead || '';
-        const apiDescLead = data.description?.lead || '';
-
-        // Clean out raw localization placeholders (e.g. product_description_1413291984 or product_feature_2028023186)
-        const cleanedDescFull = apiDescFull
-          .replace(/<li[^>]*>\s*product_feature_\d+\s*<\/li>/gi, '')
-          .replace(/<ul[^>]*>\s*<\/ul>/gi, '')
-          .replace(/product_feature_\d+/gi, '')
-          .replace(/product_description_\d+/gi, '')
-          .trim();
+        const cleanedDescFull = cleanGogDescriptionHtml(data.description?.full || data.description?.lead || '');
+        const cleanedDescLead = cleanGogDescriptionHtml(data.description?.lead || '');
 
         const isPlaceholderDesc =
           !cleanedDescFull ||
           cleanedDescFull.length < 30 ||
-          cleanedDescFull.includes('product_description_');
+          isGenericPlaceholderSynopsis(cleanedDescFull, gameTitle);
 
         if (!isPlaceholderDesc && cleanedDescFull) {
           descriptionFull = cleanedDescFull;
-          descriptionLead = apiDescLead || descriptionLead || extractFirstParagraph(cleanedDescFull) || '';
+          descriptionLead = extractFirstParagraph(cleanedDescLead || cleanedDescFull) || descriptionLead || '';
         } else if (GOG_SPECIAL_DESCRIPTIONS[gogId]) {
           descriptionLead = GOG_SPECIAL_DESCRIPTIONS[gogId].lead;
           descriptionFull = GOG_SPECIAL_DESCRIPTIONS[gogId].full;
-        } else if (data.slug && !descriptionFull) {
+        }
+
+        if (data.release_date && releaseDate === 'TBA') {
+          releaseDate = data.release_date.substring(0, 10);
+        }
+      }
+
+      // Universal GOG Catalog Product Fallback (for bundled/bonus editions whose own product ID holds a placeholder)
+      if (!descriptionFull || isGenericPlaceholderSynopsis(descriptionFull, gameTitle)) {
+        const lookupTitle = (gameTitle || data?.title || v2Data?._embedded?.product?.title || '').trim();
+        const purchaseSlug =
+          typeof data?.links?.purchase_link === 'string'
+            ? data.links.purchase_link.split('/').filter(Boolean).pop()
+            : undefined;
+
+        let catProd: any = null;
+        if (lookupTitle || purchaseSlug) {
+          try {
+            const q = lookupTitle || purchaseSlug || '';
+            const catUrl = `${this.getGogCatalogBaseUrl()}/v1/catalog?query=${encodeURIComponent(q)}&limit=5&productType=in:game,pack`;
+            const catRes = await axios.get(catUrl, { timeout: 6000 });
+            const products = Array.isArray(catRes.data?.products) ? catRes.data.products : [];
+            const normLookup = lookupTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
+            catProd =
+              (purchaseSlug ? products.find((p: any) => p?.slug === purchaseSlug) : null) ||
+              (normLookup
+                ? products.find(
+                    (p: any) =>
+                      String(p?.title || '')
+                        .toLowerCase()
+                        .replace(/[^a-z0-9]/g, '') === normLookup
+                  )
+                : null) ||
+              products[0];
+          } catch (catErr: any) {
+            console.warn(
+              `[Fallback Provider] GOG catalog search fallback failed for ${lookupTitle}:`,
+              catErr?.message
+            );
+          }
+        }
+
+        if (catProd) {
+          if (catProd.releaseDate && releaseDate === 'TBA') {
+            releaseDate = String(catProd.releaseDate).replace(/\./g, '-').substring(0, 10);
+          }
+          if (!v2Devs?.length && Array.isArray(catProd.developers) && catProd.developers.length > 0) {
+            v2Devs = catProd.developers;
+          }
+          if (!v2Pubs?.length && Array.isArray(catProd.publishers) && catProd.publishers.length > 0) {
+            v2Pubs = catProd.publishers;
+          }
+          if (!capsuleImage && catProd.coverVertical) {
+            capsuleImage = ensureHttps(catProd.coverVertical);
+          }
+          if (!headerImage && catProd.coverHorizontal) {
+            headerImage = ensureHttps(catProd.coverHorizontal);
+          }
+          if (screenshots.length === 0 && Array.isArray(catProd.screenshots)) {
+            screenshots = mapGogScreenshots(catProd.screenshots);
+          }
+
+          if (catProd.id && String(catProd.id) !== cleanGogId) {
+            try {
+              const catProdUrl = `${this.getGogBaseUrl()}/products/${encodeURIComponent(String(catProd.id))}?expand=description,screenshots,videos`;
+              const catV2Url = `${this.getGogBaseUrl()}/v2/games/${encodeURIComponent(String(catProd.id))}`;
+              const [catProdSettled, catV2Settled] = await Promise.allSettled([
+                axios.get(catProdUrl, { timeout: 6000 }),
+                !v2Localizations?.length ? axios.get(catV2Url, { timeout: 6000 }) : Promise.resolve(null),
+              ]);
+              const catData = catProdSettled.status === 'fulfilled' ? catProdSettled.value?.data : null;
+              const catV2Data = catV2Settled.status === 'fulfilled' ? catV2Settled.value?.data : null;
+              if (
+                !v2Localizations?.length &&
+                Array.isArray(catV2Data?._embedded?.localizations) &&
+                catV2Data._embedded.localizations.length > 0
+              ) {
+                v2Localizations = catV2Data._embedded.localizations;
+              }
+              if (catData) {
+                if (!v1Languages && catData.languages && typeof catData.languages === 'object') {
+                  v1Languages = catData.languages;
+                }
+                const cleanedCatFull = cleanGogDescriptionHtml(
+                  catData.description?.full || catData.description?.lead || ''
+                );
+                const cleanedCatLead = cleanGogDescriptionHtml(catData.description?.lead || '');
+                if (
+                  cleanedCatFull &&
+                  cleanedCatFull.length >= 30 &&
+                  !isGenericPlaceholderSynopsis(cleanedCatFull, lookupTitle)
+                ) {
+                  descriptionFull = cleanedCatFull;
+                  descriptionLead =
+                    extractFirstParagraph(cleanedCatLead || cleanedCatFull) || descriptionLead || '';
+                }
+                if (screenshots.length === 0 && Array.isArray(catData.screenshots)) {
+                  screenshots = mapGogScreenshots(catData.screenshots);
+                }
+                if (movies.length === 0 && Array.isArray(catData.videos)) {
+                  movies = catData.videos.map((v: any, idx: number) => ({
+                    id: idx,
+                    name: `Trailer ${idx + 1}`,
+                    thumbnail: ensureHttps(v.thumbnail_url || ''),
+                    webm: { 480: '', max: '' },
+                    mp4: { 480: ensureHttps(v.video_url || ''), max: ensureHttps(v.video_url || '') },
+                  }));
+                }
+                if (catData.release_date && releaseDate === 'TBA') {
+                  releaseDate = String(catData.release_date).substring(0, 10);
+                }
+              }
+            } catch (catProdErr: any) {
+              console.warn(
+                `[Fallback Provider] GOG catalog product detail lookup failed for ${catProd.id}:`,
+                catProdErr?.message
+              );
+            }
+          }
+        }
+
+        const targetSlug = purchaseSlug || catProd?.slug || data?.slug;
+        if (!descriptionFull && targetSlug) {
           try {
             const pageUrl =
               typeof window !== 'undefined' && window.location.hostname === 'localhost'
-                ? `/api/gog-profile/en/game/${encodeURIComponent(data.slug)}`
-                : `https://www.gog.com/en/game/${encodeURIComponent(data.slug)}`;
+                ? `/api/gog-profile/en/game/${encodeURIComponent(targetSlug)}`
+                : `https://www.gog.com/en/game/${encodeURIComponent(targetSlug)}`;
             const pageRes = await axios.get(pageUrl, { timeout: 5000 });
             if (pageRes.data && typeof pageRes.data === 'string') {
               const cheerio = await import('cheerio');
               const $ = cheerio.load(pageRes.data);
               const descEl = $('.description');
               descEl.find('script, style, .description__copyrights').remove();
-              const scrapedHtml = descEl.html()?.trim();
-              if (scrapedHtml && !scrapedHtml.includes('product_description_')) {
+              const scrapedHtml = cleanGogDescriptionHtml(descEl.html()?.trim() || '');
+              if (scrapedHtml && !isGenericPlaceholderSynopsis(scrapedHtml, lookupTitle)) {
                 descriptionFull = scrapedHtml;
-                descriptionLead = descEl.text()?.split('\n')[0]?.trim() || descriptionLead;
+                descriptionLead =
+                  extractFirstParagraph(scrapedHtml) ||
+                  descEl.text()?.split('\n')[0]?.trim() ||
+                  descriptionLead;
               }
             }
           } catch (scrapeErr: any) {
-            console.warn(`[Fallback Provider] Store page scrape failed for ${data.slug}:`, scrapeErr?.message);
+            console.warn(`[Fallback Provider] Store page scrape failed for ${targetSlug}:`, scrapeErr?.message);
           }
-        }
-
-        if (data.release_date && releaseDate === 'TBA') {
-          releaseDate = data.release_date.substring(0, 10);
         }
       }
     } catch (err: any) {
@@ -340,10 +709,17 @@ export class FallbackMetadataProvider {
       recommended: formatGogSystemRequirements(cached?.systemRequirements?.recommended),
     };
 
+    const cleanGogShort = stripHtmlToPlainSynopsis(descriptionLead || descriptionFull);
+    const parsedGogLangs = parseGogLocalizations(v2Localizations, v1Languages);
+    const cachedSupportedLangs =
+      cached?.supportedLanguages && cached.supportedLanguages !== 'English<strong>*</strong>'
+        ? cached.supportedLanguages
+        : undefined;
+
     return {
       aboutTheGame: descriptionFull,
       detailedDescription: descriptionFull,
-      shortDescription: descriptionLead,
+      shortDescription: cleanGogShort,
       headerImage: ensureHttps(headerImage),
       capsuleImage: ensureHttps(capsuleImage),
       screenshots,
@@ -354,32 +730,178 @@ export class FallbackMetadataProvider {
       genres: v2Genres,
       tags: v2Tags,
       categories,
-      supportedLanguages: cached?.supportedLanguages || 'English<strong>*</strong>',
+      supportedLanguages:
+        parsedGogLangs.supportedLanguages || cachedSupportedLangs || 'TEXT: English',
+      languageOptions: parsedGogLangs.languageOptions,
+      languageTableSchema: parsedGogLangs.languageTableSchema || 'audio_text',
       systemRequirements: sysReqs,
       achievements: cached?.features?.includes('Achievements') ? { total: 20 } : undefined,
     };
   }
 
   /**
-   * Fetches rich metadata directly from Epic Games Store Content API (e.g. for Epic exclusives)
+   * Fetches rich metadata directly from Epic Games Store Catalog Offers API (via IPC) and Content API
    */
-  async fetchEpicProductMetadata(slugOrTitle: string): Promise<Partial<SteamEnrichedMetadata> | null> {
+  async fetchEpicProductMetadata(
+    slugOrTitle: string,
+    options?: {
+      appName?: string;
+      namespace?: string;
+      catalogItemId?: string;
+      title?: string;
+    }
+  ): Promise<Partial<SteamEnrichedMetadata> | null> {
+    let ipcMetadata: Partial<SteamEnrichedMetadata> | null = null;
+
+    // Step 1: Official Epic Catalog Offers API via Electron IPC Bridge
+    if (typeof window !== 'undefined' && (window as any).electronAPI?.fetchEpicProductMetadata) {
+      try {
+        const ipcData = await (window as any).electronAPI.fetchEpicProductMetadata({
+          slug: slugOrTitle,
+          appName: options?.appName || slugOrTitle,
+          namespace: options?.namespace,
+          catalogItemId: options?.catalogItemId,
+          title: options?.title || slugOrTitle,
+        });
+
+        if (
+          ipcData &&
+          (ipcData.shortDescription ||
+            ipcData.detailedDescription ||
+            ipcData.aboutTheGame ||
+            (Array.isArray(ipcData.screenshots) && ipcData.screenshots.length > 0) ||
+            (Array.isArray(ipcData.movies) && ipcData.movies.length > 0))
+        ) {
+          const mappedScreenshots: SteamScreenshot[] = Array.isArray(ipcData.screenshots)
+            ? (ipcData.screenshots
+                .map((s: any, idx: number) => {
+                  const url = typeof s === 'string' ? s : s?.pathFull || s?.url || '';
+                  if (!url) return null;
+                  return {
+                    id: idx,
+                    pathThumbnail: ensureHttps(url),
+                    pathFull: ensureHttps(url),
+                  };
+                })
+                .filter(Boolean) as SteamScreenshot[])
+            : [];
+
+          const mappedMovies: SteamMovie[] = Array.isArray(ipcData.movies)
+            ? (ipcData.movies
+                .map((m: any, idx: number) => {
+                  if (!m) return null;
+                  const hlsUrl = m.hls || '';
+                  const mp4Max = m.mp4?.max || m.videoUrl || hlsUrl || '';
+                  const mp4Low = m.mp4?.['480'] || mp4Max;
+                  const webmMax = m.webm?.max || mp4Max;
+                  const webmLow = m.webm?.['480'] || mp4Low;
+                  if (!hlsUrl && !mp4Max) return null;
+                  return {
+                    id: typeof m.id === 'number' ? m.id : idx,
+                    name: m.name || `Trailer ${idx + 1}`,
+                    thumbnail: ensureHttps(m.thumbnail || ''),
+                    webm: { '480': webmLow, max: webmMax },
+                    mp4: { '480': mp4Low, max: mp4Max },
+                    hls: hlsUrl || undefined,
+                  } as SteamMovie;
+                })
+                .filter(Boolean) as SteamMovie[])
+            : [];
+
+          const rawAbout = (
+            ipcData.aboutTheGame ||
+            ipcData.detailedDescription ||
+            ipcData.shortDescription ||
+            ''
+          )
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .trim();
+          const formattedAbout = rawAbout ? formatDescriptionToHtml(rawAbout) : '';
+          const cleanShort = stripHtmlToPlainSynopsis(
+            ipcData.shortDescription || rawAbout
+          );
+
+          const parsedIpcLangs = parseEpicLanguages(
+            ipcData.supportedLanguages || ipcData.languages
+          );
+
+          ipcMetadata = {
+            name: ipcData.title || options?.title || slugOrTitle,
+            shortDescription: cleanShort,
+            detailedDescription: formattedAbout || cleanShort,
+            aboutTheGame: formattedAbout || cleanShort,
+            headerImage: ipcData.headerImage ? ensureHttps(ipcData.headerImage) : undefined,
+            capsuleImage: ipcData.capsuleImage ? ensureHttps(ipcData.capsuleImage) : undefined,
+            releaseDate: ipcData.releaseDate,
+            developers: ipcData.developers,
+            publishers: ipcData.publishers,
+            screenshots: mappedScreenshots,
+            movies: mappedMovies,
+            ...(parsedIpcLangs.supportedLanguages
+              ? { supportedLanguages: parsedIpcLangs.supportedLanguages }
+              : {}),
+            ...(parsedIpcLangs.languageOptions
+              ? { languageOptions: parsedIpcLangs.languageOptions }
+              : {}),
+            languageTableSchema: 'audio_text',
+            ...(ipcData.systemRequirements ? { systemRequirements: ipcData.systemRequirements } : {}),
+            ...(ipcData.namespace ? { epicNamespace: ipcData.namespace } : {}),
+          } as Partial<SteamEnrichedMetadata>;
+
+          if (
+            mappedMovies.length > 0 &&
+            cleanShort &&
+            mappedScreenshots.length > 0 &&
+            Boolean(ipcMetadata.supportedLanguages)
+          ) {
+            return ipcMetadata;
+          }
+        }
+      } catch (ipcErr: any) {
+        console.warn(
+          `[Fallback Provider] Epic IPC product lookup failed for ${slugOrTitle}:`,
+          ipcErr?.message
+        );
+      }
+    }
+
+    // Step 2: Epic Content Products API by slug (enriches video trailers, carousel media, and system requirements)
     try {
-      const cleanSlug = slugOrTitle
+      const primarySlug = slugOrTitle
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '');
+      const titleCandidateSlug = (options?.title || ipcMetadata?.name || '')
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
 
-      const url =
-        typeof window !== 'undefined' && window.location.hostname === 'localhost'
-          ? `/api/epic-content/api/en-US/content/products/${cleanSlug}`
-          : `${this.getEpicContentBaseUrl()}/api/en-US/content/products/${cleanSlug}`;
+      const slugsToTry = Array.from(
+        new Set([primarySlug, titleCandidateSlug].filter((s) => s && s.length > 1))
+      );
 
-      const res = await axios.get(url, { timeout: 8000 });
-      const data = res.data;
+      let home: any = null;
+      for (const candidateSlug of slugsToTry) {
+        try {
+          const url =
+            typeof window !== 'undefined' && window.location.hostname === 'localhost'
+              ? `/api/epic-content/api/en-US/content/products/${candidateSlug}`
+              : `${this.getEpicContentBaseUrl()}/api/en-US/content/products/${candidateSlug}`;
 
-      const home = data?.pages?.find((p: any) => p.type === 'productHome') || data?.pages?.[0];
-      if (!home?.data) return null;
+          const res = await axios.get(url, { timeout: 8000 });
+          const data = res.data;
+          const foundHome =
+            data?.pages?.find((p: any) => p.type === 'productHome') || data?.pages?.[0];
+          if (foundHome?.data) {
+            home = foundHome;
+            break;
+          }
+        } catch {
+          // Try next candidate slug
+        }
+      }
+
+      if (!home?.data) return ipcMetadata;
 
       const d = home.data;
       const screenshots: SteamScreenshot[] = [];
@@ -458,9 +980,11 @@ export class FallbackMetadataProvider {
       const minReq = reqs.map((r: any) => (r.title && r.minimum ? `<strong>${r.title}:</strong> ${r.minimum}` : '')).filter(Boolean).join('<br>');
       const recReq = reqs.map((r: any) => (r.title && r.recommended ? `<strong>${r.title}:</strong> ${r.recommended}` : '')).filter(Boolean).join('<br>');
 
+      const parsedContentLangs = parseEpicLanguages(d.requirements?.languages);
+
       const descFull = d.about?.description || d.about?.about || d.markdown?.markdown || '';
       const formattedAbout = formatDescriptionToHtml(descFull);
-      const descShort = d.about?.shortDescription || '';
+      const descShort = stripHtmlToPlainSynopsis(d.about?.shortDescription || descFull);
       const headerImage =
         d.hero?.backgroundImageUrl ||
         d.hero?.portrait ||
@@ -475,7 +999,7 @@ export class FallbackMetadataProvider {
         d.hero?.logoImage?.src ||
         '';
 
-      return {
+      const contentMetadata: Partial<SteamEnrichedMetadata> = {
         aboutTheGame: formattedAbout,
         detailedDescription: formattedAbout,
         shortDescription: descShort,
@@ -484,6 +1008,9 @@ export class FallbackMetadataProvider {
         iconUrl,
         screenshots,
         movies,
+        supportedLanguages: parsedContentLangs.supportedLanguages,
+        languageOptions: parsedContentLangs.languageOptions,
+        languageTableSchema: 'audio_text',
         systemRequirements: {
           minimum: minReq,
           recommended: recReq,
@@ -493,9 +1020,56 @@ export class FallbackMetadataProvider {
         publishers: d.about?.publisherAttribution ? [d.about.publisherAttribution] : undefined,
         achievements: undefined,
       };
+
+      if (ipcMetadata) {
+        const mergedScreenshots = [
+          ...(ipcMetadata.screenshots || []),
+          ...screenshots.filter(
+            (s) => !(ipcMetadata?.screenshots || []).some((existing) => existing.pathFull === s.pathFull)
+          ),
+        ];
+        return {
+          ...contentMetadata,
+          ...ipcMetadata,
+          shortDescription: ipcMetadata.shortDescription || contentMetadata.shortDescription,
+          detailedDescription: ipcMetadata.detailedDescription || contentMetadata.detailedDescription,
+          aboutTheGame: ipcMetadata.aboutTheGame || contentMetadata.aboutTheGame,
+          headerImage: ipcMetadata.headerImage || contentMetadata.headerImage,
+          capsuleImage: ipcMetadata.capsuleImage || contentMetadata.capsuleImage,
+          iconUrl: ipcMetadata.iconUrl || contentMetadata.iconUrl,
+          screenshots: mergedScreenshots,
+          movies:
+            ipcMetadata.movies && ipcMetadata.movies.length > 0
+              ? ipcMetadata.movies
+              : contentMetadata.movies,
+          supportedLanguages:
+            ipcMetadata.supportedLanguages || contentMetadata.supportedLanguages,
+          languageOptions:
+            ipcMetadata.languageOptions && ipcMetadata.languageOptions.length > 0
+              ? ipcMetadata.languageOptions
+              : contentMetadata.languageOptions,
+          languageTableSchema:
+            ipcMetadata.languageTableSchema || contentMetadata.languageTableSchema || 'audio_text',
+          systemRequirements:
+            ipcMetadata.systemRequirements?.minimum || ipcMetadata.systemRequirements?.recommended
+              ? ipcMetadata.systemRequirements
+              : contentMetadata.systemRequirements,
+          releaseDate: ipcMetadata.releaseDate || contentMetadata.releaseDate,
+          developers:
+            ipcMetadata.developers && ipcMetadata.developers.length > 0
+              ? ipcMetadata.developers
+              : contentMetadata.developers,
+          publishers:
+            ipcMetadata.publishers && ipcMetadata.publishers.length > 0
+              ? ipcMetadata.publishers
+              : contentMetadata.publishers,
+        };
+      }
+
+      return contentMetadata;
     } catch (err: any) {
       console.warn(`[Fallback Provider] Epic product content lookup failed for ${slugOrTitle}:`, err?.message);
-      return null;
+      return ipcMetadata;
     }
   }
 
@@ -512,6 +1086,15 @@ export class FallbackMetadataProvider {
     const override = explicitOverride ?? getUserOverrideForGame(game);
     const route = inferMetadataRouteFromOverride(override);
 
+    const lookupTitle = route?.targetTitle || override?.title || game.title;
+
+    const epicOptions = {
+      appName: epicPlatform?.platformGameId,
+      namespace: (epicPlatform as any)?.namespace,
+      catalogItemId: (epicPlatform as any)?.catalogItemId,
+      title: lookupTitle,
+    };
+
     let storeMetadata: Partial<SteamEnrichedMetadata> | null = null;
 
     // 1. Honor explicit Step 4 MetadataSourceRoute first (allows routing any game to GOG or Epic)
@@ -521,7 +1104,7 @@ export class FallbackMetadataProvider {
         (route.matchedId ? String(route.matchedId).replace(/^gog-/, '') : undefined) ||
         gogPlatform?.platformGameId;
       if (targetGogId) {
-        storeMetadata = await this.fetchGogProductMetadata(String(targetGogId));
+        storeMetadata = await this.fetchGogProductMetadata(String(targetGogId), lookupTitle);
       }
     } else if (route?.source === 'epic') {
       const explicitSlug =
@@ -529,23 +1112,22 @@ export class FallbackMetadataProvider {
         (route.matchedId && !/^[0-9a-f]{20,}$/i.test(String(route.matchedId))
           ? String(route.matchedId).replace(/^epic-/, '')
           : undefined);
-      const titleSlug = (route.targetTitle || override?.title || game.title)
+      const titleSlug = lookupTitle
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
 
       if (explicitSlug) {
-        storeMetadata = await this.fetchEpicProductMetadata(explicitSlug);
+        storeMetadata = await this.fetchEpicProductMetadata(explicitSlug, epicOptions);
       }
       if (!storeMetadata && titleSlug) {
-        storeMetadata = await this.fetchEpicProductMetadata(titleSlug);
+        storeMetadata = await this.fetchEpicProductMetadata(titleSlug, epicOptions);
       }
-      if (
-        !storeMetadata &&
-        epicPlatform?.platformGameId &&
-        !/^[0-9a-f]{20,}$/i.test(epicPlatform.platformGameId)
-      ) {
-        storeMetadata = await this.fetchEpicProductMetadata(epicPlatform.platformGameId);
+      if (!storeMetadata && epicPlatform?.platformGameId) {
+        storeMetadata = await this.fetchEpicProductMetadata(
+          epicPlatform.platformGameId,
+          epicOptions
+        );
       }
     }
 
@@ -553,7 +1135,7 @@ export class FallbackMetadataProvider {
     if (!storeMetadata) {
       const fallbackGogId = route?.gogId || gogPlatform?.platformGameId;
       if (fallbackGogId) {
-        storeMetadata = await this.fetchGogProductMetadata(String(fallbackGogId));
+        storeMetadata = await this.fetchGogProductMetadata(String(fallbackGogId), lookupTitle);
       }
     }
 
@@ -562,14 +1144,16 @@ export class FallbackMetadataProvider {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
-      storeMetadata = await this.fetchEpicProductMetadata(route?.epicSlug || titleSlug);
+      storeMetadata = await this.fetchEpicProductMetadata(
+        route?.epicSlug || titleSlug,
+        epicOptions
+      );
 
-      if (
-        !storeMetadata &&
-        epicPlatform?.platformGameId &&
-        !/^[0-9a-f]{20,}$/i.test(epicPlatform.platformGameId)
-      ) {
-        storeMetadata = await this.fetchEpicProductMetadata(epicPlatform.platformGameId);
+      if (!storeMetadata && epicPlatform?.platformGameId) {
+        storeMetadata = await this.fetchEpicProductMetadata(
+          epicPlatform.platformGameId,
+          epicOptions
+        );
       }
     }
 
@@ -656,7 +1240,7 @@ export class FallbackMetadataProvider {
         ? `${game.title} is a ${genres.slice(0, 3).join(', ')} title${devs.length > 0 ? ` developed by ${devs[0]}` : ''}.`
         : `${game.title} is a single-player title${devs.length > 0 ? ` developed by ${devs[0]}` : ''}.`;
 
-    const shortDescription =
+    const rawShortCandidate =
       storeMetadata?.shortDescription && !isGenericPlaceholderSynopsis(storeMetadata.shortDescription, game.title)
         ? storeMetadata.shortDescription.trim()
         : game.shortDescription && !isGenericPlaceholderSynopsis(game.shortDescription, game.title)
@@ -664,6 +1248,8 @@ export class FallbackMetadataProvider {
         : firstParaDesc && !isGenericPlaceholderSynopsis(firstParaDesc, game.title)
         ? firstParaDesc
         : cleanSummary;
+
+    const shortDescription = stripHtmlToPlainSynopsis(rawShortCandidate) || cleanSummary;
 
     const detailedDescription =
       storeMetadata?.detailedDescription ||
@@ -686,7 +1272,9 @@ export class FallbackMetadataProvider {
       genres,
       tags,
       categories,
-      supportedLanguages: storeMetadata?.supportedLanguages,
+      supportedLanguages: storeMetadata?.supportedLanguages || 'TEXT: English',
+      languageOptions: storeMetadata?.languageOptions,
+      languageTableSchema: storeMetadata?.languageTableSchema || 'audio_text',
       screenshots:
         storeMetadata?.screenshots && storeMetadata.screenshots.length > 0
           ? storeMetadata.screenshots

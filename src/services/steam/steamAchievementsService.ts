@@ -4,8 +4,36 @@ import { loadIntegrations } from '../integrations/integrationStorage';
 import { KNOWN_USER_STEAM_ACHIEVEMENTS } from '../storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
 
+const STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC = 'antigravity_steam_achievements_last_sync_ts';
+const DEFAULT_ACHIEVEMENTS_SYNC_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 export class SteamAchievementsService {
   private inMemoryCache = new Map<number, StoreAchievementSummary>();
+
+  /**
+   * Checks whether a full library achievement sync has completed within the cooldown window.
+   */
+  hasRecentFullSync(cooldownMs: number = DEFAULT_ACHIEVEMENTS_SYNC_COOLDOWN_MS): boolean {
+    if (typeof localStorage === 'undefined') return false;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC);
+      if (!raw) return false;
+      const ts = Number(raw);
+      return Boolean(ts > 0 && Date.now() - ts < cooldownMs);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Records that a full library achievement sync has completed.
+   */
+  recordFullSyncCompleted(timestamp: number = Date.now()): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(STORAGE_KEY_ACHIEVEMENTS_LAST_SYNC, String(timestamp));
+    } catch {}
+  }
 
   /**
    * Retrieves the connected user's active SteamID64 and optional API key.
@@ -163,6 +191,18 @@ export class SteamAchievementsService {
         const res = await axios.get(url, { timeout: 5000 });
         const list = res.data?.playerstats?.achievements;
         if (Array.isArray(list)) {
+          if (list.length === 0 && (!existingCached || existingCached.total === 0)) {
+            const zeroSummary: StoreAchievementSummary = {
+              unlocked: 0,
+              total: 0,
+              percentage: 0,
+              isMastered: false,
+              source: 'live_cloud_api',
+              syncedAt: new Date().toISOString(),
+            };
+            this.setCachedAchievement(appId, zeroSummary);
+            return zeroSummary;
+          }
           const total = list.length;
           const unlocked = list.filter((a: any) => a.achieved === 1).length;
           const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
@@ -181,8 +221,37 @@ export class SteamAchievementsService {
             }) || liveSummary;
           this.setCachedAchievement(appId, reconciled);
           return reconciled;
+        } else if (
+          res.data?.playerstats?.error === 'Requested app has no stats' &&
+          (!existingCached || existingCached.total === 0)
+        ) {
+          const zeroSummary: StoreAchievementSummary = {
+            unlocked: 0,
+            total: 0,
+            percentage: 0,
+            isMastered: false,
+            source: 'live_cloud_api',
+            syncedAt: new Date().toISOString(),
+          };
+          this.setCachedAchievement(appId, zeroSummary);
+          return zeroSummary;
         }
       } catch (err: any) {
+        if (
+          err?.response?.data?.playerstats?.error === 'Requested app has no stats' &&
+          (!existingCached || existingCached.total === 0)
+        ) {
+          const zeroSummary: StoreAchievementSummary = {
+            unlocked: 0,
+            total: 0,
+            percentage: 0,
+            isMastered: false,
+            source: 'live_cloud_api',
+            syncedAt: new Date().toISOString(),
+          };
+          this.setCachedAchievement(appId, zeroSummary);
+          return zeroSummary;
+        }
         // Fall back to community XML
       }
     }
@@ -261,7 +330,41 @@ export class SteamAchievementsService {
               }) || liveSummary;
             this.setCachedAchievement(appId, reconciled);
             return reconciled;
+          } else if (
+            res.status === 200 &&
+            xml.includes('<playerstats>') &&
+            !xml.includes('<privacyState>private') &&
+            !xml.includes('<error>') &&
+            (!existingCached || existingCached.total === 0)
+          ) {
+            const zeroSummary: StoreAchievementSummary = {
+              unlocked: 0,
+              total: 0,
+              percentage: 0,
+              isMastered: false,
+              source: 'live_cloud_xml',
+              syncedAt: new Date().toISOString(),
+            };
+            this.setCachedAchievement(appId, zeroSummary);
+            return zeroSummary;
           }
+        } else if (
+          res.status === 200 &&
+          xml.includes('<playerstats>') &&
+          !xml.includes('<privacyState>private') &&
+          !xml.includes('<error>') &&
+          (!existingCached || existingCached.total === 0)
+        ) {
+          const zeroSummary: StoreAchievementSummary = {
+            unlocked: 0,
+            total: 0,
+            percentage: 0,
+            isMastered: false,
+            source: 'live_cloud_xml',
+            syncedAt: new Date().toISOString(),
+          };
+          this.setCachedAchievement(appId, zeroSummary);
+          return zeroSummary;
         }
       } catch (err: any) {
         // Fall through to cached data
@@ -365,6 +468,7 @@ export class SteamAchievementsService {
 
     if (prioritized.length === 0) {
       onProgress?.(steamGames.length, steamGames.length);
+      this.recordFullSyncCompleted();
       return results;
     }
 
@@ -417,6 +521,10 @@ export class SteamAchievementsService {
         const merged = { ...existing, ...results };
         localStorage.setItem('antigravity_steam_achievements', JSON.stringify(merged));
       } catch {}
+    }
+
+    if (Object.keys(results).length > 0 || steamGames.length > 0) {
+      this.recordFullSyncCompleted();
     }
 
     return results;

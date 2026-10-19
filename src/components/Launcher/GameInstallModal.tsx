@@ -61,29 +61,37 @@ function deduplicateInstallers(
     if (nonLinux.length > 0) filtered = nonLinux;
   }
 
-  const byOs = new Map<InstallerItem['os'], InstallerItem[]>();
+  const byGroup = new Map<string, InstallerItem[]>();
   for (const ins of filtered) {
-    const list = byOs.get(ins.os) || [];
+    const groupKey = ins.os;
+    const list = byGroup.get(groupKey) || [];
     list.push(ins);
-    byOs.set(ins.os, list);
+    byGroup.set(groupKey, list);
   }
 
-  const bestPerOs: InstallerItem[] = [];
-  for (const [, candidates] of byOs.entries()) {
+  const bestPerGroup: InstallerItem[] = [];
+  for (const [, candidates] of byGroup.entries()) {
     const sorted = [...candidates].sort((a, b) => {
       const langDiff =
         (/^en/i.test(a.language || '') ? 0 : 1) - (/^en/i.test(b.language || '') ? 0 : 1);
       if (langDiff !== 0) return langDiff;
       return (b.totalSizeBytes || 0) - (a.totalSizeBytes || 0);
     });
-    bestPerOs.push(sorted[0]);
+    bestPerGroup.push(sorted[0]);
   }
 
-  const osOrder: Record<InstallerItem['os'], number> = winHost
-    ? { windows: 0, mac: 1, linux: 2 }
-    : { mac: 0, windows: 1, linux: 2 };
+  const getSortRank = (item: InstallerItem): number => {
+    if (winHost) {
+      if (item.os === 'windows') return 0;
+      if (item.os === 'mac') return 1;
+      return 2;
+    }
+    if (item.os === 'mac') return 0;
+    if (item.os === 'windows') return 1;
+    return 2;
+  };
 
-  return bestPerOs.sort((a, b) => (osOrder[a.os] ?? 99) - (osOrder[b.os] ?? 99));
+  return bestPerGroup.sort((a, b) => getSortRank(a) - getSortRank(b));
 }
 
 export const GameInstallModal: React.FC<GameInstallModalProps> = ({
@@ -209,11 +217,18 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     }
   };
 
+  const activePlatformObj =
+    game.platforms.find((p) => p.platformId === selectedPlatformId) || game.platforms[0];
+
   const uniqueInstallers = deduplicateInstallers(installInfo?.availableInstallers, isWindowsHost);
+  const hasMacBuildOption = uniqueInstallers.some((i) => i.os === 'mac');
   const selectedInstaller =
     uniqueInstallers.find((i) => i.id === selectedInstallerId) || uniqueInstallers[0];
   const estimatedSizeBytes =
-    selectedInstaller?.totalSizeBytes || installInfo?.estimatedSizeBytes || 0;
+    selectedInstaller?.totalSizeBytes ||
+    installInfo?.estimatedSizeBytes ||
+    activePlatformObj?.installSize ||
+    0;
 
   const freeBytes = diskSpace?.freeBytes || 0;
   const totalBytes = diskSpace?.totalBytes || 1;
@@ -225,9 +240,6 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       : 0;
   const hasEnoughSpace =
     estimatedSizeBytes === 0 || freeBytes === 0 || freeBytes >= estimatedSizeBytes;
-
-  const activePlatformObj =
-    game.platforms.find((p) => p.platformId === selectedPlatformId) || game.platforms[0];
 
   const handleStartInstall = async () => {
     if (isStarting) return;
@@ -250,6 +262,8 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         installerId: selectedInstallerId,
         os: isWindowsHost ? 'windows' : selectedOs,
         createShortcut,
+        estimatedSizeBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
+        totalBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
       });
 
       if (res.success) {
@@ -282,6 +296,12 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             : 'Installs directly via native legendary integration with automatic credential bridging from your authenticated Epic session (or Heroic / Epic Games Launcher fallback) while monitoring real-time manifest progress.',
         };
       case 'steam':
+        if (!isWindowsHost && selectedOs === 'windows') {
+          return {
+            title: 'CrossOver Windows Steam Bottle + Live ACF Progress Monitor',
+            desc: 'Installs the Windows build inside your CrossOver bottle via Windows Steam (automatically bootstrapping Windows Steam if needed) and tracks real-time download progress via appmanifest_*.acf.',
+          };
+        }
         return {
           title: 'Steam Client Protocol + Live ACF Progress Monitor',
           desc: isWindowsHost
@@ -445,13 +465,19 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   >
                     {uniqueInstallers.map((ins) => {
                       const ver = formatVersion(ins.version);
+                      const sizeSuffix = ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : '';
+                      const verSuffix = ver ? ` (${ver})` : '';
+                      let optionLabel: string;
+                      if (ins.os === 'mac') {
+                        optionLabel = `★ Recommended: Native macOS Build${verSuffix}${sizeSuffix}`;
+                      } else if (ins.os === 'windows') {
+                        optionLabel = `${hasMacBuildOption ? 'Alternative: ' : ''}Windows Build via CrossOver / Wine${verSuffix}${sizeSuffix}`;
+                      } else {
+                        optionLabel = `Linux Build${verSuffix}${sizeSuffix}`;
+                      }
                       return (
                         <option key={ins.id} value={ins.id}>
-                          {ins.os === 'mac'
-                            ? `★ Recommended: Native macOS Build${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`
-                            : ins.os === 'windows'
-                            ? `Alternative: Windows Build via CrossOver / Wine${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`
-                            : `Linux Build${ver ? ` (${ver})` : ''}${ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : ''}`}
+                          {optionLabel}
                         </option>
                       );
                     })}
@@ -468,7 +494,9 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     <div className="flex items-start gap-2 text-[11px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-3 py-2 leading-relaxed">
                       <Cpu className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
                       <span>
-                        Windows Compatibility Mode selected: Will install the Windows x64 build and run it through CrossOver / Wine instead of the native macOS build.
+                        {hasMacBuildOption
+                          ? 'Windows Compatibility Mode selected: Will install the Windows x64 build and run it through CrossOver / Wine instead of the native macOS build.'
+                          : `No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will install the Windows build and run it via CrossOver / Wine.`}
                       </span>
                     </div>
                   )}

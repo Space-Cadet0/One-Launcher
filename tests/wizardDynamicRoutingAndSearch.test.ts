@@ -424,7 +424,10 @@ describe('Fix & Match Wizard: Priority Scopes, Dynamic Routing & Cross-Storefron
       });
 
       const enriched = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(applied);
-      expect(fallbackMetadataProvider.fetchGogProductMetadata).toHaveBeenCalledWith('1458058109');
+      expect(fallbackMetadataProvider.fetchGogProductMetadata).toHaveBeenCalledWith(
+        '1458058109',
+        'The Saboteur'
+      );
       expect(enriched.screenshots).toHaveLength(1);
       expect(enriched.screenshots[0].pathFull).toBe('https://images.gog.com/ss1_full.jpg');
       expect(enriched.movies).toHaveLength(1);

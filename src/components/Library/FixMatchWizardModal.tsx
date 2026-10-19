@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
+import { StorefrontId } from '../../contracts/platform';
 import {
   UserGameOverride,
   SearchMatchCandidate,
@@ -9,7 +10,11 @@ import {
   MetadataSourceRoute,
   ReviewScoreRoute,
 } from '../../contracts/override';
-import { metadataScraperService } from '../../services/scraper/metadataScraperService';
+import {
+  metadataScraperService,
+  buildCandidateStoreUrl,
+} from '../../services/scraper/metadataScraperService';
+import { getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import {
   reviewCandidateService,
   ReviewCandidateOption,
@@ -46,6 +51,7 @@ export interface FixMatchWizardModalProps {
   onClose: () => void;
   onApplyOverride: (override: UserGameOverride) => void;
   onResetOverride?: (gameId: string) => void;
+  onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   existingOverride?: UserGameOverride;
   initialStep?: WizardStep;
   initialCandidate?: SearchMatchCandidate | null;
@@ -80,6 +86,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   onClose,
   onApplyOverride,
   onResetOverride,
+  onHideGame,
   existingOverride,
   initialStep,
   initialCandidate,
@@ -827,10 +834,28 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
     const finalTitle = customTitle.trim() || scrapedBundle.title;
 
+    const srcPlat =
+      game.platforms?.find((p) => p.platformId === existingOverride?.originalSourcePlatformId) ||
+      game.platforms?.find((p) => p.platformId === existingOverride?.platformId) ||
+      game.platforms?.[0];
+
+    const rawSrcTitle =
+      existingOverride?.originalSourceTitle ||
+      srcPlat?.originalTitle ||
+      game.originalStoreTitle ||
+      game.title;
+
+    const isSplittingFromMerged = Boolean(
+      (game as any)?.isSplittingFromMerged || existingOverride?.splitFromMerged
+    );
+
     const override: UserGameOverride = {
       gameId: game.id,
       platformId: game.platforms?.[0]?.platformId,
       platformGameId: game.platforms?.[0]?.platformGameId,
+      originalSourceTitle: rawSrcTitle,
+      originalSourcePlatformId: srcPlat?.platformId,
+      ...(isSplittingFromMerged ? { splitFromMerged: true } : {}),
       matchedStore,
       matchedId: scrapedBundle.matchedId,
       title: finalTitle,
@@ -863,11 +888,30 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
   if (!isOpen || !game) return null;
 
+  const isSplittingFromMerged = Boolean(
+    (game as any)?.isSplittingFromMerged || existingOverride?.splitFromMerged
+  );
+
+  const sourcePlatform =
+    game.platforms?.find((p) => p.platformId === existingOverride?.originalSourcePlatformId) ||
+    game.platforms?.find((p) => p.platformId === existingOverride?.platformId) ||
+    game.platforms?.[0];
+
+  const rawSourceTitle =
+    existingOverride?.originalSourceTitle ||
+    sourcePlatform?.originalTitle ||
+    game.originalStoreTitle ||
+    game.title;
+
+  const isTitleOverridden =
+    Boolean(existingOverride?.title) &&
+    rawSourceTitle.toLowerCase().trim() !== game.title.toLowerCase().trim();
+
   const sourceTabs: SourceFilterTab[] = ['All', 'Steam', 'IGDB', 'GOG', 'Epic'];
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
+      className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
       onClick={handleCloseWizard}
     >
       <div
@@ -884,17 +928,39 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               <Wand className="w-5 h-5" />
             </div>
             <div>
-              <h2 id="fix-match-wizard-title" className="text-base font-bold text-white tracking-wide flex items-center gap-2">
-                Fix Match & Metadata
+              <h2 id="fix-match-wizard-title" className="text-base font-bold text-white tracking-wide flex items-center gap-2 flex-wrap">
+                <span>Fix Match &amp; Metadata</span>
                 {existingOverride && (
                   <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">
                     Custom Match Active
                   </span>
                 )}
+                {isSplittingFromMerged && (
+                  <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                    Splitting &amp; Matching Individual {getStorefrontDisplayName(sourcePlatform?.platformId || 'steam')} Entry
+                  </span>
+                )}
               </h2>
-              <p className="text-xs text-slate-400 truncate max-w-md">
-                Resolving canonical identity for: <span className="text-slate-200 font-medium">{game.title}</span>
-              </p>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400 mt-0.5">
+                {sourcePlatform && (
+                  <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-[#1b2838] border border-[#2a475e] text-[10px] font-semibold text-sky-300">
+                    {getStorefrontDisplayName(sourcePlatform.platformId)}
+                  </span>
+                )}
+                <span>
+                  Source Scrape Title:{' '}
+                  <strong className="text-slate-200 font-medium">&ldquo;{rawSourceTitle}&rdquo;</strong>
+                </span>
+                {isTitleOverridden && (
+                  <>
+                    <ChevronRight className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>
+                      Active Display Title:{' '}
+                      <strong className="text-amber-300 font-semibold">&ldquo;{game.title}&rdquo;</strong>
+                    </span>
+                  </>
+                )}
+              </div>
             </div>
           </div>
 
@@ -1083,6 +1149,39 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                 </button>
               </div>
 
+              {/* Source Entitlement vs Active Match Comparison Banner */}
+              <div className="mt-3 p-3 rounded-lg bg-[#131c27] border border-[#2a475e]/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className="text-slate-400 font-medium">Original Storefront Entitlement:</span>
+                  <span className="px-1.5 py-0.5 rounded bg-[#1b2838] border border-[#2a475e] text-[10px] font-bold text-sky-300">
+                    {getStorefrontDisplayName(sourcePlatform?.platformId || 'steam')}
+                  </span>
+                  <span className="text-white font-semibold truncate">
+                    &ldquo;{rawSourceTitle}&rdquo;
+                  </span>
+                  {sourcePlatform?.platformGameId && (
+                    <span className="text-[10px] font-mono text-slate-400">
+                      (Platform ID: {sourcePlatform.platformGameId})
+                    </span>
+                  )}
+                </div>
+
+                {existingOverride && (
+                  <div className="flex flex-wrap items-center gap-1.5 min-w-0 sm:border-l sm:border-[#2a475e] sm:pl-3">
+                    <span className="text-amber-300/90 font-medium">Currently Routed To:</span>
+                    <span className="px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-500/40 text-[10px] font-bold text-amber-300 uppercase">
+                      {existingOverride.matchedStore}
+                    </span>
+                    <span className="text-amber-200 font-semibold truncate">
+                      &ldquo;{existingOverride.title || game.title}&rdquo;
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      (ID: {existingOverride.matchedId})
+                    </span>
+                  </div>
+                )}
+              </div>
+
               {/* Candidate Results Grid */}
               <div className="mt-4">
                 <div className="flex items-center justify-between mb-2">
@@ -1110,6 +1209,16 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                     {candidates.map((cand) => {
                       const isSelected = selectedCandidate?.id === cand.id;
                       const isCurrentOverride = existingOverride?.matchedId === cand.id;
+                      const storeUrl =
+                        cand.storeUrl ||
+                        buildCandidateStoreUrl({
+                          source: cand.source,
+                          title: cand.title,
+                          steamAppId: cand.steamAppId,
+                          gogId: cand.source === 'gog' ? cand.id : undefined,
+                          epicSlug: cand.source === 'epic' ? String(cand.id) : undefined,
+                          igdbId: cand.igdbId ?? (cand.source === 'igdb' ? cand.id : undefined),
+                        });
 
                       let sourceColor = 'bg-sky-950/70 border-sky-600/50 text-sky-300';
                       if (cand.source === 'gog') {
@@ -1188,12 +1297,28 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                               </p>
                             )}
 
-                            {isCurrentOverride && (
-                              <div className="mt-2 inline-flex items-center gap-1 text-[10px] text-amber-300 font-medium">
-                                <Check className="w-3 h-3 text-amber-400" />
-                                <span>Current Override</span>
-                              </div>
-                            )}
+                            <div className="mt-2 flex items-center gap-2 flex-wrap">
+                              {storeUrl && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    handleOpenExternal(storeUrl, e);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-[10px] font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer"
+                                  title={`Open ${cand.source.toUpperCase()} store page for ${cand.title} in browser`}
+                                >
+                                  <ExternalLink className="w-2.5 h-2.5" />
+                                  <span>Store Page</span>
+                                </button>
+                              )}
+
+                              {isCurrentOverride && (
+                                <div className="inline-flex items-center gap-1 text-[10px] text-amber-300 font-medium">
+                                  <Check className="w-3 h-3 text-amber-400" />
+                                  <span>Current Override</span>
+                                </div>
+                              )}
+                            </div>
                           </div>
 
                           {/* Right Arrow indicator */}
@@ -1827,7 +1952,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-sky-950/70 border border-sky-500/50 text-sky-300">
                     Target: {scrapedBundle.matchedStore}
                   </span>
@@ -1836,6 +1961,34 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                       Steam ID: {scrapedBundle.steamAppId}
                     </span>
                   ) : null}
+                  {(() => {
+                    const targetStoreUrl = buildCandidateStoreUrl({
+                      source: scrapedBundle.matchedStore,
+                      title: scrapedBundle.title,
+                      steamAppId: scrapedBundle.steamAppId ?? undefined,
+                      gogId:
+                        scrapedBundle.matchedStore === 'gog'
+                          ? scrapedBundle.matchedId
+                          : undefined,
+                      epicSlug:
+                        scrapedBundle.matchedStore === 'epic'
+                          ? String(scrapedBundle.matchedId)
+                          : undefined,
+                      igdbId: scrapedBundle.igdbId,
+                    });
+                    if (!targetStoreUrl) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={(e) => handleOpenExternal(targetStoreUrl, e)}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#131c27] hover:bg-[#2a475e] border border-[#2a475e] text-[10px] font-semibold text-[#66c0f4] hover:text-white transition-colors cursor-pointer"
+                        title={`Open ${scrapedBundle.matchedStore.toUpperCase()} store page in browser`}
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        <span>Store Page</span>
+                      </button>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -1899,23 +2052,53 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
                   <div className="flex flex-wrap gap-2 pt-1">
                     {metadataSources.map((srcOpt) => {
                       const isActive = selectedMetadataSourceId === srcOpt.id;
+                      const srcStoreUrl =
+                        srcOpt.storeUrl ||
+                        buildCandidateStoreUrl({
+                          source: srcOpt.source,
+                          title: srcOpt.title,
+                          steamAppId: srcOpt.steamAppId ?? undefined,
+                          gogId: srcOpt.gogId,
+                          epicSlug: srcOpt.epicSlug,
+                          igdbId: srcOpt.igdbId,
+                        });
                       return (
-                        <button
+                        <div
                           key={srcOpt.id}
-                          type="button"
-                          onClick={() => handleSelectMetadataSource(srcOpt)}
-                          className={`px-3 py-1.5 rounded-md border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer ${
+                          className={`rounded-md border text-xs font-semibold transition-all flex items-center overflow-hidden ${
                             isActive
                               ? 'bg-[#66c0f4] text-slate-950 border-[#66c0f4] shadow-md'
                               : 'bg-[#16202d] border-[#2a475e] text-slate-300 hover:text-white hover:border-[#66c0f4]/60'
                           }`}
                         >
-                          <span className="uppercase text-[10px] font-bold opacity-80">
-                            {srcOpt.source}
-                          </span>
-                          <span>•</span>
-                          <span>{srcOpt.sourceLabel}</span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSelectMetadataSource(srcOpt)}
+                            className="px-3 py-1.5 flex items-center gap-2 cursor-pointer"
+                          >
+                            <span className="uppercase text-[10px] font-bold opacity-80">
+                              {srcOpt.source}
+                            </span>
+                            <span>•</span>
+                            <span>{srcOpt.sourceLabel}</span>
+                          </button>
+                          {srcStoreUrl && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                handleOpenExternal(srcStoreUrl, e);
+                              }}
+                              className={`px-2 py-1.5 border-l flex items-center gap-1 cursor-pointer transition-colors ${
+                                isActive
+                                  ? 'border-slate-950/20 hover:bg-black/15 text-slate-950'
+                                  : 'border-[#2a475e] hover:bg-[#2a475e] text-[#66c0f4] hover:text-white'
+                              }`}
+                              title={`Open ${srcOpt.source.toUpperCase()} store page for ${srcOpt.title} in browser`}
+                            >
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
                       );
                     })}
                   </div>
@@ -2151,8 +2334,8 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         </div>
 
         {/* Modal Bottom Action Footer Bar */}
-        <div className="px-6 py-4 border-t border-[#2a475e]/70 bg-[#131c27] flex items-center justify-between">
-          <div>
+        <div className="px-6 py-4 border-t border-[#2a475e]/70 bg-[#131c27] flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
             {existingOverride && onResetOverride && (
               <button
                 type="button"
@@ -2165,6 +2348,25 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 <span>Reset to Default</span>
+              </button>
+            )}
+            {onHideGame && (
+              <button
+                type="button"
+                onClick={() => {
+                  onHideGame(
+                    game,
+                    isSplittingFromMerged || game.platforms?.length === 1
+                      ? sourcePlatform?.platformId
+                      : undefined
+                  );
+                  handleCloseWizard();
+                }}
+                className="px-3.5 py-2 rounded-md border border-rose-500/40 bg-rose-950/40 text-rose-300 hover:bg-rose-900/60 hover:text-white transition-colors text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-sm"
+                title="Hide / suppress this entry from your active library (can be restored anytime in Library Match & Overrides Studio)"
+              >
+                <EyeOff className="w-3.5 h-3.5" />
+                <span>Hide / Suppress Entry</span>
               </button>
             )}
           </div>

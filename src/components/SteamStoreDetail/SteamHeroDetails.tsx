@@ -2,6 +2,7 @@ import React from 'react';
 import { SteamReviewSummary } from '../../contracts/steam';
 import { OpenCriticData, getTierColor } from '../../services/opencritic/openCritic';
 import { ActiveGameFilter } from '../../contracts/filter';
+import { stripHtmlToPlainSynopsis } from '../../services/steam/fallbackMetadataProvider';
 import { HelpCircle, ExternalLink } from 'lucide-react';
 
 interface SteamHeroDetailsProps {
@@ -54,7 +55,7 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
 
       {/* Short Synopsis Description */}
       <div className="text-[13px] leading-[18px] text-[#c6d4df] mb-3 line-clamp-4 min-h-[54px]">
-        {shortDescription || 'No overview available for this title.'}
+        {stripHtmlToPlainSynopsis(shortDescription, 360) || 'No overview available for this title.'}
       </div>
 
       {/* Reviews Summary Block (Steam + OpenCritic) */}

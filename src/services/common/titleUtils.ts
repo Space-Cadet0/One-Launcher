@@ -57,17 +57,64 @@ export function isEditionToken(token: string): boolean {
 }
 
 /**
- * Normalizes title string by stripping trademarks, apostrophes, and punctuation.
+ * Normalizes title string by collapsing dotted acronyms, normalizing diacritics,
+ * and stripping trademarks, apostrophes/quotes, and punctuation.
  */
 export function normalizeTitleKey(title: string): string {
   if (!title) return '';
   return title
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/\b(?:[a-z]\.){2,}[a-z]?\.?/gi, (m) => m.replace(/\./g, ''))
     .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
+    .replace(/['’‘"“”]/g, '')
     .replace(/[^a-z0-9]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Punctuation-, apostrophe-, hyphen-, and acronym-tolerant search matcher.
+ * Handles cases like:
+ * - "Alien Isolation" -> "Alien: Isolation"
+ * - "deaths door" -> "Death's Door"
+ * - "Stalker" -> "S.T.A.L.K.E.R. 2: Heart of Chornobyl"
+ * - "spiderman" -> "Spider-Man"
+ */
+export function matchesLooseSearchQuery(
+  target: string | undefined | null,
+  query: string | undefined | null
+): boolean {
+  if (!query || !query.trim()) return true;
+  if (!target) return false;
+
+  const q = query.trim();
+  if (target.toLowerCase().includes(q.toLowerCase())) {
+    return true;
+  }
+
+  const normTarget = normalizeTitleKey(target);
+  const normQuery = normalizeTitleKey(q);
+  if (!normQuery) return true;
+  if (!normTarget) return false;
+
+  if (normTarget.includes(normQuery)) {
+    return true;
+  }
+
+  const compactTarget = normTarget.replace(/\s+/g, '');
+  const compactQuery = normQuery.replace(/\s+/g, '');
+  if (compactQuery.length >= 3 && compactTarget.includes(compactQuery)) {
+    return true;
+  }
+
+  const queryTokens = normQuery.split(' ').filter(Boolean);
+  if (queryTokens.length > 1 && queryTokens.every((token) => normTarget.includes(token))) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -76,9 +123,12 @@ export function normalizeTitleKey(title: string): string {
 export function stripEditionSuffix(title: string): string {
   if (!title) return '';
   return title
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/\b(?:[a-z]\.){2,}[a-z]?\.?/gi, (m) => m.replace(/\./g, ''))
     .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
+    .replace(/['’‘"“”]/g, '')
     .replace(
       /\b(digital\s+)?(the\s+)?(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|director'?s cut|goty|game of the year|remastered|remake)\b.*$/i,
       ''

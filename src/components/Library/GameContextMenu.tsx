@@ -1,15 +1,16 @@
-import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { GameCollection } from '../../contracts/collection';
+import { CollectionIcon } from '../Common/CollectionIcon';
 import {
   Wand,
   Film,
   FolderPlus,
   ChevronRight,
   Check,
-  Folder,
   Sliders,
   Trophy,
+  EyeOff,
 } from 'lucide-react';
 
 export interface GameContextMenuProps {
@@ -24,6 +25,7 @@ export interface GameContextMenuProps {
   onToggleCollection: (collectionId: string, gameId: string) => void;
   onManageCollections: (game: CanonicalGame) => void;
   onViewAchievements?: (game: CanonicalGame) => void;
+  onHideGame?: (game: CanonicalGame) => void;
 }
 
 export const GameContextMenu: React.FC<GameContextMenuProps> = ({
@@ -38,22 +40,54 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
   onToggleCollection,
   onManageCollections,
   onViewAchievements,
+  onHideGame,
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const submenuRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isSubmenuOpen, setIsSubmenuOpen] = useState(false);
   const [coords, setCoords] = useState<{ x: number; y: number }>({ x, y });
   const [flyLeft, setFlyLeft] = useState(false);
 
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
+  const openSubmenu = useCallback(() => {
+    clearCloseTimer();
+    setIsSubmenuOpen(true);
+  }, [clearCloseTimer]);
+
+  const scheduleCloseSubmenu = useCallback(
+    (delayMs = 260) => {
+      clearCloseTimer();
+      closeTimerRef.current = setTimeout(() => {
+        setIsSubmenuOpen(false);
+        closeTimerRef.current = null;
+      }, delayMs);
+    },
+    [clearCloseTimer]
+  );
+
+  useEffect(() => {
+    return () => {
+      clearCloseTimer();
+    };
+  }, [clearCloseTimer]);
+
   // Recalculate coordinates whenever open or x/y changes to keep completely within viewport bounds
   useLayoutEffect(() => {
     if (!isOpen) {
+      clearCloseTimer();
       setIsSubmenuOpen(false);
       return;
     }
 
     const menuWidth = 230;
-    const menuHeight = 150;
+    const menuHeight = 220;
     const submenuWidth = 210;
     const padding = 8;
 
@@ -76,7 +110,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
     } else {
       setFlyLeft(false);
     }
-  }, [isOpen, x, y]);
+  }, [isOpen, x, y, clearCloseTimer]);
 
   // Handle outside click, window scroll, and escape key
   useEffect(() => {
@@ -120,6 +154,8 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
 
   if (!isOpen || !game) return null;
 
+  const flyUp = typeof window !== 'undefined' && coords.y + 420 > window.innerHeight;
+
   return (
     <div
       ref={menuRef}
@@ -147,6 +183,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
       <button
         type="button"
         role="menuitem"
+        onMouseEnter={() => scheduleCloseSubmenu(140)}
         onClick={() => {
           onClose();
           onFixMatch(game);
@@ -161,6 +198,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
       <button
         type="button"
         role="menuitem"
+        onMouseEnter={() => scheduleCloseSubmenu(140)}
         onClick={() => {
           onClose();
           onSyncStoreMedia(game);
@@ -176,6 +214,7 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
         <button
           type="button"
           role="menuitem"
+          onMouseEnter={() => scheduleCloseSubmenu(140)}
           onClick={() => {
             onClose();
             onViewAchievements(game);
@@ -187,18 +226,21 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
         </button>
       )}
 
-      {/* Action 3: Assign to Collection (Branching Submenu) */}
+      {/* Action 4: Assign to Collection (Branching Submenu) */}
       <div
         className="relative"
-        onMouseEnter={() => setIsSubmenuOpen(true)}
-        onMouseLeave={() => setIsSubmenuOpen(false)}
+        onMouseEnter={openSubmenu}
+        onMouseLeave={() => scheduleCloseSubmenu(260)}
       >
         <button
           type="button"
           role="menuitem"
           aria-haspopup="true"
           aria-expanded={isSubmenuOpen}
-          onClick={() => setIsSubmenuOpen((prev) => !prev)}
+          onClick={() => {
+            clearCloseTimer();
+            setIsSubmenuOpen((prev) => !prev);
+          }}
           className={`w-full flex items-center justify-between px-3 py-2 text-left transition-colors cursor-pointer ${
             isSubmenuOpen ? 'bg-[#1b2838] text-white' : 'hover:bg-[#1b2838] hover:text-white'
           }`}
@@ -210,67 +252,102 @@ export const GameContextMenu: React.FC<GameContextMenuProps> = ({
           <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
         </button>
 
-        {/* Branching Submenu */}
+        {/* Branching Submenu with continuous hover bridge corridor */}
         {isSubmenuOpen && (
           <div
             ref={submenuRef}
-            role="menu"
-            aria-label="Collections submenu"
-            className={`absolute top-0 ${
-              flyLeft ? 'right-full mr-1' : 'left-full ml-1'
-            } w-52 max-h-72 overflow-y-auto rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_25px_rgba(0,0,0,0.85)] py-1.5 z-50 backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 custom-scrollbar`}
+            onMouseEnter={openSubmenu}
+            onMouseLeave={() => scheduleCloseSubmenu(220)}
+            className={`absolute ${flyUp ? 'bottom-0' : 'top-0'} ${
+              flyLeft ? 'right-full pr-1.5' : 'left-full pl-1.5'
+            } z-50 before:content-[''] before:absolute before:-top-4 before:-bottom-4 ${
+              flyLeft ? 'before:-right-3 before:w-4' : 'before:-left-3 before:w-4'
+            }`}
           >
-            <div className="px-3 py-1 border-b border-[#2a475e]/60 mb-1 text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-              Collections
-            </div>
-
-            {collections.length === 0 ? (
-              <div className="px-3 py-2 text-[11px] text-slate-400 italic">
-                No collections created
-              </div>
-            ) : (
-              collections.map((col) => {
-                const isAssigned = Array.isArray(col.gameIds) && col.gameIds.includes(game.id);
-                return (
-                  <button
-                    key={col.id}
-                    type="button"
-                    role="menuitemcheckbox"
-                    aria-checked={isAssigned}
-                    onClick={() => {
-                      onToggleCollection(col.id, game.id);
-                    }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer text-xs"
-                  >
-                    <div className="flex items-center gap-2 min-w-0 pr-2">
-                      <Folder className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                      <span className="truncate">{col.name}</span>
-                    </div>
-                    {isAssigned && (
-                      <Check className="w-3.5 h-3.5 text-[#66c0f4] shrink-0 font-bold" />
-                    )}
-                  </button>
-                );
-              })
-            )}
-
-            <div className="my-1 border-t border-[#2a475e]/60" />
-
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                onClose();
-                onManageCollections(game);
-              }}
-              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer text-xs text-slate-300 font-medium"
+            <div
+              role="menu"
+              aria-label="Collections submenu"
+              className="w-52 max-h-72 overflow-y-auto rounded-md bg-[#16202d] border border-[#2a475e] shadow-[0_10px_25px_rgba(0,0,0,0.85)] py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 custom-scrollbar"
             >
-              <Sliders className="w-3.5 h-3.5 text-[#66c0f4]" />
-              <span>Manage Collections...</span>
-            </button>
+              <div className="px-3 py-1 border-b border-[#2a475e]/60 mb-1 text-[10px] uppercase font-bold text-slate-400 tracking-wider">
+                Collections
+              </div>
+
+              {collections.length === 0 ? (
+                <div className="px-3 py-2 text-[11px] text-slate-400 italic">
+                  No collections created
+                </div>
+              ) : (
+                collections.map((col) => {
+                  const isAssigned = Array.isArray(col.gameIds) && col.gameIds.includes(game.id);
+                  return (
+                    <button
+                      key={col.id}
+                      type="button"
+                      role="menuitemcheckbox"
+                      aria-checked={isAssigned}
+                      onClick={() => {
+                        onToggleCollection(col.id, game.id);
+                      }}
+                      className="w-full flex items-center justify-between px-3 py-1.5 text-left hover:bg-[#1b2838] hover:text-white transition-colors cursor-pointer text-xs"
+                    >
+                      <div className="flex items-center gap-2 min-w-0 pr-2">
+                        <CollectionIcon
+                          iconId={col.icon}
+                          collectionId={col.id}
+                          size={14}
+                          className={isAssigned ? 'text-[#66c0f4] shrink-0' : 'text-slate-500 shrink-0'}
+                        />
+                        <span className="truncate">{col.name}</span>
+                      </div>
+                      {isAssigned && (
+                        <Check className="w-3.5 h-3.5 text-[#66c0f4] shrink-0 font-bold" />
+                      )}
+                    </button>
+                  );
+                })
+              )}
+
+              <div className="my-1 border-t border-[#2a475e]/60" />
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  onClose();
+                  onManageCollections(game);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-[#1b2838] hover:text-[#66c0f4] transition-colors cursor-pointer text-xs text-slate-300 font-medium"
+              >
+                <Sliders className="w-3.5 h-3.5 text-[#66c0f4]" />
+                <span>Manage Collections...</span>
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Action 5: Hide / Suppress from Library */}
+      {onHideGame && (
+        <div
+          className="mt-1 pt-1 border-t border-[#2a475e]/60"
+          onMouseEnter={() => scheduleCloseSubmenu(140)}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              onClose();
+              onHideGame(game);
+            }}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-white transition-colors cursor-pointer group"
+          >
+            <EyeOff className="w-4 h-4 text-rose-400 group-hover:scale-110 transition-transform shrink-0" />
+            <span>Hide / Suppress from Library</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 };
+

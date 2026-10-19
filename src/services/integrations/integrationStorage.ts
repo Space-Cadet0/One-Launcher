@@ -3,13 +3,19 @@ import { StorefrontIntegration, StorefrontCredentials } from '../../contracts/in
 import { CanonicalGame } from '../../contracts/game';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import { steamIntegration } from './steamIntegration';
-import { gogIntegration } from './gogIntegration';
+import { gogIntegration, normalizeGogAvatarUrl } from './gogIntegration';
 import { epicIntegration } from './epicIntegration';
 import { xboxIntegration } from './xboxIntegration';
 import { mergeScannedSteamGames } from '../storage/librarySync';
 import { GOG_USER_LIBRARY, EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
-import { sanitizeGameCatalog, normalizeCanonicalTitle, hasSameStorefrontConflict } from './catalogSanitizer';
+import {
+  sanitizeGameCatalog,
+  normalizeCanonicalTitle,
+  hasSameStorefrontConflict,
+  hasSplitOverrideConflict,
+} from './catalogSanitizer';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
+import { isUnsuitableCoverUrl, isUnsuitableHeaderUrl } from '../igdb/igdbCoverService';
 import {
   loadUserOverrides,
   getUserOverrideForGame,
@@ -20,6 +26,104 @@ import {
 const STORAGE_KEY_INTEGRATIONS = 'antigravity_storefront_integrations';
 const STORAGE_KEY_CUSTOM_GAMES = 'antigravity_synced_user_games';
 const STORAGE_KEY_MAIN_CATALOG = 'universal_game_library_catalog';
+export const STORAGE_KEY_VERIFIED_ENTITLEMENTS = 'antigravity_verified_storefront_entitlements_v1';
+
+export interface VerifiedUserEntitlements {
+  steam: number[];
+  gog: string[];
+  epic: string[];
+  xbox: string[];
+}
+
+function getSafeStorage(): Storage | null {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+export function getVerifiedUserEntitlements(): VerifiedUserEntitlements {
+  const empty: VerifiedUserEntitlements = { steam: [], gog: [], epic: [], xbox: [] };
+  const storage = getSafeStorage();
+  if (!storage) return empty;
+  try {
+    const raw = storage.getItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    return {
+      steam: Array.isArray(parsed?.steam) ? parsed.steam.filter((n: any) => typeof n === 'number' && n > 0) : [],
+      gog: Array.isArray(parsed?.gog) ? parsed.gog.filter((s: any) => typeof s === 'string' && s.length > 0) : [],
+      epic: Array.isArray(parsed?.epic) ? parsed.epic.filter((s: any) => typeof s === 'string' && s.length > 0) : [],
+      xbox: Array.isArray(parsed?.xbox) ? parsed.xbox.filter((s: any) => typeof s === 'string' && s.length > 0) : [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function recordVerifiedUserEntitlements(
+  storefrontId: StorefrontId,
+  games: CanonicalGame[]
+): void {
+  const storage = getSafeStorage();
+  if (!storage || !Array.isArray(games) || games.length === 0) return;
+  try {
+    const current = getVerifiedUserEntitlements();
+    if (storefrontId === 'steam') {
+      const set = new Set<number>(current.steam);
+      for (const g of games) {
+        if (!g || g.isVerifiedEntitlement === false) continue;
+        const steamPlat = g.platforms?.find((p) => p.platformId === 'steam');
+        const appId =
+          g.steamAppId ||
+          (steamPlat?.platformGameId && !isNaN(Number(steamPlat.platformGameId))
+            ? Number(steamPlat.platformGameId)
+            : undefined);
+        if (appId && appId > 0) set.add(appId);
+      }
+      current.steam = Array.from(set);
+    } else if (storefrontId === 'gog' || storefrontId === 'epic' || storefrontId === 'xbox') {
+      const set = new Set<string>(current[storefrontId]);
+      for (const g of games) {
+        if (!g || g.isVerifiedEntitlement === false) continue;
+        const plat = g.platforms?.find((p) => p.platformId === storefrontId);
+        if (plat?.platformGameId) {
+          set.add(plat.platformGameId.trim().toLowerCase());
+        }
+        if (g.title) {
+          const norm = normalizeCanonicalTitle(g.title);
+          if (norm) set.add(norm);
+        }
+      }
+      current[storefrontId] = Array.from(set);
+    }
+    storage.setItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS, JSON.stringify(current));
+  } catch (err) {
+    console.warn('Failed to record verified storefront entitlements:', err);
+  }
+}
+
+export function clearVerifiedUserEntitlements(storefrontId?: StorefrontId): void {
+  const storage = getSafeStorage();
+  if (!storage) return;
+  try {
+    if (!storefrontId) {
+      storage.removeItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS);
+      return;
+    }
+    const current = getVerifiedUserEntitlements();
+    if (storefrontId === 'steam') current.steam = [];
+    else if (storefrontId === 'gog') current.gog = [];
+    else if (storefrontId === 'epic') current.epic = [];
+    else if (storefrontId === 'xbox') current.xbox = [];
+    storage.setItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS, JSON.stringify(current));
+  } catch (err) {
+    console.warn('Failed to clear verified storefront entitlements:', err);
+  }
+}
 
 export const DEFAULT_INTEGRATIONS: StorefrontIntegration[] = [
   {
@@ -62,7 +166,21 @@ export function loadIntegrations(): StorefrontIntegration[] {
     }
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed;
+      let changed = false;
+      const normalized = parsed.map((i: StorefrontIntegration) => {
+        if (i && i.storefrontId === 'gog' && i.avatarUrl) {
+          const normUrl = normalizeGogAvatarUrl(i.avatarUrl);
+          if (normUrl && normUrl !== i.avatarUrl) {
+            changed = true;
+            return { ...i, avatarUrl: normUrl };
+          }
+        }
+        return i;
+      });
+      if (changed) {
+        saveIntegrations(normalized);
+      }
+      return normalized;
     }
     return DEFAULT_INTEGRATIONS;
   } catch (err) {
@@ -175,6 +293,10 @@ export function mergeStorefrontGames(
   storefrontId: StorefrontId
 ): CanonicalGame[] {
   const userOverrides = loadUserOverrides();
+  const verifiedIncoming = newGames.filter((g) => g && g.isVerifiedEntitlement === true);
+  if (verifiedIncoming.length > 0) {
+    recordVerifiedUserEntitlements(storefrontId, verifiedIncoming);
+  }
   const sanitizedNew = sanitizeGameCatalog(newGames);
   const merged = currentCatalog.map((g) => {
     if (g.id.startsWith('steam-') && g.steamAppId) {
@@ -207,12 +329,13 @@ export function mergeStorefrontGames(
     const incomingPlatGameId = String(platformOwnership.platformGameId || '').trim();
 
     const existingIndex = merged.findIndex((g) => {
+      if (hasSameStorefrontConflict(g, newGame)) return false;
+      if (hasSplitOverrideConflict(g, newGame, userOverrides)) return false;
       const ov = getUserOverrideForGame(g, userOverrides);
       if (ov) {
         if (ov.gameId && (ov.gameId === newGame.id || (newGame.steamAppId && ov.gameId === `steam-${newGame.steamAppId}`))) return true;
         if (newGame.steamAppId && ov.steamAppId && ov.steamAppId === newGame.steamAppId) return true;
       }
-      if (hasSameStorefrontConflict(g, newGame)) return false;
       if (
         incomingPlatGameId &&
         g.platforms.every((p) => p.platformId === storefrontId) &&
@@ -270,9 +393,9 @@ export function mergeStorefrontGames(
         ...existing,
         title: preferStorefrontTitle ? newGame.title : existing.title,
         sortTitle: preferStorefrontTitle ? (newGame.sortTitle || existing.sortTitle) : existing.sortTitle,
-        headerImage: (existing.headerImage && !existing.headerImage.includes('egs-badge.png')) ? existing.headerImage : newGame.headerImage,
-        capsuleImage: (existing.capsuleImage && !existing.capsuleImage.includes('egs-badge.png')) ? existing.capsuleImage : newGame.capsuleImage,
-        iconUrl: (existing.iconUrl && !existing.iconUrl.includes('egs-badge.png')) ? existing.iconUrl : (newGame.iconUrl || newGame.capsuleImage || newGame.headerImage),
+        headerImage: !isUnsuitableHeaderUrl(existing.headerImage) ? existing.headerImage : newGame.headerImage,
+        capsuleImage: !isUnsuitableCoverUrl(existing.capsuleImage) ? existing.capsuleImage : newGame.capsuleImage,
+        iconUrl: !isUnsuitableHeaderUrl(existing.iconUrl) ? existing.iconUrl : (newGame.iconUrl || newGame.capsuleImage || newGame.headerImage),
         steamAppId: existing.steamAppId || newGame.steamAppId,
         id: existing.steamAppId
           ? `steam-${existing.steamAppId}`
@@ -329,6 +452,7 @@ export function removeStorefrontGames(
   currentCatalog: CanonicalGame[],
   storefrontId: StorefrontId
 ): CanonicalGame[] {
+  clearVerifiedUserEntitlements(storefrontId);
   const remaining: CanonicalGame[] = [];
 
   for (const game of currentCatalog) {

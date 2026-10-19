@@ -4,7 +4,9 @@ import {
   normalizeCanonicalTitle,
   hasSameStorefrontConflict,
   sanitizeGameCatalog,
+  getSuppressedCatalogEntries,
 } from '../src/services/integrations/catalogSanitizer';
+import { unhideStorefrontEntry } from '../src/services/storage/userOverrideStorage';
 import {
   mergeStorefrontGames,
 } from '../src/services/integrations/integrationStorage';
@@ -160,7 +162,7 @@ describe('PDF Ground-Truth Storefront Reconciliation Fixes', () => {
     expect(mafiaDefinitive?.platforms.some((p) => p.platformId === 'gog' && p.platformGameId === '1993581340')).toBe(true);
   });
 
-  it('sanitizeGameCatalog preserves verified storefront entitlements even if they look like prologues/betas', () => {
+  it('sanitizeGameCatalog suppresses prologues/betas into getSuppressedCatalogEntries by default and preserves them when restored by user', () => {
     const catalog: CanonicalGame[] = [
       {
         id: 'steam-1309',
@@ -202,13 +204,30 @@ describe('PDF Ground-Truth Storefront Reconciliation Fixes', () => {
     ];
 
     const sanitized = sanitizeGameCatalog(catalog);
-    expect(sanitized.some((g) => g.id === 'steam-1309')).toBe(true);
-    expect(sanitized.some((g) => g.id === 'gog-1589624510')).toBe(true);
-    expect(sanitized.some((g) => g.id === 'epic-chivalry2-testing')).toBe(true);
+    // Standalone base game (Unreal Tournament) is preserved
     expect(sanitized.some((g) => g.id === 'epic-UnrealTournamentDev')).toBe(true);
-    // Unverified beta and Unreal Engine tools are still filtered out
+    // Non-game betas, prologues, test branches, and engine tools are suppressed by default
+    expect(sanitized.some((g) => g.id === 'steam-1309')).toBe(false);
+    expect(sanitized.some((g) => g.id === 'gog-1589624510')).toBe(false);
+    expect(sanitized.some((g) => g.id === 'epic-chivalry2-testing')).toBe(false);
     expect(sanitized.some((g) => g.id === 'epic-unverified-beta')).toBe(false);
     expect(sanitized.some((g) => g.id === 'epic-unreal-engine-5')).toBe(false);
+
+    // And recorded in getSuppressedCatalogEntries() for the Library Match & Overrides Studio
+    const suppressed = getSuppressedCatalogEntries();
+    expect(suppressed.some((e) => e.rawTitle === 'SiN Multiplayer')).toBe(true);
+    expect(suppressed.some((e) => e.rawTitle === 'Urbek City Builder Prologue')).toBe(true);
+    expect(suppressed.some((e) => e.rawTitle === 'Chivalry 2 - Public Testing')).toBe(true);
+
+    // When explicitly restored by the user via unhideStorefrontEntry, they are included in the active library
+    unhideStorefrontEntry('steam', '1309', 'steam-1309');
+    unhideStorefrontEntry('gog', '1589624510', 'gog-1589624510');
+    unhideStorefrontEntry('epic', 'chivalry2-testing', 'epic-chivalry2-testing');
+
+    const restoredSanitized = sanitizeGameCatalog(catalog);
+    expect(restoredSanitized.some((g) => g.id === 'steam-1309')).toBe(true);
+    expect(restoredSanitized.some((g) => g.id === 'gog-1589624510')).toBe(true);
+    expect(restoredSanitized.some((g) => g.id === 'epic-chivalry2-testing')).toBe(true);
   });
 
   it('steamAchievementsService.fetchPlayerGameAchievements extracts achievements from redirected HTML when Steam strips ?xml=1', async () => {

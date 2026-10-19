@@ -144,6 +144,7 @@ function saveTokens(storefrontId, tokenData) {
   try {
     const existing = loadSavedTokens();
     existing[storefrontId] = {
+      ...(existing[storefrontId] || {}),
       ...tokenData,
       updatedAt: new Date().toISOString(),
     };
@@ -164,10 +165,6 @@ function clearTokens(storefrontId) {
     console.warn('Failed to clear tokens:', err.message);
   }
 }
-
-const KNOWN_STEAM_MAPPINGS = {};
-
-const KNOWN_EPIC_APP_NAMES = {};
 
 const EDITION_WORDS = new Set([
   'complete',
@@ -329,31 +326,10 @@ const steamMatchCache = new Map();
  */
 async function matchSteamAppId(rawTitle) {
   if (!rawTitle) return undefined;
-  const clean = rawTitle.trim();
-  const lower = clean.toLowerCase();
+  const lower = rawTitle.trim().toLowerCase();
 
   if (steamMatchCache.has(lower)) {
     return steamMatchCache.get(lower);
-  }
-
-  // 1. Curated dictionary check
-  if (KNOWN_STEAM_MAPPINGS[lower]) {
-    const id = KNOWN_STEAM_MAPPINGS[lower];
-    steamMatchCache.set(lower, id);
-    return id;
-  }
-
-  // 2. Normalized title check
-  const normalized = lower
-    .replace(/[™®©]/g, '')
-    .replace(/ - (digital deluxe|deluxe|enhanced|game of the year|goty|definitive|director's cut|complete|remastered|drm-free|standard) edition/i, '')
-    .replace(/ \((digital deluxe|deluxe|enhanced|game of the year|goty|definitive|director's cut|complete|remastered|drm-free|standard) edition\)/i, '')
-    .trim();
-
-  if (KNOWN_STEAM_MAPPINGS[normalized]) {
-    const id = KNOWN_STEAM_MAPPINGS[normalized];
-    steamMatchCache.set(lower, id);
-    return id;
   }
 
   steamMatchCache.set(lower, undefined);
@@ -414,6 +390,64 @@ async function renewGogTokens(refreshToken) {
 }
 
 /**
+ * Normalize GOG avatar URLs (handling protocol-relative //images.gog-statics.com/<hash>
+ * which returns 404 without a size suffix + .jpg extension, as well as avatars maps).
+ */
+function normalizeGogAvatarUrl(rawAvatar, avatarsObj) {
+  const candidates = [];
+  if (avatarsObj && typeof avatarsObj === 'object') {
+    candidates.push(
+      avatarsObj.menu_user_av_big2,
+      avatarsObj.menu_user_av_big,
+      avatarsObj.large_2x,
+      avatarsObj.large,
+      avatarsObj.sdk_img_184,
+      avatarsObj.medium_2x,
+      avatarsObj.medium,
+      avatarsObj.menu_big_2,
+      avatarsObj.menu_big,
+      avatarsObj.menu_user_av_small2,
+      avatarsObj.menu_user_av_small,
+      avatarsObj.small_2x,
+      avatarsObj.small
+    );
+  }
+  if (rawAvatar && typeof rawAvatar === 'object') {
+    candidates.push(
+      rawAvatar.large_2x,
+      rawAvatar.large,
+      rawAvatar.sdk_img_184,
+      rawAvatar.medium_2x,
+      rawAvatar.medium,
+      rawAvatar.menu_big_2,
+      rawAvatar.menu_big,
+      rawAvatar.menu_user_av_big2,
+      rawAvatar.menu_user_av_big,
+      rawAvatar.small_2x,
+      rawAvatar.small
+    );
+  } else if (typeof rawAvatar === 'string' && rawAvatar.trim()) {
+    candidates.push(rawAvatar.trim());
+  }
+
+  for (const cand of candidates) {
+    if (typeof cand !== 'string' || !cand.trim()) continue;
+    let url = cand.trim();
+    if (url.startsWith('//')) {
+      url = `https:${url}`;
+    } else if (url.startsWith('http://')) {
+      url = `https://${url.slice(7)}`;
+    }
+    // Bare GOG CDN hash without size suffix or file extension returns 404 unless suffixed
+    if (/^https:\/\/images\.gog(-statics)?\.com\/[0-9a-f]{32,64}$/i.test(url)) {
+      url = `${url}_menu_user_av_big2.jpg`;
+    }
+    return url;
+  }
+  return undefined;
+}
+
+/**
  * Fetch GOG Account Details
  */
 async function fetchGogAccount(accessToken) {
@@ -425,6 +459,9 @@ async function fetchGogAccount(accessToken) {
   });
 
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`GOG account token expired (${res.status})`);
+    }
     return {
       username: 'GOG User',
       avatarUrl: undefined,
@@ -432,10 +469,47 @@ async function fetchGogAccount(accessToken) {
   }
 
   const data = await res.json();
+  let username = data.username || 'GOG User';
+  let userId = data.userId;
+  let avatarUrl = normalizeGogAvatarUrl(data.avatar, data.avatars);
+
+  if ((!avatarUrl || username === 'GOG User') && userId) {
+    try {
+      const userRes = await fetch(`https://users.gog.com/users/${encodeURIComponent(userId)}`, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
+        },
+      });
+      if (userRes.ok) {
+        const userJson = await userRes.json();
+        if (userJson?.username && username === 'GOG User') {
+          username = userJson.username;
+        }
+        const fallbackAvatar = normalizeGogAvatarUrl(userJson?.avatar, userJson?.avatars);
+        if (fallbackAvatar) {
+          avatarUrl = fallbackAvatar;
+        }
+      }
+    } catch {}
+  }
+
+  try {
+    const existing = loadSavedTokens();
+    if (existing?.gog && typeof existing.gog === 'object') {
+      saveTokens('gog', {
+        ...existing.gog,
+        user_id: userId || existing.gog.user_id,
+        username: username !== 'GOG User' ? username : existing.gog.username,
+        avatarUrl: avatarUrl || existing.gog.avatarUrl,
+      });
+    }
+  } catch {}
+
   return {
-    username: data.username || 'GOG User',
-    userId: data.userId,
-    avatarUrl: data.avatar || undefined,
+    username,
+    userId,
+    avatarUrl,
   };
 }
 
@@ -669,6 +743,8 @@ async function fetchGogAchievements(accessToken, username, userId) {
  */
 async function fetchGogOwnedGames(accessToken, username, userId) {
   const games = [];
+  const suppressedItems = [];
+  fetchGogOwnedGames.lastSuppressedItems = suppressedItems;
 
   // 1. Fetch playtime & achievement stats
   const { achievements: achievementsMap, stats: playtimeMap } = await fetchGogAchievements(
@@ -731,10 +807,70 @@ async function fetchGogOwnedGames(accessToken, username, userId) {
           achievementsMap[lowerTitle] ||
           achievementsMap[normTitle];
 
+        const nonGameReason = classifyNonGameStorefrontItem({
+          title,
+          platformId: 'gog',
+          platformGameId: strId,
+          isDlc: false,
+        });
+        if (nonGameReason) {
+          const rawGame = {
+            id: `gog-${p.id}`,
+            title,
+            originalStoreTitle: title,
+            sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
+            isVerifiedEntitlement: true,
+            platforms: [
+              {
+                platformId: 'gog',
+                platformGameId: strId,
+                originalTitle: title,
+                installed: false,
+                playtimeMinutes: stats.playtime || 0,
+                lastPlayed: stats.lastSession || undefined,
+              },
+            ],
+            headerImage: coverUrl,
+            capsuleImage: gogEnriched[strId]?.coverVertical || '',
+            shortDescription: '',
+            releaseDate: '',
+            developers: [],
+            publishers: [],
+            genres: p.category ? [p.category] : ['Action'],
+            tags: ['GOG', 'DRM-Free'],
+          };
+          suppressedItems.push({
+            id: `gog-${p.id}`,
+            rawTitle: title,
+            platformId: 'gog',
+            platformGameId: strId,
+            reason: nonGameReason,
+            reasonCategory: 'non_game_filter',
+            rawGame,
+          });
+          continue;
+        }
+
         const steamAppId = await matchSteamAppId(title);
 
         const enrichedEntry = gogEnriched[strId];
         const verticalGogCover = enrichedEntry?.coverVertical || null;
+
+        const rawWorksOn = p.worksOn || p.os || enrichedEntry?.worksOn || enrichedEntry?.platforms;
+        const resolvedOsPlatforms =
+          rawWorksOn && typeof rawWorksOn === 'object'
+            ? {
+                windows: Boolean(rawWorksOn.Windows ?? rawWorksOn.windows ?? true),
+                mac: Boolean(rawWorksOn.Mac ?? rawWorksOn.mac ?? false),
+                linux: Boolean(rawWorksOn.Linux ?? rawWorksOn.linux ?? false),
+              }
+            : undefined;
+        const resolvedNativePlatforms = resolvedOsPlatforms
+          ? [
+              ...(resolvedOsPlatforms.windows ? ['windows'] : []),
+              ...(resolvedOsPlatforms.mac ? ['mac'] : []),
+            ]
+          : undefined;
 
         const hasSteamVertical = Boolean(steamAppId);
 
@@ -752,6 +888,10 @@ async function fetchGogOwnedGames(accessToken, username, userId) {
           sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
           steamAppId,
           isVerifiedEntitlement: true,
+          ...(resolvedNativePlatforms && resolvedNativePlatforms.length > 0
+            ? { nativePlatforms: resolvedNativePlatforms }
+            : {}),
+          ...(resolvedOsPlatforms ? { worksOn: resolvedOsPlatforms } : {}),
           platforms: [
             {
               platformId: 'gog',
@@ -760,6 +900,7 @@ async function fetchGogOwnedGames(accessToken, username, userId) {
               playtimeMinutes: stats.playtime || 0,
               lastPlayed: stats.lastSession || undefined,
               achievements: gameAch || undefined,
+              ...(resolvedOsPlatforms ? { platforms: resolvedOsPlatforms } : {}),
             },
           ],
           headerImage: headerImg,
@@ -816,13 +957,6 @@ async function exchangeEpicCode(code) {
 
   saveTokens('epic', data);
   return data;
-}
-
-let EPIC_BASE_GAMES = [];
-try {
-  EPIC_BASE_GAMES = require('./epicBaseGames.json');
-} catch (e) {
-  // Ignore if not present
 }
 
 /**
@@ -962,50 +1096,61 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
   }
   fetchEpicOwnedGames.lastAchievementsMap = achievementsMap;
 
-  // 3. Initialize with authoritative base games catalog if available
   const gamesMap = new Map();
   const knownAppIds = new Set();
   const knownTitles = new Set();
+  const suppressedItems = [];
+  fetchEpicOwnedGames.lastSuppressedItems = suppressedItems;
 
-  if (EPIC_BASE_GAMES && EPIC_BASE_GAMES.length > 0) {
-    for (const baseGame of EPIC_BASE_GAMES) {
-      const epicPlat = baseGame.platforms.find((p) => p.platformId === 'epic');
-      const gameId = epicPlat?.platformGameId;
-      const pt = (gameId ? (playtimeMap.get(gameId) || playtimeMap.get(gameId.toLowerCase())) : null) || {};
+  const pushEpicSuppressedItem = (item, title, reason, description = '', developer = '', keyImages = []) => {
+    if (!title || title === 'Live' || /^[0-9a-f]{20,}$/i.test(title)) return;
+    const appName = item.appName || item.catalogItemId || title;
+    const tallCover =
+      (Array.isArray(keyImages) &&
+        keyImages.find((img) => img.type === 'DieselGameBoxTall' || img.type === 'OfferImageTall')?.url) ||
+      '';
+    const wideBanner =
+      (Array.isArray(keyImages) &&
+        keyImages.find((img) => img.type === 'DieselGameBox' || img.type === 'OfferImageWide')?.url) ||
+      tallCover ||
+      '';
+    const rawGame = {
+      id: `epic-${appName}`,
+      title,
+      originalStoreTitle: title,
+      sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
+      isVerifiedEntitlement: true,
+      platforms: [
+        {
+          platformId: 'epic',
+          platformGameId: String(appName),
+          originalTitle: title,
+          namespace: item.namespace || undefined,
+          catalogItemId: item.catalogItemId || undefined,
+          installed: false,
+        },
+      ],
+      headerImage: wideBanner,
+      capsuleImage: tallCover || wideBanner,
+      shortDescription: description || '',
+      releaseDate: '',
+      developers: developer ? [developer] : [],
+      publishers: ['Epic Games Store'],
+      genres: ['Action'],
+      tags: ['Epic Games Store'],
+    };
+    suppressedItems.push({
+      id: `epic-${appName}`,
+      rawTitle: title,
+      platformId: 'epic',
+      platformGameId: String(appName),
+      reason,
+      reasonCategory: 'non_game_filter',
+      rawGame,
+    });
+  };
 
-      const titleLower = baseGame.title.toLowerCase().trim();
-      const normTitle = baseGame.title.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-      const gameAch =
-        achievementsMap[titleLower] ||
-        achievementsMap[normTitle] ||
-        (gameId ? achievementsMap[gameId.toLowerCase()] : null) ||
-        achievementsMap[baseGame.id.toLowerCase()];
-
-      const gameObj = {
-        ...baseGame,
-        isVerifiedEntitlement: true,
-        platforms: baseGame.platforms.map((p) =>
-          p.platformId === 'epic'
-            ? {
-                ...p,
-                playtimeMinutes: pt.totalTime !== undefined ? pt.totalTime : p.playtimeMinutes,
-                lastPlayed: pt.lastPlayed || p.lastPlayed,
-                achievements: gameAch || p.achievements,
-              }
-            : p
-        ),
-      };
-
-      gamesMap.set(gameObj.id, gameObj);
-      knownTitles.add(titleLower);
-      knownTitles.add(normTitle);
-      if (gameId) {
-        knownAppIds.add(gameId.toLowerCase());
-      }
-    }
-  }
-
-  // 4. Fetch live items from Library Service with cursor pagination
+  // 3. Fetch live items from Library Service with cursor pagination
   try {
     let cursor = undefined;
     let hasMore = true;
@@ -1052,25 +1197,44 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
       ) {
         continue;
       }
+      if (item.appName?.startsWith('Fortnite_')) continue;
+
       const hasRealMainGame = Boolean(
         (item.metadata?.mainGameItem && (item.metadata.mainGameItem.id || item.metadata.mainGameItem.namespace)) ||
         (item.mainGameItem && (item.mainGameItem.id || item.mainGameItem.namespace))
       );
-      if (hasRealMainGame) continue;
-
       const itemType = (item.metadata?.itemType || '').toUpperCase();
-      if (['ADD_ON', 'DLC', 'CONSUMABLE', 'WALLET', 'SUBSCRIPTION', 'PLUGIN', 'EXTRA', 'CURRENCY'].includes(itemType)) {
-        continue;
-      }
-
+      const isNonGameType = ['ADD_ON', 'DLC', 'CONSUMABLE', 'WALLET', 'SUBSCRIPTION', 'PLUGIN', 'EXTRA', 'CURRENCY'].includes(itemType);
       const categories = item.metadata?.categories || [];
       const isAddonCategory = categories.some((c) =>
         ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
           (c.path || '').toLowerCase().includes(sub)
         )
       );
-      if (isAddonCategory) continue;
-      if (item.appName?.startsWith('Fortnite_')) continue;
+
+      if (hasRealMainGame || isNonGameType || isAddonCategory) {
+        const metaTitle = (item.metadata?.title || '').trim();
+        if (metaTitle) {
+          const reason =
+            classifyNonGameStorefrontItem({
+              title: metaTitle,
+              platformId: 'epic',
+              platformGameId: item.appName,
+              isDlc: true,
+              itemType,
+              categories,
+            }) || 'Filtered: DLC / Add-On / Expansion Content';
+          pushEpicSuppressedItem(
+            item,
+            metaTitle,
+            reason,
+            item.metadata?.description || '',
+            item.metadata?.developer || '',
+            item.metadata?.keyImages || []
+          );
+        }
+        continue;
+      }
 
       const appNameLower = (item.appName || '').toLowerCase().trim();
       const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
@@ -1086,15 +1250,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
         batch.map(async (item) => {
           const appNameLower = (item.appName || '').toLowerCase().trim();
           const catalogIdLower = (item.catalogItemId || '').toLowerCase().trim();
-          let rawTitle = (item.metadata?.title || '').trim();
-          const titleLower = (rawTitle || item.sandboxName || '').toLowerCase().trim();
-
-          const codename =
-            KNOWN_EPIC_APP_NAMES[appNameLower] ||
-            KNOWN_EPIC_APP_NAMES[catalogIdLower] ||
-            KNOWN_EPIC_APP_NAMES[titleLower];
-
-          let title = codename ? codename.title : rawTitle;
+          let title = (item.metadata?.title || '').trim();
           let description = item.metadata?.description || '';
           let developer = item.metadata?.developer || '';
           let keyImages = item.metadata?.keyImages || [];
@@ -1114,7 +1270,27 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
                 const meta = cData[item.catalogItemId];
                 if (meta) {
                   const isDlc = meta.categories?.some((c) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
-                  if (isDlc) return null;
+                  if (isDlc) {
+                    if (meta.title) {
+                      const reason =
+                        classifyNonGameStorefrontItem({
+                          title: meta.title,
+                          platformId: 'epic',
+                          platformGameId: item.appName,
+                          isDlc: true,
+                          categories: meta.categories,
+                        }) || 'Filtered: DLC / Add-On / Expansion Content';
+                      pushEpicSuppressedItem(
+                        item,
+                        meta.title,
+                        reason,
+                        meta.description || '',
+                        meta.developer || '',
+                        meta.keyImages || []
+                      );
+                    }
+                    return null;
+                  }
                   if (meta.title) {
                     title = meta.title;
                     resolvedFromCatalog = true;
@@ -1125,7 +1301,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
                 }
               }
             } catch {}
-            if (!resolvedFromCatalog && !codename && !item.metadata?.title) {
+            if (!resolvedFromCatalog && !item.metadata?.title) {
               return null;
             }
           }
@@ -1140,10 +1316,12 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           }
 
           let cleanDesc = String(description || '')
+            .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/\[\/?[a-z0-9_*=\s"'-]+\]/gi, '')
             .replace(/\s+/g, ' ')
             .trim();
           if (
+            cleanDesc.toLowerCase() === title.toLowerCase().trim() ||
             /^description is not set\.?$/i.test(cleanDesc) ||
             (!/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(title) &&
               /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(cleanDesc))
@@ -1156,40 +1334,92 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
             }
           }
 
+          const nonGameReason = classifyNonGameStorefrontItem({
+            title,
+            platformId: 'epic',
+            platformGameId: item.appName,
+            isDlc: false,
+            categories: item.metadata?.categories,
+          });
+          if (nonGameReason) {
+            pushEpicSuppressedItem(item, title, nonGameReason, cleanDesc, developer, keyImages);
+            return null;
+          }
+
+          registerEpicNamespaceMapping({
+            appName: item.appName,
+            namespace: item.namespace,
+            catalogItemId: item.catalogItemId,
+            title,
+          });
+
+          let offerMeta = null;
+          if (!cleanDesc && item.namespace) {
+            try {
+              offerMeta = await fetchEpicProductOfferMetadata({
+                appName: item.appName,
+                namespace: item.namespace,
+                catalogItemId: item.catalogItemId,
+                title,
+              });
+              if (offerMeta?.shortDescription) {
+                cleanDesc = offerMeta.shortDescription;
+              }
+              if (!developer && offerMeta?.developers?.[0]) {
+                developer = offerMeta.developers[0];
+              }
+            } catch {}
+          }
+
           return {
             item,
             appNameLower,
             catalogIdLower,
             namespaceLower: (item.namespace || '').toLowerCase().trim(),
-            codename,
             title,
             description: cleanDesc,
             developer,
             keyImages,
+            offerMeta,
           };
         })
       );
 
       for (const entry of resolvedBatch) {
         if (!entry) continue;
-        const { item, appNameLower, catalogIdLower, namespaceLower, codename, title, description, developer, keyImages } = entry;
+        const {
+          item,
+          appNameLower,
+          catalogIdLower,
+          namespaceLower,
+          title,
+          description,
+          developer,
+          keyImages,
+          offerMeta,
+        } = entry;
         const lower = title.toLowerCase().trim();
         if (knownAppIds.has(appNameLower)) continue;
 
-        const tallCover = keyImages.find((img) => img.type === 'DieselGameBoxTall')?.url;
-        const wideBanner = keyImages.find((img) => img.type === 'DieselGameBox')?.url || tallCover;
+        const tallCover =
+          keyImages.find((img) => img.type === 'DieselGameBoxTall' || img.type === 'OfferImageTall')?.url ||
+          offerMeta?.capsuleImage;
+        const wideBanner =
+          keyImages.find((img) => img.type === 'DieselGameBox' || img.type === 'OfferImageWide')?.url ||
+          offerMeta?.headerImage ||
+          tallCover;
         const pt = playtimeMap.get(item.appName) || playtimeMap.get(item.catalogItemId) || {};
-        const steamAppId = (codename && codename.steamAppId) ? codename.steamAppId : await matchSteamAppId(title);
+        const steamAppId = await matchSteamAppId(title);
 
         const headerImg = steamAppId
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`
-          : (codename && codename.headerImage) || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
+          : wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
         const capsuleImg = steamAppId
           ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
-          : (codename && codename.capsuleImage) || tallCover || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
+          : tallCover || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
-        const finalDev = (codename && codename.developer) ? codename.developer : developer;
+        const finalDev = developer || offerMeta?.developers?.[0] || '';
         const baseGameId = steamAppId ? `steam-${steamAppId}` : `epic-${item.appName}`;
         const gameId = gamesMap.has(baseGameId) ? `epic-${item.appName}` : baseGameId;
         const normTitle = lower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1208,6 +1438,16 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           achievementsMap[normTitle] = gameAch;
         }
 
+        const resolvedReleaseDate =
+          offerMeta?.releaseDate ||
+          (item.metadata?.releaseDate && !String(item.metadata.releaseDate).startsWith('2099')
+            ? String(item.metadata.releaseDate).split('T')[0]
+            : '');
+        const resolvedDevs = finalDev ? [finalDev] : offerMeta?.developers || [];
+        const resolvedPubs = item.metadata?.publisher
+          ? [item.metadata.publisher]
+          : offerMeta?.publishers || ['Epic Games Store'];
+
         const newGame = {
           id: gameId,
           title,
@@ -1218,6 +1458,8 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
             {
               platformId: 'epic',
               platformGameId: item.appName,
+              namespace: item.namespace || offerMeta?.namespace || undefined,
+              catalogItemId: item.catalogItemId || offerMeta?.catalogItemId || undefined,
               installed: false,
               playtimeMinutes: pt.totalTime || 0,
               lastPlayed: pt.lastPlayed || undefined,
@@ -1226,12 +1468,39 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           ],
           headerImage: headerImg,
           capsuleImage: capsuleImg,
-          shortDescription: description || '',
-          releaseDate: item.metadata?.releaseDate ? String(item.metadata.releaseDate).split('T')[0] : '',
-          developers: finalDev ? [finalDev] : [],
-          publishers: item.metadata?.publisher ? [item.metadata.publisher] : ['Epic Games Store'],
+          shortDescription: description || offerMeta?.shortDescription || '',
+          detailedDescription: offerMeta?.detailedDescription || undefined,
+          releaseDate: resolvedReleaseDate,
+          developers: resolvedDevs,
+          publishers: resolvedPubs,
           genres: ['Action'],
           tags: ['Epic Games Store'],
+          enrichedMetadata: offerMeta
+            ? {
+                appId: steamAppId || 0,
+                name: title,
+                shortDescription: description || offerMeta.shortDescription || '',
+                detailedDescription: offerMeta.detailedDescription || description || '',
+                aboutTheGame: offerMeta.aboutTheGame || offerMeta.detailedDescription || description || '',
+                headerImage: offerMeta.headerImage || headerImg,
+                capsuleImage: offerMeta.capsuleImage || capsuleImg,
+                developers: resolvedDevs,
+                publishers: resolvedPubs,
+                genres: ['Action'],
+                tags: ['Epic Games Store'],
+                categories: [],
+                screenshots: Array.isArray(offerMeta.screenshots)
+                  ? offerMeta.screenshots.map((url, idx) => ({
+                      id: idx,
+                      pathThumbnail: url,
+                      pathFull: url,
+                    }))
+                  : [],
+                movies: [],
+                releaseDate: resolvedReleaseDate || 'Available Now',
+                platforms: { windows: true, mac: false, linux: false },
+              }
+            : undefined,
         };
 
         gamesMap.set(gameId, newGame);
@@ -1283,6 +1552,687 @@ async function renewEpicTokens(refreshToken) {
   return data;
 }
 
+const epicAppNamespaceCache = new Map();
+const epicOfferMetadataCache = new Map();
+let cachedEpicClientToken = null;
+let cachedEpicClientTokenExpiry = 0;
+let hasScannedLocalEpicMetadata = false;
+let hasFetchedEpicCloudAssets = false;
+
+function registerEpicNamespaceMapping({ appName, namespace, catalogItemId, title } = {}) {
+  if (!namespace) return;
+  const entry = {
+    appName: appName ? String(appName).trim() : undefined,
+    namespace: String(namespace).trim(),
+    catalogItemId: catalogItemId ? String(catalogItemId).trim() : undefined,
+    title: title ? String(title).trim() : undefined,
+  };
+  if (entry.appName) {
+    epicAppNamespaceCache.set('app:' + entry.appName.toLowerCase(), entry);
+  }
+  if (entry.catalogItemId) {
+    epicAppNamespaceCache.set('cat:' + entry.catalogItemId.toLowerCase(), entry);
+  }
+  if (entry.title) {
+    const norm = entry.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (norm) {
+      epicAppNamespaceCache.set('title:' + norm, entry);
+    }
+  }
+}
+
+async function getEpicCatalogAccessToken(forceClientCredentials = false) {
+  if (!forceClientCredentials) {
+    try {
+      const saved = loadSavedTokens()?.epic;
+      if (saved?.access_token) {
+        const expiresAtMs = saved.expires_at ? new Date(saved.expires_at).getTime() : 0;
+        if (expiresAtMs && expiresAtMs - Date.now() < 60000 && saved.refresh_token) {
+          try {
+            const renewed = await renewEpicTokens(saved.refresh_token);
+            if (renewed?.access_token) return renewed.access_token;
+          } catch {}
+        } else if (!expiresAtMs || expiresAtMs > Date.now()) {
+          return saved.access_token;
+        }
+      }
+    } catch {}
+  }
+
+  if (cachedEpicClientToken && Date.now() < cachedEpicClientTokenExpiry) {
+    return cachedEpicClientToken;
+  }
+
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      token_type: 'eg1',
+    });
+    const res = await fetch('https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `basic ${EPIC_CLIENT_AUTH}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+      },
+      body: body.toString(),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.access_token) {
+        cachedEpicClientToken = data.access_token;
+        cachedEpicClientTokenExpiry = Date.now() + ((data.expires_in || 3600) - 120) * 1000;
+        return data.access_token;
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to obtain Epic client_credentials token:', err.message);
+  }
+
+  return null;
+}
+
+function getLocalLegendaryBaseDirs() {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const userDataDir = (() => {
+    try {
+      return app ? app.getPath('userData') : '';
+    } catch {
+      return '';
+    }
+  })();
+
+  const candidates = [
+    homeDir ? path.join(homeDir, '.config/legendary') : '',
+    homeDir ? path.join(homeDir, 'Library/Application Support/heroic/legendaryConfig/legendary') : '',
+    userDataDir ? path.join(userDataDir, 'legendaryConfig/legendary') : '',
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'heroic/legendaryConfig/legendary') : '',
+  ].filter(Boolean);
+
+  return Array.from(new Set(candidates));
+}
+
+async function resolveEpicNamespaceAndIds(payload = {}) {
+  const rawAppName = String(payload.appName || payload.slug || '')
+    .replace(/^epic-/i, '')
+    .trim();
+  const normTitle = String(payload.title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+  if (payload.namespace && String(payload.namespace).trim()) {
+    return {
+      namespace: String(payload.namespace).trim(),
+      catalogItemId: payload.catalogItemId ? String(payload.catalogItemId).trim() : null,
+      appName: rawAppName || null,
+    };
+  }
+
+  const lookupInCache = () => {
+    if (rawAppName && epicAppNamespaceCache.has('app:' + rawAppName.toLowerCase())) {
+      return epicAppNamespaceCache.get('app:' + rawAppName.toLowerCase());
+    }
+    if (payload.catalogItemId && epicAppNamespaceCache.has('cat:' + String(payload.catalogItemId).toLowerCase())) {
+      return epicAppNamespaceCache.get('cat:' + String(payload.catalogItemId).toLowerCase());
+    }
+    if (normTitle && epicAppNamespaceCache.has('title:' + normTitle)) {
+      return epicAppNamespaceCache.get('title:' + normTitle);
+    }
+    return null;
+  };
+
+  let cached = lookupInCache();
+  if (cached?.namespace) return cached;
+
+  // 2. Check local Legendary / Heroic metadata files
+  const legendaryBaseDirs = getLocalLegendaryBaseDirs();
+  if (rawAppName) {
+    for (const baseDir of legendaryBaseDirs) {
+      const metaFile = path.join(baseDir, 'metadata', `${rawAppName}.json`);
+      if (fs.existsSync(metaFile)) {
+        try {
+          const json = JSON.parse(fs.readFileSync(metaFile, 'utf-8'));
+          const ns = json?.metadata?.namespace || json?.namespace;
+          const catId = json?.metadata?.id || json?.catalog_item_id;
+          const t = json?.app_title || json?.metadata?.title;
+          if (ns) {
+            registerEpicNamespaceMapping({
+              appName: json?.app_name || rawAppName,
+              namespace: ns,
+              catalogItemId: catId,
+              title: t,
+            });
+            cached = lookupInCache();
+            if (cached?.namespace) return cached;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  if (!hasScannedLocalEpicMetadata) {
+    hasScannedLocalEpicMetadata = true;
+    for (const baseDir of legendaryBaseDirs) {
+      const assetsFile = path.join(baseDir, 'assets.json');
+      if (fs.existsSync(assetsFile)) {
+        try {
+          const assetsJson = JSON.parse(fs.readFileSync(assetsFile, 'utf-8'));
+          for (const list of Object.values(assetsJson || {})) {
+            if (Array.isArray(list)) {
+              for (const item of list) {
+                registerEpicNamespaceMapping({
+                  appName: item?.app_name || item?.appName,
+                  namespace: item?.namespace,
+                  catalogItemId: item?.catalog_item_id || item?.catalogItemId,
+                  title: item?.app_title || item?.title,
+                });
+              }
+            }
+          }
+        } catch {}
+      }
+
+      const installedFile = path.join(baseDir, 'installed.json');
+      if (fs.existsSync(installedFile)) {
+        try {
+          const instJson = JSON.parse(fs.readFileSync(installedFile, 'utf-8'));
+          for (const item of Object.values(instJson || {})) {
+            if (item && typeof item === 'object') {
+              registerEpicNamespaceMapping({
+                appName: item.app_name || item.appName,
+                namespace: item.namespace,
+                catalogItemId: item.catalog_item_id || item.catalogItemId,
+                title: item.title || item.app_title,
+              });
+            }
+          }
+        } catch {}
+      }
+
+      const metaDir = path.join(baseDir, 'metadata');
+      if (fs.existsSync(metaDir)) {
+        try {
+          const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+          for (const f of files) {
+            try {
+              const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf-8'));
+              registerEpicNamespaceMapping({
+                appName: json?.app_name || f.replace(/\.json$/i, ''),
+                namespace: json?.metadata?.namespace || json?.namespace,
+                catalogItemId: json?.metadata?.id || json?.catalog_item_id,
+                title: json?.app_title || json?.metadata?.title,
+              });
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Check local Epic Games Launcher Manifests/*.item
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    const manifestDirs = [
+      homeDir ? path.join(homeDir, 'Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests') : '',
+      'C:\\ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests',
+    ].filter(Boolean);
+
+    for (const mDir of manifestDirs) {
+      if (fs.existsSync(mDir)) {
+        try {
+          const itemFiles = fs.readdirSync(mDir).filter((f) => f.endsWith('.item'));
+          for (const f of itemFiles) {
+            try {
+              const json = JSON.parse(fs.readFileSync(path.join(mDir, f), 'utf-8'));
+              registerEpicNamespaceMapping({
+                appName: json?.AppName,
+                namespace: json?.CatalogNamespace,
+                catalogItemId: json?.CatalogItemId,
+                title: json?.DisplayName,
+              });
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  }
+
+  cached = lookupInCache();
+  if (cached?.namespace) return cached;
+
+  // 4. If still unresolved and user has a saved Epic token, query public assets list once
+  if (!hasFetchedEpicCloudAssets) {
+    const savedEpic = loadSavedTokens()?.epic;
+    if (savedEpic?.access_token) {
+      hasFetchedEpicCloudAssets = true;
+      try {
+        let token = await getEpicCatalogAccessToken(false);
+        if (token) {
+          let assetsRes = await fetch(
+            'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows?label=Live',
+            {
+              headers: {
+                Authorization: `bearer ${token}`,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+              },
+            }
+          );
+          if ((assetsRes.status === 401 || assetsRes.status === 403) && savedEpic.refresh_token) {
+            try {
+              const renewed = await renewEpicTokens(savedEpic.refresh_token);
+              token = renewed.access_token;
+              assetsRes = await fetch(
+                'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows?label=Live',
+                {
+                  headers: {
+                    Authorization: `bearer ${token}`,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+                  },
+                }
+              );
+            } catch {}
+          }
+          if (assetsRes.ok) {
+            const assetsList = await assetsRes.json();
+            if (Array.isArray(assetsList)) {
+              for (const asset of assetsList) {
+                registerEpicNamespaceMapping({
+                  appName: asset?.appName,
+                  namespace: asset?.namespace,
+                  catalogItemId: asset?.catalogItemId,
+                });
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  cached = lookupInCache();
+  if (cached?.namespace) return cached;
+
+  return {
+    namespace: payload.namespace || null,
+    catalogItemId: payload.catalogItemId || null,
+    appName: rawAppName || null,
+  };
+}
+
+function extractFirstOfferParagraph(rawLong) {
+  if (!rawLong) return '';
+  const cleaned = String(rawLong)
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .trim();
+
+  if (!cleaned) return '';
+  const paragraphs = cleaned
+    .split(/\r?\n+/)
+    .map((line) => line.replace(/^#{1,6}\s+/, '').replace(/\*\*(.+?)\*\*/g, '$1').replace(/\s+/g, ' ').trim())
+    .filter((line) => line.length >= 25 && !/^(about|overview|description|features|story)$/i.test(line));
+
+  if (paragraphs.length === 0) return '';
+  let first = paragraphs[0];
+  if (first.length > 280) {
+    const sub = first.substring(0, 280);
+    const lastSpace = sub.lastIndexOf(' ');
+    first = (lastSpace > 180 ? sub.substring(0, lastSpace) : sub).trim() + '...';
+  }
+  return first;
+}
+
+async function fetchEpicProductOfferMetadata(payload = {}) {
+  try {
+    const resolved = await resolveEpicNamespaceAndIds(payload);
+    const namespace = resolved?.namespace;
+    const catalogItemId = resolved?.catalogItemId || payload.catalogItemId;
+    if (!namespace) return null;
+
+    const cacheKey = `${namespace}:${String(catalogItemId || resolved?.appName || payload.title || '').toLowerCase()}`;
+    if (epicOfferMetadataCache.has(cacheKey)) {
+      return epicOfferMetadataCache.get(cacheKey);
+    }
+
+    let token = await getEpicCatalogAccessToken(false);
+    if (!token) {
+      token = await getEpicCatalogAccessToken(true);
+    }
+    if (!token) return null;
+
+    const offersUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${encodeURIComponent(namespace)}/offers?count=20&locale=en-US&country=US`;
+    let res = await fetch(offersUrl, {
+      headers: {
+        Authorization: `bearer ${token}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+      },
+    });
+
+    if (res.status === 401 || res.status === 403) {
+      token = await getEpicCatalogAccessToken(true);
+      if (token) {
+        res = await fetch(offersUrl, {
+          headers: {
+            Authorization: `bearer ${token}`,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+          },
+        });
+      }
+    }
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    const elements = Array.isArray(data?.elements) ? data.elements : [];
+    if (elements.length === 0) return null;
+
+    const normTarget = String(payload.title || resolved?.title || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+
+    const baseGameOffers = elements.filter((el) => el && el.offerType === 'BASE_GAME');
+    let offer = null;
+    if (baseGameOffers.length > 0) {
+      offer =
+        (normTarget
+          ? baseGameOffers.find(
+              (el) =>
+                String(el.title || '')
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]/g, '') === normTarget
+            )
+          : null) || baseGameOffers[0];
+    }
+    if (!offer && normTarget) {
+      offer = elements.find(
+        (el) =>
+          el &&
+          String(el.title || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '') === normTarget
+      );
+    }
+    if (!offer) {
+      offer =
+        elements.find(
+          (el) =>
+            el &&
+            el.offerType !== 'ADD_ON' &&
+            el.offerType !== 'DLC' &&
+            el.offerType !== 'CONSUMABLE'
+        ) || elements[0];
+    }
+    if (!offer) return null;
+
+    const offerTitle = String(offer.title || payload.title || resolved?.title || '').trim();
+    let rawShort = String(offer.description || '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (
+      rawShort.toLowerCase() === offerTitle.toLowerCase() ||
+      /^description is not set\.?$/i.test(rawShort)
+    ) {
+      rawShort = '';
+    }
+
+    const rawLong = String(offer.longDescription || offer.technicalDetails || '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .trim();
+
+    if (!rawShort && rawLong) {
+      rawShort = extractFirstOfferParagraph(rawLong);
+    }
+
+    const keyImages = Array.isArray(offer.keyImages) ? offer.keyImages : [];
+    const screenshotSet = new Set();
+    for (const img of keyImages) {
+      if (!img || typeof img.url !== 'string') continue;
+      if (
+        (img.type === 'featuredMedia' || img.type === 'GalleryImage' || img.type === 'Screenshot') &&
+        img.url.startsWith('http')
+      ) {
+        screenshotSet.add(img.url);
+      }
+    }
+    for (const img of keyImages) {
+      if (!img || typeof img.url !== 'string') continue;
+      if (img.type === 'heroCarouselVideo' && img.url.includes('cover=')) {
+        try {
+          const coverParam = decodeURIComponent(img.url.split('cover=')[1].split('&')[0]);
+          if (coverParam.startsWith('http')) {
+            screenshotSet.add(coverParam);
+          }
+        } catch {}
+      }
+    }
+
+    const headerImage =
+      keyImages.find((img) => img?.type === 'OfferImageWide')?.url ||
+      keyImages.find((img) => img?.type === 'DieselGameBox')?.url ||
+      keyImages.find((img) => img?.type === 'Thumbnail')?.url ||
+      undefined;
+    const capsuleImage =
+      keyImages.find((img) => img?.type === 'OfferImageTall')?.url ||
+      keyImages.find((img) => img?.type === 'DieselGameBoxTall')?.url ||
+      undefined;
+
+    const movies = [];
+    let systemRequirements = undefined;
+    let languages = undefined;
+
+    // Resolve candidate product slugs from offer mappings, attributes, and title to fetch video trailers from Epic Content API
+    const rawSlugCandidates = [
+      ...(Array.isArray(offer.catalogNs?.mappings)
+        ? offer.catalogNs.mappings.map((m) => m?.pageSlug)
+        : []),
+      typeof offer.productSlug === 'string' ? offer.productSlug.split('/')[0] : '',
+      typeof offer.urlSlug === 'string' ? offer.urlSlug : '',
+      ...(Array.isArray(offer.customAttributes)
+        ? offer.customAttributes
+            .filter((a) => a && /slug/i.test(String(a.key || '')))
+            .map((a) => String(a.value || '').replace(/\/home$/i, ''))
+        : offer.customAttributes && typeof offer.customAttributes === 'object'
+        ? [
+            offer.customAttributes['com.epicgames.app.productSlug']?.value?.replace(/\/home$/i, ''),
+            ...Object.entries(offer.customAttributes)
+              .filter(([k]) => /slug/i.test(k))
+              .map(([, v]) => String(v?.value || v || '').replace(/\/home$/i, '')),
+          ]
+        : []),
+      offerTitle
+        ? offerTitle
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+        : '',
+      payload.slug
+        ? String(payload.slug)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+        : '',
+    ];
+
+    const candidateSlugs = Array.from(
+      new Set(
+        rawSlugCandidates
+          .map((s) => String(s || '').trim().toLowerCase())
+          .filter((s) => s.length > 1 && !/^[0-9a-f]{20,}$/i.test(s))
+      )
+    );
+
+    for (const cSlug of candidateSlugs) {
+      try {
+        const contentUrl = `https://store-content.ak.epicgames.com/api/en-US/content/products/${encodeURIComponent(cSlug)}`;
+        const contentRes = await fetch(contentUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+            Accept: 'application/json',
+          },
+        });
+        if (!contentRes.ok) continue;
+        const contentData = await contentRes.json();
+        const home =
+          (Array.isArray(contentData?.pages) &&
+            contentData.pages.find((p) => p && p.type === 'productHome')) ||
+          contentData?.pages?.[0];
+        if (!home?.data) continue;
+
+        const d = home.data;
+        const carouselItems = Array.isArray(d.carousel?.items) ? d.carousel.items : [];
+        carouselItems.forEach((item, idx) => {
+          if (!item) return;
+          const rawImg =
+            item.image?.src ||
+            item.image?.url ||
+            (typeof item.image === 'string' ? item.image : null) ||
+            item.src ||
+            item.url;
+          if (typeof rawImg === 'string' && rawImg.startsWith('http')) {
+            screenshotSet.add(rawImg);
+          }
+
+          if (item.video?.recipes) {
+            try {
+              const recipes =
+                typeof item.video.recipes === 'string'
+                  ? JSON.parse(item.video.recipes)
+                  : item.video.recipes;
+              const langObj =
+                recipes?.['en-US'] ||
+                recipes?.['en'] ||
+                (recipes && typeof recipes === 'object' ? Object.values(recipes)[0] : null);
+              if (Array.isArray(langObj)) {
+                const hlsOutput = langObj
+                  .find((r) => r && r.recipe === 'video-hls')
+                  ?.outputs?.find((o) => o && o.key === 'manifest');
+                const mp4Output = langObj
+                  .find((r) => r && (r.recipe === 'video-fmp4' || r.recipe === 'video-webm'))
+                  ?.outputs?.find((o) => o && o.key === 'manifest');
+                const thumbOutput = langObj
+                  .find((r) => Array.isArray(r?.outputs) && r.outputs.some((o) => o?.key === 'thumbnail'))
+                  ?.outputs?.find((o) => o?.key === 'thumbnail');
+
+                const videoUrl = hlsOutput?.url || mp4Output?.url;
+                const thumbUrl = thumbOutput?.url || '';
+                if (videoUrl) {
+                  movies.push({
+                    id: idx,
+                    name: `Trailer ${movies.length + 1}`,
+                    thumbnail: thumbUrl,
+                    webm: { '480': videoUrl, max: videoUrl },
+                    mp4: { '480': videoUrl, max: videoUrl },
+                    hls: hlsOutput?.url,
+                  });
+                }
+                if (thumbUrl && thumbUrl.startsWith('http')) {
+                  screenshotSet.add(thumbUrl);
+                }
+              }
+            } catch {}
+          }
+        });
+
+        const galleryImages = Array.isArray(d.gallery?.galleryImages) ? d.gallery.galleryImages : [];
+        for (const g of galleryImages) {
+          const gUrl = g?.src || g?.url || (typeof g === 'string' ? g : null);
+          if (typeof gUrl === 'string' && gUrl.startsWith('http')) {
+            screenshotSet.add(gUrl);
+          }
+        }
+
+        const reqs = Array.isArray(d.requirements?.systems?.[0]?.details)
+          ? d.requirements.systems[0].details
+          : [];
+        if (reqs.length > 0) {
+          const minReq = reqs
+            .map((r) => (r?.title && r?.minimum ? `<strong>${r.title}:</strong> ${r.minimum}` : ''))
+            .filter(Boolean)
+            .join('<br>');
+          const recReq = reqs
+            .map((r) =>
+              r?.title && r?.recommended ? `<strong>${r.title}:</strong> ${r.recommended}` : ''
+            )
+            .filter(Boolean)
+            .join('<br>');
+          if (minReq || recReq) {
+            systemRequirements = { minimum: minReq, recommended: recReq };
+          }
+        }
+
+        if (Array.isArray(d.requirements?.languages) && d.requirements.languages.length > 0) {
+          languages = d.requirements.languages.filter(
+            (l) => typeof l === 'string' && l.trim().length > 0
+          );
+        } else if (typeof d.requirements?.languages === 'string' && d.requirements.languages.trim()) {
+          languages = [d.requirements.languages.trim()];
+        }
+
+        if (!rawLong) {
+          const contentDesc = String(
+            d.about?.description || d.about?.about || d.markdown?.markdown || ''
+          )
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .trim();
+          if (contentDesc) {
+            rawShort = rawShort || extractFirstOfferParagraph(contentDesc);
+          }
+        }
+
+        break;
+      } catch {}
+    }
+
+    let screenshots = Array.from(screenshotSet);
+    if (screenshots.length === 0 && headerImage) {
+      screenshots = [headerImage];
+    }
+
+    const rawDate =
+      offer.pcReleaseDate || offer.releaseDate || offer.effectiveDate || offer.viewableDate || '';
+    const releaseDate =
+      rawDate && !String(rawDate).startsWith('2099')
+        ? String(rawDate).substring(0, 10)
+        : undefined;
+
+    const devName = String(offer.developerDisplayName || offer.seller?.name || '').trim();
+    const pubName = String(offer.publisherDisplayName || offer.seller?.name || '').trim();
+
+    const result = {
+      title: offerTitle || undefined,
+      shortDescription: rawShort || undefined,
+      detailedDescription: rawLong || rawShort || undefined,
+      aboutTheGame: rawLong || rawShort || undefined,
+      screenshots,
+      movies: movies.length > 0 ? movies : undefined,
+      systemRequirements,
+      languages,
+      supportedLanguages:
+        Array.isArray(languages) && languages.length > 0 ? languages.join(' | ') : undefined,
+      headerImage,
+      capsuleImage,
+      releaseDate,
+      developers: devName ? [devName] : undefined,
+      publishers: pubName ? [pubName] : undefined,
+      namespace,
+      catalogItemId: catalogItemId || offer.id || undefined,
+    };
+
+    epicOfferMetadataCache.set(cacheKey, result);
+    return result;
+  } catch (err) {
+    console.warn('fetchEpicProductOfferMetadata warning:', err.message);
+    return null;
+  }
+}
+
 async function fetchIgdbCover(gameTitle) {
   if (!gameTitle) return null;
   const cleanTitle = gameTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1323,9 +2273,308 @@ async function fetchIgdbCover(gameTitle) {
   return null;
 }
 
+/**
+ * Classifies whether a storefront item is a non-game (beta, test branch, prologue, tool/SDK/redistributable, soundtrack/artbook, or DLC/add-on)
+ * and returns a descriptive suppression reason string, or null if it is a standalone base game.
+ */
+function classifyNonGameStorefrontItem({
+  title = '',
+  platformId = '',
+  platformGameId = '',
+  isDlc = false,
+  itemType = '',
+  categories = [],
+} = {}) {
+  const cleanTitle = String(title || '').trim();
+  const lower = cleanTitle.toLowerCase();
+  const compact = lower.replace(/[^a-z0-9]/g, '');
+  const platIdLower = String(platformGameId || '').toLowerCase().trim();
+
+  // 1. Tools / Editors / Redistributables / Servers / SDKs
+  if (
+    platIdLower === 'gog-redist' ||
+    /\b(pre-game\s+editor|resource\s+archiver|dedicated\s+server|authoring\s+tools|mod\s+kit|modkit|sdk|redistributables?|common\s+redistributables|benchmark\s+tool)\b/i.test(
+      cleanTitle
+    )
+  ) {
+    return 'Filtered: Tool / Editor / Redistributable / Server';
+  }
+
+  // 2. Soundtracks / Artbooks / Digital Goodies / Bonus Content
+  if (
+    /\b(digital\s+soundtrack|original\s+soundtrack|official\s+soundtrack|soundtrack|ost|art\s*book|artbook|digital\s+goodies|goodies\s+pack|wallpaper|hd\s+wallpaper|hd\s+sound|hd\s+texture|voice\s+pack|bonus\s+content)\b/i.test(
+      cleanTitle
+    ) ||
+    lower === 'death stranding content'
+  ) {
+    return 'Filtered: Digital Soundtrack / Artbook / Bonus Content';
+  }
+
+  // 3. Betas / Test Branches / Legacy Clients / Multiplayer-Only Clients
+  if (
+    /\b(beta|public\s+test|public\s+testing|tech\s+beta|closed\s+beta|open\s+beta|test\s+branch|test\s+server|legacy\s+mode|experimental\s+branch|playtest|stress\s+test|staging| technical\s+test)\b/i.test(
+      cleanTitle
+    ) ||
+    /(?:tech|closed|open)?beta$/i.test(compact) ||
+    lower === 'sin multiplayer'
+  ) {
+    return 'Filtered: Beta / Test Branch / Legacy Client';
+  }
+
+  // 4. Prologues / Playable Teasers / Demos / Alphas / Trials
+  if (
+    /\b(prologue|playable\s+teaser|demo|free\s+trial|trial\s+version|alpha\s+version|teaser)\b/i.test(
+      cleanTitle
+    )
+  ) {
+    return 'Filtered: Prologue / Playable Teaser / Demo / Alpha';
+  }
+
+  // 5. Explicit DLC / Add-On / Expansion / Pack flags or title patterns
+  const catHasDlc =
+    Array.isArray(categories) &&
+    categories.some((c) =>
+      ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
+        String(c?.path || '').toLowerCase().includes(sub)
+      )
+    );
+  const typeUpper = String(itemType || '').toUpperCase();
+  const isDlcType = [
+    'ADD_ON',
+    'DLC',
+    'CONSUMABLE',
+    'WALLET',
+    'SUBSCRIPTION',
+    'PLUGIN',
+    'EXTRA',
+    'CURRENCY',
+  ].includes(typeUpper);
+
+  if (
+    isDlc ||
+    catHasDlc ||
+    isDlcType ||
+    /\b(dlc|season\s+pass|expansion\s+pass|add-on|addon|starter\s+pack|upgrade\s+pack|supporter\s+pack|cosmetic\s+pack|weapon\s+pack|skin\s+pack)\b/i.test(
+      cleanTitle
+    )
+  ) {
+    return 'Filtered: DLC / Add-On / Expansion Content';
+  }
+
+  return null;
+}
+
+/**
+ * Scans local storefront metadata caches (Legendary/Heroic Epic metadata, Heroic GOG library cache, saved tokens)
+ * to discover all owned non-game items (betas, test branches, prologues, tools/editors, soundtracks/artbooks, DLCs)
+ * so they appear in the Library Match & Overrides Studio while remaining suppressed from the main game library.
+ */
+function scanLocalSuppressedStorefrontItems(customOptions = {}) {
+  const resultsMap = new Map();
+  const homeDir = customOptions.homedir || process.env.HOME || process.env.USERPROFILE || '';
+
+  const addSuppressedEntry = (entry) => {
+    if (!entry || !entry.platformId || !entry.platformGameId || !entry.rawTitle) return;
+    const key = `${entry.platformId}:${entry.platformGameId}`;
+    if (!resultsMap.has(key)) {
+      resultsMap.set(key, entry);
+    }
+  };
+
+  // 1. Scan Legendary / Heroic Epic metadata directories
+  const legendaryDirs = customOptions.legendaryDirs || getLocalLegendaryBaseDirs();
+  for (const baseDir of legendaryDirs) {
+    const metaDir = path.join(baseDir, 'metadata');
+    if (!fs.existsSync(metaDir)) continue;
+    try {
+      const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+      for (const file of files) {
+        try {
+          const json = JSON.parse(fs.readFileSync(path.join(metaDir, file), 'utf-8'));
+          const appName = String(json?.app_name || file.replace(/\.json$/i, '')).trim();
+          const title = String(json?.app_title || json?.metadata?.title || '').trim();
+          if (!appName || !title || title === '1' || title === 'Live') continue;
+          if (/^[0-9a-f]{20,}$/i.test(title)) continue;
+          if (appName.startsWith('Fortnite_')) continue;
+          const ns = json?.metadata?.namespace || json?.namespace || '';
+          if (ns === 'ue' || ns === '89efe5924d3d467c839449ab6ab52e7f' || String(ns).startsWith('ue-')) {
+            continue;
+          }
+
+          const categories = json?.metadata?.categories || [];
+          const hasMainGame = Boolean(
+            json?.metadata?.mainGameItem &&
+              (json.metadata.mainGameItem.id || json.metadata.mainGameItem.namespace)
+          );
+          const itemType = json?.metadata?.itemType || '';
+          const reason = classifyNonGameStorefrontItem({
+            title,
+            platformId: 'epic',
+            platformGameId: appName,
+            isDlc: hasMainGame,
+            itemType,
+            categories,
+          });
+
+          if (reason) {
+            const keyImages = json?.metadata?.keyImages || [];
+            const tallCover =
+              (Array.isArray(keyImages) &&
+                keyImages.find((img) => img.type === 'DieselGameBoxTall' || img.type === 'OfferImageTall')?.url) ||
+              '';
+            const wideBanner =
+              (Array.isArray(keyImages) &&
+                keyImages.find((img) => img.type === 'DieselGameBox' || img.type === 'OfferImageWide')?.url) ||
+              tallCover ||
+              '';
+            const developer = json?.metadata?.developer || '';
+            const description = json?.metadata?.description || '';
+            const catId = json?.metadata?.id || json?.catalog_item_id || undefined;
+
+            const rawGame = {
+              id: `epic-${appName}`,
+              title,
+              originalStoreTitle: title,
+              sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
+              isVerifiedEntitlement: true,
+              platforms: [
+                {
+                  platformId: 'epic',
+                  platformGameId: appName,
+                  originalTitle: title,
+                  namespace: ns || undefined,
+                  catalogItemId: catId,
+                  installed: false,
+                },
+              ],
+              headerImage: wideBanner,
+              capsuleImage: tallCover || wideBanner,
+              shortDescription: description,
+              releaseDate: '',
+              developers: developer ? [developer] : [],
+              publishers: ['Epic Games Store'],
+              genres: ['Action'],
+              tags: ['Epic Games Store'],
+            };
+
+            addSuppressedEntry({
+              id: `epic-${appName}`,
+              rawTitle: title,
+              platformId: 'epic',
+              platformGameId: appName,
+              reason,
+              reasonCategory: 'non_game_filter',
+              rawGame,
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // 2. Scan Heroic GOG library cache (gog_library.json)
+  const gogCacheFiles = customOptions.gogCacheFiles || [
+    homeDir ? path.join(homeDir, 'Library/Application Support/heroic/store_cache/gog_library.json') : '',
+    homeDir ? path.join(homeDir, '.config/heroic/store_cache/gog_library.json') : '',
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'heroic/store_cache/gog_library.json') : '',
+  ].filter(Boolean);
+
+  for (const gogFile of gogCacheFiles) {
+    if (!fs.existsSync(gogFile)) continue;
+    try {
+      const json = JSON.parse(fs.readFileSync(gogFile, 'utf-8'));
+      const gamesList = Array.isArray(json?.games) ? json.games : [];
+      for (const item of gamesList) {
+        const appName = String(item?.app_name || '').trim();
+        const title = String(item?.title || '').trim();
+        if (!appName || !title) continue;
+        const isDlc = Boolean(item?.install?.is_dlc);
+        const reason = classifyNonGameStorefrontItem({
+          title,
+          platformId: 'gog',
+          platformGameId: appName,
+          isDlc,
+        });
+        if (reason) {
+          const headerImg = item?.art_cover || item?.art_square || '';
+          const capsuleImg = item?.art_square || item?.art_cover || '';
+          const rawGame = {
+            id: `gog-${appName}`,
+            title,
+            originalStoreTitle: title,
+            sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
+            isVerifiedEntitlement: true,
+            platforms: [
+              {
+                platformId: 'gog',
+                platformGameId: appName,
+                originalTitle: title,
+                installed: false,
+              },
+            ],
+            headerImage: headerImg,
+            capsuleImage: capsuleImg,
+            shortDescription: item?.extra?.about?.description || '',
+            releaseDate: '',
+            developers: item?.developer ? [item.developer] : [],
+            publishers: [],
+            genres: Array.isArray(item?.extra?.genres) ? item.extra.genres : ['Action'],
+            tags: ['GOG', 'DRM-Free'],
+          };
+          addSuppressedEntry({
+            id: `gog-${appName}`,
+            rawTitle: title,
+            platformId: 'gog',
+            platformGameId: appName,
+            reason,
+            reasonCategory: 'non_game_filter',
+            rawGame,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Also check saved Steam tokens games list for any non-game entries
+  try {
+    const savedTokens = loadSavedTokens();
+    const steamGames = Array.isArray(savedTokens?.steam?.games) ? savedTokens.steam.games : [];
+    for (const g of steamGames) {
+      const title = String(g?.title || '').trim();
+      const appId = String(g?.steamAppId || g?.platforms?.[0]?.platformGameId || g?.id || '').replace(/^steam-/, '');
+      if (!title || !appId) continue;
+      const reason = classifyNonGameStorefrontItem({
+        title,
+        platformId: 'steam',
+        platformGameId: appId,
+        isDlc: false,
+      });
+      if (reason) {
+        addSuppressedEntry({
+          id: `steam-${appId}`,
+          rawTitle: title,
+          platformId: 'steam',
+          platformGameId: appId,
+          reason,
+          reasonCategory: 'non_game_filter',
+          rawGame: {
+            ...g,
+            id: `steam-${appId}`,
+            originalStoreTitle: g.originalStoreTitle || title,
+            isVerifiedEntitlement: true,
+          },
+        });
+      }
+    }
+  } catch {}
+
+  return Array.from(resultsMap.values());
+}
+
 module.exports = {
   exchangeGogCode,
   renewGogTokens,
+  normalizeGogAvatarUrl,
   fetchGogAccount,
   fetchGogOwnedGames,
   fetchGogAchievements,
@@ -1333,10 +2582,14 @@ module.exports = {
   renewEpicTokens,
   fetchEpicOwnedGames,
   fetchEpicAchievements,
+  fetchEpicProductOfferMetadata,
+  resolveEpicNamespaceAndIds,
   loadSavedTokens,
   saveTokens,
   clearTokens,
   fetchIgdbCover,
   computeTokenSimilarity,
+  classifyNonGameStorefrontItem,
+  scanLocalSuppressedStorefrontItems,
 };
 

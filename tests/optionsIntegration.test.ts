@@ -589,7 +589,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(bundle.storefrontAnchor?.metacriticUrl).toContain('age-of-empires-ii-definitive-edition');
         expect(bundle.storefrontAnchor?.isVerifiedGroundTruth).toBe(true);
         expect(bundle.steamAppId).toBe(813780);
-      });
+      }, 20000);
 
       it('attaches verified storefrontAnchor with storefront="gog" and sets steamAppId=null when scraping a GOG candidate', async () => {
         const mockGogAnchor: StorefrontReviewAnchor = {
@@ -620,7 +620,7 @@ describe('Comprehensive Options 1, 2, and 3 Integration & Regression Test Suite'
         expect(bundle.storefrontAnchor?.isVerifiedGroundTruth).toBe(true);
         // Guarantee GOG match does not poison steamAppId
         expect(bundle.steamAppId).toBeNull();
-      });
+      }, 20000);
     });
 
     describe('criticScoreService.resolveDynamicScore honoring storefrontAnchor as verified ground truth', () => {

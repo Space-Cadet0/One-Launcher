@@ -279,3 +279,23 @@ table.steam-lang-table td span.check {
 .steam-game-details a:hover {
   color: #ffffff;
 }
+
+/* ========================================================
+   MACOS / ELECTRON FRAMELESS WINDOW DRAG REGION
+   ======================================================== */
+.app-drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.app-no-drag,
+.app-drag-region button,
+.app-drag-region a,
+.app-drag-region input,
+.app-drag-region select,
+.app-drag-region [role="button"],
+.app-drag-region [role="menu"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+

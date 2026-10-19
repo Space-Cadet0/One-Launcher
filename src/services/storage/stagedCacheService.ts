@@ -69,6 +69,7 @@ export interface StagedCacheEntry<T> {
   version: number; // 9
   source?: string;
   isVerified?: boolean;
+  dynamicResolved?: boolean;
   failureReason?: 'not_found' | 'rate_limited' | 'network_error' | string;
   [key: string]: any;
 }
@@ -278,6 +279,7 @@ export function createStagedCacheEntry<T>(
     source?: string;
     failureReason?: 'not_found' | 'rate_limited' | 'network_error' | string;
     isVerified?: boolean;
+    dynamicResolved?: boolean;
     customTtlMs?: number;
     cachedAt?: number;
     version?: number;
@@ -297,6 +299,7 @@ export function createStagedCacheEntry<T>(
   if (options?.source !== undefined) entry.source = options.source;
   if (options?.isVerified !== undefined) entry.isVerified = options.isVerified;
   if (options?.failureReason !== undefined) entry.failureReason = options.failureReason;
+  if (options?.dynamicResolved !== undefined) entry.dynamicResolved = options.dynamicResolved;
 
   // Shallow merge data properties for backward-compatibility with tests checking entry.score
   if (data && typeof data === 'object') {
@@ -306,6 +309,7 @@ export function createStagedCacheEntry<T>(
     entry.tier = tier;
     entry.cachedAt = cachedAt;
     entry.ttlMs = ttlMs;
+    if (options?.dynamicResolved !== undefined) entry.dynamicResolved = options.dynamicResolved;
   }
 
   return entry;
@@ -322,6 +326,7 @@ export function saveStagedCache<T>(
     source?: string;
     failureReason?: 'not_found' | 'rate_limited' | 'network_error' | string;
     isVerified?: boolean;
+    dynamicResolved?: boolean;
     customTtlMs?: number;
     cachedAt?: number;
     version?: number;

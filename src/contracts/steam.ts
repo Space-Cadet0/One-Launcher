@@ -39,6 +39,8 @@ export interface SteamCategory {
   icon?: string;
 }
 
+export type LanguageTableSchema = 'steam' | 'audio_text';
+
 export interface SteamLanguageOption {
   name: string;
   hasInterface: boolean;
@@ -66,6 +68,8 @@ export interface SteamEnrichedMetadata {
   systemRequirements: SteamSystemRequirements;
   reviewSummary: SteamReviewSummary;
   supportedLanguages?: string;
+  languageOptions?: SteamLanguageOption[];
+  languageTableSchema?: LanguageTableSchema;
   legalNotice?: string;
   drmNotice?: string;
   controllerSupport?: string;
@@ -80,6 +84,11 @@ export interface SteamEnrichedMetadata {
   metacritic?: {
     score: number;
     url: string;
+  };
+  platforms?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
   };
 }
 

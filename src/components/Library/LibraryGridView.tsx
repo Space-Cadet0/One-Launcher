@@ -1,6 +1,8 @@
 import React, { useState, useRef, useMemo, useEffect, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
+import { NativeOsBadges } from '../Common/NativeOsBadges';
+import { getNativeOsPlatforms } from '../../services/platform/nativeOsService';
 import { StorefrontId } from '../../contracts/platform';
 import {
   Gamepad2,
@@ -35,6 +37,7 @@ import {
 import {
   extractFirstParagraph,
   isGenericPlaceholderSynopsis,
+  stripHtmlToPlainSynopsis,
   GOG_SPECIAL_DESCRIPTIONS,
 } from '../../services/steam/fallbackMetadataProvider';
 import gogEnrichedCache from '../../services/storage/gogEnrichedCache.json';
@@ -56,13 +59,24 @@ function getCleanSynopsis(
   targetAppId?: number | null,
   userOverride?: UserGameOverride | null
 ): string | null {
+  const cleanCandidate = (raw?: string | null): string | null => {
+    if (!raw) return null;
+    const stripped = stripHtmlToPlainSynopsis(raw, 280);
+    if (!stripped || isPlaceholderSynopsis(stripped, game.title)) return null;
+    return stripped;
+  };
+
   // 0. User manual override ALWAYS takes priority #1
   const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
-  if (effectiveOverride?.shortDescription && !isPlaceholderSynopsis(effectiveOverride.shortDescription, game.title)) {
-    return effectiveOverride.shortDescription.trim();
+  const overrideDesc = cleanCandidate(effectiveOverride?.shortDescription);
+  if (overrideDesc) {
+    return overrideDesc;
   }
-  if (effectiveOverride && game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
-    return game.shortDescription.trim();
+  if (effectiveOverride) {
+    const overrideGameDesc = cleanCandidate(game.shortDescription);
+    if (overrideGameDesc) {
+      return overrideGameDesc;
+    }
   }
 
   // If user explicitly unlinked from Steam, targetAppId should be ignored
@@ -70,25 +84,27 @@ function getCleanSynopsis(
 
   // 1. Steam blurb cache (curated store blurbs for 387+ matched catalog titles)
   if (effectiveAppId) {
-    const blurb = (steamBlurbCache as Record<string, string>)[String(effectiveAppId)];
-    if (blurb && !isPlaceholderSynopsis(blurb, game.title)) {
-      return blurb.trim();
+    const blurb = cleanCandidate((steamBlurbCache as Record<string, string>)[String(effectiveAppId)]);
+    if (blurb) {
+      return blurb;
     }
   }
 
   // 2. Steam enriched cache
   if (effectiveAppId) {
     const cached = (steamEnrichedCache as Record<string, any>)[String(effectiveAppId)];
-    if (cached?.shortDescription && !isPlaceholderSynopsis(cached.shortDescription, game.title)) {
-      return cached.shortDescription.trim();
+    const cachedDesc = cleanCandidate(cached?.shortDescription);
+    if (cachedDesc) {
+      return cachedDesc;
     }
   }
 
   // 3. Steam API live memory cache
   if (effectiveAppId) {
     const live = steamApi.getCachedMetadata(effectiveAppId);
-    if (live?.shortDescription && !isPlaceholderSynopsis(live.shortDescription, game.title)) {
-      return live.shortDescription.trim();
+    const liveDesc = cleanCandidate(live?.shortDescription);
+    if (liveDesc) {
+      return liveDesc;
     }
   }
 
@@ -96,36 +112,40 @@ function getCleanSynopsis(
   const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
   if (gogPlat?.platformGameId) {
     const special = GOG_SPECIAL_DESCRIPTIONS[gogPlat.platformGameId];
-    if (special?.lead && !isPlaceholderSynopsis(special.lead, game.title)) {
-      return special.lead.trim();
+    const specialLead = cleanCandidate(special?.lead);
+    if (specialLead) {
+      return specialLead;
     }
     const gogCached = (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId];
-    if (gogCached?.shortDescription && !isPlaceholderSynopsis(gogCached.shortDescription, game.title)) {
-      return gogCached.shortDescription.trim();
+    const gogDesc = cleanCandidate(gogCached?.shortDescription);
+    if (gogDesc) {
+      return gogDesc;
     }
   }
 
   // 5. Enriched metadata on game
-  if (game.enrichedMetadata?.shortDescription && !isPlaceholderSynopsis(game.enrichedMetadata.shortDescription, game.title)) {
-    return game.enrichedMetadata.shortDescription.trim();
+  const enrichedDesc = cleanCandidate(game.enrichedMetadata?.shortDescription);
+  if (enrichedDesc) {
+    return enrichedDesc;
   }
 
   // 6. Game shortDescription (if not a placeholder)
-  if (game.shortDescription && !isPlaceholderSynopsis(game.shortDescription, game.title)) {
-    return game.shortDescription.trim();
+  const gameDesc = cleanCandidate(game.shortDescription);
+  if (gameDesc) {
+    return gameDesc;
   }
 
   // 7. First paragraph of game description (truncated with ... if needed)
   const gogCachedData = gogPlat?.platformGameId ? (gogEnrichedCache as Record<string, any>)[gogPlat.platformGameId] : null;
   const firstPara =
-    extractFirstParagraph(game.enrichedMetadata?.detailedDescription) ||
-    extractFirstParagraph(game.enrichedMetadata?.aboutTheGame) ||
-    extractFirstParagraph(gogCachedData?.aboutTheGame) ||
-    extractFirstParagraph(gogCachedData?.detailedDescription) ||
-    extractFirstParagraph(game.shortDescription);
+    extractFirstParagraph(game.enrichedMetadata?.detailedDescription, 280) ||
+    extractFirstParagraph(game.enrichedMetadata?.aboutTheGame, 280) ||
+    extractFirstParagraph(gogCachedData?.aboutTheGame, 280) ||
+    extractFirstParagraph(gogCachedData?.detailedDescription, 280) ||
+    extractFirstParagraph(game.shortDescription, 280);
 
   if (firstPara && !isPlaceholderSynopsis(firstPara, game.title)) {
-    return firstPara;
+    return stripHtmlToPlainSynopsis(firstPara, 280);
   }
 
   // 8. Clean summary from genres and developers
@@ -135,7 +155,7 @@ function getCleanSynopsis(
       .filter((g) => g.length > 0 && !g.toLowerCase().includes('drm-free') && !g.toLowerCase().includes('gog') && !g.toLowerCase().includes('store exclusive'));
     if (cleanGenres.length > 0) {
       const dev = game.developers?.[0] ? ` developed by ${game.developers[0]}` : '';
-      return `${game.title} is a ${cleanGenres.slice(0, 3).join(', ')} title${dev}.`;
+      return stripHtmlToPlainSynopsis(`${game.title} is a ${cleanGenres.slice(0, 3).join(', ')} title${dev}.`, 280);
     }
   }
 
@@ -188,6 +208,12 @@ function getReleaseYear(game: CanonicalGame, targetAppId?: number | null): strin
 }
 
 const HOVER_DELAY_MS = 400;
+
+const globalAttemptedCoverLookups = new Set<string>();
+
+export function clearAttemptedCoverLookups(): void {
+  globalAttemptedCoverLookups.clear();
+}
 
 export function getCoverCandidates(
   game: CanonicalGame,
@@ -357,7 +383,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
       const hasResolvedSteamId = !isExplicitNonSteam && Boolean(steamMatcher.getEffectiveSteamAppId(game));
 
-      if (!hasResolvedSteamId && !isExplicitNonSteam) {
+      if (!hasResolvedSteamId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
         steamMatcher
           .matchGameToSteam(game.title, {
             releaseYear: game.releaseDate,
@@ -368,11 +394,8 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
 
       const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
       if (gogPlat?.platformGameId) {
-        const hasGogBoxArt = Boolean(
-          igdbCoverService.getGogVerticalCoverInstant(gogPlat.platformGameId, game.title)
-        );
         if (
-          !hasGogBoxArt &&
+          !igdbCoverService.hasAttemptedGogVerticalCover(gogPlat.platformGameId, game.title) &&
           (!hasResolvedSteamId || isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage))
         ) {
           igdbCoverService
@@ -394,7 +417,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     const matchReviewBadge =
       game.needsMatchReview === true && !effectiveOverride ? (
         <div
-          className="absolute bottom-2 left-2 z-20 flex items-center gap-1 bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[9px] font-semibold px-1.5 py-0.5 rounded shadow backdrop-blur-sm"
+          className="absolute bottom-9 left-2 z-20 flex items-center gap-1 bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[9px] font-semibold px-1.5 py-0.5 rounded shadow backdrop-blur-sm"
           title="Low-confidence automatic match — click Fix Match to verify"
         >
           <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
@@ -465,11 +488,16 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
               // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
               if (ratio > 0.94) {
                 setCandidateIndex((prev) => prev + 1);
-                if (onNeedCoverLookup) onNeedCoverLookup(game);
               }
             }
           }}
           onError={() => {
+            if (currentSrc) {
+              const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900\.jpg/i);
+              if (m) {
+                igdbCoverService.recordDeadSteamCover(Number(m[1]));
+              }
+            }
             // Declaratively advance to the next candidate without mutating the DOM
             setCandidateIndex((prev) => prev + 1);
           }}
@@ -481,6 +509,27 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
   }
 );
 
+
+export type GridSortOption = 'alphabetical' | 'rating' | 'playtime' | 'recent';
+export const GRID_SORT_STORAGE_KEY = 'one_launcher_grid_sort_by';
+
+export function isValidGridSortOption(val: unknown): val is GridSortOption {
+  return val === 'alphabetical' || val === 'rating' || val === 'playtime' || val === 'recent';
+}
+
+export function loadPersistedGridSort(): GridSortOption {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const saved = window.localStorage.getItem(GRID_SORT_STORAGE_KEY);
+      if (isValidGridSortOption(saved)) {
+        return saved;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return 'alphabetical';
+}
 
 interface LibraryGridViewProps {
   games: CanonicalGame[];
@@ -494,11 +543,14 @@ interface LibraryGridViewProps {
   onClearActiveFilter?: () => void;
   connectedStorefronts?: StorefrontId[];
   onFixMatch?: (game: CanonicalGame) => void;
+  onHideGame?: (game: CanonicalGame) => void;
   onSyncGameMedia?: (game: CanonicalGame) => void;
   collections?: GameCollection[];
   onToggleGameInCollection?: (collectionId: string, gameId: string) => void;
   onOpenManageCollectionsModal?: (game?: CanonicalGame) => void;
   onViewAchievements?: (game: CanonicalGame) => void;
+  sortBy?: GridSortOption;
+  onSortChange?: (sort: GridSortOption) => void;
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -513,11 +565,14 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   onClearActiveFilter,
   connectedStorefronts,
   onFixMatch,
+  onHideGame,
   onSyncGameMedia,
   collections,
   onToggleGameInCollection,
   onOpenManageCollectionsModal,
   onViewAchievements,
+  sortBy: sortByProp,
+  onSortChange,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -564,15 +619,13 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   };
 
   const connectedSet = useMemo(() => {
-    if (connectedStorefronts && connectedStorefronts.length > 0) {
+    if (connectedStorefronts !== undefined) {
       return new Set<StorefrontId>(connectedStorefronts);
     }
     try {
       const integrations = loadIntegrations();
       const connected = integrations.filter((i) => i.isConnected).map((i) => i.storefrontId);
-      if (connected.length > 0) {
-        return new Set<StorefrontId>(connected);
-      }
+      return new Set<StorefrontId>(connected);
     } catch {
       // Fallback
     }
@@ -584,7 +637,17 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     y: 0,
     align: 'left',
   });
-  const [sortBy, setSortBy] = useState<'alphabetical' | 'rating' | 'playtime' | 'recent'>('alphabetical');
+  const [internalSortBy, setInternalSortBy] = useState<GridSortOption>(() =>
+    sortByProp && isValidGridSortOption(sortByProp) ? sortByProp : loadPersistedGridSort()
+  );
+
+  useEffect(() => {
+    if (sortByProp && isValidGridSortOption(sortByProp)) {
+      setInternalSortBy(sortByProp);
+    }
+  }, [sortByProp]);
+
+  const sortBy = sortByProp && isValidGridSortOption(sortByProp) ? sortByProp : internalSortBy;
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const popoutRef = useRef<HTMLDivElement | null>(null);
   const activeCardRef = useRef<HTMLDivElement | null>(null);
@@ -594,12 +657,12 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
   const [dynamicBlurb, setDynamicBlurb] = useState<{ id: string; blurb: string } | null>(null);
   const [coverOverrides, setCoverOverrides] = useState<Record<string, string | null>>({});
-  const attemptedCoverLookupsRef = useRef<Set<string>>(new Set());
 
   // Listen for user override additions / modifications to reactively update the grid
   const [overrideVersion, setOverrideVersion] = useState(0);
   useEffect(() => {
     const handleOverrideUpdate = () => {
+      globalAttemptedCoverLookups.clear();
       setOverrideVersion((v) => v + 1);
     };
     window.addEventListener('antigravity:user-override-updated', handleOverrideUpdate);
@@ -611,14 +674,14 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const userOverridesMap = useMemo(() => loadUserOverrides(), [games, overrideVersion]);
 
   const handleNeedCoverLookup = useCallback((game: CanonicalGame) => {
-    if (attemptedCoverLookupsRef.current.has(game.id)) return;
-    attemptedCoverLookupsRef.current.add(game.id);
+    if (globalAttemptedCoverLookups.has(game.id)) return;
+    globalAttemptedCoverLookups.add(game.id);
 
-    let targetAppId = steamMatcher.getEffectiveSteamAppId(game);
+    const targetAppId = steamMatcher.getEffectiveSteamAppId(game);
     const releaseYear = getReleaseYear(game, targetAppId);
     const isExplicitNonSteam = game.isExplicitNonSteam === true;
 
-    if (!targetAppId && !isExplicitNonSteam) {
+    if (!targetAppId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
       steamMatcher
         .matchGameToSteam(game.title, {
           releaseYear: game.releaseDate,
@@ -627,11 +690,21 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         .catch(() => null);
     }
 
-    igdbCoverService.fetchIgdbCover(game.title, releaseYear).then((resolvedCover) => {
-      if (resolvedCover) {
-        setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+    if (igdbCoverService.hasAttemptedIgdbCover(game.title, releaseYear)) {
+      const instant = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+      if (instant) {
+        setCoverOverrides((prev) => ({ ...prev, [game.id]: instant }));
       }
-    });
+      return;
+    }
+
+    igdbCoverService
+      .fetchIgdbCover(game.title, releaseYear, undefined, { trackInGlobalBar: false })
+      .then((resolvedCover) => {
+        if (resolvedCover) {
+          setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
+        }
+      });
   }, []);
 
   useEffect(() => {
@@ -822,8 +895,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     if (!hasStoreSynopsis(hoveredGame, targetAppId)) {
       let active = true;
       steamApi.fetchGameMetadata(targetAppId).then((meta) => {
-        if (active && meta?.shortDescription && !isPlaceholderSynopsis(meta.shortDescription, hoveredGame.title)) {
-          setDynamicBlurb({ id: hoveredGame.id, blurb: meta.shortDescription.trim() });
+        const plainBlurb = stripHtmlToPlainSynopsis(meta?.shortDescription, 280);
+        if (active && plainBlurb && !isPlaceholderSynopsis(plainBlurb, hoveredGame.title)) {
+          setDynamicBlurb({ id: hoveredGame.id, blurb: plainBlurb });
         }
       });
       return () => {
@@ -832,50 +906,67 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     }
   }, [hoveredGame?.id]);
 
-  const handleSortChange = (newSort: 'alphabetical' | 'rating' | 'playtime' | 'recent') => {
-    setSortBy(newSort);
+  const handleSortChange = (newSort: GridSortOption) => {
+    setInternalSortBy(newSort);
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(GRID_SORT_STORAGE_KEY, newSort);
+      }
+    } catch {
+      // ignore storage errors
+    }
+    onSortChange?.(newSort);
     if (gridContainerRef.current?.parentElement) {
       gridContainerRef.current.parentElement.scrollTop = 0;
     }
   };
 
-  // Sorting
-  const sortedGames = [...games].sort((a, b) => {
-    if (sortBy === 'rating') {
-      const targetSteamIdA = steamMatcher.getEffectiveSteamAppId(a);
-      const targetSteamIdB = steamMatcher.getEffectiveSteamAppId(b);
-      const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent, undefined, undefined, false, true);
-      const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent, undefined, undefined, false, true);
-      const scoreA = ocA?.score ?? -1;
-      const scoreB = ocB?.score ?? -1;
-      if (scoreB !== scoreA) {
-        return scoreB - scoreA; // Highest verified critic score first
+  // Sorting & deterministic deduplication
+  const sortedGames = useMemo(() => {
+    const seenIds = new Set<string>();
+    const uniqueGames: CanonicalGame[] = [];
+    for (const g of games) {
+      if (!g || !g.id || seenIds.has(g.id)) continue;
+      seenIds.add(g.id);
+      uniqueGames.push(g);
+    }
+    return uniqueGames.sort((a, b) => {
+      if (sortBy === 'rating') {
+        const targetSteamIdA = steamMatcher.getEffectiveSteamAppId(a);
+        const targetSteamIdB = steamMatcher.getEffectiveSteamAppId(b);
+        const ocA = getOpenCriticData(targetSteamIdA || undefined, a.title, a.reviewSummary?.positivePercent, undefined, undefined, false, true);
+        const ocB = getOpenCriticData(targetSteamIdB || undefined, b.title, b.reviewSummary?.positivePercent, undefined, undefined, false, true);
+        const scoreA = ocA?.score ?? -1;
+        const scoreB = ocB?.score ?? -1;
+        if (scoreB !== scoreA) {
+          return scoreB - scoreA; // Highest verified critic score first
+        }
+        const recA = ocA?.percentRecommended ?? -1;
+        const recB = ocB?.percentRecommended ?? -1;
+        if (recB !== recA) {
+          return recB - recA;
+        }
+        return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
       }
-      const recA = ocA?.percentRecommended ?? -1;
-      const recB = ocB?.percentRecommended ?? -1;
-      if (recB !== recA) {
-        return recB - recA;
+      if (sortBy === 'playtime') {
+        const ptA = a.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
+        const ptB = b.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
+        return ptB - ptA;
+      }
+      if (sortBy === 'recent') {
+        const getRecentMs = (g: CanonicalGame) => {
+          let maxMs = 0;
+          for (const p of g.platforms) {
+            const ms = parseTimestampMs(p.lastPlayed);
+            if (ms && ms > maxMs) maxMs = ms;
+          }
+          return maxMs;
+        };
+        return getRecentMs(b) - getRecentMs(a);
       }
       return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
-    }
-    if (sortBy === 'playtime') {
-      const ptA = a.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
-      const ptB = b.platforms.reduce((acc, p) => acc + (p.playtimeMinutes || 0), 0);
-      return ptB - ptA;
-    }
-    if (sortBy === 'recent') {
-      const getRecentMs = (g: CanonicalGame) => {
-        let maxMs = 0;
-        for (const p of g.platforms) {
-          const ms = parseTimestampMs(p.lastPlayed);
-          if (ms && ms > maxMs) maxMs = ms;
-        }
-        return maxMs;
-      };
-      return getRecentMs(b) - getRecentMs(a);
-    }
-    return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
-  });
+    });
+  }, [games, sortBy, overrideVersion]);
 
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
     startHoverForCard(game, e.currentTarget);
@@ -1063,13 +1154,13 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
         {/* Game Covers Grid (Aspect Ratio ~2:3 Portrait Posters) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
-          {sortedGames.map((game) => {
+          {sortedGames.map((game, idx) => {
             const isRunning = launcherService.isGameRunning(game.id);
             const isInstalled =
               game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
             return (
               <div
-                key={game.id}
+                key={`${game.id}::${idx}`}
                 data-game-id={game.id}
                 onClick={(e) => {
                   if (contextMenu.isOpen) {
@@ -1119,17 +1210,21 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20 pointer-events-none" />
 
                   {/* Top Header: Running or Installed status badge */}
-                  {isRunning ? (
-                    <div className="absolute top-2 left-2 flex items-center gap-1 bg-amber-950/90 border border-amber-400/70 text-amber-300 text-[10px] font-bold px-1.5 py-0.5 rounded shadow z-10">
-                      <Activity className="w-2.5 h-2.5 text-amber-400 animate-pulse" />
-                      <span>Running</span>
+                  {(isRunning || isInstalled) && (
+                    <div className="absolute top-2 left-2 z-20 flex items-center gap-1 pointer-events-none">
+                      {isRunning ? (
+                        <div className="flex items-center gap-1 bg-amber-950/90 border border-amber-400/70 text-amber-300 text-[10px] font-bold px-1.5 py-0.5 rounded shadow">
+                          <Activity className="w-2.5 h-2.5 text-amber-400 animate-pulse" />
+                          <span>Running</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow">
+                          <CheckCircle2 className="w-2.5 h-2.5" />
+                          <span>Ready</span>
+                        </div>
+                      )}
                     </div>
-                  ) : isInstalled ? (
-                    <div className="absolute top-2 left-2 flex items-center gap-1 bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 text-[10px] font-semibold px-1.5 py-0.5 rounded shadow z-10">
-                      <CheckCircle2 className="w-2.5 h-2.5" />
-                      <span>Ready</span>
-                    </div>
-                  ) : null}
+                  )}
 
                   {/* Top-Right: Critic Score Pill */}
                   {(() => {
@@ -1188,6 +1283,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       </div>
                     );
                   })()}
+
+                  {/* Overlayed Bottom-Left: Native OS Compatibility Badge */}
+                  <div className="absolute bottom-2 left-2 z-10 pointer-events-none">
+                    <NativeOsBadges platforms={getNativeOsPlatforms(game)} variant="cover-badge" />
+                  </div>
 
                   {/* Overlayed Bottom-Right: Storefront Icons Game is Owned On */}
                   <div
@@ -1549,6 +1649,14 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         onViewAchievements={(game) => {
           if (onViewAchievements) onViewAchievements(game);
         }}
+        onHideGame={
+          onHideGame
+            ? (game) => {
+                setHoveredGame(null);
+                onHideGame(game);
+              }
+            : undefined
+        }
       />
     </div>
   );

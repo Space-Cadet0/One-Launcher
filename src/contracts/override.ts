@@ -1,4 +1,5 @@
 import type { StorefrontReviewAnchor, CriticScoreData, CriticSource } from './critic';
+import type { StorefrontId } from './platform';
 
 export interface ReviewScoreRoute {
   mode: 'routed' | 'static' | 'unrated';
@@ -17,6 +18,7 @@ export interface MetadataSourceOption {
   source: 'steam' | 'gog' | 'epic' | 'igdb' | 'original';
   sourceLabel: string; // e.g. 'Steam Store Metadata', 'GOG.com Metadata', 'Epic Games Store', 'IGDB Metadata'
   matchedId: string | number;
+  storeUrl?: string;
   steamAppId?: number;
   gogId?: string;
   epicSlug?: string;
@@ -52,6 +54,7 @@ export interface SearchMatchCandidate {
   source: 'steam' | 'igdb' | 'gog' | 'epic';
   title: string;
   year?: string | number;
+  storeUrl?: string;
   capsuleImage?: string;
   headerImage?: string;
   description?: string;
@@ -98,6 +101,10 @@ export interface UserGameOverride {
   gameId: string;
   platformId?: string;
   platformGameId?: string;
+  originalSourceTitle?: string;
+  originalSourcePlatformId?: StorefrontId;
+  splitFromMerged?: boolean;
+  isHidden?: boolean;
   matchedStore: 'steam' | 'gog' | 'epic' | 'igdb' | 'custom';
   matchedId?: string | number;
   title?: string;

@@ -31,7 +31,7 @@ import {
 } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
-import { EPIC_USER_LIBRARY } from '../../services/storage/storefrontLibraries';
+import { normalizeGogAvatarUrl } from '../../services/integrations/gogIntegration';
 
 interface IntegrationsModalProps {
   isOpen: boolean;
@@ -99,7 +99,9 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   // Active external authentication tracking
   const [authenticatingStore, setAuthenticatingStore] = useState<StorefrontId | null>(null);
   const [authRedirectInput, setAuthRedirectInput] = useState('');
+  const authRedirectInputRef = useRef('');
   const popupRef = useRef<Window | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
   const authStartTimeRef = useRef<number>(0);
 
   // Advanced manual inputs toggle
@@ -120,6 +122,24 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [avatarImgError, setAvatarImgError] = useState(false);
+
+  useEffect(() => {
+    setAvatarImgError(false);
+  }, [selectedTab, integrations]);
+
+  useEffect(() => {
+    authRedirectInputRef.current = authRedirectInput;
+  }, [authRedirectInput]);
+
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current !== null) {
+        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const extractCodeFromInput = (input: string): string | null => {
     if (!input) return null;
@@ -180,9 +200,99 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         window.electronAPI
           .getSavedTokens()
           .then((savedTokens: any) => {
+            let updatedIntegrations = loadIntegrations();
+            let integrationsChanged = false;
+            const activeCatalog = loadCurrentCatalog();
+
+            // 1. Reconcile Steam saved token
+            if (savedTokens?.steam?.steamId || savedTokens?.steam?.access_token) {
+              const steamInteg = updatedIntegrations.find((i) => i.storefrontId === 'steam');
+              const steamId = savedTokens.steam.steamId || steamInteg?.credentials?.steamId || steamInteg?.accountId;
+              const accountName = savedTokens.steam.accountName || steamInteg?.accountName || 'Steam User';
+              if (
+                !steamInteg ||
+                !steamInteg.isConnected ||
+                !steamInteg.credentials?.steamId ||
+                steamInteg.accountName !== accountName
+              ) {
+                const count =
+                  (Array.isArray(savedTokens.steam.games) && savedTokens.steam.games.length) ||
+                  steamInteg?.gamesCount ||
+                  activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'steam')).length;
+                updatedIntegrations = updatedIntegrations.map((i) =>
+                  i.storefrontId === 'steam'
+                    ? {
+                        ...i,
+                        isConnected: true,
+                        accountName,
+                        accountId: steamId,
+                        avatarUrl: savedTokens.steam.avatarUrl || i.avatarUrl,
+                        gamesCount: count,
+                        lastSyncedAt: savedTokens.steam.updatedAt || new Date().toISOString(),
+                        authMethod: 'oauth' as const,
+                        credentials: {
+                          ...i.credentials,
+                          steamId,
+                        },
+                        statusMessage: `Connected as ${accountName} (${count} titles synced)`,
+                      }
+                    : i
+                );
+                integrationsChanged = true;
+              }
+            }
+
+            // 2. Reconcile GOG saved token
+            if (savedTokens?.gog?.access_token) {
+              const gogInteg = updatedIntegrations.find((i) => i.storefrontId === 'gog');
+              const gogUserId = savedTokens.gog.user_id || gogInteg?.accountId;
+              const resolvedGogAvatar =
+                normalizeGogAvatarUrl(savedTokens.gog.avatarUrl) ||
+                normalizeGogAvatarUrl(gogInteg?.avatarUrl) ||
+                gogInteg?.avatarUrl;
+              const resolvedGogName =
+                savedTokens.gog.username ||
+                (gogInteg?.accountName && gogInteg.accountName !== 'GOG User' ? gogInteg.accountName : undefined) ||
+                'GOG User';
+              if (
+                !gogInteg ||
+                !gogInteg.isConnected ||
+                !gogInteg.credentials?.gogToken ||
+                (resolvedGogAvatar && gogInteg.avatarUrl !== resolvedGogAvatar) ||
+                (savedTokens.gog.username && gogInteg.accountName !== savedTokens.gog.username)
+              ) {
+                const count =
+                  gogInteg?.gamesCount && gogInteg.gamesCount > 0
+                    ? gogInteg.gamesCount
+                    : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'gog')).length;
+                const accountName = resolvedGogName;
+                updatedIntegrations = updatedIntegrations.map((i) =>
+                  i.storefrontId === 'gog'
+                    ? {
+                        ...i,
+                        isConnected: true,
+                        accountName,
+                        accountId: gogUserId,
+                        avatarUrl: resolvedGogAvatar || i.avatarUrl,
+                        gamesCount: count,
+                        lastSyncedAt: savedTokens.gog.updatedAt || new Date().toISOString(),
+                        authMethod: 'oauth' as const,
+                        credentials: {
+                          ...i.credentials,
+                          gogToken: savedTokens.gog.access_token,
+                          gogUsername: accountName,
+                        },
+                        statusMessage: `Connected as ${accountName} (${count} titles synced)`,
+                      }
+                    : i
+                );
+                integrationsChanged = true;
+              }
+            }
+
+            // 3. Reconcile Epic saved token
             if (savedTokens?.epic?.access_token) {
-              const currentIntegrations = loadIntegrations();
-              const epicInteg = currentIntegrations.find((i) => i.storefrontId === 'epic');
+              const epicInteg = updatedIntegrations.find((i) => i.storefrontId === 'epic');
               const displayName = savedTokens.epic.displayName || 'Epic User';
               if (
                 !epicInteg ||
@@ -193,34 +303,35 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 const count =
                   epicInteg?.gamesCount && epicInteg.gamesCount > 0
                     ? epicInteg.gamesCount
-                    : EPIC_USER_LIBRARY.length;
-                const updated = currentIntegrations.map((i) => {
-                  if (i.storefrontId === 'epic') {
-                    return {
-                      ...i,
-                      isConnected: true,
-                      accountName: displayName,
-                      accountId: savedTokens.epic.account_id,
-                      gamesCount: count,
-                      lastSyncedAt: savedTokens.epic.updatedAt || new Date().toISOString(),
-                      authMethod: 'oauth' as const,
-                      credentials: {
-                        epicToken: savedTokens.epic.access_token,
-                        epicRefreshToken: savedTokens.epic.refresh_token,
-                        epicAccountId: savedTokens.epic.account_id,
-                        epicTokenExpiresAt: savedTokens.epic.expires_at,
-                      },
-                      statusMessage: `Connected as ${displayName} (${count} titles synced)`,
-                    };
-                  }
-                  return i;
-                });
-                saveIntegrations(updated);
-                setIntegrations(updated);
-                return;
+                    : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'epic')).length;
+                updatedIntegrations = updatedIntegrations.map((i) =>
+                  i.storefrontId === 'epic'
+                    ? {
+                        ...i,
+                        isConnected: true,
+                        accountName: displayName,
+                        accountId: savedTokens.epic.account_id,
+                        gamesCount: count,
+                        lastSyncedAt: savedTokens.epic.updatedAt || new Date().toISOString(),
+                        authMethod: 'oauth' as const,
+                        credentials: {
+                          epicToken: savedTokens.epic.access_token,
+                          epicRefreshToken: savedTokens.epic.refresh_token,
+                          epicAccountId: savedTokens.epic.account_id,
+                          epicTokenExpiresAt: savedTokens.epic.expires_at,
+                        },
+                        statusMessage: `Connected as ${displayName} (${count} titles synced)`,
+                      }
+                    : i
+                );
+                integrationsChanged = true;
               }
             }
-            setIntegrations(loadIntegrations());
+
+            if (integrationsChanged) {
+              saveIntegrations(updatedIntegrations);
+            }
+            setIntegrations(updatedIntegrations);
           })
           .catch(() => setIntegrations(loadIntegrations()));
       } else {
@@ -239,21 +350,29 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
    * Common handler for native synchronization success
    */
   const handleNativeSyncSuccess = (storefrontId: StorefrontId, res: any) => {
-    const gamesList = res.games || [];
+    const rawGamesList: CanonicalGame[] = res.games || [];
+    const gamesList = rawGamesList.map((g) => ({
+      ...g,
+      isVerifiedEntitlement: true,
+    }));
+    const current = loadCurrentCatalog();
     const count =
       gamesList.length > 0
         ? gamesList.length
-        : storefrontId === 'epic'
-        ? EPIC_USER_LIBRARY.length
-        : 0;
+        : current.filter((g) => g.platforms.some((p) => p.platformId === storefrontId)).length;
+
+    const normalizedAvatarUrl =
+      storefrontId === 'gog'
+        ? normalizeGogAvatarUrl(res.avatarUrl) || res.avatarUrl
+        : res.avatarUrl;
 
     const integration: StorefrontIntegration = {
       storefrontId,
       name: STORE_AUTH_CONFIGS[storefrontId]?.storeName || storefrontId.toUpperCase(),
       isConnected: true,
       accountName: res.accountName || 'Connected User',
-      accountId: res.accountId || res.tokenData?.account_id || res.tokenData?.steamId,
-      avatarUrl: res.avatarUrl,
+      accountId: res.accountId || res.tokenData?.account_id || res.tokenData?.steamId || res.tokenData?.user_id,
+      avatarUrl: normalizedAvatarUrl,
       gamesCount: count,
       lastSyncedAt: new Date().toISOString(),
       authMethod: 'oauth',
@@ -265,10 +384,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         epicAccountId: res.tokenData?.account_id,
         epicTokenExpiresAt: res.tokenData?.expires_at,
         gogUsername: storefrontId === 'gog' ? res.accountName : undefined,
+        gogToken: storefrontId === 'gog' ? (res.tokenData?.access_token || 'saved_in_electron') : undefined,
       },
     };
 
-    const current = loadCurrentCatalog();
     const merged = gamesList.length > 0 ? mergeStorefrontGames(current, gamesList, storefrontId) : current;
     const updatedIntegrations = loadIntegrations().map((i) =>
       i.storefrontId === storefrontId ? integration : i
@@ -345,11 +464,17 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
     // Watch for popup closure
     if (popup) {
-      const checkClosedTimer = window.setInterval(async () => {
+      if (pollTimerRef.current !== null) {
+        window.clearInterval(pollTimerRef.current);
+      }
+      pollTimerRef.current = window.setInterval(async () => {
         try {
           if (popup.closed) {
-            window.clearInterval(checkClosedTimer);
-            if (authRedirectInput.trim()) {
+            if (pollTimerRef.current !== null) {
+              window.clearInterval(pollTimerRef.current);
+              pollTimerRef.current = null;
+            }
+            if (authRedirectInputRef.current.trim()) {
               await completeStoreAuthentication(storefrontId);
             }
           }
@@ -376,7 +501,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     setIsSubmitting(true);
     setErrorMsg(null);
 
-    const tokenOrCode = explicitCode || extractCodeFromInput(authRedirectInput) || undefined;
+    const tokenOrCode =
+      explicitCode ||
+      extractCodeFromInput(authRedirectInput) ||
+      (storefrontId === 'epic' ? extractCodeFromInput(epicToken) || epicToken.trim() || undefined : undefined) ||
+      undefined;
 
     // In Electron Desktop App: use native sync or native code exchange directly
     if (typeof window !== 'undefined' && window.electronAPI?.isElectron) {
@@ -434,7 +563,9 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         accountName = integration.accountName || 'Steam User';
       } else if (storefrontId === 'epic') {
         const hasExistingToken = Boolean(
-          currentIntegration.credentials?.epicToken || currentIntegration.credentials?.epicRefreshToken
+          (storefrontId === 'epic' && Boolean(epicToken.trim())) ||
+            currentIntegration.credentials?.epicToken ||
+            currentIntegration.credentials?.epicRefreshToken
         );
         if (!tokenOrCode && !hasExistingToken) {
           setErrorMsg('To sync live Epic purchases, please copy the authorization URL or code from the Epic pop-up window and paste it here.');
@@ -444,7 +575,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
         const { integration, games } = await connectEpicIntegration({
           epicAccountId: epicInput.trim() || currentIntegration.credentials?.epicAccountId || undefined,
-          epicToken: tokenOrCode || currentIntegration.credentials?.epicToken || undefined,
+          epicToken: tokenOrCode || epicToken.trim() || currentIntegration.credentials?.epicToken || undefined,
           epicRefreshToken: currentIntegration.credentials?.epicRefreshToken,
           epicTokenExpiresAt: currentIntegration.credentials?.epicTokenExpiresAt,
         });
@@ -739,10 +870,15 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
             <div className="bg-[#16202d] border border-steam-border/80 rounded-lg p-5 space-y-4">
               <div className="flex items-center justify-between pb-4 border-b border-steam-border/40">
                 <div className="flex items-center gap-4">
-                  {currentIntegration.avatarUrl ? (
+                  {currentIntegration.avatarUrl && !avatarImgError ? (
                     <img
-                      src={currentIntegration.avatarUrl}
+                      src={
+                        selectedTab === 'gog'
+                          ? normalizeGogAvatarUrl(currentIntegration.avatarUrl) || currentIntegration.avatarUrl
+                          : currentIntegration.avatarUrl
+                      }
                       alt="Avatar"
+                      onError={() => setAvatarImgError(true)}
                       className="w-14 h-14 rounded border border-steam-border shadow-md object-cover"
                     />
                   ) : (

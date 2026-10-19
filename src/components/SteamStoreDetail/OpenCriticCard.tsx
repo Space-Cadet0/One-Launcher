@@ -350,24 +350,6 @@ export const OpenCriticCard: React.FC<OpenCriticCardProps> = ({ openCritic, game
           </div>
         </div>
       </div>
-
-      {/* Summary Note Footer */}
-      {openCritic.summary && (
-        <div className="mt-3 pt-2.5 border-t border-[#2a475e]/40 flex items-start gap-2 text-[11px] text-[#acb2b8] leading-relaxed">
-          <span className="text-steam-accent font-semibold flex-shrink-0">
-            {isGog
-              ? 'GOG Consensus:'
-              : isEpic
-              ? 'Epic Consensus:'
-              : isMetacriticUser
-              ? 'User Sentiment:'
-              : isSteam
-              ? 'Community Consensus:'
-              : 'Critic Consensus:'}
-          </span>
-          <span className="italic">{openCritic.summary}</span>
-        </div>
-      )}
     </div>
   );
 };

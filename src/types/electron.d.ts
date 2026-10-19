@@ -18,7 +18,7 @@ import type {
 
 export interface ElectronAPI {
   isElectron: boolean;
-  platform?: string;
+  platform: string;
   loginStore: (storefrontId: string) => Promise<any>;
   syncStore: (
     storefrontId: string,
@@ -30,6 +30,7 @@ export interface ElectronAPI {
     accountId?: string;
     avatarUrl?: string;
     games?: CanonicalGame[];
+    suppressedItems?: any[];
     achievements?: Record<string | number, any>;
     error?: string;
   }>;
@@ -49,6 +50,13 @@ export interface ElectronAPI {
     error?: string;
   }>;
   fetchIgdbCover: (title: string) => Promise<string | null>;
+  fetchEpicProductMetadata?: (payload: {
+    appName?: string;
+    namespace?: string;
+    catalogItemId?: string;
+    title?: string;
+    slug?: string;
+  }) => Promise<any>;
 
   // Universal Game Launcher & Install Manager IPC
   scanAllInstalledGames: () => Promise<{
@@ -86,6 +94,7 @@ export interface ElectronAPI {
       error?: string;
     }) => void
   ) => () => void;
+  onFullscreenChanged?: (cb: (isFullScreen: boolean) => void) => () => void;
 }
 
 declare global {

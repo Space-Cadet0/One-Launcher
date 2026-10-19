@@ -312,4 +312,84 @@ describe('Fix Match & Context Menu UI Components', () => {
     expect(formatMatchPercentage(0)).toBeNull();
     expect(formatMatchPercentage(-5)).toBeNull();
   });
+
+  it('places Hide / Suppress from Library in the right-click GameContextMenu and removes the top-left button from LibraryGridView cards', async () => {
+    const { LibraryGridView } = await import('../src/components/Library/LibraryGridView');
+
+    const contextHtml = renderToString(
+      React.createElement(GameContextMenu, {
+        isOpen: true,
+        x: 150,
+        y: 250,
+        game: mockGame,
+        collections: mockCollections,
+        onClose: vi.fn(),
+        onFixMatch: vi.fn(),
+        onSyncStoreMedia: vi.fn(),
+        onToggleCollection: vi.fn(),
+        onManageCollections: vi.fn(),
+        onHideGame: vi.fn(),
+      })
+    );
+    expect(contextHtml).toContain('Hide / Suppress from Library');
+
+    const gridHtml = renderToString(
+      React.createElement(LibraryGridView, {
+        games: [mockGame],
+        onSelectGame: vi.fn(),
+        onHideGame: vi.fn(),
+      })
+    );
+    // Ensure the top-left card overlay no longer renders the accidental-trigger suppress button
+    expect(gridHtml).not.toContain('title="Hide / Suppress from Library"');
+  });
+
+  it('orders TopNavBar burger menu items into logical groups consistently across main and individual game views', async () => {
+    const { TopNavBar } = await import('../src/components/Navigation/TopNavBar');
+
+    const html = renderToString(
+      React.createElement(TopNavBar, {
+        selectedPlatform: 'all',
+        onSelectPlatform: vi.fn(),
+        installedOnly: false,
+        onToggleInstalledOnly: vi.fn(),
+        totalGamesCount: 811,
+        filteredCount: 811,
+        isSyncing: false,
+        onTriggerSync: vi.fn(),
+        onHomeClick: vi.fn(),
+        onOpenIntegrations: vi.fn(),
+        onOpenLibraryMatchManager: vi.fn(),
+        onSyncAllMedia: vi.fn(),
+        onSyncTrophies: vi.fn(),
+        onRefreshScores: vi.fn(),
+        currentGameTitle: 'Cyberpunk 2077',
+        canSyncCurrentGame: true,
+        onSyncCurrentGame: vi.fn(),
+        onOpenFixMatch: vi.fn(),
+        onOpenAchievements: vi.fn(),
+        defaultMenuOpen: true,
+      })
+    );
+
+    const idxAccounts = html.indexOf('>Accounts<');
+    const idxMatchStudio = html.indexOf('Library Match &amp; Overrides Studio');
+    const idxSyncIntegrations = html.indexOf('Sync Integrations');
+    const idxSyncAllMedia = html.indexOf('Sync Store Media (All Games)');
+    const idxSyncTrophies = html.indexOf('Sync Trophies');
+    const idxRefreshScores = html.indexOf('Refresh Critic Scores');
+    const idxFixMatch = html.indexOf('Fix Match &amp; Metadata...');
+    const idxSyncThisGame = html.indexOf('Sync Store Media (This Game)');
+    const idxViewAchievements = html.indexOf('View Achievements...');
+
+    expect(idxAccounts).toBeGreaterThan(-1);
+    expect(idxMatchStudio).toBeGreaterThan(idxAccounts);
+    expect(idxSyncIntegrations).toBeGreaterThan(idxMatchStudio);
+    expect(idxSyncAllMedia).toBeGreaterThan(idxSyncIntegrations);
+    expect(idxSyncTrophies).toBeGreaterThan(idxSyncAllMedia);
+    expect(idxRefreshScores).toBeGreaterThan(idxSyncTrophies);
+    expect(idxFixMatch).toBeGreaterThan(idxRefreshScores);
+    expect(idxSyncThisGame).toBeGreaterThan(idxFixMatch);
+    expect(idxViewAchievements).toBeGreaterThan(idxSyncThisGame);
+  });
 });

@@ -18,7 +18,9 @@
   "build": {
     "appId": "com.onelauncher.app",
     "productName": "One Launcher",
+    "icon": "build/icon.png",
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.games",
       "target": [
         { "target": "dmg", "arch": ["arm64"] },
@@ -27,7 +29,11 @@
       "hardenedRuntime": false,
       "gatekeeperAssess": false
     },
+    "dmg": {
+      "icon": "build/icon.icns"
+    },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         { "target": "nsis", "arch": ["x64"] },
         { "target": "dir", "arch": ["x64"] }
@@ -38,6 +44,9 @@
       "perMachine": true,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
       "include": "build/installer.nsh"
     },
     "files": [

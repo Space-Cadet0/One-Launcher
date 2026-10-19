@@ -22,6 +22,7 @@ import {
   removeUserOverride,
 } from '../src/services/storage/userOverrideStorage';
 import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
+import { SteamStorePage } from '../src/components/SteamStoreDetail/SteamStorePage';
 import { DownloadManagerDrawer } from '../src/components/Launcher/DownloadManagerDrawer';
 import { GameInstallModal } from '../src/components/Launcher/GameInstallModal';
 import { GameLaunchConfigModal } from '../src/components/Launcher/GameLaunchConfigModal';
@@ -1079,21 +1080,31 @@ setTimeout(() => process.exit(0), 40);
       expect(service.getLaunchConfig(multiStoreGame.id)?.preferredPlatformId).toBe('epic');
     });
 
-    it('renders SteamLibraryActionBar across Install, Installing, Play (Steam/GOG/Epic), CrossOver/Wine, and Running states', async () => {
-      // 1. Uninstalled Multi-Storefront Game -> shows Install button + Storefront Switcher
+    it('renders SteamLibraryActionBar and SteamStorePage header across Install, Installing, Play (Steam/GOG/Epic), CrossOver/Wine, and Running states', async () => {
+      // 1. Uninstalled Multi-Storefront Game -> shows Install button + Storefront Switcher (and omits redundant In Library)
       const uninstalledHtml = renderToString(
         React.createElement(SteamLibraryActionBar, {
           game: multiStoreGame,
         })
       );
       expect(uninstalledHtml).toContain('Install');
-      expect(uninstalledHtml).toContain('In Library');
+      expect(uninstalledHtml).not.toContain('In Library');
+      expect(uninstalledHtml).not.toContain('Ready to Play');
       expect(uninstalledHtml).toContain('Target Storefront');
       expect(uninstalledHtml).toContain('Steam');
       expect(uninstalledHtml).toContain('GOG.com');
       expect(uninstalledHtml).toContain('Epic Games');
 
-      // 2. Installed Game on GOG -> shows Play button + Ready to Play + via GOG.com
+      const uninstalledPageHtml = renderToString(
+        React.createElement(SteamStorePage, {
+          game: multiStoreGame,
+        })
+      );
+      expect(uninstalledPageHtml).toContain('Owned on:');
+      expect(uninstalledPageHtml).not.toContain('In Library');
+      expect(uninstalledPageHtml).not.toContain('Ready to Play');
+
+      // 2. Installed Game on GOG -> ActionBar shows Play button; SteamStorePage header shows Ready to Play • GOG.com near Owned on:
       const installedGogGame: CanonicalGame = {
         ...multiStoreGame,
         platforms: [
@@ -1114,11 +1125,19 @@ setTimeout(() => process.exit(0), 40);
         })
       );
       expect(installedHtml).toContain('Play');
-      expect(installedHtml).toContain('Ready to Play');
-      expect(installedHtml).toContain('via GOG.com');
+      expect(installedHtml).not.toContain('Ready to Play');
       expect(installedHtml).toContain('50.0 GB');
 
-      // 3. Installed Windows Binary on macOS -> shows CrossOver / Wine badge
+      const installedPageHtml = renderToString(
+        React.createElement(SteamStorePage, {
+          game: installedGogGame,
+        })
+      );
+      expect(installedPageHtml).toContain('Ready to Play');
+      expect(installedPageHtml).toContain('GOG.com');
+      expect(installedPageHtml).toContain('Owned on:');
+
+      // 3. Installed Windows Binary on macOS -> SteamStorePage header shows CrossOver / Wine badge
       const winOnMacGame: CanonicalGame = {
         ...multiStoreGame,
         id: 'epic-alanwake2',
@@ -1140,8 +1159,15 @@ setTimeout(() => process.exit(0), 40);
         })
       );
       expect(winOnMacHtml).toContain('Play');
-      expect(winOnMacHtml).toContain('Ready to Play');
-      expect(winOnMacHtml).toContain('CrossOver / Wine');
+      expect(winOnMacHtml).not.toContain('Ready to Play');
+
+      const winOnMacPageHtml = renderToString(
+        React.createElement(SteamStorePage, {
+          game: winOnMacGame,
+        })
+      );
+      expect(winOnMacPageHtml).toContain('Ready to Play');
+      expect(winOnMacPageHtml).toContain('CrossOver / Wine (Epic Games)');
 
       // 4. Active Download state on singleton launcherService -> shows Installing X%
       delete (globalThis as any).window.electronAPI;
@@ -1164,8 +1190,9 @@ setTimeout(() => process.exit(0), 40);
         React.createElement(DownloadManagerDrawer, {
           isOpen: true,
         })
-      );
-      expect(drawerHtml).toContain('Downloads &amp; Installations');
+      ).replace(/<!--\s*-->/g, '');
+      expect(drawerHtml).toContain('Downloads');
+      expect(drawerHtml).toContain('1 Active');
       expect(drawerHtml).toContain('The Witcher 3: Wild Hunt');
       expect(drawerHtml).toContain('Downloading');
 
@@ -1176,7 +1203,7 @@ setTimeout(() => process.exit(0), 40);
       }
       launcherService.clearCompletedDownloads();
 
-      // 5. Running state on singleton launcherService -> shows Running + Stop button + Active Session
+      // 5. Running state on singleton launcherService -> ActionBar shows Running + Stop button; SteamStorePage header shows Active Session
       await launcherService.launchGame(installedGogGame, 'gog');
       const runningHtml = renderToString(
         React.createElement(SteamLibraryActionBar, {
@@ -1185,7 +1212,14 @@ setTimeout(() => process.exit(0), 40);
       );
       expect(runningHtml).toContain('Running');
       expect(runningHtml).toContain('Stop');
-      expect(runningHtml).toContain('Active Session');
+      expect(runningHtml).not.toContain('Active Session');
+
+      const runningPageHtml = renderToString(
+        React.createElement(SteamStorePage, {
+          game: installedGogGame,
+        })
+      );
+      expect(runningPageHtml).toContain('Active Session');
 
       await launcherService.stopGame(installedGogGame.id);
 
@@ -1699,7 +1733,7 @@ setTimeout(() => process.exit(0), 30);
 
       expect(crossoverEnv.CX_BOTTLE).toBe('OneLauncher');
       expect(crossoverEnv.WINEPREFIX).toBe(oneLauncherBottleDir);
-      expect(crossoverEnv.WINEESYNC).toBe('1');
+      expect(crossoverEnv.WINEESYNC).toBe('0');
       expect(crossoverEnv.WINEMSYNC).toBe('1');
       expect(crossoverRes.targetBottle).toBe('OneLauncher');
       expect(crossoverRes.winePrefix).toBe(oneLauncherBottleDir);
@@ -1726,7 +1760,7 @@ setTimeout(() => process.exit(0), 30);
       expect(gptkEnv.WINEPREFIX).toBe(expectedPrefix);
       expect(fs.existsSync(expectedPrefix)).toBe(true);
       expect(gptkEnv.WINEMSYNC).toBe('1');
-      expect(gptkEnv.WINEESYNC).toBe('1');
+      expect(gptkEnv.WINEESYNC).toBe('0');
       expect(gptkEnv.WINEDLLOVERRIDES).toContain('winemenubuilder.exe=d');
       expect(gptkRes.winePrefix).toBe(expectedPrefix);
     });
@@ -2023,7 +2057,14 @@ exit 1
       // Re-open Manage Game menu and verify label switched to 'Mark as Uninstalled (Cloud Only)'
       const afterInstallClosed = renderActionBar();
       expect(afterInstallClosed.html).toContain('Play');
-      expect(afterInstallClosed.html).toContain('Ready to Play');
+      expect(afterInstallClosed.html).not.toContain('Ready to Play');
+
+      const afterInstallPageHtml = renderToString(
+        React.createElement(SteamStorePage, {
+          game: testGame,
+        })
+      );
+      expect(afterInstallPageHtml).toContain('Ready to Play');
 
       const manageCogBtn2 = findElements(
         afterInstallClosed.vnode,
@@ -3075,9 +3116,18 @@ setTimeout(() => process.exit(0), 30);
 
         let barVnode = renderActionBar();
         const barClosedHtml = renderToString(barVnode);
-        expect(barClosedHtml).toContain('Ready to Play');
-        expect(barClosedHtml).toContain('via GOG.com');
+        expect(barClosedHtml).toContain('Play');
+        expect(barClosedHtml).not.toContain('Ready to Play');
         expect(barClosedHtml).not.toContain('CrossOver / Wine');
+
+        const winPageHtml = renderToString(
+          React.createElement(SteamStorePage, {
+            game: winGame,
+          })
+        );
+        expect(winPageHtml).toContain('Ready to Play');
+        expect(winPageHtml).toContain('GOG.com');
+        expect(winPageHtml).not.toContain('CrossOver / Wine');
 
         // Open Manage Game menu
         const manageBtn = findElement(
@@ -3792,11 +3842,2999 @@ setTimeout(() => process.exit(0), 150);
       const updatedMap = loadUserOverrides();
       expect(updatedMap['perf-test-1']).toBeUndefined();
     });
+
+    it('Issue 1 & 2: parses storage requirements accurately without mistaking RAM for disk space and never renders hardcoded 65 GB / 15 GB in SteamLibraryActionBar', () => {
+      // 1. Steam HTML with Memory + Storage
+      const steamHtml =
+        '<strong>Minimum:</strong><br><ul class="bb_ul"><li><strong>Memory:</strong> 8 GB RAM<br></li><li><strong>Storage:</strong> 24.5 GB available space</li></ul>';
+      expect(launcherEngine.parseStorageRequirementBytes(steamHtml)).toBe(
+        Math.round(24.5 * 1024 ** 3)
+      );
+
+      // 2. GOG description text with Memory + Hard Drive Space
+      const gogText = 'Memory: 4 GB RAM, Hard Drive Space: 600 MB free disk space';
+      expect(launcherEngine.parseStorageRequirementBytes(gogText)).toBe(600 * 1024 ** 2);
+
+      // 3. Text with ONLY RAM -> undefined (must not mistake 16 GB RAM for storage)
+      expect(launcherEngine.parseStorageRequirementBytes('Memory: 16 GB RAM')).toBeUndefined();
+
+      // 4. SteamLibraryActionBar rendering for an uninstalled game with no installSize and no storage requirement in metadata
+      const uninstalledGame: CanonicalGame = {
+        id: 'steam-999111',
+        title: 'Mystery Indie RPG',
+        sortTitle: 'Mystery Indie RPG',
+        steamAppId: 999111,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '999111',
+            installed: false,
+          },
+        ],
+        headerImage: 'https://example.com/mystery.jpg',
+        developers: ['Indie Dev'],
+        publishers: ['Indie Pub'],
+        genres: ['RPG', 'Action'],
+        tags: ['Open World', 'RPG', 'Action'],
+      };
+
+      const states: any[] = [];
+      const renderActionBar = () => {
+        let stateIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect() {},
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          return (SteamLibraryActionBar as any)({
+            game: uninstalledGame,
+            metadata: {
+              appId: 999111,
+              name: 'Mystery Indie RPG',
+              systemRequirements: {
+                minimum: 'Memory: 16 GB RAM',
+              },
+            },
+          });
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      const html = renderToString(renderActionBar()).replace(/<!--\s*-->/g, '');
+      expect(html).toContain('Space Required');
+      expect(html).toContain('—');
+      expect(html).not.toContain('65 GB');
+      expect(html).not.toContain('15 GB');
+    });
+
+    it('Issue 3: initializes real download tasks with speedBytesPerSec: 0, etaSeconds: undefined, and real/zero totalBytes instead of fake 120.0 MB / 18.0 MB/s', async () => {
+      // Case A: Real download with estimatedSizeBytes provided
+      const resWithEstimate = await launcherEngine.installGame(
+        {
+          gameId: 'steam-1091500',
+          title: 'Cyberpunk 2077',
+          platformId: 'steam',
+          platformGameId: '1091500',
+          steamAppId: 1091500,
+          estimatedSizeBytes: 500000000,
+        },
+        {
+          platform: 'darwin',
+          homedir: path.join(tmpRoot, 'real-dl-home-a'),
+          userDataDir,
+          disableSteamMonitor: true,
+        }
+      );
+
+      expect(resWithEstimate.success).toBe(true);
+      expect(resWithEstimate.task.speedBytesPerSec).toBe(0);
+      expect(resWithEstimate.task.etaSeconds).toBeUndefined();
+      expect(resWithEstimate.task.totalBytes).toBe(500000000);
+      expect(resWithEstimate.task.totalBytes).not.toBe(125829120);
+      launcherEngine.cancelDownload(resWithEstimate.task.taskId);
+
+      // Case B: Real download with no estimatedSizeBytes provided
+      const resWithoutEstimate = await launcherEngine.installGame(
+        {
+          gameId: 'steam-1145360',
+          title: 'Hades',
+          platformId: 'steam',
+          platformGameId: '1145360',
+          steamAppId: 1145360,
+        },
+        {
+          platform: 'darwin',
+          homedir: path.join(tmpRoot, 'real-dl-home-b'),
+          userDataDir,
+          disableSteamMonitor: true,
+        }
+      );
+
+      expect(resWithoutEstimate.success).toBe(true);
+      expect(resWithoutEstimate.task.speedBytesPerSec).toBe(0);
+      expect(resWithoutEstimate.task.etaSeconds).toBeUndefined();
+      expect(resWithoutEstimate.task.totalBytes).toBe(0);
+      expect(resWithoutEstimate.task.totalBytes).not.toBe(125829120);
+      launcherEngine.cancelDownload(resWithoutEstimate.task.taskId);
+    });
+
+    it('Issue 6: repairs flattened macOS GOG bundles into Contents/, preserves Contents/ on re-flatten, restores +x permissions, and selects inner game binary over GOGLauncher', () => {
+      const tempInstallDir = path.join(tmpRoot, 'GOG-Flattened-Mac-Bundle', 'TestGame');
+
+      // Simulate broken/flattened macOS GOG bundle at root of install dir with 0o644 permissions
+      writeTempFile(
+        path.join(tempInstallDir, 'Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>GOGLauncher</string></dict></plist>`,
+        0o644
+      );
+      writeTempFile(path.join(tempInstallDir, 'PkgInfo'), 'APPL????', 0o644);
+      writeTempFile(
+        path.join(tempInstallDir, 'MacOS', 'GOGLauncher'),
+        '#!/bin/sh\necho "GOGLauncher wrapper"\n',
+        0o644
+      );
+      writeTempFile(
+        path.join(
+          tempInstallDir,
+          'Resources',
+          'game',
+          'TestGame.app',
+          'Contents',
+          'Info.plist'
+        ),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>TestGame_64</string></dict></plist>`,
+        0o644
+      );
+      writeTempFile(
+        path.join(
+          tempInstallDir,
+          'Resources',
+          'game',
+          'TestGame.app',
+          'Contents',
+          'MacOS',
+          'TestGame_64'
+        ),
+        '#!/bin/sh\necho "Real TestGame_64 binary"\n',
+        0o644
+      );
+
+      // 1. Repair via flattenGogNestedInstallDir and restore +x permissions via ensureMacExecutablePermissions
+      launcherEngine.flattenGogNestedInstallDir(tempInstallDir, '1234567890');
+      launcherEngine.ensureMacExecutablePermissions(tempInstallDir);
+
+      const restoredPlist = path.join(tempInstallDir, 'Contents', 'Info.plist');
+      const restoredLauncher = path.join(tempInstallDir, 'Contents', 'MacOS', 'GOGLauncher');
+      const restoredGameBin = path.join(
+        tempInstallDir,
+        'Contents',
+        'Resources',
+        'game',
+        'TestGame.app',
+        'Contents',
+        'MacOS',
+        'TestGame_64'
+      );
+
+      expect(fs.existsSync(restoredPlist)).toBe(true);
+      expect(fs.existsSync(restoredLauncher)).toBe(true);
+      expect(fs.existsSync(restoredGameBin)).toBe(true);
+      expect(fs.existsSync(path.join(tempInstallDir, 'Info.plist'))).toBe(false);
+
+      // 2. Subsequent call to flattenGogNestedInstallDir must NOT flatten Contents/
+      launcherEngine.flattenGogNestedInstallDir(tempInstallDir, '1234567890');
+      expect(fs.existsSync(restoredPlist)).toBe(true);
+      expect(fs.existsSync(restoredLauncher)).toBe(true);
+      expect(fs.existsSync(restoredGameBin)).toBe(true);
+
+      // 3. Both binaries must have executable (+x) permissions on POSIX filesystems
+      if (process.platform !== 'win32') {
+        expect((fs.statSync(restoredLauncher).mode & 0o111) !== 0).toBe(true);
+        expect((fs.statSync(restoredGameBin).mode & 0o111) !== 0).toBe(true);
+      }
+
+      // 4. findPrimaryExecutable must select inner TestGame_64 binary over GOGLauncher wrapper
+      launcherEngine.invalidateScanCaches();
+      const discovery = launcherEngine.findPrimaryExecutable(tempInstallDir, {
+        platform: 'darwin',
+        hintName: 'TestGame',
+      });
+      expect(discovery.executablePath).toBe(restoredGameBin);
+    });
+
+    it('Test A: syncGogFirstPartyLauncher registers macOS .app bundle path, legacy_build_id for generation 1, branch = NULL, ProductStates (3, 0), and unwrapped inner PlayTasks executable', () => {
+      const { DatabaseSync } = require('node:sqlite');
+      const tempDir = path.join(tmpRoot, 'GOG-Galaxy-Mac-V1');
+      const tempHome = path.join(tempDir, 'home');
+      const tempUserData = path.join(tempDir, 'userdata');
+      const mockDbPath = path.join(tempDir, 'galaxy-2.0.db');
+      const mockConfigPath = path.join(tempDir, 'config.json');
+
+      fs.mkdirSync(tempDir, { recursive: true });
+      fs.writeFileSync(
+        mockConfigPath,
+        JSON.stringify({ libraryPath: '/Users/Shared/GOG.com/Galaxy/Games', installationPaths: [] }),
+        'utf8'
+      );
+
+      // Seed Builds table with generation: 1 and legacy_build_id: '23581250'
+      const seedDb = new DatabaseSync(mockDbPath);
+      seedDb.exec(
+        'CREATE TABLE IF NOT EXISTS Builds (productId INTEGER, buildId INTEGER, generation INTEGER, manifest TEXT);'
+      );
+      seedDb
+        .prepare('INSERT INTO Builds (productId, buildId, generation, manifest) VALUES (?, ?, ?, ?)')
+        .run(
+          1207664543,
+          12511,
+          1,
+          JSON.stringify({
+            items: [{ build_id: '12511', legacy_build_id: '23581250', generation: 1 }],
+          })
+        );
+      seedDb.close();
+
+      // Create <tempDir>/Ascendant/Ascendant.app with GOGLauncher wrapper and inner Ascendant_64 64-bit Mach-O binary
+      const ascendantInstallDir = path.join(tempDir, 'Ascendant');
+      const outerAppPath = path.join(ascendantInstallDir, 'Ascendant.app');
+      const outerLauncherBin = path.join(outerAppPath, 'Contents', 'MacOS', 'GOGLauncher');
+      const innerGameBin = path.join(
+        outerAppPath,
+        'Contents',
+        'Resources',
+        'game',
+        'Ascendant.app',
+        'Contents',
+        'MacOS',
+        'Ascendant_64'
+      );
+
+      writeTempFile(
+        path.join(outerAppPath, 'Contents', 'Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>GOGLauncher</string></dict></plist>`,
+        0o644
+      );
+      writeTempFile(outerLauncherBin, '#!/bin/sh\necho "GOGLauncher"\n', 0o755);
+      writeTempFile(
+        path.join(
+          outerAppPath,
+          'Contents',
+          'Resources',
+          'game',
+          'Ascendant.app',
+          'Contents',
+          'Info.plist'
+        ),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Ascendant_64</string></dict></plist>`,
+        0o644
+      );
+
+      // Write 64-bit Mach-O header (0xfeedfacf LE = [0xcf, 0xfa, 0xed, 0xfe])
+      fs.mkdirSync(path.dirname(innerGameBin), { recursive: true });
+      const machO64Buf = Buffer.alloc(64);
+      machO64Buf.writeUInt32LE(0xfeedfacf, 0);
+      fs.writeFileSync(innerGameBin, machO64Buf, { mode: 0o755 });
+
+      const syncRes = launcherEngine.syncGogFirstPartyLauncher(
+        {
+          platformId: 'gog',
+          platformGameId: '1207664543',
+          title: 'Ascendant',
+          installPath: ascendantInstallDir,
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          gogGalaxyDbPath: mockDbPath,
+          gogGalaxyConfigPath: mockConfigPath,
+        }
+      );
+
+      expect(syncRes.synced).toBe(true);
+
+      const verifyDb = new DatabaseSync(mockDbPath);
+      try {
+        const ibp = verifyDb
+          .prepare('SELECT * FROM InstalledBaseProducts WHERE productId = ?')
+          .get(1207664543);
+        expect(ibp).toBeTruthy();
+        expect(ibp.installationPath).toBe(outerAppPath);
+        expect(Number(ibp.generation)).toBe(1);
+        expect(Number(ibp.buildId)).toBe(23581250);
+        expect(ibp.branch).toBeNull();
+
+        const bmt = verifyDb
+          .prepare('SELECT * FROM BaseModificationTargets WHERE productId = ?')
+          .get(1207664543);
+        expect(bmt).toBeTruthy();
+        expect(bmt.installationPath).toBe(outerAppPath);
+        expect(Number(bmt.buildId)).toBe(23581250);
+        expect(bmt.branch).toBeNull();
+
+        const ps = verifyDb
+          .prepare('SELECT * FROM ProductStates WHERE productId = ?')
+          .get(1207664543);
+        expect(ps).toBeTruthy();
+        expect(Number(ps.installation)).toBe(3);
+        expect(Number(ps.operation)).toBe(0);
+
+        const pt = verifyDb
+          .prepare(
+            'SELECT ptlp.executablePath FROM PlayTasks pt JOIN PlayTaskLaunchParameters ptlp ON pt.id = ptlp.playTaskId WHERE pt.gameReleaseKey = ?'
+          )
+          .get('gog_1207664543');
+        expect(pt).toBeTruthy();
+        expect(pt.executablePath).toBe(innerGameBin);
+
+        const pSettings = verifyDb
+          .prepare('SELECT * FROM ProductSettings WHERE gameReleaseKey = ?')
+          .get('gog_1207664543');
+        expect(pSettings).toBeTruthy();
+        expect(pSettings.gameReleaseKey).toBe('gog_1207664543');
+      } finally {
+        verifyDb.close();
+      }
+    });
+
+    it('Test B: inspectMacMachOHeader & findPrimaryExecutable detect 32-bit i386 Mach-O binaries and fall back to playable Windows .exe on macOS while preferring 64-bit Mach-O when available', () => {
+      const mockInstallDir = path.join(tmpRoot, 'Another-World-Dual-Dir');
+      const macAppBin = path.join(
+        mockInstallDir,
+        'Another World.app',
+        'Contents',
+        'MacOS',
+        'Another World'
+      );
+      const winExePath = path.join(mockInstallDir, 'anowor.exe');
+
+      writeTempFile(
+        path.join(mockInstallDir, 'Another World.app', 'Contents', 'Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Another World</string></dict></plist>`,
+        0o644
+      );
+
+      // 1. Write 32-bit i386 Mach-O header (0xfeedface LE = [0xce, 0xfa, 0xed, 0xfe])
+      fs.mkdirSync(path.dirname(macAppBin), { recursive: true });
+      const machO32Buf = Buffer.alloc(64);
+      machO32Buf.writeUInt32LE(0xfeedface, 0);
+      fs.writeFileSync(macAppBin, machO32Buf, { mode: 0o755 });
+
+      // Write playable Windows PE stub (< 64 bytes synthetic stub or valid PE)
+      writeTempFile(winExePath, 'MZ-valid-windows-pe-binary-stub', 0o755);
+
+      const header32 = launcherEngine.inspectMacMachOHeader(macAppBin);
+      expect(header32).toEqual({
+        isMachO: true,
+        is64Bit: false,
+        is32BitOnly: true,
+      });
+
+      launcherEngine.invalidateScanCaches();
+      const discovery32 = launcherEngine.findPrimaryExecutable(mockInstallDir, {
+        platform: 'darwin',
+        hintName: 'Another World',
+      });
+      expect(discovery32.executablePath).toBe(winExePath);
+      expect(discovery32.isWindowsBinaryOnMac).toBe(true);
+
+      // 2. Replace .app binary with 64-bit Mach-O header (0xfeedfacf LE) -> selects native macOS binary
+      const machO64Buf = Buffer.alloc(64);
+      machO64Buf.writeUInt32LE(0xfeedfacf, 0);
+      fs.writeFileSync(macAppBin, machO64Buf, { mode: 0o755 });
+
+      const header64 = launcherEngine.inspectMacMachOHeader(macAppBin);
+      expect(header64).toEqual({
+        isMachO: true,
+        is64Bit: true,
+        is32BitOnly: false,
+      });
+
+      launcherEngine.invalidateScanCaches();
+      const discovery64 = launcherEngine.findPrimaryExecutable(mockInstallDir, {
+        platform: 'darwin',
+        hintName: 'Another World',
+      });
+      expect(discovery64.executablePath).toBe(macAppBin);
+      expect(discovery64.isWindowsBinaryOnMac).toBe(false);
+    });
+
+    it('Test E: computeSmoothedDownloadSpeed stabilizes 0.5 MB/s decompression dips and 31 MB/s socket buffer bursts into a steady rolling speed', () => {
+      const MB = 1024 * 1024;
+      const taskId = 'speed-smooth-test-1';
+
+      // Tick 1 (t=1000ms): 18.0 MB/s steady start
+      const s1 = launcherEngine.computeSmoothedDownloadSpeed(taskId, {
+        bytesDownloaded: 18 * MB,
+        rawSpeedBytesPerSec: 18 * MB,
+        decompressedSpeedBytesPerSec: 18 * MB,
+        nowMs: 1000,
+      });
+      expect(s1).toBe(18 * MB);
+
+      // Tick 2 (t=2000ms): 0.5 MB/s single-chunk decompression pause while decompressed write is 22 MB/s
+      const s2 = launcherEngine.computeSmoothedDownloadSpeed(taskId, {
+        bytesDownloaded: Math.round(18.5 * MB),
+        rawSpeedBytesPerSec: Math.round(0.5 * MB),
+        decompressedSpeedBytesPerSec: 22 * MB,
+        nowMs: 2000,
+      });
+      // Must NOT plunge down to 0.5 MB/s — stays smoothly above 15 MB/s
+      expect(s2 / MB).toBeGreaterThanOrEqual(15);
+      expect(s2 / MB).toBeLessThanOrEqual(20);
+
+      // Tick 3 (t=3000ms): 31.0 MB/s OS kernel TCP receive buffer flush burst
+      const s3 = launcherEngine.computeSmoothedDownloadSpeed(taskId, {
+        bytesDownloaded: Math.round(49.5 * MB),
+        rawSpeedBytesPerSec: 31 * MB,
+        decompressedSpeedBytesPerSec: 16 * MB,
+        nowMs: 3000,
+      });
+      // Must NOT spike to 31 MB/s — stays smoothly in the 15-22 MB/s band
+      expect(s3 / MB).toBeGreaterThanOrEqual(15);
+      expect(s3 / MB).toBeLessThanOrEqual(22);
+
+      // Also verify clearStaleGogdlManifestCache removes cached manifest file
+      const fakeHome = path.join(tmpRoot, 'gogdl-cache-home');
+      const cachedManifest = path.join(
+        fakeHome,
+        'Library/Application Support/heroic_gogdl/manifests/2006298293'
+      );
+      writeTempFile(cachedManifest, '{"version": 2}', 0o644);
+      expect(fs.existsSync(cachedManifest)).toBe(true);
+      launcherEngine.clearStaleGogdlManifestCache('gog-2006298293', { homedir: fakeHome });
+      expect(fs.existsSync(cachedManifest)).toBe(false);
+    });
+
+    it('normalizes bare protocol-relative GOG avatar hashes to valid HTTPS CDN image URLs', async () => {
+      const storeSync = require('../electron/storeSync.cjs');
+      const { normalizeGogAvatarUrl: tsNormalize } = await import('../src/services/integrations/gogIntegration');
+
+      const bareProtocolRelative =
+        '//images.gog-statics.com/79dd38e771b528424a97b2282ec62cb245ace21f3aaadeae142518d6ad4066ef';
+      const expectedNormalized =
+        'https://images.gog-statics.com/79dd38e771b528424a97b2282ec62cb245ace21f3aaadeae142518d6ad4066ef_menu_user_av_big2.jpg';
+
+      expect(storeSync.normalizeGogAvatarUrl(bareProtocolRelative)).toBe(expectedNormalized);
+      expect(tsNormalize(bareProtocolRelative)).toBe(expectedNormalized);
+
+      // Also test when avatars map is provided from menu.gog.com/v1/account/basic
+      const avatarsMap = {
+        menu_user_av_big2:
+          'https://images.gog-statics.com/79dd38e771b528424a97b2282ec62cb245ace21f3aaadeae142518d6ad4066ef_menu_user_av_big2.jpg',
+      };
+      expect(storeSync.normalizeGogAvatarUrl(bareProtocolRelative, avatarsMap)).toBe(expectedNormalized);
+      expect(tsNormalize(bareProtocolRelative, avatarsMap)).toBe(expectedNormalized);
+    });
+  });
+
+  // =========================================================================
+  // 23. MACOS STEAM WINDOWS BUILD VIA CROSSOVER (steam-win-compat) & BOTTLE RESOLUTION
+  // =========================================================================
+  describe('23. macOS Steam Windows Build via CrossOver (steam-win-compat), Bottle VDF Discovery & Direct CrossOver Launch', () => {
+    it('Test 1: launcherEngine.getGameInstallInfo on darwin returns [steam-win-compat] for Windows-only Steam games and [steam-mac-native, steam-win-compat] when native macOS build exists', async () => {
+      const tempHome = path.join(tmpRoot, 'steam-compat-home-1');
+      const tempUserData = path.join(tmpRoot, 'steam-compat-userdata-1');
+      fs.mkdirSync(tempHome, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      const winOnlyInfo = await launcherEngine.getGameInstallInfo(
+        {
+          platformId: 'steam',
+          platformGameId: '1091500',
+          title: 'Cyberpunk 2077',
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          skipNetwork: true,
+          mockSteamAppDetails: {
+            platforms: {
+              windows: true,
+              mac: false,
+            },
+          },
+        }
+      );
+
+      expect(winOnlyInfo.availableInstallers).toHaveLength(1);
+      expect(winOnlyInfo.availableInstallers.map((i: any) => i.id)).toEqual([
+        'steam-win-compat',
+      ]);
+      expect(winOnlyInfo.availableInstallers[0].id).toBe('steam-win-compat');
+      expect(winOnlyInfo.availableInstallers[0].os).toBe('windows');
+      expect(winOnlyInfo.availableInstallers[0].name).toContain('Windows Build via CrossOver');
+
+      const macSupportedInfo = await launcherEngine.getGameInstallInfo(
+        {
+          platformId: 'steam',
+          platformGameId: '1086940',
+          title: "Baldur's Gate 3",
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          skipNetwork: true,
+          mockSteamAppDetails: {
+            platforms: {
+              windows: true,
+              mac: true,
+            },
+          },
+        }
+      );
+
+      expect(macSupportedInfo.availableInstallers.map((i: any) => i.id)).toEqual([
+        'steam-mac-native',
+        'steam-win-compat',
+      ]);
+    });
+
+    it('Test 2: GameInstallModal on macOS for a Windows-only Steam game pre-selects steam-win-compat by default, renders CrossOver Windows Steam Bottle pipeline, and passes installerId="steam-win-compat"', async () => {
+      const mockSteamWinGame: CanonicalGame = {
+        id: 'steam-1091500',
+        title: 'Cyberpunk 2077',
+        sortTitle: 'Cyberpunk 2077',
+        steamAppId: 1091500,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1091500',
+            installed: false,
+          },
+        ],
+        headerImage: 'https://cdn.example.com/cp2077.jpg',
+        developers: ['CD PROJEKT RED'],
+        publishers: ['CD PROJEKT RED'],
+        genres: ['RPG'],
+        tags: ['Cyberpunk'],
+      };
+
+      const infoSpy = vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
+        platformId: 'steam',
+        platformGameId: '1091500',
+        hostPlatform: 'darwin',
+        estimatedSizeBytes: 70 * 1024 * 1024 * 1024,
+        defaultInstallDir: '/Users/test/Library/Application Support/Steam/steamapps/common',
+        availableInstallDirs: ['/Users/test/Library/Application Support/Steam/steamapps/common'],
+        availableInstallers: [
+          {
+            id: 'steam-win-compat',
+            name: 'Cyberpunk 2077 (Windows Build via CrossOver — Windows Steam Bottle)',
+            os: 'windows',
+            totalSizeBytes: 70 * 1024 * 1024 * 1024,
+          },
+        ],
+        canDirectDownload: false,
+        requiresStoreClientFallback: true,
+        diskSpace: {
+          targetPath: '/Users/test/Library/Application Support/Steam/steamapps/common',
+          freeBytes: 250 * 1024 * 1024 * 1024,
+          totalBytes: 500 * 1024 * 1024 * 1024,
+          usedBytes: 250 * 1024 * 1024 * 1024,
+        },
+      } as any);
+
+      const startInstallSpy = vi.spyOn(launcherService, 'startInstall').mockResolvedValue({
+        success: true,
+      } as any);
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+
+      const findElements = (node: any, predicate: (el: any) => boolean, acc: any[] = []): any[] => {
+        if (!node || typeof node !== 'object') return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (predicate(node)) acc.push(node);
+        if (node.props && node.props.children) {
+          findElements(node.props.children, predicate, acc);
+        }
+        return acc;
+      };
+
+      const getTextContent = (node: any): string => {
+        if (node === null || node === undefined || typeof node === 'boolean') return '';
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (Array.isArray(node)) return node.map(getTextContent).join('');
+        if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+        return '';
+      };
+
+      const renderModal = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (GameInstallModal as any)({
+            isOpen: true,
+            game: mockSteamWinGame,
+            onClose: vi.fn(),
+          });
+          const html = renderToString(vnode);
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderModal();
+        await new Promise((r) => setTimeout(r, 15));
+        const loadedRender = renderModal();
+
+        expect(loadedRender.html).toContain('AUTO-DETECTED • WINDOWS BUILD (CROSSOVER / WINE)');
+        expect(loadedRender.html).toContain(
+          'CrossOver Windows Steam Bottle + Live ACF Progress Monitor'
+        );
+
+        const installBtn = findElements(
+          loadedRender.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Start Download & Install')
+        )[0];
+        expect(installBtn).toBeDefined();
+        await installBtn.props.onClick();
+
+        expect(startInstallSpy).toHaveBeenCalledTimes(1);
+        expect(startInstallSpy.mock.calls[0][0]).toMatchObject({
+          gameId: 'steam-1091500',
+          platformId: 'steam',
+          installerId: 'steam-win-compat',
+          os: 'windows',
+        });
+      } finally {
+        infoSpy.mockRestore();
+        startInstallSpy.mockRestore();
+      }
+    });
+
+    it('Test 3: launcherEngine.installGame on darwin with installerId="steam-win-compat" launches Windows Steam inside the CrossOver bottle and saves CrossOver bottle launch config', async () => {
+      const tempDir = path.join(tmpRoot, 'steam-compat-install-3');
+      const tempHome = path.join(tempDir, 'home');
+      const tempUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tempHome, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      const mockCrossoverWine = path.join(
+        tempHome,
+        'Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine'
+      );
+      const mockBottleSteamExe = path.join(
+        tempHome,
+        'Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steam.exe'
+      );
+      writeTempFile(mockCrossoverWine, '#!/bin/sh\nexit 0\n', 0o755);
+      writeTempFile(mockBottleSteamExe, 'MZ-mock-crossover-steam-exe', 0o755);
+
+      const openedUris: string[] = [];
+      const res = await launcherEngine.installGame(
+        {
+          gameId: 'steam-1091500',
+          title: 'Cyberpunk 2077',
+          platformId: 'steam',
+          platformGameId: '1091500',
+          steamAppId: 1091500,
+          installDir: tempDir,
+          installerId: 'steam-win-compat',
+          os: 'windows',
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          disableSteamMonitor: true,
+          onOpenExternal: (uri: string) => openedUris.push(uri),
+        }
+      );
+
+      expect(res.success).toBe(true);
+      // Should NOT open native macOS steam://install/1091500 when Wine Steam inside CrossOver bottle succeeds
+      expect(openedUris).toHaveLength(0);
+      expect(res.task.statusMessage).toContain('Installing via Windows Steam in CrossOver / Wine');
+
+      const launchConfigs = launcherEngine.getGameLaunchConfigs({ userDataDir: tempUserData });
+      expect(launchConfigs['steam-1091500']).toBeDefined();
+      expect(launchConfigs['steam-1091500'].preferredPlatformId).toBe('steam');
+      expect(launchConfigs['steam-1091500'].compatibilityLayer).toBe('crossover');
+      expect(launchConfigs['steam-1091500'].wineBottleName).toBe('Steam');
+    });
+
+    it('Test 4: Launching a Windows .exe inside steamapps/common/ on macOS runs via CrossOver (compatibility_layer:crossover) with SteamAppId env set and NEVER falls back to native macOS steam://rungameid', async () => {
+      const tempDir = path.join(tmpRoot, 'steam-win-exe-launch-mac');
+      const tempHome = path.join(tempDir, 'home');
+      const tempUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tempHome, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      const envDumpFile = path.join(tempDir, 'spawned-env.json');
+      const mockCrossoverWine = path.join(
+        tempHome,
+        'Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine'
+      );
+      writeTempFile(
+        mockCrossoverWine,
+        `#!/bin/sh
+printf '{"exe":"%s","SteamAppId":"%s","SteamGameId":"%s","CX_BOTTLE":"%s"}\\n' "$1" "$SteamAppId" "$SteamGameId" "$CX_BOTTLE" > "${envDumpFile}"
+sleep 1
+`,
+        0o755
+      );
+
+      const bottleDir = path.join(
+        tempHome,
+        'Library/Application Support/CrossOver/Bottles/Steam'
+      );
+      fs.mkdirSync(bottleDir, { recursive: true });
+
+      const gameInstallDir = path.join(
+        tempHome,
+        'Library/Application Support/Steam/steamapps/common/Quake II'
+      );
+      const quakeExe = path.join(gameInstallDir, 'rerelease/quake2.exe');
+      writeTempFile(quakeExe, 'MZ-fake-windows-pe-64bit-binary', 0o755);
+
+      const openedUris: string[] = [];
+      const launchRes = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-2320',
+          title: 'Quake II',
+          platformId: 'steam',
+          platformGameId: '2320',
+          steamAppId: 2320,
+          installPath: gameInstallDir,
+          executablePath: quakeExe,
+          isWindowsBinaryOnMac: true,
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          onOpenExternal: (uri: string) => openedUris.push(uri),
+        }
+      );
+
+      expect(launchRes.success).toBe(true);
+      expect(launchRes.session).toBeDefined();
+      expect(launchRes.session.launchMethod).toBe('compatibility_layer:crossover');
+      expect(openedUris).toHaveLength(0);
+      expect(launcherEngine.openedExternalUris).not.toContain('steam://rungameid/2320');
+
+      for (let i = 0; i < 20 && !fs.existsSync(envDumpFile); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(fs.existsSync(envDumpFile)).toBe(true);
+      const dumped = JSON.parse(fs.readFileSync(envDumpFile, 'utf8'));
+      expect(dumped.exe).toBe(quakeExe);
+      expect(dumped.SteamAppId).toBe('2320');
+      expect(dumped.SteamGameId).toBe('2320');
+      expect(dumped.CX_BOTTLE).toBe('Steam');
+
+      // Also verify steam_appid.txt was written beside the executable
+      const steamAppIdTxt = path.join(path.dirname(quakeExe), 'steam_appid.txt');
+      expect(fs.existsSync(steamAppIdTxt)).toBe(true);
+      expect(fs.readFileSync(steamAppIdTxt, 'utf8').trim()).toBe('2320');
+
+      await launcherEngine.stopGame({ gameId: 'steam-2320' });
+    });
+
+    it('Test 5: toLocalFsPath & discoverSteamLocations resolve Wine Z:\\ POSIX paths and CrossOver bottle C:\\ secondary libraries in libraryfolders.vdf', () => {
+      const tempDir = path.join(tmpRoot, 'steam-bottle-vdf-test');
+      const tempHome = path.join(tempDir, 'home');
+      const tempUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tempHome, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      // 1. Direct toLocalFsPath verification for Z:\ and C:\ paths
+      const hostExternalLib = path.join(tempDir, 'ExternalMacSteamLib');
+      fs.mkdirSync(path.join(hostExternalLib, 'steamapps'), { recursive: true });
+
+      const zWinePath = 'Z:' + hostExternalLib.replace(/\//g, '\\\\');
+      expect(launcherEngine.toLocalFsPath(zWinePath)).toBe(hostExternalLib);
+
+      const bottleDriveC = path.join(
+        tempHome,
+        'Library/Application Support/CrossOver/Bottles/Steam/drive_c'
+      );
+      const bottleSecondaryLib = path.join(bottleDriveC, 'SecondarySteamLibrary');
+      fs.mkdirSync(path.join(bottleSecondaryLib, 'steamapps'), { recursive: true });
+
+      expect(
+        launcherEngine.toLocalFsPath('C:\\\\SecondarySteamLibrary', [bottleDriveC])
+      ).toBe(bottleSecondaryLib);
+
+      // 2. discoverSteamLocations & scanAllInstalledGames with CrossOver bottle libraryfolders.vdf
+      const bottleSteamRoot = path.join(bottleDriveC, 'Program Files (x86)/Steam');
+      const bottleSteamApps = path.join(bottleSteamRoot, 'steamapps');
+      writeTempFile(
+        path.join(bottleSteamApps, 'libraryfolders.vdf'),
+        `"libraryfolders"
+{
+  "0"
+  {
+    "path" "C:\\\\Program Files (x86)\\\\Steam"
+  }
+  "1"
+  {
+    "path" "C:\\\\SecondarySteamLibrary"
+  }
+  "2"
+  {
+    "path" "${zWinePath}"
+  }
+}`
+      );
+
+      // Game inside bottle C:\SecondarySteamLibrary
+      writeTempFile(
+        path.join(bottleSecondaryLib, 'steamapps/appmanifest_2320.acf'),
+        `"AppState"
+{
+  "appid" "2320"
+  "name" "Quake II"
+  "installdir" "Quake II"
+  "SizeOnDisk" "1500000000"
+  "StateFlags" "4"
+}`
+      );
+      const quakeBottleExe = path.join(
+        bottleSecondaryLib,
+        'steamapps/common/Quake II/quake2.exe'
+      );
+      writeTempFile(quakeBottleExe, 'MZ-quake2-bottle-exe');
+
+      // Game inside Z:\ mapped host library
+      writeTempFile(
+        path.join(hostExternalLib, 'steamapps/appmanifest_1091500.acf'),
+        `"AppState"
+{
+  "appid" "1091500"
+  "name" "Cyberpunk 2077"
+  "installdir" "Cyberpunk 2077"
+  "SizeOnDisk" "70000000000"
+  "StateFlags" "4"
+}`
+      );
+      const cpHostExe = path.join(
+        hostExternalLib,
+        'steamapps/common/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe'
+      );
+      writeTempFile(cpHostExe, 'MZ-cp2077-exe');
+
+      const locations = launcherEngine.discoverSteamLocations({
+        platform: 'darwin',
+        homedir: tempHome,
+      });
+      expect(locations.steamappsDirs).toEqual(
+        expect.arrayContaining([
+          bottleSteamApps,
+          path.join(bottleSecondaryLib, 'steamapps'),
+          path.join(hostExternalLib, 'steamapps'),
+        ])
+      );
+
+      launcherEngine.invalidateScanCaches();
+      const scanRes = launcherEngine.scanAllInstalledGames({
+        platform: 'darwin',
+        homedir: tempHome,
+        userDataDir: tempUserData,
+      });
+      expect(scanRes.success).toBe(true);
+      const quakeRec = scanRes.installedGames.find(
+        (g: any) => g.platformId === 'steam' && g.platformGameId === '2320'
+      );
+      expect(quakeRec).toBeDefined();
+      expect(quakeRec.executablePath).toBe(quakeBottleExe);
+      expect(quakeRec.isWindowsBinaryOnMac).toBe(true);
+
+      const cpRec = scanRes.installedGames.find(
+        (g: any) => g.platformId === 'steam' && g.platformGameId === '1091500'
+      );
+      expect(cpRec).toBeDefined();
+      expect(cpRec.executablePath).toBe(cpHostExe);
+      expect(cpRec.isWindowsBinaryOnMac).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 24. EPIC GAMES ESTIMATED SIZE RESOLUTION FIX (BINARY MANIFEST & SLUG RESOLUTION)
+  // =========================================================================
+  describe('24. Epic Games Estimated Size Resolution Fix (parseEpicManifestBuffer & Slug-to-AppName Resolution)', () => {
+    const createSyntheticEpicBinaryManifest = (
+      chunkPartSizes: number[],
+      chunkDownloadSizes: bigint[]
+    ): Buffer => {
+      const zlib = require('node:zlib');
+
+      // 1. ManifestMeta (16 bytes)
+      const metaSize = 16;
+      const metaBuf = Buffer.alloc(metaSize);
+      metaBuf.writeUInt32LE(metaSize, 0);
+
+      // 2. ChunkDataList
+      const cdlCount = chunkDownloadSizes.length;
+      const cdlSize = 9 + cdlCount * (16 + 8 + 20 + 1 + 4 + 8);
+      const cdlBuf = Buffer.alloc(cdlSize);
+      cdlBuf.writeUInt32LE(cdlSize, 0);
+      cdlBuf.writeUInt8(0, 4);
+      cdlBuf.writeUInt32LE(cdlCount, 5);
+      const windowSizeOffset = 9 + cdlCount * (16 + 8 + 20 + 1);
+      for (let i = 0; i < cdlCount; i++) {
+        cdlBuf.writeUInt32LE(1048576, windowSizeOffset + i * 4);
+      }
+      const fileSizeOffset = windowSizeOffset + cdlCount * 4;
+      for (let i = 0; i < cdlCount; i++) {
+        cdlBuf.writeBigUInt64LE(chunkDownloadSizes[i], fileSizeOffset + i * 8);
+      }
+
+      // 3. FileManifestList
+      const fmlCount = chunkPartSizes.length;
+      // Layout: 9B header + filename (4B*N) + symlink (4B*N) + sha_hash+flags (21B*N) + install_tags (4B*N) + chunk_parts ((4B + 28B)*N)
+      const fmlSize = 9 + fmlCount * (4 + 4 + 21 + 4 + 4 + 28);
+      const fmlBuf = Buffer.alloc(fmlSize);
+      fmlBuf.writeUInt32LE(fmlSize, 0);
+      fmlBuf.writeUInt8(0, 4);
+      fmlBuf.writeUInt32LE(fmlCount, 5);
+
+      let pos = 9 + fmlCount * (4 + 4 + 21 + 4);
+      for (let i = 0; i < fmlCount; i++) {
+        // partCount = 1
+        fmlBuf.writeUInt32LE(1, pos);
+        pos += 4;
+        // struct_size = 28, guid = 16B zeros, offset = 0, size = chunkPartSizes[i]
+        fmlBuf.writeUInt32LE(28, pos);
+        fmlBuf.writeUInt32LE(chunkPartSizes[i], pos + 24);
+        pos += 28;
+      }
+
+      const uncompressedBody = Buffer.concat([metaBuf, cdlBuf, fmlBuf]);
+      const compressedBody = zlib.deflateSync(uncompressedBody);
+
+      const headerSize = 41;
+      const headerBuf = Buffer.alloc(headerSize);
+      headerBuf.writeUInt32LE(0x44bec00c, 0); // Epic binary manifest magic
+      headerBuf.writeUInt32LE(headerSize, 4);
+      headerBuf.writeUInt32LE(uncompressedBody.length, 8);
+      headerBuf.writeUInt32LE(compressedBody.length, 12);
+      headerBuf.writeUInt8(1, 36); // storedAs = 1 (zlib compressed)
+
+      return Buffer.concat([headerBuf, compressedBody]);
+    };
+
+    it('parses binary Epic .manifest buffers (0x44bec00c magic + zlib body) and resolves exact estimatedSizeBytes for Epic games via slug-to-appName lookup', async () => {
+      // Part 1: Direct unit test of launcherEngine.parseEpicManifestBuffer
+      // Two file chunk parts totaling 2,268,366,790 bytes (1,200,000,000 + 1,068,366,790)
+      const syntheticManifestBuf = createSyntheticEpicBinaryManifest(
+        [1200000000, 1068366790],
+        [1100000000n, 911455232n]
+      );
+
+      const parsedManifest = launcherEngine.parseEpicManifestBuffer(syntheticManifestBuf);
+      expect(parsedManifest).not.toBeNull();
+      expect(parsedManifest.diskSize).toBe(2268366790);
+      expect(parsedManifest.downloadSize).toBe(2011455232);
+
+      // Part 2: Integration test of launcherEngine.getGameInstallInfo with slug platformGameId='sable' and title='Sable'
+      const tempHome = path.join(tmpRoot, 'epic-manifest-home');
+      const tempUserData = path.join(tmpRoot, 'epic-manifest-userdata');
+      const legConfigDir = path.join(tempUserData, 'legendaryConfig', 'legendary');
+      const manifestsDir = path.join(legConfigDir, 'manifests');
+      fs.mkdirSync(manifestsDir, { recursive: true });
+      fs.mkdirSync(tempHome, { recursive: true });
+
+      const sableAppName = '9b48cbb1a0cf4a73b87ccbf4cde04b26';
+      fs.writeFileSync(
+        path.join(legConfigDir, 'assets.json'),
+        JSON.stringify(
+          {
+            Windows: [
+              {
+                app_name: sableAppName,
+                app_title: 'Sable',
+                asset_id: sableAppName,
+                build_version: '4.1.2',
+                catalog_item_id: 'f1927e4b2a9d41eab2df0c31ff724279',
+                namespace: '078c934e476645a982e12f1d7ce00c88',
+              },
+            ],
+            Mac: [],
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+
+      // Write cached binary .manifest file in legendaryConfig/legendary/manifests/
+      fs.writeFileSync(
+        path.join(manifestsDir, `${sableAppName}_Windows.manifest`),
+        syntheticManifestBuf
+      );
+
+      const resolvedInfo = launcherEngine.resolveEpicAppAndPlatforms(
+        {
+          platformId: 'epic',
+          platformGameId: 'sable',
+          title: 'Sable',
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+        }
+      );
+      expect(resolvedInfo.resolvedAppName).toBe(sableAppName);
+      expect(resolvedInfo.namespace).toBe('078c934e476645a982e12f1d7ce00c88');
+      expect(resolvedInfo.catalogItemId).toBe('f1927e4b2a9d41eab2df0c31ff724279');
+
+      const installInfo = await launcherEngine.getGameInstallInfo(
+        {
+          platformId: 'epic',
+          platformGameId: 'sable',
+          title: 'Sable',
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+          skipNetwork: true,
+        }
+      );
+
+      expect(installInfo.estimatedSizeBytes).toBe(2268366790);
+      expect(installInfo.availableInstallers.length).toBeGreaterThan(0);
+      expect(installInfo.availableInstallers[0].totalSizeBytes).toBe(2268366790);
+    });
+  });
+
+  // =========================================================================
+  // 25. CROSSOVER 26 PER-GAME SETTINGS, DYNAMIC LAUNCH PREVIEW & CONFIG MODAL
+  // =========================================================================
+  describe('25. CrossOver 26 Per-Game Settings (cxbottle.conf & user.reg), Dynamic Launch Mode Preview & GameLaunchConfigModal', () => {
+    it('Issue 2: applyCrossOverPerGameSettings writes CX_GRAPHICS_BACKEND (d3dmetal, dxmt, dxvk, wined3d, auto removal), D3DM_ENABLE_METALFX, DXMT_ENABLE_NVEXT, mutually exclusive WINEMSYNC/WINEESYNC to cxbottle.conf, and RetinaMode + LogPixels DPI to user.reg', () => {
+      const bottleDir = path.join(tmpRoot, 'crossover-26-bottle');
+      fs.mkdirSync(bottleDir, { recursive: true });
+      const cxbottleConfPath = path.join(bottleDir, 'cxbottle.conf');
+      const userRegPath = path.join(bottleDir, 'user.reg');
+
+      writeTempFile(
+        cxbottleConfPath,
+        `[Bottle]\n"BottleName" = "Steam"\n\n[EnvironmentVariables]\n"CUSTOM_VAR" = "keep_me"\n`
+      );
+      writeTempFile(
+        userRegPath,
+        `WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers]\n"Audio"="coreaudio"\n`
+      );
+
+      const mockLayer = {
+        id: 'crossover',
+        type: 'crossover',
+        name: 'CrossOver',
+      };
+
+      // 1. d3dmetal + DLSS enabled + High Resolution Mode enabled (192 DPI) + MSync enabled + HUDs
+      const env1: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        {
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverDlss: true,
+          crossoverHighResolutionMode: true,
+          wineMsync: true,
+          wineEsync: false,
+          metalHud: true,
+          dxvkHud: true,
+        },
+        env1,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+
+      expect(env1.CX_GRAPHICS_BACKEND).toBe('d3dmetal');
+      expect(env1.WINED3DMETAL).toBe('1');
+      expect(env1.D3DM_ENABLE_METALFX).toBe('1');
+      expect(env1.DXMT_ENABLE_NVEXT).toBe('1');
+      expect(env1.WINEMSYNC).toBe('1');
+      expect(env1.WINEESYNC).toBe('0');
+      expect(env1.MTL_HUD_ENABLED).toBe('1');
+      expect(env1.DXVK_HUD).toBe('devinfo,fps,frametimes');
+
+      const conf1 = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(conf1).toContain('"CUSTOM_VAR" = "keep_me"');
+      expect(conf1).toContain('"CX_GRAPHICS_BACKEND" = "d3dmetal"');
+      expect(conf1).toContain('"D3DM_ENABLE_METALFX" = "1"');
+      expect(conf1).toContain('"DXMT_ENABLE_NVEXT" = "1"');
+      expect(conf1).toContain('"WINEMSYNC" = "1"');
+      expect(conf1).toContain('"WINEESYNC" = "0"');
+
+      const reg1 = fs.readFileSync(userRegPath, 'utf8');
+      expect(reg1).toContain('[Software\\\\Wine\\\\Mac Driver]');
+      expect(reg1).toContain('"RetinaMode"="y"');
+      expect(reg1).toContain('[Control Panel\\\\Desktop]');
+      expect(reg1).toContain('"LogPixels"=dword:000000c0');
+
+      // 2. dxmt + High Resolution Mode disabled (96 DPI) + ESync enabled (MSync disabled)
+      const env2: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        {
+          crossoverGraphicsBackend: 'dxmt',
+          crossoverDlss: true,
+          crossoverHighResolutionMode: false,
+          wineMsync: false,
+          wineEsync: true,
+        },
+        env2,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(env2.CX_GRAPHICS_BACKEND).toBe('dxmt');
+      expect(env2.WINED3DMETAL).toBeUndefined();
+      expect(env2.D3DM_ENABLE_METALFX).toBe('1');
+      expect(env2.DXMT_ENABLE_NVEXT).toBe('1');
+      expect(env2.WINEMSYNC).toBe('0');
+      expect(env2.WINEESYNC).toBe('1');
+
+      const conf2 = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(conf2).toContain('"CX_GRAPHICS_BACKEND" = "dxmt"');
+      expect(conf2).toContain('"WINEMSYNC" = "0"');
+      expect(conf2).toContain('"WINEESYNC" = "1"');
+
+      const reg2 = fs.readFileSync(userRegPath, 'utf8');
+      expect(reg2).toContain('"RetinaMode"="n"');
+      expect(reg2).not.toContain('"RetinaMode"="y"');
+      expect(reg2).toContain('[Control Panel\\\\Desktop]');
+      expect(reg2).toContain('"LogPixels"=dword:00000060');
+      expect(reg2).not.toContain('"LogPixels"=dword:000000c0');
+
+      // 2b. Verify mutual exclusion when legacy config has both wineMsync: true and wineEsync: true, or both false
+      const envBothTrue: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        { wineMsync: true, wineEsync: true },
+        envBothTrue,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(envBothTrue.WINEMSYNC).toBe('1');
+      expect(envBothTrue.WINEESYNC).toBe('0');
+
+      const envBothFalse: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        { wineMsync: false, wineEsync: false },
+        envBothFalse,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(envBothFalse.WINEMSYNC).toBe('0');
+      expect(envBothFalse.WINEESYNC).toBe('0');
+
+      // 3. dxvk (forces DLSS off even if crossoverDlss: true) and wined3d
+      const env3: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        {
+          crossoverGraphicsBackend: 'dxvk',
+          crossoverDlss: true,
+        },
+        env3,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(env3.CX_GRAPHICS_BACKEND).toBe('dxvk');
+      expect(env3.D3DM_ENABLE_METALFX).toBe('0');
+      expect(env3.DXMT_ENABLE_NVEXT).toBe('0');
+      expect(fs.readFileSync(cxbottleConfPath, 'utf8')).toContain(
+        '"CX_GRAPHICS_BACKEND" = "dxvk"'
+      );
+
+      const env4: Record<string, string> = {};
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        {
+          crossoverGraphicsBackend: 'wined3d',
+          crossoverDlss: false,
+        },
+        env4,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(env4.CX_GRAPHICS_BACKEND).toBe('wined3d');
+      expect(fs.readFileSync(cxbottleConfPath, 'utf8')).toContain(
+        '"CX_GRAPHICS_BACKEND" = "wined3d"'
+      );
+
+      // 4. 'auto' removes CX_GRAPHICS_BACKEND from both env and cxbottle.conf
+      const env5: Record<string, string> = {
+        CX_GRAPHICS_BACKEND: 'wined3d',
+        WINED3DMETAL: '1',
+      };
+      launcherEngine.applyCrossOverPerGameSettings(
+        mockLayer,
+        {
+          crossoverGraphicsBackend: 'auto',
+          crossoverDlss: false,
+        },
+        env5,
+        bottleDir,
+        { skipRegistrySpawn: true }
+      );
+      expect(env5.CX_GRAPHICS_BACKEND).toBeUndefined();
+      expect(env5.WINED3DMETAL).toBeUndefined();
+      const conf5 = fs.readFileSync(cxbottleConfPath, 'utf8');
+      expect(conf5).not.toContain('CX_GRAPHICS_BACKEND');
+      expect(conf5).toContain('"CUSTOM_VAR" = "keep_me"');
+    });
+
+    it('Issue 3A: launcherService.resolveEffectiveLaunchModePreview returns accurate build classifications, dynamic badges, descriptions, and warnings across mac_native_app, windows_exe_on_mac, windows_native, and not_installed', async () => {
+      const svc = new LauncherService();
+
+      // 1. mac_native_app on darwin
+      const macGame: CanonicalGame = {
+        id: 'gog-1456460669',
+        title: "Baldur's Gate 3",
+        sortTitle: "Baldur's Gate 3",
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: '1456460669',
+            installed: true,
+            installPath: "/Applications/Baldur's Gate 3.app",
+            executablePath: "/Applications/Baldur's Gate 3.app/Contents/MacOS/BaldursGate3",
+            isWindowsBinaryOnMac: false,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      const macPreview = svc.resolveEffectiveLaunchModePreview(macGame, 'gog');
+      expect(macPreview.detectedBuildType).toBe('mac_native_app');
+      expect(macPreview.detectedBuildLabel).toContain('macOS Native App Bundle (.app)');
+      expect(macPreview.autoResolvedMethod).toBe('direct');
+      expect(macPreview.modeNotes.auto.badge).toBe('Recommended');
+      expect(macPreview.modeNotes.direct.badge).toBe('Native macOS');
+      expect(macPreview.modeNotes.compatibility_layer.badge).toBe('Not Needed');
+      expect(macPreview.modeNotes.compatibility_layer.warning).toContain(
+        'already a native macOS build'
+      );
+
+      // 2. windows_exe_on_mac on darwin
+      const winExeOnMacGame: CanonicalGame = {
+        id: 'steam-2320',
+        title: 'Quake II',
+        sortTitle: 'Quake II',
+        steamAppId: 2320,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '2320',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Quake II',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Quake II/quake2.exe',
+            isWindowsBinaryOnMac: true,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+
+      const winOnMacPreview = svc.resolveEffectiveLaunchModePreview(
+        winExeOnMacGame,
+        'steam',
+        { compatibilityLayer: 'crossover', wineBottleName: 'Steam' }
+      );
+      expect(winOnMacPreview.detectedBuildType).toBe('windows_exe_on_mac');
+      expect(winOnMacPreview.detectedBuildLabel).toContain('Windows Build (.exe) on macOS');
+      expect(winOnMacPreview.autoResolvedMethod).toBe('compatibility_layer');
+      expect(winOnMacPreview.autoResolvedSummary).toContain('Bottle: "Steam"');
+      expect(winOnMacPreview.modeNotes.auto.badge).toBe('Recommended');
+      expect(winOnMacPreview.modeNotes.compatibility_layer.badge).toBe('Active Pipeline');
+      expect(winOnMacPreview.modeNotes.direct.badge).toBe('Requires Translation');
+      expect(winOnMacPreview.modeNotes.direct.warning).toContain(
+        'macOS cannot execute Windows .exe binaries natively'
+      );
+      expect(winOnMacPreview.modeNotes.storefront_uri.badge).toBe('Caution on macOS');
+      expect(winOnMacPreview.modeNotes.storefront_uri.warning).toContain(
+        'cannot launch Windows-only .exe builds directly'
+      );
+
+      // 2b. Bottle-path install before executablePath is hydrated classifies as windows_exe_on_mac (keeping High Resolution Mode visible)
+      const unhydratedBottleInstallGame: CanonicalGame = {
+        id: 'gog-bioshock',
+        title: 'BioShock Remastered',
+        sortTitle: 'BioShock Remastered',
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: 'bioshock_remastered',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/OneLauncher/drive_c/GOG Games/BioShock Remastered',
+            executablePath: undefined,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+      const bottleInstallPreview = svc.resolveEffectiveLaunchModePreview(
+        unhydratedBottleInstallGame,
+        'gog'
+      );
+      expect(bottleInstallPreview.detectedBuildType).toBe('windows_exe_on_mac');
+      expect(bottleInstallPreview.autoResolvedMethod).toBe('compatibility_layer');
+      expect(bottleInstallPreview.visibleSections.compatibilityLayer).toBe(true);
+
+      // 3. windows_native on win32
+      (globalThis as any).window.electronAPI = { platform: 'win32' };
+      try {
+        const winNativePreview = svc.resolveEffectiveLaunchModePreview(winExeOnMacGame, 'steam');
+        expect(winNativePreview.detectedBuildType).toBe('windows_native');
+        expect(winNativePreview.detectedBuildLabel).toContain('Windows Native Build (.exe)');
+        expect(winNativePreview.autoResolvedMethod).toBe('direct');
+        expect(winNativePreview.modeNotes.direct.badge).toBe('Native Windows');
+        expect(winNativePreview.modeNotes.compatibility_layer.warning).toContain(
+          'not required on native Windows hosts'
+        );
+      } finally {
+        delete (globalThis as any).window.electronAPI;
+      }
+
+      // 4. not_installed
+      const uninstalledGame: CanonicalGame = {
+        id: 'epic-alanwake2',
+        title: 'Alan Wake 2',
+        sortTitle: 'Alan Wake 2',
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: 'AlanWake2',
+            installed: false,
+          },
+        ],
+        headerImage: '',
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+      };
+      const uninstalledPreview = svc.resolveEffectiveLaunchModePreview(uninstalledGame, 'epic');
+      expect(uninstalledPreview.detectedBuildType).toBe('not_installed');
+      expect(uninstalledPreview.isInstalled).toBe(false);
+      expect(uninstalledPreview.autoResolvedMethod).toBe('storefront_uri');
+      expect(uninstalledPreview.modeNotes.direct.badge).toBe('Requires Executable');
+      expect(uninstalledPreview.modeNotes.direct.warning).toContain(
+        'No local installation detected yet'
+      );
+
+      // 5. Verify saveLaunchConfig strips undefined keys and resetLaunchConfig deletes the config cleanly
+      const savedPayloads: any[] = [];
+      (globalThis as any).window.electronAPI = {
+        saveGameLaunchConfig: async (cfg: any) => {
+          savedPayloads.push(cfg);
+          return launcherEngine.saveGameLaunchConfig(cfg, { userDataDir });
+        },
+      };
+
+      await svc.saveLaunchConfig({
+        gameId: 'steam-2320',
+        launchMethod: 'compatibility_layer',
+        customExecutablePath: '/tmp/custom/quake2.exe',
+        crossoverGraphicsBackend: 'd3dmetal',
+        crossoverHighResolutionMode: true,
+        crossoverDlss: true,
+      });
+      expect(svc.getLaunchConfig('steam-2320')).toMatchObject({
+        gameId: 'steam-2320',
+        launchMethod: 'compatibility_layer',
+        customExecutablePath: '/tmp/custom/quake2.exe',
+        crossoverGraphicsBackend: 'd3dmetal',
+        crossoverHighResolutionMode: true,
+        crossoverDlss: true,
+      });
+
+      // Clear customExecutablePath and crossoverHighResolutionMode by passing undefined
+      await svc.saveLaunchConfig({
+        gameId: 'steam-2320',
+        launchMethod: 'auto',
+        customExecutablePath: undefined,
+        crossoverGraphicsBackend: 'auto',
+        crossoverHighResolutionMode: undefined,
+      });
+      expect(svc.getLaunchConfig('steam-2320')?.customExecutablePath).toBeUndefined();
+      expect(svc.getLaunchConfig('steam-2320')?.crossoverHighResolutionMode).toBeUndefined();
+
+      // Reset config completely
+      await svc.resetLaunchConfig('steam-2320');
+      expect(svc.getLaunchConfig('steam-2320')).toBeUndefined();
+      expect(savedPayloads[savedPayloads.length - 1]).toMatchObject({
+        gameId: 'steam-2320',
+        reset: true,
+      });
+      const diskConfigs = launcherEngine.getGameLaunchConfigs({ userDataDir });
+      expect(diskConfigs['steam-2320']).toBeUndefined();
+    });
+
+    it('Issue 3B: GameLaunchConfigModal renders CrossOver 26 controls, dynamic Launch Mode badges & warnings, enforces MSync/ESync mutual exclusion, disables DLSS on DXVK/WineD3D, and resets cleanly via resetLaunchConfig', async () => {
+      const mockGame: CanonicalGame = {
+        id: 'steam-2320',
+        title: 'Quake II',
+        sortTitle: 'Quake II',
+        steamAppId: 2320,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '2320',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/Steam/steamapps/common/Quake II',
+            executablePath:
+              '/Users/test/Library/Application Support/Steam/steamapps/common/Quake II/quake2.exe',
+            isWindowsBinaryOnMac: true,
+          },
+        ],
+        headerImage: '',
+        developers: ['id Software'],
+        publishers: ['Bethesda'],
+        genres: ['Action'],
+        tags: ['FPS'],
+      };
+
+      const detectSpy = vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue([
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['Steam', 'Default'],
+        },
+      ]);
+      const getLayersSpy = vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue([
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['Steam', 'Default'],
+        },
+      ]);
+      const saveSpy = vi.spyOn(launcherService, 'saveLaunchConfig').mockResolvedValue();
+      const resetSpy = vi.spyOn(launcherService, 'resetLaunchConfig').mockResolvedValue();
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+
+      const findElements = (node: any, predicate: (el: any) => boolean, acc: any[] = []): any[] => {
+        if (!node || typeof node !== 'object') return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (predicate(node)) acc.push(node);
+        if (node.props && node.props.children) {
+          findElements(node.props.children, predicate, acc);
+        }
+        return acc;
+      };
+
+      const getTextContent = (node: any): string => {
+        if (node === null || node === undefined || typeof node === 'boolean') return '';
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (Array.isArray(node)) return node.map(getTextContent).join('');
+        if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+        return '';
+      };
+
+      const renderConfigModal = () => {
+        let stateIdx = 0;
+        let effectIdx = 0;
+        const internals = (React as any)
+          .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = stateIdx++;
+            if (idx >= states.length) {
+              states.push(typeof initial === 'function' ? initial() : initial);
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (GameLaunchConfigModal as any)({
+            isOpen: true,
+            game: mockGame,
+            onClose: vi.fn(),
+          });
+          const html = renderToString(vnode);
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      try {
+        renderConfigModal();
+        await new Promise((r) => setTimeout(r, 15));
+        const r1 = renderConfigModal();
+
+        // Verify Detected Installation banner and dynamic Launch Mode badges
+        expect(r1.html).toContain('Detected Installation');
+        expect(r1.html).toContain('Windows Build (.exe) on macOS');
+        expect(r1.html).toContain('Active Pipeline');
+        expect(r1.html).toContain('Requires Translation');
+        expect(r1.html).toContain('Caution on macOS');
+        expect(r1.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
+        expect(r1.html).toContain('aria-label="Graphics Backend"');
+        expect(r1.html).toContain('aria-label="High Resolution Mode"');
+        expect(r1.html).toContain('DLSS (MetalFX Upscaling)');
+        expect(r1.html).toContain(
+          'Exposes NVIDIA DLSS to the game (powered by Apple MetalFX) for D3DMetal &amp; DXMT — select Quality / Balanced / Performance inside the game’s graphics settings.'
+        );
+
+        // Verify default MSync/ESync mutual exclusion state (MSync: ON, ESync: OFF)
+        const getMsyncBtn = (vnode: any) =>
+          findElements(
+            vnode,
+            (el) => el.type === 'button' && getTextContent(el).startsWith('MSync')
+          )[0];
+        const getEsyncBtn = (vnode: any) =>
+          findElements(
+            vnode,
+            (el) => el.type === 'button' && getTextContent(el).startsWith('ESync')
+          )[0];
+
+        expect(getTextContent(getMsyncBtn(r1.vnode))).toBe('MSyncON');
+        expect(getTextContent(getEsyncBtn(r1.vnode))).toBe('ESyncOFF');
+
+        // Click ESync button -> turns ESync ON and automatically turns MSync OFF
+        getEsyncBtn(r1.vnode).props.onClick();
+
+        const rEsync = renderConfigModal();
+        expect(getTextContent(getEsyncBtn(rEsync.vnode))).toBe('ESyncON');
+        expect(getTextContent(getMsyncBtn(rEsync.vnode))).toBe('MSyncOFF');
+
+        // Click MSync button -> turns MSync ON and automatically turns ESync OFF
+        getMsyncBtn(rEsync.vnode).props.onClick();
+
+        const rMsync = renderConfigModal();
+        expect(getTextContent(getMsyncBtn(rMsync.vnode))).toBe('MSyncON');
+        expect(getTextContent(getEsyncBtn(rMsync.vnode))).toBe('ESyncOFF');
+
+        // Switch Launch Mode to 'storefront_uri' -> verify dynamic warning banner appears
+        const storefrontModeBtn = findElements(
+          rMsync.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Storefront Client Protocol')
+        )[0];
+        expect(storefrontModeBtn).toBeDefined();
+        storefrontModeBtn.props.onClick();
+
+        const r2 = renderConfigModal();
+        expect(r2.html).toContain(
+          'Native macOS storefront clients (such as macOS Steam) cannot launch Windows-only .exe builds directly'
+        );
+
+        // Select Graphics Backend = 'dxvk' -> verify DLSS button becomes disabled ('Unavailable')
+        const backendSelect = findElements(
+          r2.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        expect(backendSelect).toBeDefined();
+        backendSelect.props.onChange({ target: { value: 'dxvk' } });
+
+        const r3 = renderConfigModal();
+        expect(r3.html).toContain('Not available with DXVK or WineD3D');
+        expect(r3.html).toContain('Unavailable');
+
+        // Select Graphics Backend = 'd3dmetal', enable High Resolution Mode and DLSS, and Save
+        const backendSelect3 = findElements(
+          r3.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        backendSelect3.props.onChange({ target: { value: 'd3dmetal' } });
+
+        const retinaSelect = findElements(
+          r3.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+        )[0];
+        retinaSelect.props.onChange({ target: { value: 'true' } });
+
+        const r4 = renderConfigModal();
+        const dlssBtn = findElements(
+          r4.vnode,
+          (el) =>
+            el.type === 'button' &&
+            (getTextContent(el) === 'Disabled' || getTextContent(el) === 'Enabled')
+        )[0];
+        expect(dlssBtn).toBeDefined();
+        dlssBtn.props.onClick();
+
+        const r5 = renderConfigModal();
+        const saveBtn = findElements(
+          r5.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Save Configuration')
+        )[0];
+        await saveBtn.props.onClick();
+
+        expect(saveSpy).toHaveBeenCalledTimes(1);
+        expect(saveSpy.mock.calls[0][0]).toMatchObject({
+          gameId: 'steam-2320',
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverHighResolutionMode: true,
+          crossoverDlss: true,
+          wineMsync: true,
+          wineEsync: false,
+        });
+
+        // Click "Reset to Auto-Detect" button -> verify resetLaunchConfig is called and state resets
+        const resetBtn = findElements(
+          r5.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Reset to Auto-Detect')
+        )[0];
+        expect(resetBtn).toBeDefined();
+        await resetBtn.props.onClick();
+
+        expect(resetSpy).toHaveBeenCalledWith('steam-2320', 'steam');
+        const rReset = renderConfigModal();
+        const resetBackendSelect = findElements(
+          rReset.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        expect(resetBackendSelect.props.value).toBe('auto');
+      } finally {
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        saveSpy.mockRestore();
+        resetSpy.mockRestore();
+      }
+    });
+  });
+
+  // =========================================================================
+  // 26. PER-GAME, PER-STOREFRONT LAUNCH & COMPATIBILITY SETTINGS (MULTI-STOREFRONT ISOLATION)
+  // =========================================================================
+  describe('26. Per-Game, Per-Storefront Launch & Compatibility Settings (Multi-Storefront Isolation)', () => {
+    it('isolates GOG and Steam launch profiles, customExecutablePath, installation status, GameLaunchConfigModal storefront switching, and per-storefront reset without cross-storefront leakage', async () => {
+      const tempGogExe = path.join(tmpRoot, 'GOG', 'Quake', 'quake_x64.exe');
+      writeTempFile(tempGogExe, 'MZ-quake-gog-win64-binary');
+
+      const multiStoreGame: CanonicalGame = {
+        id: 'steam-2310',
+        title: 'Quake',
+        sortTitle: 'Quake',
+        steamAppId: 2310,
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: '1435827232',
+            installed: false,
+            playtimeMinutes: 45,
+          },
+          {
+            platformId: 'steam',
+            platformGameId: '2310',
+            installed: false,
+            playtimeMinutes: 120,
+          },
+        ],
+        headerImage: '',
+        developers: ['id Software'],
+        publishers: ['Bethesda Softworks'],
+        genres: ['Action'],
+        tags: ['FPS'],
+      };
+
+      (globalThis as any).window.electronAPI = {
+        saveGameLaunchConfig: async (cfg: any) =>
+          launcherEngine.saveGameLaunchConfig(cfg, { userDataDir }),
+        getGameLaunchConfigs: async () =>
+          launcherEngine.getGameLaunchConfigs({ userDataDir }),
+      };
+
+      const detectSpy = vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue([
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['GOGBottle', 'SteamBottle', 'Default'],
+        },
+      ]);
+      const getLayersSpy = vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue([
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['GOGBottle', 'SteamBottle', 'Default'],
+        },
+      ]);
+
+      try {
+        // 1. Configure GOG ('gog') with compatibility_layer, GOGBottle, d3dmetal, High Resolution Mode true, and customExecutablePath
+        await launcherService.saveLaunchConfig(
+          {
+            gameId: multiStoreGame.id,
+            preferredPlatformId: 'gog',
+            launchMethod: 'compatibility_layer',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'GOGBottle',
+            crossoverGraphicsBackend: 'd3dmetal',
+            crossoverHighResolutionMode: true,
+            customExecutablePath: tempGogExe,
+          },
+          'gog'
+        );
+
+        // 2. Configure Steam ('steam') with storefront_uri, SteamBottle, dxmt, High Resolution Mode false, and NO customExecutablePath
+        await launcherService.saveLaunchConfig(
+          {
+            gameId: multiStoreGame.id,
+            preferredPlatformId: 'steam',
+            launchMethod: 'storefront_uri',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'SteamBottle',
+            crossoverGraphicsBackend: 'dxmt',
+            crossoverHighResolutionMode: false,
+            customExecutablePath: undefined,
+          },
+          'steam'
+        );
+
+        // 3. Verify launcherService.getLaunchConfig(game.id, 'gog') and ('steam') return isolated profiles with zero cross-storefront leakage
+        const gogCfg = launcherService.getLaunchConfig(multiStoreGame.id, 'gog');
+        const steamCfg = launcherService.getLaunchConfig(multiStoreGame.id, 'steam');
+
+        expect(gogCfg).toBeDefined();
+        expect(gogCfg?.preferredPlatformId).toBe('gog');
+        expect(gogCfg?.launchMethod).toBe('compatibility_layer');
+        expect(gogCfg?.wineBottleName).toBe('GOGBottle');
+        expect(gogCfg?.crossoverGraphicsBackend).toBe('d3dmetal');
+        expect(gogCfg?.crossoverHighResolutionMode).toBe(true);
+        expect(gogCfg?.customExecutablePath).toBe(tempGogExe);
+
+        expect(steamCfg).toBeDefined();
+        expect(steamCfg?.preferredPlatformId).toBe('steam');
+        expect(steamCfg?.launchMethod).toBe('storefront_uri');
+        expect(steamCfg?.wineBottleName).toBe('SteamBottle');
+        expect(steamCfg?.crossoverGraphicsBackend).toBe('dxmt');
+        expect(steamCfg?.crossoverHighResolutionMode).toBe(false);
+        expect(steamCfg?.customExecutablePath).toBeUndefined();
+
+        // 4. Verify on-disk persistence and launcherEngine.resolvePlatformLaunchConfig isolation
+        const diskConfigs = launcherEngine.getGameLaunchConfigs({ userDataDir });
+        const savedDiskEntry = diskConfigs[multiStoreGame.id];
+        expect(savedDiskEntry).toBeDefined();
+        expect(savedDiskEntry.platformConfigs?.gog).toMatchObject({
+          launchMethod: 'compatibility_layer',
+          wineBottleName: 'GOGBottle',
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverHighResolutionMode: true,
+          customExecutablePath: tempGogExe,
+        });
+        expect(savedDiskEntry.platformConfigs?.steam).toMatchObject({
+          launchMethod: 'storefront_uri',
+          wineBottleName: 'SteamBottle',
+          crossoverGraphicsBackend: 'dxmt',
+          crossoverHighResolutionMode: false,
+        });
+        expect(savedDiskEntry.platformConfigs?.steam?.customExecutablePath).toBeUndefined();
+
+        const resolvedGogEngineCfg = launcherEngine.resolvePlatformLaunchConfig(
+          savedDiskEntry,
+          'gog'
+        );
+        expect(resolvedGogEngineCfg.launchMethod).toBe('compatibility_layer');
+        expect(resolvedGogEngineCfg.wineBottleName).toBe('GOGBottle');
+        expect(resolvedGogEngineCfg.customExecutablePath).toBe(tempGogExe);
+
+        const resolvedSteamEngineCfg = launcherEngine.resolvePlatformLaunchConfig(
+          savedDiskEntry,
+          'steam'
+        );
+        expect(resolvedSteamEngineCfg.launchMethod).toBe('storefront_uri');
+        expect(resolvedSteamEngineCfg.wineBottleName).toBe('SteamBottle');
+        expect(resolvedSteamEngineCfg.customExecutablePath).toBeUndefined();
+
+        const resolvedUnconfiguredEpic = launcherEngine.resolvePlatformLaunchConfig(
+          savedDiskEntry,
+          'epic'
+        );
+        expect(resolvedUnconfiguredEpic.launchMethod).toBe('auto');
+        expect(resolvedUnconfiguredEpic.customExecutablePath).toBeUndefined();
+
+        // 5. Verify launcherService.isGameInstalled is true for GOG and false for Steam
+        expect(launcherService.isGameInstalled(multiStoreGame, 'gog')).toBe(true);
+        expect(launcherService.isGameInstalled(multiStoreGame, 'steam')).toBe(false);
+        expect(
+          launcherService.getInstalledRecordForGame(multiStoreGame, 'gog')?.executablePath
+        ).toBe(tempGogExe);
+        expect(
+          launcherService.getInstalledRecordForGame(multiStoreGame, 'steam')
+        ).toBeUndefined();
+
+        // 6. Verify GameLaunchConfigModal opened with initialPlatformId="gog" loads GOG settings,
+        // switching to Steam button swaps all form fields to Steam settings, and saving preserves both in platformConfigs
+        const states: any[] = [];
+        const effectsRan: boolean[] = [];
+
+        const findElements = (
+          node: any,
+          predicate: (el: any) => boolean,
+          acc: any[] = []
+        ): any[] => {
+          if (!node || typeof node !== 'object') return acc;
+          if (Array.isArray(node)) {
+            for (const child of node) findElements(child, predicate, acc);
+            return acc;
+          }
+          if (predicate(node)) acc.push(node);
+          if (node.props && node.props.children) {
+            findElements(node.props.children, predicate, acc);
+          }
+          return acc;
+        };
+
+        const getTextContent = (node: any): string => {
+          if (node === null || node === undefined || typeof node === 'boolean') return '';
+          if (typeof node === 'string' || typeof node === 'number') return String(node);
+          if (Array.isArray(node)) return node.map(getTextContent).join('');
+          if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+          return '';
+        };
+
+        const onSavedMock = vi.fn();
+        const renderMultiStoreModal = () => {
+          let stateIdx = 0;
+          let effectIdx = 0;
+          const internals = (React as any)
+            .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+          const prevH = internals.H;
+          internals.H = {
+            useState(initial: any) {
+              const idx = stateIdx++;
+              if (idx >= states.length) {
+                states.push(typeof initial === 'function' ? initial() : initial);
+              }
+              const setState = (updater: any) => {
+                states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+              };
+              return [states[idx], setState];
+            },
+            useEffect(fn: () => any) {
+              const idx = effectIdx++;
+              if (!effectsRan[idx]) {
+                effectsRan[idx] = true;
+                fn();
+              }
+            },
+            useRef(initial: any) {
+              return { current: initial };
+            },
+            useMemo(fn: () => any) {
+              return fn();
+            },
+            useCallback(fn: any) {
+              return fn;
+            },
+          };
+          try {
+            const vnode = (GameLaunchConfigModal as any)({
+              isOpen: true,
+              game: multiStoreGame,
+              initialPlatformId: 'gog',
+              onClose: vi.fn(),
+              onSaved: onSavedMock,
+            });
+            const html = renderToString(vnode);
+            return { vnode, html };
+          } finally {
+            internals.H = prevH;
+          }
+        };
+
+        renderMultiStoreModal();
+        await new Promise((r) => setTimeout(r, 15));
+        const modalGogRender = renderMultiStoreModal();
+
+        // Confirm GOG pill is active and GOG fields are loaded
+        const gogPillBtn = findElements(
+          modalGogRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'gog'
+        )[0];
+        const steamPillBtn = findElements(
+          modalGogRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'steam'
+        )[0];
+        expect(gogPillBtn).toBeDefined();
+        expect(steamPillBtn).toBeDefined();
+        expect(gogPillBtn.props['aria-pressed']).toBe(true);
+        expect(steamPillBtn.props['aria-pressed']).toBe(false);
+
+        const exeInputGog = findElements(
+          modalGogRender.vnode,
+          (el) =>
+            el.type === 'input' &&
+            typeof el.props?.placeholder === 'string' &&
+            el.props.placeholder.includes('Auto-detected from storefront manifest')
+        )[0];
+        expect(exeInputGog).toBeDefined();
+        expect(exeInputGog.props.value).toBe(tempGogExe);
+
+        const backendSelectGog = findElements(
+          modalGogRender.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        expect(backendSelectGog.props.value).toBe('d3dmetal');
+
+        const retinaSelectGog = findElements(
+          modalGogRender.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+        )[0];
+        expect(retinaSelectGog.props.value).toBe('true');
+
+        const bottleSelectGog = findElements(
+          modalGogRender.vnode,
+          (el) => el.type === 'select' && el.props?.value === 'GOGBottle'
+        )[0];
+        expect(bottleSelectGog).toBeDefined();
+
+        // Click Steam storefront button -> verify form fields swap to Steam profile
+        steamPillBtn.props.onClick();
+        const modalSteamRender = renderMultiStoreModal();
+
+        const gogPillAfter = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'gog'
+        )[0];
+        const steamPillAfter = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'steam'
+        )[0];
+        expect(gogPillAfter.props['aria-pressed']).toBe(false);
+        expect(steamPillAfter.props['aria-pressed']).toBe(true);
+
+        const exeInputSteam = findElements(
+          modalSteamRender.vnode,
+          (el) =>
+            el.type === 'input' &&
+            typeof el.props?.placeholder === 'string' &&
+            el.props.placeholder.includes('Auto-detected from storefront manifest')
+        )[0];
+        expect(exeInputSteam.props.value).toBe('');
+
+        const backendSelectSteam = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
+        )[0];
+        expect(backendSelectSteam.props.value).toBe('dxmt');
+
+        const retinaSelectSteam = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'High Resolution Mode'
+        )[0];
+        expect(retinaSelectSteam.props.value).toBe('false');
+
+        const bottleSelectSteam = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'select' && el.props?.value === 'SteamBottle'
+        )[0];
+        expect(bottleSelectSteam).toBeDefined();
+
+        // Save Configuration from the modal and verify both GOG and Steam profiles remain intact in platformConfigs
+        const saveBtn = findElements(
+          modalSteamRender.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Save Configuration')
+        )[0];
+        expect(saveBtn).toBeDefined();
+        await saveBtn.props.onClick();
+
+        expect(onSavedMock).toHaveBeenCalledTimes(1);
+        const savedModalConfig = onSavedMock.mock.calls[0][0];
+        expect(savedModalConfig.platformConfigs?.gog).toMatchObject({
+          launchMethod: 'compatibility_layer',
+          wineBottleName: 'GOGBottle',
+          crossoverGraphicsBackend: 'd3dmetal',
+          crossoverHighResolutionMode: true,
+          customExecutablePath: tempGogExe,
+        });
+        expect(savedModalConfig.platformConfigs?.steam).toMatchObject({
+          launchMethod: 'storefront_uri',
+          wineBottleName: 'SteamBottle',
+          crossoverGraphicsBackend: 'dxmt',
+          crossoverHighResolutionMode: false,
+        });
+        expect(savedModalConfig.platformConfigs?.steam?.customExecutablePath).toBeUndefined();
+
+        // 7. Reset only GOG profile -> preserves Steam profile
+        await launcherService.resetLaunchConfig(multiStoreGame.id, 'gog');
+
+        expect(launcherService.getLaunchConfig(multiStoreGame.id, 'gog')).toBeUndefined();
+        expect(launcherService.isGameInstalled(multiStoreGame, 'gog')).toBe(false);
+
+        const remainingSteamCfg = launcherService.getLaunchConfig(multiStoreGame.id, 'steam');
+        expect(remainingSteamCfg).toBeDefined();
+        expect(remainingSteamCfg?.launchMethod).toBe('storefront_uri');
+        expect(remainingSteamCfg?.wineBottleName).toBe('SteamBottle');
+        expect(remainingSteamCfg?.crossoverGraphicsBackend).toBe('dxmt');
+
+        const diskAfterGogReset = launcherEngine.getGameLaunchConfigs({ userDataDir });
+        expect(diskAfterGogReset[multiStoreGame.id]?.platformConfigs?.gog).toBeUndefined();
+        expect(diskAfterGogReset[multiStoreGame.id]?.platformConfigs?.steam).toBeDefined();
+
+        // 8. Reset remaining Steam profile -> removes the config entry cleanly from memory and disk
+        await launcherService.resetLaunchConfig(multiStoreGame.id, 'steam');
+
+        expect(launcherService.getLaunchConfig(multiStoreGame.id, 'steam')).toBeUndefined();
+        expect(launcherService.getLaunchConfig(multiStoreGame.id)).toBeUndefined();
+
+        const diskAfterFullReset = launcherEngine.getGameLaunchConfigs({ userDataDir });
+        expect(diskAfterFullReset[multiStoreGame.id]).toBeUndefined();
+      } finally {
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        delete (globalThis as any).window.electronAPI;
+      }
+    });
+  });
+
+  // =========================================================================
+  // 27. DYNAMIC & INSTALL-TYPE-RELEVANT LAUNCH & COMPATIBILITY SETTINGS PER STOREFRONT
+  // =========================================================================
+  describe('27. Dynamic & Install-Type-Relevant Launch & Compatibility Settings per Storefront', () => {
+    it('dynamically hides CrossOver/Wine controls for macOS Native (.app) storefronts while revealing them for Windows (.exe) storefronts and adapts CrossOver vs Wine/GPTK rendering sub-panels', async () => {
+      const hybridStoreGame: CanonicalGame = {
+        id: 'steam-2310-hybrid',
+        title: 'Quake',
+        sortTitle: 'Quake',
+        steamAppId: 2310,
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: '1435827232',
+            installed: true,
+            installPath: '/Applications/Quake.app',
+            executablePath: '/Applications/Quake.app/Contents/MacOS/Quake',
+            isWindowsBinaryOnMac: false,
+            playtimeMinutes: 45,
+          },
+          {
+            platformId: 'steam',
+            platformGameId: '2310',
+            installed: true,
+            installPath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Quake',
+            executablePath:
+              '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Quake/Quake_x64.exe',
+            isWindowsBinaryOnMac: true,
+            playtimeMinutes: 120,
+          },
+        ],
+        headerImage: '',
+        developers: ['id Software'],
+        publishers: ['Bethesda Softworks'],
+        genres: ['Action'],
+        tags: ['FPS'],
+      };
+
+      (globalThis as any).window.electronAPI = {
+        saveGameLaunchConfig: async (cfg: any) =>
+          launcherEngine.saveGameLaunchConfig(cfg, { userDataDir }),
+        getGameLaunchConfigs: async () =>
+          launcherEngine.getGameLaunchConfigs({ userDataDir }),
+      };
+
+      const mockLayers: CompatibilityLayerInfo[] = [
+        {
+          id: 'crossover',
+          type: 'crossover',
+          name: 'CrossOver',
+          binaryPath: '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine',
+          availableBottles: ['Steam', 'Default'],
+        },
+        {
+          id: 'whisky',
+          type: 'whisky',
+          name: 'Whisky',
+          binaryPath:
+            '/Users/test/Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64',
+          availableBottles: ['WhiskyBottle'],
+        },
+      ];
+
+      const detectSpy = vi
+        .spyOn(launcherService, 'detectCompatibilityLayers')
+        .mockResolvedValue(mockLayers);
+      const getLayersSpy = vi
+        .spyOn(launcherService, 'getCompatibilityLayers')
+        .mockReturnValue(mockLayers);
+
+      try {
+        // 1. Verify resolveEffectiveLaunchModePreview for GOG (mac_native_app)
+        const gogPreview = launcherService.resolveEffectiveLaunchModePreview(
+          hybridStoreGame,
+          'gog'
+        );
+        expect(gogPreview.detectedBuildType).toBe('mac_native_app');
+        expect(gogPreview.availableModes).toEqual(['auto', 'direct', 'storefront_uri']);
+        expect(gogPreview.availableModes).not.toContain('compatibility_layer');
+        expect(gogPreview.visibleSections).toEqual({
+          compatibilityLayer: false,
+          crossoverRendering: false,
+          nativeMacMetalHud: true,
+          executableAndArgs: true,
+          environmentAndHooks: true,
+        });
+
+        // 2. Verify resolveEffectiveLaunchModePreview for Steam (windows_exe_on_mac)
+        const steamPreview = launcherService.resolveEffectiveLaunchModePreview(
+          hybridStoreGame,
+          'steam'
+        );
+        expect(steamPreview.detectedBuildType).toBe('windows_exe_on_mac');
+        expect(steamPreview.availableModes).toEqual([
+          'auto',
+          'direct',
+          'compatibility_layer',
+          'storefront_uri',
+        ]);
+        expect(steamPreview.visibleSections).toEqual({
+          compatibilityLayer: true,
+          crossoverRendering: true,
+          nativeMacMetalHud: false,
+          executableAndArgs: true,
+          environmentAndHooks: true,
+        });
+
+        // 3. Render GameLaunchConfigModal with initialPlatformId="gog" (macOS Native .app storefront)
+        const states: any[] = [];
+        const effectsRan: boolean[] = [];
+
+        const findElements = (
+          node: any,
+          predicate: (el: any) => boolean,
+          acc: any[] = []
+        ): any[] => {
+          if (!node || typeof node !== 'object') return acc;
+          if (Array.isArray(node)) {
+            for (const child of node) findElements(child, predicate, acc);
+            return acc;
+          }
+          if (predicate(node)) acc.push(node);
+          if (node.props && node.props.children) {
+            findElements(node.props.children, predicate, acc);
+          }
+          return acc;
+        };
+
+        const getTextContent = (node: any): string => {
+          if (node === null || node === undefined || typeof node === 'boolean') return '';
+          if (typeof node === 'string' || typeof node === 'number') return String(node);
+          if (Array.isArray(node)) return node.map(getTextContent).join('');
+          if (typeof node === 'object' && node.props) return getTextContent(node.props.children);
+          return '';
+        };
+
+        const onSavedMock = vi.fn();
+        const renderHybridModal = () => {
+          let stateIdx = 0;
+          let effectIdx = 0;
+          const internals = (React as any)
+            .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+          const prevH = internals.H;
+          internals.H = {
+            useState(initial: any) {
+              const idx = stateIdx++;
+              if (idx >= states.length) {
+                states.push(typeof initial === 'function' ? initial() : initial);
+              }
+              const setState = (updater: any) => {
+                states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+              };
+              return [states[idx], setState];
+            },
+            useEffect(fn: () => any) {
+              const idx = effectIdx++;
+              if (!effectsRan[idx]) {
+                effectsRan[idx] = true;
+                fn();
+              }
+            },
+            useRef(initial: any) {
+              return { current: initial };
+            },
+            useMemo(fn: () => any) {
+              return fn();
+            },
+            useCallback(fn: any) {
+              return fn;
+            },
+          };
+          try {
+            const vnode = (GameLaunchConfigModal as any)({
+              isOpen: true,
+              game: hybridStoreGame,
+              initialPlatformId: 'gog',
+              onClose: vi.fn(),
+              onSaved: onSavedMock,
+            });
+            const html = renderToString(vnode);
+            return { vnode, html };
+          } finally {
+            internals.H = prevH;
+          }
+        };
+
+        renderHybridModal();
+        await new Promise((r) => setTimeout(r, 15));
+        const gogRender = renderHybridModal();
+
+        // Verify modal header for macOS Native build
+        expect(gogRender.html).toContain('Launch Settings (macOS Native)');
+
+        // Verify GOG native macOS .app does NOT render compatibility layer or CrossOver controls
+        expect(gogRender.html).not.toContain(
+          'macOS Compatibility Layer (CrossOver / Whisky / Wine / GPTK)'
+        );
+        expect(gogRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
+        expect(gogRender.html).not.toContain('aria-label="Graphics Backend"');
+        expect(gogRender.html).not.toContain('DLSS (MetalFX Upscaling)');
+        expect(gogRender.html).not.toContain('Target Bottle Name');
+        expect(gogRender.html).not.toContain('MSync');
+        expect(gogRender.html).not.toContain('ESync');
+        expect(gogRender.html).not.toContain('DXVK HUD');
+
+        // Verify GOG native macOS .app DOES render native macOS Metal HUD section and only 3 native-relevant launch modes
+        expect(gogRender.html).toContain('data-section="native-mac-settings"');
+        expect(gogRender.html).toContain('Apple Metal Performance HUD (MTL_HUD_ENABLED=1)');
+        expect(gogRender.html).toContain('Auto-Detect (Recommended)');
+        expect(gogRender.html).toContain('Direct Application (.app / binary)');
+        expect(gogRender.html).toContain('Storefront Client Protocol');
+        expect(gogRender.html).not.toContain(
+          'macOS Compatibility Layer (CrossOver / Wine / GPTK)'
+        );
+
+        // 4. Click the Steam storefront pill (which has Windows .exe installed on macOS)
+        const steamPillBtn = findElements(
+          gogRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'steam'
+        )[0];
+        expect(steamPillBtn).toBeDefined();
+        steamPillBtn.props.onClick();
+
+        const steamRender = renderHybridModal();
+        expect(steamRender.html).toContain('Launch &amp; Compatibility Settings');
+        expect(steamRender.html).not.toContain('data-section="native-mac-settings"');
+        expect(steamRender.html).toContain('data-section="compatibility-layer-settings"');
+        expect(steamRender.html).toContain(
+          'macOS Compatibility Layer (CrossOver / Whisky / Wine / GPTK)'
+        );
+        expect(steamRender.html).toContain('CrossOver 26 Rendering &amp; Display Settings');
+        expect(steamRender.html).toContain('aria-label="Graphics Backend"');
+        expect(steamRender.html).toContain('aria-label="High Resolution Mode"');
+        expect(steamRender.html).toContain('DLSS (MetalFX Upscaling)');
+        expect(steamRender.html).toContain('MSync');
+        expect(steamRender.html).toContain('ESync');
+        expect(steamRender.html).toContain('DXVK HUD');
+
+        // 5. Switch Compatibility Runner on the Steam storefront to 'whisky'
+        const runnerSelect = findElements(
+          steamRender.vnode,
+          (el) => el.type === 'select' && el.props?.['aria-label'] === 'Compatibility Runner'
+        )[0];
+        expect(runnerSelect).toBeDefined();
+        runnerSelect.props.onChange({ target: { value: 'whisky' } });
+
+        const whiskyRender = renderHybridModal();
+        // Verify CrossOver-only Graphics Backend and DLSS hide while Wine/GPTK Display & Sync settings remain visible
+        expect(whiskyRender.html).not.toContain('CrossOver 26 Rendering &amp; Display Settings');
+        expect(whiskyRender.html).not.toContain('aria-label="Graphics Backend"');
+        expect(whiskyRender.html).not.toContain('DLSS (MetalFX Upscaling)');
+        expect(whiskyRender.html).toContain('Wine / GPTK Display &amp; Synchronization Settings');
+        expect(whiskyRender.html).toContain('aria-label="High Resolution Mode"');
+        expect(whiskyRender.html).toContain('MSync');
+        expect(whiskyRender.html).toContain('ESync');
+
+        // 6. Switch back to GOG (mac_native_app), toggle native Metal HUD on, and click Save Configuration
+        const gogPillBtn2 = findElements(
+          whiskyRender.vnode,
+          (el) => el.type === 'button' && el.props?.['data-storefront-pill'] === 'gog'
+        )[0];
+        expect(gogPillBtn2).toBeDefined();
+        gogPillBtn2.props.onClick();
+
+        const gogRender2 = renderHybridModal();
+        const nativeSection = findElements(
+          gogRender2.vnode,
+          (el) => el.props?.['data-section'] === 'native-mac-settings'
+        )[0];
+        expect(nativeSection).toBeDefined();
+        const metalHudToggleBtn = findElements(
+          nativeSection,
+          (el) => el.type === 'button'
+        )[0];
+        expect(metalHudToggleBtn).toBeDefined();
+        metalHudToggleBtn.props.onClick();
+
+        const gogRender3 = renderHybridModal();
+        const saveBtn = findElements(
+          gogRender3.vnode,
+          (el) => el.type === 'button' && getTextContent(el).includes('Save Configuration')
+        )[0];
+        expect(saveBtn).toBeDefined();
+        await saveBtn.props.onClick();
+
+        expect(onSavedMock).toHaveBeenCalledTimes(1);
+        const savedConfig = onSavedMock.mock.calls[0][0];
+
+        // Verify platformConfigs.gog has metalHud: true and no Wine/CrossOver pollution
+        expect(savedConfig.platformConfigs?.gog).toBeDefined();
+        expect(savedConfig.platformConfigs?.gog?.metalHud).toBe(true);
+        expect(savedConfig.platformConfigs?.gog?.compatibilityLayer).toBeUndefined();
+        expect(savedConfig.platformConfigs?.gog?.wineBottleName).toBeUndefined();
+        expect(savedConfig.platformConfigs?.gog?.crossoverGraphicsBackend).toBeUndefined();
+
+        // Verify platformConfigs.steam retains its compatibility layer settings (with MSync/ESync mutual exclusion)
+        expect(savedConfig.platformConfigs?.steam).toBeDefined();
+        expect(savedConfig.platformConfigs?.steam?.compatibilityLayer).toBe('whisky');
+        expect(savedConfig.platformConfigs?.steam?.wineMsync).toBe(true);
+        expect(savedConfig.platformConfigs?.steam?.wineEsync).toBe(false);
+
+        await launcherService.resetLaunchConfig(hybridStoreGame.id);
+      } finally {
+        detectSpy.mockRestore();
+        getLayersSpy.mockRestore();
+        delete (globalThis as any).window.electronAPI;
+      }
+    });
+  });
+
+  // =========================================================================
+  // 28. UNIVERSAL STOREFRONT LAUNCH MANIFEST & EXECUTABLE DISCOVERY
+  // =========================================================================
+  describe('28. Universal Storefront Launch Manifest & Executable Discovery (Steam appinfo.vdf, Source Engine gameinfo.txt, & Bottle PE Filtering)', () => {
+    const buildSyntheticSteamAppInfoVdfV29 = (
+      appId: number,
+      launchEntries: Array<{
+        id: string;
+        executable: string;
+        arguments?: string;
+        workingdir?: string;
+        type?: string;
+        oslist?: string;
+      }>
+    ): Buffer => {
+      const stringTable: string[] = [];
+      const getStringIdx = (str: string): number => {
+        let idx = stringTable.indexOf(str);
+        if (idx === -1) {
+          idx = stringTable.length;
+          stringTable.push(str);
+        }
+        return idx;
+      };
+
+      const chunks: Buffer[] = [];
+      const pushByte = (b: number) => chunks.push(Buffer.from([b]));
+      const pushUInt32 = (v: number) => {
+        const b = Buffer.alloc(4);
+        b.writeUInt32LE(v, 0);
+        chunks.push(b);
+      };
+      const pushCString = (s: string) => {
+        chunks.push(Buffer.from(s + '\0', 'utf8'));
+      };
+      const beginObject = (key: string) => {
+        pushByte(0x00);
+        pushUInt32(getStringIdx(key));
+      };
+      const endObject = () => {
+        pushByte(0x08);
+      };
+      const writeStringProp = (key: string, val: string) => {
+        pushByte(0x01);
+        pushUInt32(getStringIdx(key));
+        pushCString(val);
+      };
+
+      beginObject('appinfo');
+      beginObject('config');
+      beginObject('launch');
+      for (const entry of launchEntries) {
+        beginObject(entry.id);
+        writeStringProp('executable', entry.executable);
+        if (entry.arguments) writeStringProp('arguments', entry.arguments);
+        if (entry.workingdir) writeStringProp('workingdir', entry.workingdir);
+        if (entry.type) writeStringProp('type', entry.type);
+        if (entry.oslist) {
+          beginObject('config');
+          writeStringProp('oslist', entry.oslist);
+          endObject();
+        }
+        endObject();
+      }
+      endObject(); // launch
+      endObject(); // config
+      endObject(); // appinfo
+      endObject(); // root
+
+      const payloadBuf = Buffer.concat(chunks);
+      const entryMetaBuf = Buffer.alloc(60, 0); // 60 bytes metadata in v28/v29
+      const entryHeaderBuf = Buffer.alloc(8);
+      entryHeaderBuf.writeUInt32LE(appId, 0);
+      entryHeaderBuf.writeUInt32LE(entryMetaBuf.length + payloadBuf.length, 4);
+
+      const sentinelBuf = Buffer.alloc(4, 0); // appId = 0 terminator
+
+      const entriesBlock = Buffer.concat([
+        entryHeaderBuf,
+        entryMetaBuf,
+        payloadBuf,
+        sentinelBuf,
+      ]);
+
+      const headerBuf = Buffer.alloc(16);
+      headerBuf.writeUInt32LE(0x07564429, 0); // v29 magic
+      headerBuf.writeUInt32LE(1, 4); // universe
+      const strTableOffset = 16 + entriesBlock.length;
+      headerBuf.writeBigInt64LE(BigInt(strTableOffset), 8);
+
+      const strCountBuf = Buffer.alloc(4);
+      strCountBuf.writeUInt32LE(stringTable.length, 0);
+      const strBuffers = stringTable.map((s) => Buffer.from(s + '\0', 'utf8'));
+
+      return Buffer.concat([headerBuf, entriesBlock, strCountBuf, ...strBuffers]);
+    };
+
+    const createValidWinPeBuffer = (is64Bit = false): Buffer => {
+      const buf = Buffer.alloc(512, 0);
+      buf.write('MZ', 0, 'ascii');
+      buf.writeUInt32LE(0x80, 0x3c); // e_lfanew = 0x80
+      buf.write('PE\0\0', 0x80, 'ascii');
+      buf.writeUInt16LE(is64Bit ? 0x8664 : 0x014c, 0x84);
+      buf.writeUInt16LE(2, 0x80 + 24 + 68); // Subsystem = Windows GUI (2)
+      return buf;
+    };
+
+    it('resolves Portal (hl2.exe + "-game portal -steam") via binary appinfo.vdf v29, Source Engine gameinfo.txt fallback, Bottle PE Filtering (ignoring bin/itemtest.com & bin/hammer.exe), and spawns CrossOver with ["-game", "portal", "-steam"]', async () => {
+      const tempDir = path.join(tmpRoot, 'universal-portal-manifest-discovery');
+      const tempHome = path.join(tempDir, 'home');
+      const tempUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tempHome, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      const bottleDir = path.join(
+        tempHome,
+        'Library/Application Support/CrossOver/Bottles/OneLauncher'
+      );
+      const bottleSteamRoot = path.join(bottleDir, 'drive_c/Program Files (x86)/Steam');
+      const bottleSteamApps = path.join(bottleSteamRoot, 'steamapps');
+      const portalInstallDir = path.join(bottleSteamApps, 'common/Portal');
+      fs.mkdirSync(portalInstallDir, { recursive: true });
+
+      // 1. Populate Portal directory inside CrossOver bottle with:
+      // - hl2.exe (valid Windows GUI PE binary)
+      // - bin/itemtest.com (executable permissions 0o755 + MZ header — must NEVER be picked)
+      // - bin/hammer.exe (SDK level editor — must NEVER be picked)
+      // - portal/gameinfo.txt (Source Engine mod manifest)
+      const hl2Exe = path.join(portalInstallDir, 'hl2.exe');
+      const itemtestCom = path.join(portalInstallDir, 'bin/itemtest.com');
+      const hammerExe = path.join(portalInstallDir, 'bin/hammer.exe');
+      const gameInfoTxt = path.join(portalInstallDir, 'portal/gameinfo.txt');
+
+      fs.mkdirSync(path.dirname(hl2Exe), { recursive: true });
+      fs.writeFileSync(hl2Exe, createValidWinPeBuffer(false), { mode: 0o755 });
+
+      fs.mkdirSync(path.dirname(itemtestCom), { recursive: true });
+      fs.writeFileSync(itemtestCom, createValidWinPeBuffer(false), { mode: 0o755 });
+      fs.writeFileSync(hammerExe, createValidWinPeBuffer(false), { mode: 0o755 });
+
+      writeTempFile(
+        gameInfoTxt,
+        `"GameInfo"\n{\n\tgame\t"Portal"\n\ttype\tsingleplayer_only\n}\n`
+      );
+
+      // Verify findPrimaryExecutable selects hl2.exe with isWindowsBinaryOnMac: true and ignores bin/itemtest.com & bin/hammer.exe
+      launcherEngine.invalidateScanCaches();
+      const primaryDiscovered = launcherEngine.findPrimaryExecutable(portalInstallDir, {
+        platform: 'darwin',
+        hintName: 'Portal',
+      });
+      expect(primaryDiscovered.executablePath).toBe(hl2Exe);
+      expect(primaryDiscovered.isWindowsBinaryOnMac).toBe(true);
+      expect(primaryDiscovered.executablePath).not.toContain('itemtest.com');
+      expect(primaryDiscovered.executablePath).not.toContain('hammer.exe');
+
+      // Verify resolveDefaultEngineLaunchArguments discovers "-game portal -steam" from portal/gameinfo.txt
+      const engineDefaultArgs = launcherEngine.resolveDefaultEngineLaunchArguments(
+        portalInstallDir,
+        hl2Exe
+      );
+      expect(engineDefaultArgs).toBe('-game portal -steam');
+
+      // 2. Write synthetic binary Steam appinfo.vdf (v29 0x07564429) and appmanifest_400.acf
+      const appinfoVdfPath = path.join(bottleSteamRoot, 'appcache/appinfo.vdf');
+      fs.mkdirSync(path.dirname(appinfoVdfPath), { recursive: true });
+      const vdfBuffer = buildSyntheticSteamAppInfoVdfV29(400, [
+        {
+          id: '0',
+          executable: 'hl2.exe',
+          arguments: '-game portal -steam',
+          type: 'default',
+          oslist: 'windows',
+        },
+        {
+          id: '1',
+          executable: 'bin\\hammer.exe',
+          type: 'tool',
+          oslist: 'windows',
+        },
+      ]);
+      fs.writeFileSync(appinfoVdfPath, vdfBuffer);
+
+      writeTempFile(
+        path.join(bottleSteamApps, 'appmanifest_400.acf'),
+        `"AppState"
+{
+  "appid" "400"
+  "Universe" "1"
+  "name" "Portal"
+  "StateFlags" "4"
+  "installdir" "Portal"
+  "SizeOnDisk" "4347052354"
+  "buildid" "19017868"
+}`
+      );
+
+      launcherEngine.invalidateScanCaches();
+      const appInfoSpec = launcherEngine.resolveSteamAppInfoLaunchSpec(
+        bottleSteamApps,
+        400,
+        portalInstallDir,
+        { platform: 'darwin' }
+      );
+      expect(appInfoSpec).not.toBeNull();
+      expect(appInfoSpec.executablePath).toBe(hl2Exe);
+      expect(appInfoSpec.launchArguments).toBe('-game portal -steam');
+      expect(appInfoSpec.isWindowsBinaryOnMac).toBe(true);
+
+      // Verify scanAllInstalledGames populates executablePath = hl2.exe and launchArguments = "-game portal -steam"
+      const scanRes = launcherEngine.scanAllInstalledGames({
+        platform: 'darwin',
+        homedir: tempHome,
+        userDataDir: tempUserData,
+        forceRefresh: true,
+      });
+      expect(scanRes.success).toBe(true);
+      const scannedPortal = scanRes.installedGames.find(
+        (g: any) => g.platformId === 'steam' && String(g.platformGameId) === '400'
+      );
+      expect(scannedPortal).toBeDefined();
+      expect(scannedPortal.executablePath).toBe(hl2Exe);
+      expect(scannedPortal.launchArguments).toBe('-game portal -steam');
+      expect(scannedPortal.isWindowsBinaryOnMac).toBe(true);
+
+      // 3. Verify launchGame heals a stale/corrupted executablePath (bin/itemtest.com) to hl2.exe
+      // and spawns CrossOver wine with [hl2.exe, "-game", "portal", "-steam"] without requiring custom user launch arguments
+      const argsDumpFile = path.join(tempDir, 'crossover-portal-args.json');
+      const mockCrossoverWine = path.join(
+        tempHome,
+        'Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine'
+      );
+      writeTempFile(
+        mockCrossoverWine,
+        `#!/bin/sh
+printf '{"exe":"%s","arg1":"%s","arg2":"%s","arg3":"%s","CX_BOTTLE":"%s","SteamAppId":"%s"}\\n' "$1" "$2" "$3" "$4" "$CX_BOTTLE" "$SteamAppId" > "${argsDumpFile}"
+sleep 1
+`,
+        0o755
+      );
+
+      const launchRes = await launcherEngine.launchGame(
+        {
+          gameId: 'steam-400',
+          title: 'Portal',
+          platformId: 'steam',
+          platformGameId: '400',
+          steamAppId: 400,
+          installPath: portalInstallDir,
+          executablePath: itemtestCom, // Intentionally pass stale/bad .com binary to verify self-healing
+          isWindowsBinaryOnMac: false,
+        },
+        {
+          platform: 'darwin',
+          homedir: tempHome,
+          userDataDir: tempUserData,
+        }
+      );
+
+      expect(launchRes.success).toBe(true);
+      expect(launchRes.session).toBeDefined();
+      expect(launchRes.session.executablePath).toBe(hl2Exe);
+      expect(launchRes.session.launchMethod).toBe('compatibility_layer:crossover');
+
+      for (let i = 0; i < 20 && !fs.existsSync(argsDumpFile); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(fs.existsSync(argsDumpFile)).toBe(true);
+      const spawned = JSON.parse(fs.readFileSync(argsDumpFile, 'utf8'));
+      expect(spawned.exe).toBe(hl2Exe);
+      expect([spawned.arg1, spawned.arg2, spawned.arg3]).toEqual(['-game', 'portal', '-steam']);
+      expect(spawned.CX_BOTTLE).toBe('OneLauncher');
+      expect(spawned.SteamAppId).toBe('400');
+
+      await launcherEngine.stopGame({ gameId: 'steam-400' });
+    });
+  });
+
+  // =========================================================================
+  // 29. COMPLETE CROSSOVER STEAM BOTTLE UNINSTALL & ORPHANED MANIFEST SELF-HEALING
+  // =========================================================================
+  describe('29. Complete CrossOver Steam Bottle Uninstall & Orphaned Manifest Self-Healing (Bug 1 & Bug 2)', () => {
+    it('Bug 1 & Bug 2: uninstallGame removes CrossOver bottle appmanifest_*.acf, common/<installdir>, libraryfolders.vdf app entry, Windows .url / cxmenu wrappers, and ~/Applications/CrossOver/<Game>.app without launching macOS Steam or deleting Steam.app', async () => {
+      const tempDir = path.join(tmpRoot, 'crossover-bottle-uninstall-2320');
+      const tmpHome = path.join(tempDir, 'home');
+      const tmpUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tmpHome, { recursive: true });
+      fs.mkdirSync(tmpUserData, { recursive: true });
+
+      const bottleRoot = path.join(
+        tmpHome,
+        'Library/Application Support/CrossOver/Bottles/OneLauncher'
+      );
+      const steamappsDir = path.join(
+        bottleRoot,
+        'drive_c/Program Files (x86)/Steam/steamapps'
+      );
+      const acfPath = path.join(steamappsDir, 'appmanifest_2320.acf');
+      const gameCommonDir = path.join(steamappsDir, 'common/Quake 2');
+      const quakeExePath = path.join(gameCommonDir, 'quake2.exe');
+      const libraryFoldersVdfPath = path.join(steamappsDir, 'libraryfolders.vdf');
+
+      writeTempFile(
+        acfPath,
+        `"AppState"
+{
+  "appid" "2320"
+  "Universe" "1"
+  "name" "Quake II"
+  "StateFlags" "4"
+  "installdir" "Quake 2"
+  "SizeOnDisk" "6677996420"
+}`
+      );
+      writeTempFile(quakeExePath, 'MZ-quake2-64bit-pe-executable', 0o755);
+      writeTempFile(
+        libraryFoldersVdfPath,
+        `"libraryfolders"
+{
+  "0"
+  {
+    "path" "C:\\\\Program Files (x86)\\\\Steam"
+    "apps"
+    {
+      "2320"		"6677996420"
+      "400"		"4347052354"
+    }
+  }
+}
+`
+      );
+
+      const desktopUrlPath = path.join(
+        bottleRoot,
+        'drive_c/users/crossover/Desktop/Quake II.url'
+      );
+      const startMenuUrlPath = path.join(
+        bottleRoot,
+        'drive_c/users/crossover/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Steam/Quake II.url'
+      );
+      const cxmenuUrlPath = path.join(
+        bottleRoot,
+        'desktopdata/cxmenu/StartMenu.C^5Fusers_crossover_Desktop/Quake II.url'
+      );
+
+      writeTempFile(
+        desktopUrlPath,
+        `[InternetShortcut]\nURL=steam://rungameid/2320\nIconIndex=0\n`
+      );
+      writeTempFile(
+        startMenuUrlPath,
+        `[InternetShortcut]\nURL=steam://rungameid/2320\nIconIndex=0\n`
+      );
+      writeTempFile(
+        cxmenuUrlPath,
+        `#!/bin/sh\nexec "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine" --bottle "OneLauncher" --start "C:\\\\users\\\\crossover\\\\Desktop\\\\Quake II.url" "$@"\n`,
+        0o755
+      );
+
+      const quakeAppDir = path.join(tmpHome, 'Applications/CrossOver/Steam/Quake II.app');
+      const quakePlistPath = path.join(quakeAppDir, 'Contents/Info.plist');
+      writeTempFile(
+        quakePlistPath,
+        `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.codeweavers.CrossOverHelper.quake2</string>
+  <key>CFBundleName</key>
+  <string>Quake II</string>
+  <key>CXHelperAppBottleName</key>
+  <string>OneLauncher</string>
+  <key>CrossOverHelperCommand</key>
+  <string>${cxmenuUrlPath}</string>
+</dict>
+</plist>`
+      );
+
+      const steamAppDir = path.join(tmpHome, 'Applications/CrossOver/Steam/Steam.app');
+      const steamPlistPath = path.join(steamAppDir, 'Contents/Info.plist');
+      writeTempFile(
+        steamPlistPath,
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.codeweavers.CrossOverHelper.steam</string>
+  <key>CFBundleName</key>
+  <string>Steam</string>
+  <key>CXHelperAppBottleName</key>
+  <string>OneLauncher</string>
+</dict>
+</plist>`
+      );
+
+      const mockOpenExternal = vi.fn();
+      const prevOpenedLen = launcherEngine.openedExternalUris.length;
+
+      const uninstallRes = await launcherEngine.uninstallGame(
+        {
+          gameId: 'steam-2320',
+          platformId: 'steam',
+          platformGameId: '2320',
+          steamAppId: 2320,
+          title: 'Quake II',
+          installPath: gameCommonDir,
+        },
+        {
+          platform: 'darwin',
+          homedir: tmpHome,
+          userDataDir: tmpUserData,
+          openExternal: mockOpenExternal,
+          onOpenExternal: mockOpenExternal,
+        }
+      );
+
+      expect(uninstallRes.success).toBe(true);
+      // Verify macOS Steam is NEVER launched via steam://uninstall/2320
+      expect(mockOpenExternal).not.toHaveBeenCalled();
+      expect(launcherEngine.openedExternalUris.slice(prevOpenedLen)).not.toContain(
+        'steam://uninstall/2320'
+      );
+
+      // Verify manifest, common/<installdir>, libraryfolders.vdf entry, and CrossOver shortcuts are removed
+      expect(fs.existsSync(acfPath)).toBe(false);
+      expect(fs.existsSync(gameCommonDir)).toBe(false);
+      const updatedVdf = fs.readFileSync(libraryFoldersVdfPath, 'utf8');
+      expect(updatedVdf).not.toContain('"2320"');
+      expect(updatedVdf).toContain('"400"');
+
+      expect(fs.existsSync(desktopUrlPath)).toBe(false);
+      expect(fs.existsSync(startMenuUrlPath)).toBe(false);
+      expect(fs.existsSync(cxmenuUrlPath)).toBe(false);
+      expect(fs.existsSync(quakeAppDir)).toBe(false);
+      // Verify Steam.app is preserved
+      expect(fs.existsSync(steamAppDir)).toBe(true);
+
+      // Verify subsequent scan returns 0 installed records for 2320
+      const scanRes = launcherEngine.scanAllInstalledGames({
+        platform: 'darwin',
+        homedir: tmpHome,
+        userDataDir: tmpUserData,
+        forceRefresh: true,
+      });
+      expect(scanRes.success).toBe(true);
+      expect(
+        scanRes.installedGames.filter((g: any) => String(g.platformGameId) === '2320')
+      ).toHaveLength(0);
+      expect(scanRes.installedSteamAppIds).not.toContain(2320);
+    });
+
+    it('Bug 2: scanAllInstalledGames self-heals orphaned CrossOver bottle appmanifest_*.acf and save-only common/<installdir> leftovers with zero executables', () => {
+      const tempDir = path.join(tmpRoot, 'crossover-bottle-self-heal-2320');
+      const tmpHome = path.join(tempDir, 'home');
+      const tmpUserData = path.join(tempDir, 'userdata');
+      fs.mkdirSync(tmpHome, { recursive: true });
+      fs.mkdirSync(tmpUserData, { recursive: true });
+
+      const bottleRoot = path.join(
+        tmpHome,
+        'Library/Application Support/CrossOver/Bottles/OneLauncher'
+      );
+      const steamappsDir = path.join(
+        bottleRoot,
+        'drive_c/Program Files (x86)/Steam/steamapps'
+      );
+      const acfPath = path.join(steamappsDir, 'appmanifest_2320.acf');
+      const gameCommonDir = path.join(steamappsDir, 'common/Quake 2');
+      const saveFileOnly = path.join(gameCommonDir, 'baseq2/save/game.ssv');
+      const cfgFileOnly = path.join(gameCommonDir, 'baseq2/q2config.cfg');
+      const libraryFoldersVdfPath = path.join(steamappsDir, 'libraryfolders.vdf');
+
+      writeTempFile(
+        acfPath,
+        `"AppState"
+{
+  "appid" "2320"
+  "Universe" "1"
+  "name" "Quake II"
+  "StateFlags" "4"
+  "installdir" "Quake 2"
+  "SizeOnDisk" "6677996420"
+}`
+      );
+      // Only cloud save/config files left behind after in-Steam uninstall (zero .exe or .app)
+      writeTempFile(saveFileOnly, 'save-state-bytes');
+      writeTempFile(cfgFileOnly, 'bind TAB "inven"');
+      writeTempFile(
+        libraryFoldersVdfPath,
+        `"libraryfolders"
+{
+  "0"
+  {
+    "path" "C:\\\\Program Files (x86)\\\\Steam"
+    "apps"
+    {
+      "2320"		"6677996420"
+    }
+  }
+}
+`
+      );
+
+      const quakeAppDir = path.join(tmpHome, 'Applications/CrossOver/Steam/Quake II.app');
+      writeTempFile(
+        path.join(quakeAppDir, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.codeweavers.CrossOverHelper.quake2</string>
+  <key>CFBundleName</key>
+  <string>Quake II</string>
+  <key>CXHelperAppBottleName</key>
+  <string>OneLauncher</string>
+</dict>
+</plist>`
+      );
+
+      const steamAppDir = path.join(tmpHome, 'Applications/CrossOver/Steam/Steam.app');
+      writeTempFile(
+        path.join(steamAppDir, 'Contents/Info.plist'),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.codeweavers.CrossOverHelper.steam</string>
+  <key>CFBundleName</key>
+  <string>Steam</string>
+</dict>
+</plist>`
+      );
+
+      launcherEngine.invalidateScanCaches();
+      const scanRes = launcherEngine.scanAllInstalledGames({
+        platform: 'darwin',
+        homedir: tmpHome,
+        userDataDir: tmpUserData,
+        forceRefresh: true,
+      });
+
+      expect(scanRes.success).toBe(true);
+      // 2320 must NOT be reported as installed
+      expect(
+        scanRes.installedGames.filter((g: any) => String(g.platformGameId) === '2320')
+      ).toHaveLength(0);
+      expect(scanRes.installedSteamAppIds).not.toContain(2320);
+
+      // Orphaned bottle manifest, save-only directory, libraryfolders.vdf entry, and Quake II.app shortcut are self-healed
+      expect(fs.existsSync(acfPath)).toBe(false);
+      expect(fs.existsSync(gameCommonDir)).toBe(false);
+      expect(fs.readFileSync(libraryFoldersVdfPath, 'utf8')).not.toContain('"2320"');
+      expect(fs.existsSync(quakeAppDir)).toBe(false);
+      expect(fs.existsSync(steamAppDir)).toBe(true);
+    });
   });
 });
-
-
-
-
-
-

@@ -6,7 +6,11 @@ import { StorefrontId } from '../../contracts/platform';
 import { getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { steamApi } from '../../services/steam/steamApi';
 import { steamMatcher } from '../../services/steam/steamMatcher';
-import { fallbackMetadataProvider } from '../../services/steam/fallbackMetadataProvider';
+import {
+  fallbackMetadataProvider,
+  isGenericPlaceholderSynopsis,
+  stripHtmlToPlainSynopsis,
+} from '../../services/steam/fallbackMetadataProvider';
 import { loadCurrentCatalog, saveCurrentCatalog, loadIntegrations } from '../../services/integrations/integrationStorage';
 import { MediaGallery } from './MediaGallery';
 import { SteamHeroDetails } from './SteamHeroDetails';
@@ -16,6 +20,8 @@ import { getOpenCriticData } from '../../services/opencritic/openCritic';
 import { OpenCriticCard } from './OpenCriticCard';
 import { SystemRequirements } from './SystemRequirements';
 import { PlatformBadges } from './PlatformBadges';
+import { NativeOsBadges } from '../Common/NativeOsBadges';
+import { getNativeOsPlatforms } from '../../services/platform/nativeOsService';
 import { SteamLanguagesTable } from './SteamLanguagesTable';
 import { SteamFeaturesList } from './SteamFeaturesList';
 import { SteamSidebarNotices } from './SteamSidebarNotices';
@@ -33,21 +39,25 @@ import {
   Sparkles,
   ArrowLeft,
   AlertCircle,
+  Activity,
+  CheckCircle2,
 } from 'lucide-react';
 import { ActiveGameFilter } from '../../contracts/filter';
 import { GameCollection } from '../../contracts/collection';
+import { launcherService } from '../../services/launcher/launcherService';
 
 interface SteamStorePageProps {
   game: CanonicalGame;
   collections?: GameCollection[];
   onBackToLibrary?: () => void;
   onManageCollections?: () => void;
-  onToggleInstallStatus?: () => void;
+  onToggleInstallStatus?: (platformId?: StorefrontId) => void;
   onApplyFilter?: (filter: ActiveGameFilter) => void;
   onGameUpdated?: (updated: CanonicalGame) => void;
   connectedStorefronts?: StorefrontId[];
   onOpenIntegrations?: () => void;
   onFixMatch?: () => void;
+  onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   onViewAchievements?: (storefrontId?: StorefrontId) => void;
 }
 
@@ -62,10 +72,12 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   connectedStorefronts,
   onOpenIntegrations,
   onFixMatch,
+  onHideGame,
   onViewAchievements,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
+  const [, setLauncherTick] = useState(0);
   const [metadata, setMetadata] = useState<SteamEnrichedMetadata | null>(
     game.enrichedMetadata || null
   );
@@ -73,6 +85,10 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const [isLoading, setIsLoading] = useState(!game.enrichedMetadata);
   const isCooldown = steamApi.isStoreRateLimited();
   const activeGameIdRef = useRef<string>(game.id);
+
+  useEffect(() => {
+    return launcherService.subscribe(() => setLauncherTick((t) => t + 1));
+  }, []);
 
   const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
   const metadataRoute = useMemo(
@@ -100,6 +116,30 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const disconnectedPlatforms = currentGame.platforms.filter(
     (p) => !connectedSet.has(p.platformId as StorefrontId)
   );
+
+  const effectivePlatform =
+    launcherService.getEffectivePlatformForGame(currentGame) || currentGame.platforms[0];
+  const activeStoreId = effectivePlatform?.platformId || 'steam';
+  const installedRecord = launcherService.getInstalledRecordForGame(currentGame, activeStoreId);
+  const isRunning = launcherService.isGameRunning(currentGame.id);
+  const isInstalled =
+    launcherService.isGameInstalled(currentGame, activeStoreId) ||
+    Boolean(effectivePlatform?.installed) ||
+    currentGame.platforms.some((p) => p.installed);
+  const isWindowsHost =
+    (typeof (launcherService as any).isWindowsHost === 'function' &&
+      (launcherService as any).isWindowsHost()) ||
+    (typeof window !== 'undefined' && (window as any)?.electronAPI?.platform === 'win32');
+  const isWindowsBinaryOnMac =
+    !isWindowsHost &&
+    Boolean(
+      installedRecord?.isWindowsBinaryOnMac ||
+        effectivePlatform?.isWindowsBinaryOnMac
+    );
+  const storeDisplayName = getStorefrontDisplayName(activeStoreId);
+  const installedPlatNames = currentGame.platforms
+    .filter((p) => launcherService.isGameInstalled(currentGame, p.platformId) || p.installed)
+    .map((p) => getStorefrontDisplayName(p.platformId));
 
   useEffect(() => {
     setCurrentGame(game);
@@ -133,6 +173,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
       // If user explicitly unlinked from Steam (steamAppId === null) or routed metadata to a non-Steam source
       const isExplicitNonSteam =
+        game.isExplicitNonSteam === true ||
         currentOverride?.steamAppId === null ||
         currentOverride?.isExplicitNonSteam === true ||
         isRoutedToNonSteamStore ||
@@ -165,19 +206,141 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         }
       }
 
+      const buildEnrichedTopLevelFields = (meta?: SteamEnrichedMetadata | null) => {
+        const cleanMetaShort = meta?.shortDescription
+          ? stripHtmlToPlainSynopsis(meta.shortDescription)
+          : '';
+        const cleanGameShort = game.shortDescription
+          ? stripHtmlToPlainSynopsis(game.shortDescription)
+          : '';
+        const incomingShort =
+          cleanMetaShort && !isGenericPlaceholderSynopsis(cleanMetaShort, game.title)
+            ? cleanMetaShort
+            : undefined;
+        const nextShortDescription =
+          (!cleanGameShort || isGenericPlaceholderSynopsis(cleanGameShort, game.title)) &&
+          incomingShort
+            ? incomingShort
+            : cleanGameShort || game.shortDescription;
+        const nextDetailedDescription =
+          (!game.detailedDescription ||
+            isGenericPlaceholderSynopsis(game.detailedDescription, game.title)) &&
+          (meta?.aboutTheGame || meta?.detailedDescription)
+            ? meta?.aboutTheGame || meta?.detailedDescription
+            : game.detailedDescription || meta?.aboutTheGame || meta?.detailedDescription;
+        const validIncomingDevs =
+          meta?.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
+        const nextDevelopers =
+          (!game.developers || game.developers.length === 0) && validIncomingDevs.length > 0
+            ? validIncomingDevs
+            : game.developers;
+        const validIncomingPubs =
+          meta?.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
+        const nextPublishers =
+          (!game.publishers || game.publishers.length === 0) && validIncomingPubs.length > 0
+            ? validIncomingPubs
+            : game.publishers;
+        const nextReleaseDate =
+          (!game.releaseDate || game.releaseDate === 'TBA') &&
+          meta?.releaseDate &&
+          meta.releaseDate !== 'TBA'
+            ? meta.releaseDate
+            : game.releaseDate;
+
+        const richerScreenshots =
+          (meta?.screenshots?.length || 0) > (game.enrichedMetadata?.screenshots?.length || 0);
+        const richerMovies =
+          (meta?.movies?.length || 0) > (game.enrichedMetadata?.movies?.length || 0);
+        const upgradedPlaceholderSynopsis =
+          Boolean(game.enrichedMetadata?.shortDescription) &&
+          isGenericPlaceholderSynopsis(game.enrichedMetadata?.shortDescription, game.title) &&
+          Boolean(nextShortDescription) &&
+          !isGenericPlaceholderSynopsis(nextShortDescription, game.title);
+        const updatedAbout =
+          Boolean(meta?.aboutTheGame) && meta?.aboutTheGame !== game.enrichedMetadata?.aboutTheGame;
+        const updatedLanguages =
+          Boolean(
+            meta?.supportedLanguages &&
+              meta.supportedLanguages !== game.enrichedMetadata?.supportedLanguages
+          ) ||
+          Boolean(
+            (meta?.languageOptions?.length || 0) > 0 &&
+              (meta?.languageOptions?.length !== game.enrichedMetadata?.languageOptions?.length ||
+                JSON.stringify(meta?.languageOptions) !==
+                  JSON.stringify(game.enrichedMetadata?.languageOptions))
+          ) ||
+          Boolean(
+            meta?.languageTableSchema &&
+              meta.languageTableSchema !== game.enrichedMetadata?.languageTableSchema
+          );
+
+        const topLevelChanged =
+          nextShortDescription !== game.shortDescription ||
+          nextDevelopers !== game.developers ||
+          nextReleaseDate !== game.releaseDate ||
+          richerScreenshots ||
+          richerMovies ||
+          upgradedPlaceholderSynopsis ||
+          updatedAbout ||
+          updatedLanguages;
+
+        return {
+          nextShortDescription,
+          nextDetailedDescription,
+          nextDevelopers,
+          nextPublishers,
+          nextReleaseDate,
+          topLevelChanged,
+        };
+      };
+
       // Case A: User explicitly routed Step 4 metadata to GOG or Epic
       if (isRoutedToNonSteamStore) {
-        const [fallbackData, liveAchs] = await Promise.all([
+        const crossSteamAppId = game.steamAppId || route?.steamAppId;
+        const [rawFallbackData, liveAchs] = await Promise.all([
           fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, currentOverride),
           game.steamAppId
             ? steamAchievementsService.fetchPlayerGameAchievements(game.steamAppId)
             : Promise.resolve(null),
         ]);
 
+        let fallbackData = rawFallbackData;
+        if (
+          fallbackData &&
+          (!fallbackData.movies || fallbackData.movies.length === 0)
+        ) {
+          if (game.enrichedMetadata?.movies && game.enrichedMetadata.movies.length > 0) {
+            fallbackData = {
+              ...fallbackData,
+              movies: game.enrichedMetadata.movies,
+            };
+          } else if (crossSteamAppId) {
+            try {
+              const steamMetaForMovies = await steamApi.fetchGameMetadata(crossSteamAppId);
+              if (steamMetaForMovies?.movies && steamMetaForMovies.movies.length > 0) {
+                fallbackData = {
+                  ...fallbackData,
+                  movies: steamMetaForMovies.movies,
+                };
+              }
+            } catch {
+              // Ignore cross-store movie fallback error
+            }
+          }
+        }
+
         if (isMounted && fallbackData) {
           setMetadata(fallbackData);
+          const {
+            nextShortDescription,
+            nextDetailedDescription,
+            nextDevelopers,
+            nextPublishers,
+            nextReleaseDate,
+            topLevelChanged,
+          } = buildEnrichedTopLevelFields(fallbackData);
           let updatedPlatforms = game.platforms;
-          let hasChanges = !game.enrichedMetadata || isOverrideUpdated;
+          let hasChanges = !game.enrichedMetadata || isOverrideUpdated || topLevelChanged;
 
           if (liveAchs) {
             const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
@@ -199,6 +362,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             const updatedGame: CanonicalGame = {
               ...game,
               platforms: updatedPlatforms,
+              shortDescription: nextShortDescription,
+              detailedDescription: nextDetailedDescription,
+              developers: nextDevelopers,
+              publishers: nextPublishers,
+              releaseDate: nextReleaseDate,
               enrichedMetadata: fallbackData,
             };
             setCurrentGame(updatedGame);
@@ -216,18 +384,45 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           let resolvedMetadata: SteamEnrichedMetadata | null = null;
           if (liveData) {
             resolvedMetadata = liveData;
-            setMetadata(liveData);
+            if (!resolvedMetadata.movies || resolvedMetadata.movies.length === 0) {
+              if (game.enrichedMetadata?.movies && game.enrichedMetadata.movies.length > 0) {
+                resolvedMetadata = {
+                  ...resolvedMetadata,
+                  movies: game.enrichedMetadata.movies,
+                };
+              } else if (
+                game.platforms.some((p) => p.platformId === 'epic' || p.platformId === 'gog')
+              ) {
+                try {
+                  const nonSteamFallback =
+                    await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
+                      game,
+                      currentOverride
+                    );
+                  if (nonSteamFallback?.movies && nonSteamFallback.movies.length > 0) {
+                    resolvedMetadata = {
+                      ...resolvedMetadata,
+                      movies: nonSteamFallback.movies,
+                    };
+                  }
+                } catch {
+                  // Ignore fallback movie lookup error
+                }
+              }
+            }
+            setMetadata(resolvedMetadata);
             if (currentOverride && route?.mode === 'routed' && route.source === 'steam') {
               updateRoutedMetadataSnapshot(game.id, {
-                title: liveData.name,
-                shortDescription: liveData.shortDescription,
-                detailedDescription: liveData.detailedDescription || liveData.aboutTheGame,
-                headerImage: liveData.headerImage,
-                developers: liveData.developers,
-                publishers: liveData.publishers,
-                genres: liveData.genres,
-                tags: liveData.tags,
-                releaseDate: liveData.releaseDate,
+                title: resolvedMetadata.name,
+                shortDescription: resolvedMetadata.shortDescription,
+                detailedDescription:
+                  resolvedMetadata.detailedDescription || resolvedMetadata.aboutTheGame,
+                headerImage: resolvedMetadata.headerImage,
+                developers: resolvedMetadata.developers,
+                publishers: resolvedMetadata.publishers,
+                genres: resolvedMetadata.genres,
+                tags: resolvedMetadata.tags,
+                releaseDate: resolvedMetadata.releaseDate,
               });
             }
           } else {
@@ -241,7 +436,16 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             }
           }
 
-          let hasChanges = false;
+          const {
+            nextShortDescription,
+            nextDetailedDescription,
+            nextDevelopers,
+            nextPublishers,
+            nextReleaseDate,
+            topLevelChanged,
+          } = buildEnrichedTopLevelFields(resolvedMetadata);
+
+          let hasChanges = topLevelChanged;
           let updatedPlatforms = game.platforms;
 
           if (liveAchs) {
@@ -280,6 +484,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               ...game,
               platforms: updatedPlatforms,
               steamAppId: targetAppId,
+              shortDescription: nextShortDescription,
+              detailedDescription: nextDetailedDescription,
+              developers: nextDevelopers,
+              publishers: nextPublishers,
+              releaseDate: nextReleaseDate,
               enrichedMetadata: resolvedMetadata || game.enrichedMetadata,
             };
             setCurrentGame(updatedGame);
@@ -288,15 +497,40 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         }
       } else {
         // Case C: Non-Steam game (e.g. GOG, Epic, IGDB exclusive)
-        const fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
+        let fallbackData = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
           game,
           currentOverride
         );
+        if (
+          fallbackData &&
+          (!fallbackData.movies || fallbackData.movies.length === 0) &&
+          game.enrichedMetadata?.movies &&
+          game.enrichedMetadata.movies.length > 0
+        ) {
+          fallbackData = {
+            ...fallbackData,
+            movies: game.enrichedMetadata.movies,
+          };
+        }
         if (isMounted && fallbackData) {
           setMetadata(fallbackData);
-          if (!game.enrichedMetadata || isOverrideUpdated) {
+          const {
+            nextShortDescription,
+            nextDetailedDescription,
+            nextDevelopers,
+            nextPublishers,
+            nextReleaseDate,
+            topLevelChanged,
+          } = buildEnrichedTopLevelFields(fallbackData);
+          const hasChanges = !game.enrichedMetadata || isOverrideUpdated || topLevelChanged;
+          if (hasChanges) {
             const updatedGame: CanonicalGame = {
               ...game,
+              shortDescription: nextShortDescription,
+              detailedDescription: nextDetailedDescription,
+              developers: nextDevelopers,
+              publishers: nextPublishers,
+              releaseDate: nextReleaseDate,
               enrichedMetadata: fallbackData,
             };
             setCurrentGame(updatedGame);
@@ -507,7 +741,28 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             <h1 className="text-3xl md:text-4xl font-extrabold text-white tracking-tight drop-shadow">
               {game.title}
             </h1>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2.5">
+              {(isRunning || isInstalled) && (
+                <div className="flex items-center gap-2 border-r border-[#2a475e]/70 pr-3 mr-1">
+                  {isRunning ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-500/40 text-xs font-semibold text-emerald-400">
+                      <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse shrink-0" />
+                      <span>Active Session</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/40 border border-emerald-500/30 text-xs font-semibold text-emerald-400">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>Ready to Play</span>
+                      <span className="text-[11px] font-normal text-[#8f98a0] ml-0.5">
+                        •{' '}
+                        {isWindowsBinaryOnMac
+                          ? `CrossOver / Wine (${installedPlatNames.join(', ') || storeDisplayName})`
+                          : installedPlatNames.join(', ') || storeDisplayName}
+                      </span>
+                    </span>
+                  )}
+                </div>
+              )}
               <span className="text-xs uppercase tracking-wider text-steam-subtext font-semibold">
                 Owned on:
               </span>
@@ -518,6 +773,28 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 size="md"
                 connectedStorefronts={connectedStorefronts}
               />
+              {(() => {
+                const nativePlatforms = getNativeOsPlatforms(currentGame);
+                if (nativePlatforms.length === 0) return null;
+                return (
+                  <div className="inline-flex items-center gap-1.5 ml-2 pl-2.5 border-l border-white/15">
+                    <span className="text-xs uppercase tracking-wider text-steam-subtext font-semibold">
+                      Native OS:
+                    </span>
+                    <NativeOsBadges
+                      platforms={nativePlatforms}
+                      variant="detail-pill"
+                      onSelectOs={(os) =>
+                        onApplyFilter?.({
+                          type: 'os',
+                          label: 'Native OS',
+                          value: os === 'mac' ? 'macOS' : 'Windows',
+                        })
+                      }
+                    />
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
@@ -532,6 +809,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           onApplyFilter={onApplyFilter}
           connectedStorefronts={connectedStorefronts}
           onFixMatch={onFixMatch}
+          onHideGame={onHideGame}
           onViewAchievements={onViewAchievements}
         />
 
@@ -625,7 +903,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             />
 
             {/* Exact 1:1 Languages Matrix Table */}
-            <SteamLanguagesTable rawSupportedLanguagesHtml={metadata?.supportedLanguages} />
+            <SteamLanguagesTable
+              rawSupportedLanguagesHtml={metadata?.supportedLanguages}
+              languageOptions={metadata?.languageOptions}
+              languageTableSchema={metadata?.languageTableSchema}
+            />
 
             {/* Controller Support, Deck Verified, Anti-Cheat, EULA, and Details */}
             <SteamSidebarNotices

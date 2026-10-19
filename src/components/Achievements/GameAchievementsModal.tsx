@@ -2,11 +2,11 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import type {
-  DetailedAchievement,
   StorefrontAchievementsData,
   MultiStoreAchievementsMap,
 } from '../../contracts/achievement';
 import { achievementDetailService } from '../../services/achievements/achievementDetailService';
+import { matchesLooseSearchQuery } from '../../services/common/titleUtils';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
 import {
   Trophy,
@@ -31,40 +31,7 @@ export interface GameAchievementsModalProps {
   onClose: () => void;
 }
 
-export type TrophyTier = 'platinum' | 'gold' | 'silver' | 'bronze';
-
-/**
- * Classifies PlayStation-style trophy tiers based on Epic XP, global rarity, and milestones.
- */
-export function getAchievementTrophyTier(
-  ach: DetailedAchievement,
-  totalCount: number,
-  index: number
-): TrophyTier {
-  if (
-    ach.xp === 250 ||
-    (totalCount > 5 && index === 0 && ach.name.toLowerCase().includes('all achievements')) ||
-    (totalCount > 5 && index === totalCount - 1 && ach.name.toLowerCase().includes('all achievements'))
-  ) {
-    return 'platinum';
-  }
-  if (ach.xp !== undefined) {
-    if (ach.xp >= 100) return 'gold';
-    if (ach.xp >= 50) return 'silver';
-    return 'bronze';
-  }
-  const pct = ach.globalPercentage;
-  if (pct !== undefined) {
-    if (pct < 10.0) return 'gold';
-    if (pct < 35.0) return 'silver';
-    return 'bronze';
-  }
-  if (ach.rarityTier === 'ultra_rare') return 'gold';
-  if (ach.rarityTier === 'rare' || ach.rarityTier === 'uncommon') return 'silver';
-  return 'bronze';
-}
-
-type FilterTab = 'all' | 'unlocked' | 'locked' | 'secret' | 'platinum' | 'gold' | 'silver' | 'bronze';
+type FilterTab = 'all' | 'unlocked' | 'locked' | 'secret';
 type SortOption = 'default' | 'rarity_rarest' | 'rarity_common' | 'unlock_date' | 'name';
 
 export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
@@ -166,22 +133,14 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
       list = list.filter((a) => !a.unlocked);
     } else if (activeFilterTab === 'secret') {
       list = list.filter((a) => a.isSecret);
-    } else if (
-      activeFilterTab === 'platinum' ||
-      activeFilterTab === 'gold' ||
-      activeFilterTab === 'silver' ||
-      activeFilterTab === 'bronze'
-    ) {
-      list = list.filter((a, idx) => getAchievementTrophyTier(a, currentStoreData.achievements.length, idx) === activeFilterTab);
     }
 
     // Text search query
     if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
       list = list.filter(
         (a) =>
-          a.name.toLowerCase().includes(q) ||
-          (a.description && a.description.toLowerCase().includes(q))
+          matchesLooseSearchQuery(a.name, searchQuery) ||
+          matchesLooseSearchQuery(a.description, searchQuery)
       );
     }
 
@@ -224,53 +183,6 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   const lockedCount = Math.max(0, totalCount - unlockedCount);
   const secretCount = currentStoreData?.achievements.filter((a) => a.isSecret).length || 0;
 
-  // PlayStation-style Trophy Count Overview
-  const trophyCounts = useMemo(() => {
-    if (!currentStoreData?.achievements) {
-      return {
-        platinum: { unlocked: 0, total: 0 },
-        gold: { unlocked: 0, total: 0 },
-        silver: { unlocked: 0, total: 0 },
-        bronze: { unlocked: 0, total: 0 },
-      };
-    }
-    const achs = currentStoreData.achievements;
-    const total = achs.length;
-    let platTot = 0, platUnl = 0;
-    let goldTot = 0, goldUnl = 0;
-    let silvTot = 0, silvUnl = 0;
-    let bronTot = 0, bronUnl = 0;
-
-    achs.forEach((a, idx) => {
-      const tier = getAchievementTrophyTier(a, total, idx);
-      if (tier === 'platinum') {
-        platTot++;
-        if (a.unlocked) platUnl++;
-      } else if (tier === 'gold') {
-        goldTot++;
-        if (a.unlocked) goldUnl++;
-      } else if (tier === 'silver') {
-        silvTot++;
-        if (a.unlocked) silvUnl++;
-      } else {
-        bronTot++;
-        if (a.unlocked) bronUnl++;
-      }
-    });
-
-    if (platTot === 0 && total >= 5) {
-      platTot = 1;
-      if (isMastered) platUnl = 1;
-    }
-
-    return {
-      platinum: { unlocked: platUnl, total: platTot },
-      gold: { unlocked: goldUnl, total: goldTot },
-      silver: { unlocked: silvUnl, total: silvTot },
-      bronze: { unlocked: bronUnl, total: bronTot },
-    };
-  }, [currentStoreData, isMastered]);
-
   if (!isOpen || !game) return null;
 
   return (
@@ -286,7 +198,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
         aria-labelledby="achievements-modal-title"
       >
         {/* Top Header Banner */}
-        <div className="relative border-b border-[#2a475e] bg-gradient-to-r from-[#172435] via-[#101822] to-[#14202d] px-6 py-4.5 flex items-center justify-between shrink-0">
+        <div className="relative border-b border-[#2a475e] bg-gradient-to-r from-[#172435] via-[#101822] to-[#14202d] px-6 py-4 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3.5 min-w-0">
             <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-amber-500/20 to-amber-700/10 border border-amber-500/40 flex items-center justify-center shadow-inner shrink-0">
               <Trophy className="w-5 h-5 text-amber-400 fill-amber-400/20" />
@@ -405,68 +317,6 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 />
               </div>
 
-              {/* PlayStation-style Trophy Count Overview */}
-              <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                {trophyCounts.platinum.total > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setActiveFilterTab(activeFilterTab === 'platinum' ? 'all' : 'platinum')}
-                    className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold transition-all cursor-pointer ${
-                      activeFilterTab === 'platinum'
-                        ? 'bg-cyan-900 text-cyan-200 border-cyan-400 ring-1 ring-cyan-400'
-                        : 'bg-cyan-950/70 border-cyan-500/50 text-cyan-300 hover:border-cyan-400'
-                    }`}
-                    title="Filter by Platinum Trophies"
-                  >
-                    <Trophy className="w-3 h-3 text-cyan-300 fill-cyan-400/40" />
-                    <span>{trophyCounts.platinum.unlocked}/{trophyCounts.platinum.total}</span>
-                    <span className="text-[9px] font-normal opacity-80">Plat</span>
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterTab(activeFilterTab === 'gold' ? 'all' : 'gold')}
-                  className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold transition-all cursor-pointer ${
-                    activeFilterTab === 'gold'
-                      ? 'bg-amber-900 text-amber-200 border-amber-400 ring-1 ring-amber-400'
-                      : 'bg-amber-950/70 border-amber-500/50 text-amber-300 hover:border-amber-400'
-                  }`}
-                  title="Filter by Gold Trophies"
-                >
-                  <Trophy className="w-3 h-3 text-amber-400 fill-amber-400/40" />
-                  <span>{trophyCounts.gold.unlocked}/{trophyCounts.gold.total}</span>
-                  <span className="text-[9px] font-normal opacity-80">Gold</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterTab(activeFilterTab === 'silver' ? 'all' : 'silver')}
-                  className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold transition-all cursor-pointer ${
-                    activeFilterTab === 'silver'
-                      ? 'bg-slate-700 text-white border-slate-300 ring-1 ring-slate-300'
-                      : 'bg-slate-800/80 border-slate-400/50 text-slate-200 hover:border-slate-300'
-                  }`}
-                  title="Filter by Silver Trophies"
-                >
-                  <Trophy className="w-3 h-3 text-slate-300 fill-slate-300/40" />
-                  <span>{trophyCounts.silver.unlocked}/{trophyCounts.silver.total}</span>
-                  <span className="text-[9px] font-normal opacity-80">Silver</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterTab(activeFilterTab === 'bronze' ? 'all' : 'bronze')}
-                  className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold transition-all cursor-pointer ${
-                    activeFilterTab === 'bronze'
-                      ? 'bg-amber-950 text-amber-400 border-amber-600 ring-1 ring-amber-600'
-                      : 'bg-[#2d1b14]/90 border-amber-800/50 text-amber-500 hover:border-amber-600'
-                  }`}
-                  title="Filter by Bronze Trophies"
-                >
-                  <Trophy className="w-3 h-3 text-amber-600 fill-amber-700/40" />
-                  <span>{trophyCounts.bronze.unlocked}/{trophyCounts.bronze.total}</span>
-                  <span className="text-[9px] font-normal opacity-80">Bronze</span>
-                </button>
-              </div>
-
               {/* Storefront XP / Gamerscore breakdown */}
               {currentStoreData?.totalXp !== undefined && currentStoreData.totalXp > 0 && (
                 <div className="flex items-center gap-2 mt-1.5 text-xs text-slate-300">
@@ -542,57 +392,6 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 <span>Secret ({secretCount})</span>
               </button>
             )}
-            <div className="h-4 w-[1px] bg-slate-700/60 mx-1 shrink-0" />
-            {trophyCounts.platinum.total > 0 && (
-              <button
-                type="button"
-                onClick={() => setActiveFilterTab(activeFilterTab === 'platinum' ? 'all' : 'platinum')}
-                className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                  activeFilterTab === 'platinum'
-                    ? 'bg-cyan-950 text-cyan-200 border border-cyan-400/80'
-                    : 'text-slate-400 hover:text-cyan-300 bg-[#16202d] border border-transparent'
-                }`}
-              >
-                <Trophy className="w-3 h-3 text-cyan-300" />
-                <span>Platinum ({trophyCounts.platinum.total})</span>
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => setActiveFilterTab(activeFilterTab === 'gold' ? 'all' : 'gold')}
-              className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                activeFilterTab === 'gold'
-                  ? 'bg-amber-950 text-amber-200 border border-amber-400/80'
-                  : 'text-slate-400 hover:text-amber-300 bg-[#16202d] border border-transparent'
-              }`}
-            >
-              <Trophy className="w-3 h-3 text-amber-400" />
-              <span>Gold ({trophyCounts.gold.total})</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveFilterTab(activeFilterTab === 'silver' ? 'all' : 'silver')}
-              className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                activeFilterTab === 'silver'
-                  ? 'bg-slate-800 text-slate-100 border border-slate-400/80'
-                  : 'text-slate-400 hover:text-slate-200 bg-[#16202d] border border-transparent'
-              }`}
-            >
-              <Trophy className="w-3 h-3 text-slate-300" />
-              <span>Silver ({trophyCounts.silver.total})</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveFilterTab(activeFilterTab === 'bronze' ? 'all' : 'bronze')}
-              className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                activeFilterTab === 'bronze'
-                  ? 'bg-[#2d1b14] text-amber-400 border border-amber-700/80'
-                  : 'text-slate-400 hover:text-amber-500 bg-[#16202d] border border-transparent'
-              }`}
-            >
-              <Trophy className="w-3 h-3 text-amber-600" />
-              <span>Bronze ({trophyCounts.bronze.total})</span>
-            </button>
           </div>
 
           {/* Search & Sort Controls */}
@@ -604,7 +403,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 placeholder="Search achievements..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-8.5 pr-3 py-1.5 rounded bg-[#16202d] border border-[#2a475e] text-xs text-white placeholder-slate-500 focus:outline-none focus:border-steam-accent"
+                className="w-full pl-9 pr-8 py-1.5 rounded bg-[#16202d] border border-[#2a475e] text-xs text-white placeholder-slate-500 focus:outline-none focus:border-steam-accent"
               />
               {searchQuery && (
                 <button
@@ -673,24 +472,9 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
               )}
             </div>
           ) : (
-            displayedAchievements.map((ach, index) => {
+            displayedAchievements.map((ach) => {
               const isUnlocked = ach.unlocked;
               const isSecretHidden = ach.isSecret && !isUnlocked && !revealedSecrets.has(ach.id);
-
-              // PlayStation Trophy tier
-              const trophyTier = getAchievementTrophyTier(ach, totalCount, index);
-              let trophyTierStyle = 'border-amber-800/60 bg-[#2d1b14]/80 text-amber-500';
-              let trophyIconFill = 'fill-amber-600/30';
-              if (trophyTier === 'platinum') {
-                trophyTierStyle = 'border-cyan-400/60 bg-cyan-950/70 text-cyan-300 shadow-[0_0_8px_rgba(34,211,238,0.3)]';
-                trophyIconFill = 'fill-cyan-400/40';
-              } else if (trophyTier === 'gold') {
-                trophyTierStyle = 'border-amber-400/60 bg-amber-950/70 text-amber-300 shadow-[0_0_8px_rgba(251,191,36,0.3)]';
-                trophyIconFill = 'fill-amber-400/40';
-              } else if (trophyTier === 'silver') {
-                trophyTierStyle = 'border-slate-400/50 bg-[#222933]/80 text-slate-200';
-                trophyIconFill = 'fill-slate-300/40';
-              }
 
               // Rarity styling
               let rarityBadge = null;
@@ -778,7 +562,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
 
                       {/* Unlocked Checkmark Badge */}
                       {isUnlocked && (
-                        <div className="absolute bottom-1 right-1 w-4.5 h-4.5 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shadow font-bold">
+                        <div className="absolute bottom-1 right-1 w-5 h-5 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shadow font-bold">
                           <CheckCircle2 className="w-3.5 h-3.5 text-white" />
                         </div>
                       )}
@@ -868,17 +652,12 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                     </div>
                   </div>
 
-                  {/* Right: Trophy Tier & Rarity Percentage Badge */}
-                  <div className="self-end sm:self-center shrink-0 flex items-center gap-2">
-                    <div
-                      className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-bold tracking-wide uppercase shadow-sm ${trophyTierStyle}`}
-                      title={`${trophyTier.toUpperCase()} Trophy Tier`}
-                    >
-                      <Trophy className={`w-3 h-3 ${trophyIconFill}`} />
-                      <span>{trophyTier}</span>
+                  {/* Right: Rarity Percentage Badge */}
+                  {rarityBadge && (
+                    <div className="self-end sm:self-center shrink-0 flex items-center gap-2">
+                      {rarityBadge}
                     </div>
-                    {rarityBadge}
-                  </div>
+                  )}
                 </div>
               );
             })

@@ -2,28 +2,39 @@ import { GameCollection } from '../../contracts/collection';
 
 const STORAGE_KEY = 'antigravity_user_collections';
 
+export const DEFAULT_COLLECTION_ICONS: Record<string, string> = {
+  favorites: 'star',
+  'currently-playing': 'play',
+  backlog: 'clock',
+  completed: 'trophy',
+};
+
 export const DEFAULT_COLLECTIONS: GameCollection[] = [
   {
     id: 'favorites',
     name: 'Favorites',
+    icon: 'star',
     isDefault: true,
     gameIds: [],
   },
   {
     id: 'currently-playing',
     name: 'Currently Playing',
+    icon: 'play',
     isDefault: true,
     gameIds: [],
   },
   {
     id: 'backlog',
     name: 'Backlog',
+    icon: 'clock',
     isDefault: false,
     gameIds: [],
   },
   {
     id: 'completed',
     name: 'Completed',
+    icon: 'trophy',
     isDefault: false,
     gameIds: [],
   },
@@ -47,9 +58,10 @@ const MIGRATED_IDS: Record<string, string> = {
 function sanitizeCollections(cols: GameCollection[]): GameCollection[] {
   return cols.map((col) => ({
     ...col,
+    icon: col.icon || DEFAULT_COLLECTION_ICONS[col.id] || 'folder',
     gameIds: Array.from(
       new Set(
-        col.gameIds
+        (col.gameIds || [])
           .map((id) => MIGRATED_IDS[id] || id)
           .filter((id) => !UNOWNED_MOCK_IDS.has(id))
       )

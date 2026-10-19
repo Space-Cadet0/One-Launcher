@@ -211,7 +211,9 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/steam-store/, ''),
         headers: {
-          Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+          Cookie:
+            'Steam_Language=english; birthtime=568022401; mature_content=1; wants_mature_content=1',
+          'Accept-Language': 'en-US,en;q=0.9',
         },
       },
       '/api/steam-api': {

@@ -3,6 +3,7 @@ import { CanonicalGame } from '../../contracts/game';
 import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import { GameCollection } from '../../contracts/collection';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
+import { CollectionIcon } from '../Common/CollectionIcon';
 import {
   Gamepad2,
   CheckCircle2,
@@ -17,9 +18,6 @@ import {
   FolderTree,
   Bookmark,
   LayoutGrid,
-  Play,
-  Clock,
-  Trophy,
   Layers,
   Sliders,
   X,
@@ -555,18 +553,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                         )}
                       </button>
 
-                      {col.id === 'favorites' && (
-                        <Star className="w-3 h-3 fill-amber-400 text-amber-400 flex-shrink-0" />
-                      )}
-                      {col.id === 'currently-playing' && (
-                        <Play className="w-3 h-3 fill-emerald-400 text-emerald-400 flex-shrink-0" />
-                      )}
-                      {col.id === 'backlog' && (
-                        <Clock className="w-3 h-3 text-sky-400 flex-shrink-0" />
-                      )}
-                      {col.id === 'completed' && (
-                        <Trophy className="w-3 h-3 text-yellow-400 flex-shrink-0" />
-                      )}
+                      <CollectionIcon iconId={col.icon} collectionId={col.id} size={13} />
                       <span className="truncate">{col.name}</span>
                       <span className="text-[10px] text-[#677788] font-normal">({col.games.length})</span>
                     </div>

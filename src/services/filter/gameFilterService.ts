@@ -8,6 +8,10 @@ import {
   getEffectiveCategories,
   getEffectiveTags,
 } from '../steam/steamFeatureNormalizer';
+import {
+  isNativelyAvailableOnMac,
+  isNativelyAvailableOnWindows,
+} from '../platform/nativeOsService';
 
 const cache = steamEnrichedCache as Record<string, any>;
 
@@ -17,6 +21,22 @@ const cache = steamEnrichedCache as Record<string, any>;
 export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter): boolean {
   if (!filter || !filter.value) return true;
   const target = filter.value.trim().toLowerCase();
+
+  if (filter.type === 'os') {
+    if (
+      target === 'mac' ||
+      target === 'macos' ||
+      target === 'mac os' ||
+      target === 'osx' ||
+      target === 'apple'
+    ) {
+      return isNativelyAvailableOnMac(game);
+    }
+    if (target === 'windows' || target === 'win' || target === 'pc') {
+      return isNativelyAvailableOnWindows(game);
+    }
+    return false;
+  }
 
   if (filter.type === 'opencritic' || filter.type === 'rating' || filter.type === 'critic') {
     const oc = getOpenCriticData(game.steamAppId, game.title, game.reviewSummary?.positivePercent);

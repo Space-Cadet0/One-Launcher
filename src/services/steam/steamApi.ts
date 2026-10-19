@@ -5,6 +5,7 @@ import {
   SteamScreenshot,
   SteamMovie,
   SteamCategory,
+  SteamLanguageOption,
 } from '../../contracts/steam';
 
 export function getSteamCategoryIconUrl(id: number): string {
@@ -53,6 +54,142 @@ export function getSteamCategoryIconUrl(id: number): string {
 
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { requestScheduler, RequestPriority } from '../network/requestScheduler';
+import { stripHtmlToPlainSynopsis } from './fallbackMetadataProvider';
+
+/**
+ * Universally detects non-English regional dubbed/subtitled trailer titles across storefronts.
+ * Preserves English, US, UK, EN, International, Global, PEGI, and ESRB trailers.
+ */
+export function isNonEnglishRegionalMovieName(name?: string): boolean {
+  if (!name || typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+
+  // 1. Non-Latin regional scripts (CJK, Cyrillic, Arabic, Hangul, Kana)
+  if (/[\u0400-\u04ff\u0600-\u06ff\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]/.test(trimmed)) {
+    return true;
+  }
+
+  // 2. Underscore/hyphen/bracket-delimited regional ISO language/country tags in production trailer filenames
+  // e.g. "Wolfenstein II_Launch Trailer_IT_PEGI", "Trailer_FR", "Launch_DE_1080p", "[ES]", "(ITA)"
+  if (
+    /(?:^|[\s_\-[(\/])(?:IT|ITA|FR|FRA|FRE|DE|DEU|GER|ES|ESP|SPA|PT|POR|BR|PTBR|PT-BR|RU|RUS|PL|POL|JP|JPN|KR|KOR|CN|CHN|ZH|ZHS|ZHT|TW|CHT|CHS|TR|TUR|AR|ARA|LATAM|ES-MX|ES-AR|FR-CA)(?:$|[\s_\-\])\/])/i.test(
+      trimmed
+    )
+  ) {
+    return true;
+  }
+
+  // 3. Explicit non-English language labels or localized "trailer" words
+  if (
+    /\b(?:italian|italiano|french|fran[cç]ais|german|deutsch|spanish|espa[nñ]ol|portuguese|portugu[eê]s|russian|polish|polski|japanese|korean|chinese|simplified\s+chinese|traditional\s+chinese|turkish|t[uü]rk[cç]e|arabic|latam|bande[\s-]annonce|tr[aá]iler\s+en\s+espa[nñ]ol)\b/i.test(
+      trimmed
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Filters out regional non-English trailers when at least one English/international trailer exists.
+ * Falls back to the full list only if every single trailer is non-English.
+ */
+export function filterEnglishMovies<T extends { name?: string }>(movies?: T[] | null): T[] {
+  if (!Array.isArray(movies) || movies.length === 0) return [];
+  const englishMovies = movies.filter((m) => !isNonEnglishRegionalMovieName(m?.name));
+  return englishMovies.length > 0 ? englishMovies : movies;
+}
+
+/**
+ * Parses the exact 3-column language matrix (`Interface`, `Full Audio`, `Subtitles`)
+ * from a Steam store page HTML `<table class="game_language_options">`.
+ */
+export function parseSteamLanguageTableHtml(html?: string): SteamLanguageOption[] {
+  if (!html || typeof html !== 'string') return [];
+  const tableMatch = html.match(/<table[^>]*class=["'][^"']*game_language_options[^"']*["'][^>]*>[\s\S]*?<\/table>/i);
+  if (!tableMatch) return [];
+
+  const rows = tableMatch[0].match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  const options: SteamLanguageOption[] = [];
+  const seen = new Set<string>();
+
+  const hasCheck = (cell?: string): boolean =>
+    /&#10004;|&#x2714;|✔|✓|<span|<img/i.test(cell || '');
+
+  for (const row of rows) {
+    if (/<th[\s>]/i.test(row) || /colspan=/i.test(row)) continue;
+    const cells = row.match(/<td[\s\S]*?<\/td>/gi) || [];
+    if (cells.length < 2) continue;
+
+    const name = (cells[0] || '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&quot;/gi, '"')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!name) continue;
+
+    const hasInterface = hasCheck(cells[1]);
+    const hasAudio = hasCheck(cells[2]);
+    const hasSubtitles = hasCheck(cells[3]);
+
+    if (!hasInterface && !hasAudio && !hasSubtitles) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    options.push({
+      name,
+      hasInterface,
+      hasAudio,
+      hasSubtitles,
+    });
+  }
+
+  return options;
+}
+
+/**
+ * Fallback parser for Steam's `data.supported_languages` string from `/api/appdetails`.
+ * Only marks `hasSubtitles: true` when the string explicitly contains an asterisk `*`
+ * audio/subtitle footnote marker (preventing false-positive Subtitles ticks on Interface-only games).
+ */
+export function parseSteamSupportedLanguagesString(rawHtml?: string): SteamLanguageOption[] {
+  if (!rawHtml || typeof rawHtml !== 'string') return [];
+  const hasAudioMarker = /\*/.test(rawHtml);
+  const mainPart = rawHtml.split(/<br\s*\/?>/i)[0] || '';
+  const items = mainPart.split(',');
+  const results: SteamLanguageOption[] = [];
+  const seen = new Set<string>();
+
+  for (const item of items) {
+    const hasAudio = item.includes('*');
+    const cleanName = item
+      .replace(/<[^>]*>/g, '')
+      .replace(/\*/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleanName) continue;
+    const key = cleanName.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    results.push({
+      name: cleanName,
+      hasInterface: true,
+      hasAudio,
+      hasSubtitles: hasAudioMarker,
+    });
+  }
+
+  return results;
+}
 
 export class SteamApiService {
   private cache = new Map<number, SteamEnrichedMetadata>();
@@ -78,7 +215,21 @@ export class SteamApiService {
   getCachedMetadata(appId: number): SteamEnrichedMetadata | null {
     if (this.cache.has(appId)) return this.cache.get(appId)!;
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
-    if (preCached && preCached.shortDescription) return preCached as SteamEnrichedMetadata;
+    if (preCached && preCached.shortDescription) {
+      const languageOptions =
+        Array.isArray(preCached.languageOptions) && preCached.languageOptions.length > 0
+          ? preCached.languageOptions
+          : preCached.supportedLanguages
+          ? parseSteamSupportedLanguagesString(preCached.supportedLanguages)
+          : undefined;
+      return {
+        ...(preCached as SteamEnrichedMetadata),
+        shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
+        movies: filterEnglishMovies(preCached.movies || []),
+        languageOptions,
+        languageTableSchema: preCached.languageTableSchema || 'steam',
+      };
+    }
     return null;
   }
 
@@ -92,23 +243,35 @@ export class SteamApiService {
 
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
     if (preCached && preCached.aboutTheGame) {
-      const normalizedMovies: SteamMovie[] = (preCached.movies || []).map((m: any) => ({
-        id: m.id,
-        name: m.name,
-        thumbnail: m.thumbnail,
-        hls: m.hls || m.hls_h264 || '',
-        webm: m.webm || {},
-        mp4: m.mp4 || {},
-      }));
+      const normalizedMovies: SteamMovie[] = filterEnglishMovies(
+        (preCached.movies || []).map((m: any) => ({
+          id: m.id,
+          name: m.name,
+          thumbnail: m.thumbnail,
+          hls: m.hls || m.hls_h264 || '',
+          webm: m.webm || {},
+          mp4: m.mp4 || {},
+        }))
+      );
+
+      const languageOptions =
+        Array.isArray(preCached.languageOptions) && preCached.languageOptions.length > 0
+          ? preCached.languageOptions
+          : preCached.supportedLanguages
+          ? parseSteamSupportedLanguagesString(preCached.supportedLanguages)
+          : undefined;
 
       const enriched: SteamEnrichedMetadata = {
         ...preCached,
+        shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
         capsuleImage:
           preCached.capsuleImage ||
           preCached.library_capsule ||
           preCached.capsule_imagev5 ||
           preCached.capsule_image,
         movies: normalizedMovies,
+        languageOptions,
+        languageTableSchema: preCached.languageTableSchema || 'steam',
         categories: (preCached.categories || []).map((c: any) => ({
           ...c,
           icon: getSteamCategoryIconUrl(c.id),
@@ -123,20 +286,32 @@ export class SteamApiService {
     }
 
     const baseUrl = this.getBaseUrl();
-    const url = `${baseUrl}/api/appdetails?appids=${appId}&l=english`;
+    const url = `${baseUrl}/api/appdetails?appids=${appId}&l=english&cc=US`;
 
     return requestScheduler
       .schedule(
         url,
         async () => {
-          const [detailsRes, reviewsRes] = await Promise.all([
+          const [detailsRes, reviewsRes, storePageRes] = await Promise.all([
             axios.get(url, {
               timeout: 8000,
               headers: {
-                Cookie: 'birthtime=568022401; mature_content=1; wants_mature_content=1',
+                Cookie:
+                  'Steam_Language=english; birthtime=568022401; mature_content=1; wants_mature_content=1',
+                'Accept-Language': 'en-US,en;q=0.9',
               },
             }),
             axios.get(`${baseUrl}/appreviews/${appId}?json=1&language=all`, { timeout: 6000 }).catch(() => null),
+            axios
+              .get(`${baseUrl}/app/${appId}/?l=english&cc=US`, {
+                timeout: 6000,
+                headers: {
+                  Cookie:
+                    'Steam_Language=english; birthtime=568022401; mature_content=1; wants_mature_content=1',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+              })
+              .catch(() => null),
           ]);
 
           const appData = detailsRes.data?.[appId];
@@ -175,11 +350,8 @@ export class SteamApiService {
             };
           });
 
-          // Filter out regional non-English trailers (e.g. CJK dubs) when English/international trailers exist
-          const hasEnglishMovies = rawMovies.some((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name));
-          const movies = hasEnglishMovies
-            ? rawMovies.filter((m) => !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(m.name))
-            : rawMovies;
+          // Filter out regional non-English trailers (e.g. CJK/European dubs) when English/international trailers exist
+          const movies = filterEnglishMovies(rawMovies);
 
           // Extract review summary
           let reviewSummary: SteamReviewSummary = {
@@ -237,10 +409,18 @@ export class SteamApiService {
             (typeof data.capsule_image === 'string' && data.capsule_image) ||
             undefined;
 
+          const htmlLanguageOptions = parseSteamLanguageTableHtml(
+            typeof storePageRes?.data === 'string' ? storePageRes.data : ''
+          );
+          const resolvedLanguageOptions =
+            htmlLanguageOptions.length > 0
+              ? htmlLanguageOptions
+              : parseSteamSupportedLanguagesString(data.supported_languages);
+
           const metadata: SteamEnrichedMetadata = {
             appId,
             name: data.name,
-            shortDescription: data.short_description || '',
+            shortDescription: stripHtmlToPlainSynopsis(data.short_description || ''),
             detailedDescription: data.detailed_description || '',
             aboutTheGame: data.about_the_game || '',
             headerImage: data.header_image || '',
@@ -259,6 +439,8 @@ export class SteamApiService {
             },
             reviewSummary,
             supportedLanguages: data.supported_languages,
+            languageOptions: resolvedLanguageOptions.length > 0 ? resolvedLanguageOptions : undefined,
+            languageTableSchema: 'steam',
             legalNotice: data.legal_notice,
             drmNotice: data.drm_notice,
             controllerSupport: data.controller_support,
@@ -271,6 +453,13 @@ export class SteamApiService {
                     url: data.metacritic.url || '',
                   }
                 : undefined,
+            platforms: data.platforms
+              ? {
+                  windows: Boolean(data.platforms.windows),
+                  mac: Boolean(data.platforms.mac),
+                  linux: Boolean(data.platforms.linux),
+                }
+              : undefined,
           };
 
           this.cache.set(appId, metadata);

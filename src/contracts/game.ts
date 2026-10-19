@@ -23,16 +23,27 @@ export interface StoreAchievementSummary {
   conflictDetails?: string;
 }
 
+export type NativeOsPlatform = 'windows' | 'mac';
+
 export interface GamePlatformOwnership {
   platformId: StorefrontId;
   platformGameId: string;
+  namespace?: string;
+  catalogItemId?: string;
+  originalTitle?: string;
   installed: boolean;
   installPath?: string;
   executablePath?: string;
+  launchArguments?: string;
   installSize?: number;
   version?: string;
   runner?: string;
   isWindowsBinaryOnMac?: boolean;
+  platforms?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
+  };
   lastPlayed?: string;
   playtimeMinutes?: number;
   achievements?: StoreAchievementSummary;
@@ -41,10 +52,12 @@ export interface GamePlatformOwnership {
 export interface CanonicalGame {
   id: string; // canonical slug / uuid
   title: string;
+  originalStoreTitle?: string;
   sortTitle: string;
   steamAppId?: number;
   isExplicitNonSteam?: boolean;
   platforms: GamePlatformOwnership[];
+  nativePlatforms?: NativeOsPlatform[];
   headerImage: string;
   capsuleImage?: string;
   iconUrl?: string;

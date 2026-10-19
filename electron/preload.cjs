@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   fetchSteamBatchAchievements: (appIds) =>
     ipcRenderer.invoke('steam:fetch-achievements', { appIds }),
   fetchIgdbCover: (title) => ipcRenderer.invoke('igdb:fetch-cover', title),
+  fetchEpicProductMetadata: (payload) => ipcRenderer.invoke('store:fetch-epic-metadata', payload),
 
   // Universal Game Launcher & Install Manager IPC
   scanAllInstalledGames: () => ipcRenderer.invoke('launcher:scan-installed'),
@@ -49,5 +50,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = (_e, data) => cb(data);
     ipcRenderer.on('launcher:session-updated', handler);
     return () => ipcRenderer.removeListener('launcher:session-updated', handler);
+  },
+  onFullscreenChanged: (cb) => {
+    const handler = (_e, isFullScreen) => cb(Boolean(isFullScreen));
+    ipcRenderer.on('window:fullscreen-changed', handler);
+    return () => ipcRenderer.removeListener('window:fullscreen-changed', handler);
   },
 });
