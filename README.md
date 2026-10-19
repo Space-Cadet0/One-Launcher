@@ -24,8 +24,11 @@
 *Browse your entire collection across Steam, GOG, and Epic Games in a high-density vertical box-art grid with live Metacritic/OpenCritic badges, multi-storefront ownership indicators, instant punctuation-tolerant search, and custom sidebar collections.*
 
 ### Rich Game Detail View & Multi-Storefront Switcher
-![One Launcher Game Detail View](docs/screenshots/game-detail.png)
-*Inspect hero artwork, playtime, achievement mastery progress, Metacritic/OpenCritic consensus, HowLongToBeat estimates (Main Story, Main + Extras, Completionist), system requirements, and accurate Audio / Interface / Subtitles language matrices—and switch between owned storefront editions on the fly.*
+![One Launcher Game Detail View — Media Gallery & Multi-Storefront Switcher](docs/screenshots/game-detail.png)
+*Inspect high-resolution screenshot galleries and trailers, playtime, achievement mastery progress, active CrossOver/Wine compatibility pipeline status, and switch between owned storefront editions (`Steam`, `GOG.com`, `Epic Games`) right next to the **PLAY** button.*
+
+![One Launcher Game Detail View — About This Game, HowLongToBeat & Critic Consensus](docs/screenshots/game-detail-about.png)
+*Scroll down on any game page for **HowLongToBeat** completion estimates (Main Story, Main + Sides, Completionist, All Styles), **Metacritic & OpenCritic** review consensus cards, rich HTML **About This Game** descriptions with inline media, **System Requirements**, storefront capability badges, and accurate 3-column **Supported Languages** matrices (`Interface`, `Full Audio`, `Subtitles`).*
 
 ### CrossOver 26 & macOS Compatibility Launch Settings
 ![CrossOver 26 and Launch Compatibility Settings](docs/screenshots/crossover-launch-settings.png)
