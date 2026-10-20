@@ -877,6 +877,63 @@ describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider',
       expect(topNavSource).toContain('onToggleInstalledOnly');
       expect(topNavSource).toContain('onSelectPlatform');
     });
+
+    it('sorts games by Release Year (Newest First desc by default, Oldest First asc on second click) with unknown release years placed at the end', () => {
+      window.localStorage.removeItem('one_launcher_grid_sort_by');
+      window.localStorage.removeItem('one_launcher_grid_release_year_order');
+
+      const index = buildLibraryFilterIndex(SAMPLE_GAMES);
+      const harness = createComponentHarness(LibraryGridView, {
+        games: SAMPLE_GAMES,
+        onSelectGame: () => {},
+        libraryFilterIndex: index,
+      });
+
+      const tree1 = harness.render();
+      const releaseYearSortBtn1 = findElements(
+        tree1,
+        (el) => el.props?.['data-testid'] === 'grid-sort-release-year'
+      )[0];
+      expect(releaseYearSortBtn1).toBeDefined();
+
+      // 1st click: activates 'release_year' sort in 'desc' (Newest First) order
+      releaseYearSortBtn1.props.onClick();
+      expect(window.localStorage.getItem('one_launcher_grid_sort_by')).toBe('release_year');
+
+      const tree2 = harness.render();
+      const descGameIds = findElements(tree2, (el) => Boolean(el.props?.['data-game-id'])).map(
+        (el) => el.props['data-game-id']
+      );
+      expect(descGameIds).toEqual([
+        'game-bg3', // 2023
+        'game-starfield', // 2023
+        'game-cp2077', // 2020
+        'game-disco', // 2019
+        'game-halo', // 2019
+        'game-retro-tba', // TBA (unknown year always at the end)
+      ]);
+
+      // 2nd click while already active: toggles order to 'asc' (Oldest First)
+      const releaseYearSortBtn2 = findElements(
+        tree2,
+        (el) => el.props?.['data-testid'] === 'grid-sort-release-year'
+      )[0];
+      releaseYearSortBtn2.props.onClick();
+      expect(window.localStorage.getItem('one_launcher_grid_release_year_order')).toBe('asc');
+
+      const tree3 = harness.render();
+      const ascGameIds = findElements(tree3, (el) => Boolean(el.props?.['data-game-id'])).map(
+        (el) => el.props['data-game-id']
+      );
+      expect(ascGameIds).toEqual([
+        'game-disco', // 2019
+        'game-halo', // 2019
+        'game-cp2077', // 2020
+        'game-bg3', // 2023
+        'game-starfield', // 2023
+        'game-retro-tba', // TBA (unknown year remains at the end)
+      ]);
+    });
   });
 
   describe('Performance Benchmark (1,000-Game Library)', () => {
