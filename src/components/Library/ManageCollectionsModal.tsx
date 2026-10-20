@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { GameCollection } from '../../contracts/collection';
 import { CanonicalGame } from '../../contracts/game';
-import { FolderPlus, X, Check, Trash2, Edit2, Bookmark, ChevronDown } from 'lucide-react';
+import { FolderPlus, X, Check, Trash2, Edit2, Bookmark, ChevronDown, GripVertical } from 'lucide-react';
 import {
   CollectionIcon,
   COLLECTION_ICON_OPTIONS,
@@ -17,6 +17,7 @@ interface ManageCollectionsModalProps {
   onRenameCollection: (id: string, newName: string, icon?: string) => void;
   onDeleteCollection: (id: string) => void;
   onToggleGameInCollection: (collectionId: string, gameId: string) => void;
+  onReorderCollections?: (fromIndex: number, toIndex: number) => void;
 }
 
 export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
@@ -28,6 +29,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   onRenameCollection,
   onDeleteCollection,
   onToggleGameInCollection,
+  onReorderCollections,
 }) => {
   const [newColName, setNewColName] = useState('');
   const [newCollectionIcon, setNewCollectionIcon] = useState<string>('folder');
@@ -36,6 +38,8 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [editingIcon, setEditingIcon] = useState<string>('folder');
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
 
   if (!isOpen) return null;
 
@@ -89,19 +93,74 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
             </p>
           )}
 
+          <div className="flex items-center justify-between text-[11px] text-steam-subtext">
+            <span className="font-semibold uppercase tracking-wider text-white/90">
+              Your Collections ({collections.length})
+            </span>
+            {collections.length > 1 && onReorderCollections && (
+              <span className="text-[10px] text-[#8f98a0]">Drag to reorder in sidebar</span>
+            )}
+          </div>
+
           {/* Collections List */}
           <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
-            {collections.map((col) => {
+            {collections.map((col, index) => {
               const isIncluded = game ? col.gameIds.includes(game.id) : false;
               const isEditing = editingId === col.id;
+              const isDragging = draggedIndex === index;
+              const isDragOver = dragOverIndex === index && draggedIndex !== index;
 
               return (
                 <div
                   key={col.id}
-                  className={`flex flex-col px-3 py-2 rounded border transition-colors ${
+                  data-testid={`collection-row-${col.id}`}
+                  draggable={!isEditing && Boolean(onReorderCollections)}
+                  onDragStart={(e) => {
+                    setDraggedIndex(index);
+                    e.dataTransfer?.setData('text/plain', String(index));
+                    if (e.dataTransfer) {
+                      e.dataTransfer.effectAllowed = 'move';
+                    }
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    if (e.dataTransfer) {
+                      e.dataTransfer.dropEffect = 'move';
+                    }
+                    if (dragOverIndex !== index) {
+                      setDragOverIndex(index);
+                    }
+                  }}
+                  onDragLeave={() => {
+                    if (dragOverIndex === index) {
+                      setDragOverIndex(null);
+                    }
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const rawIdx = e.dataTransfer?.getData('text/plain');
+                    const fromIdx =
+                      draggedIndex !== null
+                        ? draggedIndex
+                        : rawIdx !== undefined && rawIdx !== ''
+                          ? Number(rawIdx)
+                          : NaN;
+                    if (!Number.isNaN(fromIdx) && fromIdx !== index && onReorderCollections) {
+                      onReorderCollections(fromIdx, index);
+                    }
+                    setDraggedIndex(null);
+                    setDragOverIndex(null);
+                  }}
+                  onDragEnd={() => {
+                    setDraggedIndex(null);
+                    setDragOverIndex(null);
+                  }}
+                  className={`group flex flex-col px-3 py-2 rounded border transition-colors ${
                     isIncluded
                       ? 'bg-[#223547] border-steam-accent/50 text-white'
                       : 'bg-[#16202d] border-[#2a475e]/60 text-steam-text hover:bg-[#1f2d3d]'
+                  } ${isDragging ? 'opacity-50 border-[#66c0f4]/60' : ''} ${
+                    isDragOver ? 'border-[#66c0f4] ring-1 ring-[#66c0f4]/50 bg-[#66c0f4]/10' : ''
                   }`}
                 >
                   {isEditing ? (
@@ -178,6 +237,13 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                         onClick={() => game && onToggleGameInCollection(col.id, game.id)}
                         className="flex items-center gap-2.5 flex-1 cursor-pointer select-none"
                       >
+                        <div
+                          data-testid={`drag-handle-${col.id}`}
+                          className="text-slate-500 group-hover:text-slate-300 cursor-grab active:cursor-grabbing shrink-0"
+                          title="Drag to reorder"
+                        >
+                          <GripVertical className="w-4 h-4" />
+                        </div>
                         {game && (
                           <div
                             className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${

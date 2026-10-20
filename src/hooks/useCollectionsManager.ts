@@ -89,6 +89,25 @@ export function useCollectionsManager() {
     });
   }, []);
 
+  const handleReorderCollections = useCallback((fromIndex: number, toIndex: number) => {
+    setCollections((prev) => {
+      if (
+        fromIndex < 0 ||
+        fromIndex >= prev.length ||
+        toIndex < 0 ||
+        toIndex >= prev.length ||
+        fromIndex === toIndex
+      ) {
+        return prev;
+      }
+      const updated = [...prev];
+      const [moved] = updated.splice(fromIndex, 1);
+      updated.splice(toIndex, 0, moved);
+      saveCollections(updated);
+      return updated;
+    });
+  }, []);
+
   return {
     collections,
     isManageCollectionsOpen,
@@ -100,5 +119,6 @@ export function useCollectionsManager() {
     handleUpdateCollectionIcon,
     handleDeleteCollection,
     handleToggleGameInCollection,
+    handleReorderCollections,
   };
 }

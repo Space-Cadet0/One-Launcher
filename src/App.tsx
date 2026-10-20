@@ -313,6 +313,7 @@ export function App() {
     handleRenameCollection,
     handleDeleteCollection,
     handleToggleGameInCollection,
+    handleReorderCollections,
   } = useCollectionsManager();
 
   const navigateSelectGroup = (groupId: string | null) => {
@@ -2366,6 +2367,7 @@ export function App() {
             onRenameCollection={handleRenameCollection}
             onDeleteCollection={handleDeleteCollection}
             onToggleGameInCollection={handleToggleGameInCollection}
+            onReorderCollections={handleReorderCollections}
           />
         </Suspense>
       )}

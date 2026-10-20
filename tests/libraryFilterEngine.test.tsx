@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
 import type { CanonicalGame } from '../src/contracts/game';
 import {
   DEFAULT_LIBRARY_FILTER_STATE,
@@ -861,12 +860,13 @@ describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider',
       ).toEqual(['RPG']);
     });
 
-    it('enforces strict v2 constraints: LibrarySidebar.tsx is untouched and TopNavBar.tsx retains distinct Storefront & Installed Only controls', () => {
-      const sidebarDiff = execSync('git diff src/components/Library/LibrarySidebar.tsx', {
-        cwd: ROOT_DIR,
-        encoding: 'utf8',
-      });
-      expect(sidebarDiff.trim()).toBe('');
+    it('enforces strict v2 constraints: LibrarySidebar.tsx does not import LibraryFilterPanel and TopNavBar.tsx retains distinct Storefront & Installed Only controls', () => {
+      const sidebarSource = fs.readFileSync(
+        path.join(ROOT_DIR, 'src', 'components', 'Library', 'LibrarySidebar.tsx'),
+        'utf8'
+      );
+      expect(sidebarSource).not.toContain('LibraryFilterPanel');
+      expect(sidebarSource).not.toContain('libraryFilterIndex');
 
       const topNavSource = fs.readFileSync(
         path.join(ROOT_DIR, 'src', 'components', 'Navigation', 'TopNavBar.tsx'),

@@ -478,7 +478,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             title="Create or manage collections"
           >
             <FolderPlus className="w-3 h-3 text-steam-accent" />
-            <span className="hidden sm:inline">+ Group</span>
+            <span className="hidden sm:inline">Groups</span>
           </button>
         </div>
       </div>
