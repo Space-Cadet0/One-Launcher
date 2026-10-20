@@ -16,6 +16,7 @@ import {
   Sliders,
   SlidersHorizontal,
   Award,
+  Calendar,
   AlertCircle,
   Activity,
 } from 'lucide-react';
@@ -661,11 +662,18 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
 );
 
 
-export type GridSortOption = 'alphabetical' | 'rating' | 'playtime' | 'recent';
+export type GridSortOption = 'alphabetical' | 'rating' | 'playtime' | 'recent' | 'release_year';
 export const GRID_SORT_STORAGE_KEY = 'one_launcher_grid_sort_by';
+export const GRID_RELEASE_YEAR_ORDER_STORAGE_KEY = 'one_launcher_grid_release_year_order';
 
 export function isValidGridSortOption(val: unknown): val is GridSortOption {
-  return val === 'alphabetical' || val === 'rating' || val === 'playtime' || val === 'recent';
+  return (
+    val === 'alphabetical' ||
+    val === 'rating' ||
+    val === 'playtime' ||
+    val === 'recent' ||
+    val === 'release_year'
+  );
 }
 
 export function loadPersistedGridSort(): GridSortOption {
@@ -680,6 +688,20 @@ export function loadPersistedGridSort(): GridSortOption {
     // ignore storage errors
   }
   return 'alphabetical';
+}
+
+export function loadPersistedReleaseYearOrder(): 'desc' | 'asc' {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const saved = window.localStorage.getItem(GRID_RELEASE_YEAR_ORDER_STORAGE_KEY);
+      if (saved === 'asc' || saved === 'desc') {
+        return saved;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return 'desc';
 }
 
 interface LibraryGridViewProps {
@@ -835,6 +857,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   const [isFilterPanelOpen, setIsFilterPanelOpen] = useState(false);
   const [internalFilterState, setInternalFilterState] = useState<LibraryFilterState>(
     DEFAULT_LIBRARY_FILTER_STATE
+  );
+  const [releaseYearOrder, setReleaseYearOrder] = useState<'desc' | 'asc'>(() =>
+    loadPersistedReleaseYearOrder()
   );
   const effectiveFilterState = libraryFilterState ?? internalFilterState;
   const fallbackFilterIndex = useMemo(
@@ -1169,9 +1194,23 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         };
         return getRecentMs(b) - getRecentMs(a);
       }
+      if (sortBy === 'release_year') {
+        const yearA =
+          effectiveFilterIndex.entriesById.get(a.id)?.releaseYear ??
+          (Number(getReleaseYear(a, steamMatcher.getEffectiveSteamAppId(a))) || null);
+        const yearB =
+          effectiveFilterIndex.entriesById.get(b.id)?.releaseYear ??
+          (Number(getReleaseYear(b, steamMatcher.getEffectiveSteamAppId(b))) || null);
+        if (yearA === null && yearB !== null) return 1;
+        if (yearA !== null && yearB === null) return -1;
+        if (yearA !== null && yearB !== null && yearA !== yearB) {
+          return releaseYearOrder === 'asc' ? yearA - yearB : yearB - yearA;
+        }
+        return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+      }
       return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
     });
-  }, [games, sortBy, overrideVersion, effectiveFilterIndex, effectiveFilterState]);
+  }, [games, sortBy, releaseYearOrder, overrideVersion, effectiveFilterIndex, effectiveFilterState]);
 
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
     startHoverForCard(game, e.currentTarget);
@@ -1331,6 +1370,43 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                 }`}
               >
                 Recently Played
+              </button>
+              <button
+                type="button"
+                data-testid="grid-sort-release-year"
+                onClick={() => {
+                  if (sortBy !== 'release_year') {
+                    handleSortChange('release_year');
+                  } else {
+                    const nextOrder = releaseYearOrder === 'desc' ? 'asc' : 'desc';
+                    setReleaseYearOrder(nextOrder);
+                    try {
+                      if (typeof window !== 'undefined' && window.localStorage) {
+                        window.localStorage.setItem(GRID_RELEASE_YEAR_ORDER_STORAGE_KEY, nextOrder);
+                      }
+                    } catch {
+                      // ignore storage errors
+                    }
+                  }
+                }}
+                className={`px-3 py-1 rounded text-xs font-semibold whitespace-nowrap transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  sortBy === 'release_year'
+                    ? 'bg-steam-accent text-black shadow-sm'
+                    : 'text-steam-text hover:text-white'
+                }`}
+                title={
+                  sortBy === 'release_year'
+                    ? releaseYearOrder === 'desc'
+                      ? 'Sorted by Release Year: Newest First (Click for Oldest First)'
+                      : 'Sorted by Release Year: Oldest First (Click for Newest First)'
+                    : 'Sort by Release Year'
+                }
+              >
+                <Calendar className="w-3.5 h-3.5" />
+                <span>
+                  Release Year
+                  {sortBy === 'release_year' ? (releaseYearOrder === 'desc' ? ' ↓' : ' ↑') : ''}
+                </span>
               </button>
             </div>
           </div>
@@ -1619,16 +1695,30 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   >
                     {game.title}
                   </h3>
-                  <div className="flex items-center justify-between text-[10px] text-steam-subtext mt-0.5">
-                    <span>
-                      {game.genres.slice(0, 1).join(', ') || 'Game'}
-                    </span>
-                    {formatPlaytime(game) && (
-                      <span className="text-white/80 font-medium">
-                        {formatPlaytime(game)}
-                      </span>
-                    )}
-                  </div>
+                  {(() => {
+                    const cardReleaseYear =
+                      effectiveFilterIndex.entriesById.get(game.id)?.releaseYear ||
+                      getReleaseYear(game, steamMatcher.getEffectiveSteamAppId(game));
+                    const playtimeLabel = formatPlaytime(game);
+                    return (
+                      <div className="flex items-center justify-between text-[10px] text-steam-subtext mt-0.5 gap-1.5">
+                        <span className="truncate">
+                          {game.genres.slice(0, 1).join(', ') || 'Game'}
+                          {cardReleaseYear && sortBy !== 'release_year' ? ` • ${cardReleaseYear}` : ''}
+                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {sortBy === 'release_year' && cardReleaseYear && (
+                            <span className="px-1.5 py-0.2 rounded bg-steam-accent/20 border border-steam-accent/40 text-steam-accent font-mono font-semibold text-[10px]">
+                              {cardReleaseYear}
+                            </span>
+                          )}
+                          {playtimeLabel && (
+                            <span className="text-white/80 font-medium">{playtimeLabel}</span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             );
