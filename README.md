@@ -154,13 +154,6 @@ npm run build:win
 
 ---
 
-## Privacy & Local-First Architecture
-
-- **Zero Telemetry & No Third-Party Cloud Accounts**: All of your library catalogs, custom collections, metadata overrides, and authentication tokens are stored locally on your machine.
-- **Read-Only Storefront Discovery**: One Launcher reads local storefront manifests (`libraryfolders.vdf`, GOG Galaxy DB, Epic `.item` manifests) non-destructively and never modifies your storefront client installations.
-
----
-
 ## License
 
 Released under the [MIT License](LICENSE).
