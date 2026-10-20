@@ -69,18 +69,42 @@ function sanitizeCollections(cols: GameCollection[]): GameCollection[] {
   }));
 }
 
+function collectionsDiffer(a: GameCollection[], b: GameCollection[]): boolean {
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) {
+    const colA = a[i];
+    const colB = b[i];
+    if (
+      !colA ||
+      !colB ||
+      colA.id !== colB.id ||
+      colA.name !== colB.name ||
+      colA.icon !== colB.icon ||
+      !Array.isArray(colA.gameIds) ||
+      colA.gameIds.length !== colB.gameIds.length
+    ) {
+      return true;
+    }
+    for (let j = 0; j < colA.gameIds.length; j++) {
+      if (colA.gameIds[j] !== colB.gameIds[j]) return true;
+    }
+  }
+  return false;
+}
+
 export function loadCollections(): GameCollection[] {
   if (typeof window === 'undefined') return DEFAULT_COLLECTIONS;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      saveCollections(DEFAULT_COLLECTIONS);
       return DEFAULT_COLLECTIONS;
     }
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
       const sanitized = sanitizeCollections(parsed);
-      saveCollections(sanitized);
+      if (collectionsDiffer(parsed, sanitized)) {
+        saveCollections(sanitized);
+      }
       return sanitized;
     }
     return DEFAULT_COLLECTIONS;

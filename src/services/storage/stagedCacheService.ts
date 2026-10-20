@@ -334,6 +334,7 @@ export function saveStagedCache<T>(
 ): StagedCacheEntry<T> {
   const entry = createStagedCacheEntry<T>(data, tier, options);
   const storage = getStorage();
+  trackedCacheKeys.add(key);
 
   if (storage) {
     try {
@@ -418,21 +419,25 @@ export function loadStagedCache<T>(
   }
 }
 
+export const STAGED_CACHE_PREFIX = 'antigravity_staged_';
+const trackedCacheKeys = new Set<string>();
+
 /**
  * Removes a staged cache entry from persistent storage and in-memory fallback.
  */
 export function evictStagedCache(key: string): void {
+  trackedCacheKeys.delete(key);
   const storage = getStorage();
   if (storage) {
     try {
       storage.removeItem(key);
-      if (!key.startsWith('antigravity_staged_')) {
-        storage.removeItem(`antigravity_staged_${key}`);
+      if (!key.startsWith(STAGED_CACHE_PREFIX)) {
+        storage.removeItem(`${STAGED_CACHE_PREFIX}${key}`);
       }
     } catch {}
   }
   memoryFallback.delete(key);
-  memoryFallback.delete(`antigravity_staged_${key}`);
+  memoryFallback.delete(`${STAGED_CACHE_PREFIX}${key}`);
 }
 
 /**
@@ -448,6 +453,14 @@ export function clearExpiredStagedCache(): void {
       for (let i = 0; i < storage.length; i++) {
         const key = storage.key(i);
         if (!key) continue;
+        if (
+          !key.startsWith(STAGED_CACHE_PREFIX) &&
+          !key.startsWith('antigravity_critic_') &&
+          !key.startsWith('steam_match_') &&
+          !trackedCacheKeys.has(key)
+        ) {
+          continue;
+        }
         try {
           const raw = storage.getItem(key);
           if (!raw) continue;
@@ -471,6 +484,7 @@ export function clearExpiredStagedCache(): void {
       }
       for (const k of keysToRemove) {
         storage.removeItem(k);
+        trackedCacheKeys.delete(k);
       }
     } catch {}
   }

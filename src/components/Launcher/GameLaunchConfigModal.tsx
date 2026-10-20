@@ -213,6 +213,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const [isCheckingUpdates, setIsCheckingUpdates] = useState<boolean>(false);
   const [isUpdatingRunner, setIsUpdatingRunner] = useState<boolean>(false);
   const [runnerUpdateFeedback, setRunnerUpdateFeedback] = useState<string | null>(null);
+  const [, setInstallInfoTick] = useState(0);
 
   const loadFormFieldsForPlatform = (
     targetPlatId: StorefrontId,
@@ -236,7 +237,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
           ? activeLayers[0].type
           : 'crossover';
     setCompatibilityLayer(defaultLayer);
-    setWineBottleName(source?.wineBottleName || activeLayers[0]?.availableBottles?.[0] || '');
+    setWineBottleName(source?.wineBottleName || '');
     setWinePrefixPath(source?.winePrefixPath || '');
     setCrossoverGraphicsBackend(source?.crossoverGraphicsBackend || 'auto');
     setCrossoverD3DMetalVersion(
@@ -284,6 +285,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) return;
+    let active = true;
 
     const existingBase = launcherService.getLaunchConfig(game.id);
     const effPlat = launcherService.getEffectivePlatformForGame(game);
@@ -306,7 +308,18 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setRunnerUpdates(launcherService.getRunnerUpdates());
     loadFormFieldsForPlatform(startPlatId, initialDrafts, initialLayers);
 
+    if (!launcherService.isGameInstalled(game, startPlatId)) {
+      launcherService
+        .getGameInstallInfo(game, startPlatId)
+        .then(() => {
+          if (!active) return;
+          setInstallInfoTick((t) => t + 1);
+        })
+        .catch(() => {});
+    }
+
     launcherService.detectCompatibilityLayers().then((layers) => {
+      if (!active) return;
       setDetectedLayers(layers);
       const validLayers = layers.filter((l) =>
         COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
@@ -315,9 +328,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         initialDrafts[startPlatId] ?? launcherService.getLaunchConfig(game.id, startPlatId);
       if (!activeSource?.compatibilityLayer && validLayers.length > 0) {
         setCompatibilityLayer(validLayers[0].type);
-        if (!activeSource?.wineBottleName && validLayers[0].availableBottles?.length) {
-          setWineBottleName(validLayers[0].availableBottles[0]);
-        }
       }
     });
 
@@ -331,15 +341,20 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       launcherService
         .checkCompatibilityLayerUpdates()
         .then((updates) => {
+          if (!active) return;
           if (updates && typeof updates === 'object') {
             setRunnerUpdates(updates);
           }
         })
         .catch(() => {})
         .finally(() => {
-          setIsCheckingUpdates(false);
+          if (active) setIsCheckingUpdates(false);
         });
     }
+
+    return () => {
+      active = false;
+    };
   }, [isOpen, game.id, initialPlatformId]);
 
   if (!isOpen) return null;
@@ -497,12 +512,25 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setDraftsByPlatform(nextDrafts);
     setPreferredPlatformId(nextPlatId);
     loadFormFieldsForPlatform(nextPlatId, nextDrafts);
+    if (!launcherService.isGameInstalled(game, nextPlatId)) {
+      launcherService
+        .getGameInstallInfo(game, nextPlatId)
+        .then(() => setInstallInfoTick((t) => t + 1))
+        .catch(() => {});
+    }
   };
 
   const visibleLaunchModes = LAUNCH_MODES.filter((m) =>
     preview.availableModes.includes(m.value)
   ).map((m) => {
     if (m.value === 'auto') {
+      if (!isWindowsHost && !preview.isInstalled && preview.hasDualMacAndWinBuild) {
+        return {
+          ...m,
+          label: 'Native macOS Build (Recommended — Auto-Detect)',
+          desc: 'Installs and launches the official Native macOS build automatically with zero translation overhead.',
+        };
+      }
       if (preview.detectedBuildType === 'windows_exe_on_mac') {
         return {
           ...m,
@@ -521,6 +549,20 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       };
     }
     if (m.value === 'compatibility_layer') {
+      if (!preview.isInstalled) {
+        if (!isWindowsHost && preview.hasDualMacAndWinBuild) {
+          return {
+            ...m,
+            label: 'Pre-Configure Compatibility Runner & Bottle',
+            desc: 'Use the Windows (.exe) build via CrossOver, GPTK, or Wine translation instead of the native macOS build.',
+          };
+        }
+        return {
+          ...m,
+          label: 'Pre-Configure Compatibility Runner & Bottle',
+          desc: 'Pre-select the macOS translation runner, target CrossOver bottle, and graphics settings before installing.',
+        };
+      }
       return {
         ...m,
         label: 'Custom Compatibility Runner & Bottle',
@@ -574,10 +616,16 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         if (launchMethod === 'storefront_uri' || launchMethod === 'compatibility_layer') {
           setLaunchMethod('direct');
         }
-      } else if (launchMethod === 'auto') {
-        if (selected.toLowerCase().endsWith('.exe')) {
+      } else if (selected.toLowerCase().endsWith('.exe')) {
+        if (launchMethod === 'direct' || launchMethod === 'storefront_uri') {
+          setLaunchMethod('auto');
+        } else if (launchMethod === 'auto') {
           setLaunchMethod('compatibility_layer');
-        } else {
+        }
+      } else {
+        if (launchMethod === 'compatibility_layer') {
+          setLaunchMethod('auto');
+        } else if (launchMethod === 'auto') {
           setLaunchMethod('direct');
         }
       }
@@ -595,6 +643,9 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     const selected = await launcherService.selectFolder(winePrefixPath || undefined);
     if (selected) {
       setWinePrefixPath(selected);
+      if (preview.detectedBuildType === 'windows_exe_on_mac' && launchMethod === 'auto') {
+        setLaunchMethod('compatibility_layer');
+      }
     }
   };
 
@@ -606,9 +657,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       setDetectedLayers(refreshed);
       const matched = refreshed.find((l) => l.type === compatibilityLayer);
       if (matched) {
-        if (!wineBottleName && matched.availableBottles?.length) {
-          setWineBottleName(matched.availableBottles[0]);
-        }
         setRunnerActionFeedback({
           tone: 'emerald',
           text: `Detected ${matched.name}${matched.version ? ` (${matched.version})` : ''} at ${matched.binaryPath}.`,
@@ -687,10 +735,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
       );
       const refreshed = res.layers || (await launcherService.detectCompatibilityLayers());
       setDetectedLayers(refreshed);
-      const matched = refreshed.find((l) => l.type === compatibilityLayer);
-      if (matched && !wineBottleName && matched.availableBottles?.length) {
-        setWineBottleName(matched.availableBottles[0]);
-      }
       if (res.success) {
         setRunnerActionFeedback({
           tone: 'emerald',
@@ -748,7 +792,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     setWorkingDirectory('');
     setLaunchArguments('');
     setCompatibilityLayer(validLayers[0]?.type || 'crossover');
-    setWineBottleName(validLayers[0]?.availableBottles?.[0] || '');
+    setWineBottleName('');
     setWinePrefixPath('');
     setCrossoverGraphicsBackend('auto');
     setCrossoverD3DMetalVersion('auto');
@@ -797,6 +841,8 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                   installPath: prof.workingDirectory || prof.customExecutablePath,
                   executablePath: prof.customExecutablePath,
                   installed: true,
+                  isWindowsBinaryOnMac:
+                    !isWindowsHost && /\.exe$/i.test(prof.customExecutablePath),
                 },
               })
             );
@@ -827,13 +873,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   const activeModeWarning = activeModeNote?.warning;
   const discoveredTargetPath = preview.executablePath || preview.installPath;
 
-  const executablePathLabel = isWindowsHost
-    ? 'Executable Path (.exe)'
-    : isMacNativeBuild
-      ? 'Application Bundle or Binary Path (.app / Mach-O)'
-      : preview.detectedBuildType === 'windows_exe_on_mac'
-        ? 'Windows Executable Path (.exe)'
-        : 'Executable Path (.app, binary, or Windows .exe)';
+  const executablePathLabel = !preview.isInstalled
+    ? 'Locate Existing Local Executable'
+    : isWindowsHost
+      ? 'Executable Path (.exe)'
+      : isMacNativeBuild
+        ? 'Application Bundle or Binary Path (.app / Mach-O)'
+        : preview.detectedBuildType === 'windows_exe_on_mac'
+          ? 'Windows Executable Path (.exe)'
+          : 'Executable Path (.app, binary, or Windows .exe)';
 
   return (
     <div
@@ -1035,76 +1083,106 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             )}
           </div>
 
-          {/* Custom Executable Path & Working Directory */}
-          <div className="grid grid-cols-1 gap-3.5 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5">
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1.5">
-                  <FileCode className="w-3.5 h-3.5 text-sky-400" />
-                  <span>{executablePathLabel}</span>
-                </label>
-                <span className="text-[10px] text-steam-subtext">
-                  Also links existing local installations
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={customExecutablePath}
-                  onChange={(e) => setCustomExecutablePath(e.target.value)}
-                  placeholder="Auto-detected from storefront manifest or select manually..."
-                  className="flex-1 rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-                />
-                <button
-                  type="button"
-                  onClick={handleBrowseExecutable}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
-                >
-                  <FolderOpen className="w-3.5 h-3.5" />
-                  <span>Browse Executable...</span>
-                </button>
+          {/* Storefront Client Protocol Handoff Notice (shown when storefront_uri is active on an installed game) */}
+          {activeDisplayMethod === 'storefront_uri' && preview.isInstalled && (
+            <div
+              data-section="storefront-uri-notice"
+              className="rounded-lg bg-[#0e151f] border border-[#26384d] p-3.5 flex items-start gap-2.5 text-xs text-steam-subtext"
+            >
+              <ExternalLink className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-bold text-white">
+                  Delegated to {getStorefrontDisplayName(preferredPlatformId)} Desktop Client
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  Launch is handed off directly to the official{' '}
+                  <span className="text-white font-semibold">
+                    {getStorefrontDisplayName(preferredPlatformId)}
+                  </span>{' '}
+                  desktop client via URI protocol. Local executable, working directory, environment
+                  variable, and shell hook overrides are bypassed in this mode.
+                </p>
               </div>
             </div>
+          )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {/* Working Directory */}
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-                  Working Directory
-                </label>
-                <div className="flex items-center gap-1.5">
+          {/* Custom Executable Path & Working Directory */}
+          {preview.visibleSections.executableAndArgs && (
+            <div
+              data-section="executable-and-args"
+              className="grid grid-cols-1 gap-3.5 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5"
+            >
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1.5">
+                    <FileCode className="w-3.5 h-3.5 text-sky-400" />
+                    <span>{executablePathLabel}</span>
+                  </label>
+                  <span className="text-[10px] text-steam-subtext">
+                    Also links existing local installations
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
                   <input
                     type="text"
-                    value={workingDirectory}
-                    onChange={(e) => setWorkingDirectory(e.target.value)}
-                    placeholder="Default game folder"
-                    className="flex-1 min-w-0 rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                    value={customExecutablePath}
+                    onChange={(e) => setCustomExecutablePath(e.target.value)}
+                    placeholder="Auto-detected from storefront manifest or select manually..."
+                    className="flex-1 rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
                   />
                   <button
                     type="button"
-                    onClick={handleBrowseWorkingDir}
-                    className="px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+                    onClick={handleBrowseExecutable}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
                   >
-                    Browse...
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    <span>Browse Executable...</span>
                   </button>
                 </div>
               </div>
 
-              {/* Command-Line Arguments */}
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-                  Launch Arguments
-                </label>
-                <input
-                  type="text"
-                  value={launchArguments}
-                  onChange={(e) => setLaunchArguments(e.target.value)}
-                  placeholder="e.g. -windowed -skipintro -dx11"
-                  className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-                />
-              </div>
+              {(preview.isInstalled || Boolean(customExecutablePath.trim())) && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Working Directory */}
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                      Working Directory
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        value={workingDirectory}
+                        onChange={(e) => setWorkingDirectory(e.target.value)}
+                        placeholder="Default game folder"
+                        className="flex-1 min-w-0 rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleBrowseWorkingDir}
+                        className="px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+                      >
+                        Browse...
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Command-Line Arguments */}
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                      Launch Arguments
+                    </label>
+                    <input
+                      type="text"
+                      value={launchArguments}
+                      onChange={(e) => setLaunchArguments(e.target.value)}
+                      placeholder="e.g. -windowed -skipintro -dx11"
+                      className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
+          )}
 
           {/* Native macOS Performance & Overlay Card (shown for native macOS .app / Mach-O builds) */}
           {!isWindowsHost && preview.visibleSections.nativeMacMetalHud && (
@@ -1154,16 +1232,29 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               data-section="compatibility-layer-settings"
               className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-4"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <Cpu className="w-4 h-4 text-amber-400" />
                   <span className="text-xs font-bold text-white uppercase tracking-wider">
                     macOS Compatibility Layer (CrossOver / Apple GPTK / Wine)
                   </span>
                 </div>
-                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-semibold">
-                  {detectedLayers.filter((l) => l.type !== 'native').length} Detected on System
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${
+                      activeDisplayMethod === 'compatibility_layer'
+                        ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                        : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                    }`}
+                  >
+                    {activeDisplayMethod === 'compatibility_layer'
+                      ? 'Custom Runner Pinned'
+                      : 'Auto-Detect Runner'}
+                  </span>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-semibold">
+                    {detectedLayers.filter((l) => l.type !== 'native').length} Detected on System
+                  </span>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1178,6 +1269,12 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     value={compatibilityLayer}
                     onChange={(e) => {
                       setCompatibilityLayer(e.target.value as CompatibilityLayerType);
+                      if (
+                        preview.detectedBuildType === 'windows_exe_on_mac' &&
+                        launchMethod === 'auto'
+                      ) {
+                        setLaunchMethod('compatibility_layer');
+                      }
                       setRunnerActionFeedback(null);
                       setRunnerUpdateFeedback(null);
                     }}
@@ -1207,7 +1304,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                     <select
                       aria-label="Target Bottle Name"
                       value={wineBottleName}
-                      onChange={(e) => setWineBottleName(e.target.value)}
+                      onChange={(e) => {
+                        setWineBottleName(e.target.value);
+                        if (
+                          preview.detectedBuildType === 'windows_exe_on_mac' &&
+                          launchMethod === 'auto'
+                        ) {
+                          setLaunchMethod('compatibility_layer');
+                        }
+                      }}
                       className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
                     >
                       <option value="">Default Bottle ({availableBottles[0]})</option>
@@ -1222,7 +1327,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                       type="text"
                       aria-label="Target Bottle Name"
                       value={wineBottleName}
-                      onChange={(e) => setWineBottleName(e.target.value)}
+                      onChange={(e) => {
+                        setWineBottleName(e.target.value);
+                        if (
+                          preview.detectedBuildType === 'windows_exe_on_mac' &&
+                          launchMethod === 'auto'
+                        ) {
+                          setLaunchMethod('compatibility_layer');
+                        }
+                      }}
                       placeholder="e.g. Steam, GOG, Default"
                       className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
                     />
@@ -1521,7 +1634,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                   <input
                     type="text"
                     value={winePrefixPath}
-                    onChange={(e) => setWinePrefixPath(e.target.value)}
+                    onChange={(e) => {
+                      setWinePrefixPath(e.target.value);
+                      if (
+                        preview.detectedBuildType === 'windows_exe_on_mac' &&
+                        launchMethod === 'auto'
+                      ) {
+                        setLaunchMethod('compatibility_layer');
+                      }
+                    }}
                     placeholder="~/Library/Application Support/CrossOver/Bottles/..."
                     className="flex-1 rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
                   />
@@ -1815,86 +1936,96 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             </div>
           )}
 
-          {/* Environment Variables & Custom Overrides */}
-          <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Sliders className="w-4 h-4 text-sky-400" />
-                <span className="text-xs font-bold text-white uppercase tracking-wider">
-                  Environment Variables
-                </span>
+          {preview.visibleSections.environmentAndHooks && (
+            <>
+              {/* Environment Variables & Custom Overrides */}
+              <div
+                data-section="environment-variables"
+                className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Sliders className="w-4 h-4 text-sky-400" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">
+                      Environment Variables
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-steam-subtext">
+                    Custom KEY=VALUE process overrides
+                  </span>
+                </div>
+
+                {isWindowsHost && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {WINDOWS_QUICK_ENV_TOGGLES.map((item) => {
+                      const isActive = currentEnvMap[item.key] === item.value;
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => handleToggleQuickEnv(item.key, item.value)}
+                          className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-all cursor-pointer ${
+                            isActive
+                              ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                              : 'bg-[#141d2b] border-[#26384d] text-steam-subtext hover:text-white'
+                          }`}
+                          title={item.desc}
+                        >
+                          {item.label} ({item.key}={item.value})
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <textarea
+                  rows={2}
+                  value={envText}
+                  onChange={(e) => setEnvText(e.target.value)}
+                  placeholder={
+                    isWindowsHost
+                      ? 'KEY=VALUE (one per line, e.g. DXVK_HUD=1)'
+                      : 'KEY=VALUE (one per line, e.g. MANGOHUD=1)'
+                  }
+                  className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                />
               </div>
-              <span className="text-[10px] text-steam-subtext">
-                Custom KEY=VALUE process overrides
-              </span>
-            </div>
 
-            {isWindowsHost && (
-              <div className="flex flex-wrap gap-1.5">
-                {WINDOWS_QUICK_ENV_TOGGLES.map((item) => {
-                  const isActive = currentEnvMap[item.key] === item.value;
-                  return (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() => handleToggleQuickEnv(item.key, item.value)}
-                      className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-all cursor-pointer ${
-                        isActive
-                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                          : 'bg-[#141d2b] border-[#26384d] text-steam-subtext hover:text-white'
-                      }`}
-                      title={item.desc}
-                    >
-                      {item.label} ({item.key}={item.value})
-                    </button>
-                  );
-                })}
+              {/* Pre-Launch & Post-Exit Shell Commands */}
+              <div
+                data-section="shell-hooks"
+                className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5"
+              >
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1">
+                    <Terminal className="w-3 h-3 text-sky-400" />
+                    <span>Pre-Launch Command</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={preLaunchCommand}
+                    onChange={(e) => setPreLaunchCommand(e.target.value)}
+                    placeholder="Optional shell script before launch"
+                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1">
+                    <Terminal className="w-3 h-3 text-sky-400" />
+                    <span>Post-Exit Command</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={postExitCommand}
+                    onChange={(e) => setPostExitCommand(e.target.value)}
+                    placeholder="Optional shell script after game exits"
+                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                  />
+                </div>
               </div>
-            )}
-
-            <textarea
-              rows={2}
-              value={envText}
-              onChange={(e) => setEnvText(e.target.value)}
-              placeholder={
-                isWindowsHost
-                  ? 'KEY=VALUE (one per line, e.g. DXVK_HUD=1)'
-                  : 'KEY=VALUE (one per line, e.g. MANGOHUD=1)'
-              }
-              className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-            />
-          </div>
-
-          {/* Pre-Launch & Post-Exit Shell Commands */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5">
-            <div className="space-y-1">
-              <label className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1">
-                <Terminal className="w-3 h-3 text-sky-400" />
-                <span>Pre-Launch Command</span>
-              </label>
-              <input
-                type="text"
-                value={preLaunchCommand}
-                onChange={(e) => setPreLaunchCommand(e.target.value)}
-                placeholder="Optional shell script before launch"
-                className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1">
-                <Terminal className="w-3 h-3 text-sky-400" />
-                <span>Post-Exit Command</span>
-              </label>
-              <input
-                type="text"
-                value={postExitCommand}
-                onChange={(e) => setPostExitCommand(e.target.value)}
-                placeholder="Optional shell script after game exits"
-                className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-              />
-            </div>
-          </div>
+            </>
+          )}
         </div>
 
         {/* Footer */}

@@ -19,6 +19,10 @@ import type {
   UpdateCompatibilityLayerResult,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
+import {
+  getStorefrontNativeOsFlags,
+  saveCachedGogOsSupport,
+} from '../platform/nativeOsService';
 import { steamApi } from '../steam/steamApi';
 
 const LAUNCH_CONFIGS_STORAGE_KEY = 'one_launcher_game_configs_v1';
@@ -91,6 +95,15 @@ function sanitizeLegacyCompatLayer(layer?: any): CompatibilityLayerType | undefi
   return layer as CompatibilityLayerType;
 }
 
+function normalizeTitleForMatch(title?: string): string {
+  if (!title) return '';
+  return title
+    .toLowerCase()
+    .replace(/[™®©]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
 export class LauncherService {
   private installedRecords: InstalledGameRecord[] = [];
   private activeSessions: Map<string, ActiveGameSession> = new Map();
@@ -98,6 +111,7 @@ export class LauncherService {
   private launchConfigs: Record<string, GameLaunchConfig> = {};
   private compatibilityLayers: CompatibilityLayerInfo[] = [];
   private runnerUpdates: Record<string, CompatibilityLayerUpdateInfo> = {};
+  private installInfoCache: Map<string, GameInstallInfo> = new Map();
   private listeners: Set<() => void> = new Set();
   private initialized = false;
   private unsubscribeDownload?: () => void;
@@ -401,6 +415,13 @@ export class LauncherService {
     const task = data?.task;
     if (task && task.status === 'completed') {
       const installPath = task.finalInstallPath || task.installDir;
+      const isWindowsBinaryOnMac =
+        !this.isWindowsHost() &&
+        (Boolean(task.isWindowsBinaryOnMac) ||
+          Boolean(task.executablePath && /\.exe$/i.test(task.executablePath)) ||
+          /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
+            String(task.executablePath || installPath || '')
+          ));
       const newRecord: InstalledGameRecord = {
         platformId: task.platformId,
         platformGameId: task.platformGameId,
@@ -410,6 +431,7 @@ export class LauncherService {
         executablePath: task.executablePath,
         installSize: task.totalBytes,
         runner: 'one_launcher',
+        isWindowsBinaryOnMac,
       };
 
       const existingIdx = this.installedRecords.findIndex(
@@ -432,6 +454,7 @@ export class LauncherService {
               platformGameId: task.platformGameId,
               installPath,
               executablePath: task.executablePath,
+              isWindowsBinaryOnMac,
               installed: true,
             },
           })
@@ -531,6 +554,14 @@ export class LauncherService {
             this.installedRecords = res.installedGames.map((r) =>
               isWin ? { ...r, isWindowsBinaryOnMac: false } : r
             );
+            if ((res as any).epicPlatformSupport) {
+              Object.defineProperty(this.installedRecords, 'epicPlatformSupport', {
+                value: (res as any).epicPlatformSupport,
+                enumerable: false,
+                configurable: true,
+                writable: true,
+              });
+            }
             this.lastScanTimestamp = Date.now();
 
             const hasAnyCustomExe = Object.values(this.launchConfigs).some(
@@ -620,6 +651,7 @@ export class LauncherService {
                   etaSeconds: 0,
                   finalInstallPath: matchedRecord.installPath,
                   executablePath: matchedRecord.executablePath,
+                  isWindowsBinaryOnMac: matchedRecord.isWindowsBinaryOnMac,
                   completedAt: new Date().toISOString(),
                   statusMessage: 'Installation complete',
                 };
@@ -633,6 +665,7 @@ export class LauncherService {
                         platformGameId: task.platformGameId,
                         installPath: matchedRecord.installPath,
                         executablePath: matchedRecord.executablePath,
+                        isWindowsBinaryOnMac: matchedRecord.isWindowsBinaryOnMac,
                         installed: true,
                       },
                     })
@@ -658,6 +691,7 @@ export class LauncherService {
                         platformGameId: rec.platformGameId,
                         installPath: rec.installPath,
                         executablePath: rec.executablePath,
+                        isWindowsBinaryOnMac: rec.isWindowsBinaryOnMac,
                         installed: true,
                       },
                     })
@@ -831,17 +865,48 @@ export class LauncherService {
 
     // 1. Helper to check matching platform records in installedRecords
     const matchPlatformRecord = (p: GamePlatformOwnership): InstalledGameRecord | undefined => {
+      const pGameId = String(p.platformGameId || (p as any).storefrontAppId || '');
       const exact = this.installedRecords.find(
         (r) =>
           r.platformId === p.platformId &&
-          (String(r.platformGameId) === String(p.platformGameId) ||
+          ((pGameId && String(r.platformGameId) === pGameId) ||
             (p.platformId === 'steam' &&
               game.steamAppId &&
               Number(r.appId || r.platformGameId) === Number(game.steamAppId)))
       );
       if (exact) return exact;
 
+      const byPathOrTitle = this.installedRecords.find(
+        (r) =>
+          r.platformId === p.platformId &&
+          ((p.installPath && r.installPath && r.installPath === p.installPath) ||
+            (p.executablePath && r.executablePath && r.executablePath === p.executablePath) ||
+            (game.title &&
+              r.title &&
+              normalizeTitleForMatch(r.title) === normalizeTitleForMatch(game.title)))
+      );
+      if (byPathOrTitle) return byPathOrTitle;
+
       if (p.installed && (p.installPath || p.executablePath)) {
+        const isWinPath = Boolean(
+          (p.executablePath && /\.exe$/i.test(p.executablePath)) ||
+            /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
+              String(p.executablePath || p.installPath || '')
+            )
+        );
+        const isMacPath = Boolean(
+          (p.executablePath && !/\.exe$/i.test(p.executablePath)) ||
+            (p.installPath && /\.app(\/|$)/i.test(p.installPath))
+        );
+        const inferredWinOnMac = this.isWindowsHost()
+          ? false
+          : p.isWindowsBinaryOnMac !== undefined
+            ? p.isWindowsBinaryOnMac
+            : isWinPath
+              ? true
+              : isMacPath
+                ? false
+                : undefined;
         return {
           platformId: p.platformId,
           platformGameId: p.platformGameId,
@@ -852,7 +917,7 @@ export class LauncherService {
           launchArguments: p.launchArguments,
           installSize: p.installSize,
           version: p.version,
-          isWindowsBinaryOnMac: this.isWindowsHost() ? false : p.isWindowsBinaryOnMac,
+          isWindowsBinaryOnMac: inferredWinOnMac,
         };
       }
       return undefined;
@@ -890,6 +955,8 @@ export class LauncherService {
           executablePath: platCfg.customExecutablePath,
           launchArguments: platCfg.launchArguments || targetPlat?.launchArguments,
           runner: 'custom',
+          isWindowsBinaryOnMac:
+            !this.isWindowsHost() && /\.exe$/i.test(platCfg.customExecutablePath),
         };
       }
 
@@ -932,6 +999,8 @@ export class LauncherService {
         executablePath: cfg.customExecutablePath,
         launchArguments: cfg.launchArguments || targetPlat?.launchArguments,
         runner: 'custom',
+        isWindowsBinaryOnMac:
+          !this.isWindowsHost() && /\.exe$/i.test(cfg.customExecutablePath),
       };
     }
 
@@ -948,6 +1017,8 @@ export class LauncherService {
             executablePath: platProfile.customExecutablePath,
             launchArguments: platProfile.launchArguments || targetPlat?.launchArguments,
             runner: 'custom',
+            isWindowsBinaryOnMac:
+              !this.isWindowsHost() && /\.exe$/i.test(platProfile.customExecutablePath),
           };
         }
       }
@@ -1100,14 +1171,18 @@ export class LauncherService {
       platformId || effPlatform?.platformId || (game.steamAppId ? 'steam' : 'custom');
     const resolvedPlatformGameId =
       effPlatform?.platformGameId || (game.steamAppId ? String(game.steamAppId) : game.id);
+    const storeFlags = getStorefrontNativeOsFlags(game, resolvedPlatformId);
 
     if (typeof window !== 'undefined' && window.electronAPI?.getGameInstallInfo) {
       try {
-        const cachedSteamMeta = game.steamAppId
-          ? steamApi.getCachedMetadata(Number(game.steamAppId))
-          : undefined;
+        const cachedSteamMeta =
+          resolvedPlatformId === 'steam' && game.steamAppId
+            ? steamApi.getCachedMetadata(Number(game.steamAppId))
+            : undefined;
         const steamPlatforms =
-          cachedSteamMeta?.platforms || game.enrichedMetadata?.platforms;
+          resolvedPlatformId === 'steam'
+            ? cachedSteamMeta?.platforms || game.enrichedMetadata?.platforms
+            : undefined;
         const res = await window.electronAPI.getGameInstallInfo({
           gameId: game.id,
           title: game.title,
@@ -1116,11 +1191,48 @@ export class LauncherService {
           steamAppId: game.steamAppId,
           targetInstallDir,
           steamPlatforms,
+          storePlatforms: {
+            windows: storeFlags.windows,
+            mac: storeFlags.mac,
+          },
         });
-        return {
+        const resHostPlatform = res.hostPlatform || hostPlatform;
+        if (Array.isArray(res.availableInstallers) && res.availableInstallers.length > 0) {
+          const hasMac = res.availableInstallers.some((i) => i.os === 'mac');
+          const hasWin = res.availableInstallers.some((i) => i.os === 'windows');
+          const targetPlat = (game.platforms || []).find(
+            (p) => p.platformId === resolvedPlatformId
+          );
+          if (resHostPlatform === 'win32') {
+            if (targetPlat) {
+              targetPlat.platforms = {
+                ...targetPlat.platforms,
+                windows: hasWin,
+                mac: targetPlat.platforms?.mac ?? false,
+              };
+            }
+          } else {
+            if (targetPlat) {
+              targetPlat.platforms = {
+                ...targetPlat.platforms,
+                windows: hasWin,
+                mac: hasMac,
+              };
+            }
+            if (resolvedPlatformId === 'gog') {
+              saveCachedGogOsSupport(resolvedPlatformGameId, game.title, {
+                windows: hasWin,
+                mac: hasMac,
+              });
+            }
+          }
+        }
+        const info: GameInstallInfo = {
           ...res,
-          hostPlatform: res.hostPlatform || hostPlatform,
+          hostPlatform: resHostPlatform,
         };
+        this.setCachedInstallInfoEntry(`${game.id}:${resolvedPlatformId}`, info);
+        return info;
       } catch (err) {
         console.warn('[LauncherService] getGameInstallInfo fallback:', err);
       }
@@ -1142,7 +1254,25 @@ export class LauncherService {
       : [defaultInstallDir, '/Applications'];
     const diskSpace = (await this.getDiskSpace(targetInstallDir || defaultInstallDir)) || undefined;
 
-    return {
+    const macFallbackInstallers: NonNullable<GameInstallInfo['availableInstallers']> = [];
+    if (!isWin) {
+      if (storeFlags.mac) {
+        macFallbackInstallers.push({
+          id: `${resolvedPlatformId}-mac-native`,
+          name: `${game.title || 'Game'} — Native macOS Build`,
+          os: 'mac',
+        });
+      }
+      if (storeFlags.windows || macFallbackInstallers.length === 0) {
+        macFallbackInstallers.push({
+          id: `${resolvedPlatformId}-win-compat`,
+          name: `${game.title || 'Game'} — Windows Build (CrossOver / Wine)`,
+          os: 'windows',
+        });
+      }
+    }
+
+    const fallbackInfo: GameInstallInfo = {
       platformId: resolvedPlatformId,
       platformGameId: resolvedPlatformGameId,
       hostPlatform,
@@ -1156,11 +1286,42 @@ export class LauncherService {
               os: 'windows',
             },
           ]
-        : undefined,
+        : macFallbackInstallers,
       canDirectDownload: resolvedPlatformId === 'gog',
       requiresStoreClientFallback: resolvedPlatformId !== 'gog',
       diskSpace,
     };
+    this.setCachedInstallInfoEntry(`${game.id}:${resolvedPlatformId}`, fallbackInfo);
+    return fallbackInfo;
+  }
+
+  private setCachedInstallInfoEntry(key: string, info: GameInstallInfo): void {
+    if (!key) return;
+    if (this.installInfoCache.has(key)) {
+      this.installInfoCache.delete(key);
+    }
+    while (this.installInfoCache.size >= 250) {
+      const oldestKey = this.installInfoCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.installInfoCache.delete(oldestKey);
+    }
+    this.installInfoCache.set(key, info);
+  }
+
+  public getCachedInstallInfo(
+    gameId?: string,
+    platformId?: StorefrontId
+  ): GameInstallInfo | undefined {
+    if (!gameId) return undefined;
+    if (platformId) {
+      return this.installInfoCache.get(`${gameId}:${platformId}`);
+    }
+    for (const [key, value] of this.installInfoCache.entries()) {
+      if (key.startsWith(`${gameId}:`)) {
+        return value;
+      }
+    }
+    return undefined;
   }
 
   public async launchGame(
@@ -1305,6 +1466,8 @@ export class LauncherService {
       ...request,
       estimatedSizeBytes: request.estimatedSizeBytes,
       totalBytes: resolvedTotalBytes,
+      ...(request.compatibilityLayer ? { compatibilityLayer: request.compatibilityLayer } : {}),
+      ...(request.wineBottleName ? { wineBottleName: request.wineBottleName } : {}),
     };
 
     if (typeof window !== 'undefined' && window.electronAPI?.installGame) {
@@ -1692,15 +1855,28 @@ export class LauncherService {
     const normalizedExe = selectedExe.replace(/[\\/]+$/, '');
     const lastSepIdx = Math.max(normalizedExe.lastIndexOf('/'), normalizedExe.lastIndexOf('\\'));
     const exeDir = lastSepIdx > 0 ? normalizedExe.slice(0, lastSepIdx) : undefined;
+    const isWinExeOnMac = !this.isWindowsHost() && /\.exe$/i.test(selectedExe);
+
+    let resolvedLaunchMethod: LaunchMethod;
+    if (isWinExeOnMac) {
+      resolvedLaunchMethod =
+        existingCfg.launchMethod === 'compatibility_layer' ? 'compatibility_layer' : 'auto';
+    } else if (!this.isWindowsHost()) {
+      resolvedLaunchMethod = existingCfg.launchMethod === 'auto' ? 'auto' : 'direct';
+    } else {
+      resolvedLaunchMethod =
+        existingCfg.launchMethod &&
+        existingCfg.launchMethod !== 'storefront_uri' &&
+        existingCfg.launchMethod !== 'compatibility_layer'
+          ? existingCfg.launchMethod
+          : 'direct';
+    }
 
     const updatedCfg: GameLaunchConfig = {
       ...existingCfg,
       gameId: game.id,
       preferredPlatformId: resolvedPlatformId,
-      launchMethod:
-        existingCfg.launchMethod && existingCfg.launchMethod !== 'storefront_uri'
-          ? existingCfg.launchMethod
-          : 'direct',
+      launchMethod: resolvedLaunchMethod,
       customExecutablePath: selectedExe,
       ...(exeDir ? { workingDirectory: exeDir } : {}),
     };
@@ -1719,6 +1895,7 @@ export class LauncherService {
             platformGameId: resolvedPlatformGameId,
             installPath: exeDir || selectedExe,
             executablePath: selectedExe,
+            isWindowsBinaryOnMac: isWinExeOnMac,
             installed: true,
           },
         })
@@ -2031,6 +2208,26 @@ export class LauncherService {
     const bottleName =
       mergedDraft.wineBottleName || activeLayer?.availableBottles?.[0];
 
+    const cachedInstallInfo = this.getCachedInstallInfo(game?.id, platformId);
+    let hasMacInstaller = false;
+    let hasWinInstaller = true;
+    if (
+      cachedInstallInfo?.availableInstallers &&
+      cachedInstallInfo.availableInstallers.length > 0
+    ) {
+      hasMacInstaller = cachedInstallInfo.availableInstallers.some((i) => i.os === 'mac');
+      hasWinInstaller = cachedInstallInfo.availableInstallers.some((i) => i.os === 'windows');
+    } else {
+      const storeFlags = game
+        ? getStorefrontNativeOsFlags(game, platformId)
+        : { windows: true, mac: false, isExplicit: false };
+      hasMacInstaller = storeFlags.mac;
+      hasWinInstaller = storeFlags.windows;
+    }
+    const hasDualMacAndWinBuild = hasMacInstaller && hasWinInstaller;
+    const isKnownMacOnly = hasMacInstaller && !hasWinInstaller;
+    const isKnownWinOnlyOnMac = hasWinInstaller && !hasMacInstaller;
+
     let detectedBuildType: ResolvedLaunchModePreview['detectedBuildType'] =
       'not_installed';
     let detectedBuildLabel = 'Not Installed Locally';
@@ -2039,9 +2236,29 @@ export class LauncherService {
 
     if (!isInstalled) {
       detectedBuildType = 'not_installed';
-      detectedBuildLabel = 'Not Installed Locally';
-      detectedBuildDetail =
-        'Install this game first or link an existing executable below.';
+      if (hostPlatform !== 'win32') {
+        if (hasDualMacAndWinBuild) {
+          detectedBuildLabel =
+            'Not Installed Locally • Native macOS (Recommended) & Windows Builds Available';
+          detectedBuildDetail = `Both a Native macOS build (Recommended) and a Windows build (via ${layerName} translation) are available on ${storeName}.`;
+        } else if (isKnownWinOnlyOnMac) {
+          detectedBuildLabel = 'Not Installed Locally • Windows Build (CrossOver / Wine)';
+          detectedBuildDetail =
+            'Install this Windows build via One Launcher (or pre-configure CrossOver / Wine below) or link an existing executable.';
+        } else if (isKnownMacOnly) {
+          detectedBuildLabel = 'Not Installed Locally • Native macOS Build';
+          detectedBuildDetail =
+            'Install this native macOS build via One Launcher or link an existing .app bundle below.';
+        } else {
+          detectedBuildLabel = 'Not Installed Locally';
+          detectedBuildDetail =
+            'Install this game first or link an existing executable below.';
+        }
+      } else {
+        detectedBuildLabel = 'Not Installed Locally';
+        detectedBuildDetail =
+          'Install this game first or link an existing executable below.';
+      }
     } else if (hostPlatform === 'win32') {
       detectedBuildType = 'windows_native';
       detectedBuildLabel = 'Windows Native Build (.exe)';
@@ -2050,20 +2267,21 @@ export class LauncherService {
     } else {
       const isExplicitAppBundle = Boolean(
         (executablePath && /\.app(\/|$)/i.test(executablePath)) ||
-          (!executablePath && installPath && /\.app$/i.test(installPath))
+          (!executablePath && installPath && /\.app(\/|$)/i.test(installPath))
       );
       const isBottlePath = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
         String(executablePath || installPath || '')
       );
+      const hasExplicitWinFlag =
+        installedRecord?.isWindowsBinaryOnMac !== undefined
+          ? installedRecord.isWindowsBinaryOnMac
+          : effPlatform?.isWindowsBinaryOnMac;
       const isExeOnMac =
-        Boolean(executablePath && /\.exe$/i.test(executablePath)) ||
+        Boolean(executablePath && /\.(exe|bat|msi)$/i.test(executablePath)) ||
         (!isExplicitAppBundle &&
-          (Boolean(
-            installedRecord?.isWindowsBinaryOnMac ||
-              effPlatform?.isWindowsBinaryOnMac
-          ) ||
+          (Boolean(hasExplicitWinFlag) ||
             isBottlePath ||
-            Boolean(mergedDraft.wineBottleName || mergedDraft.winePrefixPath)));
+            (!executablePath && hasExplicitWinFlag !== false && isKnownWinOnlyOnMac)));
 
       if (isExeOnMac) {
         detectedBuildType = 'windows_exe_on_mac';
@@ -2089,41 +2307,62 @@ export class LauncherService {
       sanitizeLegacyCompatLayer(savedConfig?.compatibilityLayer) ||
       layers[0]?.type ||
       'crossover';
-    const hasExplicitBottleOrCompatConfig = Boolean(
-      draftConfig?.wineBottleName ||
-        draftConfig?.winePrefixPath ||
-        savedConfig?.wineBottleName ||
-        savedConfig?.winePrefixPath ||
-        (savedConfig?.crossoverGraphicsBackend &&
-          savedConfig.crossoverGraphicsBackend !== 'auto')
-    );
 
     let availableModes: LaunchMethod[];
-    let visibleSections: ResolvedLaunchModePreview['visibleSections'];
-
     if (hostPlatform === 'win32') {
-      availableModes = ['auto', 'direct', 'storefront_uri'];
+      if (detectedBuildType === 'windows_native') {
+        availableModes =
+          platformId === 'custom' ? ['auto', 'direct'] : ['auto', 'direct', 'storefront_uri'];
+      } else {
+        availableModes =
+          effectiveLaunchMethod === 'direct' ? ['auto', 'direct'] : ['auto'];
+      }
+    } else if (
+      detectedBuildType === 'mac_native_app' ||
+      detectedBuildType === 'mac_native_bin'
+    ) {
+      availableModes =
+        platformId === 'custom' ? ['auto', 'direct'] : ['auto', 'direct', 'storefront_uri'];
+    } else if (detectedBuildType === 'windows_exe_on_mac') {
+      availableModes = ['auto', 'compatibility_layer'];
+    } else {
+      if (isKnownMacOnly) {
+        availableModes =
+          effectiveLaunchMethod === 'direct' ? ['auto', 'direct'] : ['auto'];
+      } else {
+        availableModes =
+          effectiveLaunchMethod === 'direct'
+            ? ['auto', 'compatibility_layer', 'direct']
+            : ['auto', 'compatibility_layer'];
+      }
+    }
+
+    const activeMode: LaunchMethod = availableModes.includes(effectiveLaunchMethod)
+      ? effectiveLaunchMethod
+      : 'auto';
+    const isStorefrontUriMode = activeMode === 'storefront_uri';
+
+    let visibleSections: ResolvedLaunchModePreview['visibleSections'];
+    if (hostPlatform === 'win32') {
       visibleSections = {
         compatibilityLayer: false,
         crossoverRendering: false,
         nativeMacMetalHud: false,
-        executableAndArgs: true,
-        environmentAndHooks: true,
+        executableAndArgs: !isStorefrontUriMode || !isInstalled,
+        environmentAndHooks: !isStorefrontUriMode && isInstalled,
       };
     } else if (
       detectedBuildType === 'mac_native_app' ||
       detectedBuildType === 'mac_native_bin'
     ) {
-      availableModes = ['auto', 'direct', 'storefront_uri'];
       visibleSections = {
         compatibilityLayer: false,
         crossoverRendering: false,
-        nativeMacMetalHud: true,
-        executableAndArgs: true,
-        environmentAndHooks: true,
+        nativeMacMetalHud: !isStorefrontUriMode,
+        executableAndArgs: !isStorefrontUriMode,
+        environmentAndHooks: !isStorefrontUriMode,
       };
     } else if (detectedBuildType === 'windows_exe_on_mac') {
-      availableModes = ['auto', 'compatibility_layer'];
       visibleSections = {
         compatibilityLayer: true,
         crossoverRendering:
@@ -2134,22 +2373,18 @@ export class LauncherService {
         environmentAndHooks: true,
       };
     } else {
-      const showCompatForUninstalled =
-        effectiveLaunchMethod === 'compatibility_layer' ||
-        hasExplicitBottleOrCompatConfig;
-      availableModes =
-        effectiveLaunchMethod === 'direct'
-          ? ['auto', 'direct', 'compatibility_layer', 'storefront_uri']
-          : ['auto', 'compatibility_layer', 'storefront_uri'];
+      const showCompatForUninstalled = activeMode === 'compatibility_layer';
+      const showNativeMacForUninstalled =
+        !showCompatForUninstalled && hasDualMacAndWinBuild && activeMode === 'auto';
       visibleSections = {
         compatibilityLayer: showCompatForUninstalled,
         crossoverRendering:
           showCompatForUninstalled &&
           (effectiveCompatLayer === 'crossover' ||
             effectiveCompatLayer === 'crossover_preview'),
-        nativeMacMetalHud: false,
+        nativeMacMetalHud: showNativeMacForUninstalled,
         executableAndArgs: true,
-        environmentAndHooks: true,
+        environmentAndHooks: showCompatForUninstalled,
       };
     }
 
@@ -2164,6 +2399,7 @@ export class LauncherService {
         detectedBuildType,
         detectedBuildLabel,
         detectedBuildDetail,
+        hasDualMacAndWinBuild,
         autoResolvedMethod: 'compatibility_layer',
         autoResolvedSummary: `Launches Windows executable (.exe) via ${layerName}${bottleSuffix}.`,
         recommendedModes: ['auto', 'compatibility_layer'],
@@ -2216,6 +2452,7 @@ export class LauncherService {
         detectedBuildType,
         detectedBuildLabel,
         detectedBuildDetail,
+        hasDualMacAndWinBuild,
         autoResolvedMethod: 'direct',
         autoResolvedSummary:
           detectedBuildType === 'mac_native_app'
@@ -2264,6 +2501,7 @@ export class LauncherService {
         detectedBuildType,
         detectedBuildLabel,
         detectedBuildDetail,
+        hasDualMacAndWinBuild,
         autoResolvedMethod: autoMethod,
         autoResolvedSummary: executablePath
           ? `Launches native Windows executable (${exeName}) directly.`
@@ -2300,6 +2538,7 @@ export class LauncherService {
     }
 
     // not_installed
+    const isDualBuildMacPreview = hostPlatform !== 'win32' && hasDualMacAndWinBuild;
     return {
       isInstalled: false,
       hostPlatform,
@@ -2309,6 +2548,7 @@ export class LauncherService {
       detectedBuildType: 'not_installed',
       detectedBuildLabel,
       detectedBuildDetail,
+      hasDualMacAndWinBuild,
       autoResolvedMethod: 'storefront_uri',
       autoResolvedSummary:
         'Game is not installed locally yet. Install via One Launcher or link an existing executable below.',
@@ -2316,12 +2556,19 @@ export class LauncherService {
       availableModes,
       visibleSections,
       modeNotes: {
-        auto: {
-          badge: 'Recommended',
-          badgeTone: 'emerald',
-          dynamicDesc:
-            'Automatically selects the optimal native or CrossOver pipeline once installed or linked.',
-        },
+        auto: isDualBuildMacPreview
+          ? {
+              badge: 'Recommended • Native macOS',
+              badgeTone: 'emerald',
+              dynamicDesc:
+                'Installs and launches the official Native macOS build automatically with zero translation overhead.',
+            }
+          : {
+              badge: 'Recommended',
+              badgeTone: 'emerald',
+              dynamicDesc:
+                'Automatically selects the optimal native or CrossOver pipeline once installed or linked.',
+            },
         direct: {
           badge: 'Requires Executable',
           badgeTone: 'amber',
@@ -2329,11 +2576,17 @@ export class LauncherService {
           warning:
             'No local installation detected yet. Link a custom executable path below to use Direct Executable mode.',
         },
-        compatibility_layer: {
-          badge: 'Pre-Configure',
-          badgeTone: 'sky',
-          dynamicDesc: `Pre-configure ${layerName} bottle, CrossOver 26 graphics backend, and HUD settings before installing or linking a Windows .exe.`,
-        },
+        compatibility_layer: isDualBuildMacPreview
+          ? {
+              badge: 'Windows Translation',
+              badgeTone: 'sky',
+              dynamicDesc: `Use the Windows (.exe) build via ${layerName} instead of the native macOS build — pre-configure runner, bottle, and graphics settings.`,
+            }
+          : {
+              badge: 'Pre-Configure',
+              badgeTone: 'sky',
+              dynamicDesc: `Pre-configure ${layerName} bottle, CrossOver 26 graphics backend, and HUD settings before installing or linking a Windows .exe.`,
+            },
         storefront_uri: {
           badge: 'Store Fallback',
           badgeTone: 'sky',

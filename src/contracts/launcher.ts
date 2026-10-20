@@ -183,6 +183,8 @@ export interface ResolvedLaunchModePreview {
     | 'not_installed';
   detectedBuildLabel: string;
   detectedBuildDetail: string;
+  /** True when the storefront offers both a Native macOS build (Recommended) and a Windows build (via Compatibility / Translation layer) */
+  hasDualMacAndWinBuild?: boolean;
   autoResolvedMethod: LaunchMethod;
   autoResolvedSummary: string;
   recommendedModes: LaunchMethod[];
@@ -251,6 +253,7 @@ export interface DownloadTaskState {
   completedAt?: string;
   finalInstallPath?: string;
   executablePath?: string;
+  isWindowsBinaryOnMac?: boolean;
 }
 
 export interface DiskSpaceInfo {
@@ -303,7 +306,14 @@ export interface GameInstallInfoRequest {
     mac?: boolean;
     linux?: boolean;
   };
+  storePlatforms?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
+  };
 }
+
+export type GetGameInstallInfoPayload = GameInstallInfoRequest;
 
 export interface LaunchGameRequest {
   gameId: string;
@@ -337,6 +347,8 @@ export interface InstallGameRequest {
   createShortcut?: boolean;
   estimatedSizeBytes?: number;
   totalBytes?: number;
+  compatibilityLayer?: CompatibilityLayerType;
+  wineBottleName?: string;
 }
 
 export interface UninstallGameRequest {

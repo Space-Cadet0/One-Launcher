@@ -881,13 +881,19 @@ export class MetacriticResolver {
                   return null;
                 }
 
-                // Guard against franchise spinoff / studio collisions on base-title review URLs
+                // Guard against franchise spinoff subtitle collisions on base-title review URLs
                 const descText = jsonLd.description || '';
-                if (
-                  !/\bsurvival instinct\b/i.test(title) &&
-                  (/\bsurvival instinct\b/i.test(descText) || /\bterminal reality\b/i.test(descText))
-                ) {
-                  return null;
+                const titleNoYear = title.replace(/\s*\((?:19|20)\d{2}\)/g, '').trim();
+                const escapedBase = titleNoYear.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                if (escapedBase && !title.includes(':')) {
+                  const spinoffColonRe = new RegExp(`\\b${escapedBase}:\\s+([A-Z][A-Za-z0-9'\\s-]{2,})`, 'i');
+                  const spinoffMatch = descText.match(spinoffColonRe);
+                  if (spinoffMatch?.[1]) {
+                    const subLower = spinoffMatch[1].trim().toLowerCase();
+                    if (subLower && !title.toLowerCase().includes(subLower)) {
+                      return null;
+                    }
+                  }
                 }
 
                 const rating = jsonLd.aggregateRating;

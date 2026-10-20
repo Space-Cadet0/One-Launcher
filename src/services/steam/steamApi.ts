@@ -192,7 +192,8 @@ export function parseSteamSupportedLanguagesString(rawHtml?: string): SteamLangu
 }
 
 export class SteamApiService {
-  private static readonly MAX_METADATA_CACHE_SIZE = 250;
+  public static readonly MAX_METADATA_CACHE_ENTRIES = 150;
+  public static readonly MAX_METADATA_CACHE_SIZE = 150;
   private cache = new Map<number, SteamEnrichedMetadata>();
   private rateLimitedUntil = 0;
 
@@ -203,13 +204,13 @@ export class SteamApiService {
   private setCacheEntry(appId: number, value: SteamEnrichedMetadata): void {
     if (this.metadataCache.has(appId)) {
       this.metadataCache.delete(appId);
-    } else if (this.metadataCache.size >= SteamApiService.MAX_METADATA_CACHE_SIZE) {
-      const oldestKey = this.metadataCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.metadataCache.delete(oldestKey);
-      }
     }
     this.metadataCache.set(appId, value);
+    while (this.metadataCache.size > SteamApiService.MAX_METADATA_CACHE_SIZE) {
+      const oldestKey = this.metadataCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.metadataCache.delete(oldestKey);
+    }
   }
 
   public trimMemoryCache(maxEntries = 100): void {
@@ -239,7 +240,11 @@ export class SteamApiService {
   }
 
   getCachedMetadata(appId: number): SteamEnrichedMetadata | null {
-    if (this.metadataCache.has(appId)) return this.metadataCache.get(appId)!;
+    if (this.metadataCache.has(appId)) {
+      const hit = this.metadataCache.get(appId)!;
+      this.setCacheEntry(appId, hit);
+      return hit;
+    }
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
     if (preCached && preCached.shortDescription) {
       const languageOptions =

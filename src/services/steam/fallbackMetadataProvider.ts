@@ -1183,12 +1183,12 @@ export class FallbackMetadataProvider {
           positivePercent: ocData.score,
         }
       : {
-          reviewScore: 8,
-          reviewScoreDesc: 'Positive',
-          totalPositive: 80,
-          totalNegative: 20,
-          totalReviews: 100,
-          positivePercent: 80,
+          reviewScore: 0,
+          reviewScoreDesc: 'No user reviews',
+          totalPositive: 0,
+          totalNegative: 0,
+          totalReviews: 0,
+          positivePercent: 0,
         };
 
     const devs =

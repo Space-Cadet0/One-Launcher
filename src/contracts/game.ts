@@ -28,6 +28,7 @@ export type NativeOsPlatform = 'windows' | 'mac';
 export interface GamePlatformOwnership {
   platformId: StorefrontId;
   platformGameId: string;
+  storefrontAppId?: string;
   namespace?: string;
   catalogItemId?: string;
   originalTitle?: string;

@@ -178,18 +178,50 @@ function toLocalFsPath(rawPath, customRoots = []) {
 }
 
 /**
+ * Atomically write file content via temporary file + rename with safe fallback
+ */
+function atomicWriteFileSync(filePath, content) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {}
+    fs.writeFileSync(filePath, content, 'utf8');
+  }
+}
+
+const ALLOWED_EXTERNAL_URI_SCHEME_RE =
+  /^https?:\/\/|^steam:\/\/|^goggalaxy:\/\/|^com\.epicgames\.launcher:\/\/|^heroic:\/\//i;
+
+/**
  * Open an external URI via Electron shell (or record for headless tests)
  */
 const openedExternalUris = [];
 async function openExternalUri(uri, options = {}) {
-  openedExternalUris.push(uri);
+  if (typeof uri !== 'string' || !uri.trim()) {
+    return false;
+  }
+  const cleanUri = uri.trim();
+  if (!ALLOWED_EXTERNAL_URI_SCHEME_RE.test(cleanUri)) {
+    return false;
+  }
+  openedExternalUris.push(cleanUri);
   if (typeof options.onOpenExternal === 'function') {
-    await options.onOpenExternal(uri);
+    await options.onOpenExternal(cleanUri);
     return true;
   }
   try {
     if (electron.shell && typeof electron.shell.openExternal === 'function') {
-      await electron.shell.openExternal(uri);
+      await electron.shell.openExternal(cleanUri);
       return true;
     }
   } catch {}
@@ -558,15 +590,47 @@ function resolveMacAppBundleBinary(appBundlePath) {
   return appBundlePath;
 }
 
+const MAX_DISCOVERY_CACHE_ENTRIES = 500;
+const MAX_LEGENDARY_CACHE_DIRS = 16;
 const executableDiscoveryCache = new Map();
 const steamAppInfoCache = new Map();
+const legendaryMetadataDirCache = new Map();
+const legendaryAssetsFileCache = new Map();
+const legendaryAliasesFileCache = new Map();
 let lastProductionScanCache = { timestamp: 0, result: null };
 let lastSyncedEpicFingerprint = '';
 let lastSyncedGogFingerprint = '';
 
+function setBoundedMapEntry(map, key, value, maxEntries = MAX_DISCOVERY_CACHE_ENTRIES) {
+  if (!map.has(key) && map.size >= maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
+
+function evictExecutableDiscoveryCacheForPath(targetPath) {
+  if (!targetPath) return;
+  const rawStr = String(targetPath);
+  const resolvedStr = path.resolve(rawStr);
+  executableDiscoveryCache.delete(rawStr);
+  executableDiscoveryCache.delete(resolvedStr);
+  const prefixes = [`${rawStr}|`, `${rawStr}:`, `${resolvedStr}|`, `${resolvedStr}:`];
+  for (const key of Array.from(executableDiscoveryCache.keys())) {
+    if (prefixes.some((prefix) => String(key).startsWith(prefix))) {
+      executableDiscoveryCache.delete(key);
+    }
+  }
+}
+
 function invalidateScanCaches() {
   executableDiscoveryCache.clear();
   steamAppInfoCache.clear();
+  legendaryMetadataDirCache.clear();
+  legendaryAssetsFileCache.clear();
+  legendaryAliasesFileCache.clear();
   lastProductionScanCache = { timestamp: 0, result: null };
   lastSyncedEpicFingerprint = '';
   lastSyncedGogFingerprint = '';
@@ -596,6 +660,7 @@ function hasShebangHeader(filePath) {
 function findPrimaryExecutable(installPath, options = {}) {
   const platform = options.platform || process.platform;
   const hintName = options.hintName || options.preferredHint || '';
+  const preferWindowsExecutable = Boolean(options.preferWindowsExecutable);
   const localInstallPath = toLocalFsPath(installPath);
 
   if (!localInstallPath || !fs.existsSync(localInstallPath)) {
@@ -631,7 +696,7 @@ function findPrimaryExecutable(installPath, options = {}) {
     return { executablePath: undefined, isWindowsBinaryOnMac: false };
   }
 
-  const cacheKey = `${localInstallPath}|${platform}|${hintName}`;
+  const cacheKey = `${localInstallPath}|${platform}|${hintName}|${preferWindowsExecutable ? 'win' : 'auto'}`;
   const cached = executableDiscoveryCache.get(cacheKey);
   if (
     cached &&
@@ -653,11 +718,16 @@ function findPrimaryExecutable(installPath, options = {}) {
   }
 
   const cacheAndReturn = (result) => {
-    executableDiscoveryCache.set(cacheKey, {
-      result,
-      mtimeMs: rootMtimeMs,
-      timestamp: Date.now(),
-    });
+    setBoundedMapEntry(
+      executableDiscoveryCache,
+      cacheKey,
+      {
+        result,
+        mtimeMs: rootMtimeMs,
+        timestamp: Date.now(),
+      },
+      MAX_DISCOVERY_CACHE_ENTRIES
+    );
     return { ...result };
   };
 
@@ -794,6 +864,18 @@ function findPrimaryExecutable(installPath, options = {}) {
         : winExeCandidates;
 
   if (platform === 'darwin') {
+    if (preferWindowsExecutable && filteredWinCandidates.length > 0) {
+      filteredWinCandidates.sort(
+        (a, b) =>
+          scoreExecutableCandidate(b.path, localInstallPath, hintName, b.peInfo) -
+          scoreExecutableCandidate(a.path, localInstallPath, hintName, a.peInfo)
+      );
+      return cacheAndReturn({
+        executablePath: filteredWinCandidates[0].path,
+        isWindowsBinaryOnMac: true,
+      });
+    }
+
     if (!isInsideBottle && macApps.length > 0) {
       macApps.sort(
         (a, b) =>
@@ -1581,7 +1663,7 @@ function loadManagedInstalledGames(userDataDir) {
 function saveManagedInstalledGames(records, userDataDir) {
   const filePath = getManagedInstalledFilePath(userDataDir);
   try {
-    fs.writeFileSync(filePath, JSON.stringify(records, null, 2), 'utf8');
+    atomicWriteFileSync(filePath, JSON.stringify(records, null, 2));
     invalidateScanCaches();
     return true;
   } catch {
@@ -1729,9 +1811,9 @@ function getGameLaunchConfigs(options = {}) {
           }
         }
       }
-      if (modified) {
+      if (modified && (options.pruneMissingExecutables === true || options.persistPrunedConfigs === true)) {
         try {
-          fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2), 'utf8');
+          atomicWriteFileSync(filePath, JSON.stringify(parsed, null, 2));
         } catch {}
       }
       return parsed;
@@ -1749,7 +1831,7 @@ function saveGameLaunchConfig(config, options = {}) {
   if (config.reset === true) {
     delete existing[config.gameId];
     try {
-      fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf8');
+      atomicWriteFileSync(filePath, JSON.stringify(existing, null, 2));
       invalidateScanCaches();
       return { success: true, config: { gameId: config.gameId } };
     } catch (err) {
@@ -1824,7 +1906,7 @@ function saveGameLaunchConfig(config, options = {}) {
 
   existing[config.gameId] = updated;
   try {
-    fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf8');
+    atomicWriteFileSync(filePath, JSON.stringify(existing, null, 2));
     invalidateScanCaches();
     return { success: true, config: updated };
   } catch (err) {
@@ -1853,10 +1935,20 @@ function scanAllInstalledGames(options = {}) {
       lastProductionScanCache.result &&
       Date.now() - lastProductionScanCache.timestamp < 3000
     ) {
+      const cachedInstalledGames = lastProductionScanCache.result.installedGames.map((g) => ({ ...g }));
+      const cachedEpicSupport = { ...(lastProductionScanCache.result.epicPlatformSupport || {}) };
+      try {
+        Object.defineProperty(cachedInstalledGames, 'epicPlatformSupport', {
+          value: cachedEpicSupport,
+          enumerable: false,
+          configurable: true,
+        });
+      } catch {}
       return {
         success: true,
-        installedGames: lastProductionScanCache.result.installedGames.map((g) => ({ ...g })),
+        installedGames: cachedInstalledGames,
         installedSteamAppIds: [...lastProductionScanCache.result.installedSteamAppIds],
+        epicPlatformSupport: cachedEpicSupport,
       };
     }
 
@@ -1865,6 +1957,7 @@ function scanAllInstalledGames(options = {}) {
     const customRoots = Array.isArray(options.customRoots) ? options.customRoots : [];
     const userDataDir = getUserDataDir(options.userDataDir);
     const isIsolatedTest = Boolean(options.homedir || (options.customRoots && options.customRoots.length > 0));
+    const launchConfigs = getGameLaunchConfigs({ userDataDir });
 
     const discoveredMap = new Map();
     const installedSteamAppIds = [];
@@ -1874,13 +1967,69 @@ function scanAllInstalledGames(options = {}) {
       const key = `${record.platformId}:${record.platformGameId}`;
       const existing = discoveredMap.get(key);
       if (existing) {
-        discoveredMap.set(key, {
-          ...existing,
-          ...record,
-          executablePath: record.executablePath || existing.executablePath,
-          installPath: record.installPath || existing.installPath,
-          launchArguments: record.launchArguments || existing.launchArguments,
-        });
+        if (
+          platform === 'darwin' &&
+          ['steam', 'gog', 'epic'].includes(record.platformId) &&
+          Boolean(existing.isWindowsBinaryOnMac) !== Boolean(record.isWindowsBinaryOnMac)
+        ) {
+          const platPrefixRe = new RegExp(`^${record.platformId}[-_]`, 'i');
+          const cleanId = String(
+            record.storefrontAppId || record.appId || record.platformGameId || ''
+          ).replace(platPrefixRe, '');
+          let rawSaved =
+            launchConfigs[`${record.platformId}-${cleanId}`] ||
+            launchConfigs[`${record.platformId}_${cleanId}`] ||
+            launchConfigs[String(record.platformGameId)] ||
+            launchConfigs[cleanId] ||
+            null;
+          if (!rawSaved && cleanId) {
+            const lowerClean = cleanId.toLowerCase();
+            for (const [cfgKey, cfgVal] of Object.entries(launchConfigs)) {
+              if (!cfgVal || typeof cfgVal !== 'object') continue;
+              const kLower = cfgKey.toLowerCase();
+              if (
+                kLower === `${record.platformId}-${lowerClean}` ||
+                kLower === `${record.platformId}_${lowerClean}` ||
+                kLower === lowerClean ||
+                String(cfgVal.gameId || '').toLowerCase() === `${record.platformId}-${lowerClean}` ||
+                Boolean(
+                  cfgVal.platformConfigs &&
+                    cfgVal.platformConfigs[record.platformId] &&
+                    kLower.includes(lowerClean)
+                )
+              ) {
+                rawSaved = cfgVal;
+                break;
+              }
+            }
+          }
+          const savedCfg = resolvePlatformLaunchConfig(rawSaved || {}, record.platformId);
+          const preferWinBottle = savedCfg?.launchMethod === 'compatibility_layer';
+          const preferred = preferWinBottle
+            ? record.isWindowsBinaryOnMac
+              ? record
+              : existing
+            : !record.isWindowsBinaryOnMac
+              ? record
+              : existing;
+          const secondary = preferred === record ? existing : record;
+          discoveredMap.set(key, {
+            ...secondary,
+            ...preferred,
+            executablePath: preferred.executablePath || secondary.executablePath,
+            installPath: preferred.installPath || secondary.installPath,
+            launchArguments: preferred.launchArguments || secondary.launchArguments,
+            isWindowsBinaryOnMac: Boolean(preferred.isWindowsBinaryOnMac),
+          });
+        } else {
+          discoveredMap.set(key, {
+            ...existing,
+            ...record,
+            executablePath: record.executablePath || existing.executablePath,
+            installPath: record.installPath || existing.installPath,
+            launchArguments: record.launchArguments || existing.launchArguments,
+          });
+        }
       } else {
         discoveredMap.set(key, record);
       }
@@ -2458,6 +2607,12 @@ function scanAllInstalledGames(options = {}) {
       if (localInstall && fs.existsSync(localInstall)) {
         const existingKey = `${rec.platformId}:${rec.platformGameId}`;
         const existingDiscovered = discoveredMap.get(existingKey);
+        const isSameInstallDir = Boolean(
+          existingDiscovered &&
+            existingDiscovered.installPath &&
+            path.resolve(existingDiscovered.installPath) === path.resolve(localInstall)
+        );
+        const matchedDiscovered = isSameInstallDir ? existingDiscovered : null;
         const recExeLocal = rec.executablePath ? toLocalFsPath(rec.executablePath, customRoots) : '';
         const isRecExeValid =
           Boolean(recExeLocal) &&
@@ -2465,14 +2620,14 @@ function scanAllInstalledGames(options = {}) {
           !isExcludedExecutable(path.basename(recExeLocal)) &&
           !/\.com$/i.test(recExeLocal);
         const discovered =
-          existingDiscovered && existingDiscovered.executablePath
+          matchedDiscovered && matchedDiscovered.executablePath
             ? {
-                executablePath: existingDiscovered.executablePath,
-                isWindowsBinaryOnMac: existingDiscovered.isWindowsBinaryOnMac,
+                executablePath: matchedDiscovered.executablePath,
+                isWindowsBinaryOnMac: matchedDiscovered.isWindowsBinaryOnMac,
               }
             : findPrimaryExecutable(localInstall, { platform, hintName: rec.title });
         const effectiveExe =
-          existingDiscovered?.executablePath ||
+          matchedDiscovered?.executablePath ||
           (isRecExeValid ? recExeLocal : undefined) ||
           discovered.executablePath;
         if (!effectiveExe || !fs.existsSync(effectiveExe)) {
@@ -2480,26 +2635,35 @@ function scanAllInstalledGames(options = {}) {
           continue;
         }
         const effectiveLaunchArgs =
-          existingDiscovered?.launchArguments ||
+          matchedDiscovered?.launchArguments ||
           rec.launchArguments ||
           resolveDefaultEngineLaunchArguments(localInstall, effectiveExe);
+        const inferredWinOnMac =
+          matchedDiscovered?.isWindowsBinaryOnMac !== undefined
+            ? matchedDiscovered.isWindowsBinaryOnMac
+            : rec.isWindowsBinaryOnMac !== undefined
+              ? rec.isWindowsBinaryOnMac
+              : Boolean(
+                  discovered.isWindowsBinaryOnMac ||
+                    (platform === 'darwin' &&
+                      ((effectiveExe && /\.exe$/i.test(effectiveExe)) ||
+                        /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
+                          String(effectiveExe || rec.installPath || '')
+                        )))
+                );
         validManagedRecords.push({
           ...rec,
           installPath: localInstall,
           executablePath: effectiveExe,
+          isWindowsBinaryOnMac: inferredWinOnMac,
         });
         addRecord({
           ...rec,
           installPath: localInstall,
           executablePath: effectiveExe,
           ...(effectiveLaunchArgs ? { launchArguments: effectiveLaunchArgs } : {}),
-          runner: existingDiscovered?.runner || rec.runner || 'one_launcher',
-          isWindowsBinaryOnMac:
-            existingDiscovered?.isWindowsBinaryOnMac !== undefined
-              ? existingDiscovered.isWindowsBinaryOnMac
-              : rec.isWindowsBinaryOnMac !== undefined
-                ? rec.isWindowsBinaryOnMac
-                : discovered.isWindowsBinaryOnMac,
+          runner: matchedDiscovered?.runner || rec.runner || 'one_launcher',
+          isWindowsBinaryOnMac: inferredWinOnMac,
         });
       } else {
         managedPruned = true;
@@ -2511,7 +2675,6 @@ function scanAllInstalledGames(options = {}) {
       } catch {}
     }
 
-    const launchConfigs = getGameLaunchConfigs({ userDataDir });
     for (const cfg of Object.values(launchConfigs)) {
       if (!cfg || typeof cfg !== 'object') continue;
       const customEntries = [];
@@ -2579,6 +2742,14 @@ function scanAllInstalledGames(options = {}) {
     }
 
     const installedGames = Array.from(discoveredMap.values());
+    const { epicPlatformSupport } = collectLocalEpicMetadataAndSupport(options);
+    try {
+      Object.defineProperty(installedGames, 'epicPlatformSupport', {
+        value: epicPlatformSupport,
+        enumerable: false,
+        configurable: true,
+      });
+    } catch {}
 
     if (!options.skipFirstPartySync) {
       const epicFingerprint = installedGames
@@ -2640,7 +2811,7 @@ function scanAllInstalledGames(options = {}) {
     if (isDefaultProdScan) {
       lastProductionScanCache = {
         timestamp: Date.now(),
-        result: { installedGames, installedSteamAppIds },
+        result: { installedGames, installedSteamAppIds, epicPlatformSupport },
       };
     }
 
@@ -2648,6 +2819,7 @@ function scanAllInstalledGames(options = {}) {
       success: true,
       installedGames,
       installedSteamAppIds,
+      epicPlatformSupport,
     };
   } catch (err) {
     return {
@@ -2655,6 +2827,7 @@ function scanAllInstalledGames(options = {}) {
       error: err.message,
       installedGames: [],
       installedSteamAppIds: [],
+      epicPlatformSupport: {},
     };
   }
 }
@@ -3464,7 +3637,7 @@ function syncGogFirstPartyLauncher(record, options = {}) {
         fs.mkdirSync(path.dirname(gogDbPath), { recursive: true });
         const { DatabaseSync } = require('node:sqlite');
         db = new DatabaseSync(gogDbPath, { readBigInts: true });
-        db.exec('PRAGMA busy_timeout = 3000;');
+        db.exec('PRAGMA busy_timeout = 5000;');
 
         if (!options.homedir && !options.gogGalaxyDbPath && platform === 'darwin') {
           let alreadySyncedInDb = false;
@@ -3493,7 +3666,7 @@ function syncGogFirstPartyLauncher(record, options = {}) {
 
           if (!alreadySyncedInDb) {
             try {
-              const pgrepOut = execSync('pgrep -f "GOG Galaxy"', {
+              const pgrepOut = execFileSync('pgrep', ['-f', 'GOG Galaxy'], {
                 stdio: ['ignore', 'pipe', 'ignore'],
                 timeout: 1500,
               })
@@ -3513,18 +3686,10 @@ function syncGogFirstPartyLauncher(record, options = {}) {
                   } catch {}
                   db = null;
                   try {
-                    execSync('killall "GOG Galaxy"', { stdio: 'ignore', timeout: 2000 });
+                    execFileSync('killall', ['GOG Galaxy'], { stdio: 'ignore', timeout: 2000 });
                   } catch {}
-                  for (let i = 0; i < 15; i++) {
-                    try {
-                      execSync('pgrep -f "GOG Galaxy"', { stdio: 'ignore', timeout: 500 });
-                      execSync('sleep 0.1', { stdio: 'ignore', timeout: 500 });
-                    } catch {
-                      break;
-                    }
-                  }
                   db = new DatabaseSync(gogDbPath, { readBigInts: true });
-                  db.exec('PRAGMA busy_timeout = 3000;');
+                  db.exec('PRAGMA busy_timeout = 5000;');
                   shouldRelaunchGalaxy = true;
                 }
               }
@@ -3718,7 +3883,7 @@ function unregisterGogFirstPartyLauncher(cleanId, installPath, options = {}) {
       try {
         const { DatabaseSync } = require('node:sqlite');
         db = new DatabaseSync(gogDbPath, { readBigInts: true });
-        db.exec('PRAGMA busy_timeout = 3000;');
+        db.exec('PRAGMA busy_timeout = 5000;');
         try {
           db.prepare(
             'DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE gameReleaseKey = ?)'
@@ -3765,7 +3930,7 @@ function unregisterGogFirstPartyLauncher(cleanId, installPath, options = {}) {
 
     if (platform === 'win32' && !options.homedir && !options.skipRegistry && normId) {
       try {
-        execSync(`reg delete "HKCU\\Software\\GOG.com\\Games\\${normId}" /f`, {
+        execFileSync('reg.exe', ['delete', `HKCU\\Software\\GOG.com\\Games\\${normId}`, '/f'], {
           stdio: 'ignore',
           timeout: 3000,
         });
@@ -4775,6 +4940,14 @@ async function updateCompatibilityLayer(payload = {}, options = {}) {
   }
 
   let openedExternalUrl = false;
+  if (!updatedViaBrew && payload.dmgPath && fs.existsSync(payload.dmgPath)) {
+    try {
+      const targetAppsDir = options.customApplicationsDir || path.join(homedir, 'Applications');
+      await mountAndExtractDmgSafe(payload.dmgPath, targetAppsDir, options);
+      updatedViaBrew = true;
+    } catch {}
+  }
+
   if (!updatedViaBrew) {
     const targetUrl = defaultUpdateUrls[runnerType] || defaultUpdateUrls.crossover;
     await openExternalUri(targetUrl, options);
@@ -4801,6 +4974,64 @@ async function updateCompatibilityLayer(payload = {}, options = {}) {
     detectedLayers,
     updateInfo: updates[runnerType],
   };
+}
+
+/**
+ * Safely mount a macOS .dmg archive via hdiutil attach, copy any .app bundle inside to targetDestDir,
+ * and guarantee hdiutil detach runs inside a finally block.
+ */
+async function mountAndExtractDmgSafe(dmgPath, targetDestDir, options = {}) {
+  const mountPoint = path.join(
+    os.tmpdir(),
+    `ol-dmg-mount-${process.pid}-${Date.now()}`
+  );
+  const execHdiutil =
+    typeof options.onExecHdiutil === 'function'
+      ? options.onExecHdiutil
+      : (args) =>
+          new Promise((resolve, reject) => {
+            execFile(
+              'hdiutil',
+              args,
+              { timeout: 120000 },
+              (err, stdout, stderr) => {
+                if (err) reject(err);
+                else resolve({ stdout, stderr });
+              }
+            );
+          });
+
+  let attached = false;
+  try {
+    await execHdiutil([
+      'attach',
+      dmgPath,
+      '-mountpoint',
+      mountPoint,
+      '-nobrowse',
+      '-readonly',
+      '-quiet',
+    ]);
+    attached = true;
+
+    if (fs.existsSync(mountPoint) && targetDestDir) {
+      fs.mkdirSync(targetDestDir, { recursive: true });
+      const entries = fs.readdirSync(mountPoint);
+      const appEntry = entries.find((e) => e.toLowerCase().endsWith('.app'));
+      if (appEntry) {
+        const srcApp = path.join(mountPoint, appEntry);
+        const destApp = path.join(targetDestDir, appEntry);
+        fs.cpSync(srcApp, destApp, { recursive: true, force: true });
+      }
+    }
+    return { success: true, mountPoint };
+  } finally {
+    if (attached || typeof options.onExecHdiutil === 'function') {
+      try {
+        await execHdiutil(['detach', mountPoint, '-force', '-quiet']);
+      } catch {}
+    }
+  }
 }
 
 /**
@@ -5115,7 +5346,7 @@ function applyCrossOverPerGameSettings(
 
           const finalConf =
             existingConf.slice(0, sectionStart) + newSectionBody + remainder;
-          fs.writeFileSync(cxbottleConfPath, finalConf, 'utf8');
+          atomicWriteFileSync(cxbottleConfPath, finalConf);
         } else {
           const envLines = ['[EnvironmentVariables]'];
           for (const [k, v] of updates.entries()) {
@@ -5127,7 +5358,7 @@ function applyCrossOverPerGameSettings(
               : existingConf.length > 0
                 ? `${existingConf}\n`
                 : '';
-          fs.writeFileSync(cxbottleConfPath, `${prefix}${envLines.join('\n')}\n`, 'utf8');
+          atomicWriteFileSync(cxbottleConfPath, `${prefix}${envLines.join('\n')}\n`);
         }
       } catch {}
     }
@@ -5202,18 +5433,19 @@ function applyCrossOverPerGameSettings(
         regContent = `${prefix}\n[Control Panel\\\\Desktop]\n"LogPixels"=${logPixelsDword}\n`;
       }
 
-      fs.writeFileSync(userRegPath, regContent, 'utf8');
+      atomicWriteFileSync(userRegPath, regContent);
     } catch {}
 
     if (
-      !options.homedir &&
-      !options.skipRegistrySpawn &&
+      effectiveOptions?.syncLiveWineReg === true &&
+      !effectiveOptions.homedir &&
+      !effectiveOptions.skipRegistrySpawn &&
       chosenLayer?.binaryPath &&
       fs.existsSync(chosenLayer.binaryPath)
     ) {
       const regEnv = { ...process.env, ...env };
       try {
-        execFileSync(
+        execFile(
           chosenLayer.binaryPath,
           [
             'reg',
@@ -5227,11 +5459,12 @@ function applyCrossOverPerGameSettings(
             retinaVal,
             '/f',
           ],
-          { timeout: 2500, stdio: 'ignore', env: regEnv }
+          { timeout: 2500, env: regEnv },
+          () => {}
         );
       } catch {}
       try {
-        execFileSync(
+        execFile(
           chosenLayer.binaryPath,
           [
             'reg',
@@ -5245,7 +5478,8 @@ function applyCrossOverPerGameSettings(
             logPixelsDec,
             '/f',
           ],
-          { timeout: 2500, stdio: 'ignore', env: regEnv }
+          { timeout: 2500, env: regEnv },
+          () => {}
         );
       } catch {}
     }
@@ -5547,6 +5781,10 @@ async function launchGame(payload = {}, options = {}) {
     };
 
     const launchMethod = launchConfig.launchMethod || payload.launchMethod || 'auto';
+    const preferWindowsExe =
+      platform === 'darwin' &&
+      launchMethod === 'compatibility_layer' &&
+      !launchConfig.customExecutablePath;
 
     // Resolve executable path
     let resolvedExePath = undefined;
@@ -5573,6 +5811,18 @@ async function launchGame(payload = {}, options = {}) {
       }
     }
 
+    if (preferWindowsExe && localInstallDir && fs.existsSync(localInstallDir)) {
+      const winDiscovered = findPrimaryExecutable(localInstallDir, {
+        platform,
+        hintName: payload.title,
+        preferWindowsExecutable: true,
+      });
+      if (winDiscovered.executablePath && fs.existsSync(winDiscovered.executablePath)) {
+        resolvedExePath = winDiscovered.executablePath;
+        isWindowsBinaryOnMac = Boolean(winDiscovered.isWindowsBinaryOnMac);
+      }
+    }
+
     let appInfoSpec = null;
     if (!launchConfig.customExecutablePath && payload.platformId === 'steam') {
       const steamAppIdVal = String(payload.steamAppId || payload.platformGameId || '')
@@ -5588,12 +5838,44 @@ async function launchGame(payload = {}, options = {}) {
           searchInstallDir,
           { platform }
         );
-        if (appInfoSpec && appInfoSpec.executablePath && fs.existsSync(appInfoSpec.executablePath)) {
+        if (
+          !resolvedExePath &&
+          appInfoSpec &&
+          appInfoSpec.executablePath &&
+          fs.existsSync(appInfoSpec.executablePath)
+        ) {
           resolvedExePath = appInfoSpec.executablePath;
           if (appInfoSpec.isWindowsBinaryOnMac) {
             isWindowsBinaryOnMac = true;
           }
         }
+      }
+    }
+
+    if (
+      platform === 'darwin' &&
+      !preferWindowsExe &&
+      !launchConfig.customExecutablePath &&
+      !isInstallInsideBottle &&
+      localInstallDir &&
+      fs.existsSync(localInstallDir) &&
+      !resolvedExePath &&
+      payload.executablePath &&
+      /\.exe$/i.test(payload.executablePath)
+    ) {
+      const discoveredNative = findPrimaryExecutable(localInstallDir, {
+        platform,
+        hintName: payload.title,
+        preferWindowsExecutable: false,
+      });
+      if (
+        discoveredNative?.executablePath &&
+        !discoveredNative.isWindowsBinaryOnMac &&
+        !/\.exe$/i.test(discoveredNative.executablePath) &&
+        fs.existsSync(discoveredNative.executablePath)
+      ) {
+        resolvedExePath = discoveredNative.executablePath;
+        isWindowsBinaryOnMac = false;
       }
     }
 
@@ -5613,9 +5895,12 @@ async function launchGame(payload = {}, options = {}) {
         /\.com$/i.test(resolvedExePath) ||
         isExcludedExecutable(path.basename(resolvedExePath)))
     ) {
-      executableDiscoveryCache.delete(path.resolve(localInstallDir));
+      evictExecutableDiscoveryCacheForPath(localInstallDir);
       const discovered =
-        appInfoSpec && appInfoSpec.executablePath && fs.existsSync(appInfoSpec.executablePath)
+        !preferWindowsExe &&
+        appInfoSpec &&
+        appInfoSpec.executablePath &&
+        fs.existsSync(appInfoSpec.executablePath)
           ? {
               executablePath: appInfoSpec.executablePath,
               isWindowsBinaryOnMac: appInfoSpec.isWindowsBinaryOnMac,
@@ -5623,11 +5908,14 @@ async function launchGame(payload = {}, options = {}) {
           : findPrimaryExecutable(localInstallDir, {
               platform,
               hintName: payload.title,
+              preferWindowsExecutable: preferWindowsExe,
             });
       if (discovered.executablePath) {
         resolvedExePath = discovered.executablePath;
         if (discovered.isWindowsBinaryOnMac) {
           isWindowsBinaryOnMac = true;
+        } else if (!/\.exe$/i.test(discovered.executablePath)) {
+          isWindowsBinaryOnMac = false;
         }
         if (payload.executablePath && resolvedExePath !== toLocalFsPath(payload.executablePath)) {
           try {
@@ -5655,10 +5943,13 @@ async function launchGame(payload = {}, options = {}) {
       const discovered = findPrimaryExecutable(payload.installPath, {
         platform,
         hintName: payload.title,
+        preferWindowsExecutable: preferWindowsExe,
       });
       resolvedExePath = discovered.executablePath;
       if (discovered.isWindowsBinaryOnMac) {
         isWindowsBinaryOnMac = true;
+      } else if (discovered.executablePath && !/\.exe$/i.test(discovered.executablePath)) {
+        isWindowsBinaryOnMac = false;
       }
     }
 
@@ -5673,6 +5964,7 @@ async function launchGame(payload = {}, options = {}) {
         {
           platform,
           hintName: payload.title,
+          preferWindowsExecutable: preferWindowsExe,
         }
       );
       if (rediscovered.executablePath) {
@@ -5695,6 +5987,7 @@ async function launchGame(payload = {}, options = {}) {
           {
             platform,
             hintName: payload.title,
+            preferWindowsExecutable: preferWindowsExe,
           }
         );
         resolvedExePath = rediscovered.executablePath || undefined;
@@ -5735,11 +6028,18 @@ async function launchGame(payload = {}, options = {}) {
       } catch {}
     }
 
+    const isMacNativeExecutable =
+      Boolean(resolvedExePath) &&
+      !/\.(exe|bat|msi)$/i.test(resolvedExePath) &&
+      !isWindowsBinaryOnMac;
     const useCompatLayer =
       platform === 'darwin' &&
       (isWindowsBinaryOnMac ||
-        launchMethod === 'compatibility_layer' ||
-        (launchConfig.compatibilityLayer && launchConfig.compatibilityLayer !== 'native'));
+        Boolean(resolvedExePath && /\.(exe|bat|msi)$/i.test(resolvedExePath)) ||
+        (launchMethod === 'compatibility_layer' && !isMacNativeExecutable) ||
+        (!isMacNativeExecutable &&
+          launchConfig.compatibilityLayer &&
+          launchConfig.compatibilityLayer !== 'native'));
 
     const isSteamAutoUriPreferred =
       payload.platformId === 'steam' &&
@@ -6068,11 +6368,20 @@ async function launchGame(payload = {}, options = {}) {
       let seenRunningOnSystem = false;
       const pollTimer = setInterval(() => {
         if (entry.finalized) return;
-        const cmd =
-          process.platform === 'win32'
-            ? 'tasklist /FO CSV /NH'
-            : 'ps -ax -o pid=,command=';
-        exec(cmd, { timeout: 2500 }, (err, stdout) => {
+        const trackedPid = Number(entry.session?.pid || entry.pid || 0);
+        if (trackedPid > 0) {
+          try {
+            process.kill(trackedPid, 0);
+            seenRunningOnSystem = true;
+            return;
+          } catch (killErr) {
+            if (killErr && killErr.code === 'EPERM') {
+              seenRunningOnSystem = true;
+              return;
+            }
+          }
+        }
+        const handleProcessList = (err, stdout) => {
           if (err || !stdout || entry.finalized) return;
           const exeHint = path.basename(payload.executablePath || payload.installPath || '').toLowerCase();
           const resolvedExeHint = resolvedExePath ? path.basename(resolvedExePath).toLowerCase() : '';
@@ -6085,7 +6394,12 @@ async function launchGame(payload = {}, options = {}) {
           } else if (seenRunningOnSystem) {
             finalizeGameSession(gameId);
           }
-        });
+        };
+        if (process.platform === 'win32') {
+          execFile('tasklist.exe', ['/FO', 'CSV', '/NH'], { timeout: 2500 }, handleProcessList);
+        } else {
+          execFile('ps', ['-ax', '-o', 'pid=,command='], { timeout: 2500 }, handleProcessList);
+        }
       }, 4000);
       if (typeof pollTimer.unref === 'function') {
         pollTimer.unref();
@@ -6159,7 +6473,7 @@ async function stopGame(request = {}, options = {}) {
       const exeBase = path.basename(targetEntry.session.executablePath);
       if (exeBase && exeBase.length > 3) {
         try {
-          exec(`pkill -f "${exeBase.replace(/"/g, '')}"`, () => {});
+          execFile('pkill', ['-f', exeBase], () => {});
         } catch {}
       }
     }
@@ -6278,6 +6592,8 @@ function getDefaultInstallDir(platformId = 'custom', options = {}) {
   return path.join(homedir, 'Games', 'OneLauncher', storeFolder);
 }
 
+const quarantineClearedBinaries = new Set();
+
 function findBundledOrSystemCliBinary(baseName, options = {}) {
   const homedir = options.homedir || os.homedir();
   if (options.homedir && options.allowSystemBinariesInTest !== true) {
@@ -6315,6 +6631,15 @@ function findBundledOrSystemCliBinary(baseName, options = {}) {
         fs.chmodSync(found, 0o755);
       }
     } catch {}
+    if (process.platform === 'darwin' && !quarantineClearedBinaries.has(found)) {
+      quarantineClearedBinaries.add(found);
+      try {
+        execFileSync('xattr', ['-dr', 'com.apple.quarantine', found], {
+          stdio: 'ignore',
+          timeout: 1500,
+        });
+      } catch {}
+    }
   }
   return found;
 }
@@ -6344,6 +6669,13 @@ async function ensureLegendaryConfigAndAuth(options = {}) {
 
   const candidateHeroicDirs = [
     path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary'),
+    path.join(
+      process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+      'heroic',
+      'legendaryConfig',
+      'legendary'
+    ),
+    path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary'),
     path.join(homedir, '.config/legendary'),
   ];
 
@@ -6374,6 +6706,14 @@ async function ensureLegendaryConfigAndAuth(options = {}) {
       path.join(legendaryConfigPath, 'user.json'),
       path.join(homedir, '.config/legendary/user.json'),
       path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary/user.json'),
+      path.join(
+        process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+        'heroic',
+        'legendaryConfig',
+        'legendary',
+        'user.json'
+      ),
+      path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary', 'user.json'),
     ];
     for (const userJsonFile of candidateUserJsonPaths) {
       if (fs.existsSync(userJsonFile)) {
@@ -6431,10 +6771,9 @@ async function ensureLegendaryConfigAndAuth(options = {}) {
       };
 
       try {
-        fs.writeFileSync(
+        atomicWriteFileSync(
           path.join(legendaryConfigPath, 'user.json'),
-          JSON.stringify(userJsonPayload, null, 2),
-          'utf8'
+          JSON.stringify(userJsonPayload, null, 2)
         );
       } catch {}
 
@@ -6444,10 +6783,9 @@ async function ensureLegendaryConfigAndAuth(options = {}) {
           if (!fs.existsSync(defaultLegendaryDir)) {
             fs.mkdirSync(defaultLegendaryDir, { recursive: true });
           }
-          fs.writeFileSync(
+          atomicWriteFileSync(
             path.join(defaultLegendaryDir, 'user.json'),
-            JSON.stringify(userJsonPayload, null, 2),
-            'utf8'
+            JSON.stringify(userJsonPayload, null, 2)
           );
         } catch {}
       }
@@ -6488,9 +6826,12 @@ async function ensureGogdlAuthConfig(options = {}) {
     } catch {}
   }
 
+  const activeStoreSync = options.storeSync || storeSync;
   const savedTokens =
     options.savedTokens ||
-    (storeSync && typeof storeSync.loadSavedTokens === 'function' ? storeSync.loadSavedTokens() : {});
+    (activeStoreSync && typeof activeStoreSync.loadSavedTokens === 'function'
+      ? activeStoreSync.loadSavedTokens()
+      : {});
   let gogData =
     savedTokens && savedTokens.gog
       ? { ...savedTokens.gog }
@@ -6504,8 +6845,8 @@ async function ensureGogdlAuthConfig(options = {}) {
     gogData &&
     gogData.refresh_token &&
     !options.skipNetwork &&
-    storeSync &&
-    typeof storeSync.renewGogTokens === 'function'
+    activeStoreSync &&
+    typeof activeStoreSync.renewGogTokens === 'function'
   ) {
     const updatedAtMs = gogData.updatedAt ? new Date(gogData.updatedAt).getTime() : 0;
     const maxAgeMs = ((gogData.expires_in || 3600) - 600) * 1000;
@@ -6517,13 +6858,18 @@ async function ensureGogdlAuthConfig(options = {}) {
 
     if (needsRefresh) {
       try {
-        const renewed = await storeSync.renewGogTokens(gogData.refresh_token);
+        const renewed = await activeStoreSync.renewGogTokens(gogData.refresh_token);
         if (renewed && renewed.access_token) {
           gogData = {
             ...gogData,
             ...renewed,
             updatedAt: renewed.updatedAt || new Date().toISOString(),
           };
+          if (typeof activeStoreSync.saveTokens === 'function') {
+            try {
+              activeStoreSync.saveTokens('gog', gogData);
+            } catch {}
+          }
         }
       } catch {}
     }
@@ -6546,7 +6892,7 @@ async function ensureGogdlAuthConfig(options = {}) {
       },
     };
     try {
-      fs.writeFileSync(gogAuthPath, JSON.stringify(authPayload, null, 2), 'utf8');
+      atomicWriteFileSync(gogAuthPath, JSON.stringify(authPayload, null, 2));
     } catch {}
   } else {
     const heroicAuth = path.join(homedir, 'Library/Application Support/heroic/gog_store/auth.json');
@@ -6561,35 +6907,40 @@ async function ensureGogdlAuthConfig(options = {}) {
 }
 
 /**
- * Resolve Epic Games app_name and native macOS vs Windows build availability
+ * Scan and cache local Legendary assets.json, aliases.json, and metadata/*.json
+ * to resolve per-game Epic macOS and Windows build availability with <1ms cached lookups.
  */
-function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
+function collectLocalEpicMetadataAndSupport(options = {}) {
   const homedir = options.homedir || os.homedir();
   const userDataDir = getUserDataDir(options.userDataDir);
   const customRoots = Array.isArray(options.customRoots) ? options.customRoots : [];
-
-  const cleanId = String(payload.platformGameId || payload.gameId || '')
-    .replace(/^epic-/i, '')
-    .trim();
-  const title = String(payload.title || '').trim();
   const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const normTitle = norm(title);
-  const normCleanId = norm(cleanId);
 
-  const configDirs = [
-    path.join(userDataDir, 'legendaryConfig/legendary'),
-    path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary'),
-    path.join(homedir, '.config/legendary'),
-    ...customRoots.map((r) => toLocalFsPath(r, customRoots)),
-    ...customRoots.map((r) => path.join(toLocalFsPath(r, customRoots), 'legendary')),
-    ...customRoots.map((r) =>
-      path.join(toLocalFsPath(r, customRoots), 'heroic/legendaryConfig/legendary')
-    ),
-  ];
+  const configDirs = Array.from(
+    new Set([
+      path.join(userDataDir, 'legendaryConfig/legendary'),
+      path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary'),
+      path.join(
+        process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+        'heroic',
+        'legendaryConfig',
+        'legendary'
+      ),
+      path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary'),
+      path.join(homedir, '.config/legendary'),
+      ...customRoots.map((r) => toLocalFsPath(r, customRoots)),
+      ...customRoots.map((r) => path.join(toLocalFsPath(r, customRoots), 'legendary')),
+      ...customRoots.map((r) =>
+        path.join(toLocalFsPath(r, customRoots), 'heroic/legendaryConfig/legendary')
+      ),
+    ])
+  );
 
   const winAssets = [];
   const macAssets = [];
   const aliasToAppName = new Map();
+  const metaSummaries = [];
+  const seenMetaAppNames = new Set();
 
   for (const dir of configDirs) {
     if (!dir || !fs.existsSync(dir)) continue;
@@ -6597,16 +6948,42 @@ function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
     const aliasesFile = path.join(dir, 'aliases.json');
     if (fs.existsSync(aliasesFile)) {
       try {
-        const aliasesObj = JSON.parse(fs.readFileSync(aliasesFile, 'utf8'));
-        if (aliasesObj && typeof aliasesObj === 'object') {
-          for (const [appNameKey, list] of Object.entries(aliasesObj)) {
-            if (!Array.isArray(list)) continue;
-            for (const alias of list) {
-              const n = norm(alias);
-              if (n && !aliasToAppName.has(n)) {
-                aliasToAppName.set(n, appNameKey);
+        const st = fs.statSync(aliasesFile);
+        const mtimeMs = st.mtimeMs || 0;
+        const size = st.size || 0;
+        const cachedAliases = legendaryAliasesFileCache.get(aliasesFile);
+        let aliasEntries = null;
+        if (
+          cachedAliases &&
+          cachedAliases.mtimeMs === mtimeMs &&
+          cachedAliases.size === size &&
+          Array.isArray(cachedAliases.entries)
+        ) {
+          aliasEntries = cachedAliases.entries;
+        } else {
+          aliasEntries = [];
+          const aliasesObj = JSON.parse(fs.readFileSync(aliasesFile, 'utf8'));
+          if (aliasesObj && typeof aliasesObj === 'object') {
+            for (const [appNameKey, list] of Object.entries(aliasesObj)) {
+              if (!Array.isArray(list)) continue;
+              for (const alias of list) {
+                const n = norm(alias);
+                if (n) {
+                  aliasEntries.push([n, appNameKey]);
+                }
               }
             }
+          }
+          setBoundedMapEntry(
+            legendaryAliasesFileCache,
+            aliasesFile,
+            { mtimeMs, size, entries: aliasEntries },
+            MAX_LEGENDARY_CACHE_DIRS
+          );
+        }
+        for (const [n, appNameKey] of aliasEntries) {
+          if (!aliasToAppName.has(n)) {
+            aliasToAppName.set(n, appNameKey);
           }
         }
       } catch {}
@@ -6615,36 +6992,222 @@ function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
     const assetsFile = path.join(dir, 'assets.json');
     if (fs.existsSync(assetsFile)) {
       try {
-        const parsed = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            if (!item || typeof item !== 'object') continue;
-            const hasMacInfo =
-              String(item.platform || '').toLowerCase() === 'mac' ||
-              Boolean(item.asset_infos && item.asset_infos.Mac && Object.keys(item.asset_infos.Mac).length > 0);
-            const hasWinInfo =
-              String(item.platform || '').toLowerCase() === 'windows' ||
-              Boolean(
-                item.asset_infos &&
-                  item.asset_infos.Windows &&
-                  Object.keys(item.asset_infos.Windows).length > 0
-              ) ||
-              (!item.platform && !item.asset_infos);
+        const st = fs.statSync(assetsFile);
+        const mtimeMs = st.mtimeMs || 0;
+        const size = st.size || 0;
+        const cachedAssets = legendaryAssetsFileCache.get(assetsFile);
+        let fileWinAssets = null;
+        let fileMacAssets = null;
+        if (
+          cachedAssets &&
+          cachedAssets.mtimeMs === mtimeMs &&
+          cachedAssets.size === size &&
+          Array.isArray(cachedAssets.winAssets) &&
+          Array.isArray(cachedAssets.macAssets)
+        ) {
+          fileWinAssets = cachedAssets.winAssets;
+          fileMacAssets = cachedAssets.macAssets;
+        } else {
+          fileWinAssets = [];
+          fileMacAssets = [];
+          const parsed = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              if (!item || typeof item !== 'object') continue;
+              const hasMacInfo =
+                String(item.platform || '').toLowerCase() === 'mac' ||
+                Boolean(
+                  item.asset_infos &&
+                    item.asset_infos.Mac &&
+                    Object.keys(item.asset_infos.Mac).length > 0
+                );
+              const hasWinInfo =
+                String(item.platform || '').toLowerCase() === 'windows' ||
+                Boolean(
+                  item.asset_infos &&
+                    item.asset_infos.Windows &&
+                    Object.keys(item.asset_infos.Windows).length > 0
+                ) ||
+                (!item.platform && !item.asset_infos);
 
-            if (hasMacInfo) macAssets.push(item);
-            if (hasWinInfo) winAssets.push(item);
+              if (hasMacInfo) fileMacAssets.push(item);
+              if (hasWinInfo) fileWinAssets.push(item);
+            }
+          } else if (parsed && typeof parsed === 'object') {
+            if (Array.isArray(parsed.Windows)) {
+              fileWinAssets.push(...parsed.Windows);
+            }
+            if (Array.isArray(parsed.Mac)) {
+              fileMacAssets.push(...parsed.Mac);
+            }
           }
-        } else if (parsed && typeof parsed === 'object') {
-          if (Array.isArray(parsed.Windows)) {
-            winAssets.push(...parsed.Windows);
+          setBoundedMapEntry(
+            legendaryAssetsFileCache,
+            assetsFile,
+            { mtimeMs, size, winAssets: fileWinAssets, macAssets: fileMacAssets },
+            MAX_LEGENDARY_CACHE_DIRS
+          );
+        }
+        winAssets.push(...fileWinAssets);
+        macAssets.push(...fileMacAssets);
+      } catch {}
+    }
+
+    const metaDir = path.join(dir, 'metadata');
+    if (fs.existsSync(metaDir)) {
+      try {
+        const st = fs.statSync(metaDir);
+        const mtimeMs = st.mtimeMs || 0;
+        const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+        const fileCount = files.length;
+        const cachedMeta = legendaryMetadataDirCache.get(metaDir);
+        let dirSummaries = null;
+        if (
+          cachedMeta &&
+          cachedMeta.mtimeMs === mtimeMs &&
+          cachedMeta.fileCount === fileCount &&
+          Array.isArray(cachedMeta.summaries)
+        ) {
+          dirSummaries = cachedMeta.summaries;
+        } else {
+          dirSummaries = [];
+          for (const f of files) {
+            try {
+              const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf8'));
+              if (!json || typeof json !== 'object') continue;
+              const appName = String(json.app_name || f.replace(/\.json$/i, '')).trim();
+              if (!appName) continue;
+              const catalogItemId = String(
+                json.catalog_item_id || json.id || json.metadata?.id || ''
+              ).trim();
+              const namespace = String(json.namespace || json.metadata?.namespace || '').trim();
+              const appTitle = String(json.app_title || json.metadata?.title || '').trim();
+              const normTitle = norm(appTitle);
+              const hasMacAsset = Boolean(
+                json.asset_infos?.Mac && Object.keys(json.asset_infos.Mac).length > 0
+              );
+              const hasWinAsset = Boolean(
+                json.asset_infos?.Windows && Object.keys(json.asset_infos.Windows).length > 0
+              );
+              const releaseInfo = json.metadata?.releaseInfo || json.releaseInfo;
+              const hasMacRelease =
+                Array.isArray(releaseInfo) &&
+                releaseInfo.some(
+                  (r) =>
+                    r &&
+                    Array.isArray(r.platform) &&
+                    r.platform.some((p) => /^mac$/i.test(String(p)))
+                );
+              const hasWinRelease =
+                Array.isArray(releaseInfo) &&
+                releaseInfo.some(
+                  (r) =>
+                    r &&
+                    Array.isArray(r.platform) &&
+                    r.platform.some((p) => /^(windows|win32)$/i.test(String(p)))
+                );
+              const hasMac = hasMacAsset || hasMacRelease;
+              const hasWin = hasWinAsset || hasWinRelease || !hasMac;
+              dirSummaries.push({
+                appName,
+                catalogItemId,
+                namespace,
+                appTitle,
+                normTitle,
+                hasMac,
+                hasWin,
+                macVersion: json.asset_infos?.Mac?.build_version || undefined,
+                winVersion: json.asset_infos?.Windows?.build_version || undefined,
+              });
+            } catch {}
           }
-          if (Array.isArray(parsed.Mac)) {
-            macAssets.push(...parsed.Mac);
+          setBoundedMapEntry(
+            legendaryMetadataDirCache,
+            metaDir,
+            {
+              mtimeMs,
+              fileCount,
+              summaries: dirSummaries,
+            },
+            MAX_LEGENDARY_CACHE_DIRS
+          );
+        }
+        for (const s of dirSummaries) {
+          const key = s.appName.toLowerCase();
+          if (!seenMetaAppNames.has(key)) {
+            seenMetaAppNames.add(key);
+            metaSummaries.push(s);
           }
         }
       } catch {}
     }
   }
+
+  const epicPlatformSupport = {};
+  const mergeSupport = (rawKey, win, mac) => {
+    const k = String(rawKey || '').toLowerCase().trim();
+    if (!k) return;
+    const prev = epicPlatformSupport[k] || { windows: false, mac: false };
+    epicPlatformSupport[k] = {
+      windows: Boolean(prev.windows || win),
+      mac: Boolean(prev.mac || mac),
+    };
+  };
+
+  for (const item of winAssets) {
+    if (!item || typeof item !== 'object') continue;
+    mergeSupport(item.app_name || item.appName, true, false);
+    mergeSupport(item.catalog_item_id || item.catalogItemId, true, false);
+    if (item.app_title || item.title) {
+      mergeSupport(norm(item.app_title || item.title), true, false);
+    }
+  }
+  for (const item of macAssets) {
+    if (!item || typeof item !== 'object') continue;
+    mergeSupport(item.app_name || item.appName, false, true);
+    mergeSupport(item.catalog_item_id || item.catalogItemId, false, true);
+    if (item.app_title || item.title) {
+      mergeSupport(norm(item.app_title || item.title), false, true);
+    }
+  }
+  for (const s of metaSummaries) {
+    const existingByApp = epicPlatformSupport[s.appName.toLowerCase()];
+    const hasWin = Boolean(s.hasWin || existingByApp?.windows);
+    const hasMac = Boolean(s.hasMac || existingByApp?.mac);
+    mergeSupport(s.appName, hasWin, hasMac);
+    mergeSupport(s.catalogItemId, hasWin, hasMac);
+    if (s.normTitle) {
+      mergeSupport(s.normTitle, hasWin, hasMac);
+    }
+    if (s.appTitle) {
+      mergeSupport(s.appTitle, hasWin, hasMac);
+    }
+  }
+
+  return {
+    configDirs,
+    winAssets,
+    macAssets,
+    aliasToAppName,
+    metaSummaries,
+    epicPlatformSupport,
+  };
+}
+
+/**
+ * Resolve Epic Games app_name and native macOS vs Windows build availability
+ */
+function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
+  const cleanId = String(payload.platformGameId || payload.gameId || '')
+    .replace(/^epic-/i, '')
+    .trim();
+  const title = String(payload.title || '').trim();
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normTitle = norm(title);
+  const normCleanId = norm(cleanId);
+
+  const { configDirs, winAssets, macAssets, aliasToAppName, metaSummaries } =
+    collectLocalEpicMetadataAndSupport(options);
 
   const matchesEntry = (entry, targetAppName) => {
     if (!entry || typeof entry !== 'object') return false;
@@ -6667,6 +7230,27 @@ function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
     return false;
   };
 
+  const matchesMetaSummary = (s, targetAppName) => {
+    if (!s) return false;
+    if (targetAppName && s.appName.toLowerCase() === String(targetAppName).toLowerCase()) {
+      return true;
+    }
+    if (cleanId) {
+      const cleanLower = cleanId.toLowerCase();
+      if (
+        s.appName.toLowerCase() === cleanLower ||
+        (s.catalogItemId && s.catalogItemId.toLowerCase() === cleanLower) ||
+        (s.namespace && s.namespace.toLowerCase() === cleanLower)
+      ) {
+        return true;
+      }
+    }
+    if (normTitle && s.normTitle && s.normTitle === normTitle) {
+      return true;
+    }
+    return false;
+  };
+
   let resolvedAppName = '';
 
   // 1. Direct match in assets.json
@@ -6678,7 +7262,13 @@ function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
     resolvedAppName = directWin.app_name;
   }
 
-  // 2. Fallback to aliases.json match by title or cleanId
+  // 2. Match in metadata/*.json summaries (by app_name, catalog_item_id, namespace, or normalized app_title)
+  const matchedMeta = metaSummaries.find((s) => matchesMetaSummary(s, resolvedAppName));
+  if (!resolvedAppName && matchedMeta && matchedMeta.appName) {
+    resolvedAppName = matchedMeta.appName;
+  }
+
+  // 3. Fallback to aliases.json match by title or cleanId
   if (!resolvedAppName) {
     if (normTitle && aliasToAppName.has(normTitle)) {
       resolvedAppName = aliasToAppName.get(normTitle);
@@ -6693,18 +7283,33 @@ function resolveEpicAppAndPlatforms(payload = {}, options = {}) {
 
   const macEntry = macAssets.find((e) => matchesEntry(e, resolvedAppName));
   const winEntry = winAssets.find((e) => matchesEntry(e, resolvedAppName));
+  const metaSummary =
+    matchedMeta || metaSummaries.find((s) => matchesMetaSummary(s, resolvedAppName)) || null;
 
-  const hasMacBuild = Boolean(macEntry);
-  const hasWindowsBuild =
-    winAssets.length > 0 || macAssets.length > 0 ? Boolean(winEntry) || !hasMacBuild : true;
+  const foundInLocal = Boolean(macEntry || winEntry || metaSummary);
+  const hasMacBuild = foundInLocal
+    ? Boolean(macEntry) || Boolean(metaSummary?.hasMac)
+    : Boolean(payload.storePlatforms?.mac === true);
+  const hasWindowsBuild = foundInLocal
+    ? Boolean(winEntry) || Boolean(metaSummary?.hasWin) || !hasMacBuild
+    : payload.storePlatforms?.windows !== undefined
+      ? Boolean(payload.storePlatforms.windows)
+      : true;
 
   const macVersion =
-    macEntry?.build_version || macEntry?.asset_infos?.Mac?.build_version || undefined;
+    macEntry?.build_version ||
+    macEntry?.asset_infos?.Mac?.build_version ||
+    metaSummary?.macVersion ||
+    undefined;
   const winVersion =
-    winEntry?.build_version || winEntry?.asset_infos?.Windows?.build_version || undefined;
+    winEntry?.build_version ||
+    winEntry?.asset_infos?.Windows?.build_version ||
+    metaSummary?.winVersion ||
+    undefined;
 
-  let namespace = macEntry?.namespace || winEntry?.namespace;
-  let catalogItemId = macEntry?.catalog_item_id || winEntry?.catalog_item_id;
+  let namespace = macEntry?.namespace || winEntry?.namespace || metaSummary?.namespace;
+  let catalogItemId =
+    macEntry?.catalog_item_id || winEntry?.catalog_item_id || metaSummary?.catalogItemId;
 
   if ((!namespace || !catalogItemId) && resolvedAppName) {
     for (const dir of configDirs) {
@@ -7207,8 +7812,9 @@ async function getGameInstallInfo(payload = {}, options = {}) {
       return cleaned || undefined;
     };
 
+    let productData = null;
     if (cleanId && (!options.skipNetwork || options.mockGogProductData)) {
-      let productData = options.mockGogProductData || (await fetchGogProduct(gogToken));
+      productData = options.mockGogProductData || (await fetchGogProduct(gogToken));
       if (!options.mockGogProductData && (!productData || !productData.downloads) && gogToken) {
         try {
           const refreshedAuth = await ensureGogdlAuthConfig({
@@ -7412,8 +8018,38 @@ async function getGameInstallInfo(payload = {}, options = {}) {
       }
     }
 
+    const storeSupportsMac =
+      availableInstallers.some((i) => i.os === 'mac') ||
+      Boolean(productData?.content_system_compatibility?.osx) ||
+      Boolean(payload.storePlatforms?.mac);
+    const storeSupportsWin =
+      availableInstallers.some((i) => i.os === 'windows') ||
+      Boolean(productData?.content_system_compatibility?.windows) ||
+      Boolean(payload.storePlatforms?.windows);
+
+    if (
+      platform === 'darwin' &&
+      availableInstallers.some((i) => i.os === 'mac') &&
+      !availableInstallers.some((i) => i.os === 'windows') &&
+      (productData?.content_system_compatibility?.windows === true ||
+        payload.storePlatforms?.windows === true)
+    ) {
+      availableInstallers.push({
+        id: 'gog-win-compat',
+        name: `${titleLabel} — Windows Build via CrossOver / Wine`,
+        os: 'windows',
+        language: 'en',
+        totalSizeBytes: estimatedSizeBytes,
+      });
+    }
+
     if (estimatedSizeBytes && cleanId) {
-      installInfoSizeCache.set(`gog:${cleanId}:${platform}`, estimatedSizeBytes);
+      setBoundedMapEntry(
+        installInfoSizeCache,
+        `gog:${cleanId}:${platform}`,
+        estimatedSizeBytes,
+        MAX_DISCOVERY_CACHE_ENTRIES
+      );
     }
 
     if (estimatedSizeBytes && availableInstallers.length > 0) {
@@ -7436,6 +8072,36 @@ async function getGameInstallInfo(payload = {}, options = {}) {
             os: 'windows',
             language: 'en',
             totalSizeBytes: fallbackWinSize,
+          },
+        ];
+      } else if (
+        (payload.storePlatforms && payload.storePlatforms.mac === false) ||
+        (productData?.content_system_compatibility &&
+          productData.content_system_compatibility.osx === false &&
+          storeSupportsWin)
+      ) {
+        availableInstallers = [
+          {
+            id: 'gog-win-default',
+            name: `${titleLabel} — Windows Build (CrossOver / Wine Fallback, No macOS Native Build)`,
+            os: 'windows',
+            language: 'en',
+            totalSizeBytes: fallbackWinSize,
+          },
+        ];
+      } else if (
+        payload.storePlatforms &&
+        payload.storePlatforms.mac === true &&
+        payload.storePlatforms.windows === false &&
+        !storeSupportsWin
+      ) {
+        availableInstallers = [
+          {
+            id: 'gog-mac-default',
+            name: `${titleLabel} (macOS Universal Installer)`,
+            os: 'mac',
+            language: 'en',
+            totalSizeBytes: fallbackMacSize,
           },
         ];
       } else {
@@ -7486,6 +8152,14 @@ async function getGameInstallInfo(payload = {}, options = {}) {
           'legendary',
           'installed.json'
         ),
+        path.join(
+          process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+          'heroic',
+          'legendaryConfig',
+          'legendary',
+          'installed.json'
+        ),
+        path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary', 'installed.json'),
       ];
       for (const legInstalledPath of installedJsonPaths) {
         try {
@@ -7514,6 +8188,14 @@ async function getGameInstallInfo(payload = {}, options = {}) {
           'legendary',
           'manifests'
         ),
+        path.join(
+          process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+          'heroic',
+          'legendaryConfig',
+          'legendary',
+          'manifests'
+        ),
+        path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary', 'manifests'),
       ];
       for (const mDir of manifestDirs) {
         try {
@@ -7552,6 +8234,14 @@ async function getGameInstallInfo(payload = {}, options = {}) {
               'legendary',
               'metadata'
             ),
+            path.join(
+              process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+              'heroic',
+              'legendaryConfig',
+              'legendary',
+              'metadata'
+            ),
+            path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary', 'metadata'),
           ];
           for (const metaDir of metaDirs) {
             const metaPath = path.join(metaDir, `${resolvedAppName}.json`);
@@ -7748,7 +8438,12 @@ async function getGameInstallInfo(payload = {}, options = {}) {
     }
 
     if (estimatedSizeBytes && resolvedAppName) {
-      installInfoSizeCache.set(`epic:${resolvedAppName}:${platform}`, estimatedSizeBytes);
+      setBoundedMapEntry(
+        installInfoSizeCache,
+        `epic:${resolvedAppName}:${platform}`,
+        estimatedSizeBytes,
+        MAX_DISCOVERY_CACHE_ENTRIES
+      );
     }
 
     if (platform === 'darwin') {
@@ -7881,7 +8576,12 @@ async function getGameInstallInfo(payload = {}, options = {}) {
               parseStorageRequirementBytes(macReqText);
             if (parsedSize) {
               estimatedSizeBytes = parsedSize;
-              installInfoSizeCache.set(`steam:${cleanId}:${platform}`, estimatedSizeBytes);
+              setBoundedMapEntry(
+                installInfoSizeCache,
+                `steam:${cleanId}:${platform}`,
+                estimatedSizeBytes,
+                MAX_DISCOVERY_CACHE_ENTRIES
+              );
             }
           }
         }
@@ -8461,16 +9161,20 @@ async function installGame(payload = {}, options = {}) {
         const existingConfigs = getGameLaunchConfigs(options);
         const rawExistingConfig = (payload.gameId && existingConfigs[payload.gameId]) || {};
         const existingConfig = resolvePlatformLaunchConfig(rawExistingConfig, 'steam');
+        const requestedLayerType = payload.compatibilityLayer || existingConfig.compatibilityLayer;
         const preferredLayer =
-          layers.find((l) => l.type === 'crossover' || l.type === 'crossover_preview') || layers[0];
+          (requestedLayerType && layers.find((l) => l.type === requestedLayerType)) ||
+          layers.find((l) => l.type === 'crossover' || l.type === 'crossover_preview') ||
+          layers[0];
 
         const env = { ...process.env };
         await ensureCompatibilityLayerReady(preferredLayer, existingConfig, env, options);
 
         const candidateBottles = [];
         const targetBottleName =
-          env.CX_BOTTLE ||
+          payload.wineBottleName ||
           existingConfig.wineBottleName ||
+          env.CX_BOTTLE ||
           (Array.isArray(preferredLayer.availableBottles) && preferredLayer.availableBottles[0]) ||
           'OneLauncher';
         const targetBottlePath =
@@ -8562,6 +9266,7 @@ async function installGame(payload = {}, options = {}) {
                     ...existingConfig,
                     gameId: payload.gameId,
                     preferredPlatformId: 'steam',
+                    launchMethod: 'compatibility_layer',
                     compatibilityLayer: resolvedTarget.layer.type,
                     wineBottleName: resolvedTarget.bottleName,
                   },
@@ -8571,6 +9276,23 @@ async function installGame(payload = {}, options = {}) {
             }
           } catch {}
         }
+      } else if (platform === 'darwin' && !isWinCompatInstall && payload.gameId) {
+        try {
+          const existingConfigs = getGameLaunchConfigs(options);
+          const rawExistingConfig = existingConfigs[payload.gameId] || {};
+          const existingConfig = resolvePlatformLaunchConfig(rawExistingConfig, 'steam');
+          if (existingConfig?.launchMethod === 'compatibility_layer') {
+            saveGameLaunchConfig(
+              {
+                ...existingConfig,
+                gameId: payload.gameId,
+                preferredPlatformId: 'steam',
+                launchMethod: 'auto',
+              },
+              options
+            );
+          }
+        } catch {}
       }
 
       if (
@@ -8756,6 +9478,14 @@ async function installGame(payload = {}, options = {}) {
               const candidateInstalledFiles = [
                 path.join(authInfo.legendaryConfigPath, 'installed.json'),
                 path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary/installed.json'),
+                path.join(
+                  process.env.APPDATA || path.join(homedir, 'AppData', 'Roaming'),
+                  'heroic',
+                  'legendaryConfig',
+                  'legendary',
+                  'installed.json'
+                ),
+                path.join(homedir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary', 'installed.json'),
                 path.join(homedir, '.config/legendary/installed.json'),
               ];
               for (const instFile of candidateInstalledFiles) {
@@ -8785,6 +9515,7 @@ async function installGame(payload = {}, options = {}) {
               const exeDiscovery = findPrimaryExecutable(actualInstallPath, {
                 platform,
                 hintName: title,
+                preferWindowsExecutable: platform === 'darwin' && epicPlatformFlag === 'Windows',
               });
 
               let executablePath = exeDiscovery.executablePath;
@@ -8979,6 +9710,7 @@ async function installGame(payload = {}, options = {}) {
             const existingExeCheck = findPrimaryExecutable(finalInstallPath, {
               platform,
               hintName: title,
+              preferWindowsExecutable: platform === 'darwin' && gogPlatformFlag === 'windows',
             });
             if (!existingExeCheck.executablePath) {
               clearStaleGogdlManifestCache(cleanId, options);
@@ -9170,6 +9902,7 @@ async function installGame(payload = {}, options = {}) {
                 const exeDiscovery = findPrimaryExecutable(targetScanDir, {
                   platform,
                   hintName: title,
+                  preferWindowsExecutable: platform === 'darwin' && gogPlatformFlag === 'windows',
                 });
 
                 if (!exeDiscovery.executablePath && !options.homedir && !options.skipNetwork) {
@@ -9580,7 +10313,7 @@ async function downloadGogV1Depot(
 
     if (platform === 'darwin') {
       ensureMacExecutablePermissions(finalInstallPath);
-      executableDiscoveryCache.delete(path.resolve(finalInstallPath));
+      executableDiscoveryCache.clear();
       const macExeDiscovery = findPrimaryExecutable(finalInstallPath, {
         platform: 'darwin',
         hintName: title,
@@ -9634,10 +10367,11 @@ async function downloadGogV1Depot(
       }
     }
 
-    executableDiscoveryCache.delete(path.resolve(finalInstallPath));
+    executableDiscoveryCache.clear();
     const finalExeDiscovery = findPrimaryExecutable(finalInstallPath, {
       platform,
       hintName: title,
+      preferWindowsExecutable: platform === 'darwin' && gogPlatformFlag === 'windows',
     });
     const isWindowsBinaryOnMac = Boolean(finalExeDiscovery.isWindowsBinaryOnMac);
 
@@ -10558,6 +11292,8 @@ module.exports = {
   onSessionUpdated,
   onDownloadUpdated,
   openedExternalUris,
+  atomicWriteFileSync,
+  openExternalUri,
 
   // A) Scanner & Helpers
   toLocalFsPath,
@@ -10568,6 +11304,7 @@ module.exports = {
   resolveMacAppBundleBinary,
   ensureMacExecutablePermissions,
   invalidateScanCaches,
+  evictExecutableDiscoveryCacheForPath,
   inspectWindowsExecutableHeader,
   inspectMacMachOHeader,
   scoreExecutableCandidate,
@@ -10592,6 +11329,7 @@ module.exports = {
   hasValidInitializedBottles,
   detectCompatibilityLayers,
   installCompatibilityLayer,
+  mountAndExtractDmgSafe,
   extractRunnerVersionInfo,
   detectBundledD3DMetalVersions,
   compareRunnerVersions,
@@ -10612,6 +11350,7 @@ module.exports = {
   findGogdlBinary,
   ensureLegendaryConfigAndAuth,
   ensureGogdlAuthConfig,
+  collectLocalEpicMetadataAndSupport,
   resolveEpicAppAndPlatforms,
   startSteamInstallMonitor,
   ensureWindowsSteamInBottle,

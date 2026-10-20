@@ -1,8 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useCallback, useDeferredValue, lazy, Suspense } from 'react';
 import { CanonicalGame } from './contracts/game';
 import { StorefrontId } from './contracts/platform';
-import { mergeScannedSteamGames } from './services/storage/librarySync';
-import { FULL_USER_STEAM_GAMES } from './services/storage/fullUserSteamGames';
 import { scanLocalInstalledGames, scanLocalSteamAchievements } from './services/system/localSystemScanner';
 import {
   cacheUserSteamAchievements,
@@ -63,7 +61,6 @@ import {
   SuppressedCatalogEntry,
   registerSuppressedCatalogEntries,
 } from './services/integrations/catalogSanitizer';
-import { GOG_USER_LIBRARY, EPIC_USER_LIBRARY } from './services/storage/storefrontLibraries';
 import {
   CheckCircle2,
   Layers,
@@ -133,30 +130,13 @@ export function App() {
           }));
           const sanitized = sanitizeGameCatalog(cleaned, { allowNewPurchases: true });
           try {
-            localStorage.setItem('universal_game_library_catalog', JSON.stringify(sanitized));
+            saveCurrentCatalog(sanitized, { skipSanitize: true });
           } catch {}
           return sanitized;
         }
       } catch (e) {
         console.error('Failed to parse cached games:', e);
       }
-    }
-    if (
-      FULL_USER_STEAM_GAMES.length > 0 ||
-      GOG_USER_LIBRARY.length > 0 ||
-      EPIC_USER_LIBRARY.length > 0
-    ) {
-      const defaultCatalog = sanitizeGameCatalog(
-        mergeStorefrontGames(
-          mergeStorefrontGames(mergeScannedSteamGames([]), GOG_USER_LIBRARY, 'gog'),
-          EPIC_USER_LIBRARY,
-          'epic'
-        )
-      );
-      try {
-        localStorage.setItem('universal_game_library_catalog', JSON.stringify(defaultCatalog));
-      } catch {}
-      return defaultCatalog;
     }
     return [];
   });
@@ -459,7 +439,6 @@ export function App() {
             if (
               !gogInteg ||
               !gogInteg.isConnected ||
-              !gogInteg.credentials?.gogToken ||
               gogInteg.avatarUrl !== gogAvatar ||
               gogInteg.accountName !== accountName
             ) {
@@ -479,8 +458,6 @@ export function App() {
                       lastSyncedAt: savedTokens.gog.updatedAt || new Date().toISOString(),
                       authMethod: 'oauth' as const,
                       credentials: {
-                        ...i.credentials,
-                        gogToken: savedTokens.gog.access_token,
                         gogUsername: accountName !== 'GOG User' ? accountName : i.credentials?.gogUsername,
                       },
                       statusMessage: `Connected as ${accountName} (${count} titles synced)`,
@@ -499,7 +476,7 @@ export function App() {
               !epicInteg ||
               !epicInteg.isConnected ||
               epicInteg.accountName !== displayName ||
-              !epicInteg.credentials?.epicToken
+              !epicInteg.credentials?.epicAccountId
             ) {
               const count =
                 epicInteg?.gamesCount && epicInteg.gamesCount > 0
@@ -516,8 +493,6 @@ export function App() {
                       lastSyncedAt: savedTokens.epic.updatedAt || new Date().toISOString(),
                       authMethod: 'oauth' as const,
                       credentials: {
-                        epicToken: savedTokens.epic.access_token,
-                        epicRefreshToken: savedTokens.epic.refresh_token,
                         epicAccountId: savedTokens.epic.account_id,
                         epicTokenExpiresAt: savedTokens.epic.expires_at,
                       },
@@ -631,6 +606,10 @@ export function App() {
         }
       }
 
+      const epicPlatformSupport: Record<string, { windows: boolean; mac: boolean }> | undefined = (
+        allInstalledRecords as any
+      )?.epicPlatformSupport;
+
       let steamAchs: Record<number, { unlocked: number; total: number; percentage: number }> = {};
       try {
         const scanned = await scanLocalSteamAchievements();
@@ -643,21 +622,39 @@ export function App() {
       }
 
       let installedSteamAppIds: Set<number> | null = null;
-      let installedGamesList: { platformId?: string; appId: number; name?: string; installPath?: string }[] = [];
+      let installedGamesList: {
+        platformId?: string;
+        platformGameId?: string;
+        storefrontAppId?: string;
+        appId?: number;
+        name?: string;
+        title?: string;
+        installPath?: string;
+        executablePath?: string;
+        isWindowsBinaryOnMac?: boolean;
+        installSize?: number;
+        version?: string;
+        launchArguments?: string;
+      }[] = [];
       if (allInstalledRecords.length > 0) {
         installedSteamAppIds = new Set(
           allInstalledRecords
             .filter((r) => r.platformId === 'steam' && (r.appId || !isNaN(Number(r.platformGameId))))
             .map((r) => Number(r.appId || r.platformGameId))
         );
-        installedGamesList = allInstalledRecords
-          .filter((r) => r.platformId === 'steam' && (r.appId || !isNaN(Number(r.platformGameId))))
-          .map((r) => ({
-            platformId: r.platformId,
-            appId: Number(r.appId || r.platformGameId),
-            name: r.title,
-            installPath: r.installPath,
-          }));
+        installedGamesList = allInstalledRecords.map((r) => ({
+          platformId: r.platformId,
+          platformGameId: r.platformGameId,
+          appId: r.appId || (!isNaN(Number(r.platformGameId)) ? Number(r.platformGameId) : undefined),
+          name: r.title,
+          title: r.title,
+          installPath: r.installPath,
+          executablePath: r.executablePath,
+          isWindowsBinaryOnMac: r.isWindowsBinaryOnMac,
+          installSize: r.installSize,
+          version: r.version,
+          launchArguments: r.launchArguments,
+        }));
       } else {
         try {
           const scanResult = await scanLocalInstalledGames();
@@ -675,9 +672,13 @@ export function App() {
       setGames((prevGames) => {
         let changed = false;
         const existingAppIds = new Set<number>();
+        const existingPlatformKeys = new Set<string>();
         for (const g of prevGames) {
           if (g.steamAppId) existingAppIds.add(g.steamAppId);
           for (const p of g.platforms) {
+            if (p.platformId && p.platformGameId) {
+              existingPlatformKeys.add(`${p.platformId}:${String(p.platformGameId).trim().toLowerCase()}`);
+            }
             if (p.platformId === 'steam' && p.platformGameId) {
               const num = parseInt(p.platformGameId, 10);
               if (!isNaN(num)) existingAppIds.add(num);
@@ -687,6 +688,7 @@ export function App() {
 
         const updated = prevGames.map((game) => {
           let gameChanged = false;
+          let epicPlatformsUpdated = false;
           const targetAppId = game.steamAppId;
           const ach = targetAppId
             ? (steamAchs[targetAppId] || getKnownSteamAchievements(targetAppId, game.title))
@@ -703,7 +705,8 @@ export function App() {
                 (String(r.platformGameId) === String(p.platformGameId) ||
                   (p.platformId === 'steam' &&
                     targetAppId &&
-                    Number(r.appId || r.platformGameId) === Number(targetAppId)))
+                    Number(r.appId || r.platformGameId) === Number(targetAppId)) ||
+                  Boolean(p.installPath && r.installPath && r.installPath === p.installPath))
             );
 
             if (matchedRecord) {
@@ -798,6 +801,31 @@ export function App() {
                 }
               }
             } else if (p.platformId === 'epic') {
+              if (epicPlatformSupport) {
+                const appKey = String(p.storefrontAppId || p.platformGameId || '').toLowerCase();
+                const cleanAppKey = appKey.replace(/^epic-/i, '');
+                const titleKey = normalizeCanonicalTitle(game.title);
+                const rawTitleKey = game.title.toLowerCase().trim();
+                const alnumTitleKey = (game.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+                const epicSupport =
+                  (appKey ? epicPlatformSupport[appKey] : undefined) ||
+                  (cleanAppKey ? epicPlatformSupport[cleanAppKey] : undefined) ||
+                  (titleKey ? epicPlatformSupport[titleKey] : undefined) ||
+                  (rawTitleKey ? epicPlatformSupport[rawTitleKey] : undefined) ||
+                  (alnumTitleKey ? epicPlatformSupport[alnumTitleKey] : undefined);
+                if (
+                  epicSupport &&
+                  (!p.platforms || p.platforms.mac !== Boolean(epicSupport.mac))
+                ) {
+                  newP.platforms = {
+                    windows: true,
+                    mac: Boolean(epicSupport.mac),
+                    linux: false,
+                  };
+                  pChanged = true;
+                  epicPlatformsUpdated = true;
+                }
+              }
               const epicAch = getKnownEpicAchievements(game.id, game.title);
               if (epicAch && epicAch.total > 0) {
                 const reconciled = reconcileAchievementSummaries(
@@ -827,50 +855,134 @@ export function App() {
 
           if (gameChanged) {
             changed = true;
-            return { ...game, platforms: updatedPlatforms };
+            return {
+              ...game,
+              platforms: updatedPlatforms,
+              ...(epicPlatformsUpdated ? { nativePlatforms: undefined } : {}),
+            };
           }
           return game;
         });
 
-        // Add any newly installed Steam games detected on disk if Steam integration is connected
-        const isSteamConnected = loadIntegrations().some((i) => i.storefrontId === 'steam' && i.isConnected);
-        if (isSteamConnected && installedGamesList && installedGamesList.length > 0) {
+        // Automatically add any newly discovered local Steam, GOG, or Epic games detected on disk
+        if (installedGamesList && installedGamesList.length > 0) {
           for (const item of installedGamesList) {
-            if ((item.platformId && item.platformId !== 'steam') || !item.appId || item.appId <= 0) {
-              continue;
-            }
-            if (!existingAppIds.has(item.appId)) {
-              existingAppIds.add(item.appId);
-              const title = item.name || `Steam App ${item.appId}`;
-              updated.push({
-                id: `steam-${item.appId}`,
-                title,
-                sortTitle: title,
-                steamAppId: item.appId,
-                isVerifiedEntitlement: true,
-                platforms: [
-                  {
-                    platformId: 'steam',
-                    platformGameId: String(item.appId),
-                    installed: true,
-                    installPath: item.installPath,
-                  },
-                ],
-                headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${item.appId}/header.jpg`,
-                shortDescription: '',
-                releaseDate: 'TBA',
-                developers: [],
-                publishers: [],
-                genres: [],
-                tags: [],
-              });
-              changed = true;
+            const platId = (item.platformId || 'steam') as StorefrontId;
+            const rawTitle = (item.title || item.name || '').trim();
+            if (platId === 'steam') {
+              const appId = Number(item.appId || item.platformGameId);
+              if (!appId || isNaN(appId) || appId <= 0) continue;
+              if (!existingAppIds.has(appId)) {
+                existingAppIds.add(appId);
+                existingPlatformKeys.add(`steam:${appId}`);
+                const title = rawTitle || `Steam App ${appId}`;
+                updated.push({
+                  id: `steam-${appId}`,
+                  title,
+                  sortTitle: title.replace(/^(The|A|An)\s+/i, '').trim(),
+                  steamAppId: appId,
+                  isVerifiedEntitlement: true,
+                  platforms: [
+                    {
+                      platformId: 'steam',
+                      platformGameId: String(appId),
+                      installed: true,
+                      installPath: item.installPath,
+                      executablePath: item.executablePath,
+                      isWindowsBinaryOnMac: (item as any).isWindowsBinaryOnMac,
+                      installSize: (item as any).installSize,
+                      version: (item as any).version,
+                      launchArguments: (item as any).launchArguments,
+                    },
+                  ],
+                  headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
+                  capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900_2x.jpg`,
+                  shortDescription: '',
+                  releaseDate: 'TBA',
+                  developers: [],
+                  publishers: [],
+                  genres: [],
+                  tags: [],
+                });
+                changed = true;
+              }
+            } else if (platId === 'gog' || platId === 'epic') {
+              const storefrontAppId = String(
+                item.platformGameId || item.storefrontAppId || (item.appId && item.appId > 0 ? item.appId : '')
+              ).trim();
+              if (!rawTitle || !storefrontAppId) continue;
+              const platKey = `${platId}:${storefrontAppId.toLowerCase()}`;
+              if (existingPlatformKeys.has(platKey)) continue;
+              existingPlatformKeys.add(platKey);
+
+              const normTitle = normalizeCanonicalTitle(rawTitle);
+              const matchedIdx = normTitle
+                ? updated.findIndex((g) => normalizeCanonicalTitle(g.title) === normTitle)
+                : -1;
+              if (matchedIdx >= 0) {
+                const targetGame = updated[matchedIdx];
+                if (!targetGame.platforms.some((p) => p.platformId === platId)) {
+                  updated[matchedIdx] = {
+                    ...targetGame,
+                    platforms: [
+                      ...targetGame.platforms,
+                      {
+                        platformId: platId,
+                        platformGameId: storefrontAppId,
+                        installed: true,
+                        installPath: item.installPath,
+                        executablePath: item.executablePath,
+                        isWindowsBinaryOnMac: (item as any).isWindowsBinaryOnMac,
+                        installSize: (item as any).installSize,
+                        version: (item as any).version,
+                        launchArguments: (item as any).launchArguments,
+                      },
+                    ],
+                  };
+                  changed = true;
+                }
+              } else {
+                const matchedSteamId = steamMatcher.matchGameToSteamInstant(rawTitle) || undefined;
+                updated.push({
+                  id: matchedSteamId ? `steam-${matchedSteamId}` : `${platId}-${storefrontAppId}`,
+                  title: rawTitle,
+                  sortTitle: rawTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+                  steamAppId: matchedSteamId,
+                  isVerifiedEntitlement: true,
+                  platforms: [
+                    {
+                      platformId: platId,
+                      platformGameId: storefrontAppId,
+                      installed: true,
+                      installPath: item.installPath,
+                      executablePath: item.executablePath,
+                      isWindowsBinaryOnMac: (item as any).isWindowsBinaryOnMac,
+                      installSize: (item as any).installSize,
+                      version: (item as any).version,
+                      launchArguments: (item as any).launchArguments,
+                    },
+                  ],
+                  headerImage: matchedSteamId
+                    ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamId}/header.jpg`
+                    : '',
+                  capsuleImage: matchedSteamId
+                    ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamId}/library_600x900_2x.jpg`
+                    : undefined,
+                  shortDescription: '',
+                  releaseDate: 'TBA',
+                  developers: [],
+                  publishers: [],
+                  genres: [],
+                  tags: [],
+                });
+                changed = true;
+              }
             }
           }
         }
 
         if (changed) {
-          localStorage.setItem('universal_game_library_catalog', JSON.stringify(updated));
+          saveCurrentCatalog(updated, { skipSanitize: true });
           return updated;
         }
         return prevGames;
@@ -1041,7 +1153,15 @@ export function App() {
 
     const handleGameInstalled = (e: any) => {
       const detail = e.detail || {};
-      const { gameId, platformId, platformGameId, installed, installPath, executablePath } = detail;
+      const {
+        gameId,
+        platformId,
+        platformGameId,
+        installed,
+        installPath,
+        executablePath,
+        isWindowsBinaryOnMac,
+      } = detail;
       if (!gameId && !platformGameId) return;
 
       setGames((prevGames) => {
@@ -1083,6 +1203,8 @@ export function App() {
                 installed: true,
                 installPath: installPath !== undefined ? installPath : p.installPath,
                 executablePath: executablePath !== undefined ? executablePath : p.executablePath,
+                isWindowsBinaryOnMac:
+                  isWindowsBinaryOnMac !== undefined ? isWindowsBinaryOnMac : p.isWindowsBinaryOnMac,
               };
             }
             return p;
@@ -1163,7 +1285,7 @@ export function App() {
         }
         return g;
       });
-      localStorage.setItem('universal_game_library_catalog', JSON.stringify(updated));
+      saveCurrentCatalog(updated, { skipSanitize: true });
       return updated;
     });
   };
@@ -2362,7 +2484,7 @@ export function App() {
             onClose={() => setIsIntegrationsModalOpen(false)}
             onLibraryUpdated={(newGames) => {
               setGames(newGames);
-              localStorage.setItem('universal_game_library_catalog', JSON.stringify(newGames));
+              saveCurrentCatalog(newGames, { skipSanitize: true });
               if (newGames.length > 0 && (!selectedGame || !newGames.some((g) => g.id === selectedGame.id))) {
                 navigateSelectGame(newGames[0]);
               }

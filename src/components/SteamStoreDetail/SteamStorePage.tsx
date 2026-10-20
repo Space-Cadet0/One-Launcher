@@ -653,6 +653,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       game.enrichedMetadata?.aboutTheGame ||
       game.enrichedMetadata?.detailedDescription;
 
+  const sanitizedDetailedDescription = useMemo(
+    () => (detailedDescription ? DOMPurify.sanitize(detailedDescription) : ''),
+    [detailedDescription]
+  );
+
   const effectiveSteamId = steamMatcher.getEffectiveSteamAppId(game);
 
   const [openCriticData, setOpenCriticData] = useState<any>(() =>
@@ -879,7 +884,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               {detailedDescription ? (
                 <div
                   className="steam-description-content text-sm space-y-3 leading-relaxed"
-                  dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(detailedDescription) }}
+                  dangerouslySetInnerHTML={{ __html: sanitizedDetailedDescription }}
                 />
               ) : shortDescription ? (
                 <div className="steam-description-content text-sm space-y-3 leading-relaxed text-[#acb2b8]">

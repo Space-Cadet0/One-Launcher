@@ -192,10 +192,15 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     };
   }, [games, collections]);
 
+  const favoriteIdsSet = useMemo(
+    () => new Set(collections.find((c) => c.id === 'favorites')?.gameIds || []),
+    [collections]
+  );
+
   const renderGameRow = (game: CanonicalGame, idx?: number) => {
     const isSelected = game.id === selectedGameId;
     const isInstalled = game.platforms.some((p) => p.installed);
-    const isFav = collections.find((c) => c.id === 'favorites')?.gameIds.includes(game.id) || false;
+    const isFav = favoriteIdsSet.has(game.id);
     const platformSig =
       game.platforms?.map((p) => `${p.platformId}:${p.platformGameId}`).join('|') || '';
     const rowKey = `${game.id}::${platformSig || idx || 0}`;
@@ -204,6 +209,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       <div
         key={rowKey}
         onClick={() => onSelectGame(game)}
+        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 36px' }}
         className={`cv-sidebar-row relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-all group select-none ${
           isSelected
             ? 'bg-[#223547] text-white border-l-4 border-steam-accent shadow-inner'

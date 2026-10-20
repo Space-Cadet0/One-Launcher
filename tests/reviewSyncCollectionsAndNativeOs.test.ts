@@ -26,6 +26,8 @@ import {
 } from '../src/components/Common/CollectionIcon';
 import {
   getNativeOsPlatforms,
+  getStorefrontNativeOsPlatforms,
+  getStorefrontNativeOsFlags,
   isNativelyAvailableOnMac,
   isNativelyAvailableOnWindows,
   matchesNativeOsQuery,
@@ -677,6 +679,109 @@ describe('Review Sync Deduplication, Reviews Card Cleanup, Collection Icons & Na
       expect(detailPageHtml).toContain('data-testid="detail-native-os-badges"');
       expect(detailPageHtml).toContain('data-testid="detail-native-os-pill-mac"');
       expect(detailPageHtml).toContain('data-testid="detail-native-os-pill-windows"');
+    });
+
+    it('strictly isolates per-storefront native OS flags so Epic-only or GOG-only Windows builds never inherit Steam mac:true metadata (e.g. 20 Minutes Till Dawn)', () => {
+      const epicOnlyTwentyMinutesTillDawn: CanonicalGame = {
+        id: 'epic-4656facc740742a39e265b026e13d075',
+        title: '20 Minutes Till Dawn',
+        sortTitle: '20 Minutes Till Dawn',
+        steamAppId: 1966900,
+        enrichedMetadata: {
+          appId: 1966900,
+          name: '20 Minutes Till Dawn',
+          shortDescription: 'Survive the endless horde for 20 minutes.',
+          headerImage: '',
+          developers: ['flanne'],
+          publishers: ['Erabit'],
+          genres: ['Action'],
+          categories: [],
+          releaseDate: 'Jun 8, 2023',
+          platforms: { windows: true, mac: true, linux: false },
+          screenshots: [],
+          movies: [],
+        },
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: '4656facc740742a39e265b026e13d075',
+            installed: false,
+            platforms: { windows: true, mac: false },
+          },
+        ],
+        headerImage: '',
+        developers: ['flanne'],
+        publishers: ['Erabit'],
+        genres: ['Action'],
+        tags: [],
+      };
+
+      expect(getStorefrontNativeOsFlags(epicOnlyTwentyMinutesTillDawn, 'epic')).toEqual({
+        windows: true,
+        mac: false,
+        isExplicit: true,
+      });
+      expect(getStorefrontNativeOsPlatforms(epicOnlyTwentyMinutesTillDawn, 'epic')).toEqual([
+        'windows',
+      ]);
+      expect(getNativeOsPlatforms(epicOnlyTwentyMinutesTillDawn)).toEqual(['windows']);
+      expect(isNativelyAvailableOnMac(epicOnlyTwentyMinutesTillDawn)).toBe(false);
+      expect(isNativelyAvailableOnWindows(epicOnlyTwentyMinutesTillDawn)).toBe(true);
+      expect(
+        matchesGameFilter(epicOnlyTwentyMinutesTillDawn, { type: 'os', value: 'macOS' })
+      ).toBe(false);
+      expect(
+        matchesGameFilter(epicOnlyTwentyMinutesTillDawn, { type: 'os', value: 'Windows' })
+      ).toBe(true);
+      expect(matchesNativeOsQuery(epicOnlyTwentyMinutesTillDawn, 'macos')).toBe(false);
+    });
+
+    it('resolves per-storefront native OS support independently for multi-store duplicate ownership (Steam Mac + Windows vs GOG Windows-only)', () => {
+      const multiStoreGame: CanonicalGame = {
+        id: 'steam-999111',
+        title: 'Cross-Store RPG',
+        sortTitle: 'Cross-Store RPG',
+        steamAppId: 999111,
+        enrichedMetadata: {
+          appId: 999111,
+          name: 'Cross-Store RPG',
+          shortDescription: 'Owned on both Steam and GOG.',
+          headerImage: '',
+          developers: ['Studio X'],
+          publishers: ['Studio X'],
+          genres: ['RPG'],
+          categories: [],
+          releaseDate: '2024',
+          platforms: { windows: true, mac: true, linux: false },
+          screenshots: [],
+          movies: [],
+        },
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '999111',
+            installed: false,
+            platforms: { windows: true, mac: true },
+          },
+          {
+            platformId: 'gog',
+            platformGameId: '1234567890',
+            installed: false,
+            platforms: { windows: true, mac: false },
+          },
+        ],
+        headerImage: '',
+        developers: ['Studio X'],
+        publishers: ['Studio X'],
+        genres: ['RPG'],
+        tags: [],
+      };
+
+      expect(getStorefrontNativeOsPlatforms(multiStoreGame, 'steam')).toEqual(['windows', 'mac']);
+      expect(getStorefrontNativeOsPlatforms(multiStoreGame, 'gog')).toEqual(['windows']);
+      expect(getNativeOsPlatforms(multiStoreGame, 'steam')).toEqual(['windows', 'mac']);
+      expect(getNativeOsPlatforms(multiStoreGame, 'gog')).toEqual(['windows']);
+      expect(getNativeOsPlatforms(multiStoreGame)).toEqual(['windows', 'mac']);
     });
   });
 });

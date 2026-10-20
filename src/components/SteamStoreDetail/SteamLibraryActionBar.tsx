@@ -583,37 +583,59 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     Local Files &amp; Installation
                   </div>
 
-                  {/* 1. Browse Local Files */}
-                  <button
-                    type="button"
-                    disabled={!hasLocalFilesPath}
-                    onClick={async () => {
-                      setIsManageMenuOpen(false);
-                      const ok = await launcherService.browseLocalFiles(game, selectedPlatformId);
-                      if (!ok) {
-                        showTempFeedback('Could not open local game folder.');
-                      }
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] disabled:opacity-40 disabled:pointer-events-none transition-colors text-left cursor-pointer"
-                  >
-                    <FolderOpen className="w-4 h-4 text-sky-400 shrink-0" />
-                    <span>Browse Local Files</span>
-                  </button>
+                  {isInstalled ? (
+                    <>
+                      {/* 1. Browse Local Files */}
+                      <button
+                        type="button"
+                        disabled={!hasLocalFilesPath}
+                        onClick={async () => {
+                          setIsManageMenuOpen(false);
+                          const ok = await launcherService.browseLocalFiles(
+                            game,
+                            selectedPlatformId
+                          );
+                          if (!ok) {
+                            showTempFeedback('Could not open local game folder.');
+                          }
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] disabled:opacity-40 disabled:pointer-events-none transition-colors text-left cursor-pointer"
+                      >
+                        <FolderOpen className="w-4 h-4 text-sky-400 shrink-0" />
+                        <span>Browse Local Files</span>
+                      </button>
 
-                  {/* 2. Verify / Repair Game Files */}
-                  <button
-                    type="button"
-                    disabled={!isInstalled}
-                    onClick={async () => {
-                      setIsManageMenuOpen(false);
-                      const res = await launcherService.verifyGameFiles(game, selectedPlatformId);
-                      showTempFeedback(res.message || res.error || 'Verification triggered.');
-                    }}
-                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] disabled:opacity-40 disabled:pointer-events-none transition-colors text-left cursor-pointer"
-                  >
-                    <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>Verify / Repair Game Files</span>
-                  </button>
+                      {/* 2. Verify / Repair Game Files */}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setIsManageMenuOpen(false);
+                          const res = await launcherService.verifyGameFiles(
+                            game,
+                            selectedPlatformId
+                          );
+                          showTempFeedback(res.message || res.error || 'Verification triggered.');
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer"
+                      >
+                        <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>Verify / Repair Game Files</span>
+                      </button>
+                    </>
+                  ) : (
+                    /* 1. Install Game... (shown when not installed) */
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsManageMenuOpen(false);
+                        setIsInstallModalOpen(true);
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2d40] transition-colors text-left cursor-pointer"
+                    >
+                      <Download className="w-4 h-4 text-sky-400 shrink-0" />
+                      <span>Install Game...</span>
+                    </button>
+                  )}
 
                   {/* 3. Locate Installed Game... */}
                   <button

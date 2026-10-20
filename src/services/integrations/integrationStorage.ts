@@ -22,6 +22,7 @@ import {
   applyUserOverrideToGame,
   applyUserOverridesToCatalog,
 } from '../storage/userOverrideStorage';
+import { clearExpiredStagedCache } from '../storage/stagedCacheService';
 
 const STORAGE_KEY_INTEGRATIONS = 'antigravity_storefront_integrations';
 const STORAGE_KEY_CUSTOM_GAMES = 'antigravity_synced_user_games';
@@ -192,7 +193,30 @@ export function loadIntegrations(): StorefrontIntegration[] {
 export function saveIntegrations(integrations: StorefrontIntegration[]): void {
   if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem(STORAGE_KEY_INTEGRATIONS, JSON.stringify(integrations));
+    const isElectronRuntime = Boolean(window.electronAPI);
+    const sanitized = integrations.map((integ) => {
+      if (!integ) return integ;
+      const copy: Record<string, any> = { ...integ };
+      delete copy.access_token;
+      delete copy.refresh_token;
+      delete copy.accessToken;
+      delete copy.refreshToken;
+      if (copy.credentials && typeof copy.credentials === 'object') {
+        const creds: Record<string, any> = { ...copy.credentials };
+        delete creds.access_token;
+        delete creds.refresh_token;
+        delete creds.accessToken;
+        delete creds.refreshToken;
+        if (isElectronRuntime) {
+          delete creds.gogToken;
+          delete creds.epicToken;
+          delete creds.epicRefreshToken;
+        }
+        copy.credentials = creds;
+      }
+      return copy as StorefrontIntegration;
+    });
+    localStorage.setItem(STORAGE_KEY_INTEGRATIONS, JSON.stringify(sanitized));
   } catch (err) {
     console.error('Failed to save storefront integrations to localStorage', err);
   }
@@ -208,6 +232,7 @@ let inMemoryCatalogRawRef: string | null = null;
 let pendingCatalogSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingCatalogGames: CanonicalGame[] | null = null;
 let pendingCatalogNeedsSanitize = false;
+let pendingCatalogNeedsOverrides = false;
 
 function isTestEnv(): boolean {
   try {
@@ -220,9 +245,36 @@ function isTestEnv(): boolean {
   }
 }
 
+function evictExpendableCachesForCatalogQuota(): void {
+  try {
+    clearExpiredStagedCache();
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (
+        key &&
+        (key.startsWith('antigravity_detailed_achievements_') ||
+          key.startsWith('antigravity_achievement_details_'))
+      ) {
+        keysToRemove.push(key);
+      }
+    }
+    for (const k of keysToRemove) {
+      localStorage.removeItem(k);
+    }
+  } catch {
+    // Ignore storage cleanup errors
+  }
+}
+
 function writeCatalogToLocalStorage(cleaned: CanonicalGame[]): void {
   const serialized = JSON.stringify(cleaned);
-  localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+  try {
+    localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+  } catch (err) {
+    evictExpendableCachesForCatalogQuota();
+    localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+  }
   inMemoryCatalogCache = cleaned;
   inMemoryCatalogRawRef = serialized;
 
@@ -233,7 +285,9 @@ function writeCatalogToLocalStorage(cleaned: CanonicalGame[]): void {
       !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
   );
   if (customGames.length > 0) {
-    localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(customGames));
+    try {
+      localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(customGames));
+    } catch {}
   } else {
     localStorage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
   }
@@ -246,11 +300,16 @@ export function flushPendingCatalogSave(): void {
   }
   if (pendingCatalogGames !== null && typeof window !== 'undefined') {
     try {
-      const toWrite = pendingCatalogNeedsSanitize
-        ? sanitizeGameCatalog(applyUserOverridesToCatalog(pendingCatalogGames, loadUserOverrides()))
-        : pendingCatalogGames;
+      let toWrite = pendingCatalogGames;
+      if (pendingCatalogNeedsOverrides || pendingCatalogNeedsSanitize) {
+        toWrite = applyUserOverridesToCatalog(toWrite, loadUserOverrides());
+      }
+      if (pendingCatalogNeedsSanitize) {
+        toWrite = sanitizeGameCatalog(toWrite);
+      }
       pendingCatalogGames = null;
       pendingCatalogNeedsSanitize = false;
+      pendingCatalogNeedsOverrides = false;
       writeCatalogToLocalStorage(toWrite);
     } catch (err) {
       console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
@@ -350,9 +409,38 @@ export function loadCurrentCatalog(): CanonicalGame[] {
 export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalogOptions): void {
   if (typeof window === 'undefined') return;
   try {
+    if (options?.skipSanitize) {
+      inMemoryCatalogCache = games;
+      if (options?.immediate || isTestEnv()) {
+        if (pendingCatalogSaveTimer) {
+          clearTimeout(pendingCatalogSaveTimer);
+          pendingCatalogSaveTimer = null;
+        }
+        pendingCatalogGames = null;
+        pendingCatalogNeedsSanitize = false;
+        pendingCatalogNeedsOverrides = false;
+        const withOverrides = applyUserOverridesToCatalog(games, loadUserOverrides());
+        writeCatalogToLocalStorage(withOverrides);
+      } else {
+        pendingCatalogGames = games;
+        pendingCatalogNeedsSanitize = false;
+        pendingCatalogNeedsOverrides = true;
+        if (!pendingCatalogSaveTimer) {
+          pendingCatalogSaveTimer = setTimeout(() => {
+            try {
+              flushPendingCatalogSave();
+            } catch (e) {
+              console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
+            }
+          }, 1200);
+        }
+      }
+      return;
+    }
+
     const userOverrides = loadUserOverrides();
     const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
-    const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
+    const cleaned = sanitizeGameCatalog(withOverrides);
     inMemoryCatalogCache = cleaned;
 
     if (options?.immediate || isTestEnv()) {
@@ -362,10 +450,12 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
       }
       pendingCatalogGames = null;
       pendingCatalogNeedsSanitize = false;
+      pendingCatalogNeedsOverrides = false;
       writeCatalogToLocalStorage(cleaned);
     } else {
       pendingCatalogGames = cleaned;
-      pendingCatalogNeedsSanitize = Boolean(options?.skipSanitize);
+      pendingCatalogNeedsSanitize = false;
+      pendingCatalogNeedsOverrides = false;
       if (!pendingCatalogSaveTimer) {
         pendingCatalogSaveTimer = setTimeout(() => {
           try {
@@ -481,6 +571,10 @@ export function mergeStorefrontGames(
               ? {
                   ...p,
                   platformGameId: platformOwnership.platformGameId || p.platformGameId,
+                  storefrontAppId: platformOwnership.storefrontAppId || p.storefrontAppId,
+                  namespace: platformOwnership.namespace || p.namespace,
+                  catalogItemId: platformOwnership.catalogItemId || p.catalogItemId,
+                  platforms: platformOwnership.platforms || p.platforms,
                   installed: platformOwnership.installed ?? p.installed,
                   lastPlayed:
                     storefrontId === 'steam' && newGame.isVerifiedEntitlement

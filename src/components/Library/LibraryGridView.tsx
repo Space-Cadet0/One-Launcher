@@ -776,9 +776,27 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     const handleUpdate = () => {
       setCriticUpdateTick((t) => t + 1);
     };
+    const getLauncherGridSignature = () => {
+      const running = launcherService
+        .getRunningGames()
+        .map((r) => `${r.gameId}:${r.platformId || ''}`)
+        .sort()
+        .join(',');
+      const installed = launcherService
+        .getInstalledRecords()
+        .map((i) => `${i.platformId}:${i.platformGameId || i.appId || ''}:${i.executablePath || ''}`)
+        .sort()
+        .join(',');
+      return `${running}|${installed}`;
+    };
+    let prevSig = getLauncherGridSignature();
     window.addEventListener('antigravity_critic_updated', handleUpdate);
     const unsubLauncher = launcherService.subscribe(() => {
-      setCriticUpdateTick((t) => t + 1);
+      const nextSig = getLauncherGridSignature();
+      if (nextSig !== prevSig) {
+        prevSig = nextSig;
+        setCriticUpdateTick((t) => t + 1);
+      }
     });
     return () => {
       window.removeEventListener('antigravity_critic_updated', handleUpdate);
@@ -1516,13 +1534,13 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
         {/* Game Covers Grid (Aspect Ratio ~2:3 Portrait Posters) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
-          {sortedGames.map((game, idx) => {
+          {sortedGames.map((game) => {
             const isRunning = launcherService.isGameRunning(game.id);
             const isInstalled =
               game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
             return (
               <div
-                key={`${game.id}::${idx}`}
+                key={game.id}
                 data-game-id={game.id}
                 onClick={(e) => {
                   if (contextMenu.isOpen) {

@@ -1068,333 +1068,340 @@ ipcMain.handle('store:exchange-code', async (_event, { storefrontId, code }) => 
   return processStoreAuth(storefrontId, code);
 });
 
+const inFlightStoreSyncs = new Map();
+
 /**
  * Background / Manual sync of store using stored session tokens
  */
 ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) => {
-  const savedTokens = storeSync.loadSavedTokens();
-  let tokenData = savedTokens[storefrontId] || {};
-  if (!tokenData.access_token && !fallbackCredentials?.epicToken && !fallbackCredentials?.gogToken) {
-    return { success: false, error: `No saved credentials found for ${storefrontId}. Please connect in Settings.` };
+  const syncKey = String(storefrontId || '').toLowerCase().trim() || 'default';
+  if (inFlightStoreSyncs.has(syncKey)) {
+    return inFlightStoreSyncs.get(syncKey);
   }
 
-  try {
-    let accountName = 'Verified User';
-    let avatarUrl = undefined;
-    let games = [];
+  const syncPromise = (async () => {
+    const savedTokens = storeSync.loadSavedTokens();
+    let tokenData = savedTokens[storefrontId] || {};
+    if (!tokenData.access_token && !fallbackCredentials?.epicToken && !fallbackCredentials?.gogToken) {
+      return { success: false, error: `No saved credentials found for ${storefrontId}. Please connect in Settings.` };
+    }
 
-    if (storefrontId === 'steam') {
-      accountName = tokenData.accountName || 'Steam User';
-      avatarUrl = tokenData.avatarUrl;
-      games = Array.isArray(tokenData.games) ? tokenData.games : [];
-      let refreshedLive = false;
+    try {
+      let accountName = 'Verified User';
+      let avatarUrl = undefined;
+      let games = [];
 
-      if (tokenData.webapi_token && tokenData.steamId) {
-        try {
-          const res = await fetch(
-            `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?access_token=${encodeURIComponent(
-              tokenData.webapi_token
-            )}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`
-          );
-          if (res.ok) {
-            const apiJson = await res.json();
-            if (Array.isArray(apiJson?.response?.games) && apiJson.response.games.length > 0) {
+      if (storefrontId === 'steam') {
+        accountName = tokenData.accountName || 'Steam User';
+        avatarUrl = tokenData.avatarUrl;
+        games = Array.isArray(tokenData.games) ? tokenData.games : [];
+        let refreshedLive = false;
+
+        if (tokenData.webapi_token && tokenData.steamId) {
+          try {
+            const res = await fetch(
+              `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?access_token=${encodeURIComponent(
+                tokenData.webapi_token
+              )}&steamid=${encodeURIComponent(tokenData.steamId)}&include_appinfo=1&include_played_free_games=1&include_free_sub=0`
+            );
+            if (res.ok) {
+              const apiJson = await res.json();
+              if (Array.isArray(apiJson?.response?.games) && apiJson.response.games.length > 0) {
+                const refreshed = parseSteamGamesListJson(
+                  { rgGames: apiJson.response.games, strProfileName: accountName },
+                  tokenData.steamId,
+                  accountName,
+                  avatarUrl
+                );
+                games = refreshed.games;
+                tokenData = { ...tokenData, games };
+                storeSync.saveTokens('steam', tokenData);
+                refreshedLive = true;
+              }
+            }
+          } catch {}
+        }
+
+        if (!refreshedLive) {
+          try {
+            const cleanBrowserUA = session.defaultSession
+              .getUserAgent()
+              .replace(/\s+OneLauncher\/[^\s]+/gi, '')
+              .replace(/\s+one-launcher\/[^\s]+/gi, '')
+              .replace(/\s+Electron\/[^\s]+/gi, '');
+
+            const ssrResult = await new Promise((resolveSsr) => {
+              let done = false;
+              const bgWin = new BrowserWindow({
+                width: 1024,
+                height: 768,
+                show: false,
+                webPreferences: {
+                  nodeIntegration: false,
+                  contextIsolation: true,
+                  partition: 'persist:storefront_auth',
+                  userAgent: cleanBrowserUA,
+                  images: false,
+                  spellcheck: false,
+                  backgroundThrottling: true,
+                  v8CacheOptions: 'none',
+                },
+              });
+
+              let timer = null;
+              const finish = (val) => {
+                if (done) return;
+                done = true;
+                if (timer) clearTimeout(timer);
+                try {
+                  if (typeof storeSync.destroyScraperWindowCleanly === 'function') {
+                    storeSync.destroyScraperWindowCleanly(bgWin);
+                  } else if (bgWin && !bgWin.isDestroyed()) {
+                    bgWin.destroy();
+                  }
+                } catch {}
+                resolveSsr(val);
+              };
+
+              timer = setTimeout(() => finish(null), 12000);
+
+              bgWin.webContents.on('did-finish-load', async () => {
+                if (done || bgWin.isDestroyed()) return;
+                const currentUrl = bgWin.webContents.getURL();
+                if (!currentUrl || currentUrl.includes('/login') || !currentUrl.includes('steamcommunity.com')) {
+                  return;
+                }
+                try {
+                  const extracted = await bgWin.webContents.executeJavaScript(`
+                    (function() {
+                      let ssr = window.SSR;
+                      if (!ssr) {
+                        const ssrScript = document.getElementById('valve-ssr-data');
+                        if (ssrScript && ssrScript.textContent) {
+                          try { ssr = JSON.parse(ssrScript.textContent); } catch (e) {}
+                        }
+                      }
+                      if (!ssr) return null;
+                      let webApiToken = undefined;
+                      let rgGames = null;
+                      const storeItems = {};
+                      const loaderData = Array.isArray(ssr.loaderData) ? ssr.loaderData : [];
+                      for (const item of loaderData) {
+                        if (!item) continue;
+                        try {
+                          const parsed = typeof item === 'string' ? JSON.parse(item) : item;
+                          if (parsed && parsed.strWebAPIToken && !webApiToken) webApiToken = String(parsed.strWebAPIToken);
+                        } catch (e) {}
+                      }
+                      const rawQueryData = ssr.renderContext && ssr.renderContext.queryData;
+                      if (rawQueryData) {
+                        try {
+                          const qd = typeof rawQueryData === 'string' ? JSON.parse(rawQueryData) : rawQueryData;
+                          const queries = Array.isArray(qd && qd.queries) ? qd.queries : [];
+                          for (const q of queries) {
+                            const key = Array.isArray(q && q.queryKey) ? q.queryKey : [];
+                            const data = q && q.state ? q.state.data : undefined;
+                            if (!data) continue;
+                            if (key[0] === 'OwnedGames' && Array.isArray(data)) {
+                              rgGames = data;
+                            } else if (key[0] === 'StoreItem' && typeof key[1] === 'string' && key[1].startsWith('app_')) {
+                              storeItems[key[1].replace('app_', '')] = data;
+                            }
+                          }
+                        } catch (e) {}
+                      }
+                      if (Array.isArray(rgGames) && rgGames.length > 0) {
+                        return { rgGames, storeItems, webApiToken };
+                      }
+                      return null;
+                    })()
+                  `);
+                  if (extracted && Array.isArray(extracted.rgGames) && extracted.rgGames.length > 0) {
+                    finish(extracted);
+                  }
+                } catch {}
+              });
+
+              bgWin.loadURL('https://steamcommunity.com/my/games/?tab=all').catch(() => {
+                finish(null);
+              });
+            });
+
+            if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
               const refreshed = parseSteamGamesListJson(
-                { rgGames: apiJson.response.games, strProfileName: accountName },
+                { rgGames: ssrResult.rgGames, strProfileName: accountName, storeItems: ssrResult.storeItems || {} },
                 tokenData.steamId,
                 accountName,
                 avatarUrl
               );
               games = refreshed.games;
-              tokenData = { ...tokenData, games };
-              storeSync.saveTokens('steam', tokenData);
-              refreshedLive = true;
-            }
-          }
-        } catch {}
-      }
-
-      if (!refreshedLive) {
-        try {
-          const cleanBrowserUA = session.defaultSession
-            .getUserAgent()
-            .replace(/\s+OneLauncher\/[^\s]+/gi, '')
-            .replace(/\s+one-launcher\/[^\s]+/gi, '')
-            .replace(/\s+Electron\/[^\s]+/gi, '');
-
-          const ssrResult = await new Promise((resolveSsr) => {
-            let done = false;
-            const bgWin = new BrowserWindow({
-              width: 1024,
-              height: 768,
-              show: false,
-              webPreferences: {
-                nodeIntegration: false,
-                contextIsolation: true,
-                partition: 'persist:storefront_auth',
-                userAgent: cleanBrowserUA,
-                images: false,
-                spellcheck: false,
-                backgroundThrottling: true,
-                v8CacheOptions: 'none',
-              },
-            });
-
-            let timer = null;
-            const finish = (val) => {
-              if (done) return;
-              done = true;
-              if (timer) clearTimeout(timer);
-              try {
-                if (
-                  bgWin &&
-                  !bgWin.isDestroyed() &&
-                  bgWin.webContents &&
-                  bgWin.webContents.session &&
-                  typeof bgWin.webContents.session.clearCache === 'function'
-                ) {
-                  bgWin.webContents.session.clearCache().catch(() => {});
-                }
-              } catch {}
-              try {
-                if (!bgWin.isDestroyed()) bgWin.destroy();
-              } catch {}
-              resolveSsr(val);
-            };
-
-            timer = setTimeout(() => finish(null), 12000);
-
-            bgWin.webContents.on('did-finish-load', async () => {
-              if (done || bgWin.isDestroyed()) return;
-              const currentUrl = bgWin.webContents.getURL();
-              if (!currentUrl || currentUrl.includes('/login') || !currentUrl.includes('steamcommunity.com')) {
-                return;
-              }
-              try {
-                const extracted = await bgWin.webContents.executeJavaScript(`
-                  (function() {
-                    let ssr = window.SSR;
-                    if (!ssr) {
-                      const ssrScript = document.getElementById('valve-ssr-data');
-                      if (ssrScript && ssrScript.textContent) {
-                        try { ssr = JSON.parse(ssrScript.textContent); } catch (e) {}
-                      }
-                    }
-                    if (!ssr) return null;
-                    let webApiToken = undefined;
-                    let rgGames = null;
-                    const storeItems = {};
-                    const loaderData = Array.isArray(ssr.loaderData) ? ssr.loaderData : [];
-                    for (const item of loaderData) {
-                      if (!item) continue;
-                      try {
-                        const parsed = typeof item === 'string' ? JSON.parse(item) : item;
-                        if (parsed && parsed.strWebAPIToken && !webApiToken) webApiToken = String(parsed.strWebAPIToken);
-                      } catch (e) {}
-                    }
-                    const rawQueryData = ssr.renderContext && ssr.renderContext.queryData;
-                    if (rawQueryData) {
-                      try {
-                        const qd = typeof rawQueryData === 'string' ? JSON.parse(rawQueryData) : rawQueryData;
-                        const queries = Array.isArray(qd && qd.queries) ? qd.queries : [];
-                        for (const q of queries) {
-                          const key = Array.isArray(q && q.queryKey) ? q.queryKey : [];
-                          const data = q && q.state ? q.state.data : undefined;
-                          if (!data) continue;
-                          if (key[0] === 'OwnedGames' && Array.isArray(data)) {
-                            rgGames = data;
-                          } else if (key[0] === 'StoreItem' && typeof key[1] === 'string' && key[1].startsWith('app_')) {
-                            storeItems[key[1].replace('app_', '')] = data;
-                          }
-                        }
-                      } catch (e) {}
-                    }
-                    if (Array.isArray(rgGames) && rgGames.length > 0) {
-                      return { rgGames, storeItems, webApiToken };
-                    }
-                    return null;
-                  })()
-                `);
-                if (extracted && Array.isArray(extracted.rgGames) && extracted.rgGames.length > 0) {
-                  finish(extracted);
-                }
-              } catch {}
-            });
-
-            bgWin.loadURL('https://steamcommunity.com/my/games/?tab=all').catch(() => {
-              finish(null);
-            });
-          });
-
-          if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
-            const refreshed = parseSteamGamesListJson(
-              { rgGames: ssrResult.rgGames, strProfileName: accountName, storeItems: ssrResult.storeItems || {} },
-              tokenData.steamId,
-              accountName,
-              avatarUrl
-            );
-            games = refreshed.games;
-            tokenData = {
-              ...tokenData,
-              webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
-              games,
-            };
-            storeSync.saveTokens('steam', tokenData);
-          }
-        } catch {}
-      }
-
-      let steamAchMap = {};
-      if (Array.isArray(games) && games.length > 0) {
-        const localPlaytimes = readLocalSteamPlaytimes();
-        const appIds = games
-          .map((g) => Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0)))
-          .filter((id) => id > 0);
-        steamAchMap = await fetchSteamBatchAchievements(tokenData.webapi_token, tokenData.steamId, appIds);
-
-        games = games.map((g) => {
-          const appId = Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0));
-          const localPt = appId ? localPlaytimes[appId] : null;
-          const ach = appId ? steamAchMap[appId] : null;
-          if ((!localPt || !localPt.playtimeMinutes) && !ach) {
-            return g.isVerifiedEntitlement === true ? g : { ...g, isVerifiedEntitlement: true };
-          }
-          return {
-            ...g,
-            isVerifiedEntitlement: true,
-            platforms: (g.platforms || []).map((p) => {
-              if (p.platformId !== 'steam') return p;
-              const mergedPt = localPt && localPt.playtimeMinutes
-                ? Math.max(Number(p.playtimeMinutes || 0), localPt.playtimeMinutes)
-                : Number(p.playtimeMinutes || 0);
-              const existingAch = p.achievements;
-              let mergedAch = existingAch;
-              if (ach && ach.total > 0) {
-                const bestUnlocked = existingAch ? Math.max(ach.unlocked, Number(existingAch.unlocked || 0)) : ach.unlocked;
-                const bestTotal = existingAch ? Math.max(ach.total, Number(existingAch.total || 0)) : ach.total;
-                const pct = bestTotal > 0 ? Math.round((bestUnlocked / bestTotal) * 100) : 0;
-                mergedAch = {
-                  unlocked: bestUnlocked,
-                  total: bestTotal,
-                  percentage: pct,
-                  isMastered: Boolean(ach.isMastered) || (bestTotal > 0 && bestUnlocked >= bestTotal),
-                };
-              }
-              return {
-                ...p,
-                playtimeMinutes: mergedPt,
-                achievements: mergedAch,
+              tokenData = {
+                ...tokenData,
+                webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
+                games,
               };
-            }),
-          };
-        });
-        tokenData = { ...tokenData, games };
-        storeSync.saveTokens('steam', tokenData);
-      }
-      return {
-        success: true,
-        storefrontId,
-        accountName,
-        accountId: tokenData.steamId,
-        avatarUrl,
-        games,
-        achievements: steamAchMap,
-        suppressedItems:
-          typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
-            ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'steam')
-            : [],
-      };
-    } else if (storefrontId === 'gog') {
-      let accessToken = tokenData.access_token || fallbackCredentials?.gogToken;
-      let accountId = undefined;
-      try {
-        const account = await storeSync.fetchGogAccount(accessToken);
-        accountName = account.username || 'GOG User';
-        accountId = account.userId;
-        avatarUrl = account.avatarUrl;
-        games = await storeSync.fetchGogOwnedGames(accessToken, accountName, account.userId);
-      } catch (err) {
-        // Automatically renew token if expired
-        if (tokenData.refresh_token) {
-          const renewed = await storeSync.renewGogTokens(tokenData.refresh_token);
-          accessToken = renewed.access_token;
+              storeSync.saveTokens('steam', tokenData);
+            }
+          } catch {}
+        }
+
+        let steamAchMap = {};
+        if (Array.isArray(games) && games.length > 0) {
+          const localPlaytimes = readLocalSteamPlaytimes();
+          const appIds = games
+            .map((g) => Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0)))
+            .filter((id) => id > 0);
+          steamAchMap = await fetchSteamBatchAchievements(tokenData.webapi_token, tokenData.steamId, appIds);
+
+          games = games.map((g) => {
+            const appId = Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0));
+            const localPt = appId ? localPlaytimes[appId] : null;
+            const ach = appId ? steamAchMap[appId] : null;
+            if ((!localPt || !localPt.playtimeMinutes) && !ach) {
+              return g.isVerifiedEntitlement === true ? g : { ...g, isVerifiedEntitlement: true };
+            }
+            return {
+              ...g,
+              isVerifiedEntitlement: true,
+              platforms: (g.platforms || []).map((p) => {
+                if (p.platformId !== 'steam') return p;
+                const mergedPt = localPt && localPt.playtimeMinutes
+                  ? Math.max(Number(p.playtimeMinutes || 0), localPt.playtimeMinutes)
+                  : Number(p.playtimeMinutes || 0);
+                const existingAch = p.achievements;
+                let mergedAch = existingAch;
+                if (ach && ach.total > 0) {
+                  const bestUnlocked = existingAch ? Math.max(ach.unlocked, Number(existingAch.unlocked || 0)) : ach.unlocked;
+                  const bestTotal = existingAch ? Math.max(ach.total, Number(existingAch.total || 0)) : ach.total;
+                  const pct = bestTotal > 0 ? Math.round((bestUnlocked / bestTotal) * 100) : 0;
+                  mergedAch = {
+                    unlocked: bestUnlocked,
+                    total: bestTotal,
+                    percentage: pct,
+                    isMastered: Boolean(ach.isMastered) || (bestTotal > 0 && bestUnlocked >= bestTotal),
+                  };
+                }
+                return {
+                  ...p,
+                  playtimeMinutes: mergedPt,
+                  achievements: mergedAch,
+                };
+              }),
+            };
+          });
+          tokenData = { ...tokenData, games };
+          storeSync.saveTokens('steam', tokenData);
+        }
+        return {
+          success: true,
+          storefrontId,
+          accountName,
+          accountId: tokenData.steamId,
+          avatarUrl,
+          games,
+          achievements: steamAchMap,
+          suppressedItems:
+            typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+              ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'steam')
+              : [],
+        };
+      } else if (storefrontId === 'gog') {
+        let accessToken = tokenData.access_token || fallbackCredentials?.gogToken;
+        let accountId = undefined;
+        try {
           const account = await storeSync.fetchGogAccount(accessToken);
           accountName = account.username || 'GOG User';
           accountId = account.userId;
           avatarUrl = account.avatarUrl;
           games = await storeSync.fetchGogOwnedGames(accessToken, accountName, account.userId);
-        } else {
-          throw err;
-        }
-      }
-      const localGogSuppressed =
-        typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
-          ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'gog')
-          : [];
-      return {
-        success: true,
-        storefrontId,
-        accountName,
-        accountId,
-        avatarUrl,
-        games,
-        achievements: storeSync.fetchGogOwnedGames.lastAchievementsMap || {},
-        suppressedItems: [...(storeSync.fetchGogOwnedGames.lastSuppressedItems || []), ...localGogSuppressed],
-      };
-    } else if (storefrontId === 'epic') {
-      let accessToken = tokenData.access_token || fallbackCredentials?.epicToken;
-      let accountId = tokenData.account_id || fallbackCredentials?.epicAccountId;
-      accountName = tokenData.displayName || accountId || 'Epic Games User';
-      try {
-        games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
-      } catch (err) {
-        if (fallbackCredentials?.epicToken && fallbackCredentials.epicToken !== accessToken) {
-          try {
-            accessToken = fallbackCredentials.epicToken;
-            games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
-            storeSync.saveTokens('epic', {
-              ...tokenData,
-              access_token: accessToken,
-              refresh_token: fallbackCredentials.epicRefreshToken || tokenData.refresh_token,
-              account_id: accountId,
-            });
-          } catch (innerErr) {
-            games = [];
-          }
-        }
-        if (!games || games.length === 0) {
-          const refreshCand = fallbackCredentials?.epicRefreshToken || tokenData.refresh_token;
-          if (refreshCand) {
-            const renewed = await storeSync.renewEpicTokens(refreshCand);
+        } catch (err) {
+          // Automatically renew token if expired
+          if (tokenData.refresh_token) {
+            const renewed = await storeSync.renewGogTokens(tokenData.refresh_token);
             accessToken = renewed.access_token;
-            accountId = renewed.account_id || accountId;
-            accountName = renewed.displayName || accountName;
-            games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+            const account = await storeSync.fetchGogAccount(accessToken);
+            accountName = account.username || 'GOG User';
+            accountId = account.userId;
+            avatarUrl = account.avatarUrl;
+            games = await storeSync.fetchGogOwnedGames(accessToken, accountName, account.userId);
           } else {
             throw err;
           }
         }
+        const localGogSuppressed =
+          typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+            ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'gog')
+            : [];
+        return {
+          success: true,
+          storefrontId,
+          accountName,
+          accountId,
+          avatarUrl,
+          games,
+          achievements: storeSync.fetchGogOwnedGames.lastAchievementsMap || {},
+          suppressedItems: [...(storeSync.fetchGogOwnedGames.lastSuppressedItems || []), ...localGogSuppressed],
+        };
+      } else if (storefrontId === 'epic') {
+        let accessToken = tokenData.access_token || fallbackCredentials?.epicToken;
+        let accountId = tokenData.account_id || fallbackCredentials?.epicAccountId;
+        accountName = tokenData.displayName || accountId || 'Epic Games User';
+        try {
+          games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+        } catch (err) {
+          if (fallbackCredentials?.epicToken && fallbackCredentials.epicToken !== accessToken) {
+            try {
+              accessToken = fallbackCredentials.epicToken;
+              games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+              storeSync.saveTokens('epic', {
+                ...tokenData,
+                access_token: accessToken,
+                refresh_token: fallbackCredentials.epicRefreshToken || tokenData.refresh_token,
+                account_id: accountId,
+              });
+            } catch (innerErr) {
+              games = [];
+            }
+          }
+          if (!games || games.length === 0) {
+            const refreshCand = fallbackCredentials?.epicRefreshToken || tokenData.refresh_token;
+            if (refreshCand) {
+              const renewed = await storeSync.renewEpicTokens(refreshCand);
+              accessToken = renewed.access_token;
+              accountId = renewed.account_id || accountId;
+              accountName = renewed.displayName || accountName;
+              games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+            } else {
+              throw err;
+            }
+          }
+        }
+        const localEpicSuppressed =
+          typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
+            ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'epic')
+            : [];
+        return {
+          success: true,
+          storefrontId,
+          accountName,
+          accountId,
+          avatarUrl,
+          games,
+          achievements: storeSync.fetchEpicOwnedGames.lastAchievementsMap || {},
+          suppressedItems: [...(storeSync.fetchEpicOwnedGames.lastSuppressedItems || []), ...localEpicSuppressed],
+        };
       }
-      const localEpicSuppressed =
-        typeof storeSync.scanLocalSuppressedStorefrontItems === 'function'
-          ? storeSync.scanLocalSuppressedStorefrontItems().filter((x) => x.platformId === 'epic')
-          : [];
-      return {
-        success: true,
-        storefrontId,
-        accountName,
-        accountId,
-        avatarUrl,
-        games,
-        achievements: storeSync.fetchEpicOwnedGames.lastAchievementsMap || {},
-        suppressedItems: [...(storeSync.fetchEpicOwnedGames.lastSuppressedItems || []), ...localEpicSuppressed],
-      };
-    }
 
-    return { success: true, storefrontId, accountName, avatarUrl, games, achievements: {} };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
+      return { success: true, storefrontId, accountName, avatarUrl, games, achievements: {} };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  })().finally(() => {
+    inFlightStoreSyncs.delete(syncKey);
+  });
+
+  inFlightStoreSyncs.set(syncKey, syncPromise);
+  return syncPromise;
 });
 
 ipcMain.handle('store:get-tokens', async () => {
@@ -1562,14 +1569,13 @@ ipcMain.handle('scan:steam-achievements', async () => {
  */
 ipcMain.handle('shell:open-external', async (_event, url) => {
   if (
-    url &&
-    (url.startsWith('https://') ||
-      url.startsWith('http://') ||
-      url.startsWith('steam://') ||
-      url.startsWith('goggalaxy://') ||
-      url.startsWith('com.epicgames.launcher://'))
+    typeof url === 'string' &&
+    url.trim().length > 0 &&
+    /^https?:\/\/|^steam:\/\/|^goggalaxy:\/\/|^com\.epicgames\.launcher:\/\/|^heroic:\/\//i.test(
+      url.trim()
+    )
   ) {
-    await require('electron').shell.openExternal(url);
+    await require('electron').shell.openExternal(url.trim());
     return true;
   }
   return false;

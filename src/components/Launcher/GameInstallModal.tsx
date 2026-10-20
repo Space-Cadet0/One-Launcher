@@ -94,6 +94,9 @@ function deduplicateInstallers(
   return bestPerGroup.sort((a, b) => getSortRank(a) - getSortRank(b));
 }
 
+let diskSpaceReqSeq = 0;
+let diskSpaceDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
 export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   isOpen,
   game,
@@ -125,6 +128,21 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   const [createShortcut, setCreateShortcut] = useState<boolean>(true);
   const [isStarting, setIsStarting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const compatLayers = launcherService
+    .getCompatibilityLayers()
+    .filter((l) => l.type !== 'native');
+  const existingLaunchCfg = launcherService.getLaunchConfig(game.id, selectedPlatformId);
+  const [selectedCompatRunner, setSelectedCompatRunner] = useState<string>(() =>
+    existingLaunchCfg?.compatibilityLayer && existingLaunchCfg.compatibilityLayer !== 'native'
+      ? existingLaunchCfg.compatibilityLayer
+      : compatLayers[0]?.type || 'crossover'
+  );
+  const [selectedBottleName, setSelectedBottleName] = useState<string>(() =>
+    existingLaunchCfg?.wineBottleName || ''
+  );
+  const activeCompatLayer =
+    compatLayers.find((l) => l.type === selectedCompatRunner) || compatLayers[0];
 
   const isWindowsHost =
     (installInfo as any)?.hostPlatform === 'win32' ||
@@ -166,19 +184,33 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         setInstallDir(
           info.defaultInstallDir || (winHost ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher')
         );
+        if (diskSpaceDebounceTimer) {
+          clearTimeout(diskSpaceDebounceTimer);
+          diskSpaceDebounceTimer = null;
+        }
+        const reqId = ++diskSpaceReqSeq;
         if (info.diskSpace) {
           setDiskSpace(info.diskSpace);
         } else {
           launcherService.getDiskSpace(info.defaultInstallDir).then((ds) => {
-            if (active && ds) setDiskSpace(ds);
+            if (active && reqId === diskSpaceReqSeq && ds) setDiskSpace(ds);
           });
         }
+
+        const platCfg = launcherService.getLaunchConfig(game.id, selectedPlatformId);
+        if (platCfg?.compatibilityLayer && platCfg.compatibilityLayer !== 'native') {
+          setSelectedCompatRunner(platCfg.compatibilityLayer);
+        }
+        setSelectedBottleName(platCfg?.wineBottleName || '');
 
         const deduped = deduplicateInstallers(info.availableInstallers, winHost);
         if (deduped.length > 0) {
           const preferredInstaller = winHost
             ? deduped.find((i) => i.os === 'windows')
-            : deduped.find((i) => i.os === 'mac');
+            : platCfg?.launchMethod === 'compatibility_layer' &&
+                deduped.some((i) => i.os === 'windows')
+              ? deduped.find((i) => i.os === 'windows')
+              : deduped.find((i) => i.os === 'mac');
           const chosen = preferredInstaller || deduped[0];
           setSelectedInstallerId(chosen.id);
           setSelectedOs(winHost ? 'windows' : chosen.os);
@@ -197,15 +229,36 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
     return () => {
       active = false;
+      if (diskSpaceDebounceTimer) {
+        clearTimeout(diskSpaceDebounceTimer);
+        diskSpaceDebounceTimer = null;
+      }
     };
   }, [isOpen, game.id, selectedPlatformId]);
 
   if (!isOpen) return null;
 
-  const handleDirectoryChange = async (newDir: string) => {
+  const handleDirectoryChange = async (newDir: string, debounce = false) => {
     setInstallDir(newDir);
+    if (diskSpaceDebounceTimer) {
+      clearTimeout(diskSpaceDebounceTimer);
+      diskSpaceDebounceTimer = null;
+    }
+    const reqId = ++diskSpaceReqSeq;
+    const isTestEnv =
+      (typeof process !== 'undefined' && process.env?.NODE_ENV === 'test') ||
+      (typeof import.meta !== 'undefined' && (import.meta as any).env?.MODE === 'test');
+    if (debounce && !isTestEnv) {
+      diskSpaceDebounceTimer = setTimeout(async () => {
+        const ds = await launcherService.getDiskSpace(newDir);
+        if (reqId === diskSpaceReqSeq && ds) {
+          setDiskSpace(ds);
+        }
+      }, 250);
+      return;
+    }
     const ds = await launcherService.getDiskSpace(newDir);
-    if (ds) {
+    if (reqId === diskSpaceReqSeq && ds) {
       setDiskSpace(ds);
     }
   };
@@ -222,6 +275,8 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
   const uniqueInstallers = deduplicateInstallers(installInfo?.availableInstallers, isWindowsHost);
   const hasMacBuildOption = uniqueInstallers.some((i) => i.os === 'mac');
+  const macInstaller = uniqueInstallers.find((i) => i.os === 'mac');
+  const winInstaller = uniqueInstallers.find((i) => i.os === 'windows');
   const selectedInstaller =
     uniqueInstallers.find((i) => i.id === selectedInstallerId) || uniqueInstallers[0];
   const estimatedSizeBytes =
@@ -247,6 +302,39 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     setErrorMsg(null);
 
     try {
+      if (!isWindowsHost) {
+        if (selectedOs === 'windows') {
+          await launcherService.saveLaunchConfig(
+            {
+              ...(existingLaunchCfg || { gameId: game.id, launchMethod: 'compatibility_layer' }),
+              gameId: game.id,
+              preferredPlatformId: selectedPlatformId,
+              launchMethod: 'compatibility_layer',
+              compatibilityLayer: (selectedCompatRunner || 'crossover') as any,
+              wineBottleName: selectedBottleName.trim() || undefined,
+            },
+            selectedPlatformId
+          );
+        } else if (
+          selectedOs === 'mac' &&
+          (existingLaunchCfg?.launchMethod === 'compatibility_layer' ||
+            (game.platforms.length > 1 &&
+              existingLaunchCfg?.preferredPlatformId &&
+              existingLaunchCfg.preferredPlatformId !== selectedPlatformId))
+        ) {
+          await launcherService.saveLaunchConfig(
+            {
+              ...(existingLaunchCfg || { gameId: game.id, launchMethod: 'auto' }),
+              gameId: game.id,
+              preferredPlatformId: selectedPlatformId,
+              launchMethod: 'auto',
+              compatibilityLayer: undefined,
+            },
+            selectedPlatformId
+          );
+        }
+      }
+
       const res = await launcherService.startInstall({
         gameId: game.id,
         title: game.title,
@@ -264,7 +352,13 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         createShortcut,
         estimatedSizeBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
         totalBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
-      });
+        ...(!isWindowsHost && selectedOs === 'windows'
+          ? {
+              compatibilityLayer: selectedCompatRunner as any,
+              wineBottleName: selectedBottleName.trim() || undefined,
+            }
+          : {}),
+      } as any);
 
       if (res.success) {
         onInstallStarted?.(res.task);
@@ -451,7 +545,76 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   )}
                 </div>
               ) : uniqueInstallers.length > 1 ? (
-                <div className="space-y-2">
+                <div className="space-y-2.5">
+                  {macInstaller && winInstaller && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <button
+                        type="button"
+                        data-testid="install-option-mac-native"
+                        aria-pressed={selectedOs === 'mac'}
+                        onClick={() => {
+                          setSelectedInstallerId(macInstaller.id);
+                          setSelectedOs('mac');
+                        }}
+                        className={`text-left rounded-lg p-3 border transition-all cursor-pointer space-y-1.5 ${
+                          selectedOs === 'mac'
+                            ? 'bg-emerald-950/50 border-emerald-400 shadow-[0_0_14px_rgba(16,185,129,0.22)]'
+                            : 'bg-[#17212e] border-[#26384d] hover:border-emerald-500/40 hover:bg-[#1b2736]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-extrabold uppercase tracking-wider text-emerald-300">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                            <span>★ Recommended • Native macOS</span>
+                          </span>
+                        </div>
+                        <div className="text-xs font-bold text-white">Native macOS Build</div>
+                        <p className="text-[11px] text-steam-subtext leading-relaxed">
+                          Official macOS build — runs natively on your Mac without translation layers.
+                          {formatVersion(macInstaller.version)
+                            ? ` (${formatVersion(macInstaller.version)})`
+                            : ''}
+                          {macInstaller.totalSizeBytes
+                            ? ` • ${formatBytes(macInstaller.totalSizeBytes)}`
+                            : ''}
+                        </p>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid="install-option-win-compat"
+                        aria-pressed={selectedOs === 'windows'}
+                        onClick={() => {
+                          setSelectedInstallerId(winInstaller.id);
+                          setSelectedOs('windows');
+                        }}
+                        className={`text-left rounded-lg p-3 border transition-all cursor-pointer space-y-1.5 ${
+                          selectedOs === 'windows'
+                            ? 'bg-amber-950/50 border-amber-400 shadow-[0_0_14px_rgba(245,158,11,0.22)]'
+                            : 'bg-[#17212e] border-[#26384d] hover:border-amber-500/40 hover:bg-[#1b2736]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-[10px] font-extrabold uppercase tracking-wider text-amber-300">
+                            <Cpu className="w-3 h-3 text-amber-400 shrink-0" />
+                            <span>Compatibility / Translation Layer</span>
+                          </span>
+                        </div>
+                        <div className="text-xs font-bold text-white">
+                          Windows Build (CrossOver / Wine)
+                        </div>
+                        <p className="text-[11px] text-steam-subtext leading-relaxed">
+                          Installs the Windows build and runs via CrossOver, GPTK, or Wine translation.
+                          {formatVersion(winInstaller.version)
+                            ? ` (${formatVersion(winInstaller.version)})`
+                            : ''}
+                          {winInstaller.totalSizeBytes
+                            ? ` • ${formatBytes(winInstaller.totalSizeBytes)}`
+                            : ''}
+                        </p>
+                      </button>
+                    </div>
+                  )}
                   <select
                     aria-label="Installer Build"
                     value={selectedInstallerId || ''}
@@ -531,6 +694,70 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             </div>
           )}
 
+          {/* Pre-Install Compatibility Runner & Bottle Selector (shown only on macOS when installing a Windows build) */}
+          {!isWindowsHost && selectedOs === 'windows' && compatLayers.length > 0 && (
+            <div
+              data-testid="preinstall-compat-config"
+              className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 text-amber-400" />
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">
+                    Compatibility Runner &amp; Target Bottle
+                  </span>
+                </div>
+                <span className="text-[10px] text-steam-subtext">
+                  Saved to game launch profile
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
+                    Compatibility Runner
+                  </label>
+                  <select
+                    data-testid="preinstall-compat-runner"
+                    aria-label="Compatibility Runner"
+                    value={selectedCompatRunner}
+                    onChange={(e) => setSelectedCompatRunner(e.target.value)}
+                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
+                  >
+                    {compatLayers.map((layer) => (
+                      <option key={layer.type} value={layer.type}>
+                        {layer.name}
+                        {layer.version ? ` (v${layer.version})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
+                    Target Bottle
+                  </label>
+                  <select
+                    data-testid="preinstall-compat-bottle"
+                    aria-label="Target Bottle"
+                    value={selectedBottleName}
+                    onChange={(e) => setSelectedBottleName(e.target.value)}
+                    className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
+                  >
+                    <option value="">
+                      Default Bottle ({activeCompatLayer?.availableBottles?.[0] || 'OneLauncher'})
+                    </option>
+                    {(activeCompatLayer?.availableBottles || []).map((bottle) => (
+                      <option key={bottle} value={bottle}>
+                        {bottle}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Target Installation Directory */}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
@@ -540,7 +767,11 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               {installInfo?.availableInstallDirs && installInfo.availableInstallDirs.length > 1 && (
                 <select
                   value={
-                    installInfo.availableInstallDirs.includes(installDir) ? installDir : ''
+                    installInfo.availableInstallDirs
+                      .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
+                      .includes(installDir)
+                      ? installDir
+                      : ''
                   }
                   onChange={(e) => {
                     if (e.target.value) handleDirectoryChange(e.target.value);
@@ -550,11 +781,13 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   <option value="" disabled>
                     Preset Locations...
                   </option>
-                  {installInfo.availableInstallDirs.map((dir) => (
-                    <option key={dir} value={dir}>
-                      {dir}
-                    </option>
-                  ))}
+                  {installInfo.availableInstallDirs
+                    .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
+                    .map((dir) => (
+                      <option key={dir} value={dir}>
+                        {dir}
+                      </option>
+                    ))}
                 </select>
               )}
             </div>
@@ -563,7 +796,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               <input
                 type="text"
                 value={installDir}
-                onChange={(e) => handleDirectoryChange(e.target.value)}
+                onChange={(e) => handleDirectoryChange(e.target.value, true)}
                 placeholder="~/Games/OneLauncher"
                 className="flex-1 rounded-lg bg-[#0e151f] border border-[#2a475e] px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
               />

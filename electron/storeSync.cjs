@@ -35,6 +35,60 @@ function isSafeStorageAvailable() {
   }
 }
 
+function atomicWriteFileSync(filePath, content) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {}
+    fs.writeFileSync(filePath, content, 'utf8');
+  }
+}
+
+function destroyScraperWindowCleanly(win) {
+  if (!win) return;
+  try {
+    if (typeof win.isDestroyed === 'function' && win.isDestroyed()) return;
+    if (win.webContents) {
+      try {
+        if (typeof win.webContents.removeAllListeners === 'function') {
+          win.webContents.removeAllListeners();
+        }
+      } catch {}
+      try {
+        if (win.webContents.session && typeof win.webContents.session.clearCache === 'function') {
+          const res = win.webContents.session.clearCache();
+          if (res && typeof res.catch === 'function') {
+            res.catch(() => {});
+          }
+        }
+      } catch {}
+    }
+    try {
+      if (typeof win.destroy === 'function') {
+        win.destroy();
+      } else if (typeof win.close === 'function') {
+        win.close();
+      }
+    } catch {
+      try {
+        if (typeof win.close === 'function') win.close();
+      } catch {}
+    }
+  } catch {}
+}
+
+const inFlightTokenRenewals = new Map();
+
 function writeTokensFile(tokens) {
   const filePath = getTokensFilePath();
   const jsonStr = JSON.stringify(tokens, null, 2);
@@ -46,7 +100,7 @@ function writeTokensFile(tokens) {
         _encrypted: true,
         data: encryptedBuffer.toString('base64'),
       };
-      fs.writeFileSync(filePath, JSON.stringify(encryptedPayload, null, 2), 'utf-8');
+      atomicWriteFileSync(filePath, JSON.stringify(encryptedPayload, null, 2));
       return;
     } catch (encErr) {
       console.warn('Failed to encrypt tokens with safeStorage, falling back to plaintext:', encErr.message);
@@ -54,7 +108,7 @@ function writeTokensFile(tokens) {
   }
 
   // Graceful fallback if safeStorage is not available or encryption failed
-  fs.writeFileSync(filePath, jsonStr, 'utf-8');
+  atomicWriteFileSync(filePath, jsonStr);
 }
 
 function loadSavedTokens() {
@@ -368,25 +422,37 @@ async function exchangeGogCode(code) {
  * Automatically renew GOG access token using refresh_token (matching Playnite / Heroic)
  */
 async function renewGogTokens(refreshToken) {
-  const tokenUrl = `https://auth.gog.com/token?client_id=${GOG_CLIENT_ID}&client_secret=${GOG_CLIENT_SECRET}&grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`;
-  const res = await fetch(tokenUrl, {
-    method: 'GET',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
-    },
+  const inflightKey = 'gog';
+  if (inFlightTokenRenewals.has(inflightKey)) {
+    return inFlightTokenRenewals.get(inflightKey);
+  }
+
+  const renewalPromise = (async () => {
+    const tokenUrl = `https://auth.gog.com/token?client_id=${GOG_CLIENT_ID}&client_secret=${GOG_CLIENT_SECRET}&grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`;
+    const res = await fetch(tokenUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GOGGalaxy/2.0',
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`Failed to renew GOG token (${res.status})`);
+    }
+
+    const data = await res.json();
+    if (!data.access_token) {
+      throw new Error('GOG refresh response missing access_token');
+    }
+
+    saveTokens('gog', data);
+    return data;
+  })().finally(() => {
+    inFlightTokenRenewals.delete(inflightKey);
   });
 
-  if (!res.ok) {
-    throw new Error(`Failed to renew GOG token (${res.status})`);
-  }
-
-  const data = await res.json();
-  if (!data.access_token) {
-    throw new Error('GOG refresh response missing access_token');
-  }
-
-  saveTokens('gog', data);
-  return data;
+  inFlightTokenRenewals.set(inflightKey, renewalPromise);
+  return renewalPromise;
 }
 
 /**
@@ -1243,6 +1309,48 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
       filteredItems.push(item);
     }
 
+    const macEpicAppIds = extractEpicMacSupportFromLegendaryDirs(getLocalLegendaryBaseDirs());
+
+    if (accessToken) {
+      const macAbort = new AbortController();
+      const macTimeout = setTimeout(() => macAbort.abort(), 4000);
+      try {
+        const macRes = await fetch(
+          'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Mac?label=Live',
+          {
+            signal: macAbort.signal,
+            headers: {
+              Authorization: `bearer ${accessToken}`,
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+            },
+          }
+        );
+        if (macRes.ok) {
+          const macAssets = await macRes.json();
+          if (Array.isArray(macAssets)) {
+            for (const a of macAssets) {
+              const an = String(a?.appName || a?.app_name || '').toLowerCase().trim();
+              const cid = String(a?.catalogItemId || a?.catalog_item_id || '').toLowerCase().trim();
+              const aid = String(a?.assetId || a?.asset_id || '').toLowerCase().trim();
+              if (an) macEpicAppIds.add(an);
+              if (cid) macEpicAppIds.add(cid);
+              if (aid) macEpicAppIds.add(aid);
+            }
+          }
+        }
+      } catch {}
+      clearTimeout(macTimeout);
+    }
+
+    const hasReleaseInfoPlatformMac = (relList) =>
+      Array.isArray(relList) &&
+      relList.some(
+        (r) =>
+          r &&
+          Array.isArray(r.platform) &&
+          r.platform.some((p) => /^mac$/i.test(String(p)))
+      );
+
     const BATCH_SIZE = 15;
     for (let i = 0; i < filteredItems.length; i += BATCH_SIZE) {
       const batch = filteredItems.slice(i, i + BATCH_SIZE);
@@ -1254,12 +1362,16 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           let description = item.metadata?.description || '';
           let developer = item.metadata?.developer || '';
           let keyImages = item.metadata?.keyImages || [];
+          let hasReleaseInfoMac = hasReleaseInfoPlatformMac(item.metadata?.releaseInfo);
 
           if (!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
             let resolvedFromCatalog = false;
+            const catAbort = new AbortController();
+            const catTimer = setTimeout(() => catAbort.abort(), 6000);
             try {
               const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
               const cRes = await fetch(catUrl, {
+                signal: catAbort.signal,
                 headers: {
                   Authorization: `bearer ${accessToken}`,
                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
@@ -1269,6 +1381,9 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
                 const cData = await cRes.json();
                 const meta = cData[item.catalogItemId];
                 if (meta) {
+                  if (hasReleaseInfoPlatformMac(meta.releaseInfo)) {
+                    hasReleaseInfoMac = true;
+                  }
                   const isDlc = meta.categories?.some((c) => ['addons', 'dlc'].includes(c.path)) || Boolean(meta.mainGameItem);
                   if (isDlc) {
                     if (meta.title) {
@@ -1300,7 +1415,11 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
                   keyImages = meta.keyImages || keyImages;
                 }
               }
-            } catch {}
+            } catch {
+              // Ignore individual catalog failure
+            } finally {
+              clearTimeout(catTimer);
+            }
             if (!resolvedFromCatalog && !item.metadata?.title) {
               return null;
             }
@@ -1381,6 +1500,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
             developer,
             keyImages,
             offerMeta,
+            hasReleaseInfoMac,
           };
         })
       );
@@ -1397,9 +1517,15 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           developer,
           keyImages,
           offerMeta,
+          hasReleaseInfoMac,
         } = entry;
         const lower = title.toLowerCase().trim();
         if (knownAppIds.has(appNameLower)) continue;
+
+        const hasEpicMac =
+          macEpicAppIds.has(appNameLower) ||
+          Boolean(catalogIdLower && macEpicAppIds.has(catalogIdLower)) ||
+          Boolean(hasReleaseInfoMac);
 
         const tallCover =
           keyImages.find((img) => img.type === 'DieselGameBoxTall' || img.type === 'OfferImageTall')?.url ||
@@ -1464,6 +1590,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
               playtimeMinutes: pt.totalTime || 0,
               lastPlayed: pt.lastPlayed || undefined,
               achievements: gameAch || undefined,
+              platforms: { windows: true, mac: hasEpicMac, linux: false },
             },
           ],
           headerImage: headerImg,
@@ -1498,7 +1625,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
                   : [],
                 movies: [],
                 releaseDate: resolvedReleaseDate || 'Available Now',
-                platforms: { windows: true, mac: false, linux: false },
+                platforms: { windows: true, mac: hasEpicMac, linux: false },
               }
             : undefined,
         };
@@ -1523,33 +1650,45 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
  * Automatically renew Epic Games access token using refresh_token
  */
 async function renewEpicTokens(refreshToken) {
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: refreshToken,
-    token_type: 'eg1',
-  });
-
-  const res = await fetch('https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token', {
-    method: 'POST',
-    headers: {
-      Authorization: `basic ${EPIC_CLIENT_AUTH}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
-    },
-    body: body.toString(),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to renew Epic token (${res.status})`);
+  const inflightKey = 'epic';
+  if (inFlightTokenRenewals.has(inflightKey)) {
+    return inFlightTokenRenewals.get(inflightKey);
   }
 
-  const data = await res.json();
-  if (!data.access_token) {
-    throw new Error('Epic refresh response missing access_token');
-  }
+  const renewalPromise = (async () => {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      token_type: 'eg1',
+    });
 
-  saveTokens('epic', data);
-  return data;
+    const res = await fetch('https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `basic ${EPIC_CLIENT_AUTH}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher',
+      },
+      body: body.toString(),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Failed to renew Epic token (${res.status})`);
+    }
+
+    const data = await res.json();
+    if (!data.access_token) {
+      throw new Error('Epic refresh response missing access_token');
+    }
+
+    saveTokens('epic', data);
+    return data;
+  })().finally(() => {
+    inFlightTokenRenewals.delete(inflightKey);
+  });
+
+  inFlightTokenRenewals.set(inflightKey, renewalPromise);
+  return renewalPromise;
 }
 
 const epicAppNamespaceCache = new Map();
@@ -1647,9 +1786,76 @@ function getLocalLegendaryBaseDirs() {
     homeDir ? path.join(homeDir, 'Library/Application Support/heroic/legendaryConfig/legendary') : '',
     userDataDir ? path.join(userDataDir, 'legendaryConfig/legendary') : '',
     process.env.APPDATA ? path.join(process.env.APPDATA, 'heroic/legendaryConfig/legendary') : '',
+    homeDir ? path.join(homeDir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary') : '',
   ].filter(Boolean);
 
   return Array.from(new Set(candidates));
+}
+
+function extractEpicMacSupportFromLegendaryDirs(baseDirs = getLocalLegendaryBaseDirs()) {
+  const macEpicAppIds = new Set();
+  const dirs = Array.isArray(baseDirs) ? baseDirs : getLocalLegendaryBaseDirs();
+  for (const baseDir of dirs) {
+    if (!baseDir || !fs.existsSync(baseDir)) continue;
+    const assetsFile = path.join(baseDir, 'assets.json');
+    if (fs.existsSync(assetsFile)) {
+      try {
+        const assetsJson = JSON.parse(fs.readFileSync(assetsFile, 'utf-8'));
+        const macList = Array.isArray(assetsJson?.Mac)
+          ? assetsJson.Mac
+          : Array.isArray(assetsJson)
+            ? assetsJson.filter(
+                (it) =>
+                  String(it?.platform || '').toLowerCase() === 'mac' ||
+                  Boolean(it?.asset_infos?.Mac && Object.keys(it.asset_infos.Mac).length > 0)
+              )
+            : [];
+        for (const a of macList) {
+          const an = String(a?.app_name || a?.appName || '').toLowerCase().trim();
+          const cid = String(a?.catalog_item_id || a?.catalogItemId || '').toLowerCase().trim();
+          const aid = String(a?.asset_id || a?.assetId || '').toLowerCase().trim();
+          if (an) macEpicAppIds.add(an);
+          if (cid) macEpicAppIds.add(cid);
+          if (aid) macEpicAppIds.add(aid);
+        }
+      } catch {}
+    }
+
+    const metaDir = path.join(baseDir, 'metadata');
+    if (fs.existsSync(metaDir)) {
+      try {
+        const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+        for (const f of files) {
+          try {
+            const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf-8'));
+            const hasMacAssetInfo = Boolean(
+              json?.asset_infos?.Mac && Object.keys(json.asset_infos.Mac).length > 0
+            );
+            const releaseInfo = json?.metadata?.releaseInfo || json?.releaseInfo;
+            const hasMacRelease =
+              Array.isArray(releaseInfo) &&
+              releaseInfo.some(
+                (r) =>
+                  r &&
+                  Array.isArray(r.platform) &&
+                  r.platform.some((p) => /^mac$/i.test(String(p)))
+              );
+            if (hasMacAssetInfo || hasMacRelease) {
+              const an = String(json?.app_name || f.replace(/\.json$/i, ''))
+                .toLowerCase()
+                .trim();
+              const cid = String(json?.metadata?.id || json?.catalog_item_id || json?.id || '')
+                .toLowerCase()
+                .trim();
+              if (an) macEpicAppIds.add(an);
+              if (cid) macEpicAppIds.add(cid);
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+  return macEpicAppIds;
 }
 
 async function resolveEpicNamespaceAndIds(payload = {}) {
@@ -2572,6 +2778,8 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
 }
 
 module.exports = {
+  atomicWriteFileSync,
+  destroyScraperWindowCleanly,
   exchangeGogCode,
   renewGogTokens,
   normalizeGogAvatarUrl,
@@ -2584,6 +2792,7 @@ module.exports = {
   fetchEpicAchievements,
   fetchEpicProductOfferMetadata,
   resolveEpicNamespaceAndIds,
+  extractEpicMacSupportFromLegendaryDirs,
   loadSavedTokens,
   saveTokens,
   clearTokens,

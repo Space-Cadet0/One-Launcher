@@ -63,8 +63,37 @@ function extractXmlTag(xml: string, tag: string): string {
 }
 
 export class AchievementDetailService {
+  public static readonly MAX_MEMORY_CACHE_ENTRIES = 60;
   private inMemoryCache = new Map<string, MultiStoreAchievementsMap>();
   private schemaCache = new Map<string, DetailedAchievement[]>();
+
+  public get memoryCache(): Map<string, MultiStoreAchievementsMap> {
+    return this.inMemoryCache;
+  }
+
+  private setMemoryCacheEntry(gameId: string, data: MultiStoreAchievementsMap): void {
+    if (this.inMemoryCache.has(gameId)) {
+      this.inMemoryCache.delete(gameId);
+    }
+    this.inMemoryCache.set(gameId, data);
+    while (this.inMemoryCache.size > AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES) {
+      const oldestKey = this.inMemoryCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.inMemoryCache.delete(oldestKey);
+    }
+  }
+
+  private setSchemaCacheEntry(cacheKey: string, schema: DetailedAchievement[]): void {
+    if (this.schemaCache.has(cacheKey)) {
+      this.schemaCache.delete(cacheKey);
+    }
+    this.schemaCache.set(cacheKey, schema);
+    while (this.schemaCache.size > AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES) {
+      const oldestKey = this.schemaCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.schemaCache.delete(oldestKey);
+    }
+  }
 
   private getCommunityBaseUrl(): string {
     if (isViteBrowserDev()) {
@@ -93,7 +122,9 @@ export class AchievementDetailService {
    */
   getCachedMultiStoreAchievements(gameId: string): MultiStoreAchievementsMap | null {
     if (this.inMemoryCache.has(gameId)) {
-      return this.inMemoryCache.get(gameId)!;
+      const hit = this.inMemoryCache.get(gameId)!;
+      this.setMemoryCacheEntry(gameId, hit);
+      return hit;
     }
 
     if (typeof localStorage !== 'undefined') {
@@ -102,7 +133,7 @@ export class AchievementDetailService {
         if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed && typeof parsed === 'object') {
-            this.inMemoryCache.set(gameId, parsed);
+            this.setMemoryCacheEntry(gameId, parsed);
             return parsed;
           }
         }
@@ -115,7 +146,7 @@ export class AchievementDetailService {
    * Persists detailed achievements to memory and localStorage.
    */
   setCachedMultiStoreAchievements(gameId: string, data: MultiStoreAchievementsMap): void {
-    this.inMemoryCache.set(gameId, data);
+    this.setMemoryCacheEntry(gameId, data);
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.setItem(`antigravity_detailed_achievements_${gameId}`, JSON.stringify(data));
@@ -164,7 +195,9 @@ export class AchievementDetailService {
     // Check schema memory cache
     const cacheKey = game.steamAppId ? `id:${game.steamAppId}` : `title:${titleLower}`;
     if (this.schemaCache.has(cacheKey)) {
-      return this.schemaCache.get(cacheKey)!;
+      const hit = this.schemaCache.get(cacheKey)!;
+      this.setSchemaCacheEntry(cacheKey, hit);
+      return hit;
     }
 
     // Dynamic resolution via Steam AppID (either explicit or matched from title across GOG/Epic)
@@ -173,7 +206,7 @@ export class AchievementDetailService {
       // Check known zero-achievement status
       const knownCount = (knownAchievementsJson as Record<string, number>)[String(appId)];
       if (knownCount === 0) {
-        this.schemaCache.set(cacheKey, []);
+        this.setSchemaCacheEntry(cacheKey, []);
         return [];
       }
 
@@ -185,7 +218,7 @@ export class AchievementDetailService {
         if (html.includes('achieveRow')) {
           const parsed = this.parseSteamCommunityHtml(html, appId);
           if (parsed.length > 0) {
-            this.schemaCache.set(cacheKey, parsed);
+            this.setSchemaCacheEntry(cacheKey, parsed);
             return parsed;
           }
         }
@@ -235,7 +268,7 @@ export class AchievementDetailService {
               storefrontId: 'steam',
             };
           });
-          this.schemaCache.set(cacheKey, parsedFromApi);
+          this.setSchemaCacheEntry(cacheKey, parsedFromApi);
           return parsedFromApi;
         }
       } catch {}
@@ -250,7 +283,7 @@ export class AchievementDetailService {
         (platformMaxTotal > 0 ? platformMaxTotal : 25);
       if (totalCount > 0) {
         const generated = this.generateStructuredSchema(game, appId, totalCount);
-        this.schemaCache.set(cacheKey, generated);
+        this.setSchemaCacheEntry(cacheKey, generated);
         return generated;
       }
     }

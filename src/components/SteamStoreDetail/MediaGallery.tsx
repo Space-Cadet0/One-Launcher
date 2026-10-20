@@ -126,7 +126,13 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
           const { default: HlsModule } = await import('hls.js');
           if (cancelled) return;
           if (HlsModule.isSupported()) {
-            hlsInstance = new HlsModule({ enableWorker: true, lowLatencyMode: false });
+            hlsInstance = new HlsModule({
+              enableWorker: true,
+              lowLatencyMode: false,
+              maxBufferLength: 15,
+              maxMaxBufferLength: 30,
+              backBufferLength: 10,
+            });
             hlsInstance.loadSource(hlsUrl);
             hlsInstance.attachMedia(video);
 
@@ -182,6 +188,8 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
     return () => {
       cancelled = true;
       if (hlsInstance) {
+        hlsInstance.stopLoad();
+        hlsInstance.detachMedia();
         hlsInstance.destroy();
       }
       if (video) {

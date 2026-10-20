@@ -87,6 +87,7 @@ export interface ElectronAPI {
     success: boolean;
     installedGames?: InstalledGameRecord[];
     installedSteamAppIds?: number[];
+    epicPlatformSupport?: Record<string, { windows: boolean; mac: boolean }>;
     error?: string;
   }>;
   detectCompatibilityLayers: () => Promise<CompatibilityLayerInfo[]>;

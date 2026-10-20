@@ -242,7 +242,7 @@ export function isPlaceholderDesc(desc?: string, title?: string): boolean {
 }
 
 export const NON_GAME_CATALOG_TITLE_REGEX =
-  /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|alpha version|legacy mode|pre-game editor|resource archiver|digital goodies|goodies collection|goodie pack|digital comics|playable teaser|prologue|redistributables)\b|\bcontent$|\bdlc$|killingfloor2beta|^sin multiplayer$/i;
+  /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|alpha version|legacy mode|pre-game editor|resource archiver|digital goodies|goodies collection|goodie pack|digital comics|playable teaser|prologue|redistributables)\b|\bcontent$|\bdlc$|[a-z0-9]+beta$|^sin multiplayer$/i;
 
 export function isNonGameCatalogEntry(game: CanonicalGame): boolean {
   const title = (game.title || '').trim();
@@ -257,7 +257,7 @@ export function getNonGameSuppressionReason(game: CanonicalGame): string {
   const title = (game.title || '').trim();
   const lower = title.toLowerCase();
   if (
-    /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|legacy mode)\b|killingfloor2beta|^sin multiplayer$/i.test(
+    /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|legacy mode)\b|[a-z0-9]+beta$|^sin multiplayer$/i.test(
       title
     )
   ) {
@@ -290,6 +290,24 @@ export function getNonGameSuppressionReason(game: CanonicalGame): string {
   return 'Filtered as non-game / beta / trial / SDK / add-on entry';
 }
 
+export function isUnmappedEpicInternalCodename(gameOrTitle: CanonicalGame | string): boolean {
+  if (typeof gameOrTitle === 'string') {
+    const clean = gameOrTitle.trim().toLowerCase();
+    return Boolean(clean && !clean.includes(' ') && UNMAPPED_EPIC_INTERNAL_CODENAMES.has(clean));
+  }
+  const title = (gameOrTitle.title || '').trim().toLowerCase();
+  if (!title || title.includes(' ') || !UNMAPPED_EPIC_INTERNAL_CODENAMES.has(title)) {
+    return false;
+  }
+  const isEpic =
+    Boolean(gameOrTitle.id?.toLowerCase().startsWith('epic-')) ||
+    Boolean(gameOrTitle.platforms?.some((p) => p.platformId === 'epic'));
+  const lacksStoreMetadata =
+    !gameOrTitle.steamAppId &&
+    (!Array.isArray(gameOrTitle.platforms) || gameOrTitle.platforms.length === 0);
+  return isEpic || lacksStoreMetadata;
+}
+
 /**
  * Detects whether an item is a non-game item (Fortnite microtransactions, DLC packs, add-on assets, betas, editors, prologues)
  */
@@ -302,7 +320,7 @@ export function isEpicNonGameEntry(game: CanonicalGame): boolean {
   }
 
   // Unmapped internal Epic project codenames
-  if (UNMAPPED_EPIC_INTERNAL_CODENAMES.has(title)) {
+  if (isUnmappedEpicInternalCodename(game)) {
     return true;
   }
 
@@ -934,7 +952,7 @@ export function sanitizeGameCatalog(
 
     const currentTitleLower = game.title.toLowerCase().trim();
     let normTitle = normalizeCanonicalTitle(game.title);
-    if (UNMAPPED_EPIC_INTERNAL_CODENAMES.has(currentTitleLower)) {
+    if (isUnmappedEpicInternalCodename(game)) {
       if (!userOverride && !isRestoredNonGame) {
         recordSuppressedEntry(
           game,
@@ -1392,10 +1410,14 @@ export function sanitizeGameCatalog(
       const primary = preferIncomingEdition ? game : existing;
       const secondary = preferIncomingEdition ? existing : game;
 
-      let mergedPlatforms = primary.platforms.map((ep) => {
+      let mergedPlatforms: CanonicalGame['platforms'] = primary.platforms.map((ep) => {
         const secMatch = secondary.platforms.find((sp) => sp.platformId === ep.platformId);
         return {
           ...ep,
+          platforms: ep.platforms || secMatch?.platforms,
+          storefrontAppId: ep.storefrontAppId || secMatch?.storefrontAppId,
+          namespace: ep.namespace || secMatch?.namespace,
+          catalogItemId: ep.catalogItemId || secMatch?.catalogItemId,
           originalTitle:
             ep.originalTitle ||
             secMatch?.originalTitle ||

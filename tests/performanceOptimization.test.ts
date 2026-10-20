@@ -107,12 +107,12 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         "app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')"
       );
 
-      // 1b. Hidden store:sync scraper BrowserWindow lightweight webPreferences + session.clearCache()
+      // 1b. Hidden store:sync scraper BrowserWindow lightweight webPreferences + destroyScraperWindowCleanly
       expect(mainSource).toContain('images: false');
       expect(mainSource).toContain('spellcheck: false');
       expect(mainSource).toContain('backgroundThrottling: true');
       expect(mainSource).toContain("v8CacheOptions: 'none'");
-      expect(mainSource).toContain('bgWin.webContents.session.clearCache()');
+      expect(mainSource).toContain('storeSync.destroyScraperWindowCleanly(bgWin)');
 
       // 1c. 15s TTL caching (STEAM_LOCAL_SCAN_TTL_MS = 15000) for local Steam VDF & achievements scans
       expect(mainSource).toContain('const STEAM_LOCAL_SCAN_TTL_MS = 15000');
@@ -192,11 +192,11 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
   // 3. Bounded In-Memory Caches (SteamApiService & CriticScoreService)
   // =========================================================================
   describe('3. Bounded In-Memory Caches (SteamApiService & CriticScoreService)', () => {
-    it('caps SteamApiService metadataCache at 250 entries (MAX_METADATA_CACHE_SIZE = 250) and trims via trimMemoryCache(50)', () => {
+    it('caps SteamApiService metadataCache at 150 entries (MAX_METADATA_CACHE_SIZE = 150) and trims via trimMemoryCache(50)', () => {
       const api = new SteamApiService() as any;
-      expect((SteamApiService as any).MAX_METADATA_CACHE_SIZE).toBe(250);
+      expect((SteamApiService as any).MAX_METADATA_CACHE_SIZE).toBe(150);
 
-      for (let i = 1; i <= 310; i++) {
+      for (let i = 1; i <= 210; i++) {
         api.setCacheEntry(i, {
           appId: i,
           name: `Game ${i}`,
@@ -212,20 +212,20 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         });
       }
 
-      // Must never exceed 250 entries
-      expect(api.metadataCache.size).toBe(250);
-      // Oldest 60 entries (1..60) were evicted; entry 61 is now oldest and 310 is newest
+      // Must never exceed 150 entries
+      expect(api.metadataCache.size).toBe(150);
+      // Oldest 60 entries (1..60) were evicted; entry 61 is now oldest and 210 is newest
       expect(api.metadataCache.has(1)).toBe(false);
       expect(api.metadataCache.has(60)).toBe(false);
       expect(api.metadataCache.has(61)).toBe(true);
-      expect(api.metadataCache.has(310)).toBe(true);
+      expect(api.metadataCache.has(210)).toBe(true);
 
       // Trim down to 50 entries via trimMemoryCache(50)
       api.trimMemoryCache(50);
       expect(api.metadataCache.size).toBe(50);
-      expect(api.metadataCache.has(260)).toBe(false);
-      expect(api.metadataCache.has(261)).toBe(true);
-      expect(api.metadataCache.has(310)).toBe(true);
+      expect(api.metadataCache.has(160)).toBe(false);
+      expect(api.metadataCache.has(161)).toBe(true);
+      expect(api.metadataCache.has(210)).toBe(true);
 
       // Also verify singleton steamApi exposes trimMemoryCache
       expect(typeof steamApi.trimMemoryCache).toBe('function');
