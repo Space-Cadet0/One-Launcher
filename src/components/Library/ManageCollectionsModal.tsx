@@ -47,24 +47,15 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
     rowIndex: number,
     e: React.DragEvent<HTMLDivElement>
   ): number => {
+    if (draggedIndex !== null && rowIndex === draggedIndex) {
+      return draggedIndex;
+    }
     const rect = e.currentTarget?.getBoundingClientRect?.();
-    let candidateSlot: number;
     if (rect && rect.height > 0 && typeof e.clientY === 'number' && e.clientY > 0) {
       const isUpperHalf = e.clientY < rect.top + rect.height / 2;
-      candidateSlot = isUpperHalf ? rowIndex : rowIndex + 1;
-    } else {
-      candidateSlot =
-        draggedIndex !== null && draggedIndex < rowIndex ? rowIndex + 1 : rowIndex;
+      return isUpperHalf ? rowIndex : rowIndex + 1;
     }
-
-    if (draggedIndex !== null && rowIndex !== draggedIndex) {
-      if (candidateSlot === draggedIndex) {
-        candidateSlot = rowIndex;
-      } else if (candidateSlot === draggedIndex + 1) {
-        candidateSlot = rowIndex + 1;
-      }
-    }
-    return candidateSlot;
+    return draggedIndex !== null && draggedIndex < rowIndex ? rowIndex + 1 : rowIndex;
   };
 
   const commitDropToSlot = (
@@ -124,7 +115,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
           if (e.dataTransfer) {
             e.dataTransfer.dropEffect = 'move';
           }
-          if (!isNoOpSlot && dropSlotIndex !== slotIdx) {
+          if (dropSlotIndex !== slotIdx) {
             setDropSlotIndex(slotIdx);
           }
         }}
@@ -234,6 +225,9 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
               const isIncluded = game ? col.gameIds.includes(game.id) : false;
               const isEditing = editingId === col.id;
               const isDragging = draggedIndex === index;
+              const isReturningToOrigin =
+                isDragging &&
+                (dropSlotIndex === index || dropSlotIndex === index + 1);
               const isBeforeTarget =
                 draggedIndex !== null &&
                 dropSlotIndex === index &&
@@ -252,6 +246,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                     draggable={!isEditing && Boolean(onReorderCollections)}
                     onDragStart={(e) => {
                       setDraggedIndex(index);
+                      setDropSlotIndex(index);
                       e.dataTransfer?.setData('text/plain', String(index));
                       if (e.dataTransfer) {
                         e.dataTransfer.effectAllowed = 'move';
@@ -262,17 +257,19 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                       if (e.dataTransfer) {
                         e.dataTransfer.dropEffect = 'move';
                       }
-                      if (draggedIndex === index) return;
                       const nextSlot = resolveSlotForRowDragOver(index, e);
                       if (dropSlotIndex !== nextSlot) {
                         setDropSlotIndex(nextSlot);
                       }
                     }}
                     onDrop={(e) => {
-                      const targetSlot =
-                        dropSlotIndex !== null
-                          ? dropSlotIndex
-                          : resolveSlotForRowDragOver(index, e);
+                      if (draggedIndex === index) {
+                        e.preventDefault();
+                        setDraggedIndex(null);
+                        setDropSlotIndex(null);
+                        return;
+                      }
+                      const targetSlot = resolveSlotForRowDragOver(index, e);
                       commitDropToSlot(e, targetSlot);
                     }}
                     onDragEnd={() => {
@@ -283,7 +280,13 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                       isIncluded
                         ? 'bg-[#223547] border-steam-accent/50 text-white'
                         : 'bg-[#16202d] border-[#2a475e]/60 text-steam-text hover:bg-[#1f2d3d]'
-                    } ${isDragging ? 'opacity-45 border-[#66c0f4]/60 scale-[0.99]' : ''} ${
+                    } ${
+                      isReturningToOrigin
+                        ? 'opacity-100 border-[#66c0f4] ring-1 ring-[#66c0f4]/60 bg-[#1f3247]'
+                        : isDragging
+                          ? 'opacity-45 border-[#66c0f4]/60 scale-[0.99]'
+                          : ''
+                    } ${
                       isBeforeTarget ? 'border-t-2 border-t-[#66c0f4]' : ''
                     } ${isAfterTarget ? 'border-b-2 border-b-[#66c0f4]' : ''}`}
                   >
@@ -401,23 +404,34 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
 
                       {/* Management Actions */}
                       <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() => handleStartEditing(col)}
-                          className="p-1 text-steam-subtext hover:text-white rounded hover:bg-[#2a3c4e]"
-                          title="Edit collection name & icon"
-                        >
-                          <Edit2 className="w-3 h-3" />
-                        </button>
-                        {!col.isDefault && (
-                          <button
-                            type="button"
-                            onClick={() => onDeleteCollection(col.id)}
-                            className="p-1 text-steam-subtext hover:text-red-400 rounded hover:bg-[#2a3c4e]"
-                            title="Delete collection"
+                        {isReturningToOrigin ? (
+                          <span
+                            data-testid={`keep-position-badge-${col.id}`}
+                            className="text-[10px] font-semibold text-[#66c0f4] px-1.5 py-0.5 rounded bg-[#66c0f4]/15 border border-[#66c0f4]/40 pointer-events-none"
                           >
-                            <Trash2 className="w-3 h-3" />
-                          </button>
+                            Keep in current position
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleStartEditing(col)}
+                              className="p-1 text-steam-subtext hover:text-white rounded hover:bg-[#2a3c4e]"
+                              title="Edit collection name & icon"
+                            >
+                              <Edit2 className="w-3 h-3" />
+                            </button>
+                            {!col.isDefault && (
+                              <button
+                                type="button"
+                                onClick={() => onDeleteCollection(col.id)}
+                                className="p-1 text-steam-subtext hover:text-red-400 rounded hover:bg-[#2a3c4e]"
+                                title="Delete collection"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </>
                         )}
                       </div>
                     </div>

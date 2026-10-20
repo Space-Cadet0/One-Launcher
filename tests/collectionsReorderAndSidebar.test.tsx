@@ -346,6 +346,88 @@ describe('Drag-and-Drop Collection Reordering & Sidebar "Groups" Label', () => {
       expect(onReorderCollections).toHaveBeenCalledTimes(1);
       expect(onReorderCollections).toHaveBeenCalledWith(0, 1);
     });
+
+    it('allows dragging a collection away and returning it to its original position without reordering', () => {
+      const onReorderCollections = vi.fn();
+
+      const harness = createComponentHarness(ManageCollectionsModal, {
+        isOpen: true,
+        onClose: () => {},
+        collections: SAMPLE_COLLECTIONS,
+        onCreateCollection: () => {},
+        onRenameCollection: () => {},
+        onDeleteCollection: () => {},
+        onToggleGameInCollection: () => {},
+        onReorderCollections,
+      });
+
+      const tree1 = harness.render();
+      const rowA = findElements(
+        tree1,
+        (el) => el.props?.['data-testid'] === 'collection-row-col-a'
+      )[0];
+      const dataStore = new Map<string, string>();
+      const mockDataTransfer = {
+        setData: (type: string, val: string) => dataStore.set(type, val),
+        getData: (type: string) => dataStore.get(type) ?? '',
+        effectAllowed: '',
+        dropEffect: '',
+      };
+
+      // 1. Start dragging col-a (index 0)
+      rowA.props.onDragStart({ dataTransfer: mockDataTransfer });
+
+      // 2. Drag over slot 2 (between col-b and col-c)
+      const tree2 = harness.render();
+      const slot2 = findElements(
+        tree2,
+        (el) => el.props?.['data-testid'] === 'collection-drop-slot-2'
+      )[0];
+      slot2.props.onDragOver({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        dataTransfer: mockDataTransfer,
+      });
+
+      const tree3 = harness.render();
+      expect(
+        findElements(tree3, (el) => el.props?.['data-testid'] === 'active-drop-indicator-2')[0]
+      ).toBeDefined();
+
+      // 3. While still holding the mouse down, move back over col-a (original position)
+      const rowADragging = findElements(
+        tree3,
+        (el) => el.props?.['data-testid'] === 'collection-row-col-a'
+      )[0];
+      rowADragging.props.onDragOver({
+        preventDefault: () => {},
+        dataTransfer: mockDataTransfer,
+      });
+
+      // Verify slot 2 indicator disappears and "Keep in current position" badge appears on col-a
+      const tree4 = harness.render();
+      expect(
+        findElements(tree4, (el) => el.props?.['data-testid'] === 'active-drop-indicator-2')[0]
+      ).toBeUndefined();
+      const keepBadge = findElements(
+        tree4,
+        (el) => el.props?.['data-testid'] === 'keep-position-badge-col-a'
+      )[0];
+      expect(keepBadge).toBeDefined();
+      expect(getTextContent(keepBadge)).toBe('Keep in current position');
+
+      // 4. Drop back onto col-a -> should NOT call onReorderCollections
+      const rowAReturned = findElements(
+        tree4,
+        (el) => el.props?.['data-testid'] === 'collection-row-col-a'
+      )[0];
+      rowAReturned.props.onDrop({
+        preventDefault: () => {},
+        dataTransfer: mockDataTransfer,
+      });
+
+      expect(onReorderCollections).not.toHaveBeenCalled();
+    });
   });
 
   describe('2. useCollectionsManager Persistence', () => {
