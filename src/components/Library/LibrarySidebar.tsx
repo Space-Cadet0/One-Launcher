@@ -333,7 +333,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             type="text"
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
-            placeholder="Search by title, genre, dev..."
+            placeholder="Search by title..."
             className="w-full bg-[#10141b] border border-steam-border rounded pl-8 pr-3 py-1.5 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent transition-colors"
           />
         </div>

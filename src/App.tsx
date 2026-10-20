@@ -25,7 +25,6 @@ import {
 } from './components/Library/LibraryGridView';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
 import { CollectionIcon } from './components/Common/CollectionIcon';
-import { matchesNativeOsQuery } from './services/platform/nativeOsService';
 import { matchesLooseSearchQuery } from './services/common/titleUtils';
 import { syncJobManager } from './services/network/syncJobManager';
 import { RequestPriority } from './services/network/requestScheduler';
@@ -1190,28 +1189,11 @@ export function App() {
         if (!isInstalled) return false;
       }
 
-      // Search query
+      // Search query (Title-only: display title and original storefront title)
       if (searchQuery.trim()) {
         const matchesTitle = matchesLooseSearchQuery(game.title, searchQuery);
         const matchesOrigTitle = matchesLooseSearchQuery(game.originalStoreTitle, searchQuery);
-        const matchesDev = (game.developers || []).some((d) =>
-          matchesLooseSearchQuery(d, searchQuery)
-        );
-        const matchesGenres = (game.genres || []).some((g) =>
-          matchesLooseSearchQuery(g, searchQuery)
-        );
-        const matchesTags = (game.tags || []).some((t) =>
-          matchesLooseSearchQuery(t, searchQuery)
-        );
-        if (
-          !matchesTitle &&
-          !matchesOrigTitle &&
-          !matchesDev &&
-          !matchesGenres &&
-          !matchesTags &&
-          !matchesNativeOsQuery(game, searchQuery)
-        )
-          return false;
+        if (!matchesTitle && !matchesOrigTitle) return false;
       }
 
       // Temporary Active Link Filter (Developer, Publisher, Feature like HDR available, Genre, Tag)

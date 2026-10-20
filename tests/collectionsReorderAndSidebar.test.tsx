@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
+import fs from 'node:fs';
+import path from 'node:path';
 import { ManageCollectionsModal } from '../src/components/Library/ManageCollectionsModal';
 import { LibrarySidebar } from '../src/components/Library/LibrarySidebar';
 import { useCollectionsManager } from '../src/hooks/useCollectionsManager';
 import { loadCollections, saveCollections } from '../src/services/storage/collectionStorage';
+import { matchesLooseSearchQuery } from '../src/services/common/titleUtils';
 import type { GameCollection } from '../src/contracts/collection';
 import type { CanonicalGame } from '../src/contracts/game';
 
@@ -342,6 +345,52 @@ describe('Drag-and-Drop Collection Reordering & Sidebar "Groups" Label', () => {
       expect(idxBeta).toBeGreaterThan(-1);
       expect(idxGamma).toBeGreaterThan(idxBeta);
       expect(idxAlpha).toBeGreaterThan(idxGamma);
+
+      // Verify search input placeholder is "Search by title..."
+      const searchInput = findElements(
+        tree,
+        (el) => el.type === 'input' && el.props?.placeholder === 'Search by title...'
+      )[0];
+      expect(searchInput).toBeDefined();
+    });
+  });
+
+  describe('4. Title-Only Search Query Filtering', () => {
+    it('searches only game.title and game.originalStoreTitle so queries like "cloud" do not match tags like "Steam Cloud"', () => {
+      const appSource = fs.readFileSync(path.resolve(__dirname, '../src/App.tsx'), 'utf8');
+      expect(appSource).toContain('const matchesTitle = matchesLooseSearchQuery(game.title, searchQuery);');
+      expect(appSource).toContain('const matchesOrigTitle = matchesLooseSearchQuery(game.originalStoreTitle, searchQuery);');
+      expect(appSource).toContain('if (!matchesTitle && !matchesOrigTitle) return false;');
+
+      const testCatalog: CanonicalGame[] = [
+        {
+          id: 'steam-1091500',
+          title: 'Cyberpunk 2077',
+          platforms: [{ platformId: 'steam', platformGameId: '1091500', installed: true }],
+          genres: ['RPG'],
+          tags: ['Steam Cloud', 'Cloud Saves', 'Single-player'],
+          developers: ['CD PROJEKT RED'],
+          playtimeMinutes: 100,
+        },
+        {
+          id: 'steam-746850',
+          title: 'Cloudpunk',
+          platforms: [{ platformId: 'steam', platformGameId: '746850', installed: false }],
+          genres: ['Indie'],
+          tags: ['Steam Cloud'],
+          developers: ['ION LANDS'],
+          playtimeMinutes: 20,
+        },
+      ];
+
+      const searchQuery = 'cloud';
+      const results = testCatalog.filter((game) => {
+        const matchesTitle = matchesLooseSearchQuery(game.title, searchQuery);
+        const matchesOrigTitle = matchesLooseSearchQuery(game.originalStoreTitle, searchQuery);
+        return matchesTitle || matchesOrigTitle;
+      });
+
+      expect(results.map((g) => g.title)).toEqual(['Cloudpunk']);
     });
   });
 });
