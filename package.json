@@ -11,10 +11,10 @@
     "test": "vitest run",
     "electron": "electron electron/main.cjs",
     "desktop": "electron electron/main.cjs",
-    "build:mac": "npm run build && electron-builder --mac dir",
-    "dist:mac": "npm run build && electron-builder --mac",
+    "build:mac": "npm run build && electron-builder --mac dir --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never",
     "build:win-uninstaller": "MAKENSIS=$(find \"$HOME/Library/Caches/electron-builder\" -path \"*/mac/makensis\" 2>/dev/null | head -n 1) && NSISDIR=$(dirname $(dirname \"$MAKENSIS\")) \"$MAKENSIS\" build/standalone-uninstaller.nsi",
-    "build:win": "npm run build && electron-builder --win --x64 && npm run build:win-uninstaller"
+    "build:win": "npm run build && electron-builder --win --x64 --publish never && npm run build:win-uninstaller"
   },
   "build": {
     "appId": "com.onelauncher.app",
