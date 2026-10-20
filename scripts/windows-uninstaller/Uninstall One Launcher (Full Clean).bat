@@ -34,7 +34,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "function Remove-Safe([string]$p, [string]$lbl) { " ^
   "  if ([string]::IsNullOrWhiteSpace($p)) { return }; " ^
   "  $n = $p.TrimEnd('\','/'); " ^
-  "  if ($n.Length -le 3 -or $n -match '^[A-Za-z]:$' -or $n -match '(?i)\\Windows$' -or $n -match '(?i)\\Program Files(\s*\(x86\))?$' -or $n -match '(?i)\\Steam(\\|$)-------------' -or $n -match '(?i)\\SteamApps') { return }; " ^
+  "  if ($n.Length -le 3 -or $n -match '^[A-Za-z]:$' -or $n -match '(?i)\\Windows$' -or $n -match '(?i)\\Program Files(\s*\(x86\))?$' -or $n -match '(?i)\\Steam(\\|$)' -or $n -match '(?i)\\SteamApps') { return }; " ^
   "  if (Test-Path -LiteralPath $p) { " ^
   "    Write-Host ('  [DEL]  ' + $lbl + ': ' + $p) -ForegroundColor Gray; " ^
   "    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue; " ^
@@ -49,7 +49,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "Start-Sleep -Seconds 1; " ^
   "Write-Host '[2/7] Discovering & removing installed games from manifests...' -ForegroundColor Yellow; " ^
   "$removedPaths = @(); $removedIds = @(); " ^
-  "@(\"$env:APPDATA\one-launcher\one_launcher_installed.json\", \"$env:APPDATA\One Launcher\one_launcher_installed.json\", \"$env:APPDATA\com.onelauncher.app\one_launcher_installed.json\") | ForEach-Object { " ^
+  "@(\"$env:APPDATA\one-launcher\one_launcher_installed.json\", \"$env:APPDATA\One Launcher\one_launcher_installed.json\", \"$env:APPDATA\com.onelauncher.app\one_launcher_installed.json\", \"$env:USERPROFILE\.one-launcher\one_launcher_installed.json\") | ForEach-Object { " ^
   "  if (Test-Path -LiteralPath $_) { " ^
   "    try { " ^
   "      $data = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json; " ^
@@ -99,13 +99,24 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (Test-Path -LiteralPath $gogCfg) { " ^
   "  try { $cfg = Get-Content -LiteralPath $gogCfg -Raw | ConvertFrom-Json; if ($cfg -and $cfg.installationPaths) { $cfg.installationPaths = @($cfg.installationPaths | Where-Object { $_ -notmatch '(?i)OneLauncher' -and ($removedPaths -notcontains $_) }); $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $gogCfg -Encoding UTF8 } } catch {} " ^
   "}; " ^
-  "$gogDb = 'C:\ProgramData\GOG.com\Galaxy\Storage\galaxy-2.0.db'; " ^
-  "if ((Test-Path -LiteralPath $gogDb) -and (Get-Command sqlite3.exe -ErrorAction SilentlyContinue)) { " ^
-  "  try { $sql = \"DELETE FROM InstalledBaseProducts WHERE installationPath LIKE '%OneLauncher%'; \"; foreach ($rid in $removedIds) { if ($rid -match '^\d+$') { $sql += \"DELETE FROM InstalledBaseProducts WHERE productId = $rid; \" } }; $sql += \"DELETE FROM InstalledProducts WHERE productId NOT IN (SELECT productId FROM InstalledBaseProducts);\"; & sqlite3.exe $gogDb $sql 2>$null | Out-Null } catch {} " ^
+  "$gogDb = @('C:\ProgramData\GOG.com\Galaxy\storage\galaxy-2.0.db','C:\ProgramData\GOG.com\Galaxy\Storage\galaxy-2.0.db') | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1; " ^
+  "if ($gogDb) { " ^
+  "  try { " ^
+  "    $sql = \"CREATE TEMP TABLE IF NOT EXISTS _ol_pids (productId INTEGER PRIMARY KEY); INSERT OR IGNORE INTO _ol_pids SELECT productId FROM InstalledBaseProducts WHERE installationPath LIKE '%OneLauncher%'; \"; " ^
+  "    foreach ($rid in $removedIds) { if ($rid -match '^\d+$') { $sql += \"INSERT OR IGNORE INTO _ol_pids VALUES ($rid); \" } }; " ^
+  "    $sql += \"DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); DELETE FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM ProductSettings WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM ProductSettings WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM GameFiles WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM GameFiles WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM BaseModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM ModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM ImportedLatestBuildIds WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM InstalledBaseProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR installationPath LIKE '%OneLauncher%'; DELETE FROM InstalledProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR productId NOT IN (SELECT productId FROM InstalledBaseProducts); DELETE FROM ProductStates WHERE productId IN (SELECT productId FROM _ol_pids); DROP TABLE IF EXISTS _ol_pids;\"; " ^
+  "    $nodeExe = @(\"$env:ProgramFiles\One Launcher\One Launcher.exe\",\"${env:ProgramFiles(x86)}\One Launcher\One Launcher.exe\",\"$env:LOCALAPPDATA\Programs\One Launcher\One Launcher.exe\",\"$env:LOCALAPPDATA\Programs\one-launcher\One Launcher.exe\") | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1; " ^
+  "    if (-not $nodeExe -and (Get-Command node.exe -ErrorAction SilentlyContinue)) { $nodeExe = (Get-Command node.exe).Source }; " ^
+  "    if ($nodeExe) { $env:ELECTRON_RUN_AS_NODE = '1'; $env:OL_GOG_DB = $gogDb; $env:OL_GOG_SQL = $sql; & $nodeExe -e \"const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.env.OL_GOG_DB);for(const s of process.env.OL_GOG_SQL.split(';').map(x=>x.trim()).filter(Boolean)){try{db.exec(s+';')}catch{}}db.close();\" 2>$null | Out-Null; Remove-Item Env:\ELECTRON_RUN_AS_NODE,Env:\OL_GOG_DB,Env:\OL_GOG_SQL -ErrorAction SilentlyContinue } elseif (Get-Command sqlite3.exe -ErrorAction SilentlyContinue) { & sqlite3.exe $gogDb $sql 2>$null | Out-Null } " ^
+  "  } catch {} " ^
   "}; " ^
   "Write-Host '[3/7] Removing One Launcher game library folders...' -ForegroundColor Yellow; " ^
-  "@('C:\Games\OneLauncher','D:\Games\OneLauncher','E:\Games\OneLauncher',\"$env:USERPROFILE\Games\OneLauncher\",\"$env:USERPROFILE\OneLauncher Games\") | ForEach-Object { Remove-Safe $_ 'Game Library' }; " ^
-  "@('C:\Games','D:\Games','E:\Games',\"$env:USERPROFILE\Games\") | ForEach-Object { " ^
+  "$libDirs = @('C:\Games\OneLauncher','D:\Games\OneLauncher','E:\Games\OneLauncher',\"$env:USERPROFILE\Games\OneLauncher\",\"$env:USERPROFILE\OneLauncher Games\"); " ^
+  "Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Root) { $dl = Join-Path $_.Root 'Games\OneLauncher'; if ($libDirs -notcontains $dl) { $libDirs += $dl } } }; " ^
+  "$libDirs | ForEach-Object { Remove-Safe $_ 'Game Library' }; " ^
+  "$parentDirs = @('C:\Games','D:\Games','E:\Games',\"$env:USERPROFILE\Games\"); " ^
+  "Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Root) { $dp = Join-Path $_.Root 'Games'; if ($parentDirs -notcontains $dp) { $parentDirs += $dp } } }; " ^
+  "$parentDirs | ForEach-Object { " ^
   "  if (Test-Path -LiteralPath $_) { " ^
   "    $items = Get-ChildItem -LiteralPath $_ -Force -ErrorAction SilentlyContinue; " ^
   "    if (-not $items -or $items.Count -eq 0) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } " ^
@@ -117,9 +128,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "}; " ^
   "@(\"$env:ProgramFiles\One Launcher\",\"${env:ProgramFiles(x86)}\One Launcher\",\"$env:LOCALAPPDATA\Programs\One Launcher\",\"$env:LOCALAPPDATA\Programs\one-launcher\") | ForEach-Object { if ($_) { Remove-Safe $_ 'Application Folder' } }; " ^
   "Write-Host '[5/7] Purging Electron AppData, LocalStorage, OAuth & SafeStorage...' -ForegroundColor Yellow; " ^
-  "@(\"$env:APPDATA\one-launcher\",\"$env:APPDATA\One Launcher\",\"$env:APPDATA\com.onelauncher.app\",\"$env:LOCALAPPDATA\one-launcher\",\"$env:LOCALAPPDATA\One Launcher\",\"$env:LOCALAPPDATA\one-launcher-updater\",\"$env:LOCALAPPDATA\One Launcher-updater\",\"$env:LOCALAPPDATA\com.onelauncher.app\") | ForEach-Object { Remove-Safe $_ 'Electron Data' }; " ^
+  "@(\"$env:APPDATA\one-launcher\",\"$env:APPDATA\One Launcher\",\"$env:APPDATA\com.onelauncher.app\",\"$env:APPDATA\universal-game-library\",\"$env:LOCALAPPDATA\one-launcher\",\"$env:LOCALAPPDATA\One Launcher\",\"$env:LOCALAPPDATA\one-launcher-updater\",\"$env:LOCALAPPDATA\One Launcher-updater\",\"$env:LOCALAPPDATA\com.onelauncher.app\",\"$env:LOCALAPPDATA\universal-game-library\",\"$env:USERPROFILE\.one-launcher\",\"$env:USERPROFILE\.universal-game-library\") | ForEach-Object { Remove-Safe $_ 'Electron Data' }; " ^
   "Write-Host '[6/7] Purging Legendary & GOGDL CLI configs and caches...' -ForegroundColor Yellow; " ^
-  "@(\"$env:USERPROFILE\.config\legendary\",\"$env:APPDATA\legendary\",\"$env:LOCALAPPDATA\legendary\",\"$env:USERPROFILE\.config\gogdl\",\"$env:APPDATA\gogdl\") | ForEach-Object { Remove-Safe $_ 'CLI Config' }; " ^
+  "@(\"$env:USERPROFILE\.config\legendary\",\"$env:APPDATA\legendary\",\"$env:LOCALAPPDATA\legendary\",\"$env:USERPROFILE\.config\gogdl\",\"$env:APPDATA\gogdl\",\"$env:USERPROFILE\.config\heroic_gogdl\",\"$env:APPDATA\heroic_gogdl\",\"$env:LOCALAPPDATA\heroic_gogdl\",\"$env:APPDATA\one-launcher\gogdlConfig\",\"$env:APPDATA\One Launcher\gogdlConfig\") | ForEach-Object { Remove-Safe $_ 'CLI Config' }; " ^
   "if (Test-Path -LiteralPath \"$env:USERPROFILE\.config\") { " ^
   "  $rem = Get-ChildItem -LiteralPath \"$env:USERPROFILE\.config\" -Force -ErrorAction SilentlyContinue; " ^
   "  if (-not $rem -or $rem.Count -eq 0) { Remove-Item -LiteralPath \"$env:USERPROFILE\.config\" -Force -ErrorAction SilentlyContinue } " ^

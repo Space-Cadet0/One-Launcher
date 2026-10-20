@@ -34,7 +34,7 @@ function Remove-PathSafely {
         $normalized -match '^[A-Za-z]:$' -or
         $normalized -match '(?i)\\Windows$' -or
         $normalized -match '(?i)\\Program Files(\s*\(x86\))?$' -or
-        $normalized -match '(?i)\\Steam(\\|$)-------------' -or
+        $normalized -match '(?i)\\Steam(\\|$)' -or
         $normalized -match '(?i)\\SteamApps') {
         Write-Host "  [SKIP] Safety guard prevented deleting protected path: $TargetPath" -ForegroundColor Yellow
         return
@@ -76,7 +76,8 @@ $removedIds = @()
 $oneLauncherManifests = @(
     (Join-Path $env:APPDATA "one-launcher\one_launcher_installed.json"),
     (Join-Path $env:APPDATA "One Launcher\one_launcher_installed.json"),
-    (Join-Path $env:APPDATA "com.onelauncher.app\one_launcher_installed.json")
+    (Join-Path $env:APPDATA "com.onelauncher.app\one_launcher_installed.json"),
+    (Join-Path $env:USERPROFILE ".one-launcher\one_launcher_installed.json")
 )
 
 foreach ($manifestPath in $oneLauncherManifests) {
@@ -192,7 +193,7 @@ if (Test-Path -LiteralPath $eglDatPath) {
     } catch {}
 }
 
-# Clean up GOG Galaxy 2.0 config.json & galaxy-2.0.db SQLite entries
+# Clean up GOG Galaxy 2.0 config.json & galaxy-2.0.db SQLite entries across all 10 tables
 $gogCfg = "C:\ProgramData\GOG.com\Galaxy\config.json"
 if (Test-Path -LiteralPath $gogCfg) {
     try {
@@ -206,17 +207,57 @@ if (Test-Path -LiteralPath $gogCfg) {
     } catch {}
 }
 
-$gogDb = "C:\ProgramData\GOG.com\Galaxy\Storage\galaxy-2.0.db"
-if ((Test-Path -LiteralPath $gogDb) -and (Get-Command sqlite3.exe -ErrorAction SilentlyContinue)) {
+$gogDbCandidates = @(
+    "C:\ProgramData\GOG.com\Galaxy\storage\galaxy-2.0.db",
+    "C:\ProgramData\GOG.com\Galaxy\Storage\galaxy-2.0.db"
+)
+$gogDb = $gogDbCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($gogDb) {
     try {
-        $sql = "DELETE FROM InstalledBaseProducts WHERE installationPath LIKE '%OneLauncher%'; "
+        $sql = "CREATE TEMP TABLE IF NOT EXISTS _ol_pids (productId INTEGER PRIMARY KEY); "
+        $sql += "INSERT OR IGNORE INTO _ol_pids SELECT productId FROM InstalledBaseProducts WHERE installationPath LIKE '%OneLauncher%'; "
         foreach ($rid in $removedIds) {
             if ($rid -match "^\d+$") {
-                $sql += "DELETE FROM InstalledBaseProducts WHERE productId = $rid; "
+                $sql += "INSERT OR IGNORE INTO _ol_pids VALUES ($rid); "
             }
         }
-        $sql += "DELETE FROM InstalledProducts WHERE productId NOT IN (SELECT productId FROM InstalledBaseProducts);"
-        & sqlite3.exe $gogDb $sql 2>$null | Out-Null
+        $sql += "DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); "
+        $sql += "DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); "
+        $sql += "DELETE FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); "
+        $sql += "DELETE FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); "
+        $sql += "DELETE FROM ProductSettings WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); "
+        $sql += "DELETE FROM ProductSettings WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); "
+        $sql += "DELETE FROM GameFiles WHERE productId IN (SELECT productId FROM _ol_pids); "
+        $sql += "DELETE FROM GameFiles WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); "
+        $sql += "DELETE FROM BaseModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); "
+        $sql += "DELETE FROM ModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); "
+        $sql += "DELETE FROM ImportedLatestBuildIds WHERE productId IN (SELECT productId FROM _ol_pids); "
+        $sql += "DELETE FROM InstalledBaseProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR installationPath LIKE '%OneLauncher%'; "
+        $sql += "DELETE FROM InstalledProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR productId NOT IN (SELECT productId FROM InstalledBaseProducts); "
+        $sql += "DELETE FROM ProductStates WHERE productId IN (SELECT productId FROM _ol_pids); "
+        $sql += "DROP TABLE IF EXISTS _ol_pids;"
+
+        $nodeCandidates = @(
+            (Join-Path $env:ProgramFiles "One Launcher\One Launcher.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "One Launcher\One Launcher.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\One Launcher\One Launcher.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\one-launcher\One Launcher.exe")
+        )
+        $nodeExe = $nodeCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+        if (-not $nodeExe -and (Get-Command node.exe -ErrorAction SilentlyContinue)) {
+            $nodeExe = (Get-Command node.exe).Source
+        }
+        if ($nodeExe) {
+            $env:ELECTRON_RUN_AS_NODE = "1"
+            $env:OL_GOG_DB = $gogDb
+            $env:OL_GOG_SQL = $sql
+            & $nodeExe -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.env.OL_GOG_DB);for(const s of process.env.OL_GOG_SQL.split(';').map(x=>x.trim()).filter(Boolean)){try{db.exec(s+';')}catch{}}db.close();" 2>$null | Out-Null
+            Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+            Remove-Item Env:\OL_GOG_DB -ErrorAction SilentlyContinue
+            Remove-Item Env:\OL_GOG_SQL -ErrorAction SilentlyContinue
+        } elseif (Get-Command sqlite3.exe -ErrorAction SilentlyContinue) {
+            & sqlite3.exe $gogDb $sql 2>$null | Out-Null
+        }
     } catch {}
 }
 
@@ -232,6 +273,14 @@ $gameLibraryDirs = @(
     (Join-Path $env:USERPROFILE "Games\OneLauncher"),
     (Join-Path $env:USERPROFILE "OneLauncher Games")
 )
+Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.Root) {
+        $drvLib = Join-Path $_.Root "Games\OneLauncher"
+        if ($gameLibraryDirs -notcontains $drvLib) {
+            $gameLibraryDirs += $drvLib
+        }
+    }
+}
 
 foreach ($dir in $gameLibraryDirs) {
     Remove-PathSafely -TargetPath $dir -Label "Game Library Directory"
@@ -244,6 +293,14 @@ $parentGameDirs = @(
     "E:\Games",
     (Join-Path $env:USERPROFILE "Games")
 )
+Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.Root) {
+        $drvParent = Join-Path $_.Root "Games"
+        if ($parentGameDirs -notcontains $drvParent) {
+            $parentGameDirs += $drvParent
+        }
+    }
+}
 foreach ($parentDir in $parentGameDirs) {
     if (Test-Path -LiteralPath $parentDir) {
         $remainingItems = Get-ChildItem -LiteralPath $parentDir -Force -ErrorAction SilentlyContinue
@@ -296,11 +353,15 @@ $electronDataDirs = @(
     (Join-Path $env:APPDATA "one-launcher"),
     (Join-Path $env:APPDATA "One Launcher"),
     (Join-Path $env:APPDATA "com.onelauncher.app"),
+    (Join-Path $env:APPDATA "universal-game-library"),
     (Join-Path $env:LOCALAPPDATA "one-launcher"),
     (Join-Path $env:LOCALAPPDATA "One Launcher"),
     (Join-Path $env:LOCALAPPDATA "one-launcher-updater"),
     (Join-Path $env:LOCALAPPDATA "One Launcher-updater"),
-    (Join-Path $env:LOCALAPPDATA "com.onelauncher.app")
+    (Join-Path $env:LOCALAPPDATA "com.onelauncher.app"),
+    (Join-Path $env:LOCALAPPDATA "universal-game-library"),
+    (Join-Path $env:USERPROFILE ".one-launcher"),
+    (Join-Path $env:USERPROFILE ".universal-game-library")
 )
 
 foreach ($dataDir in $electronDataDirs) {
@@ -317,7 +378,12 @@ $cliConfigDirs = @(
     (Join-Path $env:APPDATA "legendary"),
     (Join-Path $env:LOCALAPPDATA "legendary"),
     (Join-Path $env:USERPROFILE ".config\gogdl"),
-    (Join-Path $env:APPDATA "gogdl")
+    (Join-Path $env:APPDATA "gogdl"),
+    (Join-Path $env:USERPROFILE ".config\heroic_gogdl"),
+    (Join-Path $env:APPDATA "heroic_gogdl"),
+    (Join-Path $env:LOCALAPPDATA "heroic_gogdl"),
+    (Join-Path $env:APPDATA "one-launcher\gogdlConfig"),
+    (Join-Path $env:APPDATA "One Launcher\gogdlConfig")
 )
 
 foreach ($cliDir in $cliConfigDirs) {
