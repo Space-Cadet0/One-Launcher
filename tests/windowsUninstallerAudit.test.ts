@@ -157,7 +157,11 @@ describe('Windows Uninstaller Deep Audit & Artifact Verification', () => {
 
   describe('4. Safety Guard Regex & Dynamic Multi-Drive Cleanup', () => {
     it('contains no corrupted dash typos in safety guards and enumerates drives via Get-PSDrive -PSProvider FileSystem', () => {
-      expect(contents.powershellScript).not.toContain('-------------');
+      const psNonCommentLines = contents.powershellScript
+        .split(/\r?\n/)
+        .filter((line) => !line.trimStart().startsWith('#'))
+        .join('\n');
+      expect(psNonCommentLines).not.toContain('-------------');
       expect(contents.batchWrapper).not.toContain('-------------');
 
       expect(contents.powershellScript).toContain('$normalized -match \'(?i)\\\\Steam(\\\\|$)\'');
