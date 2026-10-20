@@ -8,6 +8,8 @@ dist/
 build/*
 !build/*.nsh
 !build/*.nsi
+!build/*.ps1
+!build/*.bat
 !build/icon.icns
 !build/icon.ico
 !build/icon.png

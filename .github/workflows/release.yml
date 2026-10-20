@@ -39,11 +39,26 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --win --x64 --publish never && npm run build:win-uninstaller
 
-      - name: Verify release artifacts
+      - name: Generate SHA256SUMS.txt & Verify release artifacts
         run: |
-          ls -lh "release/One Launcher-0.1.0-arm64.dmg"
-          ls -lh "release/One Launcher Setup 0.1.0.exe"
-          ls -lh "release/One Launcher Full Uninstaller.exe"
+          cd release
+          shasum -a 256 \
+            "One Launcher-0.1.0-arm64.dmg" \
+            "One Launcher-0.1.0-arm64-mac.zip" \
+            "One Launcher Setup 0.1.0.exe" \
+            "One Launcher Full Uninstaller.exe" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh \
+            "One Launcher-0.1.0-arm64.dmg" \
+            "One Launcher-0.1.0-arm64.dmg.blockmap" \
+            "One Launcher-0.1.0-arm64-mac.zip" \
+            "One Launcher-0.1.0-arm64-mac.zip.blockmap" \
+            "One Launcher Setup 0.1.0.exe" \
+            "One Launcher Setup 0.1.0.exe.blockmap" \
+            "One Launcher Full Uninstaller.exe" \
+            "latest-mac.yml" \
+            "latest.yml" \
+            "SHA256SUMS.txt"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -53,13 +68,44 @@ jobs:
           body: |
             ## One Launcher ${{ github.ref_name }}
 
-            ### Included Release Downloads
-            - **macOS (Apple Silicon ARM64)**: `One Launcher-0.1.0-arm64.dmg` (or `One.Launcher-0.1.0-arm64.dmg`)
-            - **Windows (x64 Installer)**: `One Launcher Setup 0.1.0.exe` (or `One.Launcher.Setup.0.1.0.exe`)
-            - **Windows (x64 Standalone Complete Uninstaller)**: `One Launcher Full Uninstaller.exe` (or `One.Launcher.Full.Uninstaller.exe`)
+            Universal cross-platform game library aggregator and launcher for **Steam**, **GOG.com**, and **Epic Games Store** on **macOS (Apple Silicon ARM64)** and **Windows (x64)**.
+
+            ---
+
+            ### 📦 Downloads & Release Assets
+
+            | Platform / Asset | File | Purpose |
+            | :--- | :--- | :--- |
+            | **macOS (Apple Silicon ARM64 — Disk Image)** | `One.Launcher-0.1.0-arm64.dmg` | Primary macOS drag-and-drop installer |
+            | **macOS (Apple Silicon ARM64 — Portable ZIP)** | `One.Launcher-0.1.0-arm64-mac.zip` | Portable `.app` archive & macOS auto-updater package |
+            | **Windows (x64 — NSIS Setup Installer)** | `One.Launcher.Setup.0.1.0.exe` | Primary Windows x64 setup wizard (includes embedded full-clean uninstaller) |
+            | **Windows (x64 — Standalone Full Uninstaller)** | `One.Launcher.Full.Uninstaller.exe` | Standalone utility to completely uninstall One Launcher, wipe caches/tokens, and remove GOG Galaxy 2.0 integration entries |
+            | **Checksums & Integrity** | `SHA256SUMS.txt` | SHA-256 cryptographic checksums for all installers and archives |
+            | **Auto-Update Metadata & Delta Blockmaps** | `latest.yml`, `latest-mac.yml`, `*.blockmap` | `electron-updater` release manifests and differential update blockmaps |
+
+            ---
+
+            ### ✨ Key Highlights in ${{ github.ref_name }}
+            - **Per-Storefront & Per-Game Dual-Build Architecture (macOS & Windows)**:
+              - Automatically detects when a game owned on a specific storefront (e.g. Steam or GOG) offers both a **macOS Native** build (Recommended) and a **Windows** build via compatibility layer (`CrossOver`, `Whisky`, `Apple Game Porting Toolkit`, `Wine`).
+              - Strictly isolates OS build availability per storefront so duplicate ownership across storefronts (e.g., Steam macOS+Windows vs Epic/GOG Windows-only) presents accurate options per store.
+            - **Bundled Native Storefront CLIs**:
+              - Ships with bundled `legendary` (Epic Games Store) and `gogdl` (GOG.com) binaries for both macOS (`arm64`) and Windows (`x64`) with isolated config directories.
+            - **CrossOver 26 Per-Game Rendering & Display Controls**:
+              - Per-game configuration for Graphics Backend (`Auto`, `D3DMetal`, `DXMT`, `DXVK`, `WineD3D`), High Resolution Retina Mode, DLSS (`MetalFX`), `MSync`/`ESync`, and `Metal`/`DXVK` HUDs.
+            - **Complete Uninstaller**:
+              - Both the embedded NSIS uninstaller and standalone `One.Launcher.Full.Uninstaller.exe` clean up background processes, Electron `%APPDATA%` / `%LOCALAPPDATA%` state, isolated CLI credentials, and GOG Galaxy 2.0 `galaxy-2.0.db` plugin registrations (`PRAGMA busy_timeout = 5000`).
           files: |
             release/One Launcher-0.1.0-arm64.dmg
+            release/One Launcher-0.1.0-arm64.dmg.blockmap
+            release/One Launcher-0.1.0-arm64-mac.zip
+            release/One Launcher-0.1.0-arm64-mac.zip.blockmap
             release/One Launcher Setup 0.1.0.exe
+            release/One Launcher Setup 0.1.0.exe.blockmap
             release/One Launcher Full Uninstaller.exe
+            release/latest-mac.yml
+            release/latest.yml
+            release/SHA256SUMS.txt
+            build/Uninstall-OneLauncher.ps1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
