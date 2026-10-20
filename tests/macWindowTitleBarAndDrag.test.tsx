@@ -294,9 +294,8 @@ describe('macOS Window Title Bar Traffic Light Safe Zone & Top Bar Dragging', ()
       const mainSource = fs.readFileSync(mainCjsPath, 'utf-8');
       const preloadSource = fs.readFileSync(preloadCjsPath, 'utf-8');
 
-      expect(mainSource).toContain(
-        "titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default'"
-      );
+      expect(mainSource).toContain("titleBarStyle: 'hiddenInset'");
+      expect(mainSource).toContain('frame: false');
       expect(mainSource).toContain('trafficLightPosition: { x: 16, y: 19 }');
       expect(mainSource).toContain("mainWindow.on('enter-full-screen'");
       expect(mainSource).toContain("mainWindow.on('leave-full-screen'");
