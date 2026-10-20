@@ -14,6 +14,7 @@ import {
   ArrowLeft,
   X,
   Sliders,
+  SlidersHorizontal,
   Award,
   AlertCircle,
   Activity,
@@ -24,7 +25,19 @@ import { steamMatcher } from '../../services/steam/steamMatcher';
 import steamEnrichedCache from '../../services/storage/steamEnrichedCache.json';
 import steamBlurbCache from '../../services/storage/steamBlurbCache.json';
 import { steamApi } from '../../services/steam/steamApi';
-import { ActiveGameFilter } from '../../contracts/filter';
+import {
+  ActiveGameFilter,
+  LibraryFilterState,
+  DEFAULT_LIBRARY_FILTER_STATE,
+  countActiveFilterCriteria,
+} from '../../contracts/filter';
+import {
+  LibraryFilterIndex,
+  buildLibraryFilterIndex,
+  evaluateLibraryFilter,
+  describeActiveFilterChips,
+} from '../../services/filter/libraryFilterIndex';
+import { LibraryFilterPanel } from './LibraryFilterPanel';
 import { parseTimestampMs } from '../../utils/dateUtils';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import {
@@ -689,6 +702,11 @@ interface LibraryGridViewProps {
   onViewAchievements?: (game: CanonicalGame) => void;
   sortBy?: GridSortOption;
   onSortChange?: (sort: GridSortOption) => void;
+  libraryFilterState?: LibraryFilterState;
+  onUpdateLibraryFilterState?: (next: LibraryFilterState) => void;
+  onResetLibraryFilterState?: () => void;
+  libraryFilterIndex?: LibraryFilterIndex;
+  unfilteredTotalCount?: number;
 }
 
 export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
@@ -711,6 +729,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   onViewAchievements,
   sortBy: sortByProp,
   onSortChange,
+  libraryFilterState,
+  onUpdateLibraryFilterState,
+  onResetLibraryFilterState,
+  libraryFilterIndex,
+  unfilteredTotalCount,
 }) => {
   const gridContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -808,6 +831,45 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       window.removeEventListener('antigravity:user-override-updated', handleOverrideUpdate);
     };
   }, []);
+
+  const [isFilterPanelOpen, setIsFilterPanelOpen] = useState(false);
+  const [internalFilterState, setInternalFilterState] = useState<LibraryFilterState>(
+    DEFAULT_LIBRARY_FILTER_STATE
+  );
+  const effectiveFilterState = libraryFilterState ?? internalFilterState;
+  const fallbackFilterIndex = useMemo(
+    () => (libraryFilterIndex ? null : buildLibraryFilterIndex(games)),
+    [libraryFilterIndex, games]
+  );
+  const effectiveFilterIndex = libraryFilterIndex ?? fallbackFilterIndex!;
+
+  const handleUpdateFilterState = useCallback(
+    (next: LibraryFilterState) => {
+      setInternalFilterState(next);
+      onUpdateLibraryFilterState?.(next);
+    },
+    [onUpdateLibraryFilterState]
+  );
+
+  const handleResetFilterState = useCallback(() => {
+    setInternalFilterState(DEFAULT_LIBRARY_FILTER_STATE);
+    onResetLibraryFilterState?.();
+    onClearActiveFilter?.();
+  }, [onResetLibraryFilterState, onClearActiveFilter]);
+
+  const activeCriteriaCount = useMemo(
+    () =>
+      countActiveFilterCriteria(effectiveFilterState, {
+        minYear: effectiveFilterIndex.minReleaseYear,
+        maxYear: effectiveFilterIndex.maxReleaseYear,
+      }),
+    [effectiveFilterState, effectiveFilterIndex]
+  );
+
+  const activeFilterChips = useMemo(
+    () => describeActiveFilterChips(effectiveFilterState, effectiveFilterIndex),
+    [effectiveFilterState, effectiveFilterIndex]
+  );
 
   const userOverridesMap = useMemo(() => loadUserOverrides(), [games, overrideVersion]);
 
@@ -1059,7 +1121,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     }
   };
 
-  // Sorting & deterministic deduplication
+  // Sorting & deterministic deduplication (+ multi-category filter evaluation)
   const sortedGames = useMemo(() => {
     const seenIds = new Set<string>();
     const uniqueGames: CanonicalGame[] = [];
@@ -1068,7 +1130,12 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       seenIds.add(g.id);
       uniqueGames.push(g);
     }
-    return uniqueGames.sort((a, b) => {
+    const filteredUniqueGames = evaluateLibraryFilter(
+      uniqueGames,
+      effectiveFilterIndex,
+      effectiveFilterState
+    );
+    return filteredUniqueGames.sort((a, b) => {
       if (sortBy === 'rating') {
         const targetSteamIdA = steamMatcher.getEffectiveSteamAppId(a);
         const targetSteamIdB = steamMatcher.getEffectiveSteamAppId(b);
@@ -1104,7 +1171,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       }
       return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
     });
-  }, [games, sortBy, overrideVersion]);
+  }, [games, sortBy, overrideVersion, effectiveFilterIndex, effectiveFilterState]);
 
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
     startHoverForCard(game, e.currentTarget);
@@ -1161,10 +1228,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                 <h1 className="text-xl font-bold text-white tracking-wide flex items-center gap-2">
                   {title || 'All Games'}
                   <span className="text-xs px-2 py-0.5 rounded-full bg-[#1b2838] border border-steam-border text-steam-accent font-semibold shrink-0">
-                    {games.length}
+                    {sortedGames.length}
                   </span>
                 </h1>
-                {activeFilter && (
+                {activeFilter && activeFilterChips.length === 0 && (
                   <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-steam-accent/20 border border-steam-accent/40 text-steam-accent text-xs shrink-0">
                     <Sliders className="w-3 h-3" />
                     <span>
@@ -1181,7 +1248,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                     )}
                   </div>
                 )}
-                {onClearGroupFilter && !activeFilter && (
+                {onClearGroupFilter && !activeFilter && activeCriteriaCount === 0 && (
                   <button
                     onClick={onClearGroupFilter}
                     className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[11px] font-semibold text-steam-accent hover:text-white bg-[#16202d] hover:bg-[#202f42] border border-steam-border rounded transition-colors group cursor-pointer shrink-0"
@@ -1198,8 +1265,29 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
             </div>
           </div>
 
-          {/* Sort Controls */}
-          <div className="flex items-center gap-2 text-xs shrink-0 self-end lg:self-center">
+          {/* Filter & Sort Controls */}
+          <div className="flex flex-wrap items-center gap-2.5 text-xs shrink-0 self-end lg:self-center">
+            <button
+              type="button"
+              data-testid="library-filter-toggle-btn"
+              onClick={() => setIsFilterPanelOpen((prev) => !prev)}
+              aria-expanded={isFilterPanelOpen}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-semibold transition-all cursor-pointer shrink-0 ${
+                isFilterPanelOpen || activeCriteriaCount > 0
+                  ? 'bg-steam-accent/20 border-steam-accent text-white shadow-sm'
+                  : 'bg-[#16202d] border-steam-border text-steam-text hover:text-white hover:border-steam-accent/60'
+              }`}
+              title="Open 6-category library filter panel"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 text-steam-accent" />
+              <span>Filter</span>
+              {activeCriteriaCount > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-steam-accent text-black text-[10px] font-bold">
+                  {activeCriteriaCount}
+                </span>
+              )}
+            </button>
+
             <span className="text-steam-subtext font-medium whitespace-nowrap">Sort by:</span>
             <div className="flex items-center rounded border border-steam-border bg-[#16202d] p-0.5 shrink-0">
               <button
@@ -1248,6 +1336,66 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
           </div>
         </div>
 
+        {/* Collapsible 6-Category Filter Panel */}
+        {isFilterPanelOpen && (
+          <LibraryFilterPanel
+            filterState={effectiveFilterState}
+            onChange={handleUpdateFilterState}
+            onReset={handleResetFilterState}
+            filterIndex={effectiveFilterIndex}
+            filteredCount={sortedGames.length}
+            totalCount={unfilteredTotalCount ?? games.length}
+            onClose={() => setIsFilterPanelOpen(false)}
+          />
+        )}
+
+        {/* Active Filter Chips Bar */}
+        {(activeFilterChips.length > 0 || activeFilter) && (
+          <div
+            data-testid="active-filter-chips-bar"
+            className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-md bg-[#141d29] border border-steam-border/70 text-xs"
+          >
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-steam-subtext mr-1">
+                Active Filters:
+              </span>
+              {activeFilterChips.map((chip) => (
+                <span
+                  key={chip.id}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-steam-accent/15 border border-steam-accent/40 text-white text-[11px]"
+                >
+                  <span className="text-steam-accent font-semibold">{chip.category}:</span>
+                  <span>{chip.label}</span>
+                  <button
+                    type="button"
+                    data-testid={`remove-filter-chip-${chip.id}`}
+                    onClick={() => handleUpdateFilterState(chip.remove(effectiveFilterState))}
+                    className="p-0.5 rounded-full hover:bg-white/10 text-steam-accent hover:text-white transition-colors cursor-pointer"
+                    title={`Remove ${chip.label} filter`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+              {activeFilterChips.length === 0 && activeFilter && (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-steam-accent/15 border border-steam-accent/40 text-white text-[11px]">
+                  <span className="text-steam-accent font-semibold">{activeFilter.label}:</span>
+                  <span>{activeFilter.value}</span>
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              data-testid="clear-all-filters-btn"
+              onClick={handleResetFilterState}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#1b2838] hover:bg-[#25364b] text-steam-accent hover:text-white border border-steam-border text-[11px] font-semibold transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-3 h-3" />
+              <span>Clear All</span>
+            </button>
+          </div>
+        )}
+
         {/* Search status notice if filtering */}
         {searchQuery && (
           <div className="text-xs text-steam-subtext flex items-center gap-2">
@@ -1255,12 +1403,12 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
             <span className="text-white font-semibold bg-white/10 px-2 py-0.5 rounded">
               "{searchQuery}"
             </span>
-            <span>({games.length} matching)</span>
+            <span>({sortedGames.length} matching)</span>
           </div>
         )}
 
         {/* Empty State */}
-        {games.length === 0 && (
+        {sortedGames.length === 0 && (
           <div className="py-20 text-center flex flex-col items-center justify-center gap-3 bg-[#16202d]/50 rounded-lg border border-steam-border/60 p-8">
             <Layers className="w-12 h-12 text-steam-subtext/60" />
             <h3 className="text-base font-bold text-white">
@@ -1271,9 +1419,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                 ? `You have not assigned any titles to the "${title}" collection yet. You can add games from the sidebar or any game detail page.`
                 : 'No titles match your current filter or search criteria. Try clearing search or switching platforms.'}
             </p>
-            {activeFilter && onClearActiveFilter ? (
+            {(activeFilter && onClearActiveFilter) || activeCriteriaCount > 0 ? (
               <button
-                onClick={onClearActiveFilter}
+                onClick={handleResetFilterState}
                 className="mt-2 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded bg-steam-accent text-black font-semibold text-xs hover:brightness-110 transition-all shadow"
               >
                 <X className="w-3.5 h-3.5" />

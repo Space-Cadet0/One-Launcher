@@ -322,4 +322,55 @@ table.steam-lang-table td span.check {
   }
 }
 
+/* ========================================================
+   TWO-POINT RELEASE YEAR DUAL-RANGE SLIDER UTILITIES
+   ======================================================== */
+.dual-range-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+}
+.dual-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #66c0f4;
+  border: 2px solid #0b0e14;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+.dual-range-input::-webkit-slider-thumb:hover {
+  background: #8ad2fc;
+  transform: scale(1.12);
+}
+.dual-range-input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid #66c0f4;
+  outline-offset: 2px;
+}
+.dual-range-input::-moz-range-thumb {
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #66c0f4;
+  border: 2px solid #0b0e14;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+.dual-range-input::-moz-range-thumb:hover {
+  background: #8ad2fc;
+  transform: scale(1.12);
+}
+.dual-range-input:focus-visible::-moz-range-thumb {
+  outline: 2px solid #66c0f4;
+  outline-offset: 2px;
+}
+
+
 

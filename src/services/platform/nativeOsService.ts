@@ -16,6 +16,41 @@ interface RawOsFlags {
 const steamCache = (steamEnrichedCacheData || {}) as Record<string, any>;
 const gogCache = (gogEnrichedCacheData || {}) as Record<string, any>;
 
+let steamPlatformsByTitleMap: Map<string, RawOsFlags> | null = null;
+let gogPlatformsByTitleMap: Map<string, RawOsFlags> | null = null;
+
+function getSteamPlatformsByTitle(normTitle: string): RawOsFlags | undefined {
+  if (!normTitle) return undefined;
+  if (!steamPlatformsByTitleMap) {
+    steamPlatformsByTitleMap = new Map<string, RawOsFlags>();
+    for (const entry of Object.values(steamCache)) {
+      if (!entry || !entry.platforms) continue;
+      const key = normalizeLookupTitle(entry.name || entry.title);
+      if (key && !steamPlatformsByTitleMap.has(key)) {
+        steamPlatformsByTitleMap.set(key, entry.platforms);
+      }
+    }
+  }
+  return steamPlatformsByTitleMap.get(normTitle);
+}
+
+function getGogPlatformsByTitle(normTitle: string): RawOsFlags | undefined {
+  if (!normTitle) return undefined;
+  if (!gogPlatformsByTitleMap) {
+    gogPlatformsByTitleMap = new Map<string, RawOsFlags>();
+    for (const entry of Object.values(gogCache)) {
+      if (!entry) continue;
+      const flags = entry.platforms || entry.worksOn;
+      if (!flags) continue;
+      const key = normalizeLookupTitle(entry.title || entry.name);
+      if (key && !gogPlatformsByTitleMap.has(key)) {
+        gogPlatformsByTitleMap.set(key, flags);
+      }
+    }
+  }
+  return gogPlatformsByTitleMap.get(normTitle);
+}
+
 function normalizeLookupTitle(title?: string): string {
   if (!title) return '';
   return title
@@ -107,22 +142,18 @@ export function getNativeOsPlatforms(game: CanonicalGame): NativeOsPlatform[] {
       candidates.push(staticSteamEntry.platforms);
     }
   } else if (normTitle && !game.isExplicitNonSteam) {
-    for (const entry of Object.values(steamCache)) {
-      if (entry && normalizeLookupTitle(entry.name || entry.title) === normTitle && entry.platforms) {
-        candidates.push(entry.platforms);
-        break;
-      }
+    const matchedSteamFlags = getSteamPlatformsByTitle(normTitle);
+    if (matchedSteamFlags) {
+      candidates.push(matchedSteamFlags);
     }
   }
 
   if (gogId && gogCache[gogId]) {
     candidates.push(gogCache[gogId]?.platforms || gogCache[gogId]?.worksOn);
   } else if (normTitle) {
-    for (const entry of Object.values(gogCache)) {
-      if (entry && normalizeLookupTitle(entry.title || entry.name) === normTitle) {
-        candidates.push(entry.platforms || entry.worksOn);
-        break;
-      }
+    const matchedGogFlags = getGogPlatformsByTitle(normTitle);
+    if (matchedGogFlags) {
+      candidates.push(matchedGogFlags);
     }
   }
 

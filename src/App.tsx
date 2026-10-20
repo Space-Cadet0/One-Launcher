@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
+import { useState, useMemo, useEffect, useRef, useCallback, useDeferredValue, lazy, Suspense } from 'react';
 import { CanonicalGame } from './contracts/game';
 import { StorefrontId } from './contracts/platform';
 import { mergeScannedSteamGames } from './services/storage/librarySync';
@@ -70,8 +70,17 @@ import {
   Layers,
   Sliders,
 } from 'lucide-react';
-import { ActiveGameFilter } from './contracts/filter';
+import {
+  ActiveGameFilter,
+  LibraryFilterState,
+  DEFAULT_LIBRARY_FILTER_STATE,
+  activeGameFilterToLibraryFilterState,
+} from './contracts/filter';
 import { matchesGameFilter } from './services/filter/gameFilterService';
+import {
+  buildLibraryFilterIndex,
+  evaluateLibraryFilter,
+} from './services/filter/libraryFilterIndex';
 import { useNavigationHistory } from './hooks/useNavigationHistory';
 import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
 import { useCollectionsManager } from './hooks/useCollectionsManager';
@@ -266,7 +275,13 @@ export function App() {
     });
   };
 
+  const [libraryFilterState, setLibraryFilterState] = useState<LibraryFilterState>(
+    DEFAULT_LIBRARY_FILTER_STATE
+  );
+  const deferredLibraryFilterState = useDeferredValue(libraryFilterState);
+
   const navigateApplyFilter = (filter: ActiveGameFilter) => {
+    setLibraryFilterState((prev) => activeGameFilterToLibraryFilterState(filter, prev, false));
     pushEntry({
       view: 'grid',
       selectedGameId: selectedGame?.id || null,
@@ -319,6 +334,7 @@ export function App() {
   };
 
   const navigateClearFilter = () => {
+    setLibraryFilterState(DEFAULT_LIBRARY_FILTER_STATE);
     pushEntry({
       view: 'grid',
       selectedGameId: selectedGame?.id || null,
@@ -1152,9 +1168,14 @@ export function App() {
     });
   };
 
-  // Filtered games list for the sidebar
+  const libraryFilterIndex = useMemo(
+    () => buildLibraryFilterIndex(games),
+    [games, gameRefreshKey]
+  );
+
+  // Filtered games list for the sidebar and grid
   const filteredGames = useMemo(() => {
-    return games.filter((game) => {
+    const baseFiltered = games.filter((game) => {
       // Platform filter
       if (selectedPlatform !== 'all') {
         const hasPlatform = game.platforms.some((p) => p.platformId === selectedPlatform);
@@ -1199,7 +1220,21 @@ export function App() {
 
       return true;
     });
-  }, [games, selectedPlatform, installedOnly, searchQuery, activeFilter]);
+
+    return evaluateLibraryFilter(
+      baseFiltered,
+      libraryFilterIndex,
+      deferredLibraryFilterState
+    );
+  }, [
+    games,
+    selectedPlatform,
+    installedOnly,
+    searchQuery,
+    activeFilter,
+    libraryFilterIndex,
+    deferredLibraryFilterState,
+  ]);
 
   // Active group data for grid view filtering
   const activeGroupData = useMemo(() => {
@@ -2288,6 +2323,14 @@ export function App() {
               onViewAchievements={handleOpenAchievements}
               sortBy={gridSortBy}
               onSortChange={setGridSortBy}
+              libraryFilterState={libraryFilterState}
+              onUpdateLibraryFilterState={setLibraryFilterState}
+              onResetLibraryFilterState={() => {
+                setLibraryFilterState(DEFAULT_LIBRARY_FILTER_STATE);
+                navigateClearFilter();
+              }}
+              libraryFilterIndex={libraryFilterIndex}
+              unfilteredTotalCount={games.length}
             />
           ) : (
             <SteamStorePage

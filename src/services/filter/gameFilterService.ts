@@ -39,7 +39,15 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
   }
 
   if (filter.type === 'opencritic' || filter.type === 'rating' || filter.type === 'critic') {
-    const oc = getOpenCriticData(game.steamAppId, game.title, game.reviewSummary?.positivePercent);
+    const oc = getOpenCriticData(
+      game.steamAppId,
+      game.title,
+      game.reviewSummary?.positivePercent,
+      game.releaseDate,
+      undefined,
+      false,
+      true
+    );
     if (!oc) return false;
     const tier = oc.tier.toLowerCase();
     return tier === target || target.includes(tier) || tier.includes(target);
@@ -279,6 +287,39 @@ export function matchesGameFilter(game: CanonicalGame, filter: ActiveGameFilter)
       }
     }
 
+    return false;
+  }
+
+  if (filter.type === 'franchise') {
+    const titleLower = (game.title || '').toLowerCase();
+    const origLower = (game.originalStoreTitle || '').toLowerCase();
+    return (
+      titleLower.includes(target) ||
+      origLower.includes(target) ||
+      game.developers.some((d) => d.toLowerCase().includes(target)) ||
+      game.publishers.some((p) => p.toLowerCase().includes(target)) ||
+      game.tags.some((t) => t.toLowerCase().includes(target))
+    );
+  }
+
+  if (filter.type === 'platform') {
+    return (game.platforms || []).some(
+      (p) => p.platformId.toLowerCase() === target || target.includes(p.platformId.toLowerCase())
+    );
+  }
+
+  if (filter.type === 'status') {
+    const isInstalled = (game.platforms || []).some((p) => p.installed);
+    if (target === 'installed') return isInstalled;
+    if (target === 'not_installed' || target === 'uninstalled' || target === 'not installed') {
+      return !isInstalled;
+    }
+    const totalPlaytime = (game.platforms || []).reduce(
+      (acc, p) => acc + (p.playtimeMinutes || 0),
+      0
+    );
+    if (target === 'unplayed') return totalPlaytime === 0;
+    if (target === 'played') return totalPlaytime > 0;
     return false;
   }
 
