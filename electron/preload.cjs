@@ -69,4 +69,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:maximized-changed', handler);
     return () => ipcRenderer.removeListener('window:maximized-changed', handler);
   },
+  trimMemory: () => ipcRenderer.invoke('perf:trim-memory'),
 });

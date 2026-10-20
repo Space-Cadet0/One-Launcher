@@ -419,13 +419,11 @@ describe('Phase 3: Six Bugs & Epic Video Regression Verification Suite', () => {
         expect(fullOverlayInitial).toBeDefined();
         expect(fullOverlayInitial.props.src).toBe('https://cdn.example.com/shot1_full.jpg');
 
-        // Verify background preloading of thumbnails and first 4 full-res screenshots
+        // Verify bounded background preloading of active + next 1 adjacent full-res screenshots ([0, 1])
         expect(preloadedSrcs).toContain('https://cdn.example.com/shot1_full.jpg');
         expect(preloadedSrcs).toContain('https://cdn.example.com/shot2_full.jpg');
-        expect(preloadedSrcs).toContain('https://cdn.example.com/shot3_full.jpg');
-        expect(preloadedSrcs).toContain('https://cdn.example.com/shot4_full.jpg');
 
-        // Click the 3rd screenshot thumbnail (index 2)
+        // Click the next screenshot thumbnail (index 1)
         const nextBtn = findElements(
           initialTree,
           (el) => el.type === 'button' && el.props?.['aria-label'] === 'Next thumbnail'
@@ -446,8 +444,8 @@ describe('Phase 3: Six Bugs & Epic Video Regression Verification Suite', () => {
         // Immediately renders shot2 thumbnail as 0ms base layer + shot2 full-res overlay
         expect(thumbBaseSecond.props.src).toBe('https://cdn.example.com/shot2_thumb.jpg');
         expect(fullOverlaySecond.props.src).toBe('https://cdn.example.com/shot2_full.jpg');
-        // And preloads adjacent shot5_full.jpg (activeIndex 1 + offset 3 = index 4)
-        expect(preloadedSrcs).toContain('https://cdn.example.com/shot5_full.jpg');
+        // And preloads adjacent shot3_full.jpg (activeIndex 1 + offset 1 = index 2)
+        expect(preloadedSrcs).toContain('https://cdn.example.com/shot3_full.jpg');
       } finally {
         (globalThis as any).Image = OriginalImage;
       }

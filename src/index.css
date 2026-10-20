@@ -299,3 +299,27 @@ table.steam-lang-table td span.check {
   app-region: no-drag;
 }
 
+/* ========================================================
+   CONTENT-VISIBILITY & RENDERING CONTAINMENT UTILITIES
+   ======================================================== */
+.cv-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px 300px;
+}
+.cv-sidebar-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 260px 32px;
+}
+.cv-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 100% 420px;
+}
+@supports not (content-visibility: auto) {
+  .cv-card,
+  .cv-sidebar-row,
+  .cv-section {
+    contain: layout style paint;
+  }
+}
+
+

@@ -145,6 +145,17 @@ if (!gotTheLock) {
     }
   });
 
+  try {
+    if (app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
+      app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512');
+      if (process.platform === 'win32') {
+        app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+      }
+    }
+  } catch {
+    // Ignore if commandLine is unavailable in mocked test environments
+  }
+
   app.whenReady().then(() => {
     if (process.platform === 'darwin' && app.dock && !app.isPackaged) {
       try {
@@ -381,10 +392,23 @@ async function processStoreAuth(storefrontId, code) {
   }
 }
 
+const STEAM_LOCAL_SCAN_TTL_MS = 15000;
+let cachedLocalSteamPlaytimes = null;
+let cachedLocalSteamPlaytimesAt = 0;
+let cachedLocalSteamAchievements = null;
+let cachedLocalSteamAchievementsAt = 0;
+
 /**
  * Read local Steam playtimes (Playtime + PlaytimeDisconnected) from localconfig.vdf
  */
-function readLocalSteamPlaytimes() {
+function readLocalSteamPlaytimes(options = {}) {
+  if (
+    !options?.force &&
+    cachedLocalSteamPlaytimes &&
+    Date.now() - cachedLocalSteamPlaytimesAt < STEAM_LOCAL_SCAN_TTL_MS
+  ) {
+    return { ...cachedLocalSteamPlaytimes };
+  }
   const playtimes = {};
   try {
     const home = os.homedir();
@@ -419,13 +443,22 @@ function readLocalSteamPlaytimes() {
       }
     }
   } catch {}
-  return playtimes;
+  cachedLocalSteamPlaytimes = playtimes;
+  cachedLocalSteamPlaytimesAt = Date.now();
+  return { ...playtimes };
 }
 
 /**
  * Synchronously scan local Steam client userdata librarycache for achievement counts
  */
-function scanLocalSteamAchievementsSync() {
+function scanLocalSteamAchievementsSync(options = {}) {
+  if (
+    !options?.force &&
+    cachedLocalSteamAchievements &&
+    Date.now() - cachedLocalSteamAchievementsAt < STEAM_LOCAL_SCAN_TTL_MS
+  ) {
+    return { ...cachedLocalSteamAchievements };
+  }
   const achievements = {};
   try {
     const home = os.homedir();
@@ -497,7 +530,9 @@ function scanLocalSteamAchievementsSync() {
       } catch {}
     }
   } catch {}
-  return achievements;
+  cachedLocalSteamAchievements = achievements;
+  cachedLocalSteamAchievementsAt = Date.now();
+  return { ...achievements };
 }
 
 /**
@@ -1098,6 +1133,10 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
                 contextIsolation: true,
                 partition: 'persist:storefront_auth',
                 userAgent: cleanBrowserUA,
+                images: false,
+                spellcheck: false,
+                backgroundThrottling: true,
+                v8CacheOptions: 'none',
               },
             });
 
@@ -1106,6 +1145,17 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
               if (done) return;
               done = true;
               if (timer) clearTimeout(timer);
+              try {
+                if (
+                  bgWin &&
+                  !bgWin.isDestroyed() &&
+                  bgWin.webContents &&
+                  bgWin.webContents.session &&
+                  typeof bgWin.webContents.session.clearCache === 'function'
+                ) {
+                  bgWin.webContents.session.clearCache().catch(() => {});
+                }
+              } catch {}
               try {
                 if (!bgWin.isDestroyed()) bgWin.destroy();
               } catch {}
@@ -1833,4 +1883,24 @@ ipcMain.handle('window:perform-menu-action', (_event, action) => {
     default:
       return false;
   }
+});
+
+ipcMain.handle('perf:trim-memory', async () => {
+  try {
+    if (
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      mainWindow.webContents &&
+      mainWindow.webContents.session &&
+      typeof mainWindow.webContents.session.clearCache === 'function'
+    ) {
+      await mainWindow.webContents.session.clearCache().catch(() => {});
+    }
+  } catch {}
+  if (typeof global.gc === 'function') {
+    try {
+      global.gc();
+    } catch {}
+  }
+  return { success: true };
 });

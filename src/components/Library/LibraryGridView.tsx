@@ -232,6 +232,14 @@ export function getCoverCandidates(
     candidates.push(trimmed);
   };
 
+  const addWith1xPriority = (url?: string | null, force: boolean = false) => {
+    if (!url) return;
+    if (!force && url.includes('/library_600x900_2x.jpg')) {
+      add(url.replace('/library_600x900_2x.jpg', '/library_600x900.jpg'), false);
+    }
+    add(url, force);
+  };
+
   // 1. Authoritative user manual override ALWAYS takes absolute priority #1
   const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
   if (effectiveOverride?.capsuleImage) {
@@ -239,6 +247,11 @@ export function getCoverCandidates(
   }
   if (effectiveOverride && game.capsuleImage) {
     add(game.capsuleImage, true);
+  }
+
+  const rawImagesCover = (game as any).images?.cover as string | undefined;
+  if (rawImagesCover && !isGogCroppedHorizontalCover(rawImagesCover, game.headerImage)) {
+    addWith1xPriority(rawImagesCover);
   }
 
   // 2. Official Steam 600x900 2:3 Library Portrait Cover (preferred whenever a game has a confirmed Steam match)
@@ -249,8 +262,10 @@ export function getCoverCandidates(
     : null;
 
   if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
-    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
+    add(`https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+    add(`https://cdn.akamai.steamstatic.com/steam/apps/${targetSteamId}/library_600x900.jpg`);
     add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
   }
 
   // 3. Official Steam / Epic / GOG tall vertical posters
@@ -273,7 +288,7 @@ export function getCoverCandidates(
           lower.includes('portrait'))) ||
       isGog
     ) {
-      add(game.capsuleImage);
+      addWith1xPriority(game.capsuleImage);
     }
   }
 
@@ -286,7 +301,7 @@ export function getCoverCandidates(
 
   // 5. Primary capsule image if valid and not a server-cropped horizontal GOG banner
   if (game.capsuleImage && !isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage)) {
-    add(game.capsuleImage);
+    addWith1xPriority(game.capsuleImage);
   }
 
   // 6. Enriched metadata or cached Steam API capsule fallback (e.g. hashed CDN paths)
@@ -294,16 +309,153 @@ export function getCoverCandidates(
     game.enrichedMetadata?.capsuleImage &&
     !isGogCroppedHorizontalCover(game.enrichedMetadata.capsuleImage, game.headerImage)
   ) {
-    add(game.enrichedMetadata.capsuleImage);
+    addWith1xPriority(game.enrichedMetadata.capsuleImage);
   }
   if (targetSteamId) {
     const cachedMeta = steamApi.getCachedMetadata(targetSteamId);
     if (cachedMeta?.capsuleImage) {
-      add(cachedMeta.capsuleImage);
+      addWith1xPriority(cachedMeta.capsuleImage);
     }
   }
 
   return candidates;
+}
+
+// ========================================================
+// SHARED O(1) COVER EVENT DISPATCH REGISTRY
+// ========================================================
+type CoverEventCallback = () => void;
+
+const subscribersByGameId = new Map<string, Set<CoverEventCallback>>();
+const subscribersByNormTitle = new Map<string, Set<CoverEventCallback>>();
+const subscribersByGogId = new Map<string, Set<CoverEventCallback>>();
+const allCoverSubscribers = new Set<CoverEventCallback>();
+let isGlobalCoverListenerAttached = false;
+
+function notifySubscriberSet(set?: Set<CoverEventCallback>): void {
+  if (!set || set.size === 0) return;
+  for (const cb of Array.from(set)) {
+    cb();
+  }
+}
+
+function handleGlobalSteamMatchUpdated(e: Event): void {
+  const detail = (e as CustomEvent)?.detail;
+  const gameId = detail?.gameId ? String(detail.gameId) : '';
+  const matchedTitle = detail?.title ? normalizeKey(String(detail.title)) : '';
+
+  if (!gameId && !matchedTitle) {
+    notifySubscriberSet(allCoverSubscribers);
+    return;
+  }
+  if (gameId) {
+    notifySubscriberSet(subscribersByGameId.get(gameId));
+  }
+  if (matchedTitle) {
+    notifySubscriberSet(subscribersByNormTitle.get(matchedTitle));
+  }
+}
+
+function handleGlobalGogCoverUpdated(e: Event): void {
+  const detail = (e as CustomEvent)?.detail;
+  const gameId = detail?.gameId ? String(detail.gameId) : '';
+  const gogId = detail?.gogId ? String(detail.gogId).replace(/^gog-/, '') : '';
+  const gogTitle = detail?.title ? normalizeKey(String(detail.title)) : '';
+
+  if (!gameId && !gogId && !gogTitle) {
+    notifySubscriberSet(allCoverSubscribers);
+    return;
+  }
+  if (gameId) {
+    notifySubscriberSet(subscribersByGameId.get(gameId));
+  }
+  if (gogId) {
+    notifySubscriberSet(subscribersByGogId.get(gogId));
+  }
+  if (gogTitle) {
+    notifySubscriberSet(subscribersByNormTitle.get(gogTitle));
+  }
+}
+
+function subscribeToCoverUpdates(
+  gameId: string,
+  title: string,
+  gogPlatformGameId: string | undefined,
+  cb: CoverEventCallback
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+
+  const normTitle = normalizeKey(title);
+  const cleanGogId = gogPlatformGameId ? String(gogPlatformGameId).replace(/^gog-/, '') : '';
+
+  allCoverSubscribers.add(cb);
+
+  if (gameId) {
+    let set = subscribersByGameId.get(gameId);
+    if (!set) {
+      set = new Set();
+      subscribersByGameId.set(gameId, set);
+    }
+    set.add(cb);
+  }
+
+  if (normTitle) {
+    let set = subscribersByNormTitle.get(normTitle);
+    if (!set) {
+      set = new Set();
+      subscribersByNormTitle.set(normTitle, set);
+    }
+    set.add(cb);
+  }
+
+  if (cleanGogId) {
+    let set = subscribersByGogId.get(cleanGogId);
+    if (!set) {
+      set = new Set();
+      subscribersByGogId.set(cleanGogId, set);
+    }
+    set.add(cb);
+  }
+
+  if (!isGlobalCoverListenerAttached && allCoverSubscribers.size > 0) {
+    window.addEventListener('antigravity:steam-match-updated', handleGlobalSteamMatchUpdated);
+    window.addEventListener('antigravity:gog-cover-updated', handleGlobalGogCoverUpdated);
+    isGlobalCoverListenerAttached = true;
+  }
+
+  return () => {
+    allCoverSubscribers.delete(cb);
+
+    if (gameId) {
+      const set = subscribersByGameId.get(gameId);
+      if (set) {
+        set.delete(cb);
+        if (set.size === 0) subscribersByGameId.delete(gameId);
+      }
+    }
+
+    if (normTitle) {
+      const set = subscribersByNormTitle.get(normTitle);
+      if (set) {
+        set.delete(cb);
+        if (set.size === 0) subscribersByNormTitle.delete(normTitle);
+      }
+    }
+
+    if (cleanGogId) {
+      const set = subscribersByGogId.get(cleanGogId);
+      if (set) {
+        set.delete(cb);
+        if (set.size === 0) subscribersByGogId.delete(cleanGogId);
+      }
+    }
+
+    if (isGlobalCoverListenerAttached && allCoverSubscribers.size === 0) {
+      window.removeEventListener('antigravity:steam-match-updated', handleGlobalSteamMatchUpdated);
+      window.removeEventListener('antigravity:gog-cover-updated', handleGlobalGogCoverUpdated);
+      isGlobalCoverListenerAttached = false;
+    }
+  };
 }
 
 interface GameCardCoverProps {
@@ -316,31 +468,13 @@ interface GameCardCoverProps {
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
   ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup }) => {
     const [steamMatchVersion, setSteamMatchVersion] = useState(0);
+    const gogPlatformGameId = game.platforms?.find((p) => p.platformId === 'gog')?.platformGameId;
 
     useEffect(() => {
-      const handleSteamMatch = (e: any) => {
-        const matchedTitle = e.detail?.title;
-        if (!matchedTitle || normalizeKey(matchedTitle) === normalizeKey(game.title)) {
-          setSteamMatchVersion((v) => v + 1);
-        }
-      };
-      const handleGogCover = (e: any) => {
-        const { gogId, title: gogTitle } = e.detail || {};
-        const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
-        if (
-          (gogId && gogPlat?.platformGameId && String(gogPlat.platformGameId) === String(gogId)) ||
-          (gogTitle && normalizeKey(gogTitle) === normalizeKey(game.title))
-        ) {
-          setSteamMatchVersion((v) => v + 1);
-        }
-      };
-      window.addEventListener('antigravity:steam-match-updated', handleSteamMatch);
-      window.addEventListener('antigravity:gog-cover-updated', handleGogCover);
-      return () => {
-        window.removeEventListener('antigravity:steam-match-updated', handleSteamMatch);
-        window.removeEventListener('antigravity:gog-cover-updated', handleGogCover);
-      };
-    }, [game.title, game.platforms]);
+      return subscribeToCoverUpdates(game.id, game.title, gogPlatformGameId, () => {
+        setSteamMatchVersion((v) => v + 1);
+      });
+    }, [game.id, game.title, gogPlatformGameId]);
 
     const candidates = useMemo(() => {
       return getCoverCandidates(game, overrideCoverUrl || undefined, userOverride);
@@ -438,6 +572,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
               src={game.headerImage}
               alt=""
               aria-hidden="true"
+              decoding="async"
               className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
               onError={() => setHeaderFallbackFailed(true)}
             />
@@ -445,6 +580,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
               src={game.headerImage}
               alt={game.title}
               loading="lazy"
+              decoding="async"
               className="relative z-10 w-full aspect-[460/215] object-cover shadow-lg border-y border-white/10"
               onError={() => setHeaderFallbackFailed(true)}
             />
@@ -479,6 +615,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           src={currentSrc}
           alt={game.title}
           loading="lazy"
+          decoding="async"
           onLoad={(e) => {
             const { naturalWidth, naturalHeight } = e.currentTarget;
             if (naturalWidth && naturalHeight && !isUserExplicitCover) {
@@ -493,8 +630,9 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           }}
           onError={() => {
             if (currentSrc) {
-              const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900\.jpg/i);
-              if (m) {
+              const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900(?:_2x)?\.jpg/i);
+              const nextCandidate = candidates[candidateIndex + 1] || '';
+              if (m && !nextCandidate.includes(`/apps/${m[1]}/library_600x900`)) {
                 igdbCoverService.recordDeadSteamCover(Number(m[1]));
               }
             }
@@ -1182,7 +1320,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   contentVisibility: 'auto',
                   containIntrinsicSize: '200px 300px',
                 }}
-                className="group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-all duration-200 cursor-pointer shadow-md hover:shadow-2xl hover:scale-[1.03] active:scale-[0.99]"
+                className="cv-card group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-all duration-200 cursor-pointer shadow-md hover:shadow-2xl hover:scale-[1.03] active:scale-[0.99]"
               >
                 {/* 2:3 Portrait Capsule Viewport */}
                 <div

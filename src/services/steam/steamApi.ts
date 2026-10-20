@@ -192,8 +192,34 @@ export function parseSteamSupportedLanguagesString(rawHtml?: string): SteamLangu
 }
 
 export class SteamApiService {
+  private static readonly MAX_METADATA_CACHE_SIZE = 250;
   private cache = new Map<number, SteamEnrichedMetadata>();
   private rateLimitedUntil = 0;
+
+  private get metadataCache(): Map<number, SteamEnrichedMetadata> {
+    return this.cache;
+  }
+
+  private setCacheEntry(appId: number, value: SteamEnrichedMetadata): void {
+    if (this.metadataCache.has(appId)) {
+      this.metadataCache.delete(appId);
+    } else if (this.metadataCache.size >= SteamApiService.MAX_METADATA_CACHE_SIZE) {
+      const oldestKey = this.metadataCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.metadataCache.delete(oldestKey);
+      }
+    }
+    this.metadataCache.set(appId, value);
+  }
+
+  public trimMemoryCache(maxEntries = 100): void {
+    const limit = Math.max(0, maxEntries);
+    while (this.metadataCache.size > limit) {
+      const oldestKey = this.metadataCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.metadataCache.delete(oldestKey);
+    }
+  }
 
   isStoreRateLimited(): boolean {
     return Date.now() < this.rateLimitedUntil || requestScheduler.isRateLimited('store.steampowered.com');
@@ -213,7 +239,7 @@ export class SteamApiService {
   }
 
   getCachedMetadata(appId: number): SteamEnrichedMetadata | null {
-    if (this.cache.has(appId)) return this.cache.get(appId)!;
+    if (this.metadataCache.has(appId)) return this.metadataCache.get(appId)!;
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
     if (preCached && preCached.shortDescription) {
       const languageOptions =
@@ -237,8 +263,10 @@ export class SteamApiService {
     appId: number,
     priority: number = RequestPriority.P1_VIEWPORT
   ): Promise<SteamEnrichedMetadata | null> {
-    if (this.cache.has(appId)) {
-      return this.cache.get(appId)!;
+    if (this.metadataCache.has(appId)) {
+      const cached = this.metadataCache.get(appId)!;
+      this.setCacheEntry(appId, cached);
+      return cached;
     }
 
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
@@ -277,7 +305,7 @@ export class SteamApiService {
           icon: getSteamCategoryIconUrl(c.id),
         })),
       };
-      this.cache.set(appId, enriched);
+      this.setCacheEntry(appId, enriched);
       return enriched;
     }
 
@@ -462,7 +490,7 @@ export class SteamApiService {
               : undefined,
           };
 
-          this.cache.set(appId, metadata);
+          this.setCacheEntry(appId, metadata);
 
           return metadata;
         },

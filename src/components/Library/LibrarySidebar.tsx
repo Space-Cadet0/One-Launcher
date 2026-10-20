@@ -204,7 +204,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       <div
         key={rowKey}
         onClick={() => onSelectGame(game)}
-        className={`relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-all group select-none ${
+        className={`cv-sidebar-row relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-all group select-none ${
           isSelected
             ? 'bg-[#223547] text-white border-l-4 border-steam-accent shadow-inner'
             : 'text-steam-text hover:bg-[#1a212b] hover:text-white border-l-4 border-transparent'

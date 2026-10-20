@@ -198,8 +198,73 @@ export function saveIntegrations(integrations: StorefrontIntegration[]): void {
   }
 }
 
-export function loadCurrentCatalog(): CanonicalGame[] {
-  const userOverrides = loadUserOverrides();
+export interface SaveCatalogOptions {
+  immediate?: boolean;
+  skipSanitize?: boolean;
+}
+
+let inMemoryCatalogCache: CanonicalGame[] | null = null;
+let inMemoryCatalogRawRef: string | null = null;
+let pendingCatalogSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingCatalogGames: CanonicalGame[] | null = null;
+let pendingCatalogNeedsSanitize = false;
+
+function isTestEnv(): boolean {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      Boolean((process as any).env?.VITEST || (process as any).env?.NODE_ENV === 'test')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function writeCatalogToLocalStorage(cleaned: CanonicalGame[]): void {
+  const serialized = JSON.stringify(cleaned);
+  localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+  inMemoryCatalogCache = cleaned;
+  inMemoryCatalogRawRef = serialized;
+
+  // Save only custom games delta to STORAGE_KEY_CUSTOM_GAMES, NOT the duplicate copy of all master games
+  const customGames = cleaned.filter(
+    (g) =>
+      g.platforms?.some((p) => p.platformId === 'custom') ||
+      !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
+  );
+  if (customGames.length > 0) {
+    localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(customGames));
+  } else {
+    localStorage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
+  }
+}
+
+export function flushPendingCatalogSave(): void {
+  if (pendingCatalogSaveTimer) {
+    clearTimeout(pendingCatalogSaveTimer);
+    pendingCatalogSaveTimer = null;
+  }
+  if (pendingCatalogGames !== null && typeof window !== 'undefined') {
+    try {
+      const toWrite = pendingCatalogNeedsSanitize
+        ? sanitizeGameCatalog(applyUserOverridesToCatalog(pendingCatalogGames, loadUserOverrides()))
+        : pendingCatalogGames;
+      pendingCatalogGames = null;
+      pendingCatalogNeedsSanitize = false;
+      writeCatalogToLocalStorage(toWrite);
+    } catch (err) {
+      console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
+    }
+  }
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('beforeunload', () => {
+    flushPendingCatalogSave();
+  });
+}
+
+function buildDefaultBaseCatalog(userOverrides: ReturnType<typeof loadUserOverrides>): CanonicalGame[] {
   let defaultBase: CanonicalGame[] = [];
   if (
     FULL_USER_STEAM_GAMES.length > 0 ||
@@ -215,19 +280,45 @@ export function loadCurrentCatalog(): CanonicalGame[] {
     );
     defaultBase = applyUserOverridesToCatalog(defaultBase, userOverrides);
   }
+  return defaultBase;
+}
 
-  if (typeof window === 'undefined') return defaultBase;
+export function loadCurrentCatalog(): CanonicalGame[] {
+  const userOverrides = loadUserOverrides();
+
+  if (typeof window === 'undefined') {
+    return buildDefaultBaseCatalog(userOverrides);
+  }
+
   try {
+    if (pendingCatalogGames !== null && inMemoryCatalogCache !== null) {
+      return applyUserOverridesToCatalog(inMemoryCatalogCache, userOverrides);
+    }
+
     const raw = localStorage.getItem(STORAGE_KEY_MAIN_CATALOG);
     if (raw) {
+      if (inMemoryCatalogCache !== null && inMemoryCatalogRawRef === raw) {
+        return applyUserOverridesToCatalog(inMemoryCatalogCache, userOverrides);
+      }
+
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
         let cleaned = sanitizeGameCatalog(parsed, { allowNewPurchases: true });
         cleaned = applyUserOverridesToCatalog(cleaned, userOverrides);
-        saveCurrentCatalog(cleaned);
+        inMemoryCatalogCache = cleaned;
+        if (cleaned.length !== parsed.length) {
+          writeCatalogToLocalStorage(cleaned);
+        } else {
+          inMemoryCatalogRawRef = raw;
+        }
         return cleaned;
       }
+    } else {
+      inMemoryCatalogCache = null;
+      inMemoryCatalogRawRef = null;
     }
+
+    const defaultBase = buildDefaultBaseCatalog(userOverrides);
     // Merge any custom games if stored in custom games delta
     const customRaw = localStorage.getItem(STORAGE_KEY_CUSTOM_GAMES);
     if (customRaw) {
@@ -249,42 +340,64 @@ export function loadCurrentCatalog(): CanonicalGame[] {
         console.warn('Failed to parse custom games cache:', err);
       }
     }
+    return applyUserOverridesToCatalog(defaultBase, userOverrides);
   } catch (err) {
     console.warn('Failed to load cached universal catalog:', err);
   }
-  return applyUserOverridesToCatalog(defaultBase, userOverrides);
+  return buildDefaultBaseCatalog(userOverrides);
 }
 
-let lastSavedCatalogRef: CanonicalGame[] | null = null;
-let lastSavedCatalogLength = -1;
-
-export function saveCurrentCatalog(games: CanonicalGame[]): void {
+export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalogOptions): void {
   if (typeof window === 'undefined') return;
-  if (games === lastSavedCatalogRef && games.length === lastSavedCatalogLength) {
-    return;
-  }
   try {
     const userOverrides = loadUserOverrides();
     const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
-    const cleaned = sanitizeGameCatalog(withOverrides);
-    localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, JSON.stringify(cleaned));
-    lastSavedCatalogRef = games;
-    lastSavedCatalogLength = games.length;
+    const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
+    inMemoryCatalogCache = cleaned;
 
-    // Save only custom games delta to STORAGE_KEY_CUSTOM_GAMES, NOT the duplicate copy of all 811 master games
-    const customGames = cleaned.filter(
-      (g) =>
-        g.platforms?.some((p) => p.platformId === 'custom') ||
-        !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
-    );
-    if (customGames.length > 0) {
-      localStorage.setItem(STORAGE_KEY_CUSTOM_GAMES, JSON.stringify(customGames));
+    if (options?.immediate || isTestEnv()) {
+      if (pendingCatalogSaveTimer) {
+        clearTimeout(pendingCatalogSaveTimer);
+        pendingCatalogSaveTimer = null;
+      }
+      pendingCatalogGames = null;
+      pendingCatalogNeedsSanitize = false;
+      writeCatalogToLocalStorage(cleaned);
     } else {
-      localStorage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
+      pendingCatalogGames = cleaned;
+      pendingCatalogNeedsSanitize = Boolean(options?.skipSanitize);
+      if (!pendingCatalogSaveTimer) {
+        pendingCatalogSaveTimer = setTimeout(() => {
+          try {
+            flushPendingCatalogSave();
+          } catch (e) {
+            console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
+          }
+        }, 1200);
+      }
     }
   } catch (err) {
     console.error('Failed to save universal catalog', err);
   }
+}
+
+export function clearIntegrationStorage(): void {
+  if (pendingCatalogSaveTimer) {
+    clearTimeout(pendingCatalogSaveTimer);
+    pendingCatalogSaveTimer = null;
+  }
+  pendingCatalogGames = null;
+  pendingCatalogNeedsSanitize = false;
+  inMemoryCatalogCache = null;
+  inMemoryCatalogRawRef = null;
+  const storage = getSafeStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(STORAGE_KEY_INTEGRATIONS);
+    storage.removeItem(STORAGE_KEY_CUSTOM_GAMES);
+    storage.removeItem(STORAGE_KEY_MAIN_CATALOG);
+    storage.removeItem(STORAGE_KEY_VERIFIED_ENTITLEMENTS);
+  } catch {}
 }
 
 export function mergeStorefrontGames(

@@ -199,9 +199,9 @@ describe('User Game Override & Storage Layer', () => {
       capsuleImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/548090/library_600x900_2x.jpg',
     };
 
-    // Default candidates without override prefer Steam 600x900
+    // Default candidates without override prefer Steam 600x900 (1x prioritized before 2x)
     const defaultCandidates = getCoverCandidates(game);
-    expect(defaultCandidates[0]).toContain('548090/library_600x900_2x.jpg');
+    expect(defaultCandidates[0]).toContain('548090/library_600x900.jpg');
 
     // User applies an override with classic GOG vertical art
     const gogCoverArt = 'https://images.gog-statics.com/bfa3ef0eb558b33325550eb4e56b6cf3a6f99a1c935b5cf10187128a691810ae.jpg';

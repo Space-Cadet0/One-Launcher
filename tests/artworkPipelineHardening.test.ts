@@ -248,15 +248,21 @@ describe('Phase 3A: Artwork & Media Pipeline Hardening', () => {
       );
 
       expect(candidates[0]).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg'
+        'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900.jpg'
       );
       expect(candidates[1]).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900.jpg'
+        'https://cdn.akamai.steamstatic.com/steam/apps/870780/library_600x900.jpg'
       );
       expect(candidates[2]).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900.jpg'
+      );
+      expect(candidates[3]).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/870780/library_600x900_2x.jpg'
+      );
+      expect(candidates[4]).toBe(
         'https://images.gog-statics.com/77873a93caeab4889e3f032f58687f25f9c6277d0e71182127812f21ac62e005.jpg'
       );
-      expect(candidates[3]).toBe('https://images.igdb.com/igdb/image/upload/t_cover_big/co_control.jpg');
+      expect(candidates[5]).toBe('https://images.igdb.com/igdb/image/upload/t_cover_big/co_control.jpg');
     });
 
     it('rejects GOG server-cropped horizontal covers (_glx_vertical_cover or shared horizontal hash)', () => {

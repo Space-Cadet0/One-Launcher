@@ -13,6 +13,19 @@ import {
   updateRoutedMetadataSnapshot,
 } from '../storage/userOverrideStorage';
 import { loadStagedCache } from '../storage/stagedCacheService';
+import { flushPendingCatalogSave } from '../integrations/integrationStorage';
+
+async function yieldToMainThread(): Promise<void> {
+  if (
+    typeof globalThis !== 'undefined' &&
+    'scheduler' in globalThis &&
+    typeof (globalThis as any).scheduler?.yield === 'function'
+  ) {
+    await (globalThis as any).scheduler.yield();
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
 
 export type SyncCategory =
   | 'storefront_libraries'
@@ -693,134 +706,145 @@ export class SyncJobManager {
     const chunkSize = isBackground ? 2 : 3;
     let completedCount = 0;
 
-    for (let i = 0; i < targetGames.length; i += chunkSize) {
-      if (this.isCancelled || this.criticLoopToken !== myToken || this.state?.status === 'cancelled') {
-        break;
-      }
-
-      await this.waitWhilePausedOrPreempted();
-      if (this.isCancelled || this.criticLoopToken !== myToken) break;
-
-      const chunk = targetGames.slice(i, i + chunkSize);
-      const activeTitles = new Set<string>();
-      const firstTitle = chunk[0]?.title;
-
-      const stat = this.categoryStats.get('critic_scores');
-      if (stat) {
-        stat.completed = completedCount;
-        if (firstTitle) stat.lastItemName = firstTitle;
-      }
-
-      if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
-        const activeCats = this.getActiveCategories();
-        if (activeCats.length > 1) {
-          this.recomputeAggregateStateFromCategories('critic_scores', firstTitle);
-        } else {
-          this.updateState({
-            current: completedCount,
-            total: targetGames.length,
-            currentItemName: firstTitle,
-          });
+    try {
+      for (let i = 0; i < targetGames.length; i += chunkSize) {
+        if (this.isCancelled || this.criticLoopToken !== myToken || this.state?.status === 'cancelled') {
+          break;
         }
-      }
 
-      await Promise.all(
-        chunk.map(async (game) => {
-          if (this.isCancelled || this.criticLoopToken !== myToken) return;
-          await this.waitWhilePausedOrPreempted();
-          if (this.isCancelled || this.criticLoopToken !== myToken) return;
-          if (game.title) {
-            activeTitles.add(game.title);
+        await this.waitWhilePausedOrPreempted();
+        if (this.isCancelled || this.criticLoopToken !== myToken) break;
+
+        const chunk = targetGames.slice(i, i + chunkSize);
+        const activeTitles = new Set<string>();
+        const firstTitle = chunk[0]?.title;
+
+        const stat = this.categoryStats.get('critic_scores');
+        if (stat) {
+          stat.completed = completedCount;
+          if (firstTitle) stat.lastItemName = firstTitle;
+        }
+
+        if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
+          const activeCats = this.getActiveCategories();
+          if (activeCats.length > 1) {
+            this.recomputeAggregateStateFromCategories('critic_scores', firstTitle);
+          } else {
+            this.updateState({
+              current: completedCount,
+              total: targetGames.length,
+              currentItemName: firstTitle,
+            });
           }
-          try {
-            let targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
-            if (!targetSteamId && !game.isExplicitNonSteam) {
-              try {
-                const matchedId = await steamMatcher.matchGameToSteam(game.title, {
-                  releaseYear: game.releaseDate,
-                  developers: game.developers,
-                });
-                if (matchedId) targetSteamId = matchedId;
-              } catch {}
+        }
+
+        await Promise.all(
+          chunk.map(async (game) => {
+            if (this.isCancelled || this.criticLoopToken !== myToken) return;
+            await this.waitWhilePausedOrPreempted();
+            if (this.isCancelled || this.criticLoopToken !== myToken) return;
+            if (game.title) {
+              activeTitles.add(game.title);
             }
-            await criticScoreService.resolveDynamicScore(
-              game.title,
-              targetSteamId,
-              game.releaseDate,
-              undefined,
-              {
-                bypassAttempted: Boolean(options?.forceRefresh),
-                platforms: game.platforms,
-                gameId: game.id,
-                genres: game.genres,
-              }
-            );
-          } catch {} finally {
-            activeTitles.delete(game.title);
-            if (!this.isCancelled && this.criticLoopToken === myToken) {
-              completedCount = Math.min(targetGames.length, completedCount + 1);
-              const nextActiveTitle = activeTitles.values().next().value as string | undefined;
-              const nextItemName = nextActiveTitle ?? (stat?.lastItemName || this.state?.currentItemName);
-              if (stat) {
-                stat.completed = completedCount;
-                if (nextItemName) stat.lastItemName = nextItemName;
-              }
-              if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
-                const activeCats = this.getActiveCategories();
-                if (activeCats.length > 1) {
-                  this.recomputeAggregateStateFromCategories('critic_scores', nextItemName);
-                } else {
-                  this.updateState({
-                    current: completedCount,
-                    total: targetGames.length,
-                    currentItemName: nextItemName,
+            try {
+              let targetSteamId = steamMatcher.getEffectiveSteamAppId(game);
+              if (!targetSteamId && !game.isExplicitNonSteam) {
+                try {
+                  const matchedId = await steamMatcher.matchGameToSteam(game.title, {
+                    releaseYear: game.releaseDate,
+                    developers: game.developers,
                   });
+                  if (matchedId) targetSteamId = matchedId;
+                } catch {}
+              }
+              await criticScoreService.resolveDynamicScore(
+                game.title,
+                targetSteamId,
+                game.releaseDate,
+                undefined,
+                {
+                  bypassAttempted: Boolean(options?.forceRefresh),
+                  platforms: game.platforms,
+                  gameId: game.id,
+                  genres: game.genres,
+                }
+              );
+            } catch {} finally {
+              activeTitles.delete(game.title);
+              if (!this.isCancelled && this.criticLoopToken === myToken) {
+                completedCount = Math.min(targetGames.length, completedCount + 1);
+                const nextActiveTitle = activeTitles.values().next().value as string | undefined;
+                const nextItemName = nextActiveTitle ?? (stat?.lastItemName || this.state?.currentItemName);
+                if (stat) {
+                  stat.completed = completedCount;
+                  if (nextItemName) stat.lastItemName = nextItemName;
+                }
+                if (this.state && (this.state.id === jobId || this.state.id.startsWith('auto-'))) {
+                  const activeCats = this.getActiveCategories();
+                  if (activeCats.length > 1) {
+                    this.recomputeAggregateStateFromCategories('critic_scores', nextItemName);
+                  } else {
+                    this.updateState({
+                      current: completedCount,
+                      total: targetGames.length,
+                      currentItemName: nextItemName,
+                    });
+                  }
                 }
               }
             }
-          }
-        })
-      );
+          })
+        );
 
-      if (
-        isBackground &&
-        completedCount < targetGames.length &&
-        !this.isCancelled &&
-        this.criticLoopToken === myToken &&
-        !(typeof process !== 'undefined' && process.env.VITEST)
-      ) {
-        await new Promise((r) => setTimeout(r, 300));
+        await yieldToMainThread();
+
+        if (
+          isBackground &&
+          completedCount < targetGames.length &&
+          !this.isCancelled &&
+          this.criticLoopToken === myToken &&
+          !(typeof process !== 'undefined' && process.env.VITEST)
+        ) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
       }
-    }
 
-    if (this.criticLoopToken !== myToken) return;
+      if (this.criticLoopToken !== myToken) return;
 
-    const stat = this.categoryStats.get('critic_scores');
-    if (stat) {
-      stat.inFlight = 0;
-      stat.completed = stat.total;
-    }
+      const stat = this.categoryStats.get('critic_scores');
+      if (stat) {
+        stat.inFlight = 0;
+        stat.completed = stat.total;
+      }
 
-    if (this.isCancelled || this.state?.status === 'cancelled') {
-      this.categoryStats.delete('critic_scores');
-      this.updateState({
-        status: 'cancelled',
-        currentItemName: undefined,
-      });
-    } else {
-      const remainingCats = this.getActiveCategories().filter((c) => c !== 'critic_scores');
-      if (remainingCats.length > 0) {
-        this.categoryStats.delete('critic_scores');
-        this.recomputeAggregateStateFromCategories(remainingCats[0]);
-      } else {
+      if (this.isCancelled || this.state?.status === 'cancelled') {
         this.categoryStats.delete('critic_scores');
         this.updateState({
-          status: 'completed',
-          current: targetGames.length,
-          total: targetGames.length,
+          status: 'cancelled',
           currentItemName: undefined,
         });
+      } else {
+        const remainingCats = this.getActiveCategories().filter((c) => c !== 'critic_scores');
+        if (remainingCats.length > 0) {
+          this.categoryStats.delete('critic_scores');
+          this.recomputeAggregateStateFromCategories(remainingCats[0]);
+        } else {
+          this.categoryStats.delete('critic_scores');
+          this.updateState({
+            status: 'completed',
+            current: targetGames.length,
+            total: targetGames.length,
+            currentItemName: undefined,
+          });
+        }
       }
+    } finally {
+      try {
+        flushPendingCatalogSave();
+        if (typeof window !== 'undefined') {
+          (window as any).electronAPI?.trimMemory?.()?.catch?.(() => {});
+        }
+      } catch {}
     }
   }
 
@@ -888,146 +912,158 @@ export class SyncJobManager {
     this.syncHeadlineAndPriorityFields();
     this.notify();
 
-    for (let i = 0; i < eligibleGames.length; i++) {
-      if (this.isCancelled || this.state.status === 'cancelled') {
-        break;
-      }
-
-      const game = eligibleGames[i];
-      this.updateState({
-        current: i,
-        currentItemName: game.title,
-      });
-
-      // 1. Pause & Priority Preemption handling
-      await this.waitWhilePausedOrPreempted();
-      if (this.isCancelled) break;
-
-      // 2. Akamai rate limit edge cooldown handling
-      if (requestScheduler.isRateLimited('store.steampowered.com')) {
-        this.updateState({
-          status: 'rate_limited',
-          cooldownSecondsRemaining: requestScheduler.getCooldownRemaining('store.steampowered.com'),
-        });
-
-        while (requestScheduler.isRateLimited('store.steampowered.com') && !this.isCancelled) {
-          await new Promise((r) => setTimeout(r, 1000));
-          if (this.state && this.state.status === 'rate_limited') {
-            this.updateState({
-              cooldownSecondsRemaining: requestScheduler.getCooldownRemaining('store.steampowered.com'),
-            });
-          }
+    try {
+      for (let i = 0; i < eligibleGames.length; i++) {
+        if (this.isCancelled || this.state.status === 'cancelled') {
+          break;
         }
 
+        const game = eligibleGames[i];
+        this.updateState({
+          current: i,
+          currentItemName: game.title,
+        });
+
+        // 1. Pause & Priority Preemption handling
+        await this.waitWhilePausedOrPreempted();
         if (this.isCancelled) break;
 
-        this.updateState({
-          status: 'running',
-          cooldownSecondsRemaining: undefined,
-        });
-      }
+        // 2. Akamai rate limit edge cooldown handling
+        if (requestScheduler.isRateLimited('store.steampowered.com')) {
+          this.updateState({
+            status: 'rate_limited',
+            cooldownSecondsRemaining: requestScheduler.getCooldownRemaining('store.steampowered.com'),
+          });
 
-      // 3. Perform fetch (respecting Step 4 MetadataSourceRoute)
-      const ov = getUserOverrideForGame(game);
-      const route = inferMetadataRouteFromOverride(ov);
-      const isNonSteamRouted =
-        route?.mode === 'routed' && (route.source === 'gog' || route.source === 'epic');
-      const targetAppId =
-        route?.source === 'steam' && route.steamAppId
-          ? route.steamAppId
-          : steamMatcher.getEffectiveSteamAppId(game);
-      const hasNonSteamPlatform = Boolean(
-        game.platforms?.some((p) => p.platformId === 'gog' || p.platformId === 'epic')
-      );
-
-      if (isNonSteamRouted || targetAppId || hasNonSteamPlatform) {
-        try {
-          const refreshed =
-            isNonSteamRouted || !targetAppId
-              ? await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, ov)
-              : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND);
-
-          if (refreshed) {
-            if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
-              updateRoutedMetadataSnapshot(game.id, {
-                title: refreshed.name,
-                shortDescription: refreshed.shortDescription,
-                detailedDescription: refreshed.detailedDescription || refreshed.aboutTheGame,
-                headerImage: refreshed.headerImage,
-                developers: refreshed.developers,
-                publishers: refreshed.publishers,
-                genres: refreshed.genres,
-                tags: refreshed.tags,
-                releaseDate: refreshed.releaseDate,
+          while (requestScheduler.isRateLimited('store.steampowered.com') && !this.isCancelled) {
+            await new Promise((r) => setTimeout(r, 1000));
+            if (this.state && this.state.status === 'rate_limited') {
+              this.updateState({
+                cooldownSecondsRemaining: requestScheduler.getCooldownRemaining('store.steampowered.com'),
               });
             }
-
-            const preservePinnedSynopsis = Boolean(ov && (route?.customSynopsisEdited || route?.mode === 'custom'));
-            const preservePinnedCover = Boolean(ov?.capsuleImage);
-            const validRefreshedShort =
-              refreshed.shortDescription &&
-              !isGenericPlaceholderSynopsis(refreshed.shortDescription, game.title)
-                ? refreshed.shortDescription
-                : undefined;
-            const validRefreshedDevs =
-              refreshed.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
-            const validRefreshedPubs =
-              refreshed.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
-
-            const updatedGame: CanonicalGame = {
-              ...game,
-              steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
-              enrichedMetadata: refreshed || game.enrichedMetadata,
-              headerImage: refreshed.headerImage || game.headerImage,
-              capsuleImage: preservePinnedCover
-                ? ov!.capsuleImage!
-                : refreshed.capsuleImage || game.capsuleImage,
-              shortDescription: preservePinnedSynopsis
-                ? ov!.shortDescription || game.shortDescription
-                : validRefreshedShort || game.shortDescription,
-              detailedDescription:
-                refreshed.detailedDescription ||
-                refreshed.aboutTheGame ||
-                game.detailedDescription,
-              developers: validRefreshedDevs.length ? validRefreshedDevs : game.developers,
-              publishers: validRefreshedPubs.length ? validRefreshedPubs : game.publishers,
-              genres: refreshed.genres?.length ? refreshed.genres : game.genres,
-              tags: refreshed.tags?.length ? refreshed.tags : game.tags,
-              releaseDate:
-                refreshed.releaseDate && refreshed.releaseDate !== 'TBA'
-                  ? refreshed.releaseDate
-                  : game.releaseDate,
-              reviewSummary: refreshed.reviewSummary || game.reviewSummary,
-            };
-
-            onGameUpdated(updatedGame);
           }
-        } catch (err: any) {
-          if (err?.isRateLimited || err?.status === 429 || err?.response?.status === 429) {
-            // Trigger rate limited state and retry this game
-            i--;
-            continue;
-          }
-          console.warn(`[SyncJobManager] Media sync error for ${game.title}:`, err?.message || err);
+
+          if (this.isCancelled) break;
+
+          this.updateState({
+            status: 'running',
+            cooldownSecondsRemaining: undefined,
+          });
         }
+
+        // 3. Perform fetch (respecting Step 4 MetadataSourceRoute)
+        const ov = getUserOverrideForGame(game);
+        const route = inferMetadataRouteFromOverride(ov);
+        const isNonSteamRouted =
+          route?.mode === 'routed' && (route.source === 'gog' || route.source === 'epic');
+        const targetAppId =
+          route?.source === 'steam' && route.steamAppId
+            ? route.steamAppId
+            : steamMatcher.getEffectiveSteamAppId(game);
+        const hasNonSteamPlatform = Boolean(
+          game.platforms?.some((p) => p.platformId === 'gog' || p.platformId === 'epic')
+        );
+
+        if (isNonSteamRouted || targetAppId || hasNonSteamPlatform) {
+          try {
+            const refreshed =
+              isNonSteamRouted || !targetAppId
+                ? await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(game, ov)
+                : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND);
+
+            if (refreshed) {
+              if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
+                updateRoutedMetadataSnapshot(game.id, {
+                  title: refreshed.name,
+                  shortDescription: refreshed.shortDescription,
+                  detailedDescription: refreshed.detailedDescription || refreshed.aboutTheGame,
+                  headerImage: refreshed.headerImage,
+                  developers: refreshed.developers,
+                  publishers: refreshed.publishers,
+                  genres: refreshed.genres,
+                  tags: refreshed.tags,
+                  releaseDate: refreshed.releaseDate,
+                });
+              }
+
+              const preservePinnedSynopsis = Boolean(ov && (route?.customSynopsisEdited || route?.mode === 'custom'));
+              const preservePinnedCover = Boolean(ov?.capsuleImage);
+              const validRefreshedShort =
+                refreshed.shortDescription &&
+                !isGenericPlaceholderSynopsis(refreshed.shortDescription, game.title)
+                  ? refreshed.shortDescription
+                  : undefined;
+              const validRefreshedDevs =
+                refreshed.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
+              const validRefreshedPubs =
+                refreshed.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
+
+              const updatedGame: CanonicalGame = {
+                ...game,
+                steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
+                enrichedMetadata: refreshed || game.enrichedMetadata,
+                headerImage: refreshed.headerImage || game.headerImage,
+                capsuleImage: preservePinnedCover
+                  ? ov!.capsuleImage!
+                  : refreshed.capsuleImage || game.capsuleImage,
+                shortDescription: preservePinnedSynopsis
+                  ? ov!.shortDescription || game.shortDescription
+                  : validRefreshedShort || game.shortDescription,
+                detailedDescription:
+                  refreshed.detailedDescription ||
+                  refreshed.aboutTheGame ||
+                  game.detailedDescription,
+                developers: validRefreshedDevs.length ? validRefreshedDevs : game.developers,
+                publishers: validRefreshedPubs.length ? validRefreshedPubs : game.publishers,
+                genres: refreshed.genres?.length ? refreshed.genres : game.genres,
+                tags: refreshed.tags?.length ? refreshed.tags : game.tags,
+                releaseDate:
+                  refreshed.releaseDate && refreshed.releaseDate !== 'TBA'
+                    ? refreshed.releaseDate
+                    : game.releaseDate,
+                reviewSummary: refreshed.reviewSummary || game.reviewSummary,
+              };
+
+              onGameUpdated(updatedGame);
+            }
+          } catch (err: any) {
+            if (err?.isRateLimited || err?.status === 429 || err?.response?.status === 429) {
+              // Trigger rate limited state and retry this game
+              i--;
+              await yieldToMainThread();
+              continue;
+            }
+            console.warn(`[SyncJobManager] Media sync error for ${game.title}:`, err?.message || err);
+          }
+        }
+
+        this.updateState({
+          current: i + 1,
+        });
+        await yieldToMainThread();
       }
 
-      this.updateState({
-        current: i + 1,
-      });
-    }
-
-    if (this.isCancelled || this.state?.status === 'cancelled') {
-      this.updateState({
-        status: 'cancelled',
-        currentItemName: undefined,
-      });
-    } else {
-      this.updateState({
-        status: 'completed',
-        current: eligibleGames.length,
-        currentItemName: undefined,
-      });
+      if (this.isCancelled || this.state?.status === 'cancelled') {
+        this.updateState({
+          status: 'cancelled',
+          currentItemName: undefined,
+        });
+      } else {
+        this.updateState({
+          status: 'completed',
+          current: eligibleGames.length,
+          currentItemName: undefined,
+        });
+      }
+    } finally {
+      try {
+        flushPendingCatalogSave();
+        steamApi.trimMemoryCache(120);
+        if (typeof window !== 'undefined') {
+          (window as any).electronAPI?.trimMemory?.()?.catch?.(() => {});
+        }
+      } catch {}
     }
   }
 

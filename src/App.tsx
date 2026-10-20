@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { useState, useMemo, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
 import { CanonicalGame } from './contracts/game';
 import { StorefrontId } from './contracts/platform';
 import { mergeScannedSteamGames } from './services/storage/librarySync';
@@ -23,11 +23,6 @@ import {
   GridSortOption,
   loadPersistedGridSort,
 } from './components/Library/LibraryGridView';
-import { ManageCollectionsModal } from './components/Library/ManageCollectionsModal';
-import { IntegrationsModal } from './components/Navigation/IntegrationsModal';
-import { FixMatchWizardModal } from './components/Library/FixMatchWizardModal';
-import { LibraryMatchManagerModal } from './components/Library/LibraryMatchManagerModal';
-import { GameAchievementsModal } from './components/Achievements/GameAchievementsModal';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
 import { CollectionIcon } from './components/Common/CollectionIcon';
 import { matchesNativeOsQuery } from './services/platform/nativeOsService';
@@ -81,8 +76,38 @@ import { useNavigationHistory } from './hooks/useNavigationHistory';
 import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
 import { useCollectionsManager } from './hooks/useCollectionsManager';
 import { launcherService } from './services/launcher/launcherService';
-import { DownloadManagerDrawer } from './components/Launcher/DownloadManagerDrawer';
 import { InstalledGameRecord } from './contracts/launcher';
+
+const ManageCollectionsModal = lazy(() =>
+  import('./components/Library/ManageCollectionsModal').then((m) => ({
+    default: m.ManageCollectionsModal,
+  }))
+);
+const IntegrationsModal = lazy(() =>
+  import('./components/Navigation/IntegrationsModal').then((m) => ({
+    default: m.IntegrationsModal,
+  }))
+);
+const FixMatchWizardModal = lazy(() =>
+  import('./components/Library/FixMatchWizardModal').then((m) => ({
+    default: m.FixMatchWizardModal,
+  }))
+);
+const LibraryMatchManagerModal = lazy(() =>
+  import('./components/Library/LibraryMatchManagerModal').then((m) => ({
+    default: m.LibraryMatchManagerModal,
+  }))
+);
+const GameAchievementsModal = lazy(() =>
+  import('./components/Achievements/GameAchievementsModal').then((m) => ({
+    default: m.GameAchievementsModal,
+  }))
+);
+const DownloadManagerDrawer = lazy(() =>
+  import('./components/Launcher/DownloadManagerDrawer').then((m) => ({
+    default: m.DownloadManagerDrawer,
+  }))
+);
 
 export function App() {
   const [games, setGames] = useState<CanonicalGame[]>(() => {
@@ -1834,7 +1859,7 @@ export function App() {
           if (idx === -1) return prev;
           const next = [...prev];
           next[idx] = updatedGame;
-          saveCurrentCatalog(next);
+          saveCurrentCatalog(next, { skipSanitize: true });
           return next;
         });
       });
@@ -2287,79 +2312,101 @@ export function App() {
       </div>
 
       {/* Modal: Manage Collections */}
-      <ManageCollectionsModal
-        isOpen={isManageCollectionsOpen}
-        onClose={handleCloseManageCollections}
-        collections={collections}
-        game={collectionModalGame}
-        onCreateCollection={handleCreateCollection}
-        onRenameCollection={handleRenameCollection}
-        onDeleteCollection={handleDeleteCollection}
-        onToggleGameInCollection={handleToggleGameInCollection}
-      />
+      {isManageCollectionsOpen && (
+        <Suspense fallback={null}>
+          <ManageCollectionsModal
+            isOpen={isManageCollectionsOpen}
+            onClose={handleCloseManageCollections}
+            collections={collections}
+            game={collectionModalGame}
+            onCreateCollection={handleCreateCollection}
+            onRenameCollection={handleRenameCollection}
+            onDeleteCollection={handleDeleteCollection}
+            onToggleGameInCollection={handleToggleGameInCollection}
+          />
+        </Suspense>
+      )}
 
       {/* Modal: Storefront Integrations & Cloud Sync (No Launchers Required) */}
-      <IntegrationsModal
-        isOpen={isIntegrationsModalOpen}
-        onClose={() => setIsIntegrationsModalOpen(false)}
-        onLibraryUpdated={(newGames) => {
-          setGames(newGames);
-          localStorage.setItem('universal_game_library_catalog', JSON.stringify(newGames));
-          if (newGames.length > 0 && (!selectedGame || !newGames.some((g) => g.id === selectedGame.id))) {
-            navigateSelectGame(newGames[0]);
-          }
-        }}
-      />
+      {isIntegrationsModalOpen && (
+        <Suspense fallback={null}>
+          <IntegrationsModal
+            isOpen={isIntegrationsModalOpen}
+            onClose={() => setIsIntegrationsModalOpen(false)}
+            onLibraryUpdated={(newGames) => {
+              setGames(newGames);
+              localStorage.setItem('universal_game_library_catalog', JSON.stringify(newGames));
+              if (newGames.length > 0 && (!selectedGame || !newGames.some((g) => g.id === selectedGame.id))) {
+                navigateSelectGame(newGames[0]);
+              }
+            }}
+          />
+        </Suspense>
+      )}
 
       {/* Modal: Fix Match & Metadata Override Wizard */}
-      <FixMatchWizardModal
-        isOpen={isFixMatchModalOpen}
-        game={fixMatchGame}
-        onClose={() => {
-          setIsFixMatchModalOpen(false);
-          setFixMatchGame(null);
-        }}
-        onApplyOverride={handleApplyOverride}
-        onResetOverride={handleResetOverride}
-        onHideGame={handleHideGame}
-        existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
-      />
+      {isFixMatchModalOpen && (
+        <Suspense fallback={null}>
+          <FixMatchWizardModal
+            isOpen={isFixMatchModalOpen}
+            game={fixMatchGame}
+            onClose={() => {
+              setIsFixMatchModalOpen(false);
+              setFixMatchGame(null);
+            }}
+            onApplyOverride={handleApplyOverride}
+            onResetOverride={handleResetOverride}
+            onHideGame={handleHideGame}
+            existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
+          />
+        </Suspense>
+      )}
 
       {/* Modal: Library Match & Overrides Studio */}
-      <LibraryMatchManagerModal
-        isOpen={isMatchManagerOpen}
-        games={games}
-        onClose={() => setIsMatchManagerOpen(false)}
-        onFixMatchForGame={(gameToFix) => {
-          handleOpenFixMatch(gameToFix);
-        }}
-        onResetOverride={handleResetOverride}
-        onResetOverrideForGame={handleResetOverride}
-        onInspectGame={(gameToInspect) => {
-          navigateSelectGame(gameToInspect);
-        }}
-        onSelectGame={(gameToSelect) => {
-          navigateSelectGame(gameToSelect);
-        }}
-        onHideGame={handleHideGame}
-        onUnhideEntry={handleUnhideEntry}
-        onGameUpdated={handleGameUpdated}
-      />
+      {isMatchManagerOpen && (
+        <Suspense fallback={null}>
+          <LibraryMatchManagerModal
+            isOpen={isMatchManagerOpen}
+            games={games}
+            onClose={() => setIsMatchManagerOpen(false)}
+            onFixMatchForGame={(gameToFix) => {
+              handleOpenFixMatch(gameToFix);
+            }}
+            onResetOverride={handleResetOverride}
+            onResetOverrideForGame={handleResetOverride}
+            onInspectGame={(gameToInspect) => {
+              navigateSelectGame(gameToInspect);
+            }}
+            onSelectGame={(gameToSelect) => {
+              navigateSelectGame(gameToSelect);
+            }}
+            onHideGame={handleHideGame}
+            onUnhideEntry={handleUnhideEntry}
+            onGameUpdated={handleGameUpdated}
+          />
+        </Suspense>
+      )}
 
       {/* Modal: Multi-Storefront Individual Achievements Browser */}
-      <GameAchievementsModal
-        isOpen={isAchievementsModalOpen}
-        game={achievementsModalGame}
-        initialStorefrontId={achievementsInitialStorefrontId}
-        onClose={() => {
-          setIsAchievementsModalOpen(false);
-          setAchievementsModalGame(null);
-          setAchievementsInitialStorefrontId(undefined);
-        }}
-      />
+      {isAchievementsModalOpen && (
+        <Suspense fallback={null}>
+          <GameAchievementsModal
+            isOpen={isAchievementsModalOpen}
+            game={achievementsModalGame}
+            initialStorefrontId={achievementsInitialStorefrontId}
+            onClose={() => {
+              setIsAchievementsModalOpen(false);
+              setAchievementsModalGame(null);
+              setAchievementsInitialStorefrontId(undefined);
+            }}
+          />
+        </Suspense>
+      )}
 
       {/* Slide-over Drawer: Universal Download & Installation Manager */}
-      <DownloadManagerDrawer />
+      <Suspense fallback={null}>
+        <DownloadManagerDrawer />
+      </Suspense>
 
       {/* Global Sync Progress Bar Dock */}
       <GlobalSyncProgressBar />

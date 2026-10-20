@@ -867,7 +867,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         />
 
         {/* Content Section: Description & Technical Specs */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 pt-4">
+        <div className="cv-section grid grid-cols-1 lg:grid-cols-12 gap-8 pt-4">
           {/* Main Column: "About This Game" */}
           <div className="lg:col-span-8 space-y-6">
             <div className="bg-[#16202d] rounded border border-steam-border p-6 shadow-md">

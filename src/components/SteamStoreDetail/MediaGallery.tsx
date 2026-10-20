@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import { SteamScreenshot, SteamMovie } from '../../contracts/steam';
 import { isNonEnglishRegionalMovieName } from '../../services/steam/steamApi';
 import {
@@ -116,41 +116,63 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
     const video = videoRef.current;
     if (!video) return;
 
+    let cancelled = false;
     let hlsInstance: Hls | null = null;
     setIsError(false);
 
-    if (hlsUrl && Hls.isSupported()) {
-      hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: false });
-      hlsInstance.loadSource(hlsUrl);
-      hlsInstance.attachMedia(video);
+    if (hlsUrl) {
+      void (async () => {
+        try {
+          const { default: HlsModule } = await import('hls.js');
+          if (cancelled) return;
+          if (HlsModule.isSupported()) {
+            hlsInstance = new HlsModule({ enableWorker: true, lowLatencyMode: false });
+            hlsInstance.loadSource(hlsUrl);
+            hlsInstance.attachMedia(video);
 
-      hlsInstance.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              console.warn('HLS network error, attempting recovery...', data);
-              hlsInstance?.startLoad();
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              console.warn('HLS media error, attempting recovery...', data);
-              hlsInstance?.recoverMediaError();
-              break;
-            default:
-              console.warn('HLS unrecoverable fatal error:', data);
-              hlsInstance?.destroy();
-              hlsInstance = null;
-              if (mp4MaxUrl) {
-                video.src = mp4MaxUrl;
-              } else {
-                setIsError(true);
+            hlsInstance.on(HlsModule.Events.ERROR, (_event, data) => {
+              if (data.fatal) {
+                switch (data.type) {
+                  case HlsModule.ErrorTypes.NETWORK_ERROR:
+                    console.warn('HLS network error, attempting recovery...', data);
+                    hlsInstance?.startLoad();
+                    break;
+                  case HlsModule.ErrorTypes.MEDIA_ERROR:
+                    console.warn('HLS media error, attempting recovery...', data);
+                    hlsInstance?.recoverMediaError();
+                    break;
+                  default:
+                    console.warn('HLS unrecoverable fatal error:', data);
+                    hlsInstance?.destroy();
+                    hlsInstance = null;
+                    if (mp4MaxUrl) {
+                      video.src = mp4MaxUrl;
+                    } else {
+                      setIsError(true);
+                    }
+                    break;
+                }
               }
-              break;
+            });
+          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Native Safari / WebKit HLS
+            video.src = hlsUrl;
+          } else if (mp4MaxUrl) {
+            video.src = mp4MaxUrl;
+          } else {
+            setIsError(true);
+          }
+        } catch {
+          if (cancelled) return;
+          if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = hlsUrl;
+          } else if (mp4MaxUrl) {
+            video.src = mp4MaxUrl;
+          } else {
+            setIsError(true);
           }
         }
-      });
-    } else if (hlsUrl && video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native Safari / WebKit HLS
-      video.src = hlsUrl;
+      })();
     } else if (mp4MaxUrl) {
       video.src = mp4MaxUrl;
     } else {
@@ -158,6 +180,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
     }
 
     return () => {
+      cancelled = true;
       if (hlsInstance) {
         hlsInstance.destroy();
       }
@@ -300,7 +323,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
     setActiveIndex(0);
   }, [screenshots, movies]);
 
-  // Eagerly preload all thumbnails + first 4 full-res screenshots + adjacent full-res screenshots
+  // Preload only the active screenshot + next 1 adjacent screenshot
   useEffect(() => {
     const preloadFullUrl = (url?: string) => {
       if (!url || preloadedSetRef.current.has(url)) return;
@@ -326,30 +349,18 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
       }
     };
 
-    for (const s of screenshots) {
-      preloadThumbUrl(s.pathThumbnail);
-    }
-
-    // Preload first 4 screenshots immediately on mount/game change
-    for (let i = 0; i < Math.min(4, screenshots.length); i++) {
-      preloadFullUrl(screenshots[i]?.pathFull);
-    }
-
-    // Preload active screenshot + next 3 and previous 2 in primary showcase
-    const currentItem = items[activeIndex];
-    if (currentItem?.type === 'screenshot') {
-      preloadFullUrl(currentItem.screenshot.pathFull);
-    }
-    for (let offset = -2; offset <= 3; offset++) {
+    // Preload active screenshot + next 1 adjacent screenshot in primary showcase
+    for (const offset of [0, 1]) {
       const target = items[activeIndex + offset];
       if (target?.type === 'screenshot') {
+        preloadThumbUrl(target.screenshot.pathThumbnail);
         preloadFullUrl(target.screenshot.pathFull);
       }
     }
 
-    // Preload active lightbox screenshot + next 3 and previous 2
+    // Preload active lightbox screenshot + next 1 adjacent screenshot
     if (lightboxIndex !== null && allScreenshots.length > 0) {
-      for (let offset = -2; offset <= 3; offset++) {
+      for (const offset of [0, 1]) {
         const idx = (lightboxIndex + offset + allScreenshots.length) % allScreenshots.length;
         preloadFullUrl(allScreenshots[idx]?.pathFull);
       }
@@ -437,7 +448,8 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                   src={thumbSrc}
                   alt="Screenshot preview"
                   className="w-full h-full object-cover select-none transition-transform duration-300 group-hover:scale-[1.01]"
-                  decoding="sync"
+                  fetchPriority="high"
+                  decoding="async"
                 />
                 {/* Full-resolution progressive overlay */}
                 <img
@@ -452,6 +464,7 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     isFullReady ? 'opacity-100' : 'opacity-0'
                   }`}
                   loading="eager"
+                  fetchPriority="high"
                   decoding="async"
                 />
                 <button
@@ -477,7 +490,13 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
             }}
           >
             {headerImage ? (
-              <img src={headerImage} alt="Cover" className="w-full h-full object-cover" />
+              <img
+                src={headerImage}
+                alt="Cover"
+                className="w-full h-full object-cover"
+                fetchPriority="high"
+                decoding="async"
+              />
             ) : (
               <span className="text-steam-subtext text-sm">No media available</span>
             )}
@@ -525,7 +544,9 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                     src={thumbUrl}
                     alt={item.type === 'movie' ? item.movie.name : `Thumbnail ${idx}`}
                     className="w-full h-full object-cover"
-                    loading="eager"
+                    loading="lazy"
+                    decoding="async"
+                    fetchPriority="low"
                   />
                   {item.type === 'movie' && (
                     <div className="absolute inset-0 bg-black/30 flex items-center justify-center">

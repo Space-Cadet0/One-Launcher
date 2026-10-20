@@ -83,9 +83,24 @@ const PREV_STORAGE_PREFIX = 'antigravity_critic_v7_';
 const LEGACY_STORAGE_PREFIX = 'antigravity_critic_score_';
 
 class CriticScoreService {
+  private static readonly MAX_IN_MEMORY_CACHE_SIZE = 1200;
   private inMemoryCache = new Map<string, CriticScoreData | null>();
   private inFlightResolutions = new Map<string, Promise<CriticScoreData | null>>();
   private attemptedDynamicResolutions = new Set<string>();
+
+  private setInMemoryCache(key: string, value: CriticScoreData | null): void {
+    if (this.inMemoryCache.has(key)) {
+      this.inMemoryCache.delete(key);
+    }
+    this.inMemoryCache.set(key, value);
+    if (this.inMemoryCache.size > CriticScoreService.MAX_IN_MEMORY_CACHE_SIZE) {
+      while (this.inMemoryCache.size > 1000) {
+        const oldestKey = this.inMemoryCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.inMemoryCache.delete(oldestKey);
+      }
+    }
+  }
 
   constructor() {
     this.purgeLegacyScores();
@@ -192,11 +207,11 @@ class CriticScoreService {
       if (targetTitle) keysToSet.add(`title:${targetTitle.toLowerCase()}`);
 
       if (route.mode === 'unrated') {
-        this.inMemoryCache.set(cacheKey, null);
+        this.setInMemoryCache(cacheKey, null);
         saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         for (const k of keysToSet) {
           if (k !== cacheKey) {
-            this.inMemoryCache.set(k, null);
+            this.setInMemoryCache(k, null);
             saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, null, MutabilityTier.TIER_0_USER_OVERRIDE);
           }
         }
@@ -212,11 +227,11 @@ class CriticScoreService {
 
       if (route.mode === 'static') {
         const staticData = override.reviewScoreOverride ?? null;
-        this.inMemoryCache.set(cacheKey, staticData);
+        this.setInMemoryCache(cacheKey, staticData);
         saveStagedCache<CriticScoreData>(stagedKey, staticData, MutabilityTier.TIER_0_USER_OVERRIDE);
         for (const k of keysToSet) {
           if (k !== cacheKey) {
-            this.inMemoryCache.set(k, staticData);
+            this.setInMemoryCache(k, staticData);
             saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, staticData, MutabilityTier.TIER_0_USER_OVERRIDE);
           }
         }
@@ -235,14 +250,14 @@ class CriticScoreService {
           releaseDate: override.releaseDate || oldGame?.releaseDate,
           isOverride: false,
         });
-        this.inMemoryCache.set(cacheKey, override.reviewScoreOverride);
+        this.setInMemoryCache(cacheKey, override.reviewScoreOverride);
         saveStagedCache<CriticScoreData>(stagedKey, override.reviewScoreOverride, dynamicTier, {
           source: override.reviewScoreOverride.source,
           isVerified: override.reviewScoreOverride.isVerified,
         });
         for (const k of keysToSet) {
           if (k !== cacheKey) {
-            this.inMemoryCache.set(k, override.reviewScoreOverride);
+            this.setInMemoryCache(k, override.reviewScoreOverride);
             saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, override.reviewScoreOverride, dynamicTier, {
               source: override.reviewScoreOverride.source,
               isVerified: override.reviewScoreOverride.isVerified,
@@ -960,7 +975,7 @@ class CriticScoreService {
       if (route?.mode === 'unrated') {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
-        this.inMemoryCache.set(cacheKey, null);
+        this.setInMemoryCache(cacheKey, null);
         saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         return null;
       }
@@ -968,7 +983,7 @@ class CriticScoreService {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
         const staticScore = userOverride.reviewScoreOverride ?? null;
-        this.inMemoryCache.set(cacheKey, staticScore);
+        this.setInMemoryCache(cacheKey, staticScore);
         saveStagedCache<CriticScoreData>(stagedKey, staticScore, MutabilityTier.TIER_0_USER_OVERRIDE);
         return staticScore;
       }
@@ -982,7 +997,7 @@ class CriticScoreService {
         if (staged.valid && staged.data) {
           this.attemptedDynamicResolutions.add(cacheKey);
           if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
-          this.inMemoryCache.set(cacheKey, staged.data);
+          this.setInMemoryCache(cacheKey, staged.data);
           return staged.data;
         }
         if (!skipBackgroundTrigger && !this.attemptedDynamicResolutions.has(cacheKey)) {
@@ -1006,11 +1021,11 @@ class CriticScoreService {
       this.attemptedDynamicResolutions.add(cacheKey);
       if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
       if (stagedTier0.entry.data === null) {
-        this.inMemoryCache.set(cacheKey, null);
+        this.setInMemoryCache(cacheKey, null);
         return null;
       }
       if (stagedTier0.entry.data) {
-        this.inMemoryCache.set(cacheKey, stagedTier0.entry.data);
+        this.setInMemoryCache(cacheKey, stagedTier0.entry.data);
         return stagedTier0.entry.data;
       }
     }
@@ -1068,7 +1083,7 @@ class CriticScoreService {
           }
           if (cached && isScoreSemanticallyCompatible(cached)) {
             if (mKey !== cacheKey) {
-              this.inMemoryCache.set(cacheKey, cached);
+              this.setInMemoryCache(cacheKey, cached);
             }
             if (cached.isSynthetic || cached.source === 'opencritic') {
               triggerDynamicResolution();
@@ -1101,7 +1116,7 @@ class CriticScoreService {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
         if (existingStaged.data && isScoreSemanticallyCompatible(existingStaged.data)) {
-          this.inMemoryCache.set(cacheKey, existingStaged.data);
+          this.setInMemoryCache(cacheKey, existingStaged.data);
           return existingStaged.data;
         }
       }
@@ -1143,7 +1158,7 @@ class CriticScoreService {
               isVerified: altStaged.data.isVerified,
               dynamicResolved: Boolean(altStaged.entry.dynamicResolved),
             });
-            this.inMemoryCache.set(`id:${steamAppId}`, altStaged.data);
+            this.setInMemoryCache(`id:${steamAppId}`, altStaged.data);
           }
         }
       }
@@ -1167,7 +1182,7 @@ class CriticScoreService {
     if (staged.entry) {
       if (staged.entry.data === null) {
         if (staged.valid && !bypassTTL) {
-          this.inMemoryCache.set(cacheKey, null);
+          this.setInMemoryCache(cacheKey, null);
           this.attemptedDynamicResolutions.add(cacheKey);
           if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
           return null;
@@ -1179,7 +1194,7 @@ class CriticScoreService {
           return null;
         }
       } else if (staged.data && isScoreSemanticallyCompatible(staged.data)) {
-        this.inMemoryCache.set(cacheKey, staged.data);
+        this.setInMemoryCache(cacheKey, staged.data);
         if (staged.valid && !bypassTTL) {
           if (staged.data.isSynthetic && !staged.entry.dynamicResolved) {
             // Synchronous pre-resolution synthetic score that hasn't completed dynamic cascade yet
@@ -1339,13 +1354,13 @@ class CriticScoreService {
     if (userOverride && (userOverride.reviewScoreOverride !== undefined || userOverride.reviewRoute !== undefined)) {
       const route = inferReviewRouteFromOverride(userOverride);
       if (route?.mode === 'unrated') {
-        this.inMemoryCache.set(cacheKey, null);
+        this.setInMemoryCache(cacheKey, null);
         saveStagedCache<CriticScoreData>(stagedKey, null, MutabilityTier.TIER_0_USER_OVERRIDE);
         return null;
       }
       if (route?.mode === 'static') {
         const staticScore = userOverride.reviewScoreOverride ?? null;
-        this.inMemoryCache.set(cacheKey, staticScore);
+        this.setInMemoryCache(cacheKey, staticScore);
         saveStagedCache<CriticScoreData>(stagedKey, staticScore, MutabilityTier.TIER_0_USER_OVERRIDE);
         return staticScore;
       }
@@ -1358,7 +1373,7 @@ class CriticScoreService {
             releaseDate: userOverride.releaseDate || effectiveReleaseDate,
             isOverride: false,
           });
-          this.inMemoryCache.set(cacheKey, refreshed);
+          this.setInMemoryCache(cacheKey, refreshed);
           saveStagedCache<CriticScoreData>(stagedKey, refreshed, dynamicTier, {
             source: refreshed.source,
             isVerified: refreshed.isVerified,
@@ -1366,7 +1381,7 @@ class CriticScoreService {
           });
           const lower = title.toLowerCase();
           if (lower && cacheKey !== `title:${lower}`) {
-            this.inMemoryCache.set(`title:${lower}`, refreshed);
+            this.setInMemoryCache(`title:${lower}`, refreshed);
             saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}title:${lower}`, refreshed, dynamicTier, {
               source: refreshed.source,
               isVerified: refreshed.isVerified,
@@ -1408,11 +1423,11 @@ class CriticScoreService {
       (stagedTier0.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE || stagedTier0.entry.tier === 'override')
     ) {
       if (stagedTier0.entry.data === null) {
-        this.inMemoryCache.set(cacheKey, null);
+        this.setInMemoryCache(cacheKey, null);
         return null;
       }
       if (stagedTier0.entry.data) {
-        this.inMemoryCache.set(cacheKey, stagedTier0.entry.data);
+        this.setInMemoryCache(cacheKey, stagedTier0.entry.data);
         return stagedTier0.entry.data;
       }
     }
@@ -1875,7 +1890,7 @@ class CriticScoreService {
       return;
     }
     if (data && typeof data.score === 'number' && data.score > 0) {
-      this.inMemoryCache.set(key, data);
+      this.setInMemoryCache(key, data);
       const tier = determineGameMutabilityTier({
         releaseDate,
         genres,
@@ -1892,7 +1907,7 @@ class CriticScoreService {
         if (normKey) {
           const normStagedKey = `${STORAGE_PREFIX}title:${normKey}`;
           if (normStagedKey !== stagedKey) {
-            this.inMemoryCache.set(`title:${normKey}`, data);
+            this.setInMemoryCache(`title:${normKey}`, data);
             saveStagedCache<CriticScoreData>(normStagedKey, data, tier, {
               source: data.source,
               isVerified: data.isVerified,
@@ -1902,7 +1917,7 @@ class CriticScoreService {
         }
       }
     } else {
-      this.inMemoryCache.set(key, null);
+      this.setInMemoryCache(key, null);
       saveStagedCache<CriticScoreData>(stagedKey, null, 'negative', {
         failureReason: 'not_found',
         dynamicResolved: options?.dynamicResolved,

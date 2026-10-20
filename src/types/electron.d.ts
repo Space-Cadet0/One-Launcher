@@ -128,6 +128,7 @@ export interface ElectronAPI {
   closeWindow: () => Promise<boolean>;
   performMenuAction: (action: WindowMenuAction) => Promise<boolean>;
   onMaximizedChanged: (callback: (isMaximized: boolean) => void) => () => void;
+  trimMemory?: () => Promise<{ success: boolean }>;
 }
 
 declare global {
