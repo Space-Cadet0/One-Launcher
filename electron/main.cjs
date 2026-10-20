@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, session, nativeImage, Menu } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -20,6 +20,7 @@ function getAppIconPath() {
 }
 
 function createMainWindow() {
+  const isMac = process.platform === 'darwin';
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -28,10 +29,15 @@ function createMainWindow() {
     title: 'One Launcher',
     icon: getAppIconPath(),
     backgroundColor: '#0b0f17',
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    ...(process.platform === 'darwin'
-      ? { trafficLightPosition: { x: 16, y: 19 } }
-      : {}),
+    ...(isMac
+      ? {
+          titleBarStyle: 'hiddenInset',
+          trafficLightPosition: { x: 16, y: 19 },
+        }
+      : {
+          frame: false,
+          autoHideMenuBar: true,
+        }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
@@ -40,6 +46,39 @@ function createMainWindow() {
       webSecurity: true, // Secure webSecurity enabled; cross-origin requests handled via IPC and onHeadersReceived
     },
   });
+
+  if (!isMac) {
+    mainWindow.setMenuBarVisibility(false);
+
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown' || !mainWindow || mainWindow.isDestroyed()) return;
+      const key = String(input.key || '').toLowerCase();
+      const ctrlOrCmd = Boolean(input.control || input.meta);
+
+      if (input.key === 'F11') {
+        event.preventDefault();
+        mainWindow.setFullScreen(!mainWindow.isFullScreen());
+      } else if (input.key === 'F12' || (ctrlOrCmd && input.shift && key === 'i')) {
+        event.preventDefault();
+        mainWindow.webContents.toggleDevTools();
+      } else if (ctrlOrCmd && input.shift && key === 'r') {
+        event.preventDefault();
+        mainWindow.webContents.reloadIgnoringCache();
+      } else if (ctrlOrCmd && !input.shift && key === 'r') {
+        event.preventDefault();
+        mainWindow.webContents.reload();
+      } else if (ctrlOrCmd && (key === '=' || key === '+')) {
+        event.preventDefault();
+        mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() + 0.5);
+      } else if (ctrlOrCmd && key === '-') {
+        event.preventDefault();
+        mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() - 0.5);
+      } else if (ctrlOrCmd && key === '0') {
+        event.preventDefault();
+        mainWindow.webContents.setZoomLevel(0);
+      }
+    });
+  }
 
   const distHtml = path.join(__dirname, '../dist/index.html');
   if (app.isPackaged || process.env.NODE_ENV === 'production' || !process.env.ELECTRON_START_URL) {
@@ -75,6 +114,17 @@ function createMainWindow() {
   mainWindow.on('leave-full-screen', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('window:fullscreen-changed', false);
+    }
+  });
+
+  mainWindow.on('maximize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized-changed', true);
+    }
+  });
+  mainWindow.on('unmaximize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized-changed', false);
     }
   });
 
@@ -1680,3 +1730,107 @@ ipcMain.handle('igdb:fetch-cover', async (_event, gameTitle) => {
   }
 });
 
+// ============================================================================
+// Custom Steam-Style Window & Menu Bar IPC Handlers
+// ============================================================================
+
+ipcMain.handle('window:toggle-fullscreen', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const next = !mainWindow.isFullScreen();
+  mainWindow.setFullScreen(next);
+  return next;
+});
+
+ipcMain.handle('window:is-fullscreen', () => {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen());
+});
+
+ipcMain.handle('window:minimize', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.minimize();
+  }
+  return true;
+});
+
+ipcMain.handle('window:maximize-toggle', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+    return false;
+  }
+  mainWindow.maximize();
+  return true;
+});
+
+ipcMain.handle('window:is-maximized', () => {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized());
+});
+
+ipcMain.handle('window:close', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.close();
+  }
+  return true;
+});
+
+ipcMain.handle('window:perform-menu-action', (_event, action) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const act = String(action || '').toLowerCase().trim();
+  switch (act) {
+    case 'reload':
+      mainWindow.webContents.reload();
+      return true;
+    case 'force-reload':
+      mainWindow.webContents.reloadIgnoringCache();
+      return true;
+    case 'toggle-devtools':
+      mainWindow.webContents.toggleDevTools();
+      return true;
+    case 'reset-zoom':
+      mainWindow.webContents.setZoomLevel(0);
+      return true;
+    case 'zoom-in':
+      mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() + 0.5);
+      return true;
+    case 'zoom-out':
+      mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() - 0.5);
+      return true;
+    case 'toggle-fullscreen':
+      mainWindow.setFullScreen(!mainWindow.isFullScreen());
+      return true;
+    case 'undo':
+      mainWindow.webContents.undo();
+      return true;
+    case 'redo':
+      mainWindow.webContents.redo();
+      return true;
+    case 'cut':
+      mainWindow.webContents.cut();
+      return true;
+    case 'copy':
+      mainWindow.webContents.copy();
+      return true;
+    case 'paste':
+      mainWindow.webContents.paste();
+      return true;
+    case 'select-all':
+      mainWindow.webContents.selectAll();
+      return true;
+    case 'minimize':
+      mainWindow.minimize();
+      return true;
+    case 'maximize-toggle':
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+      } else {
+        mainWindow.maximize();
+      }
+      return true;
+    case 'close':
+    case 'quit':
+      app.quit();
+      return true;
+    default:
+      return false;
+  }
+});

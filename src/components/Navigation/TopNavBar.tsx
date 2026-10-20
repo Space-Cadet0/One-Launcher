@@ -3,6 +3,7 @@ import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
 import { launcherService } from '../../services/launcher/launcherService';
+import type { WindowMenuAction } from '../../types/electron';
 import {
   RefreshCw,
   Layers,
@@ -16,7 +17,11 @@ import {
   Award,
   Download,
   Sliders,
+  Minus,
+  X,
 } from 'lucide-react';
+
+type TopMenuId = 'file' | 'edit' | 'view' | 'window';
 
 interface TopNavBarProps {
   searchQuery?: string;
@@ -92,13 +97,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(defaultMenuOpen);
   const [isFullScreen, setIsFullScreen] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
+  const [openMenu, setOpenMenu] = useState<TopMenuId | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const topMenuBarRef = useRef<HTMLDivElement | null>(null);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
 
   useEffect(() => {
     const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
     if (api?.onFullscreenChanged) {
       return api.onFullscreenChanged((full: boolean) => setIsFullScreen(Boolean(full)));
+    }
+  }, []);
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
+    if (!api) return;
+    if (typeof api.isWindowMaximized === 'function') {
+      api
+        .isWindowMaximized()
+        .then((val: boolean) => setIsMaximized(Boolean(val)))
+        .catch(() => {});
+    }
+    if (typeof api.onMaximizedChanged === 'function') {
+      return api.onMaximizedChanged((val: boolean) => setIsMaximized(Boolean(val)));
     }
   }, []);
 
@@ -109,6 +131,14 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       : Boolean((window as any).electronAPI?.isElectron) &&
         /Mac|Darwin/i.test(navigator.platform || navigator.userAgent || ''));
   const needsTrafficLightInset = isMacWindow && !isFullScreen;
+
+  const isWindowsOrLinuxWindow =
+    typeof window !== 'undefined' &&
+    Boolean((window as any).electronAPI) &&
+    ((window as any).electronAPI.platform === 'win32' ||
+      (window as any).electronAPI.platform === 'linux' ||
+      (!isMacWindow && Boolean((window as any).electronAPI.minimizeWindow))) &&
+    !isFullScreen;
 
   useEffect(() => {
     const unsub = launcherService.subscribe(() => {
@@ -135,27 +165,46 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     return Math.round(sum / activeDownloads.length);
   }, [activeDownloads]);
 
-  // Close burger menu on outside click or escape
+  // Close burger menu or top window menu on outside click or escape
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setIsMenuOpen(false);
       }
+      if (topMenuBarRef.current && !topMenuBarRef.current.contains(event.target as Node)) {
+        setOpenMenu(null);
+      }
     }
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         setIsMenuOpen(false);
+        setOpenMenu(null);
       }
     }
-    if (isMenuOpen) {
+    if (typeof document !== 'undefined' && (isMenuOpen || openMenu !== null)) {
       document.addEventListener('mousedown', handleClickOutside);
       document.addEventListener('keydown', handleKeyDown);
     }
     return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-      document.removeEventListener('keydown', handleKeyDown);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('mousedown', handleClickOutside);
+        document.removeEventListener('keydown', handleKeyDown);
+      }
     };
-  }, [isMenuOpen]);
+  }, [isMenuOpen, openMenu]);
+
+  const runMenuAction = (action: WindowMenuAction) => {
+    setOpenMenu(null);
+    window.electronAPI?.performMenuAction?.(action);
+  };
+
+  const handleOpenDownloadsDrawer = () => {
+    if (onOpenDownloads) {
+      onOpenDownloads();
+    } else {
+      launcherService.openDownloadDrawer();
+    }
+  };
 
   // All known storefront IDs in canonical order
   const allPlatforms: StorefrontId[] = [
@@ -211,6 +260,413 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       className="app-drag-region sticky top-0 z-40 bg-[#171a21]/95 backdrop-blur-md border-b border-steam-border shadow-md select-none"
       style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
     >
+      {isWindowsOrLinuxWindow && (
+        <div
+          data-testid="steam-integrated-window-bar"
+          className="bg-[#10151d] border-b border-[#1f2937]/80 h-8 flex items-center justify-between select-none relative z-50"
+          style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+        >
+          {/* Left Side: Brand Icon + Title + Steam-Style Menu Bar */}
+          <div
+            ref={topMenuBarRef}
+            className="app-no-drag flex items-center h-full pl-2.5 gap-0.5"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            <img
+              src="./favicon-32x32.png"
+              alt=""
+              className="w-3.5 h-3.5 rounded-sm mr-1.5 pointer-events-none"
+            />
+            <span className="text-[11px] font-bold tracking-wide text-[#66c0f4] mr-2">
+              One Launcher
+            </span>
+
+            {/* File Menu */}
+            <div className="relative">
+              <button
+                type="button"
+                data-testid="win-menu-file"
+                onClick={() => setOpenMenu(openMenu === 'file' ? null : 'file')}
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'file') setOpenMenu('file');
+                }}
+                className={`px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  openMenu === 'file'
+                    ? 'bg-[#253447] text-white'
+                    : 'text-steam-subtext hover:text-white hover:bg-white/5'
+                }`}
+              >
+                File
+              </button>
+              {openMenu === 'file' && (
+                <div
+                  data-testid="win-menu-dropdown-file"
+                  className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onOpenIntegrations();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Accounts &amp; Storefronts...</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onOpenLibraryMatchManager?.();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Library Match &amp; Overrides Studio...</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onTriggerSync();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Sync All Integrations</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      handleOpenDownloadsDrawer();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Downloads Manager</span>
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('quit')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Exit One Launcher</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Alt+F4</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Edit Menu */}
+            <div className="relative">
+              <button
+                type="button"
+                data-testid="win-menu-edit"
+                onClick={() => setOpenMenu(openMenu === 'edit' ? null : 'edit')}
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'edit') setOpenMenu('edit');
+                }}
+                className={`px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  openMenu === 'edit'
+                    ? 'bg-[#253447] text-white'
+                    : 'text-steam-subtext hover:text-white hover:bg-white/5'
+                }`}
+              >
+                Edit
+              </button>
+              {openMenu === 'edit' && (
+                <div
+                  data-testid="win-menu-dropdown-edit"
+                  className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
+                >
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('undo')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Undo</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+Z</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('redo')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Redo</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+Y</span>
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('cut')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Cut</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+X</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('copy')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Copy</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+C</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('paste')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Paste</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+V</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('select-all')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Select All</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+A</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* View Menu */}
+            <div className="relative">
+              <button
+                type="button"
+                data-testid="win-menu-view"
+                onClick={() => setOpenMenu(openMenu === 'view' ? null : 'view')}
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'view') setOpenMenu('view');
+                }}
+                className={`px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  openMenu === 'view'
+                    ? 'bg-[#253447] text-white'
+                    : 'text-steam-subtext hover:text-white hover:bg-white/5'
+                }`}
+              >
+                View
+              </button>
+              {openMenu === 'view' && (
+                <div
+                  data-testid="win-menu-dropdown-view"
+                  className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
+                >
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('reload')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Reload</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+R</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('force-reload')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Force Reload</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">
+                      Ctrl+Shift+R
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('toggle-devtools')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Toggle Developer Tools</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">
+                      Ctrl+Shift+I
+                    </span>
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('reset-zoom')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Actual Size</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+0</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('zoom-in')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Zoom In</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl++</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('zoom-out')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Zoom Out</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+-</span>
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => runMenuAction('toggle-fullscreen')}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Toggle Full Screen</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">F11</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Window Menu */}
+            <div className="relative">
+              <button
+                type="button"
+                data-testid="win-menu-window"
+                onClick={() => setOpenMenu(openMenu === 'window' ? null : 'window')}
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'window') setOpenMenu('window');
+                }}
+                className={`px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  openMenu === 'window'
+                    ? 'bg-[#253447] text-white'
+                    : 'text-steam-subtext hover:text-white hover:bg-white/5'
+                }`}
+              >
+                Window
+              </button>
+              {openMenu === 'window' && (
+                <div
+                  data-testid="win-menu-dropdown-window"
+                  className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      window.electronAPI?.minimizeWindow?.();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Minimize</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Ctrl+M</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      window.electronAPI
+                        ?.toggleMaximizeWindow?.()
+                        .then((val) => {
+                          if (typeof val === 'boolean') setIsMaximized(val);
+                        })
+                        .catch(() => {});
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Maximize / Restore</span>
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onToggleInstalledOnly();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Installed Games Only</span>
+                    {installedOnly && (
+                      <span className="text-xs font-bold text-emerald-400 ml-4">✓</span>
+                    )}
+                  </button>
+                  <div className="border-t border-steam-border/50 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      window.electronAPI?.closeWindow?.();
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>Close Window</span>
+                    <span className="text-[10px] text-steam-subtext font-mono ml-4">Alt+F4</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right Side: Integrated Steam Window Control Buttons */}
+          <div
+            className="app-no-drag flex items-center h-full"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            <button
+              type="button"
+              data-testid="win-btn-minimize"
+              title="Minimize"
+              aria-label="Minimize"
+              onClick={() => window.electronAPI?.minimizeWindow?.()}
+              className="h-full w-11 flex items-center justify-center text-steam-subtext hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+            >
+              <Minus className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              data-testid="win-btn-maximize"
+              title={isMaximized ? 'Restore Down' : 'Maximize'}
+              aria-label={isMaximized ? 'Restore Down' : 'Maximize'}
+              onClick={() => {
+                window.electronAPI
+                  ?.toggleMaximizeWindow?.()
+                  .then((val) => {
+                    if (typeof val === 'boolean') setIsMaximized(val);
+                  })
+                  .catch(() => {});
+              }}
+              className="h-full w-11 flex items-center justify-center text-steam-subtext hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+            >
+              {isMaximized ? (
+                <svg
+                  width="10"
+                  height="10"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                >
+                  <path d="M2.5 2.5V1h6.5v6.5H7.5" />
+                  <rect x="1" y="2.5" width="6.5" height="6.5" />
+                </svg>
+              ) : (
+                <svg
+                  width="10"
+                  height="10"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                >
+                  <rect x="1" y="1" width="8" height="8" />
+                </svg>
+              )}
+            </button>
+            <button
+              type="button"
+              data-testid="win-btn-close"
+              title="Close"
+              aria-label="Close"
+              onClick={() => window.electronAPI?.closeWindow?.()}
+              className="h-full w-11 flex items-center justify-center text-steam-subtext hover:text-white hover:bg-[#e81123] transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       <div
         data-mac-traffic-inset={needsTrafficLightInset ? 'true' : 'false'}
         className={`w-full pr-4 ${

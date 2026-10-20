@@ -21,6 +21,25 @@ import type {
   VerifyGameRequest,
 } from '../contracts/launcher';
 
+export type WindowMenuAction =
+  | 'reload'
+  | 'force-reload'
+  | 'toggle-devtools'
+  | 'reset-zoom'
+  | 'zoom-in'
+  | 'zoom-out'
+  | 'toggle-fullscreen'
+  | 'undo'
+  | 'redo'
+  | 'cut'
+  | 'copy'
+  | 'paste'
+  | 'select-all'
+  | 'minimize'
+  | 'maximize-toggle'
+  | 'close'
+  | 'quit';
+
 export interface ElectronAPI {
   isElectron: boolean;
   platform: string;
@@ -103,6 +122,12 @@ export interface ElectronAPI {
     }) => void
   ) => () => void;
   onFullscreenChanged?: (cb: (isFullScreen: boolean) => void) => () => void;
+  minimizeWindow: () => Promise<boolean>;
+  toggleMaximizeWindow: () => Promise<boolean>;
+  isWindowMaximized: () => Promise<boolean>;
+  closeWindow: () => Promise<boolean>;
+  performMenuAction: (action: WindowMenuAction) => Promise<boolean>;
+  onMaximizedChanged: (callback: (isMaximized: boolean) => void) => () => void;
 }
 
 declare global {

@@ -8103,5 +8103,301 @@ sleep 1
       }
     });
   });
+
+  // ============================================================================
+  // 31. Steam-Style Integrated Window & Menu Bar on Windows/Linux
+  // ============================================================================
+  describe('31. Steam-Style Integrated Window & Menu Bar on Windows/Linux', () => {
+    let previousElectronAPI: any;
+
+    beforeEach(() => {
+      previousElectronAPI = (globalThis as any).window?.electronAPI;
+    });
+
+    afterEach(() => {
+      if (previousElectronAPI === undefined) {
+        delete (globalThis as any).window.electronAPI;
+      } else {
+        (globalThis as any).window.electronAPI = previousElectronAPI;
+      }
+    });
+
+    it('1. Windows (electronAPI.platform = "win32") renders Steam-style integrated window bar, File/Edit/View/Window menus, hover switching, performMenuAction IPC dispatches, and minimize/maximize/close controls', async () => {
+      const ReactModule = await import('react');
+      const React = ReactModule.default || ReactModule;
+      const { renderToString } = await import('react-dom/server');
+      const { TopNavBar } = await import('../src/components/Navigation/TopNavBar');
+
+      const minimizeWindowMock = vi.fn().mockResolvedValue(undefined);
+      const toggleMaximizeWindowMock = vi.fn().mockResolvedValue(true);
+      const closeWindowMock = vi.fn().mockResolvedValue(undefined);
+      const isWindowMaximizedMock = vi.fn().mockResolvedValue(false);
+      const onMaximizedChangedMock = vi.fn().mockReturnValue(() => {});
+      const performMenuActionMock = vi.fn().mockResolvedValue(undefined);
+
+      (globalThis as any).window.electronAPI = {
+        ...(previousElectronAPI || {}),
+        isElectron: true,
+        platform: 'win32',
+        minimizeWindow: minimizeWindowMock,
+        toggleMaximizeWindow: toggleMaximizeWindowMock,
+        closeWindow: closeWindowMock,
+        isWindowMaximized: isWindowMaximizedMock,
+        onMaximizedChanged: onMaximizedChangedMock,
+        performMenuAction: performMenuActionMock,
+      };
+
+      const findElements = (
+        node: any,
+        predicate: (el: any) => boolean,
+        acc: any[] = []
+      ): any[] => {
+        if (!node) return acc;
+        if (Array.isArray(node)) {
+          for (const child of node) findElements(child, predicate, acc);
+          return acc;
+        }
+        if (typeof node === 'object') {
+          if (predicate(node)) acc.push(node);
+          if (typeof node.type === 'function') {
+            try {
+              const rendered = node.type(node.props || {});
+              findElements(rendered, predicate, acc);
+            } catch {}
+          }
+          if (node.props && node.props.children) {
+            findElements(node.props.children, predicate, acc);
+          }
+        }
+        return acc;
+      };
+
+      const getTextContent = (node: any): string => {
+        if (node === null || node === undefined || typeof node === 'boolean') return '';
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (Array.isArray(node)) return node.map(getTextContent).join('');
+        if (typeof node === 'object' && node.props) {
+          return getTextContent(node.props.children);
+        }
+        return '';
+      };
+
+      const states: any[] = [];
+      const effectsRan: boolean[] = [];
+      const internals =
+        (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE ||
+        (React as any).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
+
+      const renderTopNav = () => {
+        let hookIdx = 0;
+        let effectIdx = 0;
+        const prevH = internals.H;
+        internals.H = {
+          useState(initial: any) {
+            const idx = hookIdx++;
+            if (!(idx in states)) {
+              states[idx] = typeof initial === 'function' ? initial() : initial;
+            }
+            const setState = (updater: any) => {
+              states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+            };
+            return [states[idx], setState];
+          },
+          useEffect(fn: () => any) {
+            const idx = effectIdx++;
+            if (!effectsRan[idx]) {
+              effectsRan[idx] = true;
+              fn();
+            }
+          },
+          useRef(initial: any) {
+            return { current: initial };
+          },
+          useMemo(fn: () => any) {
+            return fn();
+          },
+          useCallback(fn: any) {
+            return fn;
+          },
+        };
+        try {
+          const vnode = (TopNavBar as any)({
+            selectedPlatform: 'all',
+            onSelectPlatform: vi.fn(),
+            installedOnly: false,
+            onToggleInstalledOnly: vi.fn(),
+            totalGamesCount: 42,
+            filteredCount: 42,
+            isSyncing: false,
+            onTriggerSync: vi.fn(),
+            onHomeClick: vi.fn(),
+            onOpenIntegrations: vi.fn(),
+          });
+          const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+          return { vnode, html };
+        } finally {
+          internals.H = prevH;
+        }
+      };
+
+      const r1 = renderTopNav();
+
+      // 1a. Verify steam-integrated-window-bar, 4 menu triggers, and 3 caption buttons render
+      expect(r1.html).toContain('data-testid="steam-integrated-window-bar"');
+      expect(r1.html).toContain('data-testid="win-menu-file"');
+      expect(r1.html).toContain('data-testid="win-menu-edit"');
+      expect(r1.html).toContain('data-testid="win-menu-view"');
+      expect(r1.html).toContain('data-testid="win-menu-window"');
+      expect(r1.html).toContain('data-testid="win-btn-minimize"');
+      expect(r1.html).toContain('data-testid="win-btn-maximize"');
+      expect(r1.html).toContain('data-testid="win-btn-close"');
+      expect(r1.html).toContain('data-mac-traffic-inset="false"');
+
+      // 1b. Click win-menu-view -> opens win-menu-dropdown-view with all 7 View actions
+      const viewMenuBtn = findElements(
+        r1.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-menu-view'
+      )[0];
+      expect(viewMenuBtn).toBeDefined();
+      viewMenuBtn.props.onClick();
+
+      const rViewOpen = renderTopNav();
+      expect(rViewOpen.html).toContain('data-testid="win-menu-dropdown-view"');
+      expect(rViewOpen.html).toContain('Reload');
+      expect(rViewOpen.html).toContain('Force Reload');
+      expect(rViewOpen.html).toContain('Toggle Developer Tools');
+      expect(rViewOpen.html).toContain('Actual Size');
+      expect(rViewOpen.html).toContain('Zoom In');
+      expect(rViewOpen.html).toContain('Zoom Out');
+      expect(rViewOpen.html).toContain('Toggle Full Screen');
+
+      // Verify clicking each item in View dropdown calls performMenuAction with exact action ID
+      const expectedViewActions: Array<[string, string]> = [
+        ['Reload', 'reload'],
+        ['Force Reload', 'force-reload'],
+        ['Toggle Developer Tools', 'toggle-devtools'],
+        ['Actual Size', 'reset-zoom'],
+        ['Zoom In', 'zoom-in'],
+        ['Zoom Out', 'zoom-out'],
+        ['Toggle Full Screen', 'toggle-fullscreen'],
+      ];
+
+      for (const [label, actionId] of expectedViewActions) {
+        // Ensure View menu is open
+        const currentRender = renderTopNav();
+        let dropdown = findElements(
+          currentRender.vnode,
+          (el) => el.props?.['data-testid'] === 'win-menu-dropdown-view'
+        )[0];
+        if (!dropdown) {
+          const btn = findElements(
+            currentRender.vnode,
+            (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-menu-view'
+          )[0];
+          btn.props.onClick();
+          dropdown = findElements(
+            renderTopNav().vnode,
+            (el) => el.props?.['data-testid'] === 'win-menu-dropdown-view'
+          )[0];
+        }
+        expect(dropdown).toBeDefined();
+        const itemBtn = findElements(
+          dropdown,
+          (el) =>
+            el.type === 'button' &&
+            getTextContent(el).startsWith(label) &&
+            (label !== 'Reload' || !getTextContent(el).startsWith('Force Reload'))
+        )[0];
+        expect(itemBtn).toBeDefined();
+        itemBtn.props.onClick();
+        expect(performMenuActionMock).toHaveBeenLastCalledWith(actionId);
+      }
+
+      // 1c. Re-open View menu, then hover over win-menu-file -> switches active dropdown to win-menu-dropdown-file
+      const rClosed = renderTopNav();
+      const viewTrigger = findElements(
+        rClosed.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-menu-view'
+      )[0];
+      viewTrigger.props.onClick();
+
+      const rViewAgain = renderTopNav();
+      expect(rViewAgain.html).toContain('data-testid="win-menu-dropdown-view"');
+
+      const fileTrigger = findElements(
+        rViewAgain.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-menu-file'
+      )[0];
+      expect(fileTrigger).toBeDefined();
+      fileTrigger.props.onMouseEnter();
+
+      const rFileHovered = renderTopNav();
+      expect(rFileHovered.html).toContain('data-testid="win-menu-dropdown-file"');
+      expect(rFileHovered.html).not.toContain('data-testid="win-menu-dropdown-view"');
+
+      // 1d. Click minimize, maximize, and close window caption buttons
+      const minBtn = findElements(
+        rFileHovered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-btn-minimize'
+      )[0];
+      const maxBtn = findElements(
+        rFileHovered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-btn-maximize'
+      )[0];
+      const closeBtn = findElements(
+        rFileHovered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-testid'] === 'win-btn-close'
+      )[0];
+
+      expect(minBtn).toBeDefined();
+      expect(maxBtn).toBeDefined();
+      expect(closeBtn).toBeDefined();
+
+      minBtn.props.onClick();
+      expect(minimizeWindowMock).toHaveBeenCalledTimes(1);
+
+      maxBtn.props.onClick();
+      expect(toggleMaximizeWindowMock).toHaveBeenCalledTimes(1);
+
+      closeBtn.props.onClick();
+      expect(closeWindowMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('2. macOS (electronAPI.platform = "darwin") preserves data-mac-traffic-inset="true" and does NOT render steam-integrated-window-bar or Windows caption buttons', async () => {
+      const ReactModule = await import('react');
+      const React = ReactModule.default || ReactModule;
+      const { renderToString } = await import('react-dom/server');
+      const { TopNavBar } = await import('../src/components/Navigation/TopNavBar');
+
+      (globalThis as any).window.electronAPI = {
+        ...(previousElectronAPI || {}),
+        isElectron: true,
+        platform: 'darwin',
+      };
+
+      const html = renderToString(
+        React.createElement(TopNavBar, {
+          selectedPlatform: 'all',
+          onSelectPlatform: vi.fn(),
+          installedOnly: false,
+          onToggleInstalledOnly: vi.fn(),
+          totalGamesCount: 42,
+          filteredCount: 42,
+          isSyncing: false,
+          onTriggerSync: vi.fn(),
+          onHomeClick: vi.fn(),
+          onOpenIntegrations: vi.fn(),
+        })
+      ).replace(/<!--\s*-->/g, '');
+
+      expect(html).toContain('data-mac-traffic-inset="true"');
+      expect(html).toContain('pl-[88px]');
+      expect(html).not.toContain('data-testid="steam-integrated-window-bar"');
+      expect(html).not.toContain('data-testid="win-btn-minimize"');
+      expect(html).not.toContain('data-testid="win-btn-maximize"');
+      expect(html).not.toContain('data-testid="win-btn-close"');
+    });
+  });
 });
+
 
