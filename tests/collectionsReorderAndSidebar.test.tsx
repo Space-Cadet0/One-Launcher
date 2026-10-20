@@ -276,6 +276,76 @@ describe('Drag-and-Drop Collection Reordering & Sidebar "Groups" Label', () => {
       expect(onReorderCollections).toHaveBeenCalledTimes(1);
       expect(onReorderCollections).toHaveBeenCalledWith(0, 2);
     });
+
+    it('highlights the active between-collections drop slot and inserts a dragged collection between two collections', () => {
+      const onReorderCollections = vi.fn();
+
+      const harness = createComponentHarness(ManageCollectionsModal, {
+        isOpen: true,
+        onClose: () => {},
+        collections: SAMPLE_COLLECTIONS,
+        onCreateCollection: () => {},
+        onRenameCollection: () => {},
+        onDeleteCollection: () => {},
+        onToggleGameInCollection: () => {},
+        onReorderCollections,
+      });
+
+      const tree1 = harness.render();
+      const rowA = findElements(
+        tree1,
+        (el) => el.props?.['data-testid'] === 'collection-row-col-a'
+      )[0];
+      const dataStore = new Map<string, string>();
+      const mockDataTransfer = {
+        setData: (type: string, val: string) => dataStore.set(type, val),
+        getData: (type: string) => dataStore.get(type) ?? '',
+        effectAllowed: '',
+        dropEffect: '',
+      };
+
+      // Start dragging col-a (index 0)
+      rowA.props.onDragStart({ dataTransfer: mockDataTransfer });
+
+      // Drag over drop-slot-2 (between col-b "Beta Strategy" at index 1 and col-c "Gamma Sci-Fi" at index 2)
+      const tree2 = harness.render();
+      const slotBetweenBandC = findElements(
+        tree2,
+        (el) => el.props?.['data-testid'] === 'collection-drop-slot-2'
+      )[0];
+      expect(slotBetweenBandC).toBeDefined();
+
+      slotBetweenBandC.props.onDragOver({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        dataTransfer: mockDataTransfer,
+      });
+
+      // Verify active drop indicator renders between col-b and col-c
+      const tree3 = harness.render();
+      const activeIndicator = findElements(
+        tree3,
+        (el) => el.props?.['data-testid'] === 'active-drop-indicator-2'
+      )[0];
+      expect(activeIndicator).toBeDefined();
+      expect(getTextContent(activeIndicator)).toContain(
+        'Drop between "Beta Strategy" & "Gamma Sci-Fi"'
+      );
+
+      // Drop onto slot 2 -> moves index 0 to index 1 (resulting in [col-b, col-a, col-c])
+      const slotActive = findElements(
+        tree3,
+        (el) => el.props?.['data-testid'] === 'collection-drop-slot-2'
+      )[0];
+      slotActive.props.onDrop({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        dataTransfer: mockDataTransfer,
+      });
+
+      expect(onReorderCollections).toHaveBeenCalledTimes(1);
+      expect(onReorderCollections).toHaveBeenCalledWith(0, 1);
+    });
   });
 
   describe('2. useCollectionsManager Persistence', () => {

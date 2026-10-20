@@ -39,9 +39,127 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   const [editingName, setEditingName] = useState('');
   const [editingIcon, setEditingIcon] = useState<string>('folder');
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
-  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  const [dropSlotIndex, setDropSlotIndex] = useState<number | null>(null);
 
   if (!isOpen) return null;
+
+  const resolveSlotForRowDragOver = (
+    rowIndex: number,
+    e: React.DragEvent<HTMLDivElement>
+  ): number => {
+    const rect = e.currentTarget?.getBoundingClientRect?.();
+    let candidateSlot: number;
+    if (rect && rect.height > 0 && typeof e.clientY === 'number' && e.clientY > 0) {
+      const isUpperHalf = e.clientY < rect.top + rect.height / 2;
+      candidateSlot = isUpperHalf ? rowIndex : rowIndex + 1;
+    } else {
+      candidateSlot =
+        draggedIndex !== null && draggedIndex < rowIndex ? rowIndex + 1 : rowIndex;
+    }
+
+    if (draggedIndex !== null && rowIndex !== draggedIndex) {
+      if (candidateSlot === draggedIndex) {
+        candidateSlot = rowIndex;
+      } else if (candidateSlot === draggedIndex + 1) {
+        candidateSlot = rowIndex + 1;
+      }
+    }
+    return candidateSlot;
+  };
+
+  const commitDropToSlot = (
+    e: React.DragEvent<HTMLDivElement>,
+    targetSlot: number
+  ) => {
+    e.preventDefault();
+    const rawIdx = e.dataTransfer?.getData('text/plain');
+    const fromIdx =
+      draggedIndex !== null
+        ? draggedIndex
+        : rawIdx !== undefined && rawIdx !== ''
+          ? Number(rawIdx)
+          : NaN;
+
+    if (
+      !Number.isNaN(fromIdx) &&
+      onReorderCollections &&
+      targetSlot !== fromIdx &&
+      targetSlot !== fromIdx + 1
+    ) {
+      const toIdx = fromIdx < targetSlot ? targetSlot - 1 : targetSlot;
+      if (toIdx >= 0 && toIdx < collections.length && toIdx !== fromIdx) {
+        onReorderCollections(fromIdx, toIdx);
+      }
+    }
+    setDraggedIndex(null);
+    setDropSlotIndex(null);
+  };
+
+  const renderDropSlot = (slotIdx: number) => {
+    if (!onReorderCollections || collections.length <= 1) return null;
+    const isNoOpSlot =
+      draggedIndex === null ||
+      slotIdx === draggedIndex ||
+      slotIdx === draggedIndex + 1;
+    const isActiveSlot = !isNoOpSlot && dropSlotIndex === slotIdx;
+
+    const prevCol = slotIdx > 0 ? collections[slotIdx - 1] : null;
+    const nextCol = slotIdx < collections.length ? collections[slotIdx] : null;
+    const slotLabel =
+      prevCol && nextCol
+        ? `Drop between "${prevCol.name}" & "${nextCol.name}"`
+        : nextCol
+          ? `Drop at top — before "${nextCol.name}"`
+          : prevCol
+            ? `Drop at bottom — after "${prevCol.name}"`
+            : 'Drop here';
+
+    return (
+      <div
+        key={`drop-slot-${slotIdx}`}
+        data-testid={`collection-drop-slot-${slotIdx}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.dataTransfer) {
+            e.dataTransfer.dropEffect = 'move';
+          }
+          if (!isNoOpSlot && dropSlotIndex !== slotIdx) {
+            setDropSlotIndex(slotIdx);
+          }
+        }}
+        onDrop={(e) => {
+          e.stopPropagation();
+          commitDropToSlot(e, slotIdx);
+        }}
+        className={`transition-all duration-150 ${
+          isActiveSlot
+            ? 'my-1.5 py-1.5 px-2.5 rounded border border-dashed border-[#66c0f4] bg-[#66c0f4]/15 shadow-[0_0_12px_rgba(102,192,244,0.28)]'
+            : draggedIndex !== null && !isNoOpSlot
+              ? 'h-2.5 flex items-center'
+              : slotIdx === 0 || slotIdx === collections.length
+                ? 'h-0.5'
+                : 'h-1.5'
+        }`}
+      >
+        {isActiveSlot ? (
+          <div
+            data-testid={`active-drop-indicator-${slotIdx}`}
+            className="flex flex-col gap-1 w-full pointer-events-none"
+          >
+            <div className="flex items-center w-full">
+              <span className="w-2 h-2 rounded-full bg-[#66c0f4] shadow-[0_0_8px_#66c0f4] shrink-0" />
+              <div className="h-0.5 flex-1 bg-[#66c0f4] shadow-[0_0_8px_#66c0f4]" />
+              <span className="w-2 h-2 rounded-full bg-[#66c0f4] shadow-[0_0_8px_#66c0f4] shrink-0" />
+            </div>
+            <span className="text-[10px] font-semibold text-[#66c0f4] text-center tracking-wide">
+              {slotLabel}
+            </span>
+          </div>
+        ) : null}
+      </div>
+    );
+  };
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -103,66 +221,72 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
           </div>
 
           {/* Collections List */}
-          <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+          <div
+            className="max-h-72 overflow-y-auto pr-1"
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setDropSlotIndex(null);
+              }
+            }}
+          >
+            {renderDropSlot(0)}
             {collections.map((col, index) => {
               const isIncluded = game ? col.gameIds.includes(game.id) : false;
               const isEditing = editingId === col.id;
               const isDragging = draggedIndex === index;
-              const isDragOver = dragOverIndex === index && draggedIndex !== index;
+              const isBeforeTarget =
+                draggedIndex !== null &&
+                dropSlotIndex === index &&
+                index !== draggedIndex &&
+                index !== draggedIndex + 1;
+              const isAfterTarget =
+                draggedIndex !== null &&
+                dropSlotIndex === index + 1 &&
+                index + 1 !== draggedIndex &&
+                index + 1 !== draggedIndex + 1;
 
               return (
-                <div
-                  key={col.id}
-                  data-testid={`collection-row-${col.id}`}
-                  draggable={!isEditing && Boolean(onReorderCollections)}
-                  onDragStart={(e) => {
-                    setDraggedIndex(index);
-                    e.dataTransfer?.setData('text/plain', String(index));
-                    if (e.dataTransfer) {
-                      e.dataTransfer.effectAllowed = 'move';
-                    }
-                  }}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    if (e.dataTransfer) {
-                      e.dataTransfer.dropEffect = 'move';
-                    }
-                    if (dragOverIndex !== index) {
-                      setDragOverIndex(index);
-                    }
-                  }}
-                  onDragLeave={() => {
-                    if (dragOverIndex === index) {
-                      setDragOverIndex(null);
-                    }
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const rawIdx = e.dataTransfer?.getData('text/plain');
-                    const fromIdx =
-                      draggedIndex !== null
-                        ? draggedIndex
-                        : rawIdx !== undefined && rawIdx !== ''
-                          ? Number(rawIdx)
-                          : NaN;
-                    if (!Number.isNaN(fromIdx) && fromIdx !== index && onReorderCollections) {
-                      onReorderCollections(fromIdx, index);
-                    }
-                    setDraggedIndex(null);
-                    setDragOverIndex(null);
-                  }}
-                  onDragEnd={() => {
-                    setDraggedIndex(null);
-                    setDragOverIndex(null);
-                  }}
-                  className={`group flex flex-col px-3 py-2 rounded border transition-colors ${
-                    isIncluded
-                      ? 'bg-[#223547] border-steam-accent/50 text-white'
-                      : 'bg-[#16202d] border-[#2a475e]/60 text-steam-text hover:bg-[#1f2d3d]'
-                  } ${isDragging ? 'opacity-50 border-[#66c0f4]/60' : ''} ${
-                    isDragOver ? 'border-[#66c0f4] ring-1 ring-[#66c0f4]/50 bg-[#66c0f4]/10' : ''
-                  }`}
-                >
+                <React.Fragment key={col.id}>
+                  <div
+                    data-testid={`collection-row-${col.id}`}
+                    draggable={!isEditing && Boolean(onReorderCollections)}
+                    onDragStart={(e) => {
+                      setDraggedIndex(index);
+                      e.dataTransfer?.setData('text/plain', String(index));
+                      if (e.dataTransfer) {
+                        e.dataTransfer.effectAllowed = 'move';
+                      }
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      if (e.dataTransfer) {
+                        e.dataTransfer.dropEffect = 'move';
+                      }
+                      if (draggedIndex === index) return;
+                      const nextSlot = resolveSlotForRowDragOver(index, e);
+                      if (dropSlotIndex !== nextSlot) {
+                        setDropSlotIndex(nextSlot);
+                      }
+                    }}
+                    onDrop={(e) => {
+                      const targetSlot =
+                        dropSlotIndex !== null
+                          ? dropSlotIndex
+                          : resolveSlotForRowDragOver(index, e);
+                      commitDropToSlot(e, targetSlot);
+                    }}
+                    onDragEnd={() => {
+                      setDraggedIndex(null);
+                      setDropSlotIndex(null);
+                    }}
+                    className={`group flex flex-col px-3 py-2 rounded border transition-all ${
+                      isIncluded
+                        ? 'bg-[#223547] border-steam-accent/50 text-white'
+                        : 'bg-[#16202d] border-[#2a475e]/60 text-steam-text hover:bg-[#1f2d3d]'
+                    } ${isDragging ? 'opacity-45 border-[#66c0f4]/60 scale-[0.99]' : ''} ${
+                      isBeforeTarget ? 'border-t-2 border-t-[#66c0f4]' : ''
+                    } ${isAfterTarget ? 'border-b-2 border-b-[#66c0f4]' : ''}`}
+                  >
                   {isEditing ? (
                     <div className="space-y-2.5 w-full">
                       <div className="flex items-center gap-2 w-full">
@@ -298,7 +422,9 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                       </div>
                     </div>
                   )}
-                </div>
+                  </div>
+                  {renderDropSlot(index + 1)}
+                </React.Fragment>
               );
             })}
           </div>
