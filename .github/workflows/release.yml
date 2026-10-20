@@ -1,0 +1,65 @@
+name: Build & Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build macOS DMG, Windows Installer & Windows Uninstaller
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ensure bundled CLI binary permissions
+        run: chmod +x electron/bin/arm64/darwin/* || true
+
+      - name: Build macOS ARM64 DMG
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist:mac
+
+      - name: Build Windows x64 Installer & Standalone Full Uninstaller
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run build:win
+
+      - name: Verify release artifacts
+        run: |
+          ls -lh "release/One Launcher-0.1.0-arm64.dmg"
+          ls -lh "release/One Launcher Setup 0.1.0.exe"
+          ls -lh "release/One Launcher Full Uninstaller.exe"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: One Launcher ${{ github.ref_name }} (macOS ARM64 & Windows x64)
+          generate_release_notes: true
+          body: |
+            ## One Launcher ${{ github.ref_name }}
+
+            ### Included Release Downloads
+            - **macOS (Apple Silicon ARM64)**: `One Launcher-0.1.0-arm64.dmg` (or `One.Launcher-0.1.0-arm64.dmg`)
+            - **Windows (x64 Installer)**: `One Launcher Setup 0.1.0.exe` (or `One.Launcher.Setup.0.1.0.exe`)
+            - **Windows (x64 Standalone Complete Uninstaller)**: `One Launcher Full Uninstaller.exe` (or `One.Launcher.Full.Uninstaller.exe`)
+          files: |
+            release/One Launcher-0.1.0-arm64.dmg
+            release/One Launcher Setup 0.1.0.exe
+            release/One Launcher Full Uninstaller.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

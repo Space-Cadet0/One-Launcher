@@ -8,6 +8,9 @@ dist/
 build/*
 !build/*.nsh
 !build/*.nsi
+!build/icon.icns
+!build/icon.ico
+!build/icon.png
 out/
 release/
 *.dmg
