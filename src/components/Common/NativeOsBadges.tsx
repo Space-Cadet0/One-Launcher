@@ -63,7 +63,7 @@ export const NativeOsBadges: React.FC<NativeOsBadgesProps> = ({
   if (variant === 'cover-badge') {
     return (
       <div
-        className={`bg-[#0e141b]/85 backdrop-blur-md border border-white/15 px-1.5 py-1 rounded shadow-md flex items-center gap-1 text-white/85 ${className}`.trim()}
+        className={`bg-[#0e141b]/95 border border-white/15 px-1.5 py-1 rounded shadow-md flex items-center gap-1 text-white/85 ${className}`.trim()}
         title={tooltipText}
         data-testid="cover-native-os-badge"
       >

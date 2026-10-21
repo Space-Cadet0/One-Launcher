@@ -1059,7 +1059,7 @@ export class SyncJobManager {
     } finally {
       try {
         flushPendingCatalogSave();
-        steamApi.trimMemoryCache(120);
+        steamApi.trimMemoryCache(30);
         if (typeof window !== 'undefined') {
           (window as any).electronAPI?.trimMemory?.()?.catch?.(() => {});
         }

@@ -513,12 +513,13 @@ export function App() {
             saveIntegrations(updatedIntegrations);
           }
 
-          // Sync live storefronts & trophies in background on startup
+          // Sync live storefronts & trophies in background on startup (staggered sequentially to cap peak heap)
           if (window.electronAPI?.syncStore) {
-            if (savedTokens?.steam?.access_token || savedTokens?.steam?.steamId) {
-              window.electronAPI
-                .syncStore('steam')
-                .then((syncRes: any) => {
+            const syncStore = window.electronAPI.syncStore;
+            (async () => {
+              if (savedTokens?.steam?.access_token || savedTokens?.steam?.steamId) {
+                try {
+                  const syncRes: any = await syncStore('steam');
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(syncRes.suppressedItems);
                   }
@@ -536,14 +537,12 @@ export function App() {
                       return merged;
                     });
                   }
-                })
-                .catch(() => {});
-            }
+                } catch {}
+              }
 
-            if (savedTokens?.gog?.access_token) {
-              window.electronAPI
-                .syncStore('gog')
-                .then((syncRes: any) => {
+              if (savedTokens?.gog?.access_token) {
+                try {
+                  const syncRes: any = await syncStore('gog');
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(syncRes.suppressedItems);
                   }
@@ -561,14 +560,12 @@ export function App() {
                       return merged;
                     });
                   }
-                })
-                .catch(() => {});
-            }
+                } catch {}
+              }
 
-            if (savedTokens?.epic?.access_token) {
-              window.electronAPI
-                .syncStore('epic')
-                .then((syncRes: any) => {
+              if (savedTokens?.epic?.access_token) {
+                try {
+                  const syncRes: any = await syncStore('epic');
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(syncRes.suppressedItems);
                   }
@@ -586,9 +583,11 @@ export function App() {
                       return merged;
                     });
                   }
-                })
-                .catch(() => {});
-            }
+                } catch {}
+              }
+
+              window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+            })();
           }
         })
         .catch((e: any) => console.warn('Error reading Electron tokens:', e));
@@ -896,7 +895,7 @@ export function App() {
                     },
                   ],
                   headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
-                  capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900_2x.jpg`,
+                  capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_600x900.jpg`,
                   shortDescription: '',
                   releaseDate: 'TBA',
                   developers: [],
@@ -966,7 +965,7 @@ export function App() {
                     ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamId}/header.jpg`
                     : '',
                   capsuleImage: matchedSteamId
-                    ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamId}/library_600x900_2x.jpg`
+                    ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matchedSteamId}/library_600x900.jpg`
                     : undefined,
                   shortDescription: '',
                   releaseDate: 'TBA',
@@ -1046,27 +1045,55 @@ export function App() {
 
   // Reactively persist newly discovered Steam App IDs, GOG covers, game sessions, and installation events
   useEffect(() => {
-    const handleSteamMatchUpdated = (e: any) => {
-      const { title, steamAppId } = e.detail || {};
-      if (!title || typeof steamAppId !== 'number' || steamAppId <= 0) return;
-      const targetNorm = title.toLowerCase().trim();
+    const pendingSteamMatches = new Map<string, number>();
+    const pendingGogCovers = new Map<string, string>();
+    let batchUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+    const isVitest = typeof process !== 'undefined' && Boolean((process as any).env?.VITEST);
+
+    const flushPendingMediaUpdates = () => {
+      batchUpdateTimer = null;
+      if (pendingSteamMatches.size === 0 && pendingGogCovers.size === 0) return;
+
+      const steamSnapshot = new Map(pendingSteamMatches);
+      const gogSnapshot = new Map(pendingGogCovers);
+      pendingSteamMatches.clear();
+      pendingGogCovers.clear();
 
       setGames((prevGames) => {
         let changed = false;
         const nextGames = prevGames.map((g) => {
-          if (
-            !g.steamAppId &&
-            !g.isExplicitNonSteam &&
-            g.title.toLowerCase().trim() === targetNorm
-          ) {
-            changed = true;
-            return { ...g, steamAppId };
+          let updatedGame = g;
+
+          if (steamSnapshot.size > 0 && !updatedGame.steamAppId && !updatedGame.isExplicitNonSteam) {
+            const matchedId = steamSnapshot.get(updatedGame.title.toLowerCase().trim());
+            if (matchedId) {
+              changed = true;
+              updatedGame = { ...updatedGame, steamAppId: matchedId };
+            }
           }
-          return g;
+
+          if (gogSnapshot.size > 0) {
+            const gogPlat = updatedGame.platforms?.find((p) => p.platformId === 'gog');
+            if (gogPlat) {
+              const coverUrl = gogSnapshot.get(String(gogPlat.platformGameId));
+              if (
+                coverUrl &&
+                (!updatedGame.capsuleImage ||
+                  updatedGame.capsuleImage.includes('_glx_vertical_cover') ||
+                  updatedGame.capsuleImage === updatedGame.headerImage)
+              ) {
+                changed = true;
+                updatedGame = { ...updatedGame, capsuleImage: coverUrl };
+              }
+            }
+          }
+
+          return updatedGame;
         });
+
         if (changed) {
           try {
-            saveCurrentCatalog(nextGames);
+            saveCurrentCatalog(nextGames, { skipSanitize: true });
           } catch {}
           return nextGames;
         }
@@ -1074,35 +1101,29 @@ export function App() {
       });
     };
 
+    const scheduleMediaBatchFlush = () => {
+      if (isVitest) {
+        flushPendingMediaUpdates();
+        return;
+      }
+      if (!batchUpdateTimer) {
+        batchUpdateTimer = setTimeout(flushPendingMediaUpdates, 300);
+      }
+    };
+
+    const handleSteamMatchUpdated = (e: any) => {
+      const { title, steamAppId } = e.detail || {};
+      if (!title || typeof steamAppId !== 'number' || steamAppId <= 0) return;
+      pendingSteamMatches.set(title.toLowerCase().trim(), steamAppId);
+      scheduleMediaBatchFlush();
+    };
+
     const handleGogCoverUpdated = (e: any) => {
       const { gogId, coverUrl } = e.detail || {};
       if (!gogId || !coverUrl) return;
       const cleanGogId = String(gogId).replace(/^gog-/, '');
-
-      setGames((prevGames) => {
-        let changed = false;
-        const nextGames = prevGames.map((g) => {
-          const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
-          if (
-            gogPlat &&
-            String(gogPlat.platformGameId) === cleanGogId &&
-            (!g.capsuleImage ||
-              g.capsuleImage.includes('_glx_vertical_cover') ||
-              g.capsuleImage === g.headerImage)
-          ) {
-            changed = true;
-            return { ...g, capsuleImage: coverUrl };
-          }
-          return g;
-        });
-        if (changed) {
-          try {
-            saveCurrentCatalog(nextGames);
-          } catch {}
-          return nextGames;
-        }
-        return prevGames;
-      });
+      pendingGogCovers.set(cleanGogId, coverUrl);
+      scheduleMediaBatchFlush();
     };
 
     const handleGameSessionEnded = (e: any) => {
@@ -1238,6 +1259,10 @@ export function App() {
     window.addEventListener('antigravity:game-session-ended', handleGameSessionEnded);
     window.addEventListener('antigravity:game-installed', handleGameInstalled);
     return () => {
+      if (batchUpdateTimer) {
+        clearTimeout(batchUpdateTimer);
+        batchUpdateTimer = null;
+      }
       window.removeEventListener('antigravity:steam-match-updated', handleSteamMatchUpdated);
       window.removeEventListener('antigravity:gog-cover-updated', handleGogCoverUpdated);
       window.removeEventListener('antigravity:game-session-ended', handleGameSessionEnded);
@@ -1649,7 +1674,7 @@ export function App() {
             steamAppId: matched,
             id: `steam-${matched}`,
             headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/header.jpg`,
-            capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900_2x.jpg`,
+            capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900.jpg`,
           };
           assignedSteamIds.set(matched, enriched);
           return enriched;
@@ -1720,6 +1745,7 @@ export function App() {
     } finally {
       setIsSyncing(false);
       setTimeout(() => setSyncNotice(null), 5000);
+      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
     }
   };
 
@@ -1851,6 +1877,7 @@ export function App() {
     } finally {
       setIsSyncingTrophies(false);
       setTimeout(() => setSyncNotice(null), 5000);
+      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
     }
   };
 
@@ -1992,25 +2019,64 @@ export function App() {
     setSyncNotice('Starting store media sync (trailers, screenshots & descriptions)...');
     const initialNoticeTimer = setTimeout(() => setSyncNotice(null), 3000);
 
+    const pendingMediaUpdates = new Map<string, CanonicalGame>();
+    let mediaFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    const isVitest = typeof process !== 'undefined' && Boolean((process as any).env?.VITEST);
+
+    const flushMediaBatch = () => {
+      mediaFlushTimer = null;
+      if (pendingMediaUpdates.size === 0) return;
+      const batch = new Map(pendingMediaUpdates);
+      pendingMediaUpdates.clear();
+
+      setGames((prev) => {
+        let changed = false;
+        const next = prev.map((g) => {
+          const updated = batch.get(g.id);
+          if (updated) {
+            changed = true;
+            return updated;
+          }
+          return g;
+        });
+        if (!changed) return prev;
+        saveCurrentCatalog(next, { skipSanitize: true });
+        return next;
+      });
+    };
+
     try {
       await syncJobManager.startStoreMediaSync(games, (updatedGame) => {
-        setGames((prev) => {
-          const idx = prev.findIndex((g) => g.id === updatedGame.id);
-          if (idx === -1) return prev;
-          const next = [...prev];
-          next[idx] = updatedGame;
-          saveCurrentCatalog(next, { skipSanitize: true });
-          return next;
-        });
+        pendingMediaUpdates.set(updatedGame.id, updatedGame);
+        if (isVitest) {
+          flushMediaBatch();
+        } else if (!mediaFlushTimer) {
+          mediaFlushTimer = setTimeout(flushMediaBatch, 350);
+        }
       });
+      if (mediaFlushTimer) {
+        clearTimeout(mediaFlushTimer);
+        mediaFlushTimer = null;
+      }
+      flushMediaBatch();
       clearTimeout(initialNoticeTimer);
       setSyncNotice('Store media sync complete! Refreshed trailers, screenshots & descriptions.');
     } catch (err: any) {
+      if (mediaFlushTimer) {
+        clearTimeout(mediaFlushTimer);
+        mediaFlushTimer = null;
+      }
+      flushMediaBatch();
       clearTimeout(initialNoticeTimer);
       setSyncNotice(`Media sync notice: ${err?.message || 'Finished media sync'}`);
     } finally {
+      if (mediaFlushTimer) {
+        clearTimeout(mediaFlushTimer);
+        mediaFlushTimer = null;
+      }
       setIsSyncingAllMedia(false);
       setTimeout(() => setSyncNotice(null), 5000);
+      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
     }
   };
 
@@ -2044,6 +2110,7 @@ export function App() {
     } finally {
       setIsSyncingScores(false);
       setTimeout(() => setSyncNotice(null), 5000);
+      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
     }
   };
 

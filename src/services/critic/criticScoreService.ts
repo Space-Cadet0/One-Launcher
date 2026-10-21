@@ -82,8 +82,9 @@ const STORAGE_PREFIX = 'antigravity_critic_v8_';
 const PREV_STORAGE_PREFIX = 'antigravity_critic_v7_';
 const LEGACY_STORAGE_PREFIX = 'antigravity_critic_score_';
 
-class CriticScoreService {
-  private static readonly MAX_IN_MEMORY_CACHE_SIZE = 1200;
+export class CriticScoreService {
+  public static readonly MAX_IN_MEMORY_CACHE_SIZE = 1200;
+  public static readonly EVICT_TARGET_CACHE_SIZE = 1000;
   private inMemoryCache = new Map<string, CriticScoreData | null>();
   private inFlightResolutions = new Map<string, Promise<CriticScoreData | null>>();
   private attemptedDynamicResolutions = new Set<string>();
@@ -94,7 +95,7 @@ class CriticScoreService {
     }
     this.inMemoryCache.set(key, value);
     if (this.inMemoryCache.size > CriticScoreService.MAX_IN_MEMORY_CACHE_SIZE) {
-      while (this.inMemoryCache.size > 1000) {
+      while (this.inMemoryCache.size > CriticScoreService.EVICT_TARGET_CACHE_SIZE) {
         const oldestKey = this.inMemoryCache.keys().next().value;
         if (oldestKey === undefined) break;
         this.inMemoryCache.delete(oldestKey);

@@ -192,8 +192,8 @@ export function parseSteamSupportedLanguagesString(rawHtml?: string): SteamLangu
 }
 
 export class SteamApiService {
-  public static readonly MAX_METADATA_CACHE_ENTRIES = 150;
-  public static readonly MAX_METADATA_CACHE_SIZE = 150;
+  public static readonly MAX_METADATA_CACHE_ENTRIES = 60;
+  public static readonly MAX_METADATA_CACHE_SIZE = 60;
   private cache = new Map<number, SteamEnrichedMetadata>();
   private rateLimitedUntil = 0;
 
@@ -213,7 +213,7 @@ export class SteamApiService {
     }
   }
 
-  public trimMemoryCache(maxEntries = 100): void {
+  public trimMemoryCache(maxEntries: number = 30): void {
     const limit = Math.max(0, maxEntries);
     while (this.metadataCache.size > limit) {
       const oldestKey = this.metadataCache.keys().next().value;
@@ -256,7 +256,8 @@ export class SteamApiService {
       return {
         ...(preCached as SteamEnrichedMetadata),
         shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
-        movies: filterEnglishMovies(preCached.movies || []),
+        movies: filterEnglishMovies<SteamMovie>(preCached.movies || []).slice(0, 4),
+        screenshots: Array.isArray(preCached.screenshots) ? preCached.screenshots.slice(0, 12) : [],
         languageOptions,
         languageTableSchema: preCached.languageTableSchema || 'steam',
       };
@@ -276,7 +277,7 @@ export class SteamApiService {
 
     const preCached = (steamEnrichedCache as Record<string, any>)[String(appId)];
     if (preCached && preCached.aboutTheGame) {
-      const normalizedMovies: SteamMovie[] = filterEnglishMovies(
+      const normalizedMovies: SteamMovie[] = filterEnglishMovies<SteamMovie>(
         (preCached.movies || []).map((m: any) => ({
           id: m.id,
           name: m.name,
@@ -285,7 +286,7 @@ export class SteamApiService {
           webm: m.webm || {},
           mp4: m.mp4 || {},
         }))
-      );
+      ).slice(0, 4);
 
       const languageOptions =
         Array.isArray(preCached.languageOptions) && preCached.languageOptions.length > 0
@@ -294,14 +295,21 @@ export class SteamApiService {
           ? parseSteamSupportedLanguagesString(preCached.supportedLanguages)
           : undefined;
 
+      const rawDetailedDesc = String(preCached.detailedDescription || '');
+      const rawAbout = String(preCached.aboutTheGame || '');
+
       const enriched: SteamEnrichedMetadata = {
         ...preCached,
         shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
+        detailedDescription:
+          rawDetailedDesc.length > 15000 ? rawDetailedDesc.slice(0, 15000) : rawDetailedDesc,
+        aboutTheGame: rawAbout.length > 15000 ? rawAbout.slice(0, 15000) : rawAbout,
         capsuleImage:
           preCached.capsuleImage ||
           preCached.library_capsule ||
           preCached.capsule_imagev5 ||
           preCached.capsule_image,
+        screenshots: Array.isArray(preCached.screenshots) ? preCached.screenshots.slice(0, 12) : [],
         movies: normalizedMovies,
         languageOptions,
         languageTableSchema: preCached.languageTableSchema || 'steam',
@@ -355,11 +363,13 @@ export class SteamApiService {
           const data = appData.data;
 
           // Extract screenshots
-          const screenshots: SteamScreenshot[] = (data.screenshots || []).map((s: any) => ({
-            id: s.id,
-            pathThumbnail: s.path_thumbnail,
-            pathFull: s.path_full,
-          }));
+          const screenshots: SteamScreenshot[] = (data.screenshots || [])
+            .slice(0, 12)
+            .map((s: any) => ({
+              id: s.id,
+              pathThumbnail: s.path_thumbnail,
+              pathFull: s.path_full,
+            }));
 
           // Extract movies / trailers
           const rawMovies: SteamMovie[] = (data.movies || []).map((m: any) => {
@@ -384,7 +394,7 @@ export class SteamApiService {
           });
 
           // Filter out regional non-English trailers (e.g. CJK/European dubs) when English/international trailers exist
-          const movies = filterEnglishMovies(rawMovies);
+          const movies = filterEnglishMovies(rawMovies).slice(0, 4);
 
           // Extract review summary
           let reviewSummary: SteamReviewSummary = {
@@ -450,12 +460,17 @@ export class SteamApiService {
               ? htmlLanguageOptions
               : parseSteamSupportedLanguagesString(data.supported_languages);
 
+          const rawDetailedDesc = String(data.detailed_description || '');
+          const rawAboutTheGame = String(data.about_the_game || '');
+
           const metadata: SteamEnrichedMetadata = {
             appId,
             name: data.name,
             shortDescription: stripHtmlToPlainSynopsis(data.short_description || ''),
-            detailedDescription: data.detailed_description || '',
-            aboutTheGame: data.about_the_game || '',
+            detailedDescription:
+              rawDetailedDesc.length > 15000 ? rawDetailedDesc.slice(0, 15000) : rawDetailedDesc,
+            aboutTheGame:
+              rawAboutTheGame.length > 15000 ? rawAboutTheGame.slice(0, 15000) : rawAboutTheGame,
             headerImage: data.header_image || '',
             capsuleImage: resolvedCapsuleImage,
             developers: data.developers || [],

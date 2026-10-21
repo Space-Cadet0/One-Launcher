@@ -219,13 +219,16 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         {/* Small Thumbnail Icon */}
         <div className="w-6 h-6 rounded bg-black/60 overflow-hidden flex-shrink-0 border border-steam-border/40 group-hover:border-steam-accent/50 relative">
           {(() => {
-            const initialIconUrl =
+            const rawUrl =
               game.iconUrl ||
               game.capsuleImage ||
               (game.steamAppId
                 ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/header.jpg`
                 : undefined) ||
               game.headerImage;
+            const initialIconUrl = rawUrl
+              ? rawUrl.replace(/\/library_600x900_2x\.jpg(\?.*)?$/i, '/library_600x900.jpg$1')
+              : undefined;
 
             return (
               <>
@@ -235,6 +238,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                     alt=""
                     className="w-full h-full object-cover"
                     loading="lazy"
+                    decoding="async"
                     onError={(e) => {
                       const currentSrc = e.currentTarget.src;
                       const steamHeader = game.steamAppId

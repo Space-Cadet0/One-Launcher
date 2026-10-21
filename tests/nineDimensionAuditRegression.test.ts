@@ -408,7 +408,7 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
   // Dimension 3: Memory Leak Prevention
   // =========================================================================
   describe('Dimension 3: Memory Leak Prevention', () => {
-    it('caps AchievementDetailService inMemoryCache at <= 60 entries (LRU) and SteamApiService metadataCache at <= 150 entries', () => {
+    it('caps AchievementDetailService inMemoryCache at <= 60 entries (LRU) and SteamApiService metadataCache at <= 60 entries', () => {
       const achSvc = new AchievementDetailService();
       expect(AchievementDetailService.MAX_MEMORY_CACHE_ENTRIES).toBe(60);
 
@@ -430,10 +430,10 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       expect(achSvc.memoryCache.has('game-85')).toBe(true);
 
       const steamSvc = new SteamApiService() as any;
-      expect(SteamApiService.MAX_METADATA_CACHE_ENTRIES).toBe(150);
-      expect(SteamApiService.MAX_METADATA_CACHE_SIZE).toBe(150);
+      expect(SteamApiService.MAX_METADATA_CACHE_ENTRIES).toBe(60);
+      expect(SteamApiService.MAX_METADATA_CACHE_SIZE).toBe(60);
 
-      for (let i = 1; i <= 190; i++) {
+      for (let i = 1; i <= 90; i++) {
         steamSvc.setCacheEntry(i, {
           appId: i,
           name: `App ${i}`,
@@ -449,11 +449,11 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
         });
       }
 
-      expect(steamSvc.metadataCache.size).toBe(150);
+      expect(steamSvc.metadataCache.size).toBe(60);
       expect(steamSvc.metadataCache.has(1)).toBe(false);
-      expect(steamSvc.metadataCache.has(40)).toBe(false);
-      expect(steamSvc.metadataCache.has(41)).toBe(true);
-      expect(steamSvc.metadataCache.has(190)).toBe(true);
+      expect(steamSvc.metadataCache.has(30)).toBe(false);
+      expect(steamSvc.metadataCache.has(31)).toBe(true);
+      expect(steamSvc.metadataCache.has(90)).toBe(true);
     });
 
     it('configures Hls in MediaGallery.tsx with bounded buffers (15/30/10) and cleans up via stopLoad(), detachMedia(), destroy()', () => {

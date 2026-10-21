@@ -373,7 +373,18 @@ function computeTokenSimilarity(source, candidate) {
   return jaccard;
 }
 
+const MAX_STORE_SYNC_CACHE_ENTRIES = 500;
 const steamMatchCache = new Map();
+
+function setBoundedCacheEntry(map, key, value, maxEntries = MAX_STORE_SYNC_CACHE_ENTRIES) {
+  if (!map.has(key) && map.size >= maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
 
 /**
  * Intelligent Steam App ID matcher for titles across all storefronts
@@ -386,7 +397,7 @@ async function matchSteamAppId(rawTitle) {
     return steamMatchCache.get(lower);
   }
 
-  steamMatchCache.set(lower, undefined);
+  setBoundedCacheEntry(steamMatchCache, lower, undefined, MAX_STORE_SYNC_CACHE_ENTRIES);
   return undefined;
 }
 
@@ -945,7 +956,7 @@ async function fetchGogOwnedGames(accessToken, username, userId) {
           : coverUrl;
 
         const capsuleImg = hasSteamVertical
-          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
+          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`
           : (verticalGogCover || '');
 
         games.push({
@@ -1351,7 +1362,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           r.platform.some((p) => /^mac$/i.test(String(p)))
       );
 
-    const BATCH_SIZE = 15;
+    const BATCH_SIZE = 6;
     for (let i = 0; i < filteredItems.length; i += BATCH_SIZE) {
       const batch = filteredItems.slice(i, i + BATCH_SIZE);
       const resolvedBatch = await Promise.all(
@@ -1542,7 +1553,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
           : wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
         const capsuleImg = steamAppId
-          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`
+          ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`
           : tallCover || wideBanner || 'https://cdn2.unrealengine.com/egs-badge.png';
 
         const finalDev = developer || offerMeta?.developers?.[0] || '';
@@ -1707,15 +1718,15 @@ function registerEpicNamespaceMapping({ appName, namespace, catalogItemId, title
     title: title ? String(title).trim() : undefined,
   };
   if (entry.appName) {
-    epicAppNamespaceCache.set('app:' + entry.appName.toLowerCase(), entry);
+    setBoundedCacheEntry(epicAppNamespaceCache, 'app:' + entry.appName.toLowerCase(), entry, MAX_STORE_SYNC_CACHE_ENTRIES);
   }
   if (entry.catalogItemId) {
-    epicAppNamespaceCache.set('cat:' + entry.catalogItemId.toLowerCase(), entry);
+    setBoundedCacheEntry(epicAppNamespaceCache, 'cat:' + entry.catalogItemId.toLowerCase(), entry, MAX_STORE_SYNC_CACHE_ENTRIES);
   }
   if (entry.title) {
     const norm = entry.title.toLowerCase().replace(/[^a-z0-9]/g, '');
     if (norm) {
-      epicAppNamespaceCache.set('title:' + norm, entry);
+      setBoundedCacheEntry(epicAppNamespaceCache, 'title:' + norm, entry, MAX_STORE_SYNC_CACHE_ENTRIES);
     }
   }
 }
@@ -2431,7 +2442,7 @@ async function fetchEpicProductOfferMetadata(payload = {}) {
       catalogItemId: catalogItemId || offer.id || undefined,
     };
 
-    epicOfferMetadataCache.set(cacheKey, result);
+    setBoundedCacheEntry(epicOfferMetadataCache, cacheKey, result, MAX_STORE_SYNC_CACHE_ENTRIES);
     return result;
   } catch (err) {
     console.warn('fetchEpicProductOfferMetadata warning:', err.message);
@@ -2777,9 +2788,33 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   return Array.from(resultsMap.values());
 }
 
+function trimStoreSyncMemory() {
+  fetchGogOwnedGames.lastAchievementsMap = null;
+  fetchGogOwnedGames.lastSuppressedItems = null;
+  fetchEpicOwnedGames.lastAchievementsMap = null;
+  fetchEpicOwnedGames.lastSuppressedItems = null;
+  while (epicOfferMetadataCache.size > 100) {
+    const oldestKey = epicOfferMetadataCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    epicOfferMetadataCache.delete(oldestKey);
+  }
+  while (epicAppNamespaceCache.size > MAX_STORE_SYNC_CACHE_ENTRIES) {
+    const oldestKey = epicAppNamespaceCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    epicAppNamespaceCache.delete(oldestKey);
+  }
+  while (steamMatchCache.size > MAX_STORE_SYNC_CACHE_ENTRIES) {
+    const oldestKey = steamMatchCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    steamMatchCache.delete(oldestKey);
+  }
+}
+
 module.exports = {
   atomicWriteFileSync,
   destroyScraperWindowCleanly,
+  trimStoreSyncMemory,
+  epicOfferMetadataCache,
   exchangeGogCode,
   renewGogTokens,
   normalizeGogAvatarUrl,

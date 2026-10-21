@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webFrame } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
@@ -69,5 +69,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:maximized-changed', handler);
     return () => ipcRenderer.removeListener('window:maximized-changed', handler);
   },
-  trimMemory: () => ipcRenderer.invoke('perf:trim-memory'),
+  // trimMemory: () => ipcRenderer.invoke('perf:trim-memory')
+  trimMemory: () => {
+    try {
+      webFrame?.clearCache?.();
+    } catch {}
+    return ipcRenderer.invoke('perf:trim-memory');
+  },
 });

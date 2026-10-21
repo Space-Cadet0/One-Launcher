@@ -472,15 +472,34 @@ function subscribeToCoverUpdates(
   };
 }
 
+const coverViewportCallbacks = new WeakMap<Element, (isNear: boolean) => void>();
+let sharedCoverObserver: IntersectionObserver | null = null;
+function getSharedCoverObserver(): IntersectionObserver | null {
+  if (typeof IntersectionObserver === 'undefined') return null;
+  if (!sharedCoverObserver) {
+    sharedCoverObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const cb = coverViewportCallbacks.get(entry.target);
+          if (cb) cb(entry.isIntersecting);
+        }
+      },
+      { rootMargin: '1000px 0px 1000px 0px' }
+    );
+  }
+  return sharedCoverObserver;
+}
+
 interface GameCardCoverProps {
   game: CanonicalGame;
   overrideCoverUrl?: string | null;
   userOverride?: UserGameOverride | null;
   onNeedCoverLookup?: (game: CanonicalGame) => void;
+  cardIndex?: number;
 }
 
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
-  ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup }) => {
+  ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup, cardIndex }) => {
     const [steamMatchVersion, setSteamMatchVersion] = useState(0);
     const gogPlatformGameId = game.platforms?.find((p) => p.platformId === 'gog')?.platformGameId;
 
@@ -496,7 +515,32 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
 
     const [candidateIndex, setCandidateIndex] = useState(0);
     const [headerFallbackFailed, setHeaderFallbackFailed] = useState(false);
+    const [isNearViewport, setIsNearViewport] = useState<boolean>(
+      () => (cardIndex ?? 0) < 42 || typeof IntersectionObserver === 'undefined'
+    );
+    const coverContainerRef = useRef<HTMLDivElement | null>(null);
     const topCandidate = candidates[0] || '';
+
+    useEffect(() => {
+      if ((cardIndex ?? 0) < 42 || typeof IntersectionObserver === 'undefined') {
+        setIsNearViewport(true);
+        return;
+      }
+      const el = coverContainerRef.current;
+      const observer = getSharedCoverObserver();
+      if (!el || !observer) {
+        setIsNearViewport(true);
+        return;
+      }
+      coverViewportCallbacks.set(el, (near) => {
+        setIsNearViewport(near);
+      });
+      observer.observe(el);
+      return () => {
+        coverViewportCallbacks.delete(el);
+        observer.unobserve(el);
+      };
+    }, [cardIndex]);
 
     // Reset candidate progression when game, explicit override, or top priority candidate upgrades
     useEffect(() => {
@@ -526,6 +570,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
 
     // Proactively resolve confirmed Steam matches and official GOG v2 boxArtImage covers for non-Steam games
     useEffect(() => {
+      if (!isNearViewport) return;
       if (effectiveOverride?.capsuleImage) return;
       const isExplicitNonSteam =
         effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
@@ -552,6 +597,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         }
       }
     }, [
+      isNearViewport,
       game.id,
       game.title,
       game.releaseDate,
@@ -565,7 +611,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     const matchReviewBadge =
       game.needsMatchReview === true && !effectiveOverride ? (
         <div
-          className="absolute bottom-9 left-2 z-20 flex items-center gap-1 bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[9px] font-semibold px-1.5 py-0.5 rounded shadow backdrop-blur-sm"
+          className="absolute bottom-9 left-2 z-20 flex items-center gap-1 bg-amber-950/95 border border-amber-500/60 text-amber-300 text-[9px] font-semibold px-1.5 py-0.5 rounded shadow"
           title="Low-confidence automatic match — click Fix Match to verify"
         >
           <AlertCircle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
@@ -581,23 +627,30 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         !game.headerImage.includes('egs-badge.png')
       ) {
         return (
-          <div className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] overflow-hidden select-none">
-            <img
-              src={game.headerImage}
-              alt=""
-              aria-hidden="true"
-              decoding="async"
-              className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
-              onError={() => setHeaderFallbackFailed(true)}
-            />
-            <img
-              src={game.headerImage}
-              alt={game.title}
-              loading="lazy"
-              decoding="async"
-              className="relative z-10 w-full aspect-[460/215] object-cover shadow-lg border-y border-white/10"
-              onError={() => setHeaderFallbackFailed(true)}
-            />
+          <div
+            ref={coverContainerRef}
+            className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] overflow-hidden select-none"
+          >
+            {isNearViewport && (
+              <>
+                <img
+                  src={game.headerImage}
+                  alt=""
+                  aria-hidden="true"
+                  decoding="async"
+                  className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
+                  onError={() => setHeaderFallbackFailed(true)}
+                />
+                <img
+                  src={game.headerImage}
+                  alt={game.title}
+                  loading="lazy"
+                  decoding="async"
+                  className="relative z-10 w-full aspect-[460/215] object-cover shadow-lg border-y border-white/10"
+                  onError={() => setHeaderFallbackFailed(true)}
+                />
+              </>
+            )}
             <span className="relative z-10 mt-2 text-[11px] font-semibold text-slate-200 line-clamp-2 leading-tight px-2 drop-shadow">
               {game.title}
             </span>
@@ -607,7 +660,10 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       }
 
       return (
-        <div className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none">
+        <div
+          ref={coverContainerRef}
+          className="grid-cover-fallback relative w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-[#1b2838] to-[#0f161f] select-none"
+        >
           <Gamepad2 className="w-10 h-10 text-slate-500 mb-2 opacity-60 group-hover:scale-110 group-hover:text-steam-accent transition-all" />
           <span className="text-xs font-semibold text-slate-300 line-clamp-3 leading-tight px-1">
             {game.title}
@@ -623,40 +679,44 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     );
 
     return (
-      <>
-        <img
-          key={currentSrc}
-          src={currentSrc}
-          alt={game.title}
-          loading="lazy"
-          decoding="async"
-          onLoad={(e) => {
-            const { naturalWidth, naturalHeight } = e.currentTarget;
-            if (naturalWidth && naturalHeight && !isUserExplicitCover) {
-              const ratio = naturalWidth / naturalHeight;
-              // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
-              // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
-              // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
-              if (ratio > 0.94) {
-                setCandidateIndex((prev) => prev + 1);
+      <div ref={coverContainerRef} className="relative w-full h-full">
+        {isNearViewport ? (
+          <img
+            key={currentSrc}
+            src={currentSrc}
+            alt={game.title}
+            loading="lazy"
+            decoding="async"
+            onLoad={(e) => {
+              const { naturalWidth, naturalHeight } = e.currentTarget;
+              if (naturalWidth && naturalHeight && !isUserExplicitCover) {
+                const ratio = naturalWidth / naturalHeight;
+                // Reject square (1.0) and landscape (> 1.0) images in portrait gridview
+                // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
+                // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
+                if (ratio > 0.94) {
+                  setCandidateIndex((prev) => prev + 1);
+                }
               }
-            }
-          }}
-          onError={() => {
-            if (currentSrc) {
-              const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900(?:_2x)?\.jpg/i);
-              const nextCandidate = candidates[candidateIndex + 1] || '';
-              if (m && !nextCandidate.includes(`/apps/${m[1]}/library_600x900`)) {
-                igdbCoverService.recordDeadSteamCover(Number(m[1]));
+            }}
+            onError={() => {
+              if (currentSrc) {
+                const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900(?:_2x)?\.jpg/i);
+                const nextCandidate = candidates[candidateIndex + 1] || '';
+                if (m && !nextCandidate.includes(`/apps/${m[1]}/library_600x900`)) {
+                  igdbCoverService.recordDeadSteamCover(Number(m[1]));
+                }
               }
-            }
-            // Declaratively advance to the next candidate without mutating the DOM
-            setCandidateIndex((prev) => prev + 1);
-          }}
-          className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
-        />
+              // Declaratively advance to the next candidate without mutating the DOM
+              setCandidateIndex((prev) => prev + 1);
+            }}
+            className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
+          />
+        ) : (
+          <div className="w-full h-full bg-[#111923]" />
+        )}
         {matchReviewBadge}
-      </>
+      </div>
     );
   }
 );
@@ -773,8 +833,25 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
   const [, setCriticUpdateTick] = useState(0);
   useEffect(() => {
-    const handleUpdate = () => {
-      setCriticUpdateTick((t) => t + 1);
+    let criticThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleUpdate = (e?: Event) => {
+      const isImmediate =
+        Boolean((e as CustomEvent)?.detail?.refreshedAll) ||
+        Boolean(typeof process !== 'undefined' && process.env?.VITEST);
+      if (isImmediate) {
+        if (criticThrottleTimer) {
+          clearTimeout(criticThrottleTimer);
+          criticThrottleTimer = null;
+        }
+        setCriticUpdateTick((t) => t + 1);
+        return;
+      }
+      if (!criticThrottleTimer) {
+        criticThrottleTimer = setTimeout(() => {
+          criticThrottleTimer = null;
+          setCriticUpdateTick((t) => t + 1);
+        }, 350);
+      }
     };
     const getLauncherGridSignature = () => {
       const running = launcherService
@@ -799,6 +876,10 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       }
     });
     return () => {
+      if (criticThrottleTimer) {
+        clearTimeout(criticThrottleTimer);
+        criticThrottleTimer = null;
+      }
       window.removeEventListener('antigravity_critic_updated', handleUpdate);
       unsubLauncher();
     };
@@ -1534,7 +1615,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
         {/* Game Covers Grid (Aspect Ratio ~2:3 Portrait Posters) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4">
-          {sortedGames.map((game) => {
+          {sortedGames.map((game, idx) => {
             const isRunning = launcherService.isGameRunning(game.id);
             const isInstalled =
               game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
@@ -1582,6 +1663,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                         overrideCoverUrl={cardOverrideCover}
                         userOverride={cardUserOverride}
                         onNeedCoverLookup={handleNeedCoverLookup}
+                        cardIndex={idx}
                       />
                     );
                   })()}
@@ -1649,7 +1731,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       : 'OpenCritic';
                     return (
                       <div
-                        className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md backdrop-blur-md transition-all ${
+                        className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md transition-all ${
                           ocColors.badgeBg
                         } ${ocColors.badgeBorder} ${ocColors.badgeText} ${
                           sortBy === 'rating'
@@ -1671,7 +1753,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
                   {/* Overlayed Bottom-Right: Storefront Icons Game is Owned On */}
                   <div
-                    className="absolute bottom-2 right-2 flex items-center gap-1.5 bg-black/85 backdrop-blur-md px-2 py-1 rounded border border-white/20 shadow-lg pointer-events-none group-hover:border-steam-accent/60 transition-colors z-10"
+                    className="absolute bottom-2 right-2 flex items-center gap-1.5 bg-[#0a0e14]/95 px-2 py-1 rounded border border-white/20 shadow-lg pointer-events-none group-hover:border-steam-accent/60 transition-colors z-10"
                     title={`Owned on: ${game.platforms
                       .map((p) => {
                         const name = getStorefrontDisplayName(p.platformId);

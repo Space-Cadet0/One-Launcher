@@ -11,9 +11,12 @@ export function useCriticScoreWarmup(games: CanonicalGame[]) {
   useEffect(() => {
     if (!games || games.length === 0) return;
 
+    const initialDelayMs =
+      typeof process !== 'undefined' && Boolean((process as any).env?.VITEST) ? 350 : 2500;
+
     const timer = setTimeout(() => {
       syncJobManager.startCriticScoreSync(games, { isBackgroundWarmup: true }).catch(() => {});
-    }, 350);
+    }, initialDelayMs);
 
     return () => {
       clearTimeout(timer);

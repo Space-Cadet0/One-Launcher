@@ -267,19 +267,88 @@ function evictExpendableCachesForCatalogQuota(): void {
   }
 }
 
+const MAX_STORED_SCREENSHOTS = 12;
+const MAX_STORED_MOVIES = 4;
+const MAX_STORED_DESCRIPTION_CHARS = 12000;
+
+export function compactGameForStorage(game: CanonicalGame): CanonicalGame {
+  if (!game || typeof game !== 'object') return game;
+
+  let nextGame = game;
+  if (
+    typeof nextGame.detailedDescription === 'string' &&
+    nextGame.detailedDescription.length > MAX_STORED_DESCRIPTION_CHARS
+  ) {
+    nextGame = {
+      ...nextGame,
+      detailedDescription: nextGame.detailedDescription.slice(0, MAX_STORED_DESCRIPTION_CHARS),
+    };
+  }
+
+  const meta = nextGame.enrichedMetadata;
+  if (!meta || typeof meta !== 'object') {
+    return nextGame;
+  }
+
+  const screenshotsNeedTrim =
+    Array.isArray(meta.screenshots) && meta.screenshots.length > MAX_STORED_SCREENSHOTS;
+  const moviesNeedTrim = Array.isArray(meta.movies) && meta.movies.length > MAX_STORED_MOVIES;
+  const detailedDescNeedsTrim =
+    typeof meta.detailedDescription === 'string' &&
+    meta.detailedDescription.length > MAX_STORED_DESCRIPTION_CHARS;
+  const aboutNeedsTrim =
+    typeof meta.aboutTheGame === 'string' &&
+    meta.aboutTheGame.length > MAX_STORED_DESCRIPTION_CHARS;
+
+  const trimmedDetailed = detailedDescNeedsTrim
+    ? meta.detailedDescription!.slice(0, MAX_STORED_DESCRIPTION_CHARS)
+    : meta.detailedDescription;
+  const trimmedAbout = aboutNeedsTrim
+    ? meta.aboutTheGame!.slice(0, MAX_STORED_DESCRIPTION_CHARS)
+    : meta.aboutTheGame;
+  const hasDuplicateAbout =
+    Boolean(trimmedDetailed && trimmedAbout && trimmedAbout === trimmedDetailed);
+
+  if (
+    !screenshotsNeedTrim &&
+    !moviesNeedTrim &&
+    !detailedDescNeedsTrim &&
+    !aboutNeedsTrim &&
+    !hasDuplicateAbout
+  ) {
+    return nextGame;
+  }
+
+  const nextMeta = {
+    ...meta,
+    screenshots: screenshotsNeedTrim
+      ? meta.screenshots.slice(0, MAX_STORED_SCREENSHOTS)
+      : meta.screenshots,
+    movies: moviesNeedTrim ? meta.movies.slice(0, MAX_STORED_MOVIES) : meta.movies,
+    detailedDescription: trimmedDetailed,
+    aboutTheGame: hasDuplicateAbout ? '' : (trimmedAbout ?? ''),
+  };
+
+  return {
+    ...nextGame,
+    enrichedMetadata: nextMeta,
+  };
+}
+
 function writeCatalogToLocalStorage(cleaned: CanonicalGame[]): void {
-  const serialized = JSON.stringify(cleaned);
+  const compacted = cleaned.map(compactGameForStorage);
+  const serialized = JSON.stringify(compacted);
   try {
     localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
   } catch (err) {
     evictExpendableCachesForCatalogQuota();
     localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
   }
-  inMemoryCatalogCache = cleaned;
+  inMemoryCatalogCache = compacted;
   inMemoryCatalogRawRef = serialized;
 
   // Save only custom games delta to STORAGE_KEY_CUSTOM_GAMES, NOT the duplicate copy of all master games
-  const customGames = cleaned.filter(
+  const customGames = compacted.filter(
     (g) =>
       g.platforms?.some((p) => p.platformId === 'custom') ||
       !g.platforms?.some((p) => ['steam', 'gog', 'epic', 'xbox'].includes(p.platformId))
@@ -301,8 +370,9 @@ export function flushPendingCatalogSave(): void {
   if (pendingCatalogGames !== null && typeof window !== 'undefined') {
     try {
       let toWrite = pendingCatalogGames;
-      if (pendingCatalogNeedsOverrides || pendingCatalogNeedsSanitize) {
-        toWrite = applyUserOverridesToCatalog(toWrite, loadUserOverrides());
+      if (pendingCatalogNeedsOverrides) {
+        const userOverrides = loadUserOverrides();
+        toWrite = applyUserOverridesToCatalog(toWrite, userOverrides);
       }
       if (pendingCatalogNeedsSanitize) {
         toWrite = sanitizeGameCatalog(toWrite);
@@ -310,6 +380,7 @@ export function flushPendingCatalogSave(): void {
       pendingCatalogGames = null;
       pendingCatalogNeedsSanitize = false;
       pendingCatalogNeedsOverrides = false;
+      inMemoryCatalogCache = toWrite;
       writeCatalogToLocalStorage(toWrite);
     } catch (err) {
       console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
@@ -409,53 +480,13 @@ export function loadCurrentCatalog(): CanonicalGame[] {
 export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalogOptions): void {
   if (typeof window === 'undefined') return;
   try {
-    if (options?.skipSanitize) {
+    if (!options?.immediate && !isTestEnv()) {
       inMemoryCatalogCache = games;
-      if (options?.immediate || isTestEnv()) {
-        if (pendingCatalogSaveTimer) {
-          clearTimeout(pendingCatalogSaveTimer);
-          pendingCatalogSaveTimer = null;
-        }
-        pendingCatalogGames = null;
-        pendingCatalogNeedsSanitize = false;
-        pendingCatalogNeedsOverrides = false;
-        const withOverrides = applyUserOverridesToCatalog(games, loadUserOverrides());
-        writeCatalogToLocalStorage(withOverrides);
-      } else {
-        pendingCatalogGames = games;
-        pendingCatalogNeedsSanitize = false;
-        pendingCatalogNeedsOverrides = true;
-        if (!pendingCatalogSaveTimer) {
-          pendingCatalogSaveTimer = setTimeout(() => {
-            try {
-              flushPendingCatalogSave();
-            } catch (e) {
-              console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
-            }
-          }, 1200);
-        }
+      pendingCatalogGames = games;
+      pendingCatalogNeedsOverrides = true;
+      if (!options?.skipSanitize) {
+        pendingCatalogNeedsSanitize = true;
       }
-      return;
-    }
-
-    const userOverrides = loadUserOverrides();
-    const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
-    const cleaned = sanitizeGameCatalog(withOverrides);
-    inMemoryCatalogCache = cleaned;
-
-    if (options?.immediate || isTestEnv()) {
-      if (pendingCatalogSaveTimer) {
-        clearTimeout(pendingCatalogSaveTimer);
-        pendingCatalogSaveTimer = null;
-      }
-      pendingCatalogGames = null;
-      pendingCatalogNeedsSanitize = false;
-      pendingCatalogNeedsOverrides = false;
-      writeCatalogToLocalStorage(cleaned);
-    } else {
-      pendingCatalogGames = cleaned;
-      pendingCatalogNeedsSanitize = false;
-      pendingCatalogNeedsOverrides = false;
       if (!pendingCatalogSaveTimer) {
         pendingCatalogSaveTimer = setTimeout(() => {
           try {
@@ -465,7 +496,22 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
           }
         }, 1200);
       }
+      return;
     }
+
+    if (pendingCatalogSaveTimer) {
+      clearTimeout(pendingCatalogSaveTimer);
+      pendingCatalogSaveTimer = null;
+    }
+    pendingCatalogGames = null;
+    pendingCatalogNeedsSanitize = false;
+    pendingCatalogNeedsOverrides = false;
+
+    const userOverrides = loadUserOverrides();
+    const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
+    const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
+    inMemoryCatalogCache = cleaned;
+    writeCatalogToLocalStorage(cleaned);
   } catch (err) {
     console.error('Failed to save universal catalog', err);
   }

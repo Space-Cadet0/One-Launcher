@@ -147,9 +147,21 @@ if (!gotTheLock) {
 
   try {
     if (app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
-      app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512');
+      app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384');
+      app.commandLine.appendSwitch('disk-cache-size', String(50 * 1024 * 1024));
+      app.commandLine.appendSwitch('media-cache-size', String(25 * 1024 * 1024));
+      app.commandLine.appendSwitch('gpu-program-cache-size-kb', '4096');
+      app.commandLine.appendSwitch('renderer-process-limit', '2');
       if (process.platform === 'win32') {
-        app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+        app.commandLine.appendSwitch(
+          'disable-features',
+          'CalculateNativeWinOcclusion,SpareRendererForSitePerProcess,BackForwardCache'
+        );
+      } else {
+        app.commandLine.appendSwitch(
+          'disable-features',
+          'SpareRendererForSitePerProcess,BackForwardCache'
+        );
       }
     }
   } catch {
@@ -621,10 +633,10 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
 
     const headerFile = (si && si.header) || 'header.jpg';
     const capsuleFile =
-      (si && (si.library_capsule_2x || si.library_capsule)) ||
+      (si && (si.library_capsule || si.library_capsule_2x)) ||
       (typeof g.capsule_filename === 'string' && g.capsule_filename.includes('/')
         ? g.capsule_filename
-        : 'library_600x900_2x.jpg');
+        : 'library_600x900.jpg');
 
     const gameObj = {
       id: `steam-${appId}`,
@@ -1130,102 +1142,93 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
               .replace(/\s+one-launcher\/[^\s]+/gi, '')
               .replace(/\s+Electron\/[^\s]+/gi, '');
 
-            const ssrResult = await new Promise((resolveSsr) => {
-              let done = false;
-              const bgWin = new BrowserWindow({
-                width: 1024,
-                height: 768,
-                show: false,
-                webPreferences: {
-                  nodeIntegration: false,
-                  contextIsolation: true,
-                  partition: 'persist:storefront_auth',
-                  userAgent: cleanBrowserUA,
-                  images: false,
-                  spellcheck: false,
-                  backgroundThrottling: true,
-                  v8CacheOptions: 'none',
-                },
-              });
-
-              let timer = null;
-              const finish = (val) => {
-                if (done) return;
-                done = true;
-                if (timer) clearTimeout(timer);
+            let ssrResult = null;
+            try {
+              const authSession = session.fromPartition('persist:storefront_auth');
+              if (authSession && typeof authSession.fetch === 'function') {
+                const fetchAbort = new AbortController();
+                const fetchTimer = setTimeout(() => fetchAbort.abort(), 10000);
                 try {
-                  if (typeof storeSync.destroyScraperWindowCleanly === 'function') {
-                    storeSync.destroyScraperWindowCleanly(bgWin);
-                  } else if (bgWin && !bgWin.isDestroyed()) {
-                    bgWin.destroy();
-                  }
-                } catch {}
-                resolveSsr(val);
-              };
-
-              timer = setTimeout(() => finish(null), 12000);
-
-              bgWin.webContents.on('did-finish-load', async () => {
-                if (done || bgWin.isDestroyed()) return;
-                const currentUrl = bgWin.webContents.getURL();
-                if (!currentUrl || currentUrl.includes('/login') || !currentUrl.includes('steamcommunity.com')) {
-                  return;
-                }
-                try {
-                  const extracted = await bgWin.webContents.executeJavaScript(`
-                    (function() {
-                      let ssr = window.SSR;
-                      if (!ssr) {
-                        const ssrScript = document.getElementById('valve-ssr-data');
-                        if (ssrScript && ssrScript.textContent) {
-                          try { ssr = JSON.parse(ssrScript.textContent); } catch (e) {}
-                        }
-                      }
-                      if (!ssr) return null;
-                      let webApiToken = undefined;
-                      let rgGames = null;
-                      const storeItems = {};
-                      const loaderData = Array.isArray(ssr.loaderData) ? ssr.loaderData : [];
-                      for (const item of loaderData) {
-                        if (!item) continue;
-                        try {
-                          const parsed = typeof item === 'string' ? JSON.parse(item) : item;
-                          if (parsed && parsed.strWebAPIToken && !webApiToken) webApiToken = String(parsed.strWebAPIToken);
-                        } catch (e) {}
-                      }
-                      const rawQueryData = ssr.renderContext && ssr.renderContext.queryData;
-                      if (rawQueryData) {
-                        try {
-                          const qd = typeof rawQueryData === 'string' ? JSON.parse(rawQueryData) : rawQueryData;
-                          const queries = Array.isArray(qd && qd.queries) ? qd.queries : [];
-                          for (const q of queries) {
-                            const key = Array.isArray(q && q.queryKey) ? q.queryKey : [];
-                            const data = q && q.state ? q.state.data : undefined;
-                            if (!data) continue;
-                            if (key[0] === 'OwnedGames' && Array.isArray(data)) {
-                              rgGames = data;
-                            } else if (key[0] === 'StoreItem' && typeof key[1] === 'string' && key[1].startsWith('app_')) {
-                              storeItems[key[1].replace('app_', '')] = data;
+                  const ssrRes = await authSession.fetch('https://steamcommunity.com/my/games/?tab=all', {
+                    signal: fetchAbort.signal,
+                    headers: {
+                      'User-Agent': cleanBrowserUA,
+                      Accept: 'text/html,application/xhtml+xml',
+                    },
+                  });
+                  if (ssrRes && ssrRes.ok && !String(ssrRes.url || '').includes('/login')) {
+                    const html = await ssrRes.text();
+                    const ssrMatch = html.match(/<script\s+id=["']valve-ssr-data["'][^>]*>([\s\S]*?)<\/script>/i);
+                    if (ssrMatch && ssrMatch[1]) {
+                      try {
+                        const ssr = JSON.parse(ssrMatch[1].trim());
+                        let webApiToken = undefined;
+                        let rgGames = null;
+                        const storeItems = {};
+                        const loaderData = Array.isArray(ssr?.loaderData) ? ssr.loaderData : [];
+                        for (const item of loaderData) {
+                          if (!item) continue;
+                          try {
+                            const parsed = typeof item === 'string' ? JSON.parse(item) : item;
+                            if (parsed && parsed.strWebAPIToken && !webApiToken) {
+                              webApiToken = String(parsed.strWebAPIToken);
                             }
+                          } catch {}
+                        }
+                        const rawQueryData = ssr?.renderContext?.queryData;
+                        if (rawQueryData) {
+                          try {
+                            const qd = typeof rawQueryData === 'string' ? JSON.parse(rawQueryData) : rawQueryData;
+                            const queries = Array.isArray(qd?.queries) ? qd.queries : [];
+                            for (const q of queries) {
+                              const key = Array.isArray(q?.queryKey) ? q.queryKey : [];
+                              const data = q?.state?.data;
+                              if (!data) continue;
+                              if (key[0] === 'OwnedGames' && Array.isArray(data)) {
+                                rgGames = data;
+                              } else if (
+                                key[0] === 'StoreItem' &&
+                                typeof key[1] === 'string' &&
+                                key[1].startsWith('app_')
+                              ) {
+                                storeItems[key[1].replace('app_', '')] = data;
+                              }
+                            }
+                          } catch {}
+                        }
+                        if (Array.isArray(rgGames) && rgGames.length > 0) {
+                          ssrResult = { rgGames, storeItems, webApiToken };
+                        }
+                      } catch {}
+                    }
+                    if (!ssrResult) {
+                      const legacyMatch = html.match(/data-profile-gameslist="([^"]+)"/i);
+                      if (legacyMatch && legacyMatch[1]) {
+                        try {
+                          const decoded = legacyMatch[1]
+                            .replace(/&quot;/g, '"')
+                            .replace(/&amp;/g, '&')
+                            .replace(/&lt;/g, '<')
+                            .replace(/&gt;/g, '>')
+                            .replace(/&#039;/g, "'")
+                            .replace(/&#39;/g, "'");
+                          const parsedLegacy = JSON.parse(decoded);
+                          if (Array.isArray(parsedLegacy?.rgGames) && parsedLegacy.rgGames.length > 0) {
+                            ssrResult = {
+                              rgGames: parsedLegacy.rgGames,
+                              storeItems: parsedLegacy.storeItems || {},
+                              webApiToken: parsedLegacy.strWebAPIToken || parsedLegacy.webapi_token,
+                            };
                           }
-                        } catch (e) {}
+                        } catch {}
                       }
-                      if (Array.isArray(rgGames) && rgGames.length > 0) {
-                        return { rgGames, storeItems, webApiToken };
-                      }
-                      return null;
-                    })()
-                  `);
-                  if (extracted && Array.isArray(extracted.rgGames) && extracted.rgGames.length > 0) {
-                    finish(extracted);
+                    }
                   }
-                } catch {}
-              });
-
-              bgWin.loadURL('https://steamcommunity.com/my/games/?tab=all').catch(() => {
-                finish(null);
-              });
-            });
+                } finally {
+                  clearTimeout(fetchTimer);
+                }
+              }
+            } catch {}
 
             if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
               const refreshed = parseSteamGamesListJson(
@@ -1241,6 +1244,123 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
                 games,
               };
               storeSync.saveTokens('steam', tokenData);
+              refreshedLive = true;
+            }
+
+            if (!refreshedLive) {
+              ssrResult = await new Promise((resolveSsr) => {
+                let done = false;
+                const bgWin = new BrowserWindow({
+                  width: 1024,
+                  height: 768,
+                  show: false,
+                  webPreferences: {
+                    nodeIntegration: false,
+                    contextIsolation: true,
+                    partition: 'persist:storefront_auth',
+                    userAgent: cleanBrowserUA,
+                    images: false,
+                    spellcheck: false,
+                    backgroundThrottling: true,
+                    v8CacheOptions: 'none',
+                  },
+                });
+
+                let timer = null;
+                const finish = (val) => {
+                  if (done) return;
+                  done = true;
+                  if (timer) clearTimeout(timer);
+                  try {
+                    if (typeof storeSync.destroyScraperWindowCleanly === 'function') {
+                      storeSync.destroyScraperWindowCleanly(bgWin);
+                    } else if (bgWin && !bgWin.isDestroyed()) {
+                      bgWin.destroy();
+                    }
+                  } catch {}
+                  resolveSsr(val);
+                };
+
+                timer = setTimeout(() => finish(null), 12000);
+
+                bgWin.webContents.on('did-finish-load', async () => {
+                  if (done || bgWin.isDestroyed()) return;
+                  const currentUrl = bgWin.webContents.getURL();
+                  if (!currentUrl || currentUrl.includes('/login') || !currentUrl.includes('steamcommunity.com')) {
+                    return;
+                  }
+                  try {
+                    const extracted = await bgWin.webContents.executeJavaScript(`
+                      (function() {
+                        let ssr = window.SSR;
+                        if (!ssr) {
+                          const ssrScript = document.getElementById('valve-ssr-data');
+                          if (ssrScript && ssrScript.textContent) {
+                            try { ssr = JSON.parse(ssrScript.textContent); } catch (e) {}
+                          }
+                        }
+                        if (!ssr) return null;
+                        let webApiToken = undefined;
+                        let rgGames = null;
+                        const storeItems = {};
+                        const loaderData = Array.isArray(ssr.loaderData) ? ssr.loaderData : [];
+                        for (const item of loaderData) {
+                          if (!item) continue;
+                          try {
+                            const parsed = typeof item === 'string' ? JSON.parse(item) : item;
+                            if (parsed && parsed.strWebAPIToken && !webApiToken) webApiToken = String(parsed.strWebAPIToken);
+                          } catch (e) {}
+                        }
+                        const rawQueryData = ssr.renderContext && ssr.renderContext.queryData;
+                        if (rawQueryData) {
+                          try {
+                            const qd = typeof rawQueryData === 'string' ? JSON.parse(rawQueryData) : rawQueryData;
+                            const queries = Array.isArray(qd && qd.queries) ? qd.queries : [];
+                            for (const q of queries) {
+                              const key = Array.isArray(q && q.queryKey) ? q.queryKey : [];
+                              const data = q && q.state ? q.state.data : undefined;
+                              if (!data) continue;
+                              if (key[0] === 'OwnedGames' && Array.isArray(data)) {
+                                rgGames = data;
+                              } else if (key[0] === 'StoreItem' && typeof key[1] === 'string' && key[1].startsWith('app_')) {
+                                storeItems[key[1].replace('app_', '')] = data;
+                              }
+                            }
+                          } catch (e) {}
+                        }
+                        if (Array.isArray(rgGames) && rgGames.length > 0) {
+                          return { rgGames, storeItems, webApiToken };
+                        }
+                        return null;
+                      })()
+                    `);
+                    if (extracted && Array.isArray(extracted.rgGames) && extracted.rgGames.length > 0) {
+                      finish(extracted);
+                    }
+                  } catch {}
+                });
+
+                bgWin.loadURL('https://steamcommunity.com/my/games/?tab=all').catch(() => {
+                  finish(null);
+                });
+              });
+
+              if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
+                const refreshed = parseSteamGamesListJson(
+                  { rgGames: ssrResult.rgGames, strProfileName: accountName, storeItems: ssrResult.storeItems || {} },
+                  tokenData.steamId,
+                  accountName,
+                  avatarUrl
+                );
+                games = refreshed.games;
+                tokenData = {
+                  ...tokenData,
+                  webapi_token: ssrResult.webApiToken || tokenData.webapi_token,
+                  games,
+                };
+                storeSync.saveTokens('steam', tokenData);
+                refreshedLive = true;
+              }
             }
           } catch {}
         }
@@ -1398,6 +1518,9 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
     }
   })().finally(() => {
     inFlightStoreSyncs.delete(syncKey);
+    try {
+      storeSync.trimStoreSyncMemory?.();
+    } catch {}
   });
 
   inFlightStoreSyncs.set(syncKey, syncPromise);
@@ -1892,6 +2015,12 @@ ipcMain.handle('window:perform-menu-action', (_event, action) => {
 });
 
 ipcMain.handle('perf:trim-memory', async () => {
+  try {
+    launcherEngine.trimLauncherEngineMemory?.();
+  } catch {}
+  try {
+    storeSync.trimStoreSyncMemory?.();
+  } catch {}
   try {
     if (
       mainWindow &&

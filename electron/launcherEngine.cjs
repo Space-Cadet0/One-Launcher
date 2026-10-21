@@ -592,8 +592,11 @@ function resolveMacAppBundleBinary(appBundlePath) {
 
 const MAX_DISCOVERY_CACHE_ENTRIES = 500;
 const MAX_LEGENDARY_CACHE_DIRS = 16;
+const MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES = 2000;
+const STEAM_APPINFO_BUF_IDLE_TTL_MS = 5000;
 const executableDiscoveryCache = new Map();
 const steamAppInfoCache = new Map();
+const steamResolvedLaunchSpecCache = new Map();
 const legendaryMetadataDirCache = new Map();
 const legendaryAssetsFileCache = new Map();
 const legendaryAliasesFileCache = new Map();
@@ -625,9 +628,37 @@ function evictExecutableDiscoveryCacheForPath(targetPath) {
   }
 }
 
+function trimLauncherEngineMemory() {
+  for (const [, entry] of steamAppInfoCache.entries()) {
+    if (entry) {
+      if (entry.evictTimer) {
+        try {
+          clearTimeout(entry.evictTimer);
+        } catch {}
+        entry.evictTimer = null;
+      }
+      entry.buf = null;
+    }
+  }
+  while (steamResolvedLaunchSpecCache.size > 1000) {
+    const oldestKey = steamResolvedLaunchSpecCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    steamResolvedLaunchSpecCache.delete(oldestKey);
+  }
+}
+
 function invalidateScanCaches() {
   executableDiscoveryCache.clear();
+  for (const [, entry] of steamAppInfoCache.entries()) {
+    if (entry && entry.evictTimer) {
+      try {
+        clearTimeout(entry.evictTimer);
+      } catch {}
+      entry.evictTimer = null;
+    }
+  }
   steamAppInfoCache.clear();
+  steamResolvedLaunchSpecCache.clear();
   legendaryMetadataDirCache.clear();
   legendaryAssetsFileCache.clear();
   legendaryAliasesFileCache.clear();
@@ -1039,6 +1070,22 @@ function parseSteamAcf(acfContent) {
  * Locate and parse Steam binary <SteamRoot>/appcache/appinfo.vdf (v27, v28, v29)
  * to resolve the authoritative executable, launch arguments, and working directory for an AppID.
  */
+function scheduleSteamAppInfoBufEviction(entry) {
+  if (!entry) return;
+  if (entry.evictTimer) {
+    try {
+      clearTimeout(entry.evictTimer);
+    } catch {}
+  }
+  entry.evictTimer = setTimeout(() => {
+    entry.buf = null;
+    entry.evictTimer = null;
+  }, STEAM_APPINFO_BUF_IDLE_TTL_MS);
+  if (entry.evictTimer && typeof entry.evictTimer.unref === 'function') {
+    entry.evictTimer.unref();
+  }
+}
+
 function getIndexedSteamAppInfoVdf(appinfoPath) {
   try {
     if (!appinfoPath || !fs.existsSync(appinfoPath)) return null;
@@ -1046,7 +1093,16 @@ function getIndexedSteamAppInfoVdf(appinfoPath) {
     const mtimeMs = st.mtimeMs || 0;
     const cached = steamAppInfoCache.get(appinfoPath);
     if (cached && cached.mtimeMs === mtimeMs) {
+      if (cached.buf) {
+        scheduleSteamAppInfoBufEviction(cached);
+      }
       return cached;
+    }
+    if (cached && cached.evictTimer) {
+      try {
+        clearTimeout(cached.evictTimer);
+      } catch {}
+      cached.evictTimer = null;
     }
 
     const buf = fs.readFileSync(appinfoPath);
@@ -1100,8 +1156,10 @@ function getIndexedSteamAppInfoVdf(appinfoPath) {
       magic,
       strings,
       appIndex,
+      evictTimer: null,
     };
-    steamAppInfoCache.set(appinfoPath, indexed);
+    scheduleSteamAppInfoBufEviction(indexed);
+    setBoundedMapEntry(steamAppInfoCache, appinfoPath, indexed, 16);
     return indexed;
   } catch {
     return null;
@@ -1218,20 +1276,69 @@ function resolveSteamAppInfoLaunchSpec(steamappsDirOrInstallPath, appId, install
     const indexed = getIndexedSteamAppInfoVdf(appinfoPath);
     if (!indexed) return null;
 
-    const sliceRange = indexed.appIndex.get(cleanAppId);
-    if (!sliceRange) return null;
+    const platform = options.platform || process.platform;
+    const specCacheKey = `${appinfoPath}::${indexed.mtimeMs}::${cleanAppId}`;
+    if (steamResolvedLaunchSpecCache.has(specCacheKey)) {
+      const cachedEntry = steamResolvedLaunchSpecCache.get(specCacheKey);
+      if (
+        cachedEntry &&
+        cachedEntry.installPath === resolvedInstallPath &&
+        cachedEntry.platform === platform
+      ) {
+        if (cachedEntry.spec === null) return null;
+        if (cachedEntry.spec.executablePath && fs.existsSync(cachedEntry.spec.executablePath)) {
+          return { ...cachedEntry.spec };
+        }
+      }
+    }
 
-    const parsedApp = parseSteamBinaryVdfSlice(
-      indexed.buf,
-      sliceRange.payloadStart,
-      sliceRange.payloadEnd,
-      indexed.strings
-    );
+    const slice = indexed.appIndex.get(cleanAppId);
+    if (!slice) {
+      setBoundedMapEntry(
+        steamResolvedLaunchSpecCache,
+        specCacheKey,
+        { installPath: resolvedInstallPath, platform, spec: null },
+        MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES
+      );
+      return null;
+    }
+
+    let parsedApp = null;
+    if (indexed.buf) {
+      scheduleSteamAppInfoBufEviction(indexed);
+      parsedApp = parseSteamBinaryVdfSlice(
+        indexed.buf,
+        slice.payloadStart,
+        slice.payloadEnd,
+        indexed.strings
+      );
+    } else {
+      const sliceLen = slice.payloadEnd - slice.payloadStart;
+      if (sliceLen <= 0) return null;
+      const sliceBuf = Buffer.allocUnsafe(sliceLen);
+      const fd = fs.openSync(appinfoPath, 'r');
+      try {
+        fs.readSync(fd, sliceBuf, 0, sliceLen, slice.payloadStart);
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+      }
+      parsedApp = parseSteamBinaryVdfSlice(sliceBuf, 0, sliceLen, indexed.strings);
+    }
+
     const root = parsedApp?.appinfo || parsedApp;
     const launchMap = root?.config?.launch;
-    if (!launchMap || typeof launchMap !== 'object') return null;
+    if (!launchMap || typeof launchMap !== 'object') {
+      setBoundedMapEntry(
+        steamResolvedLaunchSpecCache,
+        specCacheKey,
+        { installPath: resolvedInstallPath, platform, spec: null },
+        MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES
+      );
+      return null;
+    }
 
-    const platform = options.platform || process.platform;
     const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(
       resolvedInstallPath || ''
     );
@@ -1306,7 +1413,15 @@ function resolveSteamAppInfoLaunchSpec(steamappsDirOrInstallPath, appId, install
       });
     }
 
-    if (candidates.length === 0) return null;
+    if (candidates.length === 0) {
+      setBoundedMapEntry(
+        steamResolvedLaunchSpecCache,
+        specCacheKey,
+        { installPath: resolvedInstallPath, platform, spec: null },
+        MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES
+      );
+      return null;
+    }
     candidates.sort((a, b) => b.score - a.score);
 
     const best = candidates[0];
@@ -1327,12 +1442,19 @@ function resolveSteamAppInfoLaunchSpec(steamappsDirOrInstallPath, appId, install
       platform === 'darwin' &&
       (isInsideBottle || best.executablePath.toLowerCase().endsWith('.exe'));
 
-    return {
+    const resolvedSpec = {
       executablePath: best.executablePath,
       launchArguments,
       workingDirectory,
       isWindowsBinaryOnMac,
     };
+    setBoundedMapEntry(
+      steamResolvedLaunchSpecCache,
+      specCacheKey,
+      { installPath: resolvedInstallPath, platform, spec: resolvedSpec },
+      MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES
+    );
+    return { ...resolvedSpec };
   } catch {
     return null;
   }
@@ -10794,6 +10916,7 @@ function shutdownLauncherEngine() {
       entry.pollTimer = null;
     }
   }
+  trimLauncherEngineMemory();
 }
 
 /**
@@ -11589,6 +11712,8 @@ module.exports = {
   updateDownloadTask,
   clearDownloadQueue,
   shutdownLauncherEngine,
+  trimLauncherEngineMemory,
+  steamAppInfoCache,
 
   // E) File Management & Config Persistence
   browseLocalFiles,
