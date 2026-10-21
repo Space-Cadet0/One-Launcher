@@ -999,6 +999,16 @@ export class SyncJobManager {
               const validRefreshedPubs =
                 refreshed.publishers?.filter((p) => p && p !== 'Unknown Publisher') || [];
 
+              const validRefreshedCapsule =
+                refreshed.capsuleImage &&
+                !refreshed.capsuleImage.includes('184x69') &&
+                !refreshed.capsuleImage.includes('231x87') &&
+                !refreshed.capsuleImage.includes('capsule_sm_120') &&
+                !refreshed.capsuleImage.includes('_glx_vertical_cover') &&
+                !refreshed.capsuleImage.includes('header.jpg')
+                  ? refreshed.capsuleImage
+                  : undefined;
+
               const updatedGame: CanonicalGame = {
                 ...game,
                 steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
@@ -1006,7 +1016,7 @@ export class SyncJobManager {
                 headerImage: refreshed.headerImage || game.headerImage,
                 capsuleImage: preservePinnedCover
                   ? ov!.capsuleImage!
-                  : refreshed.capsuleImage || game.capsuleImage,
+                  : validRefreshedCapsule || game.capsuleImage,
                 shortDescription: preservePinnedSynopsis
                   ? ov!.shortDescription || game.shortDescription
                   : validRefreshedShort || game.shortDescription,

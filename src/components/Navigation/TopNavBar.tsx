@@ -257,7 +257,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
 
   return (
     <header
-      className="app-drag-region sticky top-0 z-40 bg-[#171a21]/95 backdrop-blur-md border-b border-steam-border shadow-md select-none"
+      className="app-drag-region sticky top-0 z-40 bg-[#171a21] border-b border-steam-border shadow-md select-none"
       style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
     >
       {isWindowsOrLinuxWindow && (
@@ -702,7 +702,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             {/* Burger Dropdown Menu */}
             {isMenuOpen && (
               <div
-                className="app-no-drag absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 backdrop-blur-md animate-in fade-in zoom-in-95 duration-150"
+                className="app-no-drag absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 animate-in fade-in zoom-in-95 duration-150"
                 style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
               >
                 {/* Brand Header */}

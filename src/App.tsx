@@ -14,13 +14,15 @@ import { reconcileAchievementSummaries } from './services/storage/achievementRec
 import { steamAchievementsService } from './services/steam/steamAchievementsService';
 import { achievementDetailService } from './services/achievements/achievementDetailService';
 import { TopNavBar } from './components/Navigation/TopNavBar';
-import { LibrarySidebar } from './components/Library/LibrarySidebar';
+import { LibrarySidebar, clearFailedSidebarIconUrls } from './components/Library/LibrarySidebar';
 import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
 import {
   LibraryGridView,
   GridSortOption,
   loadPersistedGridSort,
+  clearFailedCoverUrls,
 } from './components/Library/LibraryGridView';
+import { igdbCoverService, isUnsuitableCoverUrl } from './services/igdb/igdbCoverService';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
 import { CollectionIcon } from './components/Common/CollectionIcon';
 import { matchesLooseSearchQuery } from './services/common/titleUtils';
@@ -1891,6 +1893,15 @@ export function App() {
     const target = gameToSync || selectedGame;
     if (!target || isSyncingCurrentGame) return;
     const targetAppId = steamMatcher.getEffectiveSteamAppId(target);
+    const gogId = target.platforms?.find((p) => p.platformId === 'gog')?.platformGameId;
+
+    // Evict any negative or stale caches for this game so manual sync always performs a fresh resolution
+    igdbCoverService.evictCacheForGame(target.title, gogId, targetAppId);
+    if (targetAppId) {
+      steamApi.evictCache(targetAppId);
+    }
+    clearFailedCoverUrls(target.id);
+    clearFailedSidebarIconUrls();
 
     setIsSyncingCurrentGame(true);
     setSyncNotice(
@@ -1902,37 +1913,63 @@ export function App() {
     try {
       await syncJobManager.runPriorityAction('Syncing Game Media', target.title, async () => {
         if (!targetAppId) {
-          const refreshed = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(target);
-          if (refreshed) {
+          const [refreshed, gogBoxArt, igdbCover] = await Promise.all([
+            fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(target).catch(() => null),
+            gogId
+              ? igdbCoverService
+                  .fetchGogVerticalCover(gogId, target.title, RequestPriority.P0_INTERACTIVE)
+                  .catch(() => null)
+              : Promise.resolve(null),
+            igdbCoverService
+              .fetchIgdbCover(
+                target.title,
+                target.releaseDate,
+                RequestPriority.P0_INTERACTIVE
+              )
+              .catch(() => null),
+          ]);
+
+          const validRefreshedCapsule =
+            gogBoxArt ||
+            (refreshed?.capsuleImage && !isUnsuitableCoverUrl(refreshed.capsuleImage)
+              ? refreshed.capsuleImage
+              : undefined) ||
+            igdbCover;
+
+          if (refreshed || validRefreshedCapsule) {
             setGames((prevGames) => {
               const updated = prevGames.map((g) => {
                 if (g.id === target.id) {
-                  const cleanDevelopers = refreshed.developers?.filter(
+                  const cleanDevelopers = refreshed?.developers?.filter(
                     (d) => d && d !== 'Unknown Developer'
                   );
+                  const existingValidCapsule =
+                    g.capsuleImage && !isUnsuitableCoverUrl(g.capsuleImage)
+                      ? g.capsuleImage
+                      : undefined;
                   return {
                     ...g,
-                    enrichedMetadata: refreshed,
-                    headerImage: refreshed.headerImage || g.headerImage,
-                    capsuleImage: refreshed.capsuleImage || g.capsuleImage,
+                    enrichedMetadata: refreshed || g.enrichedMetadata,
+                    headerImage: refreshed?.headerImage || g.headerImage,
+                    capsuleImage: validRefreshedCapsule || existingValidCapsule,
                     shortDescription:
-                      refreshed.shortDescription &&
+                      refreshed?.shortDescription &&
                       !isGenericPlaceholderSynopsis(refreshed.shortDescription, target.title)
                         ? refreshed.shortDescription
                         : g.shortDescription,
                     detailedDescription:
-                      refreshed.detailedDescription ||
-                      refreshed.aboutTheGame ||
+                      refreshed?.detailedDescription ||
+                      refreshed?.aboutTheGame ||
                       g.detailedDescription,
                     developers: cleanDevelopers?.length ? cleanDevelopers : g.developers,
-                    publishers: refreshed.publishers?.length ? refreshed.publishers : g.publishers,
+                    publishers: refreshed?.publishers?.length ? refreshed.publishers : g.publishers,
                     releaseDate:
-                      refreshed.releaseDate && refreshed.releaseDate !== 'TBA'
+                      refreshed?.releaseDate && refreshed.releaseDate !== 'TBA'
                         ? refreshed.releaseDate
                         : g.releaseDate,
-                    genres: refreshed.genres?.length ? refreshed.genres : g.genres,
-                    tags: refreshed.tags?.length ? refreshed.tags : g.tags,
-                    reviewSummary: refreshed.reviewSummary || g.reviewSummary,
+                    genres: refreshed?.genres?.length ? refreshed.genres : g.genres,
+                    tags: refreshed?.tags?.length ? refreshed.tags : g.tags,
+                    reviewSummary: refreshed?.reviewSummary || g.reviewSummary,
                   };
                 }
                 return g;
@@ -1957,12 +1994,32 @@ export function App() {
           }
         } catch {}
 
-        const [refreshed, liveAchs] = await Promise.all([
+        const [refreshed, browseAssets, liveAchs] = await Promise.all([
           steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE),
+          steamApi.fetchStoreBrowseAssets(targetAppId),
           steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
         ]);
 
-        if (refreshed || liveAchs) {
+        let resolvedVerticalCover =
+          (refreshed?.capsuleImage && !isUnsuitableCoverUrl(refreshed.capsuleImage)
+            ? refreshed.capsuleImage
+            : undefined) ||
+          (browseAssets?.capsuleImage && !isUnsuitableCoverUrl(browseAssets.capsuleImage)
+            ? browseAssets.capsuleImage
+            : undefined);
+
+        if (!resolvedVerticalCover) {
+          resolvedVerticalCover =
+            (await igdbCoverService
+              .fetchIgdbCover(
+                target.title,
+                refreshed?.releaseDate || target.releaseDate,
+                RequestPriority.P0_INTERACTIVE
+              )
+              .catch(() => null)) || undefined;
+        }
+
+        if (refreshed || browseAssets || resolvedVerticalCover || liveAchs) {
           setGames((prevGames) => {
             const updated = prevGames.map((g) => {
               if (g.id === target.id) {
@@ -1976,13 +2033,20 @@ export function App() {
                   return p;
                 });
 
+                const existingValidCapsule =
+                  g.capsuleImage && !isUnsuitableCoverUrl(g.capsuleImage)
+                    ? g.capsuleImage
+                    : undefined;
+
                 return {
                   ...g,
                   steamAppId: targetAppId,
                   platforms: updatedPlatforms,
                   enrichedMetadata: refreshed || g.enrichedMetadata,
-                  headerImage: refreshed?.headerImage || g.headerImage,
-                  capsuleImage: refreshed?.capsuleImage || g.capsuleImage,
+                  headerImage:
+                    refreshed?.headerImage || browseAssets?.headerImage || g.headerImage,
+                  capsuleImage: resolvedVerticalCover || existingValidCapsule,
+                  iconUrl: browseAssets?.iconUrl || g.iconUrl,
                   shortDescription: refreshed?.shortDescription || g.shortDescription,
                   developers: refreshed?.developers?.length ? refreshed.developers : g.developers,
                   publishers: refreshed?.publishers?.length ? refreshed.publishers : g.publishers,
@@ -2446,6 +2510,7 @@ export function App() {
               saveCurrentScroll(mainContentRef.current.scrollTop);
             }
           }}
+          style={{ overflowAnchor: 'none' }}
           className="flex-1 h-full overflow-y-auto bg-[#0b0f14] relative"
         >
           {isGridView || !selectedGame ? (

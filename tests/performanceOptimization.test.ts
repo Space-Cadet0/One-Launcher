@@ -170,21 +170,27 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
   // 1. Electron Main Process Memory Hardening (electron/main.cjs, launcherEngine.cjs, storeSync.cjs)
   // =========================================================================
   describe('1. Electron Main Process Memory Hardening (electron/main.cjs, launcherEngine.cjs, storeSync.cjs)', () => {
-    it('configures --max-old-space-size=384, Chromium disk/media/GPU cache caps, renderer-process-limit, lightweight store:sync scraper BrowserWindow, 15s Steam VDF scan TTL, and perf:trim-memory IPC', () => {
+    it('configures --max-old-space-size=384 --expose-gc, Chromium disk/media cache caps, renderer-process-limit=2, 256MB GPU tile memory cap, createMainWindow spellcheck/backgroundThrottling, lightweight store:sync scraper BrowserWindow, 15s Steam VDF scan TTL, and perf:trim-memory IPC', () => {
       const mainCjsPath = path.join(repoRoot, 'electron/main.cjs');
       const preloadCjsPath = path.join(repoRoot, 'electron/preload.cjs');
       const mainSource = fs.readFileSync(mainCjsPath, 'utf8');
       const preloadSource = fs.readFileSync(preloadCjsPath, 'utf8');
 
-      // 1a. V8 heap cap (384 MB), Chromium disk/media/GPU shader cache bounds, renderer process limit, and feature flags
-      expect(mainSource).toContain("app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384')");
+      // 1a. V8 heap cap (384 MB) + --expose-gc, Chromium disk/media cache bounds, renderer process limit, and feature flags (never artificially capping GPU tile memory)
+      expect(mainSource).toContain("app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384 --expose-gc')");
       expect(mainSource).toContain("app.commandLine.appendSwitch('disk-cache-size', String(50 * 1024 * 1024))");
       expect(mainSource).toContain("app.commandLine.appendSwitch('media-cache-size', String(25 * 1024 * 1024))");
-      expect(mainSource).toContain("app.commandLine.appendSwitch('gpu-program-cache-size-kb', '4096')");
       expect(mainSource).toContain("app.commandLine.appendSwitch('renderer-process-limit', '2')");
+      expect(mainSource).not.toContain("appendSwitch('force-gpu-mem-available-mb'");
       expect(mainSource).toContain(
-        'CalculateNativeWinOcclusion,SpareRendererForSitePerProcess,BackForwardCache'
+        'SpareRendererForSitePerProcess,BackForwardCache'
       );
+
+      // 1a-ii. Verify createMainWindow webPreferences explicitly sets spellcheck: false and backgroundThrottling: true
+      const createMainWinMatch = mainSource.match(/function createMainWindow\(\)[\s\S]*?webPreferences:\s*\{([\s\S]*?)\}/);
+      expect(createMainWinMatch).toBeTruthy();
+      expect(createMainWinMatch![1]).toContain('spellcheck: false');
+      expect(createMainWinMatch![1]).toContain('backgroundThrottling: true');
 
       // 1b. Hidden store:sync scraper BrowserWindow lightweight webPreferences + destroyScraperWindowCleanly
       expect(mainSource).toContain('images: false');
@@ -200,13 +206,14 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         'Date.now() - cachedLocalSteamAchievementsAt < STEAM_LOCAL_SCAN_TTL_MS'
       );
 
-      // 1d. perf:trim-memory IPC handler & preload webFrame.clearCache() bridge
+      // 1d. perf:trim-memory IPC handler & preload globalThis.gc() + webFrame.clearCache() bridge
       expect(mainSource).toContain("ipcMain.handle('perf:trim-memory'");
       expect(mainSource).toContain('mainWindow.webContents.session.clearCache()');
       expect(mainSource).toContain('launcherEngine.trimLauncherEngineMemory?.()');
       expect(mainSource).toContain('storeSync.trimStoreSyncMemory?.()');
+      expect(preloadSource).toContain('globalThis.gc()');
       expect(preloadSource).toContain('webFrame?.clearCache?.()');
-      expect(preloadSource).toContain("ipcRenderer.invoke('perf:trim-memory')");
+      expect(preloadSource).toContain("ipcRenderer.invoke('perf:trim-memory'");
     });
 
     it('evicts raw steamAppInfoCache Buffer via launcherEngine.trimLauncherEngineMemory() while retaining appIndex/strings and re-reading only the target byte slice on demand', () => {
@@ -368,7 +375,7 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
       }
     });
 
-    it('compacts bloated enrichedMetadata (caps screenshots at 12, movies at 4, descriptions at 12,000 chars, and deduplicates identical aboutTheGame) when persisting to localStorage', () => {
+    it('compacts bloated top-level & enrichedMetadata fields (caps screenshots at 12, movies at 4, descriptions at 12,000 chars, and deduplicates identical aboutTheGame) when persisting to localStorage', () => {
       const longHtmlDescription = 'A'.repeat(18_500);
       const bloatedScreenshots = Array.from({ length: 25 }, (_, idx) => ({
         id: idx + 1,
@@ -399,6 +406,9 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         headerImage: 'https://example.com/header.jpg',
         shortDescription: 'Short summary',
         detailedDescription: longHtmlDescription,
+        aboutTheGame: longHtmlDescription, // Top-level duplicate of detailedDescription -> should deduplicate to ''
+        screenshots: bloatedScreenshots, // Top-level screenshots -> should cap at 12
+        movies: bloatedMovies, // Top-level movies -> should cap at 4
         developers: ['CD PROJEKT RED'],
         publishers: ['CD PROJEKT RED'],
         genres: ['RPG'],
@@ -418,7 +428,7 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
           screenshots: bloatedScreenshots,
           movies: bloatedMovies,
         },
-      };
+      } as any;
 
       // Test saveCurrentCatalog followed by flushPendingCatalogSave()
       saveCurrentCatalog([bloatedGame], { skipSanitize: true });
@@ -426,11 +436,14 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
 
       const rawJson = localStorage.getItem('universal_game_library_catalog');
       expect(rawJson).toBeTruthy();
-      const persisted = JSON.parse(rawJson!) as CanonicalGame[];
+      const persisted = JSON.parse(rawJson!) as any[];
       expect(persisted).toHaveLength(1);
 
       const savedGame = persisted[0];
       expect(savedGame.detailedDescription?.length).toBe(12_000);
+      expect(savedGame.aboutTheGame).toBe('');
+      expect(savedGame.screenshots).toHaveLength(12);
+      expect(savedGame.movies).toHaveLength(4);
       expect(savedGame.enrichedMetadata?.detailedDescription?.length).toBe(12_000);
       expect(savedGame.enrichedMetadata?.aboutTheGame).toBe('');
       expect(savedGame.enrichedMetadata?.screenshots).toHaveLength(12);
@@ -510,7 +523,25 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
   // 4. Grid Card 1x Cover Priority, Viewport Windowing & O(1) Shared Event Dispatch
   // =========================================================================
   describe('4. Grid Card 1x Cover Priority, Viewport Windowing & O(1) Shared Event Dispatch (LibraryGridView.tsx & LibrarySidebar.tsx)', () => {
-    it('prioritizes 1x library_600x900.jpg (2.16 MB RGBA) before 2x library_600x900_2x.jpg (8.64 MB RGBA), eliminates per-card backdrop-blur, and windows offscreen card <img> elements past index 42', () => {
+    it('prioritizes 1x library_600x900.jpg (2.16 MB RGBA) before 2x library_600x900_2x.jpg (8.64 MB RGBA), appends h=480&resize=1 to Epic CDN covers, uses rootMargin 600px with resolvedCandidateIndexCache and unmount src cleanup, eliminates blur-3xl/drop-shadow/per-card backdrop-blur, and windows offscreen card <img> elements past index 28', () => {
+      const gridSource = fs.readFileSync(
+        path.join(repoRoot, 'src/components/Library/LibraryGridView.tsx'),
+        'utf8'
+      );
+      const storefrontIconSource = fs.readFileSync(
+        path.join(repoRoot, 'src/components/Common/StorefrontIcon.tsx'),
+        'utf8'
+      );
+
+      // Verify getSharedCoverObserver uses rootMargin: '600px 0px 600px 0px', caches resolvedCandidateIndexCache, and LibraryGridView + StorefrontIcon have zero blur-3xl or SVG drop-shadow filter surfaces
+      expect(gridSource).toContain("rootMargin: '600px 0px 600px 0px'");
+      expect(gridSource).toContain('resolvedCandidateIndexCache');
+      expect(gridSource).toContain('notifyImageUnmounted');
+      expect(gridSource).toContain('scheduleScrollIdleMemoryTrim');
+      expect(gridSource).not.toContain('blur-3xl');
+      expect(gridSource).not.toContain('drop-shadow');
+      expect(storefrontIconSource).toContain('.replace(/\\bdrop-shadow(?:-[^\\s]+)?\\b/g, \'\')');
+
       const gameWith2xCapsule: CanonicalGame = {
         id: 'steam-1091500',
         title: 'Cyberpunk 2077',
@@ -542,6 +573,31 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
       const first2xIdx = candidates.findIndex((u) => u.endsWith('/library_600x900_2x.jpg'));
       expect(first1xIdx).toBe(0);
       expect(first2xIdx).toBeGreaterThan(first1xIdx);
+
+      // Verify getCoverCandidates appends h=480&resize=1 to cdn1.epicgames.com cover URLs
+      const epicGame: CanonicalGame = {
+        id: 'epic-alan-wake-2',
+        title: 'Alan Wake 2',
+        sortTitle: 'Alan Wake 2',
+        isExplicitNonSteam: true,
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: 'alan-wake-2',
+            installed: false,
+          },
+        ],
+        headerImage: 'https://cdn1.epicgames.com/offer/alan-wake-2/wide.jpg',
+        capsuleImage: 'https://cdn1.epicgames.com/offer/alan-wake-2/EGS_AlanWake2_Tall_1200x1600.jpg',
+        developers: ['Remedy'],
+        publishers: ['Epic Games'],
+        genres: ['Action'],
+        tags: ['Horror'],
+      };
+      const epicCandidates = getCoverCandidates(epicGame, null, null);
+      expect(epicCandidates[0]).toBe(
+        'https://cdn1.epicgames.com/offer/alan-wake-2/EGS_AlanWake2_Tall_1200x1600.jpg?h=480&resize=1'
+      );
 
       // Render LibraryGridView with 50 cards and verify:
       // - Cards 0..41 mount <img> immediately
@@ -582,11 +638,13 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         expect(gridHtml).toContain('cv-card');
         expect(gridHtml).toContain('decoding="async"');
         expect(gridHtml).toContain('/1000/library_600x900.jpg');
-        expect(gridHtml).toContain('/1041/library_600x900.jpg');
-        // Card index 42 (steam-1042) is beyond the initial 42-card window and has not intersected yet
-        expect(gridHtml).not.toContain('/1042/library_600x900.jpg');
-        // Zero per-card GPU backdrop-blur-sm layers across all 50 cards (only the single sticky header uses backdrop-blur-md)
+        expect(gridHtml).toContain('/1027/library_600x900.jpg');
+        // Card index 28 (steam-1028) is beyond the initial 28-card window and has not intersected yet
+        expect(gridHtml).not.toContain('/1028/library_600x900.jpg');
+        // Zero per-card GPU backdrop-blur-sm, blur-3xl, or drop-shadow layers across all 50 cards
         expect(gridHtml).not.toContain('backdrop-blur-sm');
+        expect(gridHtml).not.toContain('blur-3xl');
+        expect(gridHtml).not.toContain('drop-shadow');
         expect((gridHtml.match(/backdrop-blur/g) || []).length).toBeLessThanOrEqual(1);
       } finally {
         if (prevIO === undefined) {
@@ -597,32 +655,76 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
       }
     });
 
-    it('rewrites library_600x900_2x.jpg to 1x library_600x900.jpg and uses decoding="async" + loading="lazy" in LibrarySidebar thumbnails', () => {
-      const sidebarGame: CanonicalGame = {
-        id: 'steam-620',
-        title: 'Portal 2',
-        sortTitle: 'Portal 2',
-        steamAppId: 620,
-        platforms: [
-          {
-            platformId: 'steam',
-            platformGameId: '620',
-            installed: true,
-          },
-        ],
-        headerImage:
-          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/header.jpg',
-        capsuleImage:
-          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/library_600x900_2x.jpg',
-        developers: ['Valve'],
-        publishers: ['Valve'],
-        genres: ['Puzzle'],
-        tags: ['Puzzle'],
-      };
+    it('mounts LibrarySidebar <img> thumbnails only within the visible scroll window (0..28 on initial render, omitting row 35), rewrites 2x Steam covers to 1x, and appends h=96&resize=1 to cdn1.epicgames.com thumbnails', () => {
+      const fortySidebarGames: CanonicalGame[] = Array.from({ length: 40 }, (_, idx) => {
+        const padded = String(idx).padStart(3, '0');
+        if (idx === 0) {
+          return {
+            id: 'steam-620',
+            title: `Game ${padded}`,
+            sortTitle: `Game ${padded}`,
+            steamAppId: 620,
+            platforms: [
+              {
+                platformId: 'steam',
+                platformGameId: '620',
+                installed: true,
+              },
+            ],
+            headerImage:
+              'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/header.jpg',
+            capsuleImage:
+              'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/library_600x900_2x.jpg',
+            developers: ['Valve'],
+            publishers: ['Valve'],
+            genres: ['Puzzle'],
+            tags: ['Puzzle'],
+          };
+        }
+        if (idx === 1) {
+          return {
+            id: 'epic-sidebar-1',
+            title: `Game ${padded}`,
+            sortTitle: `Game ${padded}`,
+            platforms: [
+              {
+                platformId: 'epic',
+                platformGameId: 'epic-app-1',
+                installed: true,
+              },
+            ],
+            headerImage: 'https://cdn1.epicgames.com/offer/ns/tall_cover_01.jpg',
+            capsuleImage: 'https://cdn1.epicgames.com/offer/ns/tall_cover_01.jpg',
+            developers: ['Epic'],
+            publishers: ['Epic'],
+            genres: ['Action'],
+            tags: ['Action'],
+          };
+        }
+        return {
+          id: `steam-${2000 + idx}`,
+          title: `Game ${padded}`,
+          sortTitle: `Game ${padded}`,
+          steamAppId: 2000 + idx,
+          platforms: [
+            {
+              platformId: 'steam',
+              platformGameId: String(2000 + idx),
+              installed: false,
+            },
+          ],
+          headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${2000 + idx}/header.jpg`,
+          capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${2000 + idx}/library_600x900_2x.jpg`,
+          developers: ['Studio'],
+          publishers: ['Publisher'],
+          genres: ['Action'],
+          tags: ['Action'],
+        };
+      });
 
       const sidebarHtml = renderToString(
         React.createElement(LibrarySidebar, {
-          games: [sidebarGame],
+          games: fortySidebarGames,
           selectedGameId: 'steam-620',
           onSelectGame: vi.fn(),
           searchQuery: '',
@@ -637,8 +739,18 @@ describe('Phase 4: Comprehensive Performance Optimization & Resource Footprint V
         })
       );
 
-      expect(sidebarHtml).toContain('/620/library_600x900.jpg');
+      // Row 0 (steam-620) rewrites 2x/1x portrait cover to tiny capsule_sm_120.jpg and mounts <img>
+      expect(sidebarHtml).toContain('/620/capsule_sm_120.jpg');
       expect(sidebarHtml).not.toContain('/620/library_600x900_2x.jpg');
+      // Row 1 (epic-sidebar-1) appends h=96&resize=1 to cdn1.epicgames.com thumbnail URL
+      expect(sidebarHtml).toContain(
+        'https://cdn1.epicgames.com/offer/ns/tall_cover_01.jpg?h=96&amp;resize=1'
+      );
+      // Row 28 (steam-2028) is inside initial 0..28 window -> mounts <img>
+      expect(sidebarHtml).toContain('/2028/capsule_sm_120.jpg');
+      // Row 35 (steam-2035) is outside initial 0..28 window -> omits <img> until scrolled near
+      expect(sidebarHtml).toContain('Game 035');
+      expect(sidebarHtml).not.toContain('/2035/capsule_sm_120.jpg');
       expect(sidebarHtml).toContain('decoding="async"');
       expect(sidebarHtml).toContain('loading="lazy"');
     });

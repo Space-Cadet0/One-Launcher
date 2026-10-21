@@ -239,17 +239,24 @@ export function getCoverCandidates(
 
   const add = (url?: string | null, force: boolean = false) => {
     if (!url) return;
-    const trimmed = url.trim();
-    if (!trimmed || seen.has(trimmed)) return;
+    let trimmed = url.trim();
+    if (!trimmed) return;
     if (!force && isUnsuitableCoverUrl(trimmed)) return;
+    if (
+      /cdn[12]?\.epicgames\.com\//i.test(trimmed) &&
+      !/[?&][hw]=/i.test(trimmed)
+    ) {
+      trimmed = `${trimmed}${trimmed.includes('?') ? '&' : '?'}h=480&resize=1`;
+    }
+    if (seen.has(trimmed)) return;
     seen.add(trimmed);
     candidates.push(trimmed);
   };
 
   const addWith1xPriority = (url?: string | null, force: boolean = false) => {
     if (!url) return;
-    if (!force && url.includes('/library_600x900_2x.jpg')) {
-      add(url.replace('/library_600x900_2x.jpg', '/library_600x900.jpg'), false);
+    if (url.includes('/library_600x900_2x.jpg')) {
+      add(url.replace('/library_600x900_2x.jpg', '/library_600x900.jpg'), force);
     }
     add(url, force);
   };
@@ -257,10 +264,10 @@ export function getCoverCandidates(
   // 1. Authoritative user manual override ALWAYS takes absolute priority #1
   const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
   if (effectiveOverride?.capsuleImage) {
-    add(effectiveOverride.capsuleImage, true);
+    addWith1xPriority(effectiveOverride.capsuleImage, true);
   }
   if (effectiveOverride && game.capsuleImage) {
-    add(game.capsuleImage, true);
+    addWith1xPriority(game.capsuleImage, true);
   }
 
   const rawImagesCover = (game as any).images?.cover as string | undefined;
@@ -275,11 +282,29 @@ export function getCoverCandidates(
     ? steamMatcher.getEffectiveSteamAppId(game)
     : null;
 
-  if (targetSteamId && !isKnownDeadSteamCover(targetSteamId)) {
-    add(`https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
-    add(`https://cdn.akamai.steamstatic.com/steam/apps/${targetSteamId}/library_600x900.jpg`);
-    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
-    add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
+  if (targetSteamId) {
+    const browseAssets = steamApi.getStoreBrowseAssetsInstant(targetSteamId);
+    if (browseAssets?.capsuleImage) {
+      addWith1xPriority(browseAssets.capsuleImage);
+    }
+    if (
+      game.capsuleImage &&
+      /\/apps\/\d+\/[a-f0-9]{40}\/library_capsule/i.test(game.capsuleImage)
+    ) {
+      addWith1xPriority(game.capsuleImage);
+    }
+    if (
+      game.enrichedMetadata?.capsuleImage &&
+      /\/apps\/\d+\/[a-f0-9]{40}\/library_capsule/i.test(game.enrichedMetadata.capsuleImage)
+    ) {
+      addWith1xPriority(game.enrichedMetadata.capsuleImage);
+    }
+    if (!isKnownDeadSteamCover(targetSteamId)) {
+      add(`https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+      add(`https://cdn.akamai.steamstatic.com/steam/apps/${targetSteamId}/library_600x900.jpg`);
+      add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`);
+      add(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`);
+    }
   }
 
   // 3. Official Steam / Epic / GOG tall vertical posters
@@ -295,6 +320,7 @@ export function getCoverCandidates(
     if (
       (!isGog &&
         (lower.includes('library_capsule.jpg') ||
+          lower.includes('library_capsule_2x.jpg') ||
           lower.includes('offerimagetall') ||
           lower.includes('dieselstorefronttall') ||
           lower.includes('t_cover_big') ||
@@ -356,14 +382,18 @@ function notifySubscriberSet(set?: Set<CoverEventCallback>): void {
 function handleGlobalSteamMatchUpdated(e: Event): void {
   const detail = (e as CustomEvent)?.detail;
   const gameId = detail?.gameId ? String(detail.gameId) : '';
+  const appId = detail?.appId ? `steam-${detail.appId}` : '';
   const matchedTitle = detail?.title ? normalizeKey(String(detail.title)) : '';
 
-  if (!gameId && !matchedTitle) {
+  if (!gameId && !appId && !matchedTitle) {
     notifySubscriberSet(allCoverSubscribers);
     return;
   }
   if (gameId) {
     notifySubscriberSet(subscribersByGameId.get(gameId));
+  }
+  if (appId) {
+    notifySubscriberSet(subscribersByGameId.get(appId));
   }
   if (matchedTitle) {
     notifySubscriberSet(subscribersByNormTitle.get(matchedTitle));
@@ -433,6 +463,7 @@ function subscribeToCoverUpdates(
 
   if (!isGlobalCoverListenerAttached && allCoverSubscribers.size > 0) {
     window.addEventListener('antigravity:steam-match-updated', handleGlobalSteamMatchUpdated);
+    window.addEventListener('antigravity:steam-assets-resolved', handleGlobalSteamMatchUpdated);
     window.addEventListener('antigravity:gog-cover-updated', handleGlobalGogCoverUpdated);
     isGlobalCoverListenerAttached = true;
   }
@@ -466,6 +497,7 @@ function subscribeToCoverUpdates(
 
     if (isGlobalCoverListenerAttached && allCoverSubscribers.size === 0) {
       window.removeEventListener('antigravity:steam-match-updated', handleGlobalSteamMatchUpdated);
+      window.removeEventListener('antigravity:steam-assets-resolved', handleGlobalSteamMatchUpdated);
       window.removeEventListener('antigravity:gog-cover-updated', handleGlobalGogCoverUpdated);
       isGlobalCoverListenerAttached = false;
     }
@@ -484,10 +516,130 @@ function getSharedCoverObserver(): IntersectionObserver | null {
           if (cb) cb(entry.isIntersecting);
         }
       },
-      { rootMargin: '1000px 0px 1000px 0px' }
+      { rootMargin: '600px 0px 600px 0px' }
     );
   }
   return sharedCoverObserver;
+}
+
+let unmountedImageCount = 0;
+let throttlePruneTimer: ReturnType<typeof setTimeout> | null = null;
+let idlePruneTimer1: ReturnType<typeof setTimeout> | null = null;
+let idlePruneTimer2: ReturnType<typeof setTimeout> | null = null;
+let lastPruneTimestamp = 0;
+
+let isFastScrolling = false;
+let fastScrollCalmTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingFastScrollMountFns = new Set<() => void>();
+const scrollWindowState = new Map<string, { lastPos: number; windowTime: number; windowPos: number }>();
+
+export function isCurrentlyFastScrolling(): boolean {
+  return isFastScrolling;
+}
+
+export function addPendingFastScrollMount(fn: () => void): void {
+  pendingFastScrollMountFns.add(fn);
+}
+
+export function removePendingFastScrollMount(fn: () => void): void {
+  pendingFastScrollMountFns.delete(fn);
+}
+
+export function recordScrollActivity(scrollTop: number, sourceKey: string = 'main'): void {
+  if (typeof window === 'undefined') return;
+  const now = Date.now();
+  const prev = scrollWindowState.get(sourceKey);
+  if (!prev) {
+    const stepDelta = Math.abs(scrollTop);
+    scrollWindowState.set(sourceKey, { lastPos: scrollTop, windowTime: now, windowPos: scrollTop });
+    if (stepDelta > 300) {
+      isFastScrolling = true;
+      if (fastScrollCalmTimer) clearTimeout(fastScrollCalmTimer);
+      fastScrollCalmTimer = setTimeout(() => {
+        fastScrollCalmTimer = null;
+        isFastScrolling = false;
+        const fns = Array.from(pendingFastScrollMountFns);
+        pendingFastScrollMountFns.clear();
+        for (const fn of fns) {
+          fn();
+        }
+      }, 120);
+    }
+  } else {
+    const stepDelta = Math.abs(scrollTop - prev.lastPos);
+    const windowElapsed = now - prev.windowTime;
+    const windowDist = Math.abs(scrollTop - prev.windowPos);
+    prev.lastPos = scrollTop;
+
+    if (stepDelta > 300 || (windowDist > 300 && windowElapsed <= 150)) {
+      isFastScrolling = true;
+      if (fastScrollCalmTimer) clearTimeout(fastScrollCalmTimer);
+      fastScrollCalmTimer = setTimeout(() => {
+        fastScrollCalmTimer = null;
+        isFastScrolling = false;
+        const fns = Array.from(pendingFastScrollMountFns);
+        pendingFastScrollMountFns.clear();
+        for (const fn of fns) {
+          fn();
+        }
+      }, 120);
+    }
+    if (windowElapsed >= 100 || windowDist > 300) {
+      prev.windowTime = now;
+      prev.windowPos = scrollTop;
+    }
+  }
+  scheduleScrollIdleMemoryTrim();
+}
+
+export function notifyImageUnmounted(): void {
+  if (typeof window === 'undefined') return;
+  unmountedImageCount++;
+  if (unmountedImageCount >= 18 && !throttlePruneTimer) {
+    const elapsed = Date.now() - lastPruneTimestamp;
+    const delay = Math.max(80, 400 - elapsed);
+    throttlePruneTimer = setTimeout(() => {
+      throttlePruneTimer = null;
+      if (unmountedImageCount > 0) {
+        unmountedImageCount = 0;
+        lastPruneTimestamp = Date.now();
+        window.electronAPI?.trimMemory?.();
+      }
+    }, delay);
+  }
+}
+
+export function scheduleScrollIdleMemoryTrim(): void {
+  if (typeof window === 'undefined') return;
+  if (idlePruneTimer1) clearTimeout(idlePruneTimer1);
+  if (idlePruneTimer2) clearTimeout(idlePruneTimer2);
+
+  idlePruneTimer1 = setTimeout(() => {
+    idlePruneTimer1 = null;
+    unmountedImageCount = 0;
+    lastPruneTimestamp = Date.now();
+    window.electronAPI?.trimMemory?.();
+  }, 350);
+
+  idlePruneTimer2 = setTimeout(() => {
+    idlePruneTimer2 = null;
+    unmountedImageCount = 0;
+    lastPruneTimestamp = Date.now();
+    window.electronAPI?.trimMemory?.();
+  }, 1600);
+}
+
+const resolvedCandidateIndexCache = new Map<string, number>();
+const failedCoverUrls = new Set<string>();
+
+export function clearFailedCoverUrls(gameId?: string): void {
+  failedCoverUrls.clear();
+  resolvedCandidateIndexCache.clear();
+  if (gameId) {
+    globalAttemptedCoverLookups.delete(gameId);
+  } else {
+    globalAttemptedCoverLookups.clear();
+  }
 }
 
 interface GameCardCoverProps {
@@ -501,6 +653,7 @@ interface GameCardCoverProps {
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
   ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup, cardIndex }) => {
     const [steamMatchVersion, setSteamMatchVersion] = useState(0);
+    const [failedTick, setFailedTick] = useState(0);
     const gogPlatformGameId = game.platforms?.find((p) => p.platformId === 'gog')?.platformGameId;
 
     useEffect(() => {
@@ -513,16 +666,27 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       return getCoverCandidates(game, overrideCoverUrl || undefined, userOverride);
     }, [game, overrideCoverUrl, userOverride, steamMatchVersion]);
 
-    const [candidateIndex, setCandidateIndex] = useState(0);
     const [headerFallbackFailed, setHeaderFallbackFailed] = useState(false);
     const [isNearViewport, setIsNearViewport] = useState<boolean>(
-      () => (cardIndex ?? 0) < 42 || typeof IntersectionObserver === 'undefined'
+      () => (cardIndex ?? 0) < 28 || typeof IntersectionObserver === 'undefined'
     );
     const coverContainerRef = useRef<HTMLDivElement | null>(null);
-    const topCandidate = candidates[0] || '';
+    const imgElementRef = useRef<HTMLImageElement | null>(null);
+
+    const handleImgRef = useCallback((node: HTMLImageElement | null) => {
+      const prev = imgElementRef.current;
+      if (prev && prev !== node) {
+        prev.onload = null;
+        prev.onerror = null;
+        prev.removeAttribute('src');
+        prev.src = '';
+        notifyImageUnmounted();
+      }
+      imgElementRef.current = node;
+    }, []);
 
     useEffect(() => {
-      if ((cardIndex ?? 0) < 42 || typeof IntersectionObserver === 'undefined') {
+      if (typeof IntersectionObserver === 'undefined') {
         setIsNearViewport(true);
         return;
       }
@@ -532,36 +696,65 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         setIsNearViewport(true);
         return;
       }
+      let enterTimer: ReturnType<typeof setTimeout> | null = null;
+      const mountNow = () => {
+        setIsNearViewport(true);
+      };
       coverViewportCallbacks.set(el, (near) => {
-        setIsNearViewport(near);
+        if (enterTimer) {
+          clearTimeout(enterTimer);
+          enterTimer = null;
+        }
+        removePendingFastScrollMount(mountNow);
+        if (near) {
+          if (isCurrentlyFastScrolling()) {
+            addPendingFastScrollMount(mountNow);
+          } else {
+            enterTimer = setTimeout(() => {
+              enterTimer = null;
+              if (isCurrentlyFastScrolling()) {
+                addPendingFastScrollMount(mountNow);
+              } else {
+                setIsNearViewport(true);
+              }
+            }, 16);
+          }
+        } else {
+          setIsNearViewport(false);
+        }
       });
       observer.observe(el);
       return () => {
+        if (enterTimer) {
+          clearTimeout(enterTimer);
+        }
+        removePendingFastScrollMount(mountNow);
         coverViewportCallbacks.delete(el);
         observer.unobserve(el);
       };
-    }, [cardIndex]);
+    }, []);
 
-    // Reset candidate progression when game, explicit override, or top priority candidate upgrades
-    useEffect(() => {
-      setCandidateIndex(0);
-    }, [
-      game.id,
-      game.steamAppId,
-      game.capsuleImage,
-      overrideCoverUrl,
-      userOverride?.capsuleImage,
-      topCandidate,
-    ]);
+    const fallbackHeaderUrl =
+      game.enrichedMetadata?.headerImage ||
+      steamApi.getStoreBrowseAssetsInstant(game.steamAppId)?.headerImage ||
+      game.headerImage;
 
     useEffect(() => {
       setHeaderFallbackFailed(false);
-    }, [game.id, game.headerImage]);
+    }, [game.id, fallbackHeaderUrl]);
 
-    const currentSrc = candidateIndex < candidates.length ? candidates[candidateIndex] : null;
+    const currentSrc = useMemo(() => {
+      for (const url of candidates) {
+        if (url && !failedCoverUrls.has(url)) {
+          return url;
+        }
+      }
+      return null;
+    }, [candidates, failedTick]);
+
     const effectiveOverride = userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
 
-    // Only invoke IGDB fallback lookup when all primary vertical cover candidates have failed
+    // Only invoke IGDB / Steam StoreBrowse fallback lookup when all primary vertical cover candidates have failed
     useEffect(() => {
       if (!currentSrc && onNeedCoverLookup) {
         onNeedCoverLookup(game);
@@ -572,30 +765,33 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     useEffect(() => {
       if (!isNearViewport) return;
       if (effectiveOverride?.capsuleImage) return;
-      const isExplicitNonSteam =
-        effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
-      const hasResolvedSteamId = !isExplicitNonSteam && Boolean(steamMatcher.getEffectiveSteamAppId(game));
+      const timer = setTimeout(() => {
+        const isExplicitNonSteam =
+          effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
+        const hasResolvedSteamId = !isExplicitNonSteam && Boolean(steamMatcher.getEffectiveSteamAppId(game));
 
-      if (!hasResolvedSteamId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
-        steamMatcher
-          .matchGameToSteam(game.title, {
-            releaseYear: game.releaseDate,
-            developers: game.developers,
-          })
-          .catch(() => null);
-      }
-
-      const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
-      if (gogPlat?.platformGameId) {
-        if (
-          !igdbCoverService.hasAttemptedGogVerticalCover(gogPlat.platformGameId, game.title) &&
-          (!hasResolvedSteamId || isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage))
-        ) {
-          igdbCoverService
-            .fetchGogVerticalCover(gogPlat.platformGameId, game.title)
+        if (!hasResolvedSteamId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
+          steamMatcher
+            .matchGameToSteam(game.title, {
+              releaseYear: game.releaseDate,
+              developers: game.developers,
+            })
             .catch(() => null);
         }
-      }
+
+        const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+        if (gogPlat?.platformGameId) {
+          if (
+            !igdbCoverService.hasAttemptedGogVerticalCover(gogPlat.platformGameId, game.title) &&
+            (!hasResolvedSteamId || isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage))
+          ) {
+            igdbCoverService
+              .fetchGogVerticalCover(gogPlat.platformGameId, game.title)
+              .catch(() => null);
+          }
+        }
+      }, 250);
+      return () => clearTimeout(timer);
     }, [
       isNearViewport,
       game.id,
@@ -621,10 +817,10 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
 
     if (!currentSrc) {
       if (
-        game.headerImage &&
+        fallbackHeaderUrl &&
         !headerFallbackFailed &&
-        !game.headerImage.includes('default.png') &&
-        !game.headerImage.includes('egs-badge.png')
+        !fallbackHeaderUrl.includes('default.png') &&
+        !fallbackHeaderUrl.includes('egs-badge.png')
       ) {
         return (
           <div
@@ -633,16 +829,13 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           >
             {isNearViewport && (
               <>
-                <img
-                  src={game.headerImage}
-                  alt=""
+                <div
                   aria-hidden="true"
-                  decoding="async"
-                  className="absolute inset-0 w-full h-full object-cover scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
-                  onError={() => setHeaderFallbackFailed(true)}
+                  className="absolute inset-0 w-full h-full scale-125 blur-md opacity-40 brightness-75 pointer-events-none"
                 />
                 <img
-                  src={game.headerImage}
+                  ref={handleImgRef}
+                  src={fallbackHeaderUrl}
                   alt={game.title}
                   loading="lazy"
                   decoding="async"
@@ -651,7 +844,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
                 />
               </>
             )}
-            <span className="relative z-10 mt-2 text-[11px] font-semibold text-slate-200 line-clamp-2 leading-tight px-2 drop-shadow">
+            <span className="relative z-10 mt-2 text-[11px] font-semibold text-slate-200 line-clamp-2 leading-tight px-2">
               {game.title}
             </span>
             {matchReviewBadge}
@@ -682,10 +875,10 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       <div ref={coverContainerRef} className="relative w-full h-full">
         {isNearViewport ? (
           <img
+            ref={handleImgRef}
             key={currentSrc}
             src={currentSrc}
             alt={game.title}
-            loading="lazy"
             decoding="async"
             onLoad={(e) => {
               const { naturalWidth, naturalHeight } = e.currentTarget;
@@ -695,22 +888,29 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
                 // ratio > 0.94 cleanly rejects 1:1 square icons and wide banners
                 // while preserving legitimate portrait covers like Epic's 1280x1440 (0.888)
                 if (ratio > 0.94) {
-                  setCandidateIndex((prev) => prev + 1);
+                  failedCoverUrls.add(currentSrc);
+                  setFailedTick((t) => t + 1);
+                  return;
                 }
               }
             }}
             onError={() => {
               if (currentSrc) {
+                failedCoverUrls.add(currentSrc);
                 const m = currentSrc.match(/\/apps\/(\d+)\/library_600x900(?:_2x)?\.jpg/i);
-                const nextCandidate = candidates[candidateIndex + 1] || '';
-                if (m && !nextCandidate.includes(`/apps/${m[1]}/library_600x900`)) {
-                  igdbCoverService.recordDeadSteamCover(Number(m[1]));
+                if (m) {
+                  const appIdNum = Number(m[1]);
+                  const hasRemainingUnhashedSteam = candidates.some(
+                    (c) => !failedCoverUrls.has(c) && c.includes(`/apps/${m[1]}/library_600x900`)
+                  );
+                  if (!hasRemainingUnhashedSteam) {
+                    igdbCoverService.recordDeadSteamCover(appIdNum);
+                  }
                 }
               }
-              // Declaratively advance to the next candidate without mutating the DOM
-              setCandidateIndex((prev) => prev + 1);
+              setFailedTick((t) => t + 1);
             }}
-            className="w-full h-full object-cover group-hover:brightness-105 transition-all duration-300"
+            className="w-full h-full object-cover"
           />
         ) : (
           <div className="w-full h-full bg-[#111923]" />
@@ -1005,30 +1205,63 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     const releaseYear = getReleaseYear(game, targetAppId);
     const isExplicitNonSteam = game.isExplicitNonSteam === true;
 
+    const triggerIgdbLookup = () => {
+      if (igdbCoverService.hasAttemptedIgdbCover(game.title, releaseYear)) {
+        const instant = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+        if (instant) {
+          setCoverOverrides((prev) =>
+            prev[game.id] === instant ? prev : { ...prev, [game.id]: instant }
+          );
+        }
+        return;
+      }
+
+      igdbCoverService
+        .fetchIgdbCover(game.title, releaseYear, undefined, { trackInGlobalBar: false })
+        .then((resolvedCover) => {
+          if (resolvedCover) {
+            setCoverOverrides((prev) =>
+              prev[game.id] === resolvedCover ? prev : { ...prev, [game.id]: resolvedCover }
+            );
+          }
+        });
+    };
+
+    if (targetAppId && !isExplicitNonSteam) {
+      steamApi
+        .fetchStoreBrowseAssets(targetAppId)
+        .then((assets) => {
+          if (assets?.capsuleImage) {
+            setCoverOverrides((prev) =>
+              prev[game.id] === assets.capsuleImage!
+                ? prev
+                : { ...prev, [game.id]: assets.capsuleImage! }
+            );
+            return;
+          }
+          triggerIgdbLookup();
+        })
+        .catch(() => {
+          triggerIgdbLookup();
+        });
+      return;
+    }
+
     if (!targetAppId && !isExplicitNonSteam && !steamMatcher.hasAttemptedMatch(game.title)) {
       steamMatcher
         .matchGameToSteam(game.title, {
           releaseYear: game.releaseDate,
           developers: game.developers,
         })
+        .then((matchedId) => {
+          if (matchedId) {
+            steamApi.fetchStoreBrowseAssets(matchedId).catch(() => null);
+          }
+        })
         .catch(() => null);
     }
 
-    if (igdbCoverService.hasAttemptedIgdbCover(game.title, releaseYear)) {
-      const instant = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
-      if (instant) {
-        setCoverOverrides((prev) => ({ ...prev, [game.id]: instant }));
-      }
-      return;
-    }
-
-    igdbCoverService
-      .fetchIgdbCover(game.title, releaseYear, undefined, { trackInGlobalBar: false })
-      .then((resolvedCover) => {
-        if (resolvedCover) {
-          setCoverOverrides((prev) => ({ ...prev, [game.id]: resolvedCover }));
-        }
-      });
+    triggerIgdbLookup();
   }, []);
 
   useEffect(() => {
@@ -1036,14 +1269,17 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       const { title, coverUrl } = e.detail || {};
       if (title && coverUrl) {
         setCoverOverrides((prev) => {
-          const next = { ...prev };
           const normTitle = normalizeKey(title);
+          let changed = false;
+          let next: Record<string, string | null> | null = null;
           for (const g of gamesRef.current) {
-            if (normalizeKey(g.title) === normTitle) {
+            if (normalizeKey(g.title) === normTitle && prev[g.id] !== coverUrl) {
+              if (!next) next = { ...prev };
               next[g.id] = coverUrl;
+              changed = true;
             }
           }
-          return next;
+          return changed && next ? next : prev;
         });
       }
     };
@@ -1098,9 +1334,16 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       activeCardRef.current = null;
     };
 
-    const handleScrollOrWheel = () => {
+    const handleScrollOrWheel = (e: Event) => {
       // Dismiss any open popout immediately while scrolling
       handleDismiss();
+      const target = e.target as HTMLElement | null;
+      if (target && typeof target.scrollTop === 'number') {
+        const key = target.tagName === 'MAIN' ? 'main' : 'sidebar';
+        recordScrollActivity(target.scrollTop, key);
+      } else {
+        scheduleScrollIdleMemoryTrim();
+      }
 
       if (scrollEndTimeoutRef.current) {
         clearTimeout(scrollEndTimeoutRef.current);
@@ -1352,7 +1595,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   return (
     <div ref={gridContainerRef} className="w-full min-h-full bg-[#0e141b] text-steam-text pb-28 relative select-none">
       {/* Background ambient lighting */}
-      <div className="absolute top-0 left-0 right-0 h-96 opacity-10 pointer-events-none bg-gradient-to-b from-steam-accent/40 via-transparent to-transparent filter blur-3xl" />
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-[1600px] h-96 bg-[radial-gradient(ellipse_at_top,_rgba(102,192,244,0.12),_transparent_70%)] pointer-events-none opacity-60 z-0" />
 
       <div className="max-w-[1600px] mx-auto px-6 pt-6 space-y-6 relative">
         {/* Header Bar */}
@@ -1639,11 +1882,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   e.stopPropagation();
                   handleContextMenu(game, e);
                 }}
-                style={{
-                  contentVisibility: 'auto',
-                  containIntrinsicSize: '200px 300px',
-                }}
-                className="cv-card group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-all duration-200 cursor-pointer shadow-md hover:shadow-2xl hover:scale-[1.03] active:scale-[0.99]"
+                className="cv-card group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-colors duration-150 cursor-pointer shadow-md hover:shadow-2xl"
               >
                 {/* 2:3 Portrait Capsule Viewport */}
                 <div
@@ -1731,7 +1970,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                       : 'OpenCritic';
                     return (
                       <div
-                        className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md transition-all ${
+                        className={`absolute top-2 right-2 z-10 flex items-center gap-1 text-[10px] font-extrabold px-1.5 py-0.5 rounded border shadow-md ${
                           ocColors.badgeBg
                         } ${ocColors.badgeBorder} ${ocColors.badgeText} ${
                           sortBy === 'rating'
@@ -1768,7 +2007,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                         <div key={p.platformId} className="relative flex items-center">
                           <StorefrontIcon
                             storefrontId={p.platformId}
-                            className={`w-3.5 h-3.5 drop-shadow ${
+                            className={`w-3.5 h-3.5 ${
                               isPlatConnected ? 'text-white/90' : 'text-amber-200/80'
                             }`}
                           />
@@ -1784,11 +2023,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   </div>
 
                   {/* Hover Quick Action Indicator */}
-                  <div className="absolute inset-0 bg-steam-accent/10 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
+                  <div className="absolute inset-0 bg-steam-accent/10 hidden group-hover:block pointer-events-none" />
                 </div>
 
                 {/* Bottom Card Title Info */}
-                <div className="p-2.5 bg-[#16202d] flex flex-col justify-between border-t border-steam-border/40 min-h-[46px]">
+                <div className="p-2.5 bg-[#16202d] flex flex-col justify-between border-t border-steam-border/40 h-[56px]">
                   <h3
                     className="text-xs font-semibold text-white/90 group-hover:text-steam-accent truncate transition-colors"
                     title={game.title}
@@ -1846,7 +2085,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
             e.stopPropagation();
             handleContextMenu(hoveredGame, e);
           }}
-          className="w-80 rounded-lg overflow-hidden bg-[#16202d]/95 backdrop-blur-xl border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer animate-in fade-in zoom-in-95 duration-150 text-steam-text"
+          className="w-80 rounded-lg overflow-hidden bg-[#16202d] border border-steam-accent/70 shadow-[0_12px_40px_rgba(0,0,0,0.85)] pointer-events-auto cursor-pointer animate-in fade-in zoom-in-95 duration-150 text-steam-text"
         >
           {(() => {
             const hoveredOverride = userOverridesMap[hoveredGame.id] || getUserOverrideForGame(hoveredGame, userOverridesMap);
@@ -1867,11 +2106,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-[#16202d] via-transparent to-black/30" />
                   <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between gap-2">
-                    <span className="text-sm font-bold text-white drop-shadow truncate">
+                    <span className="text-sm font-bold text-white truncate">
                       {hoveredGame.title}
                     </span>
                     {releaseYear && (
-                      <span className="text-[11px] font-bold text-white/90 px-1.5 py-0.5 rounded bg-black/75 backdrop-blur-sm border border-white/20 shrink-0 shadow">
+                      <span className="text-[11px] font-bold text-white/90 px-1.5 py-0.5 rounded bg-black/85 border border-white/20 shrink-0 shadow">
                         {releaseYear}
                       </span>
                     )}

@@ -191,11 +191,174 @@ export function parseSteamSupportedLanguagesString(rawHtml?: string): SteamLangu
   return results;
 }
 
+export interface SteamStoreBrowseAssets {
+  capsuleImage?: string;
+  headerImage?: string;
+  iconUrl?: string;
+  ts: number;
+}
+
+const STORAGE_KEY_BROWSE_ASSETS = 'antigravity_steam_browse_assets_v1';
+
 export class SteamApiService {
   public static readonly MAX_METADATA_CACHE_ENTRIES = 60;
   public static readonly MAX_METADATA_CACHE_SIZE = 60;
   private cache = new Map<number, SteamEnrichedMetadata>();
   private rateLimitedUntil = 0;
+  private browseAssetsCache = new Map<number, SteamStoreBrowseAssets>();
+  private inFlightBrowseAssets = new Map<number, Promise<SteamStoreBrowseAssets | null>>();
+  private browseCacheLoaded = false;
+
+  private loadBrowseAssetsCache(): void {
+    if (this.browseCacheLoaded) return;
+    this.browseCacheLoaded = true;
+    try {
+      if (typeof localStorage === 'undefined') return;
+      const raw = localStorage.getItem(STORAGE_KEY_BROWSE_ASSETS);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          const id = Number(k);
+          if (Number.isFinite(id) && id > 0 && v && typeof v === 'object') {
+            const entry = v as SteamStoreBrowseAssets;
+            if (entry.capsuleImage || entry.headerImage || entry.iconUrl) {
+              this.browseAssetsCache.set(id, entry);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  private saveBrowseAssetsCache(): void {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      const obj: Record<string, SteamStoreBrowseAssets> = {};
+      const entries = Array.from(this.browseAssetsCache.entries()).slice(-1000);
+      for (const [k, v] of entries) {
+        if (v.capsuleImage || v.headerImage || v.iconUrl) {
+          obj[String(k)] = v;
+        }
+      }
+      localStorage.setItem(STORAGE_KEY_BROWSE_ASSETS, JSON.stringify(obj));
+    } catch {
+      // Ignore quota errors
+    }
+  }
+
+  public getStoreBrowseAssetsInstant(appId?: number | null): SteamStoreBrowseAssets | null {
+    if (!appId || appId <= 0) return null;
+    this.loadBrowseAssetsCache();
+    return this.browseAssetsCache.get(appId) || null;
+  }
+
+  public evictCache(appId: number): void {
+    if (!appId) return;
+    this.metadataCache.delete(appId);
+    this.loadBrowseAssetsCache();
+    if (this.browseAssetsCache.delete(appId)) {
+      this.saveBrowseAssetsCache();
+    }
+  }
+
+  private getSteamWebApiBaseUrl(): string {
+    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+      return '/api/steam-api';
+    }
+    return 'https://api.steampowered.com';
+  }
+
+  public async fetchStoreBrowseAssets(appId: number): Promise<SteamStoreBrowseAssets | null> {
+    if (!appId || appId <= 0) return null;
+    this.loadBrowseAssetsCache();
+    const cached = this.browseAssetsCache.get(appId);
+    if (cached && cached.capsuleImage) {
+      return cached;
+    }
+
+    if (this.inFlightBrowseAssets.has(appId)) {
+      return this.inFlightBrowseAssets.get(appId)!;
+    }
+
+    const promise = (async (): Promise<SteamStoreBrowseAssets | null> => {
+      try {
+        const inputJson = JSON.stringify({
+          ids: [{ appid: appId }],
+          context: { language: 'english', country_code: 'US' },
+          data_request: { include_assets: true },
+        });
+        const url = `${this.getSteamWebApiBaseUrl()}/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
+          inputJson
+        )}`;
+        const res = await axios.get(url, { timeout: 6000 });
+        const item = res?.data?.response?.store_items?.[0];
+        const assets = item?.assets;
+        if (!assets || typeof assets !== 'object') {
+          return cached || null;
+        }
+
+        const format =
+          typeof assets.asset_url_format === 'string' && assets.asset_url_format
+            ? assets.asset_url_format
+            : `steam/apps/${appId}/\${FILENAME}`;
+
+        const buildAssetUrl = (file?: string): string | undefined => {
+          if (!file || typeof file !== 'string') return undefined;
+          if (file.startsWith('http')) return file;
+          return `https://shared.akamai.steamstatic.com/store_item_assets/${format.replace(
+            '${FILENAME}',
+            file
+          )}`;
+        };
+
+        const capsuleImage = buildAssetUrl(assets.library_capsule || assets.library_capsule_2x);
+        const headerImage = buildAssetUrl(assets.header);
+        const rawIcon =
+          typeof assets.community_icon === 'string' && assets.community_icon
+            ? assets.community_icon
+            : undefined;
+        const iconUrl = rawIcon
+          ? rawIcon.startsWith('http')
+            ? rawIcon
+            : `https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/${appId}/${
+                rawIcon.endsWith('.jpg') ? rawIcon : `${rawIcon}.jpg`
+              }`
+          : undefined;
+
+        if (!capsuleImage && !headerImage && !iconUrl) {
+          return cached || null;
+        }
+
+        const resolved: SteamStoreBrowseAssets = {
+          capsuleImage: capsuleImage || cached?.capsuleImage,
+          headerImage: headerImage || cached?.headerImage,
+          iconUrl: iconUrl || cached?.iconUrl,
+          ts: Date.now(),
+        };
+        this.browseAssetsCache.set(appId, resolved);
+        this.saveBrowseAssetsCache();
+
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('antigravity:steam-assets-resolved', {
+              detail: { appId, ...resolved },
+            })
+          );
+        }
+        return resolved;
+      } catch {
+        return cached || null;
+      } finally {
+        this.inFlightBrowseAssets.delete(appId);
+      }
+    })();
+
+    this.inFlightBrowseAssets.set(appId, promise);
+    return promise;
+  }
 
   private get metadataCache(): Map<number, SteamEnrichedMetadata> {
     return this.cache;
@@ -298,17 +461,22 @@ export class SteamApiService {
       const rawDetailedDesc = String(preCached.detailedDescription || '');
       const rawAbout = String(preCached.aboutTheGame || '');
 
+      const rawPreCachedCapsule = preCached.capsuleImage || preCached.library_capsule;
+      const validPreCachedCapsule =
+        typeof rawPreCachedCapsule === 'string' &&
+        rawPreCachedCapsule &&
+        !rawPreCachedCapsule.includes('184x69') &&
+        !rawPreCachedCapsule.includes('231x87')
+          ? rawPreCachedCapsule
+          : this.getStoreBrowseAssetsInstant(appId)?.capsuleImage;
+
       const enriched: SteamEnrichedMetadata = {
         ...preCached,
         shortDescription: stripHtmlToPlainSynopsis(preCached.shortDescription),
         detailedDescription:
           rawDetailedDesc.length > 15000 ? rawDetailedDesc.slice(0, 15000) : rawDetailedDesc,
         aboutTheGame: rawAbout.length > 15000 ? rawAbout.slice(0, 15000) : rawAbout,
-        capsuleImage:
-          preCached.capsuleImage ||
-          preCached.library_capsule ||
-          preCached.capsule_imagev5 ||
-          preCached.capsule_image,
+        capsuleImage: validPreCachedCapsule,
         screenshots: Array.isArray(preCached.screenshots) ? preCached.screenshots.slice(0, 12) : [],
         movies: normalizedMovies,
         languageOptions,
@@ -446,11 +614,20 @@ export class SteamApiService {
             };
           }
 
+          const directLibraryCapsule =
+            typeof data.library_capsule === 'string' &&
+            data.library_capsule &&
+            !data.library_capsule.includes('184x69') &&
+            !data.library_capsule.includes('231x87')
+              ? data.library_capsule
+              : undefined;
+
+          const browseAssets = directLibraryCapsule
+            ? this.getStoreBrowseAssetsInstant(appId)
+            : await this.fetchStoreBrowseAssets(appId).catch(() => null);
+
           const resolvedCapsuleImage =
-            (typeof data.library_capsule === 'string' && data.library_capsule) ||
-            (typeof data.capsule_imagev5 === 'string' && data.capsule_imagev5) ||
-            (typeof data.capsule_image === 'string' && data.capsule_image) ||
-            undefined;
+            directLibraryCapsule || browseAssets?.capsuleImage || undefined;
 
           const htmlLanguageOptions = parseSteamLanguageTableHtml(
             typeof storePageRes?.data === 'string' ? storePageRes.data : ''
@@ -471,7 +648,7 @@ export class SteamApiService {
               rawDetailedDesc.length > 15000 ? rawDetailedDesc.slice(0, 15000) : rawDetailedDesc,
             aboutTheGame:
               rawAboutTheGame.length > 15000 ? rawAboutTheGame.slice(0, 15000) : rawAboutTheGame,
-            headerImage: data.header_image || '',
+            headerImage: data.header_image || browseAssets?.headerImage || '',
             capsuleImage: resolvedCapsuleImage,
             developers: data.developers || [],
             publishers: data.publishers || [],

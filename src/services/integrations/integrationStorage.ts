@@ -271,6 +271,10 @@ const MAX_STORED_SCREENSHOTS = 12;
 const MAX_STORED_MOVIES = 4;
 const MAX_STORED_DESCRIPTION_CHARS = 12000;
 
+function computeCatalogFingerprint(raw: string): string {
+  return `${raw.length}:${raw.slice(0, 64)}:${raw.slice(-64)}`;
+}
+
 export function compactGameForStorage(game: CanonicalGame): CanonicalGame {
   if (!game || typeof game !== 'object') return game;
 
@@ -282,6 +286,40 @@ export function compactGameForStorage(game: CanonicalGame): CanonicalGame {
     nextGame = {
       ...nextGame,
       detailedDescription: nextGame.detailedDescription.slice(0, MAX_STORED_DESCRIPTION_CHARS),
+    };
+  }
+
+  const rawTopAbout = (nextGame as any).aboutTheGame;
+  if (typeof rawTopAbout === 'string') {
+    const trimmedTopAbout =
+      rawTopAbout.length > MAX_STORED_DESCRIPTION_CHARS
+        ? rawTopAbout.slice(0, MAX_STORED_DESCRIPTION_CHARS)
+        : rawTopAbout;
+    const finalTopAbout =
+      nextGame.detailedDescription && trimmedTopAbout === nextGame.detailedDescription
+        ? ''
+        : trimmedTopAbout;
+    if (finalTopAbout !== rawTopAbout) {
+      nextGame = {
+        ...nextGame,
+        ...({ aboutTheGame: finalTopAbout } as any),
+      };
+    }
+  }
+
+  const rawTopScreenshots = (nextGame as any).screenshots;
+  if (Array.isArray(rawTopScreenshots) && rawTopScreenshots.length > MAX_STORED_SCREENSHOTS) {
+    nextGame = {
+      ...nextGame,
+      ...({ screenshots: rawTopScreenshots.slice(0, MAX_STORED_SCREENSHOTS) } as any),
+    };
+  }
+
+  const rawTopMovies = (nextGame as any).movies;
+  if (Array.isArray(rawTopMovies) && rawTopMovies.length > MAX_STORED_MOVIES) {
+    nextGame = {
+      ...nextGame,
+      ...({ movies: rawTopMovies.slice(0, MAX_STORED_MOVIES) } as any),
     };
   }
 
@@ -345,7 +383,7 @@ function writeCatalogToLocalStorage(cleaned: CanonicalGame[]): void {
     localStorage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
   }
   inMemoryCatalogCache = compacted;
-  inMemoryCatalogRawRef = serialized;
+  inMemoryCatalogRawRef = computeCatalogFingerprint(serialized);
 
   // Save only custom games delta to STORAGE_KEY_CUSTOM_GAMES, NOT the duplicate copy of all master games
   const customGames = compacted.filter(
@@ -421,25 +459,34 @@ export function loadCurrentCatalog(): CanonicalGame[] {
   }
 
   try {
-    if (pendingCatalogGames !== null && inMemoryCatalogCache !== null) {
+    if (
+      (pendingCatalogGames !== null || !isTestEnv()) &&
+      inMemoryCatalogCache !== null
+    ) {
       return applyUserOverridesToCatalog(inMemoryCatalogCache, userOverrides);
     }
 
     const raw = localStorage.getItem(STORAGE_KEY_MAIN_CATALOG);
     if (raw) {
-      if (inMemoryCatalogCache !== null && inMemoryCatalogRawRef === raw) {
+      const fp = computeCatalogFingerprint(raw);
+      if (inMemoryCatalogCache !== null && inMemoryCatalogRawRef === fp) {
         return applyUserOverridesToCatalog(inMemoryCatalogCache, userOverrides);
       }
 
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        let cleaned = sanitizeGameCatalog(parsed, { allowNewPurchases: true });
+        let compactedAny = false;
+        let cleaned = sanitizeGameCatalog(parsed, { allowNewPurchases: true }).map((g) => {
+          const c = compactGameForStorage(g);
+          if (c !== g) compactedAny = true;
+          return c;
+        });
         cleaned = applyUserOverridesToCatalog(cleaned, userOverrides);
         inMemoryCatalogCache = cleaned;
-        if (cleaned.length !== parsed.length) {
+        if (cleaned.length !== parsed.length || compactedAny) {
           writeCatalogToLocalStorage(cleaned);
         } else {
-          inMemoryCatalogRawRef = raw;
+          inMemoryCatalogRawRef = fp;
         }
         return cleaned;
       }

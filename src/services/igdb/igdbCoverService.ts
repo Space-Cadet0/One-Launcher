@@ -4,12 +4,19 @@
  * portrait covers hosted on images.igdb.com.
  */
 
-import { isSequelMismatch, normalizeTitleKey, EDITION_TOKENS } from '../common/titleUtils';
+import {
+  isSequelMismatch,
+  normalizeTitleKey,
+  extractSequelIdentifier,
+  EDITION_TOKENS,
+} from '../common/titleUtils';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { syncJobManager } from '../network/syncJobManager';
 import { isTitleCompatible } from '../critic/metacriticResolver';
 
+const STORAGE_KEY_IGDB_COVERS_V1 = 'antigravity_igdb_covers';
 const STORAGE_KEY_IGDB_COVERS = 'antigravity_igdb_covers_v2';
+const STORAGE_KEY_COVER_SCHEMA_MIGRATION = 'antigravity_igdb_covers_schema_v3';
 const STORAGE_KEY_GOG_BOXART = 'antigravity_gog_boxart_v1';
 const STORAGE_KEY_DEAD_STEAM_COVERS = 'antigravity_dead_steam_covers_v1';
 const NEGATIVE_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -76,6 +83,9 @@ export function isUnsuitableCoverUrl(url?: string | null): boolean {
 
   // 1. Known horizontal banner URL dimensions / names & GOG server-cropped horizontal formatter
   if (
+    lower.includes('184x69') ||
+    lower.includes('capsule_184x69') ||
+    lower.includes('capsule_sm_120') ||
     lower.includes('231x87') ||
     lower.includes('467x181') ||
     lower.includes('616x353') ||
@@ -180,11 +190,59 @@ const EDITION_WORDS = new Set([
   'upgrade',
   'vr',
   'hd',
+  'digital',
+  'gog',
+  'steam',
+  'epic',
 ]);
 
+/**
+ * Matches numbered series titles when the storefront omits the subtitle while IGDB/Lutris
+ * includes a colon subtitle (e.g. "Ultima Underworld I" <-> "Ultima Underworld: The Stygian Abyss",
+ * "Ultima Underworld II" <-> "Ultima Underworld II: Labyrinth of Worlds").
+ */
+export function isNumberedBaseTitleSubtitleMatch(
+  queryTitle: string,
+  candidateTitle: string
+): boolean {
+  if (!queryTitle || !candidateTitle) return false;
+  if (queryTitle.includes(':') || !candidateTitle.includes(':')) return false;
+
+  const cleanQ = queryTitle.replace(/[™®©]/g, '').trim();
+  const candBase = candidateTitle.split(':')[0].replace(/[™®©]/g, '').trim();
+  if (!cleanQ || !candBase) return false;
+
+  // Must end with an explicit Roman or Arabic sequel numeral
+  if (!/\b(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|1|2|3|4|5|6|7|8|9|10)\s*$/i.test(cleanQ)) {
+    return false;
+  }
+
+  // Case A: Exact base + numeral match (e.g. "Ultima Underworld II" === "Ultima Underworld II")
+  if (!isSequelMismatch(cleanQ, candBase) && normalizeTitleKey(cleanQ) === normalizeTitleKey(candBase)) {
+    return true;
+  }
+
+  // Case B: Explicit Part I / 1 vs original subtitled first entry without numeral
+  if (/\b(?:i|1)\s*$/i.test(cleanQ) && extractSequelIdentifier(candidateTitle) === null) {
+    const strippedQ = cleanQ.replace(/\s+\b(?:i|1)\s*$/i, '').trim();
+    const baseWords = normalizeTitleKey(candBase).split(/\s+/).filter(Boolean);
+    if (baseWords.length >= 2 && normalizeTitleKey(strippedQ) === normalizeTitleKey(candBase)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export function computeTokenSimilarity(t1: string, t2: string): number {
-  if (isSequelMismatch(t1, t2)) return 0;
-  if (!isTitleCompatible(t1, t2)) return 0;
+  const numberedSubtitleMatch =
+    isNumberedBaseTitleSubtitleMatch(t1, t2) || isNumberedBaseTitleSubtitleMatch(t2, t1);
+  if (!numberedSubtitleMatch) {
+    if (isSequelMismatch(t1, t2)) return 0;
+    if (!isTitleCompatible(t1, t2)) return 0;
+  } else {
+    return 0.92;
+  }
 
   const cleanT1 = normalizeTitleKey(t1);
   const cleanT2 = normalizeTitleKey(t2);
@@ -258,6 +316,50 @@ export class IgdbCoverService {
     }
   }
 
+  public evictCacheForGame(
+    title?: string,
+    gogId?: string | number | null,
+    steamAppId?: number | null
+  ): void {
+    if (steamAppId && steamAppId > 0) {
+      KNOWN_DEAD_STEAM_COVER_APP_IDS.delete(steamAppId);
+      this.deadSteamTimestamps.delete(steamAppId);
+      if (typeof localStorage !== 'undefined') {
+        try {
+          const deadObj: Record<string, number> = {};
+          for (const [id, ts] of this.deadSteamTimestamps.entries()) {
+            deadObj[String(id)] = ts;
+          }
+          localStorage.setItem(STORAGE_KEY_DEAD_STEAM_COVERS, JSON.stringify(deadObj));
+        } catch {
+          // Ignore storage error
+        }
+      }
+    }
+
+    if (gogId !== undefined && gogId !== null && gogId !== '') {
+      const cleanId = String(gogId).replace(/^gog-/, '').trim();
+      if (cleanId) {
+        this.gogBoxArtCache.delete(`id:${cleanId}`);
+        this.gogNegativeTimestamps.delete(`id:${cleanId}`);
+      }
+    }
+
+    if (title && title.trim()) {
+      const norm = normalizeKey(title);
+      const lower = title.trim().toLowerCase();
+      this.gogBoxArtCache.delete(`title:${norm}`);
+      for (const k of Array.from(this.cache.keys())) {
+        if (k === norm || k === lower || k.startsWith(`${norm}:`)) {
+          this.cache.delete(k);
+          this.negativeTimestamps.delete(k);
+        }
+      }
+    }
+
+    this.savePersistentCache();
+  }
+
   public recordDeadSteamCover(appId?: number | null): void {
     if (!appId || appId <= 0) return;
     const now = Date.now();
@@ -279,37 +381,79 @@ export class IgdbCoverService {
   private loadPersistentCache() {
     if (typeof localStorage === 'undefined') return;
     try {
+      const hasMigratedSchemaV3 =
+        localStorage.getItem(STORAGE_KEY_COVER_SCHEMA_MIGRATION) === '1';
+      let needsSaveAfterMigration = false;
+
+      // 1. Migrate positive covers from legacy v1 key ('antigravity_igdb_covers')
+      const rawV1 = localStorage.getItem(STORAGE_KEY_IGDB_COVERS_V1);
+      if (rawV1) {
+        try {
+          const parsedV1 = JSON.parse(rawV1);
+          if (parsedV1 && typeof parsedV1 === 'object') {
+            for (const [k, v] of Object.entries(parsedV1)) {
+              const nk = normalizeCacheKey(k);
+              if (typeof v === 'string' && v.trim() && !isUnsuitableCoverUrl(v)) {
+                this.cache.set(nk, v);
+                needsSaveAfterMigration = true;
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed v1 cache
+        }
+      }
+
+      // 2. Load v2 IGDB cover cache (purging false negatives once on schema v3 migration)
       const raw = localStorage.getItem(STORAGE_KEY_IGDB_COVERS);
       if (raw) {
         const parsed = JSON.parse(raw);
         for (const [k, v] of Object.entries(parsed)) {
           const nk = normalizeCacheKey(k);
-          if (typeof v === 'string' && v.trim()) {
+          if (typeof v === 'string' && v.trim() && !isUnsuitableCoverUrl(v)) {
             this.cache.set(nk, v);
           } else if (v && typeof v === 'object' && (v as any).url === null) {
-            const cachedAt = Number((v as any).cachedAt || 0);
-            if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
-              this.cache.set(nk, null);
-              this.negativeTimestamps.set(nk, cachedAt);
+            if (hasMigratedSchemaV3 && !this.cache.has(nk)) {
+              const cachedAt = Number((v as any).cachedAt || 0);
+              if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
+                this.cache.set(nk, null);
+                this.negativeTimestamps.set(nk, cachedAt);
+              }
+            } else {
+              needsSaveAfterMigration = true;
             }
           }
         }
       }
+
+      // 3. Load GOG boxArt cache (purging outage negatives once on schema v3 migration)
       const rawGog = localStorage.getItem(STORAGE_KEY_GOG_BOXART);
       if (rawGog) {
         const parsedGog = JSON.parse(rawGog);
         for (const [k, v] of Object.entries(parsedGog)) {
-          if (typeof v === 'string' && v.trim()) {
+          if (typeof v === 'string' && v.trim() && !isUnsuitableCoverUrl(v)) {
             this.gogBoxArtCache.set(k, v);
           } else if (v && typeof v === 'object' && (v as any).url === null) {
-            const cachedAt = Number((v as any).cachedAt || 0);
-            if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
-              this.gogBoxArtCache.set(k, null);
-              this.gogNegativeTimestamps.set(k, cachedAt);
+            if (hasMigratedSchemaV3) {
+              const cachedAt = Number((v as any).cachedAt || 0);
+              if (cachedAt > 0 && Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS) {
+                this.gogBoxArtCache.set(k, null);
+                this.gogNegativeTimestamps.set(k, cachedAt);
+              }
+            } else {
+              needsSaveAfterMigration = true;
             }
           }
         }
       }
+
+      if (!hasMigratedSchemaV3) {
+        localStorage.setItem(STORAGE_KEY_COVER_SCHEMA_MIGRATION, '1');
+        if (needsSaveAfterMigration) {
+          this.savePersistentCache();
+        }
+      }
+
       const rawDeadSteam = localStorage.getItem(STORAGE_KEY_DEAD_STEAM_COVERS);
       if (rawDeadSteam) {
         const parsedDead = JSON.parse(rawDeadSteam);
@@ -418,6 +562,7 @@ export class IgdbCoverService {
     }
 
     const executeGogLookup = async (): Promise<string | null> => {
+      let receivedDefinitiveResponse = false;
       try {
         const url =
           typeof window !== 'undefined' && window.location.hostname === 'localhost'
@@ -439,6 +584,7 @@ export class IgdbCoverService {
         );
 
         if (res && res.ok) {
+          receivedDefinitiveResponse = true;
           const data = await res.json();
           const boxArt = data?._links?.boxArtImage?.href;
           if (boxArt && typeof boxArt === 'string' && !isUnsuitableCoverUrl(boxArt)) {
@@ -457,15 +603,19 @@ export class IgdbCoverService {
             }
             return normalizedUrl;
           }
+        } else if (res && res.status === 404) {
+          receivedDefinitiveResponse = true;
         }
       } catch (err: any) {
         console.warn('[IgdbCoverService] GOG v2 boxArtImage fetch error:', cleanId, err?.message);
       }
 
-      const now = Date.now();
-      this.gogBoxArtCache.set(`id:${cleanId}`, null);
-      this.gogNegativeTimestamps.set(`id:${cleanId}`, now);
-      this.savePersistentCache();
+      if (receivedDefinitiveResponse) {
+        const now = Date.now();
+        this.gogBoxArtCache.set(`id:${cleanId}`, null);
+        this.gogNegativeTimestamps.set(`id:${cleanId}`, now);
+        this.savePersistentCache();
+      }
       return null;
     };
 
@@ -641,9 +791,14 @@ export class IgdbCoverService {
     }
 
     const executeLookup = async (): Promise<string | null> => {
+      let receivedOkResponse = false;
       // Query search endpoint via Vite proxy or direct HTTPS with full sequel, compatibility, and releaseYear verification
       try {
-        const query = cleanRaw.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+        const query = cleanRaw
+          .replace(/[™®©]/g, '')
+          .replace(/[:\-–—]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
         const searchUrl =
           typeof window !== 'undefined' && window.location.hostname === 'localhost'
             ? `/api/lutris/api/games?search=${encodeURIComponent(query)}`
@@ -667,32 +822,69 @@ export class IgdbCoverService {
           'lutris.net'
         );
 
-        if (res.ok) {
+        if (res && res.ok) {
+          receivedOkResponse = true;
           const data = await res.json();
           const items: any[] = data.results || [];
           if (items.length > 0) {
             let bestCover: string | null = null;
             let bestScore = -1;
 
+            const hasCloseYearAlternative =
+              effectiveReleaseYear !== null &&
+              items.some((cand: any) => {
+                if (!cand?.coverart) return false;
+                const cName = cand.name || '';
+                const cNumberedSubMatch = isNumberedBaseTitleSubtitleMatch(cleanRaw, cName);
+                if (
+                  !cNumberedSubMatch &&
+                  (isSequelMismatch(cleanRaw, cName) || !isTitleCompatible(cleanRaw, cName))
+                ) {
+                  return false;
+                }
+                const cYear =
+                  cand.year !== undefined && cand.year !== null && cand.year !== ''
+                    ? Number(cand.year)
+                    : null;
+                return (
+                  cYear !== null &&
+                  !Number.isNaN(cYear) &&
+                  Math.abs(effectiveReleaseYear - cYear) <= 2
+                );
+              });
+
             for (const item of items) {
               if (!item.coverart) continue;
               const itemName = item.name || '';
-              if (isSequelMismatch(cleanRaw, itemName) || !isTitleCompatible(cleanRaw, itemName)) {
+              const numberedSubMatch = isNumberedBaseTitleSubtitleMatch(cleanRaw, itemName);
+              if (
+                !numberedSubMatch &&
+                (isSequelMismatch(cleanRaw, itemName) || !isTitleCompatible(cleanRaw, itemName))
+              ) {
                 continue;
               }
 
               const candNorm = normalizeKey(itemName);
-              let score = computeTokenSimilarity(norm, candNorm) * 100;
+              let score = numberedSubMatch
+                ? 92
+                : computeTokenSimilarity(cleanRaw, itemName) * 100;
 
               const itemYear =
                 item.year !== undefined && item.year !== null && item.year !== ''
                   ? Number(item.year)
                   : null;
-              const hasEraMismatch =
+              const isNewerReboot =
                 effectiveReleaseYear !== null &&
                 itemYear !== null &&
                 !Number.isNaN(itemYear) &&
-                Math.abs(effectiveReleaseYear - itemYear) >= 4;
+                itemYear - effectiveReleaseYear >= 4;
+              const isOlderOverriddenByCloseYear =
+                effectiveReleaseYear !== null &&
+                itemYear !== null &&
+                !Number.isNaN(itemYear) &&
+                effectiveReleaseYear - itemYear >= 4 &&
+                hasCloseYearAlternative;
+              const hasEraMismatch = isNewerReboot || isOlderOverriddenByCloseYear;
 
               if (candNorm === norm && !hasEraMismatch) {
                 score += 50;
@@ -702,7 +894,7 @@ export class IgdbCoverService {
                 const yearDiff = Math.abs(effectiveReleaseYear - itemYear);
                 if (yearDiff <= 1) {
                   score += 15;
-                } else if (yearDiff >= 4) {
+                } else if (hasEraMismatch) {
                   score -= 35;
                 }
               }
@@ -731,15 +923,17 @@ export class IgdbCoverService {
         console.warn('Dynamic IGDB cover fetch error for', cleanRaw, err?.message);
       }
 
-      // Mark negative cache and persist to avoid infinite retries across scrolls and app restarts
-      const now = Date.now();
-      this.cache.set(cacheKey, null);
-      this.negativeTimestamps.set(cacheKey, now);
-      if (!effectiveReleaseYear) {
-        this.cache.set(norm, null);
-        this.negativeTimestamps.set(norm, now);
+      // Only mark negative cache when the API actually responded cleanly (not on network/5xx errors)
+      if (receivedOkResponse) {
+        const now = Date.now();
+        this.cache.set(cacheKey, null);
+        this.negativeTimestamps.set(cacheKey, now);
+        if (!effectiveReleaseYear) {
+          this.cache.set(norm, null);
+          this.negativeTimestamps.set(norm, now);
+        }
+        this.savePersistentCache();
       }
-      this.savePersistentCache();
       return null;
     };
 

@@ -70,10 +70,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('window:maximized-changed', handler);
   },
   // trimMemory: () => ipcRenderer.invoke('perf:trim-memory')
-  trimMemory: () => {
+  trimMemory: (options) => {
+    try {
+      if (typeof globalThis.gc === 'function') {
+        globalThis.gc();
+      }
+    } catch {}
     try {
       webFrame?.clearCache?.();
     } catch {}
-    return ipcRenderer.invoke('perf:trim-memory');
+    return ipcRenderer.invoke('perf:trim-memory', options);
   },
 });

@@ -43,6 +43,8 @@ function createMainWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
+      spellcheck: false,
+      backgroundThrottling: true,
       webSecurity: true, // Secure webSecurity enabled; cross-origin requests handled via IPC and onHeadersReceived
     },
   });
@@ -147,10 +149,9 @@ if (!gotTheLock) {
 
   try {
     if (app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
-      app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384');
+      app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384 --expose-gc');
       app.commandLine.appendSwitch('disk-cache-size', String(50 * 1024 * 1024));
       app.commandLine.appendSwitch('media-cache-size', String(25 * 1024 * 1024));
-      app.commandLine.appendSwitch('gpu-program-cache-size-kb', '4096');
       app.commandLine.appendSwitch('renderer-process-limit', '2');
       if (process.platform === 'win32') {
         app.commandLine.appendSwitch(
@@ -596,9 +597,45 @@ async function fetchSteamBatchAchievements(webapiToken, steamId, appIds = []) {
 }
 
 /**
+ * Fetch batch Steam store asset hashes using public IStoreBrowseService/GetItems/v1
+ */
+async function fetchSteamStoreBrowseItemsMap(appIds = []) {
+  const storeItems = {};
+  if (!Array.isArray(appIds) || appIds.length === 0) return storeItems;
+  const cleanIds = Array.from(new Set(appIds.map((id) => Number(id)).filter((id) => id > 0)));
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < cleanIds.length; i += CHUNK_SIZE) {
+    const chunk = cleanIds.slice(i, i + CHUNK_SIZE);
+    const inputJson = JSON.stringify({
+      ids: chunk.map((appid) => ({ appid })),
+      context: { language: 'english', country_code: 'US' },
+      data_request: { include_assets: true },
+    });
+    const url = `https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
+      inputJson
+    )}`;
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const json = await res.json();
+        const items = json?.response?.store_items;
+        if (Array.isArray(items)) {
+          for (const item of items) {
+            if (item?.appid && item?.assets) {
+              storeItems[String(item.appid)] = item.assets;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  return storeItems;
+}
+
+/**
  * Convert Steam web gameslist JSON into CanonicalGame objects
  */
-function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
+function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl, existingGames = []) {
   const parsed = typeof rawJsonStr === 'string' ? JSON.parse(rawJsonStr) : rawJsonStr;
   const rgGames = Array.isArray(parsed?.rgGames)
     ? parsed.rgGames
@@ -608,6 +645,14 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
         ? parsed
         : [];
   const storeItems = (parsed && typeof parsed.storeItems === 'object' && parsed.storeItems) || {};
+  const existingByAppId = new Map();
+  if (Array.isArray(existingGames)) {
+    for (const eg of existingGames) {
+      if (eg && eg.steamAppId) {
+        existingByAppId.set(Number(eg.steamAppId), eg);
+      }
+    }
+  }
   const resolvedName = parsed?.strProfileName || personaName || 'Steam User';
   const localPlaytimes = readLocalSteamPlaytimes();
   const localAchievements = scanLocalSteamAchievementsSync();
@@ -627,6 +672,7 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
     const ach = localAchievements[appId];
 
     const si = storeItems[String(appId)];
+    const existingGame = existingByAppId.get(appId);
     const assetFormat = (si && si.asset_url_format) || `steam/apps/${appId}/\${FILENAME}`;
     const buildAssetUrl = (filename) =>
       `https://shared.akamai.steamstatic.com/store_item_assets/${assetFormat.replace('${FILENAME}', filename)}`;
@@ -637,6 +683,34 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
       (typeof g.capsule_filename === 'string' && g.capsule_filename.includes('/')
         ? g.capsule_filename
         : 'library_600x900.jpg');
+
+    const rawIconHash =
+      (si && si.community_icon) ||
+      (typeof g.img_icon_url === 'string' && g.img_icon_url.trim()) ||
+      '';
+    const resolvedIconUrl = rawIconHash
+      ? rawIconHash.startsWith('http')
+        ? rawIconHash
+        : `https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/${appId}/${
+            rawIconHash.endsWith('.jpg') ? rawIconHash : `${rawIconHash}.jpg`
+          }`
+      : existingGame?.iconUrl;
+
+    const builtHeader = buildAssetUrl(headerFile);
+    const builtCapsule = buildAssetUrl(capsuleFile);
+    const finalHeader =
+      !si &&
+      existingGame?.headerImage &&
+      /\/apps\/\d+\/[a-f0-9]{40}\//i.test(existingGame.headerImage)
+        ? existingGame.headerImage
+        : builtHeader;
+    const finalCapsule =
+      !si &&
+      existingGame?.capsuleImage &&
+      /\/apps\/\d+\/[a-f0-9]{40}\//i.test(existingGame.capsuleImage) &&
+      !existingGame.capsuleImage.includes('184x69')
+        ? existingGame.capsuleImage
+        : builtCapsule;
 
     const gameObj = {
       id: `steam-${appId}`,
@@ -663,8 +737,9 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl) {
             : undefined,
         },
       ],
-      headerImage: buildAssetUrl(headerFile),
-      capsuleImage: buildAssetUrl(capsuleFile),
+      headerImage: finalHeader,
+      capsuleImage: finalCapsule,
+      iconUrl: resolvedIconUrl,
       shortDescription: '',
       releaseDate: 'Released',
       developers: [],
@@ -1119,11 +1194,14 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
             if (res.ok) {
               const apiJson = await res.json();
               if (Array.isArray(apiJson?.response?.games) && apiJson.response.games.length > 0) {
+                const ownedAppIds = apiJson.response.games.map((g) => g.appid).filter(Boolean);
+                const storeItems = await fetchSteamStoreBrowseItemsMap(ownedAppIds);
                 const refreshed = parseSteamGamesListJson(
-                  { rgGames: apiJson.response.games, strProfileName: accountName },
+                  { rgGames: apiJson.response.games, storeItems, strProfileName: accountName },
                   tokenData.steamId,
                   accountName,
-                  avatarUrl
+                  avatarUrl,
+                  games
                 );
                 games = refreshed.games;
                 tokenData = { ...tokenData, games };
@@ -2014,7 +2092,7 @@ ipcMain.handle('window:perform-menu-action', (_event, action) => {
   }
 });
 
-ipcMain.handle('perf:trim-memory', async () => {
+ipcMain.handle('perf:trim-memory', async (_event, options) => {
   try {
     launcherEngine.trimLauncherEngineMemory?.();
   } catch {}
@@ -2023,6 +2101,7 @@ ipcMain.handle('perf:trim-memory', async () => {
   } catch {}
   try {
     if (
+      options?.clearDiskCache &&
       mainWindow &&
       !mainWindow.isDestroyed() &&
       mainWindow.webContents &&

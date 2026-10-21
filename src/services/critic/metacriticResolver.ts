@@ -92,7 +92,8 @@ const METACRITIC_STOP_WORDS = new Set([
   'standard', 'deluxe', 'gold', 'silver', 'platinum', 'diamond', 'collectors', 'collector', 'ultimate',
   'complete', 'special', 'limited', 'definitive', 'enhanced', 'anniversary', 'edition', 'remastered',
   'remake', 'directors', 'cut', 'legacy', 'classic', 'redux', 'extended', 'enchanted',
-  'emperor', 'gourmet', 'celebration', 'spacers', 'choice', 'uncut', 'year', 'original', 'story'
+  'emperor', 'gourmet', 'celebration', 'spacers', 'choice', 'uncut', 'year', 'original', 'story',
+  'digital', 'gog', 'steam', 'epic'
 ]);
 
 const PURE_EDITION_WORDS = new Set([
@@ -103,6 +104,7 @@ const PURE_EDITION_WORDS = new Set([
   'spacers', 'choice', 'uncut', 'year', 'original', 'story', 'trials', 'ecto',
   'lightspeed', 'landmark', 'super', 'turbo', 'championship', 'unrated', 'anthology', 'telltale',
   'series', 'sid', 'meiers', 'meier', '20', '10', '25', '30',
+  'digital', 'gog', 'steam', 'epic',
 ]);
 
 /**

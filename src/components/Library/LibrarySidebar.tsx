@@ -1,9 +1,16 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import { GameCollection } from '../../contracts/collection';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
 import { CollectionIcon } from '../Common/CollectionIcon';
+import {
+  notifyImageUnmounted,
+  recordScrollActivity,
+  isCurrentlyFastScrolling,
+  addPendingFastScrollMount,
+  removePendingFastScrollMount,
+} from './LibraryGridView';
 import {
   Gamepad2,
   CheckCircle2,
@@ -25,8 +32,261 @@ import {
 
 import { ActiveGameFilter } from '../../contracts/filter';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
+import { igdbCoverService, isKnownDeadSteamCover } from '../../services/igdb/igdbCoverService';
+import { steamApi } from '../../services/steam/steamApi';
 
 const COLLAPSED_STORAGE_KEY = 'antigravity_library_collapsed_groups';
+
+const MAX_FAILED_SIDEBAR_ICON_URLS = 2000;
+const failedSidebarIconUrls = new Set<string>();
+
+export function markSidebarIconUrlFailed(url?: string | null): void {
+  if (!url) return;
+  if (failedSidebarIconUrls.size >= MAX_FAILED_SIDEBAR_ICON_URLS) {
+    const oldest = failedSidebarIconUrls.values().next().value;
+    if (oldest !== undefined) failedSidebarIconUrls.delete(oldest);
+  }
+  failedSidebarIconUrls.add(url);
+}
+
+export function clearFailedSidebarIconUrls(): void {
+  failedSidebarIconUrls.clear();
+}
+
+function isUnhashedSteamAppAssetUrl(url: string, appId?: number | null): boolean {
+  if (!appId) return false;
+  if (!url.includes(`/apps/${appId}/`)) return false;
+  return !/\/apps\/\d+\/[a-f0-9]{40}\//i.test(url);
+}
+
+function toSidebarIconUrl(rawUrl?: string | null): string | null {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.includes('default.png') || trimmed.includes('egs-badge.png')) {
+    return null;
+  }
+  const hasSha1Subdir = /\/apps\/\d+\/[a-f0-9]{40}\//i.test(trimmed);
+  let transformed = hasSha1Subdir
+    ? trimmed
+    : trimmed.replace(/\/library_600x900(?:_2x)?\.jpg(\?.*)?$/i, '/capsule_sm_120.jpg$1');
+  transformed = transformed.replace(/\/t_cover_big(?:_2x)?\//i, '/t_thumb/');
+  if (
+    /cdn[12]?\.epicgames\.com\//i.test(transformed) &&
+    !/[?&][hw]=/i.test(transformed)
+  ) {
+    transformed = `${transformed}${transformed.includes('?') ? '&' : '?'}h=96&resize=1`;
+  }
+  return transformed;
+}
+
+const sidebarIconCallbacks = new WeakMap<Element, (isNear: boolean) => void>();
+let sharedSidebarIconObserver: IntersectionObserver | null = null;
+function getSharedSidebarIconObserver(): IntersectionObserver | null {
+  if (typeof IntersectionObserver === 'undefined') return null;
+  if (!sharedSidebarIconObserver) {
+    sharedSidebarIconObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const cb = sidebarIconCallbacks.get(entry.target);
+          if (cb) cb(entry.isIntersecting);
+        }
+      },
+      { rootMargin: '400px 0px 400px 0px' }
+    );
+  }
+  return sharedSidebarIconObserver;
+}
+
+const SidebarRowThumbnail: React.FC<{ game: CanonicalGame; rowIndex: number }> = React.memo(
+  ({ game, rowIndex }) => {
+    const [isNear, setIsNear] = useState<boolean>(() => rowIndex <= 28);
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const imgElementRef = useRef<HTMLImageElement | null>(null);
+
+    const handleImgRef = useCallback((node: HTMLImageElement | null) => {
+      const prev = imgElementRef.current;
+      if (prev && prev !== node) {
+        prev.onload = null;
+        prev.onerror = null;
+        prev.removeAttribute('src');
+        prev.src = '';
+        notifyImageUnmounted();
+      }
+      imgElementRef.current = node;
+    }, []);
+
+    useEffect(() => {
+      if (typeof IntersectionObserver === 'undefined') {
+        setIsNear(true);
+        return;
+      }
+      const el = containerRef.current;
+      const observer = getSharedSidebarIconObserver();
+      if (!el || !observer) {
+        setIsNear(true);
+        return;
+      }
+      let enterTimer: ReturnType<typeof setTimeout> | null = null;
+      const mountNow = () => {
+        setIsNear(true);
+      };
+      sidebarIconCallbacks.set(el, (near) => {
+        if (enterTimer) {
+          clearTimeout(enterTimer);
+          enterTimer = null;
+        }
+        removePendingFastScrollMount(mountNow);
+        if (near) {
+          if (isCurrentlyFastScrolling()) {
+            addPendingFastScrollMount(mountNow);
+          } else {
+            enterTimer = setTimeout(() => {
+              enterTimer = null;
+              if (isCurrentlyFastScrolling()) {
+                addPendingFastScrollMount(mountNow);
+              } else {
+                setIsNear(true);
+              }
+            }, 16);
+          }
+        } else {
+          setIsNear(false);
+        }
+      });
+      observer.observe(el);
+      return () => {
+        if (enterTimer) {
+          clearTimeout(enterTimer);
+        }
+        removePendingFastScrollMount(mountNow);
+        sidebarIconCallbacks.delete(el);
+        observer.unobserve(el);
+      };
+    }, []);
+
+    const [failedTick, setFailedTick] = useState(0);
+
+    const iconCandidates = useMemo(() => {
+      const list: string[] = [];
+      const seen = new Set<string>();
+      const deadSteam = game.steamAppId ? isKnownDeadSteamCover(game.steamAppId) : false;
+
+      const pushCandidate = (raw?: string | null) => {
+        const formatted = toSidebarIconUrl(raw);
+        if (!formatted || seen.has(formatted)) return;
+        seen.add(formatted);
+        list.push(formatted);
+      };
+
+      const browseAssets = game.steamAppId
+        ? steamApi.getStoreBrowseAssetsInstant(game.steamAppId)
+        : null;
+
+      const rawSources = [
+        game.iconUrl,
+        browseAssets?.iconUrl,
+        game.capsuleImage,
+        browseAssets?.capsuleImage,
+        game.enrichedMetadata?.capsuleImage,
+        browseAssets?.headerImage,
+        game.enrichedMetadata?.headerImage,
+        game.headerImage,
+      ];
+
+      // 1. Prefer Steam community icons, hashed Steam store assets, or non-Steam icons first
+      for (const src of rawSources) {
+        if (!src) continue;
+        if (deadSteam && isUnhashedSteamAppAssetUrl(src, game.steamAppId)) {
+          continue;
+        }
+        if (
+          /\/apps\/\d+\/[a-f0-9]{40}\//i.test(src) ||
+          src.includes('steamcommunity/public/images/apps/')
+        ) {
+          pushCandidate(src);
+        }
+      }
+
+      // 2. Standard game icon / capsule / header candidates (skipping known dead unhashed Steam URLs)
+      for (const src of rawSources) {
+        if (!src) continue;
+        if (deadSteam && isUnhashedSteamAppAssetUrl(src, game.steamAppId)) {
+          continue;
+        }
+        pushCandidate(src);
+      }
+
+      // 3. Instant IGDB cover thumbnail
+      const igdbInstant = igdbCoverService.getIgdbCoverInstant(
+        game.title,
+        game.steamAppId,
+        game.id
+      );
+      if (igdbInstant) {
+        pushCandidate(igdbInstant);
+      }
+
+      // 4. Standard Steam small capsule / header fallbacks (only if not marked dead unhashed Steam CDN)
+      if (game.steamAppId && !deadSteam) {
+        pushCandidate(
+          `https://cdn.akamai.steamstatic.com/steam/apps/${game.steamAppId}/capsule_sm_120.jpg`
+        );
+        pushCandidate(
+          `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/capsule_sm_120.jpg`
+        );
+        pushCandidate(
+          `https://cdn.akamai.steamstatic.com/steam/apps/${game.steamAppId}/header.jpg`
+        );
+      }
+
+      return list;
+    }, [
+      game.id,
+      game.title,
+      game.steamAppId,
+      game.iconUrl,
+      game.capsuleImage,
+      game.headerImage,
+      game.enrichedMetadata?.capsuleImage,
+      game.enrichedMetadata?.headerImage,
+    ]);
+
+    const activeIconUrl = useMemo(
+      () => iconCandidates.find((u) => !failedSidebarIconUrls.has(u)) || null,
+      [iconCandidates, failedTick]
+    );
+
+    return (
+      <div
+        ref={containerRef}
+        className="w-6 h-6 rounded bg-black/60 overflow-hidden flex-shrink-0 border border-steam-border/40 group-hover:border-steam-accent/50 relative"
+      >
+        {isNear && activeIconUrl ? (
+          <img
+            ref={handleImgRef}
+            src={activeIconUrl}
+            alt=""
+            className="w-full h-full object-cover"
+            loading="lazy"
+            decoding="async"
+            onError={() => {
+              markSidebarIconUrlFailed(activeIconUrl);
+              setFailedTick((t) => t + 1);
+            }}
+          />
+        ) : null}
+        <div
+          className={`w-full h-full ${
+            isNear && activeIconUrl ? 'hidden' : 'flex'
+          } items-center justify-center bg-gradient-to-br from-[#1b2838] to-[#2a475e] text-[10px] font-bold text-steam-accent select-none`}
+          aria-hidden="true"
+        >
+          {game.title.charAt(0).toUpperCase()}
+        </div>
+      </div>
+    );
+  }
+);
 
 interface LibrarySidebarProps {
   games: CanonicalGame[];
@@ -85,6 +345,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   });
 
   const [isStoresDropdownOpen, setIsStoresDropdownOpen] = useState(false);
+  const [hoveredRowKey, setHoveredRowKey] = useState<string | null>(null);
   const storesDropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -197,76 +458,33 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     [collections]
   );
 
+  let sidebarRenderedRowIdx = 0;
+
   const renderGameRow = (game: CanonicalGame, idx?: number) => {
+    const currentRowIdx = sidebarRenderedRowIdx++;
     const isSelected = game.id === selectedGameId;
     const isInstalled = game.platforms.some((p) => p.installed);
     const isFav = favoriteIdsSet.has(game.id);
     const platformSig =
       game.platforms?.map((p) => `${p.platformId}:${p.platformGameId}`).join('|') || '';
     const rowKey = `${game.id}::${platformSig || idx || 0}`;
+    const showHoverActions = currentRowIdx <= 28 || hoveredRowKey === rowKey;
 
     return (
       <div
         key={rowKey}
         onClick={() => onSelectGame(game)}
-        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 36px' }}
-        className={`cv-sidebar-row relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-all group select-none ${
+        onMouseEnter={() => {
+          if (currentRowIdx > 28) setHoveredRowKey(rowKey);
+        }}
+        className={`cv-sidebar-row relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-colors group select-none ${
           isSelected
             ? 'bg-[#223547] text-white border-l-4 border-steam-accent shadow-inner'
             : 'text-steam-text hover:bg-[#1a212b] hover:text-white border-l-4 border-transparent'
         }`}
       >
         {/* Small Thumbnail Icon */}
-        <div className="w-6 h-6 rounded bg-black/60 overflow-hidden flex-shrink-0 border border-steam-border/40 group-hover:border-steam-accent/50 relative">
-          {(() => {
-            const rawUrl =
-              game.iconUrl ||
-              game.capsuleImage ||
-              (game.steamAppId
-                ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/header.jpg`
-                : undefined) ||
-              game.headerImage;
-            const initialIconUrl = rawUrl
-              ? rawUrl.replace(/\/library_600x900_2x\.jpg(\?.*)?$/i, '/library_600x900.jpg$1')
-              : undefined;
-
-            return (
-              <>
-                {initialIconUrl ? (
-                  <img
-                    src={initialIconUrl}
-                    alt=""
-                    className="w-full h-full object-cover"
-                    loading="lazy"
-                    decoding="async"
-                    onError={(e) => {
-                      const currentSrc = e.currentTarget.src;
-                      const steamHeader = game.steamAppId
-                        ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId}/header.jpg`
-                        : null;
-                      if (steamHeader && currentSrc !== steamHeader && !currentSrc.includes(`${game.steamAppId}/header.jpg`)) {
-                        e.currentTarget.src = steamHeader;
-                      } else if (game.headerImage && currentSrc !== game.headerImage) {
-                        e.currentTarget.src = game.headerImage;
-                      } else {
-                        e.currentTarget.style.display = 'none';
-                        if (e.currentTarget.nextElementSibling) {
-                          (e.currentTarget.nextElementSibling as HTMLElement).style.display = 'flex';
-                        }
-                      }
-                    }}
-                  />
-                ) : null}
-                <div
-                  className={`w-full h-full ${initialIconUrl ? 'hidden' : 'flex'} items-center justify-center bg-gradient-to-br from-[#1b2838] to-[#2a475e] text-[10px] font-bold text-steam-accent select-none`}
-                  aria-hidden="true"
-                >
-                  {game.title.charAt(0).toUpperCase()}
-                </div>
-              </>
-            );
-          })()}
-        </div>
+        <SidebarRowThumbnail game={game} rowIndex={currentRowIdx} />
 
         {/* Game Title & Badges */}
         <div className="flex-1 min-w-0 flex flex-col justify-center">
@@ -294,33 +512,35 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         </div>
 
         {/* Actions on Hover */}
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          {/* Favorite Star Button */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleGameInCollection('favorites', game.id);
-            }}
-            className={`p-1 rounded hover:bg-black/40 transition-colors ${
-              isFav ? 'text-amber-400 opacity-100' : 'text-steam-subtext hover:text-amber-400'
-            }`}
-            title={isFav ? 'Remove from Favorites' : 'Add to Favorites'}
-          >
-            <Star className={`w-3 h-3 ${isFav ? 'fill-amber-400' : ''}`} />
-          </button>
+        {showHoverActions && (
+          <div className="hidden group-hover:flex items-center gap-1">
+            {/* Favorite Star Button */}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleGameInCollection('favorites', game.id);
+              }}
+              className={`p-1 rounded hover:bg-black/40 transition-colors ${
+                isFav ? 'text-amber-400 opacity-100' : 'text-steam-subtext hover:text-amber-400'
+              }`}
+              title={isFav ? 'Remove from Favorites' : 'Add to Favorites'}
+            >
+              <Star className={`w-3 h-3 ${isFav ? 'fill-amber-400' : ''}`} />
+            </button>
 
-          {/* Manage Collections Menu Button */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenManageCollectionsModal(game);
-            }}
-            className="p-1 text-steam-subtext hover:text-white rounded hover:bg-black/40 transition-colors"
-            title="Manage Collections"
-          >
-            <MoreVertical className="w-3 h-3" />
-          </button>
-        </div>
+            {/* Manage Collections Menu Button */}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenManageCollectionsModal(game);
+              }}
+              className="p-1 text-steam-subtext hover:text-white rounded hover:bg-black/40 transition-colors"
+              title="Manage Collections"
+            >
+              <MoreVertical className="w-3 h-3" />
+            </button>
+          </div>
+        )}
 
         {/* Persistent Favorite Star if active and not hovered */}
         {isFav && (
@@ -494,7 +714,11 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       </div>
 
       {/* Games List (Grouped or Flat) */}
-      <div className="flex-1 overflow-y-auto py-1.5 px-2">
+      <div
+        style={{ overflowAnchor: 'none' }}
+        onScroll={(e) => recordScrollActivity(e.currentTarget.scrollTop, 'sidebar')}
+        className="flex-1 overflow-y-auto py-1.5 px-2"
+      >
         {/* Quick Grid View Switcher */}
         {onViewAllGamesGrid && (
           <button

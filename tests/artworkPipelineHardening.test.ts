@@ -118,10 +118,103 @@ describe('Phase 3A: Artwork & Media Pipeline Hardening', () => {
       expect(scheduleSpy.mock.calls[0][2]).toBe(Priority.P2_BACKGROUND);
       expect(scheduleSpy.mock.calls[0][3]).toBe('lutris.net');
     });
+
+    it('matches trademarked titles, digital/GOG edition variants, classic storefront re-release years, and numbered series entries', async () => {
+      global.fetch = vi.fn().mockImplementation(async (url: string) => {
+        const decoded = decodeURIComponent(url);
+        if (decoded.includes('DEATH STRANDING 2')) {
+          return {
+            ok: true,
+            json: async () => ({
+              results: [
+                {
+                  name: 'Death Stranding 2: On The Beach - Digital Deluxe Edition',
+                  year: 2025,
+                  coverart: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co9ipx.jpg',
+                },
+              ],
+            }),
+          };
+        }
+        if (decoded.includes('Ultima IV')) {
+          return {
+            ok: true,
+            json: async () => ({
+              results: [
+                {
+                  name: 'Ultima IV: Quest of the Avatar',
+                  year: 1985,
+                  coverart: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co_u4.jpg',
+                },
+              ],
+            }),
+          };
+        }
+        if (decoded.includes('Ultima Underworld I') && !decoded.includes('II')) {
+          return {
+            ok: true,
+            json: async () => ({
+              results: [
+                {
+                  name: 'Ultima Underworld: The Stygian Abyss',
+                  year: 1992,
+                  coverart: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co_uw_1.jpg',
+                },
+              ],
+            }),
+          };
+        }
+        if (decoded.includes('Ultima Underworld II')) {
+          return {
+            ok: true,
+            json: async () => ({
+              results: [
+                {
+                  name: 'Ultima Underworld II: Labyrinth of Worlds',
+                  year: 1993,
+                  coverart: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co_uw_2.jpg',
+                },
+              ],
+            }),
+          };
+        }
+        if (decoded.includes('Daggerfall Unity')) {
+          return {
+            ok: true,
+            json: async () => ({
+              results: [
+                {
+                  name: 'Daggerfall Unity',
+                  year: 2019,
+                  coverart: 'https://images.igdb.com/igdb/image/upload/t_cover_big/co_dfu.jpg',
+                },
+              ],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ results: [] }) };
+      });
+
+      expect(await igdbCoverService.fetchIgdbCover('DEATH STRANDING 2: ON THE BEACH', 2025)).toBe(
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co9ipx.jpg'
+      );
+      expect(await igdbCoverService.fetchIgdbCover('Ultima™ IV: Quest of the Avatar', 2011)).toBe(
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co_u4.jpg'
+      );
+      expect(await igdbCoverService.fetchIgdbCover('Ultima™ Underworld I', 2011)).toBe(
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co_uw_1.jpg'
+      );
+      expect(await igdbCoverService.fetchIgdbCover('Ultima™ Underworld II', 2011)).toBe(
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co_uw_2.jpg'
+      );
+      expect(await igdbCoverService.fetchIgdbCover('Daggerfall Unity - GOG Cut', 2022)).toBe(
+        'https://images.igdb.com/igdb/image/upload/t_cover_big/co_dfu.jpg'
+      );
+    });
   });
 
   describe('steamApi capsuleImage fallback extraction', () => {
-    it('extracts library_capsule or capsule_imagev5 from Steam appdetails payload', async () => {
+    it('extracts library_capsule from Steam appdetails or resolves hashed library_capsule via IStoreBrowseService/GetItems/v1 without polluting with 184x69', async () => {
       const testAppId = 9999991;
       vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
         if (url.includes('appdetails')) {
@@ -149,6 +242,54 @@ describe('Phase 3A: Artwork & Media Pipeline Hardening', () => {
       expect(meta).not.toBeNull();
       expect(meta?.capsuleImage).toBe(
         'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/9999991/hash123/library_capsule.jpg'
+      );
+
+      // Now test modern Steam game (like Death Stranding 2 / Blood of Dawnwalker) where appdetails omits library_capsule
+      const modernAppId = 3280350;
+      steamApi.evictCache(modernAppId);
+      vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+        if (url.includes('appdetails')) {
+          return {
+            data: {
+              [modernAppId]: {
+                success: true,
+                data: {
+                  name: 'DEATH STRANDING 2: ON THE BEACH',
+                  short_description: 'Embark on an inspiring mission of human connection.',
+                  header_image:
+                    'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg?t=1774022345',
+                  capsule_imagev5:
+                    'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/6e07f61e2585bae97d2406d45666a7ee70543792/capsule_184x69.jpg?t=1774022345',
+                },
+              },
+            },
+          };
+        }
+        if (url.includes('IStoreBrowseService/GetItems/v1')) {
+          return {
+            data: {
+              response: {
+                store_items: [
+                  {
+                    appid: modernAppId,
+                    assets: {
+                      asset_url_format: 'steam/apps/3280350/${FILENAME}?t=1774022345',
+                      header: '6270c77b0729e2df0a17d660286eeddfd9169386/header.jpg',
+                      library_capsule: '9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg',
+                      community_icon: '49fefdf2ae0e6171985509acec890b756cedc694',
+                    },
+                  },
+                ],
+              },
+            },
+          };
+        }
+        return { data: {} };
+      });
+
+      const modernMeta = await steamApi.fetchGameMetadata(modernAppId);
+      expect(modernMeta?.capsuleImage).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3280350/9b523fd411eeaefe80f238489745325a1cd2317f/library_capsule.jpg?t=1774022345'
       );
     });
   });

@@ -24,6 +24,7 @@ import {
 import {
   filterEnglishMovies,
   isNonEnglishRegionalMovieName,
+  steamApi,
 } from '../steam/steamApi';
 import {
   loadUserOverrides,
@@ -1336,6 +1337,80 @@ export function sanitizeGameCatalog(
       game.enrichedMetadata.releaseDate !== 'TBA'
     ) {
       game = { ...game, releaseDate: game.enrichedMetadata.releaseDate };
+    }
+
+    // Strip horizontal 184x69 micro-banners from capsuleImage and upgrade unhashed Steam headerImage from enrichedMetadata / browseAssets
+    if (game.enrichedMetadata?.capsuleImage && isUnsuitableCoverUrl(game.enrichedMetadata.capsuleImage)) {
+      game = {
+        ...game,
+        enrichedMetadata: {
+          ...game.enrichedMetadata,
+          capsuleImage: undefined,
+        },
+      };
+    }
+
+    if (
+      !userOverride?.headerImage &&
+      game.enrichedMetadata?.headerImage &&
+      /\/apps\/\d+\/[a-f0-9]{40}\//i.test(game.enrichedMetadata.headerImage) &&
+      (!game.headerImage || !/\/apps\/\d+\/[a-f0-9]{40}\//i.test(game.headerImage))
+    ) {
+      game = {
+        ...game,
+        headerImage: game.enrichedMetadata.headerImage,
+      };
+    }
+
+    if (
+      !userOverride?.capsuleImage &&
+      game.capsuleImage &&
+      (game.capsuleImage.includes('184x69') || game.capsuleImage.includes('capsule_sm_120'))
+    ) {
+      game = {
+        ...game,
+        capsuleImage:
+          game.enrichedMetadata?.capsuleImage && !isUnsuitableCoverUrl(game.enrichedMetadata.capsuleImage)
+            ? game.enrichedMetadata.capsuleImage
+            : undefined,
+      };
+    }
+
+    if (game.steamAppId && !game.isExplicitNonSteam) {
+      const browseAssets = steamApi.getStoreBrowseAssetsInstant(game.steamAppId);
+      if (browseAssets) {
+        const nextCapsule =
+          !userOverride?.capsuleImage &&
+          browseAssets.capsuleImage &&
+          (!game.capsuleImage || isUnsuitableCoverUrl(game.capsuleImage))
+            ? browseAssets.capsuleImage
+            : game.capsuleImage;
+        const nextHeader =
+          !userOverride?.headerImage &&
+          browseAssets.headerImage &&
+          (!game.headerImage || !/\/apps\/\d+\/[a-f0-9]{40}\//i.test(game.headerImage))
+            ? browseAssets.headerImage
+            : game.headerImage;
+        const nextIcon =
+          browseAssets.iconUrl &&
+          (!game.iconUrl ||
+            (!/\/apps\/\d+\/[a-f0-9]{40}\//i.test(game.iconUrl) &&
+              !game.iconUrl.includes('steamcommunity/public/images/apps/')))
+            ? browseAssets.iconUrl
+            : game.iconUrl;
+        if (
+          nextCapsule !== game.capsuleImage ||
+          nextHeader !== game.headerImage ||
+          nextIcon !== game.iconUrl
+        ) {
+          game = {
+            ...game,
+            capsuleImage: nextCapsule,
+            headerImage: nextHeader,
+            iconUrl: nextIcon,
+          };
+        }
+      }
     }
 
     // Systemic resolution of GOG official vertical covers from verified enriched cache

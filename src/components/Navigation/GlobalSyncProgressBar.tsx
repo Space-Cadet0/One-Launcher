@@ -104,7 +104,7 @@ export function GlobalSyncProgressBar() {
     <div
       role="region"
       aria-label="Global synchronization progress"
-      className="fixed bottom-6 right-6 z-50 w-96 max-w-[calc(100vw-3rem)] rounded-xl border border-zinc-700/80 bg-zinc-900/95 p-4 shadow-2xl backdrop-blur-md transition-all duration-300 animate-in fade-in slide-in-from-bottom-5"
+      className="fixed bottom-6 right-6 z-50 w-96 max-w-[calc(100vw-3rem)] rounded-xl border border-zinc-700/80 bg-zinc-900 p-4 shadow-2xl transition-colors duration-200"
     >
       {/* Top Header Row */}
       <div className="flex items-center justify-between gap-2 mb-2">
