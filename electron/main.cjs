@@ -8,6 +8,12 @@ const launcherEngine = require('./launcherEngine.cjs');
 // Ensure videos and embedded trailers autoplay smoothly without requiring user gesture
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Prevent Chromium's OSCrypt from querying or creating "One Launcher Safe Storage" in the macOS Login Keychain,
+// eliminating macOS Keychain password prompts on initial launch and across app updates.
+if (process.platform === 'darwin' && app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
+  app.commandLine.appendSwitch('use-mock-keychain');
+}
+
 let mainWindow = null;
 launcherEngine.setMainWindowGetter(() => mainWindow);
 

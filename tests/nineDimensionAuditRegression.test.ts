@@ -814,6 +814,59 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       const parsed = JSON.parse(rawStored!);
       expect(parsed[0].credentials.gogUsername).toBe('TestPlayer');
     });
+
+    it('encrypts tokens.json with hardware-bound AES-256-GCM (_encrypted_v2) + 0o600 permissions without triggering macOS Keychain (safeStorage)', () => {
+      const mainSource = fs.readFileSync(path.join(repoRoot, 'electron/main.cjs'), 'utf8');
+      expect(mainSource).toContain("app.commandLine.appendSwitch('use-mock-keychain')");
+
+      const storeSyncSource = fs.readFileSync(path.join(repoRoot, 'electron/storeSync.cjs'), 'utf8');
+      expect(storeSyncSource).not.toContain('safeStorage.encryptString');
+      expect(storeSyncSource).not.toContain('safeStorage.decryptString');
+      expect(storeSyncSource).toContain('aes-256-gcm');
+
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-vault-test-'));
+      const tokenFile = path.join(tmpDir, 'tokens.json');
+      try {
+        const sampleTokens = {
+          gog: { access_token: 'gog-secret-123', refresh_token: 'gog-refresh-456', user_id: 'u1' },
+          epic: { access_token: 'epic-secret-789', account_id: 'e1' },
+        };
+
+        storeSync.writeTokensFile(sampleTokens, {
+          filePath: tokenFile,
+          machineIdOverride: 'machine-alpha-uuid',
+        });
+
+        const onDiskRaw = fs.readFileSync(tokenFile, 'utf8');
+        expect(onDiskRaw).not.toContain('gog-secret-123');
+        expect(onDiskRaw).not.toContain('epic-secret-789');
+
+        const onDiskParsed = JSON.parse(onDiskRaw);
+        expect(onDiskParsed._encrypted_v2).toBe(true);
+        expect(onDiskParsed.alg).toBe('aes-256-gcm');
+
+        if (process.platform !== 'win32') {
+          const mode = fs.statSync(tokenFile).mode & 0o777;
+          expect(mode).toBe(0o600);
+        }
+
+        // Same machine decrypts cleanly
+        const loadedSameMachine = storeSync.loadSavedTokens({
+          filePath: tokenFile,
+          machineIdOverride: 'machine-alpha-uuid',
+        });
+        expect(loadedSameMachine).toEqual(sampleTokens);
+
+        // Different machine cannot decrypt the hardware-bound vault
+        const loadedOtherMachine = storeSync.loadSavedTokens({
+          filePath: tokenFile,
+          machineIdOverride: 'machine-beta-uuid',
+        });
+        expect(loadedOtherMachine).toEqual({});
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
   });
 
   // =========================================================================

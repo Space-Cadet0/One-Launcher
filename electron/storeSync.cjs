@@ -1,6 +1,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, safeStorage } = require('electron');
+const os = require('node:os');
+const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
+const { app } = require('electron');
 
 const GOG_CLIENT_ID = '46899977096215655';
 const GOG_CLIENT_SECRET = '9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9';
@@ -8,13 +11,118 @@ const GOG_REDIRECT_URI = 'https://embed.gog.com/on_login_success?origin=client';
 
 const EPIC_CLIENT_AUTH = 'MzRhMDJjZjhmNDQxNGUyOWIxNTkyMTg3NmRhMzZmOWE6ZGFhZmJjY2M3Mzc3NDUwMzlkZmZlNTNkOTRmYzc2Y2Y=';
 
+let cachedMachineIdentity = null;
+
+/**
+ * Derives deterministic, hardware-bound key material for the local workstation
+ * without touching or prompting the macOS Keychain or Windows Credential UI.
+ */
+function getMachineIdentityKeyMaterial(options = {}) {
+  if (options && typeof options.machineIdOverride === 'string' && options.machineIdOverride) {
+    return `one-launcher-vault-v2:${options.machineIdOverride}`;
+  }
+  if (cachedMachineIdentity) {
+    return cachedMachineIdentity;
+  }
+
+  let hwId = '';
+  try {
+    if (process.platform === 'darwin') {
+      const out = execFileSync('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const match = out && out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+      if (match && match[1]) {
+        hwId = match[1].trim();
+      }
+    } else if (process.platform === 'win32') {
+      const out = execFileSync(
+        'reg',
+        ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'],
+        {
+          encoding: 'utf8',
+          timeout: 2000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          windowsHide: true,
+        }
+      );
+      const match = out && out.match(/MachineGuid\s+REG_SZ\s+([^\r\n]+)/i);
+      if (match && match[1]) {
+        hwId = match[1].trim();
+      }
+    } else {
+      for (const idPath of ['/etc/machine-id', '/var/lib/dbus/machine-id']) {
+        if (fs.existsSync(idPath)) {
+          hwId = fs.readFileSync(idPath, 'utf8').trim();
+          if (hwId) break;
+        }
+      }
+    }
+  } catch {
+    // Fallback to OS/host identity if hardware UUID query fails in restricted environments
+  }
+
+  if (!hwId) {
+    hwId = `${os.hostname()}:${os.platform()}:${os.arch()}`;
+  }
+
+  let username = 'user';
+  try {
+    username = os.userInfo().username || 'user';
+  } catch {}
+
+  cachedMachineIdentity = `one-launcher-vault-v2:${hwId}:${username}`;
+  return cachedMachineIdentity;
+}
+
+function encryptTokensPayload(jsonStr, options = {}) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(getMachineIdentityKeyMaterial(options), salt, 32);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(jsonStr, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    _encrypted_v2: true,
+    alg: 'aes-256-gcm',
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    data: encrypted.toString('base64'),
+  };
+}
+
+function decryptTokensPayload(payload, options = {}) {
+  if (
+    !payload ||
+    payload._encrypted_v2 !== true ||
+    typeof payload.salt !== 'string' ||
+    typeof payload.iv !== 'string' ||
+    typeof payload.tag !== 'string' ||
+    typeof payload.data !== 'string'
+  ) {
+    throw new Error('Invalid v2 encrypted token payload');
+  }
+  const salt = Buffer.from(payload.salt, 'base64');
+  const iv = Buffer.from(payload.iv, 'base64');
+  const tag = Buffer.from(payload.tag, 'base64');
+  const data = Buffer.from(payload.data, 'base64');
+  const key = crypto.scryptSync(getMachineIdentityKeyMaterial(options), salt, 32);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+  return JSON.parse(decrypted);
+}
+
 function getTokensFilePath() {
   try {
     const defaultDir = path.join(process.env.HOME || '.', '.one-launcher');
     const legacyDir = path.join(process.env.HOME || '.', '.universal-game-library');
     const userDataPath = app ? app.getPath('userData') : (fs.existsSync(legacyDir) && !fs.existsSync(defaultDir) ? legacyDir : defaultDir);
     if (!fs.existsSync(userDataPath)) {
-      fs.mkdirSync(userDataPath, { recursive: true });
+      fs.mkdirSync(userDataPath, { recursive: true, mode: 0o700 });
     }
     return path.join(userDataPath, 'tokens.json');
   } catch {
@@ -22,35 +130,32 @@ function getTokensFilePath() {
   }
 }
 
-function isSafeStorageAvailable() {
-  try {
-    return Boolean(
-      typeof safeStorage !== 'undefined' &&
-      safeStorage &&
-      typeof safeStorage.isEncryptionAvailable === 'function' &&
-      safeStorage.isEncryptionAvailable()
-    );
-  } catch {
-    return false;
-  }
-}
-
 function atomicWriteFileSync(filePath, content) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmpPath, filePath);
+    if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(filePath, 0o600);
+      } catch {}
+    }
   } catch (err) {
     try {
       if (fs.existsSync(tmpPath)) {
         fs.unlinkSync(tmpPath);
       }
     } catch {}
-    fs.writeFileSync(filePath, content, 'utf8');
+    fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o600 });
+    if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(filePath, 0o600);
+      } catch {}
+    }
   }
 }
 
@@ -89,31 +194,24 @@ function destroyScraperWindowCleanly(win) {
 
 const inFlightTokenRenewals = new Map();
 
-function writeTokensFile(tokens) {
-  const filePath = getTokensFilePath();
+function writeTokensFile(tokens, options = {}) {
+  const filePath = (options && options.filePath) || getTokensFilePath();
   const jsonStr = JSON.stringify(tokens, null, 2);
 
-  if (isSafeStorageAvailable()) {
-    try {
-      const encryptedBuffer = safeStorage.encryptString(jsonStr);
-      const encryptedPayload = {
-        _encrypted: true,
-        data: encryptedBuffer.toString('base64'),
-      };
-      atomicWriteFileSync(filePath, JSON.stringify(encryptedPayload, null, 2));
-      return;
-    } catch (encErr) {
-      console.warn('Failed to encrypt tokens with safeStorage, falling back to plaintext:', encErr.message);
-    }
+  try {
+    const encryptedPayload = encryptTokensPayload(jsonStr, options);
+    atomicWriteFileSync(filePath, JSON.stringify(encryptedPayload, null, 2));
+    return;
+  } catch (encErr) {
+    console.warn('Failed to encrypt tokens with AES-256-GCM, falling back to protected file:', encErr.message);
   }
 
-  // Graceful fallback if safeStorage is not available or encryption failed
   atomicWriteFileSync(filePath, jsonStr);
 }
 
-function loadSavedTokens() {
+function loadSavedTokens(options = {}) {
   try {
-    const filePath = getTokensFilePath();
+    const filePath = (options && options.filePath) || getTokensFilePath();
     if (!fs.existsSync(filePath)) {
       return {};
     }
@@ -123,68 +221,43 @@ function loadSavedTokens() {
       return {};
     }
 
-    // Try parsing as JSON first
     let parsed;
     try {
       parsed = JSON.parse(rawContent.toString('utf-8'));
     } catch {
-      // If not JSON, it might be a raw binary buffer encrypted by safeStorage
-      if (isSafeStorageAvailable()) {
-        try {
-          const decrypted = safeStorage.decryptString(rawContent);
-          return JSON.parse(decrypted);
-        } catch (rawDecErr) {
-          console.warn('Failed to decrypt raw binary tokens buffer:', rawDecErr.message);
-        }
-      }
       return {};
     }
 
-    // Handle encrypted payload format: { _encrypted: true, data: "base64..." }
-    if (parsed && parsed._encrypted === true && typeof parsed.data === 'string') {
-      if (isSafeStorageAvailable()) {
-        try {
-          const buffer = Buffer.from(parsed.data, 'base64');
-          const decrypted = safeStorage.decryptString(buffer);
-          return JSON.parse(decrypted);
-        } catch (decErr) {
-          console.warn('Failed to decrypt tokens payload with safeStorage:', decErr.message);
-          return {};
-        }
-      } else {
-        console.warn('safeStorage is not available to decrypt tokens; unable to read encrypted tokens.');
+    // 1. Hardware-bound AES-256-GCM encrypted payload format (_encrypted_v2: true)
+    if (parsed && parsed._encrypted_v2 === true) {
+      try {
+        return decryptTokensPayload(parsed, options);
+      } catch (decErr) {
+        console.warn('Failed to decrypt v2 tokens payload:', decErr.message);
         return {};
       }
     }
 
-    // Handle per-token encrypted format if present: { gog: { _encrypted: true, data: "..." } }
-    if (parsed && typeof parsed === 'object') {
-      let containsPerTokenEncryption = false;
-      const decryptedTokens = {};
-      for (const [key, value] of Object.entries(parsed)) {
-        if (value && typeof value === 'object' && value._encrypted === true && typeof value.data === 'string') {
-          containsPerTokenEncryption = true;
-          if (isSafeStorageAvailable()) {
-            try {
-              const buffer = Buffer.from(value.data, 'base64');
-              const decrypted = safeStorage.decryptString(buffer);
-              decryptedTokens[key] = JSON.parse(decrypted);
-            } catch (err) {
-              console.warn(`Failed to decrypt token for ${key}:`, err.message);
-            }
-          }
-        } else {
-          decryptedTokens[key] = value;
-        }
-      }
-      if (containsPerTokenEncryption) {
-        return decryptedTokens;
-      }
+    // 2. Legacy safeStorage format (_encrypted: true): ignore without invoking Keychain
+    if (parsed && parsed._encrypted === true) {
+      return {};
+    }
 
-      // Legacy plaintext JSON backward compatibility:
-      // Return parsed plaintext directly. Next time saveTokens is called,
-      // it will be migrated to the encrypted format via writeTokensFile.
-      return parsed;
+    // 3. Plaintext JSON backward compatibility: migrate on disk to _encrypted_v2 automatically
+    if (parsed && typeof parsed === 'object') {
+      const cleanedTokens = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (value && typeof value === 'object' && value._encrypted === true) {
+          continue;
+        }
+        cleanedTokens[key] = value;
+      }
+      if (Object.keys(cleanedTokens).length > 0) {
+        try {
+          writeTokensFile(cleanedTokens, options);
+        } catch {}
+      }
+      return cleanedTokens;
     }
 
     return {};
@@ -2812,6 +2885,10 @@ function trimStoreSyncMemory() {
 
 module.exports = {
   atomicWriteFileSync,
+  getMachineIdentityKeyMaterial,
+  encryptTokensPayload,
+  decryptTokensPayload,
+  writeTokensFile,
   destroyScraperWindowCleanly,
   trimStoreSyncMemory,
   epicOfferMetadataCache,
