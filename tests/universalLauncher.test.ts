@@ -3159,11 +3159,11 @@ setTimeout(() => process.exit(0), 30);
     it('verifies Windows Uninstaller packaging config, NSIS hooks, standalone uninstaller .exe/.bat/.ps1, and complete cleanup target coverage', () => {
       const repoRoot = path.resolve(__dirname, '..');
 
-      // 1. Verify package.json NSIS uninstaller configuration
+      // 1. Verify package.json NSIS uninstaller configuration (deleteAppDataOnUninstall: false for upgrade safety; customUnInstall handles explicit uninstall purge)
       const pkgPath = path.join(repoRoot, 'package.json');
       expect(fs.existsSync(pkgPath)).toBe(true);
       const pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      expect(pkgJson.build?.nsis?.deleteAppDataOnUninstall).toBe(true);
+      expect(pkgJson.build?.nsis?.deleteAppDataOnUninstall).toBe(false);
       expect(pkgJson.build?.nsis?.include).toBe('build/installer.nsh');
 
       // 2. Verify all Windows uninstaller artifacts exist on disk

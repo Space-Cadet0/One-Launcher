@@ -81,4 +81,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     } catch {}
     return ipcRenderer.invoke('perf:trim-memory', options);
   },
+  getAppVersion: () => ipcRenderer.invoke('app:get-version'),
+  getAppInfo: () => ipcRenderer.invoke('app:get-info'),
+  checkForAppUpdates: () => ipcRenderer.invoke('app:check-for-updates'),
 });

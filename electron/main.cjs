@@ -2124,3 +2124,119 @@ ipcMain.handle('perf:trim-memory', async (_event, options) => {
   }
   return { success: true };
 });
+
+// ============================================================================
+// Application Version, Upgrade Status & GitHub Release Update Checker IPC
+// ============================================================================
+
+function compareSemver(verA, verB) {
+  const cleanA = String(verA || '0.0.0').replace(/^v/i, '').split('-')[0];
+  const cleanB = String(verB || '0.0.0').replace(/^v/i, '').split('-')[0];
+  const partsA = cleanA.split('.').map((n) => parseInt(n, 10) || 0);
+  const partsB = cleanB.split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(partsA.length, partsB.length, 3);
+  for (let i = 0; i < len; i++) {
+    const a = partsA[i] || 0;
+    const b = partsB[i] || 0;
+    if (a > b) return 1;
+    if (a < b) return -1;
+  }
+  return 0;
+}
+
+ipcMain.handle('app:get-version', () => {
+  try {
+    return app.getVersion();
+  } catch {
+    return '0.1.0';
+  }
+});
+
+ipcMain.handle('app:get-info', () => {
+  let version = '0.1.0';
+  try {
+    version = app.getVersion();
+  } catch {}
+  return {
+    version,
+    platform: process.platform,
+    isUpdatedLaunch: Array.isArray(process.argv) && process.argv.includes('--updated'),
+  };
+});
+
+ipcMain.handle('app:check-for-updates', async () => {
+  const defaultReleaseUrl = 'https://github.com/Space-Cadet0/One-Launcher/releases';
+  let currentVersion = '0.1.0';
+  try {
+    currentVersion = app.getVersion();
+  } catch {}
+
+  try {
+    const res = await fetch('https://api.github.com/repos/Space-Cadet0/One-Launcher/releases/latest', {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `OneLauncher/${currentVersion}`,
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) {
+      return {
+        currentVersion,
+        latestVersion: currentVersion,
+        hasUpdate: false,
+        releaseUrl: defaultReleaseUrl,
+      };
+    }
+
+    const data = await res.json();
+    const rawTag = String(data?.tag_name || data?.name || currentVersion).trim();
+    const latestVersion = rawTag.replace(/^v/i, '').trim() || currentVersion;
+    const hasUpdate = compareSemver(latestVersion, currentVersion) > 0;
+    const releaseUrl = data?.html_url || defaultReleaseUrl;
+    const assets = Array.isArray(data?.assets) ? data.assets : [];
+
+    let matchedAsset = null;
+    if (process.platform === 'win32') {
+      matchedAsset =
+        assets.find(
+          (a) =>
+            a &&
+            typeof a.name === 'string' &&
+            /setup.*\.exe$/i.test(a.name) &&
+            !/uninstaller/i.test(a.name)
+        ) ||
+        assets.find(
+          (a) =>
+            a &&
+            typeof a.name === 'string' &&
+            /\.exe$/i.test(a.name) &&
+            !/uninstaller/i.test(a.name)
+        );
+    } else if (process.platform === 'darwin') {
+      matchedAsset =
+        assets.find((a) => a && typeof a.name === 'string' && /-arm64\.dmg$/i.test(a.name)) ||
+        assets.find((a) => a && typeof a.name === 'string' && /\.dmg$/i.test(a.name));
+    }
+
+    const downloadUrl = matchedAsset?.browser_download_url || releaseUrl;
+    const publishedAt = data?.published_at || undefined;
+
+    return {
+      currentVersion,
+      latestVersion,
+      hasUpdate,
+      releaseUrl,
+      downloadUrl,
+      publishedAt,
+    };
+  } catch {
+    return {
+      currentVersion,
+      latestVersion: currentVersion,
+      hasUpdate: false,
+      releaseUrl: defaultReleaseUrl,
+    };
+  }
+});
+

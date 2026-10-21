@@ -369,3 +369,19 @@ export interface VerifyGameRequest {
   steamAppId?: number;
   installPath?: string;
 }
+
+export interface AppInfoResult {
+  version: string;
+  platform: string;
+  isUpdatedLaunch?: boolean;
+}
+
+export interface AppUpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseUrl?: string;
+  downloadUrl?: string;
+  publishedAt?: string;
+  error?: string;
+}

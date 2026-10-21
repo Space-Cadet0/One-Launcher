@@ -378,6 +378,25 @@ export function App() {
 
   // Synchronize installed game status, tokens, and achievements against the workstation and cloud
   useEffect(() => {
+    if (typeof window !== 'undefined' && window.electronAPI?.getAppInfo) {
+      window.electronAPI
+        .getAppInfo()
+        .then((info) => {
+          const previousVersion = localStorage.getItem('one_launcher_last_run_version');
+          const currentVersion = info?.version || '0.1.0';
+          localStorage.setItem('one_launcher_last_run_version', currentVersion);
+          if (
+            (previousVersion && previousVersion !== currentVersion) ||
+            info?.isUpdatedLaunch === true
+          ) {
+            setSyncNotice(
+              `Updated to One Launcher v${currentVersion} — Your library, connected accounts, and installed games have been preserved.`
+            );
+          }
+        })
+        .catch(() => {});
+    }
+
     // Reconcile saved native Electron tokens (Steam, GOG, Epic) into local integrations state
     if (typeof window !== 'undefined' && window.electronAPI?.getSavedTokens) {
       window.electronAPI

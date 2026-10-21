@@ -1507,4 +1507,87 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       }
     });
   });
+
+  // ============================================================================
+  // Windows NSIS In-Place Upgrade Safety & App Update Lifecycle
+  // ============================================================================
+  describe('Windows NSIS In-Place Upgrade Safety & App Update Lifecycle', () => {
+    it('package.json sets build.nsis.deleteAppDataOnUninstall === false to prevent silent data wipe during NSIS upgrades', () => {
+      const pkgRaw = fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8');
+      const pkg = JSON.parse(pkgRaw);
+      expect(pkg.build?.nsis?.deleteAppDataOnUninstall).toBe(false);
+    });
+
+    it('build/installer.nsh defines customInit, customInstall, and customUnInstall with upgrade/keep-data guards and zero unused Var /GLOBAL warnings', () => {
+      const nsh = fs.readFileSync(path.resolve(__dirname, '../build/installer.nsh'), 'utf8');
+
+      // 1. customInit neutralizes legacy unpatched v0.1.0 uninstaller Registry strings when not deleting app data
+      expect(nsh).toContain('!macro customInit');
+      expect(nsh).toContain('${ifNot} ${isDeleteAppData}');
+      expect(nsh).toContain('DeleteRegValue HKLM "${UNINSTALL_REGISTRY_KEY}" "UninstallString"');
+      expect(nsh).toContain('DeleteRegValue HKLM "${UNINSTALL_REGISTRY_KEY}" "QuietUninstallString"');
+      expect(nsh).toContain('DeleteRegValue HKCU "${UNINSTALL_REGISTRY_KEY}" "UninstallString"');
+      expect(nsh).toContain('DeleteRegValue HKCU "${UNINSTALL_REGISTRY_KEY}" "QuietUninstallString"');
+
+      // 2. customInstall is defined
+      expect(nsh).toContain('!macro customInstall');
+
+      // 3. customUnInstall wraps destructive cleanup steps (Steps 2-8) in ${isUpdated} and /KEEP_APP_DATA guards
+      expect(nsh).toContain('!macro customUnInstall');
+      expect(nsh).toContain('${if} ${isUpdated}');
+      expect(nsh).toContain('${GetOptions} $R0 "/KEEP_APP_DATA" $R0');
+      expect(nsh).toContain(
+        'DetailPrint "Upgrading existing One Launcher installation — preserving user accounts, library data, and installed games..."'
+      );
+
+      // 4. Zero Var /GLOBAL declarations so makensis -WX compiles cleanly without unused-variable warnings
+      expect(nsh).not.toMatch(/^\s*Var\s+\/GLOBAL\b/im);
+    });
+
+    it('build/standalone-uninstaller.nsi includes the in-place update preservation tip for users', () => {
+      const standaloneNsi = fs.readFileSync(
+        path.resolve(__dirname, '../build/standalone-uninstaller.nsi'),
+        'utf8'
+      );
+      expect(standaloneNsi).toContain(
+        'TIP: If you are updating One Launcher to a newer version, click No and run the new One Launcher Setup.exe directly'
+      );
+    });
+
+    it('electron/main.cjs and electron/preload.cjs register and expose app version, info, and update check IPC handlers', () => {
+      const mainCjs = fs.readFileSync(path.resolve(__dirname, '../electron/main.cjs'), 'utf8');
+      const preloadCjs = fs.readFileSync(path.resolve(__dirname, '../electron/preload.cjs'), 'utf8');
+
+      expect(mainCjs).toContain("ipcMain.handle('app:get-version'");
+      expect(mainCjs).toContain("ipcMain.handle('app:get-info'");
+      expect(mainCjs).toContain("ipcMain.handle('app:check-for-updates'");
+
+      expect(preloadCjs).toContain("getAppVersion: () => ipcRenderer.invoke('app:get-version')");
+      expect(preloadCjs).toContain("getAppInfo: () => ipcRenderer.invoke('app:get-info')");
+      expect(preloadCjs).toContain(
+        "checkForAppUpdates: () => ipcRenderer.invoke('app:check-for-updates')"
+      );
+    });
+
+    it('TopNavBar.tsx renders dynamic v{appVersion} badge and Check for Updates menu item, and App.tsx displays post-update preservation notice', () => {
+      const topNavSrc = fs.readFileSync(
+        path.resolve(__dirname, '../src/components/Navigation/TopNavBar.tsx'),
+        'utf8'
+      );
+      const appSrc = fs.readFileSync(path.resolve(__dirname, '../src/App.tsx'), 'utf8');
+
+      expect(topNavSrc).toContain('data-testid="menu-app-version"');
+      expect(topNavSrc).toContain('v{appVersion}');
+      expect(topNavSrc).toContain('data-testid="menu-check-for-updates"');
+      expect(topNavSrc).toContain("'Check for Updates'");
+
+      expect(appSrc).toContain('window.electronAPI?.getAppInfo');
+      expect(appSrc).toContain("localStorage.getItem('one_launcher_last_run_version')");
+      expect(appSrc).toContain("localStorage.setItem('one_launcher_last_run_version', currentVersion)");
+      expect(appSrc).toContain(
+        'Updated to One Launcher v${currentVersion} — Your library, connected accounts, and installed games have been preserved.'
+      );
+    });
+  });
 });
+

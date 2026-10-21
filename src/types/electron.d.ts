@@ -130,6 +130,25 @@ export interface ElectronAPI {
   performMenuAction: (action: WindowMenuAction) => Promise<boolean>;
   onMaximizedChanged: (callback: (isMaximized: boolean) => void) => () => void;
   trimMemory?: () => Promise<{ success: boolean }>;
+  getAppVersion?: () => Promise<string>;
+  getAppInfo?: () => Promise<AppInfoResult>;
+  checkForAppUpdates?: () => Promise<AppUpdateCheckResult>;
+}
+
+export interface AppInfoResult {
+  version: string;
+  platform: string;
+  isUpdatedLaunch?: boolean;
+}
+
+export interface AppUpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseUrl?: string;
+  downloadUrl?: string;
+  publishedAt?: string;
+  error?: string;
 }
 
 declare global {

@@ -3,7 +3,7 @@ import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
 import { launcherService } from '../../services/launcher/launcherService';
-import type { WindowMenuAction } from '../../types/electron';
+import type { AppUpdateCheckResult, WindowMenuAction } from '../../types/electron';
 import {
   RefreshCw,
   Layers,
@@ -102,6 +102,73 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const topMenuBarRef = useRef<HTMLDivElement | null>(null);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
+  const [appVersion, setAppVersion] = useState<string>('0.1.0');
+  const [updateStatus, setUpdateStatus] = useState<
+    'idle' | 'checking' | 'up-to-date' | 'update-available'
+  >('idle');
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateCheckResult | null>(null);
+
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
+    if (typeof api?.getAppVersion === 'function') {
+      api
+        .getAppVersion()
+        .then((ver: string) => {
+          if (ver && typeof ver === 'string' && ver.trim()) {
+            setAppVersion(ver.trim());
+          }
+        })
+        .catch(() => {});
+    }
+    if (typeof api?.checkForAppUpdates === 'function') {
+      api
+        .checkForAppUpdates()
+        .then((res: AppUpdateCheckResult) => {
+          if (res?.currentVersion && typeof res.currentVersion === 'string') {
+            setAppVersion(res.currentVersion);
+          }
+          if (res?.hasUpdate) {
+            setUpdateInfo(res);
+            setUpdateStatus('update-available');
+          }
+        })
+        .catch(() => {});
+    }
+  }, []);
+
+  const handleCheckForUpdates = async () => {
+    const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
+    if (updateInfo?.hasUpdate && (updateInfo.downloadUrl || updateInfo.releaseUrl)) {
+      const targetUrl = (updateInfo.downloadUrl || updateInfo.releaseUrl)!;
+      setIsMenuOpen(false);
+      if (typeof api?.openExternalUrl === 'function') {
+        await api.openExternalUrl(targetUrl);
+      } else if (typeof api?.openExternal === 'function') {
+        await api.openExternal(targetUrl);
+      } else if (typeof window !== 'undefined') {
+        window.open(targetUrl, '_blank', 'noopener,noreferrer');
+      }
+      return;
+    }
+
+    if (updateStatus === 'checking') return;
+    setUpdateStatus('checking');
+    try {
+      const res: AppUpdateCheckResult | undefined = await api?.checkForAppUpdates?.();
+      if (res?.currentVersion) {
+        setAppVersion(res.currentVersion);
+      }
+      if (res?.hasUpdate) {
+        setUpdateInfo(res);
+        setUpdateStatus('update-available');
+      } else {
+        if (res) setUpdateInfo(res);
+        setUpdateStatus('up-to-date');
+      }
+    } catch {
+      setUpdateStatus('up-to-date');
+    }
+  };
 
   useEffect(() => {
     const api = typeof window !== 'undefined' ? (window as any).electronAPI : undefined;
@@ -717,7 +784,19 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                       One Launcher
                     </span>
                   </div>
-                  <span className="text-[10px] text-steam-subtext font-mono">v0.1.0</span>
+                  <div className="flex items-center gap-1.5">
+                    {updateInfo?.hasUpdate && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                        Update
+                      </span>
+                    )}
+                    <span
+                      data-testid="menu-app-version"
+                      className="text-[10px] text-steam-subtext font-mono"
+                    >
+                      v{appVersion}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Group 1: Accounts & Library Management */}
@@ -999,6 +1078,56 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     )}
                   </div>
                 )}
+
+                {/* Group 4: Application Updates */}
+                <div className="mt-1 pt-1.5 border-t border-steam-border/50">
+                  <button
+                    type="button"
+                    data-testid="menu-check-for-updates"
+                    onClick={handleCheckForUpdates}
+                    disabled={updateStatus === 'checking'}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer disabled:opacity-50 group"
+                    title={
+                      updateInfo?.hasUpdate
+                        ? `Download One Launcher v${updateInfo.latestVersion} — Your library, connected accounts, and installed games are automatically preserved.`
+                        : 'Check for a newer version of One Launcher'
+                    }
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      {updateInfo?.hasUpdate ? (
+                        <Download className="w-4 h-4 shrink-0 text-emerald-400 group-hover:scale-110 transition-transform" />
+                      ) : (
+                        <RefreshCw
+                          className={`w-4 h-4 shrink-0 ${
+                            updateStatus === 'checking'
+                              ? 'animate-spin text-steam-accent'
+                              : 'text-sky-400 group-hover:rotate-45 transition-transform'
+                          }`}
+                        />
+                      )}
+                      <div className="flex flex-col min-w-0">
+                        <span
+                          className={`font-semibold truncate ${
+                            updateInfo?.hasUpdate ? 'text-emerald-300' : 'text-white'
+                          }`}
+                        >
+                          {updateStatus === 'checking'
+                            ? 'Checking for updates...'
+                            : updateInfo?.hasUpdate
+                              ? `Update Available: v${updateInfo.latestVersion} — Download`
+                              : updateStatus === 'up-to-date'
+                                ? `Up to date (v${appVersion})`
+                                : 'Check for Updates'}
+                        </span>
+                        <span className="text-[10px] text-steam-subtext truncate">
+                          {updateInfo?.hasUpdate
+                            ? 'Accounts & library preserved on update'
+                            : `Current version: v${appVersion}`}
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+                </div>
               </div>
             )}
           </div>

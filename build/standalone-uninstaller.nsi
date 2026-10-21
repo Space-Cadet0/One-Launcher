@@ -17,7 +17,7 @@ XPStyle on
 
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "One Launcher — Complete Uninstaller"
-!define MUI_WELCOMEPAGE_TEXT "This standalone utility will completely remove One Launcher from your Windows system, including:$\r$\n$\r$\n• Running One Launcher, Legendary, and GOGDL processes$\r$\n• Application binaries in C:\Program Files\One Launcher and AppData$\r$\n• All games installed by One Launcher (C:\Games\OneLauncher and custom install locations)$\r$\n• All Electron AppData, LocalStorage, OAuth sessions, and encrypted credentials$\r$\n• Bundled Epic (Legendary) and GOG (gogdl) CLI configurations$\r$\n• Desktop & Start Menu shortcuts, temporary files, and Windows Registry entries$\r$\n$\r$\nClick Next to begin the complete cleanup."
+!define MUI_WELCOMEPAGE_TEXT "This standalone utility will completely remove One Launcher from your Windows system, including:$\r$\n$\r$\n• Running One Launcher, Legendary, and GOGDL processes$\r$\n• Application binaries in C:\Program Files\One Launcher and AppData$\r$\n• All games installed by One Launcher (C:\Games\OneLauncher and custom install locations)$\r$\n• All Electron AppData, LocalStorage, OAuth sessions, and encrypted credentials$\r$\n• Bundled Epic (Legendary) and GOG (gogdl) CLI configurations$\r$\n• Desktop & Start Menu shortcuts, temporary files, and Windows Registry entries$\r$\n$\r$\nTIP: If you are updating One Launcher to a newer version, click Cancel and run the new One Launcher Setup.exe directly — all your games, accounts, and library settings will be preserved.$\r$\n$\r$\nClick Next to begin the complete cleanup."
 !define MUI_FINISHPAGE_TITLE "Uninstallation Complete"
 !define MUI_FINISHPAGE_TEXT "One Launcher and all associated games, caches, credentials, and registry entries have been completely removed from your computer."
 
@@ -30,7 +30,7 @@ XPStyle on
 Function .onInit
   IfSilent done_confirm
   MessageBox MB_YESNO|MB_ICONEXCLAMATION \
-    "Are you sure you want to completely remove One Launcher, all saved account sessions, caches, and all games downloaded through One Launcher?" \
+    "Are you sure you want to completely remove One Launcher, all saved account sessions, caches, and all games downloaded through One Launcher?$\r$\n$\r$\nTIP: If you are updating One Launcher to a newer version, click No and run the new One Launcher Setup.exe directly — all your games, accounts, and library settings will be preserved." \
     /SD IDYES IDYES done_confirm
   Abort
   done_confirm:
