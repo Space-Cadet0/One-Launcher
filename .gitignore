@@ -6,6 +6,7 @@ node_modules/
 # Build output
 dist/
 build/*
+!build/*.cjs
 !build/*.nsh
 !build/*.nsi
 !build/*.ps1

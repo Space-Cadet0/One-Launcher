@@ -20,6 +20,7 @@
     "appId": "com.onelauncher.app",
     "productName": "One Launcher",
     "icon": "build/icon.png",
+    "afterPack": "build/afterPack.cjs",
     "mac": {
       "icon": "build/icon.icns",
       "category": "public.app-category.games",

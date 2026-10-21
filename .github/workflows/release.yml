@@ -39,12 +39,13 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --win --x64 --publish never && npm run build:win-uninstaller
 
-      - name: Verify release artifacts
+      - name: Verify release artifacts & macOS code signature
         run: |
           ls -lh \
             "release/One Launcher-0.1.0-arm64.dmg" \
             "release/One Launcher Setup 0.1.0.exe" \
             "release/One Launcher Full Uninstaller.exe"
+          codesign --verify --deep --strict --verbose=2 "release/mac-arm64/One Launcher.app"
 
       - name: Recreate clean GitHub Release for tag
         env:
@@ -66,7 +67,11 @@ jobs:
             ### 📥 Downloads
 
             * 🍎 **Mac Users (Apple Silicon M1/M2/M3/M4):**
-              Download **`One.Launcher-0.1.0-arm64.dmg`**, open it, and drag **One Launcher** to your **Applications** folder.
+              1. Download **`One.Launcher-0.1.0-arm64.dmg`**, open it, and drag **One Launcher** to your **Applications** folder.
+              2. **First-Launch Gatekeeper Note:** Because this open-source build is ad-hoc signed rather than notarized with a paid Apple Developer account, macOS may block opening it after a browser download. To clear the browser quarantine flag, run this one-liner in **Terminal**:
+                 ```bash
+                 xattr -cr "/Applications/One Launcher.app"
+                 ```
             * 🪟 **Windows Users (64-bit):**
               Download **`One.Launcher.Setup.0.1.0.exe`** and run the installer.
             * 🧹 **Windows Complete Uninstaller (Optional):**
