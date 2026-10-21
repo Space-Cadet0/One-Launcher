@@ -51,10 +51,10 @@ Stop juggling multiple launchers to remember where you own or installed a game:
 - **Steam Integration**: Sign in via Steam OpenID or connect your public Steam profile, and automatically scan local `libraryfolders.vdf` & `appmanifest_*.acf` files across internal and external drives—including Steam installs inside CrossOver and Wine bottles.
 - **GOG.com Integration**: Connect via official GOG OAuth to import your cloud library, scan local GOG Galaxy databases, and automatically detect standalone offline GOG installers.
 - **Epic Games Store Integration**: Connect via Epic OAuth (`authorization_code` or seamless browser sign-in) and automatically detect local Epic Games Launcher, Heroic Games Launcher, and Legendary manifests.
-- **Automatic Multi-Storefront Deduplication**: Own the same title on Steam, GOG, and Epic? One Launcher merges them into a single unified entry displaying all owned storefront badges, combined playtime, and a per-storefront installation switcher right next to the **PLAY** button.
+- **Automatic Multi-Storefront Deduplication**: Own the same title on Steam, GOG, and Epic? One Launcher merges them into a single unified entry displaying all owned storefront badges, combined playtime, and a per-storefront installation switcher right next to the 
 
-### 2. First-Class macOS & CrossOver 26 Compatibility Engine
-Built from the ground up for Mac gamers running both native Apple Silicon titles and Windows games:
+### 2. CrossOver 26 & Wine Compatibility
+For Mac gamers running both native Apple Silicon titles and Windows games:
 - **Automatic Bottle & `.exe` Discovery**: Scans CrossOver 26 (`~/Library/Application Support/CrossOver/Bottles`), Apple Game Porting Toolkit (GPTK), Open-Source Wine prefixes, Heroic, and custom directories to find installed Windows games automatically.
 - **Smart Storefront-in-Bottle Routing**: If a Windows game is installed via a Windows Steam, GOG Galaxy, or Epic Games client inside a CrossOver bottle, One Launcher automatically routes execution through the bottle's storefront client or direct `.exe` without erroneously triggering native macOS `steam://` or `com.epicgames.launcher://` URL schemes.
 - **Per-Game & Per-Storefront Launch Profiles**: Configure distinct executables, working directories, launch arguments, and compatibility runners for each storefront edition of a game (`Steam`, `GOG.com`, `Epic Games`).
@@ -69,23 +69,15 @@ Every game in your library is automatically enriched with:
 - **High-Resolution Artwork**: Vertical 2:3 library capsules, widescreen hero headers, HD logos, screenshot galleries, and video trailers.
 - **Metacritic & OpenCritic Scores**: Live critic score badges (`Mighty`, `Strong`, `Fair`, `Weak`) with percentage recommended and review counts, plus one-click sorting by critic rating.
 - **HowLongToBeat Estimates**: Accurate completion times broken down by **Main Story**, **Main + Extras**, and **Completionist** playstyles.
-- **Accurate Multi-Tier Supported Languages**: Full language support breakdown across **Interface**, **Full Audio**, and **Subtitles**, parsed directly from storefront localization tables and structured Steam HTML matrices.
 
-### 4. Unified Achievements & Mastery Tracking
-- **Interactive Achievements Modal**: Inspect every unlocked and locked achievement for your games, complete with high-resolution icons, unlock timestamps, and global player rarity percentages.
+### 4. Multi Storefront Achievements
+- **Interactive Achievements Modal**: Inspect every unlocked and locked achievement for your games, complete with high-resolution icons, unlock timestamps, and global player rarity percentages synced for all storefronts.
 - **Spoiler Protection**: Hidden/secret achievement descriptions are blurred until you click to reveal them.
-- **Mastery Badges**: Games where you've unlocked 100% of achievements earn a golden **Mastered** crown across your library and detail views.
-- **Loose & Punctuation-Tolerant Search**: Quickly filter long achievement lists by title or description without worrying about punctuation or casing.
 
-### 5. Custom Collections & Punctuation-Tolerant Instant Search
-- **24-Icon Custom Collections**: Create unlimited custom groups (e.g., *Favorites*, *Currently Playing*, *RPG Masterpieces*, *Mac Native Gems*, *Sci-Fi & Cyberpunk*, *Completed 100%*) and personalize each shelf with 24 crisp vector icons (`star`, `flame`, `sword`, `shield`, `gamepad`, `trophy`, `crown`, `rocket`, `apple`, `monitor`, and more).
-- **Punctuation-Tolerant Instant Search**: Find any game immediately regardless of colons, apostrophes, periods, or hyphens:
-  - Type `alien isolation` to match **Alien: Isolation**
-  - Type `deaths door` to match **Death's Door**
-  - Type `stalker 2` to match **S.T.A.L.K.E.R. 2: Heart of Chornobyl**
-  - Type `spiderman` to match **Marvel's Spider-Man Remastered**
+### 5. Custom Collections
+- **24-Icon Custom Collections**: Create unlimited custom groups (e.g., *Favorites*, *Currently Playing*, *RPG Masterpieces*, *Mac Native Gems*, *Sci-Fi & Cyberpunk*, *Completed 100%*) and personalize each shelf with 24 vector icons
 
-### 6. 4-Step Fix Match & Metadata Override Studio
+### 6. 4-Step Fix Match & Metadata Override
 If a local game folder has an ambiguous name or you want custom box art:
 1. **Step 1 — Search & Identify**: Search across Steam, GOG, Epic Games, and IGDB simultaneously with punctuation-tolerant matching.
 2. **Step 2 — Artwork Selection**: Pick your preferred vertical cover art, hero banner, and logo from any matched provider or provide a custom image URL/local file.
