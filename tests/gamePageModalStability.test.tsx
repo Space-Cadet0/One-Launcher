@@ -505,8 +505,8 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
     const initialGame = createSampleGame({
       platforms: [
         {
-          platformId: 'steam',
-          platformGameId: '1091500',
+          platformId: 'gog',
+          platformGameId: '1423049311',
           installed: false,
           playtimeMinutes: 120,
         },
@@ -516,7 +516,7 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
     const installHarness = createComponentHarness(GameInstallModal, {
       isOpen: true,
       game: initialGame,
-      initialPlatformId: 'steam',
+      initialPlatformId: 'gog',
       onClose: vi.fn(),
     });
 
@@ -527,11 +527,11 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
     const dirInputs = findElements(tree, (el) => el.type === 'input');
     expect(dirInputs.length).toBeGreaterThan(0);
     const dirInput = dirInputs[0];
-    dirInput.props.onChange({ target: { value: '/Volumes/ExternalSSD/SteamLibrary' } });
+    dirInput.props.onChange({ target: { value: '/Volumes/ExternalSSD/GOGLibrary' } });
 
     tree = installHarness.render();
     expect(findElements(tree, (el) => el.type === 'input')[0].props.value).toBe(
-      '/Volumes/ExternalSSD/SteamLibrary'
+      '/Volumes/ExternalSSD/GOGLibrary'
     );
 
     // Re-render with a brand-new CanonicalGame reference for the same game.id
@@ -543,7 +543,7 @@ describe('Game Detail Page Refresh & Modal Stability Fix', () => {
 
     // Custom install path must be preserved
     expect(findElements(tree, (el) => el.type === 'input')[0].props.value).toBe(
-      '/Volumes/ExternalSSD/SteamLibrary'
+      '/Volumes/ExternalSSD/GOGLibrary'
     );
 
     installHarness.unmount();

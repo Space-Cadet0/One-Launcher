@@ -759,57 +759,108 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           )}
 
           {/* Target Installation Directory */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
-                Installation Directory
-              </label>
-              {installInfo?.availableInstallDirs && installInfo.availableInstallDirs.length > 1 && (
-                <select
-                  value={
-                    installInfo.availableInstallDirs
-                      .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
-                      .includes(installDir)
-                      ? installDir
-                      : ''
-                  }
-                  onChange={(e) => {
-                    if (e.target.value) handleDirectoryChange(e.target.value);
-                  }}
-                  className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none"
-                >
-                  <option value="" disabled>
-                    Preset Locations...
-                  </option>
-                  {installInfo.availableInstallDirs
-                    .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
-                    .map((dir) => (
-                      <option key={dir} value={dir}>
-                        {dir}
-                      </option>
-                    ))}
-                </select>
-              )}
-            </div>
+          {selectedPlatformId === 'steam' ? (
+            <div
+              data-testid="steam-managed-install-location"
+              className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">
+                    Steam Library Location
+                  </span>
+                </div>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                  Managed by Steam Client (steamapps/common)
+                </span>
+              </div>
 
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={installDir}
-                onChange={(e) => handleDirectoryChange(e.target.value, true)}
-                placeholder="~/Games/OneLauncher"
-                className="flex-1 rounded-lg bg-[#0e151f] border border-[#2a475e] px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-              />
-              <button
-                type="button"
-                onClick={handleBrowseFolder}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
-              >
-                <FolderOpen className="w-3.5 h-3.5" />
-                <span>Browse...</span>
-              </button>
+              <div className="flex items-center justify-between gap-2 bg-[#141d2b] border border-[#26384d] rounded-md px-2.5 py-1.5">
+                <span className="text-xs font-mono text-sky-200 truncate">
+                  {installDir || installInfo?.defaultInstallDir || 'Steam Library'}
+                </span>
+                {installInfo?.availableInstallDirs &&
+                  installInfo.availableInstallDirs.length > 1 && (
+                    <select
+                      data-testid="steam-library-drive-select"
+                      aria-label="Preview Steam Library Drive"
+                      value={
+                        installInfo.availableInstallDirs.includes(installDir)
+                          ? installDir
+                          : installInfo.availableInstallDirs[0] || ''
+                      }
+                      onChange={(e) => {
+                        if (e.target.value) handleDirectoryChange(e.target.value, false);
+                      }}
+                      className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none shrink-0"
+                    >
+                      {installInfo.availableInstallDirs.map((dir) => (
+                        <option key={dir} value={dir}>
+                          {dir}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+              </div>
+
+              <p className="text-[11px] text-steam-subtext leading-relaxed">
+                Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
+              </p>
             </div>
-          </div>
+          ) : (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+                  Installation Directory
+                </label>
+                {installInfo?.availableInstallDirs && installInfo.availableInstallDirs.length > 1 && (
+                  <select
+                    value={
+                      installInfo.availableInstallDirs
+                        .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
+                        .includes(installDir)
+                        ? installDir
+                        : ''
+                    }
+                    onChange={(e) => {
+                      if (e.target.value) handleDirectoryChange(e.target.value);
+                    }}
+                    className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none"
+                  >
+                    <option value="" disabled>
+                      Preset Locations...
+                    </option>
+                    {installInfo.availableInstallDirs
+                      .filter((dir) => isWindowsHost || selectedOs !== 'windows' || dir !== '/Applications')
+                      .map((dir) => (
+                        <option key={dir} value={dir}>
+                          {dir}
+                        </option>
+                      ))}
+                  </select>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={installDir}
+                  onChange={(e) => handleDirectoryChange(e.target.value, true)}
+                  placeholder="~/Games/OneLauncher"
+                  className="flex-1 rounded-lg bg-[#0e151f] border border-[#2a475e] px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                />
+                <button
+                  type="button"
+                  onClick={handleBrowseFolder}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  <span>Browse...</span>
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Live Disk Space Indicator Bar */}
           <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2">

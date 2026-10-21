@@ -1424,7 +1424,7 @@ function getDirectorySizeFast(dirPath, maxDepth = 4) {
 /**
  * Parse Steam logs/content_log.txt tail content for real-time download & staging progress of a specific AppID
  */
-function parseSteamContentLogForApp(logContent, appId) {
+function parseSteamContentLogForApp(logContent, appId, minTimestampMs = 0) {
   const result = {
     bytesDownloaded: 0,
     bytesToDownload: 0,
@@ -1432,6 +1432,8 @@ function parseSteamContentLogForApp(logContent, appId) {
     bytesToStage: 0,
     phase: undefined,
     fullyInstalled: false,
+    updateStarted: false,
+    isRunning: false,
     speedBytesPerSec: 0,
   };
 
@@ -1441,6 +1443,16 @@ function parseSteamContentLogForApp(logContent, appId) {
   const lines = logContent.split(/\r?\n/);
 
   for (const line of lines) {
+    if (minTimestampMs > 0) {
+      const tsMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/);
+      if (tsMatch) {
+        const lineTs = new Date(tsMatch[1].replace(' ', 'T')).getTime();
+        if (Number.isFinite(lineTs) && lineTs < minTimestampMs - 10000) {
+          continue;
+        }
+      }
+    }
+
     const rateMatch =
       line.match(/Current download rate:\s*([\d.]+)\s*Mbps/i) ||
       line.match(/Increasing target number of download connections to \d+\s*\(rate was [\d.]+,\s*now\s*([\d.]+)\)/i);
@@ -1452,6 +1464,21 @@ function parseSteamContentLogForApp(logContent, appId) {
     }
 
     if (!appPrefixRe.test(line)) continue;
+
+    if (
+      /update started/i.test(line) ||
+      /state changed\s*:\s*[^(\r\n]*(?:Uninstalled|Update Required)/i.test(line)
+    ) {
+      result.bytesDownloaded = 0;
+      result.bytesToDownload = 0;
+      result.bytesStaged = 0;
+      result.bytesToStage = 0;
+      result.fullyInstalled = false;
+      result.speedBytesPerSec = 0;
+      if (/update started/i.test(line)) {
+        result.updateStarted = true;
+      }
+    }
 
     const dlMatch = line.match(/download\s+(\d+)\/(\d+)/i);
     if (dlMatch) {
@@ -1469,17 +1496,18 @@ function parseSteamContentLogForApp(logContent, appId) {
     if (updateChangedMatch) {
       const rawPhase = updateChangedMatch[1].trim();
       result.phase = rawPhase;
-      if (/running update|downloading|staging|preallocating/i.test(rawPhase)) {
+      if (/^none$/i.test(rawPhase)) {
+        result.isRunning = false;
+      } else if (/running update|downloading|staging|preallocating|allocating|verifying|committing/i.test(rawPhase)) {
         result.fullyInstalled = false;
+        result.isRunning = true;
       }
     }
 
     if (/state changed\s*:\s*[^(\r\n]*Fully Installed/i.test(line)) {
       result.fullyInstalled = true;
+      result.isRunning = false;
       result.phase = 'Fully Installed';
-    } else if (/update started/i.test(line)) {
-      result.fullyInstalled = false;
-      result.speedBytesPerSec = 0;
     }
   }
 
@@ -2839,7 +2867,12 @@ function resolveEpicFirstPartyPaths(options = {}) {
   const platform = options.platform || process.platform;
   const homedir = options.homedir || os.homedir();
 
-  if (options.homedir && !options.eglManifestsDir && !options.eglLauncherInstalledPath) {
+  if (
+    options.homedir &&
+    !options.eglManifestsDir &&
+    !options.eglLauncherInstalledPath &&
+    !options.eglLauncherInstalledDat
+  ) {
     return { eglManifestsDir: null, eglLauncherInstalledPath: null, isolatedNoOp: true };
   }
 
@@ -2854,6 +2887,7 @@ function resolveEpicFirstPartyPaths(options = {}) {
 
   const eglLauncherInstalledPath =
     options.eglLauncherInstalledPath ||
+    options.eglLauncherInstalledDat ||
     (!options.homedir
       ? platform === 'win32'
         ? path.join(programData, 'Epic', 'UnrealEngineLauncher', 'LauncherInstalled.dat')
@@ -2881,12 +2915,13 @@ function syncEpicFirstPartyLauncher(options = {}) {
     const epicGamesMap = new Map();
     const installPathToAppName = new Map();
 
-    const legendaryInstalledFiles = [
-      path.join(userDataDir, 'legendaryConfig/legendary/installed.json'),
-      path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary/installed.json'),
-      path.join(homedir, '.config/legendary/installed.json'),
-      path.join(homedir, 'AppData/Roaming/heroic/legendaryConfig/legendary/installed.json'),
+    const legendaryDirs = [
+      path.join(userDataDir, 'legendaryConfig/legendary'),
+      path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary'),
+      path.join(homedir, '.config/legendary'),
+      path.join(homedir, 'AppData/Roaming/heroic/legendaryConfig/legendary'),
     ];
+    const legendaryInstalledFiles = legendaryDirs.map((d) => path.join(d, 'installed.json'));
 
     for (const legFile of legendaryInstalledFiles) {
       if (!fs.existsSync(legFile)) continue;
@@ -2912,6 +2947,7 @@ function syncEpicFirstPartyLauncher(options = {}) {
             title: item.title || appName,
             version: item.version || '1.0',
             install_size: item.install_size || item.installSize || 0,
+            _legFile: legFile,
           });
           installPathToAppName.set(path.resolve(installPath), appName);
         }
@@ -2964,7 +3000,7 @@ function syncEpicFirstPartyLauncher(options = {}) {
       }
     }
 
-    // 3. Direct Node.js .item Manifest Synthesis & Verification
+    // 3. Direct Node.js .item + .mancpn + .manifest Synthesis & Verification
     let syncedCount = 0;
     if (eglManifestsDir) {
       fs.mkdirSync(eglManifestsDir, { recursive: true });
@@ -2976,33 +3012,47 @@ function syncEpicFirstPartyLauncher(options = {}) {
           try {
             const parsed = JSON.parse(fs.readFileSync(path.join(eglManifestsDir, f), 'utf8'));
             if (parsed && typeof parsed === 'object') {
-              existingItems.push(parsed);
+              existingItems.push({ ...parsed, _fileName: f });
             }
           } catch {}
         }
       } catch {}
 
-      const metadataDirs = [
-        path.join(userDataDir, 'legendaryConfig/legendary/metadata'),
-        path.join(homedir, 'Library/Application Support/heroic/legendaryConfig/legendary/metadata'),
-        path.join(homedir, '.config/legendary/metadata'),
-        path.join(homedir, 'AppData/Roaming/heroic/legendaryConfig/legendary/metadata'),
-      ];
+      const metadataDirs = legendaryDirs.map((d) => path.join(d, 'metadata'));
+
+      // Load assets.json fallback map for catalog_item_id & namespace
+      const assetsCatalogMap = new Map();
+      for (const legDir of legendaryDirs) {
+        const assetsFile = path.join(legDir, 'assets.json');
+        if (!fs.existsSync(assetsFile)) continue;
+        try {
+          const rawAssets = JSON.parse(fs.readFileSync(assetsFile, 'utf8'));
+          const assetLists = [];
+          if (Array.isArray(rawAssets)) {
+            assetLists.push(rawAssets);
+          } else if (rawAssets && typeof rawAssets === 'object') {
+            for (const val of Object.values(rawAssets)) {
+              if (Array.isArray(val)) assetLists.push(val);
+            }
+          }
+          for (const list of assetLists) {
+            for (const asset of list) {
+              if (!asset || typeof asset !== 'object') continue;
+              const aName = String(asset.app_name || asset.appName || '').trim();
+              if (!aName || assetsCatalogMap.has(aName)) continue;
+              const cid = asset.catalog_item_id || asset.catalogItemId || '';
+              const cns = asset.namespace || asset.catalogNamespace || '';
+              if (cid || cns) {
+                assetsCatalogMap.set(aName, { catalogItemId: cid, catalogNamespace: cns });
+              }
+            }
+          }
+        } catch {}
+      }
 
       for (const [appName, entry] of epicGamesMap.entries()) {
         const installPath = entry.installPath;
         if (!installPath || !fs.existsSync(installPath)) continue;
-
-        const alreadyValid = existingItems.some(
-          (it) =>
-            it.AppName === appName &&
-            it.InstallLocation === installPath &&
-            it.bIsIncompleteInstall === false
-        );
-        if (alreadyValid) {
-          syncedCount++;
-          continue;
-        }
 
         let meta = null;
         for (const metaDir of metadataDirs) {
@@ -3015,14 +3065,85 @@ function syncEpicFirstPartyLauncher(options = {}) {
           }
         }
 
+        const assetsFallback = assetsCatalogMap.get(appName);
         const catalogItemId =
-          meta?.id || meta?.app_info?.id || entry.catalog_item_id || entry.catalogItemId || '';
+          meta?.asset_infos?.Windows?.catalog_item_id ||
+          meta?.asset_infos?.Mac?.catalog_item_id ||
+          meta?.metadata?.id ||
+          meta?.id ||
+          meta?.app_info?.id ||
+          entry.catalog_item_id ||
+          entry.catalogItemId ||
+          assetsFallback?.catalogItemId ||
+          '';
         const catalogNamespace =
+          meta?.asset_infos?.Windows?.namespace ||
+          meta?.asset_infos?.Mac?.namespace ||
+          meta?.metadata?.namespace ||
+          meta?.achievements?.namespace ||
           meta?.namespace ||
           meta?.app_info?.namespace ||
           entry.namespace ||
           entry.catalogNamespace ||
+          assetsFallback?.catalogNamespace ||
           '';
+
+        // Search for binary .manifest file in Legendary manifests directories
+        const manifestSearchDirs = [];
+        if (entry._legFile) {
+          manifestSearchDirs.push(path.join(path.dirname(entry._legFile), 'manifests'));
+        }
+        for (const legDir of legendaryDirs) {
+          const mDir = path.join(legDir, 'manifests');
+          if (!manifestSearchDirs.includes(mDir)) manifestSearchDirs.push(mDir);
+        }
+
+        let sourceManifestPath = null;
+        let bestManifestMtime = -1;
+        for (const mDir of manifestSearchDirs) {
+          if (!fs.existsSync(mDir)) continue;
+          try {
+            const mFiles = fs.readdirSync(mDir);
+            for (const mf of mFiles) {
+              if (!mf.toLowerCase().endsWith('.manifest')) continue;
+              if (mf === `${appName}.manifest` || mf.startsWith(`${appName}_`)) {
+                const candidatePath = path.join(mDir, mf);
+                try {
+                  const st = fs.statSync(candidatePath);
+                  if (st.mtimeMs > bestManifestMtime) {
+                    bestManifestMtime = st.mtimeMs;
+                    sourceManifestPath = candidatePath;
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+        }
+
+        const alreadyValid = existingItems.some((it) => {
+          if (
+            it.AppName !== appName ||
+            it.InstallLocation !== installPath ||
+            it.bIsIncompleteInstall !== false ||
+            !it.CatalogItemId ||
+            !it.CatalogNamespace ||
+            !it.InstallationGuid
+          ) {
+            return false;
+          }
+          const itemGuid = String(it.InstallationGuid);
+          const mancpnExists = fs.existsSync(path.join(installPath, '.egstore', `${itemGuid}.mancpn`));
+          if (!mancpnExists) return false;
+          if (sourceManifestPath && !fs.existsSync(path.join(installPath, '.egstore', `${itemGuid}.manifest`))) {
+            return false;
+          }
+          return true;
+        });
+
+        if (alreadyValid) {
+          syncedCount++;
+          continue;
+        }
 
         let relativeExePath = '';
         if (entry.executable && !path.isAbsolute(String(entry.executable))) {
@@ -3040,18 +3161,34 @@ function syncEpicFirstPartyLauncher(options = {}) {
             relativeExePath = path.basename(discovered.executablePath);
           }
         }
+        const cleanLaunchExecutable = String(relativeExePath || '')
+          .replace(/^[.\\/]+/, '')
+          .replace(/\\/g, '/');
 
-        const guid = crypto
-          .createHash('md5')
-          .update(`${appName}:${installPath}`)
-          .digest('hex')
+        const existingForApp = existingItems.find((it) => it.AppName === appName);
+        const existingGuid = String(
+          entry.egl_guid || existingForApp?.InstallationGuid || ''
+        )
+          .replace(/[^0-9a-fA-F]/g, '')
           .toUpperCase();
+
+        const guid =
+          existingGuid.length === 32
+            ? existingGuid
+            : crypto
+                .createHash('md5')
+                .update(`${appName}:${installPath}`)
+                .digest('hex')
+                .toUpperCase();
+
+        const mandatoryFolderName =
+          meta?.metadata?.customAttributes?.FolderName?.value || path.basename(installPath);
 
         const itemPayload = {
           FormatVersion: 0,
           bIsIncompleteInstall: false,
           LaunchCommand: entry.launch_parameters || '',
-          LaunchExecutable: relativeExePath || '',
+          LaunchExecutable: cleanLaunchExecutable,
           ManifestLocation: path.join(installPath, '.egstore'),
           StagingLocation: path.join(installPath, '.egstore', 'bps'),
           bIsApplication: true,
@@ -3067,10 +3204,11 @@ function syncEpicFirstPartyLauncher(options = {}) {
           ChunkDbs: [],
           CompatibleApps: [],
           DisplayName: entry.title || meta?.app_title || appName,
+          FullAppName: appName,
           InstallationGuid: guid,
           InstallLocation: installPath,
           InstallSessionId: '',
-          InstallTags: [],
+          InstallTags: Array.isArray(entry.install_tags) ? entry.install_tags : [],
           InstallComponents: [],
           HostInstallationGuid: '',
           PrereqIds: [],
@@ -3081,24 +3219,65 @@ function syncEpicFirstPartyLauncher(options = {}) {
           MainWindowProcessName: '',
           ProcessNames: [],
           MainGameAppName: appName,
-          MandatoryAppFolderName: path.basename(installPath),
+          MandatoryAppFolderName: mandatoryFolderName,
           OwnershipToken: 'false',
           CatalogNamespace: catalogNamespace,
           CatalogItemId: catalogItemId,
           AppVersionString: String(entry.version || '1.0'),
         };
 
-        const serializedItem = JSON.stringify(itemPayload, null, 2);
+        const mancpnPayload = {
+          FormatVersion: 0,
+          AppName: appName,
+          CatalogItemId: catalogItemId,
+          CatalogNamespace: catalogNamespace,
+        };
+
         try {
           const egstoreDir = path.join(installPath, '.egstore');
-          fs.mkdirSync(egstoreDir, { recursive: true });
-          fs.writeFileSync(path.join(egstoreDir, `${guid}.item`), serializedItem, 'utf8');
+          const bpsDir = path.join(egstoreDir, 'bps');
+          fs.mkdirSync(bpsDir, { recursive: true });
+          // Clean up any stale .item files that may have been written to .egstore previously
+          try {
+            const egFiles = fs.readdirSync(egstoreDir);
+            for (const ef of egFiles) {
+              if (ef.toLowerCase().endsWith('.item')) {
+                fs.rmSync(path.join(egstoreDir, ef), { force: true });
+              }
+            }
+          } catch {}
+          atomicWriteFileSync(
+            path.join(egstoreDir, `${guid}.mancpn`),
+            JSON.stringify(mancpnPayload, null, 2)
+          );
+          if (sourceManifestPath && fs.existsSync(sourceManifestPath)) {
+            fs.copyFileSync(sourceManifestPath, path.join(egstoreDir, `${guid}.manifest`));
+          }
         } catch {}
 
         try {
-          fs.writeFileSync(path.join(eglManifestsDir, `${guid}.item`), serializedItem, 'utf8');
+          // Remove any stale .item files for this appName with a different filename
+          for (const oldItem of existingItems) {
+            if (oldItem.AppName === appName && oldItem._fileName && oldItem._fileName !== `${guid}.item`) {
+              try {
+                fs.rmSync(path.join(eglManifestsDir, oldItem._fileName), { force: true });
+              } catch {}
+            }
+          }
+          const serializedItem = JSON.stringify(itemPayload, null, 2);
+          atomicWriteFileSync(path.join(eglManifestsDir, `${guid}.item`), serializedItem);
           syncedCount++;
         } catch {}
+
+        if (entry._legFile && fs.existsSync(entry._legFile) && entry.egl_guid !== guid) {
+          try {
+            const rawLeg = JSON.parse(fs.readFileSync(entry._legFile, 'utf8'));
+            if (rawLeg && typeof rawLeg === 'object' && !Array.isArray(rawLeg) && rawLeg[appName]) {
+              rawLeg[appName].egl_guid = guid;
+              atomicWriteFileSync(entry._legFile, JSON.stringify(rawLeg, null, 2));
+            }
+          } catch {}
+        }
       }
     }
 
@@ -3154,10 +3333,9 @@ function syncEpicFirstPartyLauncher(options = {}) {
 
       try {
         fs.mkdirSync(path.dirname(eglLauncherInstalledPath), { recursive: true });
-        fs.writeFileSync(
+        atomicWriteFileSync(
           eglLauncherInstalledPath,
-          JSON.stringify({ InstallationList: Array.from(listMap.values()) }, null, 2),
-          'utf8'
+          JSON.stringify({ InstallationList: Array.from(listMap.values()) }, null, 2)
         );
       } catch {}
     }
@@ -7350,7 +7528,7 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
   let lastBytes = 0;
   let lastTickTime = Date.now();
 
-  const readContentLogTail = (steamRoots) => {
+  const readContentLogTail = (steamRoots, minTimestampMs = 0) => {
     let bestLogInfo = null;
     for (const root of steamRoots) {
       const candidateLogs = [
@@ -7368,8 +7546,10 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
           const buf = Buffer.alloc(readLen);
           fs.readSync(fd, buf, 0, readLen, size - readLen);
           fs.closeSync(fd);
-          const parsedLog = parseSteamContentLogForApp(buf.toString('utf8'), appId);
+          const parsedLog = parseSteamContentLogForApp(buf.toString('utf8'), appId, minTimestampMs);
           if (
+            parsedLog.updateStarted ||
+            parsedLog.isRunning ||
             parsedLog.fullyInstalled ||
             parsedLog.bytesToDownload > 0 ||
             parsedLog.bytesToStage > 0 ||
@@ -7403,21 +7583,12 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
     }
 
     const { steamRoots, steamappsDirs } = discoverSteamLocations(options);
-    const logInfo = readContentLogTail(steamRoots);
+    const logInfo = readContentLogTail(steamRoots, Number(task.startedAt || 0));
 
     let parsed = null;
     let matchedSteamappsDir = null;
-    let downloadingDirBytes = 0;
 
     for (const steamappsDir of steamappsDirs) {
-      const dlDir = path.join(steamappsDir, 'downloading', String(appId));
-      if (fs.existsSync(dlDir)) {
-        const dSize = getDirectorySizeFast(dlDir, 4);
-        if (dSize > downloadingDirBytes) {
-          downloadingDirBytes = dSize;
-        }
-      }
-
       const acfPath = path.join(steamappsDir, `appmanifest_${appId}.acf`);
       if (fs.existsSync(acfPath)) {
         try {
@@ -7435,28 +7606,40 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
     const acfTotal = Number(parsed?.BytesToDownload || 0);
     const acfStaged = Number(parsed?.BytesStaged || 0);
     const acfToStage = Number(parsed?.BytesToStage || 0);
-    const logDownloaded = Number(logInfo?.bytesDownloaded || 0);
+    let logDownloaded = Number(logInfo?.bytesDownloaded || 0);
+    const logTotal = Number(logInfo?.bytesToDownload || 0);
+    const logStaged = Number(logInfo?.bytesStaged || 0);
+    const logToStage = Number(logInfo?.bytesToStage || 0);
 
-    let effectiveTotal =
-      acfTotal ||
-      logInfo?.bytesToDownload ||
-      acfToStage ||
-      logInfo?.bytesToStage ||
-      Number(parsed?.SizeOnDisk || 0) ||
-      task.totalBytes;
+    // Guard against stale content_log lines when ACF explicitly shows download just started (0 / acfTotal)
+    if (acfTotal > 0 && acfDownloaded === 0 && logDownloaded >= acfTotal * 0.9) {
+      logDownloaded = 0;
+    }
 
-    let effectiveDownloaded =
-      acfDownloaded > 0 || logDownloaded > 0
-        ? Math.max(acfDownloaded, logDownloaded)
-        : downloadingDirBytes > 0
-          ? effectiveTotal > 0
-            ? Math.min(effectiveTotal, downloadingDirBytes)
-            : downloadingDirBytes
-          : 0;
+    const downloadTotal = acfTotal > 0 ? acfTotal : logTotal;
+    const downloadDone =
+      downloadTotal > 0
+        ? Math.min(downloadTotal, Math.max(acfDownloaded, logDownloaded))
+        : Math.max(acfDownloaded, logDownloaded);
 
-    if (effectiveDownloaded === 0 && acfStaged > 0 && acfToStage > 0) {
-      effectiveDownloaded = acfStaged;
-      effectiveTotal = acfToStage;
+    const stageTotal = acfToStage > 0 ? acfToStage : logToStage;
+    const stageDone =
+      stageTotal > 0
+        ? Math.min(stageTotal, Math.max(acfStaged, logStaged))
+        : Math.max(acfStaged, logStaged);
+
+    let effectiveTotal = 0;
+    let effectiveDownloaded = 0;
+
+    if (downloadTotal > 0) {
+      effectiveTotal = downloadTotal;
+      effectiveDownloaded = downloadDone;
+    } else if (stageTotal > 0) {
+      effectiveTotal = stageTotal;
+      effectiveDownloaded = stageDone;
+    } else {
+      effectiveTotal = Number(parsed?.SizeOnDisk || 0) || task.totalBytes || 0;
+      effectiveDownloaded = downloadDone || stageDone || 0;
     }
 
     const stateFlags = parsed && parsed.StateFlags ? String(parsed.StateFlags).trim() : '';
@@ -7544,17 +7727,45 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
       return;
     }
 
-    if (parsed || logInfo || downloadingDirBytes > 0) {
-      const progressPercent =
+    const hasActiveLogProgress = Boolean(
+      logInfo &&
+        (logInfo.updateStarted ||
+          logInfo.isRunning ||
+          logInfo.fullyInstalled ||
+          logInfo.bytesToDownload > 0 ||
+          logInfo.bytesToStage > 0 ||
+          logInfo.phase)
+    );
+
+    if (!parsed && !hasActiveLogProgress) {
+      updateDownloadTask(
+        taskId,
+        {
+          status: 'downloading',
+          progressPercent: 0,
+          bytesDownloaded: 0,
+          speedBytesPerSec: 0,
+          statusMessage: 'Waiting for confirmation in Steam client...',
+        },
+        options
+      );
+      return;
+    }
+
+    if (parsed || hasActiveLogProgress) {
+      const phaseLabel =
+        logInfo?.phase ||
+        (acfStaged > 0 && acfTotal > 0 && acfDownloaded >= acfTotal ? 'Staging' : 'Downloading');
+
+      const rawRatio = effectiveTotal > 0 ? effectiveDownloaded / effectiveTotal : 0;
+      let progressPercent =
         effectiveTotal > 0
-          ? Math.min(
-              99,
-              Math.max(
-                task.progressPercent || 0,
-                Math.round((effectiveDownloaded / effectiveTotal) * 100)
-              )
-            )
+          ? Math.min(99, Math.max(task.progressPercent || 0, Math.floor(rawRatio * 100)))
           : task.progressPercent || 0;
+
+      if (effectiveDownloaded === 0 && /preallocating|allocating/i.test(phaseLabel)) {
+        progressPercent = 0;
+      }
 
       const now = Date.now();
       let rawSpeedBytesPerSec = logInfo?.speedBytesPerSec || 0;
@@ -7575,14 +7786,16 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
           ? Math.max(1, Math.round((effectiveTotal - effectiveDownloaded) / speedBytesPerSec))
           : task.etaSeconds;
 
-      const phaseLabel =
-        logInfo?.phase ||
-        (acfStaged > 0 && acfTotal > 0 && acfDownloaded >= acfTotal ? 'Staging' : 'Downloading');
       const nextStatus = /staging|extracting/i.test(phaseLabel)
         ? 'extracting'
         : /verifying/i.test(phaseLabel)
           ? 'verifying'
           : 'downloading';
+
+      const statusMessage =
+        effectiveDownloaded === 0 && /preallocating|allocating/i.test(phaseLabel)
+          ? `Steam: Preallocating ${task.title} (0%)...`
+          : `Steam: ${phaseLabel} ${task.title} (${progressPercent}%)...`;
 
       updateDownloadTask(
         taskId,
@@ -7593,7 +7806,7 @@ function startSteamInstallMonitor(taskId, appId, options = {}) {
           totalBytes: effectiveTotal,
           speedBytesPerSec,
           etaSeconds,
-          statusMessage: `Steam: ${phaseLabel} ${task.title} (${progressPercent}%)...`,
+          statusMessage,
         },
         options
       );
@@ -7747,14 +7960,14 @@ async function getGameInstallInfo(payload = {}, options = {}) {
   const platform = options.platform || process.platform;
   const homedir = options.homedir || os.homedir();
 
-  const defaultInstallDir = getDefaultInstallDir(platformId, options);
-  const availableInstallDirs =
+  let defaultInstallDir = getDefaultInstallDir(platformId, options);
+  let availableInstallDirs =
     platform === 'darwin'
       ? [defaultInstallDir, '/Applications', path.join(homedir, 'Applications')]
       : [defaultInstallDir, 'C:\\Games', 'D:\\Games'];
 
   const targetDir = payload.targetInstallDir || defaultInstallDir;
-  const diskSpace = getDiskSpace(targetDir, options);
+  let diskSpace = getDiskSpace(targetDir, options);
 
   let estimatedSizeBytes = payload.estimatedSizeBytes ? Number(payload.estimatedSizeBytes) : undefined;
   let availableInstallers = [];
@@ -8492,9 +8705,15 @@ async function getGameInstallInfo(payload = {}, options = {}) {
     const titleLabel = payload.title || 'Game';
     const cleanId = String(payload.steamAppId || platformGameId).replace(/^steam-/i, '');
 
-    if (!estimatedSizeBytes && cleanId) {
-      try {
-        const { steamappsDirs } = discoverSteamLocations(options);
+    try {
+      const { steamappsDirs } = discoverSteamLocations(options);
+      if (Array.isArray(steamappsDirs) && steamappsDirs.length > 0) {
+        const steamCommonDirs = steamappsDirs.map((d) => path.join(d, 'common'));
+        defaultInstallDir = steamCommonDirs[0];
+        availableInstallDirs = Array.from(new Set([...steamCommonDirs, ...availableInstallDirs]));
+        diskSpace = getDiskSpace(payload.targetInstallDir || defaultInstallDir, options);
+      }
+      if (!estimatedSizeBytes && cleanId && Array.isArray(steamappsDirs)) {
         for (const dir of steamappsDirs) {
           const acfPath = path.join(dir, `appmanifest_${cleanId}.acf`);
           if (fs.existsSync(acfPath)) {
@@ -8506,8 +8725,8 @@ async function getGameInstallInfo(payload = {}, options = {}) {
             }
           }
         }
-      } catch {}
-    }
+      }
+    } catch {}
 
     if (!estimatedSizeBytes && cleanId && installInfoSizeCache.has(`steam:${cleanId}:${platform}`)) {
       estimatedSizeBytes = installInfoSizeCache.get(`steam:${cleanId}:${platform}`);
@@ -9568,7 +9787,7 @@ async function installGame(payload = {}, options = {}) {
               }
 
               try {
-                syncEpicFirstPartyLauncher(options);
+                syncEpicFirstPartyLauncher({ ...options, runLegendaryEglSync: true });
               } catch {}
 
               updateDownloadTask(

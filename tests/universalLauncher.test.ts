@@ -3386,9 +3386,13 @@ setTimeout(() => process.exit(0), 30);
       expect(parsedItem.InstallLocation).toBe(epicGameDir);
       expect(parsedItem.bIsIncompleteInstall).toBe(false);
 
-      // Verify .egstore/<GUID>.item inside installPath
-      const egstoreItemPath = path.join(epicGameDir, '.egstore', eglItemFiles[0]);
-      expect(fs.existsSync(egstoreItemPath)).toBe(true);
+      // Verify .egstore/<GUID>.mancpn inside installPath
+      const itemGuid = parsedItem.InstallationGuid;
+      const egstoreMancpnPath = path.join(epicGameDir, '.egstore', `${itemGuid}.mancpn`);
+      expect(fs.existsSync(egstoreMancpnPath)).toBe(true);
+      const parsedMancpn = JSON.parse(fs.readFileSync(egstoreMancpnPath, 'utf8'));
+      expect(parsedMancpn.FormatVersion).toBe(0);
+      expect(parsedMancpn.AppName).toBe(epicAppName);
 
       // Verify LauncherInstalled.dat contains the entry in InstallationList
       expect(fs.existsSync(tempLauncherInstalledPath)).toBe(true);
@@ -9761,4 +9765,560 @@ sleep 1
       }
     });
   });
+
+  // =========================================================================
+  // 34. REAL-WORLD WINDOWS X64 FEEDBACK FIXES: EPIC FIRST-PARTY REGISTRATION,
+  //     STEAM MANAGED INSTALL LOCATION, & STEAM PREALLOCATION PROGRESS GUARD
+  // =========================================================================
+  describe('34. Real-World Windows x64 Feedback Fixes: Epic First-Party Registration, Steam Managed Install Location & Steam Preallocation Progress Guard', () => {
+    it('Issue 1: syncEpicFirstPartyLauncher on Windows x64 extracts nested asset_infos.Windows CatalogItemId/CatalogNamespace, self-heals incomplete .item manifests, writes .egstore/<guid>.mancpn & <guid>.manifest, and updates LauncherInstalled.dat', () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onelauncher-win64-epic-sync-'));
+      const tempUserData = path.join(tempDir, 'userData');
+      const eglManifestsDir = path.join(tempDir, 'ProgramData', 'Epic', 'EpicGamesLauncher', 'Data', 'Manifests');
+      const eglLauncherInstalledDat = path.join(
+        tempDir,
+        'ProgramData',
+        'Epic',
+        'UnrealEngineLauncher',
+        'LauncherInstalled.dat'
+      );
+
+      try {
+        const appName = 'b3c4d5e6f7a8901234567890abcdef12';
+        const catalogItemId = 'cat_item_99887766554433221100ff';
+        const catalogNamespace = 'ns_epic_win64_realworld_01';
+        const guid = 'A1B2C3D4E5F60718293A4B5C6D7E8F90';
+        const installPath = path.join(tempDir, 'Games', 'CyberActionWin64');
+        const binDir = path.join(installPath, 'Binaries', 'Win64');
+        fs.mkdirSync(binDir, { recursive: true });
+
+        const exePath = path.join(binDir, 'CyberAction-Win64-Shipping.exe');
+        fs.writeFileSync(exePath, 'MZ-windows-x64-shipping-executable');
+
+        const legBaseDir = path.join(tempUserData, 'legendaryConfig', 'legendary');
+        const legMetaDir = path.join(legBaseDir, 'metadata');
+        const legManifestsDir = path.join(legBaseDir, 'manifests');
+        fs.mkdirSync(legMetaDir, { recursive: true });
+        fs.mkdirSync(legManifestsDir, { recursive: true });
+
+        // 1. Write Legendary installed.json with Windows backslash relative executable
+        const installedJsonPath = path.join(legBaseDir, 'installed.json');
+        fs.writeFileSync(
+          installedJsonPath,
+          JSON.stringify(
+            {
+              [appName]: {
+                app_name: appName,
+                title: 'Cyber Action Win64',
+                install_path: installPath,
+                executable: '.\\Binaries\\Win64\\CyberAction-Win64-Shipping.exe',
+                version: '2.4.1-win64',
+                install_size: 4294967296,
+                platform: 'Windows',
+              },
+            },
+            null,
+            2
+          ),
+          'utf8'
+        );
+
+        // 2. Write metadata/<appName>.json with nested asset_infos.Windows.catalog_item_id & namespace
+        //    and metadata.customAttributes.FolderName.value
+        fs.writeFileSync(
+          path.join(legMetaDir, `${appName}.json`),
+          JSON.stringify(
+            {
+              app_name: appName,
+              app_title: 'Cyber Action Win64',
+              asset_infos: {
+                Windows: {
+                  app_name: appName,
+                  asset_id: appName,
+                  build_version: '2.4.1-win64',
+                  catalog_item_id: catalogItemId,
+                  namespace: catalogNamespace,
+                },
+              },
+              metadata: {
+                customAttributes: {
+                  FolderName: {
+                    type: 'STRING',
+                    value: 'CyberActionCustomFolder',
+                  },
+                },
+              },
+            },
+            null,
+            2
+          ),
+          'utf8'
+        );
+
+        // 3. Write binary manifest in manifests/<appName>_win.manifest
+        const sourceManifestBytes = Buffer.from('EPIC-BINARY-MANIFEST-WIN64-PAYLOAD-9876543210', 'utf8');
+        const sourceManifestFile = path.join(legManifestsDir, `${appName}_win.manifest`);
+        fs.writeFileSync(sourceManifestFile, sourceManifestBytes);
+
+        // 4. Place an existing incomplete .item manifest in eglManifestsDir with empty CatalogItemId & CatalogNamespace
+        //    and missing .egstore/<guid>.mancpn to verify self-healing
+        fs.mkdirSync(eglManifestsDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(eglManifestsDir, `${guid}.item`),
+          JSON.stringify(
+            {
+              FormatVersion: 0,
+              bIsIncompleteInstall: false,
+              AppName: appName,
+              DisplayName: 'Cyber Action Win64',
+              InstallationGuid: guid,
+              InstallLocation: installPath,
+              CatalogItemId: '',
+              CatalogNamespace: '',
+              LaunchExecutable: '.\\Binaries\\Win64\\CyberAction-Win64-Shipping.exe',
+            },
+            null,
+            2
+          ),
+          'utf8'
+        );
+
+        //Also place a stale .item inside .egstore to verify cleanup
+        const egstoreDir = path.join(installPath, '.egstore');
+        fs.mkdirSync(egstoreDir, { recursive: true });
+        fs.writeFileSync(path.join(egstoreDir, `${guid}.item`), '{}', 'utf8');
+
+        // 5. Run syncEpicFirstPartyLauncher
+        const syncRes = launcherEngine.syncEpicFirstPartyLauncher({
+          platform: 'win32',
+          homedir: tempDir,
+          userDataDir: tempUserData,
+          eglManifestsDir,
+          eglLauncherInstalledDat,
+        });
+
+        expect(syncRes.synced).toBe(1);
+
+        // Verify self-healed <guid>.item in eglManifestsDir
+        const healedItemPath = path.join(eglManifestsDir, `${guid}.item`);
+        expect(fs.existsSync(healedItemPath)).toBe(true);
+        const healedItem = JSON.parse(fs.readFileSync(healedItemPath, 'utf8'));
+        expect(healedItem.CatalogItemId).toBe(catalogItemId);
+        expect(healedItem.CatalogNamespace).toBe(catalogNamespace);
+        expect(healedItem.MandatoryAppFolderName).toBe('CyberActionCustomFolder');
+        expect(healedItem.FullAppName).toBe(appName);
+        expect(healedItem.MainGameAppName).toBe(appName);
+        expect(healedItem.LaunchExecutable).toBe('Binaries/Win64/CyberAction-Win64-Shipping.exe');
+        expect(healedItem.bIsIncompleteInstall).toBe(false);
+
+        // Verify stale .item inside .egstore was removed
+        expect(fs.existsSync(path.join(egstoreDir, `${guid}.item`))).toBe(false);
+
+        // Verify <installPath>/.egstore/<guid>.mancpn exists and has required fields
+        const mancpnPath = path.join(egstoreDir, `${guid}.mancpn`);
+        expect(fs.existsSync(mancpnPath)).toBe(true);
+        const mancpn = JSON.parse(fs.readFileSync(mancpnPath, 'utf8'));
+        expect(mancpn).toEqual({
+          FormatVersion: 0,
+          AppName: appName,
+          CatalogItemId: catalogItemId,
+          CatalogNamespace: catalogNamespace,
+        });
+
+        // Verify <installPath>/.egstore/<guid>.manifest exists and matches binary manifest from manifests/
+        const copiedManifestPath = path.join(egstoreDir, `${guid}.manifest`);
+        expect(fs.existsSync(copiedManifestPath)).toBe(true);
+        expect(fs.readFileSync(copiedManifestPath).equals(sourceManifestBytes)).toBe(true);
+
+        // Verify LauncherInstalled.dat has the entry with NamespaceId: catalogNamespace and ItemId: catalogItemId
+        expect(fs.existsSync(eglLauncherInstalledDat)).toBe(true);
+        const launcherInstalled = JSON.parse(fs.readFileSync(eglLauncherInstalledDat, 'utf8'));
+        expect(Array.isArray(launcherInstalled.InstallationList)).toBe(true);
+        const entry = launcherInstalled.InstallationList.find((e: any) => e.AppName === appName);
+        expect(entry).toBeDefined();
+        expect(entry.InstallLocation).toBe(installPath);
+        expect(entry.NamespaceId).toBe(catalogNamespace);
+        expect(entry.ItemId).toBe(catalogItemId);
+        expect(entry.ArtifactId).toBe(appName);
+      } finally {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    it('Issue 2: getGameInstallInfo discovers Steam steamapps/common directories and GameInstallModal renders read-only Managed by Steam Client notice (with multi-library selector) for Steam while keeping editable directory input & Browse button for GOG/Epic', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onelauncher-steam-install-loc-'));
+      try {
+        const primarySteamRoot = path.join(tempDir, 'SteamPrimary');
+        const primarySteamapps = path.join(primarySteamRoot, 'steamapps');
+        const primaryCommon = path.join(primarySteamapps, 'common');
+        fs.mkdirSync(primaryCommon, { recursive: true });
+
+        const secondarySteamRoot = path.join(tempDir, 'SteamSecondaryDrive');
+        const secondarySteamapps = path.join(secondarySteamRoot, 'steamapps');
+        const secondaryCommon = path.join(secondarySteamapps, 'common');
+        fs.mkdirSync(secondaryCommon, { recursive: true });
+
+        // Write libraryfolders.vdf in primarySteamapps pointing to both libraries
+        const vdfContent = `"libraryfolders"
+{
+  "0"
+  {
+    "path" "${primarySteamRoot.replace(/\\/g, '\\\\')}"
+  }
+  "1"
+  {
+    "path" "${secondarySteamRoot.replace(/\\/g, '\\\\')}"
+  }
+}`;
+        fs.writeFileSync(path.join(primarySteamapps, 'libraryfolders.vdf'), vdfContent, 'utf8');
+
+        // 2a. Verify launcherEngine.getGameInstallInfo for platformId: 'steam' discovers steamapps/common
+        const steamInstallInfo = await launcherEngine.getGameInstallInfo(
+          {
+            platformId: 'steam',
+            platformGameId: '1091500',
+            steamAppId: 1091500,
+            title: 'Cyberpunk 2077',
+          },
+          {
+            platform: 'win32',
+            homedir: tempDir,
+            userDataDir: tempDir,
+            customRoots: [primarySteamRoot],
+            skipNetwork: true,
+          }
+        );
+
+        expect(steamInstallInfo.defaultInstallDir).toBe(primaryCommon);
+        expect(steamInstallInfo.availableInstallDirs).toContain(primaryCommon);
+        expect(steamInstallInfo.availableInstallDirs).toContain(secondaryCommon);
+
+        // 2b. Render GameInstallModal for a Steam game (selectedPlatformId === 'steam')
+        const testGame: Game = {
+          id: 'multi-store-loc-test',
+          title: 'Cyberpunk 2077',
+          platforms: [
+            {
+              platformId: 'steam',
+              platformGameId: '1091500',
+              installed: false,
+              storePlatforms: { windows: true, mac: false, linux: false },
+            } as any,
+            {
+              platformId: 'gog',
+              platformGameId: '1423049311',
+              installed: false,
+              storePlatforms: { windows: true, mac: false, linux: false },
+            } as any,
+          ],
+          status: 'backlog',
+          playtimeMinutes: 0,
+           addedAt: new Date().toISOString(),
+          genres: [],
+          tags: [],
+        };
+
+        const winHostSpy = vi.spyOn(launcherService, 'getHostPlatform').mockReturnValue('win32');
+        const getInstallInfoSpy = vi
+          .spyOn(launcherService, 'getGameInstallInfo')
+          .mockImplementation(async (_game, platId) => {
+            if (platId === 'steam') {
+              return {
+                platformId: 'steam',
+                platformGameId: '1091500',
+                hostPlatform: 'win32',
+                estimatedSizeBytes: 60 * 1024 * 1024 * 1024,
+                defaultInstallDir: primaryCommon,
+                availableInstallDirs: [primaryCommon, secondaryCommon],
+                availableInstallers: [
+                  {
+                    id: 'steam-win-native',
+                    name: 'Cyberpunk 2077 (Steam Client — Windows Native)',
+                    os: 'windows',
+                    totalSizeBytes: 60 * 1024 * 1024 * 1024,
+                  },
+                ],
+                canDirectDownload: false,
+                requiresStoreClientFallback: true,
+                diskSpace: {
+                  freeBytes: 250 * 1024 * 1024 * 1024,
+                  totalBytes: 500 * 1024 * 1024 * 1024,
+                  usedBytes: 250 * 1024 * 1024 * 1024,
+                },
+              } as any;
+            }
+            return {
+              platformId: 'gog',
+              platformGameId: '1423049311',
+              hostPlatform: 'win32',
+              estimatedSizeBytes: 60 * 1024 * 1024 * 1024,
+              defaultInstallDir: 'C:\\Games\\OneLauncher',
+              availableInstallDirs: ['C:\\Games\\OneLauncher', 'D:\\GOG Games'],
+              availableInstallers: [
+                {
+                  id: 'gog-win-native',
+                  name: 'Cyberpunk 2077 — Windows Native Build',
+                  os: 'windows',
+                  totalSizeBytes: 60 * 1024 * 1024 * 1024,
+                },
+              ],
+              canDirectDownload: true,
+              requiresStoreClientFallback: false,
+              diskSpace: {
+                freeBytes: 250 * 1024 * 1024 * 1024,
+                totalBytes: 500 * 1024 * 1024 * 1024,
+                usedBytes: 250 * 1024 * 1024 * 1024,
+              },
+            } as any;
+          });
+
+        try {
+          const renderModalForPlatform = async (platformId: 'steam' | 'gog') => {
+            const states: any[] = [];
+            const effects: boolean[] = [];
+            const internals =
+              (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE ||
+              (React as any).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
+            const doRender = () => {
+              let sIdx = 0;
+              let eIdx = 0;
+              const prevH = internals.H;
+              internals.H = {
+                useState(init: any) {
+                  const idx = sIdx++;
+                  if (idx >= states.length) {
+                    states.push(typeof init === 'function' ? init() : init);
+                  }
+                  const setS = (upd: any) => {
+                    states[idx] = typeof upd === 'function' ? upd(states[idx]) : upd;
+                  };
+                  return [states[idx], setS];
+                },
+                useEffect(fn: () => any) {
+                  const idx = eIdx++;
+                  if (!effects[idx]) {
+                    effects[idx] = true;
+                    fn();
+                  }
+                },
+                useRef(init: any) {
+                  return { current: init };
+                },
+                useMemo(fn: () => any) {
+                  return fn();
+                },
+                useCallback(fn: any) {
+                  return fn;
+                },
+              };
+              try {
+                const vnode = (GameInstallModal as any)({
+                  isOpen: true,
+                  game: testGame,
+                  initialPlatformId: platformId,
+                  onClose: vi.fn(),
+                });
+                const html = renderToString(vnode).replace(/<!--\s*-->/g, '');
+                return { vnode, html };
+              } finally {
+                internals.H = prevH;
+              }
+            };
+            doRender();
+            await new Promise((r) => setTimeout(r, 15));
+            return doRender();
+          };
+
+          const getTextContent = (node: any): string => {
+            if (node == null || typeof node === 'boolean') return '';
+            if (typeof node === 'string' || typeof node === 'number') return String(node);
+            if (Array.isArray(node)) return node.map(getTextContent).join('');
+            if (node.props?.children) return getTextContent(node.props.children);
+            return '';
+          };
+          const findElements = (node: any, predicate: (el: any) => boolean, acc: any[] = []): any[] => {
+            if (!node || typeof node !== 'object') return acc;
+            if (Array.isArray(node)) {
+              node.forEach((c) => findElements(c, predicate, acc));
+              return acc;
+            }
+            if (predicate(node)) acc.push(node);
+            if (node.props?.children) findElements(node.props.children, predicate, acc);
+            return acc;
+          };
+
+          // Steam modal assertions
+          const steamRendered = await renderModalForPlatform('steam');
+          expect(steamRendered.html).toContain('data-testid="steam-managed-install-location"');
+          expect(steamRendered.html).toContain('Managed by Steam Client');
+          expect(steamRendered.html).toContain('data-testid="steam-library-drive-select"');
+
+          const steamTextInputs = findElements(
+            steamRendered.vnode,
+            (el) => el.type === 'input' && el.props?.type === 'text'
+          );
+          expect(steamTextInputs).toHaveLength(0);
+          const steamBrowseBtns = findElements(
+            steamRendered.vnode,
+            (el) => el.type === 'button' && getTextContent(el).includes('Browse...')
+          );
+          expect(steamBrowseBtns).toHaveLength(0);
+
+          // GOG modal assertions
+          const gogRendered = await renderModalForPlatform('gog');
+          expect(gogRendered.html).not.toContain('data-testid="steam-managed-install-location"');
+          expect(gogRendered.html).toContain('Installation Directory');
+
+          const gogTextInputs = findElements(
+            gogRendered.vnode,
+            (el) => el.type === 'input' && el.props?.type === 'text'
+          );
+          expect(gogTextInputs.length).toBeGreaterThanOrEqual(1);
+          const gogBrowseBtns = findElements(
+            gogRendered.vnode,
+            (el) => el.type === 'button' && getTextContent(el).includes('Browse...')
+          );
+          expect(gogBrowseBtns.length).toBeGreaterThanOrEqual(1);
+        } finally {
+          winHostSpy.mockRestore();
+          getInstallInfoSpy.mockRestore();
+        }
+      } finally {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    it('Issue 3: parseSteamContentLogForApp resets stale download counters on update started / Uninstalled, and startSteamInstallMonitor ignores 100% pre-allocated downloading/<appId> files while advancing 0% -> 25% -> 60% -> 100%', async () => {
+      // 3a. Verify parseSteamContentLogForApp resets historical download/stage counters when update started or Uninstalled appears
+      const logWithHistoryAndReset = [
+        '[2026-10-21 10:00:01] AppID 1091500 update started : download 0/50000000',
+        '[2026-10-21 10:05:10] AppID 1091500 download 50000000/50000000',
+        '[2026-10-21 10:05:12] AppID 1091500 stage 50000000/50000000',
+        '[2026-10-21 10:05:15] AppID 1091500 state changed : Fully Installed,',
+        '[2026-10-21 10:15:00] AppID 1091500 state changed : Uninstalled,',
+        '[2026-10-21 10:20:00] AppID 1091500 update started :',
+        '[2026-10-21 10:20:01] AppID 1091500 App update changed : Running Update, Preallocating,',
+      ].join('\n');
+
+      const parsedResetLog = launcherEngine.parseSteamContentLogForApp(
+        logWithHistoryAndReset,
+        '1091500'
+      );
+      expect(parsedResetLog.bytesDownloaded).toBe(0);
+      expect(parsedResetLog.bytesToDownload).toBe(0);
+      expect(parsedResetLog.bytesStaged).toBe(0);
+      expect(parsedResetLog.bytesToStage).toBe(0);
+      expect(parsedResetLog.fullyInstalled).toBe(false);
+      expect(parsedResetLog.updateStarted).toBe(true);
+      expect(parsedResetLog.isRunning).toBe(true);
+
+      // 3b. Verify startSteamInstallMonitor never jumps to 99% when steamapps/downloading/<appId> has 100% preallocated sparse files
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onelauncher-steam-prealloc-'));
+      const tempUserData = path.join(tempDir, 'userData');
+      const steamRoot = path.join(tempDir, 'Steam');
+      const steamappsDir = path.join(steamRoot, 'steamapps');
+      const appId = '1091500';
+      const downloadingAppDir = path.join(steamappsDir, 'downloading', appId);
+      const commonAppDir = path.join(steamappsDir, 'common', 'PreallocGame');
+      fs.mkdirSync(downloadingAppDir, { recursive: true });
+      fs.mkdirSync(tempUserData, { recursive: true });
+
+      const totalGameBytes = 200000;
+      // Write a pre-allocated file equal to 100% of totalGameBytes inside steamapps/downloading/<appId>
+      fs.writeFileSync(
+        path.join(downloadingAppDir, 'preallocated_depot.bin'),
+        Buffer.alloc(totalGameBytes, 0)
+      );
+
+      const writeAcf = (bytesDownloaded: number, stateFlags: string) => {
+        const acfContent = `"AppState"
+{
+	"appid"		"${appId}"
+	"Universe"		"1"
+	"name"		"PreallocGame"
+	"StateFlags"		"${stateFlags}"
+	"installdir"		"PreallocGame"
+	"SizeOnDisk"		"${totalGameBytes}"
+	"BytesToDownload"		"${totalGameBytes}"
+	"BytesDownloaded"		"${bytesDownloaded}"
+	"BytesToStage"		"${totalGameBytes}"
+	"BytesStaged"		"${bytesDownloaded}"
+}`;
+        fs.writeFileSync(path.join(steamappsDir, `appmanifest_${appId}.acf`), acfContent, 'utf8');
+      };
+
+      // Initial state: Preallocating / starting download with BytesDownloaded = 0, StateFlags = 1026
+      writeAcf(0, '1026');
+
+      const monitorOptions = {
+        platform: 'win32',
+        homedir: tempDir,
+        userDataDir: tempUserData,
+        customRoots: [steamRoot],
+        steamPollIntervalMs: 20,
+      };
+
+      try {
+        const installRes = await launcherEngine.installGame(
+          {
+            gameId: 'steam-prealloc-test',
+            title: 'PreallocGame',
+            platformId: 'steam',
+            platformGameId: appId,
+            steamAppId: Number(appId),
+            totalBytes: totalGameBytes,
+            manualControl: true,
+          },
+          monitorOptions
+        );
+        expect(installRes.success).toBe(true);
+        const taskId = installRes.task.taskId;
+
+        launcherEngine.startSteamInstallMonitor(taskId, appId, monitorOptions);
+
+        // Wait for monitor ticks with BytesDownloaded = 0 while downloading/<appId> has 100% preallocated size
+        await new Promise((r) => setTimeout(r, 60));
+        let currentTask = launcherEngine.getDownloadQueue().find((t: any) => t.taskId === taskId);
+        expect(currentTask).toBeDefined();
+        expect(currentTask.progressPercent).toBe(0);
+        expect(currentTask.bytesDownloaded).toBe(0);
+        expect(currentTask.status).toBe('downloading');
+
+        // Advance ACF to 25% (50,000 / 200,000)
+        writeAcf(50000, '1026');
+        await new Promise((r) => setTimeout(r, 60));
+        currentTask = launcherEngine.getDownloadQueue().find((t: any) => t.taskId === taskId);
+        expect(currentTask.progressPercent).toBe(25);
+        expect(currentTask.bytesDownloaded).toBe(50000);
+
+        // Advance ACF to 60% (120,000 / 200,000)
+        writeAcf(120000, '1026');
+        await new Promise((r) => setTimeout(r, 60));
+        currentTask = launcherEngine.getDownloadQueue().find((t: any) => t.taskId === taskId);
+        expect(currentTask.progressPercent).toBe(60);
+        expect(currentTask.bytesDownloaded).toBe(120000);
+
+        // Complete installation: create common/PreallocGame with .exe and set BytesDownloaded = 200,000, StateFlags = 4
+        fs.mkdirSync(commonAppDir, { recursive: true });
+        fs.writeFileSync(path.join(commonAppDir, 'PreallocGame.exe'), 'MZ-win64-pe');
+        writeAcf(totalGameBytes, '4');
+        await new Promise((r) => setTimeout(r, 60));
+
+        currentTask = launcherEngine.getDownloadQueue().find((t: any) => t.taskId === taskId);
+        expect(currentTask.status).toBe('completed');
+        expect(currentTask.progressPercent).toBe(100);
+        expect(currentTask.finalInstallPath).toBe(commonAppDir);
+      } finally {
+        launcherEngine.clearDownloadQueue();
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+  });
 });
+
