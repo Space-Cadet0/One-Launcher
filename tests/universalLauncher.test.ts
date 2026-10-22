@@ -10319,6 +10319,220 @@ sleep 1
         } catch {}
       }
     });
+
+    it('detects older libMoltenVK.dylib _GLOBAL__sub_I_mvk_datatypes.mm deadlock symbol, keeps MTL_HUD_ENABLED=1 while injecting libone_metal_preload.dylib, cleans up when metalHud is false, and resolves adjacent/parent wineserver binaries', () => {
+      const mockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'onelauncher-mvk-hud-test-'));
+      try {
+        // 1. Wine distribution WITH _GLOBAL__sub_I_mvk_datatypes.mm in lib/libMoltenVK.dylib
+        const legacyWineRoot = path.join(mockRoot, 'wine-legacy');
+        const legacyWineBin = path.join(legacyWineRoot, 'bin', 'wine64');
+        const legacyWineserver = path.join(legacyWineRoot, 'bin', 'wineserver');
+        const legacyMvkDylib = path.join(legacyWineRoot, 'lib', 'libMoltenVK.dylib');
+        writeTempFile(legacyWineBin, '#!/bin/sh\nexit 0\n', 0o755);
+        writeTempFile(legacyWineserver, '#!/bin/sh\nexit 0\n', 0o755);
+        writeTempFile(
+          legacyMvkDylib,
+          'FAKE_MACHO_HEADER\0__TEXT\0_GLOBAL__sub_I_mvk_datatypes.mm\0MTLRegisterDevices\0'
+        );
+
+        // 2. Wine distribution WITHOUT _GLOBAL__sub_I_mvk_datatypes.mm in lib/external/libMoltenVK.dylib
+        const modernWineRoot = path.join(mockRoot, 'wine-modern');
+        const modernWineBin = path.join(modernWineRoot, 'lib', 'wine', 'x86_64-unix', 'wine');
+        const modernWineserver = path.join(modernWineRoot, 'lib', 'wine', 'bin', 'wineserver64');
+        const modernMvkDylib = path.join(
+          modernWineRoot,
+          'lib',
+          'wine',
+          'lib',
+          'external',
+          'libMoltenVK.dylib'
+        );
+        writeTempFile(modernWineBin, '#!/bin/sh\nexit 0\n', 0o755);
+        writeTempFile(modernWineserver, '#!/bin/sh\nexit 0\n', 0o755);
+        writeTempFile(modernMvkDylib, 'FAKE_MACHO_HEADER\0__TEXT\0mvkCreateInstance\0');
+
+        launcherEngine.invalidateScanCaches();
+
+        // Verify resolveWineLayerMoltenVkPath & ensureWineMetalPreloadDylib
+        expect(launcherEngine.resolveWineLayerMoltenVkPath(legacyWineBin)).toBe(legacyMvkDylib);
+        expect(launcherEngine.resolveWineLayerMoltenVkPath(modernWineBin)).toBe(modernMvkDylib);
+        const preloadDylib = launcherEngine.ensureWineMetalPreloadDylib({ userDataDir });
+        expect(preloadDylib).toBeTruthy();
+        expect(preloadDylib).toContain('libone_metal_preload.dylib');
+        expect(fs.existsSync(preloadDylib)).toBe(true);
+
+        // Verify doesWineLayerHaveMoltenVkHudDeadlock
+        expect(launcherEngine.doesWineLayerHaveMoltenVkHudDeadlock(legacyWineBin)).toBe(true);
+        expect(
+          launcherEngine.doesWineLayerHaveMoltenVkHudDeadlock({ binaryPath: legacyWineBin })
+        ).toBe(true);
+        expect(launcherEngine.doesWineLayerHaveMoltenVkHudDeadlock(modernWineBin)).toBe(false);
+        expect(
+          launcherEngine.doesWineLayerHaveMoltenVkHudDeadlock({ binaryPath: modernWineBin })
+        ).toBe(false);
+
+        // Verify applyCrossOverPerGameSettings keeps MTL_HUD_ENABLED='1' and injects libone_metal_preload.dylib + ONE_LAUNCHER_MOLTENVK_PATH when deadlock symbol is present
+        const legacyBottle = path.join(mockRoot, 'bottle-legacy');
+        fs.mkdirSync(legacyBottle, { recursive: true });
+        const legacyEnv: Record<string, string> = {};
+        launcherEngine.applyCrossOverPerGameSettings(
+          { type: 'wine', binaryPath: legacyWineBin },
+          { metalHud: true },
+          legacyEnv,
+          legacyBottle,
+          { userDataDir }
+        );
+        expect(legacyEnv.MTL_HUD_ENABLED).toBe('1');
+        expect(legacyEnv.DYLD_INSERT_LIBRARIES).toContain('libone_metal_preload.dylib');
+        expect(legacyEnv.ONE_LAUNCHER_MOLTENVK_PATH).toBe(legacyMvkDylib);
+
+        // Verify applyCrossOverPerGameSettings cleans up MTL_HUD_ENABLED, ONE_LAUNCHER_MOLTENVK_PATH, and libone_metal_preload.dylib when metalHud is false
+        launcherEngine.applyCrossOverPerGameSettings(
+          { type: 'wine', binaryPath: legacyWineBin },
+          { metalHud: false },
+          legacyEnv,
+          legacyBottle,
+          { userDataDir }
+        );
+        expect(legacyEnv.MTL_HUD_ENABLED).toBeUndefined();
+        expect(legacyEnv.ONE_LAUNCHER_MOLTENVK_PATH).toBeUndefined();
+        expect(legacyEnv.DYLD_INSERT_LIBRARIES).toBeUndefined();
+
+        // Verify applyCrossOverPerGameSettings sets MTL_HUD_ENABLED='1' without preload dylib when deadlock symbol is NOT present
+        const modernBottle = path.join(mockRoot, 'bottle-modern');
+        fs.mkdirSync(modernBottle, { recursive: true });
+        const modernEnv: Record<string, string> = {};
+        launcherEngine.applyCrossOverPerGameSettings(
+          { type: 'crossover', binaryPath: modernWineBin },
+          { metalHud: true },
+          modernEnv,
+          modernBottle,
+          { userDataDir }
+        );
+        expect(modernEnv.MTL_HUD_ENABLED).toBe('1');
+        expect(modernEnv.DYLD_INSERT_LIBRARIES).toBeUndefined();
+        expect(modernEnv.ONE_LAUNCHER_MOLTENVK_PATH).toBeUndefined();
+
+        // Verify resolveWineserverBinary resolves both adjacent bin/wineserver and ../bin/wineserver64
+        expect(launcherEngine.resolveWineserverBinary(legacyWineBin)).toBe(legacyWineserver);
+        expect(launcherEngine.resolveWineserverBinary(modernWineBin)).toBe(modernWineserver);
+        expect(launcherEngine.resolveWineserverBinary(legacyWineserver)).toBe(legacyWineserver);
+      } finally {
+        try {
+          fs.rmSync(mockRoot, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    it('resolves host display bounds via getHostMaxDisplayResolution and clamps out-of-bounds Retina-doubled .cfg and .ini resolutions via sanitizeWinePrefixDisplayConfigs idempotently', () => {
+      const mockPrefix = fs.mkdtempSync(path.join(os.tmpdir(), 'onelauncher-display-sanitize-'));
+      try {
+        // 1. Verify getHostMaxDisplayResolution(true) vs getHostMaxDisplayResolution(false)
+        const hiRes = launcherEngine.getHostMaxDisplayResolution(true, {
+          maxWidth: 3024,
+          maxHeight: 1964,
+          logicalWidth: 1512,
+          logicalHeight: 982,
+        });
+        expect(hiRes.width).toBe(3024);
+        expect(hiRes.height).toBe(1964);
+        expect(hiRes.logicalWidth).toBe(1512);
+        expect(hiRes.logicalHeight).toBe(982);
+
+        const loRes = launcherEngine.getHostMaxDisplayResolution(false, {
+          maxWidth: 3024,
+          maxHeight: 1964,
+          logicalWidth: 1512,
+          logicalHeight: 982,
+        });
+        expect(loRes.width).toBe(1512);
+        expect(loRes.height).toBe(982);
+
+        const hostResLive = launcherEngine.getHostMaxDisplayResolution(true);
+        expect(hostResLive.width).toBeGreaterThanOrEqual(1280);
+        expect(hostResLive.height).toBeGreaterThanOrEqual(720);
+        const hostResLogicalLive = launcherEngine.getHostMaxDisplayResolution(false);
+        expect(hostResLogicalLive.width).toBeGreaterThanOrEqual(640);
+        expect(hostResLogicalLive.width).toBeLessThanOrEqual(hostResLive.width);
+
+        // 2. Create a temporary Wine prefix with an out-of-bounds .cfg and .ini file
+        const cfgFile = path.join(
+          mockPrefix,
+          'drive_c/users/crossover/Saved Games/SampleEngine/Game/kexengine.cfg'
+        );
+        writeTempFile(
+          cfgFile,
+          [
+            'seta v_vsync "1"',
+            'seta v_windowed "0"',
+            'seta v_width "6048"',
+            'seta v_height "3928"',
+            'seta v_refresh "120"',
+            '',
+          ].join('\n')
+        );
+
+        const iniFile = path.join(
+          mockPrefix,
+          'drive_c/users/crossover/AppData/Local/SampleUEGame/Saved/Config/WindowsNoEditor/GameUserSettings.ini'
+        );
+        writeTempFile(
+          iniFile,
+          [
+            '[/Script/Engine.GameUserSettings]',
+            'ResolutionSizeX=7680',
+            'ResolutionSizeY=4320',
+            'LastUserConfirmedResolutionSizeX=7680',
+            'LastUserConfirmedResolutionSizeY=4320',
+            'FullscreenMode=0',
+            '',
+          ].join('\n')
+        );
+
+        const firstRun = launcherEngine.sanitizeWinePrefixDisplayConfigs(mockPrefix, {
+          maxWidth: 3024,
+          maxHeight: 1964,
+          highResolutionMode: true,
+        });
+        expect(firstRun.maxWidth).toBe(3024);
+        expect(firstRun.maxHeight).toBe(1964);
+        expect(firstRun.sanitizedFiles).toHaveLength(2);
+
+        const sanitizedCfgEntry = firstRun.sanitizedFiles.find(
+          (f: any) => f.filePath === cfgFile
+        );
+        expect(sanitizedCfgEntry).toEqual({
+          filePath: cfgFile,
+          previousWidth: 6048,
+          previousHeight: 3928,
+          clampedWidth: 3024,
+          clampedHeight: 1964,
+        });
+
+        const updatedCfgText = fs.readFileSync(cfgFile, 'utf8');
+        expect(updatedCfgText).toContain('seta v_width "3024"');
+        expect(updatedCfgText).toContain('seta v_height "1964"');
+        expect(updatedCfgText).not.toContain('6048');
+
+        const updatedIniText = fs.readFileSync(iniFile, 'utf8');
+        expect(updatedIniText).toContain('ResolutionSizeX=3024');
+        expect(updatedIniText).toContain('ResolutionSizeY=1964');
+        expect(updatedIniText).toContain('LastUserConfirmedResolutionSizeX=3024');
+        expect(updatedIniText).toContain('LastUserConfirmedResolutionSizeY=1964');
+
+        // 3. Second run on already-clamped files must be idempotent (sanitizedFiles: [])
+        const secondRun = launcherEngine.sanitizeWinePrefixDisplayConfigs(mockPrefix, {
+          maxWidth: 3024,
+          maxHeight: 1964,
+          highResolutionMode: true,
+        });
+        expect(secondRun.sanitizedFiles).toEqual([]);
+      } finally {
+        try {
+          fs.rmSync(mockPrefix, { recursive: true, force: true });
+        } catch {}
+      }
+    });
   });
 });
 

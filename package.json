@@ -57,7 +57,8 @@
       "package.json"
     ],
     "asarUnpack": [
-      "electron/bin/**/*"
+      "electron/bin/**/*",
+      "electron/helpers/**/*"
     ],
     "directories": {
       "output": "release"

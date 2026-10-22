@@ -28,20 +28,32 @@ exports.default = async function afterPack(context) {
     // Ignore if xattr is unavailable
   }
 
-  // Sign nested unpacked CLI binaries first (inside-out signing order required by Apple codesign)
-  const unpackedBinDir = path.join(
-    appPath,
-    'Contents',
-    'Resources',
-    'app.asar.unpacked',
-    'electron',
-    'bin',
-    'arm64',
-    'darwin'
-  );
-  if (fs.existsSync(unpackedBinDir)) {
-    for (const entry of fs.readdirSync(unpackedBinDir)) {
-      const binPath = path.join(unpackedBinDir, entry);
+  // Sign nested unpacked CLI binaries and Mach-O helper dylibs first (inside-out signing order required by Apple codesign)
+  const unpackedDirs = [
+    path.join(
+      appPath,
+      'Contents',
+      'Resources',
+      'app.asar.unpacked',
+      'electron',
+      'bin',
+      'arm64',
+      'darwin'
+    ),
+    path.join(
+      appPath,
+      'Contents',
+      'Resources',
+      'app.asar.unpacked',
+      'electron',
+      'helpers'
+    ),
+  ];
+  for (const unpackedDir of unpackedDirs) {
+    if (!fs.existsSync(unpackedDir)) continue;
+    for (const entry of fs.readdirSync(unpackedDir)) {
+      if (entry.endsWith('.c') || entry.endsWith('.h') || entry.endsWith('.md')) continue;
+      const binPath = path.join(unpackedDir, entry);
       if (fs.statSync(binPath).isFile()) {
         fs.chmodSync(binPath, 0o755);
         execFileSync('codesign', ['--force', '--sign', '-', binPath], {

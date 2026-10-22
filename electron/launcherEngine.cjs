@@ -600,6 +600,7 @@ const steamResolvedLaunchSpecCache = new Map();
 const legendaryMetadataDirCache = new Map();
 const legendaryAssetsFileCache = new Map();
 const legendaryAliasesFileCache = new Map();
+const moltenVkHudDeadlockCache = new Map();
 let lastProductionScanCache = { timestamp: 0, result: null };
 let lastSyncedEpicFingerprint = '';
 let lastSyncedGogFingerprint = '';
@@ -662,6 +663,7 @@ function invalidateScanCaches() {
   legendaryMetadataDirCache.clear();
   legendaryAssetsFileCache.clear();
   legendaryAliasesFileCache.clear();
+  moltenVkHudDeadlockCache.clear();
   lastProductionScanCache = { timestamp: 0, result: null };
   lastSyncedEpicFingerprint = '';
   lastSyncedGogFingerprint = '';
@@ -5416,6 +5418,248 @@ async function installCompatibilityLayer(payload = {}, options = {}) {
 }
 
 /**
+ * Resolve the bundled libMoltenVK.dylib path for a given Wine executable or layer object.
+ */
+function resolveWineLayerMoltenVkPath(wineBinary) {
+  const binPath =
+    typeof wineBinary === 'object' && wineBinary !== null
+      ? String(wineBinary.binaryPath || '')
+      : String(wineBinary || '');
+  if (!binPath) return null;
+
+  const normalizedBin = path.resolve(binPath);
+  const binDir = path.dirname(normalizedBin);
+  const wineRoot = path.resolve(binDir, '..');
+  const candidates = [
+    normalizedBin.endsWith('.dylib') ? normalizedBin : null,
+    path.join(wineRoot, 'lib', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib64', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib', 'external', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib64', 'external', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib', 'apple_gptk', 'external', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib64', 'apple_gptk', 'external', 'libMoltenVK.dylib'),
+    path.join(wineRoot, 'lib', 'wine', 'x86_64-unix', 'libMoltenVK.dylib'),
+    path.join(binDir, 'libMoltenVK.dylib'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Detect whether a Wine distribution bundles an older libMoltenVK.dylib containing the
+ * C++ static initializer `_GLOBAL__sub_I_mvk_datatypes.mm`, which calls `MTLRegisterDevices()`
+ * inside `dlopen()` while holding the global dyld API lock and deadlocks with Apple's
+ * `libMTLHud.dylib` (`MTL_HUD_ENABLED=1`) on macOS Thread 0 unless pre-initialized.
+ */
+function doesWineLayerHaveMoltenVkHudDeadlock(wineBinary) {
+  const binPath =
+    typeof wineBinary === 'object' && wineBinary !== null
+      ? String(wineBinary.binaryPath || '')
+      : String(wineBinary || '');
+  if (!binPath) return false;
+
+  const normalizedBin = path.resolve(binPath);
+  if (moltenVkHudDeadlockCache.has(normalizedBin)) {
+    return moltenVkHudDeadlockCache.get(normalizedBin);
+  }
+
+  const dylibPath = resolveWineLayerMoltenVkPath(normalizedBin);
+  if (!dylibPath) {
+    return false;
+  }
+
+  let hasDeadlock = false;
+  try {
+    const buf = fs.readFileSync(dylibPath);
+    if (buf.includes('_GLOBAL__sub_I_mvk_datatypes.mm')) {
+      hasDeadlock = true;
+    }
+    moltenVkHudDeadlockCache.set(normalizedBin, hasDeadlock);
+  } catch {}
+
+  return hasDeadlock;
+}
+
+/**
+ * Ensure the x86_64 `libone_metal_preload.dylib` helper exists on a real filesystem path
+ * outside `app.asar` so `dyld` can load it via `DYLD_INSERT_LIBRARIES`.
+ * This dylib interposes `CFRunLoopRun` on macOS Thread 0 to pre-initialize Metal and
+ * `libMoltenVK.dylib` before any Win32 threads are created, allowing `MTL_HUD_ENABLED=1`
+ * to work on Open-Source Wine / GPTK without deadlocking.
+ */
+function ensureWineMetalPreloadDylib(options = {}) {
+  const unpackedDir = __dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1');
+  const unpackedDylib = path.join(unpackedDir, 'helpers', 'libone_metal_preload.dylib');
+  const bundledDylib = path.join(__dirname, 'helpers', 'libone_metal_preload.dylib');
+
+  if (!/\.asar[\\/]/i.test(unpackedDylib) && fs.existsSync(unpackedDylib)) {
+    return unpackedDylib;
+  }
+  if (!/\.asar[\\/]/i.test(bundledDylib) && fs.existsSync(bundledDylib)) {
+    return bundledDylib;
+  }
+
+  const helpersOutDir = path.join(getUserDataDir(options?.userDataDir), 'helpers');
+  const extractedDylib = path.join(helpersOutDir, 'libone_metal_preload.dylib');
+
+  if (fs.existsSync(bundledDylib)) {
+    try {
+      if (!fs.existsSync(helpersOutDir)) {
+        fs.mkdirSync(helpersOutDir, { recursive: true });
+      }
+      if (!fs.existsSync(extractedDylib)) {
+        fs.writeFileSync(extractedDylib, fs.readFileSync(bundledDylib));
+        fs.chmodSync(extractedDylib, 0o755);
+      }
+      return extractedDylib;
+    } catch {}
+  }
+
+  if (fs.existsSync(extractedDylib)) {
+    return extractedDylib;
+  }
+
+  if (process.platform === 'darwin' && fs.existsSync('/usr/bin/clang')) {
+    try {
+      if (!fs.existsSync(helpersOutDir)) {
+        fs.mkdirSync(helpersOutDir, { recursive: true });
+      }
+      const bundledCSrc = path.join(__dirname, 'helpers', 'one_metal_preload.c');
+      const targetCSrc = fs.existsSync(bundledCSrc)
+        ? bundledCSrc
+        : path.join(helpersOutDir, 'one_metal_preload.c');
+      if (!fs.existsSync(targetCSrc)) {
+        fs.writeFileSync(
+          targetCSrc,
+          [
+            '#include <dlfcn.h>',
+            '#include <stdlib.h>',
+            '#include <pthread.h>',
+            '#include <CoreFoundation/CoreFoundation.h>',
+            'extern void *MTLCreateSystemDefaultDevice(void);',
+            'struct interpose_s { void *new_func; void *orig_func; };',
+            'static pthread_once_t s_once = PTHREAD_ONCE_INIT;',
+            'static void preinit_metal_and_mvk(void) {',
+            '  void *dev = MTLCreateSystemDefaultDevice(); (void)dev;',
+            '  const char *mvk_path = getenv("ONE_LAUNCHER_MOLTENVK_PATH");',
+            '  if (mvk_path && mvk_path[0]) dlopen(mvk_path, RTLD_NOW | RTLD_GLOBAL);',
+            '  dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_GLOBAL);',
+            '}',
+            'static void my_CFRunLoopRun(void) {',
+            '  if (pthread_main_np()) pthread_once(&s_once, preinit_metal_and_mvk);',
+            '  CFRunLoopRun();',
+            '}',
+            '__attribute__((used)) static const struct interpose_s interpose_CFRunLoopRun',
+            '  __attribute__((section("__DATA,__interpose"))) = { (void *)my_CFRunLoopRun, (void *)CFRunLoopRun };',
+            '',
+          ].join('\n'),
+          'utf8'
+        );
+      }
+      execFileSync(
+        '/usr/bin/clang',
+        [
+          '-arch',
+          'x86_64',
+          '-dynamiclib',
+          '-O2',
+          '-mmacosx-version-min=11.0',
+          targetCSrc,
+          '-o',
+          extractedDylib,
+          '-framework',
+          'CoreFoundation',
+          '-framework',
+          'Metal',
+        ],
+        { timeout: 5000, stdio: 'ignore' }
+      );
+      if (fs.existsSync(extractedDylib)) {
+        return extractedDylib;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+/**
+ * Resolve the adjacent wineserver / wineserver64 binary for a given Wine executable path.
+ */
+function resolveWineserverBinary(wineBinary) {
+  const binPath =
+    typeof wineBinary === 'object' && wineBinary !== null
+      ? String(wineBinary.binaryPath || '')
+      : String(wineBinary || '');
+  if (!binPath) return null;
+
+  const normalizedBin = path.resolve(binPath);
+  if (/wineserver(?:64)?$/i.test(normalizedBin) && fs.existsSync(normalizedBin)) {
+    return normalizedBin;
+  }
+
+  const binDir = path.dirname(normalizedBin);
+  const parentBinDir = path.resolve(binDir, '..', 'bin');
+  const candidates = [
+    path.join(binDir, 'wineserver'),
+    path.join(binDir, 'wineserver64'),
+    path.join(parentBinDir, 'wineserver'),
+    path.join(parentBinDir, 'wineserver64'),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Cleanly terminate all processes in a Wine prefix (`wineserver -k`) and wait until
+ * `wineserver` and all background prefix daemons (`explorer.exe`, `services.exe`, etc.)
+ * have completely exited and flushed registry state (`wineserver -w`).
+ */
+async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000) {
+  const wineserverBin = resolveWineserverBinary(wineBinary);
+  if (!wineserverBin || !winePrefix) {
+    return false;
+  }
+
+  const prefixEnv = {
+    ...process.env,
+    WINEPREFIX: winePrefix,
+  };
+
+  await new Promise((resolve) => {
+    try {
+      execFile(wineserverBin, ['-k'], { env: prefixEnv, timeout: timeoutMs }, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+
+  await new Promise((resolve) => {
+    try {
+      execFile(wineserverBin, ['-w'], { env: prefixEnv, timeout: timeoutMs }, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+
+  return true;
+}
+
+/**
  * Apply per-game CrossOver 26 settings (Graphics Backend, DLSS, MSync/ESync, High Resolution Mode, HUD overlays)
  * to the launch environment, <bottlePath>/cxbottle.conf, and <bottlePath>/user.reg.
  */
@@ -5502,8 +5746,43 @@ function applyCrossOverPerGameSettings(
   // 4. HUD Overlays (metalHud, dxvkHud)
   if (cfg.metalHud === true) {
     env.MTL_HUD_ENABLED = '1';
+    const candidateWineBin =
+      (chosenLayer && typeof chosenLayer === 'object' && chosenLayer.binaryPath) ||
+      effectiveOptions.wineBinary ||
+      '';
+    if (candidateWineBin && doesWineLayerHaveMoltenVkHudDeadlock(candidateWineBin)) {
+      const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
+      const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
+      if (preloadDylib) {
+        const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
+          .split(':')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (!existingInsert.includes(preloadDylib)) {
+          existingInsert.unshift(preloadDylib);
+        }
+        env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
+        if (moltenVkPath) {
+          env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
+        }
+      } else {
+        delete env.MTL_HUD_ENABLED;
+      }
+    }
   } else if (cfg.metalHud === false) {
     delete env.MTL_HUD_ENABLED;
+    delete env.ONE_LAUNCHER_MOLTENVK_PATH;
+    if (env.DYLD_INSERT_LIBRARIES) {
+      const filteredInsert = String(env.DYLD_INSERT_LIBRARIES)
+        .split(':')
+        .map((s) => s.trim())
+        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
+      if (filteredInsert.length > 0) {
+        env.DYLD_INSERT_LIBRARIES = filteredInsert.join(':');
+      } else {
+        delete env.DYLD_INSERT_LIBRARIES;
+      }
+    }
   }
 
   if (cfg.dxvkHud === true) {
@@ -5785,7 +6064,295 @@ function applyCrossOverPerGameSettings(
     }
   }
 
+  // 7. Clamp any oversized fullscreen resolutions in the Wine prefix's game configs
+  // (e.g., 2x Retina-doubled resolutions saved by older Wine/GPTK layers that exceed
+  // CrossOver 26's maximum display mode and cause SDL_GetClosestDisplayMode -> NULL crashes).
+  if (
+    isBottleDir &&
+    (process.platform === 'darwin' ||
+      effectiveOptions.platform === 'darwin' ||
+      effectiveOptions.sanitizeDisplayConfigs)
+  ) {
+    try {
+      sanitizeWinePrefixDisplayConfigs(resolvedBottlePath, {
+        ...effectiveOptions,
+        ...(typeof cfg.crossoverHighResolutionMode === 'boolean'
+          ? { highResolutionMode: cfg.crossoverHighResolutionMode }
+          : {}),
+      });
+    } catch {}
+  }
+
   return env;
+}
+
+let cachedHostDisplayMetrics = null;
+
+/**
+ * Determine the host display's maximum supported resolution (physical Retina vs logical points).
+ */
+function getHostMaxDisplayResolution(highResolutionMode = true, options = {}) {
+  if (Number(options?.maxWidth) > 0 && Number(options?.maxHeight) > 0) {
+    const mw = Math.round(Number(options.maxWidth));
+    const mh = Math.round(Number(options.maxHeight));
+    const lw = Math.round(Number(options.logicalWidth || mw));
+    const lh = Math.round(Number(options.logicalHeight || mh));
+    return {
+      width: highResolutionMode ? mw : lw,
+      height: highResolutionMode ? mh : lh,
+      nativeWidth: mw,
+      nativeHeight: mh,
+      logicalWidth: lw,
+      logicalHeight: lh,
+    };
+  }
+
+  if (electron.screen && typeof electron.screen.getAllDisplays === 'function') {
+    try {
+      const displays = electron.screen.getAllDisplays();
+      if (Array.isArray(displays) && displays.length > 0) {
+        let maxW = 0;
+        let maxH = 0;
+        let logW = 0;
+        let logH = 0;
+        for (const d of displays) {
+          const w = Number(d?.size?.width || 0);
+          const h = Number(d?.size?.height || 0);
+          const scale = Number(d?.scaleFactor || 1);
+          const physW = Math.round(w * scale);
+          const physH = Math.round(h * scale);
+          if (physW > maxW) {
+            maxW = physW;
+            maxH = physH;
+          }
+          if (w > logW) {
+            logW = Math.round(w);
+            logH = Math.round(h);
+          }
+        }
+        if (maxW > 0 && maxH > 0) {
+          return {
+            width: highResolutionMode ? maxW : logW,
+            height: highResolutionMode ? maxH : logH,
+            nativeWidth: maxW,
+            nativeHeight: maxH,
+            logicalWidth: logW,
+            logicalHeight: logH,
+          };
+        }
+      }
+    } catch {}
+  }
+
+  if (
+    !cachedHostDisplayMetrics &&
+    process.platform === 'darwin' &&
+    !options?.skipDisplayProbe &&
+    !options?.homedir
+  ) {
+    try {
+      const out = execFileSync(
+        'osascript',
+        [
+          '-l',
+          'JavaScript',
+          '-e',
+          'ObjC.import("AppKit"); const screens = $.NSScreen.screens; let maxW = 0, maxH = 0, logW = 0, logH = 0; for (let i = 0; i < screens.count; i++) { const s = screens.objectAtIndex(i); const f = s.frame; const b = s.backingScaleFactor; if (f.size.width * b > maxW) { maxW = Math.round(f.size.width * b); maxH = Math.round(f.size.height * b); } if (f.size.width > logW) { logW = Math.round(f.size.width); logH = Math.round(f.size.height); } } JSON.stringify({ maxW, maxH, logW, logH });',
+        ],
+        { timeout: 1500, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      const parsed = JSON.parse(String(out || '').trim());
+      if (parsed && Number(parsed.maxW) > 0 && Number(parsed.maxH) > 0) {
+        cachedHostDisplayMetrics = {
+          maxW: Math.round(Number(parsed.maxW)),
+          maxH: Math.round(Number(parsed.maxH)),
+          logW: Math.round(Number(parsed.logW || parsed.maxW)),
+          logH: Math.round(Number(parsed.logH || parsed.maxH)),
+        };
+      }
+    } catch {}
+  }
+
+  const metrics = cachedHostDisplayMetrics || {
+    maxW: 3840,
+    maxH: 2160,
+    logW: 1920,
+    logH: 1080,
+  };
+
+  return {
+    width: highResolutionMode ? metrics.maxW : metrics.logW,
+    height: highResolutionMode ? metrics.maxH : metrics.logH,
+    nativeWidth: metrics.maxW,
+    nativeHeight: metrics.maxH,
+    logicalWidth: metrics.logW,
+    logicalHeight: metrics.logH,
+  };
+}
+
+/**
+ * Scan engine configuration files (.cfg, .ini) inside a Wine prefix's user profile directories
+ * (`Saved Games`, `Documents/My Games`, `AppData/Local`) and clamp any saved display resolutions
+ * that exceed the host display's maximum supported resolution.
+ */
+function sanitizeWinePrefixDisplayConfigs(winePrefix, options = {}) {
+  if (!winePrefix || typeof winePrefix !== 'string' || !fs.existsSync(winePrefix)) {
+    return { sanitizedFiles: [], maxWidth: 0, maxHeight: 0 };
+  }
+
+  let highResolutionMode = true;
+  if (typeof options.highResolutionMode === 'boolean') {
+    highResolutionMode = options.highResolutionMode;
+  } else {
+    try {
+      const userRegPath = path.join(winePrefix, 'user.reg');
+      if (fs.existsSync(userRegPath)) {
+        const regHead = fs.readFileSync(userRegPath, 'utf8');
+        if (/^"RetinaMode"\s*=\s*"n"/im.test(regHead)) {
+          highResolutionMode = false;
+        }
+      }
+    } catch {}
+  }
+
+  const displayRes = getHostMaxDisplayResolution(highResolutionMode, options);
+  const maxWidth = Number(options.maxWidth) > 0 ? Math.round(Number(options.maxWidth)) : displayRes.width;
+  const maxHeight = Number(options.maxHeight) > 0 ? Math.round(Number(options.maxHeight)) : displayRes.height;
+
+  const usersDir = path.join(winePrefix, 'drive_c', 'users');
+  if (!fs.existsSync(usersDir)) {
+    return { sanitizedFiles: [], maxWidth, maxHeight };
+  }
+
+  const sanitizedFiles = [];
+  const skippedDirNames = new Set([
+    'public',
+    'steam',
+    'microsoft',
+    'temp',
+    'packages',
+    'cef',
+    'cache',
+    'shadercache',
+    'd3dscache',
+    'crashdumps',
+    'logs',
+  ]);
+
+  const cfgPairs = [
+    ['v_width', 'v_height'],
+    ['r_customwidth', 'r_customheight'],
+    ['r_width', 'r_height'],
+  ];
+  const iniPairs = [
+    ['ResolutionSizeX', 'ResolutionSizeY'],
+    ['LastUserConfirmedResolutionSizeX', 'LastUserConfirmedResolutionSizeY'],
+    ['DesiredScreenWidth', 'DesiredScreenHeight'],
+  ];
+
+  const sanitizeConfigFile = (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext !== '.cfg' && ext !== '.ini') return;
+    try {
+      const st = fs.statSync(filePath);
+      if (!st.isFile() || st.size <= 0 || st.size > 262144) return;
+      const original = fs.readFileSync(filePath, 'utf8');
+      let updated = original;
+      let prevW = 0;
+      let prevH = 0;
+
+      if (ext === '.cfg') {
+        for (const [wKey, hKey] of cfgPairs) {
+          const wRe = new RegExp(`^([ \\t]*(?:seta?\\s+)?${wKey}\\s+")(\\d+)(".*)$`, 'im');
+          const hRe = new RegExp(`^([ \\t]*(?:seta?\\s+)?${hKey}\\s+")(\\d+)(".*)$`, 'im');
+          const wMatch = wRe.exec(updated);
+          const hMatch = hRe.exec(updated);
+          if (wMatch && hMatch) {
+            const w = Number(wMatch[2]);
+            const h = Number(hMatch[2]);
+            if (w > 0 && h > 0 && (w > maxWidth || h > maxHeight)) {
+              prevW = w;
+              prevH = h;
+              updated = updated.replace(wRe, `$1${maxWidth}$3`).replace(hRe, `$1${maxHeight}$3`);
+            }
+          }
+        }
+      } else if (ext === '.ini') {
+        for (const [wKey, hKey] of iniPairs) {
+          const wRe = new RegExp(`^([ \\t]*${wKey}\\s*=\\s*)(\\d+)([ \\t]*)$`, 'im');
+          const hRe = new RegExp(`^([ \\t]*${hKey}\\s*=\\s*)(\\d+)([ \\t]*)$`, 'im');
+          const wMatch = wRe.exec(updated);
+          const hMatch = hRe.exec(updated);
+          if (wMatch && hMatch) {
+            const w = Number(wMatch[2]);
+            const h = Number(hMatch[2]);
+            if (w > 0 && h > 0 && (w > maxWidth || h > maxHeight)) {
+              prevW = w;
+              prevH = h;
+              updated = updated.replace(wRe, `$1${maxWidth}$3`).replace(hRe, `$1${maxHeight}$3`);
+            }
+          }
+        }
+      }
+
+      if (updated !== original) {
+        atomicWriteFileSync(filePath, updated);
+        sanitizedFiles.push({
+          filePath,
+          previousWidth: prevW,
+          previousHeight: prevH,
+          clampedWidth: maxWidth,
+          clampedHeight: maxHeight,
+        });
+      }
+    } catch {}
+  };
+
+  const walkConfigDir = (dirPath, depth = 0) => {
+    if (depth > 5 || !dirPath || !fs.existsSync(dirPath)) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        if (skippedDirNames.has(entry.name.toLowerCase())) continue;
+        walkConfigDir(fullPath, depth + 1);
+      } else if (entry.isFile()) {
+        sanitizeConfigFile(fullPath);
+      }
+    }
+  };
+
+  let userEntries = [];
+  try {
+    userEntries = fs.readdirSync(usersDir, { withFileTypes: true });
+  } catch {
+    return { sanitizedFiles, maxWidth, maxHeight };
+  }
+
+  for (const userEntry of userEntries) {
+    if (!userEntry.isDirectory() || userEntry.name.startsWith('.')) continue;
+    if (userEntry.name.toLowerCase() === 'public') continue;
+    const userRoot = path.join(usersDir, userEntry.name);
+    const configRoots = [
+      path.join(userRoot, 'Saved Games'),
+      path.join(userRoot, 'Documents', 'My Games'),
+      path.join(userRoot, 'My Documents', 'My Games'),
+      path.join(userRoot, 'AppData', 'Local'),
+    ];
+    for (const root of configRoots) {
+      if (fs.existsSync(root)) {
+        walkConfigDir(root, 0);
+      }
+    }
+  }
+
+  return { sanitizedFiles, maxWidth, maxHeight };
 }
 
 /**
@@ -5889,7 +6456,12 @@ async function ensureCompatibilityLayerReady(chosenLayer, launchConfig = {}, env
       options
     );
 
-    return { targetBottle, winePrefix: env.WINEPREFIX };
+    return {
+      targetBottle,
+      winePrefix: env.WINEPREFIX,
+      wineBinary: chosenLayer.binaryPath,
+      wineserverBinary: resolveWineserverBinary(chosenLayer.binaryPath),
+    };
   }
 
   let targetPrefix;
@@ -5940,7 +6512,11 @@ async function ensureCompatibilityLayerReady(chosenLayer, launchConfig = {}, env
     options
   );
 
-  return { winePrefix: targetPrefix };
+  return {
+    winePrefix: targetPrefix,
+    wineBinary: chosenLayer.binaryPath,
+    wineserverBinary: resolveWineserverBinary(chosenLayer.binaryPath),
+  };
 }
 
 /**
@@ -6362,6 +6938,8 @@ async function launchGame(payload = {}, options = {}) {
       let spawnCmd = resolvedExePath;
       let spawnArgs = [...args];
       let actualLaunchMethod = 'direct';
+      let compatResult = null;
+      let chosenCompatLayer = null;
 
       if (useCompatLayer) {
         const layers = detectCompatibilityLayers(options);
@@ -6384,7 +6962,12 @@ async function launchGame(payload = {}, options = {}) {
             };
           }
         } else {
-          await ensureCompatibilityLayerReady(chosenLayer, launchConfig, env, options);
+          compatResult = await ensureCompatibilityLayerReady(
+            chosenLayer,
+            launchConfig,
+            env,
+            options
+          );
 
           if (chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview') {
             const resolvedBottleDir =
@@ -6402,9 +6985,99 @@ async function launchGame(payload = {}, options = {}) {
               if (fallbackLayer) {
                 chosenLayer = fallbackLayer;
                 delete env.CX_BOTTLE;
-                await ensureCompatibilityLayerReady(chosenLayer, launchConfig, env, options);
+                compatResult = await ensureCompatibilityLayerReady(
+                  chosenLayer,
+                  launchConfig,
+                  env,
+                  options
+                );
               }
             }
+          }
+
+          chosenCompatLayer = chosenLayer;
+
+          // Guard against Apple libMTLHud.dylib + older libMoltenVK.dylib static initializer deadlock
+          // by injecting libone_metal_preload.dylib (`CFRunLoopRun` interpose on Thread 0) so Metal HUD
+          // remains enabled and functional without deadlocking.
+          if (
+            env.MTL_HUD_ENABLED === '1' &&
+            chosenLayer.binaryPath &&
+            doesWineLayerHaveMoltenVkHudDeadlock(chosenLayer.binaryPath)
+          ) {
+            const preloadDylib = ensureWineMetalPreloadDylib(options);
+            const moltenVkPath = resolveWineLayerMoltenVkPath(chosenLayer.binaryPath);
+            if (preloadDylib) {
+              const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
+                .split(':')
+                .map((s) => s.trim())
+                .filter(Boolean);
+              if (!existingInsert.includes(preloadDylib)) {
+                existingInsert.unshift(preloadDylib);
+              }
+              env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
+              if (moltenVkPath) {
+                env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
+              }
+            } else {
+              delete env.MTL_HUD_ENABLED;
+            }
+          }
+
+          // Pre-launch Wine prefix hygiene: if no other active game session is running in this prefix,
+          // terminate any orphaned game executable or lingering wineserver/explorer.exe from a previous session.
+          const targetWinePrefix = compatResult?.winePrefix || env.WINEPREFIX || null;
+          const hasOtherActiveSessionInPrefix =
+            Boolean(targetWinePrefix) &&
+            Array.from(activeSessions.entries()).some(
+              ([activeId, activeEntry]) =>
+                activeId !== gameId &&
+                !activeEntry.finalized &&
+                activeEntry.winePrefix &&
+                path.resolve(activeEntry.winePrefix) === path.resolve(targetWinePrefix)
+            );
+
+          if (!hasOtherActiveSessionInPrefix) {
+            if (
+              !options.homedir &&
+              resolvedExePath &&
+              resolvedExePath.toLowerCase().endsWith('.exe')
+            ) {
+              const exeBase = path.basename(resolvedExePath);
+              if (exeBase && exeBase.length > 3) {
+                await new Promise((resolve) => {
+                  try {
+                    execFile('pkill', ['-KILL', '-f', exeBase], { timeout: 1000 }, () => resolve());
+                  } catch {
+                    resolve();
+                  }
+                });
+              }
+            }
+
+            const candidateWineserver = resolveWineserverBinary(chosenLayer.binaryPath);
+            const canRunWineserver =
+              Boolean(candidateWineserver && targetWinePrefix) &&
+              (!options.homedir ||
+                candidateWineserver.startsWith(options.homedir) ||
+                candidateWineserver.startsWith(os.tmpdir()) ||
+                candidateWineserver.startsWith('/private/var/folders') ||
+                candidateWineserver.startsWith('/var/folders'));
+
+            if (canRunWineserver) {
+              await shutdownWinePrefix(chosenLayer.binaryPath, targetWinePrefix, 2000);
+            }
+          }
+
+          if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
+            try {
+              sanitizeWinePrefixDisplayConfigs(targetWinePrefix, {
+                ...options,
+                ...(typeof launchConfig.crossoverHighResolutionMode === 'boolean'
+                  ? { highResolutionMode: launchConfig.crossoverHighResolutionMode }
+                  : {}),
+              });
+            } catch {}
           }
 
           if (payload.platformId === 'steam') {
@@ -6528,15 +7201,28 @@ async function launchGame(payload = {}, options = {}) {
               status: 'running',
             };
 
+            const resolvedWineBinary =
+              useCompatLayer && chosenCompatLayer ? chosenCompatLayer.binaryPath || null : null;
+            const resolvedWineserverBinary = resolvedWineBinary
+              ? resolveWineserverBinary(resolvedWineBinary)
+              : null;
+            const resolvedWinePrefix = useCompatLayer
+              ? compatResult?.winePrefix || env.WINEPREFIX || null
+              : null;
+
             const entry = {
               session,
               child,
               startedMs: Date.now(),
               postExitCommand: launchConfig.postExitCommand,
               finalized: false,
+              stopping: false,
               stderrBuffer: '',
               exitCode: null,
               stoppedByUser: false,
+              wineBinary: resolvedWineBinary,
+              wineserverBinary: resolvedWineserverBinary,
+              winePrefix: resolvedWinePrefix,
             };
 
             if (child.stderr) {
@@ -6554,9 +7240,16 @@ async function launchGame(payload = {}, options = {}) {
               if (entry.exitCode === null || entry.exitCode === undefined) {
                 entry.exitCode = typeof code === 'number' ? code : 0;
               }
+              if (entry.stopping) {
+                return;
+              }
               if (child.stderr && !child.stderr.destroyed && child.stderr.readable) {
-                child.once('close', () => finalizeGameSession(gameId));
-                const flushTimer = setTimeout(() => finalizeGameSession(gameId), 50);
+                child.once('close', () => {
+                  if (!entry.stopping) finalizeGameSession(gameId);
+                });
+                const flushTimer = setTimeout(() => {
+                  if (!entry.stopping) finalizeGameSession(gameId);
+                }, 50);
                 if (typeof flushTimer.unref === 'function') flushTimer.unref();
               } else {
                 finalizeGameSession(gameId);
@@ -6566,7 +7259,9 @@ async function launchGame(payload = {}, options = {}) {
             child.on('error', (err) => {
               entry.exitCode = -1;
               entry.stderrBuffer += '\n' + (err && err.message ? err.message : String(err));
-              finalizeGameSession(gameId);
+              if (!entry.stopping) {
+                finalizeGameSession(gameId);
+              }
             });
 
             const startupWaitMs =
@@ -6657,10 +7352,14 @@ async function launchGame(payload = {}, options = {}) {
       startedMs: Date.now(),
       postExitCommand: launchConfig.postExitCommand,
       finalized: false,
+      stopping: false,
       pollTimer: null,
       stderrBuffer: '',
       exitCode: null,
       stoppedByUser: false,
+      wineBinary: null,
+      wineserverBinary: null,
+      winePrefix: null,
     };
 
     // Optional background process tree monitor when installPath is known
@@ -6723,8 +7422,51 @@ async function launchGame(payload = {}, options = {}) {
   }
 }
 
+function isProcessAlive(pid) {
+  if (!pid || typeof pid !== 'number' || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM');
+  }
+}
+
+async function waitForProcessExit(child, pid, timeoutMs = 400) {
+  if (!pid || !isProcessAlive(pid)) return true;
+  return new Promise((resolve) => {
+    let done = false;
+    let pollTimer = null;
+    let timeoutTimer = null;
+    const finish = (exited) => {
+      if (done) return;
+      done = true;
+      if (pollTimer) clearInterval(pollTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (child && typeof child.removeListener === 'function') {
+        child.removeListener('exit', onExit);
+      }
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    if (child && typeof child.once === 'function') {
+      child.once('exit', onExit);
+    }
+    pollTimer = setInterval(() => {
+      if (!isProcessAlive(pid)) {
+        finish(true);
+      }
+    }, 25);
+    if (typeof pollTimer.unref === 'function') pollTimer.unref();
+    timeoutTimer = setTimeout(() => {
+      finish(!isProcessAlive(pid));
+    }, timeoutMs);
+    if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
+  });
+}
+
 /**
- * Stop a running game session cleanly (SIGTERM -> SIGKILL fallback)
+ * Stop a running game session cleanly (SIGTERM -> wineserver -k/-w teardown -> SIGKILL fallback)
  */
 async function stopGame(request = {}, options = {}) {
   try {
@@ -6756,6 +7498,7 @@ async function stopGame(request = {}, options = {}) {
       };
     }
 
+    targetEntry.stopping = true;
     targetEntry.stoppedByUser = true;
     targetEntry.session.status = 'stopping';
     emitSessionUpdated({
@@ -6763,46 +7506,74 @@ async function stopGame(request = {}, options = {}) {
       event: 'stopping',
     });
 
-    if (
-      process.platform !== 'win32' &&
-      !options.homedir &&
-      !reqObj.homedir &&
-      targetEntry.session?.executablePath &&
-      targetEntry.session.executablePath.toLowerCase().endsWith('.exe')
-    ) {
-      const exeBase = path.basename(targetEntry.session.executablePath);
-      if (exeBase && exeBase.length > 3) {
+    const isTestHomedir = Boolean(options.homedir || reqObj.homedir);
+    const exePath = targetEntry.session?.executablePath || '';
+    const exeBase =
+      process.platform !== 'win32' && exePath.toLowerCase().endsWith('.exe')
+        ? path.basename(exePath)
+        : '';
+
+    if (!isTestHomedir && exeBase && exeBase.length > 3) {
+      await new Promise((resolve) => {
         try {
-          execFile('pkill', ['-f', exeBase], () => {});
-        } catch {}
-      }
+          execFile('pkill', ['-TERM', '-f', exeBase], { timeout: 1000 }, () => resolve());
+        } catch {
+          resolve();
+        }
+      });
     }
 
-    if (targetEntry.child && targetEntry.child.pid) {
-      const pid = targetEntry.child.pid;
+    const pid = targetEntry.child && targetEntry.child.pid ? targetEntry.child.pid : null;
+    if (pid) {
       try {
         process.kill(pid, 'SIGTERM');
       } catch {}
+    }
 
-      // Wait briefly for process to terminate gracefully, then SIGKILL if still running
-      await new Promise((resolve) => {
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          resolve();
-        };
-        if (targetEntry.child) {
-          targetEntry.child.once('exit', finish);
+    // If this session was launched via a Wine compatibility layer, cleanly shut down wineserver
+    // (unless another active game session is currently running in the same Wine prefix).
+    const sessionWinePrefix = targetEntry.winePrefix || null;
+    const sessionWineBin = targetEntry.wineserverBinary || targetEntry.wineBinary || null;
+    if (process.platform !== 'win32' && sessionWinePrefix && sessionWineBin) {
+      const hasOtherActiveSessionInPrefix = Array.from(activeSessions.entries()).some(
+        ([k, e]) =>
+          k !== targetKey &&
+          !e.finalized &&
+          e.winePrefix &&
+          path.resolve(e.winePrefix) === path.resolve(sessionWinePrefix)
+      );
+      if (!hasOtherActiveSessionInPrefix) {
+        const resolvedWineserver = resolveWineserverBinary(sessionWineBin);
+        const canRunWineserver =
+          Boolean(resolvedWineserver) &&
+          (!isTestHomedir ||
+            resolvedWineserver.startsWith(options.homedir || reqObj.homedir || '') ||
+            resolvedWineserver.startsWith(os.tmpdir()) ||
+            resolvedWineserver.startsWith('/private/var/folders') ||
+            resolvedWineserver.startsWith('/var/folders'));
+        if (canRunWineserver) {
+          await shutdownWinePrefix(resolvedWineserver, sessionWinePrefix, 2500);
         }
-        const timer = setTimeout(() => {
-          try {
-            process.kill(pid, 'SIGKILL');
-          } catch {}
-          finish();
-        }, 400);
-        if (typeof timer.unref === 'function') timer.unref();
-      });
+      }
+    }
+
+    if (pid) {
+      const exitedGracefully = await waitForProcessExit(targetEntry.child, pid, 500);
+      if (!exitedGracefully && isProcessAlive(pid)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {}
+        if (!isTestHomedir && exeBase && exeBase.length > 3) {
+          await new Promise((resolve) => {
+            try {
+              execFile('pkill', ['-KILL', '-f', exeBase], { timeout: 1000 }, () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+        await waitForProcessExit(targetEntry.child, pid, 400);
+      }
     }
 
     const result = finalizeGameSession(targetKey) || {
@@ -11679,6 +12450,13 @@ module.exports = {
   updateCompatibilityLayer,
   ensureCompatibilityLayerReady,
   applyCrossOverPerGameSettings,
+  getHostMaxDisplayResolution,
+  sanitizeWinePrefixDisplayConfigs,
+  resolveWineLayerMoltenVkPath,
+  doesWineLayerHaveMoltenVkHudDeadlock,
+  ensureWineMetalPreloadDylib,
+  resolveWineserverBinary,
+  shutdownWinePrefix,
 
   // C) Launcher & Session Manager
   launchGame,
