@@ -28,8 +28,22 @@
         { "target": "dmg", "arch": ["arm64"] },
         { "target": "dir", "arch": ["arm64"] }
       ],
+      "files": [
+        "!electron/bin/**/win32/**"
+      ],
+      "asarUnpack": [
+        "electron/bin/*/darwin/**/*",
+        "electron/helpers/**/*"
+      ],
       "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "One Launcher uses your local network to support multiplayer games and storefront services.",
+        "NSDocumentsFolderUsageDescription": "One Launcher accesses your Documents folder to read and sync game configuration and save files.",
+        "NSDownloadsFolderUsageDescription": "One Launcher accesses your Downloads folder when importing game installers.",
+        "NSDesktopFolderUsageDescription": "One Launcher accesses your Desktop folder when managing game shortcuts.",
+        "NSRemovableVolumesUsageDescription": "One Launcher accesses external drives to scan and launch games installed on removable storage."
+      }
     },
     "dmg": {
       "icon": "build/icon.icns"
@@ -39,6 +53,13 @@
       "target": [
         { "target": "nsis", "arch": ["x64"] },
         { "target": "dir", "arch": ["x64"] }
+      ],
+      "files": [
+        "!electron/bin/**/darwin/**",
+        "!electron/helpers/**"
+      ],
+      "asarUnpack": [
+        "electron/bin/*/win32/**/*"
       ]
     },
     "nsis": {
@@ -55,10 +76,6 @@
       "dist/**/*",
       "electron/**/*",
       "package.json"
-    ],
-    "asarUnpack": [
-      "electron/bin/**/*",
-      "electron/helpers/**/*"
     ],
     "directories": {
       "output": "release"

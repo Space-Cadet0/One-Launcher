@@ -243,7 +243,7 @@ export function isPlaceholderDesc(desc?: string, title?: string): boolean {
 }
 
 export const NON_GAME_CATALOG_TITLE_REGEX =
-  /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|alpha version|legacy mode|pre-game editor|resource archiver|digital goodies|goodies collection|goodie pack|digital comics|playable teaser|prologue|redistributables)\b|\bcontent$|\bdlc$|[a-z0-9]+beta$|^sin multiplayer$/i;
+  /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|alpha version|legacy mode|pre-game editor|resource archiver|digital goodies|goodies collection|goodie pack|digital comics|playable teaser|prologue|redistributables)\b|\bcontent$|\bdlc$|[a-z0-9]+beta$|\b(?:dedicated server|multiplayer client)$|\s+multiplayer$/i;
 
 export function isNonGameCatalogEntry(game: CanonicalGame): boolean {
   const title = (game.title || '').trim();
@@ -258,7 +258,7 @@ export function getNonGameSuppressionReason(game: CanonicalGame): string {
   const title = (game.title || '').trim();
   const lower = title.toLowerCase();
   if (
-    /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|legacy mode)\b|[a-z0-9]+beta$|^sin multiplayer$/i.test(
+    /\b(tech beta|closed beta|open beta|public testing|playtest|test branch|legacy mode)\b|[a-z0-9]+beta$|\b(?:dedicated server|multiplayer client)$|\s+multiplayer$/i.test(
       title
     )
   ) {

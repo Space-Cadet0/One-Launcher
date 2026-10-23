@@ -208,8 +208,21 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     !isFullScreen;
 
   useEffect(() => {
+    const computeQueueSig = (q: ReturnType<typeof launcherService.getDownloadQueue>) =>
+      q
+        .map(
+          (t) =>
+            `${t.taskId}:${t.status}:${Math.round(t.progressPercent || 0)}:${Math.round((t.speedBytesPerSec || 0) / 1024)}`
+        )
+        .join('|');
+    let prevSig = computeQueueSig(launcherService.getDownloadQueue());
     const unsub = launcherService.subscribe(() => {
-      setDownloadQueue([...launcherService.getDownloadQueue()]);
+      const nextQueue = launcherService.getDownloadQueue();
+      const nextSig = computeQueueSig(nextQueue);
+      if (nextSig !== prevSig) {
+        prevSig = nextSig;
+        setDownloadQueue([...nextQueue]);
+      }
     });
     return unsub;
   }, []);

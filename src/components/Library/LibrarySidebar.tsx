@@ -11,6 +11,7 @@ import {
   addPendingFastScrollMount,
   removePendingFastScrollMount,
 } from './LibraryGridView';
+import { isUserActivelyScrolling } from '../../utils/scrollActivityTracker';
 import {
   Gamepad2,
   CheckCircle2,
@@ -31,8 +32,10 @@ import {
 } from 'lucide-react';
 
 import { ActiveGameFilter } from '../../contracts/filter';
+import { ActiveGameSession } from '../../contracts/launcher';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { igdbCoverService, isKnownDeadSteamCover } from '../../services/igdb/igdbCoverService';
+import { launcherService } from '../../services/launcher/launcherService';
 import { steamApi } from '../../services/steam/steamApi';
 
 const COLLAPSED_STORAGE_KEY = 'antigravity_library_collapsed_groups';
@@ -334,7 +337,8 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   const [groupByCollections, setGroupByCollections] = useState(true);
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>(() => {
     try {
-      const saved = localStorage.getItem(COLLAPSED_STORAGE_KEY);
+      const saved =
+        typeof localStorage !== 'undefined' ? localStorage.getItem(COLLAPSED_STORAGE_KEY) : null;
       if (saved) {
         return JSON.parse(saved);
       }
@@ -346,7 +350,37 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
 
   const [isStoresDropdownOpen, setIsStoresDropdownOpen] = useState(false);
   const [hoveredRowKey, setHoveredRowKey] = useState<string | null>(null);
+  const [, setLauncherTick] = useState(0);
   const storesDropdownRef = useRef<HTMLDivElement>(null);
+  const lastLauncherSigRef = useRef<string>('');
+
+  useEffect(() => {
+    const computeSig = () => {
+      const runningSig = launcherService
+        .getRunningGames()
+        .map((s) => `${s.gameId}:${s.status}`)
+        .sort()
+        .join('|');
+      const completedSig = launcherService
+        .getDownloadQueue()
+        .filter((t) => t.status === 'completed')
+        .map((t) => t.gameId)
+        .sort()
+        .join('|');
+      return `${runningSig}##${completedSig}`;
+    };
+    lastLauncherSigRef.current = computeSig();
+    const unsub = launcherService.subscribe(() => {
+      const nextSig = computeSig();
+      if (nextSig !== lastLauncherSigRef.current) {
+        lastLauncherSigRef.current = nextSig;
+        setLauncherTick((t) => t + 1);
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, []);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -458,12 +492,19 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     [collections]
   );
 
+  const runningSessionByGameId = new Map<string, ActiveGameSession>();
+  for (const session of launcherService.getRunningGames()) {
+    runningSessionByGameId.set(session.gameId, session);
+  }
+
   let sidebarRenderedRowIdx = 0;
 
   const renderGameRow = (game: CanonicalGame, idx?: number) => {
     const currentRowIdx = sidebarRenderedRowIdx++;
     const isSelected = game.id === selectedGameId;
-    const isInstalled = game.platforms.some((p) => p.installed);
+    const activeSession = runningSessionByGameId.get(game.id);
+    const isInstalled =
+      game.platforms.some((p) => p.installed) || launcherService.isGameInstalled(game);
     const isFav = favoriteIdsSet.has(game.id);
     const platformSig =
       game.platforms?.map((p) => `${p.platformId}:${p.platformGameId}`).join('|') || '';
@@ -475,9 +516,26 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         key={rowKey}
         onClick={() => onSelectGame(game)}
         onMouseEnter={() => {
-          if (currentRowIdx > 28) setHoveredRowKey(rowKey);
+          if (
+            currentRowIdx > 28 &&
+            hoveredRowKey !== rowKey &&
+            !isCurrentlyFastScrolling() &&
+            !isUserActivelyScrolling()
+          ) {
+            setHoveredRowKey(rowKey);
+          }
         }}
-        className={`cv-sidebar-row relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-colors group select-none ${
+        onMouseMove={() => {
+          if (
+            currentRowIdx > 28 &&
+            hoveredRowKey !== rowKey &&
+            !isCurrentlyFastScrolling() &&
+            !isUserActivelyScrolling()
+          ) {
+            setHoveredRowKey(rowKey);
+          }
+        }}
+        className={`${currentRowIdx > 28 ? 'cv-sidebar-row cv-sidebar-row-deferred' : 'cv-sidebar-row'} relative px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-colors group select-none ${
           isSelected
             ? 'bg-[#223547] text-white border-l-4 border-steam-accent shadow-inner'
             : 'text-steam-text hover:bg-[#1a212b] hover:text-white border-l-4 border-transparent'
@@ -496,11 +554,42 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             >
               {game.title}
             </span>
-            {isInstalled && (
-              <span
-                className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
-                title="Installed Locally"
-              />
+            {activeSession ? (
+              activeSession.status === 'starting' ? (
+                <span
+                  data-testid={`sidebar-session-status-${game.id}`}
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold text-sky-300 flex-shrink-0"
+                  title="Starting game..."
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                  <span>Starting</span>
+                </span>
+              ) : activeSession.status === 'stopping' ? (
+                <span
+                  data-testid={`sidebar-session-status-${game.id}`}
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-300 flex-shrink-0"
+                  title="Stopping & syncing cloud saves..."
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  <span>Stopping</span>
+                </span>
+              ) : (
+                <span
+                  data-testid={`sidebar-session-status-${game.id}`}
+                  className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-300 flex-shrink-0"
+                  title="Currently Running"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Running</span>
+                </span>
+              )
+            ) : (
+              isInstalled && (
+                <span
+                  className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
+                  title="Installed Locally"
+                />
+              )
             )}
             {game.platforms.length > 0 && game.platforms.every((p) => !connectedSet.has(p.platformId)) && (
               <span

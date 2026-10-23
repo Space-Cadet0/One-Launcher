@@ -653,7 +653,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 animate-in fade-in duration-150">
       <div className="bg-[#1b2838] border border-steam-border rounded-lg shadow-2xl max-w-2xl w-full overflow-hidden text-steam-text flex flex-col max-h-[90vh]">
         {/* Modal Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-steam-border/60 bg-[#16202d]">
@@ -1085,7 +1085,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                             type="text"
                             value={epicInput}
                             onChange={(e) => setEpicInput(e.target.value)}
-                            placeholder="e.g. 8aaea3405ecc4c7b8786012029e98d6a or https://store.epicgames.com/u/..."
+                            placeholder="e.g. a1b2c3d4e5f60718293a4b5c6d7e8f90 or https://store.epicgames.com/u/..."
                             className="w-full px-3 py-1.5 bg-[#0d1218] border border-steam-border rounded text-xs text-white font-mono"
                           />
                         </div>
@@ -1151,7 +1151,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
       {/* Disconnect Confirmation Warning Dialog */}
       {confirmDisconnectStore && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in duration-150">
+        <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/90 animate-in fade-in duration-150">
           <div className="bg-[#1b2838] border border-red-500/60 rounded-lg shadow-2xl max-w-md w-full overflow-hidden text-steam-text p-6 space-y-4 animate-in zoom-in-95 duration-150">
             <div className="flex items-start gap-3.5">
               <div className="p-2.5 rounded-full bg-red-950/80 border border-red-500/60 text-red-400 shrink-0">

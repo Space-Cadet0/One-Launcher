@@ -47,3 +47,9 @@ lerna-debug.log*
 # Cache
 .cache/
 cache/
+
+# Auth & Token Files (Defense in Depth)
+tokens.json
+*tokens*.json
+auth.json
+user.json

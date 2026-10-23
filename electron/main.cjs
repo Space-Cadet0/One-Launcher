@@ -1,9 +1,11 @@
-const { app, BrowserWindow, ipcMain, session, nativeImage, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, session, nativeImage, Menu, Tray } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
 const storeSync = require('./storeSync.cjs');
 const launcherEngine = require('./launcherEngine.cjs');
+const { registerLauncherIpcHandlers } = require('./ipc/launcherIpcHandlers.cjs');
+const { registerWindowAndSystemIpcHandlers } = require('./ipc/windowAndSystemIpcHandlers.cjs');
 
 // Ensure videos and embedded trailers autoplay smoothly without requiring user gesture
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -15,6 +17,11 @@ if (process.platform === 'darwin' && app && app.commandLine && typeof app.comman
 }
 
 let mainWindow = null;
+let appTray = null;
+let isZeroRendererDaemonActive = false;
+let zeroRendererTeardownTimer = null;
+let postGameExitTimer = null;
+
 launcherEngine.setMainWindowGetter(() => mainWindow);
 
 function getAppIconPath() {
@@ -24,6 +31,271 @@ function getAppIconPath() {
   const fallback = path.join(__dirname, '../build', ext);
   return fs.existsSync(fallback) ? fallback : undefined;
 }
+
+function restoreOrCreateMainWindow() {
+  isZeroRendererDaemonActive = false;
+  if (zeroRendererTeardownTimer) {
+    clearTimeout(zeroRendererTeardownTimer);
+    zeroRendererTeardownTimer = null;
+  }
+  if (process.platform === 'darwin' && app.dock && typeof app.dock.show === 'function') {
+    try {
+      app.dock.show();
+    } catch {}
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    return;
+  }
+  try {
+    mainWindow.webContents.setAudioMuted(false);
+    mainWindow.webContents.send('launcher:hibernate-state', {
+      hibernating: false,
+      inGame: (launcherEngine.getRunningGames() || []).length > 0,
+    });
+  } catch {}
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  if (!mainWindow.isVisible()) {
+    mainWindow.show();
+  }
+  mainWindow.focus();
+}
+
+function updateAppTrayMenu() {
+  if (!appTray) return;
+  try {
+    const runningGames = launcherEngine.getRunningGames() || [];
+    const activeGame = runningGames[0] || null;
+    const template = [
+      {
+        label: activeGame ? `Playing: ${activeGame.title || activeGame.gameId}` : 'One Launcher — Idle',
+        enabled: false,
+      },
+      { type: 'separator' },
+      {
+        label: 'Restore One Launcher',
+        click: () => {
+          restoreOrCreateMainWindow();
+        },
+      },
+      ...(activeGame
+        ? [
+            {
+              label: 'Stop Running Game',
+              click: () => {
+                launcherEngine.stopGame({ gameId: activeGame.gameId }).catch(() => {});
+              },
+            },
+          ]
+        : []),
+      { type: 'separator' },
+      {
+        label: 'Quit One Launcher',
+        click: () => {
+          isZeroRendererDaemonActive = false;
+          app.quit();
+        },
+      },
+    ];
+    const contextMenu = Menu.buildFromTemplate(template);
+    appTray.setContextMenu(contextMenu);
+    appTray.setToolTip(
+      activeGame ? `One Launcher — Playing: ${activeGame.title || activeGame.gameId}` : 'One Launcher'
+    );
+  } catch {}
+}
+
+function ensureAppTray() {
+  if (appTray) {
+    updateAppTrayMenu();
+    return appTray;
+  }
+  if (!Tray) return null;
+  try {
+    const iconPath = getAppIconPath();
+    let trayImg = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    if (trayImg && !trayImg.isEmpty() && typeof trayImg.resize === 'function') {
+      trayImg = trayImg.resize({ width: 18, height: 18 });
+    }
+    appTray = new Tray(trayImg);
+    appTray.on('click', () => {
+      if (process.platform !== 'darwin') {
+        restoreOrCreateMainWindow();
+      }
+    });
+    updateAppTrayMenu();
+    return appTray;
+  } catch {
+    return null;
+  }
+}
+
+launcherEngine.setSessionLifecycleHook((gameId, eventPayload) => {
+  try {
+    updateAppTrayMenu();
+    const eventType = eventPayload && eventPayload.event;
+    if (!eventType) return;
+
+    const rawGameLaunchCfg = launcherEngine.getGameLaunchConfig(gameId);
+    const activePlatformId = eventPayload?.session?.platformId || eventPayload?.platformId;
+    const gameLaunchCfg = launcherEngine.resolvePlatformLaunchConfig(rawGameLaunchCfg, activePlatformId);
+    const effectivePolicy = launcherEngine.resolveEffectivePerformancePolicy(gameLaunchCfg);
+
+    if (eventType === 'started') {
+      if (postGameExitTimer) {
+        clearTimeout(postGameExitTimer);
+        postGameExitTimer = null;
+      }
+      if (zeroRendererTeardownTimer) {
+        clearTimeout(zeroRendererTeardownTimer);
+        zeroRendererTeardownTimer = null;
+      }
+
+      const memTrimTimer = setTimeout(() => {
+        try {
+          launcherEngine.trimLauncherEngineMemory();
+        } catch {}
+      }, 3000);
+      if (typeof memTrimTimer.unref === 'function') {
+        memTrimTimer.unref();
+      }
+
+      const mode = effectivePolicy.inGameLauncherBehavior;
+      if (mode === 'keep_open') {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            mainWindow.webContents.send('launcher:hibernate-state', {
+              hibernating: false,
+              inGame: true,
+              mode: 'keep_open',
+              gameTitle: eventPayload.title,
+            });
+          } catch {}
+        }
+      } else if (mode === 'minimize_taskbar') {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            mainWindow.webContents.send('launcher:hibernate-state', {
+              hibernating: false,
+              inGame: true,
+              mode: 'minimize_taskbar',
+              gameTitle: eventPayload.title,
+            });
+          } catch {}
+          mainWindow.minimize();
+        }
+      } else if (mode === 'hide_tray_hibernate') {
+        ensureAppTray();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            mainWindow.webContents.send('launcher:hibernate-state', {
+              hibernating: true,
+              inGame: true,
+              mode: 'hide_tray_hibernate',
+              gameTitle: eventPayload.title,
+            });
+            mainWindow.webContents.setAudioMuted(true);
+            mainWindow.webContents.setBackgroundThrottling(true);
+          } catch {}
+          mainWindow.hide();
+        }
+        launcherEngine.trimLauncherEngineMemory();
+      } else if (mode === 'zero_renderer_daemon') {
+        isZeroRendererDaemonActive = true;
+        ensureAppTray();
+        zeroRendererTeardownTimer = setTimeout(() => {
+          zeroRendererTeardownTimer = null;
+          if ((launcherEngine.getRunningGames() || []).length === 0) return;
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            try {
+              mainWindow.destroy();
+            } catch {}
+            mainWindow = null;
+          }
+          launcherEngine.trimLauncherEngineMemory();
+        }, 1500);
+        if (typeof zeroRendererTeardownTimer.unref === 'function') {
+          zeroRendererTeardownTimer.unref();
+        }
+      }
+    } else if (eventType === 'stopped') {
+      const remainingGames = launcherEngine.getRunningGames() || [];
+      if (remainingGames.length > 0) return;
+
+      if (zeroRendererTeardownTimer) {
+        clearTimeout(zeroRendererTeardownTimer);
+        zeroRendererTeardownTimer = null;
+      }
+
+      const postAction = effectivePolicy.postGameLauncherBehavior;
+      if (postAction === 'exit_launcher') {
+        if (postGameExitTimer) clearTimeout(postGameExitTimer);
+        const startedWaitMs = Date.now();
+        const maxWaitMs = 60000;
+        const attemptPostGameExit = () => {
+          postGameExitTimer = null;
+          if ((launcherEngine.getRunningGames() || []).length > 0) {
+            return;
+          }
+          const hasActiveDownloads = (launcherEngine.getDownloadQueue() || []).some((t) =>
+            ['downloading', 'queued', 'extracting', 'verifying'].includes(t && t.status)
+          );
+          const hasPausedInGameDownloads =
+            typeof launcherEngine.getPausedByInGameTaskIds === 'function' &&
+            (launcherEngine.getPausedByInGameTaskIds() || []).length > 0;
+          if (hasActiveDownloads || hasPausedInGameDownloads) {
+            return;
+          }
+          const hasPostWork =
+            typeof launcherEngine.hasActivePostSessionWork === 'function' &&
+            launcherEngine.hasActivePostSessionWork();
+          if (hasPostWork && Date.now() - startedWaitMs < maxWaitMs) {
+            postGameExitTimer = setTimeout(attemptPostGameExit, 200);
+            if (typeof postGameExitTimer.unref === 'function') {
+              postGameExitTimer.unref();
+            }
+            return;
+          }
+          isZeroRendererDaemonActive = false;
+          app.quit();
+        };
+        postGameExitTimer = setTimeout(attemptPostGameExit, 1500);
+        if (typeof postGameExitTimer.unref === 'function') {
+          postGameExitTimer.unref();
+        }
+      } else if (postAction === 'stay_minimized') {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            mainWindow.webContents.setAudioMuted(false);
+            mainWindow.webContents.send('launcher:hibernate-state', {
+              hibernating: false,
+              inGame: false,
+            });
+          } catch {}
+        }
+      } else {
+        // Default: 'restore_window'
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            mainWindow.webContents.send('launcher:hibernate-state', {
+              hibernating: false,
+              inGame: false,
+            });
+          } catch {}
+        }
+        if (
+          effectivePolicy.inGameLauncherBehavior !== 'keep_open' ||
+          !mainWindow ||
+          mainWindow.isDestroyed()
+        ) {
+          restoreOrCreateMainWindow();
+        }
+      }
+    }
+  } catch {}
+});
 
 function createMainWindow() {
   const isMac = process.platform === 'darwin';
@@ -147,10 +419,7 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    restoreOrCreateMainWindow();
   });
 
   try {
@@ -319,19 +588,28 @@ if (!gotTheLock) {
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
-        createMainWindow();
+        restoreOrCreateMainWindow();
+      } else if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+        restoreOrCreateMainWindow();
       }
     });
   });
 }
 
 app.on('before-quit', () => {
+  isZeroRendererDaemonActive = false;
   try {
     launcherEngine.shutdownLauncherEngine();
   } catch {}
 });
 
 app.on('window-all-closed', () => {
+  if (
+    isZeroRendererDaemonActive ||
+    (launcherEngine.getRunningGames() || []).length > 0
+  ) {
+    return;
+  }
   if (process.platform !== 'darwin') {
     app.quit();
   }
@@ -375,6 +653,7 @@ async function processStoreAuth(storefrontId, code) {
   let tokenData = null;
 
   try {
+    launcherEngine?.clearStoreDisconnectedTombstone?.(storefrontId);
     if (storefrontId === 'gog') {
       tokenData = await storeSync.exchangeGogCode(code);
       const account = await storeSync.fetchGogAccount(tokenData.access_token);
@@ -411,16 +690,214 @@ async function processStoreAuth(storefrontId, code) {
   }
 }
 
+let inFlightEpicAuthRecovery = null;
+
+/**
+ * Recover an expired Epic Games OAuth session:
+ * 1. Silent cookie refresh via hidden BrowserWindow in `persist:storefront_auth`
+ * 2. Interactive Epic OAuth BrowserWindow fallback when `allowInteractiveAuth === true`
+ */
+async function recoverEpicAuthSession({ allowInteractiveAuth = false } = {}) {
+  if (!allowInteractiveAuth && launcherEngine?.isStoreDisconnectedTombstoned?.('epic')) {
+    return null;
+  }
+  if (inFlightEpicAuthRecovery) {
+    return inFlightEpicAuthRecovery;
+  }
+
+  inFlightEpicAuthRecovery = (async () => {
+    const cleanUA =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+    const silentRedirectUrl =
+      'https://www.epicgames.com/id/api/redirect?clientId=34a02cf8f4414e29b15921876da36f9a&responseType=code';
+
+    const extractEpicAuthCodeFromWindow = (win, targetUrl, timeoutMs, interactive) =>
+      new Promise((resolveCode) => {
+        if (!BrowserWindow) {
+          resolveCode(null);
+          return;
+        }
+        let settled = false;
+        let timer = null;
+
+        const finish = (code) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          try {
+            if (typeof storeSync.destroyScraperWindowCleanly === 'function' && !interactive) {
+              storeSync.destroyScraperWindowCleanly(win);
+            } else if (win && !win.isDestroyed()) {
+              win.close();
+              if (!win.isDestroyed()) win.destroy();
+            }
+          } catch {}
+          resolveCode(code || null);
+        };
+
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => finish(null), timeoutMs);
+        }
+
+        const checkUrl = (url) => {
+          if (!url || settled) return false;
+          if (url.includes('localhost/launcher/authorized')) {
+            try {
+              const parsed = new URL(url);
+              const code = parsed.searchParams.get('code');
+              if (code && /^[a-fA-F0-9]{32}$/.test(code)) {
+                finish(code);
+                return true;
+              }
+            } catch {}
+          }
+          return false;
+        };
+
+        const checkBodyForCode = async () => {
+          if (settled || !win || win.isDestroyed()) return;
+          const currentUrl = win.webContents.getURL() || '';
+          if (checkUrl(currentUrl)) return;
+          if (!interactive && (currentUrl.includes('/id/login') || currentUrl.includes('/login'))) {
+            finish(null);
+            return;
+          }
+          if (currentUrl.includes('/id/api/redirect')) {
+            try {
+              const bodyText = await win.webContents.executeJavaScript(
+                'document.body ? document.body.innerText : ""'
+              );
+              if (bodyText) {
+                const match =
+                  String(bodyText).match(/"authorizationCode"\s*:\s*"([a-fA-F0-9]{32})"/i) ||
+                  String(bodyText).match(/\b([a-fA-F0-9]{32})\b/);
+                if (match && match[1]) {
+                  finish(match[1]);
+                  return;
+                }
+                if (
+                  !interactive &&
+                  /"authorizationCode"\s*:\s*null/i.test(String(bodyText))
+                ) {
+                  finish(null);
+                  return;
+                }
+              }
+            } catch {}
+          }
+        };
+
+        win.webContents.on('will-prevent-unload', (event) => {
+          event.preventDefault();
+        });
+        win.webContents.on('will-redirect', (_e, url) => checkUrl(url));
+        win.webContents.on('will-navigate', (_e, url) => checkUrl(url));
+        win.webContents.on('did-navigate', async (_e, url) => {
+          if (!checkUrl(url)) {
+            await checkBodyForCode();
+          }
+        });
+        win.webContents.on('did-finish-load', async () => {
+          await checkBodyForCode();
+        });
+        win.on('closed', () => finish(null));
+
+        try {
+          win.loadURL(targetUrl).catch(() => {
+            if (!interactive) finish(null);
+          });
+        } catch {
+          finish(null);
+        }
+      });
+
+    try {
+      // Step 1: Silent cookie refresh in persist:storefront_auth
+      let authCode = null;
+      try {
+        const silentWin = new BrowserWindow({
+          width: 540,
+          height: 720,
+          show: false,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            partition: 'persist:storefront_auth',
+            userAgent: cleanUA,
+          },
+        });
+        authCode = await extractEpicAuthCodeFromWindow(
+          silentWin,
+          silentRedirectUrl,
+          6000,
+          false
+        );
+      } catch {}
+
+      // Step 2: Interactive sign-in window fallback when allowInteractiveAuth === true
+      if (!authCode && allowInteractiveAuth) {
+        try {
+          const parentWin =
+            mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+          const interactiveWin = new BrowserWindow({
+            width: STORE_OAUTH_URLS.epic.width || 540,
+            height: STORE_OAUTH_URLS.epic.height || 720,
+            parent: parentWin,
+            autoHideMenuBar: true,
+            show: true,
+            title: 'Sign in to Epic Games — One Launcher',
+            webPreferences: {
+              nodeIntegration: false,
+              contextIsolation: true,
+              partition: 'persist:storefront_auth',
+              userAgent: cleanUA,
+            },
+          });
+          authCode = await extractEpicAuthCodeFromWindow(
+            interactiveWin,
+            STORE_OAUTH_URLS.epic.url,
+            180000,
+            true
+          );
+        } catch {}
+      }
+
+      if (authCode) {
+        const tokenData = await storeSync.exchangeEpicCode(authCode);
+        if (tokenData && tokenData.access_token) {
+          storeSync.saveTokens('epic', tokenData);
+          return tokenData;
+        }
+      }
+    } catch (err) {
+      console.warn('[recoverEpicAuthSession] warning:', err.message);
+    }
+
+    return null;
+  })().finally(() => {
+    inFlightEpicAuthRecovery = null;
+  });
+
+  return inFlightEpicAuthRecovery;
+}
+
+if (typeof launcherEngine.setEpicAuthRecoveryHook === 'function') {
+  launcherEngine.setEpicAuthRecoveryHook(recoverEpicAuthSession);
+}
+
 const STEAM_LOCAL_SCAN_TTL_MS = 15000;
 let cachedLocalSteamPlaytimes = null;
 let cachedLocalSteamPlaytimesAt = 0;
 let cachedLocalSteamAchievements = null;
 let cachedLocalSteamAchievementsAt = 0;
+const steamLocalVdfMtimeCache = new Map();
+const steamLocalAchFileMtimeCache = new Map();
 
 /**
- * Read local Steam playtimes (Playtime + PlaytimeDisconnected) from localconfig.vdf
+ * Asynchronously read local Steam playtimes (Playtime + PlaytimeDisconnected) from localconfig.vdf
+ * with 15s TTL + per-file mtimeMs caching so unchanged VDF files are not re-parsed.
  */
-function readLocalSteamPlaytimes(options = {}) {
+async function readLocalSteamPlaytimes(options = {}) {
   if (
     !options?.force &&
     cachedLocalSteamPlaytimes &&
@@ -438,27 +915,51 @@ function readLocalSteamPlaytimes(options = {}) {
       'C:\\Program Files (x86)\\Steam\\userdata',
     ];
     for (const base of steamUserDirs) {
-      if (!fs.existsSync(base)) continue;
-      const userFolders = fs.readdirSync(base);
+      let userFolders = [];
+      try {
+        userFolders = await fs.promises.readdir(base);
+      } catch {
+        continue;
+      }
       for (const u of userFolders) {
         const vdfPath = path.join(base, u, 'config/localconfig.vdf');
-        if (!fs.existsSync(vdfPath)) continue;
-        const vdf = fs.readFileSync(vdfPath, 'utf8');
-        const regex = /"(\d+)"\s*\{([^{}]+)\}/g;
-        let m;
-        while ((m = regex.exec(vdf)) !== null) {
-          const appId = Number(m[1]);
-          const body = m[2];
-          if (!appId || (!body.includes('"Playtime"') && !body.includes('"LastPlayed"'))) continue;
-          const ptMatch = body.match(/"Playtime"\s+"(\d+)"/i);
-          const ptDiscMatch = body.match(/"PlaytimeDisconnected"\s+"(\d+)"/i);
-          const lpMatch = body.match(/"LastPlayed"\s+"(\d+)"/i);
-          const totalMin = (ptMatch ? Number(ptMatch[1]) : 0) + (ptDiscMatch ? Number(ptDiscMatch[1]) : 0);
-          const lpEpoch = lpMatch ? Number(lpMatch[1]) : 0;
-          if (!playtimes[appId] || totalMin >= playtimes[appId].playtimeMinutes) {
-            playtimes[appId] = { playtimeMinutes: totalMin, lastPlayedEpoch: lpEpoch };
+        try {
+          const st = await fs.promises.stat(vdfPath);
+          const prev = steamLocalVdfMtimeCache.get(vdfPath);
+          let filePlaytimes;
+          if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+            filePlaytimes = prev.playtimes;
+          } else {
+            filePlaytimes = {};
+            const vdf = await fs.promises.readFile(vdfPath, 'utf8');
+            const regex = /"(\d+)"\s*\{([^{}]+)\}/g;
+            let m;
+            while ((m = regex.exec(vdf)) !== null) {
+              const appId = Number(m[1]);
+              const body = m[2];
+              if (!appId || (!body.includes('"Playtime"') && !body.includes('"LastPlayed"'))) continue;
+              const ptMatch = body.match(/"Playtime"\s+"(\d+)"/i);
+              const ptDiscMatch = body.match(/"PlaytimeDisconnected"\s+"(\d+)"/i);
+              const lpMatch = body.match(/"LastPlayed"\s+"(\d+)"/i);
+              const totalMin = (ptMatch ? Number(ptMatch[1]) : 0) + (ptDiscMatch ? Number(ptDiscMatch[1]) : 0);
+              const lpEpoch = lpMatch ? Number(lpMatch[1]) : 0;
+              if (!filePlaytimes[appId] || totalMin >= filePlaytimes[appId].playtimeMinutes) {
+                filePlaytimes[appId] = { playtimeMinutes: totalMin, lastPlayedEpoch: lpEpoch };
+              }
+            }
+            steamLocalVdfMtimeCache.set(vdfPath, {
+              mtimeMs: st.mtimeMs,
+              size: st.size,
+              playtimes: filePlaytimes,
+            });
           }
-        }
+          for (const [appIdKey, ptObj] of Object.entries(filePlaytimes)) {
+            const appIdNum = Number(appIdKey);
+            if (!playtimes[appIdNum] || ptObj.playtimeMinutes >= playtimes[appIdNum].playtimeMinutes) {
+              playtimes[appIdNum] = ptObj;
+            }
+          }
+        } catch {}
       }
     }
   } catch {}
@@ -468,9 +969,10 @@ function readLocalSteamPlaytimes(options = {}) {
 }
 
 /**
- * Synchronously scan local Steam client userdata librarycache for achievement counts
+ * Asynchronously scan local Steam client userdata librarycache for achievement counts
+ * with 15s TTL + per-file mtimeMs caching so unchanged librarycache JSON files are not re-read.
  */
-function scanLocalSteamAchievementsSync(options = {}) {
+async function scanLocalSteamAchievements(options = {}) {
   if (
     !options?.force &&
     cachedLocalSteamAchievements &&
@@ -489,23 +991,38 @@ function scanLocalSteamAchievementsSync(options = {}) {
     ];
 
     for (const base of steamUserDirs) {
-      if (!fs.existsSync(base)) continue;
+      let userFolders = [];
       try {
-        const userFolders = fs.readdirSync(base);
-        for (const u of userFolders) {
-          const lcDir = path.join(base, u, 'config/librarycache');
-          if (!fs.existsSync(lcDir)) continue;
+        userFolders = await fs.promises.readdir(base);
+      } catch {
+        continue;
+      }
+      for (const u of userFolders) {
+        const lcDir = path.join(base, u, 'config/librarycache');
+        let files = [];
+        try {
+          files = await fs.promises.readdir(lcDir);
+        } catch {
+          continue;
+        }
 
-          // 1. Check achievement_progress.json
-          const progressFile = path.join(lcDir, 'achievement_progress.json');
-          if (fs.existsSync(progressFile)) {
-            try {
-              const raw = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
-              if (Array.isArray(raw.mapCache)) {
+        // 1. Check achievement_progress.json
+        const progressFile = path.join(lcDir, 'achievement_progress.json');
+        if (files.includes('achievement_progress.json')) {
+          try {
+            const st = await fs.promises.stat(progressFile);
+            const prevProg = steamLocalAchFileMtimeCache.get(progressFile);
+            let progMap;
+            if (prevProg && prevProg.mtimeMs === st.mtimeMs && prevProg.size === st.size) {
+              progMap = prevProg.data;
+            } else {
+              progMap = {};
+              const raw = JSON.parse(await fs.promises.readFile(progressFile, 'utf8'));
+              if (Array.isArray(raw?.mapCache)) {
                 for (const [appId, data] of raw.mapCache) {
                   if (data && typeof data.unlocked === 'number' && typeof data.total === 'number' && data.total > 0) {
                     const pct = Math.round((data.unlocked / data.total) * 100);
-                    achievements[appId] = {
+                    progMap[appId] = {
                       unlocked: data.unlocked,
                       total: data.total,
                       percentage: pct,
@@ -514,39 +1031,64 @@ function scanLocalSteamAchievementsSync(options = {}) {
                   }
                 }
               }
-            } catch {}
-          }
+              steamLocalAchFileMtimeCache.set(progressFile, {
+                mtimeMs: st.mtimeMs,
+                size: st.size,
+                data: progMap,
+              });
+            }
+            Object.assign(achievements, progMap);
+          } catch {}
+        }
 
-          // 2. Scan all <appId>.json in librarycache
-          const files = fs.readdirSync(lcDir);
-          for (const file of files) {
-            const m = file.match(/^(\d+)\.json$/);
-            if (!m) continue;
-            const appId = parseInt(m[1], 10);
-            try {
-              const content = fs.readFileSync(path.join(lcDir, file), 'utf8');
+        // 2. Scan all <appId>.json in librarycache
+        for (const file of files) {
+          const m = file.match(/^(\d+)\.json$/);
+          if (!m) continue;
+          const appId = parseInt(m[1], 10);
+          const fullAchPath = path.join(lcDir, file);
+          try {
+            const st = await fs.promises.stat(fullAchPath);
+            const prevAch = steamLocalAchFileMtimeCache.get(fullAchPath);
+            let parsedCounts = null;
+            if (prevAch && prevAch.mtimeMs === st.mtimeMs && prevAch.size === st.size) {
+              parsedCounts = prevAch.data;
+            } else {
+              const content = await fs.promises.readFile(fullAchPath, 'utf8');
               const mTotal = content.match(/"nTotal"\s*:\s*(\d+)/);
               const mAchieved = content.match(/"nAchieved"\s*:\s*(\d+)/);
               if (mTotal || mAchieved) {
-                const total = mTotal ? parseInt(mTotal[1], 10) : 0;
-                const unlocked = mAchieved ? parseInt(mAchieved[1], 10) : 0;
-                if (total > 0 || unlocked > 0) {
-                  if (!achievements[appId] || unlocked >= achievements[appId].unlocked) {
-                    const finalTotal = total > 0 ? total : (achievements[appId]?.total || unlocked);
-                    const pct = finalTotal > 0 ? Math.round((unlocked / finalTotal) * 100) : 0;
-                    achievements[appId] = {
-                      unlocked,
-                      total: finalTotal,
-                      percentage: pct,
-                      isMastered: finalTotal > 0 && pct === 100,
-                    };
-                  }
-                }
+                parsedCounts = {
+                  total: mTotal ? parseInt(mTotal[1], 10) : 0,
+                  unlocked: mAchieved ? parseInt(mAchieved[1], 10) : 0,
+                };
               }
-            } catch {}
-          }
+              if (steamLocalAchFileMtimeCache.size > 5000) {
+                const oldestKey = steamLocalAchFileMtimeCache.keys().next().value;
+                if (oldestKey !== undefined) steamLocalAchFileMtimeCache.delete(oldestKey);
+              }
+              steamLocalAchFileMtimeCache.set(fullAchPath, {
+                mtimeMs: st.mtimeMs,
+                size: st.size,
+                data: parsedCounts,
+              });
+            }
+            if (parsedCounts && (parsedCounts.total > 0 || parsedCounts.unlocked > 0)) {
+              const { total, unlocked } = parsedCounts;
+              if (!achievements[appId] || unlocked >= achievements[appId].unlocked) {
+                const finalTotal = total > 0 ? total : (achievements[appId]?.total || unlocked);
+                const pct = finalTotal > 0 ? Math.round((unlocked / finalTotal) * 100) : 0;
+                achievements[appId] = {
+                  unlocked,
+                  total: finalTotal,
+                  percentage: pct,
+                  isMastered: finalTotal > 0 && pct === 100,
+                };
+              }
+            }
+          } catch {}
         }
-      } catch {}
+      }
     }
   } catch {}
   cachedLocalSteamAchievements = achievements;
@@ -558,7 +1100,7 @@ function scanLocalSteamAchievementsSync(options = {}) {
  * Fetch batch Steam achievement progress using IPlayerService/GetAchievementsProgress/v1 + local Steam cache
  */
 async function fetchSteamBatchAchievements(webapiToken, steamId, appIds = []) {
-  const achievements = scanLocalSteamAchievementsSync();
+  const achievements = await scanLocalSteamAchievements();
   if (!webapiToken || !steamId || !Array.isArray(appIds) || appIds.length === 0) {
     return achievements;
   }
@@ -641,7 +1183,7 @@ async function fetchSteamStoreBrowseItemsMap(appIds = []) {
 /**
  * Convert Steam web gameslist JSON into CanonicalGame objects
  */
-function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl, existingGames = []) {
+async function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl, existingGames = []) {
   const parsed = typeof rawJsonStr === 'string' ? JSON.parse(rawJsonStr) : rawJsonStr;
   const rgGames = Array.isArray(parsed?.rgGames)
     ? parsed.rgGames
@@ -660,8 +1202,10 @@ function parseSteamGamesListJson(rawJsonStr, steamId, personaName, avatarUrl, ex
     }
   }
   const resolvedName = parsed?.strProfileName || personaName || 'Steam User';
-  const localPlaytimes = readLocalSteamPlaytimes();
-  const localAchievements = scanLocalSteamAchievementsSync();
+  const [localPlaytimes, localAchievements] = await Promise.all([
+    readLocalSteamPlaytimes(),
+    scanLocalSteamAchievements(),
+  ]);
   const games = [];
   const suppressedItems = [];
 
@@ -1054,7 +1598,7 @@ ipcMain.handle('auth:storefront', async (_event, storefrontId) => {
         if (steamData && steamData.gameslistJson && !resolved) {
           resolved = true;
           safelyCloseAuthWindow();
-          const parsedSteam = parseSteamGamesListJson(
+          const parsedSteam = await parseSteamGamesListJson(
             steamData.gameslistJson,
             steamData.steamId,
             steamData.personaName,
@@ -1069,6 +1613,9 @@ ipcMain.handle('auth:storefront', async (_event, storefrontId) => {
             games: parsedSteam.games,
           };
           storeSync.saveTokens('steam', tokenPayload);
+          try {
+            launcherEngine?.clearStoreDisconnectedTombstone?.('steam');
+          } catch {}
           resolve({
             success: true,
             storefrontId: 'steam',
@@ -1158,7 +1705,13 @@ ipcMain.handle('auth:storefront', async (_event, storefrontId) => {
  * Handle manual authorization code submission from UI (Alternative login)
  */
 ipcMain.handle('store:exchange-code', async (_event, { storefrontId, code }) => {
-  return processStoreAuth(storefrontId, code);
+  const res = await processStoreAuth(storefrontId, code);
+  if (res && res.success) {
+    try {
+      launcherEngine?.clearStoreDisconnectedTombstone?.(storefrontId);
+    } catch {}
+  }
+  return res;
 });
 
 const inFlightStoreSyncs = new Map();
@@ -1202,7 +1755,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
               if (Array.isArray(apiJson?.response?.games) && apiJson.response.games.length > 0) {
                 const ownedAppIds = apiJson.response.games.map((g) => g.appid).filter(Boolean);
                 const storeItems = await fetchSteamStoreBrowseItemsMap(ownedAppIds);
-                const refreshed = parseSteamGamesListJson(
+                const refreshed = await parseSteamGamesListJson(
                   { rgGames: apiJson.response.games, storeItems, strProfileName: accountName },
                   tokenData.steamId,
                   accountName,
@@ -1315,7 +1868,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
             } catch {}
 
             if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
-              const refreshed = parseSteamGamesListJson(
+              const refreshed = await parseSteamGamesListJson(
                 { rgGames: ssrResult.rgGames, strProfileName: accountName, storeItems: ssrResult.storeItems || {} },
                 tokenData.steamId,
                 accountName,
@@ -1430,7 +1983,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
               });
 
               if (ssrResult && Array.isArray(ssrResult.rgGames) && ssrResult.rgGames.length > 0) {
-                const refreshed = parseSteamGamesListJson(
+                const refreshed = await parseSteamGamesListJson(
                   { rgGames: ssrResult.rgGames, strProfileName: accountName, storeItems: ssrResult.storeItems || {} },
                   tokenData.steamId,
                   accountName,
@@ -1451,7 +2004,7 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
 
         let steamAchMap = {};
         if (Array.isArray(games) && games.length > 0) {
-          const localPlaytimes = readLocalSteamPlaytimes();
+          const localPlaytimes = await readLocalSteamPlaytimes();
           const appIds = games
             .map((g) => Number(g.steamAppId || (String(g.id || '').startsWith('steam-') ? String(g.id).replace('steam-', '') : 0)))
             .filter((id) => id > 0);
@@ -1547,9 +2100,24 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
           suppressedItems: [...(storeSync.fetchGogOwnedGames.lastSuppressedItems || []), ...localGogSuppressed],
         };
       } else if (storefrontId === 'epic') {
+        const epicDisconnected = Boolean(launcherEngine?.isStoreDisconnectedTombstoned?.('epic'));
         let accessToken = tokenData.access_token || fallbackCredentials?.epicToken;
         let accountId = tokenData.account_id || fallbackCredentials?.epicAccountId;
         accountName = tokenData.displayName || accountId || 'Epic Games User';
+        if (
+          (!accessToken || !accountId) &&
+          !epicDisconnected &&
+          typeof launcherEngine?.ensureLegendaryConfigAndAuth === 'function'
+        ) {
+          try {
+            const legAuth = await launcherEngine.ensureLegendaryConfigAndAuth();
+            if (legAuth?.accessToken) {
+              accessToken = accessToken || legAuth.accessToken;
+              accountId = accountId || legAuth.accountId;
+              accountName = legAuth.displayName || accountName;
+            }
+          } catch {}
+        }
         try {
           games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
         } catch (err) {
@@ -1570,12 +2138,31 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
           if (!games || games.length === 0) {
             const refreshCand = fallbackCredentials?.epicRefreshToken || tokenData.refresh_token;
             if (refreshCand) {
-              const renewed = await storeSync.renewEpicTokens(refreshCand);
-              accessToken = renewed.access_token;
-              accountId = renewed.account_id || accountId;
-              accountName = renewed.displayName || accountName;
-              games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
-            } else {
+              try {
+                const renewed = await storeSync.renewEpicTokens(refreshCand);
+                accessToken = renewed.access_token;
+                accountId = renewed.account_id || accountId;
+                accountName = renewed.displayName || accountName;
+                games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+              } catch {}
+            }
+            if (
+              (!games || games.length === 0) &&
+              !epicDisconnected &&
+              typeof launcherEngine?.ensureLegendaryConfigAndAuth === 'function'
+            ) {
+              const recoveredLegAuth = await launcherEngine.ensureLegendaryConfigAndAuth({
+                forceTokenRefresh: true,
+              });
+              if (recoveredLegAuth?.accessToken) {
+                accessToken = recoveredLegAuth.accessToken;
+                accountId = recoveredLegAuth.accountId || accountId;
+                accountName = recoveredLegAuth.displayName || accountName;
+                games = await storeSync.fetchEpicOwnedGames(accessToken, accountId);
+              } else {
+                throw err;
+              }
+            } else if (!games || games.length === 0) {
               throw err;
             }
           }
@@ -1612,7 +2199,28 @@ ipcMain.handle('store:sync', async (_event, storefrontId, fallbackCredentials) =
 });
 
 ipcMain.handle('store:get-tokens', async () => {
-  const saved = storeSync.loadSavedTokens() || {};
+  let saved = storeSync.loadSavedTokens() || {};
+  if (
+    (!saved.epic || !saved.epic.access_token) &&
+    !launcherEngine?.isStoreDisconnectedTombstoned?.('epic') &&
+    typeof launcherEngine?.ensureLegendaryConfigAndAuth === 'function'
+  ) {
+    try {
+      const legAuth = await launcherEngine.ensureLegendaryConfigAndAuth();
+      if (legAuth?.accessToken) {
+        saved = storeSync.loadSavedTokens() || saved;
+        if (!saved.epic || !saved.epic.access_token) {
+          saved.epic = {
+            ...(saved.epic || {}),
+            access_token: legAuth.accessToken,
+            refresh_token: legAuth.refreshToken || saved.epic?.refresh_token,
+            account_id: legAuth.accountId || saved.epic?.account_id,
+            displayName: legAuth.displayName || saved.epic?.displayName,
+          };
+        }
+      }
+    } catch {}
+  }
   if (saved.gog && saved.gog.access_token) {
     const normalizedExisting =
       typeof storeSync.normalizeGogAvatarUrl === 'function'
@@ -1657,10 +2265,34 @@ ipcMain.handle('store:get-tokens', async () => {
   return saved;
 });
 
-ipcMain.handle('store:clear-tokens', async (_event, storefrontId) => {
+const handleClearStoreTokens = async (_event, storefrontId) => {
   storeSync.clearTokens(storefrontId);
+  try {
+    launcherEngine?.purgeStoreHelperCredentials?.(storefrontId);
+  } catch {}
   return { success: true };
-});
+};
+
+ipcMain.handle('store:clear-tokens', handleClearStoreTokens);
+ipcMain.handle('store:clear-token', handleClearStoreTokens);
+
+const handleSaveStoreTokens = async (_event, arg1, arg2) => {
+  const storefrontId =
+    arg1 && typeof arg1 === 'object' ? arg1.storefrontId || arg1.store : arg1;
+  const tokenData =
+    arg1 && typeof arg1 === 'object' ? arg1.tokenData || arg1.tokens || arg2 : arg2;
+  if (!storefrontId || !tokenData || typeof tokenData !== 'object') {
+    return { success: false, error: 'Invalid storefront token payload' };
+  }
+  storeSync.saveTokens(storefrontId, tokenData);
+  try {
+    launcherEngine?.clearStoreDisconnectedTombstone?.(storefrontId);
+  } catch {}
+  return { success: true };
+};
+
+ipcMain.handle('store:save-tokens', handleSaveStoreTokens);
+ipcMain.handle('store:save-token', handleSaveStoreTokens);
 
 ipcMain.handle('epic:fetch-achievements', async (_event, { accountId, accessToken } = {}) => {
   try {
@@ -1668,6 +2300,17 @@ ipcMain.handle('epic:fetch-achievements', async (_event, { accountId, accessToke
     const savedEpic = savedTokens?.epic || {};
     let resolvedAccountId = accountId || savedEpic.account_id;
     let resolvedToken = accessToken || savedEpic.access_token;
+    if (
+      (!resolvedToken || !resolvedAccountId) &&
+      !launcherEngine?.isStoreDisconnectedTombstoned?.('epic') &&
+      typeof launcherEngine?.ensureLegendaryConfigAndAuth === 'function'
+    ) {
+      try {
+        const legAuth = await launcherEngine.ensureLegendaryConfigAndAuth();
+        resolvedToken = resolvedToken || legAuth?.accessToken;
+        resolvedAccountId = resolvedAccountId || legAuth?.accountId;
+      } catch {}
+    }
     let result = await storeSync.fetchEpicAchievements(resolvedToken, resolvedAccountId);
     if ((!result || Object.keys(result).length === 0) && savedEpic.refresh_token) {
       try {
@@ -1681,6 +2324,18 @@ ipcMain.handle('epic:fetch-achievements', async (_event, { accountId, accessToke
   } catch (err) {
     console.warn('IPC epic:fetch-achievements warning:', err.message);
     return {};
+  }
+});
+
+ipcMain.handle('epic:fetch-game-schema', async (_event, payload = {}) => {
+  try {
+    if (typeof storeSync.getEpicGameAchievementSchema === 'function') {
+      return await storeSync.getEpicGameAchievementSchema(payload);
+    }
+    return [];
+  } catch (err) {
+    console.warn('IPC epic:fetch-game-schema warning:', err.message);
+    return [];
   }
 });
 
@@ -1753,18 +2408,11 @@ ipcMain.handle('steam:fetch-achievements', async (_event, { appIds } = {}) => {
 });
 
 /**
- * Native Scanner for installed Steam, GOG, and Epic games directly from local OS filesystem
- */
-ipcMain.handle('scan:steam-installed', async () => {
-  return launcherEngine.scanAllInstalledGames();
-});
-
-/**
  * Native Scanner for Steam achievements directly from local Steam client userdata
  */
 ipcMain.handle('scan:steam-achievements', async () => {
   try {
-    const achievements = scanLocalSteamAchievementsSync();
+    const achievements = await scanLocalSteamAchievements();
     return { success: true, achievements };
   } catch (err) {
     return { success: false, error: err.message, achievements: {} };
@@ -1789,96 +2437,12 @@ ipcMain.handle('shell:open-external', async (_event, url) => {
 });
 
 // ============================================================================
-// Universal Game Launcher & Install Manager IPC Handlers
+// Universal Game Launcher & Install Manager IPC Handlers (Modularized)
 // ============================================================================
-
-ipcMain.handle('launcher:scan-installed', async (_event, options) => {
-  return launcherEngine.scanAllInstalledGames(options || {});
-});
-
-ipcMain.handle('launcher:detect-compat-layers', async (_event, options) => {
-  return launcherEngine.detectCompatibilityLayers(options || {});
-});
-
-ipcMain.handle('launcher:install-compat-layer', async (_event, payload) => {
-  return await launcherEngine.installCompatibilityLayer(payload || {});
-});
-
-ipcMain.handle('launcher:check-compat-updates', async (_event, options) => {
-  return await launcherEngine.checkCompatibilityLayerUpdates(options || {});
-});
-
-ipcMain.handle('launcher:update-compat-layer', async (_event, payload) => {
-  return await launcherEngine.updateCompatibilityLayer(payload || {});
-});
-
-ipcMain.handle('launcher:get-disk-space', async (_event, targetPath) => {
-  return launcherEngine.getDiskSpace(targetPath);
-});
-
-ipcMain.handle('launcher:get-install-info', async (_event, payload) => {
-  return await launcherEngine.getGameInstallInfo(payload || {});
-});
-
-ipcMain.handle('launcher:launch-game', async (_event, payload) => {
-  return await launcherEngine.launchGame(payload || {});
-});
-
-ipcMain.handle('launcher:stop-game', async (_event, payload) => {
-  return await launcherEngine.stopGame(payload || {});
-});
-
-ipcMain.handle('launcher:get-running-games', async () => {
-  return launcherEngine.getRunningGames();
-});
-
-ipcMain.handle('launcher:install-game', async (_event, payload) => {
-  return await launcherEngine.installGame(payload || {});
-});
-
-ipcMain.handle('launcher:pause-download', async (_event, taskId) => {
-  return launcherEngine.pauseDownload(taskId);
-});
-
-ipcMain.handle('launcher:resume-download', async (_event, taskId) => {
-  return launcherEngine.resumeDownload(taskId);
-});
-
-ipcMain.handle('launcher:cancel-download', async (_event, taskId) => {
-  return launcherEngine.cancelDownload(taskId);
-});
-
-ipcMain.handle('launcher:get-download-queue', async () => {
-  return launcherEngine.getDownloadQueue();
-});
-
-ipcMain.handle('launcher:uninstall-game', async (_event, payload) => {
-  return await launcherEngine.uninstallGame(payload || {});
-});
-
-ipcMain.handle('launcher:verify-game', async (_event, payload) => {
-  return await launcherEngine.verifyGameFiles(payload || {});
-});
-
-ipcMain.handle('launcher:browse-files', async (_event, targetPath) => {
-  return await launcherEngine.browseLocalFiles(targetPath);
-});
-
-ipcMain.handle('launcher:select-executable', async (_event, defaultPath) => {
-  return await launcherEngine.selectExecutableDialog(defaultPath);
-});
-
-ipcMain.handle('launcher:select-folder', async (_event, defaultPath) => {
-  return await launcherEngine.selectFolderDialog(defaultPath);
-});
-
-ipcMain.handle('launcher:save-launch-config', async (_event, config) => {
-  return launcherEngine.saveGameLaunchConfig(config);
-});
-
-ipcMain.handle('launcher:get-launch-configs', async () => {
-  return launcherEngine.getGameLaunchConfigs();
-});
+registerLauncherIpcHandlers({ ipcMain, launcherEngine });
+ipcMain.handle('launcher:detect-storefront-clients', (_event, options) =>
+  launcherEngine.detectInstalledStorefrontClients(options || {})
+);
 
 // HowLongToBeat Token Cache
 let hltbCachedToken = null;
@@ -1994,108 +2558,12 @@ ipcMain.handle('igdb:fetch-cover', async (_event, gameTitle) => {
 });
 
 // ============================================================================
-// Custom Steam-Style Window & Menu Bar IPC Handlers
+// Custom Steam-Style Window & Menu Bar IPC Handlers (Modularized)
 // ============================================================================
-
-ipcMain.handle('window:toggle-fullscreen', () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return false;
-  const next = !mainWindow.isFullScreen();
-  mainWindow.setFullScreen(next);
-  return next;
-});
-
-ipcMain.handle('window:is-fullscreen', () => {
-  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen());
-});
-
-ipcMain.handle('window:minimize', () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.minimize();
-  }
-  return true;
-});
-
-ipcMain.handle('window:maximize-toggle', () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return false;
-  if (mainWindow.isMaximized()) {
-    mainWindow.unmaximize();
-    return false;
-  }
-  mainWindow.maximize();
-  return true;
-});
-
-ipcMain.handle('window:is-maximized', () => {
-  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized());
-});
-
-ipcMain.handle('window:close', () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.close();
-  }
-  return true;
-});
-
-ipcMain.handle('window:perform-menu-action', (_event, action) => {
-  if (!mainWindow || mainWindow.isDestroyed()) return false;
-  const act = String(action || '').toLowerCase().trim();
-  switch (act) {
-    case 'reload':
-      mainWindow.webContents.reload();
-      return true;
-    case 'force-reload':
-      mainWindow.webContents.reloadIgnoringCache();
-      return true;
-    case 'toggle-devtools':
-      mainWindow.webContents.toggleDevTools();
-      return true;
-    case 'reset-zoom':
-      mainWindow.webContents.setZoomLevel(0);
-      return true;
-    case 'zoom-in':
-      mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() + 0.5);
-      return true;
-    case 'zoom-out':
-      mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() - 0.5);
-      return true;
-    case 'toggle-fullscreen':
-      mainWindow.setFullScreen(!mainWindow.isFullScreen());
-      return true;
-    case 'undo':
-      mainWindow.webContents.undo();
-      return true;
-    case 'redo':
-      mainWindow.webContents.redo();
-      return true;
-    case 'cut':
-      mainWindow.webContents.cut();
-      return true;
-    case 'copy':
-      mainWindow.webContents.copy();
-      return true;
-    case 'paste':
-      mainWindow.webContents.paste();
-      return true;
-    case 'select-all':
-      mainWindow.webContents.selectAll();
-      return true;
-    case 'minimize':
-      mainWindow.minimize();
-      return true;
-    case 'maximize-toggle':
-      if (mainWindow.isMaximized()) {
-        mainWindow.unmaximize();
-      } else {
-        mainWindow.maximize();
-      }
-      return true;
-    case 'close':
-    case 'quit':
-      app.quit();
-      return true;
-    default:
-      return false;
-  }
+registerWindowAndSystemIpcHandlers({
+  ipcMain,
+  app,
+  getMainWindow: () => mainWindow,
 });
 
 ipcMain.handle('perf:trim-memory', async (_event, options) => {
@@ -2117,7 +2585,7 @@ ipcMain.handle('perf:trim-memory', async (_event, options) => {
       await mainWindow.webContents.session.clearCache().catch(() => {});
     }
   } catch {}
-  if (typeof global.gc === 'function') {
+  if (!options?.passive && typeof global.gc === 'function') {
     try {
       global.gc();
     } catch {}
@@ -2165,14 +2633,20 @@ ipcMain.handle('app:get-info', () => {
 });
 
 ipcMain.handle('app:check-for-updates', async () => {
-  const defaultReleaseUrl = 'https://github.com/Space-Cadet0/One-Launcher/releases';
+  const rawRepoSlug = String(
+    process.env.ONE_LAUNCHER_GITHUB_REPO || 'Space-Cadet0/One-Launcher'
+  ).trim();
+  const repoSlug = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rawRepoSlug)
+    ? rawRepoSlug
+    : 'Space-Cadet0/One-Launcher';
+  const defaultReleaseUrl = `https://github.com/${repoSlug}/releases`;
   let currentVersion = '0.1.0';
   try {
     currentVersion = app.getVersion();
   } catch {}
 
   try {
-    const res = await fetch('https://api.github.com/repos/Space-Cadet0/One-Launcher/releases/latest', {
+    const res = await fetch(`https://api.github.com/repos/${repoSlug}/releases/latest`, {
       headers: {
         Accept: 'application/vnd.github+json',
         'User-Agent': `OneLauncher/${currentVersion}`,

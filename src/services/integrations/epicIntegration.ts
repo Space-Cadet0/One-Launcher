@@ -35,7 +35,7 @@ export class EpicIntegrationService {
   extractEpicAccountId(input?: string): string | null {
     if (!input) return null;
     const clean = input.trim();
-    // Matches 32-character hex ID (e.g. from https://store.epicgames.com/u/8aaea3405ecc4c7b8786012029e98d6a)
+    // Matches 32-character hex ID (e.g. from https://store.epicgames.com/u/a1b2c3d4e5f60718293a4b5c6d7e8f90)
     const match = clean.match(/([a-f0-9]{32})/i);
     if (match) return match[1].toLowerCase();
     return clean;

@@ -7,7 +7,6 @@
     @apply bg-steam-darkest text-steam-text font-steam antialiased;
     background-color: #0b0f14;
     background-image: radial-gradient(circle at 50% 0%, #1b2838 0%, #0b0f14 70%);
-    background-attachment: fixed;
     min-height: 100vh;
   }
 
@@ -300,15 +299,43 @@ table.steam-lang-table td span.check {
 }
 
 /* ========================================================
+   MODAL OVERLAY COMPOSITOR & SCROLL STABILITY
+   ======================================================== */
+html[data-modal-overlay-open='true'] #root {
+  pointer-events: none;
+}
+
+html[data-modal-overlay-open='true'] #root .app-drag-region,
+html[data-modal-overlay-open='true'] #root [style*='app-region'] {
+  -webkit-app-region: no-drag !important;
+  app-region: no-drag !important;
+}
+
+.modal-scroll-body {
+  background-color: #131b26;
+  overflow-anchor: none;
+  color-scheme: dark;
+  isolation: isolate;
+}
+
+/* ========================================================
    CONTENT-VISIBILITY & RENDERING CONTAINMENT UTILITIES
    ======================================================== */
 .cv-card {
-  contain: layout style;
+  contain: layout style paint;
   overflow-anchor: none;
 }
+.cv-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 22rem;
+}
 .cv-sidebar-row {
-  contain: layout style;
+  contain: layout style paint;
   overflow-anchor: none;
+}
+.cv-sidebar-row-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 2.25rem;
 }
 .cv-section {
   content-visibility: auto;
@@ -317,9 +344,11 @@ table.steam-lang-table td span.check {
 }
 @supports not (content-visibility: auto) {
   .cv-card,
+  .cv-card-deferred,
   .cv-sidebar-row,
+  .cv-sidebar-row-deferred,
   .cv-section {
-    contain: layout style;
+    contain: layout style paint;
   }
 }
 
@@ -372,6 +401,4 @@ table.steam-lang-table td span.check {
   outline: 2px solid #66c0f4;
   outline-offset: 2px;
 }
-
-
 

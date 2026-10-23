@@ -116,7 +116,91 @@ function decryptTokensPayload(payload, options = {}) {
   return JSON.parse(decrypted);
 }
 
-function getTokensFilePath() {
+function isMockOrCorruptedToken(tokenStr) {
+  if (!tokenStr || typeof tokenStr !== 'string') return false;
+  return /^(epic-rotated|gog-rotated|freshly-renewed|mock-|test-|fake-)/i.test(tokenStr.trim());
+}
+
+function sanitizeStorefrontTokensObject(tokensObj, options = {}) {
+  if (!tokensObj || typeof tokensObj !== 'object') {
+    return { cleaned: {}, modified: false };
+  }
+  const shouldSanitize =
+    options?.sanitizeMockTokens === true ||
+    !(process.env.VITEST || process.env.NODE_ENV === 'test');
+  if (!shouldSanitize) {
+    return { cleaned: tokensObj, modified: false };
+  }
+
+  let modified = false;
+  const cleaned = { ...tokensObj };
+
+  for (const [storeKey, storeVal] of Object.entries(cleaned)) {
+    if (!storeVal || typeof storeVal !== 'object') continue;
+    const copy = { ...storeVal };
+    let entryModified = false;
+
+    if (isMockOrCorruptedToken(copy.access_token)) {
+      delete copy.access_token;
+      entryModified = true;
+    }
+    if (isMockOrCorruptedToken(copy.refresh_token)) {
+      delete copy.refresh_token;
+      entryModified = true;
+    }
+    if (
+      storeKey === 'epic' &&
+      (copy.account_id === 'epic-user-1' || isMockOrCorruptedToken(copy.account_id)) &&
+      typeof copy.in_app_id === 'string' &&
+      /^[0-9a-f]{32}$/i.test(copy.in_app_id.trim())
+    ) {
+      copy.account_id = copy.in_app_id.trim();
+      entryModified = true;
+    }
+    if (
+      storeKey === 'gog' &&
+      (copy.user_id === 'gog-user-1' || copy.user_id === 'gog-user-777')
+    ) {
+      delete copy.user_id;
+      entryModified = true;
+    }
+
+    if (entryModified) {
+      cleaned[storeKey] = copy;
+      modified = true;
+    }
+  }
+
+  return { cleaned, modified };
+}
+
+function getTokensFilePath(options = {}) {
+  if (options && typeof options === 'object') {
+    const explicitFile = options.filePath || options.tokensFilePath;
+    if (typeof explicitFile === 'string' && explicitFile.trim()) {
+      return explicitFile.trim();
+    }
+    if (typeof options.userDataDir === 'string' && options.userDataDir.trim()) {
+      const dir = options.userDataDir.trim();
+      if (!fs.existsSync(dir)) {
+        try {
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        } catch {}
+      }
+      return path.join(dir, 'tokens.json');
+    }
+  }
+
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') {
+    const testDir = path.join(os.tmpdir(), `one-launcher-test-vault-${process.pid}`);
+    try {
+      if (!fs.existsSync(testDir)) {
+        fs.mkdirSync(testDir, { recursive: true, mode: 0o700 });
+      }
+    } catch {}
+    return path.join(testDir, `one-launcher-test-tokens-${process.pid}.json`);
+  }
+
   try {
     const defaultDir = path.join(process.env.HOME || '.', '.one-launcher');
     const legacyDir = path.join(process.env.HOME || '.', '.universal-game-library');
@@ -195,7 +279,7 @@ function destroyScraperWindowCleanly(win) {
 const inFlightTokenRenewals = new Map();
 
 function writeTokensFile(tokens, options = {}) {
-  const filePath = (options && options.filePath) || getTokensFilePath();
+  const filePath = getTokensFilePath(options);
   const jsonStr = JSON.stringify(tokens, null, 2);
 
   try {
@@ -211,7 +295,7 @@ function writeTokensFile(tokens, options = {}) {
 
 function loadSavedTokens(options = {}) {
   try {
-    const filePath = (options && options.filePath) || getTokensFilePath();
+    const filePath = getTokensFilePath(options);
     if (!fs.existsSync(filePath)) {
       return {};
     }
@@ -231,7 +315,14 @@ function loadSavedTokens(options = {}) {
     // 1. Hardware-bound AES-256-GCM encrypted payload format (_encrypted_v2: true)
     if (parsed && parsed._encrypted_v2 === true) {
       try {
-        return decryptTokensPayload(parsed, options);
+        const decrypted = decryptTokensPayload(parsed, options);
+        const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
+        if (modified) {
+          try {
+            writeTokensFile(cleaned, options);
+          } catch {}
+        }
+        return cleaned;
       } catch (decErr) {
         console.warn('Failed to decrypt v2 tokens payload:', decErr.message);
         return {};
@@ -252,12 +343,13 @@ function loadSavedTokens(options = {}) {
         }
         cleanedTokens[key] = value;
       }
-      if (Object.keys(cleanedTokens).length > 0) {
+      const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
+      if (Object.keys(cleaned).length > 0) {
         try {
-          writeTokensFile(cleanedTokens, options);
+          writeTokensFile(cleaned, options);
         } catch {}
       }
-      return cleanedTokens;
+      return cleaned;
     }
 
     return {};
@@ -267,26 +359,37 @@ function loadSavedTokens(options = {}) {
   }
 }
 
-function saveTokens(storefrontId, tokenData) {
+function saveTokens(storefrontId, tokenData, options = {}) {
   try {
-    const existing = loadSavedTokens();
-    existing[storefrontId] = {
+    const existing = loadSavedTokens(options);
+    const mergedEntry = {
       ...(existing[storefrontId] || {}),
       ...tokenData,
       updatedAt: new Date().toISOString(),
     };
-    writeTokensFile(existing);
+    const nextAll = {
+      ...existing,
+      [storefrontId]: mergedEntry,
+    };
+    const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
+    writeTokensFile(cleaned, options);
+    if (!options?.fromExternalFallback && storefrontId) {
+      try {
+        const { clearStoreDisconnectedTombstone } = require('./launcher/securityAndPathUtils.cjs');
+        clearStoreDisconnectedTombstone(storefrontId, options);
+      } catch {}
+    }
   } catch (err) {
     console.warn('Failed to save tokens:', err.message);
   }
 }
 
-function clearTokens(storefrontId) {
+function clearTokens(storefrontId, options = {}) {
   try {
-    const existing = loadSavedTokens();
+    const existing = loadSavedTokens(options);
     if (existing[storefrontId]) {
       delete existing[storefrontId];
-      writeTokensFile(existing);
+      writeTokensFile(existing, options);
     }
   } catch (err) {
     console.warn('Failed to clear tokens:', err.message);
@@ -506,7 +609,7 @@ async function exchangeGogCode(code) {
  * Automatically renew GOG access token using refresh_token (matching Playnite / Heroic)
  */
 async function renewGogTokens(refreshToken) {
-  const inflightKey = 'gog';
+  const inflightKey = `gog:${String(refreshToken || '')}`;
   if (inFlightTokenRenewals.has(inflightKey)) {
     return inFlightTokenRenewals.get(inflightKey);
   }
@@ -1111,9 +1214,110 @@ async function exchangeEpicCode(code) {
 
 /**
  * Fetch Epic Games Player Achievements from official launcher GraphQL service
+ * and reconcile with local Legendary metadata/*.json achievement schemas.
  */
-async function fetchEpicAchievements(accessToken, accountId) {
-  if (!accountId) return {};
+async function fetchEpicAchievements(accessToken, accountId, options = {}) {
+  const achievementsMap = {};
+  const sandboxMetaLookup = new Map();
+  const syncedAt = new Date().toISOString();
+
+  // 1. Scan local Legendary metadata/*.json to seed known Epic achievement totals/XP
+  //    and build a sandboxId (namespace) -> { appName, catalogItemId, title } lookup.
+  try {
+    const baseDirs = getLocalLegendaryBaseDirs(options);
+    for (const baseDir of baseDirs) {
+      if (!baseDir) continue;
+      const metaDir = path.join(baseDir, 'metadata');
+      if (!fs.existsSync(metaDir)) continue;
+      let files = [];
+      try {
+        files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        try {
+          const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf-8'));
+          if (!json || typeof json !== 'object') continue;
+          const appName = String(json.app_name || f.replace(/\.json$/i, '')).trim();
+          const appNameLower = appName.toLowerCase();
+          const sandboxIdLower = String(json.namespace || json.metadata?.namespace || '')
+            .toLowerCase()
+            .trim();
+          const catalogIdLower = String(
+            json.catalog_item_id || json.id || json.metadata?.id || ''
+          )
+            .toLowerCase()
+            .trim();
+          const title = String(json.app_title || json.metadata?.title || '').trim();
+          const titleLower = title.toLowerCase();
+          const normTitle = titleLower
+            .replace(/[:\-–—]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          if (sandboxIdLower) {
+            const existingList = sandboxMetaLookup.get(sandboxIdLower) || [];
+            existingList.push({
+              appNameLower,
+              catalogIdLower,
+              titleLower,
+              normTitle,
+            });
+            sandboxMetaLookup.set(sandboxIdLower, existingList);
+          }
+
+          const achBlock = json.achievements;
+          const achArray = Array.isArray(achBlock?.achievements) ? achBlock.achievements : [];
+          const total =
+            Number(achBlock?.total_achievements || 0) ||
+            (achArray.length > 0 ? achArray.length : 0);
+
+          if (total > 0) {
+            const totalXP =
+              Number(achBlock?.total_product_xp || 0) ||
+              achArray.reduce((sum, rawItem) => {
+                const a =
+                  rawItem?.achievement && typeof rawItem.achievement === 'object'
+                    ? rawItem.achievement
+                    : rawItem;
+                return sum + (Number(a?.xp ?? a?.XP ?? 0) || 0);
+              }, 0);
+            const seededSummary = {
+              unlocked: 0,
+              total,
+              percentage: 0,
+              xp: { earned: 0, total: totalXP },
+              isMastered: false,
+              source: 'local_client_cache',
+              syncedAt,
+            };
+            if (appNameLower && !achievementsMap[appNameLower]) {
+              achievementsMap[appNameLower] = seededSummary;
+              achievementsMap[`epic-${appNameLower}`] = seededSummary;
+            }
+            if (sandboxIdLower && !achievementsMap[sandboxIdLower]) {
+              achievementsMap[sandboxIdLower] = seededSummary;
+            }
+            if (catalogIdLower && !achievementsMap[catalogIdLower]) {
+              achievementsMap[catalogIdLower] = seededSummary;
+            }
+            if (titleLower && !achievementsMap[titleLower]) {
+              achievementsMap[titleLower] = seededSummary;
+            }
+            if (normTitle && !achievementsMap[normTitle]) {
+              achievementsMap[normTitle] = seededSummary;
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  if (!accountId || options.skipNetwork) {
+    return achievementsMap;
+  }
+
   try {
     const query = `query playerProfile($epicAccountId: String!, $locale: String!) {
       PlayerProfile {
@@ -1149,7 +1353,8 @@ async function fetchEpicAchievements(accessToken, accountId) {
       headers['Authorization'] = accessToken.startsWith('bearer ') ? accessToken : `bearer ${accessToken}`;
     }
 
-    const res = await fetch('https://launcher.store.epicgames.com/graphql', {
+    const fetchImpl = options.fetchFn || fetch;
+    const res = await fetchImpl('https://launcher.store.epicgames.com/graphql', {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -1163,12 +1368,11 @@ async function fetchEpicAchievements(accessToken, accountId) {
 
     if (!res.ok) {
       console.warn(`Epic achievements query returned status ${res.status}`);
-      return {};
+      return achievementsMap;
     }
 
     const json = await res.json();
     const dataList = json?.data?.PlayerProfile?.playerProfile?.achievementsSummaries?.data || [];
-    const achievementsMap = {};
 
     for (const item of dataList) {
       const total = item.productAchievements?.totalAchievements || 0;
@@ -1185,10 +1389,29 @@ async function fetchEpicAchievements(accessToken, accountId) {
         xp: { earned: earnedXP, total: totalXP },
         isMastered,
         source: 'live_cloud_graphql',
-        syncedAt: new Date().toISOString(),
+        syncedAt,
       };
 
-      if (item.sandboxId) achievementsMap[item.sandboxId.toLowerCase()] = summary;
+      const sbLower = item.sandboxId ? String(item.sandboxId).toLowerCase().trim() : '';
+      if (sbLower) {
+        achievementsMap[sbLower] = summary;
+        const localMatches = sandboxMetaLookup.get(sbLower) || [];
+        for (const m of localMatches) {
+          if (m.appNameLower) {
+            achievementsMap[m.appNameLower] = summary;
+            achievementsMap[`epic-${m.appNameLower}`] = summary;
+          }
+          if (m.catalogIdLower) {
+            achievementsMap[m.catalogIdLower] = summary;
+          }
+          if (m.titleLower) {
+            achievementsMap[m.titleLower] = summary;
+          }
+          if (m.normTitle) {
+            achievementsMap[m.normTitle] = summary;
+          }
+        }
+      }
       if (item.product?.slug) achievementsMap[item.product.slug.toLowerCase()] = summary;
       if (item.product?.name) {
         achievementsMap[item.product.name.toLowerCase().trim()] = summary;
@@ -1200,7 +1423,7 @@ async function fetchEpicAchievements(accessToken, accountId) {
     return achievementsMap;
   } catch (err) {
     console.warn('Epic achievements fetch warning:', err.message);
-    return {};
+    return achievementsMap;
   }
 }
 
@@ -1239,11 +1462,8 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
     }
   }
 
-  // 2. Fetch live achievements from Epic launcher GraphQL
-  let achievementsMap = {};
-  if (accountId) {
-    achievementsMap = await fetchEpicAchievements(accessToken, accountId);
-  }
+  // 2. Fetch live achievements from Epic launcher GraphQL (seeded with local Legendary metadata)
+  const achievementsMap = await fetchEpicAchievements(accessToken, accountId);
   fetchEpicOwnedGames.lastAchievementsMap = achievementsMap;
 
   const gamesMap = new Map();
@@ -1734,7 +1954,7 @@ async function fetchEpicOwnedGames(accessToken, accountId) {
  * Automatically renew Epic Games access token using refresh_token
  */
 async function renewEpicTokens(refreshToken) {
-  const inflightKey = 'epic';
+  const inflightKey = `epic:${String(refreshToken || '')}`;
   if (inFlightTokenRenewals.has(inflightKey)) {
     return inFlightTokenRenewals.get(inflightKey);
   }
@@ -1855,21 +2075,39 @@ async function getEpicCatalogAccessToken(forceClientCredentials = false) {
   return null;
 }
 
-function getLocalLegendaryBaseDirs() {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-  const userDataDir = (() => {
-    try {
-      return app ? app.getPath('userData') : '';
-    } catch {
-      return '';
-    }
-  })();
+function getLocalLegendaryBaseDirs(options = {}) {
+  if (Array.isArray(options?.legendaryBaseDirs)) {
+    return options.legendaryBaseDirs;
+  }
+  const hasExplicitIsolation = Boolean(options?.homedir || options?.userDataDir);
+  const homeDir = options?.homedir || process.env.HOME || process.env.USERPROFILE || '';
+  const userDataDir =
+    options?.userDataDir ||
+    (() => {
+      if (hasExplicitIsolation) return '';
+      try {
+        return app ? app.getPath('userData') : '';
+      } catch {
+        return '';
+      }
+    })();
 
   const candidates = [
     homeDir ? path.join(homeDir, '.config/legendary') : '',
     homeDir ? path.join(homeDir, 'Library/Application Support/heroic/legendaryConfig/legendary') : '',
     userDataDir ? path.join(userDataDir, 'legendaryConfig/legendary') : '',
-    process.env.APPDATA ? path.join(process.env.APPDATA, 'heroic/legendaryConfig/legendary') : '',
+    !hasExplicitIsolation && homeDir
+      ? path.join(homeDir, 'Library/Application Support/one-launcher/legendaryConfig/legendary')
+      : '',
+    !hasExplicitIsolation && homeDir
+      ? path.join(homeDir, 'Library/Application Support/One Launcher/legendaryConfig/legendary')
+      : '',
+    !hasExplicitIsolation && process.env.APPDATA
+      ? path.join(process.env.APPDATA, 'one-launcher/legendaryConfig/legendary')
+      : '',
+    !hasExplicitIsolation && process.env.APPDATA
+      ? path.join(process.env.APPDATA, 'heroic/legendaryConfig/legendary')
+      : '',
     homeDir ? path.join(homeDir, 'AppData', 'Roaming', 'heroic', 'legendaryConfig', 'legendary') : '',
   ].filter(Boolean);
 
@@ -2659,6 +2897,10 @@ function classifyNonGameStorefrontItem({
  * to discover all owned non-game items (betas, test branches, prologues, tools/editors, soundtracks/artbooks, DLCs)
  * so they appear in the Library Match & Overrides Studio while remaining suppressed from the main game library.
  */
+const suppressedEpicMetaFileCache = new Map();
+const suppressedGogCacheFileCache = new Map();
+const epicSchemaFileCache = new Map();
+
 function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   const resultsMap = new Map();
   const homeDir = customOptions.homedir || process.env.HOME || process.env.USERPROFILE || '';
@@ -2671,7 +2913,7 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
     }
   };
 
-  // 1. Scan Legendary / Heroic Epic metadata directories
+  // 1. Scan Legendary / Heroic Epic metadata directories (mtimeMs-cached per JSON file)
   const legendaryDirs = customOptions.legendaryDirs || getLocalLegendaryBaseDirs();
   for (const baseDir of legendaryDirs) {
     const metaDir = path.join(baseDir, 'metadata');
@@ -2679,15 +2921,42 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
     try {
       const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
       for (const file of files) {
+        const fullMetaPath = path.join(metaDir, file);
         try {
-          const json = JSON.parse(fs.readFileSync(path.join(metaDir, file), 'utf-8'));
+          const st = fs.statSync(fullMetaPath);
+          const cached = suppressedEpicMetaFileCache.get(fullMetaPath);
+          if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            if (cached.entry) {
+              addSuppressedEntry(cached.entry);
+            }
+            continue;
+          }
+
+          const json = JSON.parse(fs.readFileSync(fullMetaPath, 'utf-8'));
           const appName = String(json?.app_name || file.replace(/\.json$/i, '')).trim();
           const title = String(json?.app_title || json?.metadata?.title || '').trim();
-          if (!appName || !title || title === '1' || title === 'Live') continue;
-          if (/^[0-9a-f]{20,}$/i.test(title)) continue;
-          if (appName.startsWith('Fortnite_')) continue;
+          if (
+            !appName ||
+            !title ||
+            title === '1' ||
+            title === 'Live' ||
+            /^[0-9a-f]{20,}$/i.test(title) ||
+            appName.startsWith('Fortnite_')
+          ) {
+            suppressedEpicMetaFileCache.set(fullMetaPath, {
+              mtimeMs: st.mtimeMs,
+              size: st.size,
+              entry: null,
+            });
+            continue;
+          }
           const ns = json?.metadata?.namespace || json?.namespace || '';
           if (ns === 'ue' || ns === '89efe5924d3d467c839449ab6ab52e7f' || String(ns).startsWith('ue-')) {
+            suppressedEpicMetaFileCache.set(fullMetaPath, {
+              mtimeMs: st.mtimeMs,
+              size: st.size,
+              entry: null,
+            });
             continue;
           }
 
@@ -2706,6 +2975,7 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
             categories,
           });
 
+          let entry = null;
           if (reason) {
             const keyImages = json?.metadata?.keyImages || [];
             const tallCover =
@@ -2747,7 +3017,7 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
               tags: ['Epic Games Store'],
             };
 
-            addSuppressedEntry({
+            entry = {
               id: `epic-${appName}`,
               rawTitle: title,
               platformId: 'epic',
@@ -2755,14 +3025,25 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
               reason,
               reasonCategory: 'non_game_filter',
               rawGame,
-            });
+            };
+            addSuppressedEntry(entry);
           }
+
+          if (suppressedEpicMetaFileCache.size > 4000) {
+            const firstKey = suppressedEpicMetaFileCache.keys().next().value;
+            if (firstKey !== undefined) suppressedEpicMetaFileCache.delete(firstKey);
+          }
+          suppressedEpicMetaFileCache.set(fullMetaPath, {
+            mtimeMs: st.mtimeMs,
+            size: st.size,
+            entry,
+          });
         } catch {}
       }
     } catch {}
   }
 
-  // 2. Scan Heroic GOG library cache (gog_library.json)
+  // 2. Scan Heroic GOG library cache (gog_library.json, mtimeMs-cached)
   const gogCacheFiles = customOptions.gogCacheFiles || [
     homeDir ? path.join(homeDir, 'Library/Application Support/heroic/store_cache/gog_library.json') : '',
     homeDir ? path.join(homeDir, '.config/heroic/store_cache/gog_library.json') : '',
@@ -2772,6 +3053,16 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   for (const gogFile of gogCacheFiles) {
     if (!fs.existsSync(gogFile)) continue;
     try {
+      const st = fs.statSync(gogFile);
+      const cachedGog = suppressedGogCacheFileCache.get(gogFile);
+      if (cachedGog && cachedGog.mtimeMs === st.mtimeMs && cachedGog.size === st.size) {
+        for (const ent of cachedGog.entries) {
+          addSuppressedEntry(ent);
+        }
+        continue;
+      }
+
+      const fileEntries = [];
       const json = JSON.parse(fs.readFileSync(gogFile, 'utf-8'));
       const gamesList = Array.isArray(json?.games) ? json.games : [];
       for (const item of gamesList) {
@@ -2811,7 +3102,7 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
             genres: Array.isArray(item?.extra?.genres) ? item.extra.genres : ['Action'],
             tags: ['GOG', 'DRM-Free'],
           };
-          addSuppressedEntry({
+          const ent = {
             id: `gog-${appName}`,
             rawTitle: title,
             platformId: 'gog',
@@ -2819,9 +3110,16 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
             reason,
             reasonCategory: 'non_game_filter',
             rawGame,
-          });
+          };
+          fileEntries.push(ent);
+          addSuppressedEntry(ent);
         }
       }
+      suppressedGogCacheFileCache.set(gogFile, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        entries: fileEntries,
+      });
     } catch {}
   }
 
@@ -2866,6 +3164,9 @@ function trimStoreSyncMemory() {
   fetchGogOwnedGames.lastSuppressedItems = null;
   fetchEpicOwnedGames.lastAchievementsMap = null;
   fetchEpicOwnedGames.lastSuppressedItems = null;
+  suppressedEpicMetaFileCache.clear();
+  suppressedGogCacheFileCache.clear();
+  epicSchemaFileCache.clear();
   while (epicOfferMetadataCache.size > 100) {
     const oldestKey = epicOfferMetadataCache.keys().next().value;
     if (oldestKey === undefined) break;
@@ -2883,11 +3184,167 @@ function trimStoreSyncMemory() {
   }
 }
 
+/**
+ * Retrieve per-achievement schema definitions (names, descriptions, icons, XP, global rarity)
+ * for an Epic Games Store title from local Legendary metadata/*.json via non-blocking async I/O.
+ */
+async function getEpicGameAchievementSchema(payload = {}, options = {}) {
+  const rawAppName = String(
+    payload.appName || payload.platformGameId || payload.gameId || ''
+  )
+    .replace(/^epic[-_]/i, '')
+    .trim();
+  const rawNamespace = String(payload.namespace || payload.sandboxId || '').trim();
+  const rawCatalogId = String(payload.catalogItemId || '').trim();
+  const rawTitle = String(payload.title || '').trim();
+  const norm = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+  const normTitle = norm(rawTitle);
+
+  const mapRawEpicAchievement = (rawItem, idx) => {
+    const ach =
+      rawItem?.achievement && typeof rawItem.achievement === 'object'
+        ? rawItem.achievement
+        : rawItem;
+    const xpVal = Number(ach?.xp ?? ach?.XP ?? 0) || 0;
+    const rawPct =
+      typeof ach?.completed_percent === 'number'
+        ? ach.completed_percent
+        : typeof ach?.rarity?.percent === 'number'
+          ? ach.rarity.percent
+          : undefined;
+    return {
+      id: String(ach?.achievement_id || ach?.name || `epic_ach_${idx + 1}`),
+      apiName: String(ach?.achievement_id || ach?.name || `epic_ach_${idx + 1}`),
+      name: String(
+        ach?.unlocked_display_name ||
+          ach?.unlockedDisplayName ||
+          ach?.locked_display_name ||
+          ach?.lockedDisplayName ||
+          ach?.achievement_id ||
+          ach?.name ||
+          `Achievement ${idx + 1}`
+      ),
+      description: String(
+        ach?.unlocked_description ||
+          ach?.unlockedDescription ||
+          ach?.locked_description ||
+          ach?.lockedDescription ||
+          ach?.flavorText ||
+          ''
+      ),
+      hidden: Boolean(ach?.hidden),
+      xp: xpVal,
+      tierName: ach?.tier?.name ? String(ach.tier.name) : undefined,
+      globalPercentage: rawPct !== undefined ? Number(rawPct) : undefined,
+      iconUnlockedUrl: ach?.unlocked_icon_url || ach?.unlockedIconLink || undefined,
+      iconLockedUrl: ach?.locked_icon_url || ach?.lockedIconLink || undefined,
+    };
+  };
+
+  const readParsedEpicSchemaMetaAsync = async (filePath, fallbackFileName = '') => {
+    const st = await fs.promises.stat(filePath);
+    const cached = epicSchemaFileCache.get(filePath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      return cached.summary;
+    }
+    const rawText = await fs.promises.readFile(filePath, 'utf-8');
+    const json = JSON.parse(rawText);
+    if (!json || typeof json !== 'object') return null;
+    const achList = json?.achievements?.achievements;
+    const summary = {
+      appName: String(json.app_name || fallbackFileName.replace(/\.json$/i, '')).trim(),
+      namespace: String(json.namespace || json.metadata?.namespace || '').trim(),
+      catalogItemId: String(
+        json.catalog_item_id || json.id || json.metadata?.id || ''
+      ).trim(),
+      title: String(json.app_title || json.metadata?.title || '').trim(),
+      mappedAchievements:
+        Array.isArray(achList) && achList.length > 0
+          ? achList.map(mapRawEpicAchievement)
+          : [],
+    };
+    if (epicSchemaFileCache.size > 2000) {
+      const firstKey = epicSchemaFileCache.keys().next().value;
+      if (firstKey !== undefined) epicSchemaFileCache.delete(firstKey);
+    }
+    epicSchemaFileCache.set(filePath, {
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+      summary,
+    });
+    return summary;
+  };
+
+  try {
+    const baseDirs = getLocalLegendaryBaseDirs(options);
+    for (const baseDir of baseDirs) {
+      if (!baseDir) continue;
+      const metaDir = path.join(baseDir, 'metadata');
+      try {
+        const dirSt = await fs.promises.stat(metaDir);
+        if (!dirSt.isDirectory()) continue;
+      } catch {
+        continue;
+      }
+
+      if (rawAppName) {
+        const directFile = path.join(metaDir, `${rawAppName}.json`);
+        try {
+          const directSummary = await readParsedEpicSchemaMetaAsync(
+            directFile,
+            `${rawAppName}.json`
+          );
+          if (directSummary && directSummary.mappedAchievements.length > 0) {
+            return directSummary.mappedAchievements;
+          }
+        } catch {}
+      }
+
+      let files = [];
+      try {
+        const dirEntries = await fs.promises.readdir(metaDir);
+        files = dirEntries.filter((f) => f.endsWith('.json'));
+      } catch {
+        continue;
+      }
+
+      for (const f of files) {
+        try {
+          const summary = await readParsedEpicSchemaMetaAsync(path.join(metaDir, f), f);
+          if (!summary) continue;
+
+          const isMatch =
+            (rawAppName && summary.appName.toLowerCase() === rawAppName.toLowerCase()) ||
+            (rawNamespace &&
+              summary.namespace &&
+              summary.namespace.toLowerCase() === rawNamespace.toLowerCase()) ||
+            (rawCatalogId &&
+              summary.catalogItemId &&
+              summary.catalogItemId.toLowerCase() === rawCatalogId.toLowerCase()) ||
+            (normTitle && summary.title && norm(summary.title) === normTitle);
+
+          if (isMatch && summary.mappedAchievements.length > 0) {
+            return summary.mappedAchievements;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return [];
+}
+
 module.exports = {
   atomicWriteFileSync,
   getMachineIdentityKeyMaterial,
   encryptTokensPayload,
   decryptTokensPayload,
+  isMockOrCorruptedToken,
+  sanitizeStorefrontTokensObject,
+  getTokensFilePath,
   writeTokensFile,
   destroyScraperWindowCleanly,
   trimStoreSyncMemory,
@@ -2902,6 +3359,7 @@ module.exports = {
   renewEpicTokens,
   fetchEpicOwnedGames,
   fetchEpicAchievements,
+  getEpicGameAchievementSchema,
   fetchEpicProductOfferMetadata,
   resolveEpicNamespaceAndIds,
   extractEpicMacSupportFromLegendaryDirs,

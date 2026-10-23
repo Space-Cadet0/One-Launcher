@@ -72,6 +72,38 @@ Write-Host "[2/7] Scanning One Launcher & Legendary manifests for installed game
 
 $removedPaths = @()
 $removedIds = @()
+$importedPaths = @()
+$importedIds = @()
+
+$epicImportManifests = @(
+    (Join-Path $env:APPDATA "one-launcher\one_launcher_epic_imports.json"),
+    (Join-Path $env:APPDATA "One Launcher\one_launcher_epic_imports.json"),
+    (Join-Path $env:APPDATA "com.onelauncher.app\one_launcher_epic_imports.json"),
+    (Join-Path $env:USERPROFILE ".one-launcher\one_launcher_epic_imports.json")
+)
+
+foreach ($impPath in $epicImportManifests) {
+    if (Test-Path -LiteralPath $impPath) {
+        try {
+            $idata = Get-Content -LiteralPath $impPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $imap = if ($idata.imports) { $idata.imports } else { $idata }
+            if ($imap -is [System.Array]) {
+                foreach ($ie in $imap) {
+                    if ($ie.appName) { $importedIds += [string]$ie.appName }
+                    if ($ie.installPath) { $importedPaths += [string]$ie.installPath }
+                }
+            } elseif ($imap) {
+                foreach ($iprop in $imap.PSObject.Properties) {
+                    if ($iprop.Name -ne "version") {
+                        $importedIds += [string]$iprop.Name
+                        if ($iprop.Value.appName) { $importedIds += [string]$iprop.Value.appName }
+                        if ($iprop.Value.installPath) { $importedPaths += [string]$iprop.Value.installPath }
+                    }
+                }
+            }
+        } catch {}
+    }
+}
 
 $oneLauncherManifests = @(
     (Join-Path $env:APPDATA "one-launcher\one_launcher_installed.json"),
@@ -90,8 +122,10 @@ foreach ($manifestPath in $oneLauncherManifests) {
             foreach ($entry in $items) {
                 $installPath = $entry.installPath
                 $runner = [string]$entry.runner
+                $rawGid = if ($entry.platformGameId) { ([string]$entry.platformGameId -replace "^(?i)(epic|gog)[-_]", "") } else { "" }
+                $isImportedExt = ($importedPaths -contains $installPath) -or ($rawGid -and ($importedIds -contains $rawGid))
                 $title = if ($entry.title) { $entry.title } else { [string]$entry.platformGameId }
-                if ($installPath -and ($runner -in @("legendary", "gogdl", "one_launcher") -or $installPath -match "(?i)OneLauncher")) {
+                if ($installPath -and (-not $isImportedExt -or $installPath -match "(?i)OneLauncher") -and ($runner -in @("legendary", "gogdl", "one_launcher") -or $installPath -match "(?i)OneLauncher")) {
                     $removedPaths += $installPath
                     if ($installPath -match "(?i)OneLauncher") {
                         $parentPath = Split-Path -Parent $installPath
@@ -132,9 +166,10 @@ foreach ($legManifest in $legendaryManifests) {
             if ($ldata -is [System.Array]) {
                 foreach ($entry in $ldata) {
                     $installPath = $entry.install_path
-                    if ($entry.app_name) { $removedIds += [string]$entry.app_name }
-                    $title = if ($entry.title) { $entry.title } else { [string]$entry.app_name }
-                    if ($installPath) {
+                    $an = if ($entry.app_name) { [string]$entry.app_name } else { "" }
+                    $title = if ($entry.title) { $entry.title } else { $an }
+                    if ($installPath -and ($installPath -match "(?i)OneLauncher" -or ($removedPaths -contains $installPath)) -and ($importedPaths -notcontains $installPath) -and (-not $an -or ($importedIds -notcontains $an))) {
+                        if ($an) { $removedIds += $an }
                         $removedPaths += $installPath
                         if ($installPath -notmatch "(?i)\\Steam(\\|$)") {
                             Remove-PathSafely -TargetPath $installPath -Label "Epic Game ($title)"
@@ -144,11 +179,12 @@ foreach ($legManifest in $legendaryManifests) {
             } else {
                 foreach ($prop in $ldata.PSObject.Properties) {
                     $entry = $prop.Value
-                    $removedIds += [string]$prop.Name
-                    if ($entry.app_name) { $removedIds += [string]$entry.app_name }
+                    $an = if ($entry.app_name) { [string]$entry.app_name } else { [string]$prop.Name }
                     $installPath = $entry.install_path
                     $title = if ($entry.title) { $entry.title } else { $prop.Name }
-                    if ($installPath) {
+                    if ($installPath -and ($installPath -match "(?i)OneLauncher" -or ($removedPaths -contains $installPath)) -and ($importedPaths -notcontains $installPath) -and ($importedIds -notcontains [string]$prop.Name) -and ($importedIds -notcontains $an)) {
+                        $removedIds += [string]$prop.Name
+                        if ($entry.app_name) { $removedIds += [string]$entry.app_name }
                         $removedPaths += $installPath
                         if ($installPath -notmatch "(?i)\\Steam(\\|$)") {
                             Remove-PathSafely -TargetPath $installPath -Label "Epic Game ($title)"

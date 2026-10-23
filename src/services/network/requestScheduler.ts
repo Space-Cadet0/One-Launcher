@@ -37,6 +37,7 @@ export interface TokenBucket {
   capacity: number;
   cooldownUntil: number;
   cooldownDurationMs: number;
+  activeInteractiveCount: number;
   queue: QueueItem<any>[];
   timer: any;
 }
@@ -46,6 +47,10 @@ export const DOMAIN_CONFIGS: Record<string, DomainConfig> = {
     requestsPerSecond: 0.5,
     burst: 2,
     cooldownOnRateLimitSec: 900, // 15-minute Akamai edge cooldown
+  },
+  'api.steampowered.com': {
+    requestsPerSecond: 2.0,
+    burst: 4,
   },
   'steamcommunity.com': {
     requestsPerSecond: 1.0,
@@ -91,9 +96,27 @@ export class RequestScheduler {
   private enforceDelays: boolean = typeof process !== 'undefined' ? !process.env.VITEST : true;
   private interactiveScopes = new Set<string>();
   private inFlightP0Count = 0;
+  private inGameThrottled = false;
 
   constructor() {
     this.initBuckets();
+  }
+
+  /**
+   * Toggles in-game network throttling.
+   * When enabled, P1_VIEWPORT and P2_BACKGROUND queued requests are held/deferred
+   * across all domains while P0_INTERACTIVE requests continue to execute immediately.
+   * When disabled, all domain queues are immediately kicked to resume.
+   */
+  public setInGameThrottle(throttled: boolean): void {
+    this.inGameThrottled = Boolean(throttled);
+    if (!this.inGameThrottled) {
+      this.resumeAllQueues();
+    }
+  }
+
+  public isInGameThrottled(): boolean {
+    return this.inGameThrottled;
   }
 
   /**
@@ -120,9 +143,25 @@ export class RequestScheduler {
     return this.interactiveScopes.size > 0 || this.inFlightP0Count > 0;
   }
 
+  private isCandidateHeld(priority: number): boolean {
+    if (this.inGameThrottled && priority > RequestPriority.P0_INTERACTIVE) {
+      return true;
+    }
+    if (this.isInteractivePreempted() && priority >= RequestPriority.P2_BACKGROUND) {
+      return true;
+    }
+    return false;
+  }
+
+  private sortBucketQueue(bucket: TokenBucket): void {
+    if (bucket.queue.length > 1) {
+      bucket.queue.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt);
+    }
+  }
+
   private resumeAllQueues(): void {
     for (const domain of this.buckets.keys()) {
-      this.processQueue(domain);
+      this.processDomainQueue(domain);
     }
   }
 
@@ -147,6 +186,7 @@ export class RequestScheduler {
         capacity: cfg.burst,
         cooldownUntil: 0,
         cooldownDurationMs: (cfg.cooldownOnRateLimitSec || 0) * 1000,
+        activeInteractiveCount: 0,
         queue: [],
         timer: null,
       });
@@ -166,6 +206,7 @@ export class RequestScheduler {
 
     // Check Vite proxy endpoints
     if (clean.includes('/api/steam-store')) return 'store.steampowered.com';
+    if (clean.includes('/api/steam-api')) return 'api.steampowered.com';
     if (clean.includes('/api/steam-community')) return 'steamcommunity.com';
     if (clean.includes('/api/metacritic-backend')) return 'backend.metacritic.com';
     if (clean.includes('/api/metacritic')) return 'metacritic.com';
@@ -177,6 +218,7 @@ export class RequestScheduler {
 
     // Check domain string containment
     if (clean.includes('store.steampowered.com')) return 'store.steampowered.com';
+    if (clean.includes('api.steampowered.com')) return 'api.steampowered.com';
     if (clean.includes('steamcommunity.com')) return 'steamcommunity.com';
     if (clean.includes('backend.metacritic.com')) return 'backend.metacritic.com';
     if (clean.includes('metacritic.com')) return 'metacritic.com';
@@ -208,6 +250,7 @@ export class RequestScheduler {
         capacity: def.burst,
         cooldownUntil: 0,
         cooldownDurationMs: 0,
+        activeInteractiveCount: 0,
         queue: [],
         timer: null,
       };
@@ -300,11 +343,28 @@ export class RequestScheduler {
       };
 
       bucket.queue.push(item);
+      this.sortBucketQueue(bucket);
       this.processQueue(domain);
     });
   }
 
+  /**
+   * Alias for schedule() so callers using either method name route through the same priority token bucket.
+   */
+  public enqueue<T>(
+    url: string,
+    fn: () => Promise<T>,
+    priority: number = RequestPriority.P1_VIEWPORT,
+    domainKey?: string
+  ): Promise<T> {
+    return this.schedule(url, fn, priority, domainKey);
+  }
+
   private processQueue(domain: string): void {
+    this.processDomainQueue(domain);
+  }
+
+  private processDomainQueue(domain: string): void {
     const bucket = this.getBucket(domain);
 
     if (bucket.timer) {
@@ -315,13 +375,16 @@ export class RequestScheduler {
     const now = Date.now();
     if (bucket.cooldownUntil > now) {
       const delay = bucket.cooldownUntil - now;
-      bucket.timer = setTimeout(() => this.processQueue(domain), Math.min(delay, 2147483647));
+      bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.min(delay, 2147483647));
       return;
     }
 
     if (!this.enforceDelays) {
       while (bucket.queue.length > 0) {
-        bucket.queue.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt);
+        const nextCandidate = bucket.queue[0];
+        if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
+          break;
+        }
         const item = bucket.queue.shift();
         if (!item) break;
         this.executeItem(domain, bucket, item);
@@ -332,13 +395,19 @@ export class RequestScheduler {
     this.refill(bucket);
 
     while (bucket.queue.length > 0) {
-      bucket.queue.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt);
       const nextCandidate = bucket.queue[0];
-      if (!nextCandidate) break;
+      if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
+        break;
+      }
 
-      // Fast-lane for P0_INTERACTIVE: grant an immediate priority token boost so on-demand user actions
-      // never stall behind background token depletion.
-      if (nextCandidate.priority === RequestPriority.P0_INTERACTIVE && bucket.tokens < 1) {
+      // Bounded fast-lane for P0_INTERACTIVE: grant an immediate priority token boost for up to 2
+      // concurrent interactive requests per domain so on-demand user actions never stall behind
+      // background token depletion without triggering an unbounded Akamai 429 burst stampede.
+      if (
+        nextCandidate.priority === RequestPriority.P0_INTERACTIVE &&
+        bucket.tokens < 1 &&
+        bucket.activeInteractiveCount < 2
+      ) {
         bucket.tokens = 1;
       }
 
@@ -352,30 +421,42 @@ export class RequestScheduler {
     }
 
     if (bucket.queue.length > 0 && bucket.tokens < 1) {
-      const tokensNeeded = 1 - bucket.tokens;
-      const waitMs = Math.ceil((tokensNeeded / bucket.fillRate) * 1000);
-      bucket.timer = setTimeout(() => this.processQueue(domain), Math.max(10, waitMs));
+      const nextCandidate = bucket.queue[0];
+      if (nextCandidate && !this.isCandidateHeld(nextCandidate.priority)) {
+        const tokensNeeded = 1 - bucket.tokens;
+        const waitMs = Math.ceil((tokensNeeded / bucket.fillRate) * 1000);
+        bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.max(10, waitMs));
+      }
     }
   }
 
   /**
-   * Promotes any queued requests matching the given URL or domain to P0_INTERACTIVE
-   * so interactive callers awaiting a deduplicated in-flight promise never wait behind background queues.
+   * Promotes queued requests matching the exact URL to P0_INTERACTIVE
+   * (or the whole domain only when options.wholeDomain is explicitly true)
+   * so interactive callers awaiting a deduplicated in-flight promise never wait behind background queues
+   * without mass-promoting hundreds of background items on the same domain.
    */
-  public promoteToInteractive(urlOrDomain: string): void {
+  public promoteToInteractive(
+    urlOrDomain: string,
+    options?: { wholeDomain?: boolean }
+  ): void {
+    if (!urlOrDomain) return;
     const domain = this.resolveDomain(urlOrDomain);
     const bucket = this.getBucket(domain);
+    const matchWholeDomain = Boolean(options?.wholeDomain);
     let promoted = false;
     for (const item of bucket.queue) {
-      if (item.url === urlOrDomain || item.domain === domain) {
-        if (item.priority > RequestPriority.P0_INTERACTIVE) {
-          item.priority = RequestPriority.P0_INTERACTIVE;
-          promoted = true;
-        }
+      const isMatch = matchWholeDomain
+        ? item.url === urlOrDomain || item.domain === domain
+        : item.url === urlOrDomain;
+      if (isMatch && item.priority > RequestPriority.P0_INTERACTIVE) {
+        item.priority = RequestPriority.P0_INTERACTIVE;
+        promoted = true;
       }
     }
     if (promoted) {
-      this.processQueue(domain);
+      this.sortBucketQueue(bucket);
+      this.processDomainQueue(domain);
     }
   }
 
@@ -383,6 +464,7 @@ export class RequestScheduler {
     const isP0 = item.priority === RequestPriority.P0_INTERACTIVE;
     if (isP0) {
       this.inFlightP0Count++;
+      bucket.activeInteractiveCount++;
     }
     try {
       const result = await item.fn();
@@ -405,7 +487,8 @@ export class RequestScheduler {
         const backoffMs = Math.min(5000, 200 * Math.pow(2, item.retries) + jitter);
         setTimeout(() => {
           bucket.queue.push(item);
-          this.processQueue(domain);
+          this.sortBucketQueue(bucket);
+          this.processDomainQueue(domain);
         }, backoffMs);
         return;
       }
@@ -413,12 +496,13 @@ export class RequestScheduler {
       item.reject(err);
     } finally {
       if (isP0) {
+        bucket.activeInteractiveCount = Math.max(0, bucket.activeInteractiveCount - 1);
         this.inFlightP0Count = Math.max(0, this.inFlightP0Count - 1);
         if (this.inFlightP0Count === 0 && this.interactiveScopes.size === 0) {
           this.resumeAllQueues();
         }
       }
-      this.processQueue(domain);
+      this.processDomainQueue(domain);
     }
   }
 
@@ -433,9 +517,11 @@ export class RequestScheduler {
       }
       bucket.queue = [];
       bucket.cooldownUntil = 0;
+      bucket.activeInteractiveCount = 0;
     }
     this.interactiveScopes.clear();
     this.inFlightP0Count = 0;
+    this.inGameThrottled = false;
     this.buckets.clear();
     this.initBuckets();
   }

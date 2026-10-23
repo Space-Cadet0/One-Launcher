@@ -29,26 +29,25 @@ exports.default = async function afterPack(context) {
   }
 
   // Sign nested unpacked CLI binaries and Mach-O helper dylibs first (inside-out signing order required by Apple codesign)
-  const unpackedDirs = [
-    path.join(
-      appPath,
-      'Contents',
-      'Resources',
-      'app.asar.unpacked',
-      'electron',
-      'bin',
-      'arm64',
-      'darwin'
-    ),
-    path.join(
-      appPath,
-      'Contents',
-      'Resources',
-      'app.asar.unpacked',
-      'electron',
-      'helpers'
-    ),
-  ];
+  const unpackedElectronRoot = path.join(
+    appPath,
+    'Contents',
+    'Resources',
+    'app.asar.unpacked',
+    'electron'
+  );
+  const unpackedBinRoot = path.join(unpackedElectronRoot, 'bin');
+  const unpackedDirs = [];
+  if (fs.existsSync(unpackedBinRoot)) {
+    for (const archEntry of fs.readdirSync(unpackedBinRoot, { withFileTypes: true })) {
+      if (!archEntry.isDirectory()) continue;
+      const darwinArchDir = path.join(unpackedBinRoot, archEntry.name, 'darwin');
+      if (fs.existsSync(darwinArchDir)) {
+        unpackedDirs.push(darwinArchDir);
+      }
+    }
+  }
+  unpackedDirs.push(path.join(unpackedElectronRoot, 'helpers'));
   for (const unpackedDir of unpackedDirs) {
     if (!fs.existsSync(unpackedDir)) continue;
     for (const entry of fs.readdirSync(unpackedDir)) {
@@ -63,10 +62,24 @@ exports.default = async function afterPack(context) {
     }
   }
 
-  // Deep ad-hoc sign the entire application bundle (Frameworks, Helpers, Main Executable, Info.plist & CodeResources)
-  execFileSync('codesign', ['--force', '--deep', '--sign', '-', appPath], {
-    stdio: 'inherit',
-  });
+  // Deep ad-hoc sign the entire application bundle with a stable identifier-based designated requirement
+  // so macOS TCC permissions persist across builds instead of resetting on CDHash changes.
+  execFileSync(
+    'codesign',
+    [
+      '--force',
+      '--deep',
+      '--sign',
+      '-',
+      '--identifier',
+      'com.onelauncher.app',
+      '-r=designated => identifier "com.onelauncher.app"',
+      appPath,
+    ],
+    {
+      stdio: 'inherit',
+    }
+  );
 
   // Strictly verify the resulting bundle signature on disk
   execFileSync(

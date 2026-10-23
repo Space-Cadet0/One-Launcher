@@ -27,6 +27,11 @@ import steamEnrichedCache from '../../services/storage/steamEnrichedCache.json';
 import steamBlurbCache from '../../services/storage/steamBlurbCache.json';
 import { steamApi } from '../../services/steam/steamApi';
 import {
+  markScrollActivity,
+  isUserActivelyScrolling,
+  onScrollIdle,
+} from '../../utils/scrollActivityTracker';
+import {
   ActiveGameFilter,
   LibraryFilterState,
   DEFAULT_LIBRARY_FILTER_STATE,
@@ -547,6 +552,7 @@ export function removePendingFastScrollMount(fn: () => void): void {
 
 export function recordScrollActivity(scrollTop: number, sourceKey: string = 'main'): void {
   if (typeof window === 'undefined') return;
+  markScrollActivity();
   const now = Date.now();
   const prev = scrollWindowState.get(sourceKey);
   if (!prev) {
@@ -595,38 +601,36 @@ export function recordScrollActivity(scrollTop: number, sourceKey: string = 'mai
 export function notifyImageUnmounted(): void {
   if (typeof window === 'undefined') return;
   unmountedImageCount++;
-  if (unmountedImageCount >= 18 && !throttlePruneTimer) {
-    const elapsed = Date.now() - lastPruneTimestamp;
-    const delay = Math.max(80, 400 - elapsed);
+  if (unmountedImageCount >= 36 && !throttlePruneTimer) {
     throttlePruneTimer = setTimeout(() => {
       throttlePruneTimer = null;
-      if (unmountedImageCount > 0) {
-        unmountedImageCount = 0;
-        lastPruneTimestamp = Date.now();
-        window.electronAPI?.trimMemory?.();
-      }
-    }, delay);
+      scheduleScrollIdleMemoryTrim();
+    }, 1000);
   }
 }
 
 export function scheduleScrollIdleMemoryTrim(): void {
   if (typeof window === 'undefined') return;
   if (idlePruneTimer1) clearTimeout(idlePruneTimer1);
-  if (idlePruneTimer2) clearTimeout(idlePruneTimer2);
+  if (idlePruneTimer2) {
+    clearTimeout(idlePruneTimer2);
+    idlePruneTimer2 = null;
+  }
 
+  // Deep-idle passive buffer trim only after 20s of complete scroll inactivity;
+  // NEVER call webFrame.clearCache() or synchronous globalThis.gc() during or shortly after scrolling!
   idlePruneTimer1 = setTimeout(() => {
     idlePruneTimer1 = null;
-    unmountedImageCount = 0;
-    lastPruneTimestamp = Date.now();
-    window.electronAPI?.trimMemory?.();
-  }, 350);
-
-  idlePruneTimer2 = setTimeout(() => {
-    idlePruneTimer2 = null;
-    unmountedImageCount = 0;
-    lastPruneTimestamp = Date.now();
-    window.electronAPI?.trimMemory?.();
-  }, 1600);
+    if (isUserActivelyScrolling() || isCurrentlyFastScrolling()) {
+      scheduleScrollIdleMemoryTrim();
+      return;
+    }
+    if (unmountedImageCount > 0 && Date.now() - lastPruneTimestamp >= 20000) {
+      unmountedImageCount = 0;
+      lastPruneTimestamp = Date.now();
+      window.electronAPI?.trimMemory?.({ passive: true });
+    }
+  }, 20000);
 }
 
 const resolvedCandidateIndexCache = new Map<string, number>();
@@ -765,7 +769,8 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     useEffect(() => {
       if (!isNearViewport) return;
       if (effectiveOverride?.capsuleImage) return;
-      const timer = setTimeout(() => {
+      let cancelIdleWait: (() => void) | null = null;
+      const runLookup = () => {
         const isExplicitNonSteam =
           effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
         const hasResolvedSteamId = !isExplicitNonSteam && Boolean(steamMatcher.getEffectiveSteamAppId(game));
@@ -790,8 +795,18 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
               .catch(() => null);
           }
         }
+      };
+      const timer = setTimeout(() => {
+        if (isCurrentlyFastScrolling() || isUserActivelyScrolling()) {
+          cancelIdleWait = onScrollIdle(runLookup);
+        } else {
+          runLookup();
+        }
       }, 250);
-      return () => clearTimeout(timer);
+      return () => {
+        clearTimeout(timer);
+        if (cancelIdleWait) cancelIdleWait();
+      };
     }, [
       isNearViewport,
       game.id,
@@ -1047,10 +1062,17 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         return;
       }
       if (!criticThrottleTimer) {
-        criticThrottleTimer = setTimeout(() => {
-          criticThrottleTimer = null;
-          setCriticUpdateTick((t) => t + 1);
-        }, 350);
+        const scheduleCriticFlush = (delayMs: number) => {
+          criticThrottleTimer = setTimeout(() => {
+            criticThrottleTimer = null;
+            if (isCurrentlyFastScrolling() || isUserActivelyScrolling()) {
+              scheduleCriticFlush(300);
+              return;
+            }
+            setCriticUpdateTick((t) => t + 1);
+          }, delayMs);
+        };
+        scheduleCriticFlush(450);
       }
     };
     const getLauncherGridSignature = () => {
@@ -1349,24 +1371,31 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         clearTimeout(scrollEndTimeoutRef.current);
       }
 
-      // 150ms after scroll/wheel events cease, check if cursor is resting over a card
-      scrollEndTimeoutRef.current = setTimeout(() => {
-        if (!lastMousePosRef.current) return;
-        const { x, y } = lastMousePosRef.current;
-        const el = document.elementFromPoint(x, y);
-        const cardEl = el?.closest<HTMLDivElement>('[data-game-id]');
-        if (cardEl) {
-          const gameId = cardEl.getAttribute('data-game-id');
-          const game = gamesRef.current.find((g) => g.id === gameId);
-          if (game) {
-            startHoverForCardRef.current(game, cardEl);
+      // 180ms after grid scroll/wheel events cease, check if cursor is resting over a card
+      const isModalOpen =
+        typeof document !== 'undefined' &&
+        document.documentElement?.dataset?.modalOverlayOpen === 'true';
+      if (!isModalOpen) {
+        scrollEndTimeoutRef.current = setTimeout(() => {
+          if (isUserActivelyScrolling() || !lastMousePosRef.current) return;
+          if (document.documentElement?.dataset?.modalOverlayOpen === 'true') return;
+          const { x, y } = lastMousePosRef.current;
+          const el = document.elementFromPoint(x, y);
+          const cardEl = el?.closest<HTMLDivElement>('[data-game-id]');
+          if (cardEl) {
+            const gameId = cardEl.getAttribute('data-game-id');
+            const game = gamesRef.current.find((g) => g.id === gameId);
+            if (game) {
+              startHoverForCardRef.current(game, cardEl);
+            }
           }
-        }
-      }, 150);
+        }, 180);
+      }
     };
 
     const handleMouseMove = (e: MouseEvent) => {
       lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+      if (isUserActivelyScrolling() || isCurrentlyFastScrolling()) return;
 
       // If no card or popout is actively tracked, check if mouse is over a card
       if (!activeCardRef.current && !popoutRef.current) {
@@ -1444,9 +1473,16 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     window.addEventListener('mousemove', handleMouseMove, { passive: true });
 
     return () => {
-      if (scrollEndTimeoutRef.current) clearTimeout(scrollEndTimeoutRef.current);
+      if (hoverTimeoutRef.current) {
+        clearTimeout(hoverTimeoutRef.current);
+        hoverTimeoutRef.current = null;
+      }
+      if (scrollEndTimeoutRef.current) {
+        clearTimeout(scrollEndTimeoutRef.current);
+        scrollEndTimeoutRef.current = null;
+      }
       window.removeEventListener('scroll', handleScrollOrWheel, true);
-      window.removeEventListener('wheel', handleScrollOrWheel, true);
+      window.removeEventListener('wheel', handleScrollOrWheel);
       window.removeEventListener('resize', handleDismiss);
       window.removeEventListener('blur', handleDismiss);
       window.removeEventListener('mousemove', handleMouseMove);
@@ -1555,6 +1591,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
   }, [games, sortBy, releaseYearOrder, overrideVersion, effectiveFilterIndex, effectiveFilterState]);
 
   const handleMouseEnter = (game: CanonicalGame, e: React.MouseEvent<HTMLDivElement>) => {
+    if (isUserActivelyScrolling() || isCurrentlyFastScrolling()) return;
     startHoverForCard(game, e.currentTarget);
   };
 
@@ -1882,7 +1919,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
                   e.stopPropagation();
                   handleContextMenu(game, e);
                 }}
-                className="cv-card group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-colors duration-150 cursor-pointer shadow-md hover:shadow-2xl"
+                className={`${idx >= 28 ? 'cv-card cv-card-deferred' : 'cv-card'} group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-colors duration-150 cursor-pointer shadow-md hover:shadow-2xl`}
               >
                 {/* 2:3 Portrait Capsule Viewport */}
                 <div

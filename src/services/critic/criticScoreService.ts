@@ -88,6 +88,8 @@ export class CriticScoreService {
   private inMemoryCache = new Map<string, CriticScoreData | null>();
   private inFlightResolutions = new Map<string, Promise<CriticScoreData | null>>();
   private attemptedDynamicResolutions = new Set<string>();
+  private listenersInitialized = false;
+  private listenerCleanups: Array<() => void> = [];
 
   private setInMemoryCache(key: string, value: CriticScoreData | null): void {
     if (this.inMemoryCache.has(key)) {
@@ -110,8 +112,9 @@ export class CriticScoreService {
   }
 
   public initEventListeners(): void {
-    if (typeof window !== 'undefined') {
-      window.addEventListener('antigravity:user-override-updated', ((e: CustomEvent) => {
+    if (this.listenersInitialized) return;
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      const onOverrideUpdated = ((e: CustomEvent) => {
         const detail = e.detail;
         if (detail) {
           if (
@@ -128,8 +131,9 @@ export class CriticScoreService {
           const oldGame = detail.oldGame;
           this.handleUserOverride(override, oldGame);
         }
-      }) as EventListener);
-      window.addEventListener('antigravity:user-override-removed', ((e: CustomEvent) => {
+      }) as EventListener;
+
+      const onOverrideRemoved = ((e: CustomEvent) => {
         const gameId = e.detail?.gameId;
         const oldOverride = e.detail?.oldOverride;
         if (gameId || oldOverride) {
@@ -162,8 +166,26 @@ export class CriticScoreService {
             }
           }
         }
-      }) as EventListener);
+      }) as EventListener;
+
+      window.addEventListener('antigravity:user-override-updated', onOverrideUpdated);
+      window.addEventListener('antigravity:user-override-removed', onOverrideRemoved);
+      this.listenersInitialized = true;
+      this.listenerCleanups.push(() => {
+        window.removeEventListener('antigravity:user-override-updated', onOverrideUpdated);
+        window.removeEventListener('antigravity:user-override-removed', onOverrideRemoved);
+      });
     }
+  }
+
+  public disposeEventListeners(): void {
+    for (const cleanup of this.listenerCleanups) {
+      try {
+        cleanup();
+      } catch {}
+    }
+    this.listenerCleanups = [];
+    this.listenersInitialized = false;
   }
 
   /**
@@ -223,7 +245,6 @@ export class CriticScoreService {
         for (const k of keysToSet) {
           if (k !== cacheKey) {
             this.setInMemoryCache(k, null);
-            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, null, MutabilityTier.TIER_0_USER_OVERRIDE);
           }
         }
         if (typeof window !== 'undefined') {
@@ -243,7 +264,6 @@ export class CriticScoreService {
         for (const k of keysToSet) {
           if (k !== cacheKey) {
             this.setInMemoryCache(k, staticData);
-            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, staticData, MutabilityTier.TIER_0_USER_OVERRIDE);
           }
         }
         if (typeof window !== 'undefined') {
@@ -269,10 +289,6 @@ export class CriticScoreService {
         for (const k of keysToSet) {
           if (k !== cacheKey) {
             this.setInMemoryCache(k, override.reviewScoreOverride);
-            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}${k}`, override.reviewScoreOverride, dynamicTier, {
-              source: override.reviewScoreOverride.source,
-              isVerified: override.reviewScoreOverride.isVerified,
-            });
           }
         }
         if (typeof window !== 'undefined') {
@@ -1398,11 +1414,6 @@ export class CriticScoreService {
           const lower = title.toLowerCase();
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, refreshed);
-            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}title:${lower}`, refreshed, dynamicTier, {
-              source: refreshed.source,
-              isVerified: refreshed.isVerified,
-              dynamicResolved: true,
-            });
           }
           try {
             const allOverrides = loadUserOverrides();
@@ -1456,15 +1467,11 @@ export class CriticScoreService {
       // Only short-circuit if already verified Tier 1 Metacritic; if OpenCritic, allow dynamic upgrade check
       if (existing?.isVerified && existing.source === 'metacritic') {
         if (this.validateScoreSemanticCompatibility(title, existing, steamAppId)) {
-          if (steamAppId) {
-            this.cacheResult(`id:${steamAppId}`, existing, effectiveReleaseDate, enrichedGenres, {
-              dynamicResolved: true,
-            });
-          }
+          this.cacheResult(cacheKey, existing, effectiveReleaseDate, enrichedGenres, {
+            dynamicResolved: true,
+          });
           if (lowerTitleKey && lowerTitleKey !== cacheKey) {
-            this.cacheResult(lowerTitleKey, existing, effectiveReleaseDate, enrichedGenres, {
-              dynamicResolved: true,
-            });
+            this.setInMemoryCache(lowerTitleKey, existing);
           }
           return existing;
         } else {
@@ -1474,11 +1481,11 @@ export class CriticScoreService {
           if (lowerTitleKey) this.attemptedDynamicResolutions.delete(lowerTitleKey);
         }
       } else if (existing && this.validateScoreSemanticCompatibility(title, existing, steamAppId)) {
-        if (steamAppId && !this.inMemoryCache.has(`id:${steamAppId}`)) {
-          this.cacheResult(`id:${steamAppId}`, existing, effectiveReleaseDate, enrichedGenres);
+        if (!this.inMemoryCache.has(cacheKey)) {
+          this.cacheResult(cacheKey, existing, effectiveReleaseDate, enrichedGenres);
         }
-        if (lowerTitleKey && !this.inMemoryCache.has(lowerTitleKey)) {
-          this.cacheResult(lowerTitleKey, existing, effectiveReleaseDate, enrichedGenres);
+        if (lowerTitleKey && lowerTitleKey !== cacheKey && !this.inMemoryCache.has(lowerTitleKey)) {
+          this.setInMemoryCache(lowerTitleKey, existing);
         }
       }
     }
@@ -1525,13 +1532,19 @@ export class CriticScoreService {
           if (current?.isSynthetic && isCandidateValid(current)) {
             this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
             if (lower && cacheKey !== `title:${lower}`) {
-              this.cacheResult(`title:${lower}`, current, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+              this.setInMemoryCache(`title:${lower}`, current);
+            }
+            if (normKey && cacheKey !== `title:${normKey}`) {
+              this.setInMemoryCache(`title:${normKey}`, current);
             }
             return current;
           }
           this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
           if (lower && cacheKey !== `title:${lower}`) {
-            this.cacheResult(`title:${lower}`, null, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            this.setInMemoryCache(`title:${lower}`, null);
+          }
+          if (normKey && cacheKey !== `title:${normKey}`) {
+            this.setInMemoryCache(`title:${normKey}`, null);
           }
           return null;
         };
@@ -1567,10 +1580,14 @@ export class CriticScoreService {
           }
           this.cacheResult(cacheKey, data, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
           if (lower && cacheKey !== `title:${lower}`) {
-            this.cacheResult(`title:${lower}`, data, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            this.setInMemoryCache(`title:${lower}`, data);
           }
           if (normKey && cacheKey !== `title:${normKey}`) {
-            this.cacheResult(`title:${normKey}`, data, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            this.setInMemoryCache(`title:${normKey}`, data);
+          }
+          const baseKey = stripEditionSuffix(title);
+          if (baseKey && baseKey !== normKey && cacheKey !== `title:${baseKey}`) {
+            this.setInMemoryCache(`title:${baseKey}`, data);
           }
           if (typeof window !== 'undefined') {
             window.dispatchEvent(
@@ -1638,7 +1655,10 @@ export class CriticScoreService {
         if (existingPreSeeded?.isVerified && existingPreSeeded.source === 'opencritic' && isCandidateValid(existingPreSeeded)) {
           this.cacheResult(cacheKey, existingPreSeeded, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
           if (lower && cacheKey !== `title:${lower}`) {
-            this.cacheResult(`title:${lower}`, existingPreSeeded, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            this.setInMemoryCache(`title:${lower}`, existingPreSeeded);
+          }
+          if (normKey && cacheKey !== `title:${normKey}`) {
+            this.setInMemoryCache(`title:${normKey}`, existingPreSeeded);
           }
           return existingPreSeeded;
         }
@@ -1924,11 +1944,6 @@ export class CriticScoreService {
           const normStagedKey = `${STORAGE_PREFIX}title:${normKey}`;
           if (normStagedKey !== stagedKey) {
             this.setInMemoryCache(`title:${normKey}`, data);
-            saveStagedCache<CriticScoreData>(normStagedKey, data, tier, {
-              source: data.source,
-              isVerified: data.isVerified,
-              dynamicResolved: options?.dynamicResolved,
-            });
           }
         }
       }

@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import type Hls from 'hls.js';
 import { SteamScreenshot, SteamMovie } from '../../contracts/steam';
+import { launcherService } from '../../services/launcher/launcherService';
+import { isModalOverlayOpen } from '../../utils/modalOverlayLock';
 import { isNonEnglishRegionalMovieName } from '../../services/steam/steamApi';
 import {
   Play,
@@ -31,10 +33,24 @@ function extractYouTubeId(url?: string): string | null {
   return match && match[1] ? match[1] : null;
 }
 
+function shouldSuspendMediaPlayback(): boolean {
+  return (
+    launcherService.getRunningGames().length > 0 ||
+    launcherService.isInGameHibernating() ||
+    (typeof document !== 'undefined' && Boolean(document.hidden))
+  );
+}
+
 const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const wasSuspendedRef = useRef<boolean>(shouldSuspendMediaPlayback());
+  const pausedForModalRef = useRef<boolean>(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isError, setIsError] = useState(false);
+  const [isSuspendedInGame, setIsSuspendedInGame] = useState<boolean>(() =>
+    shouldSuspendMediaPlayback()
+  );
 
   // Check if it's an iframe embed (YouTube/Wistia/Vimeo from GOG or fallback providers)
   const candidateUrl =
@@ -51,56 +67,6 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
     candidateUrl.includes('wistia.net') ||
     candidateUrl.includes('player.vimeo.com');
 
-  if (isEmbed) {
-    const watchUrl = ytId ? `https://www.youtube.com/watch?v=${ytId}` : candidateUrl;
-    const embedSrc = ytId
-      ? `https://www.youtube-nocookie.com/embed/${ytId}?autoplay=1&rel=0&modestbranding=1&enablejsapi=1`
-      : candidateUrl;
-
-    const handleOpenExternal = (e: React.MouseEvent) => {
-      e.stopPropagation();
-      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
-        window.electronAPI.openExternal(watchUrl);
-      } else {
-        window.open(watchUrl, '_blank', 'noopener,noreferrer');
-      }
-    };
-
-    return (
-      <div className="relative w-full h-full bg-black flex items-center justify-center group/embed">
-        <iframe
-          src={embedSrc}
-          title={movie.name}
-          className="w-full h-full border-0"
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-          allowFullScreen
-          referrerPolicy="strict-origin-when-cross-origin"
-        />
-
-        {/* Action Pill to Open Trailer Directly in Browser */}
-        <button
-          type="button"
-          onClick={handleOpenExternal}
-          className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/85 hover:bg-[#c4302b] text-white text-xs font-semibold shadow-xl backdrop-blur-sm border border-white/20 transition-all cursor-pointer group/yt"
-          title={ytId ? 'Watch on YouTube in browser' : 'Open trailer in browser'}
-        >
-          {ytId ? (
-            <svg
-              className="w-3.5 h-3.5 fill-current text-red-500 group-hover/yt:text-white transition-colors"
-              viewBox="0 0 24 24"
-            >
-              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
-            </svg>
-          ) : (
-            <ExternalLink className="w-3.5 h-3.5" />
-          )}
-          <span>{ytId ? 'Watch on YouTube' : 'Open in Browser'}</span>
-          <ExternalLink className="w-3 h-3 opacity-70 group-hover/yt:opacity-100" />
-        </button>
-      </div>
-    );
-  }
-
   // Determine stream URLs
   const hlsUrl = movie.hls || (movie as any).hls_h264 || '';
   const mp4MaxUrl =
@@ -113,6 +79,61 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
       : '';
 
   useEffect(() => {
+    const syncSuspensionState = () => {
+      const suspended = shouldSuspendMediaPlayback();
+      const prevSuspended = wasSuspendedRef.current;
+      wasSuspendedRef.current = suspended;
+      if (suspended) {
+        pausedForModalRef.current = false;
+        videoRef.current?.pause();
+        hlsRef.current?.stopLoad();
+        setIsSuspendedInGame(true);
+      } else {
+        setIsSuspendedInGame(false);
+        if (prevSuspended) {
+          hlsRef.current?.startLoad();
+        }
+      }
+    };
+
+    const syncModalOverlayPause = () => {
+      const video = videoRef.current;
+      if (!video) return;
+      if (isModalOverlayOpen()) {
+        if (!video.paused) {
+          pausedForModalRef.current = true;
+          video.pause();
+        }
+      } else if (pausedForModalRef.current) {
+        pausedForModalRef.current = false;
+        if (!shouldSuspendMediaPlayback()) {
+          void video.play().catch(() => {});
+        }
+      }
+    };
+
+    syncSuspensionState();
+    syncModalOverlayPause();
+
+    window.addEventListener('antigravity:launcher-state-changed', syncSuspensionState);
+    window.addEventListener('antigravity:hibernate-state-changed', syncSuspensionState);
+    window.addEventListener('antigravity:modal-overlay-changed', syncModalOverlayPause);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', syncSuspensionState);
+    }
+
+    return () => {
+      window.removeEventListener('antigravity:launcher-state-changed', syncSuspensionState);
+      window.removeEventListener('antigravity:hibernate-state-changed', syncSuspensionState);
+      window.removeEventListener('antigravity:modal-overlay-changed', syncModalOverlayPause);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', syncSuspensionState);
+      }
+    };
+  }, [movie]);
+
+  useEffect(() => {
+    if (isEmbed) return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -133,15 +154,22 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
               maxMaxBufferLength: 30,
               backBufferLength: 10,
             });
+            hlsRef.current = hlsInstance;
             hlsInstance.loadSource(hlsUrl);
             hlsInstance.attachMedia(video);
+            if (shouldSuspendMediaPlayback()) {
+              hlsInstance.stopLoad();
+              video.pause();
+            }
 
             hlsInstance.on(HlsModule.Events.ERROR, (_event, data) => {
               if (data.fatal) {
                 switch (data.type) {
                   case HlsModule.ErrorTypes.NETWORK_ERROR:
                     console.warn('HLS network error, attempting recovery...', data);
-                    hlsInstance?.startLoad();
+                    if (!shouldSuspendMediaPlayback()) {
+                      hlsInstance?.startLoad();
+                    }
                     break;
                   case HlsModule.ErrorTypes.MEDIA_ERROR:
                     console.warn('HLS media error, attempting recovery...', data);
@@ -151,6 +179,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
                     console.warn('HLS unrecoverable fatal error:', data);
                     hlsInstance?.destroy();
                     hlsInstance = null;
+                    hlsRef.current = null;
                     if (mp4MaxUrl) {
                       video.src = mp4MaxUrl;
                     } else {
@@ -192,17 +221,101 @@ const VideoPlayer: React.FC<{ movie: SteamMovie }> = ({ movie }) => {
         hlsInstance.detachMedia();
         hlsInstance.destroy();
       }
+      hlsRef.current = null;
       if (video) {
         video.pause();
         video.removeAttribute('src');
         video.load();
       }
     };
-  }, [movie, hlsUrl, mp4MaxUrl]);
+  }, [isEmbed, movie, hlsUrl, mp4MaxUrl]);
+
+  if (isEmbed) {
+    const watchUrl = ytId ? `https://www.youtube.com/watch?v=${ytId}` : candidateUrl;
+    const embedSrc = ytId
+      ? `https://www.youtube-nocookie.com/embed/${ytId}?autoplay=1&rel=0&modestbranding=1&enablejsapi=1`
+      : candidateUrl;
+    const posterThumb =
+      movie.thumbnail || (ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : '');
+
+    const handleOpenExternal = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+        window.electronAPI.openExternal(watchUrl);
+      } else {
+        window.open(watchUrl, '_blank', 'noopener,noreferrer');
+      }
+    };
+
+    return (
+      <div className="relative w-full h-full bg-black flex items-center justify-center group/embed">
+        {isSuspendedInGame ? (
+          <div
+            data-testid="suspended-embed-poster"
+            onClick={() => setIsSuspendedInGame(false)}
+            className="relative w-full h-full bg-black flex items-center justify-center cursor-pointer group/video"
+          >
+            {posterThumb && (
+              <img
+                src={posterThumb}
+                alt={movie.name}
+                className="w-full h-full object-contain select-none opacity-80"
+                loading="lazy"
+                decoding="async"
+              />
+            )}
+            <div className="absolute inset-0 bg-black/45 flex flex-col items-center justify-center gap-3 transition-opacity group-hover/video:bg-black/30">
+              <div className="w-16 h-16 rounded-full bg-steam-accent/30 border-2 border-steam-accent flex items-center justify-center text-white shadow-2xl transform group-hover/video:scale-110 transition-transform">
+                <Play className="w-7 h-7 fill-white translate-x-0.5" />
+              </div>
+              <span className="text-sm font-semibold tracking-wide text-white drop-shadow bg-black/70 px-3 py-1 rounded">
+                {movie.name}
+              </span>
+              <span className="text-[11px] text-steam-subtext bg-black/70 px-2.5 py-0.5 rounded">
+                Paused for In-Game Performance — Click to Play
+              </span>
+            </div>
+          </div>
+        ) : (
+          <iframe
+            src={embedSrc}
+            title={movie.name}
+            className="w-full h-full border-0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowFullScreen
+            referrerPolicy="strict-origin-when-cross-origin"
+          />
+        )}
+
+        {/* Action Pill to Open Trailer Directly in Browser */}
+        <button
+          type="button"
+          onClick={handleOpenExternal}
+          className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/85 hover:bg-[#c4302b] text-white text-xs font-semibold shadow-xl backdrop-blur-sm border border-white/20 transition-all cursor-pointer group/yt"
+          title={ytId ? 'Watch on YouTube in browser' : 'Open trailer in browser'}
+        >
+          {ytId ? (
+            <svg
+              className="w-3.5 h-3.5 fill-current text-red-500 group-hover/yt:text-white transition-colors"
+              viewBox="0 0 24 24"
+            >
+              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+            </svg>
+          ) : (
+            <ExternalLink className="w-3.5 h-3.5" />
+          )}
+          <span>{ytId ? 'Watch on YouTube' : 'Open in Browser'}</span>
+          <ExternalLink className="w-3 h-3 opacity-70 group-hover/yt:opacity-100" />
+        </button>
+      </div>
+    );
+  }
 
   const togglePlay = () => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
+      setIsSuspendedInGame(false);
+      hlsRef.current?.startLoad();
       videoRef.current.play().catch((err) => {
         console.warn('Playback error:', err);
       });
@@ -333,6 +446,8 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
 
   // Preload only the active screenshot + next 1 adjacent screenshot
   useEffect(() => {
+    if (shouldSuspendMediaPlayback()) return;
+
     const preloadFullUrl = (url?: string) => {
       if (!url || preloadedSetRef.current.has(url)) return;
       preloadedSetRef.current.add(url);

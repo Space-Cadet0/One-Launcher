@@ -48,7 +48,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "}; " ^
   "Start-Sleep -Seconds 1; " ^
   "Write-Host '[2/7] Discovering & removing installed games from manifests...' -ForegroundColor Yellow; " ^
-  "$removedPaths = @(); $removedIds = @(); " ^
+  "$removedPaths = @(); $removedIds = @(); $importedPaths = @(); $importedIds = @(); " ^
+  "@(\"$env:APPDATA\one-launcher\one_launcher_epic_imports.json\", \"$env:APPDATA\One Launcher\one_launcher_epic_imports.json\", \"$env:APPDATA\com.onelauncher.app\one_launcher_epic_imports.json\", \"$env:USERPROFILE\.one-launcher\one_launcher_epic_imports.json\") | ForEach-Object { if (Test-Path -LiteralPath $_) { try { $impData = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json; $impMap = if ($impData.imports) { $impData.imports } else { $impData }; if ($impMap -is [System.Array]) { foreach ($ie in $impMap) { if ($ie.appName) { $importedIds += [string]$ie.appName }; if ($ie.installPath) { $importedPaths += [string]$ie.installPath } } } elseif ($impMap) { foreach ($iprop in $impMap.PSObject.Properties) { if ($iprop.Name -ne 'version') { $importedIds += [string]$iprop.Name; if ($iprop.Value.appName) { $importedIds += [string]$iprop.Value.appName }; if ($iprop.Value.installPath) { $importedPaths += [string]$iprop.Value.installPath } } } } } catch {} } }; " ^
   "@(\"$env:APPDATA\one-launcher\one_launcher_installed.json\", \"$env:APPDATA\One Launcher\one_launcher_installed.json\", \"$env:APPDATA\com.onelauncher.app\one_launcher_installed.json\", \"$env:USERPROFILE\.one-launcher\one_launcher_installed.json\") | ForEach-Object { " ^
   "  if (Test-Path -LiteralPath $_) { " ^
   "    try { " ^
@@ -56,7 +57,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "      $items = if ($data -is [System.Array]) { $data } else { $data.PSObject.Properties | ForEach-Object { $_.Value } }; " ^
   "      foreach ($entry in $items) { " ^
   "        $ip = $entry.installPath; $r = [string]$entry.runner; " ^
-  "        if ($ip -and ($r -in @('legendary','gogdl','one_launcher') -or $ip -match '(?i)OneLauncher')) { " ^
+  "        $rawGid = if ($entry.platformGameId) { ([string]$entry.platformGameId -replace '^(?i)(epic|gog)[-_]','') } else { '' }; " ^
+  "        $isExt = ($importedPaths -contains $ip) -or ($rawGid -and ($importedIds -contains $rawGid)); " ^
+  "        if ($ip -and (-not $isExt -or $ip -match '(?i)OneLauncher') -and ($r -in @('legendary','gogdl','one_launcher') -or $ip -match '(?i)OneLauncher')) { " ^
   "          $removedPaths += $ip; " ^
   "          if ($ip -match '(?i)OneLauncher') { $parent = Split-Path -Parent $ip; if ($parent -and $parent -match '(?i)OneLauncher') { $removedPaths += $parent } }; " ^
   "          if ($entry.platformGameId) { $gid = [string]$entry.platformGameId; $removedIds += $gid; $removedIds += ($gid -replace '^(?i)(epic|gog)[-_]','') }; " ^
@@ -72,14 +75,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "      $ldata = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json; " ^
   "      if ($ldata -is [System.Array]) { " ^
   "        foreach ($entry in $ldata) { " ^
-  "          $lp = $entry.install_path; if ($entry.app_name) { $removedIds += [string]$entry.app_name }; " ^
-  "          if ($lp) { $removedPaths += $lp; if ($lp -notmatch '(?i)\\Steam(\\|$)') { Remove-Safe $lp ('Epic Game (' + $entry.app_name + ')') } } " ^
+  "          $lp = $entry.install_path; $an = if ($entry.app_name) { [string]$entry.app_name } else { '' }; " ^
+  "          if ($lp -and ($lp -match '(?i)OneLauncher' -or ($removedPaths -contains $lp)) -and ($importedPaths -notcontains $lp) -and (-not $an -or ($importedIds -notcontains $an))) { " ^
+  "            if ($an) { $removedIds += $an }; $removedPaths += $lp; if ($lp -notmatch '(?i)\\Steam(\\|$)') { Remove-Safe $lp ('Epic Game (' + $an + ')') } " ^
+  "          } " ^
   "        } " ^
   "      } else { " ^
   "        foreach ($prop in $ldata.PSObject.Properties) { " ^
-  "          $removedIds += [string]$prop.Name; if ($prop.Value.app_name) { $removedIds += [string]$prop.Value.app_name }; " ^
-  "          $lp = $prop.Value.install_path; " ^
-  "          if ($lp) { $removedPaths += $lp; if ($lp -notmatch '(?i)\\Steam(\\|$)') { Remove-Safe $lp ('Epic Game (' + $prop.Name + ')') } } " ^
+  "          $an = if ($prop.Value.app_name) { [string]$prop.Value.app_name } else { [string]$prop.Name }; $lp = $prop.Value.install_path; " ^
+  "          if ($lp -and ($lp -match '(?i)OneLauncher' -or ($removedPaths -contains $lp)) -and ($importedPaths -notcontains $lp) -and ($importedIds -notcontains [string]$prop.Name) -and ($importedIds -notcontains $an)) { " ^
+  "            $removedIds += [string]$prop.Name; if ($prop.Value.app_name) { $removedIds += [string]$prop.Value.app_name }; $removedPaths += $lp; if ($lp -notmatch '(?i)\\Steam(\\|$)') { Remove-Safe $lp ('Epic Game (' + $prop.Name + ')') } " ^
+  "          } " ^
   "        } " ^
   "      } " ^
   "    } catch {} " ^

@@ -14,6 +14,7 @@ import {
 } from '../storage/userOverrideStorage';
 import { loadStagedCache } from '../storage/stagedCacheService';
 import { flushPendingCatalogSave } from '../integrations/integrationStorage';
+import { isUserActivelyScrolling, waitUntilScrollIdle } from '../../utils/scrollActivityTracker';
 
 async function yieldToMainThread(): Promise<void> {
   if (
@@ -713,6 +714,13 @@ export class SyncJobManager {
         }
 
         await this.waitWhilePausedOrPreempted();
+        if (
+          isBackground &&
+          isUserActivelyScrolling() &&
+          !(typeof process !== 'undefined' && process.env.VITEST)
+        ) {
+          await waitUntilScrollIdle(1500);
+        }
         if (this.isCancelled || this.criticLoopToken !== myToken) break;
 
         const chunk = targetGames.slice(i, i + chunkSize);
@@ -842,7 +850,7 @@ export class SyncJobManager {
       try {
         flushPendingCatalogSave();
         if (typeof window !== 'undefined') {
-          (window as any).electronAPI?.trimMemory?.()?.catch?.(() => {});
+          (window as any).electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
         }
       } catch {}
     }
@@ -1071,7 +1079,7 @@ export class SyncJobManager {
         flushPendingCatalogSave();
         steamApi.trimMemoryCache(30);
         if (typeof window !== 'undefined') {
-          (window as any).electronAPI?.trimMemory?.()?.catch?.(() => {});
+          (window as any).electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
         }
       } catch {}
     }

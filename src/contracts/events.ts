@@ -1,12 +1,24 @@
+import { CriticScoreData } from './critic';
 import { CanonicalGame } from './game';
+import {
+  ActiveGameSession,
+  CloudSaveSyncTelemetry,
+  DownloadTaskState,
+  HibernateStatePayload,
+  InstalledGameRecord,
+  LauncherPerformanceSettings,
+} from './launcher';
 import { UserGameOverride } from './override';
 import { StorefrontId } from './platform';
 
 export interface CriticUpdatedEventDetail {
   key?: string;
+  cacheKey?: string;
   appId?: number;
+  steamAppId?: number;
   title?: string;
   score?: number | null;
+  data?: CriticScoreData | null;
 }
 
 export interface UserOverrideUpdatedEventDetail {
@@ -34,6 +46,11 @@ export interface SuppressedEntriesUpdatedEventDetail {
 export interface LauncherStateChangedEventDetail {
   reason?: string;
   gameId?: string;
+  runningGames?: ActiveGameSession[];
+  downloadQueue?: DownloadTaskState[];
+  installedRecords?: InstalledGameRecord[];
+  inGameHibernating?: boolean;
+  performanceSettings?: LauncherPerformanceSettings;
 }
 
 export interface GameSessionEndedEventDetail {
@@ -41,7 +58,9 @@ export interface GameSessionEndedEventDetail {
   platformId?: StorefrontId;
   platformGameId?: string;
   sessionMinutesPlayed?: number;
+  durationSeconds?: number;
   lastPlayed?: string;
+  storefrontTotalPlaytimeMinutes?: number | null;
 }
 
 export interface GameInstalledEventDetail {
@@ -51,6 +70,7 @@ export interface GameInstalledEventDetail {
   installed: boolean;
   installPath?: string;
   executablePath?: string;
+  isWindowsBinaryOnMac?: boolean;
 }
 
 export interface OpenDownloadDrawerEventDetail {
@@ -80,17 +100,34 @@ export interface GameLaunchErrorEventDetail {
   error: string;
 }
 
+export type CloudSyncTelemetryEventDetail =
+  | CloudSaveSyncTelemetry
+  | (Partial<CloudSaveSyncTelemetry> & Record<string, any>);
+
+export type HibernateStateChangedEventDetail = HibernateStatePayload;
+
+export interface SteamAssetsResolvedEventDetail {
+  appId: number;
+  capsuleImage?: string;
+  headerImage?: string;
+  iconUrl?: string;
+  ts?: number;
+}
+
 export interface OneLauncherEventMap {
   antigravity_critic_updated: CriticUpdatedEventDetail | undefined;
   'antigravity:user-override-updated': UserOverrideUpdatedEventDetail;
   'antigravity:user-override-removed': UserOverrideRemovedEventDetail;
   'antigravity:suppressed-entries-updated': SuppressedEntriesUpdatedEventDetail | undefined;
   'antigravity:launcher-state-changed': LauncherStateChangedEventDetail | undefined;
+  'antigravity:hibernate-state-changed': HibernateStateChangedEventDetail;
+  'antigravity:cloud-sync-telemetry': CloudSyncTelemetryEventDetail;
   'antigravity:game-session-ended': GameSessionEndedEventDetail;
   'antigravity:game-installed': GameInstalledEventDetail;
   'antigravity:open-download-drawer': OpenDownloadDrawerEventDetail | undefined;
   'antigravity:igdb-cover-updated': IgdbCoverUpdatedEventDetail;
   'antigravity:steam-match-updated': SteamMatchUpdatedEventDetail;
+  'antigravity:steam-assets-resolved': SteamAssetsResolvedEventDetail;
   'antigravity:gog-cover-updated': GogCoverUpdatedEventDetail;
   'antigravity:game-launch-error': GameLaunchErrorEventDetail;
 }

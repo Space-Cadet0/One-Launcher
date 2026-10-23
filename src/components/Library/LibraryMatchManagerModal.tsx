@@ -827,7 +827,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
   return (
     <div
-      className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
+      className="fixed inset-0 z-[90] bg-black/85 flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
       onClick={onClose}
     >
       <div

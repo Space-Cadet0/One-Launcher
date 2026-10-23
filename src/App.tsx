@@ -24,25 +24,23 @@ import {
 } from './components/Library/LibraryGridView';
 import { igdbCoverService, isUnsuitableCoverUrl } from './services/igdb/igdbCoverService';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
+import {
+  markScrollActivity,
+  waitUntilScrollIdle,
+  yieldToMainThread,
+} from './utils/scrollActivityTracker';
 import { CollectionIcon } from './components/Common/CollectionIcon';
 import { matchesLooseSearchQuery } from './services/common/titleUtils';
 import { syncJobManager } from './services/network/syncJobManager';
 import { RequestPriority } from './services/network/requestScheduler';
-import { UserGameOverride } from './contracts/override';
-import {
-  saveUserOverride,
-  removeUserOverride,
-  getUserOverrideForGame,
-  applyUserOverrideToGame,
-  hideStorefrontEntry,
-  unhideStorefrontEntry,
-} from './services/storage/userOverrideStorage';
+import { getUserOverrideForGame } from './services/storage/userOverrideStorage';
 import {
   loadIntegrations,
   saveIntegrations,
   mergeStorefrontGames,
   loadCurrentCatalog,
   saveCurrentCatalog,
+  flushPendingCatalogSave,
   connectGogIntegration,
   connectEpicIntegration,
   connectXboxIntegration,
@@ -59,11 +57,10 @@ import {
 import {
   sanitizeGameCatalog,
   normalizeCanonicalTitle,
-  hasSameStorefrontConflict,
-  SuppressedCatalogEntry,
   registerSuppressedCatalogEntries,
 } from './services/integrations/catalogSanitizer';
 import {
+  AlertTriangle,
   CheckCircle2,
   Layers,
   Sliders,
@@ -82,8 +79,19 @@ import {
 import { useNavigationHistory } from './hooks/useNavigationHistory';
 import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
 import { useCollectionsManager } from './hooks/useCollectionsManager';
+import { useSyncNotice } from './hooks/useSyncNotice';
+import { useLauncherHibernationState } from './hooks/useLauncherHibernationState';
+import { usePostSessionReconciler } from './hooks/usePostSessionReconciler';
+import { useCatalogOverrideSync } from './hooks/useCatalogOverrideSync';
+import {
+  reconcileCatalogTrophiesRecords,
+  runIntelligentNonSteamMatchPass,
+} from './utils/catalogMergeUtils';
 import { launcherService } from './services/launcher/launcherService';
 import { InstalledGameRecord } from './contracts/launcher';
+import { InGameHibernationView } from './components/Launcher/InGameHibernationView';
+
+export { InGameHibernationView };
 
 const ManageCollectionsModal = lazy(() =>
   import('./components/Library/ManageCollectionsModal').then((m) => ({
@@ -133,6 +141,7 @@ export function App() {
           const sanitized = sanitizeGameCatalog(cleaned, { allowNewPurchases: true });
           try {
             saveCurrentCatalog(sanitized, { skipSanitize: true });
+            flushPendingCatalogSave();
           } catch {}
           return sanitized;
         }
@@ -336,32 +345,63 @@ export function App() {
   const [isSyncingScores, setIsSyncingScores] = useState(false);
   const [isSyncingTrophies, setIsSyncingTrophies] = useState(false);
   const [gameRefreshKey, setGameRefreshKey] = useState(0);
-  const [syncNotice, setSyncNotice] = useState<string | null>(null);
+
+  const { syncNotice, syncNoticeTone, showSyncNotice } = useSyncNotice();
+  const { isHibernating, runningGames, resumeFullUi } = useLauncherHibernationState();
+
+  const {
+    isFixMatchModalOpen,
+    setIsFixMatchModalOpen,
+    fixMatchGame,
+    setFixMatchGame,
+    isMatchManagerOpen,
+    setIsMatchManagerOpen,
+    handleOpenFixMatch,
+    handleApplyOverride,
+    handleResetOverride,
+    handleHideGame,
+    handleUnhideEntry,
+  } = useCatalogOverrideSync({
+    selectedGame,
+    isGridView,
+    navigateHome,
+    setGames,
+    setGameRefreshKey,
+    showSyncNotice,
+  });
 
   // Integrations modal state
   const [isIntegrationsModalOpen, setIsIntegrationsModalOpen] = useState(false);
-
-  // Fix Match & User Override modal state
-  const [isFixMatchModalOpen, setIsFixMatchModalOpen] = useState(false);
-  const [fixMatchGame, setFixMatchGame] = useState<CanonicalGame | null>(null);
-  const [isMatchManagerOpen, setIsMatchManagerOpen] = useState(false);
 
   // Individual Achievements modal state
   const [isAchievementsModalOpen, setIsAchievementsModalOpen] = useState(false);
   const [achievementsModalGame, setAchievementsModalGame] = useState<CanonicalGame | null>(null);
   const [achievementsInitialStorefrontId, setAchievementsInitialStorefrontId] = useState<StorefrontId | undefined>(undefined);
 
+  // Track scroll/wheel activity across ANY section or modal in the app so background syncs/saves yield cleanly
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const onScrollOrWheel = () => markScrollActivity();
+    window.addEventListener('scroll', onScrollOrWheel, { capture: true, passive: true });
+    window.addEventListener('wheel', onScrollOrWheel, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScrollOrWheel, true);
+      window.removeEventListener('wheel', onScrollOrWheel);
+    };
+  }, []);
+
   // Subscribe to background sync job updates
   useEffect(() => {
     const unsub = syncJobManager.subscribe((state) => {
       const active = Boolean(
         state &&
-          state.type !== 'achievements' &&
+          (state.type === 'store_media' ||
+            (state.type === 'multi' && state.activeCategories?.includes('store_media'))) &&
           (state.status === 'running' ||
             state.status === 'paused' ||
             state.status === 'rate_limited')
       );
-      setIsSyncingAllMedia(active);
+      setIsSyncingAllMedia((prev) => (prev === active ? prev : active));
     });
     return unsub;
   }, []);
@@ -389,8 +429,9 @@ export function App() {
             (previousVersion && previousVersion !== currentVersion) ||
             info?.isUpdatedLaunch === true
           ) {
-            setSyncNotice(
-              `Updated to One Launcher v${currentVersion} — Your library, connected accounts, and installed games have been preserved.`
+            showSyncNotice(
+              `Updated to One Launcher v${currentVersion} — Your library, connected accounts, and installed games have been preserved.`,
+              8000
             );
           }
         })
@@ -535,9 +576,10 @@ export function App() {
           }
 
           // Sync live storefronts & trophies in background on startup (staggered sequentially to cap peak heap)
-          if (window.electronAPI?.syncStore) {
+          if (window.electronAPI?.syncStore && launcherService.getRunningGames().length === 0) {
             const syncStore = window.electronAPI.syncStore;
             (async () => {
+              if (launcherService.getRunningGames().length > 0) return;
               if (savedTokens?.steam?.access_token || savedTokens?.steam?.steamId) {
                 try {
                   const syncRes: any = await syncStore('steam');
@@ -548,13 +590,15 @@ export function App() {
                     cacheUserSteamAchievements(syncRes.achievements);
                   }
                   if (syncRes?.success && syncRes.games?.length > 0) {
+                    await waitUntilScrollIdle(1500);
+                    await yieldToMainThread();
                     const verifiedGames = syncRes.games.map((g: CanonicalGame) => ({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
                     setGames((prev) => {
                       const merged = mergeStorefrontGames(prev, verifiedGames, 'steam');
-                      saveCurrentCatalog(merged);
+                      saveCurrentCatalog(merged, { skipSanitize: true });
                       return merged;
                     });
                   }
@@ -563,6 +607,7 @@ export function App() {
 
               if (savedTokens?.gog?.access_token) {
                 try {
+                  await yieldToMainThread();
                   const syncRes: any = await syncStore('gog');
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(syncRes.suppressedItems);
@@ -571,13 +616,15 @@ export function App() {
                     cacheUserGogAchievements(syncRes.achievements);
                   }
                   if (syncRes?.success && syncRes.games?.length > 0) {
+                    await waitUntilScrollIdle(1500);
+                    await yieldToMainThread();
                     const verifiedGames = syncRes.games.map((g: CanonicalGame) => ({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
                     setGames((prev) => {
                       const merged = mergeStorefrontGames(prev, verifiedGames, 'gog');
-                      saveCurrentCatalog(merged);
+                      saveCurrentCatalog(merged, { skipSanitize: true });
                       return merged;
                     });
                   }
@@ -586,6 +633,7 @@ export function App() {
 
               if (savedTokens?.epic?.access_token) {
                 try {
+                  await yieldToMainThread();
                   const syncRes: any = await syncStore('epic');
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(syncRes.suppressedItems);
@@ -594,20 +642,22 @@ export function App() {
                     cacheUserEpicAchievements(syncRes.achievements);
                   }
                   if (syncRes?.success && syncRes.games?.length > 0) {
+                    await waitUntilScrollIdle(1500);
+                    await yieldToMainThread();
                     const verifiedGames = syncRes.games.map((g: CanonicalGame) => ({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
                     setGames((prev) => {
                       const merged = mergeStorefrontGames(prev, verifiedGames, 'epic');
-                      saveCurrentCatalog(merged);
+                      saveCurrentCatalog(merged, { skipSanitize: true });
                       return merged;
                     });
                   }
                 } catch {}
               }
 
-              window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+              window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
             })();
           }
         })
@@ -620,7 +670,9 @@ export function App() {
       let allInstalledRecords: InstalledGameRecord[] = launcherService.getInstalledRecords();
       if (allInstalledRecords.length === 0) {
         try {
-          allInstalledRecords = await launcherService.scanAllInstalledGames();
+          allInstalledRecords = await launcherService.scanAllInstalledGames(false, {
+            silentInitialBoot: true,
+          });
         } catch (e) {
           console.warn('Universal installed games scan warning:', e);
         }
@@ -1010,6 +1062,7 @@ export function App() {
 
       // Background live Steam cloud sync for player achievements
       if (
+        launcherService.getRunningGames().length === 0 &&
         loadIntegrations().some((i) => i.storefrontId === 'steam' && i.isConnected) &&
         !steamAchievementsService.hasRecentFullSync()
       ) {
@@ -1065,231 +1118,7 @@ export function App() {
   useCriticScoreWarmup(games);
 
   // Reactively persist newly discovered Steam App IDs, GOG covers, game sessions, and installation events
-  useEffect(() => {
-    const pendingSteamMatches = new Map<string, number>();
-    const pendingGogCovers = new Map<string, string>();
-    let batchUpdateTimer: ReturnType<typeof setTimeout> | null = null;
-    const isVitest = typeof process !== 'undefined' && Boolean((process as any).env?.VITEST);
-
-    const flushPendingMediaUpdates = () => {
-      batchUpdateTimer = null;
-      if (pendingSteamMatches.size === 0 && pendingGogCovers.size === 0) return;
-
-      const steamSnapshot = new Map(pendingSteamMatches);
-      const gogSnapshot = new Map(pendingGogCovers);
-      pendingSteamMatches.clear();
-      pendingGogCovers.clear();
-
-      setGames((prevGames) => {
-        let changed = false;
-        const nextGames = prevGames.map((g) => {
-          let updatedGame = g;
-
-          if (steamSnapshot.size > 0 && !updatedGame.steamAppId && !updatedGame.isExplicitNonSteam) {
-            const matchedId = steamSnapshot.get(updatedGame.title.toLowerCase().trim());
-            if (matchedId) {
-              changed = true;
-              updatedGame = { ...updatedGame, steamAppId: matchedId };
-            }
-          }
-
-          if (gogSnapshot.size > 0) {
-            const gogPlat = updatedGame.platforms?.find((p) => p.platformId === 'gog');
-            if (gogPlat) {
-              const coverUrl = gogSnapshot.get(String(gogPlat.platformGameId));
-              if (
-                coverUrl &&
-                (!updatedGame.capsuleImage ||
-                  updatedGame.capsuleImage.includes('_glx_vertical_cover') ||
-                  updatedGame.capsuleImage === updatedGame.headerImage)
-              ) {
-                changed = true;
-                updatedGame = { ...updatedGame, capsuleImage: coverUrl };
-              }
-            }
-          }
-
-          return updatedGame;
-        });
-
-        if (changed) {
-          try {
-            saveCurrentCatalog(nextGames, { skipSanitize: true });
-          } catch {}
-          return nextGames;
-        }
-        return prevGames;
-      });
-    };
-
-    const scheduleMediaBatchFlush = () => {
-      if (isVitest) {
-        flushPendingMediaUpdates();
-        return;
-      }
-      if (!batchUpdateTimer) {
-        batchUpdateTimer = setTimeout(flushPendingMediaUpdates, 300);
-      }
-    };
-
-    const handleSteamMatchUpdated = (e: any) => {
-      const { title, steamAppId } = e.detail || {};
-      if (!title || typeof steamAppId !== 'number' || steamAppId <= 0) return;
-      pendingSteamMatches.set(title.toLowerCase().trim(), steamAppId);
-      scheduleMediaBatchFlush();
-    };
-
-    const handleGogCoverUpdated = (e: any) => {
-      const { gogId, coverUrl } = e.detail || {};
-      if (!gogId || !coverUrl) return;
-      const cleanGogId = String(gogId).replace(/^gog-/, '');
-      pendingGogCovers.set(cleanGogId, coverUrl);
-      scheduleMediaBatchFlush();
-    };
-
-    const handleGameSessionEnded = (e: any) => {
-      const detail = e.detail || {};
-      const { gameId, platformId, platformGameId, sessionMinutesPlayed, lastPlayed } = detail;
-      if (!gameId) return;
-
-      const addedMinutes = Math.max(1, Number(sessionMinutesPlayed) || 1);
-      const playedIso = lastPlayed || new Date().toISOString();
-
-      setGames((prevGames) => {
-        let changed = false;
-        const nextGames = prevGames.map((g) => {
-          if (g.id !== gameId) return g;
-          changed = true;
-          const targetPlatId = platformId || g.platforms[0]?.platformId;
-          const hasExactPlatformMatch = g.platforms.some(
-            (p) =>
-              p.platformId === targetPlatId ||
-              Boolean(platformGameId && String(p.platformGameId) === String(platformGameId))
-          );
-          const updatedPlatforms = g.platforms.map((p, idx) => {
-            const isMatch = hasExactPlatformMatch
-              ? p.platformId === targetPlatId ||
-                Boolean(platformGameId && String(p.platformGameId) === String(platformGameId))
-              : idx === 0;
-            if (isMatch) {
-              return {
-                ...p,
-                playtimeMinutes: (p.playtimeMinutes || 0) + addedMinutes,
-                lastPlayed: playedIso,
-              };
-            }
-            return p;
-          });
-          return { ...g, platforms: updatedPlatforms };
-        });
-
-        if (changed) {
-          try {
-            saveCurrentCatalog(nextGames);
-          } catch {}
-          return nextGames;
-        }
-        return prevGames;
-      });
-    };
-
-    const handleGameInstalled = (e: any) => {
-      const detail = e.detail || {};
-      const {
-        gameId,
-        platformId,
-        platformGameId,
-        installed,
-        installPath,
-        executablePath,
-        isWindowsBinaryOnMac,
-      } = detail;
-      if (!gameId && !platformGameId) return;
-
-      setGames((prevGames) => {
-        let changed = false;
-        const nextGames = prevGames.map((g) => {
-          const isGameMatch =
-            g.id === gameId ||
-            (platformGameId &&
-              g.platforms.some(
-                (p) =>
-                  p.platformId === platformId &&
-                  String(p.platformGameId) === String(platformGameId)
-              ));
-          if (!isGameMatch) return g;
-
-          changed = true;
-          let matchedAny = false;
-          let updatedPlatforms = g.platforms.map((p, idx) => {
-            const isPlatMatch =
-              !platformId ||
-              p.platformId === platformId ||
-              (platformGameId && String(p.platformGameId) === String(platformGameId)) ||
-              (g.platforms.length === 1 && idx === 0);
-            if (isPlatMatch) {
-              matchedAny = true;
-              if (!installed) {
-                return {
-                  ...p,
-                  installed: false,
-                  installPath: undefined,
-                  executablePath: undefined,
-                  installSize: undefined,
-                  isWindowsBinaryOnMac: undefined,
-                  launchArguments: undefined,
-                };
-              }
-              return {
-                ...p,
-                installed: true,
-                installPath: installPath !== undefined ? installPath : p.installPath,
-                executablePath: executablePath !== undefined ? executablePath : p.executablePath,
-                isWindowsBinaryOnMac:
-                  isWindowsBinaryOnMac !== undefined ? isWindowsBinaryOnMac : p.isWindowsBinaryOnMac,
-              };
-            }
-            return p;
-          });
-          if (!matchedAny && !platformId && !installed) {
-            updatedPlatforms = updatedPlatforms.map((p) => ({
-              ...p,
-              installed: false,
-              installPath: undefined,
-              executablePath: undefined,
-              installSize: undefined,
-              isWindowsBinaryOnMac: undefined,
-              launchArguments: undefined,
-            }));
-          }
-          return { ...g, platforms: updatedPlatforms };
-        });
-
-        if (changed) {
-          try {
-            saveCurrentCatalog(nextGames);
-          } catch {}
-          return nextGames;
-        }
-        return prevGames;
-      });
-    };
-
-    window.addEventListener('antigravity:steam-match-updated', handleSteamMatchUpdated);
-    window.addEventListener('antigravity:gog-cover-updated', handleGogCoverUpdated);
-    window.addEventListener('antigravity:game-session-ended', handleGameSessionEnded);
-    window.addEventListener('antigravity:game-installed', handleGameInstalled);
-    return () => {
-      if (batchUpdateTimer) {
-        clearTimeout(batchUpdateTimer);
-        batchUpdateTimer = null;
-      }
-      window.removeEventListener('antigravity:steam-match-updated', handleSteamMatchUpdated);
-      window.removeEventListener('antigravity:gog-cover-updated', handleGogCoverUpdated);
-      window.removeEventListener('antigravity:game-session-ended', handleGameSessionEnded);
-      window.removeEventListener('antigravity:game-installed', handleGameInstalled);
-    };
-  }, []);
+  usePostSessionReconciler({ setGames, showSyncNotice });
 
   const handleToggleInstallStatus = (
     gameToToggle?: CanonicalGame | null,
@@ -1415,103 +1244,12 @@ export function App() {
   }, [activeGroupId, collections, filteredGames]);
 
   // Shared helper to reconcile achievements and installation state across the game catalog
-  const reconcileCatalogTrophies = useCallback(
-    (
-      catalog: CanonicalGame[],
-      steamAchs: Record<number, any>,
-      gogAchs: Record<string, any>,
-      epicAchs: Record<string, any>,
-      installedSteamAppIds?: Set<number> | null
-    ): CanonicalGame[] => {
-      return catalog.map((game) => {
-        const targetAppId = game.steamAppId;
-        const ach = targetAppId
-          ? steamAchs[targetAppId] || getKnownSteamAchievements(targetAppId, game.title)
-          : null;
-        const titleLower = (game.title || '').toLowerCase().trim();
-        const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-
-        const updatedPlatforms = game.platforms.map((p) => {
-          const newP = { ...p };
-          const rec = launcherService.getInstalledRecordForGame(game, p.platformId);
-          if (rec && rec.platformId === p.platformId) {
-            newP.installed = true;
-            newP.installPath = rec.installPath || newP.installPath;
-            newP.executablePath = rec.executablePath || newP.executablePath;
-            newP.installSize = rec.installSize ?? newP.installSize;
-            newP.version = rec.version || newP.version;
-            newP.isWindowsBinaryOnMac = rec.isWindowsBinaryOnMac ?? newP.isWindowsBinaryOnMac;
-          }
-
-          if (p.platformId === 'steam') {
-            if (installedSteamAppIds) {
-              newP.installed =
-                (targetAppId ? installedSteamAppIds.has(targetAppId) : false) ||
-                launcherService.isGameInstalled(game, 'steam');
-            }
-            if (ach && ach.total > 0) {
-              const reconciled = reconcileAchievementSummaries(
-                p.achievements,
-                {
-                  unlocked: ach.unlocked,
-                  total: ach.total,
-                  percentage: ach.percentage,
-                  isMastered: ach.percentage >= 100 || (ach.total > 0 && ach.unlocked >= ach.total),
-                  source: (ach as any).source || 'local_client_cache',
-                  syncedAt: (ach as any).syncedAt,
-                  hasConflict: (ach as any).hasConflict,
-                  conflictDetails: (ach as any).conflictDetails,
-                },
-                { title: game.title, appId: targetAppId, store: 'steam' }
-              );
-              if (reconciled) newP.achievements = reconciled;
-            }
-          } else if (p.platformId === 'gog') {
-            const gogId = String(p.platformGameId || game.id).replace(/^gog-/, '');
-            const gogAch =
-              gogAchs[gogId] ||
-              gogAchs[`gog-${gogId}`] ||
-              gogAchs[titleLower] ||
-              gogAchs[normTitle] ||
-              getKnownGogAchievements(p.platformGameId || game.id, game.title);
-            if (gogAch && gogAch.total > 0) {
-              const reconciled = reconcileAchievementSummaries(p.achievements, gogAch, {
-                title: game.title,
-                store: 'gog',
-              });
-              if (reconciled) newP.achievements = reconciled;
-            }
-          } else if (p.platformId === 'epic') {
-            const epicId = String(p.platformGameId || game.id);
-            const epicIdLower = epicId.toLowerCase();
-            const epicAch =
-              epicAchs[epicId] ||
-              epicAchs[epicIdLower] ||
-              epicAchs[`epic-${epicIdLower}`] ||
-              epicAchs[titleLower] ||
-              epicAchs[normTitle] ||
-              getKnownEpicAchievements(p.platformGameId || game.id, game.title);
-            if (epicAch && epicAch.total > 0) {
-              const reconciled = reconcileAchievementSummaries(p.achievements, epicAch, {
-                title: game.title,
-                store: 'epic',
-              });
-              if (reconciled) newP.achievements = reconciled;
-            }
-          }
-          return newP;
-        });
-
-        return { ...game, platforms: updatedPlatforms };
-      });
-    },
-    []
-  );
+  const reconcileCatalogTrophies = useCallback(reconcileCatalogTrophiesRecords, []);
 
   // Trigger library cloud sync across all connected storefronts (Steam, GOG, Epic, Xbox)
   const handleTriggerSync = async () => {
     setIsSyncing(true);
-    setSyncNotice('Syncing all connected storefront accounts & detecting new purchases...');
+    showSyncNotice('Syncing all connected storefront accounts & detecting new purchases...');
 
     try {
       const integrations = loadIntegrations();
@@ -1664,44 +1402,7 @@ export function App() {
       }
 
       // 5. Intelligent Steam Match Pass for Non-Steam Titles
-      const assignedSteamIds = new Map<number, CanonicalGame>();
-      for (const existingGame of currentCatalog) {
-        if (existingGame.steamAppId) {
-          assignedSteamIds.set(existingGame.steamAppId, existingGame);
-        }
-      }
-      currentCatalog = currentCatalog.map((g) => {
-        if (g.steamAppId || g.isExplicitNonSteam) return g;
-        const matched = steamMatcher.getEffectiveSteamAppId(g);
-        if (matched) {
-          const existingOwner = assignedSteamIds.get(matched);
-          const conflictingOwner =
-            (existingOwner &&
-              existingOwner !== g &&
-              (hasSameStorefrontConflict(existingOwner, g) ||
-                normalizeCanonicalTitle(existingOwner.title) !== normalizeCanonicalTitle(g.title))) ||
-            currentCatalog.some(
-              (other) =>
-                other !== g &&
-                other.steamAppId === matched &&
-                (hasSameStorefrontConflict(other, g) ||
-                  normalizeCanonicalTitle(other.title) !== normalizeCanonicalTitle(g.title))
-            );
-          if (conflictingOwner) {
-            return g;
-          }
-          const enriched: CanonicalGame = {
-            ...g,
-            steamAppId: matched,
-            id: `steam-${matched}`,
-            headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/header.jpg`,
-            capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${matched}/library_600x900.jpg`,
-          };
-          assignedSteamIds.set(matched, enriched);
-          return enriched;
-        }
-        return g;
-      });
+      currentCatalog = runIntelligentNonSteamMatchPass(currentCatalog);
 
       // 6. Reconciliation pass: update achievements & local installed flags across current catalog
       currentCatalog = reconcileCatalogTrophies(
@@ -1745,8 +1446,9 @@ export function App() {
       setGameRefreshKey((k) => k + 1);
 
       if (newGamesDetected > 0) {
-        setSyncNotice(
-          `Sync complete! Detected ${newGamesDetected} newly added title${newGamesDetected === 1 ? '' : 's'} across your storefronts! (${currentCatalog.length} total titles)`
+        showSyncNotice(
+          `Sync complete! Detected ${newGamesDetected} newly added title${newGamesDetected === 1 ? '' : 's'} across your storefronts! (${currentCatalog.length} total titles)`,
+          5000
         );
       } else {
         const connectedStores = updatedIntegrations.filter((i) => i.isConnected);
@@ -1757,16 +1459,16 @@ export function App() {
           if (i.storefrontId === 'xbox') return `${xboxCount} Xbox`;
           return `${i.gamesCount} ${i.name}`;
         });
-        setSyncNotice(
-          `All connected storefronts up to date: ${storeParts.join(', ')} titles (trophies & playtime refreshed)`
+        showSyncNotice(
+          `All connected storefronts up to date: ${storeParts.join(', ')} titles (trophies & playtime refreshed)`,
+          5000
         );
       }
     } catch (err: any) {
-      setSyncNotice(`Sync notice: ${err?.message || 'Using cached verified catalog'}`);
+      showSyncNotice(`Sync notice: ${err?.message || 'Using cached verified catalog'}`, 5000);
     } finally {
       setIsSyncing(false);
-      setTimeout(() => setSyncNotice(null), 5000);
-      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
     }
   };
 
@@ -1774,7 +1476,7 @@ export function App() {
   const handleSyncTrophies = async () => {
     if (isSyncingTrophies) return;
     setIsSyncingTrophies(true);
-    setSyncNotice('Syncing trophies & achievements across Steam, GOG.com, and Epic Games Store...');
+    showSyncNotice('Syncing trophies & achievements across Steam, GOG.com, and Epic Games Store...');
 
     try {
       const integrations = loadIntegrations();
@@ -1890,15 +1592,15 @@ export function App() {
       });
 
       setGameRefreshKey((k) => k + 1);
-      setSyncNotice(
-        `Trophies synced across Steam, GOG & Epic! (${gamesWithTrophies} titles with achievement data updated)`
+      showSyncNotice(
+        `Trophies synced across Steam, GOG & Epic! (${gamesWithTrophies} titles with achievement data updated)`,
+        5000
       );
     } catch (err: any) {
-      setSyncNotice(`Trophy sync notice: ${err?.message || 'Finished syncing trophies'}`);
+      showSyncNotice(`Trophy sync notice: ${err?.message || 'Finished syncing trophies'}`, 5000);
     } finally {
       setIsSyncingTrophies(false);
-      setTimeout(() => setSyncNotice(null), 5000);
-      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
     }
   };
 
@@ -1923,7 +1625,7 @@ export function App() {
     clearFailedSidebarIconUrls();
 
     setIsSyncingCurrentGame(true);
-    setSyncNotice(
+    showSyncNotice(
       targetAppId
         ? `Syncing ${target.title} from Steam...`
         : `Syncing ${target.title} store metadata...`
@@ -1999,9 +1701,9 @@ export function App() {
               return updated;
             });
             setGameRefreshKey((prev) => prev + 1);
-            setSyncNotice(`Successfully synced ${target.title} metadata!`);
+            showSyncNotice(`Successfully synced ${target.title} metadata!`, 5000);
           } else {
-            setSyncNotice(`No new metadata updates found for ${target.title}.`);
+            showSyncNotice(`No new metadata updates found for ${target.title}.`, 5000);
           }
           return;
         }
@@ -2082,16 +1784,15 @@ export function App() {
             return updated;
           });
           setGameRefreshKey((prev) => prev + 1);
-          setSyncNotice(`Successfully synced ${target.title} from Steam!`);
+          showSyncNotice(`Successfully synced ${target.title} from Steam!`, 5000);
         } else {
-          setSyncNotice(`No new updates found on Steam for ${target.title}.`);
+          showSyncNotice(`No new updates found on Steam for ${target.title}.`, 5000);
         }
       });
     } catch (err: any) {
-      setSyncNotice(`Sync notice: ${err?.message || 'Error syncing game'}`);
+      showSyncNotice(`Sync notice: ${err?.message || 'Error syncing game'}`, 5000);
     } finally {
       setIsSyncingCurrentGame(false);
-      setTimeout(() => setSyncNotice(null), 5000);
     }
   };
 
@@ -2099,8 +1800,7 @@ export function App() {
   const handleSyncStoreMedia = async () => {
     if (isSyncingAllMedia) return;
     setIsSyncingAllMedia(true);
-    setSyncNotice('Starting store media sync (trailers, screenshots & descriptions)...');
-    const initialNoticeTimer = setTimeout(() => setSyncNotice(null), 3000);
+    showSyncNotice('Starting store media sync (trailers, screenshots & descriptions)...', 3000);
 
     const pendingMediaUpdates = new Map<string, CanonicalGame>();
     let mediaFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2142,24 +1842,21 @@ export function App() {
         mediaFlushTimer = null;
       }
       flushMediaBatch();
-      clearTimeout(initialNoticeTimer);
-      setSyncNotice('Store media sync complete! Refreshed trailers, screenshots & descriptions.');
+      showSyncNotice('Store media sync complete! Refreshed trailers, screenshots & descriptions.', 5000);
     } catch (err: any) {
       if (mediaFlushTimer) {
         clearTimeout(mediaFlushTimer);
         mediaFlushTimer = null;
       }
       flushMediaBatch();
-      clearTimeout(initialNoticeTimer);
-      setSyncNotice(`Media sync notice: ${err?.message || 'Finished media sync'}`);
+      showSyncNotice(`Media sync notice: ${err?.message || 'Finished media sync'}`, 5000);
     } finally {
       if (mediaFlushTimer) {
         clearTimeout(mediaFlushTimer);
         mediaFlushTimer = null;
       }
       setIsSyncingAllMedia(false);
-      setTimeout(() => setSyncNotice(null), 5000);
-      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
     }
   };
 
@@ -2167,8 +1864,7 @@ export function App() {
   const handleRefreshScores = async () => {
     if (isSyncingScores) return;
     setIsSyncingScores(true);
-    setSyncNotice('Starting critic score refresh across OpenCritic, Metacritic & Steam...');
-    const initialNoticeTimer = setTimeout(() => setSyncNotice(null), 3000);
+    showSyncNotice('Starting critic score refresh across OpenCritic, Metacritic & Steam...', 3000);
 
     try {
       await syncJobManager.startCriticScoreSync(games, {
@@ -2176,7 +1872,7 @@ export function App() {
         isBackgroundWarmup: false,
       });
 
-      if (typeof window !== 'undefined') {
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
         window.dispatchEvent(
           new CustomEvent('antigravity_critic_updated', {
             detail: { refreshedAll: true },
@@ -2184,16 +1880,13 @@ export function App() {
         );
       }
 
-      clearTimeout(initialNoticeTimer);
-      setSyncNotice(`Critic scores refreshed across your library.`);
+      showSyncNotice(`Critic scores refreshed across your library.`, 5000);
     } catch (err: any) {
-      clearTimeout(initialNoticeTimer);
       console.warn('Score refresh error:', err);
-      setSyncNotice('Finished refreshing available critic scores.');
+      showSyncNotice('Finished refreshing available critic scores.', 5000);
     } finally {
       setIsSyncingScores(false);
-      setTimeout(() => setSyncNotice(null), 5000);
-      window.electronAPI?.trimMemory?.()?.catch?.(() => {});
+      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
     }
   };
 
@@ -2207,234 +1900,6 @@ export function App() {
     });
   };
 
-  // User Game Override & Fix Match Handlers
-  const handleOpenFixMatch = useCallback((gameToFix?: CanonicalGame) => {
-    const targetGame = gameToFix || selectedGame;
-    if (targetGame) {
-      setFixMatchGame(targetGame);
-      setIsFixMatchModalOpen(true);
-    }
-  }, [selectedGame]);
-
-  const handleApplyOverride = useCallback(
-    (override: UserGameOverride) => {
-      saveUserOverride(override);
-
-      const isSplitting = Boolean(
-        override.splitFromMerged || (fixMatchGame as any)?.isSplittingFromMerged
-      );
-
-      setGames((prevGames) => {
-        if (isSplitting && fixMatchGame && override.platformId) {
-          // 1. Remove the split platform from any existing multi-storefront game
-          const strippedGames: CanonicalGame[] = [];
-          for (const g of prevGames) {
-            const hasSplitPlat = g.platforms?.some(
-              (p) =>
-                p.platformId === override.platformId &&
-                (!override.platformGameId ||
-                  String(p.platformGameId) === String(override.platformGameId))
-            );
-            if (hasSplitPlat && g.platforms.length > 1) {
-              const remainingPlats = g.platforms.filter(
-                (p) =>
-                  !(
-                    p.platformId === override.platformId &&
-                    (!override.platformGameId ||
-                      String(p.platformGameId) === String(override.platformGameId))
-                  )
-              );
-              if (remainingPlats.length > 0) {
-                strippedGames.push({ ...g, platforms: remainingPlats });
-              }
-            } else if (hasSplitPlat && g.platforms.length === 1 && g.id === override.gameId) {
-              // Replaced by the standalone split entry below
-            } else {
-              strippedGames.push(g);
-            }
-          }
-
-          // 2. Construct the standalone split game and apply the user override
-          const cleanBaseGame: CanonicalGame = { ...fixMatchGame, isVerifiedEntitlement: true };
-          delete (cleanBaseGame as any).isSplittingFromMerged;
-          const standaloneGame = applyUserOverrideToGame(cleanBaseGame, override, {
-            invalidateEnrichedCache: true,
-          });
-
-          const sanitizedSplit = sanitizeGameCatalog([...strippedGames, standaloneGame], {
-            allowNewPurchases: true,
-          });
-          try {
-            saveCurrentCatalog(sanitizedSplit);
-          } catch (err) {
-            console.error('Failed to save updated catalog after split override:', err);
-          }
-          return sanitizedSplit;
-        }
-
-        let matchedAny = false;
-        let updatedGames = prevGames.map((g) => {
-          const isMatch =
-            g.id === override.gameId ||
-            Boolean(
-              override.platformGameId &&
-                g.platforms?.some(
-                  (p) =>
-                    p.platformGameId === override.platformGameId &&
-                    (!override.platformId || p.platformId === override.platformId)
-                )
-            );
-          if (isMatch) {
-            matchedAny = true;
-            return applyUserOverrideToGame(g, override, { invalidateEnrichedCache: true });
-          }
-          return g;
-        });
-
-        // If the user matched & restored a previously suppressed entry, append it into the active catalog
-        if (!matchedAny && fixMatchGame) {
-          const restoredGame = applyUserOverrideToGame(
-            { ...fixMatchGame, isVerifiedEntitlement: true },
-            override,
-            {
-              invalidateEnrichedCache: true,
-            }
-          );
-          updatedGames = [...updatedGames, restoredGame];
-        }
-
-        const sanitized = sanitizeGameCatalog(updatedGames, {
-          allowNewPurchases: true,
-        });
-
-        try {
-          saveCurrentCatalog(sanitized);
-        } catch (err) {
-          console.error('Failed to save updated catalog after override:', err);
-        }
-        return sanitized;
-      });
-
-      setGameRefreshKey((prev) => prev + 1);
-      setSyncNotice(
-        isSplitting
-          ? `Split & matched "${override.title || 'game'}" as an independent library entry!`
-          : `Applied metadata & cover match for "${override.title || 'game'}"!`
-      );
-      setTimeout(() => {
-        setSyncNotice((prev) => (prev?.includes(override.title || 'game') ? null : prev));
-      }, 5000);
-    },
-    [fixMatchGame]
-  );
-
-  const handleResetOverride = useCallback((gameId: string) => {
-    removeUserOverride(gameId);
-    setGames((prevGames) => {
-      const sanitized = sanitizeGameCatalog(prevGames);
-      try {
-        saveCurrentCatalog(sanitized);
-      } catch {}
-      return sanitized;
-    });
-
-    setGameRefreshKey((prev) => prev + 1);
-    setSyncNotice('Reverted game match & metadata to default store settings.');
-    setTimeout(() => setSyncNotice(null), 5000);
-  }, []);
-
-  const handleHideGame = useCallback(
-    (gameToHide: CanonicalGame, targetPlatformId?: StorefrontId) => {
-      hideStorefrontEntry(gameToHide, targetPlatformId);
-
-      setGames((prevGames) => {
-        const nextGames: CanonicalGame[] = [];
-        for (const g of prevGames) {
-          if (g.id === gameToHide.id) {
-            if (targetPlatformId && g.platforms.length > 1) {
-              const remainingPlats = g.platforms.filter((p) => p.platformId !== targetPlatformId);
-              if (remainingPlats.length > 0) {
-                nextGames.push({ ...g, platforms: remainingPlats });
-              }
-            }
-            // Otherwise omit the hidden game completely
-          } else if (
-            targetPlatformId &&
-            gameToHide.platforms.length === 1 &&
-            g.platforms.length > 1 &&
-            g.platforms.some(
-              (p) =>
-                p.platformId === targetPlatformId &&
-                String(p.platformGameId) === String(gameToHide.platforms[0]?.platformGameId)
-            )
-          ) {
-            const remainingPlats = g.platforms.filter(
-              (p) =>
-                !(
-                  p.platformId === targetPlatformId &&
-                  String(p.platformGameId) === String(gameToHide.platforms[0]?.platformGameId)
-                )
-            );
-            if (remainingPlats.length > 0) {
-              nextGames.push({ ...g, platforms: remainingPlats });
-            }
-          } else {
-            nextGames.push(g);
-          }
-        }
-
-        const sanitized = sanitizeGameCatalog(nextGames, { allowNewPurchases: true });
-        try {
-          saveCurrentCatalog(sanitized);
-        } catch {}
-        return sanitized;
-      });
-
-      if (
-        !isGridView &&
-        selectedGame?.id === gameToHide.id &&
-        (!targetPlatformId || gameToHide.platforms.length <= 1)
-      ) {
-        navigateHome();
-      }
-
-      setGameRefreshKey((prev) => prev + 1);
-      setSyncNotice(
-        `Hidden "${gameToHide.title}"${
-          targetPlatformId ? ` (${targetPlatformId.toUpperCase()})` : ''
-        } — restore anytime in Library Match Studio > Suppressed & Filtered.`
-      );
-      setTimeout(() => setSyncNotice(null), 5000);
-    },
-    [isGridView, selectedGame]
-  );
-
-  const handleUnhideEntry = useCallback((entry: SuppressedCatalogEntry) => {
-    const restoredSnapshot = unhideStorefrontEntry(
-      entry.id,
-      entry.platformId,
-      entry.platformGameId
-    );
-    const candidateGame: CanonicalGame = {
-      ...(restoredSnapshot || entry.rawGame),
-      isVerifiedEntitlement: true,
-    };
-
-    setGames((prevGames) => {
-      const sanitized = sanitizeGameCatalog([...prevGames, candidateGame], {
-        allowNewPurchases: true,
-      });
-      try {
-        saveCurrentCatalog(sanitized);
-      } catch {}
-      return sanitized;
-    });
-
-    setGameRefreshKey((prev) => prev + 1);
-    setSyncNotice(`Restored "${entry.rawTitle || entry.rawGame.title}" back to your library!`);
-    setTimeout(() => setSyncNotice(null), 5000);
-  }, []);
-
   // Individual Achievements Modal Handler
   const handleOpenAchievements = useCallback((gameToView?: CanonicalGame, storefrontId?: StorefrontId) => {
     const targetGame = gameToView || selectedGame;
@@ -2444,6 +1909,15 @@ export function App() {
       setIsAchievementsModalOpen(true);
     }
   }, [selectedGame]);
+
+  if (isHibernating) {
+    return (
+      <InGameHibernationView
+        runningGames={runningGames}
+        onResumeFullUi={resumeFullUi}
+      />
+    );
+  }
 
   return (
     <div className="h-screen w-screen bg-[#0e141b] text-steam-text flex flex-col font-steam overflow-hidden">
@@ -2484,11 +1958,22 @@ export function App() {
         onOpenAchievements={() => handleOpenAchievements(selectedGame)}
       />
 
-      {/* Sync Status Banner */}
+      {/* Sync / Telemetry Status Banner */}
       {syncNotice && (
-        <div className="bg-emerald-950/90 border-b border-emerald-600/50 py-1.5 px-4 text-center text-xs text-emerald-300 flex items-center justify-center gap-2 flex-shrink-0 transition-all">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          {syncNotice}
+        <div
+          data-testid="sync-status-banner"
+          className={`border-b py-1.5 px-4 text-center text-xs flex items-center justify-center gap-2 flex-shrink-0 transition-all ${
+            syncNoticeTone === 'warning'
+              ? 'bg-amber-950/90 border-amber-600/50 text-amber-200'
+              : 'bg-emerald-950/90 border-emerald-600/50 text-emerald-300'
+          }`}
+        >
+          {syncNoticeTone === 'warning' ? (
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+          )}
+          <span>{syncNotice}</span>
         </div>
       )}
 

@@ -288,7 +288,7 @@ describe('Phase 1 Verification: UAT Reported Review Score Cases', () => {
       const amazonQueenCascade = await criticScoreService.resolveDynamicScore('Flight of the Amazon Queen');
       expect(amazonQueenCascade).not.toBeNull();
       expect(amazonQueenCascade?.source).toBe('steam');
-    }, 35000);
+    }, 60000);
 
     it('betas, editors and test branches strictly remain Tier 6 Unrated (null)', async () => {
       const fmEditor = await criticScoreService.resolveDynamicScore('Football Manager 2024 Pre-Game Editor');

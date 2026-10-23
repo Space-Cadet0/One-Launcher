@@ -20,12 +20,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('steam:fetch-achievements', { appIds }),
   fetchIgdbCover: (title) => ipcRenderer.invoke('igdb:fetch-cover', title),
   fetchEpicProductMetadata: (payload) => ipcRenderer.invoke('store:fetch-epic-metadata', payload),
+  fetchEpicGameSchema: (payload) => ipcRenderer.invoke('epic:fetch-game-schema', payload),
 
   // Universal Game Launcher & Install Manager IPC
-  scanAllInstalledGames: () => ipcRenderer.invoke('launcher:scan-installed'),
-  detectCompatibilityLayers: () => ipcRenderer.invoke('launcher:detect-compat-layers'),
+  scanAllInstalledGames: (opts) => ipcRenderer.invoke('launcher:scan-installed', opts),
+  detectCompatibilityLayers: (opts) => ipcRenderer.invoke('launcher:detect-compat-layers', opts),
+  detectInstalledStorefrontClients: (opts) =>
+    ipcRenderer.invoke('launcher:detect-storefront-clients', opts),
   installCompatibilityLayer: (payload) => ipcRenderer.invoke('launcher:install-compat-layer', payload),
-  checkCompatibilityLayerUpdates: () => ipcRenderer.invoke('launcher:check-compat-updates'),
+  checkCompatibilityLayerUpdates: (opts) => ipcRenderer.invoke('launcher:check-compat-updates', opts),
   updateCompatibilityLayer: (payload) => ipcRenderer.invoke('launcher:update-compat-layer', payload),
   getDiskSpace: (targetPath) => ipcRenderer.invoke('launcher:get-disk-space', targetPath),
   getGameInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
@@ -44,6 +47,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFolderDialog: (defaultPath) => ipcRenderer.invoke('launcher:select-folder', defaultPath),
   saveGameLaunchConfig: (config) => ipcRenderer.invoke('launcher:save-launch-config', config),
   getGameLaunchConfigs: () => ipcRenderer.invoke('launcher:get-launch-configs'),
+  getLauncherPerformanceSettings: (opts) => ipcRenderer.invoke('launcher:get-performance-settings', opts),
+  saveLauncherPerformanceSettings: (settings) => ipcRenderer.invoke('launcher:save-performance-settings', settings),
+  drainPendingSessions: (opts) => ipcRenderer.invoke('launcher:drain-pending-sessions', opts),
+  clearRendererImageCache: () => {
+    try {
+      webFrame?.clearCache?.();
+    } catch {}
+    return ipcRenderer.invoke('perf:trim-memory');
+  },
+  onHibernateStateChanged: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('launcher:hibernate-state', handler);
+    return () => ipcRenderer.removeListener('launcher:hibernate-state', handler);
+  },
   onDownloadUpdated: (cb) => {
     const handler = (_e, data) => cb(data);
     ipcRenderer.on('launcher:download-updated', handler);
@@ -59,6 +76,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:fullscreen-changed', handler);
     return () => ipcRenderer.removeListener('window:fullscreen-changed', handler);
   },
+  isWindowFullscreen: () => ipcRenderer.invoke('window:is-fullscreen'),
+  toggleWindowFullscreen: () => ipcRenderer.invoke('window:toggle-fullscreen'),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:maximize-toggle'),
   isWindowMaximized: () => ipcRenderer.invoke('window:is-maximized'),
@@ -71,14 +90,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   // trimMemory: () => ipcRenderer.invoke('perf:trim-memory')
   trimMemory: (options) => {
-    try {
-      if (typeof globalThis.gc === 'function') {
-        globalThis.gc();
-      }
-    } catch {}
-    try {
-      webFrame?.clearCache?.();
-    } catch {}
+    const isPassive = Boolean(options && options.passive);
+    if (!isPassive) {
+      try {
+        if (typeof globalThis.gc === 'function') {
+          globalThis.gc();
+        }
+      } catch {}
+      try {
+        if (options?.clearImageCache !== false) {
+          webFrame?.clearCache?.();
+        }
+      } catch {}
+    }
     return ipcRenderer.invoke('perf:trim-memory', options);
   },
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),

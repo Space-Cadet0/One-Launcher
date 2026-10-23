@@ -1,10 +1,23 @@
 import { StorefrontId } from './platform';
+import type { ResolvedEffectiveLaunchPolicy } from './launchPolicyResolver';
+
+export {
+  resolveEffectiveLaunchPolicy,
+  resolveEffectiveLifecyclePolicy,
+  sanitizeLaunchMethod,
+  sanitizeStorefrontLifecyclePolicy,
+  type LaunchPolicyBuildType,
+  type ResolveEffectiveLaunchPolicyInput,
+  type ResolvedEffectiveLaunchPolicy,
+} from './launchPolicyResolver';
 
 export type LaunchMethod =
   | 'auto'
   | 'direct'
   | 'storefront_uri'
-  | 'compatibility_layer';
+  | 'compatibility_layer'
+  /** @deprecated Legacy launch method automatically normalized to 'auto' */
+  | 'custom';
 
 export type CompatibilityLayerType =
   | 'native'
@@ -14,6 +27,8 @@ export type CompatibilityLayerType =
   | 'wine';
 
 export type CrossOverD3DMetalVersion = 'auto' | '4' | '3';
+
+export type WineDebugMode = 'off' | 'fixme_err' | 'warn_err' | 'relay';
 
 export interface BundledD3DMetalVersionInfo {
   /** Selector key used for CX_GRAPHICS_BACKEND_VERSION ('4', '3', or 'default') */
@@ -33,6 +48,7 @@ export interface CompatibilityLayerInfo {
   appPath?: string;
   bottlesDir?: string;
   availableBottles?: string[];
+  available?: boolean;
   version?: string;
   buildVersion?: string;
   displayVersion?: string;
@@ -123,12 +139,73 @@ export interface InstalledGameRecord {
     | 'legendary'
     | 'gogdl'
     | 'nile'
+    | 'crossover'
     | 'one_launcher'
     | 'custom';
   isWindowsBinaryOnMac?: boolean;
 }
 
 export type CrossOverGraphicsBackend = 'auto' | 'd3dmetal' | 'dxmt' | 'dxvk' | 'wined3d';
+
+export type InGameLauncherBehavior =
+  | 'keep_open'
+  | 'minimize_taskbar'
+  | 'hide_tray_hibernate'
+  | 'zero_renderer_daemon';
+
+export type PostGameLauncherBehavior =
+  | 'restore_window'
+  | 'stay_minimized'
+  | 'exit_launcher';
+
+export type StorefrontClientLifecyclePolicy =
+  | 'minimal_and_close_if_started'
+  | 'minimal_keep_running'
+  | 'default_client'
+  | 'fast_direct_bypass';
+
+export interface CloudSaveSyncTelemetry {
+  gameId: string;
+  platformId: StorefrontId;
+  direction: 'pre_launch' | 'post_exit';
+  synced: boolean;
+  status: 'cloud_sync_complete' | 'cloud_sync_warning';
+  reason?: string;
+  backupPath?: string;
+  timestamp: string;
+}
+
+export interface FastMinimalLaunchAdvisory {
+  isActive: boolean;
+  title: string;
+  footprintBenefit: string;
+  warnings: string[];
+  recommendation: string;
+  severity?: 'info' | 'warning';
+  badgeLabel?: string;
+  headline?: string;
+  consequences?: string[];
+}
+
+export interface LauncherPerformanceSettings {
+  inGameLauncherBehavior: InGameLauncherBehavior;
+  postGameLauncherBehavior: PostGameLauncherBehavior;
+  pauseBackgroundSyncInGame: boolean;
+  pauseDownloadsInGame: boolean;
+  storefrontClientLifecycle: StorefrontClientLifecyclePolicy;
+  autoShutdownWinePrefixOnExit: boolean;
+  suppressWineDebugLogging: boolean;
+}
+
+export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings = {
+  inGameLauncherBehavior: 'hide_tray_hibernate',
+  postGameLauncherBehavior: 'restore_window',
+  pauseBackgroundSyncInGame: true,
+  pauseDownloadsInGame: true,
+  storefrontClientLifecycle: 'minimal_and_close_if_started',
+  autoShutdownWinePrefixOnExit: true,
+  suppressWineDebugLogging: true,
+};
 
 export interface StorefrontLaunchProfile {
   launchMethod?: LaunchMethod;
@@ -151,12 +228,18 @@ export interface StorefrontLaunchProfile {
   wineMsync?: boolean;
   /** Wine / CrossOver eventfd synchronization (WINEESYNC) */
   wineEsync?: boolean;
+  /** Wine debug channel verbosity override (WINEDEBUG) */
+  wineDebug?: WineDebugMode | string;
   /** Apple Metal Performance HUD overlay (MTL_HUD_ENABLED=1) */
   metalHud?: boolean;
   /** DXVK FPS & frametime HUD overlay (DXVK_HUD=devinfo,fps,frametimes) */
   dxvkHud?: boolean;
   preLaunchCommand?: string;
   postExitCommand?: string;
+  /** Per-game override for in-game launcher behavior ('default' inherits global LauncherPerformanceSettings) */
+  inGameLauncherBehavior?: 'default' | InGameLauncherBehavior;
+  /** Per-game override for storefront client lifecycle policy ('default' inherits global LauncherPerformanceSettings) */
+  storefrontClientLifecycle?: 'default' | StorefrontClientLifecyclePolicy;
 }
 
 export interface GameLaunchConfig extends StorefrontLaunchProfile {
@@ -165,8 +248,64 @@ export interface GameLaunchConfig extends StorefrontLaunchProfile {
   launchMethod: LaunchMethod;
   /** CrossOver Preview per-game D3DMetal version selector (CX_GRAPHICS_BACKEND_VERSION: 'auto' | '4' | '3') */
   crossoverD3DMetalVersion?: CrossOverD3DMetalVersion;
+  /** Wine debug channel verbosity override (WINEDEBUG) */
+  wineDebug?: WineDebugMode | string;
+  /** Per-game override for in-game launcher behavior ('default' inherits global LauncherPerformanceSettings) */
+  inGameLauncherBehavior?: 'default' | InGameLauncherBehavior;
+  /** Per-game override for storefront client lifecycle policy ('default' inherits global LauncherPerformanceSettings) */
+  storefrontClientLifecycle?: 'default' | StorefrontClientLifecyclePolicy;
   /** Per-storefront launch & compatibility profiles keyed by StorefrontId ('steam' | 'gog' | 'epic' | 'custom') */
   platformConfigs?: Partial<Record<StorefrontId, StorefrontLaunchProfile>>;
+}
+
+export interface GameLaunchConfigResetRequest {
+  gameId: string;
+  launchMethod?: LaunchMethod;
+  reset?: boolean;
+  resetToDefaults?: boolean;
+  resetPlatformId?: StorefrontId;
+  preferredPlatformId?: StorefrontId;
+  platformConfigs?: Partial<Record<StorefrontId, StorefrontLaunchProfile>>;
+}
+
+export type SaveGameLaunchConfigPayload =
+  | (GameLaunchConfig & {
+      reset?: boolean;
+      resetToDefaults?: boolean;
+      resetPlatformId?: StorefrontId;
+    })
+  | GameLaunchConfigResetRequest;
+
+export type StorefrontPolicyInfoKey =
+  | StorefrontClientLifecyclePolicy
+  | 'clientless_epic'
+  | 'clientless_bottle_gog'
+  | 'protocol_delegated';
+
+export interface StorefrontPolicyOptionDescriptor {
+  value: StorefrontClientLifecyclePolicy;
+  label: string;
+  isRecommended?: boolean;
+}
+
+export interface StorefrontPolicyInfoBox {
+  policyKey: StorefrontPolicyInfoKey;
+  cardHeading: string;
+  severity: 'optimal' | 'info' | 'warning';
+  badgeLabel: string;
+  headline: string;
+  footprintSummary: string;
+  includedFeatures: string[];
+  excludedOrTradeoffs: string[];
+}
+
+export interface StorefrontLaunchPolicyView {
+  cardHeading: string;
+  isBottleContext: boolean;
+  showDropdown: boolean;
+  dropdownOptions: StorefrontPolicyOptionDescriptor[];
+  selectedDropdownValue: StorefrontClientLifecyclePolicy;
+  infoBox: StorefrontPolicyInfoBox;
 }
 
 export interface ResolvedLaunchModePreview {
@@ -187,9 +326,13 @@ export interface ResolvedLaunchModePreview {
   hasDualMacAndWinBuild?: boolean;
   autoResolvedMethod: LaunchMethod;
   autoResolvedSummary: string;
+  /** Storefront & build-type preferred default launch mode ('storefront_uri' for Steam Native, 'direct' for Epic/GOG/Custom Native, 'auto' for Bottle & uninstalled) */
+  defaultLaunchMethod: LaunchMethod;
   recommendedModes: LaunchMethod[];
   /** Launch modes relevant to this storefront's installation type */
   availableModes: LaunchMethod[];
+  /** Shared pure launch policy resolution backing both renderer preview and main-process execution */
+  resolvedPolicy?: ResolvedEffectiveLaunchPolicy;
   /** Dynamic visibility flags for modal sections based on host OS, storefront build type, and active runner */
   visibleSections: {
     compatibilityLayer: boolean;
@@ -205,9 +348,18 @@ export interface ResolvedLaunchModePreview {
       badgeTone?: 'emerald' | 'sky' | 'amber' | 'slate';
       dynamicDesc: string;
       warning?: string;
+      disabled?: boolean;
+      disabledReason?: string;
     }
   >;
 }
+
+export type ActiveGameSessionStatus =
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'cloud_sync_warning'
+  | 'cloud_sync_complete';
 
 export interface ActiveGameSession {
   sessionId: string;
@@ -219,7 +371,42 @@ export interface ActiveGameSession {
   startedAt: string; // ISO
   launchMethod: string;
   executablePath?: string;
-  status: 'starting' | 'running' | 'stopping';
+  status: ActiveGameSessionStatus;
+  cloudSync?: CloudSaveSyncTelemetry;
+  statusMessage?: string;
+}
+
+export type SessionUpdatedEventType =
+  | 'started'
+  | 'stopping'
+  | 'stopped'
+  | 'playtime_synced'
+  | 'cloud_sync_warning'
+  | 'cloud_sync_complete';
+
+export interface SessionUpdatedPayload {
+  session?: ActiveGameSession;
+  event?: SessionUpdatedEventType;
+  sessionMinutesPlayed?: number;
+  durationSeconds?: number;
+  lastPlayed?: string;
+  storefrontTotalPlaytimeMinutes?: number | null;
+  cloudSync?: CloudSaveSyncTelemetry;
+  statusMessage?: string;
+  error?: string;
+}
+
+export interface HibernateStatePayload {
+  hibernating: boolean;
+  reason?: string;
+  gameId?: string;
+  gameTitle?: string;
+  inGame?: boolean;
+  mode?: InGameLauncherBehavior | string;
+  hibernated?: boolean;
+  isHibernated?: boolean;
+  behavior?: InGameLauncherBehavior;
+  activeSessions?: number;
 }
 
 export type DownloadTaskStatus =
@@ -254,6 +441,8 @@ export interface DownloadTaskState {
   finalInstallPath?: string;
   executablePath?: string;
   isWindowsBinaryOnMac?: boolean;
+  installRequest?: InstallGameRequest;
+  tempBinPath?: string;
 }
 
 export interface DiskSpaceInfo {
@@ -326,6 +515,7 @@ export interface LaunchGameRequest {
   launchArguments?: string;
   isWindowsBinaryOnMac?: boolean;
   launchConfig?: GameLaunchConfig;
+  performanceSettings?: LauncherPerformanceSettings;
 }
 
 export interface StopGameRequest {
@@ -349,6 +539,7 @@ export interface InstallGameRequest {
   totalBytes?: number;
   compatibilityLayer?: CompatibilityLayerType;
   wineBottleName?: string;
+  includeDlcs?: boolean;
 }
 
 export interface UninstallGameRequest {

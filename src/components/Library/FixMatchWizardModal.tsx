@@ -217,11 +217,32 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
   const gameRef = useRef(game);
   gameRef.current = game;
 
+  const isOpenRef = useRef(isOpen);
+  isOpenRef.current = isOpen;
+
+  const candidateReqIdRef = useRef(0);
+  const scrapeReqIdRef = useRef(0);
+  const reviewReqIdRef = useRef(0);
+  const coverReqIdRef = useRef(0);
+  const metaSourceReqIdRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      isOpenRef.current = false;
+      candidateReqIdRef.current += 1;
+      scrapeReqIdRef.current += 1;
+      reviewReqIdRef.current += 1;
+      coverReqIdRef.current += 1;
+      metaSourceReqIdRef.current += 1;
+    };
+  }, []);
+
   // Load candidate matches from metadata scraper service (On-Demand Priority)
   const loadCandidates = useCallback(
     async (query: string, tab: SourceFilterTab, nonSteam: boolean) => {
       const currentGame = gameRef.current;
       if (!currentGame) return;
+      const reqId = ++candidateReqIdRef.current;
       setIsLoadingCandidates(true);
       try {
         const matches = await syncJobManager.runPriorityAction(
@@ -229,12 +250,16 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
           currentGame.title,
           () => metadataScraperService.getSuggestedMatches(currentGame, query, tab, nonSteam)
         );
+        if (!isOpenRef.current || reqId !== candidateReqIdRef.current) return;
         setCandidates(matches);
       } catch (err) {
+        if (!isOpenRef.current || reqId !== candidateReqIdRef.current) return;
         console.error('Failed to load candidate matches:', err);
         setCandidates([]);
       } finally {
-        setIsLoadingCandidates(false);
+        if (isOpenRef.current && reqId === candidateReqIdRef.current) {
+          setIsLoadingCandidates(false);
+        }
       }
     },
     [game?.id, game?.title]
@@ -248,6 +273,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       targetBundle: ScrapedMetadataBundle | null,
       customQuery?: string
     ) => {
+      const reqId = ++reviewReqIdRef.current;
       setIsLoadingReviews(true);
       try {
         const result = await syncJobManager.runPriorityAction(
@@ -261,6 +287,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               customQuery
             )
         );
+        if (!isOpenRef.current || reqId !== reviewReqIdRef.current) return;
         const discovered = result.candidates || [];
         setReviewCandidates(discovered);
 
@@ -386,13 +413,16 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
           setSelectedReviewRoute({ mode: 'unrated' });
         }
       } catch (err) {
+        if (!isOpenRef.current || reqId !== reviewReqIdRef.current) return;
         console.error('Failed to discover review candidates:', err);
         setReviewCandidates([]);
         setSelectedReviewOptionId('unrated');
         setSelectedReviewData(null);
         setSelectedReviewRoute({ mode: 'unrated' });
       } finally {
-        setIsLoadingReviews(false);
+        if (isOpenRef.current && reqId === reviewReqIdRef.current) {
+          setIsLoadingReviews(false);
+        }
       }
     },
     [existingOverride]
@@ -400,12 +430,19 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
   // Reset wizard state whenever modal is opened with a new or existing game
   useEffect(() => {
+    candidateReqIdRef.current += 1;
+    scrapeReqIdRef.current += 1;
+    reviewReqIdRef.current += 1;
+    coverReqIdRef.current += 1;
+    metaSourceReqIdRef.current += 1;
+
     if (isOpen && game) {
       const baseTitle = initialScrapedBundle?.title || initialCandidate?.title || game.title || '';
       setStep(initialStep || 1);
       setSearchTerm(game.title);
       setSourceTab('All');
       setNotOnSteamOnly(false);
+      setIsScrapingDetails(false);
       setSelectedCandidate(initialCandidate || null);
       setScrapedBundle(initialScrapedBundle || null);
       setSelectedCoverUrl(initialScrapedBundle?.capsuleImage || '');
@@ -479,6 +516,10 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
   // Select candidate -> proceed to Step 2 & scrape details (Non-overlapping priority scopes)
   const handleSelectCandidate = async (candidate: SearchMatchCandidate) => {
+    const reqId = ++scrapeReqIdRef.current;
+    reviewReqIdRef.current += 1;
+    coverReqIdRef.current += 1;
+    metaSourceReqIdRef.current += 1;
     setSelectedCandidate(candidate);
     setReviewCandidates([]);
     setSelectedReviewOptionId('');
@@ -500,6 +541,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
             nonSteamOnly: notOnSteamOnly,
           })
       );
+      if (!isOpenRef.current || reqId !== scrapeReqIdRef.current) return;
       resolvedBundle = bundle;
       setScrapedBundle(bundle);
       setSelectedCoverUrl(bundle.capsuleImage);
@@ -518,13 +560,16 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
       setActiveHeaderImage(bundle.headerImage || '');
       setActiveAvailableDescriptions(bundle.availableDescriptions || []);
     } catch (err) {
+      if (!isOpenRef.current || reqId !== scrapeReqIdRef.current) return;
       console.error('Failed to scrape candidate details:', err);
     } finally {
-      setIsScrapingDetails(false);
+      if (isOpenRef.current && reqId === scrapeReqIdRef.current) {
+        setIsScrapingDetails(false);
+      }
     }
 
     // Pre-warm reviews AFTER 'Scraping Match Metadata' priority scope has closed
-    if (game && resolvedBundle) {
+    if (isOpenRef.current && reqId === scrapeReqIdRef.current && game && resolvedBundle) {
       loadReviews(game, candidate, resolvedBundle);
     }
   };
@@ -536,6 +581,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     const activeTab = overrideTab || coverSourceTab;
     const query = coverSearchTerm.trim() || game.title;
     if (typeof metadataScraperService.searchCoverOptions !== 'function') return;
+    const reqId = ++coverReqIdRef.current;
     setIsSearchingCovers(true);
     try {
       const results = await syncJobManager.runPriorityAction(
@@ -543,14 +589,16 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         query,
         () => metadataScraperService.searchCoverOptions(query, activeTab, game)
       );
+      if (!isOpenRef.current || reqId !== coverReqIdRef.current) return;
       setExtraCovers(results || []);
-      if (!selectedCoverUrl && results && results.length > 0) {
-        setSelectedCoverUrl(results[0].url);
-      }
+      setSelectedCoverUrl((prev) => (!prev && results && results.length > 0 ? results[0].url : prev));
     } catch (err) {
+      if (!isOpenRef.current || reqId !== coverReqIdRef.current) return;
       console.error('Failed to search cover art:', err);
     } finally {
-      setIsSearchingCovers(false);
+      if (isOpenRef.current && reqId === coverReqIdRef.current) {
+        setIsSearchingCovers(false);
+      }
     }
   };
 
@@ -723,6 +771,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
     if (!game) return;
     const query = metadataSearchTerm.trim() || game.title;
     if (typeof metadataScraperService.searchMetadataSources !== 'function') return;
+    const reqId = ++metaSourceReqIdRef.current;
     setIsSearchingMetadataSources(true);
     try {
       const results = await syncJobManager.runPriorityAction(
@@ -730,6 +779,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         query,
         () => metadataScraperService.searchMetadataSources(query, 'All', game)
       );
+      if (!isOpenRef.current || reqId !== metaSourceReqIdRef.current) return;
       if (results && results.length > 0) {
         setMetadataSources((prev) => {
           const combined = [...results, ...prev];
@@ -743,9 +793,12 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
         handleSelectMetadataSource(results[0]);
       }
     } catch (err) {
+      if (!isOpenRef.current || reqId !== metaSourceReqIdRef.current) return;
       console.error('Failed to search storefront metadata sources:', err);
     } finally {
-      setIsSearchingMetadataSources(false);
+      if (isOpenRef.current && reqId === metaSourceReqIdRef.current) {
+        setIsSearchingMetadataSources(false);
+      }
     }
   };
 
@@ -764,7 +817,9 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
   // Keyboard navigation & escape listener
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         handleCloseWizard();
@@ -915,7 +970,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
+      className="fixed inset-0 z-[100] bg-black/85 flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150"
       onClick={handleCloseWizard}
     >
       <div
@@ -1489,7 +1544,7 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
 
                           {/* Source Pill */}
                           <div className="absolute bottom-2 left-2">
-                            <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border backdrop-blur-sm ${sourceBadgeColor}`}>
+                            <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${sourceBadgeColor}`}>
                               {cover.source}
                             </span>
                           </div>

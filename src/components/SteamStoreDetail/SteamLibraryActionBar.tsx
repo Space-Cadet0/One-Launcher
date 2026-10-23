@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
@@ -111,6 +111,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [, setLauncherTick] = useState(0);
   const [selectedPlatformId, setSelectedPlatformId] = useState<StorefrontId>(() => {
     return (
+      launcherService.getSelectedStorefrontForGame(game) ||
       launcherService.getEffectivePlatformForGame(game)?.platformId ||
       game.platforms[0]?.platformId ||
       'steam'
@@ -119,12 +120,21 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [isManageMenuOpen, setIsManageMenuOpen] = useState(false);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState(false);
   const [isLaunchConfigModalOpen, setIsLaunchConfigModalOpen] = useState(false);
+  const [isLaunchPending, setIsLaunchPending] = useState(false);
+  const [isStopPending, setIsStopPending] = useState(false);
+  const [collectionStorageTick, setCollectionStorageTick] = useState(0);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [fetchedInstallSize, setFetchedInstallSize] = useState<number | undefined>(undefined);
   const manageMenuRef = useRef<HTMLDivElement | null>(null);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+      feedbackTimerRef.current = null;
+    }
     const eff =
+      launcherService.getSelectedStorefrontForGame(game) ||
       launcherService.getEffectivePlatformForGame(game)?.platformId ||
       game.platforms[0]?.platformId ||
       'steam';
@@ -132,7 +142,15 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     setIsManageMenuOpen(false);
     setShowPlaytimePopover(false);
     setShowAchievementPopover(false);
+    setIsLaunchPending(false);
+    setIsStopPending(false);
     setActionFeedback(null);
+    return () => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+        feedbackTimerRef.current = null;
+      }
+    };
   }, [game.id]);
 
   useEffect(() => {
@@ -143,27 +161,45 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   }, []);
 
   useEffect(() => {
+    if (collections || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    const handleStorageChange = () => setCollectionStorageTick((t) => t + 1);
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, [Boolean(collections)]);
+
+  useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
       if (manageMenuRef.current && !manageMenuRef.current.contains(e.target as Node)) {
         setIsManageMenuOpen(false);
       }
     }
-    if (isManageMenuOpen) {
+    if (isManageMenuOpen && typeof document !== 'undefined') {
       document.addEventListener('mousedown', handleOutsideClick);
     }
     return () => {
-      document.removeEventListener('mousedown', handleOutsideClick);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('mousedown', handleOutsideClick);
+      }
     };
   }, [isManageMenuOpen]);
 
   const showTempFeedback = (msg: string, durationMs = 4000) => {
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+    }
     setActionFeedback(msg);
-    setTimeout(() => {
+    feedbackTimerRef.current = setTimeout(() => {
+      feedbackTimerRef.current = null;
       setActionFeedback((prev) => (prev === msg ? null : prev));
     }, durationMs);
   };
 
   useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
     const handleLaunchError = (e: Event) => {
       const event = e as CustomEvent<{ gameId?: string; error?: string }>;
       if (event.detail?.gameId === game.id && event.detail?.error) {
@@ -183,7 +219,14 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
   const installedRecord = launcherService.getInstalledRecordForGame(game, selectedPlatformId);
   const launchConfig = launcherService.getLaunchConfig(game.id, selectedPlatformId);
+  const activeSession = launcherService
+    .getRunningGames()
+    .find(
+      (s) => s.gameId === game.id && (!selectedPlatformId || s.platformId === selectedPlatformId)
+    );
   const isRunning = launcherService.isGameRunning(game.id, selectedPlatformId);
+  const isStartingSession = isLaunchPending || activeSession?.status === 'starting';
+  const isStoppingSession = isStopPending || activeSession?.status === 'stopping';
   const activeDownload = launcherService.getActiveDownload(game.id, selectedPlatformId);
   const isInstalled =
     launcherService.isGameInstalled(game, selectedPlatformId) ||
@@ -208,8 +251,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
             launchConfig.preferredPlatformId === selectedPlatformId)))
   );
 
-  // Determine if game belongs to at least 1 user collection
-  const allCollections = collections || loadCollections();
+  // Determine if game belongs to at least 1 user collection (memoized to avoid localStorage parse per render)
+  const allCollections = useMemo(
+    () => collections || loadCollections(),
+    [collections, collectionStorageTick]
+  );
   const targetGameIds = [game.id];
   if (game.steamAppId) {
     targetGameIds.push(`steam-${game.steamAppId}`, String(game.steamAppId));
@@ -223,16 +269,28 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   };
 
   const handlePlayClick = async () => {
-    const res = await launcherService.launchGame(game, selectedPlatformId);
-    if (res && !res.success) {
-      showTempFeedback(res.error || 'Failed to launch game');
+    if (isLaunchPending || isRunning) return;
+    setIsLaunchPending(true);
+    try {
+      const res = await launcherService.launchGame(game, selectedPlatformId);
+      if (res && !res.success) {
+        showTempFeedback(res.error || 'Failed to launch game');
+      }
+    } finally {
+      setIsLaunchPending(false);
     }
   };
 
   const handleStopClick = async () => {
-    const res = await launcherService.stopGame(game.id);
-    if (res.message) {
-      showTempFeedback(res.message);
+    if (isStopPending) return;
+    setIsStopPending(true);
+    try {
+      const res = await launcherService.stopGame(game.id);
+      if (res.message) {
+        showTempFeedback(res.message);
+      }
+    } finally {
+      setIsStopPending(false);
     }
   };
 
@@ -431,28 +489,76 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3 xl:gap-5">
         {/* Left: Action Button & Library Status */}
         <div className="flex items-center gap-2 xl:gap-2.5 shrink-0 flex-wrap sm:flex-nowrap py-0.5">
-          {/* Main Action Button (Running / Installing / Play / Install) */}
+          {/* Main Action Button (Starting / Running / Stopping / Installing / Play / Install) */}
           <div className="flex items-center gap-1.5 shrink-0">
             {isRunning ? (
               <div className="flex items-center gap-1.5">
-                <span className="inline-flex items-center gap-1.5 px-3 py-2 xl:py-2.5 rounded bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold text-xs uppercase tracking-wider shadow-sm">
-                  <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
-                  <span>Running</span>
-                </span>
-                <button
-                  type="button"
-                  onClick={handleStopClick}
-                  className="inline-flex items-center justify-center gap-1.5 px-4 xl:px-5 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
-                  style={{
-                    background: 'linear-gradient(to right, #dc2626 0%, #991b1b 100%)',
-                    boxShadow: '0 0 14px rgba(220, 38, 38, 0.45)',
-                  }}
-                  title={`Stop ${game.title}`}
-                >
-                  <Square className="w-3.5 h-3.5 fill-white" />
-                  <span>Stop</span>
-                </button>
+                {activeSession?.status === 'starting' ? (
+                  <span
+                    data-testid="actionbar-session-starting"
+                    className="inline-flex items-center gap-1.5 px-4 xl:px-5 py-2 xl:py-2.5 rounded bg-sky-950/80 border border-sky-500/60 text-sky-300 font-bold text-xs uppercase tracking-wider shadow-sm"
+                  >
+                    <Loader2 className="w-3.5 h-3.5 text-sky-400 animate-spin" />
+                    <span>Starting...</span>
+                  </span>
+                ) : isStoppingSession ? (
+                  <>
+                    <span
+                      data-testid="actionbar-session-stopping"
+                      className="inline-flex items-center gap-1.5 px-3 py-2 xl:py-2.5 rounded bg-amber-950/80 border border-amber-500/60 text-amber-300 font-bold text-xs uppercase tracking-wider shadow-sm"
+                    >
+                      <Loader2 className="w-3.5 h-3.5 text-amber-400 animate-spin" />
+                      <span>Stopping...</span>
+                    </span>
+                    <button
+                      type="button"
+                      disabled
+                      className="inline-flex items-center justify-center gap-1.5 px-4 xl:px-5 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md opacity-50 cursor-not-allowed shrink-0"
+                      style={{
+                        background: 'linear-gradient(to right, #dc2626 0%, #991b1b 100%)',
+                      }}
+                      title="Stopping game and syncing cloud saves..."
+                    >
+                      <Square className="w-3.5 h-3.5 fill-white" />
+                      <span>Stop</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="inline-flex items-center gap-1.5 px-3 py-2 xl:py-2.5 rounded bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold text-xs uppercase tracking-wider shadow-sm">
+                      <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                      <span>Running</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleStopClick}
+                      disabled={isStopPending}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 xl:px-5 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer disabled:opacity-50"
+                      style={{
+                        background: 'linear-gradient(to right, #dc2626 0%, #991b1b 100%)',
+                        boxShadow: '0 0 14px rgba(220, 38, 38, 0.45)',
+                      }}
+                      title={`Stop ${game.title}`}
+                    >
+                      <Square className="w-3.5 h-3.5 fill-white" />
+                      <span>Stop</span>
+                    </button>
+                  </>
+                )}
               </div>
+            ) : isStartingSession ? (
+              <button
+                type="button"
+                disabled
+                data-testid="actionbar-play-starting"
+                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md opacity-75 cursor-wait shrink-0"
+                style={{
+                  background: 'linear-gradient(to right, #75b022 5%, #588a1b 95%)',
+                }}
+              >
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Starting...</span>
+              </button>
             ) : activeDownload ? (
               <div className="flex items-center gap-1.5">
                 <button
@@ -484,19 +590,21 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 </button>
               </div>
             ) : isInstalled ? (
-              <button
-                type="button"
-                onClick={handlePlayClick}
-                className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
-                style={{
-                  background: 'linear-gradient(to right, #75b022 5%, #588a1b 95%)',
-                  boxShadow: '0 0 16px rgba(91, 163, 43, 0.45)',
-                }}
-                title={`Launch ${game.title} (${getStorefrontDisplayName(selectedPlatformId)})`}
-              >
-                <Play className="w-4 h-4 fill-white" />
-                <span>Play</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handlePlayClick}
+                  className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
+                  style={{
+                    background: 'linear-gradient(to right, #75b022 5%, #588a1b 95%)',
+                    boxShadow: '0 0 16px rgba(91, 163, 43, 0.45)',
+                  }}
+                  title={`Launch ${game.title} (${getStorefrontDisplayName(selectedPlatformId)})`}
+                >
+                  <Play className="w-4 h-4 fill-white" />
+                  <span>Play</span>
+                </button>
+              </div>
             ) : (
               <button
                 type="button"
@@ -528,7 +636,11 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 <select
                   aria-label="Target Storefront"
                   value={selectedPlatformId}
-                  onChange={(e) => setSelectedPlatformId(e.target.value as StorefrontId)}
+                  onChange={(e) => {
+                    const nextPlat = e.target.value as StorefrontId;
+                    setSelectedPlatformId(nextPlat);
+                    launcherService.setSelectedStorefrontForGame(game.id, nextPlat);
+                  }}
                   title={`Active Storefront: ${getStorefrontDisplayName(selectedPlatformId)} (Click to switch)`}
                   className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 >
@@ -1292,6 +1404,12 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         game={game}
         initialPlatformId={selectedPlatformId}
         onClose={() => setIsInstallModalOpen(false)}
+        onInstallStarted={(task) => {
+          if (task?.platformId) {
+            setSelectedPlatformId(task.platformId);
+            launcherService.setSelectedStorefrontForGame(game.id, task.platformId);
+          }
+        }}
       />
 
       {/* Per-Game Launch & Compatibility Configuration Modal */}
@@ -1303,6 +1421,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         onSaved={(cfg) => {
           if (cfg.preferredPlatformId) {
             setSelectedPlatformId(cfg.preferredPlatformId);
+            launcherService.setSelectedStorefrontForGame(game.id, cfg.preferredPlatformId);
           }
           showTempFeedback(`Saved launch configuration for ${game.title}.`);
         }}

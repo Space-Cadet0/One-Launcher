@@ -106,6 +106,7 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
     launcherService.getDownloadQueue()
   );
   const [dismissedTaskIds, setDismissedTaskIds] = useState<Set<string>>(() => new Set());
+  const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     if (isOpen !== undefined) {
@@ -134,6 +135,39 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
   const handleClose = () => {
     setInternalOpen(false);
     onClose?.();
+  };
+
+  useEffect(() => {
+    if (!effectiveOpen || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setInternalOpen(false);
+        onClose?.();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [effectiveOpen, onClose]);
+
+  const runTaskAction = async (taskId: string, action: () => Promise<unknown> | unknown) => {
+    if (pendingActionIds.has(taskId)) return;
+    setPendingActionIds((prev) => {
+      const next = new Set(prev);
+      next.add(taskId);
+      return next;
+    });
+    try {
+      await action();
+    } finally {
+      setPendingActionIds((prev) => {
+        if (!prev.has(taskId)) return prev;
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
+    }
   };
 
   if (!effectiveOpen) return null;
@@ -177,7 +211,7 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-sm animate-in fade-in duration-150 select-none"
+      className="fixed inset-0 z-50 flex justify-end bg-black/75 animate-in fade-in duration-150 select-none"
       onClick={handleClose}
     >
       <div
@@ -351,8 +385,13 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                       {task.status === 'downloading' && (
                         <button
                           type="button"
-                          onClick={() => launcherService.pauseDownload(task.taskId)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#1b2838] hover:bg-[#26384f] border border-[#2a475e] text-[10px] font-semibold text-amber-300 transition-colors cursor-pointer"
+                          disabled={pendingActionIds.has(task.taskId)}
+                          onClick={() =>
+                            runTaskAction(task.taskId, () =>
+                              launcherService.pauseDownload(task.taskId)
+                            )
+                          }
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#1b2838] hover:bg-[#26384f] border border-[#2a475e] text-[10px] font-semibold text-amber-300 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           title="Pause download"
                         >
                           <Pause className="w-3 h-3" />
@@ -363,8 +402,13 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                       {isPaused && (
                         <button
                           type="button"
-                          onClick={() => launcherService.resumeDownload(task.taskId)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[10px] font-semibold text-sky-300 transition-colors cursor-pointer"
+                          disabled={pendingActionIds.has(task.taskId)}
+                          onClick={() =>
+                            runTaskAction(task.taskId, () =>
+                              launcherService.resumeDownload(task.taskId)
+                            )
+                          }
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[10px] font-semibold text-sky-300 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           title="Resume download"
                         >
                           <Play className="w-3 h-3" />
@@ -375,8 +419,13 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                       {(isActive || isPaused) && (
                         <button
                           type="button"
-                          onClick={() => launcherService.cancelDownload(task.taskId)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-950/60 hover:bg-red-900/70 border border-red-500/40 text-[10px] font-semibold text-red-300 transition-colors cursor-pointer"
+                          disabled={pendingActionIds.has(task.taskId)}
+                          onClick={() =>
+                            runTaskAction(task.taskId, () =>
+                              launcherService.cancelDownload(task.taskId)
+                            )
+                          }
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-950/60 hover:bg-red-900/70 border border-red-500/40 text-[10px] font-semibold text-red-300 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           title="Cancel installation"
                         >
                           <X className="w-3 h-3" />

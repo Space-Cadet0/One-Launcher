@@ -23,6 +23,7 @@ import {
   applyUserOverridesToCatalog,
 } from '../storage/userOverrideStorage';
 import { clearExpiredStagedCache } from '../storage/stagedCacheService';
+import { isUserActivelyScrolling } from '../../utils/scrollActivityTracker';
 
 const STORAGE_KEY_INTEGRATIONS = 'antigravity_storefront_integrations';
 const STORAGE_KEY_CUSTOM_GAMES = 'antigravity_synced_user_games';
@@ -535,13 +536,21 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
         pendingCatalogNeedsSanitize = true;
       }
       if (!pendingCatalogSaveTimer) {
-        pendingCatalogSaveTimer = setTimeout(() => {
-          try {
-            flushPendingCatalogSave();
-          } catch (e) {
-            console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
-          }
-        }, 1200);
+        const scheduleDeferredFlush = (delayMs: number) => {
+          pendingCatalogSaveTimer = setTimeout(() => {
+            pendingCatalogSaveTimer = null;
+            if (!isTestEnv() && isUserActivelyScrolling()) {
+              scheduleDeferredFlush(600);
+              return;
+            }
+            try {
+              flushPendingCatalogSave();
+            } catch (e) {
+              console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
+            }
+          }, delayMs);
+        };
+        scheduleDeferredFlush(1200);
       }
       return;
     }
@@ -674,9 +683,12 @@ export function mergeStorefrontGames(
                       ? platformOwnership.lastPlayed
                       : platformOwnership.lastPlayed || p.lastPlayed,
                   playtimeMinutes:
-                    storefrontId === 'steam' && newGame.isVerifiedEntitlement && platformOwnership.playtimeMinutes !== undefined
+                    storefrontId === 'steam' &&
+                    newGame.isVerifiedEntitlement &&
+                    platformOwnership.playtimeMinutes !== undefined
                       ? platformOwnership.playtimeMinutes
-                      : platformOwnership.playtimeMinutes !== undefined && platformOwnership.playtimeMinutes > 0
+                      : platformOwnership.playtimeMinutes !== undefined &&
+                        platformOwnership.playtimeMinutes > 0
                       ? platformOwnership.playtimeMinutes
                       : p.playtimeMinutes,
                   achievements: reconcileAchievementSummaries(

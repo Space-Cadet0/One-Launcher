@@ -176,7 +176,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
       <div className="bg-[#1b2838] border border-[#2a475e] rounded-lg shadow-2xl w-full max-w-md overflow-hidden text-steam-text">
         {/* Header */}
         <div className="px-5 py-3.5 bg-[#121a24] border-b border-[#2a475e] flex items-center justify-between">

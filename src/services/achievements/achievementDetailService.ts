@@ -6,11 +6,12 @@ import {
   MultiStoreAchievementsMap,
   AchievementRarityTier,
 } from '../../contracts/achievement';
+import { requestScheduler, RequestPriority } from '../network/requestScheduler';
 import { steamAchievementsService } from '../steam/steamAchievementsService';
 import { steamMatcher } from '../steam/steamMatcher';
 import {
   KNOWN_GAMES_WITHOUT_ACHIEVEMENTS,
-  BALDURS_GATE_2_ACHIEVEMENTS,
+  BALDURS_GATE_2_ACHIEVEMENTS as REGISTERED_SCHEMA_OVERRIDES,
 } from './canonicalAchievementSchemas';
 import {
   KNOWN_USER_STEAM_ACHIEVEMENTS,
@@ -161,7 +162,12 @@ export class AchievementDetailService {
     const map = new Map<string, number>();
     try {
       const url = `${this.getSteamApiBaseUrl()}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid=${appId}`;
-      const res = await axios.get(url, { timeout: 6000 });
+      const res = await requestScheduler.schedule(
+        url,
+        () => axios.get(url, { timeout: 6000 }),
+        RequestPriority.P0_INTERACTIVE,
+        'api.steampowered.com'
+      );
       const list = res.data?.achievementpercentages?.achievements;
       if (Array.isArray(list)) {
         for (const item of list) {
@@ -213,7 +219,12 @@ export class AchievementDetailService {
       // Try fetching live public Steam community achievements HTML (zero-auth public schema)
       try {
         const liveHtmlUrl = `${this.getCommunityBaseUrl()}/stats/${appId}/achievements/`;
-        const res = await axios.get(liveHtmlUrl, { timeout: 4000, responseType: 'text' });
+        const res = await requestScheduler.schedule(
+          liveHtmlUrl,
+          () => axios.get(liveHtmlUrl, { timeout: 4000, responseType: 'text' }),
+          RequestPriority.P0_INTERACTIVE,
+          'steamcommunity.com'
+        );
         const html = typeof res.data === 'string' ? res.data : '';
         if (html.includes('achieveRow')) {
           const parsed = this.parseSteamCommunityHtml(html, appId);
@@ -229,13 +240,18 @@ export class AchievementDetailService {
       // Secondary zero-auth official fallback: ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/
       try {
         const url = `${this.getSteamApiBaseUrl()}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid=${appId}`;
-        const apiRes = await axios.get(url, { timeout: 6000 });
+        const apiRes = await requestScheduler.schedule(
+          url,
+          () => axios.get(url, { timeout: 6000 }),
+          RequestPriority.P0_INTERACTIVE,
+          'api.steampowered.com'
+        );
         const apiList = apiRes.data?.achievementpercentages?.achievements;
         if (Array.isArray(apiList) && apiList.length > 0) {
           const parsedFromApi: DetailedAchievement[] = apiList.map((item: any, idx: number) => {
             const rawApiName = String(item.name || `ACH_${idx + 1}`);
             const strippedApi = rawApiName.replace(/^ACH_/i, '');
-            const knownEntry = BALDURS_GATE_2_ACHIEVEMENTS.find(
+            const knownEntry = REGISTERED_SCHEMA_OVERRIDES.find(
               (b) =>
                 b.apiName.toLowerCase() === rawApiName.toLowerCase() ||
                 b.apiName.toLowerCase() === strippedApi.toLowerCase()
@@ -304,8 +320,8 @@ export class AchievementDetailService {
       if (nameMatch) {
         const name = nameMatch[1].trim();
         let desc = descMatch ? descMatch[1].trim() : '';
-        if (!desc && BALDURS_GATE_2_ACHIEVEMENTS.length > 0) {
-          const knownEntry = BALDURS_GATE_2_ACHIEVEMENTS.find(
+        if (!desc && REGISTERED_SCHEMA_OVERRIDES.length > 0) {
+          const knownEntry = REGISTERED_SCHEMA_OVERRIDES.find(
             (b) => b.name.toLowerCase() === name.toLowerCase()
           );
           if (knownEntry) desc = knownEntry.description;
@@ -375,7 +391,12 @@ export class AchievementDetailService {
     const xmlUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${appId}/?xml=1`;
 
     try {
-      const res = await axios.get(xmlUrl, { timeout: 8000, responseType: 'text' });
+      const res = await requestScheduler.schedule(
+        xmlUrl,
+        () => axios.get(xmlUrl, { timeout: 8000, responseType: 'text' }),
+        RequestPriority.P0_INTERACTIVE,
+        'steamcommunity.com'
+      );
       let xml = typeof res.data === 'string' ? res.data : '';
 
       // Handle older Steam titles with custom Steam Community friendlyURL redirects (e.g. 20920 -> TheWitcher2)
@@ -384,7 +405,12 @@ export class AchievementDetailService {
         if (friendlyMatch?.[1]) {
           try {
             const friendlyUrl = `${this.getCommunityBaseUrl()}/${pathSegment}/stats/${encodeURIComponent(friendlyMatch[1])}/?xml=1`;
-            const friendlyRes = await axios.get(friendlyUrl, { timeout: 8000, responseType: 'text' });
+            const friendlyRes = await requestScheduler.schedule(
+              friendlyUrl,
+              () => axios.get(friendlyUrl, { timeout: 8000, responseType: 'text' }),
+              RequestPriority.P0_INTERACTIVE,
+              'steamcommunity.com'
+            );
             if (typeof friendlyRes.data === 'string') {
               xml = friendlyRes.data;
             }
@@ -540,9 +566,60 @@ export class AchievementDetailService {
       };
     }
 
-    const schema = (canonicalSchema && canonicalSchema.length > 0)
-      ? canonicalSchema
-      : await this.getCanonicalGameSchema(game);
+    let schema: DetailedAchievement[] | null =
+      canonicalSchema && canonicalSchema.length > 0 ? canonicalSchema : null;
+
+    if (!schema && typeof window !== 'undefined' && (window as any).electronAPI?.fetchEpicGameSchema) {
+      try {
+        const schemaRes = await (window as any).electronAPI.fetchEpicGameSchema({
+          appName: targetId,
+          namespace: (epicPlatform as any)?.namespace,
+          title: game.title,
+        });
+        if (Array.isArray(schemaRes?.achievements) && schemaRes.achievements.length > 0) {
+          schema = schemaRes.achievements.map((rawAch: any, idx: number): DetailedAchievement => {
+            const globalPct =
+              typeof rawAch.globalPercentage === 'number'
+                ? rawAch.globalPercentage
+                : typeof rawAch.rarityPercent === 'number'
+                  ? rawAch.rarityPercent
+                  : Math.max(5, Math.round(90 - (idx / schemaRes.achievements.length) * 80));
+            return {
+              id: rawAch.id || `epic:${targetId}:${rawAch.apiName || rawAch.achievementId || idx}`,
+              apiName: rawAch.apiName || rawAch.achievementId || `EPIC_ACH_${idx + 1}`,
+              name:
+                rawAch.name ||
+                rawAch.unlockedDisplayName ||
+                rawAch.title ||
+                `${game.title} Trophy #${idx + 1}`,
+              description:
+                rawAch.description ||
+                rawAch.unlockedDescription ||
+                rawAch.lockedDescription ||
+                'Complete in-game objective to earn Epic XP.',
+              isSecret: Boolean(rawAch.hidden || rawAch.isHidden || rawAch.isSecret),
+              unlocked: Boolean(rawAch.unlocked),
+              unlockedAt: rawAch.unlockedAt,
+              iconUnlockedUrl:
+                rawAch.iconUnlockedUrl ||
+                rawAch.unlockedIconUrl ||
+                `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steamAppId || 0}/header.jpg`,
+              iconLockedUrl: rawAch.iconLockedUrl || rawAch.lockedIconUrl,
+              globalPercentage: globalPct,
+              rarityTier: classifyRarityTier(globalPct),
+              xp: typeof rawAch.xp === 'number' ? rawAch.xp : undefined,
+              storefrontId: 'epic',
+            };
+          });
+        }
+      } catch {
+        // Fall back to canonical game schema
+      }
+    }
+
+    if (!schema || schema.length === 0) {
+      schema = await this.getCanonicalGameSchema(game);
+    }
 
     if (!schema || schema.length === 0) {
       return null;
@@ -589,7 +666,7 @@ export class AchievementDetailService {
     let earnedXp = userEpic?.xp?.earned || 0;
 
     const achievements: DetailedAchievement[] = effectiveSchema.map((baseAch, index) => {
-      const isUnlocked = index < unlockedCount;
+      const isUnlocked = Boolean(baseAch.unlocked) || index < unlockedCount;
       const isPlatinum = index === totalCount - 1 && totalCount >= 10;
       const xpVal = baseAch.xp || (isPlatinum ? 250 : index % 5 === 0 ? 100 : index % 2 === 0 ? 50 : 20);
 
@@ -602,7 +679,9 @@ export class AchievementDetailService {
         ...baseAch,
         id: `epic:${targetId}:${baseAch.apiName || baseAch.name || index}`,
         unlocked: isUnlocked,
-        unlockedAt: isUnlocked ? new Date(Date.now() - (index + 1) * 86400000 * 2).toISOString() : undefined,
+        unlockedAt:
+          baseAch.unlockedAt ||
+          (isUnlocked ? new Date(Date.now() - (index + 1) * 86400000 * 2).toISOString() : undefined),
         xp: xpVal,
         storefrontId: 'epic',
       };

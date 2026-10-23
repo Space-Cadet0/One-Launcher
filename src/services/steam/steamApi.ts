@@ -271,7 +271,10 @@ export class SteamApiService {
     return 'https://api.steampowered.com';
   }
 
-  public async fetchStoreBrowseAssets(appId: number): Promise<SteamStoreBrowseAssets | null> {
+  public async fetchStoreBrowseAssets(
+    appId: number,
+    priority: number = RequestPriority.P1_VIEWPORT
+  ): Promise<SteamStoreBrowseAssets | null> {
     if (!appId || appId <= 0) return null;
     this.loadBrowseAssetsCache();
     const cached = this.browseAssetsCache.get(appId);
@@ -293,7 +296,12 @@ export class SteamApiService {
         const url = `${this.getSteamWebApiBaseUrl()}/IStoreBrowseService/GetItems/v1/?input_json=${encodeURIComponent(
           inputJson
         )}`;
-        const res = await axios.get(url, { timeout: 6000 });
+        const res = await requestScheduler.schedule(
+          url,
+          () => axios.get(url, { timeout: 6000 }),
+          priority,
+          'api.steampowered.com'
+        );
         const item = res?.data?.response?.store_items?.[0];
         const assets = item?.assets;
         if (!assets || typeof assets !== 'object') {
@@ -624,7 +632,7 @@ export class SteamApiService {
 
           const browseAssets = directLibraryCapsule
             ? this.getStoreBrowseAssetsInstant(appId)
-            : await this.fetchStoreBrowseAssets(appId).catch(() => null);
+            : await this.fetchStoreBrowseAssets(appId, priority).catch(() => null);
 
           const resolvedCapsuleImage =
             directLibraryCapsule || browseAssets?.capsuleImage || undefined;

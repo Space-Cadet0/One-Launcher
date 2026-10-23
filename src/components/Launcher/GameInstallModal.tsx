@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { CanonicalGame } from '../../contracts/game';
+import { acquireModalOverlayLock, canPortalModalToBody } from '../../utils/modalOverlayLock';
 import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import {
   DiskSpaceInfo,
@@ -126,13 +128,18 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   );
   const [diskSpace, setDiskSpace] = useState<DiskSpaceInfo | null>(null);
   const [createShortcut, setCreateShortcut] = useState<boolean>(true);
+  const [includeDlcs, setIncludeDlcs] = useState<boolean>(
+    () => selectedPlatformId === 'epic' || selectedPlatformId === 'gog'
+  );
   const [isStarting, setIsStarting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const compatLayers = launcherService
-    .getCompatibilityLayers()
-    .filter((l) => l.type !== 'native');
-  const existingLaunchCfg = launcherService.getLaunchConfig(game.id, selectedPlatformId);
+  const compatLayers = isOpen
+    ? launcherService.getCompatibilityLayers().filter((l) => l.type !== 'native')
+    : [];
+  const existingLaunchCfg = isOpen
+    ? launcherService.getLaunchConfig(game.id, selectedPlatformId)
+    : undefined;
   const [selectedCompatRunner, setSelectedCompatRunner] = useState<string>(() =>
     existingLaunchCfg?.compatibilityLayer && existingLaunchCfg.compatibilityLayer !== 'native'
       ? existingLaunchCfg.compatibilityLayer
@@ -159,9 +166,23 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         game.platforms[0]?.platformId ||
         'steam';
       setSelectedPlatformId(targetPlat);
+      setIncludeDlcs(targetPlat === 'epic' || targetPlat === 'gog');
       setErrorMsg(null);
     }
   }, [isOpen, game.id, initialPlatformId]);
+
+  useEffect(() => {
+    if (!isOpen || isStarting || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, isStarting, onClose]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -235,6 +256,11 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       }
     };
   }, [isOpen, game.id, selectedPlatformId]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    return acquireModalOverlayLock();
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -350,6 +376,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         installerId: selectedInstallerId,
         os: isWindowsHost ? 'windows' : selectedOs,
         createShortcut,
+        includeDlcs: selectedPlatformId === 'epic' || selectedPlatformId === 'gog' ? includeDlcs : false,
         estimatedSizeBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
         totalBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
         ...(!isWindowsHost && selectedOs === 'windows'
@@ -412,13 +439,20 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
   const methodInfo = getMethodDescription(selectedPlatformId);
 
-  return (
+  const modalContent = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in duration-150 select-none"
+      className="fixed inset-0 z-[100] isolate flex items-center justify-center p-4 select-none overflow-hidden overscroll-contain"
       onClick={onClose}
     >
       <div
-        className="relative w-full max-w-xl rounded-xl bg-[#131b26] border border-[#2a475e] shadow-[0_20px_60px_rgba(0,0,0,0.9)] overflow-hidden text-steam-text"
+        aria-hidden="true"
+        className="fixed inset-0 bg-[#060a10]/95 pointer-events-none"
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Install ${game.title}`}
+        className="relative z-10 w-full max-w-xl rounded-xl bg-[#131b26] border border-[#2a475e] shadow-2xl overflow-hidden text-steam-text"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Top Game Banner Header */}
@@ -463,7 +497,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         </div>
 
         {/* Modal Body */}
-        <div className="p-5 space-y-5 max-h-[75vh] overflow-y-auto">
+        <div className="p-5 space-y-5 max-h-[75vh] overflow-y-auto overscroll-contain bg-[#131b26] modal-scroll-body">
           {/* Storefront Selector if owned on > 1 platform */}
           {game.platforms.length > 1 && (
             <div className="space-y-1.5">
@@ -478,8 +512,12 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     <button
                       key={plat.platformId}
                       type="button"
-                      onClick={() => setSelectedPlatformId(plat.platformId)}
-                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                      onClick={() => {
+                        setSelectedPlatformId(plat.platformId);
+                        setIncludeDlcs(plat.platformId === 'epic' || plat.platformId === 'gog');
+                        setErrorMsg(null);
+                      }}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
                         isSelected
                           ? 'bg-sky-500/20 border-sky-400 text-white shadow-[0_0_12px_rgba(56,189,248,0.25)]'
                           : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white hover:bg-[#1d2a3a]'
@@ -556,7 +594,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                           setSelectedInstallerId(macInstaller.id);
                           setSelectedOs('mac');
                         }}
-                        className={`text-left rounded-lg p-3 border transition-all cursor-pointer space-y-1.5 ${
+                        className={`text-left rounded-lg p-3 border transition-colors cursor-pointer space-y-1.5 ${
                           selectedOs === 'mac'
                             ? 'bg-emerald-950/50 border-emerald-400 shadow-[0_0_14px_rgba(16,185,129,0.22)]'
                             : 'bg-[#17212e] border-[#26384d] hover:border-emerald-500/40 hover:bg-[#1b2736]'
@@ -588,7 +626,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                           setSelectedInstallerId(winInstaller.id);
                           setSelectedOs('windows');
                         }}
-                        className={`text-left rounded-lg p-3 border transition-all cursor-pointer space-y-1.5 ${
+                        className={`text-left rounded-lg p-3 border transition-colors cursor-pointer space-y-1.5 ${
                           selectedOs === 'windows'
                             ? 'bg-amber-950/50 border-amber-400 shadow-[0_0_14px_rgba(245,158,11,0.22)]'
                             : 'bg-[#17212e] border-[#26384d] hover:border-amber-500/40 hover:bg-[#1b2736]'
@@ -615,36 +653,38 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                       </button>
                     </div>
                   )}
-                  <select
-                    aria-label="Installer Build"
-                    value={selectedInstallerId || ''}
-                    onChange={(e) => {
-                      const id = e.target.value;
-                      setSelectedInstallerId(id);
-                      const found = uniqueInstallers.find((i) => i.id === id);
-                      if (found) setSelectedOs(found.os);
-                    }}
-                    className="w-full rounded-lg bg-[#17212e] border border-[#2a475e] px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-400"
-                  >
-                    {uniqueInstallers.map((ins) => {
-                      const ver = formatVersion(ins.version);
-                      const sizeSuffix = ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : '';
-                      const verSuffix = ver ? ` (${ver})` : '';
-                      let optionLabel: string;
-                      if (ins.os === 'mac') {
-                        optionLabel = `★ Recommended: Native macOS Build${verSuffix}${sizeSuffix}`;
-                      } else if (ins.os === 'windows') {
-                        optionLabel = `${hasMacBuildOption ? 'Alternative: ' : ''}Windows Build via CrossOver / Wine${verSuffix}${sizeSuffix}`;
-                      } else {
-                        optionLabel = `Linux Build${verSuffix}${sizeSuffix}`;
-                      }
-                      return (
-                        <option key={ins.id} value={ins.id}>
-                          {optionLabel}
-                        </option>
-                      );
-                    })}
-                  </select>
+                  {!(macInstaller && winInstaller && uniqueInstallers.length <= 2) && (
+                    <select
+                      aria-label="Installer Build"
+                      value={selectedInstallerId || ''}
+                      onChange={(e) => {
+                        const id = e.target.value;
+                        setSelectedInstallerId(id);
+                        const found = uniqueInstallers.find((i) => i.id === id);
+                        if (found) setSelectedOs(found.os);
+                      }}
+                      className="w-full rounded-lg bg-[#17212e] border border-[#2a475e] px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-400"
+                    >
+                      {uniqueInstallers.map((ins) => {
+                        const ver = formatVersion(ins.version);
+                        const sizeSuffix = ins.totalSizeBytes ? ` • ${formatBytes(ins.totalSizeBytes)}` : '';
+                        const verSuffix = ver ? ` (${ver})` : '';
+                        let optionLabel: string;
+                        if (ins.os === 'mac') {
+                          optionLabel = `★ Recommended: Native macOS Build${verSuffix}${sizeSuffix}`;
+                        } else if (ins.os === 'windows') {
+                          optionLabel = `${hasMacBuildOption ? 'Alternative: ' : ''}Windows Build via CrossOver / Wine${verSuffix}${sizeSuffix}`;
+                        } else {
+                          optionLabel = `Linux Build${verSuffix}${sizeSuffix}`;
+                        }
+                        return (
+                          <option key={ins.id} value={ins.id}>
+                            {optionLabel}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  )}
                   {selectedOs === 'mac' && (
                     <div className="flex items-start gap-2 text-[11px] text-emerald-300 bg-emerald-950/40 border border-emerald-500/40 rounded-lg px-3 py-2 leading-relaxed">
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
@@ -669,7 +709,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   <button
                     type="button"
                     onClick={() => setSelectedOs('mac')}
-                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
                       selectedOs === 'mac'
                         ? 'bg-sky-500/20 border-sky-400 text-white'
                         : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
@@ -680,7 +720,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   <button
                     type="button"
                     onClick={() => setSelectedOs('windows')}
-                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
                       selectedOs === 'windows'
                         ? 'bg-amber-500/20 border-amber-400 text-amber-200'
                         : 'bg-[#17212e] border-[#26384d] text-steam-subtext hover:text-white'
@@ -760,54 +800,100 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
           {/* Target Installation Directory */}
           {selectedPlatformId === 'steam' ? (
-            <div
-              data-testid="steam-managed-install-location"
-              className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5">
-                  <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">
-                    Steam Library Location
-                  </span>
-                </div>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
-                  Managed by Steam Client (steamapps/common)
-                </span>
-              </div>
+            (() => {
+              const effectiveSteamDisplayPath = (() => {
+                if (!isWindowsHost && selectedOs === 'windows') {
+                  const isCrossOverLayer =
+                    !activeCompatLayer ||
+                    activeCompatLayer.type === 'crossover' ||
+                    activeCompatLayer.type === 'crossover_preview' ||
+                    Boolean(selectedBottleName);
+                  if (isCrossOverLayer) {
+                    const bottlesRoot = (
+                      activeCompatLayer?.bottlesDir ||
+                      '~/Library/Application Support/CrossOver/Bottles'
+                    ).replace(/\/+$/, '');
+                    const bottleName =
+                      selectedBottleName || activeCompatLayer?.availableBottles?.[0] || 'Steam';
+                    return `${bottlesRoot}/${bottleName}/drive_c/Program Files (x86)/Steam/steamapps/common`;
+                  }
+                  const prefixRoot = (
+                    (activeCompatLayer as any)?.prefixPath ||
+                    existingLaunchCfg?.winePrefixPath ||
+                    '~/Games/OneLauncher/Prefixes/default'
+                  ).replace(/\/+$/, '');
+                  return `${prefixRoot}/drive_c/Program Files (x86)/Steam/steamapps/common`;
+                }
 
-              <div className="flex items-center justify-between gap-2 bg-[#141d2b] border border-[#26384d] rounded-md px-2.5 py-1.5">
-                <span className="text-xs font-mono text-sky-200 truncate">
-                  {installDir || installInfo?.defaultInstallDir || 'Steam Library'}
-                </span>
-                {installInfo?.availableInstallDirs &&
-                  installInfo.availableInstallDirs.length > 1 && (
-                    <select
-                      data-testid="steam-library-drive-select"
-                      aria-label="Preview Steam Library Drive"
-                      value={
-                        installInfo.availableInstallDirs.includes(installDir)
-                          ? installDir
-                          : installInfo.availableInstallDirs[0] || ''
-                      }
-                      onChange={(e) => {
-                        if (e.target.value) handleDirectoryChange(e.target.value, false);
-                      }}
-                      className="text-[11px] bg-[#17212e] border border-[#2a475e] rounded px-2 py-0.5 text-sky-300 focus:outline-none shrink-0"
+                if (!isWindowsHost) {
+                  const nativeCandidates = [
+                    ...(installInfo?.availableInstallDirs || []),
+                    installInfo?.defaultInstallDir,
+                    installDir,
+                  ].filter(
+                    (d): d is string =>
+                      typeof d === 'string' &&
+                      d.length > 0 &&
+                      !/\/Bottles\//i.test(d) &&
+                      !/\/drive_c\//i.test(d)
+                  );
+                  return (
+                    nativeCandidates[0] || '~/Library/Application Support/Steam/steamapps/common'
+                  );
+                }
+
+                return (
+                  installDir ||
+                  installInfo?.defaultInstallDir ||
+                  installInfo?.availableInstallDirs?.[0] ||
+                  'C:\\Program Files (x86)\\Steam\\steamapps\\common'
+                );
+              })();
+
+              return (
+                <div
+                  data-testid="steam-managed-install-location"
+                  className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-white">
+                        Steam Library Location
+                      </span>
+                    </div>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                      Managed by Steam Client (steamapps/common)
+                    </span>
+                  </div>
+
+                  <div
+                    data-testid="steam-library-location-display"
+                    className="min-w-0 max-w-full overflow-hidden rounded-lg border border-white/10 bg-[#141821] px-3 py-2.5 space-y-1"
+                  >
+                    <code
+                      title={effectiveSteamDisplayPath}
+                      className="truncate block text-xs font-mono text-gray-200"
                     >
-                      {installInfo.availableInstallDirs.map((dir) => (
-                        <option key={dir} value={dir}>
-                          {dir}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-              </div>
+                      {effectiveSteamDisplayPath}
+                    </code>
+                    <div className="text-[10px] text-steam-subtext truncate">
+                      {!isWindowsHost && selectedOs === 'windows'
+                        ? `CrossOver / Wine Bottle Steam Library (${
+                            selectedBottleName ||
+                            activeCompatLayer?.availableBottles?.[0] ||
+                            'Steam'
+                          })`
+                        : 'Native Steam Library'}
+                    </div>
+                  </div>
 
-              <p className="text-[11px] text-steam-subtext leading-relaxed">
-                Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
-              </p>
-            </div>
+                  <p className="text-[11px] text-steam-subtext leading-relaxed">
+                    Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
+                  </p>
+                </div>
+              );
+            })()
           ) : (
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
@@ -888,13 +974,13 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             {/* Storage Progress Bar */}
             <div className="w-full h-2 rounded-full bg-[#1b2838] overflow-hidden flex">
               <div
-                className="h-full bg-slate-600 transition-all"
+                className="h-full bg-slate-600"
                 style={{ width: `${usedPercent}%` }}
                 title={`Used Space: ${usedPercent}%`}
               />
               {installPercent > 0 && (
                 <div
-                  className={`h-full transition-all ${
+                  className={`h-full ${
                     hasEnoughSpace ? 'bg-sky-400' : 'bg-red-500'
                   }`}
                   style={{ width: `${installPercent}%` }}
@@ -907,6 +993,17 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               <div className="flex items-center gap-1.5 text-[11px] text-red-400 pt-0.5">
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                 <span>Insufficient disk space on target volume for this installation.</span>
+              </div>
+            )}
+            {(selectedPlatformId === 'epic' || selectedPlatformId === 'gog') && includeDlcs && (
+              <div
+                data-testid="dlc-disk-space-note"
+                className="flex items-center gap-1.5 text-[11px] text-steam-subtext pt-0.5"
+              >
+                <Info className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <span>
+                  Base game size shown above; total required disk space may increase when owned DLCs &amp; expansions are included.
+                </span>
               </div>
             )}
           </div>
@@ -926,6 +1023,30 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               <p className="text-[11px] text-steam-subtext leading-relaxed">{methodInfo.desc}</p>
             </div>
           </div>
+
+          {/* Owned DLCs & Expansions Toggle (GOG & Epic) */}
+          {(selectedPlatformId === 'gog' || selectedPlatformId === 'epic') && (
+            <label className="flex items-start gap-2.5 rounded-lg bg-[#0e151f] border border-[#223447] p-3 text-xs text-steam-text cursor-pointer hover:border-[#2a475e] transition-colors">
+              <input
+                type="checkbox"
+                data-testid="toggle-include-dlcs"
+                checked={includeDlcs}
+                aria-checked={includeDlcs}
+                onChange={(e) =>
+                  setIncludeDlcs(
+                    typeof e?.target?.checked === 'boolean' ? e.target.checked : !includeDlcs
+                  )
+                }
+                className="mt-0.5 rounded border-steam-border bg-[#0e151f] text-sky-500 focus:ring-0"
+              />
+              <div className="space-y-0.5 min-w-0">
+                <div className="font-semibold text-white">Include Owned DLCs &amp; Expansions</div>
+                <div className="text-[11px] text-steam-subtext leading-snug">
+                  Downloads owned expansions, season pass content, and bonus DLC depots alongside the base game
+                </div>
+              </div>
+            </label>
+          )}
 
           {/* Options Checkbox */}
           <label className="flex items-center gap-2 text-xs text-steam-text cursor-pointer">
@@ -959,7 +1080,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             type="button"
             onClick={handleStartInstall}
             disabled={isStarting || !hasEnoughSpace}
-            className="inline-flex items-center gap-2 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-all shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer"
+            className="inline-flex items-center gap-2 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer"
             style={{
               background: 'linear-gradient(to right, #0ea5e9 0%, #2563eb 100%)',
               boxShadow: '0 0 18px rgba(14, 165, 233, 0.4)',
@@ -981,4 +1102,6 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       </div>
     </div>
   );
+
+  return canPortalModalToBody() ? createPortal(modalContent, document.body) : modalContent;
 };

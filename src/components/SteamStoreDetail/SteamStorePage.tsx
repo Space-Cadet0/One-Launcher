@@ -87,8 +87,22 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   const activeGameIdRef = useRef<string>(game.id);
 
   useEffect(() => {
-    return launcherService.subscribe(() => setLauncherTick((t) => t + 1));
-  }, []);
+    const computePageLauncherSig = () => {
+      const sess = launcherService.getActiveSession(game.id);
+      const dl = launcherService.getActiveDownload(game.id);
+      const selPlat = launcherService.getSelectedStorefrontForGame(game.id) || '';
+      const rec = launcherService.getInstalledRecordForGame(game);
+      return `${sess?.sessionId || ''}:${sess?.status || ''}|${dl?.taskId || ''}:${dl?.status || ''}:${Math.round(dl?.progressPercent || 0)}|${selPlat}|${rec?.platformId || ''}:${rec?.installPath || ''}:${rec?.executablePath || ''}`;
+    };
+    let prevSig = computePageLauncherSig();
+    return launcherService.subscribe(() => {
+      const nextSig = computePageLauncherSig();
+      if (nextSig !== prevSig) {
+        prevSig = nextSig;
+        setLauncherTick((t) => t + 1);
+      }
+    });
+  }, [game]);
 
   const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
   const metadataRoute = useMemo(
@@ -825,7 +839,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         />
 
         {/* Main Steam Highlight Showcase (1:1 Steam 2-Column Split: Media Player + Details) */}
-        <div className="flex flex-col lg:flex-row gap-4 bg-[#16202d]/80 backdrop-blur rounded border border-steam-border p-4 shadow-xl">
+        <div className="flex flex-col lg:flex-row gap-4 bg-[#16202d]/95 rounded border border-steam-border p-4 shadow-xl">
           {/* Left Column: Media Gallery (Trailers + Screenshots) */}
           <div className="flex-1 min-w-0 lg:max-w-[616px]">
             {isLoading ? (
