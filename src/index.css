@@ -1,0 +1,491 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-steam-darkest text-steam-text font-steam antialiased;
+    background-color: #0b0f14;
+    background-image: radial-gradient(circle at 50% 0%, #1b2838 0%, #0b0f14 70%);
+    min-height: 100vh;
+  }
+
+  /* Steam custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0f161e;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2a475e;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3d688a;
+  }
+}
+
+/* ========================================================
+   STEAM STORE DESCRIPTION CONTENT (1:1 PIXEL MATCH)
+   ======================================================== */
+.steam-description-content {
+  color: #acb2b8;
+  line-height: 1.6;
+  font-size: 0.875rem;
+}
+.steam-description-content .bb_tag,
+.steam-description-content h2 {
+  color: #ffffff;
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin-top: 1.75rem;
+  margin-bottom: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  padding-bottom: 0.35rem;
+}
+.steam-description-content .bb_tag strong,
+.steam-description-content h2 strong {
+  color: #ffffff;
+}
+.steam-description-content .bb_paragraph,
+.steam-description-content p {
+  margin-bottom: 0.85rem;
+}
+.steam-description-content .bb_img_ctn {
+  display: block;
+  margin: 1.25rem 0;
+  position: relative;
+  border-radius: 4px;
+  overflow: hidden;
+  background-color: #000000;
+  border: 1px solid rgba(42, 71, 94, 0.4);
+}
+.steam-description-content video.bb_img,
+.steam-description-content img.bb_img,
+.steam-description-content video,
+.steam-description-content img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 3px;
+}
+.steam-description-content ul,
+.steam-description-content .bb_ul {
+  list-style-type: disc;
+  margin-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+.steam-description-content li {
+  margin-bottom: 0.25rem;
+}
+.steam-description-content strong,
+.steam-description-content b {
+  color: #ffffff;
+}
+
+/* ========================================================
+   STEAM STORE RIGHT COLUMN (1:1 PIXEL MATCH)
+   ======================================================== */
+
+.steam-block-title {
+  font-size: 12px;
+  color: #8f98a0;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-weight: 500;
+}
+
+/* Features Rows: Exact Steam game_area_details_specs_ctn layout */
+.steam-spec-row {
+  margin-bottom: 2px;
+  background-color: rgba(0, 0, 0, 0.2);
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  cursor: pointer;
+  border-radius: 1px;
+}
+
+.steam-spec-row .spec-icon {
+  padding: 0px 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 28px;
+  flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.steam-spec-row .spec-icon img {
+  max-width: 20px;
+  max-height: 20px;
+  display: block;
+  vertical-align: unset;
+}
+
+.steam-spec-row .spec-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  height: 28px;
+  background: rgba(103, 193, 245, 0.1);
+  width: 100%;
+  border-radius: 1px;
+  color: #66c0f4;
+  font-size: 12px;
+  line-height: 16px;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.steam-spec-row:hover .spec-label {
+  color: #ffffff;
+  background: linear-gradient(135deg, #67c1f5 0%, #417a9b 100%);
+}
+
+/* Steam Anti-Cheat Box: Exact .anticheat_nonkernel_notice */
+.steam-anticheat-box {
+  color: #66c0f4;
+  padding: 5px 8px;
+  line-height: 17px;
+  border-radius: 1px;
+  margin-top: 10px;
+  background: rgba(103, 193, 245, 0.1);
+  font-size: 12px;
+}
+
+.steam-anticheat-box .anticheat-title {
+  color: #66c0f4;
+  font-size: 11px;
+}
+
+.steam-anticheat-box .anticheat-name {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+/* Steam DRM Notice Box: Exact .DRM_notice */
+.steam-drm-box {
+  color: #fde68a;
+  padding: 5px 8px;
+  line-height: 17px;
+  border-radius: 1px;
+  margin-top: 8px;
+  background: linear-gradient(135deg, rgba(69, 52, 20, 0.85) 0%, rgba(92, 69, 24, 0.85) 100%);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  font-size: 12px;
+}
+
+.steam-drm-box a {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
+.steam-drm-box a:hover {
+  color: #66c0f4;
+}
+
+/* Steam Languages Table: Exact table.game_language_options */
+table.steam-lang-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+table.steam-lang-table tr {
+  border-bottom: 1px solid #4a4d52;
+}
+
+table.steam-lang-table th {
+  font-size: 11px;
+  color: #b0aeac;
+  font-weight: normal;
+  padding: 3px 0;
+}
+
+table.steam-lang-table th.checkcol {
+  width: 60px;
+  text-align: center;
+}
+
+table.steam-lang-table td {
+  color: #8f98a0;
+  padding: 3px 0px;
+  text-align: center;
+  font-size: 12px;
+}
+
+table.steam-lang-table td.lang-name {
+  text-align: left;
+  color: #8f98a0;
+  padding-left: 2px;
+}
+
+table.steam-lang-table td span.check {
+  font-weight: bold;
+  color: #67c1f5;
+  font-size: 13px;
+}
+
+/* Steam Linkbar Rows: Exact .block a.linkbar */
+.steam-linkbar-row {
+  min-height: 22px;
+  padding: 4px 8px;
+  line-height: 17px;
+  background: rgba(103, 193, 245, 0.1);
+  color: #67c1f5;
+  border-radius: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.steam-linkbar-row:hover {
+  color: #ffffff;
+  background: linear-gradient(135deg, #67c1f5 0%, #417a9b 100%);
+}
+
+/* Details block: Exact .game_details */
+.steam-game-details {
+  color: #8f98a0;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.steam-game-details b {
+  font-family: Arial, Helvetica, sans-serif;
+  color: #94a3b8;
+  font-weight: normal;
+  text-transform: uppercase;
+  font-size: 11px;
+  margin-right: 4px;
+}
+
+.steam-game-details a {
+  color: #67c1f5;
+}
+
+.steam-game-details a:hover {
+  color: #ffffff;
+}
+
+/* ========================================================
+   MACOS / ELECTRON FRAMELESS WINDOW DRAG REGION
+   ======================================================== */
+.app-drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.app-no-drag,
+.app-drag-region button,
+.app-drag-region a,
+.app-drag-region input,
+.app-drag-region select,
+.app-drag-region [role="button"],
+.app-drag-region [role="menu"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* ========================================================
+   MODAL OVERLAY COMPOSITOR & SCROLL STABILITY
+   ======================================================== */
+html[data-modal-overlay-open='true'] #root .app-drag-region,
+html[data-modal-overlay-open='true'] #root [style*='app-region'] {
+  -webkit-app-region: no-drag !important;
+  app-region: no-drag !important;
+}
+
+.modal-scroll-body {
+  background-color: #131b26;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  color-scheme: dark;
+  isolation: isolate;
+}
+
+/* ========================================================
+   CONTENT-VISIBILITY & RENDERING CONTAINMENT UTILITIES
+   ======================================================== */
+.cv-card {
+  contain: layout style paint;
+  overflow-anchor: none;
+}
+.perf-card-contain {
+  contain: layout style paint;
+  contain-intrinsic-size: auto 220px auto 330px;
+  overflow-anchor: none;
+}
+.cv-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px auto 330px;
+}
+.cv-sidebar-row {
+  contain: layout style paint;
+  overflow-anchor: none;
+}
+.cv-sidebar-row-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 2.25rem;
+}
+.cv-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 420px;
+  overflow-anchor: none;
+}
+.cv-store-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+  overflow-anchor: none;
+}
+@supports not (content-visibility: auto) {
+  .cv-card,
+  .perf-card-contain,
+  .cv-card-deferred,
+  .cv-sidebar-row,
+  .cv-sidebar-row-deferred,
+  .cv-section,
+  .cv-store-section {
+    contain: layout style paint;
+  }
+}
+
+/* Stretched primary card trigger: whole card stays clickable while sibling action buttons sit above z-index 1 */
+.card-stretched-trigger::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+/* ========================================================
+   NATIVE TOP-LAYER <dialog> MODAL SHELL & REDUCED MOTION
+   ======================================================== */
+:where(dialog.ol-modal-dialog, dialog.modal-shell) {
+  border: 0;
+  padding: 0;
+  margin: auto;
+  width: fit-content;
+  height: fit-content;
+  max-width: calc(100vw - 2rem);
+  max-height: calc(100vh - 2rem);
+  background: transparent;
+  color: inherit;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+dialog.ol-modal-dialog:modal,
+dialog.modal-shell:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.ol-modal-dialog::backdrop,
+dialog.modal-shell::backdrop {
+  background-color: rgba(5, 8, 12, 0.85);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+.ol-studio-scroll-body {
+  overscroll-behavior: contain;
+  contain: layout style;
+}
+
+.ol-studio-row-card {
+  contain: layout style paint;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto !important;
+  }
+
+  .animate-pulse,
+  .animate-ping,
+  .animate-bounce,
+  .animate-spin {
+    animation: none !important;
+  }
+
+  [class*='transition'],
+  .steam-spec-row .spec-label,
+  .steam-linkbar-row {
+    transition-duration: 0s !important;
+  }
+
+  .dual-range-input::-webkit-slider-thumb {
+    transition-duration: 0s !important;
+  }
+
+  .dual-range-input::-moz-range-thumb {
+    transition-duration: 0s !important;
+  }
+}
+
+/* ========================================================
+   TWO-POINT RELEASE YEAR DUAL-RANGE SLIDER UTILITIES
+   ======================================================== */
+.dual-range-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+}
+.dual-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #66c0f4;
+  border: 2px solid #0b0e14;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+.dual-range-input::-webkit-slider-thumb:hover {
+  background: #8ad2fc;
+  transform: scale(1.12);
+}
+.dual-range-input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid #66c0f4;
+  outline-offset: 2px;
+}
+.dual-range-input::-moz-range-thumb {
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #66c0f4;
+  border: 2px solid #0b0e14;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+.dual-range-input::-moz-range-thumb:hover {
+  background: #8ad2fc;
+  transform: scale(1.12);
+}
+.dual-range-input:focus-visible::-moz-range-thumb {
+  outline: 2px solid #66c0f4;
+  outline-offset: 2px;
+}
+

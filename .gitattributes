@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=lf
+*.nsh text eol=lf
+*.nsi text eol=lf
+
+*.png binary
+*.icns binary
+*.ico binary
+*.dll binary
+*.exe binary
+*.dylib binary
+electron/bin/** binary

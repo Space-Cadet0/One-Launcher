@@ -1,0 +1,9 @@
+LIBRARY Xgameruntime.dll
+EXPORTS
+    DllCanUnloadNow
+    InitializeApiImpl
+    InitializeApiImplEx
+    InitializeApiImplEx2
+    QueryApiImpl
+    UninitializeApiImpl
+    XErrorReport

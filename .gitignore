@@ -1,0 +1,81 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/*
+!build/*.cjs
+!build/*.nsh
+!build/*.nsi
+!build/*.ps1
+!build/*.bat
+!build/*.plist
+!build/icon.icns
+!build/icon.ico
+!build/icon.png
+out/
+release/
+*.dmg
+*.blockmap
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Cache & Test Coverage
+.cache/
+cache/
+.vitest/
+coverage/
+
+# Auth, Certificates & Session Captures (Defense in Depth)
+tokens.json
+*tokens*.json
+auth.json
+user.json
+*.cookies*
+*.har
+*.pem
+*.p12
+*.pfx
+*.cer
+
+# Local Databases, Storefront Manifests & Diagnostic Dumps (Zero-PII Defense in Depth)
+*.pdf
+*.vdf
+*.db
+*.sqlite
+*.sqlite3
+.pii-guard.local.json
+scripts/scrub-*.sh
+scripts/*_extracted*.json
+scripts/*_raw_*.json
+scripts/pdf_*
+scripts/*_authentic_*.json
+tier4_titles.json
+

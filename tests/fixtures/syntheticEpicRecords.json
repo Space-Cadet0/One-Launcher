@@ -1,0 +1,229 @@
+[
+  {
+    "namespace": "calluna-ns-001",
+    "catalogItemId": "syn_control_base_001",
+    "appName": "Calluna",
+    "country": "US",
+    "platform": ["Win32", "Windows"],
+    "productId": "prod-control",
+    "sandboxName": "Control",
+    "sandboxType": "PUBLIC",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-01-15T12:00:00.000Z",
+    "dependencies": [],
+    "metadata": {
+      "title": "Control",
+      "description": "Supernatural third-person action-adventure set inside the Oldest House.",
+      "developer": "Remedy Entertainment",
+      "categories": [{ "path": "games" }, { "path": "applications" }]
+    }
+  },
+  {
+    "namespace": "calluna-ns-001",
+    "catalogItemId": "syn_control_dlc_foundation_002",
+    "appName": "CallunaDLC1",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-control",
+    "sandboxName": "Control",
+    "sandboxType": "PUBLIC",
+    "recordType": "ADDON",
+    "acquisitionDate": "2025-01-15T12:01:00.000Z",
+    "dependencies": ["syn_control_base_001"],
+    "metadata": {
+      "title": "Control - The Foundation",
+      "categories": [{ "path": "addons" }],
+      "mainGameItem": {
+        "id": "syn_control_base_001",
+        "title": "Control"
+      }
+    }
+  },
+  {
+    "namespace": "celeste-ns-003",
+    "catalogItemId": "syn_celeste_cjk_003",
+    "appName": "Salt",
+    "country": "US",
+    "platform": ["Windows", "Mac"],
+    "productId": "prod-celeste",
+    "sandboxName": "Celeste",
+    "sandboxType": "PUBLIC",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-02-01T09:30:00.000Z",
+    "dependencies": [],
+    "metadata": {
+      "title": "Celeste",
+      "description": "蔚蓝山脉攀登之旅 — Help Madeline survive her inner demons on her journey to the top of Celeste Mountain.",
+      "developer": "Maddy Makes Games",
+      "categories": [{ "path": "games" }]
+    }
+  },
+  {
+    "namespace": "ue",
+    "catalogItemId": "syn_ue_5_4_004",
+    "appName": "UE_5.4",
+    "country": "US",
+    "platform": ["Windows", "Mac"],
+    "productId": "unreal-engine",
+    "sandboxName": "Unreal Engine",
+    "sandboxType": "PUBLIC",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-02-10T00:00:00.000Z",
+    "dependencies": [],
+    "metadata": {
+      "title": "Unreal Engine 5.4",
+      "categories": [{ "path": "engines" }]
+    }
+  },
+  {
+    "namespace": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "catalogItemId": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+    "appName": "99887766554433221100aabbccddeeff",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-live-placeholder",
+    "sandboxName": "Live",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-01T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "hex-placeholder-ns",
+    "catalogItemId": "0123456789abcdef0123456789abcdef",
+    "appName": "fedcba9876543210fedcba9876543210",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-hex-hash",
+    "sandboxName": "0123456789abcdef0123456789abcdef",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-02T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-01",
+    "catalogItemId": "syn_codename_cobaltfalcon_007",
+    "appName": "CobaltFalcon",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-cobaltfalcon",
+    "sandboxName": "CobaltFalcon",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-05T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-02",
+    "catalogItemId": "syn_codename_crimsonharbor_008",
+    "appName": "CrimsonHarbor",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-crimsonharbor",
+    "sandboxName": "CrimsonHarbor",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-06T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-03",
+    "catalogItemId": "syn_codename_obsidianspire_009",
+    "appName": "ObsidianSpire",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-obsidianspire",
+    "sandboxName": "ObsidianSpire",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-07T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-04",
+    "catalogItemId": "syn_codename_amberquasar_010",
+    "appName": "AmberQuasar",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-amberquasar",
+    "sandboxName": "AmberQuasar",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-08T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-05",
+    "catalogItemId": "syn_codename_silvervortex_011",
+    "appName": "SilverVortex",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-silvervortex",
+    "sandboxName": "SilverVortex",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-09T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-06",
+    "catalogItemId": "syn_codename_verdantecho_012",
+    "appName": "VerdantEcho",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-verdantecho",
+    "sandboxName": "VerdantEcho",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-10T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-07",
+    "catalogItemId": "syn_codename_quartzcipher_013",
+    "appName": "QuartzCipher",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-quartzcipher",
+    "sandboxName": "QuartzCipher",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-11T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "codename-ns-08",
+    "catalogItemId": "syn_codename_onyxmirage_014",
+    "appName": "OnyxMirage",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-onyxmirage",
+    "sandboxName": "OnyxMirage",
+    "sandboxType": "PRIVATE",
+    "recordType": "APPLICATION",
+    "acquisitionDate": "2025-03-12T00:00:00.000Z",
+    "dependencies": []
+  },
+  {
+    "namespace": "alanwake2-ns-015",
+    "catalogItemId": "syn_alanwake2_deluxe_015",
+    "appName": "AlanWake2DeluxeUpgrade",
+    "country": "US",
+    "platform": ["Windows"],
+    "productId": "prod-alanwake2",
+    "sandboxName": "Alan Wake 2",
+    "sandboxType": "PUBLIC",
+    "recordType": "ADDON",
+    "acquisitionDate": "2025-03-15T18:00:00.000Z",
+    "dependencies": ["syn_alanwake2_base"],
+    "metadata": {
+      "title": "Alan Wake 2 Deluxe Upgrade",
+      "categories": [{ "path": "addons" }],
+      "mainGameItem": {
+        "id": "syn_alanwake2_base",
+        "title": "Alan Wake 2"
+      }
+    }
+  }
+]

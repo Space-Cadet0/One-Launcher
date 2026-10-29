@@ -1,0 +1,19 @@
+title = "One Launcher Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist upstream public native desktop OAuth client constants (GOG Galaxy / heroic-gogdl & Epic Games Launcher / derrod/legendary, RFC 8252 §8.5) in electron/storeSync.cjs and electron/launcher/cloudSaveEngine.cjs only"
+condition = "AND"
+paths = [
+  '''^electron/storeSync\.cjs$''',
+  '''^electron/launcher/cloudSaveEngine\.cjs$''',
+]
+regexTarget = "line"
+regexes = [
+  '''46899977096215655''',
+  '''9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9''',
+  '''34a02cf8f4414e29b15921876da36f9a''',
+  '''MzRhMDJjZjhmNDQxNGUyOWIxNTkyMTg3NmRhMzZmOWE6ZGFhZmJjY2M3Mzc3NDUwMzlkZmZlNTNkOTRmYzc2Y2Y=''',
+]
