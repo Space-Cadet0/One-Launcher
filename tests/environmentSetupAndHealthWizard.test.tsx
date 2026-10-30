@@ -225,7 +225,11 @@ function seedInitializedCrossOverBottle(
   } else {
     const hostDocs = path.join(homedir, 'Documents');
     fs.mkdirSync(hostDocs, { recursive: true });
-    fs.symlinkSync(hostDocs, path.join(userDir, 'Documents'));
+    fs.symlinkSync(
+      hostDocs,
+      path.join(userDir, 'Documents'),
+      process.platform === 'win32' ? 'junction' : 'dir'
+    );
   }
 
   if (opts.withSteam) {
@@ -1130,7 +1134,7 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
                 cb(null, '', '');
                 return {};
               }
-              if (cmd.endsWith('/cxbottle')) {
+              if (cmd.replace(/\\/g, '/').endsWith('/cxbottle')) {
                 // Simulate cxbottle creating a fresh prefix with an unsandboxed ~/Documents symlink
                 seedInitializedCrossOverBottle(homedir, 'OneLauncher', {
                   withSteam: false,

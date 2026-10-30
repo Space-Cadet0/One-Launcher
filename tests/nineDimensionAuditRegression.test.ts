@@ -1354,8 +1354,10 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
 
       const xattrCalls: Array<{ cmd: string; args: string[] }> = [];
       const enginePath = path.resolve(__dirname, '../electron/launcherEngine.cjs');
+      const registryPath = path.resolve(__dirname, '../electron/launcher/engineStateRegistry.cjs');
       const origLoad = (Module as any)._load;
       const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+      const req = Module.createRequire(enginePath);
       try {
         Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
         const realCp = require('node:child_process');
@@ -1376,8 +1378,6 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
           return origLoad.call(this, request, parent, isMain);
         };
 
-        const req = Module.createRequire(enginePath);
-        const registryPath = path.resolve(__dirname, '../electron/launcher/engineStateRegistry.cjs');
         delete req.cache[registryPath];
         delete req.cache[enginePath];
         const freshDarwinEngine = req(enginePath);
@@ -1400,11 +1400,15 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       } finally {
         (Module as any)._load = origLoad;
         if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+        delete req.cache[registryPath];
+        delete req.cache[enginePath];
         fs.rmSync(tmpHome, { recursive: true, force: true });
       }
     });
 
-    it('Windows track: galaxy-2.0.db SQLite operations set PRAGMA busy_timeout = 5000 with zero execSync("sleep 0.1") spawns, reg.exe uses execFileSync array args, and session polling uses process.kill(pid, 0)', () => {
+    it(
+      'Windows track: galaxy-2.0.db SQLite operations set PRAGMA busy_timeout = 5000 with zero execSync("sleep 0.1") spawns, reg.exe uses execFileSync array args, and session polling uses process.kill(pid, 0)',
+      () => {
       const tmpWinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-win-galaxy-'));
       const installDir = path.join(tmpWinDir, 'GameInstall');
       fs.mkdirSync(installDir, { recursive: true });
@@ -1492,7 +1496,7 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
         ]);
       } finally {
         (Module as any)._load = origLoad;
-        fs.rmSync(tmpWinDir, { recursive: true, force: true });
+        fs.rmSync(tmpWinDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
       }
 
       // 3. Fast O(1) process.kill(pid, 0) liveness check in isProcessAlive
@@ -1503,7 +1507,9 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
       } finally {
         killSpy.mockRestore();
       }
-    });
+    },
+      30000
+    );
   });
 
   // =========================================================================

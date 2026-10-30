@@ -183,12 +183,15 @@ function upsertGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {a
 
   /** @type {any} */
   let db = null;
+  let inTx = false;
   try {
     const hostDbPath = toHostFilesystemPath(targetDbPath);
     fs.mkdirSync(path.dirname(hostDbPath), { recursive: true });
     const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(hostDbPath, { readBigInts: true });
     db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('BEGIN IMMEDIATE;');
+    inTx = true;
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS ReleaseKeys (key TEXT PRIMARY KEY);
@@ -320,8 +323,15 @@ function upsertGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {a
         'INSERT INTO GameFiles (installPath, productId, hash, fileAttribute) VALUES (?, ?, ?, 32)'
       ).run(gfRelPath, numericProductId, '');
     }
+    db.exec('COMMIT;');
+    inTx = false;
     return true;
   } catch {
+    if (db && inTx) {
+      try {
+        db.exec('ROLLBACK;');
+      } catch {}
+    }
     return false;
   } finally {
     if (db) {
@@ -340,10 +350,13 @@ function deleteGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {s
   const releaseKey = `gog_${normId}`;
   /** @type {any} */
   let db = null;
+  let inTx = false;
   try {
     const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(targetDbPath, { readBigInts: true });
     db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('BEGIN IMMEDIATE;');
+    inTx = true;
     try {
       db.prepare(
         'DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE gameReleaseKey = ?)'
@@ -382,8 +395,15 @@ function deleteGogSqliteProduct(/** @type {string} */ targetDbPath, /** @type {s
     try {
       db.prepare('DELETE FROM ProductStates WHERE productId = ?').run(numericProductId);
     } catch {}
+    db.exec('COMMIT;');
+    inTx = false;
     return true;
   } catch {
+    if (db && inTx) {
+      try {
+        db.exec('ROLLBACK;');
+      } catch {}
+    }
     return false;
   } finally {
     if (db) {
