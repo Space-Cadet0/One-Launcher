@@ -1659,8 +1659,9 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         mockCrossoverWine,
         `#!/usr/bin/env node
 const fs = require('node:fs');
+const tmpDump = ${JSON.stringify(`${argsDumpFile}.tmp`)};
 fs.writeFileSync(
-  ${JSON.stringify(argsDumpFile)},
+  tmpDump,
   JSON.stringify({
     exe: process.argv[2] || '',
     arg1: process.argv[3] || '',
@@ -1671,6 +1672,7 @@ fs.writeFileSync(
   }) + '\\n',
   'utf8'
 );
+fs.renameSync(tmpDump, ${JSON.stringify(argsDumpFile)});
 setTimeout(() => process.exit(0), 1000);
 `,
         0o755

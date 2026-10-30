@@ -2060,8 +2060,9 @@ setTimeout(() => process.exit(0), 150);
         mockCrossoverWine,
         `#!/usr/bin/env node
 const fs = require('node:fs');
+const tmpDump = ${JSON.stringify(`${envDumpFile}.tmp`)};
 fs.writeFileSync(
-  ${JSON.stringify(envDumpFile)},
+  tmpDump,
   JSON.stringify({
     exe: process.argv[2] || '',
     SteamAppId: process.env.SteamAppId || '',
@@ -2070,6 +2071,7 @@ fs.writeFileSync(
   }) + '\\n',
   'utf8'
 );
+fs.renameSync(tmpDump, ${JSON.stringify(envDumpFile)});
 setTimeout(() => process.exit(0), 1000);
 `,
         0o755
