@@ -8,6 +8,7 @@ import {
   XboxSubscriptionSummary,
 } from '../../contracts/game';
 import type { InstalledGameRecord } from '../../contracts/launcher';
+import type { CriticScoreData } from '../../contracts/critic';
 import { FULL_USER_STEAM_GAMES } from '../storage/fullUserSteamGames';
 import { steamIntegration } from './steamIntegration';
 import { gogIntegration, normalizeGogAvatarUrl } from './gogIntegration';
@@ -38,7 +39,9 @@ import {
   getUserOverrideForGame,
   applyUserOverrideToGame,
   applyUserOverridesToCatalog,
+  hydrateUserOverridesFromVault,
 } from '../storage/userOverrideStorage';
+import { criticScoreService } from '../critic/criticScoreService';
 import { clearExpiredStagedCache } from '../storage/stagedCacheService';
 import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
 import { isUserActivelyScrolling } from '../../utils/scrollActivityTracker';
@@ -383,11 +386,12 @@ export interface SaveCatalogOptions {
   dirtyGames?: readonly CanonicalGame[];
 }
 
-const MAX_MODAL_INCREMENTAL_DEFER_MS = 10_000;
+const MODAL_CLOSE_FLUSH_DEBOUNCE_MS = 250;
 
 let inMemoryCatalogCache: CanonicalGame[] | null = null;
 let inMemoryCatalogRawRef: string | null = null;
 let pendingCatalogSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let modalCloseFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingCatalogGames: CanonicalGame[] | null = null;
 let pendingCatalogNeedsSanitize = false;
 let pendingCatalogNeedsOverrides = false;
@@ -531,25 +535,62 @@ export function computeCatalogGamesFingerprint(games: CanonicalGame[]): string {
   return `g${games.length}:${state[0].toString(16).padStart(8, '0')}${state[1].toString(16).padStart(8, '0')}`;
 }
 
+const PROACTIVE_SLIM_LOCALSTORAGE_CHAR_THRESHOLD = 2_500_000;
+const PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD = 350;
+
+const slimmedGameWeakMemo = new WeakMap<CanonicalGame, CanonicalGame>();
+
 function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
   if (!game || typeof game !== 'object') return game;
+  const memoized = slimmedGameWeakMemo.get(game);
+  if (memoized !== undefined) return memoized;
+
+  const legacyMedia = game as CanonicalGame & { screenshots?: unknown[]; movies?: unknown[] };
+  const topScreenshotsLen = Array.isArray(legacyMedia.screenshots)
+    ? legacyMedia.screenshots.length
+    : 0;
+  const topMoviesLen = Array.isArray(legacyMedia.movies)
+    ? legacyMedia.movies.length
+    : 0;
   const slim: Record<string, unknown> = { ...game };
   delete slim.detailedDescription;
   delete slim.aboutTheGame;
   delete slim.screenshots;
   delete slim.movies;
   if (game.enrichedMetadata && typeof game.enrichedMetadata === 'object') {
-    const slimMeta: Record<string, unknown> = { ...game.enrichedMetadata };
+    const prevMeta = game.enrichedMetadata;
+    const hasScreenshotsCount = Array.isArray(prevMeta.screenshots)
+      ? prevMeta.screenshots.length
+      : (prevMeta.hasScreenshotsCount ?? topScreenshotsLen);
+    const hasMoviesCount = Array.isArray(prevMeta.movies)
+      ? prevMeta.movies.length
+      : (prevMeta.hasMoviesCount ?? topMoviesLen);
+    const slimMeta: Record<string, unknown> = {
+      ...prevMeta,
+      __quotaSlimmed: true,
+      hasScreenshotsCount,
+      hasMoviesCount,
+    };
     delete slimMeta.detailedDescription;
     delete slimMeta.aboutTheGame;
     delete slimMeta.screenshots;
     delete slimMeta.movies;
+    slimMeta.systemRequirements = {};
+    delete slimMeta.languageOptions;
+    delete slimMeta.supportedLanguages;
+    if (prevMeta.achievements && typeof prevMeta.achievements === 'object') {
+      slimMeta.achievements = { total: prevMeta.achievements.total };
+    }
     delete slimMeta.pcRequirements;
+    delete slimMeta.pcRequirementsHtml;
     delete slimMeta.macRequirements;
     delete slimMeta.linuxRequirements;
     slim.enrichedMetadata = slimMeta;
   }
-  return slim as unknown as CanonicalGame;
+  const finalSlim = slim as unknown as CanonicalGame;
+  slimmedGameWeakMemo.set(game, finalSlim);
+  slimmedGameWeakMemo.set(finalSlim, finalSlim);
+  return finalSlim;
 }
 
 const compactedGameWeakMemo = new WeakMap<CanonicalGame, CanonicalGame>();
@@ -717,23 +758,21 @@ function writeCatalogToLocalStorage(
 
   let persistedRaw: string | null = null;
   try {
-    const serialized = JSON.stringify(compacted);
-    try {
-      storage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
-      persistedRaw = serialized;
-    } catch {
-      evictExpendableCachesForCatalogQuota();
+    const serialized =
+      compacted.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD
+        ? null
+        : JSON.stringify(compacted);
+    if (serialized === null || serialized.length > PROACTIVE_SLIM_LOCALSTORAGE_CHAR_THRESHOLD) {
+      const slimSerialized = JSON.stringify(compacted.map(slimGameForLocalStorageQuota));
       try {
-        storage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
-        persistedRaw = serialized;
+        storage.setItem(STORAGE_KEY_MAIN_CATALOG, slimSerialized);
+        persistedRaw = slimSerialized;
       } catch {
-        // Fallback 1: slim heavy HTML/media fields for localStorage while keeping full rich objects in IndexedDB & memory
-        const slimSerialized = JSON.stringify(compacted.map(slimGameForLocalStorageQuota));
+        evictExpendableCachesForCatalogQuota();
         try {
           storage.setItem(STORAGE_KEY_MAIN_CATALOG, slimSerialized);
           persistedRaw = slimSerialized;
         } catch {
-          // Fallback 2: ultra-large catalog (>10,000 games) — store compact vault pointer sentinel
           const sentinel = JSON.stringify({
             __idbVaultOnly: true,
             count: compacted.length,
@@ -744,6 +783,37 @@ function writeCatalogToLocalStorage(
             persistedRaw = sentinel;
           } catch {
             // Ignore final localStorage failure; IndexedDB vault & inMemoryCatalogCache remain authoritative
+          }
+        }
+      }
+    } else {
+      try {
+        storage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+        persistedRaw = serialized;
+      } catch {
+        evictExpendableCachesForCatalogQuota();
+        try {
+          storage.setItem(STORAGE_KEY_MAIN_CATALOG, serialized);
+          persistedRaw = serialized;
+        } catch {
+          // Fallback 1: slim heavy HTML/media fields for localStorage while keeping full rich objects in IndexedDB & memory
+          const slimSerialized = JSON.stringify(compacted.map(slimGameForLocalStorageQuota));
+          try {
+            storage.setItem(STORAGE_KEY_MAIN_CATALOG, slimSerialized);
+            persistedRaw = slimSerialized;
+          } catch {
+            // Fallback 2: ultra-large catalog (>10,000 games) — store compact vault pointer sentinel
+            const sentinel = JSON.stringify({
+              __idbVaultOnly: true,
+              count: compacted.length,
+              fp: computeCatalogGamesFingerprint(compacted),
+            });
+            try {
+              storage.setItem(STORAGE_KEY_MAIN_CATALOG, sentinel);
+              persistedRaw = sentinel;
+            } catch {
+              // Ignore final localStorage failure; IndexedDB vault & inMemoryCatalogCache remain authoritative
+            }
           }
         }
       }
@@ -781,24 +851,66 @@ function writeCatalogToLocalStorage(
  */
 export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | null> {
   if (typeof window === 'undefined') return null;
+  await hydrateUserOverridesFromVault().catch(() => false);
   let vaultCatalog = await vaultGet<CanonicalGame[]>(IDB_KEY_MAIN_CATALOG);
 
-  if (
-    (!Array.isArray(vaultCatalog) || vaultCatalog.length === 0) &&
-    window.electronAPI?.offlineVault?.getCatalogSnapshot
-  ) {
+  if (window.electronAPI?.offlineVault?.getCatalogSnapshot) {
     try {
       const snap = await window.electronAPI.offlineVault.getCatalogSnapshot();
+      const details = snap?.details || {};
       if (snap?.success && Array.isArray(snap.games) && snap.games.length > 0) {
-        const details = snap.details || {};
-        vaultCatalog = snap.games.map((g) => {
-          const detailMeta = g?.id ? details[g.id]?.enrichedMetadata ?? undefined : undefined;
-          const mergedMeta = pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta);
-          return mergedMeta !== g.enrichedMetadata
-            ? { ...g, enrichedMetadata: mergedMeta }
-            : g;
-        });
-        void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
+        for (const g of snap.games) {
+          if (!g?.id) continue;
+          const detailEntry = details[g.id];
+          if (
+            detailEntry?.criticScore &&
+            typeof detailEntry.criticScore === 'object' &&
+            typeof (detailEntry.criticScore as { score?: unknown }).score === 'number'
+          ) {
+            criticScoreService.seedFromVaultIfMissing(
+              g.steamAppId,
+              g.title,
+              detailEntry.criticScore as unknown as CriticScoreData,
+              g.releaseDate,
+              g.genres
+            );
+          }
+        }
+        if (!Array.isArray(vaultCatalog) || vaultCatalog.length === 0) {
+          vaultCatalog = snap.games.map((g) => {
+            const detailEntry = g?.id ? details[g.id] : undefined;
+            const rawDetailMeta = detailEntry?.enrichedMetadata ?? undefined;
+            const detailMeta =
+              rawDetailMeta && detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
+                ? { ...rawDetailMeta, enrichedAt: detailEntry.enrichedAt }
+                : rawDetailMeta;
+            const mergedMeta = pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta);
+            return mergedMeta !== g.enrichedMetadata
+              ? { ...g, enrichedMetadata: mergedMeta }
+              : g;
+          });
+          void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
+        } else {
+          let upgradedAnyFromVaultDetails = false;
+          vaultCatalog = vaultCatalog.map((g) => {
+            const detailEntry = g?.id ? details[g.id] : undefined;
+            const rawDetailMeta = detailEntry?.enrichedMetadata ?? undefined;
+            if (!rawDetailMeta) return g;
+            const detailMeta =
+              detailEntry?.enrichedAt && !rawDetailMeta.enrichedAt
+                ? { ...rawDetailMeta, enrichedAt: detailEntry.enrichedAt }
+                : rawDetailMeta;
+            const mergedMeta = pickBestEnrichedMetadata(g.enrichedMetadata, detailMeta);
+            if (mergedMeta !== g.enrichedMetadata) {
+              upgradedAnyFromVaultDetails = true;
+              return { ...g, enrichedMetadata: mergedMeta };
+            }
+            return g;
+          });
+          if (upgradedAnyFromVaultDetails) {
+            void vaultSet(IDB_KEY_MAIN_CATALOG, vaultCatalog);
+          }
+        }
       }
     } catch {}
   }
@@ -847,6 +959,10 @@ export function flushPendingCatalogSave(): void {
     clearTimeout(pendingCatalogSaveTimer);
     pendingCatalogSaveTimer = null;
   }
+  if (modalCloseFlushTimer) {
+    clearTimeout(modalCloseFlushTimer);
+    modalCloseFlushTimer = null;
+  }
   if (pendingCatalogGames !== null && typeof window !== 'undefined') {
     try {
       let toWrite = pendingCatalogGames;
@@ -886,16 +1002,33 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   });
   window.addEventListener('antigravity:modal-overlay-changed', (e: Event) => {
     const isOpen = Boolean((e as CustomEvent<{ isOpen?: boolean }>).detail?.isOpen);
-    if (!isOpen && pendingCatalogGames !== null && !isTestEnv()) {
+    if (isOpen) {
+      if (modalCloseFlushTimer) {
+        clearTimeout(modalCloseFlushTimer);
+        modalCloseFlushTimer = null;
+      }
+      if (pendingCatalogSaveTimer) {
+        clearTimeout(pendingCatalogSaveTimer);
+        pendingCatalogSaveTimer = null;
+      }
+      return;
+    }
+    if (pendingCatalogGames !== null && !isTestEnv()) {
       pendingModalDeferStartedAt = null;
       if (pendingCatalogSaveTimer) {
         clearTimeout(pendingCatalogSaveTimer);
         pendingCatalogSaveTimer = null;
       }
-      pendingCatalogSaveTimer = setTimeout(() => {
-        pendingCatalogSaveTimer = null;
+      if (modalCloseFlushTimer) {
+        clearTimeout(modalCloseFlushTimer);
+      }
+      modalCloseFlushTimer = setTimeout(() => {
+        modalCloseFlushTimer = null;
+        if (!isTestEnv() && isModalOverlayOpen()) {
+          return;
+        }
         flushPendingCatalogSave();
-      }, 250);
+      }, MODAL_CLOSE_FLUSH_DEBOUNCE_MS);
     }
   });
 }
@@ -1037,6 +1170,21 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
         }
       }
 
+      if (isModalOverlayOpen()) {
+        if (!pendingIsFullCatalogSync && pendingModalDeferStartedAt === null) {
+          pendingModalDeferStartedAt = Date.now();
+        }
+        if (pendingCatalogSaveTimer) {
+          clearTimeout(pendingCatalogSaveTimer);
+          pendingCatalogSaveTimer = null;
+        }
+        if (modalCloseFlushTimer) {
+          clearTimeout(modalCloseFlushTimer);
+          modalCloseFlushTimer = null;
+        }
+        return;
+      }
+
       const scheduleDeferredFlush = (delayMs: number) => {
         if (pendingCatalogSaveTimer) {
           clearTimeout(pendingCatalogSaveTimer);
@@ -1044,21 +1192,12 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
         }
         pendingCatalogSaveTimer = setTimeout(() => {
           pendingCatalogSaveTimer = null;
+          if (!isTestEnv() && isModalOverlayOpen()) {
+            return;
+          }
           if (!isTestEnv() && isUserActivelyScrolling()) {
             scheduleDeferredFlush(600);
             return;
-          }
-          if (
-            !isTestEnv() &&
-            !pendingIsFullCatalogSync &&
-            isModalOverlayOpen() &&
-            pendingModalDeferStartedAt !== null
-          ) {
-            const elapsed = Date.now() - pendingModalDeferStartedAt;
-            if (elapsed < MAX_MODAL_INCREMENTAL_DEFER_MS) {
-              scheduleDeferredFlush(Math.max(250, MAX_MODAL_INCREMENTAL_DEFER_MS - elapsed));
-              return;
-            }
           }
           try {
             flushPendingCatalogSave();
@@ -1068,19 +1207,7 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
         }, delayMs);
       };
 
-      const shouldModalDefer = !pendingIsFullCatalogSync && isModalOverlayOpen();
-      if (shouldModalDefer) {
-        if (pendingModalDeferStartedAt === null) {
-          pendingModalDeferStartedAt = Date.now();
-        }
-        if (!pendingCatalogSaveTimer) {
-          const remaining = Math.max(
-            250,
-            MAX_MODAL_INCREMENTAL_DEFER_MS - (Date.now() - pendingModalDeferStartedAt)
-          );
-          scheduleDeferredFlush(remaining);
-        }
-      } else if (!pendingCatalogSaveTimer || (hadPendingSave && pendingIsFullCatalogSync)) {
+      if (!pendingCatalogSaveTimer || (hadPendingSave && pendingIsFullCatalogSync)) {
         scheduleDeferredFlush(1200);
       }
       return;
@@ -1089,6 +1216,10 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     if (pendingCatalogSaveTimer) {
       clearTimeout(pendingCatalogSaveTimer);
       pendingCatalogSaveTimer = null;
+    }
+    if (modalCloseFlushTimer) {
+      clearTimeout(modalCloseFlushTimer);
+      modalCloseFlushTimer = null;
     }
 
     let immediateDirtySnapshot: ReadonlySet<string> | null = null;
@@ -1123,6 +1254,10 @@ export function clearIntegrationStorage(): void {
   if (pendingCatalogSaveTimer) {
     clearTimeout(pendingCatalogSaveTimer);
     pendingCatalogSaveTimer = null;
+  }
+  if (modalCloseFlushTimer) {
+    clearTimeout(modalCloseFlushTimer);
+    modalCloseFlushTimer = null;
   }
   pendingCatalogGames = null;
   pendingCatalogNeedsSanitize = false;

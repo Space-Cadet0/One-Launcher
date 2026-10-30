@@ -35,6 +35,8 @@ interface SteamHeroDetailsProps {
   xboxProductId?: string | null;
   packageFamilyName?: string | null;
   xboxTitleId?: string | null;
+  headerOverrideToken?: string;
+  coverOverrideToken?: string;
 }
 
 export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
@@ -56,6 +58,8 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
   xboxProductId,
   packageFamilyName,
   xboxTitleId,
+  headerOverrideToken,
+  coverOverrideToken,
 }) => {
   const [primaryFailed, setPrimaryFailed] = useState(false);
   const [fallbackFailed, setFallbackFailed] = useState(false);
@@ -72,6 +76,7 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
         xboxProductId,
         packageFamilyName,
         xboxTitleId,
+        ov: headerOverrideToken,
       })
     : undefined;
 
@@ -87,6 +92,7 @@ export const SteamHeroDetails: React.FC<SteamHeroDetailsProps> = ({
         xboxProductId,
         packageFamilyName,
         xboxTitleId,
+        ov: coverOverrideToken,
       })
     : undefined;
 

@@ -15,6 +15,7 @@ import {
   Wand,
 } from 'lucide-react';
 import { CanonicalGame } from '../../../contracts/game';
+import { toOlMediaUrl } from '../../../contracts/network';
 import { UserGameOverride } from '../../../contracts/override';
 import { StorefrontId } from '../../../contracts/platform';
 import { SuppressedCatalogEntry } from '../../../services/integrations/catalogSanitizer';
@@ -22,6 +23,7 @@ import { launcherService } from '../../../services/launcher/launcherService';
 import {
   confirmMultipleNonGameStorefrontEntries,
   confirmNonGameStorefrontEntry,
+  getUserOverrideForGame,
   unconfirmNonGameStorefrontEntry,
 } from '../../../services/storage/userOverrideStorage';
 import { StorefrontIcon, getStorefrontDisplayName } from '../../Common/StorefrontIcon';
@@ -347,6 +349,11 @@ export function buildMatchManagerFlatRows(
   return rows;
 }
 
+export interface ResetOverrideContext {
+  game?: CanonicalGame | null;
+  override?: UserGameOverride | null;
+}
+
 export interface MatchManagerRowRenderContext {
   toggleSection: (key: MatchStudioSectionKey) => void;
   unmatchedSubFilter: UnmatchedSubFilter;
@@ -360,12 +367,39 @@ export interface MatchManagerRowRenderContext {
   selectedNonGameIds: Set<string>;
   setSelectedNonGameIds: React.Dispatch<React.SetStateAction<Set<string>>>;
   handleInspect?: (game: CanonicalGame) => void;
-  handleReset?: (gameId: string) => void;
+  handleReset?: (gameId: string, context?: ResetOverrideContext) => void;
   onFixMatchForGame: (game: CanonicalGame) => void;
   onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   onUnhideEntry?: (entry: SuppressedCatalogEntry) => void;
   onClose: () => void;
   handleOpenExternalUrl: (url?: string) => void;
+}
+
+function resolveStudioRowThumbnailSrc(game: CanonicalGame): string | undefined {
+  const override = getUserOverrideForGame(game);
+  const rawSrc =
+    override?.capsuleImage ||
+    game.capsuleImage ||
+    override?.headerImage ||
+    game.headerImage;
+  if (!rawSrc) return undefined;
+  const hasCustomOverrideArt = Boolean(override?.capsuleImage || override?.headerImage);
+  const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
+  const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
+  const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
+  return toOlMediaUrl({
+    url: rawSrc,
+    gameId: game.id,
+    role: override?.capsuleImage || game.capsuleImage ? 'cover' : 'header',
+    ordinal: 0,
+    steamAppId: game.steamAppId,
+    gogId: gogPlat?.platformGameId,
+    epicAppName: epicPlat?.platformGameId,
+    xboxProductId: xboxPlat?.xboxProductId || xboxPlat?.platformGameId,
+    packageFamilyName: xboxPlat?.packageFamilyName,
+    xboxTitleId: xboxPlat?.xboxTitleId,
+    ov: hasCustomOverrideArt ? override?.updatedAt || '1' : undefined,
+  });
 }
 
 interface EntitlementOsBadge {
@@ -845,6 +879,7 @@ export function renderMatchManagerFlatRow(
 
     case 'unmatched-row': {
       const { game, reasons, isLastInSection } = row;
+      const thumbSrc = resolveStudioRowThumbnailSrc(game);
       return (
         <div
           key={row.key}
@@ -856,9 +891,9 @@ export function renderMatchManagerFlatRow(
         >
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-10 aspect-[2/3] rounded bg-black/60 border border-[#2a475e] overflow-hidden shrink-0 flex items-center justify-center">
-              {game.capsuleImage || game.headerImage ? (
+              {thumbSrc ? (
                 <img
-                  src={game.capsuleImage || game.headerImage}
+                  src={thumbSrc}
                   alt={game.title}
                   width={40}
                   height={60}
@@ -948,6 +983,7 @@ export function renderMatchManagerFlatRow(
 
     case 'low-confidence-row': {
       const { game, isLastInSection } = row;
+      const thumbSrc = resolveStudioRowThumbnailSrc(game);
       const rawConf =
         typeof game.matchConfidence === 'number'
           ? Math.round(
@@ -968,9 +1004,9 @@ export function renderMatchManagerFlatRow(
         >
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-10 aspect-[2/3] rounded bg-black/60 border border-[#2a475e] overflow-hidden shrink-0 flex items-center justify-center">
-              {game.capsuleImage || game.headerImage ? (
+              {thumbSrc ? (
                 <img
-                  src={game.capsuleImage || game.headerImage}
+                  src={thumbSrc}
                   alt={game.title}
                   width={40}
                   height={60}
@@ -1426,7 +1462,12 @@ export function renderMatchManagerFlatRow(
             {ctx.handleReset && (
               <button
                 type="button"
-                onClick={() => ctx.handleReset!(matchedGame?.id || override.gameId)}
+                onClick={() =>
+                  ctx.handleReset!(matchedGame?.id || override.gameId, {
+                    game: matchedGame ?? null,
+                    override,
+                  })
+                }
                 className="min-h-6 px-2.5 py-1.5 rounded bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/40 text-xs font-semibold text-rose-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer"
                 title="Remove manual override and revert to automatic storefront matching"
               >
@@ -1441,6 +1482,7 @@ export function renderMatchManagerFlatRow(
 
     case 'merged-row': {
       const { game, isFirstItem, isLastInSection } = row;
+      const thumbSrc = resolveStudioRowThumbnailSrc(game);
       return (
         <div
           key={row.key}
@@ -1454,9 +1496,9 @@ export function renderMatchManagerFlatRow(
             {/* Left / Center section: Cover, Title, Storefronts Badge, and Inline Storefront Entitlement Chips */}
             <div className="flex items-center gap-3 min-w-0 flex-1 flex-wrap">
               <div className="w-8 h-11 rounded bg-black/60 border border-[#2a475e] overflow-hidden shrink-0 flex items-center justify-center">
-                {game.capsuleImage || game.headerImage ? (
+                {thumbSrc ? (
                   <img
-                    src={game.capsuleImage || game.headerImage}
+                    src={thumbSrc}
                     alt={game.title}
                     width={32}
                     height={44}

@@ -105,6 +105,82 @@ const {
   downloadGogV1Depot,
 } = require('./gogRegistryAndDirectInstaller.cjs');
 
+/** @type {((vdfText: string) => { steamId64: string, accountName: string, personaName: string, allowAutoLogin: boolean } | null) | null} */
+let cachedParseSteamLoginUsersVdfDetails = null;
+/** @type {((userDataDir: string, options: Record<string, any>) => Promise<Record<string, any>>) | null} */
+let cachedLoadSavedTokensReadOnly = null;
+
+function getParseSteamLoginUsersVdfDetails() {
+  if (!cachedParseSteamLoginUsersVdfDetails) {
+    const proberMod = /** @type {any} */ (require('./environmentHealthProber.cjs'));
+    cachedParseSteamLoginUsersVdfDetails = proberMod.parseSteamLoginUsersVdfDetails;
+  }
+  return cachedParseSteamLoginUsersVdfDetails;
+}
+
+function getLoadSavedTokensReadOnly() {
+  if (!cachedLoadSavedTokensReadOnly) {
+    const proberMod = /** @type {any} */ (require('./environmentHealthProber.cjs'));
+    cachedLoadSavedTokensReadOnly = proberMod.loadSavedTokensReadOnly;
+  }
+  return cachedLoadSavedTokensReadOnly;
+}
+
+/**
+ * Resolve One Launcher's connected 17-digit SteamID64 asynchronously without touching sync vault I/O.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string>}
+ */
+async function resolveExpectedSteamId64Async(options = {}) {
+  try {
+    const loadTokens = getLoadSavedTokensReadOnly();
+    if (typeof loadTokens !== 'function') return '';
+    const { userDataDir } = resolveIsolatedHomedirAndUserData(options);
+    if (!userDataDir) return '';
+    const savedTokens = await loadTokens(userDataDir, options);
+    const rawId = String(savedTokens?.steam?.steamId || '').trim();
+    return /^\d{17}$/.test(rawId) ? rawId : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Probe candidate `loginusers.vdf` paths asynchronously (read-only) to determine whether the
+ * target Steam instance currently has an authenticated user session on disk (matching
+ * `expectedSteamId64` when One Launcher has a connected Steam account).
+ *
+ * @param {Iterable<string>} vdfPaths
+ * @param {string} [expectedSteamId64]
+ * @returns {Promise<boolean>}
+ */
+async function hasAuthenticatedSteamSessionInVdfCandidates(vdfPaths, expectedSteamId64 = '') {
+  if (!vdfPaths) return false;
+  const parseVdf = getParseSteamLoginUsersVdfDetails();
+  if (typeof parseVdf !== 'function') return false;
+  const normalizedExpected =
+    typeof expectedSteamId64 === 'string' && /^\d{17}$/.test(expectedSteamId64.trim())
+      ? expectedSteamId64.trim()
+      : '';
+  const seen = new Set();
+  for (const rawPath of vdfPaths) {
+    const p = typeof rawPath === 'string' ? rawPath.trim() : '';
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    try {
+      const text = await fs.promises.readFile(p, 'utf8');
+      const parsed = parseVdf(text);
+      if (parsed && parsed.steamId64) {
+        if (!normalizedExpected || parsed.steamId64 === normalizedExpected) {
+          return true;
+        }
+      }
+    } catch {}
+  }
+  return false;
+}
+
 const DOWNLOAD_QUEUE_PERSIST_FILENAME = 'download_queue_v1.json';
 /** @type {Set<string>} */
 const rehydratedQueueDirs = new Set();
@@ -531,6 +607,18 @@ function startSteamInstallMonitor(
   let knownStageTotal = 0;
   let sawSteamActivity = false;
   let inFlightTick = false;
+
+  const retriggerCtx =
+    options &&
+    options._steamAuthRetrigger &&
+    typeof options._steamAuthRetrigger === 'object' &&
+    typeof options._steamAuthRetrigger.retriggerInstallAsync === 'function'
+      ? options._steamAuthRetrigger
+      : null;
+  const maxRetriggers = 2;
+  let retriggerCount = 0;
+  let authDetectedAtMs = 0;
+  let lastRetriggerAtMs = 0;
 
   const resolveTaskStartedAtMs = (/** @type {any} */ taskObj) => {
     if (options.minLogTimestampMs !== undefined) {
@@ -985,6 +1073,93 @@ function startSteamInstallMonitor(
       );
 
       if (!parsed && !hasActiveLogProgress) {
+        if (!sawSteamActivity && retriggerCtx && !retriggerCtx.wasAuthenticatedAtLaunch) {
+          if (retriggerCount < maxRetriggers) {
+            const nowAuthed = await hasAuthenticatedSteamSessionInVdfCandidates(
+              retriggerCtx.vdfCandidates,
+              retriggerCtx.expectedSteamId64
+            );
+            const postAuthTask = downloadQueueMap.get(taskId);
+            if (
+              !postAuthTask ||
+              postAuthTask.status === 'cancelled' ||
+              postAuthTask.status === 'completed' ||
+              postAuthTask.status === 'failed' ||
+              postAuthTask.status === 'paused'
+            ) {
+              return;
+            }
+            if (nowAuthed) {
+              const checkNowMs = Date.now();
+              if (!authDetectedAtMs) {
+                authDetectedAtMs = checkNowMs;
+                invalidateScanCaches();
+                cachedLocations = null;
+              }
+              const postLoginDelayMs = Number(
+                options.steamPostLoginRetriggerDelayMs ?? (isTestEnvironment(options) ? 20 : 2500)
+              );
+              const secondRetryDelayMs = Number(
+                options.steamPostLoginSecondRetryMs ?? (isTestEnvironment(options) ? 80 : 8000)
+              );
+              if (retriggerCount === 0 && checkNowMs - authDetectedAtMs >= postLoginDelayMs) {
+                retriggerCount = 1;
+                lastRetriggerAtMs = checkNowMs;
+                invalidateScanCaches();
+                cachedLocations = null;
+                try {
+                  await retriggerCtx.retriggerInstallAsync();
+                } catch (retriggerErr) {
+                  diagLog.debug('startSteamInstallMonitor.retrigger', retriggerErr, {
+                    taskId,
+                    appId,
+                    attempt: 1,
+                  });
+                }
+              } else if (
+                retriggerCount === 1 &&
+                checkNowMs - lastRetriggerAtMs >= secondRetryDelayMs
+              ) {
+                retriggerCount = 2;
+                lastRetriggerAtMs = checkNowMs;
+                invalidateScanCaches();
+                cachedLocations = null;
+                try {
+                  await retriggerCtx.retriggerInstallAsync();
+                } catch (retriggerErr) {
+                  diagLog.debug('startSteamInstallMonitor.retrigger', retriggerErr, {
+                    taskId,
+                    appId,
+                    attempt: 2,
+                  });
+                }
+              }
+            }
+          }
+
+          const pendingAuthStatusMsg =
+            retriggerCount >= 1 || authDetectedAtMs > 0
+              ? retriggerCtx.launchedViaWineSteam
+                ? 'Steam sign-in detected in bottle — triggering game download...'
+                : 'Steam sign-in detected — triggering game download...'
+              : retriggerCtx.launchedViaWineSteam
+                ? 'Installing via Windows Steam in CrossOver / Wine (waiting for Steam sign-in — download starts automatically once signed in)...'
+                : 'Installing via Steam client (waiting for Steam sign-in — download starts automatically once signed in)...';
+
+          updateDownloadTask(
+            taskId,
+            {
+              status: 'downloading',
+              progressPercent: 0,
+              bytesDownloaded: 0,
+              speedBytesPerSec: 0,
+              statusMessage: pendingAuthStatusMsg,
+            },
+            options
+          );
+          return;
+        }
+
         updateDownloadTask(
           taskId,
           {
@@ -3452,7 +3627,13 @@ async function installGame(
       const isWinCompatInstall =
         platform === 'darwin' &&
         (payload.os === 'windows' || payload.installerId === 'steam-win-compat');
+      const expectedSteamId64 = await resolveExpectedSteamId64Async(options);
       let launchedViaWineSteam = false;
+      /** @type {(() => Promise<void>) | null} */
+      let dispatchSteamInstallTriggerAsync = null;
+      /** @type {string[]} */
+      let targetVdfCandidates = [];
+      let wasAuthenticatedAtLaunch = true;
       const layers = isWinCompatInstall ? detectCompatibilityLayers(options) : [];
 
       if (isWinCompatInstall && !options.disableWineSteamSpawn && layers.length > 0) {
@@ -3560,25 +3741,60 @@ async function installGame(
           resolvedTarget &&
           resolvedTarget.foundSteamExe &&
           resolvedTarget.layer.binaryPath &&
-          fs.existsSync(resolvedTarget.layer.binaryPath)
+          (typeof options.spawnFn === 'function' || fs.existsSync(resolvedTarget.layer.binaryPath))
         ) {
           try {
-            const resolvedWineSteamSpawn = resolveWindowsNodeShebangSpawn(
-              resolvedTarget.layer.binaryPath,
-              [resolvedTarget.foundSteamExe, `steam://install/${appId}`]
+            const bottleVdfCandidates = [
+              path.join(path.dirname(resolvedTarget.foundSteamExe), 'config', 'loginusers.vdf'),
+              path.join(
+                resolvedTarget.bottlePath,
+                'drive_c/Program Files (x86)/Steam/config/loginusers.vdf'
+              ),
+              path.join(
+                resolvedTarget.bottlePath,
+                'drive_c/Program Files/Steam/config/loginusers.vdf'
+              ),
+            ];
+            wasAuthenticatedAtLaunch = await hasAuthenticatedSteamSessionInVdfCandidates(
+              bottleVdfCandidates,
+              expectedSteamId64
             );
-            const child = spawn(resolvedWineSteamSpawn.cmd, resolvedWineSteamSpawn.args, {
-              env: {
-                ...process.env,
-                ...env,
-                CX_BOTTLE: resolvedTarget.bottleName,
-                WINEPREFIX: resolvedTarget.bottlePath,
-              },
-              stdio: 'ignore',
-              detached: process.platform !== 'win32',
-            });
-            if (typeof child.unref === 'function') child.unref();
+
+            const spawnWineSteamInstall = () => {
+              const wineArgs = [resolvedTarget.foundSteamExe, `steam://install/${appId}`];
+              const spawnOpts = {
+                env: {
+                  ...process.env,
+                  ...env,
+                  CX_BOTTLE: resolvedTarget.bottleName,
+                  WINEPREFIX: resolvedTarget.bottlePath,
+                },
+                stdio: /** @type {'ignore'} */ ('ignore'),
+                detached: process.platform !== 'win32',
+              };
+              const child =
+                typeof options.spawnFn === 'function'
+                  ? options.spawnFn(resolvedTarget.layer.binaryPath, wineArgs, spawnOpts)
+                  : (() => {
+                      const resolvedWineSteamSpawn = resolveWindowsNodeShebangSpawn(
+                        resolvedTarget.layer.binaryPath,
+                        wineArgs
+                      );
+                      return spawn(
+                        resolvedWineSteamSpawn.cmd,
+                        resolvedWineSteamSpawn.args,
+                        spawnOpts
+                      );
+                    })();
+              if (child && typeof child.unref === 'function') child.unref();
+            };
+
+            spawnWineSteamInstall();
             launchedViaWineSteam = true;
+            targetVdfCandidates = bottleVdfCandidates;
+            dispatchSteamInstallTriggerAsync = async () => {
+              spawnWineSteamInstall();
+            };
 
             if (payload.gameId) {
               try {
@@ -3620,21 +3836,89 @@ async function installGame(
         !launchedViaWineSteam &&
         (!isWinCompatInstall || options.disableWineSteamSpawn || layers.length === 0)
       ) {
+        const { homedir: resolvedHome } = resolveIsolatedHomedirAndUserData(options);
+        const discoveredHostSteam = discoverSteamLocations(options);
+        /** @type {string[]} */
+        const hostVdfCandidates = [];
+        if (
+          typeof options.hostSteamLoginUsersVdfPath === 'string' &&
+          options.hostSteamLoginUsersVdfPath.trim()
+        ) {
+          hostVdfCandidates.push(options.hostSteamLoginUsersVdfPath.trim());
+        }
+        if (platform === 'darwin' && resolvedHome) {
+          hostVdfCandidates.push(
+            path.join(resolvedHome, 'Library/Application Support/Steam/config/loginusers.vdf')
+          );
+        } else if (platform === 'win32' && resolvedHome) {
+          hostVdfCandidates.push(
+            path.join(resolvedHome, 'Program Files (x86)/Steam/config/loginusers.vdf'),
+            path.join(resolvedHome, 'Steam/config/loginusers.vdf')
+          );
+          if (!options.homedir) {
+            hostVdfCandidates.push(
+              'C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf',
+              'C:\\Program Files\\Steam\\config\\loginusers.vdf'
+            );
+          }
+        } else if (resolvedHome) {
+          hostVdfCandidates.push(
+            path.join(resolvedHome, '.local/share/Steam/config/loginusers.vdf'),
+            path.join(resolvedHome, '.steam/steam/config/loginusers.vdf')
+          );
+        }
+        if (discoveredHostSteam && discoveredHostSteam.steamRoots) {
+          for (const root of discoveredHostSteam.steamRoots) {
+            if (!root) continue;
+            hostVdfCandidates.push(
+              path.join(root, 'config', 'loginusers.vdf'),
+              path.join(root, 'Steam', 'config', 'loginusers.vdf')
+            );
+          }
+        }
+
+        wasAuthenticatedAtLaunch = await hasAuthenticatedSteamSessionInVdfCandidates(
+          hostVdfCandidates,
+          expectedSteamId64
+        );
+        targetVdfCandidates = hostVdfCandidates;
+        dispatchSteamInstallTriggerAsync = async () => {
+          await openExternalUri(`steam://install/${appId}`, options);
+        };
         await openExternalUri(`steam://install/${appId}`, options);
       }
+
+      const initialSteamStatusMessage = wasAuthenticatedAtLaunch
+        ? launchedViaWineSteam
+          ? 'Installing via Windows Steam in CrossOver / Wine (monitoring appmanifest)...'
+          : 'Installing via Steam client (monitoring appmanifest & content_log)...'
+        : launchedViaWineSteam
+          ? 'Installing via Windows Steam in CrossOver / Wine (waiting for Steam sign-in — download starts automatically once signed in)...'
+          : 'Installing via Steam client (waiting for Steam sign-in — download starts automatically once signed in)...';
 
       updateDownloadTask(
         taskId,
         {
-          statusMessage: launchedViaWineSteam
-            ? 'Installing via Windows Steam in CrossOver / Wine (monitoring appmanifest)...'
-            : 'Installing via Steam client (monitoring appmanifest & content_log)...',
+          statusMessage: initialSteamStatusMessage,
         },
         options
       );
 
       if (!options.disableSteamMonitor) {
-        startSteamInstallMonitor(taskId, appId, options);
+        const monitorOptions =
+          !wasAuthenticatedAtLaunch && dispatchSteamInstallTriggerAsync
+            ? {
+                ...options,
+                _steamAuthRetrigger: {
+                  wasAuthenticatedAtLaunch: false,
+                  launchedViaWineSteam,
+                  expectedSteamId64,
+                  vdfCandidates: targetVdfCandidates,
+                  retriggerInstallAsync: dispatchSteamInstallTriggerAsync,
+                },
+              }
+            : options;
+        startSteamInstallMonitor(taskId, appId, monitorOptions);
       }
     } else if (platformId === 'epic') {
       const legendaryBin = findLegendaryBinary(options);
@@ -5831,6 +6115,7 @@ module.exports = {
   computeSmoothedDownloadSpeed,
   getDownloadQueue,
   updateDownloadTask,
+  hasAuthenticatedSteamSessionInVdfCandidates,
   startSteamInstallMonitor,
   startXboxInstallMonitor,
   ensureWindowsSteamInBottle,

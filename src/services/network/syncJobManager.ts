@@ -1,4 +1,5 @@
 import { CanonicalGame } from '../../contracts/game';
+import { MediaSyncOutcome } from '../../contracts/steam';
 import { steamMatcher } from '../steam/steamMatcher';
 import { steamApi } from '../steam/steamApi';
 import {
@@ -12,7 +13,12 @@ import {
   inferMetadataRouteFromOverride,
   updateRoutedMetadataSnapshot,
 } from '../storage/userOverrideStorage';
-import { loadStagedCache } from '../storage/stagedCacheService';
+import {
+  loadStagedCache,
+  hasFreshMediaSyncAttempt,
+  recordMediaSyncAttempt,
+  whenStagedCacheHydrated,
+} from '../storage/stagedCacheService';
 import { flushPendingCatalogSave } from '../integrations/integrationStorage';
 import {
   pickBestEnrichedMetadata,
@@ -24,7 +30,114 @@ import {
 import { isUserActivelyScrolling, waitUntilScrollIdle } from '../../utils/scrollActivityTracker';
 import { onlineLifecycleManager } from './onlineLifecycleManager';
 import { unwrapOlMediaUrl } from '../../contracts/network';
-import { fetchAndCacheHltb, getHowLongToBeat } from '../hltb/howLongToBeat';
+import { fetchAndCacheHltb, hasAttemptedHltbLookup } from '../hltb/howLongToBeat';
+
+export function evaluateGameNeedsStoreMediaSync(
+  g: CanonicalGame,
+  forceRefresh: boolean
+): { eligible: boolean; alreadyEnriched: boolean } {
+  const ov = getUserOverrideForGame(g);
+  const route = inferMetadataRouteFromOverride(ov);
+  const effectiveSteamId = steamMatcher.getEffectiveSteamAppId(g);
+  const gameExtended = g as CanonicalGame & {
+    platform?: string;
+    xboxProductId?: string;
+  };
+  const hasXboxPlat =
+    gameExtended.platform === 'xbox' ||
+    Boolean(gameExtended.xboxProductId) ||
+    Boolean(
+      g.platforms?.some((p) =>
+        typeof p === 'string'
+          ? p === 'xbox'
+          : p?.platformId === 'xbox' || Boolean(p?.xboxProductId)
+      )
+    );
+
+  let hasMediaRoute = false;
+  if (effectiveSteamId) {
+    hasMediaRoute = true;
+  } else if (
+    hasXboxPlat ||
+    g.platforms?.some((p) =>
+      typeof p === 'string'
+        ? p === 'gog' || p === 'epic'
+        : p?.platformId === 'gog' || p?.platformId === 'epic'
+    )
+  ) {
+    hasMediaRoute = true;
+  } else {
+    hasMediaRoute = Boolean(
+      route &&
+        route.mode === 'routed' &&
+        (route.source === 'steam' ||
+          route.source === 'gog' ||
+          route.source === 'epic' ||
+          (route.source === 'custom' && String(route.matchedId || '').startsWith('xbox-')))
+    );
+  }
+
+  if (!hasMediaRoute) {
+    return { eligible: false, alreadyEnriched: false };
+  }
+
+  if (forceRefresh) {
+    return { eligible: true, alreadyEnriched: false };
+  }
+
+  const meta = g.enrichedMetadata;
+  const ovUpdatedAtMs = ov?.updatedAt ? Date.parse(ov.updatedAt) || 0 : 0;
+  if (hasFreshMediaSyncAttempt(g.id, meta, ovUpdatedAtMs)) {
+    return {
+      eligible: false,
+      alreadyEnriched: Boolean(meta && meta.metadataQuality !== 'skeleton_fallback'),
+    };
+  }
+
+  const hasScreenshots =
+    (meta?.screenshots?.length || 0) > 0 ||
+    (meta?.__quotaSlimmed === true && (meta?.hasScreenshotsCount || 0) > 0);
+  const metaAlreadyFromSteam = Boolean(
+    meta &&
+      Number(meta.appId) > 0 &&
+      meta.enrichedSource !== 'xbox' &&
+      meta.metadataQuality !== 'skeleton_fallback'
+  );
+  const canStillMatchSteam =
+    !g.isExplicitNonSteam &&
+    g.steamAppId !== null &&
+    ov?.steamAppId !== null &&
+    !metaAlreadyFromSteam &&
+    (Boolean(effectiveSteamId) || !steamMatcher.hasAttemptedMatch(g.title));
+  const isStorefrontNativeMeta = Boolean(
+    meta &&
+      (meta.metadataQuality === 'storefront_native' ||
+        meta.metadataQuality === 'local_federated' ||
+        meta.enrichedSource === 'xbox' ||
+        (!g.steamAppId &&
+          meta.metadataQuality !== 'scraped' &&
+          hasXboxPlat &&
+          (!meta.appId || Number(meta.appId) <= 0)))
+  );
+  const needsRichSteamUpgrade = isStorefrontNativeMeta && canStillMatchSteam;
+
+  if (meta && meta.metadataQuality !== 'skeleton_fallback' && hasScreenshots && !needsRichSteamUpgrade) {
+    return { eligible: false, alreadyEnriched: true };
+  }
+
+  if (
+    meta &&
+    meta.metadataQuality !== 'skeleton_fallback' &&
+    !hasScreenshots &&
+    !needsRichSteamUpgrade &&
+    typeof meta.enrichedAt === 'number' &&
+    Date.now() - meta.enrichedAt < 30 * 24 * 60 * 60 * 1000
+  ) {
+    return { eligible: false, alreadyEnriched: true };
+  }
+
+  return { eligible: true, alreadyEnriched: false };
+}
 
 function normalizeStaticHydrationAssetUrl(raw?: string | null): string | null {
   if (!raw || typeof raw !== 'string') return null;
@@ -697,6 +810,25 @@ export class SyncJobManager {
       return;
     }
 
+    if (isBackground) {
+      await whenStagedCacheHydrated();
+      if (!onlineLifecycleManager.isOnline()) {
+        return;
+      }
+      if (this.state?.type === 'critic_scores' && this.state?.status === 'running') {
+        return;
+      }
+      if (
+        this.state &&
+        !this.state.id.startsWith('auto-') &&
+        (this.state.status === 'running' ||
+          this.state.status === 'paused' ||
+          this.state.status === 'rate_limited')
+      ) {
+        return;
+      }
+    }
+
     if (options?.forceRefresh) {
       criticScoreService.clearCache();
     }
@@ -731,7 +863,7 @@ export class SyncJobManager {
           const score = getOpenCriticData(
             targetSteamId || undefined,
             g.title,
-            g.reviewSummary?.positivePercent,
+            g.reviewSummary?.positivePercent ?? g.enrichedMetadata?.reviewSummary?.positivePercent,
             g.releaseDate,
             undefined,
             false,
@@ -878,7 +1010,7 @@ export class SyncJobManager {
                   if (matchedId) targetSteamId = matchedId;
                 } catch {}
               }
-              await criticScoreService.resolveDynamicScore(
+              const resolvedScore = await criticScoreService.resolveDynamicScore(
                 game.title,
                 targetSteamId,
                 game.releaseDate,
@@ -888,8 +1020,27 @@ export class SyncJobManager {
                   platforms: game.platforms,
                   gameId: game.id,
                   genres: game.genres,
+                  steamPositivePercent:
+                    game.reviewSummary?.positivePercent ??
+                    game.enrichedMetadata?.reviewSummary?.positivePercent,
                 }
               );
+              if (
+                resolvedScore &&
+                typeof window !== 'undefined' &&
+                window.electronAPI?.offlineVault?.saveGameDetail
+              ) {
+                try {
+                  void window.electronAPI.offlineVault
+                    .saveGameDetail({
+                      gameId: game.id,
+                      steamAppId: targetSteamId ?? game.steamAppId ?? null,
+                      canonicalTitle: game.title,
+                      criticScore: { ...resolvedScore } as Record<string, unknown>,
+                    })
+                    ?.catch?.(() => {});
+                } catch {}
+              }
             } catch {} finally {
               activeTitles.delete(game.title);
               if (!this.isCancelled && this.criticLoopToken === myToken) {
@@ -997,6 +1148,22 @@ export class SyncJobManager {
       return;
     }
 
+    if (isBackgroundWarmup) {
+      await whenStagedCacheHydrated();
+      if (!onlineLifecycleManager.isOnline()) {
+        return;
+      }
+      if (
+        this.state &&
+        !this.state.id.startsWith('auto-') &&
+        (this.state.status === 'running' ||
+          this.state.status === 'paused' ||
+          this.state.status === 'rate_limited')
+      ) {
+        return;
+      }
+    }
+
     // If a job is already running, cancel the old one first
     if (
       this.state &&
@@ -1012,57 +1179,11 @@ export class SyncJobManager {
     const alreadyEnrichedForHydration: CanonicalGame[] = [];
 
     const eligibleGames = games.filter((g) => {
-      let hasMediaRoute = false;
-      if (steamMatcher.getEffectiveSteamAppId(g)) {
-        hasMediaRoute = true;
-      } else if (
-        g.platforms?.some(
-          (p) => p.platformId === 'gog' || p.platformId === 'epic' || p.platformId === 'xbox'
-        )
-      ) {
-        hasMediaRoute = true;
-      } else {
-        const ov = getUserOverrideForGame(g);
-        const route = inferMetadataRouteFromOverride(ov);
-        hasMediaRoute = Boolean(
-          route &&
-            route.mode === 'routed' &&
-            (route.source === 'steam' ||
-              route.source === 'gog' ||
-              route.source === 'epic' ||
-              (route.source === 'custom' && String(route.matchedId || '').startsWith('xbox-')))
-        );
+      const evalResult = evaluateGameNeedsStoreMediaSync(g, forceRefresh);
+      if (evalResult.alreadyEnriched) {
+        alreadyEnrichedForHydration.push(g);
       }
-
-      if (!hasMediaRoute) return false;
-
-      if (
-        !forceRefresh &&
-        g.enrichedMetadata &&
-        g.enrichedMetadata.metadataQuality !== 'skeleton_fallback' &&
-        (g.enrichedMetadata.screenshots?.length || 0) > 0
-      ) {
-        const isStorefrontNativeMeta =
-          g.enrichedMetadata.metadataQuality === 'storefront_native' ||
-          g.enrichedMetadata.enrichedSource === 'xbox' ||
-          (!g.steamAppId &&
-            Boolean(g.platforms?.some((p) => p.platformId === 'xbox')) &&
-            (!g.enrichedMetadata.appId || Number(g.enrichedMetadata.appId) <= 0));
-        const canStillMatchSteam =
-          !g.isExplicitNonSteam &&
-          g.steamAppId !== null &&
-          (Boolean(g.steamAppId) || !steamMatcher.hasAttemptedMatch(g.title));
-        const needsRichSteamUpgrade =
-          isStorefrontNativeMeta &&
-          (canStillMatchSteam || (g.enrichedMetadata.movies?.length || 0) === 0);
-
-        if (!needsRichSteamUpgrade) {
-          alreadyEnrichedForHydration.push(g);
-          return false;
-        }
-      }
-
-      return true;
+      return evalResult.eligible;
     });
 
     if (
@@ -1253,6 +1374,21 @@ export class SyncJobManager {
               game.enrichedMetadata &&
                 game.enrichedMetadata.metadataQuality !== 'skeleton_fallback'
             );
+            const attemptNow = Date.now();
+            const outcome: MediaSyncOutcome =
+              !refreshed || isSkeletonRefreshed
+                ? onlineLifecycleManager.isOnline()
+                  ? 'unavailable_404'
+                  : 'transient_error'
+                : (refreshed.screenshots?.length || 0) === 0
+                ? 'partial_no_screenshots'
+                : (refreshed.movies?.length || 0) === 0
+                ? 'partial_no_trailers'
+                : 'complete';
+
+            if (onlineLifecycleManager.isOnline()) {
+              recordMediaSyncAttempt(game.id, outcome);
+            }
 
             if (refreshed && !(isSkeletonRefreshed && (hasRichExisting || isBackgroundWarmup))) {
               if (!isNonSteamRouted && targetAppId && ov && route?.mode === 'routed') {
@@ -1297,10 +1433,18 @@ export class SyncJobManager {
                   ? rawCandidateCapsule
                   : undefined;
 
-              const mergedEnriched =
+              const rawMergedEnriched =
                 pickBestEnrichedMetadata(game.enrichedMetadata, refreshed) ||
                 refreshed ||
                 game.enrichedMetadata;
+              const mergedEnriched = rawMergedEnriched
+                ? {
+                    ...rawMergedEnriched,
+                    enrichedAt: rawMergedEnriched.enrichedAt || attemptNow,
+                    lastMediaSyncAttemptAt: attemptNow,
+                    mediaSyncOutcome: outcome,
+                  }
+                : rawMergedEnriched;
 
               const updatedGame: CanonicalGame = {
                 ...game,
@@ -1358,7 +1502,7 @@ export class SyncJobManager {
                           mergedEnriched?.metadataQuality ||
                           refreshed.metadataQuality ||
                           (targetAppId && !isNonSteamRouted ? 'authoritative' : 'scraped'),
-                        enrichedAt: Date.now(),
+                        enrichedAt: mergedEnriched?.enrichedAt || attemptNow,
                       })
                       ?.catch?.(() => {});
                   } catch {}
@@ -1400,13 +1544,42 @@ export class SyncJobManager {
               }
 
               onGameUpdated(updatedGame);
+            } else if (onlineLifecycleManager.isOnline() && game.enrichedMetadata) {
+              const stampedExistingMeta = {
+                ...game.enrichedMetadata,
+                enrichedAt: game.enrichedMetadata.enrichedAt || attemptNow,
+                lastMediaSyncAttemptAt: attemptNow,
+                mediaSyncOutcome: outcome,
+              };
+              const stampedGame: CanonicalGame = {
+                ...game,
+                enrichedMetadata: stampedExistingMeta,
+              };
+              if (
+                stampedExistingMeta.metadataQuality !== 'skeleton_fallback' &&
+                typeof window !== 'undefined' &&
+                window.electronAPI?.offlineVault?.saveGameDetail
+              ) {
+                try {
+                  void window.electronAPI.offlineVault
+                    .saveGameDetail({
+                      gameId: stampedGame.id,
+                      steamAppId: stampedGame.steamAppId ?? null,
+                      canonicalTitle: stampedGame.title,
+                      enrichedMetadata: stampedExistingMeta,
+                      metadataQuality: stampedExistingMeta.metadataQuality || 'storefront_native',
+                      enrichedAt: stampedExistingMeta.enrichedAt,
+                    })
+                    ?.catch?.(() => {});
+                } catch {}
+              }
+              onGameUpdated(stampedGame);
             }
 
             if (shouldWarmHltb && onlineLifecycleManager.isOnline()) {
               try {
                 const effectiveHltbAppId = targetAppId || game.steamAppId;
-                const existingHltb = getHowLongToBeat(game.title, effectiveHltbAppId);
-                if (!existingHltb?.isAccurate) {
+                if (!hasAttemptedHltbLookup(game.title, effectiveHltbAppId)) {
                   const liveHltb = await fetchAndCacheHltb(game.title, effectiveHltbAppId).catch(
                     () => null
                   );
@@ -1481,6 +1654,9 @@ export class SyncJobManager {
                 `[SyncJobManager] Media sync error for ${game.title}:`,
                 rateErr.message || err
               );
+            }
+            if (!this.isCancelled && onlineLifecycleManager.isOnline()) {
+              recordMediaSyncAttempt(game.id, 'transient_error');
             }
           }
         }

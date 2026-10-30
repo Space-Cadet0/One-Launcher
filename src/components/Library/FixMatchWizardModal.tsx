@@ -58,7 +58,10 @@ export interface FixMatchWizardModalProps {
   game: CanonicalGame | null;
   onClose: () => void;
   onApplyOverride: (override: UserGameOverride) => void;
-  onResetOverride?: (gameId: string) => void;
+  onResetOverride?: (
+    gameId: string,
+    context?: { game?: CanonicalGame | null; override?: UserGameOverride | null }
+  ) => void;
   onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   existingOverride?: UserGameOverride;
   initialStep?: WizardStep;
@@ -1213,7 +1216,10 @@ export const FixMatchWizardModal: React.FC<FixMatchWizardModalProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  onResetOverride(game.id);
+                  onResetOverride(game.id, {
+                    game,
+                    override: existingOverride ?? null,
+                  });
                   handleCloseWizard();
                 }}
                 className="min-h-6 px-3.5 py-2 rounded-md border border-rose-500/50 bg-rose-950/40 text-rose-200 hover:bg-rose-900/60 hover:text-white transition-colors text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-sm"

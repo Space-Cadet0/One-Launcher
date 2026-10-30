@@ -1198,6 +1198,146 @@ function matchXboxManifest(manifests, { productId = '', pfn = '', titleId = '', 
   return null;
 }
 
+const STEAM_CDN_DOMAINS = [
+  'steamstatic.com',
+  'akamaihd.net',
+  'steamcdn-a.akamaihd.net',
+  'steampowered.com',
+];
+const GOG_CDN_DOMAINS = ['gog-statics.com', 'gog.com'];
+const EPIC_CDN_DOMAINS = ['epicgames.com', 'unrealengine.com'];
+const XBOX_CDN_DOMAINS = ['s-microsoft.com', 'xboxlive.com', 'microsoft.com'];
+
+/**
+ * @param {string} hostname
+ * @param {string[]} allowedDomains
+ * @returns {boolean}
+ */
+function isHostnameInAllowedDomains(hostname, allowedDomains) {
+  const cleanHost = String(hostname || '').trim().toLowerCase();
+  if (!cleanHost) return false;
+  for (const dom of allowedDomains) {
+    if (cleanHost === dom || cleanHost.endsWith(`.${dom}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Pure, universal, OS-agnostic URL-origin & content-hash compatibility check for local
+ * first-party storefront cache federation.
+ * - When `url` is empty/null (`!url`), any storefront resolver with a valid ID may resolve.
+ * - When `url` is non-empty, restricts each storefront strictly to its own CDN hosts and
+ *   verifies embedded AppID / GOG ID / content-hash consistency so cross-storefront and
+ *   third-party custom URLs are never hijacked by local disk caches.
+ *
+ * @param {'steam' | 'gog' | 'epic' | 'xbox' | string} storefront
+ * @param {string | null | undefined} url
+ * @param {Record<string, any> | null} [context]
+ * @returns {boolean}
+ */
+function isFederatedStoreUrlCompatible(storefront, url, context = null) {
+  const store = String(storefront || '').trim().toLowerCase();
+  const cleanUrl = typeof url === 'string' ? url.trim() : '';
+  const candRaw =
+    context && typeof context.candidatePath === 'string' ? context.candidatePath.trim() : '';
+  const normCand = candRaw ? candRaw.replace(/\\/g, '/') : '';
+
+  if (!cleanUrl) {
+    if (store === 'steam' && normCand && context?.steamAppId != null) {
+      const ctxAppId = String(context.steamAppId).trim();
+      const libMatch = normCand.match(/\/librarycache\/(\d+)(?:\/|_)/i);
+      if (ctxAppId && libMatch && libMatch[1] !== ctxAppId) {
+        return false;
+      }
+    } else if (store === 'gog' && normCand && context?.gogId != null) {
+      const ctxGogId = String(context.gogId).trim();
+      const gogDirMatch = normCand.match(/\/gog\/(\d+)\//i);
+      if (ctxGogId && gogDirMatch && gogDirMatch[1] !== ctxGogId) {
+        return false;
+      }
+    }
+    return Boolean(
+      store === 'steam' || store === 'gog' || store === 'epic' || store === 'xbox'
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(cleanUrl);
+  } catch {
+    return false;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname || '';
+
+  if (store === 'steam') {
+    if (!isHostnameInAllowedDomains(host, STEAM_CDN_DOMAINS)) {
+      return false;
+    }
+    const appUrlMatch = pathname.match(/\/(?:steam|images)\/apps\/(\d+)\//i);
+    const ctxAppId = context?.steamAppId != null ? String(context.steamAppId).trim() : '';
+    if (appUrlMatch && ctxAppId && appUrlMatch[1] !== ctxAppId) {
+      return false;
+    }
+    if (normCand) {
+      const libMatch = normCand.match(/\/librarycache\/(\d+)(?:\/|_)/i);
+      if (appUrlMatch && libMatch && libMatch[1] !== appUrlMatch[1]) {
+        return false;
+      }
+      if (ctxAppId && libMatch && libMatch[1] !== ctxAppId) {
+        return false;
+      }
+      const sha40SegMatch = pathname.match(/\/([0-9a-f]{40})\//i);
+      if (sha40SegMatch) {
+        const reqSha = sha40SegMatch[1].toLowerCase();
+        if (!normCand.toLowerCase().includes(reqSha)) {
+          return false;
+        }
+      }
+      const sha40FileMatch = pathname.match(/\/([0-9a-f]{40})\.(?:jpg|jpeg|png|webp|ico)$/i);
+      if (sha40FileMatch) {
+        const candFileSha = path.posix.basename(normCand).match(/^([0-9a-f]{40})\./i);
+        if (candFileSha && candFileSha[1].toLowerCase() !== sha40FileMatch[1].toLowerCase()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  if (store === 'gog') {
+    if (!isHostnameInAllowedDomains(host, GOG_CDN_DOMAINS)) {
+      return false;
+    }
+    if (normCand) {
+      const gogDirMatch = normCand.match(/\/gog\/(\d+)\//i);
+      const ctxGogId = context?.gogId != null ? String(context.gogId).trim() : '';
+      if (gogDirMatch && ctxGogId && gogDirMatch[1] !== ctxGogId) {
+        return false;
+      }
+      const urlHash64 = pathname.match(/([0-9a-f]{64})/i);
+      const fileHash64 = path.posix.basename(normCand).match(/([0-9a-f]{64})/i);
+      if (urlHash64 && fileHash64 && urlHash64[1].toLowerCase() !== fileHash64[1].toLowerCase()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (store === 'epic') {
+    return isHostnameInAllowedDomains(host, EPIC_CDN_DOMAINS);
+  }
+
+  if (store === 'xbox') {
+    return isHostnameInAllowedDomains(host, XBOX_CDN_DOMAINS);
+  }
+
+  return false;
+}
+
 /**
  * Resolves a zero-copy local Xbox artwork asset from `<Drive>:\XboxGames\*\Content\MicrosoftGame.config`
  * `<ShellVisuals>` (`Square480x480Logo`, `SplashScreenImage`, `StoreLogo`, `Square150x150Logo`) or
@@ -1222,6 +1362,9 @@ function resolveXboxFederatedAsset(xboxParamsOrPayload, role, url, roots, option
     });
   }
   const xboxParams = xboxParamsOrPayload || {};
+  if (url && !isFederatedStoreUrlCompatible('xbox', url, xboxParams)) {
+    return null;
+  }
   const manifests = scanLocalXboxGameManifests(roots, options);
   const matched = matchXboxManifest(manifests, {
     ...xboxParams,
@@ -1300,6 +1443,9 @@ function resolveXboxFederatedAsset(xboxParamsOrPayload, role, url, roots, option
  */
 function resolveSteamFederatedAsset(appId, role, url, roots, options = {}) {
   if (!appId || !/^\d+$/.test(appId)) return null;
+  if (url && !isFederatedStoreUrlCompatible('steam', url, { steamAppId: appId })) {
+    return null;
+  }
   const exts = ['webp', 'png', 'jpg', 'jpeg'];
 
   for (const steamRoot of roots.steamRoots) {
@@ -1434,6 +1580,14 @@ function resolveSteamFederatedAsset(appId, role, url, roots, options = {}) {
     }
 
     for (const candidate of candidates) {
+      if (
+        !isFederatedStoreUrlCompatible('steam', url, {
+          steamAppId: appId,
+          candidatePath: candidate,
+        })
+      ) {
+        continue;
+      }
       const validated = validateFederatedImageFile(candidate, steamRoot, options);
       if (validated.valid) {
         return {
@@ -1561,9 +1715,30 @@ function loadGogGalaxyDbSnapshot(dbPath, DatabaseSync) {
  * Queries GOG Galaxy 2.0 `galaxy-2.0.db` read-only (via single-open snapshot cache) with
  * `CAST(wc.userId AS TEXT)` 64-bit safety to locate cached images in
  * `<gogRoot>/{webcache,WebCache}/<userId>/gog/<productId>/<filename>`.
+ * Supports both `(gogId, role, url, roots, options)` and legacy `(gogId, role, roots, options)`.
+ *
+ * @param {string} gogId
+ * @param {string} role
+ * @param {any} urlOrRoots
+ * @param {any} [rootsOrOptions]
+ * @param {Record<string, any>} [maybeOptions]
  */
-function resolveGogFederatedAsset(gogId, role, roots, options = {}) {
+function resolveGogFederatedAsset(gogId, role, urlOrRoots, rootsOrOptions, maybeOptions) {
+  let url = '';
+  let roots = urlOrRoots;
+  let options = rootsOrOptions || {};
+  if (typeof urlOrRoots === 'string' || urlOrRoots === null || urlOrRoots === undefined) {
+    url = typeof urlOrRoots === 'string' ? urlOrRoots.trim() : '';
+    roots = rootsOrOptions;
+    options = maybeOptions || {};
+  }
+
   if (!gogId || !/^\d+$/.test(gogId)) return null;
+  if (!roots || !Array.isArray(roots.gogRoots)) return null;
+  if (url && !isFederatedStoreUrlCompatible('gog', url, { gogId })) {
+    return null;
+  }
+
   const gogResourceType =
     role === 'cover'
       ? 'verticalCover'
@@ -1617,6 +1792,14 @@ function resolveGogFederatedAsset(gogId, role, roots, options = {}) {
           ];
       for (const dir of webCacheDirs) {
         const candidatePath = path.join(dir, filename);
+        if (
+          !isFederatedStoreUrlCompatible('gog', url, {
+            gogId,
+            candidatePath,
+          })
+        ) {
+          continue;
+        }
         const validated = validateFederatedImageFile(candidatePath, gogRoot, options);
         if (validated.valid) {
           return {
@@ -1679,19 +1862,33 @@ function resolveHeroicImagesCacheAsset(url, roots, options = {}) {
  */
 function resolveFederatedAsset(params = {}, options = {}) {
   if (!params || typeof params !== 'object') return null;
+  if (params.ov) {
+    const ovStr = String(params.ov).trim().toLowerCase();
+    if (ovStr && ovStr !== '0' && ovStr !== 'false') {
+      return null;
+    }
+  }
   const role = String(params.role || 'cover').trim();
   const url = typeof params.url === 'string' ? params.url.trim() : '';
   const roots = options._precomputedRoots || discoverStorefrontCacheRoots(options);
 
   const steamAppId = extractSteamAppIdFromParams(params);
-  if (steamAppId && roots.steamRoots.length > 0) {
+  if (
+    steamAppId &&
+    roots.steamRoots.length > 0 &&
+    isFederatedStoreUrlCompatible('steam', url, { steamAppId })
+  ) {
     const steamHit = resolveSteamFederatedAsset(steamAppId, role, url, roots, options);
     if (steamHit) return steamHit;
   }
 
   const gogId = extractGogIdFromParams(params);
-  if (gogId && roots.gogRoots.length > 0) {
-    const gogHit = resolveGogFederatedAsset(gogId, role, roots, options);
+  if (
+    gogId &&
+    roots.gogRoots.length > 0 &&
+    isFederatedStoreUrlCompatible('gog', url, { gogId })
+  ) {
+    const gogHit = resolveGogFederatedAsset(gogId, role, url, roots, options);
     if (gogHit) return gogHit;
   }
 
@@ -1699,7 +1896,8 @@ function resolveFederatedAsset(params = {}, options = {}) {
   if (
     (xboxParams.productId || xboxParams.pfn || xboxParams.titleId) &&
     ((roots.xboxGamesRoots && roots.xboxGamesRoots.length > 0) ||
-      (roots.xboxAppCacheDirs && roots.xboxAppCacheDirs.length > 0))
+      (roots.xboxAppCacheDirs && roots.xboxAppCacheDirs.length > 0)) &&
+    isFederatedStoreUrlCompatible('xbox', url, xboxParams)
   ) {
     const xboxHit = resolveXboxFederatedAsset(
       xboxParams,
@@ -1712,25 +1910,32 @@ function resolveFederatedAsset(params = {}, options = {}) {
   }
 
   // If Epic game has no explicit URL passed yet, check local Legendary keyImages URL against Heroic images-cache
-  let effectiveUrl = url;
   const epicAppName = extractEpicAppNameFromParams(params);
-  if (!effectiveUrl && epicAppName && roots.legendaryDirs.length > 0 && roots.heroicRoots.length > 0) {
-    const localEpic = resolveLocalEpicMetadata(epicAppName, {
-      ...options,
-      _precomputedRoots: roots,
-    });
-    if (localEpic) {
-      if (role === 'cover' && localEpic.capsuleImage) {
-        effectiveUrl = localEpic.capsuleImage;
-      } else if (role === 'header' && localEpic.headerImage) {
-        effectiveUrl = localEpic.headerImage;
+  if (isFederatedStoreUrlCompatible('epic', url, { epicAppName })) {
+    let effectiveUrl = url;
+    if (
+      !effectiveUrl &&
+      epicAppName &&
+      roots.legendaryDirs.length > 0 &&
+      roots.heroicRoots.length > 0
+    ) {
+      const localEpic = resolveLocalEpicMetadata(epicAppName, {
+        ...options,
+        _precomputedRoots: roots,
+      });
+      if (localEpic) {
+        if (role === 'cover' && localEpic.capsuleImage) {
+          effectiveUrl = localEpic.capsuleImage;
+        } else if (role === 'header' && localEpic.headerImage) {
+          effectiveUrl = localEpic.headerImage;
+        }
       }
     }
-  }
 
-  if (effectiveUrl && roots.heroicRoots.length > 0) {
-    const heroicHit = resolveHeroicImagesCacheAsset(effectiveUrl, roots, options);
-    if (heroicHit) return heroicHit;
+    if (effectiveUrl && roots.heroicRoots.length > 0) {
+      const heroicHit = resolveHeroicImagesCacheAsset(effectiveUrl, roots, options);
+      if (heroicHit) return heroicHit;
+    }
   }
 
   return null;
@@ -2793,7 +2998,10 @@ module.exports = {
   discoverStorefrontCacheRoots,
   discoverStorefrontCacheRootsAsync,
   parseMicrosoftGameConfigXml,
+  isFederatedStoreUrlCompatible,
   resolveFederatedAsset,
+  resolveSteamFederatedAsset,
+  resolveGogFederatedAsset,
   resolveXboxFederatedAsset,
   resolveLocalSteamMetadata,
   resolveLocalGogMetadata,

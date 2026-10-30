@@ -2712,7 +2712,7 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
   );
 
   const defaultBottleSlug = 'OneLauncher';
-  if (safeIsBottleSlug(defaultBottleSlug)) {
+  if (safeIsBottleSlug(defaultBottleSlug) && !options.readOnly) {
     const brokenPreviewBottle = path.join(previewSpecBottlesDir, defaultBottleSlug);
     if (
       isContainedWithinRoot(previewSpecBottlesDir, brokenPreviewBottle) &&
@@ -2757,41 +2757,45 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
 
   for (const variant of crossoverVariants) {
     for (const appsDir of appsDirs) {
-      const appPath = path.join(appsDir, variant.appName);
-      if (!fs.existsSync(appPath)) continue;
+      try {
+        const appPath = path.join(appsDir, variant.appName);
+        if (!fs.existsSync(appPath)) continue;
 
-      const candidateBins = [
-        path.join(appPath, 'Contents/SharedSupport/CrossOver/bin/wine'),
-        path.join(appPath, 'Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine'),
-        path.join(appPath, 'Contents/SharedSupport/CrossOver/lib64/apple_gptk/wine'),
-      ];
-      const binaryPath = candidateBins.find((b) => fs.existsSync(b)) || candidateBins[0];
-      const availableBottles = listBottleSubdirectories(variant.bottlesDir, options);
-      const versionInfo = extractRunnerVersionInfo(variant.type, binaryPath, options);
-      const d3dmInfo = detectBundledD3DMetalVersions(
-        variant.type,
-        binaryPath,
-        versionInfo.appPath || appPath
-      );
-
-      if (!addedTypes.has(variant.id)) {
-        addedTypes.add(variant.id);
-        layers.push({
-          id: variant.id,
-          type: variant.type,
-          name: variant.name,
+        const candidateBins = [
+          path.join(appPath, 'Contents/SharedSupport/CrossOver/bin/wine'),
+          path.join(appPath, 'Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine'),
+          path.join(appPath, 'Contents/SharedSupport/CrossOver/lib64/apple_gptk/wine'),
+        ];
+        const binaryPath = candidateBins.find((b) => fs.existsSync(b)) || candidateBins[0];
+        const availableBottles = listBottleSubdirectories(variant.bottlesDir, options);
+        const versionInfo = extractRunnerVersionInfo(variant.type, binaryPath, options);
+        const d3dmInfo = detectBundledD3DMetalVersions(
+          variant.type,
           binaryPath,
-          appPath: versionInfo.appPath || appPath,
-          version: versionInfo.version,
-          buildVersion: versionInfo.buildVersion,
-          displayVersion: versionInfo.displayVersion,
-          ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
-          ...(d3dmInfo.availableD3DMetalVersions
-            ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
-            : {}),
-          bottlesDir: variant.bottlesDir,
-          availableBottles,
-        });
+          versionInfo.appPath || appPath
+        );
+
+        if (!addedTypes.has(variant.id)) {
+          addedTypes.add(variant.id);
+          layers.push({
+            id: variant.id,
+            type: variant.type,
+            name: variant.name,
+            binaryPath,
+            appPath: versionInfo.appPath || appPath,
+            version: versionInfo.version,
+            buildVersion: versionInfo.buildVersion,
+            displayVersion: versionInfo.displayVersion,
+            ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+            ...(d3dmInfo.availableD3DMetalVersions
+              ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+              : {}),
+            bottlesDir: variant.bottlesDir,
+            availableBottles,
+          });
+        }
+      } catch {
+        // Isolate transient filesystem/plist read errors per app bundle
       }
     }
   }
@@ -3568,6 +3572,7 @@ async function installCompatibilityLayer(/** @type {any} */ payload = {}, /** @t
   const brewPath = brewCandidates.find((p) => fs.existsSync(p));
 
   if (
+    mode !== 'direct' &&
     (brewPath || typeof options.onExecBrew === 'function') &&
     (runnerType === 'crossover' || runnerType === 'wine')
   ) {
@@ -3597,6 +3602,68 @@ async function installCompatibilityLayer(/** @type {any} */ payload = {}, /** @t
         };
       }
     } catch {}
+  }
+
+  const dmgPath =
+    typeof payload.dmgPath === 'string' && payload.dmgPath.trim()
+      ? payload.dmgPath.trim()
+      : typeof options.dmgPath === 'string' && options.dmgPath.trim()
+        ? options.dmgPath.trim()
+        : '';
+
+  const shouldTryDirectInstall =
+    mode === 'direct' ||
+    (mode === 'auto' &&
+      !brewPath &&
+      typeof options.onExecBrew !== 'function' &&
+      (!isTestEnvironment(options) ||
+        options.allowDirectVendorInstall === true ||
+        typeof options.fetchFn === 'function' ||
+        Boolean(dmgPath)) &&
+      (runnerType === 'crossover' || runnerType === 'wine' || Boolean(dmgPath)));
+
+  if (shouldTryDirectInstall) {
+    try {
+      const { installRunnerDirect } = require('./environmentProvisioner.cjs');
+      const directRes = await installRunnerDirect(runnerType, {
+        ...options,
+        ...(dmgPath ? { dmgPath } : {}),
+      });
+      if (directRes && directRes.installed) {
+        return {
+          success: true,
+          installed: true,
+          runnerType,
+          installedPath: directRes.installedPath,
+          message: directRes.message,
+          layers: detectCompatibilityLayers(options),
+        };
+      }
+      if (directRes && directRes.openedExternal) {
+        return {
+          success: true,
+          openedExternalInstaller: true,
+          runnerType,
+          message: directRes.message,
+          layers: detectCompatibilityLayers(options),
+        };
+      }
+    } catch (err) {
+      if (mode === 'direct') {
+        if (options.throwOnError === true) {
+          throw err;
+        }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          success: false,
+          installed: false,
+          runnerType,
+          error: errMsg,
+          message: errMsg,
+          layers: detectCompatibilityLayers(options),
+        };
+      }
+    }
   }
 
   await openExternalUri(downloadUrl, options);
@@ -3869,15 +3936,30 @@ function resolveWineserverBinary(wineBinary) {
   return null;
 }
 
-async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000) {
+async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000, extraOptions = {}) {
   const wineserverBin = resolveWineserverBinary(wineBinary);
   if (!wineserverBin || !winePrefix) {
     return false;
   }
 
+  let canonicalPrefix = winePrefix;
+  try {
+    canonicalPrefix = fs.realpathSync(winePrefix);
+  } catch {}
+
+  const bottleName =
+    extraOptions && typeof extraOptions.bottleName === 'string' && extraOptions.bottleName.trim()
+      ? extraOptions.bottleName.trim()
+      : '';
+  const execFileImpl =
+    extraOptions && typeof extraOptions.execFileFn === 'function'
+      ? extraOptions.execFileFn
+      : execFile;
+
   const prefixEnv = {
     ...process.env,
-    WINEPREFIX: winePrefix,
+    WINEPREFIX: canonicalPrefix,
+    ...(bottleName ? { CX_BOTTLE: bottleName } : {}),
   };
 
   let isNodeShebangScriptOnWin32 = false;
@@ -3892,14 +3974,14 @@ async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000) {
     new Promise((resolve) => {
       try {
         if (isNodeShebangScriptOnWin32) {
-          execFile(
+          execFileImpl(
             process.execPath,
             [wineserverBin, flag],
             { env: prefixEnv, timeout: timeoutMs },
             () => resolve(true)
           );
         } else {
-          execFile(wineserverBin, [flag], { env: prefixEnv, timeout: timeoutMs }, () =>
+          execFileImpl(wineserverBin, [flag], { env: prefixEnv, timeout: timeoutMs }, () =>
             resolve(true)
           );
         }

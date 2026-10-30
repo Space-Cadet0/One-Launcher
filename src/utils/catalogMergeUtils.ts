@@ -1,5 +1,5 @@
-import { CanonicalGame, GamePlatformOwnership, StoreAchievementSummary } from '../contracts/game';
-import { UserGameOverride } from '../contracts/override';
+import { CanonicalGame, GamePlatformOwnership, NativeOsPlatform, StoreAchievementSummary } from '../contracts/game';
+import { NativeGameBaselineSnapshot, UserGameOverride } from '../contracts/override';
 import { StorefrontId } from '../contracts/platform';
 import {
   getKnownSteamAchievements,
@@ -289,54 +289,273 @@ export function applyOverrideToCatalog(
 }
 
 /**
- * Reverts a removed user override across matching catalog entries and re-sanitizes the catalog.
+ * Captures the pre-override native baseline snapshot of a CanonicalGame so subsequent Reset
+ * deterministically restores the exact original ID, title, art, synopsis, and OS support.
+ */
+export function captureNativeGameBaseline(game: CanonicalGame): NativeGameBaselineSnapshot {
+  const primaryPlat = game.platforms?.[0];
+  const steamPlat = game.platforms?.find(
+    (p) => p?.platformId === 'steam' && p.platformGameId && !isNaN(Number(p.platformGameId))
+  );
+  const baseTitle =
+    primaryPlat?.originalTitle || game.originalStoreTitle || game.title || game.id;
+  return {
+    id: game.id,
+    title: baseTitle,
+    steamAppId:
+      typeof game.steamAppId === 'number' && game.steamAppId > 0
+        ? game.steamAppId
+        : steamPlat
+          ? Number(steamPlat.platformGameId)
+          : null,
+    capsuleImage: game.capsuleImage,
+    headerImage: game.headerImage,
+    iconUrl: game.iconUrl,
+    shortDescription: game.shortDescription,
+    detailedDescription: game.detailedDescription,
+    developers: Array.isArray(game.developers) ? [...game.developers] : undefined,
+    publishers: Array.isArray(game.publishers) ? [...game.publishers] : undefined,
+    genres: Array.isArray(game.genres) ? [...game.genres] : undefined,
+    tags: Array.isArray(game.tags) ? [...game.tags] : undefined,
+    releaseDate: game.releaseDate,
+    nativePlatforms: Array.isArray(game.nativePlatforms) ? [...game.nativePlatforms] : undefined,
+    worksOn: game.worksOn
+      ? {
+          windows: game.worksOn.windows,
+          mac: game.worksOn.mac,
+          linux: game.worksOn.linux,
+        }
+      : undefined,
+    platforms_os: game.platforms_os
+      ? {
+          windows: game.platforms_os.windows,
+          mac: game.platforms_os.mac,
+          linux: game.platforms_os.linux,
+        }
+      : undefined,
+  };
+}
+
+function recomputeOsFieldsFromPlatforms(
+  platforms?: GamePlatformOwnership[]
+): Pick<CanonicalGame, 'nativePlatforms' | 'worksOn' | 'platforms_os'> {
+  if (!Array.isArray(platforms) || platforms.length === 0) {
+    return {
+      nativePlatforms: undefined,
+      worksOn: undefined,
+      platforms_os: undefined,
+    };
+  }
+  const hasExplicitOsInfo = platforms.some(
+    (p) =>
+      (Array.isArray(p?.platforms) && p.platforms.length > 0) ||
+      p?.isWindowsBinaryOnMac !== undefined ||
+      p?.platformId === 'xbox'
+  );
+  if (!hasExplicitOsInfo) {
+    return {
+      nativePlatforms: undefined,
+      worksOn: undefined,
+      platforms_os: undefined,
+    };
+  }
+
+  let hasWindows = false;
+  let hasMac = false;
+  for (const p of platforms) {
+    if (!p) continue;
+    if (p.platformId === 'xbox' || p.isWindowsBinaryOnMac === true) {
+      hasWindows = true;
+    }
+    if (Array.isArray(p.platforms)) {
+      if (p.platforms.includes('windows')) hasWindows = true;
+      if (p.platforms.includes('mac') && !p.isWindowsBinaryOnMac) hasMac = true;
+    }
+  }
+
+  const nativePlatforms: NativeOsPlatform[] = [];
+  if (hasWindows) nativePlatforms.push('windows');
+  if (hasMac) nativePlatforms.push('mac');
+
+  return {
+    nativePlatforms: nativePlatforms.length > 0 ? nativePlatforms : undefined,
+    worksOn: { windows: hasWindows, mac: hasMac },
+    platforms_os: { windows: hasWindows, mac: hasMac },
+  };
+}
+
+/**
+ * Reverts a removed user override across matching catalog entries, restoring canonical IDs,
+ * original storefront titles, default artwork/metadata, and OS flags, then re-sanitizes and runs
+ * the intelligent non-Steam default match pass.
  */
 export function revertRemovedOverrideInCatalog(
   prevGames: CanonicalGame[],
   removedGameId: string,
-  oldOverride?: UserGameOverride
+  oldOverride?: UserGameOverride | null,
+  contextGame?: Partial<CanonicalGame> | null
 ): CanonicalGame[] {
-  const revertedGames = prevGames.map((g) => {
-    const isMatch =
-      g.id === removedGameId ||
-      Boolean(
-        oldOverride?.platformGameId &&
-          g.platforms?.some(
-            (p) =>
-              String(p.platformGameId) === String(oldOverride.platformGameId) &&
-              (!oldOverride.platformId || p.platformId === oldOverride.platformId)
-          )
-      );
-    if (!isMatch) return g;
+  const isSplitRevert = Boolean(oldOverride?.splitFromMerged);
 
-    const nativeTitle =
-      g.originalStoreTitle ||
-      oldOverride?.originalSourceTitle ||
-      g.platforms?.[0]?.originalTitle ||
-      g.title;
+  const revertedGames = prevGames.map((g) => {
+    const matchesById =
+      g.id === removedGameId ||
+      Boolean(oldOverride?.gameId && g.id === oldOverride.gameId) ||
+      Boolean(contextGame?.id && g.id === contextGame.id);
+
+    const matchesByOverridePlat = Boolean(
+      oldOverride?.platformGameId &&
+        (!isSplitRevert || g.platforms?.length === 1) &&
+        g.platforms?.some(
+          (p) =>
+            String(p.platformGameId).toLowerCase() ===
+              String(oldOverride.platformGameId).toLowerCase() &&
+            (!oldOverride.platformId ||
+              String(p.platformId).toLowerCase() === String(oldOverride.platformId).toLowerCase())
+        )
+    );
+
+    const matchesByContextPlat = Boolean(
+      !isSplitRevert &&
+        Array.isArray(contextGame?.platforms) &&
+        contextGame!.platforms!.length > 0 &&
+        g.platforms?.some((p) =>
+          contextGame!.platforms!.some(
+            (cp) =>
+              cp?.platformId &&
+              cp?.platformGameId &&
+              String(p.platformId).toLowerCase() === String(cp.platformId).toLowerCase() &&
+              String(p.platformGameId).toLowerCase() === String(cp.platformGameId).toLowerCase()
+          )
+        )
+    );
+
+    if (!matchesById && !matchesByOverridePlat && !matchesByContextPlat) {
+      return g;
+    }
+
     const steamPlat = g.platforms?.find(
       (p) => p.platformId === 'steam' && p.platformGameId && !isNaN(Number(p.platformGameId))
     );
+    const primaryPlat = g.platforms?.[0];
+    const osFieldsFromPlats = recomputeOsFieldsFromPlatforms(g.platforms);
+
+    if (oldOverride?.nativeBaseline) {
+      const nb = oldOverride.nativeBaseline;
+      const fallbackNativeId = steamPlat
+        ? `steam-${steamPlat.platformGameId}`
+        : primaryPlat?.platformId && primaryPlat?.platformGameId
+          ? `${String(primaryPlat.platformId).toLowerCase()}-${primaryPlat.platformGameId}`
+          : g.id;
+      const restoredId = nb.id || fallbackNativeId;
+      const restoredTitle =
+        nb.title ||
+        primaryPlat?.originalTitle ||
+        g.originalStoreTitle ||
+        oldOverride.originalSourceTitle ||
+        g.title;
+      const restoredSteamAppId =
+        typeof nb.steamAppId === 'number' && nb.steamAppId > 0
+          ? nb.steamAppId
+          : steamPlat
+            ? Number(steamPlat.platformGameId)
+            : undefined;
+
+      return {
+        ...g,
+        id: restoredId,
+        title: restoredTitle,
+        sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+        steamAppId: restoredSteamAppId,
+        isExplicitNonSteam: false,
+        matchConfidence: undefined,
+        needsMatchReview: undefined,
+        reviewScoreOverride: undefined,
+        enrichedMetadata: undefined,
+        capsuleImage: nb.capsuleImage,
+        headerImage: nb.headerImage ?? '',
+        iconUrl: nb.iconUrl,
+        shortDescription: nb.shortDescription ?? '',
+        detailedDescription: nb.detailedDescription,
+        developers: Array.isArray(nb.developers) ? [...nb.developers] : [],
+        publishers: Array.isArray(nb.publishers) ? [...nb.publishers] : [],
+        genres: Array.isArray(nb.genres) ? [...nb.genres] : [],
+        tags: Array.isArray(nb.tags) ? [...nb.tags] : [],
+        releaseDate: nb.releaseDate,
+        nativePlatforms: nb.nativePlatforms ?? osFieldsFromPlats.nativePlatforms,
+        worksOn: nb.worksOn ?? osFieldsFromPlats.worksOn,
+        platforms_os: nb.platforms_os ?? osFieldsFromPlats.platforms_os,
+      };
+    }
+
+    if (!steamPlat) {
+      const restoredId =
+        primaryPlat?.platformId && primaryPlat?.platformGameId
+          ? `${String(primaryPlat.platformId).toLowerCase()}-${primaryPlat.platformGameId}`
+          : g.id;
+      const restoredTitle =
+        primaryPlat?.originalTitle ||
+        g.originalStoreTitle ||
+        oldOverride?.originalSourceTitle ||
+        g.title;
+
+      return {
+        ...g,
+        ...osFieldsFromPlats,
+        id: restoredId,
+        title: restoredTitle,
+        sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+        steamAppId: undefined,
+        isExplicitNonSteam: false,
+        matchConfidence: undefined,
+        needsMatchReview: undefined,
+        reviewScoreOverride: undefined,
+        enrichedMetadata: undefined,
+        capsuleImage: undefined,
+        headerImage: '',
+        iconUrl: undefined,
+        shortDescription: '',
+        detailedDescription: undefined,
+        developers: [],
+        publishers: [],
+        genres: [],
+        tags: [],
+        releaseDate: undefined,
+      };
+    }
+
+    const steamIdStr = String(steamPlat.platformGameId);
+    const restoredAppId = Number(steamIdStr);
+    const restoredTitle =
+      steamPlat.originalTitle ||
+      g.originalStoreTitle ||
+      oldOverride?.originalSourceTitle ||
+      g.title;
+
     return {
       ...g,
-      title: nativeTitle,
-      sortTitle: nativeTitle.replace(/^(The|A|An)\s+/i, '').trim(),
-      steamAppId: steamPlat ? Number(steamPlat.platformGameId) : undefined,
-      isExplicitNonSteam: undefined,
+      ...osFieldsFromPlats,
+      id: `steam-${steamIdStr}`,
+      title: restoredTitle,
+      sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+      steamAppId: restoredAppId,
+      isExplicitNonSteam: false,
+      matchConfidence: undefined,
+      needsMatchReview: undefined,
       reviewScoreOverride: undefined,
       enrichedMetadata: undefined,
-      capsuleImage:
-        oldOverride?.capsuleImage && g.capsuleImage === oldOverride.capsuleImage
-          ? ''
-          : g.capsuleImage,
-      headerImage:
-        oldOverride?.headerImage && g.headerImage === oldOverride.headerImage
-          ? ''
-          : g.headerImage,
+      capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamIdStr}/library_600x900_2x.jpg`,
+      headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamIdStr}/header.jpg`,
+      iconUrl: undefined,
+      shortDescription: '',
+      detailedDescription: undefined,
     };
   });
 
-  return sanitizeGameCatalog(revertedGames, { allowNewPurchases: true });
+  const sanitized = sanitizeGameCatalog(revertedGames, { allowNewPurchases: true });
+  const rematched = runIntelligentNonSteamMatchPass(sanitized);
+  const didRematch = rematched.some((g, idx) => g !== sanitized[idx]);
+  return didRematch ? sanitizeGameCatalog(rematched, { allowNewPurchases: true }) : rematched;
 }
 
 /**

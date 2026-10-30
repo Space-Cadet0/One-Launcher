@@ -440,6 +440,88 @@ dialog.modal-shell::backdrop {
 }
 
 /* ========================================================
+   SYSTEM SETUP & ENVIRONMENT PROVISIONING NATIVE <progress>
+   ======================================================== */
+.ol-setup-progress {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0 solid;
+  overflow: clip;
+  border-radius: 9999px;
+  background-color: #131c27;
+  container-type: inline-size;
+  --ol-progress-fill: linear-gradient(90deg, #3b9dd9 0%, #66c0f4 100%);
+  --ol-progress-transition-duration: 0.25s;
+  --ol-progress-indeterminate-size: 32%;
+  --ol-progress-indeterminate-duration: 1.5s;
+}
+
+.ol-setup-progress:indeterminate {
+  --ol-progress-animation: ol-setup-progress-indeterminate
+    var(--ol-progress-indeterminate-duration, 1.5s) infinite linear;
+}
+
+.ol-setup-progress:indeterminate:dir(rtl) {
+  --ol-progress-animation: ol-setup-progress-indeterminate
+    var(--ol-progress-indeterminate-duration, 1.5s) infinite linear reverse;
+}
+
+.ol-setup-progress::-webkit-progress-bar {
+  background-color: transparent;
+}
+
+.ol-setup-progress::-webkit-progress-value {
+  background: var(--ol-progress-fill);
+  border-radius: 9999px;
+  transition: inline-size var(--ol-progress-transition-duration, 0.25s) ease;
+  animation: var(--ol-progress-animation, revert-rule);
+}
+
+.ol-setup-progress::-moz-progress-bar {
+  background: var(--ol-progress-fill);
+  border-radius: 9999px;
+  transition: inline-size var(--ol-progress-transition-duration, 0.25s) ease;
+  animation: var(--ol-progress-animation, revert-rule);
+}
+
+@keyframes ol-setup-progress-indeterminate {
+  from,
+  to {
+    inline-size: var(--ol-progress-indeterminate-size, 32%);
+    margin-right: auto;
+  }
+  from {
+    translate: -100%;
+  }
+  to {
+    translate: 100cqi;
+  }
+}
+
+.ol-guided-spinner {
+  --ol-guided-spin-duration: 1.2s;
+  animation: ol-guided-spin var(--ol-guided-spin-duration) linear infinite;
+}
+
+@keyframes ol-guided-spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ol-setup-progress,
+  .ol-setup-progress:indeterminate {
+    --ol-progress-indeterminate-duration: 10s;
+    --ol-progress-transition-duration: 0s;
+  }
+
+  .ol-guided-spinner {
+    --ol-guided-spin-duration: 6s;
+  }
+}
+
+/* ========================================================
    TWO-POINT RELEASE YEAR DUAL-RANGE SLIDER UTILITIES
    ======================================================== */
 .dual-range-input {

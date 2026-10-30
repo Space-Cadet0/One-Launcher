@@ -351,12 +351,11 @@ export function buildLibraryFilterIndex(
     }
 
     // Category 2: Rating (Critic Tier, Score & Review Sentiment)
-    const effectiveSteamAppId =
-      game.steamAppId || steamMatcher.getEffectiveSteamAppId(game) || undefined;
+    const effectiveSteamAppId = steamMatcher.getEffectiveSteamAppId(game);
     const oc = getOpenCriticData(
       effectiveSteamAppId,
       game.title,
-      game.reviewSummary?.positivePercent,
+      game.reviewSummary?.positivePercent ?? game.enrichedMetadata?.reviewSummary?.positivePercent,
       game.releaseDate,
       undefined,
       false,

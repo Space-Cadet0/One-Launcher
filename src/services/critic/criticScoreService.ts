@@ -12,6 +12,8 @@ import {
   evictStagedCache,
   clearExpiredStagedCache,
   isCacheEntryValid,
+  isStagedVaultHydrationComplete,
+  TIER_TTLS,
   MutabilityTier,
 } from '../storage/stagedCacheService';
 import {
@@ -177,6 +179,8 @@ export class CriticScoreService {
   private compiledOverrideIndexMemo = new WeakMap<object, CompiledReviewOverrideIndex>();
   private inFlightResolutions = new Map<string, Promise<CriticScoreData | null>>();
   private attemptedDynamicResolutions = new Set<string>();
+  private stubPinnedKeys = new Set<string>();
+  private transientFailureCounts = new Map<string, number>();
   private listenersInitialized = false;
   private listenerCleanups: Array<() => void> = [];
   private storageHydrated = false;
@@ -210,29 +214,92 @@ export class CriticScoreService {
     if (this.listenersInitialized) return;
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       const onOverrideUpdated = ((e: CustomEvent) => {
+        if (e.detail && typeof e.detail === 'object' && (e.detail as { hydratedFromVault?: boolean }).hydratedFromVault) {
+          return;
+        }
         const extracted = extractValidGameOverrideFromEventDetail(e.detail);
         if (!extracted) return;
         this.handleUserOverride(extracted.override, extracted.oldGame);
       }) as EventListener;
 
+      const onStagedVaultHydrated = (() => {
+        if (this.stubPinnedKeys.size > 0) {
+          for (const stubKey of this.stubPinnedKeys) {
+            this.inMemoryCache.delete(stubKey);
+          }
+          this.stubPinnedKeys.clear();
+        }
+      }) as EventListener;
+
       const onOverrideRemoved = ((e: CustomEvent) => {
-        const gameId = e.detail?.gameId;
-        const oldOverride = e.detail?.oldOverride;
-        if (gameId || oldOverride) {
+        const detail = (e.detail || {}) as {
+          gameId?: string;
+          deletedKeys?: string[];
+          removedOverride?: UserGameOverride;
+          oldOverride?: UserGameOverride;
+          oldGame?: Partial<CanonicalGame>;
+        };
+        const gameId = detail.gameId;
+        const oldOverride = detail.removedOverride ?? detail.oldOverride;
+        const oldGame = detail.oldGame;
+        const deletedKeys = Array.isArray(detail.deletedKeys) ? detail.deletedKeys : [];
+
+        if (gameId || oldOverride || oldGame || deletedKeys.length > 0) {
           this.clearCache();
           const keysToEvict = new Set<string>();
-          if (gameId) {
-            keysToEvict.add(gameId);
-            const cleanId = gameId.replace(/^steam-/, '');
-            keysToEvict.add(`id:${cleanId}`);
-            keysToEvict.add(`title:${gameId.toLowerCase()}`);
+
+          const addTitleKeys = (rawTitle?: string | null) => {
+            if (!rawTitle || typeof rawTitle !== 'string') return;
+            const trimmed = rawTitle.trim().toLowerCase();
+            if (!trimmed) return;
+            keysToEvict.add(`title:${trimmed}`);
+            const norm = normalizeCriticTitleKey(trimmed);
+            if (norm) {
+              keysToEvict.add(`title:${norm}`);
+            }
+          };
+
+          const addIdKeys = (rawId?: string | number | null) => {
+            if (rawId === undefined || rawId === null) return;
+            const str = String(rawId).trim();
+            if (!str) return;
+            keysToEvict.add(str);
+            const cleanId = str.replace(/^steam-/, '');
+            if (cleanId) {
+              keysToEvict.add(`id:${cleanId}`);
+            }
+            addTitleKeys(str);
+          };
+
+          addIdKeys(gameId);
+          for (const dk of deletedKeys) {
+            addIdKeys(dk);
           }
-          if (oldOverride?.steamAppId) {
-            keysToEvict.add(`id:${oldOverride.steamAppId}`);
+          if (oldOverride) {
+            addIdKeys(oldOverride.gameId);
+            if (typeof oldOverride.steamAppId === 'number' && oldOverride.steamAppId > 0) {
+              keysToEvict.add(`id:${oldOverride.steamAppId}`);
+            }
+            if (oldOverride.matchedId !== undefined) {
+              addIdKeys(oldOverride.matchedId);
+            }
+            if (oldOverride.nativeBaseline?.steamAppId) {
+              keysToEvict.add(`id:${oldOverride.nativeBaseline.steamAppId}`);
+            }
+            addIdKeys(oldOverride.nativeBaseline?.id);
+            addTitleKeys(oldOverride.title);
+            addTitleKeys(oldOverride.originalSourceTitle);
+            addTitleKeys(oldOverride.nativeBaseline?.title);
           }
-          if (oldOverride?.title) {
-            keysToEvict.add(`title:${oldOverride.title.toLowerCase().trim()}`);
+          if (oldGame) {
+            addIdKeys(oldGame.id);
+            if (typeof oldGame.steamAppId === 'number' && oldGame.steamAppId > 0) {
+              keysToEvict.add(`id:${oldGame.steamAppId}`);
+            }
+            addTitleKeys(oldGame.title);
+            addTitleKeys(oldGame.originalStoreTitle);
           }
+
           for (const key of keysToEvict) {
             this.inMemoryCache.delete(key);
             this.attemptedDynamicResolutions.delete(key);
@@ -247,11 +314,18 @@ export class CriticScoreService {
               } catch {}
             }
           }
+
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            try {
+              window.dispatchEvent(new CustomEvent('antigravity_critic_updated'));
+            } catch {}
+          }
         }
       }) as EventListener;
 
       window.addEventListener('antigravity:user-override-updated', onOverrideUpdated);
       window.addEventListener('antigravity:user-override-removed', onOverrideRemoved);
+      window.addEventListener('antigravity:staged-vault-hydrated', onStagedVaultHydrated);
       const unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
         this.attemptedDynamicResolutions.clear();
         for (const [k, v] of this.inMemoryCache.entries()) {
@@ -264,6 +338,7 @@ export class CriticScoreService {
       this.listenerCleanups.push(() => {
         window.removeEventListener('antigravity:user-override-updated', onOverrideUpdated);
         window.removeEventListener('antigravity:user-override-removed', onOverrideRemoved);
+        window.removeEventListener('antigravity:staged-vault-hydrated', onStagedVaultHydrated);
         unsubscribeOnline();
       });
     }
@@ -1088,6 +1163,8 @@ export class CriticScoreService {
    */
   clearCache(): void {
     this.inMemoryCache.clear();
+    this.stubPinnedKeys.clear();
+    this.transientFailureCounts.clear();
     this.inFlightResolutions.clear();
     this.attemptedDynamicResolutions.clear();
     metacriticResolver.clearCache();
@@ -1126,18 +1203,49 @@ export class CriticScoreService {
       }
     }
 
+    const primaryIdKey = steamAppId ? `${STORAGE_PREFIX}id:${steamAppId}` : '';
     const candidateKeys: string[] = [];
-    if (steamAppId) {
-      candidateKeys.push(`${STORAGE_PREFIX}id:${steamAppId}`);
+    if (primaryIdKey) {
+      candidateKeys.push(primaryIdKey);
     }
+    const lowerTitle = rawTitle ? rawTitle.toLowerCase() : '';
     if (rawTitle) {
-      const lower = rawTitle.toLowerCase();
-      candidateKeys.push(`${STORAGE_PREFIX}title:${lower}`);
+      candidateKeys.push(`${STORAGE_PREFIX}title:${lowerTitle}`);
       const norm = normalizeCriticTitleKey(rawTitle);
-      if (norm && norm !== lower) {
+      if (norm && norm !== lowerTitle) {
         candidateKeys.push(`${STORAGE_PREFIX}title:${norm}`);
       }
     }
+
+    let expiredPrimaryIdCachedAt: number | null = null;
+
+    const backfillTitleAliasIfNeeded = (
+      sourceKey: string,
+      stagedEntry: NonNullable<ReturnType<typeof loadStagedCache<CriticScoreData>>['entry']>,
+      resolvedData: CriticScoreData | null
+    ) => {
+      if (!primaryIdKey || sourceKey !== primaryIdKey || !lowerTitle) return;
+      const titleAliasKey = `${STORAGE_PREFIX}title:${lowerTitle}`;
+      const existingAlias = loadStagedCache<CriticScoreData>(titleAliasKey, false);
+      if (existingAlias.valid && existingAlias.entry?.dynamicResolved === true) {
+        return;
+      }
+      if (
+        existingAlias.entry &&
+        (existingAlias.entry.tier === MutabilityTier.TIER_0_USER_OVERRIDE ||
+          existingAlias.entry.tier === 'override')
+      ) {
+        return;
+      }
+      saveStagedCache<CriticScoreData>(titleAliasKey, resolvedData, stagedEntry.tier, {
+        source: stagedEntry.source,
+        isVerified: stagedEntry.isVerified,
+        failureReason: stagedEntry.failureReason,
+        dynamicResolved: true,
+        cachedAt: stagedEntry.cachedAt,
+        customTtlMs: stagedEntry.ttlMs,
+      });
+    };
 
     for (const key of candidateKeys) {
       const staged = loadStagedCache<CriticScoreData>(key, false);
@@ -1148,6 +1256,13 @@ export class CriticScoreService {
       ) {
         return true;
       }
+      if (
+        expiredPrimaryIdCachedAt !== null &&
+        key !== primaryIdKey &&
+        (staged.entry.cachedAt || 0) <= expiredPrimaryIdCachedAt
+      ) {
+        continue;
+      }
       if (!onlineLifecycleManager.isOnline()) {
         if (
           staged.data &&
@@ -1157,21 +1272,60 @@ export class CriticScoreService {
           return true;
         }
       }
-      if (staged.entry.dynamicResolved === true && isCacheEntryValid(staged.entry)) {
-        if (staged.entry.data === null) {
-          return true;
-        }
-        if (
-          staged.data &&
-          staged.data.score > 0 &&
-          (!rawTitle || this.validateScoreSemanticCompatibility(rawTitle, staged.data, steamAppId))
-        ) {
-          return true;
+      if (staged.entry.dynamicResolved === true) {
+        if (isCacheEntryValid(staged.entry)) {
+          if (staged.entry.data === null) {
+            backfillTitleAliasIfNeeded(key, staged.entry, null);
+            return true;
+          }
+          if (
+            staged.data &&
+            staged.data.score > 0 &&
+            (!rawTitle || this.validateScoreSemanticCompatibility(rawTitle, staged.data, steamAppId))
+          ) {
+            backfillTitleAliasIfNeeded(key, staged.entry, staged.data);
+            return true;
+          }
+        } else if (key === primaryIdKey) {
+          expiredPrimaryIdCachedAt = staged.entry.cachedAt || 0;
         }
       }
     }
 
     return false;
+  }
+
+  /**
+   * Seeds an authoritative critic score hydrated from the Electron SQLite vault when no
+   * valid staged cache entry or user override already exists.
+   */
+  public seedFromVaultIfMissing(
+    steamAppId: number | null | undefined,
+    title: string | undefined,
+    scoreData: CriticScoreData | null | undefined,
+    releaseDate?: string | number | null,
+    genres?: string[] | null
+  ): void {
+    if (!scoreData || typeof scoreData.score !== 'number' || scoreData.score <= 0) return;
+    this.ensureHydrated();
+    const rawTitle = (title || '').trim();
+    if (rawTitle && !this.validateScoreSemanticCompatibility(rawTitle, scoreData, steamAppId)) {
+      return;
+    }
+    if (this.hasValidCachedResolution(steamAppId, rawTitle)) {
+      return;
+    }
+    const cacheKey =
+      typeof steamAppId === 'number' && steamAppId > 0
+        ? `id:${steamAppId}`
+        : rawTitle
+        ? `title:${rawTitle.toLowerCase()}`
+        : '';
+    if (!cacheKey) return;
+    this.cacheResult(cacheKey, scoreData, releaseDate, genres, {
+      dynamicResolved: true,
+      aliasTitle: rawTitle || undefined,
+    });
   }
 
   /**
@@ -1247,7 +1401,11 @@ export class CriticScoreService {
             this.attemptedDynamicResolutions.add(cacheKey);
             if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
           }
-          this.setInMemoryCache(cacheKey, staged.data);
+          if (!staged.isCompactStub) {
+            this.setInMemoryCache(cacheKey, staged.data);
+          } else {
+            this.stubPinnedKeys.add(cacheKey);
+          }
           return staged.data;
         }
         if (
@@ -1392,7 +1550,9 @@ export class CriticScoreService {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
         if (existingStaged.data && isScoreSemanticallyCompatible(existingStaged.data)) {
-          this.setInMemoryCache(cacheKey, existingStaged.data);
+          if (!existingStaged.isCompactStub) {
+            this.setInMemoryCache(cacheKey, existingStaged.data);
+          }
           return existingStaged.data;
         }
       }
@@ -1400,9 +1560,18 @@ export class CriticScoreService {
         this.attemptedDynamicResolutions.add(cacheKey);
         if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
       }
-      this.cacheResult(cacheKey, verifiedMatch, effectiveReleaseDate, enrichedGenres, {
-        dynamicResolved: existingStaged.valid && !bypassTTL ? existingStaged.entry?.dynamicResolved : undefined,
-      });
+      if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
+        this.cacheResult(cacheKey, verifiedMatch, effectiveReleaseDate, enrichedGenres, {
+          dynamicResolved:
+            existingStaged.valid && !bypassTTL ? existingStaged.entry?.dynamicResolved : undefined,
+          aliasTitle: rawTitle || undefined,
+        });
+      } else {
+        this.setInMemoryCache(cacheKey, verifiedMatch);
+        if (!isStagedVaultHydrationComplete()) {
+          this.stubPinnedKeys.add(cacheKey);
+        }
+      }
       if (
         (verifiedMatch.isSynthetic || verifiedMatch.source === 'opencritic') &&
         !this.attemptedDynamicResolutions.has(cacheKey)
@@ -1428,7 +1597,13 @@ export class CriticScoreService {
         }
         if (altStaged.data || altStaged.entry.data === null) {
           staged = altStaged;
-          if (altStaged.data && steamAppId && cacheKey === `id:${steamAppId}`) {
+          if (
+            altStaged.data &&
+            steamAppId &&
+            cacheKey === `id:${steamAppId}` &&
+            !altStaged.isCompactStub &&
+            isStagedVaultHydrationComplete()
+          ) {
             saveStagedCache<CriticScoreData>(stagedKey, altStaged.data, altStaged.entry.tier, {
               source: altStaged.data.source,
               isVerified: altStaged.data.isVerified,
@@ -1476,11 +1651,15 @@ export class CriticScoreService {
         }
       } else if (staged.data && isScoreSemanticallyCompatible(staged.data)) {
         if (!onlineLifecycleManager.isOnline()) {
-          this.setInMemoryCache(cacheKey, staged.data);
+          if (!staged.isCompactStub) {
+            this.setInMemoryCache(cacheKey, staged.data);
+          }
           return staged.data;
         }
         if (staged.valid && !bypassTTL) {
-          this.setInMemoryCache(cacheKey, staged.data);
+          if (!staged.isCompactStub) {
+            this.setInMemoryCache(cacheKey, staged.data);
+          }
           if (staged.data.isSynthetic && !staged.entry.dynamicResolved) {
             // Synchronous pre-resolution synthetic score that hasn't completed dynamic cascade yet
             triggerDynamicResolution();
@@ -1535,10 +1714,25 @@ export class CriticScoreService {
           isVerified: false,
           isSynthetic: true,
         };
-        this.cacheResult(cacheKey, syntheticData, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+        if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
+          this.cacheResult(cacheKey, syntheticData, effectiveReleaseDate, enrichedGenres, {
+            dynamicResolved: true,
+            aliasTitle: rawTitle || undefined,
+          });
+        } else {
+          this.setInMemoryCache(cacheKey, syntheticData);
+          if (!isStagedVaultHydrationComplete()) {
+            this.stubPinnedKeys.add(cacheKey);
+          }
+        }
         return syntheticData;
       }
-      this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+      if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
+        this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
+          dynamicResolved: true,
+          aliasTitle: rawTitle || undefined,
+        });
+      }
       return null;
     }
 
@@ -1573,7 +1767,14 @@ export class CriticScoreService {
         isSynthetic: true,
       };
 
-      this.cacheResult(cacheKey, syntheticData, effectiveReleaseDate, enrichedGenres);
+      if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
+        this.cacheResult(cacheKey, syntheticData, effectiveReleaseDate, enrichedGenres);
+      } else {
+        this.setInMemoryCache(cacheKey, syntheticData);
+        if (!isStagedVaultHydrationComplete()) {
+          this.stubPinnedKeys.add(cacheKey);
+        }
+      }
       return syntheticData;
     }
 
@@ -1581,7 +1782,12 @@ export class CriticScoreService {
     if (KNOWN_UNRATED_TITLES.has(lowerTitle) || KNOWN_UNRATED_TITLES.has(getNormalizedKey())) {
       this.attemptedDynamicResolutions.add(cacheKey);
       if (lowerTitle) this.attemptedDynamicResolutions.add(`title:${lowerTitle}`);
-      this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+      if (!skipBackgroundTrigger && isStagedVaultHydrationComplete()) {
+        this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
+          dynamicResolved: true,
+          aliasTitle: rawTitle || undefined,
+        });
+      }
       return null;
     }
 
@@ -1605,6 +1811,7 @@ export class CriticScoreService {
       platforms?: Array<{ platformId: string; platformGameId?: string }>;
       gameId?: string;
       genres?: string[];
+      steamPositivePercent?: number;
     }
   ): Promise<CriticScoreData | null> {
     this.ensureHydrated();
@@ -1669,7 +1876,7 @@ export class CriticScoreService {
             isOverride: false,
           });
           this.setInMemoryCache(cacheKey, refreshed);
-          saveStagedCache<CriticScoreData>(stagedKey, refreshed, dynamicTier, {
+          const savedRouted = saveStagedCache<CriticScoreData>(stagedKey, refreshed, dynamicTier, {
             source: refreshed.source,
             isVerified: refreshed.isVerified,
             dynamicResolved: true,
@@ -1677,6 +1884,13 @@ export class CriticScoreService {
           const lower = title.toLowerCase();
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, refreshed);
+            saveStagedCache<CriticScoreData>(`${STORAGE_PREFIX}title:${lower}`, refreshed, dynamicTier, {
+              source: refreshed.source,
+              isVerified: refreshed.isVerified,
+              dynamicResolved: true,
+              cachedAt: savedRouted.cachedAt,
+              customTtlMs: savedRouted.ttlMs,
+            });
           }
           try {
             const allOverrides = loadUserOverrides();
@@ -1736,6 +1950,7 @@ export class CriticScoreService {
         if (this.validateScoreSemanticCompatibility(title, existing, steamAppId)) {
           this.cacheResult(cacheKey, existing, effectiveReleaseDate, enrichedGenres, {
             dynamicResolved: true,
+            aliasTitle: title,
           });
           if (lowerTitleKey && lowerTitleKey !== cacheKey) {
             this.setInMemoryCache(lowerTitleKey, existing);
@@ -1818,13 +2033,34 @@ export class CriticScoreService {
           const memExisting = this.inMemoryCache.get(cacheKey);
           if (memExisting && typeof memExisting.score === 'number' && memExisting.score > 0 && isCandidateValid(memExisting)) {
             priorPositiveScore = memExisting;
+          } else if (
+            steamAppId &&
+            typeof options?.steamPositivePercent === 'number' &&
+            options.steamPositivePercent > 0
+          ) {
+            const synthetic = calculateSyntheticSteamScore(options.steamPositivePercent);
+            priorPositiveScore = {
+              id: `steam-${steamAppId}`,
+              source: 'steam',
+              score: synthetic.score,
+              percentRecommended: synthetic.percentRecommended,
+              tier: synthetic.tier,
+              numReviews: 50,
+              url: `https://store.steampowered.com/app/${steamAppId}`,
+              summary: `Based on Steam community player reviews (${options.steamPositivePercent}% positive).`,
+              isVerified: false,
+              isSynthetic: true,
+            };
           }
         }
 
         const retainExplicitUnrated = () => {
           const current = this.inMemoryCache.get(cacheKey);
           if (current?.isSynthetic && isCandidateValid(current)) {
-            this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, {
+              dynamicResolved: true,
+              aliasTitle: title,
+            });
             if (lower && cacheKey !== `title:${lower}`) {
               this.setInMemoryCache(`title:${lower}`, current);
             }
@@ -1836,6 +2072,7 @@ export class CriticScoreService {
           this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
             dynamicResolved: true,
             allowOverwritePositive: true,
+            aliasTitle: title,
           });
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, null);
@@ -1878,9 +2115,11 @@ export class CriticScoreService {
 
         const retainSyntheticOrNull = () => {
           if (priorPositiveScore) {
-            if (priorPositiveScore.isSynthetic && onlineLifecycleManager.isOnline() && !hadTransientError) {
+            if (priorPositiveScore.isSynthetic && onlineLifecycleManager.isOnline()) {
               this.cacheResult(cacheKey, priorPositiveScore, effectiveReleaseDate, enrichedGenres, {
                 dynamicResolved: true,
+                aliasTitle: title,
+                customTtlMs: hadTransientError ? TIER_TTLS.fresh : undefined,
               });
             }
             this.setInMemoryCache(cacheKey, priorPositiveScore);
@@ -1895,7 +2134,13 @@ export class CriticScoreService {
 
           const current = this.inMemoryCache.get(cacheKey);
           if (current?.isSynthetic && isCandidateValid(current)) {
-            this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+            if (onlineLifecycleManager.isOnline()) {
+              this.cacheResult(cacheKey, current, effectiveReleaseDate, enrichedGenres, {
+                dynamicResolved: true,
+                aliasTitle: title,
+                customTtlMs: hadTransientError ? TIER_TTLS.fresh : undefined,
+              });
+            }
             if (lower && cacheKey !== `title:${lower}`) {
               this.setInMemoryCache(`title:${lower}`, current);
             }
@@ -1912,16 +2157,49 @@ export class CriticScoreService {
           }
 
           if (hadTransientError) {
-            this.attemptedDynamicResolutions.delete(cacheKey);
-            if (lower) this.attemptedDynamicResolutions.delete(`title:${lower}`);
-            saveStagedCache<CriticScoreData>(stagedKey, null, 'transient_error', {
-              failureReason: 'network_error',
-              dynamicResolved: false,
-            });
+            const prevFailures = this.transientFailureCounts.get(cacheKey) || 0;
+            const nextFailures = prevFailures + 1;
+            this.transientFailureCounts.set(cacheKey, nextFailures);
+            const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+            const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+            const backoffTtlMs = Math.min(
+              TWENTY_FOUR_HOURS_MS,
+              TWO_HOURS_MS * Math.pow(2, nextFailures - 1)
+            );
+            const savedTransient = saveStagedCache<CriticScoreData>(
+              stagedKey,
+              null,
+              'transient_error',
+              {
+                failureReason: 'network_error',
+                dynamicResolved: true,
+                customTtlMs: backoffTtlMs,
+              }
+            );
+            if (lower && stagedKey !== `${STORAGE_PREFIX}title:${lower}`) {
+              const titleStagedKey = `${STORAGE_PREFIX}title:${lower}`;
+              const existingTitleStaged = loadStagedCache<CriticScoreData>(titleStagedKey, false);
+              if (
+                !existingTitleStaged.entry ||
+                (existingTitleStaged.entry.tier !== MutabilityTier.TIER_0_USER_OVERRIDE &&
+                  existingTitleStaged.entry.tier !== 'override')
+              ) {
+                saveStagedCache<CriticScoreData>(titleStagedKey, null, 'transient_error', {
+                  failureReason: 'network_error',
+                  dynamicResolved: true,
+                  cachedAt: savedTransient.cachedAt,
+                  customTtlMs: backoffTtlMs,
+                });
+              }
+            }
             return null;
           }
 
-          this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+          this.transientFailureCounts.delete(cacheKey);
+          this.cacheResult(cacheKey, null, effectiveReleaseDate, enrichedGenres, {
+            dynamicResolved: true,
+            aliasTitle: title,
+          });
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, null);
           }
@@ -1955,7 +2233,11 @@ export class CriticScoreService {
           if (userOverride && userOverride.reviewScoreOverride !== undefined) {
             return;
           }
-          this.cacheResult(cacheKey, data, effectiveReleaseDate, enrichedGenres, { dynamicResolved: true });
+          this.transientFailureCounts.delete(cacheKey);
+          this.cacheResult(cacheKey, data, effectiveReleaseDate, enrichedGenres, {
+            dynamicResolved: true,
+            aliasTitle: title,
+          });
           if (lower && cacheKey !== `title:${lower}`) {
             this.setInMemoryCache(`title:${lower}`, data);
           }
@@ -2351,7 +2633,13 @@ export class CriticScoreService {
     data: CriticScoreData | null,
     releaseDate?: string | Date | number | null,
     genres?: string[] | string | null,
-    options?: { dynamicResolved?: boolean; allowOverwritePositive?: boolean }
+    options?: {
+      dynamicResolved?: boolean;
+      allowOverwritePositive?: boolean;
+      aliasTitle?: string;
+      customTtlMs?: number;
+      cachedAt?: number;
+    }
   ): void {
     const stagedKey = key.startsWith(STORAGE_PREFIX) ? key : `${STORAGE_PREFIX}${key}`;
     const existingStaged = loadStagedCache<CriticScoreData>(stagedKey, false);
@@ -2361,6 +2649,7 @@ export class CriticScoreService {
     ) {
       return;
     }
+    const rawKey = key.startsWith(STORAGE_PREFIX) ? key.slice(STORAGE_PREFIX.length) : key;
     if (data && typeof data.score === 'number' && data.score > 0) {
       this.setInMemoryCache(key, data);
       const overrideMeta = data as CriticScoreData & { isUserOverride?: boolean };
@@ -2369,12 +2658,34 @@ export class CriticScoreService {
         genres,
         isOverride: Boolean(overrideMeta.isUserOverride || (data.tier as string) === 'override'),
       });
-      saveStagedCache<CriticScoreData>(stagedKey, data, tier, {
+      const savedEntry = saveStagedCache<CriticScoreData>(stagedKey, data, tier, {
         source: data.source,
         isVerified: data.isVerified,
         dynamicResolved: options?.dynamicResolved,
+        customTtlMs: options?.customTtlMs,
+        cachedAt: options?.cachedAt,
       });
-      const rawKey = key.startsWith(STORAGE_PREFIX) ? key.slice(STORAGE_PREFIX.length) : key;
+      if (options?.dynamicResolved && rawKey.startsWith('id:') && options?.aliasTitle) {
+        const lowerAlias = options.aliasTitle.trim().toLowerCase();
+        if (lowerAlias) {
+          const titleStagedKey = `${STORAGE_PREFIX}title:${lowerAlias}`;
+          const existingTitleStaged = loadStagedCache<CriticScoreData>(titleStagedKey, false);
+          if (
+            !existingTitleStaged.entry ||
+            (existingTitleStaged.entry.tier !== MutabilityTier.TIER_0_USER_OVERRIDE &&
+              existingTitleStaged.entry.tier !== 'override')
+          ) {
+            this.setInMemoryCache(`title:${lowerAlias}`, data);
+            saveStagedCache<CriticScoreData>(titleStagedKey, data, tier, {
+              source: data.source,
+              isVerified: data.isVerified,
+              dynamicResolved: true,
+              cachedAt: savedEntry.cachedAt,
+              customTtlMs: savedEntry.ttlMs,
+            });
+          }
+        }
+      }
       if (rawKey.startsWith('title:')) {
         const normKey = normalizeCriticTitleKey(rawKey.slice(6));
         if (normKey) {
@@ -2398,10 +2709,39 @@ export class CriticScoreService {
         return;
       }
       this.setInMemoryCache(key, null);
-      saveStagedCache<CriticScoreData>(stagedKey, null, 'negative', {
+      const savedNeg = saveStagedCache<CriticScoreData>(stagedKey, null, 'negative', {
         failureReason: 'not_found',
         dynamicResolved: options?.dynamicResolved,
+        customTtlMs: options?.customTtlMs,
+        cachedAt: options?.cachedAt,
       });
+      if (options?.dynamicResolved && rawKey.startsWith('id:') && options?.aliasTitle) {
+        const lowerAlias = options.aliasTitle.trim().toLowerCase();
+        if (lowerAlias) {
+          const titleStagedKey = `${STORAGE_PREFIX}title:${lowerAlias}`;
+          const existingTitleStaged = loadStagedCache<CriticScoreData>(titleStagedKey, false);
+          if (
+            !existingTitleStaged.entry ||
+            (existingTitleStaged.entry.tier !== MutabilityTier.TIER_0_USER_OVERRIDE &&
+              existingTitleStaged.entry.tier !== 'override')
+          ) {
+            const hasPositiveTitle =
+              !options?.allowOverwritePositive &&
+              existingTitleStaged.data &&
+              typeof existingTitleStaged.data.score === 'number' &&
+              existingTitleStaged.data.score > 0;
+            if (!hasPositiveTitle) {
+              this.setInMemoryCache(`title:${lowerAlias}`, null);
+              saveStagedCache<CriticScoreData>(titleStagedKey, null, 'negative', {
+                failureReason: 'not_found',
+                dynamicResolved: true,
+                cachedAt: savedNeg.cachedAt,
+                customTtlMs: savedNeg.ttlMs,
+              });
+            }
+          }
+        }
+      }
     }
   }
 }

@@ -57,6 +57,13 @@ export interface XboxDeliveryHints {
   satisfyingEntitlementKeys?: string[];
 }
 
+export type MediaSyncOutcome =
+  | 'complete'
+  | 'partial_no_trailers'
+  | 'partial_no_screenshots'
+  | 'unavailable_404'
+  | 'transient_error';
+
 export interface SteamEnrichedMetadata {
   appId: number;
   name: string;
@@ -97,6 +104,13 @@ export interface SteamEnrichedMetadata {
     | 'skeleton_fallback';
   enrichedSource?: 'steam' | 'gog' | 'epic' | 'xbox' | 'igdb';
   fetchedAt?: number;
+  enrichedAt?: number;
+  lastMediaSyncAttemptAt?: number;
+  mediaSyncOutcome?: MediaSyncOutcome;
+  mediaSyncFailureCount?: number;
+  __quotaSlimmed?: boolean;
+  hasScreenshotsCount?: number;
+  hasMoviesCount?: number;
   achievements?: {
     total: number;
     highlighted?: Array<{

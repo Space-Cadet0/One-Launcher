@@ -618,7 +618,21 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     });
   }, [game]);
 
-  const userOverride = useMemo(() => getUserOverrideForGame(game), [game]);
+  const [overrideTick, setOverrideTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
+    const handleOverrideEvent = () => setOverrideTick((t) => t + 1);
+    window.addEventListener('antigravity:user-override-updated', handleOverrideEvent);
+    window.addEventListener('antigravity:user-override-removed', handleOverrideEvent);
+    return () => {
+      window.removeEventListener('antigravity:user-override-updated', handleOverrideEvent);
+      window.removeEventListener('antigravity:user-override-removed', handleOverrideEvent);
+    };
+  }, []);
+
+  const userOverride = useMemo(() => getUserOverrideForGame(game), [game, overrideTick]);
   const metadataRoute = useMemo(
     () => inferMetadataRouteFromOverride(userOverride),
     [userOverride]
@@ -1448,11 +1462,17 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       : currentGame.headerImage || metadata?.headerImage;
 
   const rawEffectiveHeaderImage =
-    (isDynamicRouted
-      ? candidateMetaHeader || userOverride?.headerImage
-      : userOverride?.headerImage || candidateMetaHeader) ||
+    userOverride?.headerImage ||
+    candidateMetaHeader ||
     currentGame.headerImage ||
     game.headerImage;
+
+  const headerOverrideToken = userOverride?.headerImage
+    ? userOverride.updatedAt || '1'
+    : undefined;
+  const coverOverrideToken = userOverride?.capsuleImage
+    ? userOverride.updatedAt || '1'
+    : undefined;
 
   const effectiveHeaderImage = rawEffectiveHeaderImage
     ? toOlMediaUrl({
@@ -1466,12 +1486,16 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         xboxProductId: effectiveXboxProductId,
         packageFamilyName: effectivePackageFamilyName,
         xboxTitleId: effectiveXboxTitleId,
+        ov: headerOverrideToken,
       })
     : undefined;
 
-  const fallbackHeroImage = currentGame.capsuleImage
+  const rawFallbackHeroImage =
+    userOverride?.capsuleImage || currentGame.capsuleImage || game.capsuleImage;
+
+  const fallbackHeroImage = rawFallbackHeroImage
     ? toOlMediaUrl({
-        url: currentGame.capsuleImage,
+        url: rawFallbackHeroImage,
         gameId: game.id,
         role: 'cover',
         ordinal: 0,
@@ -1481,6 +1505,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         xboxProductId: effectiveXboxProductId,
         packageFamilyName: effectivePackageFamilyName,
         xboxTitleId: effectiveXboxTitleId,
+        ov: coverOverrideToken,
       })
     : undefined;
 
@@ -1864,6 +1889,8 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             xboxProductId={effectiveXboxProductId}
             packageFamilyName={effectivePackageFamilyName}
             xboxTitleId={effectiveXboxTitleId}
+            headerOverrideToken={headerOverrideToken}
+            coverOverrideToken={coverOverrideToken}
           />
         </div>
 

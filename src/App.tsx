@@ -5,6 +5,7 @@ import {
   useRef,
   useCallback,
   useDeferredValue,
+  startTransition,
   lazy,
   Suspense,
 } from 'react';
@@ -16,6 +17,11 @@ import {
   DEFAULT_LIBRARY_FILTER_STATE,
   activeGameFilterToLibraryFilterState,
 } from './contracts/filter';
+import type {
+  EnvironmentComponentId,
+  SetupWizardOpenMode,
+  SetupWizardStepId,
+} from './contracts/environmentSetup';
 import { TopNavBar } from './components/Navigation/TopNavBar';
 import { GlobalSyncProgressBar } from './components/Navigation/GlobalSyncProgressBar';
 import { LibrarySidebar } from './components/Library/LibrarySidebar';
@@ -44,6 +50,13 @@ import {
   evaluateLibraryFilter,
 } from './services/filter/libraryFilterIndex';
 import { launcherService } from './services/launcher/launcherService';
+import {
+  environmentSetupService,
+  getRemovedComponents,
+  OPEN_SYSTEM_SETUP_EVENT,
+  shouldAutoOpenSetupWizardOnStartup,
+  type OpenSystemSetupEventDetail,
+} from './services/launcher/environmentSetupService';
 import { useNavigationHistory } from './hooks/useNavigationHistory';
 import { useCriticScoreWarmup } from './hooks/useCriticScoreWarmup';
 import { useCollectionsManager } from './hooks/useCollectionsManager';
@@ -70,16 +83,16 @@ const IntegrationsModal = lazy(() =>
     default: m.IntegrationsModal,
   }))
 );
-const FixMatchWizardModal = lazy(() =>
+const loadFixMatchWizardModal = () =>
   import('./components/Library/FixMatchWizardModal').then((m) => ({
     default: m.FixMatchWizardModal,
-  }))
-);
-const LibraryMatchManagerModal = lazy(() =>
+  }));
+const loadLibraryMatchManagerModal = () =>
   import('./components/Library/LibraryMatchManagerModal').then((m) => ({
     default: m.LibraryMatchManagerModal,
-  }))
-);
+  }));
+const FixMatchWizardModal = lazy(loadFixMatchWizardModal);
+const LibraryMatchManagerModal = lazy(loadLibraryMatchManagerModal);
 const GameAchievementsModal = lazy(() =>
   import('./components/Achievements/GameAchievementsModal').then((m) => ({
     default: m.GameAchievementsModal,
@@ -90,6 +103,11 @@ const DownloadManagerDrawer = lazy(() =>
     default: m.DownloadManagerDrawer,
   }))
 );
+const loadSystemSetupWizardModal = () =>
+  import('./components/Launcher/SystemSetupWizard/SystemSetupWizardModal').then((m) => ({
+    default: m.SystemSetupWizardModal,
+  }));
+const SystemSetupWizardModal = lazy(loadSystemSetupWizardModal);
 
 function areShallowValuesEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -246,6 +264,7 @@ export function App() {
   const activeGroupId = currentEntry.activeGroupId;
   const activeFilter = currentEntry.activeFilter;
   const [gridSortBy, setGridSortBy] = useState<GridSortOption>(() => loadPersistedGridSort());
+  const [isCatalogVaultHydrated, setIsCatalogVaultHydrated] = useState<boolean>(false);
 
   const selectedGame = useMemo(() => {
     if (!currentEntry.selectedGameId) {
@@ -432,6 +451,7 @@ export function App() {
     selectedGame,
     isGridView,
     navigateHome,
+    gamesRef: gamesLatestRef,
     setGames,
     setGameRefreshKey,
     showSyncNotice,
@@ -444,6 +464,19 @@ export function App() {
     StorefrontId | undefined
   >(undefined);
   const [isDownloadDrawerOpen, setIsDownloadDrawerOpen] = useState(false);
+  const [isSystemSetupOpen, setIsSystemSetupOpen] = useState(false);
+  const [systemSetupMode, setSystemSetupMode] = useState<SetupWizardOpenMode>('health_check');
+  const [systemSetupInitialStep, setSystemSetupInitialStep] = useState<
+    SetupWizardStepId | undefined
+  >(undefined);
+  const [systemSetupFocusComponent, setSystemSetupFocusComponent] = useState<
+    EnvironmentComponentId | undefined
+  >(undefined);
+  const [systemSetupAlertCount, setSystemSetupAlertCount] = useState<number>(
+    () => environmentSetupService.getLastSnapshot()?.counts.removedSinceLastSetupCount || 0
+  );
+  const hasCheckedStartupWizardRef = useRef(false);
+  const setupSessionBaselineSigRef = useRef<string>('');
 
   const lastExplicitlySavedCatalogRef = useRef<CanonicalGame[] | null>(null);
   const prevCommittedCatalogRef = useRef<CanonicalGame[]>(games);
@@ -511,7 +544,12 @@ export function App() {
           setGames(next);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) {
+          setIsCatalogVaultHydrated(true);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -551,21 +589,71 @@ export function App() {
     } catch {
       return prevConnectedStorefrontsRef.current;
     }
-  }, [games, isIntegrationsModalOpen, gameRefreshKey]);
+  }, [games, isIntegrationsModalOpen, isSystemSetupOpen, gameRefreshKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const win = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    let idleHandle: number | null = null;
+    let timerHandle: ReturnType<typeof setTimeout> | null = null;
+    const preloadModals = () => {
+      void loadLibraryMatchManagerModal().catch(() => {});
+      void loadFixMatchWizardModal().catch(() => {});
+    };
+    if (typeof win.requestIdleCallback === 'function') {
+      idleHandle = win.requestIdleCallback(preloadModals, { timeout: 2500 });
+    } else {
+      timerHandle = setTimeout(preloadModals, 1500);
+    }
+    return () => {
+      if (idleHandle !== null && typeof win.cancelIdleCallback === 'function') {
+        win.cancelIdleCallback(idleHandle);
+      }
+      if (timerHandle !== null) {
+        clearTimeout(timerHandle);
+      }
+    };
+  }, []);
+
+  const isInteractiveModalBusy =
+    isMatchManagerOpen || isFixMatchModalOpen || isIntegrationsModalOpen || isSystemSetupOpen;
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.offlineVault) return;
+    const vault = window.electronAPI.offlineVault as typeof window.electronAPI.offlineVault & {
+      setModalBusy?: (busy: boolean) => Promise<unknown> | void;
+    };
+    const notifyBusy = (busy: boolean) => {
+      try {
+        const maybePromise = vault.setModalBusy?.(busy);
+        if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === 'function') {
+          void (maybePromise as Promise<unknown>).catch(() => {});
+        }
+      } catch {}
+    };
+    notifyBusy(isInteractiveModalBusy);
+    return () => {
+      if (isInteractiveModalBusy) {
+        notifyBusy(false);
+      }
+    };
+  }, [isInteractiveModalBusy]);
 
   useLocalInstallSync({
     gamesRef: gamesLatestRef,
     setGames,
     overlayLauncherInstalledState,
     showSyncNotice,
+    isModalOpen: isInteractiveModalBusy,
   });
-
-  const isInteractiveModalBusy =
-    isMatchManagerOpen || isFixMatchModalOpen || isIntegrationsModalOpen;
 
   useCriticScoreWarmup(
     games,
-    isHibernating || runningGames.length > 0 || isInteractiveModalBusy
+    isHibernating || runningGames.length > 0 || isInteractiveModalBusy,
+    !isCatalogVaultHydrated
   );
 
   useBackgroundMediaWarmup({
@@ -574,6 +662,7 @@ export function App() {
     isHibernating,
     runningGamesCount: runningGames.length,
     isModalSuspended: isInteractiveModalBusy,
+    isBootHydrating: !isCatalogVaultHydrated,
     setGames,
     setIsSyncingAllMedia,
   });
@@ -815,7 +904,9 @@ export function App() {
 
   const handleCloseMatchManager = useCallback(() => {
     setIsMatchManagerOpen(false);
-  }, [setIsMatchManagerOpen]);
+    setIsFixMatchModalOpen(false);
+    setFixMatchGame(null);
+  }, [setFixMatchGame, setIsFixMatchModalOpen, setIsMatchManagerOpen]);
 
   const handleTopNavOpenAchievements = useCallback(() => {
     handleOpenAchievements();
@@ -828,6 +919,142 @@ export function App() {
   const handleCloseDownloadDrawer = useCallback(() => {
     setIsDownloadDrawerOpen(false);
   }, []);
+
+  const computeSetupSessionSignature = useCallback((): string => {
+    const ws = environmentSetupService.getWizardState();
+    let connectedSig = '';
+    try {
+      connectedSig = loadIntegrations()
+        .filter((i) => i.isConnected)
+        .map((i) => i.storefrontId)
+        .join(',');
+    } catch {}
+    return `${ws?.completedAt ?? ''}|${(ws?.configuredComponents ?? []).join(',')}|${connectedSig}`;
+  }, []);
+
+  const handleOpenSystemSetup = useCallback(
+    (
+      mode: SetupWizardOpenMode = 'health_check',
+      initialStep?: SetupWizardStepId,
+      focusComponentId?: EnvironmentComponentId
+    ) => {
+      setupSessionBaselineSigRef.current = computeSetupSessionSignature();
+      setSystemSetupMode(mode);
+      setSystemSetupInitialStep(initialStep);
+      setSystemSetupFocusComponent(focusComponentId);
+      setIsSystemSetupOpen(true);
+    },
+    [computeSetupSessionSignature]
+  );
+
+  const handleCloseSystemSetup = useCallback(() => {
+    const didSetupOrAccountsChange =
+      computeSetupSessionSignature() !== setupSessionBaselineSigRef.current;
+    setIsSystemSetupOpen(false);
+    setSystemSetupInitialStep(undefined);
+    setSystemSetupFocusComponent(undefined);
+    if (didSetupOrAccountsChange) {
+      startTransition(() => {
+        setGameRefreshKey((k) => k + 1);
+      });
+    }
+  }, [computeSetupSessionSignature]);
+
+  const handleTopNavOpenSystemSetup = useCallback(() => {
+    handleOpenSystemSetup('health_check');
+  }, [handleOpenSystemSetup]);
+
+  useEffect(() => {
+    const syncAlertCount = () => {
+      const snap = environmentSetupService.getLastSnapshot();
+      const nextCount = snap
+        ? getRemovedComponents(snap).filter(
+            (comp) => !(snap.hostPlatform === 'darwin' && comp.id === 'rosetta2')
+          ).length
+        : 0;
+      setSystemSetupAlertCount((prev) => (prev === nextCount ? prev : nextCount));
+    };
+    syncAlertCount();
+    return environmentSetupService.subscribe(syncAlertCount);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const handleOpenEvent = (event: Event) => {
+      const detail = (event as CustomEvent<OpenSystemSetupEventDetail | undefined>).detail;
+      handleOpenSystemSetup(
+        detail?.mode || 'health_check',
+        detail?.initialStep,
+        detail?.focusComponentId
+      );
+    };
+    window.addEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
+    return () => {
+      window.removeEventListener(OPEN_SYSTEM_SETUP_EVENT, handleOpenEvent);
+    };
+  }, [handleOpenSystemSetup]);
+
+  useEffect(() => {
+    if (!isCatalogVaultHydrated || hasCheckedStartupWizardRef.current) return;
+    hasCheckedStartupWizardRef.current = true;
+
+    let cancelled = false;
+    let idleHandle: number | null = null;
+    let timerHandle: ReturnType<typeof setTimeout> | null = null;
+    const win =
+      typeof window !== 'undefined'
+        ? (window as Window & {
+            requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
+            cancelIdleCallback?: (id: number) => void;
+          })
+        : undefined;
+
+    void environmentSetupService
+      .loadWizardState()
+      .then((wizardState) => {
+        if (cancelled) return;
+        const isElectronRuntime =
+          typeof window !== 'undefined' && Boolean(window.electronAPI?.isElectron);
+        const shouldAutoOpen = shouldAutoOpenSetupWizardOnStartup({
+          wizardState,
+          connectedStorefrontsCount: connectedStorefronts.length,
+          catalogGamesCount: gamesLatestRef.current.length,
+          isElectronRuntime,
+        });
+
+        if (shouldAutoOpen) {
+          handleOpenSystemSetup('first_launch');
+          return;
+        }
+
+        if (
+          isElectronRuntime &&
+          typeof window !== 'undefined' &&
+          typeof window.electronAPI?.probeEnvironmentHealth === 'function'
+        ) {
+          const runIdleProbe = () => {
+            if (cancelled) return;
+            void environmentSetupService.probeHealth(connectedStorefronts).catch(() => {});
+          };
+          if (win && typeof win.requestIdleCallback === 'function') {
+            idleHandle = win.requestIdleCallback(runIdleProbe, { timeout: 4000 });
+          } else {
+            timerHandle = setTimeout(runIdleProbe, 3000);
+          }
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (idleHandle !== null && win && typeof win.cancelIdleCallback === 'function') {
+        win.cancelIdleCallback(idleHandle);
+      }
+      if (timerHandle !== null) {
+        clearTimeout(timerHandle);
+      }
+    };
+  }, [connectedStorefronts, handleOpenSystemSetup, isCatalogVaultHydrated]);
 
   const handleMainScroll = useCallback(() => {
     if (mainContentRef.current) {
@@ -890,6 +1117,7 @@ export function App() {
       lastExplicitlySavedCatalogRef.current = newGames;
       prevCommittedCatalogRef.current = newGames;
       setGames(newGames);
+      setGameRefreshKey((k) => k + 1);
       saveCurrentCatalog(newGames, { skipSanitize: true });
       if (
         newGames.length > 0 &&
@@ -968,6 +1196,8 @@ export function App() {
         onSyncTrophies={handleSyncTrophies}
         onOpenFixMatch={handleTopNavOpenFixMatch}
         onOpenLibraryMatchManager={handleOpenMatchManager}
+        onOpenSystemSetup={handleTopNavOpenSystemSetup}
+        systemSetupAlertCount={systemSetupAlertCount}
         onOpenAchievements={handleTopNavOpenAchievements}
         onOpenDownloads={handleOpenDownloadDrawer}
       />
@@ -1113,21 +1343,6 @@ export function App() {
         </Suspense>
       )}
 
-      {/* Modal: Fix Match & Metadata Override Wizard */}
-      {isFixMatchModalOpen && (
-        <Suspense fallback={null}>
-          <FixMatchWizardModal
-            isOpen={isFixMatchModalOpen}
-            game={fixMatchGame}
-            onClose={handleCloseFixMatchModal}
-            onApplyOverride={handleApplyOverride}
-            onResetOverride={handleResetOverride}
-            onHideGame={handleHideGame}
-            existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
-          />
-        </Suspense>
-      )}
-
       {/* Modal: Library Match & Overrides Studio */}
       {isMatchManagerOpen && (
         <Suspense fallback={null}>
@@ -1145,6 +1360,21 @@ export function App() {
             onUnhideEntry={handleUnhideEntry}
             onGameUpdated={handleGameUpdated}
             onGamesBatchUpdated={handleGamesBatchUpdated}
+          />
+        </Suspense>
+      )}
+
+      {/* Modal: Fix Match & Metadata Override Wizard */}
+      {isFixMatchModalOpen && (
+        <Suspense fallback={null}>
+          <FixMatchWizardModal
+            isOpen={isFixMatchModalOpen}
+            game={fixMatchGame}
+            onClose={handleCloseFixMatchModal}
+            onApplyOverride={handleApplyOverride}
+            onResetOverride={handleResetOverride}
+            onHideGame={handleHideGame}
+            existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
           />
         </Suspense>
       )}
@@ -1167,6 +1397,22 @@ export function App() {
           <DownloadManagerDrawer
             isOpen={isDownloadDrawerOpen}
             onClose={handleCloseDownloadDrawer}
+          />
+        </Suspense>
+      )}
+
+      {/* Modal: Unified System Setup Wizard & Environment Health / Repair */}
+      {isSystemSetupOpen && (
+        <Suspense fallback={null}>
+          <SystemSetupWizardModal
+            isOpen={isSystemSetupOpen}
+            mode={systemSetupMode}
+            initialStep={systemSetupInitialStep}
+            focusComponentId={systemSetupFocusComponent}
+            connectedStorefronts={connectedStorefronts}
+            onClose={handleCloseSystemSetup}
+            onOpenIntegrationsModal={handleOpenIntegrationsModal}
+            onLibraryUpdated={handleIntegrationsLibraryUpdated}
           />
         </Suspense>
       )}

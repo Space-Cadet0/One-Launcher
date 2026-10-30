@@ -3,6 +3,7 @@ import { StorefrontId, STOREFRONT_REGISTRY } from '../../contracts/platform';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { CanonicalGame } from '../../contracts/game';
 import { launcherService } from '../../services/launcher/launcherService';
+import { environmentSetupService } from '../../services/launcher/environmentSetupService';
 import type { AppUpdateCheckResult, WindowMenuAction } from '../../types/electron';
 import { ModalShell } from '../Common/ModalShell';
 import {
@@ -18,6 +19,7 @@ import {
   Award,
   Download,
   Sliders,
+  ShieldCheck,
   Minus,
   X,
   Info,
@@ -58,6 +60,8 @@ interface TopNavBarProps {
   onSyncTrophies?: () => void;
   onOpenFixMatch?: () => void;
   onOpenLibraryMatchManager?: () => void;
+  onOpenSystemSetup?: () => void;
+  systemSetupAlertCount?: number;
   defaultMenuOpen?: boolean;
   onOpenAchievements?: () => void;
   onOpenDownloads?: () => void;
@@ -93,6 +97,8 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onSyncTrophies,
   onOpenFixMatch,
   onOpenLibraryMatchManager,
+  onOpenSystemSetup,
+  systemSetupAlertCount,
   defaultMenuOpen = false,
   onOpenAchievements,
   onOpenDownloads,
@@ -405,6 +411,32 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     className="min-h-6 w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
                   >
                     <span>Accounts &amp; Storefronts...</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      if (onOpenSystemSetup) {
+                        onOpenSystemSetup();
+                      } else {
+                        environmentSetupService.openWizard({ mode: 'health_check' });
+                      }
+                    }}
+                    className="min-h-6 w-full flex items-center justify-between px-3 py-1.5 text-xs text-steam-text hover:text-white hover:bg-[#253447] transition-colors text-left cursor-pointer"
+                  >
+                    <span>
+                      Setup Wizard...
+                      {(systemSetupAlertCount || 0) > 0 && (
+                        <span className="sr-only">{` (${systemSetupAlertCount} setup ${systemSetupAlertCount === 1 ? 'alert' : 'alerts'})`}</span>
+                      )}
+                    </span>
+                    {(systemSetupAlertCount || 0) > 0 && (
+                      <span
+                        className="w-2 h-2 rounded-full bg-amber-400 shrink-0 ml-2"
+                        aria-hidden="true"
+                      />
+                    )}
                   </button>
                   <button
                     type="button"
@@ -911,6 +943,49 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                     </div>
                   </button>
                 )}
+
+                {/* 2b. Setup Wizard */}
+                <button
+                  type="button"
+                  role="menuitem"
+                  data-testid="menu-system-setup-health"
+                  onClick={() => {
+                    setIsMenuOpen(false);
+                    if (onOpenSystemSetup) {
+                      onOpenSystemSetup();
+                    } else {
+                      environmentSetupService.openWizard({ mode: 'health_check' });
+                    }
+                  }}
+                  className="min-h-6 w-full flex items-center justify-between px-3.5 py-2 text-xs text-steam-text hover:text-white hover:bg-[#1f2c3d] transition-colors text-left cursor-pointer group"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <ShieldCheck
+                      className="w-4 h-4 shrink-0 text-emerald-400 group-hover:scale-110 transition-transform"
+                      aria-hidden="true"
+                    />
+                    <div className="flex flex-col min-w-0">
+                      <span className="font-semibold text-white truncate">
+                        Setup Wizard
+                        {(systemSetupAlertCount || 0) > 0 && (
+                          <span className="sr-only">{` (${systemSetupAlertCount} setup ${systemSetupAlertCount === 1 ? 'alert' : 'alerts'})`}</span>
+                        )}
+                      </span>
+                      <span className="text-[10px] text-steam-subtext truncate">
+                        {launcherService.getHostPlatform() === 'darwin'
+                          ? 'Accounts, Windows on Mac & launchers'
+                          : 'Accounts & game launchers'}
+                      </span>
+                    </div>
+                  </div>
+                  {(systemSetupAlertCount || 0) > 0 && (
+                    <span
+                      data-testid="menu-system-setup-alert-dot"
+                      aria-hidden="true"
+                      className="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.85)] shrink-0"
+                    />
+                  )}
+                </button>
 
                 {/* Group 2: Library Sync & Refresh */}
                 <div role="presentation" className="mt-1 pt-1.5 border-t border-steam-border/50">
@@ -1419,6 +1494,8 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       onSyncTrophies,
       onOpenFixMatch,
       onOpenLibraryMatchManager,
+      onOpenSystemSetup,
+      systemSetupAlertCount,
       onOpenAchievements,
       onOpenDownloads,
       isMenuOpen,

@@ -80,6 +80,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveLauncherPerformanceSettings: (settings) =>
     ipcRenderer.invoke('launcher:save-performance-settings', settings),
   drainPendingSessions: (opts) => ipcRenderer.invoke('launcher:drain-pending-sessions', opts),
+  probeEnvironmentHealth: (options) =>
+    ipcRenderer.invoke('launcher:probe-environment-health', options),
+  runEnvironmentSetupTasks: (payload) =>
+    ipcRenderer.invoke('launcher:run-environment-setup-tasks', payload),
+  cancelEnvironmentSetup: (runId) =>
+    ipcRenderer.invoke('launcher:cancel-environment-setup', runId),
+  startGuidedClientLogin: (payload) =>
+    ipcRenderer.invoke('launcher:start-guided-client-login', payload),
+  cancelGuidedClientLogin: (targetId) =>
+    ipcRenderer.invoke('launcher:cancel-guided-client-login', targetId),
+  getSetupWizardState: () => ipcRenderer.invoke('launcher:get-setup-wizard-state'),
+  saveSetupWizardState: (patch) =>
+    ipcRenderer.invoke('launcher:save-setup-wizard-state', patch),
+  onEnvironmentSetupProgress: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('launcher:environment-setup-progress', handler);
+    return () => ipcRenderer.removeListener('launcher:environment-setup-progress', handler);
+  },
   clearRendererImageCache: () => {
     try {
       webFrame?.clearCache?.();
@@ -162,6 +180,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     clear: (options) => ipcRenderer.invoke('offlineVault:clear', options),
     getCatalogSnapshot: () => ipcRenderer.invoke('offlineVault:get-catalog-snapshot'),
     upsertGames: (games) => ipcRenderer.invoke('offlineVault:upsert-games', games),
+    deleteGames: (gameIds) => ipcRenderer.invoke('offlineVault:delete-games', gameIds),
+    setModalBusy: (isBusy) => ipcRenderer.invoke('offlineVault:set-modal-busy', isBusy),
     getGameDetail: (gameId) => ipcRenderer.invoke('offlineVault:get-game-detail', gameId),
     saveGameDetail: (payload) => ipcRenderer.invoke('offlineVault:save-game-detail', payload),
     resolveLocalMetadata: (payload) =>

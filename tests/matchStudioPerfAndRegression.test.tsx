@@ -2030,6 +2030,7 @@ describe('Wave 3B — Match Studio Performance & Behavioral Regression Suite (da
       const darwinRoot = createClientComponentRoot(LibraryMatchManagerModal, {
         isOpen: true,
         games: [mergedDarwinGame],
+        initialTab: 'merged',
         onClose: () => {},
         onFixMatchForGame: () => {},
       });
@@ -2066,6 +2067,7 @@ describe('Wave 3B — Match Studio Performance & Behavioral Regression Suite (da
       const winRoot = createClientComponentRoot(LibraryMatchManagerModal, {
         isOpen: true,
         games: [mergedWin32Game],
+        initialTab: 'merged',
         onClose: () => {},
         onFixMatchForGame: () => {},
       });
@@ -2115,11 +2117,11 @@ describe('Wave 3B — Match Studio Performance & Behavioral Regression Suite (da
         const searchLabel = searchLandmark!.querySelector(`label[for="${searchInputId}"]`);
         expect(searchLabel).not.toBeNull();
 
-        // WAI-ARIA tablist -> 7 tabs with roving tabindex & aria-controls <-> tabpanel id linkage
+        // WAI-ARIA tablist -> 5 tabs with roving tabindex & aria-controls <-> tabpanel id linkage
         const tablist = doc.querySelector('[role="tablist"]');
         expect(tablist).not.toBeNull();
         const tabs = Array.from(tablist!.querySelectorAll('[role="tab"]'));
-        expect(tabs).toHaveLength(7);
+        expect(tabs).toHaveLength(5);
         const selectedTabs = tabs.filter((t) => t.getAttribute('aria-selected') === 'true');
         expect(selectedTabs).toHaveLength(1);
         expect(selectedTabs[0].getAttribute('tabindex')).toBe('0');

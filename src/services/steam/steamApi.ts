@@ -56,7 +56,16 @@ import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { requestScheduler, RequestPriority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
+import {
+  evictStagedCache,
+  loadStagedCache,
+  saveStagedCache,
+  STAGED_CACHE_PREFIX,
+} from '../storage/stagedCacheService';
 import { stripHtmlToPlainSynopsis } from './fallbackMetadataProvider';
+
+const STEAM_APPDETAILS_404_KEY_PREFIX = `${STAGED_CACHE_PREFIX}steam_appdetails_404_v1_`;
+const STEAM_APPDETAILS_404_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
  * Truncates rich store HTML at a safe tag/entity/container boundary so `<img ...>`,
@@ -880,6 +889,11 @@ export class SteamApiService {
       return fallbackMetadata;
     }
 
+    const neg404Key = `${STEAM_APPDETAILS_404_KEY_PREFIX}${appId}`;
+    if (!forceRefresh && loadStagedCache<null>(neg404Key, false).valid) {
+      return fallbackMetadata;
+    }
+
     const baseUrl = this.getBaseUrl();
     const url = `${baseUrl}/api/appdetails?appids=${appId}&l=english&cc=US`;
     const gameKey = `steam:${appId}`;
@@ -944,8 +958,16 @@ export class SteamApiService {
 
           const appData = detailsRes.data?.[String(appId)];
           if (!appData || !appData.success || !appData.data) {
+            if (appData && appData.success === false && onlineLifecycleManager.isOnline()) {
+              saveStagedCache<null>(neg404Key, null, 'negative', {
+                failureReason: 'not_found',
+                dynamicResolved: true,
+                customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
+              });
+            }
             return fallbackMetadata;
           }
+          evictStagedCache(neg404Key);
 
           const data = appData.data;
 
@@ -1166,6 +1188,7 @@ export class SteamApiService {
             metadataQuality: 'authoritative',
             enrichedSource: 'steam',
             fetchedAt,
+            enrichedAt: fetchedAt,
             achievements,
             metacritic:
               data.metacritic && typeof data.metacritic.score === 'number'

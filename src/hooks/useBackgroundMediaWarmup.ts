@@ -2,8 +2,6 @@ import { useEffect, useRef, useCallback, Dispatch, SetStateAction, MutableRefObj
 import { CanonicalGame } from '../contracts/game';
 import { launcherService } from '../services/launcher/launcherService';
 import { onlineLifecycleManager } from '../services/network/onlineLifecycleManager';
-import { steamMatcher } from '../services/steam/steamMatcher';
-import { getUserOverrideForGame } from '../services/storage/userOverrideStorage';
 import { mergeUpdatedGamePreservingLivePlatformState } from '../services/integrations/integrationStorage';
 
 export interface UseBackgroundMediaWarmupParams {
@@ -12,6 +10,7 @@ export interface UseBackgroundMediaWarmupParams {
   isHibernating: boolean;
   runningGamesCount: number;
   isModalSuspended?: boolean;
+  isBootHydrating?: boolean;
   setGames: Dispatch<SetStateAction<CanonicalGame[]>>;
   setIsSyncingAllMedia: Dispatch<SetStateAction<boolean>>;
 }
@@ -38,15 +37,19 @@ export function useBackgroundMediaWarmup({
   isHibernating,
   runningGamesCount,
   isModalSuspended = false,
+  isBootHydrating = false,
   setGames,
   setIsSyncingAllMedia,
 }: UseBackgroundMediaWarmupParams): void {
   const autoMediaWarmupRunningRef = useRef<boolean>(false);
   const attemptedWarmupIdsRef = useRef<Set<string>>(new Set());
+  const offlineSkippedIdsRef = useRef<Set<string>>(new Set());
   const pendingWarmupUpdatesRef = useRef<Map<string, CanonicalGame>>(new Map());
   const batchFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isModalSuspendedRef = useRef<boolean>(Boolean(isModalSuspended));
   isModalSuspendedRef.current = Boolean(isModalSuspended);
+  const isBootHydratingRef = useRef<boolean>(Boolean(isBootHydrating));
+  isBootHydratingRef.current = Boolean(isBootHydrating);
   const modalPausedJobIdRef = useRef<string | null>(null);
 
   const flushWarmupBatch = useCallback(() => {
@@ -175,6 +178,8 @@ export function useBackgroundMediaWarmup({
       flushWarmupBatch();
     }
 
+    if (isBootHydrating) return;
+
     if (isSessionSuspended || games.length === 0) return;
 
     let warmupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -184,20 +189,20 @@ export function useBackgroundMediaWarmup({
         clearTimeout(warmupTimer);
         warmupTimer = null;
       }
-      if (isModalSuspendedRef.current) return;
+      if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
       if (!onlineLifecycleManager.isOnline()) return;
 
       warmupTimer = setTimeout(() => {
         warmupTimer = null;
-        if (isModalSuspendedRef.current) return;
+        if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
         if (!onlineLifecycleManager.isOnline()) return;
         if (launcherService.getRunningGames().length > 0) return;
         if (launcherService.isInGameHibernating()) return;
         if (autoMediaWarmupRunningRef.current) return;
 
         void import('../services/network/syncJobManager')
-          .then(({ syncJobManager }) => {
-            if (isModalSuspendedRef.current) return;
+          .then(({ syncJobManager, evaluateGameNeedsStoreMediaSync }) => {
+            if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
             if (!onlineLifecycleManager.isOnline()) return;
             if (launcherService.getRunningGames().length > 0) return;
             if (launcherService.isInGameHibernating()) return;
@@ -216,43 +221,7 @@ export function useBackgroundMediaWarmup({
 
             const gamesNeedingWarmup = gamesRef.current.filter((g) => {
               if (attemptedWarmupIdsRef.current.has(g.id)) return false;
-              const meta = g.enrichedMetadata;
-              const gameExtended = g as CanonicalGame & {
-                platform?: string;
-                xboxProductId?: string;
-              };
-              const isXboxGame =
-                gameExtended.platform === 'xbox' ||
-                Boolean(gameExtended.xboxProductId) ||
-                Boolean(
-                  g.platforms?.some((p) =>
-                    typeof p === 'string'
-                      ? p === 'xbox'
-                      : p?.platformId === 'xbox' || Boolean(p?.xboxProductId)
-                  )
-                );
-              const needsMetadataWarmup =
-                !meta ||
-                meta.metadataQuality === 'skeleton_fallback' ||
-                meta.metadataQuality === 'local_federated' ||
-                meta.metadataQuality === 'storefront_native' ||
-                meta.enrichedSource === 'xbox' ||
-                (!Number(meta.appId) && isXboxGame);
-              if (!needsMetadataWarmup) {
-                return false;
-              }
-              return Boolean(
-                steamMatcher.getEffectiveSteamAppId(g) ||
-                  isXboxGame ||
-                  g.platforms?.some(
-                    (p) =>
-                      typeof p !== 'string' &&
-                      (p?.platformId === 'gog' ||
-                        p?.platformId === 'epic' ||
-                        p?.platformId === 'xbox')
-                  ) ||
-                  getUserOverrideForGame(g)
-              );
+              return evaluateGameNeedsStoreMediaSync(g, false).eligible;
             });
 
             if (gamesNeedingWarmup.length === 0) return;
@@ -261,7 +230,9 @@ export function useBackgroundMediaWarmup({
               attemptedWarmupIdsRef.current.add(g.id);
             }
 
+            const completedInRunIds = new Set<string>();
             const onWarmupGameUpdated = (updatedGame: CanonicalGame) => {
+              completedInRunIds.add(updatedGame.id);
               if (updatedGame.enrichedMetadata?.metadataQuality === 'skeleton_fallback') {
                 return;
               }
@@ -286,6 +257,13 @@ export function useBackgroundMediaWarmup({
               .catch(() => {})
               .finally(() => {
                 autoMediaWarmupRunningRef.current = false;
+                if (!onlineLifecycleManager.isOnline()) {
+                  for (const g of gamesNeedingWarmup) {
+                    if (!completedInRunIds.has(g.id)) {
+                      offlineSkippedIdsRef.current.add(g.id);
+                    }
+                  }
+                }
                 if (!isModalSuspendedRef.current) {
                   flushWarmupBatch();
                 }
@@ -300,8 +278,13 @@ export function useBackgroundMediaWarmup({
     let unsubscribeOnline: (() => void) | null = null;
     try {
       unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
-        attemptedWarmupIdsRef.current.clear();
-        if (!isModalSuspendedRef.current) {
+        if (offlineSkippedIdsRef.current.size > 0) {
+          for (const id of offlineSkippedIdsRef.current) {
+            attemptedWarmupIdsRef.current.delete(id);
+          }
+          offlineSkippedIdsRef.current.clear();
+        }
+        if (!isBootHydratingRef.current && !isModalSuspendedRef.current) {
           scheduleMediaWarmup(isVitestEnv ? 120 : 2500);
         }
       });
@@ -318,6 +301,7 @@ export function useBackgroundMediaWarmup({
     isHibernating,
     runningGamesCount,
     isModalSuspended,
+    isBootHydrating,
     gamesRef,
     setGames,
     flushWarmupBatch,

@@ -166,6 +166,7 @@ class MediaHydrationEngine {
 
     this.isSuspendedInGame = false;
     this.isPausedForDownloads = false;
+    this.isPausedForModal = false;
     this.isDisposed = false;
     this.warmStartUntil = this.now() + this.warmStartDurationMs;
 
@@ -236,6 +237,7 @@ class MediaHydrationEngine {
     const isHydrating =
       !this.isSuspendedInGame &&
       !this.isPausedForDownloads &&
+      !this.isPausedForModal &&
       (this.activeAssetFetches > 0 || this.queuedGames.size > 0);
     return {
       isHydrating,
@@ -245,6 +247,35 @@ class MediaHydrationEngine {
       pendingAssets: this.countPendingAssets(),
       ...(this.activeGameId ? { activeGameId: this.activeGameId } : {}),
     };
+  }
+
+  /**
+   * Pauses background hydration pumping while interactive modals (e.g., Fix Match / Customize Media)
+   * are open so modal search/thumbnail fetches get priority without aborting already in-flight items.
+   *
+   * @param {boolean} isBusy
+   */
+  setModalBusy(isBusy) {
+    const nextBusy = Boolean(isBusy);
+    if (nextBusy === this.isPausedForModal) {
+      return { success: true, isPausedForModal: this.isPausedForModal };
+    }
+    this.isPausedForModal = nextBusy;
+    if (nextBusy) {
+      if (this.pumpTimer) {
+        try {
+          clearTimeout(this.pumpTimer);
+        } catch {}
+        this.pumpTimer = null;
+      }
+      this.emitProgress();
+    } else if (!this.isDisposed) {
+      this.emitProgress();
+      if (!this.isSuspendedInGame && !this.isPausedForDownloads && this.queuedGames.size > 0) {
+        this.schedulePump(200);
+      }
+    }
+    return { success: true, isPausedForModal: this.isPausedForModal };
   }
 
   shouldPauseBackgroundSyncInGame() {
@@ -717,18 +748,31 @@ class MediaHydrationEngine {
         this.recordP1DetailView(gameId);
       }
 
-      const candidateAssets = this.buildAssetDescriptorsForGame(
+      const allDescriptors = this.buildAssetDescriptorsForGame(
         rawGame,
         existingDetail,
         computedPriority
-      ).filter(
+      );
+      const candidateAssets = allDescriptors.filter(
         (asset) =>
-          !this.vault.isAssetAlreadyHydratedOrBackedOff({
+          !this.vault?.isAssetAlreadyHydratedOrBackedOff?.({
             gameId,
             role: asset.role,
             ordinal: asset.ordinal,
             url: asset.url,
           })
+      );
+      const hasBackedOffFailure = allDescriptors.some(
+        (asset) =>
+          Boolean(asset.url) &&
+          Boolean(
+            this.vault?.isAssetBackedOffFailure?.({
+              gameId,
+              role: asset.role,
+              ordinal: asset.ordinal,
+              url: asset.url,
+            })
+          )
       );
 
       const needsLocalMetaAttempt =
@@ -737,6 +781,9 @@ class MediaHydrationEngine {
         existingDetail.metadataQuality === 'skeleton_fallback';
 
       if (candidateAssets.length === 0 && !needsLocalMetaAttempt) {
+        if (!hasBackedOffFailure && !(Number(existingDetail?.mediaHydratedAt) > 0)) {
+          this.vault?.markGameMediaHydrated?.(gameId, this.now());
+        }
         continue;
       }
 
@@ -761,6 +808,9 @@ class MediaHydrationEngine {
       const prevQueued = this.queuedGames.get(gameId);
       if (prevQueued) {
         prevQueued.priority = Math.min(prevQueued.priority, computedPriority);
+        prevQueued.hasPendingAssetFailure = Boolean(
+          prevQueued.hasPendingAssetFailure || hasBackedOffFailure
+        );
         if (!prevQueued.xboxProductId && resolvedXboxProductId) {
           prevQueued.xboxProductId = resolvedXboxProductId;
         }
@@ -790,6 +840,7 @@ class MediaHydrationEngine {
           isFavorited: Boolean(rawGame.isFavorited),
           priority: computedPriority,
           needsLocalMetaAttempt,
+          hasPendingAssetFailure: hasBackedOffFailure,
           assets: candidateAssets,
           enqueuedAt: this.now(),
         });
@@ -805,7 +856,12 @@ class MediaHydrationEngine {
     this.isPausedForDownloads = this.hasActiveDownloadContention();
 
     this.emitProgress();
-    if (!this.isSuspendedInGame && !this.isPausedForDownloads && this.queuedGames.size > 0) {
+    if (
+      !this.isSuspendedInGame &&
+      !this.isPausedForDownloads &&
+      !this.isPausedForModal &&
+      this.queuedGames.size > 0
+    ) {
       this.schedulePump(0);
     }
 
@@ -835,7 +891,14 @@ class MediaHydrationEngine {
   }
 
   schedulePump(delayMs = this.itemDelayMs) {
-    if (this.isDisposed || this.isSuspendedInGame || this.isPausedForDownloads) return;
+    if (
+      this.isDisposed ||
+      this.isSuspendedInGame ||
+      this.isPausedForDownloads ||
+      this.isPausedForModal
+    ) {
+      return;
+    }
     if (this.pumpTimer) return;
     if (this.queuedGames.size === 0) return;
 
@@ -861,7 +924,7 @@ class MediaHydrationEngine {
       this.emitProgress();
       return;
     }
-    if (this.isSuspendedInGame || this.isPausedForDownloads) {
+    if (this.isSuspendedInGame || this.isPausedForDownloads || this.isPausedForModal) {
       return;
     }
 
@@ -961,6 +1024,12 @@ class MediaHydrationEngine {
           requeuedAsset = true;
           // Re-prepend aborted asset so it resumes cleanly after game exit!
           gameTask.assets.unshift(nextAsset);
+        } else if (
+          (!res || res.kind === 'error') &&
+          nextAsset.url &&
+          res?.reason !== 'video_caching_prohibited'
+        ) {
+          gameTask.hasPendingAssetFailure = true;
         }
       } else if (nextAsset && abortCtrl.signal.aborted) {
         aborted = true;
@@ -975,6 +1044,9 @@ class MediaHydrationEngine {
           gameTask.assets.unshift(nextAsset);
         }
       } else {
+        if (nextAsset && nextAsset.url) {
+          gameTask.hasPendingAssetFailure = true;
+        }
         diagLog.debug('hydrationEngine.step', err, { gameId });
       }
     } finally {
@@ -985,6 +1057,9 @@ class MediaHydrationEngine {
       if (!aborted && gameTask.assets.length === 0 && !gameTask.needsLocalMetaAttempt) {
         this.queuedGames.delete(gameId);
         this.completedGames++;
+        if (!this.isDisposed && !gameTask.hasPendingAssetFailure) {
+          this.vault?.markGameMediaHydrated?.(gameId, this.now());
+        }
         const detail = this.vault ? this.vault.getGameDetail(gameId) : undefined;
         this.emitGameHydrated({ gameId, ...(detail ? { detail } : {}) });
       }
@@ -995,7 +1070,12 @@ class MediaHydrationEngine {
 
       this.emitProgress();
 
-      if (!this.isDisposed && !this.isSuspendedInGame && !this.isPausedForDownloads) {
+      if (
+        !this.isDisposed &&
+        !this.isSuspendedInGame &&
+        !this.isPausedForDownloads &&
+        !this.isPausedForModal
+      ) {
         if (this.queuedGames.size > 0) {
           this.schedulePump(this.itemDelayMs);
         }

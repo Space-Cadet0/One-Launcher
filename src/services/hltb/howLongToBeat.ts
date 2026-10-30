@@ -1,6 +1,7 @@
 import { isSequelMismatch, normalizeTitleKey, stripEditionSuffix } from '../common/titleUtils';
 import { requestScheduler, Priority } from '../network/requestScheduler';
-import { vaultSet } from '../storage/indexedDbVault';
+import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import { vaultGet, vaultSet } from '../storage/indexedDbVault';
 
 export interface HltbData {
   mainStoryHours: number;
@@ -29,13 +30,34 @@ export const HLTB_DATABASE: Record<number, HltbData> = {};
 const LEGACY_STORAGE_PREFIX = 'hltb_cache_v2_';
 const CONSOLIDATED_STORAGE_KEY = 'one_launcher_hltb_lru_v3';
 const MAX_HLTB_CACHE_ENTRIES = 1500;
+const NEGATIVE_HLTB_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
-const memoryCache = new Map<string, HltbData>();
+interface CachedHltbRecord extends HltbData {
+  cachedAt?: number;
+  unmatched?: boolean;
+}
+
+const memoryCache = new Map<string, CachedHltbRecord>();
 let cacheHydrated = false;
+let vaultHydrationStarted = false;
 let persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-function setLruEntry(key: string, value: HltbData): void {
-  if (!key || !value || value.isAccurate === false) return;
+function isUnexpiredNegativeHltbEntry(raw: unknown): raw is CachedHltbRecord {
+  if (!raw || typeof raw !== 'object') return false;
+  const candidate = raw as Partial<CachedHltbRecord>;
+  return (
+    candidate.unmatched === true &&
+    typeof candidate.cachedAt === 'number' &&
+    candidate.cachedAt > 0 &&
+    Date.now() - candidate.cachedAt < NEGATIVE_HLTB_TTL_MS
+  );
+}
+
+function setLruEntry(key: string, value: CachedHltbRecord): void {
+  if (!key || !value) return;
+  const isPositive = value.isAccurate !== false && !value.unmatched;
+  const isValidNegative = isUnexpiredNegativeHltbEntry(value);
+  if (!isPositive && !isValidNegative) return;
   if (memoryCache.has(key)) {
     memoryCache.delete(key);
   }
@@ -49,18 +71,21 @@ function setLruEntry(key: string, value: HltbData): void {
 
 function flushConsolidatedHltbCache(): void {
   if (typeof window === 'undefined') return;
-  try {
-    const payload: Record<string, HltbData> = {};
-    for (const [k, v] of memoryCache.entries()) {
-      if (v && v.isAccurate !== false) {
-        payload[k] = v;
-      }
+  const payload: Record<string, CachedHltbRecord> = {};
+  for (const [k, v] of memoryCache.entries()) {
+    if (!v) continue;
+    if (v.isAccurate !== false && !v.unmatched) {
+      payload[k] = v;
+    } else if (isUnexpiredNegativeHltbEntry(v)) {
+      payload[k] = v;
     }
+  }
+  void vaultSet('hltb_lru_v3', payload);
+  try {
     const serialized = JSON.stringify(payload);
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(CONSOLIDATED_STORAGE_KEY, serialized);
     }
-    void vaultSet('hltb_lru_v3', payload);
   } catch {
     // QuotaExceededError: memoryCache + vault retain entries
   }
@@ -83,10 +108,10 @@ function schedulePersistConsolidatedHltbCache(): void {
   }
 }
 
-function isValidHltbEntry(raw: unknown): raw is HltbData {
+function isValidHltbEntry(raw: unknown): raw is CachedHltbRecord {
   if (!raw || typeof raw !== 'object') return false;
-  const candidate = raw as Partial<HltbData>;
-  if (candidate.isAccurate === false) return false;
+  const candidate = raw as Partial<CachedHltbRecord>;
+  if (candidate.isAccurate === false || candidate.unmatched === true) return false;
   return (
     typeof candidate.mainStoryHours === 'number' &&
     typeof candidate.mainExtraHours === 'number' &&
@@ -95,7 +120,42 @@ function isValidHltbEntry(raw: unknown): raw is HltbData {
   );
 }
 
+async function hydrateHltbCacheFromVault(): Promise<void> {
+  if (typeof window === 'undefined') return;
+  try {
+    const vaultPayload = await vaultGet<Record<string, unknown>>('hltb_lru_v3');
+    if (!vaultPayload || typeof vaultPayload !== 'object' || Array.isArray(vaultPayload)) {
+      return;
+    }
+    for (const [k, v] of Object.entries(vaultPayload)) {
+      if (!k || !v || typeof v !== 'object') continue;
+      const existing = memoryCache.get(k);
+      const existingTs = existing?.cachedAt ?? 0;
+      const incomingTs =
+        typeof (v as Partial<CachedHltbRecord>).cachedAt === 'number'
+          ? ((v as Partial<CachedHltbRecord>).cachedAt as number)
+          : 0;
+      if (existing && existing.isAccurate !== false && !existing.unmatched) {
+        if (incomingTs <= existingTs) continue;
+      }
+      if (isValidHltbEntry(v)) {
+        setLruEntry(k, { ...v, isAccurate: true });
+      } else if (isUnexpiredNegativeHltbEntry(v)) {
+        if (!existing || (existing.unmatched && incomingTs > existingTs)) {
+          setLruEntry(k, v);
+        }
+      }
+    }
+  } catch {
+    // Ignore vault hydration errors
+  }
+}
+
 function ensureHltbCacheHydrated(): void {
+  if (typeof window !== 'undefined' && !vaultHydrationStarted) {
+    vaultHydrationStarted = true;
+    void hydrateHltbCacheFromVault();
+  }
   if (cacheHydrated || typeof window === 'undefined' || typeof localStorage === 'undefined') {
     return;
   }
@@ -109,6 +169,8 @@ function ensureHltbCacheHydrated(): void {
         for (const [k, v] of Object.entries(parsed)) {
           if (isValidHltbEntry(v)) {
             setLruEntry(k, { ...v, isAccurate: true });
+          } else if (isUnexpiredNegativeHltbEntry(v)) {
+            setLruEntry(k, v);
           }
         }
       }
@@ -156,10 +218,14 @@ export function normalizeTitleForHltb(title: string): string {
     .trim();
 }
 
-function getCachedHltb(key: string): HltbData | null {
+function getCachedHltb(key: string): CachedHltbRecord | null {
   ensureHltbCacheHydrated();
   if (memoryCache.has(key)) {
     const hit = memoryCache.get(key)!;
+    if (hit.unmatched && !isUnexpiredNegativeHltbEntry(hit)) {
+      memoryCache.delete(key);
+      return null;
+    }
     // Promote LRU order
     memoryCache.delete(key);
     memoryCache.set(key, hit);
@@ -168,7 +234,7 @@ function getCachedHltb(key: string): HltbData | null {
   return null;
 }
 
-function setCachedHltb(key: string, data: HltbData): void {
+function setCachedHltb(key: string, data: CachedHltbRecord): void {
   ensureHltbCacheHydrated();
   setLruEntry(key, data);
   schedulePersistConsolidatedHltbCache();
@@ -268,7 +334,7 @@ export function getHowLongToBeat(
       return { ...HLTB_TITLE_DATABASE[norm], isAccurate: true };
     }
     const cached = getCachedHltb(norm);
-    if (cached && cached.isAccurate !== false) return cached;
+    if (cached && cached.isAccurate !== false && !cached.unmatched) return cached;
   }
 
   // 2. Check appId curated database & verified cache
@@ -278,10 +344,36 @@ export function getHowLongToBeat(
 
   if (id) {
     const cached = getCachedHltb(`app_${id}`);
-    if (cached && cached.isAccurate !== false) return cached;
+    if (cached && cached.isAccurate !== false && !cached.unmatched) return cached;
   }
 
   return null;
+}
+
+/**
+ * Checks whether a HowLongToBeat lookup has already resolved positively or negatively within TTL.
+ */
+export function hasAttemptedHltbLookup(gameTitle?: string, appId?: number): boolean {
+  if (!gameTitle && !appId) return true;
+  if (gameTitle) {
+    const norm = normalizeTitleForHltb(gameTitle);
+    if (!norm) return true;
+    if (HLTB_TITLE_DATABASE[norm]) return true;
+    const cached = getCachedHltb(norm);
+    if (cached) {
+      if (cached.isAccurate !== false && !cached.unmatched) return true;
+      if (isUnexpiredNegativeHltbEntry(cached)) return true;
+    }
+  }
+  if (appId) {
+    if (HLTB_DATABASE[appId]) return true;
+    const cachedApp = getCachedHltb(`app_${appId}`);
+    if (cachedApp) {
+      if (cachedApp.isAccurate !== false && !cachedApp.unmatched) return true;
+      if (isUnexpiredNegativeHltbEntry(cachedApp)) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -299,23 +391,49 @@ export async function fetchAndCacheHltb(
   }
 
   const cached = getCachedHltb(norm);
-  if (cached && cached.isAccurate) {
-    return cached;
+  if (cached) {
+    if (cached.isAccurate && !cached.unmatched) {
+      return cached;
+    }
+    if (isUnexpiredNegativeHltbEntry(cached)) {
+      return null;
+    }
   }
+
+  const recordNegativeIfCleanOnline = (completedCleanlyOnline: boolean): null => {
+    if (completedCleanlyOnline && onlineLifecycleManager.isOnline()) {
+      const negRecord: CachedHltbRecord = {
+        mainStoryHours: 0,
+        mainExtraHours: 0,
+        completionistHours: 0,
+        allStylesHours: 0,
+        isAccurate: false,
+        unmatched: true,
+        cachedAt: Date.now(),
+      };
+      setCachedHltb(norm, negRecord);
+      if (appId) {
+        setCachedHltb(`app_${appId}`, negRecord);
+      }
+    }
+    return null;
+  };
 
   try {
     let rawResults: HltbSearchResultItem[] = [];
+    let completedCleanlyOnline = false;
 
     // Option 1: Native Electron IPC
     if (typeof window !== 'undefined' && window.electronAPI?.searchHltb) {
       const res = await window.electronAPI.searchHltb(gameTitle);
       if (res && res.success && Array.isArray(res.data)) {
         rawResults = res.data as HltbSearchResultItem[];
+        completedCleanlyOnline = true;
       }
     }
 
     // Option 2: Browser proxy or direct fetch
-    if (rawResults.length === 0 && typeof window !== 'undefined') {
+    if (rawResults.length === 0 && !completedCleanlyOnline && typeof window !== 'undefined') {
       try {
         const isLocalhost = window.location.hostname === 'localhost';
         const initUrl = isLocalhost
@@ -383,6 +501,7 @@ export async function fetchAndCacheHltb(
               const sData = (await sRes.json()) as { data?: HltbSearchResultItem[] };
               if (Array.isArray(sData.data)) {
                 rawResults = sData.data;
+                completedCleanlyOnline = true;
               }
             }
           }
@@ -392,10 +511,14 @@ export async function fetchAndCacheHltb(
       }
     }
 
-    if (rawResults.length === 0) return null;
+    if (rawResults.length === 0) {
+      return recordNegativeIfCleanOnline(completedCleanlyOnline);
+    }
 
     const match = findBestHltbMatch(gameTitle, rawResults);
-    if (!match) return null;
+    if (!match) {
+      return recordNegativeIfCleanOnline(completedCleanlyOnline);
+    }
 
     const roundHalf = (sec?: number): number =>
       sec && sec > 0 ? Math.round((sec / 3600) * 2) / 2 : 0;
@@ -405,7 +528,12 @@ export async function fetchAndCacheHltb(
     const compHours = roundHalf(match.comp_100);
     const allHours = roundHalf(match.comp_all) || mainHours;
 
-    const hltbData: HltbData = {
+    if (mainHours === 0 && extraHours === 0 && compHours === 0 && allHours === 0) {
+      return recordNegativeIfCleanOnline(completedCleanlyOnline);
+    }
+
+    const nowTs = Date.now();
+    const hltbData: CachedHltbRecord = {
       mainStoryHours: mainHours,
       mainExtraHours: extraHours,
       completionistHours: compHours,
@@ -413,6 +541,7 @@ export async function fetchAndCacheHltb(
       gameplayType: match.game_type === 'game' ? 'Full Game' : match.game_type || 'Game',
       hltbGameId: match.game_id,
       isAccurate: true,
+      cachedAt: nowTs,
     };
 
     setCachedHltb(norm, hltbData);
@@ -426,4 +555,9 @@ export async function fetchAndCacheHltb(
     console.warn('[HLTB] Failed to fetch live HowLongToBeat data:', message);
     return null;
   }
+}
+
+if (typeof window !== 'undefined') {
+  vaultHydrationStarted = true;
+  void hydrateHltbCacheFromVault();
 }

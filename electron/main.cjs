@@ -823,6 +823,19 @@ if (!gotTheLock) {
 
     createMainWindow();
 
+    if (
+      process.platform === 'darwin' &&
+      process.arch === 'arm64' &&
+      typeof launcherEngine.ensureRosetta2InBackground === 'function'
+    ) {
+      const bgRosettaTimer = setTimeout(() => {
+        void Promise.resolve(launcherEngine.ensureRosetta2InBackground()).catch(() => {});
+      }, 1500);
+      if (typeof bgRosettaTimer.unref === 'function') {
+        bgRosettaTimer.unref();
+      }
+    }
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
         restoreOrCreateMainWindow();

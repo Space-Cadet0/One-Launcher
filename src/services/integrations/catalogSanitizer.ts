@@ -130,11 +130,24 @@ let suppressedMapVersion = 0;
 let cachedSuppressedStorageRef: Storage | null = null;
 let cachedSuppressedRaw: string | null = null;
 let cachedSuppressedRestoredRef: ReadonlySet<string> | null = null;
+let inMemorySuppressedHydrated = false;
+let suppressedStorageListenerAttached = false;
 
 let cachedSuppressedSnapshot: SuppressedCatalogEntry[] | null = null;
 let cachedSnapshotMapVersion = -1;
 let cachedSnapshotHiddenRef: Record<string, unknown> | null = null;
 let cachedSnapshotRestoredRef: ReadonlySet<string> | null = null;
+
+function isTestEnv(): boolean {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test')
+    );
+  } catch {
+    return false;
+  }
+}
 
 function getSafeLocalStorage(): Storage | null {
   try {
@@ -142,6 +155,18 @@ function getSafeLocalStorage(): Storage | null {
     if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
   } catch {}
   return null;
+}
+
+function ensureSuppressedStorageListener(): void {
+  if (suppressedStorageListenerAttached) return;
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  suppressedStorageListenerAttached = true;
+  window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === null || e.key === STORAGE_KEY_SUPPRESSED_ENTRIES) {
+      inMemorySuppressedHydrated = false;
+      cachedSuppressedRaw = null;
+    }
+  });
 }
 
 function addSecondaryIndexKey(index: Map<string, Set<string>>, lookupKey: string, mapKey: string): void {
@@ -157,9 +182,20 @@ function addSecondaryIndexKey(index: Map<string, Set<string>>, lookupKey: string
 function syncSuppressedEntriesWithStorage(): void {
   const storage = getSafeLocalStorage();
   if (!storage) return;
+  ensureSuppressedStorageListener();
+  const restoredRef = getReadonlyRestoredNonGameKeys();
+
+  if (
+    !isTestEnv() &&
+    inMemorySuppressedHydrated &&
+    storage === cachedSuppressedStorageRef &&
+    restoredRef === cachedSuppressedRestoredRef
+  ) {
+    return;
+  }
+
   try {
     const raw = storage.getItem(STORAGE_KEY_SUPPRESSED_ENTRIES);
-    const restoredRef = getReadonlyRestoredNonGameKeys();
     if (!raw) {
       if (hasWrittenSuppressedToStorage || cachedSuppressedRaw !== null) {
         // Storage was explicitly cleared (e.g. in test beforeEach)
@@ -172,14 +208,18 @@ function syncSuppressedEntriesWithStorage(): void {
       cachedSuppressedStorageRef = storage;
       cachedSuppressedRaw = null;
       cachedSuppressedRestoredRef = restoredRef;
+      inMemorySuppressedHydrated = true;
       return;
     }
 
     if (
+      inMemorySuppressedHydrated &&
       storage === cachedSuppressedStorageRef &&
       raw === cachedSuppressedRaw &&
       restoredRef === cachedSuppressedRestoredRef
     ) {
+      // Adopt Blink ExternalString pointer to eliminate O(N) cross-representation string comparisons
+      cachedSuppressedRaw = raw;
       return;
     }
 
@@ -233,6 +273,7 @@ function syncSuppressedEntriesWithStorage(): void {
       cachedSuppressedStorageRef = storage;
       cachedSuppressedRaw = raw;
       cachedSuppressedRestoredRef = restoredRef;
+      inMemorySuppressedHydrated = true;
       if (sawLegacyRawGameBloat) {
         persistSuppressedEntriesToStorage();
       }
@@ -243,6 +284,7 @@ function syncSuppressedEntriesWithStorage(): void {
 function persistSuppressedEntriesToStorage(): void {
   const storage = getSafeLocalStorage();
   if (!storage) return;
+  ensureSuppressedStorageListener();
   try {
     const toPersist: PersistedSuppressedCatalogEntry[] = Array.from(
       lastSuppressedEntries.values()
@@ -267,8 +309,9 @@ function persistSuppressedEntriesToStorage(): void {
     storage.setItem(STORAGE_KEY_SUPPRESSED_ENTRIES, serialized);
     hasWrittenSuppressedToStorage = true;
     cachedSuppressedStorageRef = storage;
-    cachedSuppressedRaw = serialized;
+    cachedSuppressedRaw = isTestEnv() ? serialized : null;
     cachedSuppressedRestoredRef = getReadonlyRestoredNonGameKeys();
+    inMemorySuppressedHydrated = true;
   } catch {}
 }
 
@@ -280,6 +323,7 @@ export function clearSuppressedCatalogEntries(): void {
   hasWrittenSuppressedToStorage = false;
   cachedSuppressedRaw = null;
   cachedSuppressedSnapshot = null;
+  inMemorySuppressedHydrated = true;
   const storage = getSafeLocalStorage();
   if (storage) {
     try {
@@ -2185,6 +2229,17 @@ export function sanitizeGameCatalog(
           primary.headerImage ||
           secondary.headerImage,
         capsuleImage: (() => {
+          const primaryOv = hasUserOverrides
+            ? getUserOverrideForGame(primary, userOverrides)
+            : undefined;
+          const secondaryOv = hasUserOverrides
+            ? getUserOverrideForGame(secondary, userOverrides)
+            : undefined;
+          const pinnedOvCover =
+            primaryOv?.capsuleImage?.trim() || secondaryOv?.capsuleImage?.trim();
+          if (pinnedOvCover) {
+            return pinnedOvCover;
+          }
           if (
             isKnownDeadSteamCover(primary.steamAppId) ||
             isKnownDeadSteamCover(secondary.steamAppId) ||
@@ -2262,72 +2317,87 @@ export function sanitizeGameCatalog(
       ) {
         const existing = cleaned[candidateIndex];
         const prevExistingId = existing.id;
+        const existingOv = hasUserOverrides
+          ? getUserOverrideForGame(existing, userOverrides)
+          : undefined;
+        const gameOv = hasUserOverrides ? getUserOverrideForGame(game, userOverrides) : undefined;
 
         // A. Self-Heal Stale Overwritten Remastered/Enhanced Titles on Same-Storefront Pairs
+        // Never strip title/artwork/steamAppId on an entry with an active UserGameOverride!
         if (
           normalizeCanonicalTitle(existing.title) === normalizeCanonicalTitle(game.title) &&
           /\b(remastered|remaster|enhanced)\b/i.test(existing.title)
         ) {
-          let baseTarget: CanonicalGame;
-          if (existing.platforms.length < game.platforms.length) {
-            baseTarget = existing;
-          } else if (game.platforms.length < existing.platforms.length) {
-            baseTarget = game;
-          } else if (
-            !existing.platforms.some((p) => p.platformId === 'steam') &&
-            game.platforms.some((p) => p.platformId === 'steam')
-          ) {
-            baseTarget = existing;
-          } else if (
-            !game.platforms.some((p) => p.platformId === 'steam') &&
-            existing.platforms.some((p) => p.platformId === 'steam')
-          ) {
-            baseTarget = game;
-          } else {
-            baseTarget = existing;
+          let baseTarget: CanonicalGame | null = null;
+          if (existingOv && !gameOv) {
+            baseTarget = !game.platforms.some((p) => p.platformId === 'steam') ? game : null;
+          } else if (gameOv && !existingOv) {
+            baseTarget = !existing.platforms.some((p) => p.platformId === 'steam')
+              ? existing
+              : null;
+          } else if (!existingOv && !gameOv) {
+            if (existing.platforms.length < game.platforms.length) {
+              baseTarget = existing;
+            } else if (game.platforms.length < existing.platforms.length) {
+              baseTarget = game;
+            } else if (
+              !existing.platforms.some((p) => p.platformId === 'steam') &&
+              game.platforms.some((p) => p.platformId === 'steam')
+            ) {
+              baseTarget = existing;
+            } else if (
+              !game.platforms.some((p) => p.platformId === 'steam') &&
+              existing.platforms.some((p) => p.platformId === 'steam')
+            ) {
+              baseTarget = game;
+            } else {
+              baseTarget = existing;
+            }
           }
 
-          const restoredTitle = baseTarget.title
-            .replace(/\s*[-–—:]?\s*\b(remastered|remaster|enhanced(?:\s+edition)?)\b/gi, '')
-            .replace(/\s{2,}/g, ' ')
-            .trim();
-          const collidingAppId = baseTarget.steamAppId;
-          baseTarget.title = restoredTitle;
-          baseTarget.sortTitle = restoredTitle.replace(/^(The|A|An)\s+/i, '');
-          baseTarget.steamAppId = undefined;
-          baseTarget.enrichedMetadata = undefined;
-          const primaryPlat = baseTarget.platforms?.[0];
-          if (primaryPlat?.platformId && primaryPlat?.platformGameId) {
-            baseTarget.id = `${primaryPlat.platformId}-${primaryPlat.platformGameId}`;
-          }
-          if (collidingAppId) {
-            const appIdToken = `/steam/apps/${collidingAppId}/`;
-            if (baseTarget.headerImage?.includes(appIdToken)) baseTarget.headerImage = '';
-            if (baseTarget.capsuleImage?.includes(appIdToken)) baseTarget.capsuleImage = '';
-            if (baseTarget.iconUrl?.includes(appIdToken)) baseTarget.iconUrl = undefined;
-            const igdbRestored = igdbCoverService.getIgdbCoverInstant(
-              restoredTitle,
-              undefined,
-              baseTarget.id
-            );
-            if (igdbRestored) {
-              baseTarget.capsuleImage = igdbRestored;
-              baseTarget.iconUrl = baseTarget.iconUrl || igdbRestored;
+          if (baseTarget) {
+            const restoredTitle = baseTarget.title
+              .replace(/\s*[-–—:]?\s*\b(remastered|remaster|enhanced(?:\s+edition)?)\b/gi, '')
+              .replace(/\s{2,}/g, ' ')
+              .trim();
+            const collidingAppId = baseTarget.steamAppId;
+            baseTarget.title = restoredTitle;
+            baseTarget.sortTitle = restoredTitle.replace(/^(The|A|An)\s+/i, '');
+            baseTarget.steamAppId = undefined;
+            baseTarget.enrichedMetadata = undefined;
+            const primaryPlat = baseTarget.platforms?.[0];
+            if (primaryPlat?.platformId && primaryPlat?.platformGameId) {
+              baseTarget.id = `${primaryPlat.platformId}-${primaryPlat.platformGameId}`;
             }
-          }
-          if (baseTarget === existing) {
-            titleToIndex.set(normalizeCanonicalTitle(existing.title), candidateIndex);
-            if (collidingAppId && steamIdToIndex.get(collidingAppId) === candidateIndex) {
-              steamIdToIndex.delete(collidingAppId);
+            if (collidingAppId) {
+              const appIdToken = `/steam/apps/${collidingAppId}/`;
+              if (baseTarget.headerImage?.includes(appIdToken)) baseTarget.headerImage = '';
+              if (baseTarget.capsuleImage?.includes(appIdToken)) baseTarget.capsuleImage = '';
+              if (baseTarget.iconUrl?.includes(appIdToken)) baseTarget.iconUrl = undefined;
+              const igdbRestored = igdbCoverService.getIgdbCoverInstant(
+                restoredTitle,
+                undefined,
+                baseTarget.id
+              );
+              if (igdbRestored) {
+                baseTarget.capsuleImage = igdbRestored;
+                baseTarget.iconUrl = baseTarget.iconUrl || igdbRestored;
+              }
             }
-            if (prevExistingId && idToIndex.get(prevExistingId) === candidateIndex) {
-              idToIndex.delete(prevExistingId);
+            if (baseTarget === existing) {
+              titleToIndex.set(normalizeCanonicalTitle(existing.title), candidateIndex);
+              if (collidingAppId && steamIdToIndex.get(collidingAppId) === candidateIndex) {
+                steamIdToIndex.delete(collidingAppId);
+              }
+              if (prevExistingId && idToIndex.get(prevExistingId) === candidateIndex) {
+                idToIndex.delete(prevExistingId);
+              }
+              if (existing.id) {
+                idToIndex.set(existing.id, candidateIndex);
+              }
+            } else {
+              normTitle = normalizeCanonicalTitle(game.title);
             }
-            if (existing.id) {
-              idToIndex.set(existing.id, candidateIndex);
-            }
-          } else {
-            normTitle = normalizeCanonicalTitle(game.title);
           }
         }
 
@@ -2342,37 +2412,65 @@ export function sanitizeGameCatalog(
           const existingHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(existing.title);
           const gameHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(game.title);
 
-          let targetToDemote: CanonicalGame = game;
-          if (existingHasSteam !== gameHasSteam) {
-            targetToDemote = existingHasSteam ? game : existing;
-          } else if (existingHasEdition !== gameHasEdition) {
-            const steamCachedName = sharedAppId
-              ? (steamEnrichedCache as Record<string, SteamEnrichedCacheItem>)[String(sharedAppId)]
-                  ?.name || ''
-              : '';
-            const steamCacheHasEdition = steamCachedName
-              ? /\b(remastered|remaster|remake|enhanced)\b/i.test(steamCachedName)
-              : true;
-            if (steamCacheHasEdition) {
-              targetToDemote = existingHasEdition ? game : existing;
-            } else {
-              targetToDemote = existingHasEdition ? existing : game;
+          if (existingOv && gameOv) {
+            // Both colliding entries have explicit UserGameOverrides: preserve steamAppId, title, and artwork on BOTH,
+            // disambiguating ONLY `id` on the secondary non-Steam entry if their IDs collide!
+            if (existing.id === game.id) {
+              const idDisambigTarget =
+                existingHasSteam && !gameHasSteam
+                  ? game
+                  : !existingHasSteam && gameHasSteam
+                    ? existing
+                    : game;
+              const plat = idDisambigTarget.platforms?.[0];
+              if (plat?.platformId && plat?.platformGameId) {
+                const oldId = idDisambigTarget.id;
+                idDisambigTarget.id = `${plat.platformId}-${plat.platformGameId}`;
+                if (idDisambigTarget === existing) {
+                  if (oldId && idToIndex.get(oldId) === candidateIndex) {
+                    idToIndex.delete(oldId);
+                  }
+                  idToIndex.set(existing.id, candidateIndex);
+                }
+              }
             }
-          }
+          } else {
+            let targetToDemote: CanonicalGame = game;
+            if (existingOv && !gameOv) {
+              targetToDemote = game;
+            } else if (gameOv && !existingOv) {
+              targetToDemote = existing;
+            } else if (existingHasSteam !== gameHasSteam) {
+              targetToDemote = existingHasSteam ? game : existing;
+            } else if (existingHasEdition !== gameHasEdition) {
+              const steamCachedName = sharedAppId
+                ? (steamEnrichedCache as Record<string, SteamEnrichedCacheItem>)[String(sharedAppId)]
+                    ?.name || ''
+                : '';
+              const steamCacheHasEdition = steamCachedName
+                ? /\b(remastered|remaster|remake|enhanced)\b/i.test(steamCachedName)
+                : true;
+              if (steamCacheHasEdition) {
+                targetToDemote = existingHasEdition ? game : existing;
+              } else {
+                targetToDemote = existingHasEdition ? existing : game;
+              }
+            }
 
-          const plat = targetToDemote.platforms?.[0];
-          if (plat?.platformId && plat?.platformGameId) {
-            const oldId = targetToDemote.id;
-            targetToDemote.id = `${plat.platformId}-${plat.platformGameId}`;
-            targetToDemote.steamAppId = undefined;
-            if (targetToDemote === existing) {
-              if (sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
-                steamIdToIndex.delete(sharedAppId);
+            const plat = targetToDemote.platforms?.[0];
+            if (plat?.platformId && plat?.platformGameId) {
+              const oldId = targetToDemote.id;
+              targetToDemote.id = `${plat.platformId}-${plat.platformGameId}`;
+              targetToDemote.steamAppId = undefined;
+              if (targetToDemote === existing) {
+                if (sharedAppId && steamIdToIndex.get(sharedAppId) === candidateIndex) {
+                  steamIdToIndex.delete(sharedAppId);
+                }
+                if (oldId && idToIndex.get(oldId) === candidateIndex) {
+                  idToIndex.delete(oldId);
+                }
+                idToIndex.set(existing.id, candidateIndex);
               }
-              if (oldId && idToIndex.get(oldId) === candidateIndex) {
-                idToIndex.delete(oldId);
-              }
-              idToIndex.set(existing.id, candidateIndex);
             }
           }
         }
@@ -2398,28 +2496,41 @@ export function sanitizeGameCatalog(
     if (g.steamAppId) {
       const prevWithAppId = seenSteamAppIds.get(g.steamAppId);
       if (prevWithAppId && hasSameStorefrontConflict(prevWithAppId, g)) {
-        // Two distinct same-storefront editions still share the same steamAppId
-        const prevHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(prevWithAppId.title);
-        const currHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(g.title);
-        // Demote the base non-Steam entry (or current entry) to its native storefront ID
-        const targetToDemote =
-          !prevWithAppId.platforms.some((p) => p.platformId === 'steam') &&
-          prevWithAppId.platforms.length <= g.platforms.length &&
-          !prevHasEdition &&
-          currHasEdition
-            ? prevWithAppId
-            : g;
-        const plat = targetToDemote.platforms?.[0];
-        if (plat?.platformId && plat?.platformGameId) {
-          if (targetToDemote === prevWithAppId) {
-            seenIds.delete(prevWithAppId.id);
-            prevWithAppId.id = `${plat.platformId}-${plat.platformGameId}`;
-            prevWithAppId.steamAppId = undefined;
-            seenIds.add(prevWithAppId.id);
-            seenSteamAppIds.set(g.steamAppId, g);
-          } else {
-            g.id = `${plat.platformId}-${plat.platformGameId}`;
-            g.steamAppId = undefined;
+        const prevOv = hasUserOverrides
+          ? getUserOverrideForGame(prevWithAppId, userOverrides)
+          : undefined;
+        const currOv = hasUserOverrides ? getUserOverrideForGame(g, userOverrides) : undefined;
+
+        if (prevOv && currOv) {
+          // Both entries carry explicit UserGameOverrides: keep steamAppId, title, and artwork on BOTH;
+          // `seenIds` below disambiguates `g.id` to its native platform ID if `g.id === prevWithAppId.id`.
+        } else {
+          // Two distinct same-storefront editions still share the same steamAppId
+          const prevHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(prevWithAppId.title);
+          const currHasEdition = /\b(remastered|remaster|remake|enhanced)\b/i.test(g.title);
+          const targetToDemote =
+            prevOv && !currOv
+              ? g
+              : currOv && !prevOv
+                ? prevWithAppId
+                : !prevWithAppId.platforms.some((p) => p.platformId === 'steam') &&
+                    prevWithAppId.platforms.length <= g.platforms.length &&
+                    !prevHasEdition &&
+                    currHasEdition
+                  ? prevWithAppId
+                  : g;
+          const plat = targetToDemote.platforms?.[0];
+          if (plat?.platformId && plat?.platformGameId) {
+            if (targetToDemote === prevWithAppId) {
+              seenIds.delete(prevWithAppId.id);
+              prevWithAppId.id = `${plat.platformId}-${plat.platformGameId}`;
+              prevWithAppId.steamAppId = undefined;
+              seenIds.add(prevWithAppId.id);
+              seenSteamAppIds.set(g.steamAppId, g);
+            } else {
+              g.id = `${plat.platformId}-${plat.platformGameId}`;
+              g.steamAppId = undefined;
+            }
           }
         }
       } else {

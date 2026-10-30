@@ -380,6 +380,37 @@ const SEQUEL_STOP_WORDS = new Set([
 ]);
 const SEQUEL_SYMMETRIC_REMAKE_TOKENS = new Set(['remake', 'rebirth', 'reloaded']);
 const SEQUEL_REMASTER_EDITIONS = new Set(['remastered', 'remaster']);
+const COMPILATION_CLAUSE_STOP_WORDS = new Set([
+  'the',
+  'a',
+  'an',
+  'of',
+  'in',
+  'on',
+  'at',
+  'to',
+  'for',
+  'and',
+  'or',
+  'is',
+]);
+
+function tokenizeCompilationClause(str: string): string[] {
+  const baseTokens = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(str))
+    .toLowerCase()
+    .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
+    .replace(/['’‘ʼ`]/g, '')
+    .replace(/(\d),(\d)/g, '$1$2')
+    .replace(/([a-z])(\d)/g, '$1 $2')
+    .replace(/(\d)([a-z])/g, '$1 $2')
+    .replace(/[^a-z0-9]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => ROMAN_TO_ARABIC[token] || token);
+  const substantive = baseTokens.filter((token) => !COMPILATION_CLAUSE_STOP_WORDS.has(token));
+  return substantive.length > 0 ? substantive : baseTokens;
+}
+
 const sequelTokensMemo = new Map<string, string[]>();
 
 function getNormalizedSequelTokens(str: string): string[] {
@@ -478,10 +509,42 @@ export function isSequelMismatch(query: string, candidateName: string): boolean 
     if (qHas && !cHas) return true;
   }
 
-  // Compilation/bundle mismatch: prevent dual game compilations (e.g. 'DOOM + DOOM II')
-  // from erroneously resolving to a single component game (e.g. 'Doom II')
-  if (/\s\+\s/.test(query) && !candidateName.toLowerCase().includes('+') && !candidateName.toLowerCase().includes('plus')) {
-    return true;
+  // Compilation/bundle mismatch: prevent dual game compilations (e.g. 'Title A + Title A II')
+  // from erroneously resolving to a single component game (e.g. 'Title A' or 'Title A II'),
+  // while permitting URL-slugged compilation names ('title a title a ii') that contain every
+  // constituent clause as a non-overlapping ordered token subsequence.
+  if (
+    /\s\+\s/.test(query) &&
+    !candidateName.toLowerCase().includes('+') &&
+    !candidateName.toLowerCase().includes('plus')
+  ) {
+    const clauses = query
+      .split(/\s\+\s/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (clauses.length >= 2) {
+      const candidateClauseTokens = tokenizeCompilationClause(candidateName);
+      let candCursor = 0;
+      for (const clause of clauses) {
+        const clauseTokens = tokenizeCompilationClause(clause);
+        if (clauseTokens.length === 0) {
+          return true;
+        }
+        for (const token of clauseTokens) {
+          let foundIdx = -1;
+          for (let i = candCursor; i < candidateClauseTokens.length; i++) {
+            if (candidateClauseTokens[i] === token) {
+              foundIdx = i;
+              break;
+            }
+          }
+          if (foundIdx === -1) {
+            return true;
+          }
+          candCursor = foundIdx + 1;
+        }
+      }
+    }
   }
   return false;
 }

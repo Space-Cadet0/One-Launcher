@@ -16,13 +16,25 @@ function isVitestRuntime(): boolean {
  * never bloat cold startup, while surfacing progress in GlobalSyncProgressBar and
  * automatically pausing/resuming during interactive modals, on-demand actions, or active game sessions.
  */
-export function useCriticScoreWarmup(games: CanonicalGame[], isSuspended = false) {
+export function useCriticScoreWarmup(
+  games: CanonicalGame[],
+  isSuspended = false,
+  isBootHydrating = false
+) {
+  const gamesLatestRef = useRef<CanonicalGame[]>(games);
+  gamesLatestRef.current = games;
   const isSuspendedRef = useRef<boolean>(isSuspended);
   isSuspendedRef.current = isSuspended;
+  const isBootHydratingRef = useRef<boolean>(isBootHydrating);
+  isBootHydratingRef.current = isBootHydrating;
   const warmupActiveRef = useRef<boolean>(false);
   const suspendedPausedJobIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (isBootHydrating) {
+      return;
+    }
+
     if (isSuspended) {
       if (warmupActiveRef.current) {
         void import('../services/network/syncJobManager')
@@ -64,20 +76,22 @@ export function useCriticScoreWarmup(games: CanonicalGame[], isSuspended = false
         clearTimeout(timer);
         timer = null;
       }
-      if (isSuspendedRef.current) return;
+      if (isBootHydratingRef.current || isSuspendedRef.current) return;
       if (!onlineLifecycleManager.isOnline()) return;
 
       timer = setTimeout(() => {
         timer = null;
-        if (isSuspendedRef.current) return;
+        if (isBootHydratingRef.current || isSuspendedRef.current) return;
         if (!onlineLifecycleManager.isOnline()) return;
         if (launcherService.getRunningGames().length > 0) return;
         void import('../services/network/syncJobManager')
           .then(({ syncJobManager }) => {
-            if (isSuspendedRef.current) return;
+            if (isBootHydratingRef.current || isSuspendedRef.current) return;
+            const latestGames = gamesLatestRef.current;
+            if (!latestGames || latestGames.length === 0) return;
             warmupActiveRef.current = true;
             return Promise.resolve(
-              syncJobManager.startCriticScoreSync(games, { isBackgroundWarmup: true })
+              syncJobManager.startCriticScoreSync(latestGames, { isBackgroundWarmup: true })
             ).finally(() => {
               warmupActiveRef.current = false;
             });
@@ -93,7 +107,7 @@ export function useCriticScoreWarmup(games: CanonicalGame[], isSuspended = false
     let unsubscribeOnline: (() => void) | null = null;
     try {
       unsubscribeOnline = onlineLifecycleManager.onOnline(() => {
-        if (!isSuspendedRef.current) {
+        if (!isBootHydratingRef.current && !isSuspendedRef.current) {
           scheduleWarmup();
         }
       });
@@ -105,5 +119,5 @@ export function useCriticScoreWarmup(games: CanonicalGame[], isSuspended = false
       }
       unsubscribeOnline?.();
     };
-  }, [games.length, isSuspended]);
+  }, [games.length, isSuspended, isBootHydrating]);
 }

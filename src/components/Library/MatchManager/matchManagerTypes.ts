@@ -6,6 +6,7 @@ import { SuppressedCatalogEntry } from '../../../services/integrations/catalogSa
 export interface LibraryMatchManagerModalProps {
   isOpen: boolean;
   games: CanonicalGame[];
+  initialTab?: FilterTab;
   onClose: () => void;
   onFixMatchForGame: (game: CanonicalGame) => void;
   onResetOverride?: (gameId: string) => void;
@@ -20,9 +21,7 @@ export interface LibraryMatchManagerModalProps {
 }
 
 export type FilterTab =
-  | 'all'
-  | 'unmatched'
-  | 'low_confidence'
+  | 'needs_attention'
   | 'user_suppressed'
   | 'suppressed'
   | 'overrides'

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { acquireModalOverlayLock, canPortalModalToBody } from '../../utils/modalOverlayLock';
 import { useIsRealClientRenderer } from '../../utils/useSafeId';
@@ -48,13 +48,14 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   const pointerStartedOnBackdropRef = useRef<boolean | null>(null);
 
   const isRealClientRenderer = useIsRealClientRenderer();
+  const useDialogSyncEffect = isRealClientRenderer ? useLayoutEffect : useEffect;
 
   useEffect(() => {
     if (!isOpen || !lockOverlay) return undefined;
     return acquireModalOverlayLock();
   }, [isOpen, lockOverlay]);
 
-  useEffect(() => {
+  useDialogSyncEffect(() => {
     if (!isOpen) return undefined;
     const dialog = dialogRef.current;
     if (!dialog) return undefined;

@@ -252,6 +252,7 @@ export interface OlMediaUrlParams {
   xboxProductId?: string | null;
   packageFamilyName?: string | null;
   xboxTitleId?: string | null;
+  ov?: boolean | string | null;
 }
 
 /**
@@ -304,6 +305,9 @@ export function toOlMediaUrl(params: OlMediaUrlParams): string {
   if (params.xboxProductId) search.set('xboxProductId', String(params.xboxProductId));
   if (params.packageFamilyName) search.set('pfn', String(params.packageFamilyName));
   if (params.xboxTitleId) search.set('xboxTitleId', String(params.xboxTitleId));
+  if (params.ov) {
+    search.set('ov', typeof params.ov === 'string' ? params.ov : '1');
+  }
 
   return `ol-media://asset?${search.toString()}`;
 }

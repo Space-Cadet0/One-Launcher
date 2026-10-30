@@ -18,6 +18,7 @@ import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { computeAdaptive404RetryDelayMs, isWafOrChallengeResponse } from '../../contracts/network';
 import { TIER_TTLS } from '../storage/stagedCacheService';
+import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
 import {
   registerInstantSteamTitleMatcher,
   resolveEffectiveSteamAppId,
@@ -277,9 +278,11 @@ export class SteamMatcherService {
   private enrichedEntries: EnrichedMatchEntry[] | null = null;
   private enrichedWordIndex: Map<string, number[]> | null = null;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private cacheGeneration = 0;
 
   constructor() {
     this.loadPersistentCache();
+    void this.hydratePersistentCacheFromVault();
     try {
       if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
         window.addEventListener('beforeunload', () => {
@@ -408,7 +411,7 @@ export class SteamMatcherService {
 
         for (const [k, v] of entries) {
           const lk = k.toLowerCase();
-          if (NON_GAME_SOURCE_REGEX.test(lk) || /\s\+\s/.test(lk)) {
+          if (NON_GAME_SOURCE_REGEX.test(lk)) {
             continue;
           }
 
@@ -461,26 +464,129 @@ export class SteamMatcherService {
     }
   }
 
+  private async hydratePersistentCacheFromVault(): Promise<void> {
+    if (typeof window === 'undefined') return;
+    const gen = this.cacheGeneration;
+    try {
+      const vaultData = await vaultGet<Record<string, unknown>>(STORAGE_KEY_MATCHED_APP_IDS);
+      if (
+        gen !== this.cacheGeneration ||
+        !vaultData ||
+        typeof vaultData !== 'object' ||
+        Array.isArray(vaultData)
+      ) {
+        return;
+      }
+
+      let hydratedAny = false;
+      for (const [k, v] of Object.entries(vaultData)) {
+        const lk = k.toLowerCase();
+        if (NON_GAME_SOURCE_REGEX.test(lk)) {
+          continue;
+        }
+
+        const existingVal = this.cache.get(lk);
+        if (typeof existingVal === 'number' && existingVal > 0) {
+          continue;
+        }
+
+        if (typeof v === 'number' && v > 0) {
+          const enrichedName = (
+            steamEnrichedCache as Record<string, { name?: string } | undefined>
+          )[String(v)]?.name;
+          if (
+            enrichedName &&
+            (computeTitleSimilarity(normalizeGameTitle(lk), enrichedName) < 0.85 ||
+              DISTINCT_EDITION_TOKEN_REGEX.test(lk) !==
+                DISTINCT_EDITION_TOKEN_REGEX.test(enrichedName))
+          ) {
+            continue;
+          }
+          this.setCacheBounded(lk, v);
+          this.negativeTimestamps.delete(lk);
+          this.negativeFailureCounts.delete(lk);
+          if (this.instantMemo.get(lk) === null) {
+            this.instantMemo.delete(lk);
+          }
+          hydratedAny = true;
+        } else if (typeof v === 'object' && v !== null) {
+          const negRec = v as Partial<PersistedNegativeMatchRecord>;
+          const cachedAt = typeof negRec.cachedAt === 'number' ? negRec.cachedAt : 0;
+          const existingNegTs = this.negativeTimestamps.get(lk) || 0;
+          if (existingVal === null && existingNegTs >= cachedAt) {
+            continue;
+          }
+          const rawFailureCount = negRec.failureCount;
+          const failureCount =
+            typeof rawFailureCount === 'number' && rawFailureCount >= 1
+              ? Math.floor(rawFailureCount)
+              : undefined;
+          const effectiveTtlMs =
+            failureCount !== undefined
+              ? computeAdaptive404RetryDelayMs(failureCount)
+              : NEGATIVE_MATCH_TTL_MS;
+          const isExpired = Date.now() - cachedAt >= effectiveTtlMs;
+          if (negRec.appId === null || negRec.id === null) {
+            if (failureCount !== undefined) {
+              this.negativeFailureCounts.set(lk, failureCount);
+            }
+            if (!isExpired) {
+              this.setCacheBounded(lk, null);
+              this.setNegativeTimestampBounded(lk, cachedAt);
+              this.instantMemo.delete(lk);
+              hydratedAny = true;
+            }
+          }
+        }
+      }
+
+      if (hydratedAny) {
+        try {
+          const obj: Record<string, number | PersistedNegativeMatchRecord> = {};
+          for (const [k, v] of this.cache.entries()) {
+            if (typeof v === 'number' && v > 0) {
+              obj[k] = v;
+            } else if (v === null) {
+              const cachedAt = this.negativeTimestamps.get(k) || Date.now();
+              const failureCount = this.negativeFailureCounts.get(k);
+              obj[k] =
+                failureCount !== undefined
+                  ? { appId: null, cachedAt, failureCount }
+                  : { appId: null, cachedAt };
+            }
+          }
+          localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
+          localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
+        } catch {
+          // Ignore localStorage quota errors; IndexedDB already holds full cache
+        }
+      }
+    } catch {
+      // Ignore vault read errors
+    }
+  }
+
   private savePersistentCache() {
     if (typeof window === 'undefined') return;
     if (this.pendingSaveTimer !== null) {
       clearTimeout(this.pendingSaveTimer);
       this.pendingSaveTimer = null;
     }
-    try {
-      const obj: Record<string, number | PersistedNegativeMatchRecord> = {};
-      for (const [k, v] of this.cache.entries()) {
-        if (typeof v === 'number' && v > 0) {
-          obj[k] = v;
-        } else if (v === null) {
-          const cachedAt = this.negativeTimestamps.get(k) || Date.now();
-          const failureCount = this.negativeFailureCounts.get(k);
-          obj[k] =
-            failureCount !== undefined
-              ? { appId: null, cachedAt, failureCount }
-              : { appId: null, cachedAt };
-        }
+    const obj: Record<string, number | PersistedNegativeMatchRecord> = {};
+    for (const [k, v] of this.cache.entries()) {
+      if (typeof v === 'number' && v > 0) {
+        obj[k] = v;
+      } else if (v === null) {
+        const cachedAt = this.negativeTimestamps.get(k) || Date.now();
+        const failureCount = this.negativeFailureCounts.get(k);
+        obj[k] =
+          failureCount !== undefined
+            ? { appId: null, cachedAt, failureCount }
+            : { appId: null, cachedAt };
       }
+    }
+    void vaultSet(STORAGE_KEY_MATCHED_APP_IDS, obj);
+    try {
       localStorage.setItem(STORAGE_KEY_MATCHED_APP_IDS, JSON.stringify(obj));
       localStorage.setItem(STORAGE_KEY_MATCHER_SCHEMA, '1');
     } catch {
@@ -503,6 +609,7 @@ export class SteamMatcherService {
   }
 
   public clearCache(): void {
+    this.cacheGeneration += 1;
     if (this.pendingSaveTimer !== null) {
       clearTimeout(this.pendingSaveTimer);
       this.pendingSaveTimer = null;
@@ -514,6 +621,7 @@ export class SteamMatcherService {
     this.instantMemo.clear();
     this.enrichedEntries = null;
     this.enrichedWordIndex = null;
+    void vaultDelete(STORAGE_KEY_MATCHED_APP_IDS);
     if (typeof window !== 'undefined') {
       try {
         localStorage.removeItem(STORAGE_KEY_MATCHED_APP_IDS);

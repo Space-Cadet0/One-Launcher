@@ -1,5 +1,6 @@
 import { createStore, entries as idbEntries, type UseStore } from 'idb-keyval';
 import type { CanonicalGame } from '../../contracts/game';
+import type { MediaSyncOutcome } from '../../contracts/steam';
 import { isIndexedDbAvailable, vaultDelete, vaultGet, vaultSet } from './indexedDbVault';
 
 /**
@@ -96,7 +97,7 @@ export interface MutabilityEvaluationInput {
   data?: unknown;
 }
 
-export const MAX_MEMORY_FALLBACK_ENTRIES = 4096;
+export const MAX_MEMORY_FALLBACK_ENTRIES = 16384;
 const BULKY_STAGED_LOCALSTORAGE_BYTES = 2048;
 const MAX_STUB_STRING_CHARS = 240;
 const memoryFallback = new Map<string, StagedCacheEntry<unknown>>();
@@ -105,6 +106,8 @@ const vaultHydratedKeys = new Set<string>();
 
 let bulkVaultStore: UseStore | null = null;
 let inFlightBulkVaultHydration: Promise<number> | null = null;
+let bootHydrationPromise: Promise<number> | null = null;
+let stagedVaultHydrationComplete = false;
 
 function getBulkVaultStore(): UseStore | null {
   if (!isIndexedDbAvailable()) return null;
@@ -421,7 +424,7 @@ export function createStagedCacheEntry<T>(
   return entry;
 }
 
-const MAX_PARSED_STAGED_MEMO_ENTRIES = 4096;
+const MAX_PARSED_STAGED_MEMO_ENTRIES = 8192;
 const parsedStagedMemo = new Map<string, { raw: string; parsed: Record<string, unknown> }>();
 
 function setParsedStagedMemo(key: string, raw: string, parsed: Record<string, unknown>): void {
@@ -519,6 +522,47 @@ export async function hydrateStagedCacheKeyFromVault<T>(
   return fromVault;
 }
 
+export function isStagedVaultHydrationComplete(): boolean {
+  if (stagedVaultHydrationComplete) return true;
+  if (!isIndexedDbAvailable() || !getBulkVaultStore()) {
+    stagedVaultHydrationComplete = true;
+    return true;
+  }
+  return false;
+}
+
+export async function whenStagedCacheHydrated(timeoutMs: number = 3000): Promise<number> {
+  if (isStagedVaultHydrationComplete()) return 0;
+  const targetPromise = bootHydrationPromise ?? hydrateAllStagedCacheFromVault();
+  if (!(timeoutMs > 0)) {
+    return targetPromise;
+  }
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      targetPromise,
+      new Promise<number>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          stagedVaultHydrationComplete = true;
+          resolve(0);
+        }, timeoutMs);
+        if (
+          timeoutHandle &&
+          typeof timeoutHandle === 'object' &&
+          'unref' in timeoutHandle &&
+          typeof (timeoutHandle as { unref?: () => void }).unref === 'function'
+        ) {
+          (timeoutHandle as { unref: () => void }).unref();
+        }
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle !== null) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
 /**
  * Bulk-hydrates all `'staged:*'` entries from IndexedDB vault into the bounded in-memory cache
  * in a single cursor read so oversized (> 2KB) payloads achieve 100% full-detail hit rates after reload.
@@ -529,7 +573,10 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
     return inFlightBulkVaultHydration;
   }
   const store = getBulkVaultStore();
-  if (!store) return 0;
+  if (!store) {
+    stagedVaultHydrationComplete = true;
+    return 0;
+  }
 
   inFlightBulkVaultHydration = (async (): Promise<number> => {
     try {
@@ -566,9 +613,18 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
       return 0;
     } finally {
       inFlightBulkVaultHydration = null;
+      stagedVaultHydrationComplete = true;
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        try {
+          window.dispatchEvent(new CustomEvent('antigravity:staged-vault-hydrated'));
+        } catch {}
+      }
     }
   })();
 
+  if (!bootHydrationPromise) {
+    bootHydrationPromise = inFlightBulkVaultHydration;
+  }
   return inFlightBulkVaultHydration;
 }
 
@@ -589,6 +645,14 @@ function evaluateHydratedStagedEntry<T>(
   return { valid, stale, data, entry };
 }
 
+export interface StagedCacheLoadResult<T> {
+  valid: boolean;
+  stale?: boolean;
+  data: T | null;
+  entry?: StagedCacheEntry<T>;
+  isCompactStub?: boolean;
+}
+
 /**
  * Reads a staged cache entry and checks validity against its TTL and bypass flag.
  * Raw-string memoization skips redundant JSON.parse calls while staying 100% coherent
@@ -597,7 +661,7 @@ function evaluateHydratedStagedEntry<T>(
 export function loadStagedCache<T>(
   key: string,
   bypassTTL: boolean = false
-): { valid: boolean; stale?: boolean; data: T | null; entry?: StagedCacheEntry<T> } {
+): StagedCacheLoadResult<T> {
   const storage = getStorage();
   let raw: string | null = null;
   let resolvedKey = key;
@@ -653,12 +717,14 @@ export function loadStagedCache<T>(
 
     // If localStorage holds a compact stub (`__vaultFull: true`) and the full rich object is
     // already hydrated in memoryFallback with matching cachedAt, return the full rich object!
+    let isCompactStub = false;
     if (parsed.__vaultFull === true) {
       const memRich = memoryFallback.get(resolvedKey) as StagedCacheEntry<T> | undefined;
       if (memRich && memRich.cachedAt === parsed.cachedAt) {
         setMemoryFallbackBounded(resolvedKey, memRich);
         return evaluateHydratedStagedEntry(memRich, bypassTTL);
       }
+      isCompactStub = true;
     }
 
     let entry: StagedCacheEntry<T>;
@@ -685,10 +751,15 @@ export function loadStagedCache<T>(
       if (typeof parsed.isVerified === 'boolean') entry.isVerified = parsed.isVerified;
     }
 
-    return evaluateHydratedStagedEntry(entry, bypassTTL);
+    const evaluated = evaluateHydratedStagedEntry(entry, bypassTTL);
+    return isCompactStub ? { ...evaluated, isCompactStub: true } : evaluated;
   } catch {
     return { valid: false, data: null };
   }
+}
+
+export function isCompactStubInLocalStorage(key: string): boolean {
+  return loadStagedCache(key).isCompactStub === true;
 }
 
 export const STAGED_CACHE_PREFIX = 'antigravity_staged_';
@@ -812,8 +883,99 @@ export function clearExpiredStagedCache(options?: { onlyNegativeAndTransient?: b
   }
 }
 
+export const MEDIA_ATTEMPT_KEY_PREFIX = `${STAGED_CACHE_PREFIX}media_attempt_v1_`;
+
+export interface MediaSyncAttemptRecord {
+  outcome: MediaSyncOutcome;
+  attemptedAt: number;
+  failureCount?: number;
+}
+
+export function getMediaSyncOutcomeTtlMs(outcome?: MediaSyncOutcome): number {
+  switch (outcome) {
+    case 'unavailable_404':
+      return 14 * 24 * 60 * 60 * 1000;
+    case 'transient_error':
+      return 2 * 60 * 60 * 1000;
+    case 'complete':
+    case 'partial_no_trailers':
+    case 'partial_no_screenshots':
+    default:
+      return 30 * 24 * 60 * 60 * 1000;
+  }
+}
+
+export function recordMediaSyncAttempt(
+  gameId: string,
+  outcome: MediaSyncOutcome,
+  customTtlMs?: number,
+  failureCount?: number
+): void {
+  if (!gameId) return;
+  const ttlMs = customTtlMs ?? getMediaSyncOutcomeTtlMs(outcome);
+  const tier: MutabilityTier =
+    outcome === 'unavailable_404'
+      ? 'negative'
+      : outcome === 'transient_error'
+      ? 'transient_error'
+      : 'mature';
+  const payload: MediaSyncAttemptRecord = {
+    outcome,
+    attemptedAt: Date.now(),
+    ...(typeof failureCount === 'number' && failureCount > 0 ? { failureCount } : {}),
+  };
+  saveStagedCache<MediaSyncAttemptRecord>(`${MEDIA_ATTEMPT_KEY_PREFIX}${gameId}`, payload, tier, {
+    customTtlMs: ttlMs,
+    dynamicResolved: true,
+    failureReason:
+      outcome === 'unavailable_404'
+        ? 'not_found'
+        : outcome === 'transient_error'
+        ? 'network_error'
+        : undefined,
+  });
+}
+
+export function hasFreshMediaSyncAttempt(
+  gameId: string,
+  meta?: CanonicalGame['enrichedMetadata'] | null,
+  minAttemptedAt?: number
+): boolean {
+  const minTs = typeof minAttemptedAt === 'number' && minAttemptedAt > 0 ? minAttemptedAt : 0;
+  const hasRichMeta = Boolean(meta && meta.metadataQuality !== 'skeleton_fallback');
+  if (gameId) {
+    const staged = loadStagedCache<MediaSyncAttemptRecord>(`${MEDIA_ATTEMPT_KEY_PREFIX}${gameId}`);
+    if (staged.valid) {
+      const attemptedAt = staged.data?.attemptedAt ?? staged.entry?.cachedAt ?? 0;
+      const outcome = staged.data?.outcome;
+      const isNegativeOrBackoff =
+        outcome === 'unavailable_404' || outcome === 'transient_error';
+      if (attemptedAt >= minTs && (hasRichMeta || isNegativeOrBackoff)) {
+        return true;
+      }
+    }
+  }
+  if (meta && typeof meta.lastMediaSyncAttemptAt === 'number' && meta.lastMediaSyncAttemptAt > 0) {
+    const ttlMs = getMediaSyncOutcomeTtlMs(meta.mediaSyncOutcome);
+    const isNegativeOrBackoff =
+      meta.mediaSyncOutcome === 'unavailable_404' || meta.mediaSyncOutcome === 'transient_error';
+    if (
+      meta.lastMediaSyncAttemptAt >= minTs &&
+      Date.now() - meta.lastMediaSyncAttemptAt < ttlMs &&
+      (hasRichMeta || isNegativeOrBackoff)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 if (typeof window !== 'undefined' && isIndexedDbAvailable()) {
   try {
-    void hydrateAllStagedCacheFromVault();
-  } catch {}
+    bootHydrationPromise = hydrateAllStagedCacheFromVault();
+  } catch {
+    stagedVaultHydrationComplete = true;
+  }
+} else {
+  stagedVaultHydrationComplete = true;
 }

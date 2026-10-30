@@ -325,16 +325,62 @@ export function reconcileLaunchConfigsWithDisk(
 }
 
 let hasLaunchConfigsSnapshot = false;
+let launchConfigsStorageRef: Storage | null = null;
 let launchConfigsRawSnapshot: string | null = null;
 let launchConfigsCachedMap: Record<string, GameLaunchConfig> = {};
 
 let hasPerfSettingsSnapshot = false;
+let perfSettingsStorageRef: Storage | null = null;
 let perfSettingsRawSnapshot: string | null = null;
 let perfSettingsCached: LauncherPerformanceSettings | null = null;
 
 let hasSelectedStorefrontsSnapshot = false;
+let selectedStorefrontsStorageRef: Storage | null = null;
 let selectedStorefrontsRawSnapshot: string | null = null;
 let selectedStorefrontsCachedMap: Record<string, StorefrontId> = {};
+
+let launchConfigStorageListenerAttached = false;
+
+function isTestEnv(): boolean {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getSafeLaunchStorage(): Storage | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+    if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+function ensureLaunchConfigStorageListener(): void {
+  if (launchConfigStorageListenerAttached) return;
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  launchConfigStorageListenerAttached = true;
+  window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === null || e.key === LAUNCH_CONFIGS_STORAGE_KEY) {
+      hasLaunchConfigsSnapshot = false;
+      launchConfigsRawSnapshot = null;
+    }
+    if (e.key === null || e.key === PERF_SETTINGS_STORAGE_KEY) {
+      hasPerfSettingsSnapshot = false;
+      perfSettingsRawSnapshot = null;
+    }
+    if (e.key === null || e.key === SELECTED_STOREFRONTS_STORAGE_KEY) {
+      hasSelectedStorefrontsSnapshot = false;
+      selectedStorefrontsRawSnapshot = null;
+    }
+  });
+}
 
 function cloneLaunchConfigsMap(
   source: Record<string, GameLaunchConfig>
@@ -349,13 +395,23 @@ function cloneLaunchConfigsMap(
   return copy;
 }
 
-export function loadLocalLaunchConfigsFromStorage(): Record<string, GameLaunchConfig> {
-  if (typeof window === 'undefined' || !window.localStorage) return {};
+function ensureLaunchConfigsHydrated(): Record<string, GameLaunchConfig> {
+  const storage = getSafeLaunchStorage();
+  if (!storage) return {};
+  ensureLaunchConfigStorageListener();
+
+  if (!isTestEnv() && hasLaunchConfigsSnapshot && launchConfigsStorageRef === storage) {
+    return launchConfigsCachedMap;
+  }
+
   try {
-    const raw = window.localStorage.getItem(LAUNCH_CONFIGS_STORAGE_KEY);
-    if (hasLaunchConfigsSnapshot && raw === launchConfigsRawSnapshot) {
-      return cloneLaunchConfigsMap(launchConfigsCachedMap);
+    const raw = storage.getItem(LAUNCH_CONFIGS_STORAGE_KEY);
+    if (hasLaunchConfigsSnapshot && launchConfigsStorageRef === storage && raw === launchConfigsRawSnapshot) {
+      // Adopt Blink ExternalString pointer so subsequent checks are O(1) pointer equality
+      launchConfigsRawSnapshot = raw;
+      return launchConfigsCachedMap;
     }
+    launchConfigsStorageRef = storage;
     launchConfigsRawSnapshot = raw;
     hasLaunchConfigsSnapshot = true;
     launchConfigsCachedMap = {};
@@ -369,24 +425,55 @@ export function loadLocalLaunchConfigsFromStorage(): Record<string, GameLaunchCo
           }
         }
         launchConfigsCachedMap = sanitized;
-        return cloneLaunchConfigsMap(sanitized);
       }
     }
+    return launchConfigsCachedMap;
   } catch {
     hasLaunchConfigsSnapshot = false;
     launchConfigsRawSnapshot = null;
     launchConfigsCachedMap = {};
+    return {};
   }
-  return {};
+}
+
+export function getReadonlyLocalLaunchConfigsFromStorage(): Readonly<Record<string, GameLaunchConfig>> {
+  return ensureLaunchConfigsHydrated();
+}
+
+export function getLaunchConfigFromStorage(
+  gameId: string,
+  platformId?: StorefrontId
+): GameLaunchConfig | undefined {
+  if (!gameId) return undefined;
+  const map = ensureLaunchConfigsHydrated();
+  return resolveLaunchConfigFromMap(map, gameId, platformId);
+}
+
+export function loadLocalLaunchConfigsFromStorage(): Record<string, GameLaunchConfig> {
+  if (typeof window === 'undefined' || !window.localStorage) return {};
+  return cloneLaunchConfigsMap(ensureLaunchConfigsHydrated());
 }
 
 export function loadLocalPerformanceSettingsFromStorage(): LauncherPerformanceSettings | null {
   if (typeof window === 'undefined' || !window.localStorage) return null;
+  const storage = window.localStorage;
+  ensureLaunchConfigStorageListener();
+
+  if (!isTestEnv() && hasPerfSettingsSnapshot && perfSettingsStorageRef === storage) {
+    return perfSettingsCached ? { ...perfSettingsCached } : null;
+  }
+
   try {
-    const rawPerf = window.localStorage.getItem(PERF_SETTINGS_STORAGE_KEY);
-    if (hasPerfSettingsSnapshot && rawPerf === perfSettingsRawSnapshot) {
+    const rawPerf = storage.getItem(PERF_SETTINGS_STORAGE_KEY);
+    if (
+      hasPerfSettingsSnapshot &&
+      perfSettingsStorageRef === storage &&
+      rawPerf === perfSettingsRawSnapshot
+    ) {
+      perfSettingsRawSnapshot = rawPerf;
       return perfSettingsCached ? { ...perfSettingsCached } : null;
     }
+    perfSettingsStorageRef = storage;
     perfSettingsRawSnapshot = rawPerf;
     hasPerfSettingsSnapshot = true;
     perfSettingsCached = null;
@@ -410,10 +497,13 @@ export function persistLocalLaunchConfigsToStorage(
   configs: Record<string, GameLaunchConfig>
 ): void {
   if (typeof window === 'undefined' || !window.localStorage) return;
+  const storage = window.localStorage;
+  ensureLaunchConfigStorageListener();
   try {
     const serialized = JSON.stringify(configs);
-    window.localStorage.setItem(LAUNCH_CONFIGS_STORAGE_KEY, serialized);
-    launchConfigsRawSnapshot = serialized;
+    storage.setItem(LAUNCH_CONFIGS_STORAGE_KEY, serialized);
+    launchConfigsStorageRef = storage;
+    launchConfigsRawSnapshot = isTestEnv() ? serialized : null;
     hasLaunchConfigsSnapshot = true;
     launchConfigsCachedMap = cloneLaunchConfigsMap(configs);
   } catch {}
@@ -423,10 +513,13 @@ export function persistLocalPerformanceSettingsToStorage(
   settings: LauncherPerformanceSettings
 ): void {
   if (typeof window === 'undefined' || !window.localStorage) return;
+  const storage = window.localStorage;
+  ensureLaunchConfigStorageListener();
   try {
     const serialized = JSON.stringify(settings);
-    window.localStorage.setItem(PERF_SETTINGS_STORAGE_KEY, serialized);
-    perfSettingsRawSnapshot = serialized;
+    storage.setItem(PERF_SETTINGS_STORAGE_KEY, serialized);
+    perfSettingsStorageRef = storage;
+    perfSettingsRawSnapshot = isTestEnv() ? serialized : null;
     hasPerfSettingsSnapshot = true;
     perfSettingsCached = { ...settings };
   } catch {}
@@ -435,15 +528,25 @@ export function persistLocalPerformanceSettingsToStorage(
 const VALID_STOREFRONT_IDS = new Set<StorefrontId>(['steam', 'gog', 'epic', 'xbox', 'custom']);
 
 export function loadSelectedStorefrontsFromStorage(): Record<string, StorefrontId> {
-  const storage =
-    (typeof window !== 'undefined' && window.localStorage) ||
-    (typeof localStorage !== 'undefined' ? localStorage : undefined);
+  const storage = getSafeLaunchStorage();
   if (!storage) return {};
+  ensureLaunchConfigStorageListener();
+
+  if (!isTestEnv() && hasSelectedStorefrontsSnapshot && selectedStorefrontsStorageRef === storage) {
+    return { ...selectedStorefrontsCachedMap };
+  }
+
   try {
     const raw = storage.getItem(SELECTED_STOREFRONTS_STORAGE_KEY);
-    if (hasSelectedStorefrontsSnapshot && raw === selectedStorefrontsRawSnapshot) {
+    if (
+      hasSelectedStorefrontsSnapshot &&
+      selectedStorefrontsStorageRef === storage &&
+      raw === selectedStorefrontsRawSnapshot
+    ) {
+      selectedStorefrontsRawSnapshot = raw;
       return { ...selectedStorefrontsCachedMap };
     }
+    selectedStorefrontsStorageRef = storage;
     selectedStorefrontsRawSnapshot = raw;
     hasSelectedStorefrontsSnapshot = true;
     selectedStorefrontsCachedMap = {};
@@ -471,17 +574,17 @@ export function persistSelectedStorefrontToStorage(
   platformId: StorefrontId
 ): void {
   if (!gameId || !VALID_STOREFRONT_IDS.has(platformId)) return;
-  const storage =
-    (typeof window !== 'undefined' && window.localStorage) ||
-    (typeof localStorage !== 'undefined' ? localStorage : undefined);
+  const storage = getSafeLaunchStorage();
   if (!storage) return;
+  ensureLaunchConfigStorageListener();
   try {
     const current = loadSelectedStorefrontsFromStorage();
     if (current[gameId] === platformId) return;
     current[gameId] = platformId;
     const serialized = JSON.stringify(current);
     storage.setItem(SELECTED_STOREFRONTS_STORAGE_KEY, serialized);
-    selectedStorefrontsRawSnapshot = serialized;
+    selectedStorefrontsStorageRef = storage;
+    selectedStorefrontsRawSnapshot = isTestEnv() ? serialized : null;
     hasSelectedStorefrontsSnapshot = true;
     selectedStorefrontsCachedMap = { ...current };
   } catch {}
@@ -489,17 +592,17 @@ export function persistSelectedStorefrontToStorage(
 
 export function clearSelectedStorefrontFromStorage(gameId: string): void {
   if (!gameId) return;
-  const storage =
-    (typeof window !== 'undefined' && window.localStorage) ||
-    (typeof localStorage !== 'undefined' ? localStorage : undefined);
+  const storage = getSafeLaunchStorage();
   if (!storage) return;
+  ensureLaunchConfigStorageListener();
   try {
     const current = loadSelectedStorefrontsFromStorage();
     if (!(gameId in current)) return;
     delete current[gameId];
     const serialized = JSON.stringify(current);
     storage.setItem(SELECTED_STOREFRONTS_STORAGE_KEY, serialized);
-    selectedStorefrontsRawSnapshot = serialized;
+    selectedStorefrontsStorageRef = storage;
+    selectedStorefrontsRawSnapshot = isTestEnv() ? serialized : null;
     hasSelectedStorefrontsSnapshot = true;
     selectedStorefrontsCachedMap = { ...current };
   } catch {}

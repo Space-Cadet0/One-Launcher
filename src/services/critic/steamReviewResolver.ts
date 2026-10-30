@@ -202,7 +202,13 @@ export class SteamReviewResolver {
               if (!item?.id || !item?.name) continue;
               if (isSequelMismatch(title, item.name)) continue;
 
-              const qWords = clean.toLowerCase().replace(/['’]/g, '').split(/\s+/).filter(Boolean);
+              const qWords = clean
+                .toLowerCase()
+                .replace(/[®™©]/g, '')
+                .replace(/['’]/g, '')
+                .replace(/[^a-z0-9]/g, ' ')
+                .split(/\s+/)
+                .filter(Boolean);
               const itemWords = item.name
                 .toLowerCase()
                 .replace(/[®™©]/g, '')

@@ -305,6 +305,32 @@ const {
   shutdownLauncherEngine,
 } = require('./launcher/sessionAndProcessSupervisor.cjs');
 
+const {
+  getSetupWizardState,
+  saveSetupWizardState,
+  probeClientLoginStates,
+  probeEnvironmentHealth,
+  parseSteamLoginUsersVdfDetails,
+  parseEpicGameUserSettingsIni,
+} = require('./launcher/environmentHealthProber.cjs');
+
+const {
+  ALLOWED_INSTALLER_HOSTS,
+  validateInstallerUrl,
+  hasEmbeddedPeAuthenticodeCertificate,
+  verifyMacAppDeveloperSignature,
+  verifyMacPkgSignature,
+  verifyWindowsInstallerSignature,
+  onEnvironmentSetupProgress,
+  emitEnvironmentSetupProgress,
+  ensureRosetta2InBackground,
+  installRunnerDirect,
+  runEnvironmentSetupTasks,
+  cancelEnvironmentSetup,
+  startGuidedClientLogin,
+  cancelGuidedClientLogin,
+} = require('./launcher/environmentProvisioner.cjs');
+
 module.exports = {
   // Configuration, Diagnostics, Security & Event Hooks
   setMainWindowGetter,
@@ -535,4 +561,26 @@ module.exports = {
   resolveEffectivePerformancePolicy,
   selectExecutableDialog,
   selectFolderDialog,
+
+  // F) Environment Provisioning, Supply-Chain Verification & Client Session Auth Bridge
+  getSetupWizardState,
+  saveSetupWizardState,
+  probeClientLoginStates,
+  probeEnvironmentHealth,
+  parseSteamLoginUsersVdfDetails,
+  parseEpicGameUserSettingsIni,
+  ALLOWED_INSTALLER_HOSTS,
+  validateInstallerUrl,
+  hasEmbeddedPeAuthenticodeCertificate,
+  verifyMacAppDeveloperSignature,
+  verifyMacPkgSignature,
+  verifyWindowsInstallerSignature,
+  onEnvironmentSetupProgress,
+  emitEnvironmentSetupProgress,
+  ensureRosetta2InBackground,
+  installRunnerDirect,
+  runEnvironmentSetupTasks,
+  cancelEnvironmentSetup,
+  startGuidedClientLogin,
+  cancelGuidedClientLogin,
 };

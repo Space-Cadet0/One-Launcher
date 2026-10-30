@@ -53,20 +53,9 @@ export function VirtualGridRows<T>({
 }: VirtualGridRowsProps<T>): React.ReactElement {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
+  const prevHeightRef = useRef<number>(0);
   const safeCols = Math.max(1, columnCount);
   const rowCount = Math.ceil(items.length / safeCols);
-
-  useLayoutEffect(() => {
-    const syncMargin = () => {
-      const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
-      setScrollMargin((prev) => (prev === next ? prev : next));
-    };
-    syncMargin();
-    if (!scrollElement || typeof ResizeObserver === 'undefined') return undefined;
-    const ro = new ResizeObserver(syncMargin);
-    ro.observe(scrollElement);
-    return () => ro.disconnect();
-  }, [scrollElement]);
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -75,8 +64,52 @@ export function VirtualGridRows<T>({
     overscan,
     scrollMargin,
     initialRect: getDefaultInitialRect(),
-    useAnimationFrameWithResizeObserver: true,
+    useAnimationFrameWithResizeObserver: false,
   });
+
+  const virtualizerRef = useRef(rowVirtualizer);
+  virtualizerRef.current = rowVirtualizer;
+
+  useLayoutEffect(() => {
+    const syncMargin = () => {
+      const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
+      setScrollMargin((prev) => (prev === next ? prev : next));
+    };
+    syncMargin();
+    if (!scrollElement) {
+      prevHeightRef.current = 0;
+      return undefined;
+    }
+    const readHeight = () =>
+      scrollElement.clientHeight || Math.round(scrollElement.getBoundingClientRect().height) || 0;
+    prevHeightRef.current = readHeight();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => {
+      syncMargin();
+      const nextHeight = readHeight();
+      const wasZero = prevHeightRef.current <= 0;
+      prevHeightRef.current = nextHeight;
+      if (
+        nextHeight > 0 &&
+        (wasZero ||
+          (virtualizerRef.current.options.count > 0 &&
+            virtualizerRef.current.getVirtualItems().length === 0))
+      ) {
+        virtualizerRef.current.measure();
+      }
+    });
+    ro.observe(scrollElement);
+    return () => ro.disconnect();
+  }, [scrollElement]);
+
+  useLayoutEffect(() => {
+    if (!scrollElement || rowCount <= 0) return;
+    const currentHeight =
+      scrollElement.clientHeight || Math.round(scrollElement.getBoundingClientRect().height) || 0;
+    if (currentHeight > 0 && virtualizerRef.current.getVirtualItems().length === 0) {
+      virtualizerRef.current.measure();
+    }
+  }, [scrollElement, rowCount]);
 
   const virtualRows = rowVirtualizer.getVirtualItems();
   const effectiveMargin = rowVirtualizer.options.scrollMargin ?? scrollMargin;
@@ -142,18 +175,7 @@ export function VirtualListRows<T>({
 }: VirtualListRowsProps<T>): React.ReactElement {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
-
-  useLayoutEffect(() => {
-    const syncMargin = () => {
-      const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
-      setScrollMargin((prev) => (prev === next ? prev : next));
-    };
-    syncMargin();
-    if (!scrollElement || typeof ResizeObserver === 'undefined') return undefined;
-    const ro = new ResizeObserver(syncMargin);
-    ro.observe(scrollElement);
-    return () => ro.disconnect();
-  }, [scrollElement]);
+  const prevHeightRef = useRef<number>(0);
 
   const listVirtualizer = useVirtualizer({
     count: items.length,
@@ -168,9 +190,53 @@ export function VirtualListRows<T>({
     overscan,
     scrollMargin,
     initialRect: getDefaultInitialRect(),
-    useAnimationFrameWithResizeObserver: true,
+    useAnimationFrameWithResizeObserver: false,
     getItemKey: getItemKey ? (index) => getItemKey(items[index], index) : undefined,
   });
+
+  const virtualizerRef = useRef(listVirtualizer);
+  virtualizerRef.current = listVirtualizer;
+
+  useLayoutEffect(() => {
+    const syncMargin = () => {
+      const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
+      setScrollMargin((prev) => (prev === next ? prev : next));
+    };
+    syncMargin();
+    if (!scrollElement) {
+      prevHeightRef.current = 0;
+      return undefined;
+    }
+    const readHeight = () =>
+      scrollElement.clientHeight || Math.round(scrollElement.getBoundingClientRect().height) || 0;
+    prevHeightRef.current = readHeight();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => {
+      syncMargin();
+      const nextHeight = readHeight();
+      const wasZero = prevHeightRef.current <= 0;
+      prevHeightRef.current = nextHeight;
+      if (
+        nextHeight > 0 &&
+        (wasZero ||
+          (virtualizerRef.current.options.count > 0 &&
+            virtualizerRef.current.getVirtualItems().length === 0))
+      ) {
+        virtualizerRef.current.measure();
+      }
+    });
+    ro.observe(scrollElement);
+    return () => ro.disconnect();
+  }, [scrollElement]);
+
+  useLayoutEffect(() => {
+    if (!scrollElement || items.length <= 0) return;
+    const currentHeight =
+      scrollElement.clientHeight || Math.round(scrollElement.getBoundingClientRect().height) || 0;
+    if (currentHeight > 0 && virtualizerRef.current.getVirtualItems().length === 0) {
+      virtualizerRef.current.measure();
+    }
+  }, [scrollElement, items.length]);
 
   const virtualItems = listVirtualizer.getVirtualItems();
   const effectiveMargin = listVirtualizer.options.scrollMargin ?? scrollMargin;

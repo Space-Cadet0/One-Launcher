@@ -897,9 +897,11 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
         onResetOverrideForGame,
       });
 
-      const rendered = render();
+      let rendered = render();
 
-      // Verify all 5 sections render with their headers and items
+      // Default tab is Needs Attention (combines Unmatched + Low-Confidence; "All Sections" is removed)
+      expect(rendered.text).not.toContain('All Sections');
+      expect(rendered.text).toContain('Needs Attention (2)');
       expect(rendered.text).toContain('Unmatched Games');
       expect(rendered.text).toContain('Project Mystery Alpha');
 
@@ -907,12 +909,63 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('The Saboteur');
       expect(rendered.text).toContain('68% Confidence');
 
+      // Switch to Auto-Filtered Non-Games tab and verify suppressed section + Match & Restore action
+      const suppressedTabBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-tab-id'] === 'suppressed'
+      )[0];
+      expect(suppressedTabBtn).toBeDefined();
+      suppressedTabBtn.props.onClick();
+      rendered = render();
+
       expect(rendered.text).toContain('Suppressed & Filtered Storefront Entries');
       expect(rendered.text).toContain('The Witcher 3 Digital Goodies');
+
+      const restoreBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && getTextContent(el).includes('Match & Restore to Library')
+      )[0];
+      expect(restoreBtn).toBeDefined();
+      restoreBtn.props.onClick();
+      expect(onFixMatchForGame).toHaveBeenCalledWith(suppressedRawGame);
+
+      // Switch to Manual Overrides tab and verify Edit Match + Reset actions
+      const overridesTabBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-tab-id'] === 'overrides'
+      )[0];
+      expect(overridesTabBtn).toBeDefined();
+      overridesTabBtn.props.onClick();
+      rendered = render();
 
       expect(rendered.text).toContain('Manual Matching Overrides');
       expect(rendered.text).toContain("Sid Meier's Civilization IV: Colonization");
       expect(rendered.text).toContain("Sid Meier's Civilization IV");
+
+      const editMatchBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && getTextContent(el).includes('Edit Match')
+      )[0];
+      expect(editMatchBtn).toBeDefined();
+      editMatchBtn.props.onClick();
+      expect(onFixMatchForGame).toHaveBeenCalledWith(overriddenGame);
+
+      const resetBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && getTextContent(el).trim() === 'Reset'
+      )[0];
+      expect(resetBtn).toBeDefined();
+      resetBtn.props.onClick();
+      expect(onResetOverrideForGame).toHaveBeenCalledWith('gog-civ4col');
+
+      // Switch to Merged Multi-Store tab and verify merged storefront badges
+      const mergedTabBtn = findElements(
+        rendered.vnode,
+        (el) => el.type === 'button' && el.props?.['data-tab-id'] === 'merged'
+      )[0];
+      expect(mergedTabBtn).toBeDefined();
+      mergedTabBtn.props.onClick();
+      rendered = render();
 
       expect(rendered.text).toContain('Merged Multi-Storefront Listings');
       expect(rendered.text).toContain('Fallout: New Vegas');
@@ -922,38 +975,11 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('Installed');
       expect(rendered.text).toContain('Not Installed');
 
-      // Clicking "Match & Restore to Library" on suppressed entry calls onFixMatchForGame(suppressedRawGame)
-      const restoreBtn = findElements(
-        rendered.vnode,
-        (el) => el.type === 'button' && getTextContent(el).includes('Match & Restore to Library')
-      )[0];
-      expect(restoreBtn).toBeDefined();
-      restoreBtn.props.onClick();
-      expect(onFixMatchForGame).toHaveBeenCalledWith(suppressedRawGame);
-
-      // Clicking "Edit Match" on the manual override calls onFixMatchForGame(overriddenGame)
-      const editMatchBtn = findElements(
-        rendered.vnode,
-        (el) => el.type === 'button' && getTextContent(el).includes('Edit Match')
-      )[0];
-      expect(editMatchBtn).toBeDefined();
-      editMatchBtn.props.onClick();
-      expect(onFixMatchForGame).toHaveBeenCalledWith(overriddenGame);
-
-      // Clicking "Reset" on the manual override calls onResetOverrideForGame('gog-civ4col')
-      const resetBtn = findElements(
-        rendered.vnode,
-        (el) => el.type === 'button' && getTextContent(el).trim() === 'Reset'
-      )[0];
-      expect(resetBtn).toBeDefined();
-      resetBtn.props.onClick();
-      expect(onResetOverrideForGame).toHaveBeenCalledWith('gog-civ4col');
-
       removeUserOverride('gog-civ4col');
       expect(loadUserOverrides()['gog-civ4col']).toBeUndefined();
     });
 
-    it('separates Unmatched vs Low-Confidence tabs and accordion sections with Inspect, Fix Match, and Hide actions', () => {
+    it('merges Unmatched and Low-Confidence into a single Needs Attention tab (removing All Sections) with Accounts-style tabs and accordion sections', () => {
       const genuinelyUnmatched: CanonicalGame = {
         id: 'epic-raw-entitlement-77',
         title: 'Codename Cobalt Untracked',
@@ -1014,91 +1040,89 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
         onHideGame,
       });
 
-      const allRender = render();
+      const initialRender = render();
 
-      // Verify distinct filter tabs exist with accurate counts
-      const unmatchedTabBtn = findElements(
-        allRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).includes('Unmatched (1)')
-      )[0];
-      const lowConfTabBtn = findElements(
-        allRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).includes('Low-Confidence (1)')
-      )[0];
-      expect(unmatchedTabBtn).toBeDefined();
-      expect(lowConfTabBtn).toBeDefined();
+      // Verify "All Sections" and separate Unmatched / Low-Confidence tabs are removed,
+      // and merged into the single "Needs Attention (2)" tab with Accounts-style appearance (no green dots)
+      const tabButtons = findElements(
+        initialRender.vnode,
+        (el) => el.type === 'button' && el.props?.role === 'tab'
+      );
+      expect(tabButtons.map((b) => b.props['data-tab-id'])).toEqual([
+        'needs_attention',
+        'user_suppressed',
+        'suppressed',
+        'overrides',
+        'merged',
+      ]);
+      expect(initialRender.text).not.toContain('All Sections');
 
-      // Verify both accordion sections render in "all" view with granular diagnostic badges
-      expect(allRender.text).toContain('Unmatched Games');
-      expect(allRender.text).toContain('Codename Cobalt Untracked');
-      expect(allRender.text).toContain('Missing All Artwork');
-      expect(allRender.text).not.toContain('Unmatched Identity');
+      const needsAttentionTabBtn = tabButtons.find(
+        (b) => b.props['data-tab-id'] === 'needs_attention'
+      )!;
+      expect(getTextContent(needsAttentionTabBtn).trim()).toBe('Needs Attention (2)');
+      expect(needsAttentionTabBtn.props['aria-selected']).toBe(true);
+      expect(String(needsAttentionTabBtn.props.className)).toContain('bg-[#1b2838]');
+      expect(String(needsAttentionTabBtn.props.className)).toContain('border-steam-border');
 
-      expect(allRender.text).toContain('Low-Confidence Automatic Matches');
-      expect(allRender.text).toContain('Gothic II: Gold Edition');
-      expect(allRender.text).toContain('Gothic 2 Complete Classic');
-      expect(allRender.text).toContain('68% Confidence');
+      const inactiveTabBtn = tabButtons.find(
+        (b) => b.props['data-tab-id'] === 'user_suppressed'
+      )!;
+      expect(String(inactiveTabBtn.props.className)).toContain('bg-black/20');
+      expect(String(inactiveTabBtn.props.className)).toContain('text-steam-subtext');
 
-      // Switch to 'unmatched' tab -> shows Unmatched Games, hides Low-Confidence Automatic Matches
-      unmatchedTabBtn.props.onClick();
-      const unmatchedOnlyRender = render();
-      expect(unmatchedOnlyRender.text).toContain('Unmatched Games');
-      expect(unmatchedOnlyRender.text).toContain('Codename Cobalt Untracked');
-      expect(unmatchedOnlyRender.text).not.toContain('Low-Confidence Automatic Matches');
+      // Verify zero green status dots inside any Studio tab button
+      const greenDotsInTabs = findElements(tabButtons, (el) =>
+        String(el.props?.className || '').includes('bg-emerald-400')
+      );
+      expect(greenDotsInTabs).toHaveLength(0);
 
-      // Verify Inspect, Fix Match, and Hide buttons inside Unmatched Games section
-      const unmatchedInspectBtn = findElements(
-        unmatchedOnlyRender.vnode,
+      // Verify both accordion sections render together inside Needs Attention with granular diagnostic badges
+      expect(initialRender.text).toContain('Unmatched Games');
+      expect(initialRender.text).toContain('Codename Cobalt Untracked');
+      expect(initialRender.text).toContain('Missing All Artwork');
+      expect(initialRender.text).not.toContain('Unmatched Identity');
+
+      expect(initialRender.text).toContain('Low-Confidence Automatic Matches');
+      expect(initialRender.text).toContain('Gothic II: Gold Edition');
+      expect(initialRender.text).toContain('Gothic 2 Complete Classic');
+      expect(initialRender.text).toContain('68% Confidence');
+
+      // Verify Inspect, Fix Match, Verify / Fix Match, and Hide buttons inside both sections of Needs Attention
+      const inspectBtns = findElements(
+        initialRender.vnode,
         (el) => el.type === 'button' && getTextContent(el).trim() === 'Inspect'
-      )[0];
+      );
       const unmatchedFixBtn = findElements(
-        unmatchedOnlyRender.vnode,
+        initialRender.vnode,
         (el) => el.type === 'button' && getTextContent(el).trim() === 'Fix Match'
       )[0];
-      const unmatchedHideBtn = findElements(
-        unmatchedOnlyRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).trim() === 'Hide'
+      const lowConfVerifyFixBtn = findElements(
+        initialRender.vnode,
+        (el) => el.type === 'button' && getTextContent(el).trim() === 'Verify / Fix Match'
       )[0];
-      expect(unmatchedInspectBtn).toBeDefined();
-      expect(unmatchedFixBtn).toBeDefined();
-      expect(unmatchedHideBtn).toBeDefined();
+      const hideBtns = findElements(
+        initialRender.vnode,
+        (el) => el.type === 'button' && getTextContent(el).trim() === 'Hide'
+      );
 
-      unmatchedInspectBtn.props.onClick();
+      expect(inspectBtns).toHaveLength(2);
+      expect(unmatchedFixBtn).toBeDefined();
+      expect(lowConfVerifyFixBtn).toBeDefined();
+      expect(hideBtns).toHaveLength(2);
+
+      inspectBtns[0].props.onClick();
       expect(onInspectGame).toHaveBeenCalledWith(genuinelyUnmatched);
       unmatchedFixBtn.props.onClick();
       expect(onFixMatchForGame).toHaveBeenCalledWith(genuinelyUnmatched);
-      unmatchedHideBtn.props.onClick();
+      hideBtns[0].props.onClick();
       expect(onHideGame).toHaveBeenCalledWith(genuinelyUnmatched);
 
-      // Switch to 'low_confidence' tab -> shows Low-Confidence Automatic Matches, hides Unmatched Games
-      lowConfTabBtn.props.onClick();
-      const lowConfOnlyRender = render();
-      expect(lowConfOnlyRender.text).toContain('Low-Confidence Automatic Matches');
-      expect(lowConfOnlyRender.text).toContain('Gothic II: Gold Edition');
-      expect(lowConfOnlyRender.text).not.toContain('Unmatched Games');
-
-      // Verify Inspect, Verify / Fix Match, and Hide buttons inside Low-Confidence Automatic Matches section
-      const lowConfInspectBtn = findElements(
-        lowConfOnlyRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).trim() === 'Inspect'
-      )[0];
-      const lowConfVerifyFixBtn = findElements(
-        lowConfOnlyRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).trim() === 'Verify / Fix Match'
-      )[0];
-      const lowConfHideBtn = findElements(
-        lowConfOnlyRender.vnode,
-        (el) => el.type === 'button' && getTextContent(el).trim() === 'Hide'
-      )[0];
-      expect(lowConfInspectBtn).toBeDefined();
-      expect(lowConfVerifyFixBtn).toBeDefined();
-      expect(lowConfHideBtn).toBeDefined();
-
-      lowConfInspectBtn.props.onClick();
+      inspectBtns[1].props.onClick();
       expect(onInspectGame).toHaveBeenCalledWith(lowConfidenceMatched);
       lowConfVerifyFixBtn.props.onClick();
       expect(onFixMatchForGame).toHaveBeenCalledWith(lowConfidenceMatched);
-      lowConfHideBtn.props.onClick();
+      hideBtns[1].props.onClick();
       expect(onHideGame).toHaveBeenCalledWith(lowConfidenceMatched);
     });
 
@@ -1289,12 +1313,19 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(afterDevYearFilter.text).not.toContain('Starlight Odyssey');
       expect(afterDevYearFilter.text).not.toContain('Chronicles of Aethelgard');
 
-      // Verify Compact Inline Storefront Pills in Merged Multi-Storefront Listings
-      expect(afterDevYearFilter.text).toContain('The Witcher 3: Wild Hunt');
-      expect(afterDevYearFilter.text).toContain('2 Storefronts');
-      expect(afterDevYearFilter.text).toContain('#1207664643');
-      expect(afterDevYearFilter.text).toContain('#292030');
-      expect(afterDevYearFilter.text).toContain('The Witcher 3: Wild Hunt - GOTY');
+      // Switch to Merged Multi-Store tab to verify Compact Inline Storefront Pills in Merged Multi-Storefront Listings
+      const mergedTabBtn = findElements(
+        afterDevYearFilter.vnode,
+        (el) => el.type === 'button' && el.props?.['data-tab-id'] === 'merged'
+      )[0];
+      expect(mergedTabBtn).toBeDefined();
+      mergedTabBtn.props.onClick();
+      const mergedTabRender = render();
+      expect(mergedTabRender.text).toContain('The Witcher 3: Wild Hunt');
+      expect(mergedTabRender.text).toContain('2 Storefronts');
+      expect(mergedTabRender.text).toContain('#1207664643');
+      expect(mergedTabRender.text).toContain('#292030');
+      expect(mergedTabRender.text).toContain('The Witcher 3: Wild Hunt - GOTY');
     });
 
     it('promotes enrichedMetadata synopsis in sanitizeGameCatalog and accurately classifies Citadel Remonstered vs Galactic Civilizations III (Test branch)', () => {
@@ -1430,7 +1461,7 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       });
 
       const rendered = render();
-      expect(rendered.text).toContain('Unmatched (1)');
+      expect(rendered.text).toContain('Needs Attention (1)');
       expect(rendered.text).toContain('Missing Synopsis (1)');
       expect(rendered.text).toContain('Galactic Civilizations III (Test branch)');
       expect(rendered.text).toContain('Missing Store Synopsis');
@@ -1474,6 +1505,7 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       const { render } = createStatefulRenderer(LibraryMatchManagerModal, {
         isOpen: true,
         games: [mergedGame],
+        initialTab: 'merged',
         onClose: vi.fn(),
         onFixMatchForGame,
         onHideGame,
@@ -1642,6 +1674,7 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       const { render } = createStatefulRenderer(LibraryMatchManagerModal, {
         isOpen: true,
         games: afterFullHide,
+        initialTab: 'user_suppressed',
         onClose: vi.fn(),
         onFixMatchForGame: vi.fn(),
         onUnhideEntry,
@@ -2129,17 +2162,11 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
         onUnhideEntry,
       });
 
-      // Render "All Sections" view
+      // Initial render shows tab counts; "All Sections" is removed
       let rendered = render();
+      expect(rendered.text).not.toContain('All Sections');
       expect(rendered.text).toContain('User-Suppressed (1)');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (5)');
-      expect(rendered.text).toContain('User-Suppressed Titles');
-      expect(rendered.text).toContain('Suppressed & Filtered Storefront Entries');
-      expect(rendered.text).toContain('Betas / Test / Legacy (1)');
-      expect(rendered.text).toContain('Prologues / Demos (1)');
-      expect(rendered.text).toContain('Tools / SDKs / Servers (1)');
-      expect(rendered.text).toContain('Soundtracks / Goodies (1)');
-      expect(rendered.text).toContain('DLC / Add-ons (1)');
 
       // Switch to User-Suppressed tab -> shows ONLY Portal 2, NOT the 5 auto-filtered non-games
       const userSuppressedTabBtn = findElements(
@@ -2150,11 +2177,12 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       userSuppressedTabBtn.props.onClick();
 
       rendered = render();
+      expect(rendered.text).toContain('User-Suppressed Titles');
       expect(rendered.text).toContain('Portal 2');
       expect(rendered.text).not.toContain('Apex Arena - Public Testing');
       expect(rendered.text).not.toContain('Synthetic City Prologue');
 
-      // Switch to Auto-Filtered Non-Games tab -> shows ONLY the 5 auto-filtered non-games, NOT Portal 2
+      // Switch to Auto-Filtered Non-Games tab -> shows ONLY the 5 auto-filtered non-games + category filters, NOT Portal 2
       const autoFilteredTabBtn = findElements(
         rendered.vnode,
         (el) => el.type === 'button' && getTextContent(el).includes('Auto-Filtered Non-Games (5)')
@@ -2163,6 +2191,12 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       autoFilteredTabBtn.props.onClick();
 
       rendered = render();
+      expect(rendered.text).toContain('Suppressed & Filtered Storefront Entries');
+      expect(rendered.text).toContain('Betas / Test / Legacy (1)');
+      expect(rendered.text).toContain('Prologues / Demos (1)');
+      expect(rendered.text).toContain('Tools / SDKs / Servers (1)');
+      expect(rendered.text).toContain('Soundtracks / Goodies (1)');
+      expect(rendered.text).toContain('DLC / Add-ons (1)');
       expect(rendered.text).not.toContain('Portal 2');
       expect(rendered.text).toContain('Apex Arena - Public Testing');
       expect(rendered.text).toContain('Synthetic City Prologue');
@@ -2301,24 +2335,22 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
         tablist,
         (el) => el.type === 'button' && el.props?.role === 'tab'
       );
-      expect(tabButtons).toHaveLength(7);
+      expect(tabButtons).toHaveLength(5);
       expect(tabButtons.map((b) => b.props['data-tab-id'])).toEqual([
-        'all',
-        'unmatched',
-        'low_confidence',
+        'needs_attention',
         'user_suppressed',
         'suppressed',
         'overrides',
         'merged',
       ]);
 
-      // Initially "all" tab is active (aria-selected=true) and all others have aria-selected=false
+      // Initially "needs_attention" tab is active (aria-selected=true) and all others have aria-selected=false
       expect(
-        tabButtons.find((b) => b.props['data-tab-id'] === 'all')?.props['aria-selected']
+        tabButtons.find((b) => b.props['data-tab-id'] === 'needs_attention')?.props['aria-selected']
       ).toBe(true);
       expect(
         tabButtons
-          .filter((b) => b.props['data-tab-id'] !== 'all')
+          .filter((b) => b.props['data-tab-id'] !== 'needs_attention')
           .every((b) => b.props['aria-selected'] === false)
       ).toBe(true);
 
@@ -2363,7 +2395,6 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('4 Pending Review');
       expect(rendered.text).toContain('1 Confirmed');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (4)');
-      expect(rendered.text).toContain('✓ 1');
       expect(rendered.text).toContain('Confirmed Suppressed');
 
       // 4. Select two items via checkboxes ("Dying Light Book of Laughs DLC" & "Steamworks Common Redistributables") and click "Confirm Selected (2)"
@@ -2399,7 +2430,6 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('2 Pending Review');
       expect(rendered.text).toContain('3 Confirmed');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (2)');
-      expect(rendered.text).toContain('✓ 3');
 
       // 5. Click "Confirm All Shown (2)" to move the remaining 2 items into Accordion 2 (Reviewed & Confirmed Non-Games)
       const confirmAllShownBtn = findElements(
@@ -2413,7 +2443,6 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('0 Pending Review');
       expect(rendered.text).toContain('5 Confirmed');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (0)');
-      expect(rendered.text).toContain('✓ 5');
       expect(rendered.text).toContain(
         'All auto-filtered storefront entries have been reviewed and confirmed!'
       );
@@ -2443,7 +2472,6 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('1 Pending Review');
       expect(rendered.text).toContain('5 Confirmed');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (1)');
-      expect(rendered.text).toContain('✓ 5');
       expect(rendered.text).toContain('Cyberpunk 2077 Digital Goodies');
       expect(rendered.text).toContain('Soundtracks / Goodies (1)');
 
@@ -2468,7 +2496,6 @@ describe('Phase 4 QA Suite: Storefront-Context-Aware Install/Play, Fix & Match C
       expect(rendered.text).toContain('2 Pending Review');
       expect(rendered.text).toContain('4 Confirmed');
       expect(rendered.text).toContain('Auto-Filtered Non-Games (2)');
-      expect(rendered.text).toContain('✓ 4');
     });
   });
 });

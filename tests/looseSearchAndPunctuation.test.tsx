@@ -290,10 +290,19 @@ describe('Punctuation-Tolerant Search & Acronym Normalization Suite', () => {
           headerImage: '',
           shortDescription: '',
         }),
-        // Merged multi-store game
+        // Low-confidence automatic match with apostrophe
+        makeTestGame({
+          id: 'lowconf-deaths-door',
+          title: "Death's Door",
+          capsuleImage: 'https://example.com/deaths-door-capsule.jpg',
+          matchConfidence: 72,
+          needsMatchReview: true,
+        }),
+        // Merged multi-store game (fully matched)
         makeTestGame({
           id: 'merged-stalker',
           title: 'S.T.A.L.K.E.R. 2: Heart of Chornobyl',
+          capsuleImage: 'https://example.com/stalker2-capsule.jpg',
           platforms: [
             { platformId: 'steam', platformGameId: '1643320', installed: true, playtimeMinutes: 60 },
             { platformId: 'gog', platformGameId: 'stalker2', installed: false, playtimeMinutes: 0 },
@@ -317,6 +326,12 @@ describe('Punctuation-Tolerant Search & Acronym Normalization Suite', () => {
       });
 
       let tree = harness.render();
+      const initialNeedsAttentionBtn = findElements(
+        tree,
+        (el) => el.props?.['data-tab-id'] === 'needs_attention'
+      )[0];
+      expect(getTextContent(initialNeedsAttentionBtn)).toContain('Needs Attention (3)');
+
       const searchInput = findElements(
         tree,
         (el) =>
@@ -326,17 +341,34 @@ describe('Punctuation-Tolerant Search & Acronym Normalization Suite', () => {
       )[0];
       expect(searchInput).toBeDefined();
 
-      // Search for "alien isolation" (without colon)
+      // Search for "alien isolation" (without colon) -> matches unmatched game in Needs Attention
       searchInput.props.onChange({ target: { value: 'alien isolation' } });
       tree = harness.render();
 
-      const unmatchedTabBtn = findElements(
+      const needsAttentionAfterAlien = findElements(
         tree,
-        (el) => el.props?.['data-tab-id'] === 'unmatched'
+        (el) => el.props?.['data-tab-id'] === 'needs_attention'
       )[0];
-      expect(getTextContent(unmatchedTabBtn)).toContain('Unmatched (1)');
+      expect(getTextContent(needsAttentionAfterAlien)).toContain('Needs Attention (1)');
 
-      // Search for "stalker 2" (without dots or colon)
+      // Search for "deaths door" (without apostrophe) -> matches low-confidence game in Needs Attention
+      const searchInputDeathsDoor = findElements(
+        tree,
+        (el) =>
+          el.type === 'input' &&
+          typeof el.props?.placeholder === 'string' &&
+          el.props.placeholder.includes('Filter by title')
+      )[0];
+      searchInputDeathsDoor.props.onChange({ target: { value: 'deaths door' } });
+      tree = harness.render();
+
+      const needsAttentionAfterDeathsDoor = findElements(
+        tree,
+        (el) => el.props?.['data-tab-id'] === 'needs_attention'
+      )[0];
+      expect(getTextContent(needsAttentionAfterDeathsDoor)).toContain('Needs Attention (1)');
+
+      // Search for "stalker 2" (without dots or colon) -> matches merged multi-store game
       const searchInputAfter = findElements(
         tree,
         (el) =>
@@ -346,6 +378,12 @@ describe('Punctuation-Tolerant Search & Acronym Normalization Suite', () => {
       )[0];
       searchInputAfter.props.onChange({ target: { value: 'stalker 2' } });
       tree = harness.render();
+
+      const needsAttentionAfterStalker = findElements(
+        tree,
+        (el) => el.props?.['data-tab-id'] === 'needs_attention'
+      )[0];
+      expect(getTextContent(needsAttentionAfterStalker)).toContain('Needs Attention (0)');
 
       const mergedTabBtn = findElements(
         tree,

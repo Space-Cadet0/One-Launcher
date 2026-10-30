@@ -20,6 +20,7 @@ import {
   notifyImageUnmounted,
 } from './gridScrollTracker';
 import {
+  buildExplicitOverrideCoverUrlSet,
   failedCoverUrls,
   getCoverCandidates,
   hasUncheckedSteamBrowseAssets,
@@ -110,12 +111,17 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     }, [isCoverMounted]);
 
     const candidates = useMemo(() => {
-      return getCoverCandidates(game, overrideCoverUrl || undefined, userOverride);
-    }, [game, overrideCoverUrl, userOverride, steamMatchVersion]);
+      return getCoverCandidates(game, overrideCoverUrl || undefined, effectiveOverride);
+    }, [game, overrideCoverUrl, effectiveOverride, steamMatchVersion]);
+
+    const explicitOverrideUrls = useMemo(() => {
+      return buildExplicitOverrideCoverUrlSet(game, overrideCoverUrl, effectiveOverride);
+    }, [game, overrideCoverUrl, effectiveOverride]);
 
     const attemptedBrowseLookupAppIdRef = useRef<number | null>(null);
 
     const rawFallbackHeaderUrl =
+      effectiveOverride?.headerImage ||
       game.enrichedMetadata?.headerImage ||
       steamApi.getStoreBrowseAssetsInstant(effectiveCoverSteamAppId || game.steamAppId)
         ?.headerImage ||
@@ -136,6 +142,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
             xboxProductId: effectiveXboxProductId,
             packageFamilyName: effectivePackageFamilyName,
             xboxTitleId: effectiveXboxTitleId,
+            ov: effectiveOverride?.headerImage ? effectiveOverride.updatedAt || '1' : undefined,
           })
         : undefined;
 
@@ -152,6 +159,15 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       return null;
     }, [candidates, failedTick]);
 
+    const isCurrentCandidateUserOverride = Boolean(
+      rawCurrentSrc &&
+        (explicitOverrideUrls.has(rawCurrentSrc) ||
+          explicitOverrideUrls.has(unwrapOlMediaUrl(rawCurrentSrc)))
+    );
+    const coverOverrideToken = isCurrentCandidateUserOverride
+      ? effectiveOverride?.updatedAt || '1'
+      : undefined;
+
     const currentSrc = useMemo(() => {
       if (rawCurrentSrc) {
         const wrapped = toOlMediaUrl({
@@ -165,6 +181,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           xboxProductId: effectiveXboxProductId,
           packageFamilyName: effectivePackageFamilyName,
           xboxTitleId: effectiveXboxTitleId,
+          ov: coverOverrideToken,
         });
         if (!failedCoverUrls.has(wrapped)) {
           return wrapped;
@@ -188,6 +205,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       return null;
     }, [
       rawCurrentSrc,
+      coverOverrideToken,
       game.id,
       effectiveCoverSteamAppId,
       gogPlatformGameId,
@@ -371,10 +389,9 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
     }
 
     const unwrappedCurrentSrc = unwrapOlMediaUrl(rawCurrentSrc || currentSrc);
-    const isUserExplicitCover = Boolean(
-      (userOverride?.capsuleImage && unwrappedCurrentSrc === userOverride.capsuleImage) ||
-        (overrideCoverUrl && unwrappedCurrentSrc === overrideCoverUrl)
-    );
+    const isUserExplicitCover =
+      isCurrentCandidateUserOverride ||
+      Boolean(unwrappedCurrentSrc && explicitOverrideUrls.has(unwrappedCurrentSrc));
 
     return (
       <div className="relative w-full h-full">

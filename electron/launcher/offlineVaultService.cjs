@@ -510,6 +510,182 @@ function buildAssetUrlKey(gameId, role, ordinal, sourceUrl) {
   return `url::${cleanRole}::${urlHash}`;
 }
 
+/**
+ * Normalizes an explicit user media override flag (`ov`) from `ol-media://` or IPC params.
+ * @param {unknown} rawOv
+ * @returns {boolean}
+ */
+function isExplicitOverrideParam(rawOv) {
+  if (rawOv === true || rawOv === 1) return true;
+  if (typeof rawOv === 'number') return rawOv > 0;
+  if (typeof rawOv === 'string') {
+    const norm = rawOv.trim().toLowerCase();
+    return Boolean(
+      norm && norm !== '0' && norm !== 'false' && norm !== 'null' && norm !== 'undefined'
+    );
+  }
+  return false;
+}
+
+/**
+ * @param {string} hostname
+ * @param {string[]} allowedDomains
+ * @returns {boolean}
+ */
+function matchesCdnHost(hostname, allowedDomains) {
+  const clean = String(hostname || '').trim().toLowerCase();
+  if (!clean) return false;
+  for (const dom of allowedDomains) {
+    if (clean === dom || clean.endsWith(`.${dom}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Validates whether a SQLite `game_media_assets` federated row (`source_url` + `federated_path`)
+ * is origin-, ID-, and content-hash-compatible across macOS and Windows paths, and rejects
+ * explicit user media overrides (`params?.ov`) so custom covers always use `media_blobs`.
+ *
+ * @param {unknown} sourceUrl
+ * @param {unknown} federatedPath
+ * @param {Record<string, any> | null} [params]
+ * @returns {boolean}
+ */
+function isFederatedAssetRowCompatible(sourceUrl, federatedPath, params = null) {
+  if (isExplicitOverrideParam(params?.ov)) {
+    return false;
+  }
+  const cleanFedPath = typeof federatedPath === 'string' ? federatedPath.trim() : '';
+  if (!cleanFedPath) {
+    return false;
+  }
+
+  const normPath = cleanFedPath.replace(/\\/g, '/');
+  const normPathLower = normPath.toLowerCase();
+  const paramGogId = params?.gogId != null ? String(params.gogId).trim() : params?.gid != null ? String(params.gid).trim() : '';
+  const paramSteamId = params?.steamAppId != null ? String(params.steamAppId).trim() : params?.sid != null ? String(params.sid).trim() : '';
+
+  const gogDirMatch = normPath.match(/\/gog\/(\d+)\//i);
+  if (paramGogId && gogDirMatch && gogDirMatch[1] !== paramGogId) {
+    return false;
+  }
+  const steamDirMatch = normPath.match(/\/librarycache\/(\d+)(?:\/|_)/i);
+  if (paramSteamId && steamDirMatch && steamDirMatch[1] !== paramSteamId) {
+    return false;
+  }
+
+  const cleanUrl = typeof sourceUrl === 'string' ? sourceUrl.trim() : '';
+  if (!cleanUrl) {
+    return true;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(cleanUrl);
+  } catch {
+    return false;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname || '';
+
+  // Third-party custom artwork hosts must never resolve to local storefront federated files
+  if (matchesCdnHost(host, ['igdb.com', 'steamgriddb.com'])) {
+    return false;
+  }
+
+  const isGogCache =
+    normPathLower.includes('gog.com/galaxy/webcache') ||
+    (normPathLower.includes('/webcache/') && normPathLower.includes('/gog/'));
+  if (isGogCache) {
+    if (!matchesCdnHost(host, ['gog-statics.com', 'gog.com'])) {
+      return false;
+    }
+    const urlHash64 = pathname.match(/([0-9a-f]{64})/i);
+    const fileHash64 = path.posix.basename(normPath).match(/([0-9a-f]{64})/i);
+    if (urlHash64 && fileHash64 && urlHash64[1].toLowerCase() !== fileHash64[1].toLowerCase()) {
+      return false;
+    }
+    return true;
+  }
+
+  const isSteamCache =
+    normPathLower.includes('appcache/librarycache') ||
+    (normPathLower.includes('/userdata/') && normPathLower.includes('/config/grid/')) ||
+    normPathLower.includes('/steam/games/');
+  if (isSteamCache) {
+    if (
+      !matchesCdnHost(host, [
+        'steamstatic.com',
+        'akamaihd.net',
+        'steamcdn-a.akamaihd.net',
+        'steampowered.com',
+      ])
+    ) {
+      return false;
+    }
+    const appUrlMatch = pathname.match(/\/(?:steam|images)\/apps\/(\d+)\//i);
+    if (appUrlMatch) {
+      if (steamDirMatch && steamDirMatch[1] !== appUrlMatch[1]) {
+        return false;
+      }
+      if (paramSteamId && paramSteamId !== appUrlMatch[1]) {
+        return false;
+      }
+    }
+    const sha40SegMatch = pathname.match(/\/([0-9a-f]{40})\//i);
+    if (sha40SegMatch && normPathLower.includes('appcache/librarycache')) {
+      if (!normPathLower.includes(sha40SegMatch[1].toLowerCase())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const isXboxCache =
+    normPathLower.includes('/xboxgames/') ||
+    normPathLower.includes('microsoft.gamingapp_') ||
+    normPathLower.includes('8wekyb3d8bbwe') ||
+    normPathLower.includes('/windowsapps/');
+  if (isXboxCache) {
+    return matchesCdnHost(host, ['s-microsoft.com', 'xboxlive.com', 'microsoft.com']);
+  }
+
+  const isEpicCache =
+    normPathLower.includes('/images-cache/') ||
+    normPathLower.includes('/heroic/') ||
+    normPathLower.includes('epicgameslauncher') ||
+    normPathLower.includes('/legendary/');
+  if (isEpicCache) {
+    return matchesCdnHost(host, ['epicgames.com', 'unrealengine.com']);
+  }
+
+  return true;
+}
+
+/**
+ * Validates a candidate gameId string before SQLite queries or deletions.
+ * @param {unknown} rawId
+ * @returns {string}
+ */
+function normalizeSafeVaultGameId(rawId) {
+  if (typeof rawId !== 'string') return '';
+  const trimmed = rawId.trim();
+  if (
+    !trimmed ||
+    trimmed.length > 256 ||
+    trimmed.includes('\0') ||
+    trimmed === '__proto__' ||
+    trimmed === 'constructor' ||
+    trimmed === 'prototype'
+  ) {
+    return '';
+  }
+  return trimmed;
+}
+
 class OfflineVaultService {
   /**
    * @param {Record<string, any>} [options]
@@ -549,6 +725,7 @@ class OfflineVaultService {
 
     this.cachedFreeDiskBytes = null;
     this.cachedFreeDiskAt = 0;
+    this.isShutdown = false;
   }
 
   now() {
@@ -874,7 +1051,8 @@ class OfflineVaultService {
         critic_json TEXT,
         metadata_quality TEXT NOT NULL DEFAULT 'skeleton_fallback',
         updated_at INTEGER NOT NULL DEFAULT 0,
-        enriched_at INTEGER NOT NULL DEFAULT 0
+        enriched_at INTEGER NOT NULL DEFAULT 0,
+        media_hydrated_at INTEGER DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS media_blobs (
@@ -921,13 +1099,15 @@ class OfflineVaultService {
 
     try {
       const cols = db.prepare('PRAGMA table_info(vault_games)').all();
-      if (
-        Array.isArray(cols) &&
-        !cols.some((c) => c && c.name === 'archived_by_subscription_rotation')
-      ) {
-        db.exec(
-          'ALTER TABLE vault_games ADD COLUMN archived_by_subscription_rotation INTEGER NOT NULL DEFAULT 0;'
-        );
+      if (Array.isArray(cols)) {
+        if (!cols.some((c) => c && c.name === 'archived_by_subscription_rotation')) {
+          db.exec(
+            'ALTER TABLE vault_games ADD COLUMN archived_by_subscription_rotation INTEGER NOT NULL DEFAULT 0;'
+          );
+        }
+        if (!cols.some((c) => c && c.name === 'media_hydrated_at')) {
+          db.exec('ALTER TABLE vault_games ADD COLUMN media_hydrated_at INTEGER DEFAULT 0;');
+        }
       }
     } catch (migErr) {
       diagLog.warn('offlineVault.migrateSubscriptionRotationCol', migErr);
@@ -938,6 +1118,7 @@ class OfflineVaultService {
     ).run(this.now());
 
     this.db = db;
+    this.isShutdown = false;
     this.loadP1RecentGamesFromDb(db);
     this.runStartupSelfHeal(db);
     this.runStartupZlibCompactionIfNeeded(db);
@@ -1025,6 +1206,30 @@ class OfflineVaultService {
             if (dupId !== gid) {
               deleteAssetsStmt.run(dupId);
               deleteGameStmt.run(dupId);
+            }
+          }
+        }
+      }
+
+      // Self-heal poisoned cross-storefront, third-party CDN, or mismatched-hash federated asset rows
+      const federatedRows = db
+        .prepare(
+          "SELECT url_key, game_id, source_url, federated_path FROM game_media_assets WHERE storage_kind = 'federated'"
+        )
+        .all();
+      if (Array.isArray(federatedRows) && federatedRows.length > 0) {
+        const resetFederatedStmt = db.prepare(
+          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
+        );
+        const resetHydratedStmt = db.prepare(
+          'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
+        );
+        for (const fedRow of federatedRows) {
+          if (!fedRow || !fedRow.url_key) continue;
+          if (!isFederatedAssetRowCompatible(fedRow.source_url, fedRow.federated_path, null)) {
+            resetFederatedStmt.run(fedRow.url_key);
+            if (fedRow.game_id) {
+              resetHydratedStmt.run(String(fedRow.game_id));
             }
           }
         }
@@ -1263,6 +1468,7 @@ class OfflineVaultService {
               next_retry_at = 0,
               last_status_code = NULL,
               last_verified_at = 0;
+          UPDATE vault_games SET media_hydrated_at = 0;
         `);
       } else {
         db.exec('DELETE FROM game_media_assets;');
@@ -1371,7 +1577,7 @@ class OfflineVaultService {
     let upserted = 0;
 
     const selectExistingStmt = db.prepare(
-      'SELECT is_favorited, archived_by_subscription_rotation, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
+      'SELECT steam_app_id, is_favorited, archived_by_subscription_rotation, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
     );
     const deleteOrphanAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
     const deleteOrphanGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
@@ -1383,7 +1589,7 @@ class OfflineVaultService {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(game_id) DO UPDATE SET
         canonical_title = CASE WHEN excluded.canonical_title != '' THEN excluded.canonical_title ELSE vault_games.canonical_title END,
-        steam_app_id = COALESCE(excluded.steam_app_id, vault_games.steam_app_id),
+        steam_app_id = excluded.steam_app_id,
         is_installed = excluded.is_installed,
         is_favorited = excluded.is_favorited,
         archived_by_subscription_rotation = excluded.archived_by_subscription_rotation,
@@ -1438,12 +1644,17 @@ class OfflineVaultService {
               ? Number(existing.is_favorited || 0)
               : 0;
 
+        const rawSteamAppIdStr = typeof g.steamAppId === 'string' ? g.steamAppId.trim() : '';
         const steamAppId =
           typeof g.steamAppId === 'number' && g.steamAppId > 0
             ? g.steamAppId
-            : typeof g.steamAppId === 'string' && /^\d+$/.test(g.steamAppId)
-              ? parseInt(g.steamAppId, 10)
-              : null;
+            : rawSteamAppIdStr && /^\d+$/.test(rawSteamAppIdStr) && parseInt(rawSteamAppIdStr, 10) > 0
+              ? parseInt(rawSteamAppIdStr, 10)
+              : g.steamAppId === null || platforms !== null
+                ? null
+                : existing && typeof existing.steam_app_id === 'number' && existing.steam_app_id > 0
+                  ? existing.steam_app_id
+                  : null;
 
         const summaryCopy = { ...g };
         delete summaryCopy.enrichedMetadata;
@@ -1579,6 +1790,307 @@ class OfflineVaultService {
     }
 
     return { success: true, upserted };
+  }
+
+  /**
+   * Expands a candidate gameId into canonical/legacy separator variants (`:`, `-`, `_`).
+   * @param {Set<string>} targetSet
+   * @param {unknown} rawId
+   */
+  collectVaultGameIdVariants(targetSet, rawId) {
+    const clean = normalizeSafeVaultGameId(rawId);
+    if (!clean) return;
+    targetSet.add(clean);
+    const sepMatch = clean.match(/^(steam|gog|epic|xbox|ea|ubisoft|local)[:_-](.+)$/i);
+    if (sepMatch) {
+      const prefix = sepMatch[1].toLowerCase();
+      const rest = sepMatch[2].trim();
+      if (rest) {
+        targetSet.add(`${prefix}:${rest}`);
+        targetSet.add(`${prefix}-${rest}`);
+        targetSet.add(`${prefix}_${rest}`);
+        if (prefix === 'xbox' && /^[A-Z0-9]{12}$/i.test(rest)) {
+          const upper = rest.toUpperCase();
+          const lower = rest.toLowerCase();
+          targetSet.add(`xbox:${upper}`);
+          targetSet.add(`xbox:${lower}`);
+          targetSet.add(`xbox-${upper}`);
+          targetSet.add(`xbox-${lower}`);
+          targetSet.add(`xbox_${upper}`);
+          targetSet.add(`xbox_${lower}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Deletes orphaned or rekeyed game rows from `vault_games` and `game_media_assets`
+   * inside a single transaction while keeping content-addressed `media_blobs` intact.
+   *
+   * @param {string[] | { gameIds?: string[] } | string} gameIdsInput
+   */
+  deleteGames(gameIdsInput) {
+    const rawList = Array.isArray(gameIdsInput)
+      ? gameIdsInput
+      : gameIdsInput && typeof gameIdsInput === 'object' && Array.isArray(gameIdsInput.gameIds)
+        ? gameIdsInput.gameIds
+        : typeof gameIdsInput === 'string'
+          ? [gameIdsInput]
+          : [];
+
+    /** @type {string[]} */
+    const safeIds = [];
+    const seen = new Set();
+    for (const rawId of rawList) {
+      const safe = normalizeSafeVaultGameId(rawId);
+      if (safe && !seen.has(safe)) {
+        seen.add(safe);
+        safeIds.push(safe);
+      }
+    }
+
+    if (safeIds.length === 0) {
+      return { success: true, deleted: 0 };
+    }
+
+    const db = this.ensureOpen();
+    const deleteAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
+    const deleteGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
+    let deleted = 0;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of safeIds) {
+        deleteAssetsStmt.run(id);
+        const res = deleteGameStmt.run(id);
+        if (res && res.changes > 0) {
+          deleted += Number(res.changes);
+        }
+        this.p1RecentDetailGames.delete(id);
+      }
+      db.exec('COMMIT');
+    } catch (txErr) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {}
+      return {
+        success: false,
+        error: txErr instanceof Error ? txErr.message : String(txErr),
+      };
+    }
+
+    return { success: true, deleted };
+  }
+
+  /**
+   * Invalidates stale federated and superseded cover/header media rows when a user metadata
+   * or artwork override is saved, preserving content-addressed `media_blobs` and keeping
+   * matching `storage_kind = 'blob'` rows intact.
+   *
+   * @param {string} gameId
+   * @param {Record<string, any>} [record]
+   * @param {string[]} [extraKeys]
+   */
+  saveUserOverride(gameId, record = {}, extraKeys = []) {
+    const primaryGameId = normalizeSafeVaultGameId(gameId);
+    if (!primaryGameId) {
+      return { success: false, invalidated: 0 };
+    }
+
+    /** @type {Set<string>} */
+    const candidateIds = new Set();
+    this.collectVaultGameIdVariants(candidateIds, primaryGameId);
+    if (record && typeof record === 'object') {
+      this.collectVaultGameIdVariants(candidateIds, record.gameId);
+      if (record.platformId && record.platformGameId) {
+        this.collectVaultGameIdVariants(
+          candidateIds,
+          `${String(record.platformId).trim()}:${String(record.platformGameId).trim()}`
+        );
+      }
+      const rawSid = record.steamAppId;
+      const numSid =
+        typeof rawSid === 'number' && rawSid > 0
+          ? rawSid
+          : typeof rawSid === 'string' && /^\d+$/.test(rawSid.trim())
+            ? parseInt(rawSid.trim(), 10)
+            : 0;
+      if (numSid > 0) {
+        this.collectVaultGameIdVariants(candidateIds, `steam-${numSid}`);
+      }
+      if (Array.isArray(record.purgeKeys)) {
+        for (const pk of record.purgeKeys) {
+          this.collectVaultGameIdVariants(candidateIds, pk);
+        }
+      }
+    }
+    if (Array.isArray(extraKeys)) {
+      for (const ek of extraKeys) {
+        this.collectVaultGameIdVariants(candidateIds, ek);
+      }
+    }
+
+    const nextCoverUrl =
+      typeof record?.coverUrl === 'string' && record.coverUrl.trim()
+        ? record.coverUrl.trim()
+        : typeof record?.capsuleImage === 'string' && record.capsuleImage.trim()
+          ? record.capsuleImage.trim()
+          : '';
+    const nextHeaderUrl =
+      typeof record?.heroUrl === 'string' && record.heroUrl.trim()
+        ? record.heroUrl.trim()
+        : typeof record?.headerUrl === 'string' && record.headerUrl.trim()
+          ? record.headerUrl.trim()
+          : typeof record?.headerImage === 'string' && record.headerImage.trim()
+            ? record.headerImage.trim()
+            : '';
+
+    const nextCoverNorm = nextCoverUrl ? normalizeAssetIdentityUrl(nextCoverUrl) : '';
+    const nextHeaderNorm = nextHeaderUrl ? normalizeAssetIdentityUrl(nextHeaderUrl) : '';
+
+    const db = this.ensureOpen();
+    const selectRowsStmt = db.prepare(
+      'SELECT url_key, game_id, asset_role, source_url, storage_kind, blob_sha256 FROM game_media_assets WHERE game_id = ?'
+    );
+    const resetFederatedOnlyStmt = db.prepare(`
+      UPDATE game_media_assets
+      SET storage_kind = 'pending',
+          federated_path = NULL,
+          failure_count = 0,
+          next_retry_at = 0,
+          last_status_code = NULL
+      WHERE url_key = ?
+    `);
+    const resetFullRowStmt = db.prepare(`
+      UPDATE game_media_assets
+      SET storage_kind = 'pending',
+          blob_sha256 = NULL,
+          federated_path = NULL,
+          failure_count = 0,
+          next_retry_at = 0,
+          last_status_code = NULL
+      WHERE url_key = ?
+    `);
+    const resetHydratedStmt = db.prepare(
+      'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
+    );
+
+    let invalidated = 0;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const cid of candidateIds) {
+        const rows = selectRowsStmt.all(cid);
+        let touchedGame = false;
+        for (const row of rows) {
+          if (!row || !row.url_key) continue;
+          const role = String(row.asset_role || '').toLowerCase();
+          const isCoverRole = role === 'cover' || role === 'capsule';
+          const isHeaderRole = role === 'header' || role === 'hero';
+
+          if (isCoverRole || isHeaderRole) {
+            const expectedNorm = isCoverRole ? nextCoverNorm : nextHeaderNorm;
+            const rowNorm = row.source_url ? normalizeAssetIdentityUrl(row.source_url) : '';
+            const keepMatchingBlob =
+              cid === primaryGameId &&
+              row.storage_kind === 'blob' &&
+              Boolean(row.blob_sha256) &&
+              Boolean(expectedNorm) &&
+              rowNorm === expectedNorm;
+            if (!keepMatchingBlob) {
+              resetFullRowStmt.run(row.url_key);
+              invalidated++;
+              touchedGame = true;
+            }
+          } else if (row.storage_kind === 'federated') {
+            resetFederatedOnlyStmt.run(row.url_key);
+            invalidated++;
+            touchedGame = true;
+          }
+        }
+        if (touchedGame) {
+          resetHydratedStmt.run(cid);
+        }
+      }
+      db.exec('COMMIT');
+    } catch (txErr) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {}
+      diagLog.debug('offlineVault.saveUserOverride', txErr);
+      return { success: false, invalidated: 0 };
+    }
+
+    return { success: true, invalidated };
+  }
+
+  /**
+   * Invalidates federated and cover/header media rows across `gameId` and any removed alias/rekey
+   * IDs when a user override is reset/removed, keeping `media_blobs` intact on disk.
+   *
+   * @param {string} gameId
+   * @param {string[]} [extraKeys]
+   */
+  removeUserOverride(gameId, extraKeys = []) {
+    /** @type {Set<string>} */
+    const candidateIds = new Set();
+    this.collectVaultGameIdVariants(candidateIds, gameId);
+    if (Array.isArray(extraKeys)) {
+      for (const ek of extraKeys) {
+        this.collectVaultGameIdVariants(candidateIds, ek);
+      }
+    }
+    if (candidateIds.size === 0) {
+      return { success: false, invalidated: 0 };
+    }
+
+    const db = this.ensureOpen();
+    const resetCoverHeaderStmt = db.prepare(`
+      UPDATE game_media_assets
+      SET storage_kind = 'pending',
+          blob_sha256 = NULL,
+          federated_path = NULL,
+          failure_count = 0,
+          next_retry_at = 0,
+          last_status_code = NULL
+      WHERE game_id = ?
+        AND asset_role IN ('cover', 'capsule', 'header', 'hero')
+    `);
+    const resetFederatedStmt = db.prepare(`
+      UPDATE game_media_assets
+      SET storage_kind = 'pending',
+          federated_path = NULL,
+          failure_count = 0,
+          next_retry_at = 0,
+          last_status_code = NULL
+      WHERE game_id = ?
+        AND storage_kind = 'federated'
+    `);
+    const resetHydratedStmt = db.prepare(
+      'UPDATE vault_games SET media_hydrated_at = 0 WHERE game_id = ?'
+    );
+
+    let invalidated = 0;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const cid of candidateIds) {
+        const r1 = resetCoverHeaderStmt.run(cid);
+        const r2 = resetFederatedStmt.run(cid);
+        const changes = Number(r1?.changes || 0) + Number(r2?.changes || 0);
+        if (changes > 0) {
+          invalidated += changes;
+        }
+        resetHydratedStmt.run(cid);
+      }
+      db.exec('COMMIT');
+    } catch (txErr) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {}
+      diagLog.debug('offlineVault.removeUserOverride', txErr);
+      return { success: false, invalidated: 0 };
+    }
+
+    return { success: true, invalidated };
   }
 
   /**
@@ -1841,6 +2353,41 @@ class OfflineVaultService {
     return { success: true };
   }
 
+  /**
+   * Durably stamps `media_hydrated_at` on `vault_games` once static image hydration completes
+   * (including 0-asset games whose media URLs were all video-excluded or already verified).
+   *
+   * @param {string} gameId
+   * @param {number} [hydratedAt]
+   */
+  markGameMediaHydrated(gameId, hydratedAt = this.now()) {
+    const cleanId = String(gameId || '').trim();
+    if (!cleanId || this.isShutdown) {
+      return { success: false, updated: 0 };
+    }
+    try {
+      const db = this.db || this.ensureOpen();
+      if (!db) {
+        return { success: false, updated: 0 };
+      }
+      const ts =
+        typeof hydratedAt === 'number' && Number.isFinite(hydratedAt) && hydratedAt >= 0
+          ? Math.floor(hydratedAt)
+          : this.now();
+      const res = db
+        .prepare('UPDATE vault_games SET media_hydrated_at = ? WHERE game_id = ?')
+        .run(ts, cleanId);
+      return {
+        success: true,
+        updated: Number(res?.changes || 0),
+        mediaHydratedAt: ts,
+      };
+    } catch (err) {
+      diagLog.debug('offlineVault.markGameMediaHydrated', err, { gameId: cleanId });
+      return { success: false, updated: 0 };
+    }
+  }
+
   getGameDetail(gameId) {
     const cleanId = String(gameId || '').trim();
     if (!cleanId) return null;
@@ -1848,7 +2395,7 @@ class OfflineVaultService {
     const row = db
       .prepare(
         `
-        SELECT game_id, archived_by_subscription_rotation, enriched_json, achievements_json, hltb_json, critic_json, metadata_quality, enriched_at
+        SELECT game_id, archived_by_subscription_rotation, enriched_json, achievements_json, hltb_json, critic_json, metadata_quality, enriched_at, media_hydrated_at
         FROM vault_games
         WHERE game_id = ?
       `
@@ -1861,6 +2408,17 @@ class OfflineVaultService {
     const hltb = parseVaultJson(row.hltb_json);
     const criticScore = parseVaultJson(row.critic_json);
     const isArchivedRotation = Number(row.archived_by_subscription_rotation || 0) === 1;
+    const enrichedAtNum = Number(row.enriched_at) || 0;
+    const mediaHydratedAtNum = Number(row.media_hydrated_at) || 0;
+
+    if (
+      enrichedMetadata &&
+      typeof enrichedMetadata === 'object' &&
+      !enrichedMetadata.enrichedAt &&
+      enrichedAtNum > 0
+    ) {
+      enrichedMetadata.enrichedAt = enrichedAtNum;
+    }
 
     let effectiveQuality = row.metadata_quality || 'skeleton_fallback';
     if (
@@ -1892,7 +2450,8 @@ class OfflineVaultService {
         hltb: null,
         criticScore: null,
         metadataQuality: effectiveQuality,
-        enrichedAt: row.enriched_at || undefined,
+        enrichedAt: enrichedAtNum,
+        mediaHydratedAt: mediaHydratedAtNum,
         ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
       };
     }
@@ -1904,7 +2463,8 @@ class OfflineVaultService {
       hltb,
       criticScore,
       metadataQuality: effectiveQuality,
-      enrichedAt: row.enriched_at || undefined,
+      enrichedAt: enrichedAtNum,
+      mediaHydratedAt: mediaHydratedAtNum,
       ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
     };
   }
@@ -1912,7 +2472,18 @@ class OfflineVaultService {
   getCatalogSnapshot(options = {}) {
     const db = this.ensureOpen();
     const includeArchived = Boolean(options && options.includeArchived);
-    const rows = db.prepare('SELECT * FROM vault_games ORDER BY canonical_title ASC').all();
+    const rows = db
+      .prepare(
+        `
+        SELECT game_id, canonical_title, steam_app_id, is_installed, is_favorited,
+               archived_by_subscription_rotation, platforms_json, summary_json,
+               enriched_json, achievements_json, hltb_json, critic_json,
+               metadata_quality, updated_at, enriched_at, media_hydrated_at
+        FROM vault_games
+        ORDER BY canonical_title ASC
+      `
+      )
+      .all();
     const games = [];
     /** @type {Record<string, any>} */
     const details = {};
@@ -1930,6 +2501,17 @@ class OfflineVaultService {
       const achievements = parseVaultJson(row.achievements_json);
       const hltb = parseVaultJson(row.hltb_json);
       const criticScore = parseVaultJson(row.critic_json);
+      const enrichedAtNum = Number(row.enriched_at) || 0;
+      const mediaHydratedAtNum = Number(row.media_hydrated_at) || 0;
+
+      if (
+        enrichedMetadata &&
+        typeof enrichedMetadata === 'object' &&
+        !enrichedMetadata.enrichedAt &&
+        enrichedAtNum > 0
+      ) {
+        enrichedMetadata.enrichedAt = enrichedAtNum;
+      }
 
       let effectiveQuality = row.metadata_quality || 'skeleton_fallback';
       if (
@@ -1955,9 +2537,15 @@ class OfflineVaultService {
       }
 
       if (summary && (summary.id || row.game_id)) {
+        const effectiveGameId = String(summary.id || row.game_id || '');
+        const hasSteamEntitlement =
+          Boolean(summary.steamAppId) ||
+          effectiveGameId.startsWith('steam-') ||
+          (Array.isArray(platforms) &&
+            platforms.some((p) => p && String(p.platformId || '').toLowerCase() === 'steam'));
         const gameObj = {
           ...summary,
-          id: summary.id || row.game_id,
+          id: effectiveGameId,
           title: summary.title || row.canonical_title || row.game_id,
           sortTitle:
             summary.sortTitle ||
@@ -1965,7 +2553,11 @@ class OfflineVaultService {
               /^(The|A|An)\s+/i,
               ''
             ),
-          ...(row.steam_app_id ? { steamAppId: Number(row.steam_app_id) } : {}),
+          ...(summary.steamAppId
+            ? { steamAppId: Number(summary.steamAppId) }
+            : hasSteamEntitlement && row.steam_app_id
+              ? { steamAppId: Number(row.steam_app_id) }
+              : {}),
           ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
           platforms,
           ...(enrichedMetadata ? { enrichedMetadata } : {}),
@@ -1973,7 +2565,7 @@ class OfflineVaultService {
         games.push(gameObj);
       }
 
-      if (enrichedMetadata || achievements || hltb || criticScore) {
+      if (enrichedMetadata || achievements || hltb || criticScore || mediaHydratedAtNum > 0) {
         const gameIdKey = String(row.game_id || '');
         details[gameIdKey] = {
           gameId: gameIdKey,
@@ -1982,7 +2574,8 @@ class OfflineVaultService {
           hltb,
           criticScore,
           metadataQuality: effectiveQuality,
-          enrichedAt: row.enriched_at ? Number(row.enriched_at) : undefined,
+          enrichedAt: enrichedAtNum,
+          mediaHydratedAt: mediaHydratedAtNum,
           ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
         };
       }
@@ -2979,6 +3572,9 @@ class OfflineVaultService {
     }
 
     if (row.storage_kind === 'federated' && row.federated_path) {
+      if (!isFederatedAssetRowCompatible(sourceUrl || row.source_url, row.federated_path, params)) {
+        return false;
+      }
       try {
         const lst = fs.lstatSync(String(row.federated_path));
         if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
@@ -2992,6 +3588,25 @@ class OfflineVaultService {
     }
 
     return false;
+  }
+
+  isAssetBackedOffFailure(params = {}) {
+    if (this.isShutdown) return false;
+    const db = this.db || this.ensureOpen();
+    if (!db) return false;
+    const gameId = String(params.gameId || '').trim();
+    const role = String(params.role || 'cover').trim();
+    const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
+    const sourceUrl = String(params.url || '').trim();
+    const urlKey = buildAssetUrlKey(gameId, role, ordinal, sourceUrl);
+
+    const row = db
+      .prepare(
+        'SELECT storage_kind, failure_count, next_retry_at FROM game_media_assets WHERE url_key = ?'
+      )
+      .get(urlKey);
+    if (!row || row.storage_kind !== 'pending') return false;
+    return Number(row.failure_count || 0) > 0 || Number(row.next_retry_at || 0) > this.now();
   }
 
   bindAssetBlobRow(urlKey, gameId, role, ordinal, rawUrl, sha256) {
@@ -3040,10 +3655,11 @@ class OfflineVaultService {
           steamAppId: sp.get('steamAppId') || '',
           gogId: sp.get('gogId') || '',
           epicAppName: sp.get('epicApp') || sp.get('epicAppName') || '',
-          xboxProductId: sp.get('xboxProductId') || '',
+          xboxProductId: sp.get('xboxProductId') || sp.get('xid') || '',
           pfn: sp.get('pfn') || sp.get('packageFamilyName') || '',
           packageFamilyName: sp.get('pfn') || sp.get('packageFamilyName') || '',
-          xboxTitleId: sp.get('xboxTitleId') || '',
+          xboxTitleId: sp.get('xboxTitleId') || sp.get('xtid') || '',
+          ov: sp.get('ov') || '',
         };
       } catch {
         params = {};
@@ -3056,6 +3672,7 @@ class OfflineVaultService {
     const role = String(params.role || 'cover').trim();
     const ordinal = Math.max(0, Math.floor(Number(params.ordinal ?? params.ord ?? 0)));
     const rawUrl = typeof params.url === 'string' ? params.url.trim() : '';
+    const isExplicitOverride = isExplicitOverrideParam(params.ov);
 
     // Strict zero-video mandate: NEVER download, cache, or serve video trailer blobs!
     if (rawUrl && isRejectedVideoUrl(rawUrl)) {
@@ -3161,120 +3778,139 @@ class OfflineVaultService {
     // Tier 1B: Existing verified federated local file hit
     if (assetRow && assetRow.storage_kind === 'federated' && assetRow.federated_path) {
       const federatedPath = String(assetRow.federated_path);
-      try {
-        const lst = fs.lstatSync(federatedPath);
-        if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
-          const header = Buffer.allocUnsafe(16);
-          header.fill(0);
-          const fd = fs.openSync(federatedPath, 'r');
-          let bytesRead = 0;
-          try {
-            bytesRead = fs.readSync(fd, header, 0, 16, 0);
-          } finally {
+      if (
+        isExplicitOverride ||
+        !isFederatedAssetRowCompatible(rawUrl || assetRow.source_url, federatedPath, params)
+      ) {
+        db.prepare(
+          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
+        ).run(assetRow.url_key);
+      } else {
+        try {
+          const lst = fs.lstatSync(federatedPath);
+          if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
+            const header = Buffer.allocUnsafe(16);
+            header.fill(0);
+            const fd = fs.openSync(federatedPath, 'r');
+            let bytesRead = 0;
             try {
-              fs.closeSync(fd);
-            } catch {}
+              bytesRead = fs.readSync(fd, header, 0, 16, 0);
+            } finally {
+              try {
+                fs.closeSync(fd);
+              } catch {}
+            }
+            const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
+            if (magic.valid && magic.mimeType) {
+              return {
+                kind: 'file',
+                filePath: federatedPath,
+                mimeType: magic.mimeType,
+                sizeBytes: lst.size,
+                cacheControl: 'public, max-age=86400',
+                source: 'federated_local',
+              };
+            }
           }
-          const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
-          if (magic.valid && magic.mimeType) {
-            return {
-              kind: 'file',
-              filePath: federatedPath,
-              mimeType: magic.mimeType,
-              sizeBytes: lst.size,
-              cacheControl: 'public, max-age=86400',
-              source: 'federated_local',
-            };
-          }
-        }
-      } catch {}
-      // Self-heal if local storefront cache file was deleted
-      db.prepare(
-        "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
-      ).run(assetRow.url_key);
+        } catch {}
+        // Self-heal if local storefront cache file was deleted
+        db.prepare(
+          "UPDATE game_media_assets SET storage_kind = 'pending', federated_path = NULL WHERE url_key = ?"
+        ).run(assetRow.url_key);
+      }
     }
 
     // Tier 2: Zero-Copy First-Party Local Cache Federation (Steam, GOG Galaxy, Heroic, Xbox)
-    let resolvedXboxProductId = params.xboxProductId || params.xid || '';
-    let resolvedPfn = params.packageFamilyName || params.pfn || params.xpfn || '';
-    let resolvedXboxTitleId = params.xboxTitleId || params.xtid || '';
+    // Skip Tier 2 completely when `ov` is set so explicit user media overrides always persist into `media_blobs`.
+    if (!isExplicitOverride) {
+      let resolvedXboxProductId = params.xboxProductId || params.xid || '';
+      let resolvedPfn = params.packageFamilyName || params.pfn || params.xpfn || '';
+      let resolvedXboxTitleId = params.xboxTitleId || params.xtid || '';
 
-    if (!resolvedXboxProductId && /^xbox[-_:]([A-Z0-9]{12})$/i.test(gameId)) {
-      resolvedXboxProductId = gameId.replace(/^xbox[-_:]/i, '').toUpperCase();
-    }
-    if (gameId && (!resolvedXboxProductId || !resolvedPfn || !resolvedXboxTitleId)) {
-      try {
-        const gRow = db
-          .prepare('SELECT platforms_json, summary_json FROM vault_games WHERE game_id = ?')
-          .get(gameId);
-        if (gRow) {
-          const plats = parseVaultJson(gRow.platforms_json);
-          const xboxPlat = Array.isArray(plats)
-            ? plats.find((p) => p && String(p.platformId || '').toLowerCase() === 'xbox')
-            : null;
-          if (xboxPlat) {
-            if (!resolvedXboxProductId && xboxPlat.xboxProductId) {
-              resolvedXboxProductId = xboxPlat.xboxProductId;
-            }
-            if (!resolvedPfn && xboxPlat.packageFamilyName) {
-              resolvedPfn = xboxPlat.packageFamilyName;
-            }
-            if (!resolvedXboxTitleId && xboxPlat.xboxTitleId) {
-              resolvedXboxTitleId = xboxPlat.xboxTitleId;
+      if (!resolvedXboxProductId && /^xbox[-_:]([A-Z0-9]{12})$/i.test(gameId)) {
+        resolvedXboxProductId = gameId.replace(/^xbox[-_:]/i, '').toUpperCase();
+      }
+      if (gameId && (!resolvedXboxProductId || !resolvedPfn || !resolvedXboxTitleId)) {
+        try {
+          const gRow = db
+            .prepare('SELECT platforms_json, summary_json FROM vault_games WHERE game_id = ?')
+            .get(gameId);
+          if (gRow) {
+            const plats = parseVaultJson(gRow.platforms_json);
+            const xboxPlat = Array.isArray(plats)
+              ? plats.find((p) => p && String(p.platformId || '').toLowerCase() === 'xbox')
+              : null;
+            if (xboxPlat) {
+              if (!resolvedXboxProductId && xboxPlat.xboxProductId) {
+                resolvedXboxProductId = xboxPlat.xboxProductId;
+              }
+              if (!resolvedPfn && xboxPlat.packageFamilyName) {
+                resolvedPfn = xboxPlat.packageFamilyName;
+              }
+              if (!resolvedXboxTitleId && xboxPlat.xboxTitleId) {
+                resolvedXboxTitleId = xboxPlat.xboxTitleId;
+              }
             }
           }
-        }
-      } catch {}
-    }
+        } catch {}
+      }
 
-    const federationPayload = {
-      gameId,
-      role,
-      ordinal,
-      url: rawUrl,
-      steamAppId: params.steamAppId ?? params.sid,
-      gogId: params.gogId ?? params.gid,
-      epicAppName: params.epicAppName || params.epicApp,
-      xboxProductId: resolvedXboxProductId,
-      packageFamilyName: resolvedPfn,
-      pfn: resolvedPfn,
-      xboxTitleId: resolvedXboxTitleId,
-      title: params.title,
-    };
-
-    const federatedHit =
-      typeof this.federator?.resolveFederatedAsset === 'function'
-        ? this.federator.resolveFederatedAsset(federationPayload)
-        : typeof this.federator?.resolveLocalStoreAsset === 'function'
-          ? this.federator.resolveLocalStoreAsset(federationPayload)
-          : null;
-
-    if (federatedHit && federatedHit.path && federatedHit.mimeType) {
-      db.prepare(
-        `
-        INSERT INTO game_media_assets (
-          url_key, game_id, asset_role, ordinal, source_url, storage_kind,
-          blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
-        ) VALUES (?, ?, ?, ?, ?, 'federated', NULL, ?, 0, 0, 200, ?)
-        ON CONFLICT(url_key) DO UPDATE SET
-          storage_kind = 'federated',
-          blob_sha256 = NULL,
-          federated_path = excluded.federated_path,
-          failure_count = 0,
-          next_retry_at = 0,
-          last_status_code = 200,
-          last_verified_at = excluded.last_verified_at
-      `
-      ).run(urlKey, gameId, role, ordinal, rawUrl, federatedHit.path, nowTs);
-
-      return {
-        kind: 'file',
-        filePath: federatedHit.path,
-        mimeType: federatedHit.mimeType,
-        sizeBytes: federatedHit.sizeBytes,
-        cacheControl: 'public, max-age=86400',
-        source: federatedHit.source || 'federated_local',
+      const federationPayload = {
+        gameId,
+        role,
+        ordinal,
+        url: rawUrl,
+        ov: params.ov,
+        steamAppId: params.steamAppId ?? params.sid,
+        gogId: params.gogId ?? params.gid,
+        epicAppName: params.epicAppName || params.epicApp,
+        xboxProductId: resolvedXboxProductId,
+        packageFamilyName: resolvedPfn,
+        pfn: resolvedPfn,
+        xboxTitleId: resolvedXboxTitleId,
+        title: params.title,
       };
+
+      const federatedHit =
+        typeof this.federator?.resolveFederatedAsset === 'function'
+          ? this.federator.resolveFederatedAsset(federationPayload)
+          : typeof this.federator?.resolveLocalStoreAsset === 'function'
+            ? this.federator.resolveLocalStoreAsset(federationPayload)
+            : null;
+
+      if (
+        federatedHit &&
+        federatedHit.path &&
+        federatedHit.mimeType &&
+        isFederatedAssetRowCompatible(rawUrl, federatedHit.path, federationPayload)
+      ) {
+        db.prepare(
+          `
+          INSERT INTO game_media_assets (
+            url_key, game_id, asset_role, ordinal, source_url, storage_kind,
+            blob_sha256, federated_path, failure_count, next_retry_at, last_status_code, last_verified_at
+          ) VALUES (?, ?, ?, ?, ?, 'federated', NULL, ?, 0, 0, 200, ?)
+          ON CONFLICT(url_key) DO UPDATE SET
+            source_url = excluded.source_url,
+            storage_kind = 'federated',
+            blob_sha256 = NULL,
+            federated_path = excluded.federated_path,
+            failure_count = 0,
+            next_retry_at = 0,
+            last_status_code = 200,
+            last_verified_at = excluded.last_verified_at
+        `
+        ).run(urlKey, gameId, role, ordinal, rawUrl, federatedHit.path, nowTs);
+
+        return {
+          kind: 'file',
+          filePath: federatedHit.path,
+          mimeType: federatedHit.mimeType,
+          sizeBytes: federatedHit.sizeBytes,
+          cacheControl: 'public, max-age=86400',
+          source: federatedHit.source || 'federated_local',
+        };
+      }
     }
 
     // Tier 3: Reference-Counted `AbortSignal`-Coalesced Upstream HTTP(S) Fetch + Persist-on-Read
@@ -3828,6 +4464,7 @@ class OfflineVaultService {
       diagLog.debug('offlineVault.dbClose', err);
     }
     this.db = null;
+    this.isShutdown = true;
   }
 }
 
@@ -3857,4 +4494,6 @@ module.exports = {
   isWafOrChallengeResponse,
   isRejectedVideoUrl,
   validateFederatedImageFile,
+  isExplicitOverrideParam,
+  isFederatedAssetRowCompatible,
 };

@@ -54,9 +54,127 @@ export function getKnownAchievementTotal(
   return undefined;
 }
 
-let steamAchCache: { raw: string; parsed: Record<string, StoreAchievementSummary> } | null = null;
-let epicAchCache: { raw: string; parsed: Record<string, StoreAchievementSummary> } | null = null;
-let gogAchCache: { raw: string; parsed: Record<string, StoreAchievementSummary> } | null = null;
+const STORAGE_KEY_STEAM_ACH = 'antigravity_steam_achievements';
+const STORAGE_KEY_EPIC_ACH = 'antigravity_epic_achievements';
+const STORAGE_KEY_GOG_ACH = 'antigravity_gog_achievements';
+const STORAGE_KEY_XBOX_ACH = 'antigravity_xbox_achievements';
+
+interface AchMemorySlot {
+  hydrated: boolean;
+  storageRef: Storage | null;
+  raw: string | null;
+  parsed: Record<string, StoreAchievementSummary>;
+}
+
+const steamAchSlot: AchMemorySlot = { hydrated: false, storageRef: null, raw: null, parsed: {} };
+const epicAchSlot: AchMemorySlot = { hydrated: false, storageRef: null, raw: null, parsed: {} };
+const gogAchSlot: AchMemorySlot = { hydrated: false, storageRef: null, raw: null, parsed: {} };
+const xboxAchSlot: AchMemorySlot = { hydrated: false, storageRef: null, raw: null, parsed: {} };
+
+let achStorageListenerAttached = false;
+
+function isTestEnv(): boolean {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getSafeAchStorage(): Storage | null {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+function ensureAchStorageListener(): void {
+  if (achStorageListenerAttached) return;
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  achStorageListenerAttached = true;
+  window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === null || e.key === STORAGE_KEY_STEAM_ACH) {
+      steamAchSlot.hydrated = false;
+      steamAchSlot.raw = null;
+    }
+    if (e.key === null || e.key === STORAGE_KEY_EPIC_ACH) {
+      epicAchSlot.hydrated = false;
+      epicAchSlot.raw = null;
+    }
+    if (e.key === null || e.key === STORAGE_KEY_GOG_ACH) {
+      gogAchSlot.hydrated = false;
+      gogAchSlot.raw = null;
+    }
+    if (e.key === null || e.key === STORAGE_KEY_XBOX_ACH) {
+      xboxAchSlot.hydrated = false;
+      xboxAchSlot.raw = null;
+    }
+  });
+}
+
+function readAchMapFromSlot(
+  slot: AchMemorySlot,
+  storageKey: string
+): Record<string, StoreAchievementSummary> | null {
+  if (typeof window === 'undefined') return null;
+  ensureAchStorageListener();
+  const storage = getSafeAchStorage();
+  if (!storage) return null;
+
+  if (!isTestEnv() && slot.hydrated && slot.storageRef === storage) {
+    return Object.keys(slot.parsed).length > 0 ? slot.parsed : null;
+  }
+
+  try {
+    const raw = storage.getItem(storageKey);
+    if (slot.hydrated && slot.storageRef === storage && raw === slot.raw) {
+      // Adopt Blink ExternalString pointer to eliminate O(N) cross-representation string scans
+      slot.raw = raw;
+      return raw ? slot.parsed : null;
+    }
+    slot.storageRef = storage;
+    slot.raw = raw;
+    slot.hydrated = true;
+    if (!raw) {
+      slot.parsed = {};
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    slot.parsed =
+      parsed && typeof parsed === 'object'
+        ? (parsed as Record<string, StoreAchievementSummary>)
+        : {};
+    return slot.parsed;
+  } catch {
+    slot.hydrated = false;
+    slot.raw = null;
+    slot.parsed = {};
+    return null;
+  }
+}
+
+function writeAchMapToSlot(
+  slot: AchMemorySlot,
+  storageKey: string,
+  merged: Record<string, StoreAchievementSummary>
+): void {
+  if (typeof window === 'undefined') return;
+  ensureAchStorageListener();
+  const storage = getSafeAchStorage();
+  if (!storage) return;
+  const serialized = JSON.stringify(merged);
+  storage.setItem(storageKey, serialized);
+  slot.storageRef = storage;
+  slot.parsed = merged;
+  slot.hydrated = true;
+  slot.raw = isTestEnv() ? serialized : null;
+}
 
 /**
  * Returns user Steam achievements from live scan cache or verified records.
@@ -69,34 +187,20 @@ export function getKnownSteamAchievements(
 
   let best: StoreAchievementSummary | undefined = undefined;
 
-  // 1. Live scanned achievements from localStorage
-  if (typeof window !== 'undefined') {
-    try {
-      const cached = localStorage.getItem('antigravity_steam_achievements');
-      if (cached) {
-        if (!steamAchCache || steamAchCache.raw !== cached) {
-          steamAchCache = { raw: cached, parsed: JSON.parse(cached) };
-        }
-        const parsed = steamAchCache.parsed;
-        if (parsed[steamAppId] && typeof parsed[steamAppId].unlocked === 'number') {
-          const raw = parsed[steamAppId];
-          best = {
-            unlocked: raw.unlocked,
-            total: raw.total,
-            percentage: raw.percentage ?? (raw.total > 0 ? Math.round((raw.unlocked / raw.total) * 100) : 0),
-            isMastered: raw.isMastered ?? (raw.total > 0 && raw.unlocked >= raw.total),
-            source: raw.source || 'local_client_cache',
-            syncedAt: raw.syncedAt,
-            hasConflict: raw.hasConflict,
-            conflictDetails: raw.conflictDetails,
-          };
-        }
-      } else {
-        steamAchCache = null;
-      }
-    } catch {
-      // Ignore cache parse errors
-    }
+  // 1. Live scanned achievements from localStorage / in-memory cache
+  const parsed = readAchMapFromSlot(steamAchSlot, STORAGE_KEY_STEAM_ACH);
+  if (parsed && parsed[steamAppId] && typeof parsed[steamAppId].unlocked === 'number') {
+    const raw = parsed[steamAppId];
+    best = {
+      unlocked: raw.unlocked,
+      total: raw.total,
+      percentage: raw.percentage ?? (raw.total > 0 ? Math.round((raw.unlocked / raw.total) * 100) : 0),
+      isMastered: raw.isMastered ?? (raw.total > 0 && raw.unlocked >= raw.total),
+      source: raw.source || 'local_client_cache',
+      syncedAt: raw.syncedAt,
+      hasConflict: raw.hasConflict,
+      conflictDetails: raw.conflictDetails,
+    };
   }
 
   // 2. Verified built-in user achievements baseline
@@ -133,12 +237,7 @@ export function cacheUserSteamAchievements(
 ): void {
   if (typeof window === 'undefined') return;
   try {
-    const existingRaw = localStorage.getItem('antigravity_steam_achievements');
-    const existing: Record<string, StoreAchievementSummary> = existingRaw
-      ? steamAchCache && steamAchCache.raw === existingRaw
-        ? steamAchCache.parsed
-        : (JSON.parse(existingRaw) as Record<string, StoreAchievementSummary>)
-      : {};
+    const existing = readAchMapFromSlot(steamAchSlot, STORAGE_KEY_STEAM_ACH) || {};
     const merged: Record<number, StoreAchievementSummary> = {};
 
     for (const [k, v] of Object.entries(existing)) {
@@ -161,9 +260,11 @@ export function cacheUserSteamAchievements(
         reconcileAchievementSummaries(merged[appId], incSummary, { appId, store: 'steam' }) || incSummary;
     }
 
-    const serialized = JSON.stringify(merged);
-    localStorage.setItem('antigravity_steam_achievements', serialized);
-    steamAchCache = { raw: serialized, parsed: merged as unknown as Record<string, StoreAchievementSummary> };
+    writeAchMapToSlot(
+      steamAchSlot,
+      STORAGE_KEY_STEAM_ACH,
+      merged as unknown as Record<string, StoreAchievementSummary>
+    );
   } catch (err) {
     console.warn('Failed to cache Steam achievements to localStorage:', err);
   }
@@ -178,29 +279,17 @@ export function getKnownEpicAchievements(
 ): StoreAchievementSummary | undefined {
   let cachedSummary: StoreAchievementSummary | undefined = undefined;
 
-  if (typeof window !== 'undefined') {
-    try {
-      const cached = localStorage.getItem('antigravity_epic_achievements');
-      if (cached) {
-        if (!epicAchCache || epicAchCache.raw !== cached) {
-          epicAchCache = { raw: cached, parsed: JSON.parse(cached) };
-        }
-        const parsed = epicAchCache.parsed;
-        if (title && parsed[title.toLowerCase().trim()]) {
-          cachedSummary = parsed[title.toLowerCase().trim()];
-        } else {
-          const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-          if (normTitle && parsed[normTitle]) {
-            cachedSummary = parsed[normTitle];
-          } else if (gameId && parsed[gameId.toLowerCase()]) {
-            cachedSummary = parsed[gameId.toLowerCase()];
-          }
-        }
-      } else {
-        epicAchCache = null;
+  const parsed = readAchMapFromSlot(epicAchSlot, STORAGE_KEY_EPIC_ACH);
+  if (parsed) {
+    if (title && parsed[title.toLowerCase().trim()]) {
+      cachedSummary = parsed[title.toLowerCase().trim()];
+    } else {
+      const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (normTitle && parsed[normTitle]) {
+        cachedSummary = parsed[normTitle];
+      } else if (gameId && parsed[gameId.toLowerCase()]) {
+        cachedSummary = parsed[gameId.toLowerCase()];
       }
-    } catch {
-      // Ignore cache parse errors
     }
   }
 
@@ -226,12 +315,7 @@ export function getKnownEpicAchievements(
 export function cacheUserEpicAchievements(map: Record<string, StoreAchievementSummary>): void {
   if (typeof window === 'undefined') return;
   try {
-    const existingRaw = localStorage.getItem('antigravity_epic_achievements');
-    const existing: Record<string, StoreAchievementSummary> = existingRaw
-      ? epicAchCache && epicAchCache.raw === existingRaw
-        ? epicAchCache.parsed
-        : JSON.parse(existingRaw)
-      : {};
+    const existing = readAchMapFromSlot(epicAchSlot, STORAGE_KEY_EPIC_ACH) || {};
     const merged: Record<string, StoreAchievementSummary> = { ...existing };
 
     for (const [key, inc] of Object.entries(map)) {
@@ -251,9 +335,7 @@ export function cacheUserEpicAchievements(map: Record<string, StoreAchievementSu
         reconcileAchievementSummaries(merged[normKey], incSummary, { title: key, store: 'epic' }) || incSummary;
     }
 
-    const serialized = JSON.stringify(merged);
-    localStorage.setItem('antigravity_epic_achievements', serialized);
-    epicAchCache = { raw: serialized, parsed: merged };
+    writeAchMapToSlot(epicAchSlot, STORAGE_KEY_EPIC_ACH, merged);
   } catch (err) {
     console.warn('Failed to cache Epic achievements to localStorage:', err);
   }
@@ -268,34 +350,22 @@ export function getKnownGogAchievements(
 ): StoreAchievementSummary | undefined {
   let cachedSummary: StoreAchievementSummary | undefined = undefined;
 
-  if (typeof window !== 'undefined') {
-    try {
-      const cached = localStorage.getItem('antigravity_gog_achievements');
-      if (cached) {
-        if (!gogAchCache || gogAchCache.raw !== cached) {
-          gogAchCache = { raw: cached, parsed: JSON.parse(cached) };
-        }
-        const parsed = gogAchCache.parsed;
-        if (title && parsed[title.toLowerCase().trim()]) {
-          cachedSummary = parsed[title.toLowerCase().trim()];
-        } else {
-          const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-          if (normTitle && parsed[normTitle]) {
-            cachedSummary = parsed[normTitle];
-          } else if (gameId && parsed[gameId.toLowerCase()]) {
-            cachedSummary = parsed[gameId.toLowerCase()];
-          } else {
-            const cleanId = gameId?.replace(/^gog-/, '');
-            if (cleanId && parsed[cleanId]) {
-              cachedSummary = parsed[cleanId];
-            }
-          }
-        }
+  const parsed = readAchMapFromSlot(gogAchSlot, STORAGE_KEY_GOG_ACH);
+  if (parsed) {
+    if (title && parsed[title.toLowerCase().trim()]) {
+      cachedSummary = parsed[title.toLowerCase().trim()];
+    } else {
+      const normTitle = title?.toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (normTitle && parsed[normTitle]) {
+        cachedSummary = parsed[normTitle];
+      } else if (gameId && parsed[gameId.toLowerCase()]) {
+        cachedSummary = parsed[gameId.toLowerCase()];
       } else {
-        gogAchCache = null;
+        const cleanId = gameId?.replace(/^gog-/, '');
+        if (cleanId && parsed[cleanId]) {
+          cachedSummary = parsed[cleanId];
+        }
       }
-    } catch {
-      // Ignore cache parse errors
     }
   }
 
@@ -326,12 +396,7 @@ export function getKnownGogAchievements(
 export function cacheUserGogAchievements(map: Record<string, StoreAchievementSummary>): void {
   if (typeof window === 'undefined') return;
   try {
-    const existingRaw = localStorage.getItem('antigravity_gog_achievements');
-    const existing: Record<string, StoreAchievementSummary> = existingRaw
-      ? gogAchCache && gogAchCache.raw === existingRaw
-        ? gogAchCache.parsed
-        : JSON.parse(existingRaw)
-      : {};
+    const existing = readAchMapFromSlot(gogAchSlot, STORAGE_KEY_GOG_ACH) || {};
     const merged: Record<string, StoreAchievementSummary> = { ...existing };
 
     for (const [key, inc] of Object.entries(map)) {
@@ -350,17 +415,13 @@ export function cacheUserGogAchievements(map: Record<string, StoreAchievementSum
         reconcileAchievementSummaries(merged[normKey], incSummary, { title: key, store: 'gog' }) || incSummary;
     }
 
-    const serialized = JSON.stringify(merged);
-    localStorage.setItem('antigravity_gog_achievements', serialized);
-    gogAchCache = { raw: serialized, parsed: merged };
+    writeAchMapToSlot(gogAchSlot, STORAGE_KEY_GOG_ACH, merged);
   } catch (err) {
     console.warn('Failed to cache GOG achievements to localStorage:', err);
   }
 }
 
 export const KNOWN_USER_XBOX_ACHIEVEMENTS: Record<string, StoreAchievementSummary> = {};
-
-let xboxAchCache: { raw: string; parsed: Record<string, StoreAchievementSummary> } | null = null;
 
 /**
  * Returns user Xbox / Game Pass achievements and Gamerscore from cache or verified records.
@@ -390,25 +451,13 @@ export function getKnownXboxAchievements(
     pushKey(title.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' '));
   }
 
-  if (typeof window !== 'undefined') {
-    try {
-      const cached = localStorage.getItem('antigravity_xbox_achievements');
-      if (cached) {
-        if (!xboxAchCache || xboxAchCache.raw !== cached) {
-          xboxAchCache = { raw: cached, parsed: JSON.parse(cached) };
-        }
-        const parsed = xboxAchCache.parsed;
-        for (const key of lookupKeys) {
-          if (parsed[key]) {
-            cachedSummary = parsed[key];
-            break;
-          }
-        }
-      } else {
-        xboxAchCache = null;
+  const parsed = readAchMapFromSlot(xboxAchSlot, STORAGE_KEY_XBOX_ACH);
+  if (parsed) {
+    for (const key of lookupKeys) {
+      if (parsed[key]) {
+        cachedSummary = parsed[key];
+        break;
       }
-    } catch {
-      // Ignore cache parse errors
     }
   }
 
@@ -437,12 +486,7 @@ export function cacheUserXboxAchievements(
 ): void {
   if (typeof window === 'undefined' || !map) return;
   try {
-    const existingRaw = localStorage.getItem('antigravity_xbox_achievements');
-    const existing: Record<string, StoreAchievementSummary> = existingRaw
-      ? xboxAchCache && xboxAchCache.raw === existingRaw
-        ? xboxAchCache.parsed
-        : (JSON.parse(existingRaw) as Record<string, StoreAchievementSummary>)
-      : {};
+    const existing = readAchMapFromSlot(xboxAchSlot, STORAGE_KEY_XBOX_ACH) || {};
     const merged: Record<string, StoreAchievementSummary> = { ...existing };
 
     for (const [key, inc] of Object.entries(map)) {
@@ -491,9 +535,7 @@ export function cacheUserXboxAchievements(
         incSummary;
     }
 
-    const serialized = JSON.stringify(merged);
-    localStorage.setItem('antigravity_xbox_achievements', serialized);
-    xboxAchCache = { raw: serialized, parsed: merged };
+    writeAchMapToSlot(xboxAchSlot, STORAGE_KEY_XBOX_ACH, merged);
   } catch (err) {
     console.warn('Failed to cache Xbox achievements to localStorage:', err);
   }

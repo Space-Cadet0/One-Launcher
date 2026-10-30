@@ -27,12 +27,15 @@ export interface DomainConfig {
 export interface ScheduleOptions {
   domainKey?: string;
   gameKey?: string;
+  signal?: AbortSignal;
 }
 
 export interface QueueItem<T = unknown> {
   id: string;
   url: string;
   gameKey?: string;
+  signal?: AbortSignal;
+  cleanupAbort?: () => void;
   fn: () => Promise<T>;
   priority: number;
   domain: string;
@@ -489,8 +492,18 @@ export class RequestScheduler {
     fn: () => Promise<T>,
     priority: number = RequestPriority.P1_VIEWPORT,
     domainKeyOrOptions?: string | ScheduleOptions,
-    options?: string | { gameKey?: string }
+    options?: string | { gameKey?: string; signal?: AbortSignal }
   ): Promise<T> {
+    const signal =
+      (typeof domainKeyOrOptions === 'object' && domainKeyOrOptions !== null
+        ? domainKeyOrOptions.signal
+        : undefined) ??
+      (typeof options === 'object' && options !== null ? options.signal : undefined);
+
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError('Request aborted'));
+    }
+
     const domainKey =
       typeof domainKeyOrOptions === 'string'
         ? domainKeyOrOptions
@@ -517,10 +530,16 @@ export class RequestScheduler {
     }
 
     return new Promise<T>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(createAbortError('Request aborted'));
+        return;
+      }
+
       const item: QueueItem<T> = {
         id: `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
         url,
         gameKey,
+        signal,
         fn,
         priority,
         domain,
@@ -529,6 +548,31 @@ export class RequestScheduler {
         resolve,
         reject,
       };
+
+      if (signal) {
+        const onAbort = () => {
+          item.cleanupAbort?.();
+          const qIdx = bucket.queue.indexOf(item as unknown as QueueItem<unknown>);
+          if (qIdx !== -1) {
+            bucket.queue.splice(qIdx, 1);
+            item.reject(createAbortError('Request aborted'));
+            return;
+          }
+          for (const [retryTimer, retryItem] of bucket.retryTimers.entries()) {
+            if (retryItem === (item as unknown as QueueItem<unknown>)) {
+              clearTimeout(retryTimer);
+              bucket.retryTimers.delete(retryTimer);
+              item.reject(createAbortError('Request aborted'));
+              return;
+            }
+          }
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        item.cleanupAbort = () => {
+          signal.removeEventListener('abort', onAbort);
+          item.cleanupAbort = undefined;
+        };
+      }
 
       bucket.queue.push(item as unknown as QueueItem<unknown>);
       this.sortBucketQueue(bucket);
@@ -544,9 +588,17 @@ export class RequestScheduler {
     fn: () => Promise<T>,
     priority: number = RequestPriority.P1_VIEWPORT,
     domainKeyOrOptions?: string | ScheduleOptions,
-    options?: string | { gameKey?: string }
+    options?: string | { gameKey?: string; signal?: AbortSignal }
   ): Promise<T> {
     return this.schedule(url, fn, priority, domainKeyOrOptions, options);
+  }
+
+  private pruneAbortedHead(bucket: TokenBucket): void {
+    while (bucket.queue.length > 0 && bucket.queue[0]?.signal?.aborted) {
+      const abortedItem = bucket.queue.shift()!;
+      abortedItem.cleanupAbort?.();
+      abortedItem.reject(createAbortError('Request aborted'));
+    }
   }
 
   private processQueue(domain: string): void {
@@ -567,6 +619,8 @@ export class RequestScheduler {
       bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.min(delay, 2147483647));
       return;
     }
+
+    this.pruneAbortedHead(bucket);
 
     // HALF_OPEN canary probe: when a domain's cooldown just expired, dispatch only 1 item first
     // before draining the remainder of the queue so a still-throttled upstream isn't stampeded.
@@ -609,6 +663,7 @@ export class RequestScheduler {
 
     if (!this.enforceDelays) {
       while (bucket.queue.length > 0) {
+        this.pruneAbortedHead(bucket);
         const nextCandidate = bucket.queue[0];
         if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
           break;
@@ -623,6 +678,7 @@ export class RequestScheduler {
     this.refill(bucket);
 
     while (bucket.queue.length > 0) {
+      this.pruneAbortedHead(bucket);
       const nextCandidate = bucket.queue[0];
       if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
         break;
@@ -780,6 +836,13 @@ export class RequestScheduler {
     bucket: TokenBucket,
     item: QueueItem<unknown>
   ): Promise<void> {
+    if (item.signal?.aborted) {
+      item.cleanupAbort?.();
+      item.reject(createAbortError('Request aborted'));
+      this.processDomainQueue(domain);
+      return;
+    }
+
     const isP0 = item.priority === RequestPriority.P0_INTERACTIVE;
     if (isP0) {
       this.inFlightP0Count++;
@@ -799,9 +862,20 @@ export class RequestScheduler {
           openedUntil: 0,
         });
       }
+      item.cleanupAbort?.();
       item.resolve(result);
     } catch (err: unknown) {
       bucket.probeInFlight = false;
+      const errName =
+        err && typeof err === 'object' && 'name' in err
+          ? String((err as { name?: unknown }).name || '')
+          : '';
+      if (item.signal?.aborted || errName === 'AbortError') {
+        item.cleanupAbort?.();
+        item.reject(errName === 'AbortError' ? err : createAbortError('Request aborted'));
+        return;
+      }
+
       const httpErr = (err && typeof err === 'object' ? err : {}) as SchedulerHttpError;
       const status: number | undefined = httpErr.response?.status ?? httpErr.status;
       const headers = httpErr.response?.headers ?? httpErr.headers;
@@ -872,6 +946,11 @@ export class RequestScheduler {
         const backoffMs = this.enforceDelays ? computedBackoff : 0;
         const retryTimer = setTimeout(() => {
           bucket.retryTimers.delete(retryTimer);
+          if (item.signal?.aborted) {
+            item.cleanupAbort?.();
+            item.reject(createAbortError('Request aborted'));
+            return;
+          }
           bucket.queue.push(item);
           this.sortBucketQueue(bucket);
           this.processDomainQueue(domain);
@@ -880,6 +959,7 @@ export class RequestScheduler {
         return;
       }
 
+      item.cleanupAbort?.();
       item.reject(err);
     } finally {
       if (isP0) {
@@ -909,12 +989,14 @@ export class RequestScheduler {
         bucket.retryTimers.clear();
         for (const [retryTimer, retryItem] of pendingRetries) {
           clearTimeout(retryTimer);
+          retryItem.cleanupAbort?.();
           retryItem.reject(abortErr);
         }
       }
       if (bucket.queue.length > 0) {
         const queued = bucket.queue.splice(0, bucket.queue.length);
         for (const item of queued) {
+          item.cleanupAbort?.();
           item.reject(abortErr);
         }
       }
@@ -955,6 +1037,7 @@ export class RequestScheduler {
       const remaining: Array<QueueItem<unknown>> = [];
       for (const item of bucket.queue) {
         if (item.priority >= RequestPriority.P2_BACKGROUND) {
+          item.cleanupAbort?.();
           item.reject(new Error('Cancelled stale background request'));
         } else {
           remaining.push(item);

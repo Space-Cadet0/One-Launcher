@@ -291,6 +291,51 @@ export function clearFailedCoverUrls(gameId?: string): void {
   }
 }
 
+export function buildExplicitOverrideCoverUrlSet(
+  game: CanonicalGame,
+  overrideCoverUrl?: string | null,
+  preloadedOverride?: UserGameOverride | null
+): Set<string> {
+  const result = new Set<string>();
+  const effectiveOverride =
+    preloadedOverride !== undefined ? preloadedOverride : getUserOverrideForGame(game);
+
+  const addWithVariants = (raw?: string | null) => {
+    if (!raw) return;
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    const unwrapped = unwrapOlMediaUrl(trimmed);
+    const seeds = unwrapped && unwrapped !== trimmed ? [trimmed, unwrapped] : [trimmed];
+    for (const u of seeds) {
+      result.add(u);
+      if (u.includes('/library_600x900_2x.jpg')) {
+        result.add(u.replace('/library_600x900_2x.jpg', '/library_600x900.jpg'));
+      }
+      if (u.includes('/library_600x900.jpg')) {
+        result.add(u.replace('/library_600x900.jpg', '/library_600x900_2x.jpg'));
+      }
+      if (u.includes('/library_capsule_2x.jpg')) {
+        result.add(u.replace('/library_capsule_2x.jpg', '/library_capsule.jpg'));
+      }
+      if (u.includes('/library_capsule.jpg')) {
+        result.add(u.replace('/library_capsule.jpg', '/library_capsule_2x.jpg'));
+      }
+      if (/cdn[12]?\.epicgames\.com\//i.test(u) && !/[?&][hw]=/i.test(u)) {
+        result.add(`${u}${u.includes('?') ? '&' : '?'}h=480&resize=1`);
+      }
+    }
+  };
+
+  if (effectiveOverride?.capsuleImage) {
+    addWithVariants(effectiveOverride.capsuleImage);
+  }
+  if (overrideCoverUrl) {
+    addWithVariants(overrideCoverUrl);
+  }
+
+  return result;
+}
+
 export function getCoverCandidates(
   game: CanonicalGame,
   overrideCoverUrl?: string | null,
@@ -323,14 +368,29 @@ export function getCoverCandidates(
     }
   };
 
-  // 1. Authoritative user manual override ALWAYS takes absolute priority #1
+  const addUserExplicitCoverFirst = (url?: string | null) => {
+    if (!url) return;
+    add(url, true);
+    if (url.includes('/library_600x900_2x.jpg')) {
+      add(url.replace('/library_600x900_2x.jpg', '/library_600x900.jpg'), true);
+    }
+    if (url.includes('/library_capsule_2x.jpg')) {
+      add(url.replace('/library_capsule_2x.jpg', '/library_capsule.jpg'), true);
+    }
+  };
+
+  // 1. Authoritative user manual override ALWAYS takes absolute priority #1 (exact URL first)
   const effectiveOverride =
     userOverride !== undefined ? userOverride : getUserOverrideForGame(game);
   if (effectiveOverride?.capsuleImage) {
-    addWith1xPriority(effectiveOverride.capsuleImage, true);
+    addUserExplicitCoverFirst(effectiveOverride.capsuleImage);
   }
   if (effectiveOverride && game.capsuleImage) {
-    addWith1xPriority(game.capsuleImage, true);
+    if (effectiveOverride.capsuleImage) {
+      addUserExplicitCoverFirst(game.capsuleImage);
+    } else {
+      addWith1xPriority(game.capsuleImage, true);
+    }
   }
 
   const rawImagesCover = (game as CanonicalGame & GameWithLegacyImages).images?.cover;
@@ -505,6 +565,89 @@ function handleGlobalGogCoverUpdated(e: Event): void {
   }
 }
 
+function handleGlobalUserOverrideChanged(e?: Event): void {
+  const detail = (e as CustomEvent<Record<string, unknown> | undefined> | undefined)?.detail;
+  const eventType = typeof detail?.type === 'string' ? detail.type : undefined;
+  if (
+    eventType === 'confirmed-non-game' ||
+    eventType === 'confirmed-non-game-batch' ||
+    eventType === 'batch-confirmed-non-game' ||
+    eventType === 'unconfirmed-non-game'
+  ) {
+    return;
+  }
+
+  const candidateIds = new Set<string>();
+  const addId = (val: unknown) => {
+    if (typeof val === 'string' && val.trim()) {
+      candidateIds.add(val.trim());
+    }
+  };
+
+  addId(detail?.gameId);
+  addId(detail?.oldGameId);
+  const oldGameObj =
+    detail?.oldGame && typeof detail.oldGame === 'object'
+      ? (detail.oldGame as { id?: unknown; steamAppId?: unknown })
+      : undefined;
+  addId(oldGameObj?.id);
+  if (typeof oldGameObj?.steamAppId === 'number' && oldGameObj.steamAppId > 0) {
+    candidateIds.add(`steam-${oldGameObj.steamAppId}`);
+  }
+
+  const overrideObj =
+    detail?.override && typeof detail.override === 'object'
+      ? (detail.override as { gameId?: unknown; steamAppId?: unknown })
+      : undefined;
+  addId(overrideObj?.gameId);
+  if (typeof overrideObj?.steamAppId === 'number' && overrideObj.steamAppId > 0) {
+    candidateIds.add(`steam-${overrideObj.steamAppId}`);
+  }
+
+  if (candidateIds.size > 0) {
+    for (const id of candidateIds) {
+      clearFailedCoverUrls(id);
+    }
+    let notifiedSpecific = false;
+    for (const id of candidateIds) {
+      const subSet = subscribersByGameId.get(id);
+      if (subSet && subSet.size > 0) {
+        notifySubscriberSet(subSet);
+        notifiedSpecific = true;
+      }
+      const steamMatch = id.match(/^steam-(\d+)$/);
+      if (steamMatch) {
+        const steamSubSet = subscribersBySteamAppId.get(Number(steamMatch[1]));
+        if (steamSubSet && steamSubSet.size > 0) {
+          notifySubscriberSet(steamSubSet);
+          notifiedSpecific = true;
+        }
+      }
+    }
+    if (!notifiedSpecific) {
+      notifySubscriberSet(allCoverSubscribers);
+    }
+  } else {
+    clearFailedCoverUrls();
+    notifySubscriberSet(allCoverSubscribers);
+  }
+}
+
+let isOverrideCacheResetListenerAttached = false;
+function ensureOverrideCacheResetListener(): void {
+  if (
+    isOverrideCacheResetListenerAttached ||
+    typeof window === 'undefined' ||
+    typeof window.addEventListener !== 'function'
+  ) {
+    return;
+  }
+  isOverrideCacheResetListenerAttached = true;
+  window.addEventListener('antigravity:user-override-updated', handleGlobalUserOverrideChanged);
+  window.addEventListener('antigravity:user-override-removed', handleGlobalUserOverrideChanged);
+}
+ensureOverrideCacheResetListener();
+
 export function subscribeToCoverUpdates(
   gameId: string,
   title: string,
@@ -513,6 +656,7 @@ export function subscribeToCoverUpdates(
   cb: CoverEventCallback
 ): () => void {
   if (typeof window === 'undefined') return () => {};
+  ensureOverrideCacheResetListener();
 
   const normTitle = normalizeKey(title);
   const cleanGogId = gogPlatformGameId ? String(gogPlatformGameId).replace(/^gog-/, '') : '';

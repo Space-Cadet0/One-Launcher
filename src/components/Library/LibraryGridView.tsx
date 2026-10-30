@@ -292,7 +292,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
   const [overrideVersion, setOverrideVersion] = useState(0);
   useEffect(() => {
-    const handleOverrideUpdate = (e?: Event) => {
+    const handleOverrideChange = (e?: Event) => {
       const detail = (e as CustomEvent<Record<string, unknown> | undefined> | undefined)?.detail;
       const eventType = typeof detail?.type === 'string' ? detail.type : undefined;
       if (
@@ -303,32 +303,44 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
       ) {
         return;
       }
+      const candidateIds = new Set<string>();
+      const addId = (val: unknown) => {
+        if (typeof val === 'string' && val.trim()) {
+          candidateIds.add(val.trim());
+        }
+      };
+      addId(detail?.gameId);
+      addId(detail?.oldGameId);
+      const oldGameObj =
+        detail?.oldGame && typeof detail.oldGame === 'object'
+          ? (detail.oldGame as { id?: unknown; steamAppId?: unknown })
+          : undefined;
+      addId(oldGameObj?.id);
+      if (typeof oldGameObj?.steamAppId === 'number' && oldGameObj.steamAppId > 0) {
+        candidateIds.add(`steam-${oldGameObj.steamAppId}`);
+      }
       const overrideObj =
         detail?.override && typeof detail.override === 'object'
-          ? (detail.override as { gameId?: unknown })
+          ? (detail.override as { gameId?: unknown; steamAppId?: unknown })
           : undefined;
-      const targetGameId =
-        typeof detail?.gameId === 'string' && detail.gameId
-          ? detail.gameId
-          : typeof overrideObj?.gameId === 'string' && overrideObj.gameId
-            ? overrideObj.gameId
-            : undefined;
-      if (targetGameId) {
-        globalAttemptedCoverLookups.delete(targetGameId);
-        const prefix = `${targetGameId}:`;
-        for (const key of Array.from(globalAttemptedCoverLookups)) {
-          if (key.startsWith(prefix)) {
-            globalAttemptedCoverLookups.delete(key);
-          }
+      addId(overrideObj?.gameId);
+      if (typeof overrideObj?.steamAppId === 'number' && overrideObj.steamAppId > 0) {
+        candidateIds.add(`steam-${overrideObj.steamAppId}`);
+      }
+      if (candidateIds.size > 0) {
+        for (const id of candidateIds) {
+          clearFailedCoverUrls(id);
         }
       } else {
-        globalAttemptedCoverLookups.clear();
+        clearFailedCoverUrls();
       }
       setOverrideVersion((v) => v + 1);
     };
-    window.addEventListener('antigravity:user-override-updated', handleOverrideUpdate);
+    window.addEventListener('antigravity:user-override-updated', handleOverrideChange);
+    window.addEventListener('antigravity:user-override-removed', handleOverrideChange);
     return () => {
-      window.removeEventListener('antigravity:user-override-updated', handleOverrideUpdate);
+      window.removeEventListener('antigravity:user-override-updated', handleOverrideChange);
+      window.removeEventListener('antigravity:user-override-removed', handleOverrideChange);
     };
   }, []);
 

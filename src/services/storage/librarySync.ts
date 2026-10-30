@@ -81,18 +81,58 @@ export function pickBestEnrichedMetadata(
       other.detailedDescription
     );
 
+    const nextEnrichedAt =
+      typeof winner.enrichedAt === 'number' || typeof other.enrichedAt === 'number'
+        ? Math.max(winner.enrichedAt || 0, other.enrichedAt || 0) || undefined
+        : undefined;
+    const winnerAttemptTs =
+      typeof winner.lastMediaSyncAttemptAt === 'number' ? winner.lastMediaSyncAttemptAt : 0;
+    const otherAttemptTs =
+      typeof other.lastMediaSyncAttemptAt === 'number' ? other.lastMediaSyncAttemptAt : 0;
+    const nextLastMediaSyncAttemptAt = Math.max(winnerAttemptTs, otherAttemptTs) || undefined;
+    const nextMediaSyncOutcome =
+      otherAttemptTs > winnerAttemptTs
+        ? other.mediaSyncOutcome ?? winner.mediaSyncOutcome
+        : winner.mediaSyncOutcome ?? other.mediaSyncOutcome;
+    const nextMediaSyncFailureCount =
+      otherAttemptTs > winnerAttemptTs
+        ? other.mediaSyncFailureCount ?? winner.mediaSyncFailureCount
+        : winner.mediaSyncFailureCount ?? other.mediaSyncFailureCount;
+
+    const hasRestoredRichMedia =
+      Boolean(!winner.__quotaSlimmed || !other.__quotaSlimmed) &&
+      ((nextScreenshots && nextScreenshots.length > 0) ||
+        (nextMovies && nextMovies.length > 0) ||
+        !winner.__quotaSlimmed);
+    const nextQuotaSlimmed = hasRestoredRichMedia
+      ? undefined
+      : winner.__quotaSlimmed || other.__quotaSlimmed || undefined;
+    const nextHasScreenshotsCount = nextQuotaSlimmed
+      ? Math.max(winner.hasScreenshotsCount || 0, other.hasScreenshotsCount || 0) || undefined
+      : undefined;
+    const nextHasMoviesCount = nextQuotaSlimmed
+      ? Math.max(winner.hasMoviesCount || 0, other.hasMoviesCount || 0) || undefined
+      : undefined;
+
     if (
       nextXboxHints === winner.xboxDeliveryHints &&
       nextMovies === winner.movies &&
       nextCategories === winner.categories &&
       nextScreenshots === winner.screenshots &&
       nextShortDesc === winner.shortDescription &&
-      nextDetailedDesc === winner.detailedDescription
+      nextDetailedDesc === winner.detailedDescription &&
+      nextEnrichedAt === winner.enrichedAt &&
+      nextLastMediaSyncAttemptAt === winner.lastMediaSyncAttemptAt &&
+      nextMediaSyncOutcome === winner.mediaSyncOutcome &&
+      nextMediaSyncFailureCount === winner.mediaSyncFailureCount &&
+      nextQuotaSlimmed === winner.__quotaSlimmed &&
+      nextHasScreenshotsCount === winner.hasScreenshotsCount &&
+      nextHasMoviesCount === winner.hasMoviesCount
     ) {
       return winner;
     }
 
-    return {
+    const merged: NonNullable<CanonicalGame['enrichedMetadata']> = {
       ...winner,
       ...(nextXboxHints ? { xboxDeliveryHints: nextXboxHints } : {}),
       ...(nextMovies ? { movies: nextMovies } : {}),
@@ -100,7 +140,25 @@ export function pickBestEnrichedMetadata(
       ...(nextScreenshots ? { screenshots: nextScreenshots } : {}),
       ...(nextShortDesc !== undefined ? { shortDescription: nextShortDesc } : {}),
       ...(nextDetailedDesc !== undefined ? { detailedDescription: nextDetailedDesc } : {}),
+      ...(nextEnrichedAt !== undefined ? { enrichedAt: nextEnrichedAt } : {}),
+      ...(nextLastMediaSyncAttemptAt !== undefined
+        ? { lastMediaSyncAttemptAt: nextLastMediaSyncAttemptAt }
+        : {}),
+      ...(nextMediaSyncOutcome !== undefined ? { mediaSyncOutcome: nextMediaSyncOutcome } : {}),
+      ...(nextMediaSyncFailureCount !== undefined
+        ? { mediaSyncFailureCount: nextMediaSyncFailureCount }
+        : {}),
     };
+    if (nextQuotaSlimmed) {
+      merged.__quotaSlimmed = true;
+      if (nextHasScreenshotsCount !== undefined) merged.hasScreenshotsCount = nextHasScreenshotsCount;
+      if (nextHasMoviesCount !== undefined) merged.hasMoviesCount = nextHasMoviesCount;
+    } else {
+      delete merged.__quotaSlimmed;
+      delete merged.hasScreenshotsCount;
+      delete merged.hasMoviesCount;
+    }
+    return merged;
   };
 
   const existingRank = getEnrichedMetadataQualityRank(existing);
@@ -110,6 +168,13 @@ export function pickBestEnrichedMetadata(
     return mergeWinnerWithFallbackFields(existing, incoming);
   }
   if (incomingRank > existingRank) {
+    return mergeWinnerWithFallbackFields(incoming, existing);
+  }
+
+  if (incoming.__quotaSlimmed && !existing.__quotaSlimmed) {
+    return mergeWinnerWithFallbackFields(existing, incoming);
+  }
+  if (existing.__quotaSlimmed && !incoming.__quotaSlimmed) {
     return mergeWinnerWithFallbackFields(incoming, existing);
   }
 

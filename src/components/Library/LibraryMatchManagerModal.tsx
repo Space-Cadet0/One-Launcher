@@ -5,7 +5,8 @@ import { StorefrontId } from '../../contracts/platform';
 import {
   loadUserOverrides,
   getUserOverrideForGame,
-  isNonGameStorefrontEntryConfirmed,
+  getUserOverridesRevision,
+  loadConfirmedNonGameKeys,
 } from '../../services/storage/userOverrideStorage';
 import {
   getSuppressedCatalogEntries,
@@ -43,11 +44,13 @@ import {
   clearDurableEmptySynopsisProbe,
   extractCleanSynopsisText,
   getGranularUnmatchedReasons,
+  getSynopsisProbeRevision,
   hasDeveloperOrReleaseYear,
   hasDurableEmptySynopsisProbe,
   hasGenuineStoreSynopsis,
   isLikelyNonStoreOrTestBranchTitle,
   isSynopsisAlreadyProbed,
+  loadDurableEmptySynopsisProbeMap,
   recordDurableEmptySynopsisProbe,
 } from './MatchManager/matchManagerDiagnostics';
 import {
@@ -59,6 +62,7 @@ import {
   MatchManagerRowRenderContext,
   MatchManagerVirtualRow,
   renderMatchManagerFlatRow,
+  ResetOverrideContext,
 } from './MatchManager/MatchManagerRows';
 
 export type {
@@ -79,7 +83,9 @@ export {
 };
 
 const PROBE_FLUSH_THROTTLE_MS = 2_000;
+const INITIAL_PROBE_SCAN_DELAY_MS = 80;
 const MAX_CONCURRENT_PROBES = 2;
+const IS_VITEST_ENV = typeof process !== 'undefined' && Boolean(process.env?.VITEST);
 const STUDIO_TITLE_COLLATOR = new Intl.Collator(undefined, {
   numeric: true,
   sensitivity: 'base',
@@ -87,14 +93,20 @@ const STUDIO_TITLE_COLLATOR = new Intl.Collator(undefined, {
 
 interface CatalogLookupIndex {
   byId: Map<string, CanonicalGame>;
+  byIdLower: Map<string, CanonicalGame>;
   byPlatComposite: Map<string, CanonicalGame>;
+  byPlatCompositeLower: Map<string, CanonicalGame>;
   bySinglePlatComposite: Map<string, CanonicalGame>;
+  bySinglePlatCompositeLower: Map<string, CanonicalGame>;
 }
 
 const EMPTY_CATALOG_LOOKUP: CatalogLookupIndex = {
   byId: new Map(),
+  byIdLower: new Map(),
   byPlatComposite: new Map(),
+  byPlatCompositeLower: new Map(),
   bySinglePlatComposite: new Map(),
+  bySinglePlatCompositeLower: new Map(),
 };
 
 interface IndexedUnmatchedItem {
@@ -119,6 +131,59 @@ interface IndexedOverrideItem {
   matchedGame?: CanonicalGame;
   searchFields: string[];
 }
+
+interface CachedUnmatchedDiagEntry {
+  overridesRev: number;
+  probeRev: number;
+  eventRev: number;
+  hasProbedEntry: boolean;
+  probedVal: string | null | undefined;
+  item: IndexedUnmatchedItem | null;
+}
+
+interface CachedLowConfDiagEntry {
+  overridesRev: number;
+  eventRev: number;
+  isUnmatched: boolean;
+  item: IndexedGameItem | null;
+}
+
+const moduleProbedResultsMap = new Map<string, string | null>();
+const moduleProbingSet = new Set<string>();
+let moduleStudioEventRevision = 0;
+let lastSeenOverridesMapRef: Record<string, UserGameOverride> | null = null;
+let syntheticOverridesMapRev = 0;
+let moduleUnmatchedDiagWeakMap = new WeakMap<CanonicalGame, CachedUnmatchedDiagEntry>();
+let moduleLowConfDiagWeakMap = new WeakMap<CanonicalGame, CachedLowConfDiagEntry>();
+
+export function resetStudioSessionCachesForTests(): void {
+  moduleProbedResultsMap.clear();
+  moduleProbingSet.clear();
+  moduleStudioEventRevision += 1;
+  lastSeenOverridesMapRef = null;
+  moduleUnmatchedDiagWeakMap = new WeakMap();
+  moduleLowConfDiagWeakMap = new WeakMap();
+}
+
+function resolveEffectiveOverridesRevision(
+  overridesMap: Record<string, UserGameOverride>
+): number {
+  if (overridesMap !== lastSeenOverridesMapRef) {
+    lastSeenOverridesMapRef = overridesMap;
+    syntheticOverridesMapRev += 1;
+  }
+  const storageRev =
+    typeof getUserOverridesRevision === 'function' ? getUserOverridesRevision() : 0;
+  return storageRev * 1_000_003 + syntheticOverridesMapRev;
+}
+
+type ExtendedLibraryMatchManagerModalProps = Omit<
+  LibraryMatchManagerModalProps,
+  'onResetOverride' | 'onResetOverrideForGame'
+> & {
+  onResetOverride?: (gameId: string, context?: ResetOverrideContext) => void;
+  onResetOverrideForGame?: (gameId: string, context?: ResetOverrideContext) => void;
+};
 
 function getFlatRowKey(row: MatchManagerFlatRow): string {
   return row.key;
@@ -159,9 +224,10 @@ function matchesAnySearchField(fields: readonly string[], query: string): boolea
   return false;
 }
 
-export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> = ({
+export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModalProps> = ({
   isOpen,
   games,
+  initialTab,
   onClose,
   onFixMatchForGame,
   onResetOverride,
@@ -184,7 +250,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useSafeDeferredValue(searchQuery);
-  const [activeTab, setActiveTab] = useState<FilterTab>('all');
+  const [activeTab, setActiveTab] = useState<FilterTab>(initialTab ?? 'needs_attention');
   const [unmatchedSubFilter, setUnmatchedSubFilter] = useState<UnmatchedSubFilter>('all');
   const [autoFilteredSubFilter, setAutoFilteredSubFilter] = useState<AutoFilteredSubFilter>('all');
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
@@ -199,7 +265,9 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
   const [selectedNonGameIds, setSelectedNonGameIds] = useState<Set<string>>(new Set());
   const [overrideTick, setOverrideTick] = useState(0);
   const [nonGameConfirmTick, setNonGameConfirmTick] = useState(0);
-  const [probedSynopsisMap, setProbedSynopsisMap] = useState<Record<string, string | null>>({});
+  const [probedSynopsisMap, setProbedSynopsisMap] = useState<Record<string, string | null>>(() =>
+    moduleProbedResultsMap.size > 0 ? Object.fromEntries(moduleProbedResultsMap) : {}
+  );
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
 
   const gamesLatestRef = useRef(games);
@@ -207,8 +275,6 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
   const probedSynopsisMapLatestRef = useRef(probedSynopsisMap);
   probedSynopsisMapLatestRef.current = probedSynopsisMap;
 
-  const probingRef = useRef<Set<string>>(new Set());
-  const probedResultsRef = useRef<Map<string, string | null>>(new Map());
   const pendingMapDeltaRef = useRef<Record<string, string | null>>({});
   const hasPendingMapDeltaRef = useRef(false);
   const pendingGameUpdatesRef = useRef<Map<string, CanonicalGame>>(new Map());
@@ -221,8 +287,10 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
   const handleInspectRef = useRef(handleInspect);
   handleInspectRef.current = handleInspect;
-  const handleResetRef = useRef(handleReset);
-  handleResetRef.current = handleReset;
+  const onResetOverrideRef = useRef(onResetOverride);
+  onResetOverrideRef.current = onResetOverride;
+  const onResetOverrideForGameRef = useRef(onResetOverrideForGame);
+  onResetOverrideForGameRef.current = onResetOverrideForGame;
   const onFixMatchForGameRef = useRef(onFixMatchForGame);
   onFixMatchForGameRef.current = onFixMatchForGame;
   const onHideGameRef = useRef(onHideGame);
@@ -234,17 +302,58 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
   // Suspension snapshot caches while FixMatchWizardModal is stacked on top
   const cachedLookupRef = useRef<CatalogLookupIndex>(EMPTY_CATALOG_LOOKUP);
+  const hasHydratedLookupRef = useRef(false);
   const cachedBaseUnmatchedRef = useRef<{
     items: IndexedUnmatchedItem[];
     idSet: Set<string>;
   }>({ items: [], idSet: new Set() });
+  const hasHydratedUnmatchedRef = useRef(false);
   const cachedBaseLowConfRef = useRef<IndexedGameItem[]>([]);
+  const hasHydratedLowConfRef = useRef(false);
   const cachedBaseSuppressedRef = useRef<{
     userSuppressed: IndexedSuppressedItem[];
     autoFiltered: IndexedSuppressedItem[];
   }>({ userSuppressed: [], autoFiltered: [] });
+  const hasHydratedSuppressedRef = useRef(false);
   const cachedBaseOverridesRef = useRef<IndexedOverrideItem[]>([]);
+  const hasHydratedOverridesRef = useRef(false);
   const cachedBaseMergedRef = useRef<IndexedGameItem[]>([]);
+  const hasHydratedMergedRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      if (IS_VITEST_ENV) {
+        moduleProbedResultsMap.clear();
+        moduleProbingSet.clear();
+      }
+    };
+  }, []);
+
+  // Preload FixMatchWizardModal chunk on idle when Studio opens so clicking "Fix Match" opens in <16ms
+  useEffect(() => {
+    if (!isOpen || !isRealClientRenderer || IS_VITEST_ENV) return undefined;
+    const g = globalThis as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (typeof g.requestIdleCallback === 'function') {
+      const idleId = g.requestIdleCallback(
+        () => {
+          void import('./FixMatchWizardModal').catch(() => {});
+        },
+        { timeout: 1_500 }
+      );
+      return () => {
+        if (typeof g.cancelIdleCallback === 'function') {
+          g.cancelIdleCallback(idleId);
+        }
+      };
+    }
+    const timer = setTimeout(() => {
+      void import('./FixMatchWizardModal').catch(() => {});
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [isOpen, isRealClientRenderer]);
 
   const flushPendingGameUpdatesOnly = useCallback(() => {
     if (pendingGameUpdatesRef.current.size === 0) return;
@@ -263,7 +372,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
     }
   }, []);
 
-  const flushPendingProbeState = useCallback(() => {
+  const flushPendingProbeMapOnly = useCallback(() => {
     if (flushTimerRef.current !== null) {
       clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
@@ -274,16 +383,20 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
       hasPendingMapDeltaRef.current = false;
       setProbedSynopsisMap((prev) => ({ ...prev, ...delta }));
     }
+  }, []);
+
+  const flushPendingProbeState = useCallback(() => {
+    flushPendingProbeMapOnly();
     flushPendingGameUpdatesOnly();
-  }, [flushPendingGameUpdatesOnly]);
+  }, [flushPendingProbeMapOnly, flushPendingGameUpdatesOnly]);
 
   const scheduleThrottledProbeFlush = useCallback(() => {
     if (flushTimerRef.current !== null) return;
     flushTimerRef.current = setTimeout(() => {
       flushTimerRef.current = null;
-      flushPendingProbeState();
+      flushPendingProbeMapOnly();
     }, PROBE_FLUSH_THROTTLE_MS);
-  }, [flushPendingProbeState]);
+  }, [flushPendingProbeMapOnly]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -301,14 +414,6 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
     };
   }, [isOpen, flushPendingProbeState, flushPendingGameUpdatesOnly]);
 
-  const perGameUnmatchedMemoRef = useRef<{
-    overrideTick: number;
-    cache: WeakMap<CanonicalGame, IndexedUnmatchedItem | null>;
-  }>({
-    overrideTick: -1,
-    cache: new WeakMap(),
-  });
-
   useEffect(() => {
     if (!isOpen) return;
     const handleUpdate = (event?: Event) => {
@@ -323,9 +428,13 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
         setNonGameConfirmTick((t) => t + 1);
         return;
       }
+      moduleStudioEventRevision += 1;
       setOverrideTick((t) => t + 1);
     };
-    const handleRemoved = () => setOverrideTick((t) => t + 1);
+    const handleRemoved = () => {
+      moduleStudioEventRevision += 1;
+      setOverrideTick((t) => t + 1);
+    };
     window.addEventListener('antigravity:user-override-updated', handleUpdate);
     window.addEventListener('antigravity:user-override-removed', handleRemoved);
     return () => {
@@ -336,24 +445,44 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
   // Imperative bounded 2-worker P2_BACKGROUND synopsis probe loop scoped to [isOpen, isSuspended].
   // Never self-cancels on games/probedSynopsisMap renders, yields between batches, pauses on scroll,
-  // and persists negative probe results durably so known-empty titles are never re-scraped.
+  // aborts immediately on suspend/close, and persists negative probe results durably.
   useEffect(() => {
     if (!isOpen || isSuspended) return;
 
     let stopped = false;
+    const abortController = new AbortController();
     const inFlightIds = new Set<string>();
+
+    const waitWithAbort = (ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        if (stopped || abortController.signal.aborted) {
+          resolve();
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          abortController.signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        abortController.signal.addEventListener('abort', onAbort, { once: true });
+      });
 
     const findNextBatch = (): CanonicalGame[] => {
       const currentGames = gamesLatestRef.current;
       const liveMap = probedSynopsisMapLatestRef.current;
+      const overridesMap = loadUserOverrides();
+      const probeMap = loadDurableEmptySynopsisProbeMap();
       const batch: CanonicalGame[] = [];
       for (let i = 0; i < currentGames.length; i += 1) {
         const game = currentGames[i];
         if (
-          probingRef.current.has(game.id) ||
-          probedResultsRef.current.has(game.id) ||
-          Boolean(getUserOverrideForGame(game)) ||
-          isSynopsisAlreadyProbed(game, undefined, liveMap) ||
+          moduleProbingSet.has(game.id) ||
+          moduleProbedResultsMap.has(game.id) ||
+          Boolean(getUserOverrideForGame(game, overridesMap)) ||
+          isSynopsisAlreadyProbed(game, undefined, liveMap, probeMap) ||
           hasGenuineStoreSynopsis(game, undefined, liveMap)
         ) {
           continue;
@@ -367,11 +496,12 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
     };
 
     const runProbeLoop = async () => {
-      while (!stopped) {
-        while (!stopped && isUserActivelyScrolling()) {
-          await new Promise<void>((r) => setTimeout(r, 150));
+      await waitWithAbort(INITIAL_PROBE_SCAN_DELAY_MS);
+      while (!stopped && !abortController.signal.aborted) {
+        while (!stopped && !abortController.signal.aborted && isUserActivelyScrolling()) {
+          await waitWithAbort(150);
         }
-        if (stopped) break;
+        if (stopped || abortController.signal.aborted) break;
 
         const batch = findNextBatch();
         if (batch.length === 0) {
@@ -380,7 +510,8 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
         await Promise.all(
           batch.map(async (game) => {
-            probingRef.current.add(game.id);
+            if (stopped || abortController.signal.aborted) return;
+            moduleProbingSet.add(game.id);
             inFlightIds.add(game.id);
             try {
               const fetchPromise = game.steamAppId
@@ -394,16 +525,23 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
                   )(game, undefined, {
                     priority: RequestPriority.P2_BACKGROUND,
                     synopsisOnly: true,
+                    signal: abortController.signal,
                   } as unknown);
 
               const res = await Promise.resolve(fetchPromise);
               inFlightIds.delete(game.id);
+              if (stopped || abortController.signal.aborted) {
+                if (!moduleProbedResultsMap.has(game.id)) {
+                  moduleProbingSet.delete(game.id);
+                }
+                return;
+              }
 
               const clean = extractCleanSynopsisText(
                 res?.shortDescription || res?.aboutTheGame || res?.detailedDescription
               );
               if (res && clean.length >= 25 && !isGenericPlaceholderSynopsis(clean, game.title)) {
-                probedResultsRef.current.set(game.id, clean);
+                moduleProbedResultsMap.set(game.id, clean);
                 clearDurableEmptySynopsisProbe(game.id);
                 const validDevs =
                   res.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
@@ -423,15 +561,15 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
                       : game.releaseDate,
                   enrichedMetadata: res,
                 });
-                if (!stopped) {
+                if (!stopped && !abortController.signal.aborted) {
                   pendingMapDeltaRef.current[game.id] = clean;
                   hasPendingMapDeltaRef.current = true;
                   scheduleThrottledProbeFlush();
                 }
               } else {
-                probedResultsRef.current.set(game.id, null);
+                moduleProbedResultsMap.set(game.id, null);
                 recordDurableEmptySynopsisProbe(game.id);
-                if (!stopped) {
+                if (!stopped && !abortController.signal.aborted) {
                   pendingMapDeltaRef.current[game.id] = null;
                   hasPendingMapDeltaRef.current = true;
                   scheduleThrottledProbeFlush();
@@ -439,9 +577,15 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
               }
             } catch {
               inFlightIds.delete(game.id);
-              probedResultsRef.current.set(game.id, null);
+              if (stopped || abortController.signal.aborted) {
+                if (!moduleProbedResultsMap.has(game.id)) {
+                  moduleProbingSet.delete(game.id);
+                }
+                return;
+              }
+              moduleProbedResultsMap.set(game.id, null);
               recordDurableEmptySynopsisProbe(game.id);
-              if (!stopped) {
+              if (!stopped && !abortController.signal.aborted) {
                 pendingMapDeltaRef.current[game.id] = null;
                 hasPendingMapDeltaRef.current = true;
                 scheduleThrottledProbeFlush();
@@ -450,7 +594,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
           })
         );
 
-        if (!stopped) {
+        if (!stopped && !abortController.signal.aborted) {
           await yieldBetweenProbeBatches();
         }
       }
@@ -460,9 +604,10 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
     return () => {
       stopped = true;
+      abortController.abort();
       for (const id of inFlightIds) {
-        if (!probedResultsRef.current.has(id)) {
-          probingRef.current.delete(id);
+        if (!moduleProbedResultsMap.has(id)) {
+          moduleProbingSet.delete(id);
         }
       }
       inFlightIds.clear();
@@ -486,8 +631,22 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
   const stableInspect = useCallback((game: CanonicalGame) => {
     handleInspectRef.current?.(game);
   }, []);
-  const stableReset = useCallback((gameId: string) => {
-    handleResetRef.current?.(gameId);
+  const stableReset = useCallback((gameId: string, context?: ResetOverrideContext) => {
+    if (onResetOverrideRef.current) {
+      if (context !== undefined) {
+        onResetOverrideRef.current(gameId, context);
+      } else {
+        onResetOverrideRef.current(gameId);
+      }
+      return;
+    }
+    if (onResetOverrideForGameRef.current) {
+      if (context !== undefined && onResetOverrideForGameRef.current.length >= 2) {
+        onResetOverrideForGameRef.current(gameId, context);
+      } else {
+        onResetOverrideForGameRef.current(gameId);
+      }
+    }
   }, []);
   const stableFixMatch = useCallback((game: CanonicalGame) => {
     onFixMatchForGameRef.current(game);
@@ -512,45 +671,66 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
   // Pre-build O(1) catalog lookup maps once per catalog change when open
   const catalogLookupIndex = useMemo<CatalogLookupIndex>(() => {
     if (!isOpen) return EMPTY_CATALOG_LOOKUP;
-    if (isSuspended) return cachedLookupRef.current;
+    if (isSuspended && hasHydratedLookupRef.current) return cachedLookupRef.current;
 
     const byId = new Map<string, CanonicalGame>();
+    const byIdLower = new Map<string, CanonicalGame>();
     const byPlatComposite = new Map<string, CanonicalGame>();
+    const byPlatCompositeLower = new Map<string, CanonicalGame>();
     const bySinglePlatComposite = new Map<string, CanonicalGame>();
+    const bySinglePlatCompositeLower = new Map<string, CanonicalGame>();
 
     for (let i = 0; i < games.length; i += 1) {
       const g = games[i];
       byId.set(g.id, g);
+      byIdLower.set(g.id.toLowerCase(), g);
       const isSinglePlat = g.platforms.length === 1;
       for (let j = 0; j < g.platforms.length; j += 1) {
         const p = g.platforms[j];
         const compKey = `${p.platformId}:${String(p.platformGameId)}`;
+        const compLower = compKey.toLowerCase();
+        const dashLower = `${p.platformId}-${String(p.platformGameId)}`.toLowerCase();
         if (!byPlatComposite.has(compKey)) {
           byPlatComposite.set(compKey, g);
+        }
+        if (!byPlatCompositeLower.has(compLower)) {
+          byPlatCompositeLower.set(compLower, g);
+        }
+        if (!byIdLower.has(dashLower)) {
+          byIdLower.set(dashLower, g);
         }
         if (isSinglePlat && !bySinglePlatComposite.has(compKey)) {
           bySinglePlatComposite.set(compKey, g);
         }
+        if (isSinglePlat && !bySinglePlatCompositeLower.has(compLower)) {
+          bySinglePlatCompositeLower.set(compLower, g);
+        }
       }
     }
 
-    const next = { byId, byPlatComposite, bySinglePlatComposite };
+    const next: CatalogLookupIndex = {
+      byId,
+      byIdLower,
+      byPlatComposite,
+      byPlatCompositeLower,
+      bySinglePlatComposite,
+      bySinglePlatCompositeLower,
+    };
     cachedLookupRef.current = next;
+    hasHydratedLookupRef.current = true;
     return next;
   }, [isOpen, isSuspended, games]);
 
   // 1. Base Unmatched Games (computed & sorted ONCE per catalog/override/probe change, decoupled from searchQuery)
   const baseUnmatchedData = useMemo(() => {
     if (!isOpen) return { items: [] as IndexedUnmatchedItem[], idSet: new Set<string>() };
-    if (isSuspended) return cachedBaseUnmatchedRef.current;
+    if (isSuspended && hasHydratedUnmatchedRef.current) return cachedBaseUnmatchedRef.current;
 
-    if (perGameUnmatchedMemoRef.current.overrideTick !== overrideTick) {
-      perGameUnmatchedMemoRef.current = {
-        overrideTick,
-        cache: new WeakMap(),
-      };
-    }
-    const perGameCache = perGameUnmatchedMemoRef.current.cache;
+    const overridesMap = loadUserOverrides();
+    const overridesRev = resolveEffectiveOverridesRevision(overridesMap);
+    const probeMap = loadDurableEmptySynopsisProbeMap();
+    const probeRev = getSynopsisProbeRevision();
+    const eventRev = moduleStudioEventRevision;
     const hasProbedMapEntries = Object.keys(probedSynopsisMap).length > 0;
 
     const items: IndexedUnmatchedItem[] = [];
@@ -558,21 +738,43 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
       const game = games[i];
       const hasProbedEntryForGame =
         hasProbedMapEntries && Object.prototype.hasOwnProperty.call(probedSynopsisMap, game.id);
+      const probedVal = hasProbedEntryForGame ? probedSynopsisMap[game.id] : undefined;
 
-      if (!hasProbedEntryForGame && perGameCache.has(game)) {
-        const cachedItem = perGameCache.get(game);
-        if (cachedItem) items.push(cachedItem);
+      const cachedDiag = moduleUnmatchedDiagWeakMap.get(game);
+      if (
+        cachedDiag &&
+        cachedDiag.overridesRev === overridesRev &&
+        cachedDiag.probeRev === probeRev &&
+        cachedDiag.eventRev === eventRev &&
+        cachedDiag.hasProbedEntry === hasProbedEntryForGame &&
+        cachedDiag.probedVal === probedVal
+      ) {
+        if (cachedDiag.item) items.push(cachedDiag.item);
         continue;
       }
 
-      if (getUserOverrideForGame(game)) {
-        if (!hasProbedEntryForGame) perGameCache.set(game, null);
+      if (getUserOverrideForGame(game, overridesMap)) {
+        moduleUnmatchedDiagWeakMap.set(game, {
+          overridesRev,
+          probeRev,
+          eventRev,
+          hasProbedEntry: hasProbedEntryForGame,
+          probedVal,
+          item: null,
+        });
         continue;
       }
 
-      const reasons = getGranularUnmatchedReasons(game, undefined, probedSynopsisMap);
+      const reasons = getGranularUnmatchedReasons(game, undefined, probedSynopsisMap, probeMap);
       if (reasons.length === 0) {
-        if (!hasProbedEntryForGame) perGameCache.set(game, null);
+        moduleUnmatchedDiagWeakMap.set(game, {
+          overridesRev,
+          probeRev,
+          eventRev,
+          hasProbedEntry: hasProbedEntryForGame,
+          probedVal,
+          item: null,
+        });
         continue;
       }
 
@@ -594,7 +796,14 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
           isLikelyNonStoreOrTestBranchTitle(game.title)
         )
       ) {
-        if (!hasProbedEntryForGame) perGameCache.set(game, null);
+        moduleUnmatchedDiagWeakMap.set(game, {
+          overridesRev,
+          probeRev,
+          eventRev,
+          hasProbedEntry: hasProbedEntryForGame,
+          probedVal,
+          item: null,
+        });
         continue;
       }
 
@@ -603,7 +812,14 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
         reasons,
         searchFields: collectGameSearchFields(game),
       };
-      if (!hasProbedEntryForGame) perGameCache.set(game, builtItem);
+      moduleUnmatchedDiagWeakMap.set(game, {
+        overridesRev,
+        probeRev,
+        eventRev,
+        hasProbedEntry: hasProbedEntryForGame,
+        probedVal,
+        item: builtItem,
+      });
       items.push(builtItem);
     }
 
@@ -615,20 +831,43 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
     const next = { items, idSet };
     cachedBaseUnmatchedRef.current = next;
+    hasHydratedUnmatchedRef.current = true;
     return next;
   }, [isOpen, isSuspended, games, overrideTick, probedSynopsisMap]);
 
   // 2. Base Low-Confidence Automatic Matches (decoupled from searchQuery)
   const baseLowConfidenceItems = useMemo<IndexedGameItem[]>(() => {
     if (!isOpen) return [];
-    if (isSuspended) return cachedBaseLowConfRef.current;
+    if (isSuspended && hasHydratedLowConfRef.current) return cachedBaseLowConfRef.current;
 
+    const overridesMap = loadUserOverrides();
+    const overridesRev = resolveEffectiveOverridesRevision(overridesMap);
+    const eventRev = moduleStudioEventRevision;
     const unmatchedSet = baseUnmatchedData.idSet;
     const items: IndexedGameItem[] = [];
     for (let i = 0; i < games.length; i += 1) {
       const game = games[i];
-      if (unmatchedSet.has(game.id)) continue;
-      if (getUserOverrideForGame(game)) continue;
+      const isUnmatched = unmatchedSet.has(game.id);
+      const cachedLowConf = moduleLowConfDiagWeakMap.get(game);
+      if (
+        cachedLowConf &&
+        cachedLowConf.overridesRev === overridesRev &&
+        cachedLowConf.eventRev === eventRev &&
+        cachedLowConf.isUnmatched === isUnmatched
+      ) {
+        if (cachedLowConf.item) items.push(cachedLowConf.item);
+        continue;
+      }
+
+      if (isUnmatched || getUserOverrideForGame(game, overridesMap)) {
+        moduleLowConfDiagWeakMap.set(game, {
+          overridesRev,
+          eventRev,
+          isUnmatched,
+          item: null,
+        });
+        continue;
+      }
 
       const rawConf =
         typeof game.matchConfidence === 'number'
@@ -648,16 +887,32 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
         (typeof rawConf === 'number' && rawConf > 0 && rawConf < 85) ||
         hasTitleShift;
 
-      if (!isLowConf) continue;
+      if (!isLowConf) {
+        moduleLowConfDiagWeakMap.set(game, {
+          overridesRev,
+          eventRev,
+          isUnmatched,
+          item: null,
+        });
+        continue;
+      }
 
-      items.push({
+      const builtItem: IndexedGameItem = {
         game,
         searchFields: collectGameSearchFields(game),
+      };
+      moduleLowConfDiagWeakMap.set(game, {
+        overridesRev,
+        eventRev,
+        isUnmatched,
+        item: builtItem,
       });
+      items.push(builtItem);
     }
 
     items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game.title, b.game.title));
     cachedBaseLowConfRef.current = items;
+    hasHydratedLowConfRef.current = true;
     return items;
   }, [isOpen, isSuspended, games, baseUnmatchedData, overrideTick]);
 
@@ -669,7 +924,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
         autoFiltered: [] as IndexedSuppressedItem[],
       };
     }
-    if (isSuspended) return cachedBaseSuppressedRef.current;
+    if (isSuspended && hasHydratedSuppressedRef.current) return cachedBaseSuppressedRef.current;
 
     const rawSuppressed = getSuppressedCatalogEntries();
     const userSuppressed: IndexedSuppressedItem[] = [];
@@ -680,7 +935,8 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
       const compKey = `${entry.platformId}:${String(entry.platformGameId)}`;
       if (
         catalogLookupIndex.byId.has(entry.rawGame.id) ||
-        catalogLookupIndex.byPlatComposite.has(compKey)
+        catalogLookupIndex.byPlatComposite.has(compKey) ||
+        catalogLookupIndex.byPlatCompositeLower.has(compKey.toLowerCase())
       ) {
         continue;
       }
@@ -715,34 +971,64 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
     const next = { userSuppressed, autoFiltered };
     cachedBaseSuppressedRef.current = next;
+    hasHydratedSuppressedRef.current = true;
     return next;
   }, [isOpen, isSuspended, catalogLookupIndex, overrideTick]);
 
-  // 4. Base Manual Matching Overrides (O(1) catalog lookup, pre-sorted once)
+  // 4. Base Manual Matching Overrides (O(1) catalog lookup, multi-key deduped by newest updatedAt)
   const baseOverrideItems = useMemo<IndexedOverrideItem[]>(() => {
     if (!isOpen) return [];
-    if (isSuspended) return cachedBaseOverridesRef.current;
+    if (isSuspended && hasHydratedOverridesRef.current) return cachedBaseOverridesRef.current;
 
     const allMap = loadUserOverrides();
-    const seenGameIds = new Set<string>();
-    const list: IndexedOverrideItem[] = [];
+    const keyToEntryIndex = new Map<string, number>();
+    const dedupedList: Array<{ item: IndexedOverrideItem; updatedAtMs: number }> = [];
 
-    for (const ov of Object.values(allMap)) {
+    for (const [dictKey, ov] of Object.entries(allMap)) {
       if (!ov || !ov.gameId) continue;
-      const dedupeKey =
-        ov.platformId && ov.platformGameId
-          ? `${ov.platformId}:${ov.platformGameId}`
-          : ov.gameId;
-      if (seenGameIds.has(dedupeKey) || seenGameIds.has(ov.gameId)) continue;
-      seenGameIds.add(dedupeKey);
-      seenGameIds.add(ov.gameId);
 
-      let matchedGame = catalogLookupIndex.byId.get(ov.gameId);
+      let matchedGame =
+        catalogLookupIndex.byId.get(ov.gameId) ??
+        catalogLookupIndex.byIdLower.get(ov.gameId.toLowerCase()) ??
+        catalogLookupIndex.byId.get(dictKey) ??
+        catalogLookupIndex.byIdLower.get(dictKey.toLowerCase());
+
+      if (!matchedGame && ov.steamAppId) {
+        matchedGame = catalogLookupIndex.byId.get(`steam-${ov.steamAppId}`);
+      }
+      if (!matchedGame && ov.matchedStore === 'steam' && ov.matchedId) {
+        matchedGame = catalogLookupIndex.byId.get(`steam-${String(ov.matchedId)}`);
+      }
       if (!matchedGame && ov.platformId && ov.platformGameId) {
         const compKey = `${ov.platformId}:${String(ov.platformGameId)}`;
+        const compLower = compKey.toLowerCase();
         matchedGame = ov.splitFromMerged
-          ? catalogLookupIndex.bySinglePlatComposite.get(compKey)
-          : catalogLookupIndex.byPlatComposite.get(compKey);
+          ? (catalogLookupIndex.bySinglePlatComposite.get(compKey) ??
+            catalogLookupIndex.bySinglePlatCompositeLower.get(compLower))
+          : (catalogLookupIndex.byPlatComposite.get(compKey) ??
+            catalogLookupIndex.byPlatCompositeLower.get(compLower));
+        if (!matchedGame) {
+          matchedGame = catalogLookupIndex.byIdLower.get(
+            `${ov.platformId}-${String(ov.platformGameId)}`.toLowerCase()
+          );
+        }
+      }
+
+      const candidateKeys: string[] = [`gid:${ov.gameId.toLowerCase()}`];
+      if (dictKey) {
+        candidateKeys.push(`gid:${dictKey.toLowerCase()}`);
+      }
+      if (ov.platformId && ov.platformGameId) {
+        candidateKeys.push(
+          `plat:${ov.platformId.toLowerCase()}:${String(ov.platformGameId).toLowerCase()}`
+        );
+      }
+      if (matchedGame) {
+        const splitSuffix =
+          ov.splitFromMerged && ov.platformId && ov.platformGameId && matchedGame.platforms.length > 1
+            ? `:split:${ov.platformId.toLowerCase()}:${String(ov.platformGameId).toLowerCase()}`
+            : '';
+        candidateKeys.push(`matched:${matchedGame.id.toLowerCase()}${splitSuffix}`);
       }
 
       const searchFields: string[] = [];
@@ -758,20 +1044,47 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
       if (matchedGame?.originalStoreTitle) searchFields.push(matchedGame.originalStoreTitle);
       if (matchedGame?.id) searchFields.push(matchedGame.id);
 
-      list.push({ override: ov, matchedGame, searchFields });
+      const updatedAtMs = ov.updatedAt ? Date.parse(ov.updatedAt) || 0 : 0;
+      const built: IndexedOverrideItem = { override: ov, matchedGame, searchFields };
+
+      let existingIdx: number | undefined;
+      for (let k = 0; k < candidateKeys.length; k += 1) {
+        const found = keyToEntryIndex.get(candidateKeys[k]);
+        if (found !== undefined) {
+          existingIdx = found;
+          break;
+        }
+      }
+
+      if (existingIdx !== undefined) {
+        if (updatedAtMs >= dedupedList[existingIdx].updatedAtMs) {
+          dedupedList[existingIdx] = { item: built, updatedAtMs };
+        }
+        for (let k = 0; k < candidateKeys.length; k += 1) {
+          keyToEntryIndex.set(candidateKeys[k], existingIdx);
+        }
+      } else {
+        const nextIdx = dedupedList.length;
+        dedupedList.push({ item: built, updatedAtMs });
+        for (let k = 0; k < candidateKeys.length; k += 1) {
+          keyToEntryIndex.set(candidateKeys[k], nextIdx);
+        }
+      }
     }
 
+    const list = dedupedList.map((entry) => entry.item);
     list.sort((a, b) =>
       STUDIO_TITLE_COLLATOR.compare(a.override.title || '', b.override.title || '')
     );
     cachedBaseOverridesRef.current = list;
+    hasHydratedOverridesRef.current = true;
     return list;
   }, [isOpen, isSuspended, catalogLookupIndex, overrideTick]);
 
   // 5. Base Merged Multi-Storefront Listings (pre-sorted once)
   const baseMergedItems = useMemo<IndexedGameItem[]>(() => {
     if (!isOpen) return [];
-    if (isSuspended) return cachedBaseMergedRef.current;
+    if (isSuspended && hasHydratedMergedRef.current) return cachedBaseMergedRef.current;
 
     const items: IndexedGameItem[] = [];
     for (let i = 0; i < games.length; i += 1) {
@@ -785,6 +1098,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
 
     items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game.title, b.game.title));
     cachedBaseMergedRef.current = items;
+    hasHydratedMergedRef.current = true;
     return items;
   }, [isOpen, isSuspended, games]);
 
@@ -880,12 +1194,25 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
         confirmedAutoFilteredEntries: [] as SuppressedCatalogEntry[],
       };
     }
+    const confirmedKeys = loadConfirmedNonGameKeys();
+    const hasConfirmedKeys = confirmedKeys.size > 0;
     const unreviewed: IndexedSuppressedItem[] = [];
     const confirmed: SuppressedCatalogEntry[] = [];
     for (let i = 0; i < searchedAutoFilteredItems.length; i += 1) {
       const item = searchedAutoFilteredItems[i];
       const { entry } = item;
-      if (isNonGameStorefrontEntryConfirmed(entry.platformId, entry.platformGameId, entry.id)) {
+      const isConfirmed =
+        hasConfirmedKeys &&
+        (Boolean(
+          entry.platformId &&
+            entry.platformGameId &&
+            (confirmedKeys.has(`${entry.platformId}:${entry.platformGameId}`) ||
+              confirmedKeys.has(`${entry.platformId}-${entry.platformGameId}`))
+        ) ||
+          Boolean(
+            entry.id && (confirmedKeys.has(entry.id) || confirmedKeys.has(`game:${entry.id}`))
+          ));
+      if (isConfirmed) {
         confirmed.push(entry);
       } else {
         unreviewed.push(item);
@@ -963,12 +1290,26 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
     return filtered.map((item) => item.game);
   }, [isOpen, baseMergedItems, effectiveQuery]);
 
-  const showUnmatched = activeTab === 'all' || activeTab === 'unmatched';
-  const showLowConfidence = activeTab === 'all' || activeTab === 'low_confidence';
-  const showUserSuppressed = activeTab === 'all' || activeTab === 'user_suppressed';
-  const showSuppressed = activeTab === 'all' || activeTab === 'suppressed';
-  const showOverrides = activeTab === 'all' || activeTab === 'overrides';
-  const showMerged = activeTab === 'all' || activeTab === 'merged';
+  const handleSelectTab = useCallback(
+    (nextTab: FilterTab) => {
+      setActiveTab(nextTab);
+      scrollEl?.scrollTo?.({ top: 0 });
+    },
+    [scrollEl]
+  );
+
+  useEffect(() => {
+    if (isOpen && initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [isOpen, initialTab]);
+
+  const showUnmatched = activeTab === 'needs_attention';
+  const showLowConfidence = activeTab === 'needs_attention';
+  const showUserSuppressed = activeTab === 'user_suppressed';
+  const showSuppressed = activeTab === 'suppressed';
+  const showOverrides = activeTab === 'overrides';
+  const showMerged = activeTab === 'merged';
 
   // Single flattened discriminated-union virtualizer model for the entire scrollable studio body
   const flatRows = useMemo(() => {
@@ -1083,7 +1424,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
       className="w-full max-w-5xl"
     >
       <div
-        className="bg-[#16202d] border border-[#2a475e] rounded-xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden text-slate-200 animate-in fade-in duration-150 select-none"
+        className="bg-[#1b2838] border border-steam-border rounded-xl shadow-2xl w-full max-w-5xl h-[92vh] max-h-[92vh] flex flex-col overflow-hidden text-slate-200 animate-in fade-in duration-150 select-none"
         onClick={(e) => e.stopPropagation()}
       >
         {renderMatchManagerHeaderAndTabs({
@@ -1091,7 +1432,7 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
           panelId,
           searchInputId,
           activeTab,
-          setActiveTab,
+          setActiveTab: handleSelectTab,
           searchQuery,
           setSearchQuery,
           onClose,
@@ -1099,7 +1440,6 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
           lowConfidenceCount: lowConfidenceGames.length,
           userSuppressedCount: userSuppressedEntries.length,
           unreviewedAutoFilteredCount: unreviewedAutoFilteredEntries.length,
-          confirmedAutoFilteredCount: confirmedAutoFilteredEntries.length,
           overrideCount: overrideItems.length,
           mergedCount: mergedGames.length,
         })}
@@ -1110,9 +1450,11 @@ export const LibraryMatchManagerModal: React.FC<LibraryMatchManagerModalProps> =
           id={panelId}
           role="tabpanel"
           aria-labelledby={`${titleId}-tab-${activeTab}`}
-          hidden={Boolean(isSuspended)}
+          inert={isSuspended ? true : undefined}
           aria-hidden={Boolean(isSuspended) || undefined}
-          className="relative flex-1 overflow-y-auto p-6 custom-scrollbar ol-studio-scroll-body"
+          className={`relative flex-1 overflow-y-auto p-6 custom-scrollbar ol-studio-scroll-body${
+            isSuspended ? ' pointer-events-none' : ''
+          }`}
         >
           {flatRows.length > 50 && isRealClientRenderer ? (
             <VirtualListRows

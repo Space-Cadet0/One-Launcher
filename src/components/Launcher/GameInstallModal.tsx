@@ -11,6 +11,7 @@ import {
   GameInstallInfo,
 } from '../../contracts/launcher';
 import { launcherService } from '../../services/launcher/launcherService';
+import { environmentSetupService } from '../../services/launcher/environmentSetupService';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import {
   Download,
@@ -22,6 +23,7 @@ import {
   Info,
   Loader2,
   CheckCircle2,
+  Wrench,
 } from 'lucide-react';
 
 export interface GameInstallModalProps {
@@ -194,6 +196,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   const [preferClientlessExtraction, setPreferClientlessExtraction] = useState<boolean>(false);
   const [isStarting, setIsStarting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [, setEnvSetupRev] = useState<number>(0);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    return environmentSetupService.subscribe(() => {
+      setEnvSetupRev((r) => r + 1);
+    });
+  }, [isOpen]);
 
   const compatLayers = isOpen
     ? launcherService.getCompatibilityLayers().filter((l) => l.type !== 'native')
@@ -444,6 +454,21 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   const winInstaller = uniqueInstallers.find((i) => i.os === 'windows');
   const selectedInstaller =
     uniqueInstallers.find((i) => i.id === selectedInstallerId) || uniqueInstallers[0];
+
+  const envSnapshot = isOpen ? environmentSetupService.getLastSnapshot() : null;
+  const isWinSteamTarget =
+    !isWindowsHost &&
+    (selectedOs === 'windows' ||
+      selectedInstaller?.os === 'windows' ||
+      selectedInstaller?.id === 'steam-win-compat');
+  const targetSteamLogin =
+    selectedPlatformId === 'steam'
+      ? envSnapshot?.clientLogins?.[isWinSteamTarget ? 'bottle_steam' : 'host_steam']
+      : undefined;
+  const showSteamSignInHint = Boolean(
+    targetSteamLogin?.installed &&
+      (!targetSteamLogin.authenticated || targetSteamLogin.accountMatchesOneLauncher === false)
+  );
 
   const baseEstimatedBytes =
     sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ??
@@ -1221,47 +1246,123 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             </div>
           )}
 
+          {!isWindowsHost && selectedOs === 'windows' && compatLayers.length === 0 && (
+            <div
+              data-testid="missing-compat-runner-setup-callout"
+              role="status"
+              aria-live="polite"
+              className="rounded-lg bg-amber-950/50 border border-amber-500/45 p-3.5 flex flex-wrap items-center justify-between gap-3"
+            >
+              <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+                <div className="space-y-0.5 min-w-0">
+                  <div className="text-xs font-bold text-amber-200">
+                    Windows game support isn&rsquo;t set up yet
+                  </div>
+                  <p className="text-[11px] text-amber-100/90 leading-relaxed">
+                    Install CrossOver or Wine in Setup Wizard to play Windows games on your Mac.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                data-testid="open-setup-wizard-from-install-btn"
+                onClick={() =>
+                  environmentSetupService.openWizard({
+                    mode: 'repair',
+                    initialStep: 'compatibility',
+                  })
+                }
+                className="min-h-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/25 hover:bg-amber-500/35 border border-amber-400 text-xs font-bold text-amber-100 hover:text-white transition-colors cursor-pointer shrink-0"
+              >
+                <Wrench className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Setup Wizard...</span>
+              </button>
+            </div>
+          )}
+
           {/* Target Installation Directory */}
           {selectedPlatformId === 'steam' ? (
-            <div
-              data-testid="steam-managed-install-location"
-              className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5">
-                  <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">
-                    Steam Library Location
-                  </span>
+            <>
+              {showSteamSignInHint && targetSteamLogin && (
+                <div
+                  data-testid="steam-client-signin-hint-banner"
+                  className="rounded-lg bg-sky-950/50 border border-sky-400/45 p-3.5 flex flex-wrap items-center justify-between gap-3"
+                >
+                  <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                    <Info
+                      className="w-4 h-4 text-sky-400 shrink-0 mt-0.5"
+                      aria-hidden="true"
+                    />
+                    <div className="space-y-0.5 min-w-0">
+                      <div className="text-xs font-bold text-white">
+                        {targetSteamLogin.accountMatchesOneLauncher === false
+                          ? `${targetSteamLogin.label} is signed into a different account`
+                          : `${targetSteamLogin.label} isn’t signed in yet`}
+                      </div>
+                      <p className="text-[11px] text-slate-200 leading-relaxed">
+                        {targetSteamLogin.accountMatchesOneLauncher === false
+                          ? 'Switch to your connected Steam account first, or click Install and switch when Steam opens.'
+                          : 'Sign in first, or click Install and sign in when Steam opens.'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="open-guided-signin-from-install-btn"
+                    onClick={() =>
+                      environmentSetupService.openWizard({
+                        mode: 'health_check',
+                        initialStep: 'client_logins',
+                      })
+                    }
+                    className="min-h-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400 text-xs font-bold text-sky-100 hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 shrink-0"
+                  >
+                    <span>Sign In to Steam...</span>
+                  </button>
                 </div>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
-                  Managed by Steam Client (steamapps/common)
-                </span>
-              </div>
+              )}
 
               <div
-                data-testid="steam-library-location-display"
-                className="min-w-0 max-w-full overflow-hidden rounded-lg border border-white/10 bg-[#141821] px-3 py-2.5 space-y-1"
+                data-testid="steam-managed-install-location"
+                className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2"
               >
-                <code
-                  title={effectiveSteamDisplayPath}
-                  className="truncate block text-xs font-mono text-gray-200"
-                >
-                  {effectiveSteamDisplayPath}
-                </code>
-                <div className="text-[10px] text-steam-subtext truncate">
-                  {!isWindowsHost && selectedOs === 'windows'
-                    ? `CrossOver / Wine Bottle Steam Library (${
-                        selectedBottleName || activeCompatLayer?.availableBottles?.[0] || 'Steam'
-                      })`
-                    : 'Native Steam Library'}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <FolderOpen className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-white">
+                      Steam Library Location
+                    </span>
+                  </div>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                    Managed by Steam Client (steamapps/common)
+                  </span>
                 </div>
-              </div>
 
-              <p className="text-[11px] text-steam-subtext leading-relaxed">
-                Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
-              </p>
-            </div>
+                <div
+                  data-testid="steam-library-location-display"
+                  className="min-w-0 max-w-full overflow-hidden rounded-lg border border-white/10 bg-[#141821] px-3 py-2.5 space-y-1"
+                >
+                  <code
+                    title={effectiveSteamDisplayPath}
+                    className="truncate block text-xs font-mono text-gray-200"
+                  >
+                    {effectiveSteamDisplayPath}
+                  </code>
+                  <div className="text-[10px] text-steam-subtext truncate">
+                    {!isWindowsHost && selectedOs === 'windows'
+                      ? `CrossOver / Wine Bottle Steam Library (${
+                          selectedBottleName || activeCompatLayer?.availableBottles?.[0] || 'Steam'
+                        })`
+                      : 'Native Steam Library'}
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-steam-subtext leading-relaxed">
+                  Steam manages the installation folder for Steam games. You will select or confirm your target Steam Library drive inside the Steam installation dialog when it opens.
+                </p>
+              </div>
+            </>
           ) : (
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">

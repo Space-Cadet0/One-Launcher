@@ -15,6 +15,7 @@ import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 import { syncJobManager } from '../network/syncJobManager';
 import { isTitleCompatible } from '../critic/metacriticResolver';
+import { vaultDelete, vaultGet, vaultSet } from '../storage/indexedDbVault';
 
 const STORAGE_KEY_IGDB_COVERS_V1 = 'antigravity_igdb_covers';
 const STORAGE_KEY_IGDB_COVERS = 'antigravity_igdb_covers_v2';
@@ -318,6 +319,7 @@ export class IgdbCoverService {
   private deadSteamFailureCounts = new Map<number, number>();
   private pendingFetches = new Map<string, Promise<string | null>>();
   private initialized = false;
+  private cacheGeneration = 0;
 
   constructor() {
     // Lazily hydrated on first lookup via ensureInitialized() to avoid synchronous constructor localStorage scans
@@ -327,6 +329,7 @@ export class IgdbCoverService {
     if (this.initialized) return;
     this.initialized = true;
     this.loadPersistentCache();
+    void this.hydratePersistentCacheFromVault();
   }
 
   private setCoverCacheBounded(key: string, val: string | null): void {
@@ -356,6 +359,7 @@ export class IgdbCoverService {
   }
 
   public clearCache(): void {
+    this.cacheGeneration += 1;
     this.initialized = true;
     this.cache.clear();
     this.negativeTimestamps.clear();
@@ -365,6 +369,8 @@ export class IgdbCoverService {
     this.deadSteamFailureCounts.clear();
     this.pendingFetches.clear();
     KNOWN_DEAD_STEAM_COVER_APP_IDS.clear();
+    void vaultDelete(STORAGE_KEY_IGDB_COVERS);
+    void vaultDelete(STORAGE_KEY_GOG_BOXART);
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(STORAGE_KEY_IGDB_COVERS);
@@ -631,30 +637,88 @@ export class IgdbCoverService {
     }
   }
 
+  private async hydratePersistentCacheFromVault(): Promise<void> {
+    if (typeof window === 'undefined') return;
+    const gen = this.cacheGeneration;
+    try {
+      const [vaultCovers, vaultGog] = await Promise.all([
+        vaultGet<Record<string, unknown>>(STORAGE_KEY_IGDB_COVERS),
+        vaultGet<Record<string, unknown>>(STORAGE_KEY_GOG_BOXART),
+      ]);
+      if (gen !== this.cacheGeneration) return;
+
+      if (vaultCovers && typeof vaultCovers === 'object' && !Array.isArray(vaultCovers)) {
+        for (const [k, v] of Object.entries(vaultCovers)) {
+          const nk = normalizeCacheKey(k);
+          const existing = this.cache.get(nk);
+          if (typeof existing === 'string' && existing) continue;
+          if (typeof v === 'string' && v.trim() && !isUnsuitableCoverUrl(v)) {
+            this.setCoverCacheBounded(nk, v);
+            this.negativeTimestamps.delete(nk);
+          } else if (v && typeof v === 'object' && (v as { url?: unknown }).url === null) {
+            const cachedAt = Number((v as { cachedAt?: unknown }).cachedAt || 0);
+            const existingNegTs = this.negativeTimestamps.get(nk) || 0;
+            if (
+              cachedAt > existingNegTs &&
+              Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS
+            ) {
+              this.setCoverCacheBounded(nk, null);
+              this.negativeTimestamps.set(nk, cachedAt);
+            }
+          }
+        }
+      }
+
+      if (vaultGog && typeof vaultGog === 'object' && !Array.isArray(vaultGog)) {
+        for (const [k, v] of Object.entries(vaultGog)) {
+          const existing = this.gogBoxArtCache.get(k);
+          if (typeof existing === 'string' && existing) continue;
+          if (typeof v === 'string' && v.trim() && !isUnsuitableCoverUrl(v)) {
+            this.setGogCacheBounded(k, v);
+            this.gogNegativeTimestamps.delete(k);
+          } else if (v && typeof v === 'object' && (v as { url?: unknown }).url === null) {
+            const cachedAt = Number((v as { cachedAt?: unknown }).cachedAt || 0);
+            const existingNegTs = this.gogNegativeTimestamps.get(k) || 0;
+            if (
+              cachedAt > existingNegTs &&
+              Date.now() - cachedAt < NEGATIVE_COVER_TTL_MS
+            ) {
+              this.setGogCacheBounded(k, null);
+              this.gogNegativeTimestamps.set(k, cachedAt);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore vault read errors
+    }
+  }
+
   private savePersistentCache() {
+    const obj: Record<string, string | PersistedNegativeCoverRecord> = {};
+    for (const [k, v] of this.cache.entries()) {
+      if (typeof v === 'string' && v) {
+        obj[k] = v;
+      } else if (v === null) {
+        obj[k] = { url: null, cachedAt: this.negativeTimestamps.get(k) || Date.now() };
+      }
+    }
+    const gogObj: Record<string, string | PersistedNegativeCoverRecord> = {};
+    for (const [k, v] of this.gogBoxArtCache.entries()) {
+      if (typeof v === 'string' && v) {
+        gogObj[k] = v;
+      } else if (v === null) {
+        gogObj[k] = { url: null, cachedAt: this.gogNegativeTimestamps.get(k) || Date.now() };
+      }
+    }
+    void vaultSet(STORAGE_KEY_IGDB_COVERS, obj);
+    void vaultSet(STORAGE_KEY_GOG_BOXART, gogObj);
     if (typeof localStorage === 'undefined') return;
     try {
-      const obj: Record<string, string | PersistedNegativeCoverRecord> = {};
-      for (const [k, v] of this.cache.entries()) {
-        if (typeof v === 'string' && v) {
-          obj[k] = v;
-        } else if (v === null) {
-          obj[k] = { url: null, cachedAt: this.negativeTimestamps.get(k) || Date.now() };
-        }
-      }
       localStorage.setItem(STORAGE_KEY_IGDB_COVERS, JSON.stringify(obj));
-
-      const gogObj: Record<string, string | PersistedNegativeCoverRecord> = {};
-      for (const [k, v] of this.gogBoxArtCache.entries()) {
-        if (typeof v === 'string' && v) {
-          gogObj[k] = v;
-        } else if (v === null) {
-          gogObj[k] = { url: null, cachedAt: this.gogNegativeTimestamps.get(k) || Date.now() };
-        }
-      }
       localStorage.setItem(STORAGE_KEY_GOG_BOXART, JSON.stringify(gogObj));
     } catch {
-      // Ignore storage write error
+      // Ignore storage write error; IndexedDB vault retains full cache
     }
   }
 

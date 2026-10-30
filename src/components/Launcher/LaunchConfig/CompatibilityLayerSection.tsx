@@ -21,7 +21,9 @@ import {
   Monitor,
   RefreshCw,
   Sparkles,
+  Wrench,
 } from 'lucide-react';
+import { environmentSetupService } from '../../../services/launcher/environmentSetupService';
 import {
   COMPAT_LAYER_OPTIONS,
   CROSSOVER_BACKEND_OPTIONS,
@@ -483,6 +485,21 @@ function CompatibilityLayerSectionImpl({
                   className={`w-3.5 h-3.5 ${isRescanningRunners ? 'animate-spin' : ''}`}
                 />
                 <span>Re-Scan Installed Runners</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="open-system-setup-wizard-btn"
+                onClick={() =>
+                  environmentSetupService.openWizard({
+                    mode: 'repair',
+                    initialStep: 'compatibility',
+                  })
+                }
+                className="min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[11px] font-bold text-sky-200 hover:text-white transition-colors cursor-pointer"
+              >
+                <Wrench className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Setup Wizard...</span>
               </button>
             </div>
 

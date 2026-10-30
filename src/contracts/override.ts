@@ -48,6 +48,35 @@ export interface MetadataSourceRoute {
   targetTitle?: string;
   customTitleEdited?: boolean;
   customSynopsisEdited?: boolean;
+  customCoverEdited?: boolean;
+  customHeaderEdited?: boolean;
+}
+
+export interface NativeGameBaselineSnapshot {
+  id: string;
+  title: string;
+  steamAppId?: number | null;
+  capsuleImage?: string;
+  headerImage?: string;
+  iconUrl?: string;
+  shortDescription?: string;
+  detailedDescription?: string;
+  developers?: string[];
+  publishers?: string[];
+  genres?: string[];
+  tags?: string[];
+  releaseDate?: string;
+  nativePlatforms?: ('windows' | 'mac')[];
+  worksOn?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
+  };
+  platforms_os?: {
+    windows?: boolean;
+    mac?: boolean;
+    linux?: boolean;
+  };
 }
 
 export interface SearchMatchCandidate {
@@ -127,6 +156,7 @@ export interface UserGameOverride {
   reviewScoreOverride?: CriticScoreData | null;
   reviewRoute?: ReviewScoreRoute;
   metadataRoute?: MetadataSourceRoute;
+  nativeBaseline?: NativeGameBaselineSnapshot;
   updatedAt: string;
 }
 

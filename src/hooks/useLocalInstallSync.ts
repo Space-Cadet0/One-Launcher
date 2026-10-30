@@ -1,4 +1,4 @@
-import { useEffect, Dispatch, SetStateAction, MutableRefObject } from 'react';
+import { useEffect, useRef, Dispatch, SetStateAction, MutableRefObject } from 'react';
 import { CanonicalGame, XboxGamePassSyncMode } from '../contracts/game';
 import { StorefrontId } from '../contracts/platform';
 import { InstalledGameRecord } from '../contracts/launcher';
@@ -49,6 +49,7 @@ export interface UseLocalInstallSyncParams {
     durationMs?: number | null,
     tone?: SyncNoticeTone
   ) => void;
+  isModalOpen?: boolean;
 }
 
 interface InstalledGameListItem {
@@ -721,6 +722,35 @@ export function reconcileLocalInstallationsPure(
   };
 }
 
+type DeferredCatalogUpdater = (
+  prev: CanonicalGame[]
+) => { nextGames: CanonicalGame[]; changed: boolean };
+
+function computeDirtyCatalogGameIds(
+  prevGames: CanonicalGame[],
+  nextGames: CanonicalGame[]
+): string[] | null {
+  if (nextGames.length < prevGames.length) {
+    return null;
+  }
+  const prevById = new Map<string, CanonicalGame>();
+  for (let i = 0; i < prevGames.length; i++) {
+    const g = prevGames[i];
+    if (g?.id) {
+      prevById.set(g.id, g);
+    }
+  }
+  const dirtyIds: string[] = [];
+  for (let i = 0; i < nextGames.length; i++) {
+    const g = nextGames[i];
+    if (!g?.id) continue;
+    if (prevById.get(g.id) !== g) {
+      dirtyIds.push(g.id);
+    }
+  }
+  return dirtyIds;
+}
+
 /**
  * Startup workstation & token synchronization hook:
  * - Displays post-update version preservation banner
@@ -732,17 +762,56 @@ export function useLocalInstallSync({
   setGames,
   overlayLauncherInstalledState,
   showSyncNotice,
+  isModalOpen = false,
 }: UseLocalInstallSyncParams): void {
+  const isModalOpenRef = useRef<boolean>(Boolean(isModalOpen));
+  isModalOpenRef.current = Boolean(isModalOpen);
+  const deferredUpdatersRef = useRef<DeferredCatalogUpdater[]>([]);
+
+  useEffect(() => {
+    if (isModalOpen || deferredUpdatersRef.current.length === 0) return;
+    const queued = deferredUpdatersRef.current.splice(0, deferredUpdatersRef.current.length);
+    const initialBase = gamesRef.current.length > 0 ? gamesRef.current : loadCurrentCatalog();
+    let working = initialBase;
+    let anyChanged = false;
+    for (const compute of queued) {
+      const res = compute(working);
+      if (res.changed) {
+        working = res.nextGames;
+        anyChanged = true;
+      }
+    }
+    if (anyChanged && working !== initialBase) {
+      const dirtyIds = computeDirtyCatalogGameIds(initialBase, working);
+      gamesRef.current = working;
+      if (dirtyIds !== null) {
+        saveCurrentCatalog(working, { skipSanitize: true, dirtyGameIds: dirtyIds });
+      } else {
+        saveCurrentCatalog(working, { skipSanitize: true });
+      }
+      setGames(working);
+    }
+  }, [isModalOpen, gamesRef, setGames]);
+
   useEffect(() => {
     let cancelled = false;
 
-    const commitCatalog = (compute: (prev: CanonicalGame[]) => { nextGames: CanonicalGame[]; changed: boolean }) => {
+    const commitCatalog = (compute: DeferredCatalogUpdater) => {
       if (cancelled) return;
+      if (isModalOpenRef.current) {
+        deferredUpdatersRef.current.push(compute);
+        return;
+      }
       const base = gamesRef.current.length > 0 ? gamesRef.current : loadCurrentCatalog();
       const res = compute(base);
       if (res.changed) {
+        const dirtyIds = computeDirtyCatalogGameIds(base, res.nextGames);
         gamesRef.current = res.nextGames;
-        saveCurrentCatalog(res.nextGames, { skipSanitize: true });
+        if (dirtyIds !== null) {
+          saveCurrentCatalog(res.nextGames, { skipSanitize: true, dirtyGameIds: dirtyIds });
+        } else {
+          saveCurrentCatalog(res.nextGames, { skipSanitize: true });
+        }
         setGames(res.nextGames);
       }
     };

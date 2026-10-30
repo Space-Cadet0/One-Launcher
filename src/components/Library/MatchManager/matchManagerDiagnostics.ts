@@ -27,9 +27,39 @@ export const STORAGE_KEY_EMPTY_SYNOPSIS_PROBES =
 const EMPTY_SYNOPSIS_PROBE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_EMPTY_SYNOPSIS_PROBES = 4_000;
 
+export type DurableEmptySynopsisProbeLookup =
+  | ReadonlyMap<string, number>
+  | Record<string, number>;
+
+const IS_VITEST_ENV = typeof process !== 'undefined' && Boolean(process.env?.VITEST);
+
 let cachedEmptyProbeStorageRef: Storage | null = null;
 let cachedEmptyProbeRaw: string | null = null;
 let cachedEmptyProbeMap = new Map<string, number>();
+let isProbeMapHydratedInMemory = false;
+let synopsisProbeRevision = 0;
+let storageListenerAttached = false;
+
+export function getSynopsisProbeRevision(): number {
+  return synopsisProbeRevision;
+}
+
+function ensureProbeStorageListener(): void {
+  if (
+    storageListenerAttached ||
+    typeof window === 'undefined' ||
+    typeof window.addEventListener !== 'function'
+  ) {
+    return;
+  }
+  storageListenerAttached = true;
+  window.addEventListener('storage', (event: StorageEvent) => {
+    if (!event.key || event.key === STORAGE_KEY_EMPTY_SYNOPSIS_PROBES) {
+      isProbeMapHydratedInMemory = false;
+      synopsisProbeRevision += 1;
+    }
+  });
+}
 
 function getSafeLocalStorage(): Storage | null {
   try {
@@ -45,9 +75,13 @@ function getSafeLocalStorage(): Storage | null {
   return null;
 }
 
-function loadDurableEmptySynopsisProbeMap(): Map<string, number> {
+export function loadDurableEmptySynopsisProbeMap(): Map<string, number> {
+  ensureProbeStorageListener();
   const storage = getSafeLocalStorage();
   if (!storage || typeof storage.getItem !== 'function') {
+    return cachedEmptyProbeMap;
+  }
+  if (!IS_VITEST_ENV && storage === cachedEmptyProbeStorageRef && isProbeMapHydratedInMemory) {
     return cachedEmptyProbeMap;
   }
   let raw: string | null = null;
@@ -57,6 +91,8 @@ function loadDurableEmptySynopsisProbeMap(): Map<string, number> {
     return cachedEmptyProbeMap;
   }
   if (storage === cachedEmptyProbeStorageRef && raw === cachedEmptyProbeRaw) {
+    cachedEmptyProbeRaw = raw;
+    isProbeMapHydratedInMemory = true;
     return cachedEmptyProbeMap;
   }
   const next = new Map<string, number>();
@@ -82,16 +118,30 @@ function loadDurableEmptySynopsisProbeMap(): Map<string, number> {
   cachedEmptyProbeStorageRef = storage;
   cachedEmptyProbeRaw = raw;
   cachedEmptyProbeMap = next;
+  isProbeMapHydratedInMemory = true;
+  synopsisProbeRevision += 1;
   return next;
 }
 
-export function hasDurableEmptySynopsisProbe(gameId: string): boolean {
+export function hasDurableEmptySynopsisProbe(
+  gameId: string,
+  preloadedProbeMap?: DurableEmptySynopsisProbeLookup
+): boolean {
   if (!gameId) return false;
+  if (preloadedProbeMap !== undefined) {
+    const ts =
+      'get' in preloadedProbeMap && typeof preloadedProbeMap.get === 'function'
+        ? preloadedProbeMap.get(gameId)
+        : (preloadedProbeMap as Record<string, number>)[gameId];
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) return false;
+    return Date.now() - ts < EMPTY_SYNOPSIS_PROBE_TTL_MS;
+  }
   const map = loadDurableEmptySynopsisProbeMap();
   const ts = map.get(gameId);
   if (ts === undefined) return false;
   if (Date.now() - ts >= EMPTY_SYNOPSIS_PROBE_TTL_MS) {
     map.delete(gameId);
+    synopsisProbeRevision += 1;
     return false;
   }
   return true;
@@ -108,6 +158,7 @@ export function recordDurableEmptySynopsisProbe(gameId: string): void {
     if (oldestKey === undefined) break;
     map.delete(oldestKey);
   }
+  synopsisProbeRevision += 1;
   const storage = getSafeLocalStorage();
   if (storage && typeof storage.setItem === 'function') {
     try {
@@ -116,12 +167,14 @@ export function recordDurableEmptySynopsisProbe(gameId: string): void {
       cachedEmptyProbeStorageRef = storage;
       cachedEmptyProbeRaw = serialized;
       cachedEmptyProbeMap = map;
+      isProbeMapHydratedInMemory = true;
       return;
     } catch {
       // Fall through to in-memory update if quota is exceeded
     }
   }
   cachedEmptyProbeMap = map;
+  isProbeMapHydratedInMemory = true;
 }
 
 export function clearDurableEmptySynopsisProbe(gameId: string): void {
@@ -130,6 +183,7 @@ export function clearDurableEmptySynopsisProbe(gameId: string): void {
   if (!map.has(gameId)) return;
   const next = new Map(map);
   next.delete(gameId);
+  synopsisProbeRevision += 1;
   const storage = getSafeLocalStorage();
   if (storage && typeof storage.setItem === 'function') {
     try {
@@ -138,12 +192,14 @@ export function clearDurableEmptySynopsisProbe(gameId: string): void {
       cachedEmptyProbeStorageRef = storage;
       cachedEmptyProbeRaw = serialized;
       cachedEmptyProbeMap = next;
+      isProbeMapHydratedInMemory = true;
       return;
     } catch {
       // Ignore storage error
     }
   }
   cachedEmptyProbeMap = next;
+  isProbeMapHydratedInMemory = true;
 }
 
 export function extractCleanSynopsisText(htmlOrText?: string): string {
@@ -304,10 +360,11 @@ export function hasDeveloperOrReleaseYear(
 export function isSynopsisAlreadyProbed(
   game: CanonicalGame,
   override?: UserGameOverride,
-  probedSynopsisMap?: Record<string, string | null>
+  probedSynopsisMap?: Record<string, string | null>,
+  durableProbeMap?: DurableEmptySynopsisProbeLookup
 ): boolean {
   if (probedSynopsisMap && game.id in probedSynopsisMap) return true;
-  if (game?.id && hasDurableEmptySynopsisProbe(game.id)) return true;
+  if (game?.id && hasDurableEmptySynopsisProbe(game.id, durableProbeMap)) return true;
   if (override?.shortDescription || override?.detailedDescription) return true;
   if (game.enrichedMetadata) {
     if (
@@ -348,7 +405,8 @@ export function isSynopsisAlreadyProbed(
 export function getGranularUnmatchedReasons(
   game: CanonicalGame,
   override?: UserGameOverride,
-  probedSynopsisMap?: Record<string, string | null>
+  probedSynopsisMap?: Record<string, string | null>,
+  durableProbeMap?: DurableEmptySynopsisProbeLookup
 ): UnmatchedDiagnosticReason[] {
   const reasons: UnmatchedDiagnosticReason[] = [];
 
@@ -382,7 +440,13 @@ export function getGranularUnmatchedReasons(
     });
   }
 
-  const alreadyProbed = isSynopsisAlreadyProbed(game, override, probedSynopsisMap);
+  const resolvedProbeMap = durableProbeMap ?? loadDurableEmptySynopsisProbeMap();
+  const alreadyProbed = isSynopsisAlreadyProbed(
+    game,
+    override,
+    probedSynopsisMap,
+    resolvedProbeMap
+  );
   if (alreadyProbed) {
     let steamMetaLoaded = false;
     let cachedSteam: CachedSteamMeta = null;

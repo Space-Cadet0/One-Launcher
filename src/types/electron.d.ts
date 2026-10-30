@@ -3,6 +3,18 @@ import type {
   XboxGamePassSyncMode,
   XboxSubscriptionSummary,
 } from '../contracts/game';
+import type { StorefrontId } from '../contracts/platform';
+import type {
+  ClientLoginTargetId,
+  EnvironmentComponentId,
+  EnvironmentHealthSnapshot,
+  EnvironmentSetupProgressEvent,
+  GuidedClientLoginResult,
+  RunEnvironmentSetupRequest,
+  RunEnvironmentSetupResult,
+  SetupWizardPersistedState,
+  StartGuidedClientLoginRequest,
+} from '../contracts/environmentSetup';
 import type {
   EndpointHealthSnapshot,
   OfflineHydrationProgressPayload,
@@ -177,13 +189,31 @@ export interface UserMetadataOverride {
   title?: string;
   coverUrl?: string;
   heroUrl?: string;
+  headerUrl?: string;
   logoUrl?: string;
   iconUrl?: string;
   hidden?: boolean;
   favorite?: boolean;
   customTags?: string[];
   notes?: string;
+  platformId?: string;
+  platformGameId?: string;
+  steamAppId?: number | null;
+  matchedStore?: string;
+  matchedId?: string;
+  purgeKeys?: string[];
   updatedAt?: string;
+}
+
+export interface RemoveUserOverrideOptions {
+  gameId?: string;
+  id?: string;
+  aliasKeys?: string[];
+  aliases?: string[];
+  orphanVaultGameIds?: string[];
+  platformId?: string;
+  platformGameId?: string;
+  platforms?: Array<{ platformId?: string; platformGameId?: string }>;
 }
 
 export interface UserOverrideMutationResult {
@@ -210,6 +240,12 @@ export interface OfflineVaultBridge {
   upsertGames: (
     games: Partial<CanonicalGame>[]
   ) => Promise<{ success: boolean; upserted?: number; error?: string }>;
+  deleteGames: (
+    gameIds: string[] | { gameIds?: string[] } | string
+  ) => Promise<{ success: boolean; deleted?: number; error?: string }>;
+  setModalBusy: (
+    isBusy: boolean
+  ) => Promise<{ success: boolean; isPausedForModal?: boolean }>;
   getGameDetail: (gameId: string) => Promise<OfflineVaultGameDetail | null>;
   saveGameDetail: (
     payload: OfflineVaultGameDetail & { canonicalTitle?: string; steamAppId?: number | null }
@@ -252,11 +288,19 @@ export interface OfflineVaultBridge {
   }>;
   getUserOverrides: () => Promise<Record<string, UserMetadataOverride>>;
   saveUserOverride: (
-    gameIdOrOverride: string | { gameId?: string; id?: string },
+    gameIdOrOverride:
+      | string
+      | (object & {
+          gameId?: string;
+          id?: string;
+          purgeKeys?: string[];
+          override?: object;
+          batchOverrides?: Record<string, UserMetadataOverride>;
+        }),
     overridePatch?: object
   ) => Promise<UserOverrideMutationResult>;
   removeUserOverride: (
-    gameId: string | { gameId?: string; id?: string }
+    gameId: string | RemoveUserOverrideOptions
   ) => Promise<UserOverrideMutationResult>;
   onHealthChanged: (cb: (snapshot: EndpointHealthSnapshot) => void) => () => void;
   onGameHydrated: (
@@ -516,6 +560,30 @@ export interface ElectronAPI {
       success?: boolean;
     }
   >;
+  probeEnvironmentHealth: (options?: {
+    connectedStorefronts?: StorefrontId[];
+  }) => Promise<EnvironmentHealthSnapshot>;
+  runEnvironmentSetupTasks: (
+    payload: RunEnvironmentSetupRequest
+  ) => Promise<RunEnvironmentSetupResult>;
+  cancelEnvironmentSetup: (
+    runId: string
+  ) => Promise<{ success: boolean; cancelled: boolean }>;
+  startGuidedClientLogin: (
+    payload: StartGuidedClientLoginRequest
+  ) => Promise<GuidedClientLoginResult>;
+  cancelGuidedClientLogin: (
+    targetId: ClientLoginTargetId
+  ) => Promise<{ success: boolean; cancelled: boolean }>;
+  getSetupWizardState: () => Promise<SetupWizardPersistedState>;
+  saveSetupWizardState: (
+    patch: Partial<SetupWizardPersistedState> & {
+      addConfiguredComponents?: EnvironmentComponentId[];
+    }
+  ) => Promise<{ success: boolean; state: SetupWizardPersistedState }>;
+  onEnvironmentSetupProgress: (
+    cb: (event: EnvironmentSetupProgressEvent) => void
+  ) => () => void;
   clearRendererImageCache: () => Promise<{ success: boolean; [key: string]: unknown }>;
   onHibernateStateChanged: (
     cb: (data: HibernateStatePayload & Record<string, unknown>) => void
@@ -553,11 +621,19 @@ export interface ElectronAPI {
   checkForAppUpdates: () => Promise<AppUpdateCheckResult>;
   getUserOverrides?: () => Promise<Record<string, UserMetadataOverride>>;
   saveUserOverride?: (
-    gameIdOrOverride: string | { gameId?: string; id?: string },
+    gameIdOrOverride:
+      | string
+      | (object & {
+          gameId?: string;
+          id?: string;
+          purgeKeys?: string[];
+          override?: object;
+          batchOverrides?: Record<string, UserMetadataOverride>;
+        }),
     overridePatch?: object
   ) => Promise<UserOverrideMutationResult>;
   removeUserOverride?: (
-    gameId: string | { gameId?: string; id?: string }
+    gameId: string | RemoveUserOverrideOptions
   ) => Promise<UserOverrideMutationResult>;
 
   offlineVault?: OfflineVaultBridge;

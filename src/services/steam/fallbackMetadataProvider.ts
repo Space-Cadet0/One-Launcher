@@ -255,8 +255,40 @@ function ensureHttps(url?: string): string {
   return trimmed;
 }
 
+const MAX_SYNOPSIS_MEMO_ENTRIES = 4096;
+const MAX_SYNOPSIS_MEMO_INPUT_LEN = 16_384;
+const plainSynopsisMemo = new Map<string, string>();
+const storeBoilerplateMemo = new Map<string, string>();
+const genericPlaceholderSynopsisMemo = new Map<string, boolean>();
+const cleanGogHtmlMemo = new Map<string, string>();
+
+function lruGet<V>(cache: Map<string, V>, key: string): V | undefined {
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    cache.delete(key);
+    cache.set(key, hit);
+  }
+  return hit;
+}
+
+function lruSet<V>(cache: Map<string, V>, key: string, value: V): V {
+  if (cache.size >= MAX_SYNOPSIS_MEMO_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+  return value;
+}
+
 export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): string {
   if (!rawText || typeof rawText !== 'string') return '';
+  const canMemo = rawText.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN;
+  const memoKey = canMemo ? `${maxLength}\u0000${rawText}` : '';
+  if (canMemo) {
+    const hit = lruGet(plainSynopsisMemo, memoKey);
+    if (hit !== undefined) return hit;
+  }
+
   const clean = rawText
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/product_(?:description|feature)_\d+/gi, '')
@@ -289,7 +321,9 @@ export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): str
     })
     .trim();
 
-  if (!clean) return '';
+  if (!clean) {
+    return canMemo ? lruSet(plainSynopsisMemo, memoKey, '') : '';
+  }
 
   const paragraphs = clean
     .split(/\r?\n+/)
@@ -302,7 +336,9 @@ export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): str
         .trim()
     )
     .filter((p) => p.length > 0);
-  if (paragraphs.length === 0) return '';
+  if (paragraphs.length === 0) {
+    return canMemo ? lruSet(plainSynopsisMemo, memoKey, '') : '';
+  }
 
   while (
     paragraphs.length > 1 &&
@@ -326,7 +362,8 @@ export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): str
       firstPara = truncated.trim() + '...';
     }
   }
-  return firstPara.trim();
+  const result = firstPara.trim();
+  return canMemo ? lruSet(plainSynopsisMemo, memoKey, result) : result;
 }
 
 export function extractFirstParagraph(rawText?: string, maxLength = 260): string | null {
@@ -334,63 +371,93 @@ export function extractFirstParagraph(rawText?: string, maxLength = 260): string
   return result || null;
 }
 
-function stripTrailingStorePromoClauses(plain: string): string {
-  return plain
+export function stripStoreBoilerplate(plain: string): string {
+  if (!plain) return '';
+  const canMemo = plain.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN;
+  if (canMemo) {
+    const hit = lruGet(storeBoilerplateMemo, plain);
+    if (hit !== undefined) return hit;
+  }
+  const stripped = plain
     .replace(
       /(?:\s*[-–—|•]?\s*)?(?:buy\s+[^.!\n]{1,120}?\s+drm-free(?:\s+on\s+gog\.com)?|download\s+[^.!\n]{1,120}?\s+drm-free(?:\s+on\s+gog\.com)?|when\s+you\s+buy\s+this\s+game[\s\S]*$|[\w\s:'’-]{1,80}\s+will\s+be\s+added\s+to\s+your\s+gog\.com\s+account[^.!\n]*)[.!\s]*$/gi,
       ''
     )
     .trim();
+  return canMemo ? lruSet(storeBoilerplateMemo, plain, stripped) : stripped;
 }
+
+const stripTrailingStorePromoClauses = stripStoreBoilerplate;
 
 export function isGenericPlaceholderSynopsis(desc?: string, title?: string): boolean {
   if (!desc) return true;
-  const plainRaw = desc
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (plainRaw.length <= 3) return true;
-  if (/product_(?:description|feature)_\d+/i.test(plainRaw)) return true;
+  const canMemo =
+    desc.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN &&
+    (!title || title.length <= 512);
+  const memoKey = canMemo ? `${title ? title.trim().toLowerCase() : ''}\u0000${desc}` : '';
+  if (canMemo) {
+    const hit = lruGet(genericPlaceholderSynopsisMemo, memoKey);
+    if (hit !== undefined) return hit;
+  }
 
-  const trimmed = stripTrailingStorePromoClauses(plainRaw);
-  if (trimmed.length <= 3) return true;
-  const lower = trimmed.toLowerCase();
-  if (title && lower === title.trim().toLowerCase()) return true;
-  if (
-    /^(?:available\s+)?(?:drm-free|store\s+exclusive|epic\s+games\s+store(?:\s+title)?|gog\.com(?:\s+title)?)(?:\s+on\s+gog\.com)?[.!\s]*$/i.test(
-      trimmed
-    )
-  ) {
-    return true;
-  }
-  if (/^(?:buy\s+|download\s+|get\s+)?[^.!?]{1,90}\s+(?:drm-free\s+)?on\s+gog\.com[.!\s]*$/i.test(trimmed)) {
-    return true;
-  }
-  if (
-    trimmed.length < 60 &&
-    (lower.includes('drm-free') ||
-      lower.includes('store exclusive') ||
-      lower.includes('on gog.com') ||
-      lower.includes('epic games store'))
-  ) {
-    return true;
-  }
-  if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
-  if (lower === 'classic title') return true;
-  if (/^[a-z\s-]+ on gog\.com$/i.test(trimmed)) return true;
-  if (/^dlcs?\s+(included|available)/i.test(trimmed)) return true;
-  if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
-  if (/^bonus\s+content\s+included/i.test(trimmed)) return true;
-  if (/^this\s+(package|edition|version)\s+includes/i.test(trimmed)) return true;
-  if (/\bis\s+a\s+[\w,\s-]+\s+title(?:\s+developed\s+by\s+.+)?\.?$/i.test(trimmed)) return true;
-  if (/\bstandard\s+steam\s+catalog\s+title\b/i.test(trimmed)) return true;
-  if (/\bis\s+a\s+single-player\s+title\b/i.test(trimmed)) return true;
-  return false;
+  const compute = (): boolean => {
+    const plainRaw = desc
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (plainRaw.length <= 3) return true;
+    if (/product_(?:description|feature)_\d+/i.test(plainRaw)) return true;
+
+    const trimmed = stripTrailingStorePromoClauses(plainRaw);
+    if (trimmed.length <= 3) return true;
+    const lower = trimmed.toLowerCase();
+    if (title && lower === title.trim().toLowerCase()) return true;
+    if (
+      /^(?:available\s+)?(?:drm-free|store\s+exclusive|epic\s+games\s+store(?:\s+title)?|gog\.com(?:\s+title)?)(?:\s+on\s+gog\.com)?[.!\s]*$/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+    if (/^(?:buy\s+|download\s+|get\s+)?[^.!?]{1,90}\s+(?:drm-free\s+)?on\s+gog\.com[.!\s]*$/i.test(trimmed)) {
+      return true;
+    }
+    if (
+      trimmed.length < 60 &&
+      (lower.includes('drm-free') ||
+        lower.includes('store exclusive') ||
+        lower.includes('on gog.com') ||
+        lower.includes('epic games store'))
+    ) {
+      return true;
+    }
+    if (/^(action|role-playing|adventure|shooter|strategy|simulation|racing|sports|indie)\s+experience$/i.test(trimmed)) return true;
+    if (lower === 'classic title') return true;
+    if (/^[a-z\s-]+ on gog\.com$/i.test(trimmed)) return true;
+    if (/^dlcs?\s+(included|available)/i.test(trimmed)) return true;
+    if (/^includes\s+(the\s+following\s+)?dlc/i.test(trimmed)) return true;
+    if (/^bonus\s+content\s+included/i.test(trimmed)) return true;
+    if (/^this\s+(package|edition|version)\s+includes/i.test(trimmed)) return true;
+    if (/\bis\s+a\s+[\w,\s-]+\s+title(?:\s+developed\s+by\s+.+)?\.?$/i.test(trimmed)) return true;
+    if (/\bstandard\s+steam\s+catalog\s+title\b/i.test(trimmed)) return true;
+    if (/\bis\s+a\s+single-player\s+title\b/i.test(trimmed)) return true;
+    return false;
+  };
+
+  const result = compute();
+  return canMemo ? lruSet(genericPlaceholderSynopsisMemo, memoKey, result) : result;
 }
 
 export function cleanGogDescriptionHtml(raw?: string, synopsisOnly = false): string {
   if (!raw) return '';
+  const canMemo = raw.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN;
+  const memoKey = canMemo ? `${synopsisOnly ? '1' : '0'}\u0000${raw}` : '';
+  if (canMemo) {
+    const hit = lruGet(cleanGogHtmlMemo, memoKey);
+    if (hit !== undefined) return hit;
+  }
+
   const stripped = raw
     .replace(/<li[^>]*>\s*product_feature_\d+\s*<\/li>/gi, '')
     .replace(/<ul[^>]*>\s*<\/ul>/gi, '')
@@ -407,13 +474,15 @@ export function cleanGogDescriptionHtml(raw?: string, synopsisOnly = false): str
     .replace(/^(?:\s*<br\s*\/?>\s*)+/gi, '')
     .replace(/(?:\s*<br\s*\/?>\s*)+$/gi, '')
     .trim();
-  if (!stripped) return '';
-  if (synopsisOnly) {
-    return stripTrailingStorePromoClauses(stripHtmlToPlainSynopsis(stripped, 420));
+  if (!stripped) {
+    return canMemo ? lruSet(cleanGogHtmlMemo, memoKey, '') : '';
   }
-  return /<[a-z][\s\S]*>/i.test(stripped)
-    ? memoizedSanitizeStoreHtml(stripped)
-    : stripTrailingStorePromoClauses(stripped);
+  const result = synopsisOnly
+    ? stripTrailingStorePromoClauses(stripHtmlToPlainSynopsis(stripped, 420))
+    : /<[a-z][\s\S]*>/i.test(stripped)
+      ? memoizedSanitizeStoreHtml(stripped)
+      : stripTrailingStorePromoClauses(stripped);
+  return canMemo ? lruSet(cleanGogHtmlMemo, memoKey, result) : result;
 }
 
 export const GOG_SPECIAL_DESCRIPTIONS: Record<string, { lead: string; full: string; releaseDate?: string; headerImage?: string }> = {};
