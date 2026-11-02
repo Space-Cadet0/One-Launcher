@@ -2270,6 +2270,7 @@ int main(void) {
         sequoiaDlssEnv,
         {
           platform: 'darwin',
+          arch: 'arm64',
           darwinKernelMajor: 24,
           homedir,
           userDataDir,
@@ -2295,6 +2296,7 @@ int main(void) {
         tahoeDlssEnv,
         {
           platform: 'darwin',
+          arch: 'arm64',
           darwinKernelMajor: 25,
           homedir,
           userDataDir,
@@ -2444,6 +2446,17 @@ int main(void) {
           userDataDir: path.join(testTmpDir, 'userdata-nodflt'),
           skipRegistrySpawn: true,
           skipLiveWineRegSync: true,
+          execFileFn: (
+            file: string,
+            args: string[],
+            _opts: unknown,
+            cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+          ) => {
+            if (path.resolve(String(file)) === path.resolve(cxRunner.cxbottlePath)) {
+              fs.appendFileSync(cxRunner.cxbottleLogPath, `${args.join(' ')}\n`, 'utf8');
+            }
+            if (typeof cb === 'function') cb(null, '', '');
+          },
         }
       );
       expect(fs.existsSync(cxRunner.cxbottleLogPath)).toBe(true);

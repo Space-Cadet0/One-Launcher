@@ -677,7 +677,9 @@ describe('Xbox Chained Publisher Launchers & XGR Runtime Audit (Wave 3A)', () =>
 
       try {
         expect(server.env.ONE_XGR_LOCALE).toBe('ja-JP');
-        expect(server.env.ONE_XGR_SAVE_ROOT).toMatch(/^Z:\\/i);
+        expect(server.env.ONE_XGR_SAVE_ROOT).toMatch(
+          process.platform === 'win32' ? /^[A-Z]:\\/i : /^Z:\\/i
+        );
         expect(server.env.ONE_XGR_SAVE_ROOT).toContain('SystemAppData');
         expect(server.env.ONE_XGR_INVITE_URI).toBe('ms-xbl-1a2b3c4d://invite?session=0001');
 

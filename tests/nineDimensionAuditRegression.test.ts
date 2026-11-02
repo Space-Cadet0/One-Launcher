@@ -1309,7 +1309,7 @@ describe('9-Dimension Audit Regression Suite (macOS ARM64 & Windows x64)', () =>
           },
           env,
           tmpBottle,
-          { homedir: tmpBottle }
+          { homedir: tmpBottle, arch: 'arm64', darwinKernelMajor: 25 }
         );
 
         const confContent = fs.readFileSync(path.join(tmpBottle, 'cxbottle.conf'), 'utf8');

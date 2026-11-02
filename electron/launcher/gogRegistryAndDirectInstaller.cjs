@@ -1939,12 +1939,13 @@ async function downloadGogV1Depot(
     gogToken,
     gogdlBin,
     gogAuthPath,
-    platform = process.platform,
+    platform: rawPlatform,
     totalBytes = 0,
     includeDlcs = false,
   },
   /** @type {any} */ options = {}
 ) {
+  const platform = rawPlatform || options.platform || process.platform;
   const updateTask = (
     /** @type {string} */ id,
     /** @type {any} */ partial,
@@ -3253,13 +3254,14 @@ async function downloadGogV2Depot(
     gogToken,
     gogdlBin,
     gogAuthPath,
-    platform = process.platform,
+    platform: rawPlatform,
     totalBytes = 0,
     includeDlcs = false,
     buildsJson: preloadedBuildsJson = null,
   },
-  options = {}
+  /** @type {any} */ options = {}
 ) {
+  const platform = rawPlatform || options.platform || process.platform;
   const updateTask = (
     /** @type {string} */ id,
     /** @type {any} */ partial,

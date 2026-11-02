@@ -4580,9 +4580,19 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
       });
 
       try {
-        let tree = firstWizard.render();
-        await new Promise((r) => setTimeout(r, 25));
-        tree = firstWizard.render();
+        const waitForWizardTestId = async (testId: string) => {
+          let latest = firstWizard.render();
+          for (let attempt = 0; attempt < 50; attempt += 1) {
+            if (findVNodeByTestId(latest, testId)) {
+              return latest;
+            }
+            await new Promise((r) => setTimeout(r, 20));
+            latest = firstWizard.render();
+          }
+          return latest;
+        };
+
+        let tree = await waitForWizardTestId('removed-components-banner');
 
         // Initially shows the 4 removed items banner + Fix & Match outer container styling
         const banner = findVNodeByTestId(tree, 'removed-components-banner');
@@ -4598,17 +4608,15 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
 
         // Run provisioning -> installs all 4 items
         findVNodeByTestId(tree, 'run-provisioning-btn').props.onClick();
-        await new Promise((r) => setTimeout(r, 25));
-        tree = firstWizard.render();
+        tree = await waitForWizardTestId('continue-to-guided-signins-btn');
         expect(filesystemProvisioned).toBe(true);
         expect(findVNodeByTestId(tree, 'removed-components-banner')).toBeUndefined();
 
         // Advance to Step 5 (Sign In) via Continue/Sign In Now & sign in to both newly installed bottled launchers
         findVNodeByTestId(tree, 'continue-to-guided-signins-btn').props.onClick();
-        tree = firstWizard.render();
+        tree = await waitForWizardTestId('start-sequential-signin-btn');
         findVNodeByTestId(tree, 'start-sequential-signin-btn').props.onClick();
-        await new Promise((r) => setTimeout(r, 25));
-        tree = firstWizard.render();
+        tree = await waitForWizardTestId('finish-setup-btn');
 
         expect(findVNodeByTestId(tree, 'finish-setup-btn')).toBeDefined();
 

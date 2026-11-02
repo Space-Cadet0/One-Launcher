@@ -80,6 +80,28 @@ function fromWineWindowsPath(winPath, bottlePath = '') {
   const relRaw = driveMatch[2] || '';
   const relParts = relRaw.replace(/\\/g, '/').split('/').filter(Boolean);
 
+  if (
+    process.platform === 'win32' &&
+    bottlePath &&
+    typeof bottlePath === 'string' &&
+    bottlePath.trim()
+  ) {
+    const cleanBottle = bottlePath.trim();
+    const normInput = path.win32.resolve(trimmed).toLowerCase();
+    const normBottle = path.win32.resolve(cleanBottle).toLowerCase();
+    if (normInput === normBottle || normInput.startsWith(`${normBottle}\\`)) {
+      return path.win32.normalize(trimmed);
+    }
+    const normTmp = path.win32.resolve(os.tmpdir()).toLowerCase();
+    if (
+      (normBottle === normTmp || normBottle.startsWith(`${normTmp}\\`)) &&
+      normInput.startsWith(`${normTmp}\\`) &&
+      fs.existsSync(trimmed)
+    ) {
+      return path.win32.normalize(trimmed);
+    }
+  }
+
   if (driveLetter === 'C' && bottlePath && typeof bottlePath === 'string' && bottlePath.trim()) {
     const driveCRoot = path.join(bottlePath.trim(), 'drive_c');
     if (fs.existsSync(driveCRoot)) {

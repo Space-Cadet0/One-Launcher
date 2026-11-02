@@ -1291,35 +1291,44 @@ describe('GOG V2 Bottled Install, Scanner Race & Telemetry Regression Suite (mac
       // Case A: darwin native .app bundle
       const macRig = buildSyntheticGogV2CdnRig({ gogOs: 'osx' });
       const macInstallDir = path.join(tmpRoot, 'MacNativeGames', SYNTHETIC_TITLE);
+      const chmodPromisesSpy = vi.spyOn(fs.promises, 'chmod');
 
-      const macRes = await gogDirect.downloadGogV2Depot(
-        {
-          cleanId: SYNTHETIC_GAME_ID,
-          title: SYNTHETIC_TITLE,
-          finalInstallPath: macInstallDir,
-          gogToken: 'valid_token_mac',
-          gogPlatformFlag: 'osx',
-          platform: 'darwin',
-        },
-        {
-          platform: 'darwin',
-          homedir,
-          userDataDir,
-          fetchImpl: macRig.fetchImpl,
+      let macRes: any;
+      try {
+        macRes = await gogDirect.downloadGogV2Depot(
+          {
+            cleanId: SYNTHETIC_GAME_ID,
+            title: SYNTHETIC_TITLE,
+            finalInstallPath: macInstallDir,
+            gogToken: 'valid_token_mac',
+            gogPlatformFlag: 'osx',
+            platform: 'darwin',
+          },
+          {
+            platform: 'darwin',
+            homedir,
+            userDataDir,
+            fetchImpl: macRig.fetchImpl,
+          }
+        );
+
+        expect(macRes.success).toBe(true);
+        expect(macRes.isWindowsBinaryOnMac).toBe(false);
+        const appBundleDir = path.join(macInstallDir, `${SYNTHETIC_NESTED_FOLDER}.app`);
+        const macBinPath = path.join(appBundleDir, 'Contents', 'MacOS', 'SyntheticArena');
+        expect(fs.existsSync(macBinPath)).toBe(true);
+        expect(chmodPromisesSpy).toHaveBeenCalledWith(macBinPath, 0o755);
+        if (process.platform !== 'win32') {
+          expect(fs.statSync(macBinPath).mode & 0o111).not.toBe(0);
         }
-      );
-
-      expect(macRes.success).toBe(true);
-      expect(macRes.isWindowsBinaryOnMac).toBe(false);
-      const appBundleDir = path.join(macInstallDir, `${SYNTHETIC_NESTED_FOLDER}.app`);
-      const macBinPath = path.join(appBundleDir, 'Contents', 'MacOS', 'SyntheticArena');
-      expect(fs.existsSync(macBinPath)).toBe(true);
-      expect(fs.statSync(macBinPath).mode & 0o111).not.toBe(0);
-      expect(
-        fs
-          .readFileSync(path.join(appBundleDir, 'Contents', 'Resources', 'base', 'pak0.pak'))
-          .equals(macRig.expectedPakBuffer)
-      ).toBe(true);
+        expect(
+          fs
+            .readFileSync(path.join(appBundleDir, 'Contents', 'Resources', 'base', 'pak0.pak'))
+            .equals(macRig.expectedPakBuffer)
+        ).toBe(true);
+      } finally {
+        chmodPromisesSpy.mockRestore();
+      }
 
       // Case B: win32 native flat extraction + AppData/Roaming/heroic_gogdl/manifests/<id>
       const winRig = buildSyntheticGogV2CdnRig({ gogOs: 'windows' });

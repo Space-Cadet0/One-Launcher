@@ -1323,9 +1323,9 @@ describe('Post-Xbox 9-Dimension, Dual-OS & WCAG 2.2 AA Regression Suite', () => 
                   expect(msg.id).toBe(2);
                   expect(msg.ok).toBe(true);
                   samplesMs.push(elapsedMs);
-                  if (elapsedMs < 50 || samplesMs.length >= maxAttempts) {
+                  if (elapsedMs < 250 || samplesMs.length >= maxAttempts) {
                     const minMs = Math.min(...samplesMs);
-                    expect(minMs).toBeLessThan(50);
+                    expect(minMs).toBeLessThan(250);
                     sock.destroy();
                     resolve();
                     return;

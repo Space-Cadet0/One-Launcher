@@ -7151,7 +7151,10 @@ function applyCrossOverPerGameSettings(
   );
 
   const hostArch = String(
-    effectiveOptions.arch || chosenLayer?.hostArch || process.arch || 'arm64'
+    effectiveOptions.arch ||
+      chosenLayer?.hostArch ||
+      (process.platform === 'darwin' ? process.arch : 'arm64') ||
+      'arm64'
   )
     .trim()
     .toLowerCase();
@@ -8905,8 +8908,10 @@ async function ensureCompatibilityLayerReady(
           /** @type {Record<string, any>} */
           const cxbottleCreateEnv = { ...process.env, ...env };
           delete cxbottleCreateEnv.DYLD_INSERT_LIBRARIES;
+          const execFileImpl =
+            typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
           await new Promise((resolve) => {
-            execFile(
+            execFileImpl(
               cxbottleBin,
               ['--bottle', targetBottle, '--create', '--template', 'win10_64'],
               { timeout: 60000, env: cxbottleCreateEnv },
@@ -9011,9 +9016,11 @@ async function ensureCompatibilityLayerReady(
         suppressGuiDialogs: true,
         layerType: chosenLayer.type,
       });
+      const execFileImpl =
+        typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
       await new Promise((resolve) => {
         try {
-          execFile(
+          execFileImpl(
             alignedBoot.wineBinary,
             [...alignedBoot.prefixArgs, 'wineboot', '-u'],
             { timeout: 45000, env: alignedBoot.env },
