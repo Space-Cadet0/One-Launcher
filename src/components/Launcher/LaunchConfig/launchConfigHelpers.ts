@@ -2,6 +2,7 @@ import {
   CompatibilityLayerInfo,
   CompatibilityLayerType,
   CompatibilityLayerUpdateInfo,
+  CompatibilityRunnerOperationPhase,
   CrossOverGraphicsBackend,
   InGameLauncherBehavior,
   LauncherPerformanceSettings,
@@ -9,7 +10,18 @@ import {
   StorefrontClientLifecyclePolicy,
 } from '../../../contracts/launcher';
 import { StorefrontId } from '../../../contracts/platform';
-import { COMPATIBILITY_RUNNER_DESCRIPTORS } from '../../../services/launcher/launcherService';
+import {
+  COMPATIBILITY_RUNNER_DESCRIPTORS,
+  CROSSOVER_GRAPHICS_BACKEND_POLICIES,
+  getCrossOverGraphicsBackendPolicy,
+  type CrossOverGraphicsBackendPolicyDescriptor,
+} from '../../../services/launcher/launcherService';
+
+export {
+  CROSSOVER_GRAPHICS_BACKEND_POLICIES,
+  getCrossOverGraphicsBackendPolicy,
+  type CrossOverGraphicsBackendPolicyDescriptor,
+};
 
 export const LAUNCH_MODES: { value: LaunchMethod; label: string; desc: string }[] = [
   {
@@ -66,7 +78,7 @@ export function formatRunnerOptionLabel(
       baseLabel = `Apple Game Porting Toolkit (GPTK) — v${ver} Installed`;
       break;
     case 'wine':
-      baseLabel = `Open-Source Wine (Wine-CrossOver / Wine Stable) — v${ver} Installed`;
+      baseLabel = `Open-Source Wine (Wine Stable / Staging) — v${ver} Installed`;
       break;
     default:
       baseLabel = `${opt.label} — v${ver} Installed`;
@@ -78,13 +90,28 @@ export function formatRunnerOptionLabel(
   return baseLabel;
 }
 
-export const CROSSOVER_BACKEND_OPTIONS: { value: CrossOverGraphicsBackend; label: string }[] = [
-  { value: 'auto', label: 'Auto (Recommended — Best backend per game)' },
-  { value: 'd3dmetal', label: 'D3DMetal (Apple GPTK — DirectX 11 & 12)' },
-  { value: 'dxmt', label: 'DXMT (Metal DirectX 11 layer)' },
-  { value: 'dxvk', label: 'DXVK (Vulkan DirectX 10 & 11 layer)' },
-  { value: 'wined3d', label: 'WineD3D (OpenGL — DirectX 9 & Legacy)' },
+const CROSSOVER_BACKEND_ORDER: readonly CrossOverGraphicsBackend[] = [
+  'auto',
+  'd3dmetal',
+  'dxmt',
+  'dxvk',
+  'wined3d',
 ];
+
+export const CROSSOVER_BACKEND_OPTIONS: {
+  value: CrossOverGraphicsBackend;
+  label: string;
+  architectureBadge: string;
+  guidance: string;
+}[] = CROSSOVER_BACKEND_ORDER.map((value) => {
+  const policy = CROSSOVER_GRAPHICS_BACKEND_POLICIES[value];
+  return {
+    value: policy.value,
+    label: policy.optionLabel,
+    architectureBadge: policy.architectureBadge,
+    guidance: policy.guidance,
+  };
+});
 
 export const WINDOWS_QUICK_ENV_TOGGLES: {
   key: string;
@@ -381,4 +408,86 @@ export function computeInGameFootprintBadge({
     label: 'Low-RAM / Zero-GPU Overhead Mode',
     tone: 'emerald',
   };
+}
+
+export type WineSyncMode = 'msync' | 'esync' | 'default';
+
+export function resolveWineSyncMode(wineMsync: boolean, wineEsync: boolean): WineSyncMode {
+  if (wineMsync) return 'msync';
+  if (wineEsync) return 'esync';
+  return 'default';
+}
+
+export function formatRunnerSecondaryBuildText(params: {
+  installedVersion?: string;
+  displayVersion?: string;
+  buildVersion?: string;
+}): string {
+  const ver = (params.installedVersion || '').trim().replace(/^v/i, '');
+  let disp = (params.displayVersion || '').trim();
+
+  if (ver && disp) {
+    const escapedVer = ver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    disp = disp.replace(new RegExp(`^v?${escapedVer}\\s*[-·•:]?\\s*`, 'i'), '').trim();
+    if (disp.startsWith('(') && disp.endsWith(')')) {
+      disp = disp.slice(1, -1).trim();
+    }
+    if (disp.toLowerCase() === ver.toLowerCase() || disp.toLowerCase() === `v${ver.toLowerCase()}`) {
+      disp = '';
+    }
+  }
+
+  const rawBuild = (params.buildVersion || '').trim();
+  let buildToken = '';
+  if (rawBuild) {
+    if (ver && (rawBuild.toLowerCase() === ver.toLowerCase() || rawBuild.toLowerCase() === `v${ver.toLowerCase()}`)) {
+      buildToken = '';
+    } else if (ver && rawBuild.startsWith(`${ver}.`)) {
+      buildToken = rawBuild.slice(ver.length + 1).trim();
+    } else {
+      buildToken = rawBuild.replace(/^build\s+/i, '').trim();
+    }
+  }
+
+  const parts: string[] = [];
+  if (disp) {
+    parts.push(disp);
+  }
+  if (buildToken && (!disp || !disp.toLowerCase().includes(buildToken.toLowerCase()))) {
+    parts.push(`Build ${buildToken}`);
+  }
+  return parts.join(' · ');
+}
+
+export function formatRunnerPhaseLabel(
+  phase: CompatibilityRunnerOperationPhase,
+  operation: 'install' | 'update'
+): string {
+  switch (phase) {
+    case 'probing':
+      return 'Checking source...';
+    case 'downloading':
+      return operation === 'update' ? 'Downloading update...' : 'Downloading installer...';
+    case 'verifying_signature':
+      return 'Verifying signature...';
+    case 'extracting':
+      return 'Extracting archive...';
+    case 'installing':
+      return 'Installing into /Applications...';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    case 'cancelled':
+      return 'Cancelled';
+    default:
+      return 'Working...';
+  }
+}
+
+export function formatUserFacingPath(rawPath?: string): string {
+  if (!rawPath) return '';
+  return rawPath
+    .replace(/^\/Users\/[^/]+(?=\/|$)/, '~')
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/, '~');
 }

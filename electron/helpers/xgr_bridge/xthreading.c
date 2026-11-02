@@ -64,8 +64,13 @@ struct XTaskQueueObject {
 };
 
 #define XGR_COMPLETED_RING_SIZE 512
-#define XGR_ASYNC_MAGIC_LIVE    0x4F4E45584153594EULL
-#define XGR_ASYNC_MAGIC_DONE    0x4F4E4558444F4E45ULL
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define XGR_ASYNC_MAGIC_LIVE    ((uintptr_t)0x4F4E45584153594EULL)
+#define XGR_ASYNC_MAGIC_DONE    ((uintptr_t)0x4F4E4558444F4E45ULL)
+#else
+#define XGR_ASYNC_MAGIC_LIVE    ((uintptr_t)0x4F4E4153u)
+#define XGR_ASYNC_MAGIC_DONE    ((uintptr_t)0x4F4E444Eu)
+#endif
 
 struct xgr_async_state {
     XAsyncProviderData data; /* MUST remain first member (offset 0) */
@@ -85,10 +90,12 @@ struct xgr_async_state {
 
 struct xgr_async_block_wire {
     struct xgr_async_state *state;
-    uint64_t magic;
-    uint64_t cookie;
+    uintptr_t magic;
+    uintptr_t cookie;
     HRESULT cached_hr;
+#if UINTPTR_MAX > 0xFFFFFFFFu
     uint32_t reserved;
+#endif
 };
 
 _Static_assert(offsetof(struct xgr_async_state, data) == 0, "XAsyncProviderData must remain at offset 0");
@@ -494,7 +501,7 @@ static inline void write_wire_live(XAsyncBlock *ab, struct xgr_async_state *st)
     if (st) {
         w.state = st;
         w.magic = XGR_ASYNC_MAGIC_LIVE;
-        w.cookie = st->cookie;
+        w.cookie = (uintptr_t)st->cookie;
         w.cached_hr = E_PENDING;
     }
     memset(ab->internal, 0, sizeof(ab->internal));
@@ -538,11 +545,11 @@ static struct xgr_async_state *acquire_async_state(XAsyncBlock *ab, bool *out_is
     EnterCriticalSection(&g_async_ring_cs);
 
     uint32_t slot = (uint32_t)(w.cookie & (XGR_COMPLETED_RING_SIZE - 1));
-    if (g_completed_ring[slot] == w.state && g_completed_ring[slot]->cookie == w.cookie) {
+    if (g_completed_ring[slot] == w.state && (uintptr_t)g_completed_ring[slot]->cookie == w.cookie) {
         found = g_completed_ring[slot];
     } else {
         for (struct xgr_async_state *cur = g_active_head; cur; cur = cur->active_next) {
-            if (cur == w.state && cur->cookie == w.cookie) {
+            if (cur == w.state && (uintptr_t)cur->cookie == w.cookie) {
                 found = cur;
                 break;
             }
@@ -715,7 +722,7 @@ HRESULT xgr_async_begin(XAsyncBlock *async, void *context, const void *identity,
     st->ring_slot = -1;
     st->in_active_list = false;
     st->cookie = (uint64_t)InterlockedIncrement64(&g_next_async_cookie);
-    if (st->cookie == 0) {
+    if ((uintptr_t)st->cookie == 0) {
         st->cookie = (uint64_t)InterlockedIncrement64(&g_next_async_cookie);
     }
     st->data.async = async;
@@ -975,7 +982,7 @@ static HRESULT WINAPI th_XAsyncGetStatus(void *iface, XAsyncBlock *ab, BOOLEAN w
     return xgr_async_get_status(ab, wait != 0);
 }
 
-static HRESULT WINAPI th_XAsyncGetResultSize(void *iface, XAsyncBlock *ab, SIZE_T *sz)
+static HRESULT WINAPI th_XAsyncGetResultSize(void *iface, XAsyncBlock *ab, size_t *sz)
 {
     (void)iface;
     return xgr_async_get_result_size(ab, sz);
@@ -1012,13 +1019,13 @@ static HRESULT WINAPI th_XAsyncSchedule(void *iface, XAsyncBlock *ab, UINT32 del
     return xgr_async_schedule(ab, delayMs);
 }
 
-static void WINAPI th_XAsyncComplete(void *iface, XAsyncBlock *ab, HRESULT result, SIZE_T reqSize)
+static void WINAPI th_XAsyncComplete(void *iface, XAsyncBlock *ab, HRESULT result, size_t reqSize)
 {
     (void)iface;
     xgr_async_complete(ab, result, reqSize);
 }
 
-static HRESULT WINAPI th_XAsyncGetResult(void *iface, XAsyncBlock *ab, const void *id, SIZE_T bufSize, void *buf, SIZE_T *used)
+static HRESULT WINAPI th_XAsyncGetResult(void *iface, XAsyncBlock *ab, const void *id, size_t bufSize, void *buf, size_t *used)
 {
     (void)iface;
     return xgr_async_get_result(ab, id, bufSize, buf, used);

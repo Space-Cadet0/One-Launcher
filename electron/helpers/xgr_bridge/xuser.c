@@ -38,6 +38,29 @@ uint64_t xgr_user_get_xuid(XUserHandle user)
     return id;
 }
 
+uint64_t xgr_user_get_primary_xuid(void)
+{
+    AcquireSRWLockShared(&g_user_lock);
+    uint64_t id = g_active_user ? g_active_user->xuid : 0ULL;
+    ReleaseSRWLockShared(&g_user_lock);
+    if (id != 0ULL) return id;
+
+    struct xgr_runtime_config_snapshot cfg;
+    xgr_copy_runtime_config_snapshot(&cfg);
+    if (cfg.sessionXuid != 0ULL) return cfg.sessionXuid;
+
+    char env_xuid[64] = { 0 };
+    if (xgr_get_env_utf8(L"ONE_XGR_XUID", env_xuid, sizeof(env_xuid)) ||
+        xgr_get_env_utf8(L"ONE_LAUNCHER_XBOX_XUID", env_xuid, sizeof(env_xuid))) {
+        char *endp = NULL;
+        unsigned long long parsed = strtoull(env_xuid, &endp, 0);
+        if (endp != env_xuid && parsed != 0ULL) {
+            return (uint64_t)parsed;
+        }
+    }
+    return 0ULL;
+}
+
 HRESULT xgr_user_duplicate(XUserHandle user, XUserHandle *out_user)
 {
     if (!user || !out_user) return E_INVALIDARG;
@@ -125,10 +148,12 @@ static HRESULT ensure_signed_in_user_worker(XUserHandle *out_user)
         HRESULT hr = xgr_rpc_call("session.init", params, &res_json);
         free(params);
         if (FAILED(hr)) {
+            xgr_set_offline_mode(true);
             free(u);
             return hr;
         }
         if (res_json) {
+            xgr_apply_session_init_json(res_json);
             uint64_t xuid = 0;
             int64_t age = 3;
             if (xgr_json_get_uint64(res_json, "xuid", &xuid) && xuid != 0) u->xuid = xuid;
@@ -141,6 +166,12 @@ static HRESULT ensure_signed_in_user_worker(XUserHandle *out_user)
             if (!u->modern_gamertag[0]) snprintf(u->modern_gamertag, sizeof(u->modern_gamertag), "%s", u->gamertag);
             if (!u->unique_modern_gamertag[0]) snprintf(u->unique_modern_gamertag, sizeof(u->unique_modern_gamertag), "%s", u->modern_gamertag);
             free(res_json);
+        }
+    } else {
+        xgr_set_offline_mode(true);
+        uint64_t env_xuid = xgr_user_get_primary_xuid();
+        if (env_xuid != 0ULL) {
+            u->xuid = env_xuid;
         }
     }
 
@@ -625,13 +656,13 @@ static HRESULT WINAPI xu_XUserGetGamerPictureAsync(void *iface, XUserHandle user
     return xgr_return_hr(hr);
 }
 
-static HRESULT WINAPI xu_XUserGetGamerPictureResultSize(void *iface, XAsyncBlock *async, SIZE_T *sz)
+static HRESULT WINAPI xu_XUserGetGamerPictureResultSize(void *iface, XAsyncBlock *async, size_t *sz)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result_size(async, sz));
 }
 
-static HRESULT WINAPI xu_XUserGetGamerPictureResult(void *iface, XAsyncBlock *async, SIZE_T bufSize, void *buf, SIZE_T *used)
+static HRESULT WINAPI xu_XUserGetGamerPictureResult(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, size_t *used)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result(async, NULL, bufSize, buf, used));
@@ -705,13 +736,13 @@ static HRESULT WINAPI xu_XUserGetTokenAndSignatureAsync(
     return xgr_return_hr(hr);
 }
 
-static HRESULT WINAPI xu_XUserGetTokenAndSignatureResultSize(void *iface, XAsyncBlock *async, SIZE_T *sz)
+static HRESULT WINAPI xu_XUserGetTokenAndSignatureResultSize(void *iface, XAsyncBlock *async, size_t *sz)
 {
     (void)iface;
     return xgr_async_get_result_size(async, sz);
 }
 
-static HRESULT WINAPI xu_XUserGetTokenAndSignatureResult(void *iface, XAsyncBlock *async, SIZE_T bufSize, void *buf, XUserGetTokenAndSignatureData **ptrToBuffer, SIZE_T *used)
+static HRESULT WINAPI xu_XUserGetTokenAndSignatureResult(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, XUserGetTokenAndSignatureData **ptrToBuffer, size_t *used)
 {
     (void)iface;
     if (!ptrToBuffer) return xgr_return_hr(E_POINTER);
@@ -778,13 +809,13 @@ static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16Async(
     return xgr_return_hr(hr);
 }
 
-static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16ResultSize(void *iface, XAsyncBlock *async, SIZE_T *sz)
+static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16ResultSize(void *iface, XAsyncBlock *async, size_t *sz)
 {
     (void)iface;
     return xgr_async_get_result_size(async, sz);
 }
 
-static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16Result(void *iface, XAsyncBlock *async, SIZE_T bufSize, void *buf, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, SIZE_T *used)
+static HRESULT WINAPI xu_XUserGetTokenAndSignatureUtf16Result(void *iface, XAsyncBlock *async, size_t bufSize, void *buf, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, size_t *used)
 {
     (void)iface;
     if (!ptrToBuffer) return xgr_return_hr(E_POINTER);

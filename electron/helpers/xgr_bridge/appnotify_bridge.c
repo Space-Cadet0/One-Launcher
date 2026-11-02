@@ -8,6 +8,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <intrin.h>
 #include <stdint.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -21,13 +22,25 @@ typedef struct _APPSTATE_REGISTRATION *PAPPSTATE_REGISTRATION;
 typedef VOID (NTAPI *PAPPCONSTRAINED_CHANGE_ROUTINE)(BOOLEAN Constrained, PVOID Context);
 typedef struct _APPCONSTRAINED_REGISTRATION *PAPPCONSTRAINED_REGISTRATION;
 
-static volatile LONGLONG g_next_reg = 0x0FFFLL;
+static volatile LONG g_next_reg = 0x0FFFL;
+
+static inline uintptr_t appnotify_next_reg_token(void)
+{
+    ULONG tok = (ULONG)InterlockedIncrement(&g_next_reg);
+    if (tok == 0) {
+        tok = (ULONG)InterlockedIncrement(&g_next_reg);
+    }
+    return (uintptr_t)tok;
+}
 
 static inline void appnotify_sync_teb_last_error(void)
 {
 #if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
     DWORD err = GetLastError();
-    __asm__ __volatile__("movl %0, %%gs:0x68" : : "r"(err) : "memory");
+    __writegsdword(0x68, err);
+#elif defined(_WIN32) && (defined(__i386__) || defined(_M_IX86))
+    DWORD err = GetLastError();
+    __writefsdword(0x34, err);
 #endif
 }
 
@@ -43,7 +56,7 @@ ULONG WINAPI RegisterAppStateChangeNotification(
         appnotify_sync_teb_last_error();
         return ERROR_INVALID_PARAMETER;
     }
-    *Registration = (PAPPSTATE_REGISTRATION)(uintptr_t)InterlockedIncrement64(&g_next_reg);
+    *Registration = (PAPPSTATE_REGISTRATION)appnotify_next_reg_token();
     SetLastError(ERROR_SUCCESS);
     appnotify_sync_teb_last_error();
     return ERROR_SUCCESS;
@@ -67,7 +80,7 @@ ULONG WINAPI RegisterAppConstrainedChangeNotification(
         appnotify_sync_teb_last_error();
         return ERROR_INVALID_PARAMETER;
     }
-    *Registration = (PAPPCONSTRAINED_REGISTRATION)(uintptr_t)InterlockedIncrement64(&g_next_reg);
+    *Registration = (PAPPCONSTRAINED_REGISTRATION)appnotify_next_reg_token();
     SetLastError(ERROR_SUCCESS);
     appnotify_sync_teb_last_error();
     return ERROR_SUCCESS;

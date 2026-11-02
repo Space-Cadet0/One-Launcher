@@ -5,6 +5,7 @@ import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIc
 import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import {
   Play,
+  Pause,
   Square,
   Download,
   HardDrive,
@@ -22,6 +23,7 @@ import {
   Settings,
   FolderOpen,
   ShieldCheck,
+  AlertTriangle,
   Trash2,
   Cpu,
   FileSearch,
@@ -46,6 +48,13 @@ import { ActiveGameFilter } from '../../contracts/filter';
 import { GameCollection } from '../../contracts/collection';
 import { loadCollections } from '../../services/storage/collectionStorage';
 import { launcherService } from '../../services/launcher/launcherService';
+import { getStorefrontNativeOsFlags } from '../../services/platform/nativeOsService';
+import {
+  detectStructuralKernelAntiCheatFromNotices,
+  isBattlEyeKernelAntiCheat,
+  normalizeChainedHandoffId,
+  resolveCanonicalKernelAntiCheatDisplayName,
+} from '../../services/integrations/catalogSanitizer';
 import {
   formatByteSize,
   parseStorageRequirementTextClient,
@@ -78,6 +87,17 @@ function isXboxStoreHost(rawUrl?: string | null): boolean {
   }
 }
 
+function resolvePublisherHandoffLabel(handoffKey?: string | null, explicitName?: string | null): string {
+  if (explicitName && explicitName.trim()) return explicitName.trim();
+  const norm = String(handoffKey || '').trim().toLowerCase();
+  if (norm === 'ubisoft') return 'Ubisoft Connect';
+  if (norm === 'ea') return 'EA App';
+  if (norm === 'bnet') return 'Battle.net';
+  if (norm === 'rockstar') return 'Rockstar Games Launcher';
+  if (norm === 'riot') return 'Riot Client';
+  return norm ? norm.toUpperCase() : 'Publisher Launcher';
+}
+
 interface SteamLibraryActionBarProps {
   game: CanonicalGame;
   metadata?: SteamEnrichedMetadata | null;
@@ -89,6 +109,7 @@ interface SteamLibraryActionBarProps {
   onFixMatch?: () => void;
   onHideGame?: (game: CanonicalGame, targetPlatformId?: StorefrontId) => void;
   onViewAchievements?: (storefrontId?: StorefrontId) => void;
+  onSelectedPlatformChange?: (platformId: StorefrontId) => void;
 }
 
 export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
@@ -101,6 +122,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onFixMatch,
   onHideGame,
   onViewAchievements,
+  onSelectedPlatformChange,
 }) => {
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
   const [showPlaytimePopover, setShowPlaytimePopover] = useState(false);
@@ -160,6 +182,10 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   }, [game.id]);
 
   useEffect(() => {
+    onSelectedPlatformChange?.(selectedPlatformId);
+  }, [selectedPlatformId, onSelectedPlatformChange]);
+
+  useEffect(() => {
     const computeActionBarSignature = () => {
       const sess = launcherService
         .getRunningGames()
@@ -181,6 +207,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         dl?.taskId || '',
         dl?.status || '',
         dl ? String(Math.round(dl.progressPercent || 0)) : '',
+        dl?.statusMessage || '',
+        dl && dl.speedBytesPerSec > 0 ? (dl.speedBytesPerSec / (1024 * 1024)).toFixed(1) : '',
         persistedPlat,
         rec?.platformId || '',
         rec?.installPath || '',
@@ -433,7 +461,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       | (SteamEnrichedMetadata & { macRequirementsHtml?: string })
       | null
       | undefined;
-    const preferMacSpecs = !isWindowsHost && metadata?.platforms?.mac !== false;
+    const activeStoreFlags = getStorefrontNativeOsFlags(game, selectedPlatformId);
+    const preferMacSpecs = !isWindowsHost && activeStoreFlags.mac;
     const candidateRequirementBlocks = preferMacSpecs
       ? [
           metadata?.macRequirements?.minimum,
@@ -674,35 +703,94 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                 <span>Starting...</span>
               </button>
             ) : activeDownload ? (
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => launcherService.openDownloadDrawer()}
-                  className="relative overflow-hidden inline-flex items-center justify-center gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 shrink-0 cursor-pointer bg-[#17283b] border border-sky-400/70"
-                  title="Click to open Download Manager"
-                >
-                  <div
-                    className="absolute inset-y-0 left-0 bg-sky-500/35 transition-all duration-300 pointer-events-none"
-                    style={{ width: `${Math.min(100, Math.max(0, activeDownload.progressPercent))}%` }}
-                  />
-                  <Loader2 className="w-4 h-4 text-sky-300 animate-spin relative z-10" />
-                  <span className="relative z-10">
-                    {`Installing ${Math.round(activeDownload.progressPercent)}%`}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await launcherService.cancelDownload(activeDownload.taskId);
-                    showTempFeedback('Installation cancelled.');
-                  }}
-                  aria-label="Cancel Install"
-                  title="Cancel active installation"
-                  className="min-w-6 min-h-6 p-2 xl:p-2.5 rounded border border-red-500/50 bg-red-950/60 hover:bg-red-900/70 text-red-300 hover:text-white transition-colors shrink-0 cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
+              (() => {
+                const isPausedDownload = activeDownload.status === 'paused';
+                const activeDownloadPct = Math.min(
+                  100,
+                  Math.max(0, Math.round(activeDownload.progressPercent || 0))
+                );
+                const activeSpeedLabel =
+                  (activeDownload.status === 'downloading' ||
+                    activeDownload.status === 'extracting' ||
+                    activeDownload.status === 'verifying') &&
+                  activeDownload.speedBytesPerSec > 0
+                    ? `${
+                        activeDownload.status === 'extracting' ||
+                        activeDownload.status === 'verifying'
+                          ? 'Disk '
+                          : ''
+                      }${(activeDownload.speedBytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`
+                    : '';
+                const tooltipDetails = [
+                  activeDownload.statusMessage?.trim(),
+                  activeSpeedLabel && !activeDownload.statusMessage?.includes('MB/s')
+                    ? activeSpeedLabel
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join(' • ');
+                const activeDownloadTitle = tooltipDetails
+                  ? `${tooltipDetails} — Click to open Download Manager`
+                  : 'Click to open Download Manager';
+
+                return (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => launcherService.openDownloadDrawer()}
+                      aria-label={
+                        isPausedDownload
+                          ? `Paused ${activeDownloadPct}% — Open Download Manager`
+                          : `${activeDownloadPct}% — Open Download Manager`
+                      }
+                      className={`relative overflow-hidden inline-flex items-center justify-center gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 shrink-0 cursor-pointer ${
+                        isPausedDownload
+                          ? 'bg-[#241e14] border border-amber-400/70'
+                          : 'bg-[#17283b] border border-sky-400/70'
+                      }`}
+                      title={activeDownloadTitle}
+                    >
+                      <div
+                        aria-hidden="true"
+                        className={`absolute inset-y-0 left-0 transition-all duration-300 motion-reduce:transition-none pointer-events-none ${
+                          isPausedDownload ? 'bg-amber-500/30' : 'bg-sky-500/35'
+                        }`}
+                        style={{
+                          width: `${Math.min(100, Math.max(0, activeDownload.progressPercent || 0))}%`,
+                        }}
+                      />
+                      {isPausedDownload ? (
+                        <Pause
+                          className="w-4 h-4 text-amber-300 relative z-10"
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <Loader2
+                          className="w-4 h-4 text-sky-300 animate-spin motion-reduce:animate-none relative z-10"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <span className="relative z-10 tabular-nums">
+                        {isPausedDownload
+                          ? `Paused ${activeDownloadPct}%`
+                          : `${activeDownloadPct}%`}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await launcherService.cancelDownload(activeDownload.taskId);
+                        showTempFeedback('Installation cancelled.');
+                      }}
+                      aria-label="Cancel Install"
+                      title="Cancel active installation"
+                      className="min-w-6 min-h-6 p-2 xl:p-2.5 rounded border border-red-500/50 bg-red-950/60 hover:bg-red-900/70 text-red-300 hover:text-white transition-colors shrink-0 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" aria-hidden="true" />
+                    </button>
+                  </div>
+                );
+              })()
             ) : isInstalled ? (
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
@@ -744,6 +832,39 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     title="Game Pass access rotated out or expired. View on Xbox Store to purchase or renew."
                   >
                     <span>Subscription Expired • Xbox Store</span>
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                  </a>
+                )}
+              </div>
+            ) : isXboxSubscriptionExpired ? (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  disabled
+                  data-testid="actionbar-install-expired-disabled"
+                  className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-slate-300 tracking-wider uppercase transition-all shadow-none opacity-65 cursor-not-allowed shrink-0 bg-slate-800/80 border border-slate-600/60"
+                  title={`Game Pass access expired for ${game.title} — purchase or renew on Xbox Store to install`}
+                >
+                  <span>Subscription Expired</span>
+                </button>
+                {xboxStoreUrl && (
+                  <a
+                    href={xboxStoreUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="xbox-expired-store-cta"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+                        window.electronAPI.openExternal(xboxStoreUrl);
+                      } else {
+                        window.open(xboxStoreUrl, '_blank', 'noreferrer,noopener');
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 xl:py-2.5 rounded bg-rose-950/70 hover:bg-rose-900/80 border border-rose-500/60 text-rose-200 hover:text-white text-[11px] font-bold uppercase tracking-wider transition-colors shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400"
+                    title="Game Pass access rotated out or expired. View on Xbox Store to purchase or renew."
+                  >
+                    <span>View on Xbox Store</span>
                     <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                   </a>
                 )}
@@ -1591,6 +1712,163 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
           </div>
         </div>
       )}
+
+      {/* macOS Chained Publisher Launcher / Anti-Cheat Compatibility Callout */}
+      {!isWindowsHost &&
+        (() => {
+          const cachedInfo = launcherService.getCachedInstallInfo(game.id, selectedPlatformId);
+          const rawHandoffKey =
+            activePlatform?.chainedLauncherHandoff ||
+            activePlatform?.externalStorefrontHandoff ||
+            cachedInfo?.chainedLauncherHandoff ||
+            cachedInfo?.externalStorefrontHandoff ||
+            cachedInfo?.xboxCompatibility?.chainedLauncherHandoff ||
+            cachedInfo?.xboxCompatibility?.externalStorefrontHandoff ||
+            activePlatform?.externalLauncher ||
+            cachedInfo?.externalLauncher ||
+            '';
+          const normalizedHandoff = normalizeChainedHandoffId(rawHandoffKey);
+          const handoffKey =
+            normalizedHandoff && normalizedHandoff !== String(selectedPlatformId).toLowerCase()
+              ? normalizedHandoff
+              : '';
+          const compatTier =
+            activePlatform?.xboxBottleCompatibilityTier || cachedInfo?.xboxCompatibility?.tier;
+          const isCrossPlatformLauncher = Boolean(activePlatform?.isCrossPlatformLauncherRuntime);
+          const storeOsFlags = getStorefrontNativeOsFlags(game, selectedPlatformId);
+          const hasNativeMacForSelectedStore = Boolean(
+            isCrossPlatformLauncher ||
+              activePlatform?.platforms?.mac === true ||
+              (!handoffKey && storeOsFlags.mac)
+          );
+
+          if (hasNativeMacForSelectedStore) return null;
+
+          const structuralNotice = detectStructuralKernelAntiCheatFromNotices(
+            metadata?.drmNotice,
+            game.enrichedMetadata?.drmNotice,
+            (game as { drmNotice?: string }).drmNotice,
+            activePlatform?.xboxBottleCompatibilityReason,
+            cachedInfo?.xboxBottleCompatibilityReason
+          );
+          const rawAntiCheatLabel =
+            activePlatform?.kernelAntiCheatName ||
+            cachedInfo?.kernelAntiCheatName ||
+            game.kernelAntiCheatName ||
+            activePlatform?.antiCheatName ||
+            cachedInfo?.antiCheatName ||
+            cachedInfo?.xboxCompatibility?.antiCheatName ||
+            game.antiCheatName ||
+            structuralNotice?.kernelAntiCheatName ||
+            (handoffKey === 'riot' ? 'Riot Vanguard' : undefined);
+          const resolvedAntiCheatLabel =
+            resolveCanonicalKernelAntiCheatDisplayName(rawAntiCheatLabel) ||
+            rawAntiCheatLabel ||
+            'Windows Kernel Anti-Cheat';
+
+          const hasKernelAntiCheat = Boolean(
+            handoffKey === 'riot' ||
+              compatTier === 'tier_c_kernel_anticheat' ||
+              activePlatform?.requiresKernelAntiCheat ||
+              cachedInfo?.requiresKernelAntiCheat ||
+              cachedInfo?.xboxCompatibility?.antiCheatDetected ||
+              game.requiresKernelAntiCheat ||
+              structuralNotice
+          );
+
+          if (hasKernelAntiCheat) {
+            if (isBattlEyeKernelAntiCheat(resolvedAntiCheatLabel)) {
+              const launcherContextLabel = handoffKey
+                ? resolvePublisherHandoffLabel(
+                    handoffKey,
+                    activePlatform?.externalLauncher ||
+                      cachedInfo?.externalLauncher ||
+                      cachedInfo?.xboxCompatibility?.externalLauncher ||
+                      cachedInfo?.xboxCompatibility?.externalStorefront
+                  )
+                : null;
+              return (
+                <div
+                  data-testid="actionbar-compat-handoff-banner"
+                  role="status"
+                  className="mt-3 px-3.5 py-2.5 rounded-lg bg-[#2b1f0e] border border-amber-400/55 text-xs text-amber-100 flex items-start gap-2.5"
+                >
+                  <AlertTriangle
+                    className="w-4 h-4 text-amber-300 shrink-0 mt-0.5"
+                    aria-hidden="true"
+                  />
+                  <div className="space-y-0.5 leading-relaxed">
+                    <div className="font-bold text-amber-200 uppercase tracking-wider text-[10px]">
+                      Kernel Anti-Cheat Notice • BattlEye (Online Multiplayer Blocked on macOS)
+                    </div>
+                    <p className="text-amber-100">
+                      Online multiplayer sessions requiring BattlEye (BEDaisy.sys Windows kernel
+                      driver) cannot load inside macOS CrossOver / Wine bottles, while offline
+                      single-player Story Mode (-nobattleye) remains playable where supported.
+                      {launcherContextLabel && selectedPlatformId === 'xbox'
+                        ? ` Xbox Game Pass unlocks this title inside ${launcherContextLabel} via a linked Xbox account.`
+                        : ''}
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div
+                data-testid="actionbar-compat-handoff-banner"
+                role="status"
+                className="mt-3 px-3.5 py-2.5 rounded-lg bg-[#2a1219] border border-rose-500/50 text-xs text-rose-100 flex items-start gap-2.5"
+              >
+                <ShieldCheck className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" aria-hidden="true" />
+                <div className="space-y-0.5 leading-relaxed">
+                  <div className="font-bold text-rose-200 uppercase tracking-wider text-[10px]">
+                    Windows Kernel Anti-Cheat Required ({resolvedAntiCheatLabel})
+                  </div>
+                  <p className="text-rose-100">
+                    This Windows title requires {resolvedAntiCheatLabel}, whose Windows ring-0
+                    kernel driver cannot load inside a macOS CrossOver / Wine bottle. Play on
+                    native Windows instead.
+                  </p>
+                </div>
+              </div>
+            );
+          }
+
+          if (handoffKey || compatTier === 'tier_c_external_launcher') {
+            const launcherLabel = resolvePublisherHandoffLabel(
+              handoffKey,
+              activePlatform?.externalLauncher ||
+                cachedInfo?.externalLauncher ||
+                cachedInfo?.xboxCompatibility?.externalLauncher ||
+                cachedInfo?.xboxCompatibility?.externalStorefront
+            );
+            return (
+              <div
+                data-testid="actionbar-compat-handoff-banner"
+                role="status"
+                className="mt-3 px-3.5 py-2.5 rounded-lg bg-[#101e2e] border border-sky-500/40 text-xs text-slate-100 flex items-start gap-2.5"
+              >
+                <Cpu className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+                <div className="space-y-0.5 leading-relaxed">
+                  <div className="font-bold text-sky-300 uppercase tracking-wider text-[10px]">
+                    Windows Game • Chained Compatibility Bottle ({launcherLabel})
+                  </div>
+                  <p className="text-slate-200">
+                    This is a Windows build distributed via{' '}
+                    {getStorefrontDisplayName(selectedPlatformId)}. One Launcher automatically sets
+                    up {launcherLabel} inside your CrossOver / Wine bottle so you can sign in with
+                    {selectedPlatformId === 'xbox'
+                      ? ` the ${launcherLabel} account linked to your Xbox profile to download and play.`
+                      : ' your linked account to download and play.'}
+                  </p>
+                </div>
+              </div>
+            );
+          }
+
+          return null;
+        })()}
 
       {/* Action Feedback Toast Banner */}
       {actionFeedback && (

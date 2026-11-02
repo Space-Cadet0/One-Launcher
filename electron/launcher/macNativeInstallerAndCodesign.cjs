@@ -1,10 +1,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { execFile, execFileSync } = require('node:child_process');
 
 const {
   getElectron,
+  getMainWindow,
   getUserDataDir,
   isTestEnvironment,
   toLocalFsPath,
@@ -26,6 +28,8 @@ const {
   steamResolvedLaunchSpecCache,
   moltenVkHudDeadlockCache,
   setBoundedMapEntry,
+  evictExecutableDiscoveryCacheForPath,
+  isPathUnderActiveDownload,
 } = require('./engineStateRegistry.cjs');
 const {
   atomicWriteFileSync,
@@ -36,6 +40,8 @@ const {
   resolveBottleSteamExe,
   sandboxWinePrefixUserFolders,
   sandboxWinePrefixUserFoldersAsync,
+  upsertWineUserRegKey,
+  upsertWineUserRegKeysBatch,
   applyStrictRosettaAvxEnv,
 } = require('./wineAndCrossOverManager.cjs');
 const {
@@ -54,6 +60,16 @@ const { compareSemver } = require('../utils/semverUtils.cjs');
 const EXCLUDED_EXECUTABLE_PATTERNS = [
   /^gamelaunchhelper\.exe$/i,
   /^appxlauncher\.exe$/i,
+  /^cleanup\.exe$/i,
+  /^touchup\.exe$/i,
+  /^eaappinstaller\.exe$/i,
+  /^eainstaller\.exe$/i,
+  /^originthinsetup.*\.exe$/i,
+  /^link2ea\.exe$/i,
+  /^activationui\.exe$/i,
+  /^eaanticheat\.installer.*\.exe$/i,
+  /^getgametoken(?:32|64)?\.exe$/i,
+  /^igoproxy(?:32|64)?\.exe$/i,
   /unitycrashhandler/i,
   /^unins\d*\.exe$/i,
   /uninstall/i,
@@ -678,10 +694,94 @@ function resolveMacAppBundleBinary(appBundlePath) {
   return appBundlePath;
 }
 
+function mergeDirectoryIntoParentSync(srcDir, destDir) {
+  const entries = fs.readdirSync(srcDir);
+  for (const itemName of entries) {
+    if (itemName === '.DS_Store') {
+      try {
+        fs.rmSync(path.join(srcDir, itemName), { force: true });
+      } catch {}
+      continue;
+    }
+    const src = path.join(srcDir, itemName);
+    const dest = path.join(destDir, itemName);
+    let srcStat;
+    try {
+      srcStat = fs.lstatSync(src);
+    } catch {
+      continue;
+    }
+
+    let destStat = null;
+    try {
+      destStat = fs.lstatSync(dest);
+    } catch {
+      destStat = null;
+    }
+
+    if (!destStat) {
+      try {
+        fs.renameSync(src, dest);
+      } catch {
+        try {
+          fs.cpSync(src, dest, { recursive: true, force: true });
+          fs.rmSync(src, { recursive: true, force: true });
+        } catch {}
+      }
+      continue;
+    }
+
+    if (
+      srcStat.isDirectory() &&
+      !srcStat.isSymbolicLink() &&
+      destStat.isDirectory() &&
+      !destStat.isSymbolicLink()
+    ) {
+      mergeDirectoryIntoParentSync(src, dest);
+      try {
+        if (fs.readdirSync(src).length === 0) {
+          fs.rmdirSync(src);
+        }
+      } catch {}
+      continue;
+    }
+
+    if (!destStat.isDirectory() || destStat.isSymbolicLink()) {
+      try {
+        if (process.platform === 'win32') {
+          fs.rmSync(dest, { force: true });
+        }
+        fs.renameSync(src, dest);
+      } catch {
+        try {
+          fs.cpSync(src, dest, { recursive: true, force: true });
+          fs.rmSync(src, { recursive: true, force: true });
+        } catch {}
+      }
+    }
+  }
+}
+
+function hasIncompleteGogdlMarkers(dirPath) {
+  try {
+    return (
+      fs.existsSync(path.join(dirPath, '.gogdl-resume')) ||
+      fs.existsSync(path.join(dirPath, '.gogdl-download-cache')) ||
+      fs.existsSync(path.join(dirPath, '.onelauncher-gog-v2-resume.json'))
+    );
+  } catch {
+    return false;
+  }
+}
+
 function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
   try {
     if (!finalInstallPath || !fs.existsSync(finalInstallPath)) return finalInstallPath;
     if (finalInstallPath.toLowerCase().endsWith('.app')) return finalInstallPath;
+    if (isPathUnderActiveDownload(finalInstallPath)) return finalInstallPath;
+    if (/[\\/]steamapps[\\/]common(?:[\\/]|$)/i.test(finalInstallPath)) {
+      return finalInstallPath;
+    }
     const stat = fs.statSync(finalInstallPath);
     if (!stat.isDirectory()) return finalInstallPath;
 
@@ -731,12 +831,17 @@ function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
       return finalInstallPath;
     }
 
-    const hasRootInfoOrApp = rootEntries.some(
-      (e) =>
-        (e.isFile() && /^\.?goggame-\d+\.info$/i.test(e.name)) ||
-        (e.isDirectory() && e.name.toLowerCase().endsWith('.app'))
-    );
-    if (hasRootInfoOrApp) return finalInstallPath;
+    if (rootEntries.some((e) => e.isDirectory() && e.name.toLowerCase().endsWith('.app'))) {
+      return finalInstallPath;
+    }
+
+    /** @type {Set<string>} */
+    const rootInfoIds = new Set();
+    for (const e of rootEntries) {
+      if (!e.isFile()) continue;
+      const m = e.name.match(/^\.?goggame-(\d+)\.info$/i);
+      if (m && m[1]) rootInfoIds.add(m[1]);
+    }
 
     const visibleDirs = rootEntries.filter(
       (e) =>
@@ -750,9 +855,23 @@ function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
     let targetSubDir = null;
     for (const d of visibleDirs) {
       const subFullPath = path.join(finalInstallPath, d.name);
+      if (hasIncompleteGogdlMarkers(subFullPath)) {
+        continue;
+      }
       try {
         const subFiles = fs.readdirSync(subFullPath);
-        if (
+        if (rootInfoIds.size > 0) {
+          const matchesSameRootGame =
+            (cleanId && subFiles.includes(`goggame-${cleanId}.info`)) ||
+            subFiles.some((f) => {
+              const m = f.match(/^\.?goggame-(\d+)\.info$/i);
+              return Boolean(m && m[1] && rootInfoIds.has(m[1]));
+            });
+          if (matchesSameRootGame) {
+            targetSubDir = subFullPath;
+            break;
+          }
+        } else if (
           (cleanId && subFiles.includes(`goggame-${cleanId}.info`)) ||
           subFiles.some((f) => /^\.?goggame-\d+\.info$/i.test(f))
         ) {
@@ -762,7 +881,7 @@ function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
       } catch {}
     }
 
-    if (/[\\/]steamapps[\\/]common(?:[\\/]|$)/i.test(finalInstallPath)) {
+    if (rootInfoIds.size > 0 && !targetSubDir) {
       return finalInstallPath;
     }
 
@@ -770,34 +889,36 @@ function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
       !targetSubDir &&
       visibleDirs.length === 1 &&
       visibleFiles.length === 0 &&
-      !/^(bin|binaries|rerelease|x64|x86|win64|win32|macos|contents|resources|data|engine)$/i.test(
+      !/^(bin|binaries|rerelease|x64|x86|win64|win32|macos|content|contents|resources|data|engine)$/i.test(
         visibleDirs[0].name
       )
     ) {
-      targetSubDir = path.join(finalInstallPath, visibleDirs[0].name);
+      const candidateSubDir = path.join(finalInstallPath, visibleDirs[0].name);
+      const isXboxPackageSubDir =
+        fs.existsSync(path.join(candidateSubDir, 'MicrosoftGame.config')) ||
+        fs.existsSync(path.join(candidateSubDir, 'AppxManifest.xml'));
+      if (!isXboxPackageSubDir && !hasIncompleteGogdlMarkers(candidateSubDir)) {
+        targetSubDir = candidateSubDir;
+      }
     }
 
     if (targetSubDir && fs.existsSync(targetSubDir)) {
-      const innerItems = fs.readdirSync(targetSubDir);
-      for (const itemName of innerItems) {
-        const src = path.join(targetSubDir, itemName);
-        const dest = path.join(finalInstallPath, itemName);
-        if (fs.existsSync(dest)) continue;
-        try {
-          fs.renameSync(src, dest);
-        } catch {
-          try {
-            fs.cpSync(src, dest, { recursive: true, force: true });
-            fs.rmSync(src, { recursive: true, force: true });
-          } catch {}
-        }
-      }
+      mergeDirectoryIntoParentSync(targetSubDir, finalInstallPath);
       try {
         const remaining = fs.readdirSync(targetSubDir);
         if (remaining.length === 0) {
           fs.rmdirSync(targetSubDir);
         }
       } catch {}
+      if (rootInfoIds.size > 0) {
+        const orphanRootResume = path.join(finalInstallPath, '.gogdl-resume');
+        try {
+          if (fs.existsSync(orphanRootResume)) {
+            fs.rmSync(orphanRootResume, { force: true });
+          }
+        } catch {}
+      }
+      evictExecutableDiscoveryCacheForPath(finalInstallPath);
     }
   } catch {}
   return finalInstallPath;
@@ -817,6 +938,7 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
   }
 
   const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(localInstallPath);
+  const readOnly = Boolean(options.readOnly) || isPathUnderActiveDownload(localInstallPath);
 
   let rootMtimeMs = 0;
   try {
@@ -861,9 +983,11 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
     return { ...cached.result };
   }
 
-  if (platform === 'darwin' && !isInsideBottle) {
+  if (platform === 'darwin' && !isInsideBottle && !readOnly) {
     flattenGogNestedInstallDir(localInstallPath, undefined);
-    ensureMacExecutablePermissions(localInstallPath);
+    if (!preferWindowsExecutable) {
+      ensureMacExecutablePermissions(localInstallPath);
+    }
     try {
       rootMtimeMs = fs.statSync(localInstallPath).mtimeMs || 0;
     } catch {}
@@ -914,8 +1038,8 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
         }
         const skipRe =
           platform === 'darwin' && !isInsideBottle
-            ? /^(node_modules|redist|_commonredist|directx|vcredist|locales|streamingassets|mono|_codesignature)$/i
-            : /^(node_modules|redist|_commonredist|directx|vcredist|locales|resources|data|assets|streamingassets|mono)$/i;
+            ? /^(node_modules|redist|_commonredist|__installer|directx|vcredist|locales|streamingassets|mono|_codesignature)$/i
+            : /^(node_modules|redist|_commonredist|__installer|directx|vcredist|locales|resources|data|assets|streamingassets|mono)$/i;
         if (skipRe.test(entry.name)) {
           continue;
         }
@@ -1469,11 +1593,53 @@ function resolveSteamAppInfoLaunchSpec(
     const wantWindows = platform === 'win32' || isInsideBottle;
 
     const candidates = [];
+    /** @type {Array<{ score: number, entry: any, rawExe: string, isProtocolUri: boolean, isUbisoft: boolean }>} */
+    const protocolLaunchCandidates = [];
     for (const [, entry] of Object.entries(launchMap)) {
       if (!entry || typeof entry !== 'object' || !entry.executable) continue;
-      const relExe = String(entry.executable)
-        .replace(/^[\\/]+/, '')
-        .replace(/\\/g, path.sep);
+      const rawExe = String(entry.executable).trim();
+      if (!rawExe) continue;
+
+      const oslist = String(entry.config?.oslist || '').toLowerCase();
+      const entryType = String(entry.type || 'default').toLowerCase();
+      const isProtocolUri = /^(?:link2ea|origin2|origin|uplay):\/\//i.test(rawExe);
+      const isChainedShimExe =
+        !isProtocolUri && /(?:^|[\\/])(?:link2ea|ealauncher|upc)\.exe$/i.test(rawExe);
+
+      if (isProtocolUri || isChainedShimExe) {
+        if (oslist) {
+          if (wantWindows && !oslist.includes('windows')) {
+            continue;
+          }
+          if (
+            !wantWindows &&
+            !oslist.includes('macos') &&
+            !oslist.includes('osx') &&
+            !oslist.includes('windows')
+          ) {
+            continue;
+          }
+        }
+        let protoScore = isProtocolUri ? 120 : 90;
+        if (entryType === 'default' || entryType === 'none' || !entry.type) {
+          protoScore += 50;
+        }
+        if (entry.config?.ownsdlc) {
+          protoScore -= 15;
+        }
+        const isUbisoft =
+          /^uplay:\/\//i.test(rawExe) || /(?:^|[\\/])upc\.exe$/i.test(rawExe);
+        protocolLaunchCandidates.push({
+          score: protoScore,
+          entry,
+          rawExe,
+          isProtocolUri,
+          isUbisoft,
+        });
+        continue;
+      }
+
+      const relExe = rawExe.replace(/^[\\/]+/, '').replace(/\\/g, path.sep);
       if (!relExe || !resolvedInstallPath) continue;
 
       let candidateExe = path.join(resolvedInstallPath, relExe);
@@ -1485,7 +1651,6 @@ function resolveSteamAppInfoLaunchSpec(
 
       if (isExcludedExecutable(candidateExe)) continue;
 
-      const oslist = String(entry.config?.oslist || '').toLowerCase();
       let score = 0;
 
       if (wantWindows) {
@@ -1513,7 +1678,6 @@ function resolveSteamAppInfoLaunchSpec(
         }
       }
 
-      const entryType = String(entry.type || 'default').toLowerCase();
       if (entryType === 'default' || entryType === 'none' || !entry.type) {
         score += 50;
       } else if (entryType === 'option1' || entryType === 'option2') {
@@ -1535,6 +1699,73 @@ function resolveSteamAppInfoLaunchSpec(
         entry,
         executablePath: candidateExe,
       });
+    }
+
+    if (protocolLaunchCandidates.length > 0) {
+      protocolLaunchCandidates.sort((a, b) => b.score - a.score);
+      candidates.sort((a, b) => b.score - a.score);
+      const bestProto = protocolLaunchCandidates[0];
+      // Only let a native macOS `.app` binary override a Windows-only protocol entry if Steam ships a native Mac build
+      const hasHigherNativeMacCandidate =
+        platform === 'darwin' &&
+        !wantWindows &&
+        candidates.length > 0 &&
+        !candidates[0].executablePath.toLowerCase().endsWith('.exe') &&
+        candidates[0].score > bestProto.score;
+
+      if (!hasHigherNativeMacCandidate) {
+        let concreteExe = candidates[0]?.executablePath || null;
+        if (!concreteExe && resolvedInstallPath && fs.existsSync(resolvedInstallPath)) {
+          const discovered = findPrimaryExecutable(resolvedInstallPath, {
+            platform: wantWindows ? 'win32' : platform,
+          });
+          if (discovered?.executablePath) {
+            concreteExe = discovered.executablePath;
+          }
+        }
+        const launchArguments =
+          bestProto.entry.arguments && String(bestProto.entry.arguments).trim()
+            ? String(bestProto.entry.arguments).trim()
+            : undefined;
+        const workingDirectory =
+          bestProto.entry.workingdir && resolvedInstallPath
+            ? path.join(
+                resolvedInstallPath,
+                String(bestProto.entry.workingdir)
+                  .replace(/^[\\/]+/, '')
+                  .replace(/\\/g, path.sep)
+              )
+            : resolvedInstallPath || undefined;
+        const isWindowsBinaryOnMac =
+          platform === 'darwin' &&
+          Boolean(
+            isInsideBottle ||
+              wantWindows ||
+              !concreteExe ||
+              concreteExe.toLowerCase().endsWith('.exe')
+          );
+        const resolvedProtoSpec = {
+          executablePath: concreteExe || null,
+          args: launchArguments,
+          launchArguments,
+          workingDir: workingDirectory,
+          workingDirectory,
+          isWindowsBinaryOnMac,
+          requiresStorefrontProtocolLaunch: true,
+          ...(bestProto.isProtocolUri ? { protocolUri: bestProto.rawExe } : {}),
+          chainedLauncherHandoff: /** @type {'ubisoft' | 'ea'} */ (
+            bestProto.isUbisoft ? 'ubisoft' : 'ea'
+          ),
+          chainedHandoffTopology: /** @type {'storefront_depot_uri'} */ ('storefront_depot_uri'),
+        };
+        setBoundedMapEntry(
+          steamResolvedLaunchSpecCache,
+          specCacheKey,
+          { installPath: resolvedInstallPath, platform, spec: resolvedProtoSpec },
+          MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES
+        );
+        return { ...resolvedProtoSpec };
+      }
     }
 
     if (candidates.length === 0) {
@@ -2201,12 +2432,13 @@ function listAllInitializedBottlePaths(/** @type {any} */ options = {}) {
     return result;
   }
 
+  const includeThirdPartyPrefixes = options.includeThirdPartyPrefixes !== false;
   const bottleParentRoots = [
     path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
     path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
     path.join(homedir, 'Library/Containers/com.isaacmarovitz.Whisky/Bottles'),
     path.join(homedir, 'Games/OneLauncher/Prefixes'),
-    path.join(homedir, 'Games/Heroic/Prefixes'),
+    ...(includeThirdPartyPrefixes ? [path.join(homedir, 'Games/Heroic/Prefixes')] : []),
   ];
   for (const parentRoot of bottleParentRoots) {
     if (!fs.existsSync(parentRoot)) continue;
@@ -2225,6 +2457,12 @@ function listAllInitializedBottlePaths(/** @type {any} */ options = {}) {
     const layers = detectCompatibilityLayers(options);
     for (const layer of layers) {
       if (!layer || !layer.bottlesDir) continue;
+      if (
+        !includeThirdPartyPrefixes &&
+        /\/Games\/Heroic\/Prefixes(?:\/|$)/i.test(String(layer.bottlesDir).replace(/\\/g, '/'))
+      ) {
+        continue;
+      }
       addIfBottle(layer.bottlesDir);
       if (Array.isArray(layer.availableBottles)) {
         for (const bName of layer.availableBottles) {
@@ -2258,7 +2496,10 @@ function resolveTargetBottleForFirstPartySync(
     }
   }
 
-  const allBottles = listAllInitializedBottlePaths(options);
+  const allBottles = listAllInitializedBottlePaths({
+    ...options,
+    includeThirdPartyPrefixes: false,
+  });
   const rawGameId = String(
     recordOrEntry.platformGameId ||
       recordOrEntry.appName ||
@@ -2310,6 +2551,123 @@ function resolveTargetBottleForFirstPartySync(
   return sortedBottles[0] || null;
 }
 
+/**
+ * Resolve the path to One Launcher's external compatibility-runner install receipts file
+ * (`$HOME/Library/Application Support/OneLauncher/runner-install-receipts.json`).
+ * Never touches any file inside an `.app` bundle, keeping `codesign --verify --deep --strict` intact.
+ *
+ * @param {any} [options]
+ * @returns {string}
+ */
+function getRunnerInstallReceiptsFilePath(options = {}) {
+  const homedir = (options && options.homedir) || os.homedir();
+  return path.join(homedir, 'Library/Application Support/OneLauncher/runner-install-receipts.json');
+}
+
+/**
+ * Normalize an `.app` bundle path for receipt dictionary keying.
+ *
+ * @param {string} appPath
+ * @returns {string}
+ */
+function normalizeReceiptAppPath(appPath) {
+  return path
+    .resolve(String(appPath || '').trim())
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '');
+}
+
+/**
+ * Read `CFBundleShortVersionString` and `CFBundleVersion` from a bundle `Info.plist`
+ * (supporting both XML and binary `bplist00` formats).
+ *
+ * @param {string} plistPath
+ * @returns {{ shortVer: string, bundleVer: string }}
+ */
+function readAppBundlePlistVersionStrings(plistPath) {
+  let shortVer = '';
+  let bundleVer = '';
+  try {
+    const plistText = fs.readFileSync(plistPath, 'utf8');
+    const shortMatch = plistText.match(
+      /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/i
+    );
+    const bundleVerMatch = plistText.match(
+      /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/i
+    );
+    shortVer = shortMatch ? shortMatch[1].trim() : '';
+    bundleVer = bundleVerMatch ? bundleVerMatch[1].trim() : '';
+    if (!shortVer && !bundleVer) {
+      const parsedPlist = parsePlistStringValues(plistPath);
+      shortVer = String(parsedPlist.CFBundleShortVersionString || '').trim();
+      bundleVer = String(parsedPlist.CFBundleVersion || '').trim();
+    }
+  } catch {}
+  return { shortVer, bundleVer };
+}
+
+/**
+ * Read all stored runner install receipts (100% read-only; never creates directories or mutates files).
+ *
+ * @param {any} [options]
+ * @returns {Record<string, any>}
+ */
+function readRunnerInstallReceipts(options = {}) {
+  const filePath = getRunnerInstallReceiptsFilePath(options);
+  if (!filePath || !fs.existsSync(filePath)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.receipts && typeof parsed.receipts === 'object' && !Array.isArray(parsed.receipts)) {
+        return parsed.receipts;
+      }
+      if (!Array.isArray(parsed)) {
+        return parsed;
+      }
+    }
+  } catch {}
+  return {};
+}
+
+/**
+ * Record an external runner install receipt in `runner-install-receipts.json` when an upstream
+ * packaging tag (e.g. `3.0-3` or `11.0_1`) carries finer revision info than the bundle's `Info.plist`.
+ *
+ * @param {string} installedPath
+ * @param {string} runnerType
+ * @param {string | null | undefined} releaseVersion
+ * @param {any} [options]
+ */
+function recordRunnerInstallReceipt(installedPath, runnerType, releaseVersion, options = {}) {
+  const trimmedRelease = String(releaseVersion || '').trim();
+  if (!installedPath || !trimmedRelease) return;
+  try {
+    const plistPath = path.join(installedPath, 'Contents', 'Info.plist');
+    if (!fs.existsSync(plistPath)) return;
+    const plistStat = fs.statSync(plistPath);
+    const { shortVer, bundleVer } = readAppBundlePlistVersionStrings(plistPath);
+    const filePath = getRunnerInstallReceiptsFilePath(options);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const existingReceipts = readRunnerInstallReceipts(options);
+    const normKey = normalizeReceiptAppPath(installedPath);
+    const nextPayload = {
+      schemaVersion: 1,
+      receipts: {
+        ...existingReceipts,
+        [normKey]: {
+          runnerType: String(runnerType || '').trim(),
+          plistShortVersion: shortVer,
+          plistBundleVersion: bundleVer,
+          plistMtimeMs: Math.round(plistStat.mtimeMs),
+          releaseVersion: trimmedRelease,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    };
+    atomicWriteFileSync(filePath, JSON.stringify(nextPayload, null, 2));
+  } catch {}
+}
+
 function extractRunnerVersionInfo(
   /** @type {any} */ runnerTypeOrPath,
   /** @type {any} */ maybeBinaryPath,
@@ -2345,15 +2703,8 @@ function extractRunnerVersionInfo(
     const plistPath = path.join(appPath, 'Contents', 'Info.plist');
     if (fs.existsSync(plistPath)) {
       try {
-        const plistText = fs.readFileSync(plistPath, 'utf8');
-        const shortMatch = plistText.match(
-          /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/i
-        );
-        const bundleVerMatch = plistText.match(
-          /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/i
-        );
-        const shortVer = shortMatch ? shortMatch[1].trim() : '';
-        const bundleVer = bundleVerMatch ? bundleVerMatch[1].trim() : '';
+        const plistStat = fs.statSync(plistPath);
+        const { shortVer, bundleVer } = readAppBundlePlistVersionStrings(plistPath);
         const semverMatch = bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
         const semver = semverMatch ? semverMatch[1] : '';
         const buildNum = semverMatch && semverMatch[2] ? semverMatch[2] : '';
@@ -2370,6 +2721,30 @@ function extractRunnerVersionInfo(
           version = shortVer || bundleVer;
           buildVersion = bundleVer && bundleVer !== version ? bundleVer : undefined;
           displayVersion = buildVersion ? `${version} (${buildVersion})` : version;
+        }
+
+        const receipts = readRunnerInstallReceipts(options);
+        const normKey = normalizeReceiptAppPath(appPath);
+        const receipt =
+          receipts[normKey] ||
+          Object.entries(receipts).find(([k]) => k.toLowerCase() === normKey.toLowerCase())?.[1];
+        if (
+          receipt &&
+          typeof receipt.releaseVersion === 'string' &&
+          receipt.releaseVersion.trim() &&
+          String(receipt.plistShortVersion || '') === shortVer &&
+          String(receipt.plistBundleVersion || '') === bundleVer &&
+          typeof receipt.plistMtimeMs === 'number' &&
+          Math.abs(plistStat.mtimeMs - receipt.plistMtimeMs) <= 2000
+        ) {
+          const rawRel = receipt.releaseVersion.trim();
+          const normRel = rawRel.replace(/[-_]/g, '.');
+          const isEightDigitDateReceipt = /^\d{8}$/.test(rawRel) && Boolean(semver);
+          if (!isEightDigitDateReceipt && (!version || compareRunnerVersions(version, normRel) < 0)) {
+            version = normRel;
+            buildVersion = rawRel !== normRel ? rawRel : buildVersion;
+            displayVersion = rawRel;
+          }
         }
       } catch {}
     }
@@ -2691,9 +3066,17 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
   }
 
   const homedir = options.homedir || os.homedir();
-  const isIsolatedTest = Boolean(options.homedir || options.customApplicationsDir);
+  const isIsolatedTest = Boolean(
+    options.homedir || options.customApplicationsDir || Array.isArray(options.applicationsDirs)
+  );
   const appsDirs = [];
-  if (options.customApplicationsDir) {
+  if (Array.isArray(options.applicationsDirs)) {
+    for (const dir of options.applicationsDirs) {
+      if (typeof dir === 'string' && dir.trim()) {
+        appsDirs.push(dir.trim());
+      }
+    }
+  } else if (options.customApplicationsDir) {
     appsDirs.push(options.customApplicationsDir);
   } else {
     appsDirs.push(path.join(homedir, 'Applications'));
@@ -2734,6 +3117,20 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
       ? sharedCrossOverBottlesDir
       : previewSpecBottlesDir;
 
+  const hostArch = String(options?.arch || process.arch || 'arm64');
+  const darwinKernelMajor =
+    options?.darwinKernelMajor !== undefined
+      ? Number(options.darwinKernelMajor)
+      : process.platform === 'darwin'
+        ? Number(String(os.release() || '25.0.0').split('.')[0]) || 25
+        : 25;
+  const layerHostDlssCaps = {
+    hostArch,
+    darwinKernelMajor,
+    supportsMetalFxDlssD3dMetal: hostArch === 'arm64' && darwinKernelMajor >= 25,
+    supportsMetalFxDlssDxmt: hostArch === 'arm64' && darwinKernelMajor >= 23,
+  };
+
   /** @type {any[]} */
   const layers = [];
   const addedTypes = new Set();
@@ -2755,7 +3152,59 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
     },
   ];
 
+  /**
+   * Compare two discovered `.app` candidates so a stale `$HOME/Applications` copy never shadows
+   * a newer `/Applications` copy (or vice versa).
+   *
+   * @param {any} existingCand
+   * @param {any} nextCand
+   * @returns {boolean} true if `nextCand` has a strictly higher version/build than `existingCand`
+   */
+  const isCandidateNewerVersion = (existingCand, nextCand) => {
+    if (!existingCand) return true;
+    const verA = existingCand.buildVersion || existingCand.version || '';
+    const verB = nextCand.buildVersion || nextCand.version || '';
+    if (verA && verB) {
+      const cmp = compareRunnerVersions(verA, verB);
+      if (cmp !== 0) return cmp < 0;
+    } else if (!verA && verB) {
+      return true;
+    }
+    if (existingCand.version && nextCand.version) {
+      const shortCmp = compareRunnerVersions(existingCand.version, nextCand.version);
+      if (shortCmp !== 0) return shortCmp < 0;
+    }
+    return false;
+  };
+
+  /**
+   * Source rank helper so `/Applications` wins version ties over `$HOME/Applications`, external
+   * managers (`Heroic`, `Whisky`, `Sikarugir`, `Kegworks`, `Mythic`), and CLI wrappers.
+   *
+   * @param {string} dirPath
+   * @returns {number}
+   */
+  const getAppsDirRank = (dirPath) =>
+    path.resolve(String(dirPath || '')).replace(/\\/g, '/') === '/Applications' ? 3 : 2;
+
+  /**
+   * Compare two `{ layer, sourceRank }` entries: strictly higher version wins first;
+   * equal/missing versions break ties by `sourceRank`.
+   *
+   * @param {{ layer: any, sourceRank: number } | null} best
+   * @param {{ layer: any, sourceRank: number }} next
+   * @returns {boolean}
+   */
+  const isBetterRankedLayerCandidate = (best, next) => {
+    if (!best) return true;
+    if (isCandidateNewerVersion(best.layer, next.layer)) return true;
+    if (isCandidateNewerVersion(next.layer, best.layer)) return false;
+    return next.sourceRank > best.sourceRank;
+  };
+
   for (const variant of crossoverVariants) {
+    /** @type {{ layer: any, sourceRank: number } | null} */
+    let bestVariantEntry = null;
     for (const appsDir of appsDirs) {
       try {
         const appPath = path.join(appsDir, variant.appName);
@@ -2775,9 +3224,9 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
           versionInfo.appPath || appPath
         );
 
-        if (!addedTypes.has(variant.id)) {
-          addedTypes.add(variant.id);
-          layers.push({
+        const candidateEntry = {
+          sourceRank: getAppsDirRank(appsDir),
+          layer: {
             id: variant.id,
             type: variant.type,
             name: variant.name,
@@ -2790,60 +3239,32 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
             ...(d3dmInfo.availableD3DMetalVersions
               ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
               : {}),
+            ...layerHostDlssCaps,
             bottlesDir: variant.bottlesDir,
             availableBottles,
-          });
+          },
+        };
+
+        if (isBetterRankedLayerCandidate(bestVariantEntry, candidateEntry)) {
+          bestVariantEntry = candidateEntry;
         }
       } catch {
         // Isolate transient filesystem/plist read errors per app bundle
       }
     }
+    if (bestVariantEntry && !addedTypes.has(variant.id)) {
+      addedTypes.add(variant.id);
+      layers.push(bestVariantEntry.layer);
+    }
   }
 
-  const heroicGptkRoot = path.join(
-    homedir,
-    'Library/Application Support/heroic/tools/game-porting-toolkit'
-  );
-  if (fs.existsSync(heroicGptkRoot)) {
-    try {
-      const subdirs = fs.readdirSync(heroicGptkRoot);
-      for (const sub of subdirs) {
-        const binCandidates = [
-          path.join(heroicGptkRoot, sub, 'bin/wine64'),
-          path.join(heroicGptkRoot, sub, 'Contents/Resources/wine/bin/wine64'),
-        ];
-        const foundBin = binCandidates.find((b) => fs.existsSync(b));
-        if (foundBin && !addedTypes.has('gptk')) {
-          addedTypes.add('gptk');
-          const versionInfo = extractRunnerVersionInfo('gptk', foundBin, options);
-          const d3dmInfo = detectBundledD3DMetalVersions(
-            'gptk',
-            foundBin,
-            versionInfo.appPath || path.join(heroicGptkRoot, sub)
-          );
-          layers.push({
-            id: 'gptk',
-            type: 'gptk',
-            name: `Game Porting Toolkit (${sub})`,
-            binaryPath: foundBin,
-            appPath: versionInfo.appPath,
-            version: versionInfo.version,
-            buildVersion: versionInfo.buildVersion,
-            displayVersion: versionInfo.displayVersion,
-            ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
-            ...(d3dmInfo.availableD3DMetalVersions
-              ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
-              : {}),
-            availableBottles: [],
-          });
-        }
-      }
-    } catch {}
-  }
+  /** @type {{ layer: any, sourceRank: number } | null} */
+  let bestGptkEntry = null;
 
   for (const appsDir of appsDirs) {
-    const gptkApp = path.join(appsDir, 'Game Porting Toolkit.app');
-    if (fs.existsSync(gptkApp) && !addedTypes.has('gptk')) {
+    try {
+      const gptkApp = path.join(appsDir, 'Game Porting Toolkit.app');
+      if (!fs.existsSync(gptkApp)) continue;
       const binCandidates = [
         path.join(gptkApp, 'Contents/Resources/wine/bin/wine64'),
         path.join(gptkApp, 'Contents/SharedSupport/wine/bin/wine64'),
@@ -2855,45 +3276,152 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
         binaryPath,
         versionInfo.appPath || gptkApp
       );
-      addedTypes.add('gptk');
-      layers.push({
-        id: 'gptk',
-        type: 'gptk',
-        name: 'Apple Game Porting Toolkit',
-        binaryPath,
-        appPath: versionInfo.appPath || gptkApp,
-        version: versionInfo.version,
-        buildVersion: versionInfo.buildVersion,
-        displayVersion: versionInfo.displayVersion,
-        ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
-        ...(d3dmInfo.availableD3DMetalVersions
-          ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
-          : {}),
-        availableBottles: [],
-      });
-    }
+      const candidateEntry = {
+        sourceRank: getAppsDirRank(appsDir),
+        layer: {
+          id: 'gptk',
+          type: 'gptk',
+          name: 'Apple Game Porting Toolkit',
+          binaryPath,
+          appPath: versionInfo.appPath || gptkApp,
+          version: versionInfo.version,
+          buildVersion: versionInfo.buildVersion,
+          displayVersion: versionInfo.displayVersion,
+          ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+          ...(d3dmInfo.availableD3DMetalVersions
+            ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+            : {}),
+          ...layerHostDlssCaps,
+          availableBottles: [],
+        },
+      };
+      if (isBetterRankedLayerCandidate(bestGptkEntry, candidateEntry)) {
+        bestGptkEntry = candidateEntry;
+      }
+    } catch {}
   }
 
-  const wineEntryCandidates = [];
+  const heroicGptkRoot = path.join(
+    homedir,
+    'Library/Application Support/heroic/tools/game-porting-toolkit'
+  );
+  if (fs.existsSync(heroicGptkRoot)) {
+    try {
+      const subdirs = fs
+        .readdirSync(heroicGptkRoot)
+        .filter((sub) => !sub.startsWith('.'));
+      for (const sub of subdirs) {
+        const binCandidates = [
+          path.join(heroicGptkRoot, sub, 'bin/wine64'),
+          path.join(heroicGptkRoot, sub, 'Contents/Resources/wine/bin/wine64'),
+        ];
+        const foundBin = binCandidates.find((b) => fs.existsSync(b));
+        if (foundBin) {
+          const versionInfo = extractRunnerVersionInfo('gptk', foundBin, options);
+          const d3dmInfo = detectBundledD3DMetalVersions(
+            'gptk',
+            foundBin,
+            versionInfo.appPath || path.join(heroicGptkRoot, sub)
+          );
+          const candidateEntry = {
+            sourceRank: 1,
+            layer: {
+              id: 'gptk',
+              type: 'gptk',
+              name: `Game Porting Toolkit (${sub})`,
+              binaryPath: foundBin,
+              appPath: versionInfo.appPath,
+              version: versionInfo.version,
+              buildVersion: versionInfo.buildVersion,
+              displayVersion: versionInfo.displayVersion,
+              ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+              ...(d3dmInfo.availableD3DMetalVersions
+                ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+                : {}),
+              ...layerHostDlssCaps,
+              availableBottles: [],
+            },
+          };
+          if (isBetterRankedLayerCandidate(bestGptkEntry, candidateEntry)) {
+            bestGptkEntry = candidateEntry;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const gptkCliCandidates = [
+    options?.gptkBinaryPath,
+    path.join(homedir, 'homebrew/bin/gameportingtoolkit'),
+    ...(!isIsolatedTest
+      ? ['/opt/homebrew/bin/gameportingtoolkit', '/usr/local/bin/gameportingtoolkit']
+      : []),
+  ].filter(Boolean);
+  for (const cliBin of gptkCliCandidates) {
+    if (!fs.existsSync(cliBin)) continue;
+    try {
+      const versionInfo = extractRunnerVersionInfo('gptk', cliBin, options);
+      const d3dmInfo = detectBundledD3DMetalVersions(
+        'gptk',
+        cliBin,
+        versionInfo.appPath || path.dirname(path.dirname(cliBin))
+      );
+      const candidateEntry = {
+        sourceRank: 0,
+        layer: {
+          id: 'gptk',
+          type: 'gptk',
+          name: 'Apple Game Porting Toolkit (Homebrew)',
+          binaryPath: cliBin,
+          appPath: versionInfo.appPath,
+          version: versionInfo.version,
+          buildVersion: versionInfo.buildVersion,
+          displayVersion: versionInfo.displayVersion,
+          ...(d3dmInfo.d3dmetalVersion ? { d3dmetalVersion: d3dmInfo.d3dmetalVersion } : {}),
+          ...(d3dmInfo.availableD3DMetalVersions
+            ? { availableD3DMetalVersions: d3dmInfo.availableD3DMetalVersions }
+            : {}),
+          ...layerHostDlssCaps,
+          availableBottles: [],
+        },
+      };
+      if (isBetterRankedLayerCandidate(bestGptkEntry, candidateEntry)) {
+        bestGptkEntry = candidateEntry;
+      }
+    } catch {}
+  }
+
+  if (bestGptkEntry && !addedTypes.has('gptk')) {
+    addedTypes.add('gptk');
+    layers.push(bestGptkEntry.layer);
+  }
+
+  const preferLegacyGlWine = Boolean(options && options.preferLegacy32BitOpenGlWine);
+  /** @type {Array<{ binPath: string, name: string, retired: boolean, sourceRank: number, versionInfo: any }>} */
+  const discoveredWineEntries = [];
+
   const wineAppVariants = [
-    { appName: 'Wine Crossover.app', label: 'Open-Source Wine (Wine-CrossOver)' },
-    { appName: 'Wine Stable.app', label: 'Open-Source Wine (Wine Stable)' },
-    { appName: 'Wine Staging.app', label: 'Open-Source Wine (Wine Staging)' },
-    { appName: 'Wine Devel.app', label: 'Open-Source Wine (Wine Devel)' },
+    { appName: 'Wine Stable.app', label: 'Open-Source Wine (Wine Stable)', retired: false, variantBonus: 3 },
+    { appName: 'Wine Staging.app', label: 'Open-Source Wine (Wine Staging)', retired: false, variantBonus: 2 },
+    { appName: 'Wine Devel.app', label: 'Open-Source Wine (Wine Devel)', retired: false, variantBonus: 1 },
+    { appName: 'Wine Crossover.app', label: 'Open-Source Wine (Wine-CrossOver)', retired: true, variantBonus: 0 },
   ];
 
-  for (const appsDir of appsDirs) {
-    for (const wv of wineAppVariants) {
-      wineEntryCandidates.push(
-        {
-          binPath: path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine64'),
+  for (const wv of wineAppVariants) {
+    for (const appsDir of appsDirs) {
+      const bin64 = path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine64');
+      const bin32 = path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine');
+      const resolvedBin = fs.existsSync(bin64) ? bin64 : fs.existsSync(bin32) ? bin32 : '';
+      if (resolvedBin) {
+        const baseAppsRank = getAppsDirRank(appsDir) === 3 ? 600 : 500;
+        discoveredWineEntries.push({
+          binPath: resolvedBin,
           name: wv.label,
-        },
-        {
-          binPath: path.join(appsDir, wv.appName, 'Contents/Resources/wine/bin/wine'),
-          name: wv.label,
-        }
-      );
+          retired: wv.retired,
+          sourceRank: baseAppsRank + wv.variantBonus,
+          versionInfo: extractRunnerVersionInfo('wine', resolvedBin, options),
+        });
+      }
     }
   }
 
@@ -2903,78 +3431,162 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
       const rankHeroicWineDir = (/** @type {any} */ dirName) => {
         const lower = String(dirName || '').toLowerCase();
         const isDxmt = lower.includes('-dxmt');
-        if (lower.includes('wine-staging')) return isDxmt ? 1 : 0;
-        if (lower.includes('wine-stable') || lower.includes('wine-devel')) return isDxmt ? 3 : 2;
-        if (lower.includes('wine-crossover')) return 5;
-        return 4;
+        if (lower.includes('wine-staging')) return isDxmt ? 485 : 490;
+        if (lower.includes('wine-stable') || lower.includes('wine-devel')) return isDxmt ? 475 : 480;
+        if (lower.includes('wine-crossover')) return 450;
+        return 460;
       };
       const subdirs = fs
         .readdirSync(heroicWineRoot)
-        .filter((sub) => !sub.startsWith('.'))
-        .sort((a, b) => {
-          const rankDiff = rankHeroicWineDir(a) - rankHeroicWineDir(b);
-          if (rankDiff !== 0) return rankDiff;
-          return compareRunnerVersions(b, a);
-        });
+        .filter((sub) => !sub.startsWith('.'));
       for (const sub of subdirs) {
-        wineEntryCandidates.push(
-          {
-            binPath: path.join(heroicWineRoot, sub, 'bin/wine64'),
+        const subBinCandidates = [
+          path.join(heroicWineRoot, sub, 'bin/wine64'),
+          path.join(heroicWineRoot, sub, 'Contents/Resources/wine/bin/wine64'),
+          path.join(heroicWineRoot, sub, 'Contents/Resources/wine/bin/wine'),
+          path.join(heroicWineRoot, sub, 'bin/wine'),
+        ];
+        const resolvedSubBin = subBinCandidates.find((b) => fs.existsSync(b));
+        if (resolvedSubBin) {
+          discoveredWineEntries.push({
+            binPath: resolvedSubBin,
             name: 'Open-Source Wine (Heroic)',
-          },
-          {
-            binPath: path.join(heroicWineRoot, sub, 'Contents/Resources/wine/bin/wine64'),
-            name: 'Open-Source Wine (Heroic)',
-          },
-          {
-            binPath: path.join(heroicWineRoot, sub, 'Contents/Resources/wine/bin/wine'),
-            name: 'Open-Source Wine (Heroic)',
-          },
-          {
-            binPath: path.join(heroicWineRoot, sub, 'bin/wine'),
-            name: 'Open-Source Wine (Heroic)',
-          }
-        );
+            retired: /wine[-_\s]*crossover/i.test(sub),
+            sourceRank: rankHeroicWineDir(sub),
+            versionInfo: extractRunnerVersionInfo('wine', resolvedSubBin, options),
+          });
+        }
       }
     } catch {}
   }
 
-  wineEntryCandidates.push(
-    { binPath: path.join(homedir, 'bin/wine64'), name: 'Open-Source Wine (wine64)' },
-    { binPath: path.join(homedir, 'bin/wine'), name: 'Open-Source Wine (wine)' }
-  );
-
-  if (!isIsolatedTest) {
-    wineEntryCandidates.push(
-      { binPath: '/opt/homebrew/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)' },
-      { binPath: '/usr/local/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)' },
-      { binPath: '/opt/homebrew/bin/wine', name: 'Open-Source Wine (Homebrew wine)' },
-      { binPath: '/usr/local/bin/wine', name: 'Open-Source Wine (Homebrew wine)' }
-    );
+  // Standalone community Wine managers on macOS (Whisky, Sikarugir, Kegworks, Mythic)
+  for (const whiskyBin of [
+    path.join(homedir, 'Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64'),
+    path.join(homedir, 'Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine'),
+  ]) {
+    if (fs.existsSync(whiskyBin)) {
+      discoveredWineEntries.push({
+        binPath: whiskyBin,
+        name: 'Open-Source Wine (Whisky)',
+        retired: false,
+        sourceRank: 350,
+        versionInfo: extractRunnerVersionInfo('wine', whiskyBin, options),
+      });
+      break;
+    }
   }
 
-  const foundWineEntry = wineEntryCandidates.find((entry) => fs.existsSync(entry.binPath));
+  for (const [engineDirRel, engineLabel, engineRank] of /** @type {Array<[string, string, number]>} */ ([
+    ['Library/Application Support/Sikarugir/Engines', 'Open-Source Wine (Sikarugir)', 340],
+    ['Library/Application Support/Kegworks/Engines', 'Open-Source Wine (Kegworks)', 330],
+  ])) {
+    const enginesRoot = path.join(homedir, engineDirRel);
+    if (fs.existsSync(enginesRoot)) {
+      try {
+        const engineDirs = fs
+          .readdirSync(enginesRoot)
+          .filter((sub) => !sub.startsWith('.'));
+        for (const sub of engineDirs) {
+          const engBin = [
+            path.join(enginesRoot, sub, 'wswine.bundle/bin/wine64'),
+            path.join(enginesRoot, sub, 'wswine.bundle/bin/wine'),
+          ].find((b) => fs.existsSync(b));
+          if (engBin) {
+            discoveredWineEntries.push({
+              binPath: engBin,
+              name: engineLabel,
+              retired: /wine[-_\s]*crossover/i.test(sub),
+              sourceRank: engineRank,
+              versionInfo: extractRunnerVersionInfo('wine', engBin, options),
+            });
+          }
+        }
+      } catch {}
+    }
+  }
+
+  for (const mythicBin of [
+    path.join(homedir, 'Library/Application Support/Mythic/Libraries/Wine/bin/wine64'),
+    path.join(homedir, 'Library/Application Support/Mythic/Libraries/Wine/bin/wine'),
+  ]) {
+    if (fs.existsSync(mythicBin)) {
+      discoveredWineEntries.push({
+        binPath: mythicBin,
+        name: 'Open-Source Wine (Mythic)',
+        retired: false,
+        sourceRank: 320,
+        versionInfo: extractRunnerVersionInfo('wine', mythicBin, options),
+      });
+      break;
+    }
+  }
+
+  /** @type {Array<{ binPath: string, name: string, sourceRank: number }>} */
+  const cliWineCandidates = [
+    { binPath: path.join(homedir, 'bin/wine64'), name: 'Open-Source Wine (wine64)', sourceRank: 205 },
+    { binPath: path.join(homedir, 'bin/wine'), name: 'Open-Source Wine (wine)', sourceRank: 204 },
+  ];
+  if (!isIsolatedTest) {
+    cliWineCandidates.push(
+      { binPath: '/opt/homebrew/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)', sourceRank: 203 },
+      { binPath: '/usr/local/bin/wine64', name: 'Open-Source Wine (Homebrew wine64)', sourceRank: 202 },
+      { binPath: '/opt/homebrew/bin/wine', name: 'Open-Source Wine (Homebrew wine)', sourceRank: 201 },
+      { binPath: '/usr/local/bin/wine', name: 'Open-Source Wine (Homebrew wine)', sourceRank: 200 }
+    );
+  }
+  for (const cliItem of cliWineCandidates) {
+    if (fs.existsSync(cliItem.binPath)) {
+      discoveredWineEntries.push({
+        binPath: cliItem.binPath,
+        name: cliItem.name,
+        retired: /wine[-_\s]*crossover/i.test(cliItem.binPath),
+        sourceRank: cliItem.sourceRank,
+        versionInfo: extractRunnerVersionInfo('wine', cliItem.binPath, options),
+      });
+    }
+  }
+
+  discoveredWineEntries.sort((a, b) => {
+    if (!preferLegacyGlWine && a.retired !== b.retired) {
+      return a.retired ? 1 : -1;
+    }
+    if (preferLegacyGlWine && a.retired !== b.retired) {
+      return a.retired ? -1 : 1;
+    }
+    if (isCandidateNewerVersion(a.versionInfo, b.versionInfo)) return 1;
+    if (isCandidateNewerVersion(b.versionInfo, a.versionInfo)) return -1;
+    if (b.sourceRank !== a.sourceRank) return b.sourceRank - a.sourceRank;
+    return compareRunnerVersions(path.basename(b.binPath), path.basename(a.binPath));
+  });
+
+  const foundWineEntry = discoveredWineEntries[0];
+  const foundWineCrossoverFallback = discoveredWineEntries.find((entry) => entry.retired);
   if (foundWineEntry && !addedTypes.has('wine')) {
     addedTypes.add('wine');
     const defaultPrefix = path.join(homedir, '.wine');
-    const versionInfo = extractRunnerVersionInfo('wine', foundWineEntry.binPath, options);
+    const versionInfo = foundWineEntry.versionInfo;
     layers.push({
       id: 'wine',
       type: 'wine',
       name: foundWineEntry.name,
       binaryPath: foundWineEntry.binPath,
+      ...(foundWineCrossoverFallback
+        ? { legacy32BitOpenGlBinaryPath: foundWineCrossoverFallback.binPath }
+        : {}),
       appPath: versionInfo.appPath,
       version: versionInfo.version,
       buildVersion: versionInfo.buildVersion,
       displayVersion: versionInfo.displayVersion,
+      ...layerHostDlssCaps,
       bottlesDir: fs.existsSync(defaultPrefix) ? defaultPrefix : undefined,
       availableBottles: [],
     });
   }
 
   const hasSharedPrefix =
-    fs.existsSync(path.join(homedir, 'Games/Heroic/Prefixes/default')) ||
-    fs.existsSync(path.join(homedir, 'Games/OneLauncher/Prefixes/default/drive_c'));
+    fs.existsSync(path.join(homedir, 'Games/OneLauncher/Prefixes/default/drive_c')) ||
+    fs.existsSync(path.join(homedir, 'Games/OneLauncher/Prefixes/default/system.reg'));
 
   const isLayerReady = (/** @type {any} */ layer) => {
     if (Array.isArray(layer.availableBottles) && layer.availableBottles.length > 0) {
@@ -2995,6 +3607,227 @@ function detectCompatibilityLayers(/** @type {any} */ options = {}) {
   return layers;
 }
 
+/**
+ * Determine whether an installed compatibility runner binary or `.app` bundle is managed inside
+ * Homebrew (`Caskroom` or `Cellar`).
+ *
+ * @param {any} layer
+ * @returns {boolean}
+ */
+function isHomebrewManagedLayer(layer) {
+  if (!layer) return false;
+  for (const rawPath of [layer.binaryPath, layer.appPath]) {
+    if (!rawPath || typeof rawPath !== 'string') continue;
+    let norm = rawPath.replace(/\\/g, '/');
+    if (/\/(?:Caskroom|Cellar)\//i.test(norm) || /^\/(?:opt\/homebrew|usr\/local)\/bin\//i.test(norm)) {
+      return true;
+    }
+    try {
+      if (fs.existsSync(rawPath)) {
+        norm = fs.realpathSync(rawPath).replace(/\\/g, '/');
+        if (/\/(?:Caskroom|Cellar)\//i.test(norm)) {
+          return true;
+        }
+      }
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Detect whether a compatibility runner layer belongs to an external third-party manager
+ * (`Heroic`, or standalone managers `(Whisky, Sikarugir, Kegworks, Mythic)`).
+ *
+ * @param {any} layer
+ * @returns {string | null}
+ */
+function getExternalManagerForLayer(layer) {
+  if (!layer) return null;
+  const combined = `${layer.binaryPath || ''} ${layer.appPath || ''} ${layer.name || ''}`.replace(
+    /\\/g,
+    '/'
+  );
+  if (/\/heroic\/tools\//i.test(combined) || /\(Heroic\)/i.test(combined)) {
+    return 'Heroic';
+  }
+  if (/Whisky/i.test(combined)) return 'Whisky';
+  if (
+    combined.includes('Library/Application Support/Kegworks/Engines') ||
+    combined.includes('Open-Source Wine (Kegworks)')
+  ) {
+    return 'Sikarugir';
+  }
+  if (/Sikarugir/i.test(combined)) return 'Sikarugir';
+  if (/Mythic/i.test(combined)) return 'Mythic';
+  return null;
+}
+
+/** @type {Set<(event: any) => void>} */
+const compatRunnerProgressListeners = new Set();
+
+/** @type {Map<string, { operation: 'install' | 'update', controller: AbortController, promise: Promise<any> }>} */
+const activeCompatRunnerOps = new Map();
+
+/**
+ * Subscribe to real-time compatibility runner install/update progress events.
+ *
+ * @param {(event: any) => void} listener
+ * @returns {() => boolean}
+ */
+function onCompatibilityRunnerProgress(listener) {
+  if (typeof listener === 'function') {
+    compatRunnerProgressListeners.add(listener);
+  }
+  return () => compatRunnerProgressListeners.delete(listener);
+}
+
+/**
+ * Emit a compatibility runner progress event to in-process listeners, `options.onRunnerProgress`,
+ * and all open Electron `BrowserWindow` instances (`'launcher:compat-runner-progress'`).
+ *
+ * @param {Record<string, any>} event
+ * @param {Record<string, any>} [options]
+ */
+function emitCompatibilityRunnerProgress(event, options = {}) {
+  if (!event || typeof event !== 'object') return;
+  const normalized = {
+    runnerType: event.runnerType,
+    operation: event.operation === 'update' ? 'update' : 'install',
+    phase: event.phase || 'probing',
+    progressPercent:
+      typeof event.progressPercent === 'number' ? event.progressPercent : null,
+    ...(typeof event.bytesDownloaded === 'number'
+      ? { bytesDownloaded: event.bytesDownloaded }
+      : {}),
+    ...(typeof event.totalBytes === 'number' ? { totalBytes: event.totalBytes } : {}),
+    message: String(event.message || ''),
+    ...(event.error ? { error: String(event.error) } : {}),
+    updatedAt: event.updatedAt || new Date().toISOString(),
+  };
+
+  for (const listener of compatRunnerProgressListeners) {
+    try {
+      listener(normalized);
+    } catch {}
+  }
+
+  if (typeof options.onRunnerProgress === 'function') {
+    try {
+      options.onRunnerProgress(normalized);
+    } catch {}
+  }
+
+  if (options._skipBroadcastCompatRunnerIpc !== true) {
+    try {
+      /** @type {Set<any>} */
+      const targetWindows = new Set();
+      const electronMod = getElectron();
+      const BrowserWindow = electronMod?.BrowserWindow;
+      if (BrowserWindow && typeof BrowserWindow.getAllWindows === 'function') {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (win) targetWindows.add(win);
+        }
+      }
+      if (typeof getMainWindow === 'function') {
+        const mainWin = getMainWindow();
+        if (mainWin) targetWindows.add(mainWin);
+      }
+      for (const win of targetWindows) {
+        if (
+          win &&
+          (typeof win.isDestroyed !== 'function' || !win.isDestroyed()) &&
+          win.webContents &&
+          (typeof win.webContents.isDestroyed !== 'function' || !win.webContents.isDestroyed()) &&
+          typeof win.webContents.send === 'function'
+        ) {
+          win.webContents.send('launcher:compat-runner-progress', normalized);
+        }
+      }
+    } catch {}
+  }
+}
+
+/**
+ * Cancel an active background install or update operation for `runnerType`.
+ *
+ * @param {string} runnerType
+ * @returns {{ success: boolean, cancelled: boolean }}
+ */
+function cancelCompatibilityLayerOperation(runnerType) {
+  const cleanRunnerType = String(runnerType || '')
+    .trim()
+    .toLowerCase();
+  if (!cleanRunnerType) {
+    return { success: false, cancelled: false };
+  }
+  const activeEntry = activeCompatRunnerOps.get(cleanRunnerType);
+  if (!activeEntry) {
+    return { success: true, cancelled: false };
+  }
+  try {
+    activeEntry.controller.abort();
+  } catch {}
+  emitCompatibilityRunnerProgress({
+    runnerType: cleanRunnerType,
+    operation: activeEntry.operation,
+    phase: 'cancelled',
+    progressPercent: null,
+    message: 'Compatibility runner operation cancelled.',
+  });
+  return { success: true, cancelled: true };
+}
+
+/**
+ * Open a native macOS file picker restricted to runner installer archives (`.zip`, `.dmg`, `.tar.xz`, `.txz`).
+ *
+ * @param {string} [defaultPath]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string | null>}
+ */
+async function selectRunnerArchiveDialog(defaultPath, options = {}) {
+  /** @type {Record<string, any>} */
+  const dialogOptions = {
+    title: 'Select Compatibility Runner Installer Archive',
+    buttonLabel: 'Select Archive',
+    properties: ['openFile'],
+    filters: [
+      {
+        name: 'Runner Installer Archive',
+        extensions: ['zip', 'dmg', 'xz', 'txz'],
+      },
+    ],
+  };
+  if (typeof defaultPath === 'string' && defaultPath.trim() && !defaultPath.includes('\0')) {
+    dialogOptions.defaultPath = toLocalFsPath(defaultPath.trim());
+  }
+
+  if (typeof options.showOpenDialogFn === 'function') {
+    const mockRes = await options.showOpenDialogFn(dialogOptions);
+    if (!mockRes || mockRes.canceled || !Array.isArray(mockRes.filePaths) || !mockRes.filePaths[0]) {
+      return null;
+    }
+    return String(mockRes.filePaths[0]);
+  }
+
+  const electronMod = getElectron();
+  const dialog = electronMod?.dialog;
+  if (!dialog || typeof dialog.showOpenDialog !== 'function') {
+    return null;
+  }
+  const BrowserWindow = electronMod?.BrowserWindow;
+  const focusedWin =
+    BrowserWindow && typeof BrowserWindow.getFocusedWindow === 'function'
+      ? BrowserWindow.getFocusedWindow()
+      : null;
+  const res = focusedWin
+    ? await dialog.showOpenDialog(focusedWin, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions);
+  if (!res || res.canceled || !Array.isArray(res.filePaths) || !res.filePaths[0]) {
+    return null;
+  }
+  return String(res.filePaths[0]);
+}
+
 async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
   const layers = Array.isArray(options.layers)
     ? options.layers
@@ -3004,12 +3837,93 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
   const defaultDownloadUrls = {
     crossover: 'https://www.codeweavers.com/crossover/download',
     crossover_preview: 'https://www.codeweavers.com/preview/download',
-    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
-    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+    gptk: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+    wine: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
+  };
+
+  const hostArch = String(options?.arch || process.arch || 'arm64');
+  const darwinKernelMajor =
+    options?.darwinKernelMajor !== undefined
+      ? Number(options.darwinKernelMajor)
+      : typeof options?.osRelease === 'string' && options.osRelease.trim()
+        ? Number.parseInt(options.osRelease.trim().split('.')[0] || '0', 10) || 24
+        : process.platform === 'darwin'
+          ? Number.parseInt(String(os.release() || '24.0.0').split('.')[0] || '24', 10) || 24
+          : 24;
+  const isGptkDirectSupported = hostArch === 'arm64' && darwinKernelMajor >= 23;
+
+  const isAllowedCodeWeaversFeedUrl = (/** @type {string} */ rawUrl) => {
+    try {
+      const parsed = new URL(String(rawUrl || '').trim());
+      const host = parsed.hostname.toLowerCase();
+      if (
+        options.allowLoopbackInstallerUrls === true &&
+        (host === '127.0.0.1' || host === 'localhost')
+      ) {
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      }
+      if (parsed.protocol !== 'https:') return false;
+      return (
+        host === 'codeweavers.com' ||
+        host === 'www.codeweavers.com' ||
+        host === 'media.codeweavers.com'
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const parseSparkleEnclosureFeed = (
+    /** @type {string} */ xml,
+    /** @type {string} */ fallbackDownloadUrl
+  ) => {
+    const encMatch = xml.match(/<enclosure\b([^>]*)>/i);
+    if (!encMatch) return null;
+    const attrs = encMatch[1];
+    const verMatch = attrs.match(/\bsparkle:version=["']([^"']+)["']/i);
+    const shortMatch = attrs.match(/\bsparkle:shortVersionString=["']([^"']+)["']/i);
+    const urlMatch = attrs.match(/\burl=["']([^"']+)["']/i);
+    const lenMatch = attrs.match(/\blength=["'](\d+)["']/i);
+    const edSigMatch = attrs.match(/\bsparkle:edSignature=["']([^"']+)["']/i);
+    const rawBundleVer = verMatch ? verMatch[1].trim() : '';
+    const rawShortVer = shortMatch ? shortMatch[1].trim() : '';
+    const parsedLength = lenMatch ? Number.parseInt(lenMatch[1], 10) : 0;
+    const semverMatch = rawBundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
+    const isPreviewDateShortVer = /^\d{8}$/.test(rawShortVer) && Boolean(semverMatch);
+    const latestVersion = semverMatch
+      ? semverMatch[1]
+      : rawShortVer || rawBundleVer || undefined;
+    const latestBuildVersion = isPreviewDateShortVer
+      ? rawBundleVer || rawShortVer
+      : semverMatch && semverMatch[2]
+        ? `Build ${semverMatch[2]}`
+        : undefined;
+    const latestDisplayVersion = isPreviewDateShortVer
+      ? `${semverMatch?.[1]} (Preview ${rawShortVer})`
+      : latestVersion && latestBuildVersion
+        ? `${latestVersion} (${latestBuildVersion})`
+        : latestVersion;
+    if (!latestVersion) return null;
+    const candidateUrl = urlMatch ? urlMatch[1].trim() : '';
+    const safeUrl =
+      candidateUrl && isAllowedCodeWeaversFeedUrl(candidateUrl)
+        ? candidateUrl
+        : fallbackDownloadUrl;
+    return {
+      latestVersion,
+      rawBundleVersion: rawBundleVer || undefined,
+      latestBuildVersion,
+      latestDisplayVersion,
+      downloadUrl: safeUrl,
+      hasDirectEnclosureUrl: Boolean(candidateUrl && isAllowedCodeWeaversFeedUrl(candidateUrl)),
+      ...(parsedLength > 0 ? { estimatedDownloadBytes: parsedLength } : {}),
+      ...(edSigMatch ? { sparkleEdSignature: edSigMatch[1].trim() } : {}),
+    };
   };
 
   /** @type {Record<string, any>} */
   const feedMap = {};
+  const defaultTimeoutMs = Number(options.timeoutMs || 4500);
   if (options.mockFeeds && typeof options.mockFeeds === 'object') {
     for (const rt of runnerTypes) {
       if (options.mockFeeds[rt]) {
@@ -3018,9 +3932,10 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
     }
   } else if (
     typeof options.httpGetText === 'function' ||
+    typeof options.fetchFn === 'function' ||
     (!options.homedir && !options.skipNetwork)
   ) {
-    const fetchWithTimeout = async (/** @type {string} */ url, timeoutMs = 4500) => {
+    const fetchWithTimeout = async (/** @type {string} */ url, timeoutMs = defaultTimeoutMs) => {
       if (typeof options.httpGetText === 'function') {
         try {
           return await options.httpGetText(url);
@@ -3028,14 +3943,18 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
           return null;
         }
       }
+      const fetchImpl =
+        typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch;
+      if (typeof fetchImpl !== 'function') return null;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
+      if (typeof timer?.unref === 'function') timer.unref();
       try {
-        const res = await fetch(url, {
+        const res = await fetchImpl(url, {
           signal: controller.signal,
           headers: { 'User-Agent': 'OneGameLauncher/1.0' },
         });
-        if (!res.ok) return null;
+        if (!res || !res.ok) return null;
         return await res.text();
       } catch {
         return null;
@@ -3045,40 +3964,43 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
     };
 
     const wineLayer = layers.find((/** @type {any} */ l) => l.type === 'wine');
+    const gptkLayer = layers.find((/** @type {any} */ l) => l.type === 'gptk');
+    const previewLayer = layers.find((/** @type {any} */ l) => l.type === 'crossover_preview');
 
     await Promise.all([
       (async () => {
         const xml = await fetchWithTimeout('https://www.codeweavers.com/xml/versions/cxmac.xml');
         if (xml) {
-          const encMatch = xml.match(/<enclosure\s+([^>]+)>/i);
-          if (encMatch) {
-            const attrs = encMatch[1];
-            const verMatch = attrs.match(/sparkle:version="([^"]+)"/i);
-            const shortMatch = attrs.match(/sparkle:shortVersionString="([^"]+)"/i);
-            const urlMatch = attrs.match(/url="([^"]+)"/i);
-            const rawBundleVer = verMatch ? verMatch[1].trim() : '';
-            const rawShortVer = shortMatch ? shortMatch[1].trim() : '';
-            const semverMatch = rawBundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
-            const latestVersion = semverMatch
-              ? semverMatch[1]
-              : rawShortVer || rawBundleVer || undefined;
-            const latestBuildVersion =
-              semverMatch && semverMatch[2] ? `Build ${semverMatch[2]}` : undefined;
-            const latestDisplayVersion =
-              latestVersion && latestBuildVersion
-                ? `${latestVersion} (${latestBuildVersion})`
-                : latestVersion;
-            if (latestVersion) {
-              feedMap.crossover = {
-                latestVersion,
-                rawBundleVersion: rawBundleVer || undefined,
-                latestBuildVersion,
-                latestDisplayVersion,
-                downloadUrl: urlMatch ? urlMatch[1].trim() : defaultDownloadUrls.crossover,
-                updateMethod: 'direct_download',
-              };
-            }
+          const parsed = parseSparkleEnclosureFeed(xml, defaultDownloadUrls.crossover);
+          if (parsed) {
+            const { hasDirectEnclosureUrl: _unused, ...rest } = parsed;
+            feedMap.crossover = {
+              ...rest,
+              updateMethod: 'direct_download',
+            };
           }
+        }
+      })(),
+      (async () => {
+        if (!previewLayer?.appPath) return;
+        const plistDict = parsePlistStringValues(
+          path.join(previewLayer.appPath, 'Contents/Info.plist')
+        );
+        const rawSuFeedUrl = String(options.previewFeedUrl || plistDict.SUFeedURL || '').trim();
+        const rawSuPubKey = String(plistDict.SUPublicEDKey || '').trim();
+        if (!rawSuFeedUrl || !isAllowedCodeWeaversFeedUrl(rawSuFeedUrl)) return;
+        const xml = await fetchWithTimeout(rawSuFeedUrl);
+        if (!xml) return;
+        const parsed = parseSparkleEnclosureFeed(xml, defaultDownloadUrls.crossover_preview);
+        if (parsed && parsed.hasDirectEnclosureUrl) {
+          const { hasDirectEnclosureUrl: _unused, ...rest } = parsed;
+          feedMap.crossover_preview = {
+            ...rest,
+            feedUrl: rawSuFeedUrl,
+            ...(rawSuPubKey ? { sparklePublicEdKey: rawSuPubKey } : {}),
+            canAutoUpdate: true,
+            updateMethod: 'direct_download',
+          };
         }
       })(),
       (async () => {
@@ -3092,12 +4014,32 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
             const m = tag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
             if (m) {
               const rawVer = m[1];
+              const assets = Array.isArray(json.assets) ? json.assets : [];
+              const archiveAsset =
+                assets.find((/** @type {any} */ a) =>
+                  /\.(?:tar\.xz|txz)$/i.test(String(a?.name || ''))
+                ) ||
+                assets.find((/** @type {any} */ a) => /\.dmg$/i.test(String(a?.name || '')));
+              const assetBytes =
+                typeof archiveAsset?.size === 'number' && archiveAsset.size > 0
+                  ? archiveAsset.size
+                  : undefined;
+              const externalGptkMgr = getExternalManagerForLayer(gptkLayer);
               feedMap.gptk = {
                 latestVersion: rawVer.replace(/[-_]/g, '.'),
                 latestBuildVersion: rawVer,
                 latestDisplayVersion: rawVer,
-                downloadUrl: json.html_url || defaultDownloadUrls.gptk,
-                updateMethod: 'homebrew_cask',
+                downloadUrl:
+                  (isGptkDirectSupported && archiveAsset?.browser_download_url) ||
+                  json.html_url ||
+                  defaultDownloadUrls.gptk,
+                ...(assetBytes ? { estimatedDownloadBytes: assetBytes } : {}),
+                updateMethod:
+                  !externalGptkMgr && isHomebrewManagedLayer(gptkLayer)
+                    ? 'homebrew_cask'
+                    : isGptkDirectSupported
+                      ? 'direct_download'
+                      : 'vendor_portal',
               };
             }
           } catch {}
@@ -3107,66 +4049,145 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
         const wineBinStr = String(wineLayer?.binaryPath || '').replace(/\\/g, '/');
         const wineAppStr = String(wineLayer?.appPath || '').replace(/\\/g, '/');
         const wineNameStr = String(wineLayer?.name || '');
+        const wineCombinedStr = `${wineNameStr} ${wineAppStr} ${wineBinStr}`;
 
         const isRetiredWineCrossOver =
-          Boolean(wineLayer) &&
-          (/wine[- ]crossover/i.test(wineBinStr) ||
-            /wine[- ]crossover/i.test(wineAppStr) ||
-            /wine[- ]crossover/i.test(wineNameStr));
+          Boolean(wineLayer) && /wine[-_\s]*crossover/i.test(wineCombinedStr);
         if (isRetiredWineCrossOver) {
           return;
         }
 
-        const isHeroicWineStaging =
-          Boolean(wineLayer) && /\/heroic\/tools\/wine\/.*staging/i.test(wineBinStr);
-        if (isHeroicWineStaging) {
-          const txt = await fetchWithTimeout(
-            'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/latest'
-          );
-          if (txt) {
-            try {
-              const json = JSON.parse(txt);
-              const tag = String(json.tag_name || json.name || '');
-              const m = tag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
-              if (m) {
-                const rawVer = m[1];
-                feedMap.wine = {
+        const externalWineMgr = getExternalManagerForLayer(wineLayer);
+        const explicitWineChan = String(options.wineChannel || '')
+          .trim()
+          .toLowerCase();
+        const wineChannel =
+          explicitWineChan === 'staging' ||
+          explicitWineChan === 'devel' ||
+          explicitWineChan === 'stable'
+            ? explicitWineChan
+            : /wine[-_\s]*staging/i.test(wineCombinedStr)
+              ? 'staging'
+              : /wine[-_\s]*devel/i.test(wineCombinedStr)
+                ? 'devel'
+                : 'stable';
+
+        const caskFeedUrl =
+          wineChannel === 'staging'
+            ? 'https://formulae.brew.sh/api/cask/wine@staging.json'
+            : wineChannel === 'devel'
+              ? 'https://formulae.brew.sh/api/cask/wine@devel.json'
+              : 'https://formulae.brew.sh/api/cask/wine-stable.json';
+        const assetNameRe =
+          wineChannel === 'staging'
+            ? /wine[-_]?staging.*\.(?:tar\.xz|txz|dmg)$/i
+            : wineChannel === 'devel'
+              ? /wine[-_]?devel.*\.(?:tar\.xz|txz|dmg)$/i
+              : /wine[-_]?stable.*\.(?:tar\.xz|txz|dmg)$/i;
+
+        const [caskTxt, ghListTxt] = await Promise.all([
+          fetchWithTimeout(caskFeedUrl),
+          fetchWithTimeout(
+            'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases?per_page=20'
+          ),
+        ]);
+
+        /** @type {Record<string, any> | null} */
+        let caskCandidate = null;
+        if (caskTxt) {
+          try {
+            const json = JSON.parse(caskTxt);
+            if (json && json.version) {
+              const rawVer = String(json.version).split(',')[0].trim();
+              if (rawVer) {
+                caskCandidate = {
                   latestVersion: rawVer.replace(/[-_]/g, '.'),
                   latestBuildVersion: rawVer,
                   latestDisplayVersion: rawVer,
-                  downloadUrl:
-                    json.html_url || 'https://github.com/Gcenx/macOS_Wine_builds/releases',
-                  updateMethod: 'vendor_portal',
+                  downloadUrl: json.url || defaultDownloadUrls.wine,
                 };
               }
-            } catch {}
-          }
-          return;
-        }
-
-        const isHomebrewWineStaging =
-          Boolean(wineLayer) &&
-          (/Wine Staging\.app/i.test(wineBinStr) ||
-            /Wine Staging\.app/i.test(wineAppStr) ||
-            /Wine Staging/i.test(wineNameStr));
-        const caskFeedUrl = isHomebrewWineStaging
-          ? 'https://formulae.brew.sh/api/cask/wine@staging.json'
-          : 'https://formulae.brew.sh/api/cask/wine-stable.json';
-        const txt = await fetchWithTimeout(caskFeedUrl);
-        if (txt) {
-          try {
-            const json = JSON.parse(txt);
-            if (json && json.version) {
-              const rawVer = String(json.version);
-              feedMap.wine = {
-                latestVersion: rawVer.replace(/[-_]/g, '.'),
-                latestBuildVersion: rawVer,
-                latestDisplayVersion: rawVer,
-                downloadUrl: json.url || defaultDownloadUrls.wine,
-                updateMethod: 'homebrew_cask',
-              };
             }
           } catch {}
+        }
+
+        /** @type {Record<string, any> | null} */
+        let ghCandidate = null;
+        const parseGhReleaseItem = (/** @type {any} */ rel, allowTagFallback = false) => {
+          if (!rel || rel.draft) return null;
+          const assets = Array.isArray(rel.assets) ? rel.assets : [];
+          const matchedAsset = assets.find((/** @type {any} */ a) =>
+            assetNameRe.test(String(a?.name || ''))
+          );
+          if (!matchedAsset && !allowTagFallback) return null;
+          const tag = String(rel.tag_name || rel.name || matchedAsset?.name || '');
+          const m = tag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
+          const rawVer = m ? m[1] : tag.replace(/^v/i, '').trim();
+          if (!rawVer) return null;
+          return {
+            latestVersion: rawVer.replace(/[-_]/g, '.'),
+            latestBuildVersion: rawVer,
+            latestDisplayVersion: rawVer,
+            downloadUrl:
+              matchedAsset?.browser_download_url || rel.html_url || defaultDownloadUrls.wine,
+            ...(typeof matchedAsset?.size === 'number' && matchedAsset.size > 0
+              ? { estimatedDownloadBytes: matchedAsset.size }
+              : {}),
+          };
+        };
+
+        if (ghListTxt) {
+          try {
+            const rels = JSON.parse(ghListTxt);
+            const relArray = Array.isArray(rels) ? rels : [rels];
+            for (const rel of relArray) {
+              const parsedRel = parseGhReleaseItem(rel, false);
+              if (parsedRel) {
+                ghCandidate = parsedRel;
+                break;
+              }
+            }
+          } catch {}
+        }
+
+        if (!ghCandidate) {
+          const ghLatestTxt = await fetchWithTimeout(
+            'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/latest'
+          );
+          if (ghLatestTxt) {
+            try {
+              const latestObj = JSON.parse(ghLatestTxt);
+              const hasAssetsArray =
+                Array.isArray(latestObj?.assets) && latestObj.assets.length > 0;
+              ghCandidate = parseGhReleaseItem(latestObj, !hasAssetsArray);
+            } catch {}
+          }
+        }
+
+        const chosenWineFeed = (() => {
+          if (caskCandidate && ghCandidate) {
+            const cmp = compareRunnerVersions(
+              caskCandidate.latestVersion,
+              ghCandidate.latestVersion
+            );
+            if (cmp < 0) return ghCandidate;
+            if (cmp > 0) return caskCandidate;
+            return {
+              ...caskCandidate,
+              ...ghCandidate,
+            };
+          }
+          return ghCandidate || caskCandidate;
+        })();
+
+        if (chosenWineFeed) {
+          feedMap.wine = {
+            ...chosenWineFeed,
+            updateMethod:
+              !externalWineMgr && isHomebrewManagedLayer(wineLayer)
+                ? 'homebrew_cask'
+                : 'direct_download',
+          };
         }
       })(),
     ]);
@@ -3180,6 +4201,13 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
     const layer = layers.find((/** @type {any} */ l) => l.type === runnerType);
     const feed = feedMap[runnerType] || {};
     const stableFeed = feedMap.crossover;
+    const externalMgr = getExternalManagerForLayer(layer);
+    const isRetiredWineCrossOver =
+      runnerType === 'wine' &&
+      Boolean(layer) &&
+      /wine[-_\s]*crossover/i.test(
+        `${layer?.binaryPath || ''} ${layer?.appPath || ''} ${layer?.name || ''}`
+      );
     const stableSurpassesPreview = Boolean(
       runnerType === 'crossover_preview' &&
         layer &&
@@ -3212,7 +4240,7 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
     }
 
     let updateAvailable = false;
-    if (layer && layer.version) {
+    if (layer && layer.version && !isRetiredWineCrossOver) {
       if (feed.latestVersion) {
         if (feed.rawBundleVersion && layer.buildVersion) {
           updateAvailable =
@@ -3235,19 +4263,70 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
       }
     }
 
-    const updateMethod =
-      feed.updateMethod ||
-      (runnerType === 'crossover_preview'
-        ? 'vendor_portal'
-        : runnerType === 'crossover'
-          ? 'direct_download'
-          : 'homebrew_cask');
+    /** @type {'homebrew_cask' | 'direct_download' | 'vendor_portal' | 'external_manager'} */
+    let updateMethod;
+    let canAutoUpdate = true;
+
+    if (isRetiredWineCrossOver) {
+      updateMethod = 'vendor_portal';
+      canAutoUpdate = false;
+    } else if (runnerType === 'crossover_preview') {
+      if (
+        feed.canAutoUpdate === true ||
+        feed.updateMethod === 'direct_download' ||
+        stableSurpassesPreview ||
+        (Boolean(layer) && updateAvailable)
+      ) {
+        updateMethod = 'direct_download';
+        canAutoUpdate = true;
+      } else {
+        updateMethod = feed.updateMethod || 'vendor_portal';
+        canAutoUpdate = Boolean(feed.canAutoUpdate === true);
+      }
+    } else if (runnerType === 'gptk') {
+      if (!externalMgr && isHomebrewManagedLayer(layer)) {
+        updateMethod = 'homebrew_cask';
+        canAutoUpdate = true;
+      } else if (isGptkDirectSupported) {
+        updateMethod = 'direct_download';
+        canAutoUpdate = true;
+      } else {
+        updateMethod = 'vendor_portal';
+        canAutoUpdate = false;
+      }
+    } else if (runnerType === 'crossover') {
+      updateMethod = 'direct_download';
+      canAutoUpdate = true;
+    } else {
+      updateMethod =
+        !externalMgr && isHomebrewManagedLayer(layer) ? 'homebrew_cask' : 'direct_download';
+      canAutoUpdate = true;
+    }
 
     const statusMessage = !layer
       ? 'Not installed'
-      : updateAvailable
-        ? `Update available: ${latestDisplayVersion || latestVersion}`
-        : `Up to date (${layer.displayVersion || layer.version || 'Installed'})`;
+      : isRetiredWineCrossOver
+        ? `Retired Wine-CrossOver build (${layer.displayVersion || layer.version || 'Installed'})`
+        : updateAvailable
+          ? `Update available: ${latestDisplayVersion || latestVersion}`
+          : `Up to date (${layer.displayVersion || layer.version || 'Installed'})`;
+
+    const downloadUrl =
+      runnerType === 'crossover_preview' &&
+      !feed.canAutoUpdate &&
+      stableSurpassesPreview &&
+      stableFeed?.downloadUrl
+        ? stableFeed.downloadUrl
+        : feed.downloadUrl || defaultDownloadUrls[runnerType];
+    const estimatedDownloadBytes =
+      runnerType === 'crossover_preview' &&
+      !feed.canAutoUpdate &&
+      stableSurpassesPreview &&
+      typeof stableFeed?.estimatedDownloadBytes === 'number'
+        ? stableFeed.estimatedDownloadBytes
+        : typeof feed.estimatedDownloadBytes === 'number'
+          ? feed.estimatedDownloadBytes
+          : undefined;
 
     results[runnerType] = {
       runnerType,
@@ -3259,9 +4338,21 @@ async function checkCompatibilityLayerUpdates(/** @type {any} */ options = {}) {
       latestBuildVersion,
       latestDisplayVersion,
       updateAvailable,
-      downloadUrl: feed.downloadUrl || defaultDownloadUrls[runnerType],
-      canAutoUpdate: true,
+      downloadUrl,
+      ...(estimatedDownloadBytes ? { estimatedDownloadBytes } : {}),
+      canAutoUpdate,
       updateMethod,
+      ...(runnerType === 'crossover_preview'
+        ? {
+            stableSurpassesPreview,
+            ...(stableSurpassesPreview && (stableFeed?.latestDisplayVersion || stableFeed?.latestVersion)
+              ? {
+                  stableFallbackVersion:
+                    stableFeed.latestDisplayVersion || stableFeed.latestVersion,
+                }
+              : {}),
+          }
+        : {}),
       statusMessage,
       checkedAt,
     };
@@ -3274,161 +4365,435 @@ async function updateCompatibilityLayer(/** @type {any} */ payload = {}, /** @ty
   const runnerType = String(payload.runnerType || 'crossover')
     .toLowerCase()
     .trim();
-  const homedir = options.homedir || os.homedir();
-  const beforeLayers = detectCompatibilityLayers(options);
-  const beforeLayer = beforeLayers.find((l) => l.type === runnerType);
-  const previousVersion = beforeLayer?.version;
-  const previousBuildVersion = beforeLayer?.buildVersion;
 
-  if (typeof options.mockUpdater === 'function') {
-    const mockRes = (await options.mockUpdater(payload, options)) || {};
+  if (options._bypassSingleFlight !== true && activeCompatRunnerOps.has(runnerType)) {
+    const existingOp = activeCompatRunnerOps.get(runnerType);
+    if (existingOp) {
+      return existingOp.promise;
+    }
+  }
+
+  const controller = new AbortController();
+  if (options.signal && typeof options.signal.addEventListener === 'function') {
+    if (options.signal.aborted) controller.abort();
+    else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+
+  const runPromise = (async () => {
+    const homedir = options.homedir || os.homedir();
+    const beforeLayers = detectCompatibilityLayers(options);
+    const beforeLayer = beforeLayers.find((l) => l.type === runnerType);
+    const previousVersion = beforeLayer?.version;
+    const previousBuildVersion = beforeLayer?.buildVersion;
+
+    if (typeof options.mockUpdater === 'function') {
+      const mockRes = (await options.mockUpdater(payload, options)) || {};
+      const detectedLayers = detectCompatibilityLayers(options);
+      const newVersion =
+        mockRes.newVersion || detectedLayers.find((l) => l.type === runnerType)?.version;
+      const updates = await checkCompatibilityLayerUpdates({ ...options, layers: detectedLayers });
+      const updated =
+        mockRes.updated !== undefined
+          ? Boolean(mockRes.updated)
+          : Boolean(newVersion && newVersion !== previousVersion);
+      return {
+        success: mockRes.success !== false,
+        runnerType,
+        updated,
+        previousVersion,
+        newVersion,
+        openedExternalUrl: Boolean(mockRes.openedExternalUrl),
+        message:
+          mockRes.message ||
+          (updated
+            ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
+            : 'Runner update check completed.'),
+        detectedLayers,
+        updateInfo: updates[runnerType],
+      };
+    }
+
+    const {
+      installRunnerDirect,
+      assertRunnerSafeToReplace,
+    } = require('./environmentProvisioner.cjs');
+
+    const effectiveSafetyRunnerType =
+      runnerType === 'crossover_preview' && payload.switchToStableCrossOver === true
+        ? 'crossover'
+        : runnerType;
+    const safetyTargetLayer =
+      beforeLayers.find((l) => l.type === effectiveSafetyRunnerType) || beforeLayer || null;
+    const safetyRes = await assertRunnerSafeToReplace(
+      effectiveSafetyRunnerType,
+      safetyTargetLayer?.appPath || null,
+      safetyTargetLayer,
+      options
+    );
+    if (!safetyRes.ok) {
+      emitCompatibilityRunnerProgress(
+        {
+          runnerType,
+          operation: 'update',
+          phase: 'failed',
+          progressPercent: null,
+          message: safetyRes.error || 'Runner is currently busy.',
+          error: safetyRes.error,
+        },
+        options
+      );
+      return {
+        success: false,
+        runnerType,
+        updated: false,
+        previousVersion,
+        ...(safetyRes.busyCode ? { busyCode: safetyRes.busyCode } : {}),
+        error: safetyRes.error,
+        message: safetyRes.error || 'Runner is currently busy.',
+        detectedLayers: beforeLayers,
+      };
+    }
+
+    /** @type {Record<string, string>} */
+    const defaultUpdateUrls = {
+      crossover: 'https://www.codeweavers.com/crossover/download',
+      crossover_preview: 'https://www.codeweavers.com/preview/download',
+      gptk: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+      wine: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
+    };
+
+    const localArchivePath =
+      typeof payload.archivePath === 'string' && payload.archivePath.trim()
+        ? payload.archivePath.trim()
+        : typeof options.archivePath === 'string' && options.archivePath.trim()
+          ? options.archivePath.trim()
+          : '';
+    const localDmgPath =
+      typeof payload.dmgPath === 'string' && payload.dmgPath.trim()
+        ? payload.dmgPath.trim()
+        : typeof options.dmgPath === 'string' && options.dmgPath.trim()
+          ? options.dmgPath.trim()
+          : '';
+    const hasLocalInstaller = Boolean(localArchivePath || localDmgPath);
+
+    const brewCandidates = [
+      options.brewBinaryPath,
+      path.join(homedir, 'homebrew/bin/brew'),
+      ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
+    ].filter(Boolean);
+    const brewPath = brewCandidates.find((p) => fs.existsSync(p));
+
+    const beforeCombinedStr = `${beforeLayer?.name || ''} ${beforeLayer?.appPath || ''} ${beforeLayer?.binaryPath || ''}`.replace(
+      /\\/g,
+      '/'
+    );
+    const isWineStagingApp = Boolean(beforeLayer && /wine[-_\s]*staging/i.test(beforeCombinedStr));
+    const isWineDevelApp = Boolean(beforeLayer && /wine[-_\s]*devel/i.test(beforeCombinedStr));
+    const externalMgr = getExternalManagerForLayer(beforeLayer);
+
+    /** @type {Record<string, string>} */
+    const caskMap = {
+      crossover: 'crossover',
+      wine: isWineStagingApp ? 'wine@staging' : isWineDevelApp ? 'wine@devel' : 'wine-stable',
+      gptk: 'game-porting-toolkit',
+    };
+    const caskName = caskMap[runnerType];
+    let updatedViaBrew = false;
+    let usedMockBrewHook = false;
+
+    const shouldAttemptHomebrewUpdate =
+      Boolean(caskName) &&
+      !hasLocalInstaller &&
+      payload.switchToStableCrossOver !== true &&
+      !externalMgr &&
+      (typeof options.onExecBrew === 'function' || Boolean(options.brewBinaryPath));
+
+    if (shouldAttemptHomebrewUpdate && typeof options.onExecBrew === 'function') {
+      const args = [
+        'upgrade',
+        '--cask',
+        ...(runnerType === 'wine' ? ['--no-quarantine'] : []),
+        caskName,
+      ];
+      try {
+        emitCompatibilityRunnerProgress(
+          {
+            runnerType,
+            operation: 'update',
+            phase: 'installing',
+            progressPercent: null,
+            message: `Upgrading ${caskName} via Homebrew...`,
+          },
+          options
+        );
+        await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
+        updatedViaBrew = true;
+        usedMockBrewHook = true;
+      } catch {}
+    } else if (shouldAttemptHomebrewUpdate && brewPath) {
+      const args = [
+        'upgrade',
+        '--cask',
+        ...(runnerType === 'wine' ? ['--no-quarantine'] : []),
+        caskName,
+      ];
+      try {
+        const isCaskManaged = await new Promise((resolve) => {
+          execFile(brewPath, ['list', '--cask', caskName], { timeout: 15000 }, (err) => {
+            resolve(!err);
+          });
+        });
+        if (isCaskManaged) {
+          emitCompatibilityRunnerProgress(
+            {
+              runnerType,
+              operation: 'update',
+              phase: 'installing',
+              progressPercent: null,
+              message: `Upgrading ${caskName} via Homebrew...`,
+            },
+            options
+          );
+          await new Promise((resolve, reject) => {
+            execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
+              if (err) reject(err);
+              else resolve({ stdout, stderr });
+            });
+          });
+          updatedViaBrew = true;
+        }
+      } catch {}
+    }
+
+    const hostArch = String(options?.arch || process.arch || 'arm64');
+    const darwinKernelMajor =
+      options?.darwinKernelMajor !== undefined
+        ? Number(options.darwinKernelMajor)
+        : typeof options?.osRelease === 'string' && options.osRelease.trim()
+          ? Number.parseInt(options.osRelease.trim().split('.')[0] || '0', 10) || 24
+          : process.platform === 'darwin'
+            ? Number.parseInt(String(os.release() || '24.0.0').split('.')[0] || '24', 10) || 24
+            : 24;
+
+    const canRunDirectInCurrentEnv =
+      hasLocalInstaller ||
+      typeof options.capturePreviewDownloadFn === 'function' ||
+      options.allowInteractivePreviewCapture === true ||
+      !isTestEnvironment(options) ||
+      options.allowDirectVendorInstall === true ||
+      typeof options.fetchFn === 'function' ||
+      typeof options.mockDirectDownload === 'function';
+
+    const isDirectUpdateCapable =
+      runnerType === 'crossover' ||
+      runnerType === 'wine' ||
+      (runnerType === 'gptk' &&
+        (hasLocalInstaller || (hostArch === 'arm64' && darwinKernelMajor >= 23))) ||
+      (runnerType === 'crossover_preview' &&
+        (hasLocalInstaller ||
+          payload.switchToStableCrossOver === true ||
+          options.skipNetwork !== true));
+
+    if (!updatedViaBrew && canRunDirectInCurrentEnv && isDirectUpdateCapable) {
+      try {
+        const directRes = await installRunnerDirect(runnerType, {
+          ...options,
+          ...(localDmgPath ? { dmgPath: localDmgPath } : {}),
+          ...(localArchivePath ? { archivePath: localArchivePath } : {}),
+          ...(payload.switchToStableCrossOver === true ? { switchToStableCrossOver: true } : {}),
+          existingLayer: safetyTargetLayer,
+          _runnerOperation: 'update',
+          _suppressWizardProgressBroadcast: true,
+          _runnerProgressMeta: { runnerType, operation: 'update' },
+          signal: controller.signal,
+          onRunnerProgress: (/** @type {any} */ evt) =>
+            emitCompatibilityRunnerProgress(evt, {
+              ...options,
+              onRunnerProgress: options.onRunnerProgress,
+            }),
+        });
+
+        const didSwitchToStable =
+          payload.switchToStableCrossOver === true ||
+          Boolean(directRes && directRes.switchedToStableCrossOver);
+        const detectedLayers = detectCompatibilityLayers(options);
+        const targetAfterType =
+          runnerType === 'crossover_preview' && didSwitchToStable
+            ? 'crossover'
+            : runnerType;
+        const afterLayer =
+          detectedLayers.find((l) => l.type === targetAfterType) ||
+          detectedLayers.find((l) => l.type === runnerType);
+        const newVersion = afterLayer?.version || directRes?.version || undefined;
+        const updates = await checkCompatibilityLayerUpdates({
+          ...options,
+          layers: detectedLayers,
+        });
+
+        if (directRes && directRes.openedExternal) {
+          return {
+            success: true,
+            runnerType,
+            updated: false,
+            previousVersion,
+            newVersion,
+            openedExternalUrl: true,
+            message: directRes.message,
+            detectedLayers,
+            updateInfo: updates[runnerType],
+          };
+        }
+
+        const successMsg = didSwitchToStable
+          ? `Successfully installed CrossOver Stable ${newVersion || ''}`.trim() + '.'
+          : `Successfully updated ${afterLayer?.name || runnerType} to ${newVersion || 'latest version'}.`;
+
+        emitCompatibilityRunnerProgress(
+          {
+            runnerType,
+            operation: 'update',
+            phase: 'completed',
+            progressPercent: 100,
+            message: successMsg,
+          },
+          options
+        );
+
+        return {
+          success: true,
+          runnerType,
+          updated: Boolean(directRes && directRes.installed),
+          previousVersion,
+          newVersion,
+          openedExternalUrl: false,
+          message: successMsg,
+          detectedLayers,
+          updateInfo: updates[runnerType],
+        };
+      } catch (err) {
+        const isCancelled =
+          controller.signal.aborted ||
+          (err && typeof err === 'object' && /** @type {any} */ (err).name === 'AbortError');
+        const detectedLayers = detectCompatibilityLayers(options);
+        if (isCancelled) {
+          const cancelMsg = 'Compatibility runner update cancelled.';
+          emitCompatibilityRunnerProgress(
+            {
+              runnerType,
+              operation: 'update',
+              phase: 'cancelled',
+              progressPercent: null,
+              message: cancelMsg,
+            },
+            options
+          );
+          return {
+            success: false,
+            cancelled: true,
+            runnerType,
+            updated: false,
+            previousVersion,
+            message: cancelMsg,
+            detectedLayers,
+          };
+        }
+        if (options.throwOnError === true) {
+          throw err;
+        }
+        const errObj = /** @type {any} */ (err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        emitCompatibilityRunnerProgress(
+          {
+            runnerType,
+            operation: 'update',
+            phase: 'failed',
+            progressPercent: null,
+            message: errMsg,
+            error: errMsg,
+          },
+          options
+        );
+        return {
+          success: false,
+          runnerType,
+          updated: false,
+          previousVersion,
+          ...(errObj?.busyCode ? { busyCode: errObj.busyCode } : {}),
+          error: errMsg,
+          message: errMsg,
+          detectedLayers,
+        };
+      }
+    }
+
     const detectedLayers = detectCompatibilityLayers(options);
-    const newVersion =
-      mockRes.newVersion || detectedLayers.find((l) => l.type === runnerType)?.version;
+    const afterLayer = detectedLayers.find((l) => l.type === runnerType);
+    const newVersion = afterLayer?.version;
+    const newBuildVersion = afterLayer?.buildVersion;
     const updates = await checkCompatibilityLayerUpdates({ ...options, layers: detectedLayers });
-    const updated =
-      mockRes.updated !== undefined
-        ? Boolean(mockRes.updated)
-        : Boolean(newVersion && newVersion !== previousVersion);
+
+    let openedExternalUrl = false;
+    if (!updatedViaBrew) {
+      const targetUrl =
+        updates[runnerType]?.downloadUrl ||
+        defaultUpdateUrls[runnerType] ||
+        defaultUpdateUrls.crossover;
+      await openExternalUri(targetUrl, options);
+      openedExternalUrl = true;
+    }
+
+    const versionChanged = Boolean(
+      (newVersion && newVersion !== previousVersion) ||
+        (newBuildVersion && newBuildVersion !== previousBuildVersion)
+    );
+    const updated = usedMockBrewHook
+      ? Boolean(versionChanged || updatedViaBrew)
+      : versionChanged;
+
+    if (updated) {
+      emitCompatibilityRunnerProgress(
+        {
+          runnerType,
+          operation: 'update',
+          phase: 'completed',
+          progressPercent: 100,
+          message: `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`,
+        },
+        options
+      );
+    }
+
     return {
-      success: mockRes.success !== false,
+      success: true,
       runnerType,
       updated,
       previousVersion,
       newVersion,
-      openedExternalUrl: Boolean(mockRes.openedExternalUrl),
-      message:
-        mockRes.message ||
-        (updated
-          ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
-          : 'Runner update check completed.'),
+      openedExternalUrl,
+      message: updated
+        ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
+        : openedExternalUrl
+          ? 'Opened official update page in your browser. Click "Re-Scan Runners" once installation finishes.'
+          : 'Runner is already up to date.',
       detectedLayers,
       updateInfo: updates[runnerType],
     };
+  })();
+
+  activeCompatRunnerOps.set(runnerType, {
+    operation: 'update',
+    controller,
+    promise: runPromise,
+  });
+
+  try {
+    return await runPromise;
+  } finally {
+    const cur = activeCompatRunnerOps.get(runnerType);
+    if (cur && cur.promise === runPromise) {
+      activeCompatRunnerOps.delete(runnerType);
+    }
   }
-
-  /** @type {Record<string, string>} */
-  const defaultUpdateUrls = {
-    crossover: 'https://www.codeweavers.com/crossover/download',
-    crossover_preview: 'https://www.codeweavers.com/preview/download',
-    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
-    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
-  };
-
-  const brewCandidates = [
-    options.brewBinaryPath,
-    path.join(homedir, 'homebrew/bin/brew'),
-    ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
-  ].filter(Boolean);
-  const brewPath = brewCandidates.find((p) => fs.existsSync(p));
-
-  const beforeBinNorm = String(beforeLayer?.binaryPath || '').replace(/\\/g, '/');
-  const beforeAppNorm = String(beforeLayer?.appPath || '').replace(/\\/g, '/');
-  const isWineStagingApp = Boolean(
-    beforeLayer &&
-      (/Wine Staging\.app/i.test(beforeBinNorm) ||
-        /Wine Staging\.app/i.test(beforeAppNorm) ||
-        /Wine Staging/i.test(String(beforeLayer.name || '')))
-  );
-  const isHeroicManagedTool = Boolean(beforeLayer && /\/heroic\/tools\//i.test(beforeBinNorm));
-
-  /** @type {Record<string, string>} */
-  const caskMap = {
-    crossover: 'crossover',
-    wine: isWineStagingApp ? 'wine@staging' : 'wine-stable',
-    gptk: 'game-porting-toolkit',
-  };
-  const caskName = caskMap[runnerType];
-  let updatedViaBrew = false;
-  let usedMockBrewHook = false;
-  let extractedDmg = false;
-
-  if (caskName && typeof options.onExecBrew === 'function') {
-    const args = [
-      'upgrade',
-      '--cask',
-      ...(runnerType === 'wine' ? ['--no-quarantine'] : []),
-      caskName,
-    ];
-    try {
-      await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
-      updatedViaBrew = true;
-      usedMockBrewHook = true;
-    } catch {}
-  } else if (caskName && brewPath && !isHeroicManagedTool) {
-    const args = [
-      'upgrade',
-      '--cask',
-      ...(runnerType === 'wine' ? ['--no-quarantine'] : []),
-      caskName,
-    ];
-    try {
-      const isCaskManaged = await new Promise((resolve) => {
-        execFile(brewPath, ['list', '--cask', caskName], { timeout: 15000 }, (err) => {
-          resolve(!err);
-        });
-      });
-      if (isCaskManaged) {
-        await new Promise((resolve, reject) => {
-          execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
-            if (err) reject(err);
-            else resolve({ stdout, stderr });
-          });
-        });
-        updatedViaBrew = true;
-      }
-    } catch {}
-  }
-
-  if (!updatedViaBrew && payload.dmgPath && fs.existsSync(payload.dmgPath)) {
-    try {
-      const targetAppsDir = options.customApplicationsDir || path.join(homedir, 'Applications');
-      await mountAndExtractDmgSafe(payload.dmgPath, targetAppsDir, options);
-      updatedViaBrew = true;
-      extractedDmg = true;
-    } catch {}
-  }
-
-  const detectedLayers = detectCompatibilityLayers(options);
-  const afterLayer = detectedLayers.find((l) => l.type === runnerType);
-  const newVersion = afterLayer?.version;
-  const newBuildVersion = afterLayer?.buildVersion;
-  const updates = await checkCompatibilityLayerUpdates({ ...options, layers: detectedLayers });
-
-  let openedExternalUrl = false;
-  if (!updatedViaBrew) {
-    const targetUrl =
-      updates[runnerType]?.downloadUrl ||
-      defaultUpdateUrls[runnerType] ||
-      defaultUpdateUrls.crossover;
-    await openExternalUri(targetUrl, options);
-    openedExternalUrl = true;
-  }
-
-  const versionChanged = Boolean(
-    (newVersion && newVersion !== previousVersion) ||
-      (newBuildVersion && newBuildVersion !== previousBuildVersion)
-  );
-  const updated =
-    usedMockBrewHook || extractedDmg
-      ? Boolean(versionChanged || updatedViaBrew)
-      : versionChanged;
-
-  return {
-    success: true,
-    runnerType,
-    updated,
-    previousVersion,
-    newVersion,
-    openedExternalUrl,
-    message: updated
-      ? `Successfully updated ${runnerType} to ${newVersion || 'latest version'}.`
-      : openedExternalUrl
-        ? 'Opened official update page in your browser. Click "Re-Scan Runners" once installation finishes.'
-        : 'Runner is already up to date.',
-    detectedLayers,
-    updateInfo: updates[runnerType],
-  };
 }
 
 /**
@@ -3542,14 +4907,13 @@ async function installCompatibilityLayer(/** @type {any} */ payload = {}, /** @t
   const mode = String(payload.mode || 'auto')
     .toLowerCase()
     .trim();
-  const homedir = options.homedir || os.homedir();
 
   /** @type {Record<string, string>} */
   const downloadUrls = {
     crossover: 'https://www.codeweavers.com/crossover/download',
     crossover_preview: 'https://www.codeweavers.com/preview/download',
-    gptk: 'https://developer.apple.com/games/game-porting-toolkit/',
-    wine: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
+    gptk: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+    wine: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
   };
   const downloadUrl = downloadUrls[runnerType] || downloadUrls.crossover;
 
@@ -3564,117 +4928,309 @@ async function installCompatibilityLayer(/** @type {any} */ payload = {}, /** @t
     };
   }
 
-  const brewCandidates = [
-    options.brewBinaryPath,
-    path.join(homedir, 'homebrew/bin/brew'),
-    ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
-  ].filter(Boolean);
-  const brewPath = brewCandidates.find((p) => fs.existsSync(p));
-
-  if (
-    mode !== 'direct' &&
-    (brewPath || typeof options.onExecBrew === 'function') &&
-    (runnerType === 'crossover' || runnerType === 'wine')
-  ) {
-    const args =
-      runnerType === 'crossover'
-        ? ['install', '--cask', 'crossover']
-        : ['install', '--cask', '--no-quarantine', 'wine-stable'];
-    try {
-      if (typeof options.onExecBrew === 'function') {
-        await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
-      } else {
-        await new Promise((resolve, reject) => {
-          execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
-            if (err) reject(err);
-            else resolve({ stdout, stderr });
-          });
-        });
-      }
-      const layers = detectCompatibilityLayers(options);
-      if (layers.some((l) => l.type === runnerType)) {
-        return {
-          success: true,
-          installed: true,
-          runnerType,
-          message: 'Successfully installed via Homebrew!',
-          layers,
-        };
-      }
-    } catch {}
-  }
-
-  const dmgPath =
-    typeof payload.dmgPath === 'string' && payload.dmgPath.trim()
-      ? payload.dmgPath.trim()
-      : typeof options.dmgPath === 'string' && options.dmgPath.trim()
-        ? options.dmgPath.trim()
-        : '';
-
-  const shouldTryDirectInstall =
-    mode === 'direct' ||
-    (mode === 'auto' &&
-      !brewPath &&
-      typeof options.onExecBrew !== 'function' &&
-      (!isTestEnvironment(options) ||
-        options.allowDirectVendorInstall === true ||
-        typeof options.fetchFn === 'function' ||
-        Boolean(dmgPath)) &&
-      (runnerType === 'crossover' || runnerType === 'wine' || Boolean(dmgPath)));
-
-  if (shouldTryDirectInstall) {
-    try {
-      const { installRunnerDirect } = require('./environmentProvisioner.cjs');
-      const directRes = await installRunnerDirect(runnerType, {
-        ...options,
-        ...(dmgPath ? { dmgPath } : {}),
-      });
-      if (directRes && directRes.installed) {
-        return {
-          success: true,
-          installed: true,
-          runnerType,
-          installedPath: directRes.installedPath,
-          message: directRes.message,
-          layers: detectCompatibilityLayers(options),
-        };
-      }
-      if (directRes && directRes.openedExternal) {
-        return {
-          success: true,
-          openedExternalInstaller: true,
-          runnerType,
-          message: directRes.message,
-          layers: detectCompatibilityLayers(options),
-        };
-      }
-    } catch (err) {
-      if (mode === 'direct') {
-        if (options.throwOnError === true) {
-          throw err;
-        }
-        const errMsg = err instanceof Error ? err.message : String(err);
-        return {
-          success: false,
-          installed: false,
-          runnerType,
-          error: errMsg,
-          message: errMsg,
-          layers: detectCompatibilityLayers(options),
-        };
-      }
+  if (options._bypassSingleFlight !== true && activeCompatRunnerOps.has(runnerType)) {
+    const existingOp = activeCompatRunnerOps.get(runnerType);
+    if (existingOp) {
+      return existingOp.promise;
     }
   }
 
-  await openExternalUri(downloadUrl, options);
-  return {
-    success: true,
-    openedExternalInstaller: true,
-    runnerType,
-    message:
-      'Opened official installer page in your browser. Click "Re-Scan Runners" once installation finishes.',
-    layers: detectCompatibilityLayers(options),
-  };
+  const controller = new AbortController();
+  if (options.signal && typeof options.signal.addEventListener === 'function') {
+    if (options.signal.aborted) controller.abort();
+    else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+
+  const runPromise = (async () => {
+    const homedir = options.homedir || os.homedir();
+    const beforeLayers = detectCompatibilityLayers(options);
+    const beforeLayer = beforeLayers.find((l) => l.type === runnerType) || null;
+
+    const {
+      installRunnerDirect,
+      assertRunnerSafeToReplace,
+    } = require('./environmentProvisioner.cjs');
+
+    const safetyRes = await assertRunnerSafeToReplace(
+      runnerType,
+      beforeLayer?.appPath || null,
+      beforeLayer,
+      options
+    );
+    if (!safetyRes.ok) {
+      emitCompatibilityRunnerProgress(
+        {
+          runnerType,
+          operation: 'install',
+          phase: 'failed',
+          progressPercent: null,
+          message: safetyRes.error || 'Runner is currently busy.',
+          error: safetyRes.error,
+        },
+        options
+      );
+      return {
+        success: false,
+        installed: false,
+        runnerType,
+        ...(safetyRes.busyCode ? { busyCode: safetyRes.busyCode } : {}),
+        error: safetyRes.error,
+        message: safetyRes.error || 'Runner is currently busy.',
+        layers: beforeLayers,
+      };
+    }
+
+    const archivePath =
+      typeof payload.archivePath === 'string' && payload.archivePath.trim()
+        ? payload.archivePath.trim()
+        : typeof options.archivePath === 'string' && options.archivePath.trim()
+          ? options.archivePath.trim()
+          : '';
+    const dmgPath =
+      typeof payload.dmgPath === 'string' && payload.dmgPath.trim()
+        ? payload.dmgPath.trim()
+        : typeof options.dmgPath === 'string' && options.dmgPath.trim()
+          ? options.dmgPath.trim()
+          : '';
+    const hasLocalInstaller = Boolean(archivePath || dmgPath);
+
+    const brewCandidates = [
+      options.brewBinaryPath,
+      path.join(homedir, 'homebrew/bin/brew'),
+      ...(!options.homedir ? ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] : []),
+    ].filter(Boolean);
+    const brewPath = brewCandidates.find((p) => fs.existsSync(p));
+
+    const shouldTryHomebrewInstall =
+      !hasLocalInstaller &&
+      mode !== 'direct' &&
+      (mode === 'brew' ||
+        typeof options.onExecBrew === 'function' ||
+        Boolean(options.brewBinaryPath)) &&
+      (brewPath || typeof options.onExecBrew === 'function') &&
+      (runnerType === 'crossover' || runnerType === 'wine');
+
+    if (shouldTryHomebrewInstall) {
+      const args =
+        runnerType === 'crossover'
+          ? ['install', '--cask', 'crossover']
+          : ['install', '--cask', '--no-quarantine', 'wine-stable'];
+      try {
+        emitCompatibilityRunnerProgress(
+          {
+            runnerType,
+            operation: 'install',
+            phase: 'installing',
+            progressPercent: null,
+            message: `Installing ${runnerType} via Homebrew...`,
+          },
+          options
+        );
+        if (typeof options.onExecBrew === 'function') {
+          await options.onExecBrew(brewPath || '/opt/homebrew/bin/brew', args);
+        } else {
+          await new Promise((resolve, reject) => {
+            execFile(brewPath, args, { timeout: 300000 }, (err, stdout, stderr) => {
+              if (err) reject(err);
+              else resolve({ stdout, stderr });
+            });
+          });
+        }
+        const layers = detectCompatibilityLayers(options);
+        if (layers.some((l) => l.type === runnerType)) {
+          emitCompatibilityRunnerProgress(
+            {
+              runnerType,
+              operation: 'install',
+              phase: 'completed',
+              progressPercent: 100,
+              message: 'Successfully installed via Homebrew!',
+            },
+            options
+          );
+          return {
+            success: true,
+            installed: true,
+            runnerType,
+            message: 'Successfully installed via Homebrew!',
+            layers,
+          };
+        }
+      } catch {}
+    }
+
+    const hostArch = String(options?.arch || process.arch || 'arm64');
+    const darwinKernelMajor =
+      options?.darwinKernelMajor !== undefined
+        ? Number(options.darwinKernelMajor)
+        : typeof options?.osRelease === 'string' && options.osRelease.trim()
+          ? Number.parseInt(options.osRelease.trim().split('.')[0] || '0', 10) || 24
+          : process.platform === 'darwin'
+            ? Number.parseInt(String(os.release() || '24.0.0').split('.')[0] || '24', 10) || 24
+            : 24;
+
+    const canRunDirectInCurrentEnv =
+      hasLocalInstaller ||
+      typeof options.capturePreviewDownloadFn === 'function' ||
+      options.allowInteractivePreviewCapture === true ||
+      !isTestEnvironment(options) ||
+      options.allowDirectVendorInstall === true ||
+      typeof options.fetchFn === 'function' ||
+      typeof options.mockDirectDownload === 'function';
+
+    const isDirectInstallCapable =
+      runnerType === 'crossover' ||
+      runnerType === 'wine' ||
+      (runnerType === 'gptk' &&
+        (hasLocalInstaller || (hostArch === 'arm64' && darwinKernelMajor >= 23))) ||
+      (runnerType === 'crossover_preview' &&
+        (hasLocalInstaller ||
+          typeof options.capturePreviewDownloadFn === 'function' ||
+          options.allowInteractivePreviewCapture === true ||
+          !isTestEnvironment(options) ||
+          options.allowDirectVendorInstall === true));
+
+    const shouldTryDirectInstall =
+      mode === 'direct' ||
+      ((mode === 'auto' || mode === 'brew') &&
+        typeof options.onExecBrew !== 'function' &&
+        canRunDirectInCurrentEnv &&
+        isDirectInstallCapable);
+
+    if (shouldTryDirectInstall) {
+      try {
+        const directRes = await installRunnerDirect(runnerType, {
+          ...options,
+          ...(dmgPath ? { dmgPath } : {}),
+          ...(archivePath ? { archivePath } : {}),
+          existingLayer: beforeLayer,
+          _runnerOperation: 'install',
+          _suppressWizardProgressBroadcast: true,
+          _runnerProgressMeta: { runnerType, operation: 'install' },
+          signal: controller.signal,
+          onRunnerProgress: (/** @type {any} */ evt) =>
+            emitCompatibilityRunnerProgress(evt, {
+              ...options,
+              onRunnerProgress: options.onRunnerProgress,
+            }),
+        });
+        if (directRes && directRes.installed) {
+          emitCompatibilityRunnerProgress(
+            {
+              runnerType,
+              operation: 'install',
+              phase: 'completed',
+              progressPercent: 100,
+              message: directRes.message,
+            },
+            options
+          );
+          return {
+            success: true,
+            installed: true,
+            runnerType,
+            installedPath: directRes.installedPath,
+            message: directRes.message,
+            layers: detectCompatibilityLayers(options),
+          };
+        }
+        if (directRes && directRes.openedExternal) {
+          return {
+            success: true,
+            openedExternalInstaller: true,
+            runnerType,
+            message: directRes.message,
+            layers: detectCompatibilityLayers(options),
+          };
+        }
+      } catch (err) {
+        const isCancelled =
+          controller.signal.aborted ||
+          (err && typeof err === 'object' && /** @type {any} */ (err).name === 'AbortError');
+        if (isCancelled) {
+          const cancelMsg = 'Compatibility runner installation cancelled.';
+          emitCompatibilityRunnerProgress(
+            {
+              runnerType,
+              operation: 'install',
+              phase: 'cancelled',
+              progressPercent: null,
+              message: cancelMsg,
+            },
+            options
+          );
+          return {
+            success: false,
+            cancelled: true,
+            installed: false,
+            runnerType,
+            message: cancelMsg,
+            layers: detectCompatibilityLayers(options),
+          };
+        }
+        if (options.throwOnError === true) {
+          throw err;
+        }
+        const errObj = /** @type {any} */ (err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        emitCompatibilityRunnerProgress(
+          {
+            runnerType,
+            operation: 'install',
+            phase: 'failed',
+            progressPercent: null,
+            message: errMsg,
+            error: errMsg,
+          },
+          options
+        );
+        if (
+          mode === 'direct' ||
+          hasLocalInstaller ||
+          typeof options.capturePreviewDownloadFn === 'function' ||
+          options.allowInteractivePreviewCapture === true ||
+          !isTestEnvironment(options) ||
+          options.allowDirectVendorInstall === true ||
+          typeof options.fetchFn === 'function'
+        ) {
+          return {
+            success: false,
+            installed: false,
+            runnerType,
+            ...(errObj?.busyCode ? { busyCode: errObj.busyCode } : {}),
+            error: errMsg,
+            message: errMsg,
+            layers: detectCompatibilityLayers(options),
+          };
+        }
+      }
+    }
+
+    await openExternalUri(downloadUrl, options);
+    return {
+      success: true,
+      openedExternalInstaller: true,
+      runnerType,
+      message:
+        'Opened official installer page in your browser. Click "Re-Scan Runners" once installation finishes.',
+      layers: detectCompatibilityLayers(options),
+    };
+  })();
+
+  activeCompatRunnerOps.set(runnerType, {
+    operation: 'install',
+    controller,
+    promise: runPromise,
+  });
+
+  try {
+    return await runPromise;
+  } finally {
+    const cur = activeCompatRunnerOps.get(runnerType);
+    if (cur && cur.promise === runPromise) {
+      activeCompatRunnerOps.delete(runnerType);
+    }
+  }
 }
 
 function resolveWineLayerMoltenVkPath(wineBinary) {
@@ -3772,8 +5328,8 @@ function doesWineLayerHaveMoltenVkHudDeadlock(wineBinary) {
 }
 
 /**
- * Ensure the x86_64 `libone_metal_preload.dylib` helper exists on a real filesystem path
- * outside `app.asar` so `dyld` can load it via `DYLD_INSERT_LIBRARIES` / `CX_DYLD_INSERT_LIBRARIES`.
+ * Ensure the universal (`arm64` + `x86_64`) `libone_metal_preload.dylib` helper exists on a real
+ * filesystem path outside `app.asar` so `dyld` can load it via `DYLD_INSERT_LIBRARIES` or `CX_ENV`.
  */
 function ensureWineMetalPreloadDylib(/** @type {any} */ options = {}) {
   const electronRoot = path.resolve(__dirname, '..');
@@ -3811,61 +5367,588 @@ function ensureWineMetalPreloadDylib(/** @type {any} */ options = {}) {
   return null;
 }
 
+/** @type {Map<string, string>} */
+const liveBottleMsyncByPrefix = new Map();
+
 /**
- * Inspect whether a Wine binary is a SIP-protected `#!/usr/bin/perl` or shell wrapper and
- * either configure `CX_DYLD_INSERT_LIBRARIES` (CrossOver) or resolve the adjacent non-SIP
- * `wineloader` / `wineloader64` Mach-O binary so `DYLD_INSERT_LIBRARIES` is not stripped by `dyld`.
+ * Parse shell-quoted `KEY=VALUE` assignments compatible with Perl `Text::ParseWords::shellwords`
+ * (`bin/wine:722` `$ENV{CX_ENV}`).
+ *
+ * @param {string} rawCxEnv
+ * @returns {Array<{ key: string, rawToken: string }>}
  */
-function resolveSipSafeWineBinaryAndPreloadEnv(wineBinaryPath, /** @type {Record<string, any>} */ env = {}) {
+function parseCxEnvShellwordTokens(rawCxEnv) {
+  const str = String(rawCxEnv || '').trim();
+  if (!str) return [];
+  /** @type {Array<{ key: string, rawToken: string }>} */
+  const tokens = [];
+  let i = 0;
+  while (i < str.length) {
+    while (i < str.length && /\s/.test(str[i])) i += 1;
+    if (i >= str.length) break;
+    const start = i;
+    let unquoted = '';
+    let quoteChar = '';
+    while (i < str.length) {
+      const ch = str[i];
+      if (quoteChar) {
+        if (ch === '\\' && quoteChar === '"' && i + 1 < str.length) {
+          unquoted += str[i + 1];
+          i += 2;
+          continue;
+        }
+        if (ch === quoteChar) {
+          quoteChar = '';
+          i += 1;
+          continue;
+        }
+        unquoted += ch;
+        i += 1;
+      } else {
+        if (/\s/.test(ch)) break;
+        if (ch === '"' || ch === "'") {
+          quoteChar = ch;
+          i += 1;
+          continue;
+        }
+        if (ch === '\\' && i + 1 < str.length) {
+          unquoted += str[i + 1];
+          i += 2;
+          continue;
+        }
+        unquoted += ch;
+        i += 1;
+      }
+    }
+    const rawToken = str.slice(start, i);
+    const eqIdx = unquoted.indexOf('=');
+    const key = eqIdx > 0 ? unquoted.slice(0, eqIdx).trim() : '';
+    tokens.push({ key, rawToken });
+  }
+  return tokens;
+}
+
+/**
+ * Format a `KEY="VALUE"` token safe for Perl `Text::ParseWords::shellwords` (`$ENV{CX_ENV}`).
+ *
+ * @param {string} key
+ * @param {string} value
+ * @returns {string}
+ */
+function formatCxEnvAssignmentToken(key, value) {
+  const escaped = String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+  return `${key}="${escaped}"`;
+}
+
+/**
+ * Merge `KEY=VALUE` assignments into CrossOver's `CX_ENV` string (`bin/wine:722`), updating
+ * matching keys idempotently while preserving any existing user `CX_ENV` assignments.
+ *
+ * @param {string | undefined} existingCxEnv
+ * @param {Record<string, string | undefined | null>} updates
+ * @returns {string}
+ */
+function mergeCxEnvVariables(existingCxEnv, updates = {}) {
+  const parsed = parseCxEnvShellwordTokens(existingCxEnv || '');
+  const updateEntries = Object.entries(updates).filter(
+    ([k, v]) => k && typeof v === 'string' && v.length > 0
+  );
+  if (updateEntries.length === 0) {
+    return parsed.map((t) => t.rawToken).join(' ');
+  }
+  const updateMap = new Map(
+    updateEntries.map(([k, v]) => [k, formatCxEnvAssignmentToken(k, String(v))])
+  );
+  const seen = new Set();
+  const outTokens = [];
+  for (const tok of parsed) {
+    if (tok.key && updateMap.has(tok.key)) {
+      if (!seen.has(tok.key)) {
+        seen.add(tok.key);
+        outTokens.push(/** @type {string} */ (updateMap.get(tok.key)));
+      }
+    } else if (tok.rawToken) {
+      outTokens.push(tok.rawToken);
+    }
+  }
+  for (const [k, formatted] of updateMap.entries()) {
+    if (!seen.has(k)) {
+      seen.add(k);
+      outTokens.push(formatted);
+    }
+  }
+  return outTokens.join(' ');
+}
+
+/**
+ * Derive `<cxRoot>` (`.../Contents/SharedSupport/CrossOver`) from a CrossOver `wine` or `wineloader` binary path.
+ *
+ * @param {string} wineBinaryPath
+ * @returns {string}
+ */
+function deriveCrossOverRootFromBinaryPath(wineBinaryPath) {
+  if (!wineBinaryPath || typeof wineBinaryPath !== 'string') return '';
+  const norm = path.resolve(wineBinaryPath);
+  const sharedMatch = norm.match(/^(.*\/Contents\/SharedSupport\/CrossOver)(?:\/|$)/i);
+  if (sharedMatch && sharedMatch[1]) {
+    return sharedMatch[1];
+  }
+  const binDir = path.dirname(norm);
+  if (path.basename(binDir).toLowerCase() === 'bin') {
+    return path.dirname(binDir);
+  }
+  const unixMatch = norm.match(/^(.*)\/lib(?:64)?\/wine\/[^/]+\/wine$/i);
+  if (unixMatch && unixMatch[1]) {
+    return unixMatch[1];
+  }
+  return '';
+}
+
+/**
+ * Align `env.WINEMSYNC` with an already-live `wineserver` in `bottlePath` so helper (`reg.exe`)
+ * and game processes never abort inside `msync_init` (`rc=1`) due to client/server sync mismatch.
+ *
+ * @param {string} bottlePath
+ * @param {Record<string, any>} env
+ * @param {Record<string, any>} [options]
+ * @returns {string | undefined}
+ */
+function alignWineMsyncWithLiveBottle(bottlePath, env = {}, options = {}) {
+  if (!bottlePath || typeof bottlePath !== 'string' || !env || typeof env !== 'object') {
+    return env?.WINEMSYNC;
+  }
+  let canonicalPrefix = path.resolve(bottlePath);
+  try {
+    if (fs.existsSync(bottlePath)) {
+      canonicalPrefix = fs.realpathSync(bottlePath);
+    }
+  } catch {}
+
+  let isLive = false;
+  try {
+    const { isBottleWineserverActive } = require('./firstPartyRegistration.cjs');
+    isLive = isBottleWineserverActive(bottlePath, options);
+  } catch {
+    isLive = Boolean(options?.wineserverActive);
+  }
+
+  if (!isLive) {
+    if (env.WINEMSYNC === '0' || env.WINEMSYNC === '1') {
+      setBoundedMapEntry(liveBottleMsyncByPrefix, canonicalPrefix, String(env.WINEMSYNC), 128);
+    }
+    return env.WINEMSYNC;
+  }
+
+  // 1. Check in-memory record of the sync mode used when booting this prefix
+  const recorded = liveBottleMsyncByPrefix.get(canonicalPrefix);
+  if (recorded === '0' || recorded === '1') {
+    env.WINEMSYNC = recorded;
+    return recorded;
+  }
+
+  // 2. Check Wine server socket directory for msync artifact if running on darwin/linux
+  if (process.platform !== 'win32' && typeof process.getuid === 'function') {
+    try {
+      const st = fs.statSync(canonicalPrefix);
+      const serverFolder = `server-${Number(st.dev).toString(16)}-${Number(st.ino).toString(16)}`;
+      const uid = process.getuid();
+      for (const tmpRoot of Array.from(new Set(['/tmp', os.tmpdir()]))) {
+        const serverDir = path.join(tmpRoot, `.wine-${uid}`, serverFolder);
+        if (fs.existsSync(path.join(serverDir, 'msync'))) {
+          env.WINEMSYNC = '1';
+          setBoundedMapEntry(liveBottleMsyncByPrefix, canonicalPrefix, '1', 128);
+          return '1';
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Inspect existing `cxbottle.conf` `"WINEMSYNC"` value before any overwrite
+  try {
+    const cxbottleConfPath = path.join(bottlePath, 'cxbottle.conf');
+    if (fs.existsSync(cxbottleConfPath)) {
+      const rawConf = fs.readFileSync(cxbottleConfPath, 'utf8');
+      const msyncMatch = rawConf.match(/^\s*"WINEMSYNC"\s*=\s*"([01])"/m);
+      if (msyncMatch && (msyncMatch[1] === '0' || msyncMatch[1] === '1')) {
+        env.WINEMSYNC = msyncMatch[1];
+        setBoundedMapEntry(liveBottleMsyncByPrefix, canonicalPrefix, msyncMatch[1], 128);
+        return msyncMatch[1];
+      }
+    }
+  } catch {}
+
+  if (!env.WINEMSYNC) {
+    env.WINEMSYNC = '1';
+  }
+  return env.WINEMSYNC;
+}
+
+/**
+ * Inspect whether a Wine binary is CrossOver's Perl `bin/wine` wrapper, another SIP-interpreter
+ * shebang script, or a direct Mach-O `wineloader`, and prepare a SIP-safe & SIP-disabled-safe `env`:
+ * - CrossOver Perl `bin/wine` (`#!/usr/bin/perl`, `arm64e`): forwards `DYLD_INSERT_LIBRARIES` and
+ *   `WINEDLLOVERRIDES` via `CX_ENV` (`bin/wine:722`), mirrors `WINEDEBUG` into `CX_DEBUGMSG`, and
+ *   **always deletes top-level `DYLD_INSERT_LIBRARIES`** so `/usr/bin/perl` never crashes or drops preload.
+ * - Direct CrossOver `wineloader` Mach-O: populates `CX_ROOT` and `CX_APPLEGPTK_LIBD3DSHARED_PATH`
+ *   so `cxcompatdb.so` never logs `"CX_ROOT not set"`.
+ * - Non-CrossOver SIP-shebang Wine scripts: resolves adjacent Mach-O `wineloader`/`wineloader64` if
+ *   present, or deletes top-level `DYLD_INSERT_LIBRARIES` if falling back to the SIP script.
+ *
+ * @param {string} wineBinaryPath
+ * @param {Record<string, any>} [env]
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+/** @type {Map<string, boolean>} */
+const dyldInsertAllowedCache = new Map();
+
+/**
+ * Pure-Node (`0` subprocesses) Mach-O `LC_CODE_SIGNATURE` (`0x1d`) + `CodeDirectory` (`0xfade0c02`)
+ * + `CS_MAGIC_ENTITLEMENTS` (`0xfade7171`) inspector that determines whether a Wine / CrossOver
+ * loader binary permits `DYLD_INSERT_LIBRARIES` without macOS Hardened Runtime (`0x10000`) rejection.
+ *
+ * Returns `false` ONLY when the resolved Mach-O loader has Hardened Runtime (`flags & 0x10000`) AND
+ * lacks both `com.apple.security.cs.allow-dyld-environment-variables` and `com.apple.security.get-task-allow`.
+ * Returns `true` for unsigned binaries, non-hardened binaries, CrossOver loaders with `allow-dyld-environment-variables`,
+ * and virtual/synthetic unit-test stubs.
+ *
+ * @param {string} wineBinaryPath
+ * @returns {boolean}
+ */
+function doesWineLoaderAllowDyldInsert(wineBinaryPath) {
+  if (!wineBinaryPath || typeof wineBinaryPath !== 'string') {
+    return true;
+  }
+
+  let targetPath = wineBinaryPath;
+  try {
+    if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isFile()) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+
+  // If wineBinaryPath is a shebang wrapper (e.g. CrossOver Perl bin/wine or #!/bin/sh wine64),
+  // resolve the underlying Mach-O wineloader binary to inspect its code signature.
+  try {
+    const probeFd = fs.openSync(targetPath, 'r');
+    const magicProbe = Buffer.alloc(4);
+    let readBytes = 0;
+    try {
+      readBytes = fs.readSync(probeFd, magicProbe, 0, 4, 0);
+    } finally {
+      try {
+        fs.closeSync(probeFd);
+      } catch {}
+    }
+    if (readBytes >= 2 && magicProbe[0] === 0x23 && magicProbe[1] === 0x21) {
+      const binDir = path.dirname(path.resolve(targetPath));
+      const loaderCandidates = [
+        path.resolve(binDir, '..', 'CrossOver-Hosted Application', 'wineloader'),
+        path.resolve(binDir, '..', 'CrossOver-Hosted Application', 'wineloader64'),
+        path.join(binDir, 'wineloader64'),
+        path.join(binDir, 'wineloader'),
+        path.join(binDir, 'wine64-preloader'),
+        path.resolve(binDir, '..', 'lib64', 'wine', 'x86_64-unix', 'wine'),
+        path.resolve(binDir, '..', 'lib', 'wine', 'x86_64-unix', 'wine'),
+      ];
+      const foundMachO = loaderCandidates.find((cand) => {
+        try {
+          return fs.existsSync(cand) && inspectMacMachOHeader(cand).isMachO;
+        } catch {
+          return false;
+        }
+      });
+      if (!foundMachO) {
+        return true;
+      }
+      targetPath = foundMachO;
+    }
+  } catch {
+    return true;
+  }
+
+  let cacheKey = targetPath;
+  let fileSize = 0;
+  try {
+    const realTarget = fs.realpathSync(targetPath);
+    const st = fs.statSync(realTarget);
+    fileSize = st.size;
+    cacheKey = `${realTarget}:${Math.trunc(st.mtimeMs)}:${st.size}`;
+    targetPath = realTarget;
+  } catch {
+    return true;
+  }
+
+  if (dyldInsertAllowedCache.has(cacheKey)) {
+    return /** @type {boolean} */ (dyldInsertAllowedCache.get(cacheKey));
+  }
+
+  let allowed = true;
+  /** @type {number | null} */
+  let fd = null;
+  try {
+    fd = fs.openSync(targetPath, 'r');
+    const headLen = Math.min(fileSize, 16384);
+    if (headLen < 32) {
+      setBoundedMapEntry(dyldInsertAllowedCache, cacheKey, true, 256);
+      return true;
+    }
+    let sliceOffset = 0;
+    let headBuf = Buffer.alloc(headLen);
+    const firstRead = fs.readSync(fd, headBuf, 0, headLen, 0);
+    if (firstRead < 32) {
+      setBoundedMapEntry(dyldInsertAllowedCache, cacheKey, true, 256);
+      return true;
+    }
+
+    const magicBE = headBuf.readUInt32BE(0);
+    if (magicBE === 0xcafebabe || magicBE === 0xbebafeca) {
+      const isFatBE = magicBE === 0xcafebabe;
+      const nfat = isFatBE ? headBuf.readUInt32BE(4) : headBuf.readUInt32LE(4);
+      if (nfat >= 1 && nfat <= 16 && firstRead >= 8 + nfat * 20) {
+        const preferredCpu = process.arch === 'x64' ? 0x01000007 : 0x0100000c;
+        let chosenOff = isFatBE ? headBuf.readUInt32BE(16) : headBuf.readUInt32LE(16);
+        for (let i = 0; i < nfat; i += 1) {
+          const entryOff = 8 + i * 20;
+          const cpu = isFatBE
+            ? headBuf.readUInt32BE(entryOff)
+            : headBuf.readUInt32LE(entryOff);
+          const off = isFatBE
+            ? headBuf.readUInt32BE(entryOff + 8)
+            : headBuf.readUInt32LE(entryOff + 8);
+          if (cpu === preferredCpu && off > 0) {
+            chosenOff = off;
+            break;
+          }
+        }
+        if (chosenOff > 0 && chosenOff + 32 <= fileSize) {
+          sliceOffset = chosenOff;
+          const sliceReadLen = Math.min(fileSize - sliceOffset, 16384);
+          headBuf = Buffer.alloc(sliceReadLen);
+          const sr = fs.readSync(fd, headBuf, 0, sliceReadLen, sliceOffset);
+          if (sr < 32) {
+            setBoundedMapEntry(dyldInsertAllowedCache, cacheKey, true, 256);
+            return true;
+          }
+        }
+      }
+    }
+
+    const sliceMagicLE = headBuf.readUInt32LE(0);
+    const isMachO64LE = sliceMagicLE === 0xfeedfacf;
+    const isMachO32LE = sliceMagicLE === 0xfeedface;
+    if (!isMachO64LE && !isMachO32LE) {
+      setBoundedMapEntry(dyldInsertAllowedCache, cacheKey, true, 256);
+      return true;
+    }
+
+    const machHeaderSize = isMachO64LE ? 32 : 28;
+    const ncmds = headBuf.readUInt32LE(16);
+    const sizeofcmds = headBuf.readUInt32LE(20);
+    const neededHeaderBytes = machHeaderSize + sizeofcmds;
+    if (
+      ncmds > 0 &&
+      sizeofcmds > 0 &&
+      neededHeaderBytes <= 256 * 1024 &&
+      sliceOffset + neededHeaderBytes <= fileSize &&
+      neededHeaderBytes > headBuf.length
+    ) {
+      headBuf = Buffer.alloc(neededHeaderBytes);
+      fs.readSync(fd, headBuf, 0, neededHeaderBytes, sliceOffset);
+    }
+
+    let sigDataOff = 0;
+    let sigDataSize = 0;
+    let cmdOff = machHeaderSize;
+    const maxCmdEnd = Math.min(headBuf.length, machHeaderSize + sizeofcmds);
+    for (let i = 0; i < ncmds && cmdOff + 8 <= maxCmdEnd; i += 1) {
+      const cmd = headBuf.readUInt32LE(cmdOff);
+      const cmdsize = headBuf.readUInt32LE(cmdOff + 4);
+      if (cmdsize < 8 || cmdOff + cmdsize > maxCmdEnd) break;
+      if (cmd === 0x1d && cmdsize >= 16) {
+        sigDataOff = headBuf.readUInt32LE(cmdOff + 8);
+        sigDataSize = headBuf.readUInt32LE(cmdOff + 12);
+        break;
+      }
+      cmdOff += cmdsize;
+    }
+
+    if (
+      sigDataOff > 0 &&
+      sigDataSize >= 12 &&
+      sigDataSize <= 2 * 1024 * 1024 &&
+      sliceOffset + sigDataOff + sigDataSize <= fileSize
+    ) {
+      const sigBuf = Buffer.alloc(sigDataSize);
+      const sigRead = fs.readSync(fd, sigBuf, 0, sigDataSize, sliceOffset + sigDataOff);
+      if (sigRead >= 12 && sigBuf.readUInt32BE(0) === 0xfade0cc0) {
+        const blobCount = sigBuf.readUInt32BE(8);
+        let hasHardenedRuntime = false;
+        let hasAllowDyldEntitlement = false;
+
+        for (let b = 0; b < blobCount && 12 + (b + 1) * 8 <= sigRead; b += 1) {
+          const blobOff = sigBuf.readUInt32BE(12 + b * 8 + 4);
+          if (blobOff + 8 > sigRead) continue;
+          const blobMagic = sigBuf.readUInt32BE(blobOff);
+          const blobLen = sigBuf.readUInt32BE(blobOff + 4);
+          if (blobMagic === 0xfade0c02 && blobOff + 16 <= sigRead) {
+            const cdFlags = sigBuf.readUInt32BE(blobOff + 12);
+            if ((cdFlags & 0x00010000) !== 0) {
+              hasHardenedRuntime = true;
+            }
+          } else if (blobMagic === 0xfade7171 && blobLen > 8 && blobOff + 8 < sigRead) {
+            const entEnd = Math.min(sigRead, blobOff + blobLen);
+            const entXml = sigBuf.subarray(blobOff + 8, entEnd).toString('utf8');
+            if (
+              /<key>\s*com\.apple\.security\.(?:cs\.allow-dyld-environment-variables|get-task-allow)\s*<\/key>\s*<true\s*\/>/i.test(
+                entXml
+              )
+            ) {
+              hasAllowDyldEntitlement = true;
+            }
+          }
+        }
+
+        if (hasHardenedRuntime && !hasAllowDyldEntitlement) {
+          allowed = false;
+        }
+      }
+    }
+  } catch {
+    allowed = true;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+
+  setBoundedMapEntry(dyldInsertAllowedCache, cacheKey, allowed, 256);
+  return allowed;
+}
+
+const CX_ENV_MANAGED_FORWARD_KEYS = [
+  'WINEDLLOVERRIDES',
+  'CX_GRAPHICS_BACKEND',
+  'CX_GRAPHICS_BACKEND_VERSION',
+  'DXVK_CONFIG_FILE',
+  'DXVK_CONFIG',
+  'DXVK_STATE_CACHE_PATH',
+  'DXVK_LOG_LEVEL',
+  'DXVK_LOG_PATH',
+  'DXVK_FRAME_RATE',
+  'DXVK_HUD',
+  'DXMT_CONFIG',
+  'DXMT_LOG_LEVEL',
+  'DXMT_LOG_PATH',
+  'DXMT_METALFX_SPATIAL_SWAPCHAIN',
+  'DXMT_ENABLE_NVEXT',
+  'D3DM_ENABLE_METALFX',
+  'D3DM_MAX_FPS',
+  'D3DM_NVNGX_PATH',
+  'CX_FWD_COMPAT_GL_CTX',
+  'CX_LIBVULKAN',
+  'MVK_CONFIG_RESUME_LOST_DEVICE',
+  'MVK_CONFIG_LOG_LEVEL',
+  'MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS',
+  'MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS',
+  'MVK_CONFIG_FAST_MATH_ENABLED',
+  'MVK_ICD_LIBRARY_PATH',
+  'ONE_LAUNCHER_MOLTENVK_PATH',
+  'ONE_LAUNCHER_METAL_PRELOAD',
+  'ONE_LAUNCHER_AUDIO_BUFFER_CLAMP',
+  'ONE_LAUNCHER_AUDIO_RT_THREAD',
+  'ONE_LAUNCHER_SUPPRESS_PRELOAD',
+  'MTL_HUD_ENABLED',
+  'WINEMSYNC',
+  'WINEESYNC',
+];
+
+function resolveSipSafeWineBinaryAndPreloadEnv(
+  wineBinaryPath,
+  /** @type {Record<string, any>} */ env = {},
+  /** @type {Record<string, any>} */ options = {}
+) {
+  if (!env || typeof env !== 'object') {
+    return wineBinaryPath;
+  }
+
   if (!wineBinaryPath || typeof wineBinaryPath !== 'string') {
     return wineBinaryPath;
   }
-  if (!env.DYLD_INSERT_LIBRARIES) {
-    return wineBinaryPath;
-  }
 
-  // Always mirror DYLD_INSERT_LIBRARIES into CX_DYLD_INSERT_LIBRARIES so CrossOver's Perl wrapper
-  // forwards it into wineloader right before exec!
-  const existingCxInsert = String(env.CX_DYLD_INSERT_LIBRARIES || '')
-    .split(/:(?![\\/])/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  for (const entry of String(env.DYLD_INSERT_LIBRARIES)
-    .split(/:(?![\\/])/)
-    .map((s) => s.trim())
-    .filter(Boolean)) {
-    if (!existingCxInsert.includes(entry)) {
-      existingCxInsert.push(entry);
-    }
-  }
-  if (existingCxInsert.length > 0) {
-    env.CX_DYLD_INSERT_LIBRARIES = existingCxInsert.join(':');
-  }
+  const isCrossOverPathOrBottle =
+    /CrossOver/i.test(wineBinaryPath) ||
+    Boolean(env.CX_BOTTLE) ||
+    options?.layerType === 'crossover' ||
+    options?.layerType === 'crossover_preview';
+  const looksLikeDirectMachOLoader = /\/(?:wineloader(?:64|2)?|wine64-preloader)$/i.test(
+    wineBinaryPath
+  );
 
-  // Check if wineBinaryPath starts with a SIP-protected interpreter shebang (e.g., #!/usr/bin/perl, #!/bin/sh)
+  let isShebangScript = false;
+  let isSipInterpreter = false;
+  let fileExistsOnDisk = false;
   try {
-    if (!fs.existsSync(wineBinaryPath) || !fs.statSync(wineBinaryPath).isFile()) {
-      return wineBinaryPath;
+    if (fs.existsSync(wineBinaryPath) && fs.statSync(wineBinaryPath).isFile()) {
+      fileExistsOnDisk = true;
+      const fd = fs.openSync(wineBinaryPath, 'r');
+      try {
+        const headBuf = Buffer.alloc(128);
+        const bytesRead = fs.readSync(fd, headBuf, 0, 128, 0);
+        const firstLine = headBuf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)[0] || '';
+        const shebangMatch = firstLine.match(/^#!\s*(\/\S+)/);
+        if (shebangMatch) {
+          isShebangScript = true;
+          isSipInterpreter = /^\/(usr\/bin|bin|sbin|usr\/sbin)\//.test(shebangMatch[1]);
+        }
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+      }
     }
-    const fd = fs.openSync(wineBinaryPath, 'r');
-    const headBuf = Buffer.alloc(128);
-    const bytesRead = fs.readSync(fd, headBuf, 0, 128, 0);
-    fs.closeSync(fd);
-    const firstLine = headBuf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)[0] || '';
-    const shebangMatch = firstLine.match(/^#!\s*(\/\S+)/);
-    if (!shebangMatch) {
-      return wineBinaryPath;
+  } catch {}
+
+  const isVirtualCrossOverBinWine =
+    !fileExistsOnDisk &&
+    !looksLikeDirectMachOLoader &&
+    (/\/CrossOver[^/]*\/bin\/wine$/i.test(wineBinaryPath) ||
+      (isCrossOverPathOrBottle && /\/bin\/wine$/i.test(wineBinaryPath)));
+
+  // Case 1: CrossOver Perl `bin/wine` wrapper (real SIP-shebang script or virtual CrossOver `bin/wine`)
+  if ((isCrossOverPathOrBottle && isSipInterpreter) || isVirtualCrossOverBinWine) {
+    /** @type {Record<string, string>} */
+    const cxEnvUpdates = {};
+    if (
+      typeof env.DYLD_INSERT_LIBRARIES === 'string' &&
+      env.DYLD_INSERT_LIBRARIES.trim() &&
+      doesWineLoaderAllowDyldInsert(wineBinaryPath)
+    ) {
+      cxEnvUpdates.DYLD_INSERT_LIBRARIES = env.DYLD_INSERT_LIBRARIES.trim();
     }
-    const interp = shebangMatch[1];
-    const isSipInterpreter = /^\/(usr\/bin|bin|sbin|usr\/sbin)\//.test(interp);
-    if (!isSipInterpreter) {
-      return wineBinaryPath;
+    for (const fwdKey of CX_ENV_MANAGED_FORWARD_KEYS) {
+      const rawVal = env[fwdKey];
+      if (typeof rawVal === 'string' && rawVal.trim()) {
+        cxEnvUpdates[fwdKey] = rawVal.trim();
+      }
+    }
+    if (Object.keys(cxEnvUpdates).length > 0) {
+      env.CX_ENV = mergeCxEnvVariables(env.CX_ENV, cxEnvUpdates);
+    }
+    // NEVER leave DYLD_INSERT_LIBRARIES in top-level env when invoking #!/usr/bin/perl (arm64e)
+    delete env.DYLD_INSERT_LIBRARIES;
+
+    if (typeof env.WINEDEBUG === 'string' && env.WINEDEBUG.trim() && !env.CX_DEBUGMSG) {
+      env.CX_DEBUGMSG = env.WINEDEBUG.trim();
     }
 
-    // CrossOver's Perl wrapper natively consumes CX_DYLD_INSERT_LIBRARIES and sets upbottle environment;
-    // for non-CrossOver SIP-shebang Wine wrappers, invoke the adjacent Mach-O wineloader directly if present.
-    const isCrossOverWrapper = /CrossOver/i.test(wineBinaryPath) || Boolean(env.CX_BOTTLE);
-    if (isCrossOverWrapper) {
+    if (fileExistsOnDisk) {
       const binDir = path.dirname(path.resolve(wineBinaryPath));
       const cxWineloaderCandidates = [
         path.join(binDir, 'wineloader64'),
@@ -3882,27 +5965,196 @@ function resolveSipSafeWineBinaryAndPreloadEnv(wineBinaryPath, /** @type {Record
       if (foundLoader) {
         env.WINELOADER = env.WINELOADER || foundLoader;
       }
-      return wineBinaryPath;
     }
+    return wineBinaryPath;
+  }
 
-    const binDir = path.dirname(path.resolve(wineBinaryPath));
-    const loaderCandidates = [
-      path.join(binDir, 'wineloader64'),
-      path.join(binDir, 'wineloader'),
-      path.join(binDir, 'wine64-preloader'),
-      path.resolve(binDir, '..', 'lib', 'wine', 'x86_64-unix', 'wine'),
-      path.resolve(binDir, '..', 'lib64', 'wine', 'x86_64-unix', 'wine'),
-    ];
-    for (const cand of loaderCandidates) {
+  // Case 2: Non-CrossOver SIP-protected interpreter wrapper (e.g. #!/bin/sh wine64 or gameportingtoolkit)
+  if (isShebangScript && isSipInterpreter) {
+    const wantsDyldInsert =
+      typeof env.DYLD_INSERT_LIBRARIES === 'string' && Boolean(env.DYLD_INSERT_LIBRARIES.trim());
+    const isGptkWrapperScript = /gameportingtoolkit/i.test(path.basename(wineBinaryPath));
+    if (wantsDyldInsert && !isGptkWrapperScript) {
+      const binDir = path.dirname(path.resolve(wineBinaryPath));
+      const wineRoot = path.resolve(binDir, '..');
+      const loaderCandidates = [
+        path.join(binDir, 'wineloader64'),
+        path.join(binDir, 'wineloader'),
+        path.join(binDir, 'wine64-preloader'),
+        path.resolve(wineRoot, 'lib', 'wine', 'x86_64-unix', 'wine'),
+        path.resolve(wineRoot, 'lib64', 'wine', 'x86_64-unix', 'wine'),
+      ];
+      for (const cand of loaderCandidates) {
+        try {
+          if (
+            fs.existsSync(cand) &&
+            inspectMacMachOHeader(cand).isMachO &&
+            doesWineLoaderAllowDyldInsert(cand)
+          ) {
+            const hasExplicitLibEnv = Boolean(
+              env.DYLD_FALLBACK_LIBRARY_PATH && env.WINEDLLPATH
+            );
+            const derivedLibDirs = [
+              path.join(wineRoot, 'lib64'),
+              path.join(wineRoot, 'lib'),
+            ].filter((d) => fs.existsSync(d));
+            const derivedDllDirs = [
+              path.join(wineRoot, 'lib64', 'wine'),
+              path.join(wineRoot, 'lib', 'wine'),
+            ].filter((d) => fs.existsSync(d));
+            if (hasExplicitLibEnv || (derivedLibDirs.length > 0 && derivedDllDirs.length > 0)) {
+              if (!env.DYLD_FALLBACK_LIBRARY_PATH && derivedLibDirs.length > 0) {
+                env.DYLD_FALLBACK_LIBRARY_PATH = `${derivedLibDirs.join(':')}:/usr/lib`;
+              }
+              if (!env.WINEDLLPATH && derivedDllDirs.length > 0) {
+                env.WINEDLLPATH = derivedDllDirs.join(':');
+              }
+              return cand;
+            }
+          }
+        } catch {}
+      }
+    }
+    // Preserve wrapper script (retaining its GST_PLUGIN_SYSTEM_PATH_1_0 / DYLD_FALLBACK_LIBRARY_PATH)
+    // and strip top-level DYLD_INSERT_LIBRARIES so arm64e SIP interpreter never rejects or crashes.
+    delete env.DYLD_INSERT_LIBRARIES;
+    return wineBinaryPath;
+  }
+
+  // Case 3: Direct Mach-O binary (`wineloader` / `wineloader64` / `wine64` / `lib64/wine/.../wine`)
+  if (!isShebangScript && fileExistsOnDisk && env.DYLD_INSERT_LIBRARIES) {
+    if (!doesWineLoaderAllowDyldInsert(wineBinaryPath)) {
+      delete env.DYLD_INSERT_LIBRARIES;
+    }
+  }
+
+  if (isCrossOverPathOrBottle && !isShebangScript) {
+    const cxRoot = deriveCrossOverRootFromBinaryPath(wineBinaryPath);
+    if (cxRoot) {
+      if (!env.CX_ROOT) {
+        env.CX_ROOT = cxRoot;
+      }
+      const gptkSharedDylib = path.join(
+        cxRoot,
+        'lib64',
+        'apple_gptk',
+        'external',
+        'libd3dshared.dylib'
+      );
       try {
-        if (fs.existsSync(cand) && inspectMacMachOHeader(cand).isMachO) {
-          return cand;
+        if (!env.CX_APPLEGPTK_LIBD3DSHARED_PATH && fs.existsSync(gptkSharedDylib)) {
+          env.CX_APPLEGPTK_LIBD3DSHARED_PATH = gptkSharedDylib;
         }
       } catch {}
     }
-  } catch {}
+    if (env.ROSETTA_ADVERTISE_AVX === '0') {
+      delete env.ROSETTA_ADVERTISE_AVX;
+    }
+  }
 
   return wineBinaryPath;
+}
+
+/**
+ * Alias helper for preparing `env` right before spawning any Wine / CrossOver process
+ * (`bin/wine` Perl wrapper or direct `wineloader`), ensuring `DYLD_INSERT_LIBRARIES` is never
+ * left in top-level `env` for `#!/usr/bin/perl` and `CX_ENV` / `CX_ROOT` are properly populated.
+ *
+ * @param {string} wineBinaryPath
+ * @param {Record<string, any>} [env]
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function prepareCrossOverWineSpawnEnv(wineBinaryPath, env = {}, options = {}) {
+  return resolveSipSafeWineBinaryAndPreloadEnv(wineBinaryPath, env, options);
+}
+
+/**
+ * Prepare a fully aligned Wine command + environment for helper/bootstrap commands (`reg.exe`,
+ * `wineboot`, installer helpers, publisher clients) or game launches targeting `bottlePath`:
+ * - Aligns `WINEMSYNC` with any live `wineserver` (`alignWineMsyncWithLiveBottle`).
+ * - Applies `resolveSipSafeWineBinaryAndPreloadEnv` (`CX_ENV`, `CX_ROOT`, SIP-safe preload stripping).
+ * - Computes `prefixArgs` (`['--dll', env.WINEDLLOVERRIDES]` on CrossOver Perl `bin/wine` when non-GUI suppression is off).
+ * - When `suppressGuiDialogs === true`: disables `winemenubuilder.exe`, `mscoree`, `mshtml`,
+ *   `MTL_HUD_ENABLED`, `DXVK_HUD`, and `DYLD_INSERT_LIBRARIES`, and sets `ONE_LAUNCHER_SUPPRESS_PRELOAD=1` + `WINEDEBUG=-all`.
+ *
+ * @param {{
+ *   wineBinary: string,
+ *   bottlePath?: string,
+ *   env?: Record<string, any>,
+ *   suppressGuiDialogs?: boolean,
+ *   layerType?: string,
+ *   wineserverActive?: boolean,
+ *   includeDllFlag?: boolean
+ * }} params
+ * @returns {{ wineBinary: string, prefixArgs: string[], env: Record<string, any> }}
+ */
+function prepareAlignedBottleWineCommand(params) {
+  const src = params && typeof params === 'object' ? params : { wineBinary: '' };
+  const rawWineBin = String(src.wineBinary || '');
+  const bottlePath = typeof src.bottlePath === 'string' ? src.bottlePath : '';
+  /** @type {Record<string, any>} */
+  const targetEnv = src.env && typeof src.env === 'object' ? src.env : {};
+
+  if (bottlePath) {
+    if (!targetEnv.WINEPREFIX) {
+      targetEnv.WINEPREFIX = bottlePath;
+    }
+    const cxBottleMatch = /\/Bottles\/([^/]+)$/i.exec(bottlePath.replace(/\\/g, '/'));
+    if (cxBottleMatch && cxBottleMatch[1] && !targetEnv.CX_BOTTLE) {
+      targetEnv.CX_BOTTLE = cxBottleMatch[1];
+    }
+  }
+
+  if (src.suppressGuiDialogs === true) {
+    const existingOverrides = String(targetEnv.WINEDLLOVERRIDES || '')
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const reqDisable of ['winemenubuilder.exe=d', 'mscoree=d', 'mshtml=d']) {
+      const dllBase = reqDisable.split('=')[0].toLowerCase();
+      if (!existingOverrides.some((tok) => tok.split('=')[0].trim().toLowerCase() === dllBase)) {
+        existingOverrides.push(reqDisable);
+      }
+    }
+    targetEnv.WINEDLLOVERRIDES = existingOverrides.join(';');
+    delete targetEnv.DYLD_INSERT_LIBRARIES;
+    delete targetEnv.MTL_HUD_ENABLED;
+    delete targetEnv.DXVK_HUD;
+    targetEnv.ONE_LAUNCHER_SUPPRESS_PRELOAD = '1';
+    targetEnv.ONE_LAUNCHER_METAL_PRELOAD = '0';
+    targetEnv.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP = '0';
+    if (!targetEnv.WINEDEBUG) {
+      targetEnv.WINEDEBUG = '-all';
+    }
+  }
+
+  if (bottlePath) {
+    alignWineMsyncWithLiveBottle(bottlePath, targetEnv, {
+      wineserverActive: src.wineserverActive,
+    });
+  }
+
+  const resolvedBin = resolveSipSafeWineBinaryAndPreloadEnv(rawWineBin, targetEnv, {
+    layerType: src.layerType,
+  });
+
+  /** @type {string[]} */
+  const prefixArgs =
+    src.suppressGuiDialogs !== true &&
+    src.includeDllFlag !== false &&
+    typeof targetEnv.WINEDLLOVERRIDES === 'string' &&
+    Boolean(targetEnv.WINEDLLOVERRIDES.trim()) &&
+    /\/bin\/wine$/i.test(String(resolvedBin || '')) &&
+    (/CrossOver/i.test(String(resolvedBin || '')) || Boolean(targetEnv.CX_BOTTLE))
+      ? ['--dll', targetEnv.WINEDLLOVERRIDES.trim()]
+      : [];
+
+  return {
+    wineBinary: resolvedBin,
+    prefixArgs,
+    env: targetEnv,
+  };
 }
 
 function resolveWineserverBinary(wineBinary) {
@@ -3956,11 +6208,13 @@ async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000, extr
       ? extraOptions.execFileFn
       : execFile;
 
+  /** @type {Record<string, any>} */
   const prefixEnv = {
     ...process.env,
     WINEPREFIX: canonicalPrefix,
     ...(bottleName ? { CX_BOTTLE: bottleName } : {}),
   };
+  delete prefixEnv.DYLD_INSERT_LIBRARIES;
 
   let isNodeShebangScriptOnWin32 = false;
   if (process.platform === 'win32') {
@@ -3992,6 +6246,7 @@ async function shutdownWinePrefix(wineBinary, winePrefix, timeoutMs = 3000, extr
 
   await runWineserverFlag('-k');
   await runWineserverFlag('-w');
+  liveBottleMsyncByPrefix.delete(canonicalPrefix);
 
   return true;
 }
@@ -4049,21 +6304,689 @@ function resolveBottleEpicLauncherExe(winePrefix) {
   return null;
 }
 
+/**
+ * Curated OpenGL 1.1–3.2 + WGL extension list (< 1,250 bytes) for legacy 32-bit x86 OpenGL engines
+ * whose fixed-size stack/static `GL_EXTENSIONS` / `Com_sprintf` buffers overflow when CrossOver 26+
+ * advertises its 10,800+ byte Core-Profile / Apple-Silicon GL extension string.
+ */
+const LEGACY_32BIT_OPENGL_ENABLED_EXTENSIONS = [
+  'GL_ARB_multitexture',
+  'GL_ARB_texture_compression',
+  'GL_ARB_texture_cube_map',
+  'GL_ARB_texture_env_add',
+  'GL_ARB_texture_env_combine',
+  'GL_ARB_texture_env_dot3',
+  'GL_ARB_texture_border_clamp',
+  'GL_ARB_texture_mirrored_repeat',
+  'GL_ARB_texture_non_power_of_two',
+  'GL_ARB_vertex_buffer_object',
+  'GL_ARB_vertex_program',
+  'GL_ARB_fragment_program',
+  'GL_ARB_shader_objects',
+  'GL_ARB_vertex_shader',
+  'GL_ARB_fragment_shader',
+  'GL_ARB_shading_language_100',
+  'GL_ARB_framebuffer_object',
+  'GL_ARB_depth_texture',
+  'GL_ARB_shadow',
+  'GL_ARB_multisample',
+  'GL_ARB_occlusion_query',
+  'GL_ARB_pixel_buffer_object',
+  'GL_ARB_draw_buffers',
+  'GL_ARB_point_sprite',
+  'GL_EXT_bgra',
+  'GL_EXT_blend_color',
+  'GL_EXT_blend_minmax',
+  'GL_EXT_blend_subtract',
+  'GL_EXT_blend_func_separate',
+  'GL_EXT_compiled_vertex_array',
+  'GL_EXT_draw_range_elements',
+  'GL_EXT_fog_coord',
+  'GL_EXT_multi_draw_arrays',
+  'GL_EXT_secondary_color',
+  'GL_EXT_separate_specular_color',
+  'GL_EXT_shadow_funcs',
+  'GL_EXT_stencil_two_side',
+  'GL_EXT_stencil_wrap',
+  'GL_EXT_texture3D',
+  'GL_EXT_texture_compression_s3tc',
+  'GL_EXT_texture_edge_clamp',
+  'GL_EXT_texture_env_add',
+  'GL_EXT_texture_env_combine',
+  'GL_EXT_texture_env_dot3',
+  'GL_EXT_texture_filter_anisotropic',
+  'GL_EXT_texture_lod_bias',
+  'GL_EXT_framebuffer_object',
+  'GL_EXT_framebuffer_blit',
+  'GL_ATI_separate_stencil',
+  'GL_NV_texgen_reflection',
+  'GL_NV_register_combiners',
+  'GL_NV_texture_shader',
+  'GL_SGIS_generate_mipmap',
+  'GL_SGIS_texture_lod',
+  'WGL_ARB_extensions_string',
+  'WGL_ARB_pixel_format',
+  'WGL_ARB_pbuffer',
+  'WGL_ARB_render_texture',
+  'WGL_ARB_multisample',
+  'WGL_EXT_extensions_string',
+  'WGL_EXT_swap_control',
+].join(' ');
+
+/**
+ * Remove a specific named value from a section inside a Wine `.reg` file if present,
+ * and record `"ValueName"=-` in `options.liveSyncAccumulator` (or live `wineserver`) when active.
+ *
+ * @param {string} regFilePath
+ * @param {string} subKeyPath
+ * @param {string} valueName
+ * @param {Record<string, any>} [options]
+ * @returns {boolean}
+ */
+function removeWineRegNamedValue(regFilePath, subKeyPath, valueName, options = {}) {
+  if (!regFilePath || !subKeyPath || !valueName || !fs.existsSync(regFilePath)) {
+    return false;
+  }
+  try {
+    const content = fs.readFileSync(regFilePath, 'utf8');
+    const normalizedSubKey = subKeyPath
+      .trim()
+      .replace(/^\\+|\\+$/g, '')
+      .replace(/\\+/g, '\\');
+    const escapedSec = normalizedSubKey
+      .replace(/\\/g, '\\\\')
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const secRe = new RegExp(`^\\[${escapedSec}\\](?:\\s+\\d+)?[^\\r\\n]*$`, 'im');
+    const match = secRe.exec(content);
+    if (!match) return false;
+
+    const secStart = match.index + match[0].length;
+    const afterSec = content.slice(secStart);
+    const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+    const body = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+    const rest = nextSec ? afterSec.slice(nextSec.index) : '';
+    const targetLower = valueName.toLowerCase();
+    let removed = false;
+    const filteredLines = body.split(/\r?\n/).filter((line) => {
+      const kv = line.match(/^\s*"((?:[^"\\]|\\.)+)"\s*=/);
+      if (!kv) return true;
+      const unescaped = kv[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      if (unescaped.toLowerCase() === targetLower) {
+        removed = true;
+        return false;
+      }
+      return true;
+    });
+    if (!removed) return false;
+    atomicWriteFileSync(regFilePath, content.slice(0, secStart) + filteredLines.join('\n') + rest);
+
+    /** @type {'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE'} */
+    const hiveName =
+      path.basename(regFilePath).toLowerCase() === 'user.reg'
+        ? 'HKEY_CURRENT_USER'
+        : 'HKEY_LOCAL_MACHINE';
+    if (options && Array.isArray(options.liveSyncAccumulator)) {
+      options.liveSyncAccumulator.push({
+        hiveName,
+        normalizedSubKey,
+        entryPairsOrNullForDelete: [[valueName, { delete: true }]],
+      });
+    } else if (options && options.bottlePath && options.skipLiveWineRegSync !== true) {
+      try {
+        const { syncLiveWineRegistryAsync } = require('./firstPartyRegistration.cjs');
+        syncLiveWineRegistryAsync(
+          options.bottlePath,
+          hiveName,
+          normalizedSubKey,
+          [[valueName, { delete: true }]],
+          options
+        ).catch(() => {});
+      } catch {}
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Compose `;`-delimited `DXMT_CONFIG` / `DXVK_CONFIG` clauses without overwriting existing user clauses.
+ *
+ * @param {string | undefined | null} existing
+ * @param {string | Array<string> | Record<string, string | number | boolean> | undefined | null} additions
+ * @param {{ overwriteExisting?: boolean }} [options]
+ * @returns {string}
+ */
+function mergeSemicolonConfigClauses(existing, additions, options = {}) {
+  const overwriteExisting = Boolean(options?.overwriteExisting);
+  /** @type {Array<{ keyLower: string, clause: string }>} */
+  const ordered = [];
+  /** @type {Map<string, number>} */
+  const keyIndex = new Map();
+
+  const pushClause = (/** @type {string} */ rawClause, /** @type {boolean} */ allowOverwrite) => {
+    const trimmed = String(rawClause || '').trim();
+    if (!trimmed) return;
+    const eqIdx = trimmed.indexOf('=');
+    const keyLower = eqIdx > 0 ? trimmed.slice(0, eqIdx).trim().toLowerCase() : trimmed.toLowerCase();
+    if (!keyLower) return;
+    if (keyIndex.has(keyLower)) {
+      if (allowOverwrite) {
+        const idx = /** @type {number} */ (keyIndex.get(keyLower));
+        ordered[idx] = { keyLower, clause: trimmed };
+      }
+      return;
+    }
+    keyIndex.set(keyLower, ordered.length);
+    ordered.push({ keyLower, clause: trimmed });
+  };
+
+  for (const part of String(existing || '').split(';')) {
+    pushClause(part, false);
+  }
+
+  if (typeof additions === 'string') {
+    for (const part of additions.split(';')) {
+      pushClause(part, overwriteExisting);
+    }
+  } else if (Array.isArray(additions)) {
+    for (const item of additions) {
+      for (const part of String(item || '').split(';')) {
+        pushClause(part, overwriteExisting);
+      }
+    }
+  } else if (additions && typeof additions === 'object') {
+    for (const [k, v] of Object.entries(additions)) {
+      if (k && v !== undefined && v !== null && String(v).trim() !== '') {
+        pushClause(`${k.trim()} = ${String(v).trim()}`, overwriteExisting);
+      }
+    }
+  }
+
+  return ordered.map((entry) => entry.clause).join('; ');
+}
+
+/**
+ * Detect whether a CrossOver root directory on disk bundles 32-bit DXMT, 32-bit DXVK, and 64-bit D3DMetal.
+ * Falls back to `{ has32BitDxmt: true, has32BitDxvk: true, has64BitD3dMetal: true }` when `cxRoot` is virtual
+ * in unit tests (i.e. no `lib`/`lib64` backend tree exists on disk).
+ *
+ * @param {string} cxRoot
+ * @param {Record<string, any>} [params]
+ */
+function detectCrossOverBackendLayerSupport(cxRoot, params = {}) {
+  const explicit = params?.layerSupport && typeof params.layerSupport === 'object' ? params.layerSupport : null;
+  const layerType = String(params?.chosenLayer?.type || params?.layerType || '')
+    .trim()
+    .toLowerCase();
+  const isStandaloneNonCrossOver = layerType === 'wine' || layerType === 'gptk';
+  const bottlePath = String(params?.bottlePath || params?.winePrefix || '').trim();
+
+  let has32BitDxmt = !isStandaloneNonCrossOver;
+  let has32BitDxvk = !isStandaloneNonCrossOver;
+  let has64BitD3dMetal = layerType !== 'wine';
+
+  if (cxRoot && typeof cxRoot === 'string') {
+    try {
+      if (fs.existsSync(cxRoot) && fs.statSync(cxRoot).isDirectory()) {
+        const probe32Dxmt =
+          fs.existsSync(path.join(cxRoot, 'lib', 'dxmt', 'i386-windows', 'd3d11.dll')) ||
+          fs.existsSync(path.join(cxRoot, 'lib', 'wine', 'i386-windows', 'winemetal.dll'));
+        const probe32Dxvk =
+          fs.existsSync(path.join(cxRoot, 'lib', 'dxvk', 'i386-windows', 'd3d9.dll')) ||
+          fs.existsSync(path.join(cxRoot, 'lib', 'dxvk', 'i386-windows', 'd3d11.dll'));
+        const probe64D3dMetal =
+          fs.existsSync(path.join(cxRoot, 'lib64', 'apple_gptk')) ||
+          fs.existsSync(path.join(cxRoot, 'lib', 'external', 'D3DMetal.framework')) ||
+          fs.existsSync(path.join(cxRoot, 'lib64', 'external', 'D3DMetal.framework'));
+        const hasRealBackendTree =
+          probe32Dxmt ||
+          probe32Dxvk ||
+          probe64D3dMetal ||
+          fs.existsSync(path.join(cxRoot, 'lib', 'wine')) ||
+          fs.existsSync(path.join(cxRoot, 'lib64', 'wine'));
+        if (hasRealBackendTree || isStandaloneNonCrossOver) {
+          has32BitDxmt = probe32Dxmt;
+          has32BitDxvk = probe32Dxvk;
+          has64BitD3dMetal = probe64D3dMetal || (layerType === 'gptk' && !hasRealBackendTree);
+        }
+      }
+    } catch {}
+  }
+
+  if (isStandaloneNonCrossOver && bottlePath) {
+    try {
+      if (fs.existsSync(bottlePath) && fs.statSync(bottlePath).isDirectory()) {
+        const syswow64 =
+          resolveDriveCPathCaseInsensitive(bottlePath, ['drive_c', 'windows', 'syswow64']) ||
+          path.join(bottlePath, 'drive_c', 'windows', 'syswow64');
+        if (!has32BitDxmt && fs.existsSync(path.join(syswow64, 'winemetal.dll'))) {
+          has32BitDxmt = true;
+        }
+        if (!has32BitDxvk && fs.existsSync(path.join(syswow64, 'dxvk_config.dll'))) {
+          has32BitDxvk = true;
+        }
+      }
+    } catch {}
+  }
+
+  if (explicit) {
+    if (typeof explicit.has32BitDxmt === 'boolean') has32BitDxmt = explicit.has32BitDxmt;
+    if (typeof explicit.has32BitDxvk === 'boolean') has32BitDxvk = explicit.has32BitDxvk;
+    if (typeof explicit.has64BitD3dMetal === 'boolean') has64BitD3dMetal = explicit.has64BitD3dMetal;
+  }
+
+  return { has32BitDxmt, has32BitDxvk, has64BitD3dMetal };
+}
+
+/**
+ * Deterministic universal CrossOver graphics backend router driven strictly by PE32/PE32+ header bits,
+ * PE import/delay-import tables, UE5 IoStore `.utoc` containers, and on-disk layer layout.
+ *
+ * @param {Record<string, any>} [params]
+ */
+function resolveEffectiveCrossOverGraphicsBackend(params = {}) {
+  const src =
+    params?.capabilities && typeof params.capabilities === 'object'
+      ? { ...params.capabilities, ...params }
+      : params?.peCapabilities && typeof params.peCapabilities === 'object'
+        ? { ...params.peCapabilities, ...params }
+        : params || {};
+
+  const rawRequested = String(
+    src.requestedBackend ?? src.crossoverGraphicsBackend ?? src.backend ?? 'auto'
+  )
+    .trim()
+    .toLowerCase();
+  const normalizedRequested = rawRequested || 'auto';
+
+  const cxRoot =
+    typeof src.cxRoot === 'string' && src.cxRoot.trim()
+      ? src.cxRoot.trim()
+      : deriveCrossOverRootFromBinaryPath(
+          String(src.wineBinaryPath || src.chosenLayer?.binaryPath || '')
+        );
+  const layerSupport = detectCrossOverBackendLayerSupport(cxRoot, src);
+
+  const is32Bit = Boolean(src.is32Bit || src.effectiveMachine === 'x86' || src.isX86);
+  const is64Bit = Boolean(
+    !is32Bit &&
+      (src.is64Bit ||
+        src.effectiveMachine === 'x64' ||
+        src.effectiveMachine === 'arm64' ||
+        src.isX64)
+  );
+  const isNxCompat = src.isNxCompat === false ? false : Boolean(src.isNxCompat ?? true);
+  const importsD3d12 = Boolean(src.importsD3d12);
+  const importsD3d11Or10 = Boolean(src.importsD3d11Or10);
+  const importsD3d9 = Boolean(src.importsD3d9);
+  const importsLegacyD3dOrGl = Boolean(src.importsLegacyD3dOrGl);
+  const importsVulkan = Boolean(src.importsVulkan);
+  const hasUe5IoStoreContainer = Boolean(src.hasUe5IoStoreContainer);
+  const isD3d12Only =
+    typeof src.isD3d12Only === 'boolean'
+      ? src.isD3d12Only
+      : (importsD3d12 || hasUe5IoStoreContainer) &&
+        !importsD3d11Or10 &&
+        !importsD3d9 &&
+        !importsVulkan &&
+        !importsLegacyD3dOrGl;
+
+  let effectiveRequested = normalizedRequested;
+  /** @type {string | null} */
+  let reroutedReason = null;
+
+  // Hard Safety Guard #2: D3DMetal is 64-bit only (`is_d3dmetal_usable() == 0` on PE32).
+  // Treat `'d3dmetal'` on `is32Bit` identically to `'auto'` instead of dropping blindly to CGL OpenGL wined3d.
+  if (is32Bit && effectiveRequested === 'd3dmetal') {
+    effectiveRequested = 'auto';
+    reroutedReason = 'pe32_d3dmetal_unsupported';
+  }
+
+  // Hard Safety Guard #1: `is32Bit && isNxCompat === false` + `'dxmt'` MUST NEVER allow `'dxmt'`
+  // (prevents 100% CPU `dxmt-encode-thr` Rosetta `rwx` infinite hang).
+  if (is32Bit && isNxCompat === false && effectiveRequested === 'dxmt') {
+    reroutedReason = 'pe32_non_nx_dxmt_hang_guard';
+    if (importsD3d11Or10 && layerSupport.has32BitDxvk) {
+      return {
+        backend: 'dxvk',
+        cxGraphicsBackendEnv: 'dxvk',
+        direct3dRenderer: null,
+        reroutedReason,
+        layerSupport,
+      };
+    }
+    return {
+      backend: 'wined3d',
+      cxGraphicsBackendEnv: 'wined3d',
+      direct3dRenderer: importsD3d9 && !importsLegacyD3dOrGl ? 'vulkan' : null,
+      reroutedReason,
+      layerSupport,
+    };
+  }
+
+  // Explicit non-auto backend selection
+  if (
+    effectiveRequested === 'd3dmetal' ||
+    effectiveRequested === 'dxmt' ||
+    effectiveRequested === 'dxvk' ||
+    effectiveRequested === 'wined3d'
+  ) {
+    let resolvedExplicit = effectiveRequested;
+    if (resolvedExplicit === 'dxmt' && is32Bit && !layerSupport.has32BitDxmt) {
+      resolvedExplicit = layerSupport.has32BitDxvk ? 'dxvk' : 'wined3d';
+      reroutedReason = 'pe32_dxmt_layer_missing';
+    } else if (resolvedExplicit === 'dxvk' && is32Bit && !layerSupport.has32BitDxvk) {
+      resolvedExplicit = 'wined3d';
+      reroutedReason = 'pe32_dxvk_layer_missing';
+    } else if (resolvedExplicit === 'd3dmetal' && is64Bit && !layerSupport.has64BitD3dMetal) {
+      resolvedExplicit = 'auto';
+      reroutedReason = 'pe64_d3dmetal_layer_missing';
+    }
+    return {
+      backend: resolvedExplicit,
+      cxGraphicsBackendEnv: resolvedExplicit === 'auto' ? null : resolvedExplicit,
+      direct3dRenderer: null,
+      reroutedReason,
+      layerSupport,
+    };
+  }
+
+  // Universal `'auto'` Resolution
+  if (is32Bit) {
+    if (importsD3d11Or10 && isNxCompat !== false) {
+      if (layerSupport.has32BitDxmt) {
+        return {
+          backend: 'dxmt',
+          cxGraphicsBackendEnv: 'dxmt',
+          direct3dRenderer: null,
+          reroutedReason,
+          layerSupport,
+        };
+      }
+      if (layerSupport.has32BitDxvk) {
+        return {
+          backend: 'dxvk',
+          cxGraphicsBackendEnv: 'dxvk',
+          direct3dRenderer: null,
+          reroutedReason: reroutedReason || 'pe32_dxmt_layer_missing',
+          layerSupport,
+        };
+      }
+      return {
+        backend: 'wined3d',
+        cxGraphicsBackendEnv: 'wined3d',
+        direct3dRenderer: 'vulkan',
+        reroutedReason: reroutedReason || 'pe32_dxmt_dxvk_missing',
+        layerSupport,
+      };
+    }
+
+    if (importsD3d11Or10 && isNxCompat === false) {
+      if (layerSupport.has32BitDxvk) {
+        return {
+          backend: 'dxvk',
+          cxGraphicsBackendEnv: 'dxvk',
+          direct3dRenderer: null,
+          reroutedReason,
+          layerSupport,
+        };
+      }
+      return {
+        backend: 'wined3d',
+        cxGraphicsBackendEnv: 'wined3d',
+        direct3dRenderer: 'vulkan',
+        reroutedReason: reroutedReason || 'pe32_dxvk_layer_missing',
+        layerSupport,
+      };
+    }
+
+    if (importsD3d9 && !importsD3d11Or10 && !importsLegacyD3dOrGl) {
+      return {
+        backend: 'wined3d',
+        cxGraphicsBackendEnv: 'wined3d',
+        direct3dRenderer: 'vulkan',
+        reroutedReason,
+        layerSupport,
+      };
+    }
+
+    if (importsLegacyD3dOrGl) {
+      return {
+        backend: 'wined3d',
+        cxGraphicsBackendEnv: 'wined3d',
+        direct3dRenderer: null,
+        reroutedReason,
+        layerSupport,
+      };
+    }
+
+    // Packed / dynamically-loaded non-DEP (`isNxCompat === false`) PE32 guard:
+    // Pin to `wined3d` rather than leaving `cxGraphicsBackendEnv: null` so CrossOver `cxcompatdb`
+    // can never auto-select `dxmt` and trigger Rosetta's `WINE_SIMULATE_WRITECOPY` encode hang.
+    if (isNxCompat === false) {
+      return {
+        backend: 'wined3d',
+        cxGraphicsBackendEnv: 'wined3d',
+        direct3dRenderer: null,
+        reroutedReason: reroutedReason || 'pe32_non_nx_dxmt_hang_guard',
+        layerSupport,
+      };
+    }
+  }
+
+  if (is64Bit && isD3d12Only && layerSupport.has64BitD3dMetal) {
+    return {
+      backend: 'd3dmetal',
+      cxGraphicsBackendEnv: 'd3dmetal',
+      direct3dRenderer: null,
+      reroutedReason,
+      layerSupport,
+    };
+  }
+
+  return {
+    backend: 'auto',
+    cxGraphicsBackendEnv: null,
+    direct3dRenderer: null,
+    reroutedReason,
+    layerSupport,
+  };
+}
+
+const NON_APFS_APPLEDOUBLE_FS_TYPES = new Set([
+  'exfat',
+  'msdos',
+  'fat',
+  'fat32',
+  'vfat',
+  'ntfs',
+  'ntfs-3g',
+  'tuxera_ntfs',
+  'ufsd_ntfs',
+  'smbfs',
+  'cifs',
+  'udf',
+]);
+
+/** @type {{ ts: number, raw: string }} */
+let cachedDarwinMountTable = { ts: 0, raw: '' };
+
+function getCachedDarwinMountTableOutput() {
+  const now = Date.now();
+  if (cachedDarwinMountTable.raw && now - cachedDarwinMountTable.ts < 5000) {
+    return cachedDarwinMountTable.raw;
+  }
+  try {
+    const out = execFileSync('/sbin/mount', [], {
+      timeout: 1500,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    cachedDarwinMountTable = { ts: now, raw: String(out || '') };
+    return cachedDarwinMountTable.raw;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Remove macOS Finder `._<name>` AppleDouble resource-fork twins (`0x00051607`) ONLY on non-APFS/HFS+
+ * external/network volumes (`exfat`, `msdos`, `ntfs`, `smbfs`) and ONLY when sibling `<name>` exists.
+ * Returns `0` in `< 0.1 ms` on internal APFS `/System/Volumes/Data` paths with zero subprocesses.
+ *
+ * @param {string} targetDir
+ * @param {{ platform?: string, fsType?: string, mountOutput?: string, maxDepth?: number, maxDirs?: number }} [options]
+ * @returns {number}
+ */
+function cleanNonApfsAppleDoubleTwins(targetDir, options = {}) {
+  const effectivePlatform = options?.platform || process.platform;
+  if (effectivePlatform !== 'darwin' || !targetDir || typeof targetDir !== 'string') {
+    return 0;
+  }
+  let realTargetDir = '';
+  try {
+    if (!fs.existsSync(targetDir)) return 0;
+    realTargetDir = fs.realpathSync(targetDir);
+  } catch {
+    return 0;
+  }
+
+  // Fast < 0.1 ms short-circuit for internal APFS/HFS+ paths (/Users, /Applications, /System/Volumes/Data, /private/var, etc.)
+  if (!options?.fsType && !options?.mountOutput && !realTargetDir.startsWith('/Volumes/')) {
+    return 0;
+  }
+
+  let fsTypeLower = typeof options?.fsType === 'string' ? options.fsType.trim().toLowerCase() : '';
+  if (!fsTypeLower) {
+    const mountRaw =
+      typeof options?.mountOutput === 'string'
+        ? options.mountOutput
+        : getCachedDarwinMountTableOutput();
+    if (mountRaw) {
+      let longestMountLen = -1;
+      for (const line of mountRaw.split(/\r?\n/)) {
+        const m = line.match(/\son\s+(\/.+?)\s+\(([^,)\s]+)/);
+        if (!m) continue;
+        const mountPoint = m[1];
+        const fstype = m[2].trim().toLowerCase();
+        if (
+          realTargetDir === mountPoint ||
+          realTargetDir.startsWith(mountPoint.endsWith('/') ? mountPoint : `${mountPoint}/`)
+        ) {
+          if (mountPoint.length > longestMountLen) {
+            longestMountLen = mountPoint.length;
+            fsTypeLower = fstype;
+          }
+        }
+      }
+    }
+  }
+
+  if (!fsTypeLower || !NON_APFS_APPLEDOUBLE_FS_TYPES.has(fsTypeLower)) {
+    return 0;
+  }
+
+  const maxDepth = Number.isFinite(options?.maxDepth)
+    ? Math.max(0, Number(options.maxDepth))
+    : 5;
+  const maxDirs = Number.isFinite(options?.maxDirs)
+    ? Math.max(1, Number(options.maxDirs))
+    : 200;
+
+  let removedCount = 0;
+  let visitedDirs = 0;
+  /** @type {Array<{ dir: string, depth: number }>} */
+  const queue = [{ dir: realTargetDir, depth: 0 }];
+
+  while (queue.length > 0 && visitedDirs < maxDirs) {
+    const current = queue.shift();
+    if (!current) break;
+    visitedDirs += 1;
+
+    let entries;
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    const exactNames = new Set();
+    const lowerNames = new Set();
+    for (let i = 0; i < entries.length; i += 1) {
+      const nm = entries[i].name;
+      exactNames.add(nm);
+      lowerNames.add(nm.toLowerCase());
+    }
+
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        if (!entry.name.startsWith('._') && current.depth < maxDepth && visitedDirs < maxDirs) {
+          queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.startsWith('._') || entry.name.length <= 2) {
+        continue;
+      }
+      const baseSibling = entry.name.slice(2);
+      if (!exactNames.has(baseSibling) && !lowerNames.has(baseSibling.toLowerCase())) {
+        continue;
+      }
+      const twinPath = path.join(current.dir, entry.name);
+      /** @type {number | null} */
+      let fd = null;
+      let isAppleDouble = false;
+      try {
+        fd = fs.openSync(twinPath, 'r');
+        const magicBuf = Buffer.alloc(4);
+        const bytesRead = fs.readSync(fd, magicBuf, 0, 4, 0);
+        isAppleDouble = bytesRead === 4 && magicBuf.readUInt32BE(0) === 0x00051607;
+      } catch {
+        isAppleDouble = false;
+      } finally {
+        if (fd !== null) {
+          try {
+            fs.closeSync(fd);
+          } catch {}
+        }
+      }
+      if (isAppleDouble) {
+        try {
+          fs.unlinkSync(twinPath);
+          removedCount += 1;
+        } catch {}
+      }
+    }
+  }
+
+  return removedCount;
+}
+
 function applyCrossOverPerGameSettings(
   /** @type {any} */ chosenLayerOrBottlePath,
   /** @type {any} */ launchConfig = {},
   /** @type {any} */ envOrOptions = {},
-  bottlePath = '',
+  /** @type {any} */ bottlePath = '',
   /** @type {any} */ options = {}
 ) {
   const isStringBottleFirstArg = typeof chosenLayerOrBottlePath === 'string';
-  const effectiveOptions = isStringBottleFirstArg
-    ? envOrOptions && typeof envOrOptions === 'object'
-      ? envOrOptions
-      : {}
-    : options && typeof options === 'object'
-      ? options
-      : {};
+  const isSecondArgExeString = isStringBottleFirstArg && typeof launchConfig === 'string';
+  const effectiveOptions = isSecondArgExeString
+    ? bottlePath && typeof bottlePath === 'object'
+      ? bottlePath
+      : options && typeof options === 'object'
+        ? options
+        : {}
+    : isStringBottleFirstArg
+      ? envOrOptions && typeof envOrOptions === 'object'
+        ? envOrOptions
+        : {}
+      : options && typeof options === 'object'
+        ? options
+        : {};
   const chosenLayer = isStringBottleFirstArg
     ? { type: effectiveOptions.isPreviewRunner ? 'crossover_preview' : 'crossover' }
     : chosenLayerOrBottlePath;
@@ -4073,10 +6996,21 @@ function applyCrossOverPerGameSettings(
     : envOrOptions && typeof envOrOptions === 'object'
       ? envOrOptions
       : {};
-  const effectiveBottlePathArg = isStringBottleFirstArg ? chosenLayerOrBottlePath : bottlePath;
+  const effectiveBottlePathArg = isStringBottleFirstArg
+    ? chosenLayerOrBottlePath
+    : typeof bottlePath === 'string'
+      ? bottlePath
+      : '';
+  const explicitExeNameFromArg = isSecondArgExeString ? launchConfig.trim() : '';
 
-  const cfg = launchConfig && typeof launchConfig === 'object' ? launchConfig : {};
-  const backend =
+  const cfg = isSecondArgExeString
+    ? envOrOptions && typeof envOrOptions === 'object'
+      ? envOrOptions
+      : {}
+    : launchConfig && typeof launchConfig === 'object'
+      ? launchConfig
+      : {};
+  const requestedBackend =
     typeof cfg.crossoverGraphicsBackend === 'string'
       ? cfg.crossoverGraphicsBackend.toLowerCase().trim()
       : undefined;
@@ -4084,21 +7018,107 @@ function applyCrossOverPerGameSettings(
     typeof cfg.crossoverD3DMetalVersion === 'string'
       ? cfg.crossoverD3DMetalVersion.toLowerCase().trim()
       : undefined;
-  const isD3DMetalEligible = !backend || backend === 'auto' || backend === 'd3dmetal';
 
-  if (
-    backend === 'd3dmetal' ||
-    backend === 'dxmt' ||
-    backend === 'dxvk' ||
-    backend === 'wined3d'
-  ) {
-    env.CX_GRAPHICS_BACKEND = backend;
-    if (backend === 'd3dmetal') {
+  const candidateWineBin =
+    (chosenLayer && typeof chosenLayer === 'object' && chosenLayer.binaryPath) ||
+    effectiveOptions.wineBinary ||
+    '';
+
+  const peCapsSrc =
+    (effectiveOptions.peCapabilities && typeof effectiveOptions.peCapabilities === 'object'
+      ? effectiveOptions.peCapabilities
+      : null) ||
+    (effectiveOptions.effectiveCaps && typeof effectiveOptions.effectiveCaps === 'object'
+      ? effectiveOptions.effectiveCaps
+      : null) ||
+    (cfg.peCapabilities && typeof cfg.peCapabilities === 'object' ? cfg.peCapabilities : null);
+  const hasPeCaps = Boolean(
+    peCapsSrc ||
+      typeof effectiveOptions.is32Bit === 'boolean' ||
+      typeof effectiveOptions.is64Bit === 'boolean' ||
+      typeof effectiveOptions.isD3d12Only === 'boolean'
+  );
+  const peCaps = peCapsSrc || effectiveOptions;
+
+  const resolvedBottlePath = effectiveBottlePathArg || env.WINEPREFIX || '';
+
+  const backendRoute = resolveEffectiveCrossOverGraphicsBackend({
+    requestedBackend: requestedBackend || 'auto',
+    chosenLayer,
+    wineBinaryPath: candidateWineBin,
+    bottlePath: resolvedBottlePath,
+    cxRoot: effectiveOptions.cxRoot,
+    layerSupport: effectiveOptions.layerSupport,
+    ...(hasPeCaps
+      ? {
+          is32Bit: Boolean(peCaps.is32Bit || peCaps.effectiveMachine === 'x86'),
+          is64Bit: Boolean(
+            peCaps.is64Bit ||
+              peCaps.effectiveMachine === 'x64' ||
+              peCaps.effectiveMachine === 'arm64'
+          ),
+          isLargeAddressAware: peCaps.isLargeAddressAware,
+          isNxCompat: peCaps.isNxCompat,
+          importsD3d12: Boolean(peCaps.importsD3d12),
+          importsD3d11Or10: Boolean(peCaps.importsD3d11Or10),
+          importsD3d9: Boolean(peCaps.importsD3d9),
+          importsLegacyD3dOrGl: Boolean(peCaps.importsLegacyD3dOrGl),
+          importsVulkan: Boolean(peCaps.importsVulkan),
+          hasUe5IoStoreContainer: Boolean(peCaps.hasUe5IoStoreContainer),
+          isD3d12Only: peCaps.isD3d12Only,
+        }
+      : {}),
+  });
+  const backend = backendRoute.backend;
+
+  let isBottleDir = false;
+  if (resolvedBottlePath && fs.existsSync(resolvedBottlePath)) {
+    try {
+      isBottleDir = fs.statSync(resolvedBottlePath).isDirectory();
+    } catch {}
+  }
+
+  const isCrossOverRunner =
+    chosenLayer?.type === 'crossover' ||
+    chosenLayer?.type === 'crossover_preview' ||
+    Boolean(effectiveOptions.isPreviewRunner) ||
+    /CrossOver/i.test(String(candidateWineBin || '')) ||
+    (isBottleDir && fs.existsSync(path.join(resolvedBottlePath, 'cxbottle.conf')));
+
+  let crossOverMajor = 0;
+  const rawLayerVer = String(chosenLayer?.version || effectiveOptions.runnerVersion || '').trim();
+  if (rawLayerVer) {
+    const parsedMajor = parseInt(rawLayerVer.split('.')[0], 10);
+    if (Number.isFinite(parsedMajor) && parsedMajor > 0) {
+      crossOverMajor = parsedMajor;
+    }
+  } else if (isCrossOverRunner && candidateWineBin && fs.existsSync(candidateWineBin)) {
+    try {
+      const vInfo = extractRunnerVersionInfo(
+        chosenLayer?.type || 'crossover',
+        candidateWineBin,
+        effectiveOptions
+      );
+      const parsedMajor = parseInt(String(vInfo?.version || '').split('.')[0], 10);
+      if (Number.isFinite(parsedMajor) && parsedMajor > 0) {
+        crossOverMajor = parsedMajor;
+      }
+    } catch {}
+  }
+  const isCrossOver25Plus =
+    isCrossOverRunner &&
+    (crossOverMajor >= 25 ||
+      chosenLayer?.type === 'crossover_preview' ||
+      Boolean(effectiveOptions.isPreviewRunner));
+
+  if (backendRoute.cxGraphicsBackendEnv) {
+    env.CX_GRAPHICS_BACKEND = backendRoute.cxGraphicsBackendEnv;
+    if (!isCrossOver25Plus && backendRoute.cxGraphicsBackendEnv === 'd3dmetal') {
       env.WINED3DMETAL = '1';
-    } else {
+    } else if (!cfg.environmentVariables?.WINED3DMETAL) {
       delete env.WINED3DMETAL;
     }
-  } else if (!backend || backend === 'auto') {
+  } else {
     if (!cfg.environmentVariables?.CX_GRAPHICS_BACKEND) {
       delete env.CX_GRAPHICS_BACKEND;
     }
@@ -4107,17 +7127,85 @@ function applyCrossOverPerGameSettings(
     }
   }
 
-  if (isD3DMetalEligible && (d3dmVer === '3' || d3dmVer === '4')) {
+  const isD3DMetalEligible = !backend || backend === 'auto' || backend === 'd3dmetal';
+  const hasMultipleBundledD3dMetal =
+    !Array.isArray(chosenLayer?.availableD3DMetalVersions) ||
+    chosenLayer.availableD3DMetalVersions.length > 1;
+  if (isD3DMetalEligible && (d3dmVer === '3' || d3dmVer === '4') && hasMultipleBundledD3dMetal) {
     env.CX_GRAPHICS_BACKEND_VERSION = d3dmVer;
   } else if (!cfg.environmentVariables?.CX_GRAPHICS_BACKEND_VERSION) {
     delete env.CX_GRAPHICS_BACKEND_VERSION;
   }
 
+  const isPe32Target = Boolean(
+    hasPeCaps && (peCaps.is32Bit || peCaps.effectiveMachine === 'x86')
+  );
+  const isPe32NonLaa = Boolean(
+    isPe32Target &&
+      peCaps.isLargeAddressAware === false &&
+      cfg.forceLargeAddressAware !== true
+  );
+  const isPe32Laa = Boolean(
+    isPe32Target &&
+      (peCaps.isLargeAddressAware === true || cfg.forceLargeAddressAware === true)
+  );
+
+  const hostArch = String(
+    effectiveOptions.arch || chosenLayer?.hostArch || process.arch || 'arm64'
+  )
+    .trim()
+    .toLowerCase();
+  const rawDarwinMajor =
+    effectiveOptions.darwinKernelMajor ??
+    chosenLayer?.darwinKernelMajor ??
+    (isTestEnvironment(effectiveOptions)
+      ? 25
+      : process.platform === 'darwin'
+        ? Number(String(os.release() || '25.0.0').split('.')[0]) || 25
+        : 25);
+  const darwinMajor = Number(rawDarwinMajor) || 25;
+
   const dlssUnsupportedBackend = backend === 'dxvk' || backend === 'wined3d';
-  if (cfg.crossoverDlss === true && !dlssUnsupportedBackend) {
-    env.D3DM_ENABLE_METALFX = '1';
+  const dlssUnsupportedTarget =
+    dlssUnsupportedBackend || isPe32Target || hostArch === 'x64' || darwinMajor < 23;
+  const wantMetalFxDlss = cfg.crossoverDlss === true || cfg.metalFxUpscaling === true;
+  if (wantMetalFxDlss && !dlssUnsupportedTarget) {
     env.DXMT_ENABLE_NVEXT = '1';
-  } else if (cfg.crossoverDlss === false || (cfg.crossoverDlss === true && dlssUnsupportedBackend)) {
+    env.D3DM_ENABLE_METALFX = darwinMajor >= 25 ? '1' : '0';
+    if (!isCrossOverRunner && env.D3DM_ENABLE_METALFX === '1' && !env.D3DM_NVNGX_PATH) {
+      const wineRootForNgx = candidateWineBin
+        ? path.resolve(path.dirname(candidateWineBin), '..')
+        : '';
+      const ngxDirCandidates = [
+        wineRootForNgx ? path.join(wineRootForNgx, 'lib', 'wine', 'x86_64-windows') : '',
+        wineRootForNgx ? path.join(wineRootForNgx, 'lib64', 'wine', 'x86_64-windows') : '',
+        '/Library/Apple/usr/libexec/oah/libd3dmetal/wine/x86_64-windows',
+        '/opt/homebrew/opt/game-porting-toolkit/lib/wine/x86_64-windows',
+        '/usr/local/opt/game-porting-toolkit/lib/wine/x86_64-windows',
+      ].filter(Boolean);
+      for (const ngxDir of ngxDirCandidates) {
+        try {
+          if (fs.existsSync(path.join(ngxDir, 'nvngx.dll'))) {
+            env.D3DM_NVNGX_PATH = ngxDir;
+            const curOverrides = String(env.WINEDLLOVERRIDES || '')
+              .split(';')
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (
+              !curOverrides.some((tok) => {
+                const lhs = tok.split('=')[0].trim().toLowerCase();
+                return lhs === 'nvngx' || lhs === 'nvngx,nvapi64';
+              })
+            ) {
+              curOverrides.push('nvngx,nvapi64=n,b');
+              env.WINEDLLOVERRIDES = curOverrides.join(';');
+            }
+            break;
+          }
+        } catch {}
+      }
+    }
+  } else if (cfg.crossoverDlss === false || (wantMetalFxDlss && dlssUnsupportedTarget)) {
     env.D3DM_ENABLE_METALFX = '0';
     env.DXMT_ENABLE_NVEXT = '0';
   } else {
@@ -4131,53 +7219,74 @@ function applyCrossOverPerGameSettings(
 
   if (cfg.wineMsync === false) {
     env.WINEMSYNC = '0';
-    env.WINEESYNC = cfg.wineEsync === false ? '0' : '1';
+    if (isCrossOver25Plus) {
+      if (!cfg.environmentVariables?.WINEESYNC) delete env.WINEESYNC;
+    } else {
+      env.WINEESYNC = cfg.wineEsync === false ? '0' : '1';
+    }
   } else {
     env.WINEMSYNC = '1';
-    env.WINEESYNC = '0';
+    if (isCrossOver25Plus) {
+      if (!cfg.environmentVariables?.WINEESYNC) delete env.WINEESYNC;
+    } else {
+      env.WINEESYNC = '0';
+    }
   }
+
+  if (isBottleDir) {
+    alignWineMsyncWithLiveBottle(resolvedBottlePath, env, effectiveOptions);
+  }
+
+  const loaderAllowsDyldInsert =
+    !candidateWineBin || doesWineLoaderAllowDyldInsert(candidateWineBin);
 
   if (cfg.metalHud === true) {
     env.MTL_HUD_ENABLED = '1';
-    const candidateWineBin =
-      (chosenLayer && typeof chosenLayer === 'object' && chosenLayer.binaryPath) ||
-      effectiveOptions.wineBinary ||
-      '';
     if (candidateWineBin && doesWineLayerHaveMoltenVkHudDeadlock(candidateWineBin)) {
-      const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
-      const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
-      if (preloadDylib) {
-        const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
-          .split(/:(?![\\/])/)
-          .map((s) => s.trim())
-          .filter(Boolean);
-        if (!existingInsert.includes(preloadDylib)) {
-          existingInsert.unshift(preloadDylib);
-        }
-        env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
-
-        // Mirror into CX_DYLD_INSERT_LIBRARIES so CrossOver's SIP-protected #!/usr/bin/perl wine wrapper
-        // forwards libone_metal_preload.dylib into wineloader without dyld stripping it!
-        const existingCxInsert = String(env.CX_DYLD_INSERT_LIBRARIES || '')
-          .split(/:(?![\\/])/)
-          .map((s) => s.trim())
-          .filter(Boolean);
-        if (!existingCxInsert.includes(preloadDylib)) {
-          existingCxInsert.unshift(preloadDylib);
-        }
-        env.CX_DYLD_INSERT_LIBRARIES = existingCxInsert.join(':');
-
-        if (moltenVkPath) {
-          env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
+      if (loaderAllowsDyldInsert) {
+        const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
+        const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
+        if (preloadDylib) {
+          const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
+            .split(/:(?![\\/])/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (!existingInsert.includes(preloadDylib)) {
+            existingInsert.unshift(preloadDylib);
+          }
+          env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
+          if (moltenVkPath) {
+            env.MVK_ICD_LIBRARY_PATH = moltenVkPath;
+            env.ONE_LAUNCHER_MOLTENVK_PATH = moltenVkPath;
+          }
+        } else {
+          delete env.MTL_HUD_ENABLED;
+          if (
+            cfg.dxvkHud !== false &&
+            !env.DXVK_HUD &&
+            (backend === 'dxvk' || chosenLayer?.type === 'wine')
+          ) {
+            env.DXVK_HUD = 'devinfo,fps,frametimes';
+          }
         }
       } else {
         delete env.MTL_HUD_ENABLED;
+        if (
+          cfg.dxvkHud !== false &&
+          !env.DXVK_HUD &&
+          (backend === 'dxvk' || chosenLayer?.type === 'wine')
+        ) {
+          env.DXVK_HUD = 'devinfo,fps,frametimes';
+        }
       }
     }
   } else if (cfg.metalHud === false) {
     delete env.MTL_HUD_ENABLED;
     delete env.ONE_LAUNCHER_MOLTENVK_PATH;
-    if (env.DYLD_INSERT_LIBRARIES) {
+    if (!cfg.environmentVariables?.MVK_ICD_LIBRARY_PATH) {
+      delete env.MVK_ICD_LIBRARY_PATH;
+    }
+    if (env.DYLD_INSERT_LIBRARIES && cfg.audioBufferClamp !== true && !effectiveOptions.enableAudioBufferClamp) {
       const filteredInsert = String(env.DYLD_INSERT_LIBRARIES)
         .split(/:(?![\\/])/)
         .map((s) => s.trim())
@@ -4188,15 +7297,26 @@ function applyCrossOverPerGameSettings(
         delete env.DYLD_INSERT_LIBRARIES;
       }
     }
-    if (env.CX_DYLD_INSERT_LIBRARIES) {
-      const filteredCxInsert = String(env.CX_DYLD_INSERT_LIBRARIES)
-        .split(/:(?![\\/])/)
-        .map((s) => s.trim())
-        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
-      if (filteredCxInsert.length > 0) {
-        env.CX_DYLD_INSERT_LIBRARIES = filteredCxInsert.join(':');
-      } else {
-        delete env.CX_DYLD_INSERT_LIBRARIES;
+  }
+
+  if (cfg.audioBufferClamp === false || effectiveOptions.enableAudioBufferClamp === false) {
+    env.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP = '0';
+  } else if (cfg.audioBufferClamp === true || effectiveOptions.enableAudioBufferClamp === true) {
+    if (loaderAllowsDyldInsert) {
+      const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
+      if (preloadDylib) {
+        const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
+          .split(/:(?![\\/])/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (!existingInsert.includes(preloadDylib)) {
+          existingInsert.unshift(preloadDylib);
+        }
+        env.DYLD_INSERT_LIBRARIES = existingInsert.join(':');
+        env.ONE_LAUNCHER_AUDIO_BUFFER_CLAMP = '1';
+        if (cfg.metalHud !== true && !env.ONE_LAUNCHER_MOLTENVK_PATH) {
+          env.ONE_LAUNCHER_METAL_PRELOAD = '0';
+        }
       }
     }
   }
@@ -4207,13 +7327,26 @@ function applyCrossOverPerGameSettings(
     delete env.DXVK_HUD;
   }
 
+  if (
+    (chosenLayer?.type === 'crossover' || chosenLayer?.type === 'crossover_preview') &&
+    env.CX_FWD_COMPAT_GL_CTX === undefined &&
+    cfg.environmentVariables?.CX_FWD_COMPAT_GL_CTX === undefined
+  ) {
+    env.CX_FWD_COMPAT_GL_CTX = '1';
+  }
+
   const explicitAvxCfg =
     typeof cfg.advertiseAvx === 'boolean'
       ? cfg.advertiseAvx
       : typeof cfg.rosettaAdvertiseAvx === 'boolean'
         ? cfg.rosettaAdvertiseAvx
         : cfg.environmentVariables?.ROSETTA_ADVERTISE_AVX;
-  applyStrictRosettaAvxEnv(env, explicitAvxCfg);
+  applyStrictRosettaAvxEnv(env, explicitAvxCfg, {
+    isCrossOverWrapper: effectiveOptions.isCrossOverWrapper,
+    wineBinaryPath: candidateWineBin,
+    compatLayer: chosenLayer,
+    layerType: chosenLayer?.type,
+  });
 
   const perfSettings = getLauncherPerformanceSettings(effectiveOptions);
   if (typeof cfg.wineDebug === 'string' && cfg.wineDebug.trim()) {
@@ -4225,13 +7358,188 @@ function applyCrossOverPerGameSettings(
   ) {
     env.WINEDEBUG = '-all';
   }
+  if (isCrossOverRunner && env.WINEDEBUG && !cfg.environmentVariables?.CX_DEBUGMSG) {
+    env.CX_DEBUGMSG = String(env.WINEDEBUG);
+  }
 
-  const resolvedBottlePath = effectiveBottlePathArg || env.WINEPREFIX || '';
-  let isBottleDir = false;
-  if (resolvedBottlePath && fs.existsSync(resolvedBottlePath)) {
+  // 32-bit DXMT dynamic vertex/constant buffer NoWait guard + MetalFX Spatial Swapchain Upscaling
+  if (
+    isPe32Target &&
+    (backend === 'dxmt' || (backend === 'auto' && Boolean(peCaps.importsD3d11Or10)))
+  ) {
+    env.DXMT_CONFIG = mergeSemicolonConfigClauses(
+      env.DXMT_CONFIG,
+      'd3d11.ignoreMapFlagNoWait = True'
+    );
+  }
+
+  const spatialUpscaleFactor = Number(cfg.metalfxSpatialUpscaleFactor);
+  if (
+    Number.isFinite(spatialUpscaleFactor) &&
+    spatialUpscaleFactor > 1 &&
+    (backend === 'dxmt' || backend === 'auto')
+  ) {
+    if (!cfg.environmentVariables?.DXMT_METALFX_SPATIAL_SWAPCHAIN) {
+      env.DXMT_METALFX_SPATIAL_SWAPCHAIN = '1';
+    }
+    env.DXMT_CONFIG = mergeSemicolonConfigClauses(
+      env.DXMT_CONFIG,
+      `d3d11.metalSpatialUpscaleFactor = ${spatialUpscaleFactor}`,
+      {
+        overwriteExisting: !String(cfg.environmentVariables?.DXMT_CONFIG || '').includes(
+          'd3d11.metalSpatialUpscaleFactor'
+        ),
+      }
+    );
+  } else if (!cfg.environmentVariables?.DXMT_METALFX_SPATIAL_SWAPCHAIN) {
+    delete env.DXMT_METALFX_SPATIAL_SWAPCHAIN;
+  }
+
+  // 3-Tier Unified-Memory Cap + Multi-Backend FPS Cap + DXVK_CONFIG_FILE Materialization
+  const totalRamMB = Math.floor(
+    (Number(effectiveOptions.totalMemoryBytes) || os.totalmem()) / (1024 * 1024)
+  );
+  if (isPe32NonLaa) {
+    env.DXVK_CONFIG = mergeSemicolonConfigClauses(
+      env.DXVK_CONFIG,
+      'd3d9.maxAvailableMemory = 1536; dxgi.maxDeviceMemory = 1536; dxgi.maxSharedMemory = 1536; d3d9.deferSurfaceCreation = True; d3d9.seamlessCubes = True'
+    );
+  } else if (isPe32Laa && backend === 'dxvk') {
+    const pe32LaaDxgiCap = Math.min(3072, Math.max(2048, Math.floor(totalRamMB * 0.45)));
+    env.DXVK_CONFIG = mergeSemicolonConfigClauses(
+      env.DXVK_CONFIG,
+      `d3d9.maxAvailableMemory = 2048; dxgi.maxDeviceMemory = ${pe32LaaDxgiCap}; dxgi.maxSharedMemory = ${pe32LaaDxgiCap}; d3d9.deferSurfaceCreation = True; d3d9.seamlessCubes = True`
+    );
+  } else if (backend === 'dxvk' && !isPe32Target) {
+    const vramCapMB = Math.max(2048, Math.floor(totalRamMB * 0.45));
+    env.DXVK_CONFIG = mergeSemicolonConfigClauses(
+      env.DXVK_CONFIG,
+      `d3d9.maxAvailableMemory = 4096; dxgi.maxDeviceMemory = ${vramCapMB}; dxgi.maxSharedMemory = ${vramCapMB}`
+    );
+    if (hasPeCaps && peCaps.importsD3d9) {
+      env.DXVK_CONFIG = mergeSemicolonConfigClauses(
+        env.DXVK_CONFIG,
+        'd3d9.deferSurfaceCreation = True'
+      );
+    }
+  }
+
+  if (Number(cfg.preferredMaxFrameRate) > 0) {
+    const maxFps = Math.round(Number(cfg.preferredMaxFrameRate));
+    env.DXMT_CONFIG = mergeSemicolonConfigClauses(
+      env.DXMT_CONFIG,
+      `d3d11.preferredMaxFrameRate = ${maxFps}`
+    );
+    if (backend === 'dxvk') {
+      if (env.DXVK_FRAME_RATE === undefined && cfg.environmentVariables?.DXVK_FRAME_RATE === undefined) {
+        env.DXVK_FRAME_RATE = String(maxFps);
+      }
+      env.DXVK_CONFIG = mergeSemicolonConfigClauses(
+        env.DXVK_CONFIG,
+        `dxgi.maxFrameRate = ${maxFps}; d3d9.maxFrameRate = ${maxFps}`
+      );
+    } else if (backend === 'd3dmetal') {
+      if (env.D3DM_MAX_FPS === undefined && cfg.environmentVariables?.D3DM_MAX_FPS === undefined) {
+        env.D3DM_MAX_FPS = String(maxFps);
+      }
+    }
+  }
+
+  if (
+    typeof env.DXVK_CONFIG === 'string' &&
+    env.DXVK_CONFIG.trim() &&
+    env.DXVK_CONFIG_FILE === undefined &&
+    cfg.environmentVariables?.DXVK_CONFIG_FILE === undefined
+  ) {
     try {
-      isBottleDir = fs.statSync(resolvedBottlePath).isDirectory();
+      const normalizedClauses = env.DXVK_CONFIG.split(';')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (normalizedClauses.length > 0) {
+        const dxvkConfBody = `${normalizedClauses.join('\n')}\n`;
+        const cfgHash = crypto.createHash('sha256').update(dxvkConfBody).digest('hex').slice(0, 12);
+        const dxvkConfDir = path.join(
+          getUserDataDir(effectiveOptions?.userDataDir),
+          'shader-cache',
+          'dxvk'
+        );
+        fs.mkdirSync(dxvkConfDir, { recursive: true });
+        const dxvkConfPath = path.join(dxvkConfDir, `dxvk-${cfgHash}.conf`);
+        if (!fs.existsSync(dxvkConfPath)) {
+          atomicWriteFileSync(dxvkConfPath, dxvkConfBody);
+        }
+        env.DXVK_CONFIG_FILE = dxvkConfPath;
+      }
     } catch {}
+  }
+
+  const usesMoltenVkBackend =
+    backend === 'dxvk' ||
+    backendRoute.direct3dRenderer === 'vulkan' ||
+    Boolean(hasPeCaps && peCaps.importsVulkan);
+  if (usesMoltenVkBackend) {
+    if (
+      env.MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS === undefined &&
+      cfg.environmentVariables?.MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS === undefined
+    ) {
+      env.MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS = '0';
+    }
+    if (
+      env.MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS === undefined &&
+      cfg.environmentVariables?.MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS === undefined
+    ) {
+      env.MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS = '2';
+    }
+    if (
+      env.MVK_CONFIG_FAST_MATH_ENABLED === undefined &&
+      cfg.environmentVariables?.MVK_CONFIG_FAST_MATH_ENABLED === undefined
+    ) {
+      env.MVK_CONFIG_FAST_MATH_ENABLED = '1';
+    }
+    if (
+      env.MVK_CONFIG_RESUME_LOST_DEVICE === undefined &&
+      cfg.environmentVariables?.MVK_CONFIG_RESUME_LOST_DEVICE === undefined
+    ) {
+      env.MVK_CONFIG_RESUME_LOST_DEVICE = '1';
+    }
+  }
+
+  if (
+    env.DXVK_STATE_CACHE_PATH === undefined &&
+    cfg.environmentVariables?.DXVK_STATE_CACHE_PATH === undefined
+  ) {
+    try {
+      const dxvkCacheDir = path.join(
+        getUserDataDir(effectiveOptions?.userDataDir),
+        'shader-cache',
+        'dxvk'
+      );
+      fs.mkdirSync(dxvkCacheDir, { recursive: true });
+      env.DXVK_STATE_CACHE_PATH = dxvkCacheDir;
+    } catch {}
+  }
+
+  const isDebugLoggingOff =
+    !env.WINEDEBUG || env.WINEDEBUG === '-all' || env.WINEDEBUG === '-all,err+system';
+  if (isDebugLoggingOff) {
+    if (env.DXVK_LOG_LEVEL === undefined && cfg.environmentVariables?.DXVK_LOG_LEVEL === undefined) {
+      env.DXVK_LOG_LEVEL = 'none';
+    }
+    if (env.DXVK_LOG_PATH === undefined && cfg.environmentVariables?.DXVK_LOG_PATH === undefined) {
+      env.DXVK_LOG_PATH = 'none';
+    }
+    if (env.DXMT_LOG_LEVEL === undefined && cfg.environmentVariables?.DXMT_LOG_LEVEL === undefined) {
+      env.DXMT_LOG_LEVEL = 'none';
+    }
+    if (env.DXMT_LOG_PATH === undefined && cfg.environmentVariables?.DXMT_LOG_PATH === undefined) {
+      env.DXMT_LOG_PATH = 'none';
+    }
+    if (
+      env.MVK_CONFIG_LOG_LEVEL === undefined &&
+      cfg.environmentVariables?.MVK_CONFIG_LOG_LEVEL === undefined
+    ) {
+      env.MVK_CONFIG_LOG_LEVEL = '2';
+    }
   }
 
   if (isBottleDir) {
@@ -4244,7 +7552,8 @@ function applyCrossOverPerGameSettings(
       /\/CrossOver\/Bottles\//i.test(resolvedBottlePath.replace(/\\/g, '/')) &&
       !/\/CrossOver Preview\/Bottles\//i.test(resolvedBottlePath.replace(/\\/g, '/'));
     const hasCrossOverEnvConfig =
-      backend !== undefined ||
+      requestedBackend !== undefined ||
+      backendRoute.cxGraphicsBackendEnv !== null ||
       typeof cfg.crossoverD3DMetalVersion === 'string' ||
       typeof cfg.crossoverDlss === 'boolean' ||
       typeof cfg.wineMsync === 'boolean' ||
@@ -4259,9 +7568,6 @@ function applyCrossOverPerGameSettings(
           ? fs.readFileSync(cxbottleConfPath, 'utf8')
           : '';
 
-        // Prevent permanent Preview flag clobbering across shared bottles:
-        // - CrossOver Preview sets "Preview" = "1" (tagging "OneLauncherManagedPreview" = "1" on shared Stable bottles)
-        // - CrossOver Stable cleanly removes "Preview" = "1" when launching against a shared bottle
         if (isPreviewRunner) {
           if (/^"Preview"\s*=\s*"[^"]*"/m.test(existingConf)) {
             existingConf = existingConf.replace(
@@ -4290,29 +7596,32 @@ function applyCrossOverPerGameSettings(
         const updates = new Map();
         const removals = new Set();
 
-        if (
-          backend === 'd3dmetal' ||
-          backend === 'dxmt' ||
-          backend === 'dxvk' ||
-          backend === 'wined3d'
-        ) {
-          updates.set('CX_GRAPHICS_BACKEND', backend);
+        const hasExplicitNonAutoBackend = Boolean(
+          requestedBackend && requestedBackend !== 'auto' && backendRoute.cxGraphicsBackendEnv
+        );
+        if (hasExplicitNonAutoBackend) {
+          updates.set('CX_GRAPHICS_BACKEND', backendRoute.cxGraphicsBackendEnv);
         } else {
           removals.add('CX_GRAPHICS_BACKEND');
         }
 
-        if (isD3DMetalEligible && (d3dmVer === '3' || d3dmVer === '4')) {
+        if (
+          isD3DMetalEligible &&
+          (d3dmVer === '3' || d3dmVer === '4') &&
+          hasMultipleBundledD3dMetal
+        ) {
           updates.set('CX_GRAPHICS_BACKEND_VERSION', d3dmVer);
         } else {
           removals.add('CX_GRAPHICS_BACKEND_VERSION');
         }
+        removals.add('WINED3DMETAL');
 
-        if (cfg.crossoverDlss === true && !dlssUnsupportedBackend) {
-          updates.set('D3DM_ENABLE_METALFX', '1');
+        if (wantMetalFxDlss && !dlssUnsupportedTarget) {
+          updates.set('D3DM_ENABLE_METALFX', darwinMajor >= 25 ? '1' : '0');
           updates.set('DXMT_ENABLE_NVEXT', '1');
         } else if (
           cfg.crossoverDlss === false ||
-          (cfg.crossoverDlss === true && dlssUnsupportedBackend)
+          (wantMetalFxDlss && dlssUnsupportedTarget)
         ) {
           updates.set('D3DM_ENABLE_METALFX', '0');
           updates.set('DXMT_ENABLE_NVEXT', '0');
@@ -4322,9 +7631,13 @@ function applyCrossOverPerGameSettings(
         }
 
         updates.set('WINEMSYNC', env.WINEMSYNC);
-        updates.set('WINEESYNC', env.WINEESYNC);
-        if (env.ROSETTA_ADVERTISE_AVX === '1') {
-          updates.set('ROSETTA_ADVERTISE_AVX', '1');
+        if (isCrossOver25Plus) {
+          removals.add('WINEESYNC');
+        } else if (env.WINEESYNC !== undefined) {
+          updates.set('WINEESYNC', env.WINEESYNC);
+        }
+        if (env.ROSETTA_ADVERTISE_AVX === '1' || env.ROSETTA_ADVERTISE_AVX === '0') {
+          updates.set('ROSETTA_ADVERTISE_AVX', env.ROSETTA_ADVERTISE_AVX);
         } else {
           removals.add('ROSETTA_ADVERTISE_AVX');
         }
@@ -4401,136 +7714,676 @@ function applyCrossOverPerGameSettings(
     }
   }
 
-  if (typeof cfg.crossoverHighResolutionMode === 'boolean' && isBottleDir) {
-    const retinaVal = cfg.crossoverHighResolutionMode ? 'y' : 'n';
-    const logPixelsDword = cfg.crossoverHighResolutionMode ? 'dword:000000c0' : 'dword:00000060';
-    const logPixelsDec = cfg.crossoverHighResolutionMode ? '192' : '96';
-    const userRegPath = path.join(resolvedBottlePath, 'user.reg');
+  const enableLegacyDisplay = Boolean(
+    effectiveOptions.enableLegacyDisplayModeSynthesis || cfg.enableLegacyDisplayModeSynthesis
+  );
+  const usesLegacyDdraw = Boolean(
+    effectiveOptions.usesLegacyDirectDraw || cfg.usesLegacyDirectDraw
+  );
+  const forceLegacy96Dpi = Boolean(enableLegacyDisplay || usesLegacyDdraw);
+  const effectiveHighResolutionMode = forceLegacy96Dpi
+    ? false
+    : typeof cfg.crossoverHighResolutionMode === 'boolean'
+      ? cfg.crossoverHighResolutionMode
+      : undefined;
+
+  // Coalesced bottle registry hygiene: RetinaMode (non-destructive), LogPixels, Desktops, AppDefaults,
+  // Direct3D VideoMemorySize / Vulkan routing, reference-counted EmulateModeset, LargeAddressAware,
+  // and baseline system.reg / user.reg prefix hygiene flushed in a single `reg.exe import` call.
+  if (isBottleDir) {
     try {
-      let regContent = fs.existsSync(userRegPath)
-        ? fs.readFileSync(userRegPath, 'utf8')
-        : '';
-      if (!regContent.trim()) {
-        regContent =
-          'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n';
-      }
+      const {
+        isBottleWineserverActive,
+        upsertWineSystemRegKeysBatch,
+        flushLiveWineRegistryAccumulator,
+      } = require('./firstPartyRegistration.cjs');
+      const userRegPath = path.join(resolvedBottlePath, 'user.reg');
+      const systemRegPath = path.join(resolvedBottlePath, 'system.reg');
+      const skipLiveSync = Boolean(
+        effectiveOptions.skipRegistrySpawn ||
+          effectiveOptions.skipLiveWineRegSync ||
+          effectiveOptions.homedir
+      );
+      /** @type {Array<{ hiveName: 'HKEY_LOCAL_MACHINE' | 'HKEY_CURRENT_USER', normalizedSubKey: string, entryPairsOrNullForDelete: Array<[string, any]> | null }>} */
+      const liveSyncAccumulator = [];
+      const regUpsertOpts = {
+        ...effectiveOptions,
+        bottlePath: resolvedBottlePath,
+        regFilePath: userRegPath,
+        skipLiveWineRegSync: skipLiveSync,
+        liveSyncAccumulator,
+      };
+      /** @type {Array<{ subKeyPath: string, entries: Array<[string, any]> }>} */
+      const userRegBatchSpecs = [];
 
-      const macDriverRe = /^\[Software\\\\Wine\\\\Mac Driver\][^\r\n]*$/m;
-      const macDriverMatch = macDriverRe.exec(regContent);
-      if (macDriverMatch) {
-        const secStart = macDriverMatch.index + macDriverMatch[0].length;
-        const afterSec = regContent.slice(secStart);
-        const nextSecMatch = /^\[[^\]]+\]/m.exec(afterSec);
-        const secBody = nextSecMatch ? afterSec.slice(0, nextSecMatch.index) : afterSec;
-        const secRest = nextSecMatch ? afterSec.slice(nextSecMatch.index) : '';
-
-        let newSecBody;
-        if (/^"RetinaMode"\s*=\s*"[^"]*"/m.test(secBody)) {
-          newSecBody = secBody.replace(
-            /^"RetinaMode"\s*=\s*"[^"]*"/m,
-            `"RetinaMode"="${retinaVal}"`
-          );
-        } else {
-          newSecBody = `\n"RetinaMode"="${retinaVal}"${secBody.startsWith('\n') ? '' : '\n'}${secBody}`;
+      const rawExeInputs = [
+        explicitExeNameFromArg,
+        effectiveOptions.exeName,
+        cfg.exeName,
+        ...(Array.isArray(effectiveOptions.targetExeNames) ? effectiveOptions.targetExeNames : []),
+        ...(Array.isArray(cfg.targetExeNames) ? cfg.targetExeNames : []),
+      ];
+      const targetExeSet = new Set();
+      for (const rawExe of rawExeInputs) {
+        if (typeof rawExe !== 'string' || !rawExe.trim()) continue;
+        const baseLower = path.win32.basename(rawExe.trim()).toLowerCase();
+        if (baseLower && /\.exe$/i.test(baseLower)) {
+          targetExeSet.add(baseLower);
         }
-
-        regContent = regContent.slice(0, secStart) + newSecBody + secRest;
-      } else {
-        const prefix =
-          regContent.length > 0 && !regContent.endsWith('\n')
-            ? `${regContent}\n`
-            : regContent;
-        regContent = `${prefix}\n[Software\\\\Wine\\\\Mac Driver]\n"RetinaMode"="${retinaVal}"\n`;
       }
+      const targetExes = Array.from(targetExeSet);
 
-      const desktopRe = /^\[Control Panel\\\\Desktop\][^\r\n]*$/m;
-      const desktopMatch = desktopRe.exec(regContent);
-      if (desktopMatch) {
-        const secStart = desktopMatch.index + desktopMatch[0].length;
-        const afterSec = regContent.slice(secStart);
-        const nextSecMatch = /^\[[^\]]+\]/m.exec(afterSec);
-        const secBody = nextSecMatch ? afterSec.slice(0, nextSecMatch.index) : afterSec;
-        const secRest = nextSecMatch ? afterSec.slice(nextSecMatch.index) : '';
+      // Inspect pre-existing user.reg state once for non-destructive RetinaMode & baseline hygiene
+      let priorMacDriverManaged = false;
+      /** @type {string | null} */
+      let priorRetinaModeVal = null;
+      /** @type {string | null} */
+      let savedPriorRetinaVal = null;
+      let hasFontsSectionInUserReg = false;
+      let hasValveSteamInUserReg = false;
+      /** @type {string | null} */
+      let globalWineVersionVal = null;
 
-        let newSecBody;
-        if (/^"LogPixels"\s*=\s*[^\r\n]*/m.test(secBody)) {
-          newSecBody = secBody.replace(
-            /^"LogPixels"\s*=\s*[^\r\n]*/m,
-            `"LogPixels"=${logPixelsDword}`
+      if (fs.existsSync(userRegPath)) {
+        try {
+          let existingUserReg = fs.readFileSync(userRegPath, 'utf8');
+          hasFontsSectionInUserReg = /^\[Software\\\\Wine\\\\Fonts\](?:\s+\d+)?[^\r\n]*$/im.test(
+            existingUserReg
           );
-        } else {
-          newSecBody = `\n"LogPixels"=${logPixelsDword}${secBody.startsWith('\n') ? '' : '\n'}${secBody}`;
-        }
+          hasValveSteamInUserReg = /^\[Software\\\\Valve\\\\Steam\](?:\s+\d+)?[^\r\n]*$/im.test(
+            existingUserReg
+          );
 
-        regContent = regContent.slice(0, secStart) + newSecBody + secRest;
-      } else {
-        const prefix =
-          regContent.length > 0 && !regContent.endsWith('\n')
-            ? `${regContent}\n`
-            : regContent;
-        regContent = `${prefix}\n[Control Panel\\\\Desktop]\n"LogPixels"=${logPixelsDword}\n`;
+          // Remove non-symlink `[Software\\Wow6432Node\\Valve...]` shadow sections when `[Software\\Valve\\Steam]` exists
+          if (hasValveSteamInUserReg) {
+            const lines = existingUserReg.split(/\r?\n/);
+            /** @type {string[]} */
+            const cleanedLines = [];
+            let i = 0;
+            let removedValveShadow = false;
+            while (i < lines.length) {
+              const secHeader = lines[i].match(/^\[(Software\\\\Wow6432Node\\\\Valve(?:\\\\[^\]]*)?)\]/i);
+              if (secHeader) {
+                const rawEscapedSec = secHeader[1];
+                let endIdx = i + 1;
+                while (endIdx < lines.length && !/^\[[^\]]+\]/.test(lines[endIdx])) {
+                  endIdx += 1;
+                }
+                const secSlice = lines.slice(i + 1, endIdx).join('\n');
+                if (!/^\s*#link\b/m.test(secSlice)) {
+                  removedValveShadow = true;
+                  liveSyncAccumulator.push({
+                    hiveName: 'HKEY_CURRENT_USER',
+                    normalizedSubKey: rawEscapedSec.replace(/\\\\/g, '\\'),
+                    entryPairsOrNullForDelete: null,
+                  });
+                  i = endIdx;
+                  continue;
+                }
+              }
+              cleanedLines.push(lines[i]);
+              i += 1;
+            }
+            if (removedValveShadow) {
+              existingUserReg = cleanedLines.join('\n');
+              atomicWriteFileSync(userRegPath, existingUserReg);
+            }
+          }
+
+          const macSecMatch = /^\[Software\\\\Wine\\\\Mac Driver\](?:\s+\d+)?[^\r\n]*$/im.exec(
+            existingUserReg
+          );
+          if (macSecMatch) {
+            const secStart = macSecMatch.index + macSecMatch[0].length;
+            const afterSec = existingUserReg.slice(secStart);
+            const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+            const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+            priorMacDriverManaged = /^"OneLauncherManagedRetina"\s*=\s*"1"/im.test(secBody);
+            const rmMatch = /^"RetinaMode"\s*=\s*"([^"]*)"/im.exec(secBody);
+            if (rmMatch) priorRetinaModeVal = rmMatch[1];
+            const spMatch = /^"OneLauncherPriorRetina"\s*=\s*"([^"]*)"/im.exec(secBody);
+            if (spMatch) savedPriorRetinaVal = spMatch[1];
+          }
+
+          const globalWineMatch = /^\[Software\\\\Wine\](?:\s+\d+)?[^\r\n]*$/im.exec(
+            existingUserReg
+          );
+          if (globalWineMatch) {
+            const secStart = globalWineMatch.index + globalWineMatch[0].length;
+            const afterSec = existingUserReg.slice(secStart);
+            const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+            const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+            const verMatch = /^"Version"\s*=\s*"([^"]*)"/im.exec(secBody);
+            if (verMatch) globalWineVersionVal = verMatch[1].trim().toLowerCase();
+          }
+        } catch {}
       }
 
-      atomicWriteFileSync(userRegPath, regContent);
-    } catch {}
+      // 1. Non-destructive RetinaMode + LogPixels DPI synchronization
+      if (forceLegacy96Dpi) {
+        /** @type {Array<[string, any]>} */
+        const macDriverEntries = [
+          ['RetinaMode', { type: 'sz', value: 'n' }],
+          ['OneLauncherManagedRetina', { type: 'sz', value: '1' }],
+        ];
+        if (!priorMacDriverManaged && priorRetinaModeVal !== null) {
+          macDriverEntries.push(['OneLauncherPriorRetina', { type: 'sz', value: priorRetinaModeVal }]);
+        }
+        userRegBatchSpecs.push(
+          { subKeyPath: 'Software\\Wine\\Mac Driver', entries: macDriverEntries },
+          { subKeyPath: 'Control Panel\\Desktop', entries: [['LogPixels', { type: 'dword', value: 0x60 }]] },
+          { subKeyPath: 'Software\\Wine\\Fonts', entries: [['LogPixels', { type: 'dword', value: 0x60 }]] },
+          {
+            subKeyPath: 'Software\\Wine\\AppDefaults\\explorer.exe\\Mac Driver',
+            entries: [['RetinaMode', { type: 'sz', value: 'n' }]],
+          }
+        );
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
+            entries: [['RetinaMode', { type: 'sz', value: 'n' }]],
+          });
+        }
+      } else if (typeof effectiveHighResolutionMode === 'boolean') {
+        const retinaVal = effectiveHighResolutionMode ? 'y' : 'n';
+        const logPixelsVal = effectiveHighResolutionMode ? 0xc0 : 0x60;
+        userRegBatchSpecs.push(
+          {
+            subKeyPath: 'Software\\Wine\\Mac Driver',
+            entries: [['RetinaMode', { type: 'sz', value: retinaVal }]],
+          },
+          {
+            subKeyPath: 'Control Panel\\Desktop',
+            entries: [['LogPixels', { type: 'dword', value: logPixelsVal }]],
+          }
+        );
+        if (hasFontsSectionInUserReg) {
+          userRegBatchSpecs.push({
+            subKeyPath: 'Software\\Wine\\Fonts',
+            entries: [['LogPixels', { type: 'dword', value: logPixelsVal }]],
+          });
+        }
+      } else if (priorMacDriverManaged && savedPriorRetinaVal !== null) {
+        userRegBatchSpecs.push({
+          subKeyPath: 'Software\\Wine\\Mac Driver',
+          entries: [['RetinaMode', { type: 'sz', value: savedPriorRetinaVal }]],
+        });
+      }
 
-    if (
-      effectiveOptions?.syncLiveWineReg === true &&
-      !effectiveOptions.homedir &&
-      !effectiveOptions.skipRegistrySpawn &&
-      chosenLayer?.binaryPath &&
-      fs.existsSync(chosenLayer.binaryPath)
-    ) {
-      const regEnv = { ...process.env, ...env };
-      const runLiveRegAdd = (/** @type {string[]} */ regArgs) =>
-        new Promise((resolve) => {
-          try {
-            execFile(chosenLayer.binaryPath, regArgs, { timeout: 2500, env: regEnv }, () =>
-              resolve(true)
+      // 2. Global `[Software\\Wine]` `"Version"` poisoning recovery for 64-bit launches
+      if (
+        hasPeCaps &&
+        peCaps.is64Bit &&
+        !cfg.windowsVersion &&
+        !effectiveOptions.windowsVersion &&
+        globalWineVersionVal &&
+        (globalWineVersionVal === 'win7' ||
+          globalWineVersionVal === 'winxp' ||
+          globalWineVersionVal === 'winxp64' ||
+          globalWineVersionVal === 'vista' ||
+          globalWineVersionVal === 'win2k')
+      ) {
+        userRegBatchSpecs.push({
+          subKeyPath: 'Software\\Wine',
+          entries: [['Version', { type: 'sz', value: 'win10' }]],
+        });
+      }
+
+      // 3. Virtual Desktop synthesis & per-exe AppDefaults
+      const displayProbeOpts = skipLiveSync
+        ? { ...effectiveOptions, skipDisplayProbe: true }
+        : effectiveOptions;
+      const hostRes = getHostMaxDisplayResolution(
+        Boolean(effectiveHighResolutionMode),
+        displayProbeOpts
+      );
+      const desktopWidth = Math.max(640, Math.round(Number(hostRes?.width) || 1512));
+      const desktopHeight = Math.max(480, Math.round(Number(hostRes?.height) || 982));
+      const desktopModeStr = `${desktopWidth}x${desktopHeight}`;
+
+      userRegBatchSpecs.push({
+        subKeyPath: 'Software\\Wine\\Explorer\\Desktops',
+        entries: [['OneLauncher', { type: 'sz', value: desktopModeStr }]],
+      });
+
+      const wantVirtualDesktop = Boolean(cfg.virtualDesktop === true || enableLegacyDisplay);
+      if (wantVirtualDesktop) {
+        userRegBatchSpecs.push({
+          subKeyPath: 'Software\\Wine\\Explorer',
+          entries: [['Desktop', { type: 'sz', value: 'OneLauncher' }]],
+        });
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Explorer`,
+            entries: [['Desktop', { type: 'sz', value: 'OneLauncher' }]],
+          });
+        }
+      }
+
+      const limitLegacyGl = Boolean(
+        effectiveOptions.limitLegacy32BitGlExtensions || cfg.limitLegacy32BitGlExtensions
+      );
+      if (limitLegacyGl) {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\OpenGL`,
+            entries: [['EnabledExtensions', { type: 'sz', value: LEGACY_32BIT_OPENGL_ENABLED_EXTENSIONS }]],
+          });
+        }
+      }
+
+      if (usesLegacyDdraw) {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+            entries: [['DirectDrawRenderer', { type: 'sz', value: 'opengl' }]],
+          });
+        }
+      }
+
+      if (backendRoute.direct3dRenderer === 'vulkan') {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+            entries: [['renderer', { type: 'sz', value: 'vulkan' }]],
+          });
+        }
+      }
+
+      // 32-bit Non-LAA (`1.92 GiB` VA) Direct3D VideoMemorySize cap (`1536` MiB) on non-DXMT backends
+      if (isPe32NonLaa && backend !== 'dxmt') {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+            entries: [['VideoMemorySize', { type: 'sz', value: '1536' }]],
+          });
+        }
+      }
+
+      // Opt-in Wine AppDefaults LargeAddressAware (`dword:00000001`) for 32-bit targets
+      if (cfg.forceLargeAddressAware === true && isPe32Target) {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}`,
+            entries: [['LargeAddressAware', { type: 'dword', value: 1 }]],
+          });
+        }
+      }
+
+      const wantEmulateModeset =
+        cfg.emulateModeset === true ||
+        effectiveOptions.emulateModeset === true ||
+        (cfg.emulateModeset !== false &&
+          effectiveOptions.emulateModeset !== false &&
+          enableLegacyDisplay);
+      if (wantEmulateModeset) {
+        userRegBatchSpecs.push({
+          subKeyPath: 'Software\\Wine\\AppDefaults\\explorer.exe\\X11 Driver',
+          entries: [['EmulateModeset', { type: 'sz', value: 'y' }]],
+        });
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\X11 Driver`,
+            entries: [['EmulateModeset', { type: 'sz', value: 'y' }]],
+          });
+        }
+      }
+
+      const appLocalDllOverrides =
+        effectiveOptions.appLocalDllOverrides &&
+        typeof effectiveOptions.appLocalDllOverrides === 'object'
+          ? effectiveOptions.appLocalDllOverrides
+          : null;
+      if (appLocalDllOverrides) {
+        const dllEntries = Object.entries(appLocalDllOverrides)
+          .filter(([k, v]) => k && typeof v === 'string')
+          .map(([k, v]) => /** @type {[string, any]} */ ([k, { type: 'sz', value: v }]));
+        if (dllEntries.length > 0) {
+          for (const tExe of targetExes) {
+            userRegBatchSpecs.push({
+              subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\DllOverrides`,
+              entries: dllEntries,
+            });
+          }
+        }
+      }
+
+      if (userRegBatchSpecs.length > 0) {
+        upsertWineUserRegKeysBatch(resolvedBottlePath, userRegBatchSpecs, regUpsertOpts);
+      }
+
+      // 4. Value removals in `user.reg` (zero-write when absent; recorded into `liveSyncAccumulator` when removed)
+      if (!wantVirtualDesktop) {
+        removeWineRegNamedValue(userRegPath, 'Software\\Wine\\Explorer', 'Desktop', regUpsertOpts);
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}\\Explorer`,
+            'Desktop',
+            regUpsertOpts
+          );
+        }
+      }
+
+      if (!forceLegacy96Dpi) {
+        removeWineRegNamedValue(
+          userRegPath,
+          'Software\\Wine\\AppDefaults\\explorer.exe\\Mac Driver',
+          'RetinaMode',
+          regUpsertOpts
+        );
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
+            'RetinaMode',
+            regUpsertOpts
+          );
+        }
+        if (typeof effectiveHighResolutionMode === 'boolean') {
+          removeWineRegNamedValue(
+            userRegPath,
+            'Software\\Wine\\Mac Driver',
+            'OneLauncherManagedRetina',
+            regUpsertOpts
+          );
+          removeWineRegNamedValue(
+            userRegPath,
+            'Software\\Wine\\Mac Driver',
+            'OneLauncherPriorRetina',
+            regUpsertOpts
+          );
+        } else if (priorMacDriverManaged) {
+          if (savedPriorRetinaVal === null) {
+            removeWineRegNamedValue(
+              userRegPath,
+              'Software\\Wine\\Mac Driver',
+              'RetinaMode',
+              regUpsertOpts
             );
-          } catch {
-            resolve(false);
+          }
+          removeWineRegNamedValue(
+            userRegPath,
+            'Software\\Wine\\Mac Driver',
+            'OneLauncherManagedRetina',
+            regUpsertOpts
+          );
+          removeWineRegNamedValue(
+            userRegPath,
+            'Software\\Wine\\Mac Driver',
+            'OneLauncherPriorRetina',
+            regUpsertOpts
+          );
+        }
+      }
+
+      if (backendRoute.direct3dRenderer !== 'vulkan' && hasPeCaps) {
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+            'renderer',
+            regUpsertOpts
+          );
+        }
+      }
+
+      if (backend === 'dxmt' || isPe32Laa || (hasPeCaps && peCaps.is64Bit)) {
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+            'VideoMemorySize',
+            regUpsertOpts
+          );
+        }
+      }
+
+      if (cfg.forceLargeAddressAware === false || (hasPeCaps && peCaps.is64Bit)) {
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}`,
+            'LargeAddressAware',
+            regUpsertOpts
+          );
+        }
+      }
+
+      if (
+        !wantEmulateModeset &&
+        (cfg.emulateModeset === false ||
+          effectiveOptions.emulateModeset === false ||
+          (hasPeCaps && (peCaps.is64Bit || !enableLegacyDisplay)))
+      ) {
+        for (const tExe of targetExes) {
+          removeWineRegNamedValue(
+            userRegPath,
+            `Software\\Wine\\AppDefaults\\${tExe}\\X11 Driver`,
+            'EmulateModeset',
+            regUpsertOpts
+          );
+        }
+        let otherExeStillUsesEmulateModeset = false;
+        if (fs.existsSync(userRegPath)) {
+          try {
+            const curUserReg = fs.readFileSync(userRegPath, 'utf8');
+            const appDefX11Re =
+              /^\[Software\\\\Wine\\\\AppDefaults\\\\([^\\\]]+)\\\\X11 Driver\](?:\s+\d+)?[^\r\n]*$/gim;
+            let x11Match;
+            while ((x11Match = appDefX11Re.exec(curUserReg)) !== null) {
+              const exeLower = String(x11Match[1] || '').trim().toLowerCase();
+              if (!exeLower || exeLower === 'explorer.exe') continue;
+              const secStart = x11Match.index + x11Match[0].length;
+              const afterSec = curUserReg.slice(secStart);
+              const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+              const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+              if (/^"EmulateModeset"\s*=\s*"y"/im.test(secBody)) {
+                otherExeStillUsesEmulateModeset = true;
+                break;
+              }
+            }
+          } catch {}
+        }
+        if (!otherExeStillUsesEmulateModeset) {
+          removeWineRegNamedValue(
+            userRegPath,
+            'Software\\Wine\\AppDefaults\\explorer.exe\\X11 Driver',
+            'EmulateModeset',
+            regUpsertOpts
+          );
+        }
+      }
+
+      // 5. Baseline `system.reg` prefix hygiene (FontSubstitutes & ServicesPipeTimeout when initialized)
+      if (fs.existsSync(systemRegPath)) {
+        try {
+          const sysContent = fs.readFileSync(systemRegPath, 'utf8');
+          /** @type {Array<{ subKeyPath: string, entries: Array<[string, any]> }>} */
+          const sysRegBatchSpecs = [];
+
+          const fontSubRe =
+            /^\[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\FontSubstitutes\](?:\s+\d+)?[^\r\n]*$/im;
+          const fontSubMatch = fontSubRe.exec(sysContent);
+          let fontSubBody = '';
+          if (fontSubMatch) {
+            const secStart = fontSubMatch.index + fontSubMatch[0].length;
+            const afterSec = sysContent.slice(secStart);
+            const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+            fontSubBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+          }
+
+          const windowsDir = resolveDriveCPathCaseInsensitive(resolvedBottlePath, [
+            'drive_c',
+            'windows',
+          ]);
+          /** @type {Set<string>} */
+          const installedFontNamesLower = new Set();
+          if (windowsDir && fs.existsSync(windowsDir)) {
+            const fontsDir = resolveDriveCPathCaseInsensitive(resolvedBottlePath, [
+              'drive_c',
+              'windows',
+              'fonts',
+            ]);
+            if (fontsDir && fs.existsSync(fontsDir)) {
+              try {
+                for (const fn of fs.readdirSync(fontsDir)) {
+                  installedFontNamesLower.add(fn.toLowerCase());
+                }
+              } catch {}
+            }
+          }
+
+          /** @type {Array<[string, any]>} */
+          const missingFontSubs = [];
+          if (
+            !/^"Palatino Linotype"\s*=/im.test(fontSubBody) &&
+            !installedFontNamesLower.has('pala.ttf')
+          ) {
+            missingFontSubs.push(['Palatino Linotype', { type: 'sz', value: 'Palatino' }]);
+          }
+          if (windowsDir && fs.existsSync(windowsDir)) {
+            if (
+              !/^"Segoe UI"\s*=/im.test(fontSubBody) &&
+              !installedFontNamesLower.has('segoeui.ttf')
+            ) {
+              missingFontSubs.push(['Segoe UI', { type: 'sz', value: 'Helvetica Neue' }]);
+            }
+            if (
+              !/^"MS UI Gothic"\s*=/im.test(fontSubBody) &&
+              !installedFontNamesLower.has('msgothic.ttc') &&
+              !installedFontNamesLower.has('msgothic.ttf')
+            ) {
+              missingFontSubs.push(['MS UI Gothic', { type: 'sz', value: 'Hiragino Sans' }]);
+            }
+          }
+          if (missingFontSubs.length > 0) {
+            sysRegBatchSpecs.push({
+              subKeyPath: 'Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes',
+              entries: missingFontSubs,
+            });
+          }
+
+          const ctrlSecRe = /^\[System\\\\CurrentControlSet\\\\Control\](?:\s+\d+)?[^\r\n]*$/im;
+          const ctrlMatch = ctrlSecRe.exec(sysContent);
+          const ctrlBody = ctrlMatch
+            ? (() => {
+                const secStart = ctrlMatch.index + ctrlMatch[0].length;
+                const afterSec = sysContent.slice(secStart);
+                const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+                return nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+              })()
+            : '';
+          if (!/^"ServicesPipeTimeout"\s*=/im.test(ctrlBody)) {
+            sysRegBatchSpecs.push({
+              subKeyPath: 'System\\CurrentControlSet\\Control',
+              entries: [['ServicesPipeTimeout', { type: 'dword', value: 60000 }]],
+            });
+          }
+
+          if (sysRegBatchSpecs.length > 0) {
+            upsertWineSystemRegKeysBatch(resolvedBottlePath, sysRegBatchSpecs, {
+              ...effectiveOptions,
+              bottlePath: resolvedBottlePath,
+              regFilePath: systemRegPath,
+              skipLiveWineRegSync: skipLiveSync,
+              liveSyncAccumulator,
+            });
+          }
+        } catch {}
+      }
+
+      // 6. Single coalesced live `reg.exe import` sync (or explicit `syncLiveWineReg === true` CLI fallback)
+      const bottleServerLive = !skipLiveSync && isBottleWineserverActive(resolvedBottlePath, effectiveOptions);
+      if (bottleServerLive && liveSyncAccumulator.length > 0) {
+        flushLiveWineRegistryAccumulator(resolvedBottlePath, liveSyncAccumulator, {
+          ...effectiveOptions,
+          wineBinary: candidateWineBin || effectiveOptions.wineBinary,
+          layerType: chosenLayer?.type,
+          env,
+        }).catch(() => {});
+      } else if (
+        effectiveOptions?.syncLiveWineReg === true &&
+        typeof effectiveHighResolutionMode === 'boolean' &&
+        !effectiveOptions.homedir &&
+        !effectiveOptions.skipRegistrySpawn &&
+        chosenLayer?.binaryPath &&
+        fs.existsSync(chosenLayer.binaryPath)
+      ) {
+        const retinaVal = effectiveHighResolutionMode ? 'y' : 'n';
+        const logPixelsDec = effectiveHighResolutionMode ? '192' : '96';
+        const aligned = prepareAlignedBottleWineCommand({
+          wineBinary: chosenLayer.binaryPath,
+          bottlePath: resolvedBottlePath,
+          env: { ...process.env, ...env },
+          suppressGuiDialogs: true,
+          layerType: chosenLayer?.type,
+        });
+        const runLiveRegAdd = (/** @type {string[]} */ regArgs) =>
+          new Promise((resolve) => {
+            try {
+              execFile(
+                aligned.wineBinary,
+                [...aligned.prefixArgs, ...regArgs],
+                { timeout: 2500, env: aligned.env },
+                () => resolve(true)
+              );
+            } catch {
+              resolve(false);
+            }
+          });
+        const prefixKey = path.resolve(resolvedBottlePath);
+        const syncPromise = Promise.race([
+          Promise.all([
+            runLiveRegAdd([
+              'reg',
+              'add',
+              'HKCU\\Software\\Wine\\Mac Driver',
+              '/v',
+              'RetinaMode',
+              '/t',
+              'REG_SZ',
+              '/d',
+              retinaVal,
+              '/f',
+            ]),
+            runLiveRegAdd([
+              'reg',
+              'add',
+              'HKCU\\Control Panel\\Desktop',
+              '/v',
+              'LogPixels',
+              '/t',
+              'REG_DWORD',
+              '/d',
+              logPixelsDec,
+              '/f',
+            ]),
+            runLiveRegAdd([
+              'reg',
+              'add',
+              'HKCU\\Software\\Wine\\Fonts',
+              '/v',
+              'LogPixels',
+              '/t',
+              'REG_DWORD',
+              '/d',
+              logPixelsDec,
+              '/f',
+            ]),
+          ]),
+          new Promise((resolve) => {
+            const t = setTimeout(resolve, 3000);
+            if (typeof t.unref === 'function') t.unref();
+          }),
+        ]).finally(() => {
+          if (pendingWineRegSyncByPrefix.get(prefixKey) === syncPromise) {
+            pendingWineRegSyncByPrefix.delete(prefixKey);
           }
         });
-      const prefixKey = path.resolve(resolvedBottlePath);
-      const syncPromise = Promise.race([
-        Promise.all([
-          runLiveRegAdd([
-            'reg',
-            'add',
-            'HKCU\\Software\\Wine\\Mac Driver',
-            '/v',
-            'RetinaMode',
-            '/t',
-            'REG_SZ',
-            '/d',
-            retinaVal,
-            '/f',
-          ]),
-          runLiveRegAdd([
-            'reg',
-            'add',
-            'HKCU\\Control Panel\\Desktop',
-            '/v',
-            'LogPixels',
-            '/t',
-            'REG_DWORD',
-            '/d',
-            logPixelsDec,
-            '/f',
-          ]),
-        ]),
-        new Promise((resolve) => {
-          const t = setTimeout(resolve, 3000);
-          if (typeof t.unref === 'function') t.unref();
-        }),
-      ]).finally(() => {
-        if (pendingWineRegSyncByPrefix.get(prefixKey) === syncPromise) {
-          pendingWineRegSyncByPrefix.delete(prefixKey);
-        }
-      });
-      pendingWineRegSyncByPrefix.set(prefixKey, syncPromise);
-    }
+        pendingWineRegSyncByPrefix.set(prefixKey, syncPromise);
+      }
+    } catch {}
   }
 
   if (
@@ -4542,13 +8395,17 @@ function applyCrossOverPerGameSettings(
     try {
       sanitizeWinePrefixDisplayConfigs(resolvedBottlePath, {
         ...effectiveOptions,
-        ...(typeof cfg.crossoverHighResolutionMode === 'boolean'
-          ? { highResolutionMode: cfg.crossoverHighResolutionMode }
+        ...(typeof effectiveHighResolutionMode === 'boolean'
+          ? { highResolutionMode: effectiveHighResolutionMode }
           : {}),
       });
+      const installDirKey =
+        typeof effectiveOptions.installDir === 'string' && effectiveOptions.installDir
+          ? path.resolve(effectiveOptions.installDir)
+          : '';
       setBoundedMapEntry(
         recentDisplaySanitizeCache,
-        `${path.resolve(resolvedBottlePath)}:${String(cfg.crossoverHighResolutionMode)}`,
+        `${path.resolve(resolvedBottlePath)}:${String(effectiveHighResolutionMode)}:${installDirKey}`,
         Date.now(),
         256
       );
@@ -4647,8 +8504,14 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
           );
           const physW = pw || (isRetina && rw ? rw * 2 : rw);
           const physH = ph || (isRetina && rh ? rh * 2 : rh);
-          const logicalW = rw || (physW ? Math.round(physW / (isRetina ? 2 : 1)) : 0);
-          const logicalH = rh || (physH ? Math.round(physH / (isRetina ? 2 : 1)) : 0);
+          const logicalW =
+            isRetina && physW > 0 && (!rw || rw === physW)
+              ? Math.round(physW / 2)
+              : rw || physW;
+          const logicalH =
+            isRetina && physH > 0 && (!rh || rh === physH)
+              ? Math.round(physH / 2)
+              : rh || physH;
           if (physW > maxW) {
             maxW = physW;
             maxH = physH;
@@ -4687,20 +8550,58 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
   };
 }
 
+/** @type {Record<number, [number, number]>} */
+const IDTECH_R_MODE_RESOLUTIONS = {
+  3: [640, 480],
+  4: [800, 600],
+  5: [1024, 768],
+  6: [1152, 864],
+  7: [1280, 1024],
+  8: [1600, 1200],
+  9: [1280, 720],
+  10: [1366, 768],
+  12: [1680, 1050],
+  13: [1600, 900],
+  14: [1600, 1024],
+  15: [1920, 1200],
+  16: [2560, 1600],
+  17: [1920, 1080],
+  18: [1920, 1200],
+  19: [2560, 1600],
+};
+
+/** @type {Array<[number, number, number]>} */
+const SAFE_IDTECH_MODE_CANDIDATES = [
+  [5, 1024, 768],
+  [4, 800, 600],
+  [3, 640, 480],
+];
+
 function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options = {}) {
-  if (!winePrefix || typeof winePrefix !== 'string' || !fs.existsSync(winePrefix)) {
+  const hasValidPrefix = Boolean(
+    winePrefix && typeof winePrefix === 'string' && fs.existsSync(winePrefix)
+  );
+  const rawInstallDir =
+    options && typeof options.installDir === 'string' && options.installDir.trim()
+      ? options.installDir.trim()
+      : '';
+  const hasValidInstallDir = Boolean(rawInstallDir && fs.existsSync(rawInstallDir));
+  if (!hasValidPrefix && !hasValidInstallDir) {
     return { sanitizedFiles: [], maxWidth: 0, maxHeight: 0 };
   }
 
-  try {
-    sandboxWinePrefixUserFolders(winePrefix, options);
-  } catch {}
+  if (hasValidPrefix) {
+    try {
+      sandboxWinePrefixUserFolders(winePrefix, options);
+    } catch {}
+  }
 
-  const resolvedPrefix = path.resolve(winePrefix);
+  const resolvedPrefix = hasValidPrefix ? path.resolve(winePrefix) : '';
+  const resolvedInstallDir = hasValidInstallDir ? path.resolve(rawInstallDir) : '';
   let highResolutionMode = true;
   if (typeof options.highResolutionMode === 'boolean') {
     highResolutionMode = options.highResolutionMode;
-  } else {
+  } else if (hasValidPrefix) {
     try {
       const userRegPath = path.join(winePrefix, 'user.reg');
       if (fs.existsSync(userRegPath)) {
@@ -4718,11 +8619,6 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
   const maxHeight =
     Number(options.maxHeight) > 0 ? Math.round(Number(options.maxHeight)) : displayRes.height;
 
-  const usersDir = path.join(winePrefix, 'drive_c', 'users');
-  if (!fs.existsSync(usersDir)) {
-    return { sanitizedFiles: [], maxWidth, maxHeight };
-  }
-
   /** @type {any[]} */
   const sanitizedFiles = [];
   const skippedDirNames = new Set([
@@ -4737,6 +8633,18 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     'd3dscache',
     'crashdumps',
     'logs',
+    'add',
+    '__support',
+    '__gog_support',
+    '__installer',
+    'support',
+    '_commonredist',
+    'redist',
+    'directx',
+    'vcredist',
+    'mono',
+    'streamingassets',
+    'node_modules',
   ]);
 
   const cfgPairs = [
@@ -4750,12 +8658,16 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     ['DesiredScreenWidth', 'DesiredScreenHeight'],
   ];
 
-  const isPathInsidePrefix = (/** @type {string} */ candidatePath) => {
+  const isPathInsideAnchor = (
+    /** @type {string} */ candidatePath,
+    /** @type {string} */ anchorRoot
+  ) => {
+    if (!anchorRoot) return false;
     try {
       const lstat = fs.lstatSync(candidatePath);
       if (lstat.isSymbolicLink()) {
         const target = path.resolve(path.dirname(candidatePath), fs.readlinkSync(candidatePath));
-        return target === resolvedPrefix || target.startsWith(resolvedPrefix + path.sep);
+        return target === anchorRoot || target.startsWith(anchorRoot + path.sep);
       }
       return true;
     } catch {
@@ -4768,11 +8680,13 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     if (ext !== '.cfg' && ext !== '.ini') return;
     try {
       const st = fs.statSync(filePath);
-      if (!st.isFile() || st.size <= 0 || st.size > 262144) return;
+      if (!st.isFile() || st.size <= 0 || st.size > 524288) return;
       const original = fs.readFileSync(filePath, 'utf8');
       let updated = original;
       let prevW = 0;
       let prevH = 0;
+      let clampedW = maxWidth;
+      let clampedH = maxHeight;
 
       if (ext === '.cfg') {
         for (const [wKey, hKey] of cfgPairs) {
@@ -4787,6 +8701,32 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
               prevW = w;
               prevH = h;
               updated = updated.replace(wRe, `$1${maxWidth}$3`).replace(hRe, `$1${maxHeight}$3`);
+            }
+          }
+        }
+
+        // Clamp discrete id Tech 3 / id Tech 4 `seta r_mode "<N>"` when `r_fullscreen` is enabled
+        const isFullscreenEnabled = /^[ \t]*(?:seta?\s+)?r_fullscreen\s+"?([1-9]\d*)"?/im.test(
+          updated
+        );
+        if (isFullscreenEnabled) {
+          const rModeRe = /^([ \t]*(?:seta?\s+)?r_mode\s+")(\d+)(".*)$/im;
+          const rModeMatch = rModeRe.exec(updated);
+          if (rModeMatch) {
+            const modeIdx = Number(rModeMatch[2]);
+            const modeRes = IDTECH_R_MODE_RESOLUTIONS[modeIdx];
+            if (modeRes && (modeRes[0] > maxWidth || modeRes[1] > maxHeight)) {
+              const safePick =
+                SAFE_IDTECH_MODE_CANDIDATES.find(
+                  ([, cw, ch]) => cw <= maxWidth && ch <= maxHeight
+                ) || [3, 640, 480];
+              if (!prevW && !prevH) {
+                prevW = modeRes[0];
+                prevH = modeRes[1];
+                clampedW = safePick[1];
+                clampedH = safePick[2];
+              }
+              updated = updated.replace(rModeRe, `$1${safePick[0]}$3`);
             }
           }
         }
@@ -4814,16 +8754,21 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
           filePath,
           previousWidth: prevW,
           previousHeight: prevH,
-          clampedWidth: maxWidth,
-          clampedHeight: maxHeight,
+          clampedWidth: clampedW,
+          clampedHeight: clampedH,
         });
       }
     } catch {}
   };
 
-  const walkConfigDir = (/** @type {string} */ dirPath, depth = 0) => {
-    if (depth > 5 || !dirPath || !fs.existsSync(dirPath)) return;
-    if (!isPathInsidePrefix(dirPath)) return;
+  const walkConfigDir = (
+    /** @type {string} */ dirPath,
+    /** @type {string} */ anchorRoot,
+    depth = 0,
+    maxDepth = 5
+  ) => {
+    if (depth > maxDepth || !dirPath || !fs.existsSync(dirPath)) return;
+    if (!isPathInsideAnchor(dirPath, anchorRoot)) return;
     /** @type {fs.Dirent[]} */
     let entries = [];
     try {
@@ -4834,39 +8779,52 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     for (const entry of entries) {
       if (entry.name.startsWith('.')) continue;
       const fullPath = path.join(dirPath, entry.name);
-      if (!isPathInsidePrefix(fullPath)) continue;
+      if (!isPathInsideAnchor(fullPath, anchorRoot)) continue;
       if (entry.isDirectory()) {
         if (skippedDirNames.has(entry.name.toLowerCase())) continue;
-        walkConfigDir(fullPath, depth + 1);
+        walkConfigDir(fullPath, anchorRoot, depth + 1, maxDepth);
       } else if (entry.isFile()) {
         sanitizeConfigFile(fullPath);
       }
     }
   };
 
-  /** @type {fs.Dirent[]} */
-  let userEntries = [];
-  try {
-    userEntries = fs.readdirSync(usersDir, { withFileTypes: true });
-  } catch {
-    return { sanitizedFiles, maxWidth, maxHeight };
-  }
+  if (hasValidPrefix) {
+    const usersDir = path.join(winePrefix, 'drive_c', 'users');
+    if (fs.existsSync(usersDir)) {
+      /** @type {fs.Dirent[]} */
+      let userEntries = [];
+      try {
+        userEntries = fs.readdirSync(usersDir, { withFileTypes: true });
+      } catch {
+        userEntries = [];
+      }
 
-  for (const userEntry of userEntries) {
-    if (!userEntry.isDirectory() || userEntry.name.startsWith('.')) continue;
-    if (userEntry.name.toLowerCase() === 'public') continue;
-    const userRoot = path.join(usersDir, userEntry.name);
-    const configRoots = [
-      path.join(userRoot, 'Saved Games'),
-      path.join(userRoot, 'Documents', 'My Games'),
-      path.join(userRoot, 'My Documents', 'My Games'),
-      path.join(userRoot, 'AppData', 'Local'),
-    ];
-    for (const root of configRoots) {
-      if (fs.existsSync(root) && isPathInsidePrefix(root)) {
-        walkConfigDir(root, 0);
+      for (const userEntry of userEntries) {
+        if (!userEntry.isDirectory() || userEntry.name.startsWith('.')) continue;
+        if (userEntry.name.toLowerCase() === 'public') continue;
+        const userRoot = path.join(usersDir, userEntry.name);
+        const configRoots = [
+          path.join(userRoot, 'Saved Games'),
+          path.join(userRoot, 'Documents', 'My Games'),
+          path.join(userRoot, 'My Documents', 'My Games'),
+          path.join(userRoot, 'AppData', 'Local'),
+        ];
+        for (const root of configRoots) {
+          if (fs.existsSync(root) && isPathInsideAnchor(root, resolvedPrefix)) {
+            walkConfigDir(root, resolvedPrefix, 0, 5);
+          }
+        }
       }
     }
+  }
+
+  if (hasValidInstallDir && resolvedInstallDir) {
+    try {
+      if (fs.statSync(resolvedInstallDir).isDirectory()) {
+        walkConfigDir(resolvedInstallDir, resolvedInstallDir, 0, 3);
+      }
+    } catch {}
   }
 
   return { sanitizedFiles, maxWidth, maxHeight };
@@ -4944,11 +8902,14 @@ async function ensureCompatibilityLayerReady(
               fs.mkdirSync(bottlesDir, { recursive: true });
             }
           } catch {}
+          /** @type {Record<string, any>} */
+          const cxbottleCreateEnv = { ...process.env, ...env };
+          delete cxbottleCreateEnv.DYLD_INSERT_LIBRARIES;
           await new Promise((resolve) => {
             execFile(
               cxbottleBin,
-              ['--bottle', targetBottle, '--create', '--template', 'win10_64', '--default'],
-              { timeout: 60000, env: { ...process.env, ...env } },
+              ['--bottle', targetBottle, '--create', '--template', 'win10_64'],
+              { timeout: 60000, env: cxbottleCreateEnv },
               () => resolve(true)
             );
           });
@@ -4972,14 +8933,8 @@ async function ensureCompatibilityLayerReady(
     } else if (fs.existsSync(bottlePath)) {
       env.WINEPREFIX = bottlePath;
     }
-    if (env.WINEMSYNC === '1') {
-      env.WINEESYNC = '0';
-    } else if (env.WINEESYNC === '1') {
-      env.WINEMSYNC = '0';
-    } else {
-      env.WINEMSYNC = env.WINEMSYNC ?? '1';
-      env.WINEESYNC = env.WINEESYNC ?? (env.WINEMSYNC === '1' ? '0' : '1');
-    }
+    env.WINEMSYNC = env.WINEMSYNC ?? '1';
+    delete env.WINEESYNC;
 
     try {
       await sandboxWinePrefixUserFoldersAsync(env.WINEPREFIX || bottlePath, options);
@@ -5002,7 +8957,9 @@ async function ensureCompatibilityLayerReady(
       }
     }
 
-    const effectiveWineBinary = resolveSipSafeWineBinaryAndPreloadEnv(chosenLayer.binaryPath, env);
+    const effectiveWineBinary = resolveSipSafeWineBinaryAndPreloadEnv(chosenLayer.binaryPath, env, {
+      layerType: chosenLayer.type,
+    });
     return {
       targetBottle,
       winePrefix: env.WINEPREFIX,
@@ -5011,24 +8968,10 @@ async function ensureCompatibilityLayerReady(
     };
   }
 
-  let targetPrefix;
-  if (launchConfig && launchConfig.winePrefixPath) {
-    targetPrefix = launchConfig.winePrefixPath;
-  } else {
-    const heroicPfx1 = path.join(homedir, 'Games/Heroic/Prefixes/default/SteamHeroic/pfx');
-    const heroicPfx2 = path.join(homedir, 'Games/Heroic/Prefixes/default/SteamHeroic');
-    const heroicPfx3 = path.join(homedir, 'Games/Heroic/Prefixes/default');
-
-    if (fs.existsSync(heroicPfx1)) {
-      targetPrefix = heroicPfx1;
-    } else if (fs.existsSync(path.join(heroicPfx2, 'drive_c'))) {
-      targetPrefix = heroicPfx2;
-    } else if (fs.existsSync(path.join(heroicPfx3, 'drive_c'))) {
-      targetPrefix = heroicPfx3;
-    } else {
-      targetPrefix = path.join(homedir, 'Games/OneLauncher/Prefixes/default');
-    }
-  }
+  const targetPrefix =
+    launchConfig && launchConfig.winePrefixPath
+      ? launchConfig.winePrefixPath
+      : path.join(homedir, 'Games/OneLauncher/Prefixes/default');
 
   try {
     if (targetPrefix && !fs.existsSync(targetPrefix)) {
@@ -5049,6 +8992,38 @@ async function ensureCompatibilityLayerReady(
     env.WINEDLLOVERRIDES = env.WINEDLLOVERRIDES
       ? `${env.WINEDLLOVERRIDES};winemenubuilder.exe=d`
       : 'winemenubuilder.exe=d';
+  }
+
+  if (
+    targetPrefix &&
+    !fs.existsSync(path.join(targetPrefix, 'system.reg')) &&
+    !options.skipBottleProvisioning &&
+    !options.homedir &&
+    (!isTestEnvironment(options) || options.forceStandaloneWineboot === true) &&
+    chosenLayer.binaryPath &&
+    fs.existsSync(chosenLayer.binaryPath)
+  ) {
+    try {
+      const alignedBoot = prepareAlignedBottleWineCommand({
+        wineBinary: chosenLayer.binaryPath,
+        bottlePath: targetPrefix,
+        env: { ...process.env, ...env },
+        suppressGuiDialogs: true,
+        layerType: chosenLayer.type,
+      });
+      await new Promise((resolve) => {
+        try {
+          execFile(
+            alignedBoot.wineBinary,
+            [...alignedBoot.prefixArgs, 'wineboot', '-u'],
+            { timeout: 45000, env: alignedBoot.env },
+            () => resolve(true)
+          );
+        } catch {
+          resolve(false);
+        }
+      });
+    } catch {}
   }
 
   try {
@@ -5072,7 +9047,9 @@ async function ensureCompatibilityLayerReady(
     }
   }
 
-  const effectiveWineBinary = resolveSipSafeWineBinaryAndPreloadEnv(chosenLayer.binaryPath, env);
+  const effectiveWineBinary = resolveSipSafeWineBinaryAndPreloadEnv(chosenLayer.binaryPath, env, {
+    layerType: chosenLayer.type,
+  });
   return {
     winePrefix: targetPrefix,
     wineBinary: effectiveWineBinary,
@@ -5111,22 +9088,38 @@ module.exports = {
   listAllInitializedBottlePaths,
   resolveTargetBottleForFirstPartySync,
   extractRunnerVersionInfo,
+  readRunnerInstallReceipts,
+  recordRunnerInstallReceipt,
   parsePlistStringValues,
   detectBundledD3DMetalVersions,
   compareRunnerVersions,
   detectCompatibilityLayers,
   checkCompatibilityLayerUpdates,
   updateCompatibilityLayer,
+  cancelCompatibilityLayerOperation,
+  selectRunnerArchiveDialog,
+  onCompatibilityRunnerProgress,
   mountAndExtractDmgSafe,
   installCompatibilityLayer,
   resolveWineLayerMoltenVkPath,
   doesWineLayerHaveMoltenVkHudDeadlock,
   ensureWineMetalPreloadDylib,
+  mergeCxEnvVariables,
+  deriveCrossOverRootFromBinaryPath,
+  alignWineMsyncWithLiveBottle,
+  doesWineLoaderAllowDyldInsert,
   resolveSipSafeWineBinaryAndPreloadEnv,
+  prepareCrossOverWineSpawnEnv,
+  prepareAlignedBottleWineCommand,
   resolveWineserverBinary,
   shutdownWinePrefix,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
+  removeWineRegNamedValue,
+  mergeSemicolonConfigClauses,
+  detectCrossOverBackendLayerSupport,
+  resolveEffectiveCrossOverGraphicsBackend,
+  cleanNonApfsAppleDoubleTwins,
   applyCrossOverPerGameSettings,
   getHostMaxDisplayResolution,
   sanitizeWinePrefixDisplayConfigs,

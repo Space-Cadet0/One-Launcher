@@ -87,7 +87,17 @@ static PFN_LdrUnregisterDllNotification g_ldr_unregister = NULL;
 static SRWLOCK g_xcurl_shim_lock = SRWLOCK_INIT;
 static volatile LONG g_xcurl_hook_state = 0; /* 0 = uninitialized, 1 = installing, 2 = active/completed */
 static volatile LONG g_iat_hooks_installed = 0;
-static volatile LONGLONG g_shim_next_appstate_reg = 0x0FFFLL;
+static volatile LONG g_is_wine = 0;
+static volatile LONG g_shim_next_appstate_reg = 0x0FFFL;
+
+static inline PVOID shim_next_appstate_token(void)
+{
+    ULONG tok = (ULONG)InterlockedIncrement(&g_shim_next_appstate_reg);
+    if (tok == 0) {
+        tok = (ULONG)InterlockedIncrement(&g_shim_next_appstate_reg);
+    }
+    return (PVOID)(uintptr_t)tok;
+}
 
 void xgr_set_bridge_hmodule(HMODULE hmod)
 {
@@ -202,7 +212,7 @@ static ULONG WINAPI shim_RegisterAppStateChangeNotification(PVOID routine, PVOID
         xgr_sync_teb_last_error();
         return ERROR_INVALID_PARAMETER;
     }
-    *registration = (PVOID)(uintptr_t)InterlockedIncrement64(&g_shim_next_appstate_reg);
+    *registration = shim_next_appstate_token();
     SetLastError(ERROR_SUCCESS);
     xgr_sync_teb_last_error();
     return ERROR_SUCCESS;
@@ -222,7 +232,7 @@ static ULONG WINAPI shim_RegisterAppConstrainedChangeNotification(PVOID routine,
         xgr_sync_teb_last_error();
         return ERROR_INVALID_PARAMETER;
     }
-    *registration = (PVOID)(uintptr_t)InterlockedIncrement64(&g_shim_next_appstate_reg);
+    *registration = shim_next_appstate_token();
     SetLastError(ERROR_SUCCESS);
     xgr_sync_teb_last_error();
     return ERROR_SUCCESS;
@@ -261,19 +271,22 @@ static void patch_module_iat(HMODULE hMod)
 
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return;
 
     IMAGE_DATA_DIRECTORY imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!imp_dir.VirtualAddress || !imp_dir.Size) return;
 
+    bool wine = (InterlockedCompareExchange(&g_is_wine, 0, 0) != 0);
     IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + imp_dir.VirtualAddress);
     for (; desc->Name != 0; desc++) {
         const char *dll_name = (const char *)(base + desc->Name);
-        bool is_winhttp = (_stricmp(dll_name, "winhttp.dll") == 0);
-        bool is_appnotify = (
+        bool is_winhttp = wine && (_stricmp(dll_name, "winhttp.dll") == 0);
+        bool is_appnotify = wine && (
             _stricmp(dll_name, "api-ms-win-core-psm-appnotify-l1-1-0.dll") == 0 ||
             _stricmp(dll_name, "twinapi.appcore.dll") == 0
         );
-        if (!is_winhttp && !is_appnotify) continue;
+        bool is_playfab_gamesave = (_stricmp(dll_name, "PlayFabGameSave.dll") == 0);
+        if (!is_winhttp && !is_appnotify && !is_playfab_gamesave) continue;
         if (!desc->OriginalFirstThunk || !desc->FirstThunk) continue;
 
         IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk);
@@ -308,6 +321,12 @@ static void patch_module_iat(HMODULE hMod)
                     replace_iat_slot(iat_thunk, (void *)shim_RegisterAppConstrainedChangeNotification, NULL);
                 else if (strcmp(fn, "UnregisterAppConstrainedChangeNotification") == 0)
                     replace_iat_slot(iat_thunk, (void *)shim_UnregisterAppConstrainedChangeNotification, NULL);
+            } else if (is_playfab_gamesave) {
+                void *orig_proc = (void *)(uintptr_t)iat_thunk->u1.Function;
+                void *replacement = xgr_playfab_resolve_iat_replacement(fn, orig_proc);
+                if (replacement) {
+                    replace_iat_slot(iat_thunk, replacement, NULL);
+                }
             }
         }
     }
@@ -322,7 +341,10 @@ static bool is_excluded_system_or_bridge_module(const wchar_t *full_path, size_t
         base_buf[n] = L'\0';
         if (_wcsicmp(base_buf, L"xgameruntime.dll") == 0 ||
             _wcsicmp(base_buf, L"one_xgameruntime_bridge.dll") == 0 ||
+            _wcsicmp(base_buf, L"one_xgameruntime_bridge_x86.dll") == 0 ||
             _wcsicmp(base_buf, L"one_appnotify_bridge.dll") == 0 ||
+            _wcsicmp(base_buf, L"one_appnotify_bridge_x86.dll") == 0 ||
+            _wcsicmp(base_buf, L"playfabgamesave.dll") == 0 ||
             _wcsicmp(base_buf, L"api-ms-win-core-psm-appnotify-l1-1-0.dll") == 0 ||
             _wcsicmp(base_buf, L"winhttp.dll") == 0 ||
             _wcsicmp(base_buf, L"twinapi.appcore.dll") == 0 ||
@@ -416,12 +438,9 @@ void xgr_install_xcurl_shim(void)
     }
     InterlockedExchange(&g_xcurl_hook_state, 1);
 
-    /* Wine-Only Gate: on native Windows, leave real winhttp.dll & twinapi.appcore.dll untouched */
-    if (!is_running_under_wine()) {
-        InterlockedExchange(&g_xcurl_hook_state, 2);
-        ReleaseSRWLockExclusive(&g_xcurl_shim_lock);
-        return;
-    }
+    /* WinHTTP & AppNotify IAT hooks are Wine-gated via g_is_wine inside patch_module_iat;
+     * PlayFabGameSave.dll in-proc IAT hooks run on both Wine and GamingServices-less win32. */
+    InterlockedExchange(&g_is_wine, is_running_under_wine() ? 1 : 0);
 
     patch_loaded_non_system_modules_locked();
 

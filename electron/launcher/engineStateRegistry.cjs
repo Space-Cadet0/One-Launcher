@@ -1742,6 +1742,101 @@ async function selectFolderDialog(defaultPath) {
   return null;
 }
 
+/**
+ * Normalize a local or Wine filesystem path for case-insensitive prefix matching.
+ * @param {string} rawPath
+ * @returns {string}
+ */
+function normalizeComparableInstallPath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') return '';
+  const local = toLocalFsPath(rawPath) || rawPath;
+  const trimmed = String(local).trim();
+  if (!trimmed) return '';
+  const resolved = path.resolve(trimmed).replace(/\\/g, '/').replace(/\/+$/, '');
+  return resolved.toLowerCase();
+}
+
+/**
+ * Returns true if `candidatePath` is equal to or nested inside any task's `finalInstallPath`
+ * that is actively writing to disk (`downloading`, `extracting`, `verifying`).
+ * Prevents read-only scanners and directory flatteners from mutating in-flight installations.
+ *
+ * @param {string} candidatePath
+ * @returns {boolean}
+ */
+function isPathUnderActiveDownload(candidatePath) {
+  if (downloadQueueMap.size === 0) return false;
+  const normCand = normalizeComparableInstallPath(candidatePath);
+  if (!normCand) return false;
+
+  for (const [, task] of downloadQueueMap.entries()) {
+    if (!task || task.isSimulatedOrManual) continue;
+    if (
+      task.status !== 'downloading' &&
+      task.status !== 'extracting' &&
+      task.status !== 'verifying'
+    ) {
+      continue;
+    }
+    const normTarget = normalizeComparableInstallPath(task.finalInstallPath);
+    if (!normTarget) continue;
+    if (normCand === normTarget || normCand.startsWith(`${normTarget}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns true if `candidatePath` or `(platformId, platformGameId)` belongs to an in-flight
+ * or paused download (`queued`, `downloading`, `extracting`, `verifying`, `paused`).
+ *
+ * @param {string} [candidatePath]
+ * @param {string} [platformId]
+ * @param {string} [platformGameId]
+ * @returns {boolean}
+ */
+function isPathOrGameUnderIncompleteDownload(candidatePath, platformId, platformGameId) {
+  if (downloadQueueMap.size === 0) return false;
+  const normCand = candidatePath ? normalizeComparableInstallPath(candidatePath) : '';
+  const normPlat = platformId ? String(platformId).trim().toLowerCase() : '';
+  const normGameId = platformGameId
+    ? String(platformGameId)
+        .trim()
+        .replace(/^(gog|steam|epic|xbox)-/i, '')
+        .toLowerCase()
+    : '';
+
+  for (const [, task] of downloadQueueMap.entries()) {
+    if (!task || task.isSimulatedOrManual) continue;
+    if (
+      task.status !== 'queued' &&
+      task.status !== 'downloading' &&
+      task.status !== 'extracting' &&
+      task.status !== 'verifying' &&
+      task.status !== 'paused'
+    ) {
+      continue;
+    }
+    if (normCand) {
+      const normTarget = normalizeComparableInstallPath(task.finalInstallPath);
+      if (normTarget && (normCand === normTarget || normCand.startsWith(`${normTarget}/`))) {
+        return true;
+      }
+    }
+    if (normPlat && normGameId && String(task.platformId || '').toLowerCase() === normPlat) {
+      const taskCleanId = String(task.platformGameId || '')
+        .trim()
+        .replace(/^(gog|steam|epic|xbox)-/i, '')
+        .toLowerCase();
+      if (taskCleanId && taskCleanId === normGameId) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 module.exports = {
   // Lazy module getters
   getElectron,
@@ -1863,4 +1958,6 @@ module.exports = {
   browseLocalFiles,
   selectExecutableDialog,
   selectFolderDialog,
+  isPathUnderActiveDownload,
+  isPathOrGameUnderIncompleteDownload,
 };

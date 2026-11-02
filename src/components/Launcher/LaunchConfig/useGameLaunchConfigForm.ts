@@ -5,6 +5,7 @@ import {
   CompatibilityLayerInfo,
   CompatibilityLayerType,
   CompatibilityLayerUpdateInfo,
+  CompatibilityRunnerProgressEvent,
   CrossOverD3DMetalVersion,
   CrossOverGraphicsBackend,
   GameLaunchConfig,
@@ -21,12 +22,16 @@ import {
 } from '../../../services/launcher/launcherService';
 import { acquireModalOverlayLock } from '../../../utils/modalOverlayLock';
 import {
+  formatRunnerSecondaryBuildText,
   LAUNCH_MODES,
   parseEnvVars,
   resolveEffectiveUiStorefrontLifecycle,
+  resolveWineSyncMode,
   serializeEnvVars,
   stripManagedEnvVars,
+  type WineSyncMode,
 } from './launchConfigHelpers';
+import { resolveDlssEligibility } from './CompatibilityLayerSection';
 
 interface LauncherServiceHostAware {
   isWindowsHost?: () => boolean;
@@ -72,6 +77,16 @@ export function useGameLaunchConfigForm({
     boolean | undefined
   >(undefined);
   const [crossoverDlss, setCrossoverDlss] = useState<boolean>(false);
+  const [preferredMaxFrameRate, setPreferredMaxFrameRate] = useState<number | undefined>(
+    undefined
+  );
+  const [metalfxSpatialUpscaleFactor, setMetalfxSpatialUpscaleFactor] = useState<
+    number | undefined
+  >(undefined);
+  const [emulateModeset, setEmulateModeset] = useState<boolean | undefined>(undefined);
+  const [forceLargeAddressAware, setForceLargeAddressAware] = useState<boolean | undefined>(
+    undefined
+  );
   const [wineMsync, setWineMsync] = useState<boolean>(true);
   const [wineEsync, setWineEsync] = useState<boolean>(false);
   const [metalHud, setMetalHud] = useState<boolean>(false);
@@ -103,6 +118,9 @@ export function useGameLaunchConfigForm({
   const [isCheckingUpdates, setIsCheckingUpdates] = useState<boolean>(false);
   const [isUpdatingRunner, setIsUpdatingRunner] = useState<boolean>(false);
   const [runnerUpdateFeedback, setRunnerUpdateFeedback] = useState<string | null>(null);
+  const [runnerProgressByType, setRunnerProgressByType] = useState<
+    Partial<Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>>
+  >(() => launcherService.getActiveRunnerOperations());
   const [, setInstallInfoTick] = useState(0);
 
   const loadFormFieldsForPlatform = useCallback(
@@ -173,6 +191,40 @@ export function useGameLaunchConfigForm({
       );
       setCrossoverHighResolutionMode(source?.crossoverHighResolutionMode);
       setCrossoverDlss(Boolean(source?.crossoverDlss));
+      const envMaxFpsRaw =
+        source?.environmentVariables?.DXVK_FRAME_RATE ||
+        source?.environmentVariables?.D3DM_MAX_FPS;
+      const envMaxFpsParsed = envMaxFpsRaw ? Math.round(Number(envMaxFpsRaw)) : NaN;
+      setPreferredMaxFrameRate(
+        typeof source?.preferredMaxFrameRate === 'number' &&
+          Number.isFinite(source.preferredMaxFrameRate) &&
+          source.preferredMaxFrameRate > 0
+          ? Math.round(source.preferredMaxFrameRate)
+          : Number.isFinite(envMaxFpsParsed) && envMaxFpsParsed > 0
+            ? envMaxFpsParsed
+            : undefined
+      );
+      const envSpatialRaw = source?.environmentVariables?.DXMT_METALFX_SPATIAL_SWAPCHAIN;
+      const envSpatialParsed = envSpatialRaw ? Number(envSpatialRaw) : NaN;
+      setMetalfxSpatialUpscaleFactor(
+        typeof source?.metalfxSpatialUpscaleFactor === 'number' &&
+          Number.isFinite(source.metalfxSpatialUpscaleFactor) &&
+          source.metalfxSpatialUpscaleFactor > 1
+          ? source.metalfxSpatialUpscaleFactor
+          : Number.isFinite(envSpatialParsed) && envSpatialParsed > 1
+            ? envSpatialParsed
+            : undefined
+      );
+      setEmulateModeset(source?.emulateModeset);
+      setForceLargeAddressAware(
+        source?.forceLargeAddressAware !== undefined
+          ? Boolean(source.forceLargeAddressAware)
+          : source?.environmentVariables?.WINE_LARGE_ADDRESS_AWARE === '1'
+            ? true
+            : source?.environmentVariables?.WINE_LARGE_ADDRESS_AWARE === '0'
+              ? false
+              : undefined
+      );
       const loadedMsync =
         source?.wineMsync !== undefined
           ? source.wineMsync
@@ -332,35 +384,69 @@ export function useGameLaunchConfigForm({
     return acquireModalOverlayLock();
   }, [isOpen]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    setRunnerProgressByType(launcherService.getActiveRunnerOperations());
+    const unsubscribe = launcherService.onRunnerProgress((event) => {
+      const isTerminal =
+        event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';
+      if (isTerminal) {
+        setRunnerProgressByType((prev) => {
+          if (!prev[event.runnerType]) return prev;
+          const next = { ...prev };
+          delete next[event.runnerType];
+          return next;
+        });
+        if (event.phase === 'completed') {
+          void launcherService.detectCompatibilityLayers().then((layers) => {
+            if (Array.isArray(layers)) {
+              setDetectedLayers(layers);
+            }
+          });
+          void launcherService.checkCompatibilityLayerUpdates().then((updates) => {
+            if (updates && typeof updates === 'object') {
+              setRunnerUpdates(updates);
+            }
+          });
+        }
+      } else {
+        setRunnerProgressByType((prev) => ({
+          ...prev,
+          [event.runnerType]: event,
+        }));
+      }
+    });
+    return unsubscribe;
+  }, [isOpen]);
+
   const selectedRunnerDescriptor =
     COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === compatibilityLayer) ||
     COMPATIBILITY_RUNNER_DESCRIPTORS[0];
   const activeLayer = detectedLayers.find((l) => l.type === compatibilityLayer);
   const activeUpdateInfo = runnerUpdates[compatibilityLayer];
   const availableBottles = activeLayer?.availableBottles || [];
+  const activeRunnerProgress =
+    compatibilityLayer !== 'native' ? runnerProgressByType[compatibilityLayer] : undefined;
+  const effectiveIsInstallingRunner =
+    isInstallingRunner || activeRunnerProgress?.operation === 'install';
+  const effectiveIsUpdatingRunner =
+    isUpdatingRunner || activeRunnerProgress?.operation === 'update';
+  const wineSyncMode: WineSyncMode = resolveWineSyncMode(wineMsync, wineEsync);
 
   const activeInstalledVer = activeLayer?.version || activeUpdateInfo?.installedVersion;
   const activeInstalledBuild =
     activeLayer?.buildVersion || activeUpdateInfo?.installedBuildVersion;
   const activeInstalledDisplay =
     activeLayer?.displayVersion || activeUpdateInfo?.installedDisplayVersion;
-  const activeSecondaryBuildText = useMemo(() => {
-    const parts: string[] = [];
-    if (
-      activeInstalledDisplay &&
-      activeInstalledDisplay !== activeInstalledVer &&
-      activeInstalledDisplay !== `v${activeInstalledVer}`
-    ) {
-      parts.push(activeInstalledDisplay);
-    }
-    if (
-      activeInstalledBuild &&
-      (!activeInstalledDisplay || !activeInstalledDisplay.includes(activeInstalledBuild))
-    ) {
-      parts.push(`Build ${activeInstalledBuild}`);
-    }
-    return parts.join(' • ');
-  }, [activeInstalledDisplay, activeInstalledVer, activeInstalledBuild]);
+  const activeSecondaryBuildText = useMemo(
+    () =>
+      formatRunnerSecondaryBuildText({
+        installedVersion: activeInstalledVer,
+        displayVersion: activeInstalledDisplay,
+        buildVersion: activeInstalledBuild,
+      }),
+    [activeInstalledDisplay, activeInstalledVer, activeInstalledBuild]
+  );
 
   const resolvedBottleFolderPath =
     winePrefixPath.trim() ||
@@ -393,11 +479,6 @@ export function useGameLaunchConfigForm({
             ''
         );
 
-  const isDlssSupportedBackend =
-    crossoverGraphicsBackend === 'auto' ||
-    crossoverGraphicsBackend === 'd3dmetal' ||
-    crossoverGraphicsBackend === 'dxmt';
-
   const isDxvkHudSupported =
     compatibilityLayer === 'wine' ||
     ((compatibilityLayer === 'crossover' || compatibilityLayer === 'crossover_preview') &&
@@ -410,10 +491,11 @@ export function useGameLaunchConfigForm({
   const fallbackD3DVer =
     activeLayer?.availableD3DMetalVersions?.find((v) => v.id === '3')?.version || '3.0';
   const showD3DMetalVersionSelector =
-    (compatibilityLayer === 'crossover_preview' ||
-      Boolean(
-        activeLayer?.availableD3DMetalVersions && activeLayer.availableD3DMetalVersions.length > 1
-      )) &&
+    Boolean(
+      activeLayer?.availableD3DMetalVersions
+        ? activeLayer.availableD3DMetalVersions.length > 1
+        : compatibilityLayer === 'crossover_preview'
+    ) &&
     (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'd3dmetal');
 
   const preview = launcherService.resolveEffectiveLaunchModePreview(game, preferredPlatformId, {
@@ -425,6 +507,18 @@ export function useGameLaunchConfigForm({
     workingDirectory: workingDirectory.trim() || undefined,
     storefrontClientLifecycle,
   });
+
+  const dlssEligibility = resolveDlssEligibility({
+    crossoverGraphicsBackend,
+    activeLayer,
+    preview,
+  });
+  const isDlssSupportedBackend = dlssEligibility.supported;
+  const dlssUnavailableReason = dlssEligibility.reason;
+
+  const handleToggleForceLargeAddressAware = useCallback(() => {
+    setForceLargeAddressAware((prev) => !prev);
+  }, []);
 
   const hostPlatform: 'darwin' | 'win32' | 'linux' = isWindowsHost
     ? 'win32'
@@ -489,6 +583,9 @@ export function useGameLaunchConfigForm({
     const includeMetalHud =
       !isWindowsHost &&
       (preview.visibleSections.compatibilityLayer || preview.visibleSections.nativeMacMetalHud);
+    const priorSource =
+      draftsByPlatform[preferredPlatformId] ??
+      launcherService.getLaunchConfig(game.id, preferredPlatformId);
 
     const candidateMethod: LaunchMethod =
       isWindowsHost && launchMethod === 'compatibility_layer'
@@ -523,11 +620,22 @@ export function useGameLaunchConfigForm({
           ? crossoverDlss
           : false
         : undefined,
+      preferredMaxFrameRate: includeCompatSettings ? preferredMaxFrameRate : undefined,
+      metalfxSpatialUpscaleFactor:
+        includeCrossoverOnly &&
+        (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'dxmt')
+          ? metalfxSpatialUpscaleFactor
+          : undefined,
+      emulateModeset: includeCompatSettings ? emulateModeset : undefined,
+      forceLargeAddressAware: includeCompatSettings ? forceLargeAddressAware : undefined,
+      virtualDesktop: includeCompatSettings ? priorSource?.virtualDesktop : undefined,
+      audioBufferClamp: includeCompatSettings ? priorSource?.audioBufferClamp : undefined,
+      advertiseAvx: includeCompatSettings ? priorSource?.advertiseAvx : undefined,
+      wineDebug: includeCompatSettings ? priorSource?.wineDebug : undefined,
       wineMsync: includeCompatSettings ? wineMsync : undefined,
       wineEsync: includeCompatSettings ? wineEsync : undefined,
-      metalHud: includeMetalHud ? (metalHud ? true : undefined) : undefined,
-      dxvkHud:
-        includeCompatSettings && isDxvkHudSupported ? (dxvkHud ? true : undefined) : undefined,
+      metalHud: includeMetalHud ? metalHud : undefined,
+      dxvkHud: includeCompatSettings && isDxvkHudSupported ? dxvkHud : undefined,
       environmentVariables: Object.keys(parsedEnv).length > 0 ? parsedEnv : undefined,
       preLaunchCommand: preLaunchCommand.trim() || undefined,
       postExitCommand: postExitCommand.trim() || undefined,
@@ -549,13 +657,17 @@ export function useGameLaunchConfigForm({
     launchMethod,
     compatibilityLayer,
     selectedRunnerDescriptor,
+    activeLayer,
+    activeUpdateInfo,
     isCheckingUpdates,
-    isUpdatingRunner,
-    isInstallingRunner,
+    isUpdatingRunner: effectiveIsUpdatingRunner,
+    isInstallingRunner: effectiveIsInstallingRunner,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
     activeDisplayMethod,
     preview,
+    wineMsync,
+    wineEsync,
     loadFormFieldsForPlatform,
     buildProfileFromCurrentState,
     game,
@@ -570,13 +682,17 @@ export function useGameLaunchConfigForm({
     launchMethod,
     compatibilityLayer,
     selectedRunnerDescriptor,
+    activeLayer,
+    activeUpdateInfo,
     isCheckingUpdates,
-    isUpdatingRunner,
-    isInstallingRunner,
+    isUpdatingRunner: effectiveIsUpdatingRunner,
+    isInstallingRunner: effectiveIsInstallingRunner,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
     activeDisplayMethod,
     preview,
+    wineMsync,
+    wineEsync,
     loadFormFieldsForPlatform,
     buildProfileFromCurrentState,
     game,
@@ -824,21 +940,42 @@ export function useGameLaunchConfigForm({
     setIsUpdatingRunner(true);
     setRunnerUpdateFeedback(null);
     try {
-      const res = await launcherService.updateCompatibilityLayer(
-        cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>
-      );
+      const shouldSwitchPreviewToStable =
+        cur.compatibilityLayer === 'crossover_preview' &&
+        Boolean(cur.activeUpdateInfo?.stableSurpassesPreview) &&
+        !cur.activeUpdateInfo?.canAutoUpdate;
+      const res = shouldSwitchPreviewToStable
+        ? await launcherService.updateCompatibilityLayer('crossover_preview', {
+            switchToStableCrossOver: true,
+          })
+        : await launcherService.updateCompatibilityLayer(
+            cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>
+          );
       const refreshedLayers =
         res.detectedLayers || (await launcherService.detectCompatibilityLayers());
       setDetectedLayers(refreshedLayers);
       if (res.updateInfo) {
         const latestFromService = launcherService.getRunnerUpdates();
+        const targetInfoKey = res.updateInfo.runnerType || cur.compatibilityLayer;
         setRunnerUpdates((prev) => ({
           ...prev,
           ...latestFromService,
           [cur.compatibilityLayer]: res.updateInfo!,
+          [targetInfoKey]: res.updateInfo!,
         }));
       } else {
         setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
+      }
+      if (
+        cur.compatibilityLayer === 'crossover_preview' &&
+        res.success &&
+        refreshedLayers.some((l) => l.type === 'crossover') &&
+        (shouldSwitchPreviewToStable ||
+          Boolean(cur.activeUpdateInfo?.stableSurpassesPreview) ||
+          res.runnerType === 'crossover' ||
+          !refreshedLayers.some((l) => l.type === 'crossover_preview'))
+      ) {
+        setCompatibilityLayer('crossover');
       }
       setRunnerUpdateFeedback(res.message || res.error || null);
     } finally {
@@ -863,7 +1000,7 @@ export function useGameLaunchConfigForm({
           tone: 'emerald',
           text:
             res.message ||
-            `${cur.selectedRunnerDescriptor.shortLabel} installed via Homebrew and ready to use.`,
+            `${cur.selectedRunnerDescriptor.shortLabel} downloaded, installed, and ready to use.`,
         });
       } else {
         setRunnerActionFeedback({
@@ -871,11 +1008,119 @@ export function useGameLaunchConfigForm({
           text:
             res.error ||
             res.message ||
-            `Could not auto-install ${cur.selectedRunnerDescriptor.shortLabel}. Try the official installer download.`,
+            `Could not install ${cur.selectedRunnerDescriptor.shortLabel}. Please check your internet connection and try again.`,
         });
       }
     } finally {
       setIsInstallingRunner(false);
+    }
+  }, []);
+
+  const handleInstallRunnerFromArchive = useCallback(async () => {
+    const cur = latestRef.current;
+    if (cur.isInstallingRunner || cur.isUpdatingRunner || cur.compatibilityLayer === 'native') {
+      return;
+    }
+    const archivePath = await launcherService.selectRunnerArchive();
+    if (!archivePath) return;
+
+    const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
+    const isDmg = archivePath.toLowerCase().endsWith('.dmg');
+    const archiveOpts = {
+      archivePath,
+      ...(isDmg ? { dmgPath: archivePath } : {}),
+    };
+
+    if (cur.activeLayer) {
+      setIsUpdatingRunner(true);
+      setRunnerUpdateFeedback(null);
+      try {
+        const res = await launcherService.updateCompatibilityLayer(runnerKey, archiveOpts);
+        const refreshedLayers =
+          res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+        setDetectedLayers(refreshedLayers);
+        if (res.updateInfo) {
+          const latestFromService = launcherService.getRunnerUpdates();
+          setRunnerUpdates((prev) => ({
+            ...prev,
+            ...latestFromService,
+            [runnerKey]: res.updateInfo!,
+          }));
+        } else {
+          setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
+        }
+        setRunnerUpdateFeedback(res.message || res.error || null);
+      } finally {
+        setIsUpdatingRunner(false);
+      }
+    } else {
+      setIsInstallingRunner(true);
+      setRunnerActionFeedback(null);
+      try {
+        const res = await launcherService.installCompatibilityLayer(
+          runnerKey,
+          'direct',
+          archiveOpts
+        );
+        const refreshed = res.layers || (await launcherService.detectCompatibilityLayers());
+        setDetectedLayers(refreshed);
+        setRunnerActionFeedback({
+          tone: res.success ? 'emerald' : 'amber',
+          text:
+            res.message ||
+            res.error ||
+            (res.success
+              ? `${cur.selectedRunnerDescriptor.shortLabel} installed from local archive.`
+              : `Could not install ${cur.selectedRunnerDescriptor.shortLabel} from archive.`),
+        });
+      } finally {
+        setIsInstallingRunner(false);
+      }
+    }
+  }, []);
+
+  const handleCancelRunnerOperation = useCallback(async () => {
+    const cur = latestRef.current;
+    if (cur.compatibilityLayer === 'native') return;
+    const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
+    await launcherService.cancelCompatibilityLayerOperation(runnerKey);
+    setRunnerProgressByType((prev) => {
+      if (!prev[runnerKey]) return prev;
+      const next = { ...prev };
+      delete next[runnerKey];
+      return next;
+    });
+    setIsInstallingRunner(false);
+    setIsUpdatingRunner(false);
+    setRunnerActionFeedback({
+      tone: 'amber',
+      text: `${cur.selectedRunnerDescriptor.shortLabel} operation cancelled.`,
+    });
+  }, []);
+
+  const handleSwitchToStableCrossOver = useCallback(async () => {
+    const cur = latestRef.current;
+    if (cur.isUpdatingRunner || cur.isInstallingRunner) return;
+    setIsUpdatingRunner(true);
+    setRunnerUpdateFeedback(null);
+    try {
+      const res = await launcherService.updateCompatibilityLayer('crossover_preview', {
+        switchToStableCrossOver: true,
+      });
+      const refreshedLayers =
+        res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+      setDetectedLayers(refreshedLayers);
+      setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
+      if (res.success && refreshedLayers.some((l) => l.type === 'crossover')) {
+        setCompatibilityLayer('crossover');
+      }
+      setRunnerUpdateFeedback(
+        res.message ||
+          res.error ||
+          (res.success ? 'Switched to CrossOver Stable.' : 'Could not switch to CrossOver Stable.')
+      );
+    } finally {
+      setIsUpdatingRunner(false);
     }
   }, []);
 
@@ -917,19 +1162,32 @@ export function useGameLaunchConfigForm({
   }, []);
 
   const handleToggleWineMsync = useCallback(() => {
-    setWineMsync((prev) => {
-      const next = !prev;
-      if (next) setWineEsync(false);
-      return next;
-    });
+    const next = !latestRef.current.wineMsync;
+    setWineMsync(next);
+    if (next) {
+      setWineEsync(false);
+    }
   }, []);
 
   const handleToggleWineEsync = useCallback(() => {
-    setWineEsync((prev) => {
-      const next = !prev;
-      if (next) setWineMsync(false);
-      return next;
-    });
+    const next = !latestRef.current.wineEsync;
+    setWineEsync(next);
+    if (next) {
+      setWineMsync(false);
+    }
+  }, []);
+
+  const handleSelectWineSyncMode = useCallback((mode: WineSyncMode) => {
+    if (mode === 'msync') {
+      setWineMsync(true);
+      setWineEsync(false);
+    } else if (mode === 'esync') {
+      setWineMsync(false);
+      setWineEsync(true);
+    } else {
+      setWineMsync(false);
+      setWineEsync(false);
+    }
   }, []);
 
   const handleToggleDxvkHud = useCallback(() => {
@@ -1029,6 +1287,10 @@ export function useGameLaunchConfigForm({
     setCrossoverD3DMetalVersion('auto');
     setCrossoverHighResolutionMode(undefined);
     setCrossoverDlss(false);
+    setPreferredMaxFrameRate(undefined);
+    setMetalfxSpatialUpscaleFactor(undefined);
+    setEmulateModeset(undefined);
+    setForceLargeAddressAware(undefined);
     setWineMsync(true);
     setWineEsync(false);
     setMetalHud(false);
@@ -1144,8 +1406,17 @@ export function useGameLaunchConfigForm({
     crossoverHighResolutionMode,
     setCrossoverHighResolutionMode,
     crossoverDlss,
+    preferredMaxFrameRate,
+    setPreferredMaxFrameRate,
+    metalfxSpatialUpscaleFactor,
+    setMetalfxSpatialUpscaleFactor,
+    emulateModeset,
+    setEmulateModeset,
+    forceLargeAddressAware,
+    setForceLargeAddressAware,
     wineMsync,
     wineEsync,
+    wineSyncMode,
     metalHud,
     dxvkHud,
     envText,
@@ -1159,15 +1430,18 @@ export function useGameLaunchConfigForm({
     storefrontClientLifecycle,
     setStorefrontClientLifecycle,
     perfSettings,
+    hasEditedGlobalPerfSettings,
     detectedLayers,
     isSaving,
-    isInstallingRunner,
+    isInstallingRunner: effectiveIsInstallingRunner,
     isRescanningRunners,
     runnerActionFeedback,
     runnerUpdates,
     isCheckingUpdates,
-    isUpdatingRunner,
+    isUpdatingRunner: effectiveIsUpdatingRunner,
     runnerUpdateFeedback,
+    runnerProgressByType,
+    activeRunnerProgress,
     selectedRunnerDescriptor,
     activeLayer,
     activeUpdateInfo,
@@ -1177,6 +1451,7 @@ export function useGameLaunchConfigForm({
     resolvedBottleFolderPath,
     isWindowsHost,
     isDlssSupportedBackend,
+    dlssUnavailableReason,
     isDxvkHudSupported,
     primaryD3DVer,
     fallbackD3DVer,
@@ -1203,13 +1478,18 @@ export function useGameLaunchConfigForm({
     handleCheckRunnerUpdates,
     handleUpdateRunner,
     handleInstallRunnerViaBrew,
+    handleInstallRunnerFromArchive,
+    handleCancelRunnerOperation,
+    handleSwitchToStableCrossOver,
     handleDownloadRunner,
     handleOpenBottleFolder,
     handleSelectCompatibilityLayer,
     handleToggleMetalHud,
     handleToggleCrossoverDlss,
+    handleToggleForceLargeAddressAware,
     handleToggleWineMsync,
     handleToggleWineEsync,
+    handleSelectWineSyncMode,
     handleToggleDxvkHud,
     handleChangeStorefrontClientLifecycle,
     handleChangePostGameBehavior,

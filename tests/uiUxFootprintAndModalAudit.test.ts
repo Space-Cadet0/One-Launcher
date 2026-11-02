@@ -109,8 +109,17 @@ function createStatefulRenderer<P extends object>(
         n.forEach(walk);
         return;
       }
+      if (
+        typeof n.type === 'function' &&
+        (n.type.name === 'LaunchSelect' || n.type.name === 'SwitchControl')
+      ) {
+        walk(n.type(n.props || {}));
+        return;
+      }
       if (predicate(n)) out.push(n);
-      if (n.props?.children) walk(n.props.children);
+      if (n.props?.children) {
+        walk(n.props.children);
+      }
     };
     walk(node);
     return out;
@@ -866,7 +875,8 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     expect(modal.html).not.toContain('translateZ(0)');
     expect(modal.html).not.toContain('contain:layout style paint');
     expect(modal.html).not.toContain('Checking for updates...');
-    expect(modal.html).toContain('Up to Date (v26.0.0)');
+    expect(modal.html).toContain('v26.0.0');
+    expect(modal.html).toContain('Up to Date');
     modal.unmount();
 
     // Verify GameInstallModal also uses flat sibling scrim without backdrop-blur or contain:layout style paint
@@ -1127,17 +1137,18 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
       modal.findElements((el) => el.props?.['data-testid'] === 'toggle-dxvk-hud')[0];
     expect(getDxvkBtn().props.disabled).toBe(false);
 
-    // Enable DXVK HUD, then switch Graphics Backend to D3DMetal -> DXVK HUD disables ("N/A") and is omitted on save!
+    // Enable DXVK HUD, then switch Graphics Backend to D3DMetal -> DXVK HUD disables ("Unavailable") and is omitted on save!
     getDxvkBtn().props.onClick();
     modal.rerender();
-    expect(renderToString(getDxvkBtn())).toContain('ON');
+    expect(getDxvkBtn().props['aria-checked']).toBe(true);
 
     modal
       .findElements((el) => el.props?.['aria-label'] === 'Graphics Backend')[0]
       .props.onChange({ target: { value: 'd3dmetal' } });
     modal.rerender();
     expect(getDxvkBtn().props.disabled).toBe(true);
-    expect(renderToString(getDxvkBtn())).toContain('N/A');
+    expect(getDxvkBtn().props['aria-checked']).toBe(false);
+    expect(modal.html).toContain('Unavailable');
 
     // Switch runner to GPTK (with 0 bottles) -> hides no-op Target Bottle Name input & updates WinePrefix placeholder
     modal
@@ -1153,7 +1164,11 @@ describe('UI/UX Game Page, Launch & Compatibility Settings, and Storefront Funct
     // Verify technical text/textarea inputs disable spellCheck & autoCorrect, and macOS env placeholder omits Linux MANGOHUD
     expect(modal.html).not.toContain('MANGOHUD=1');
     const textInputs = modal.findElements(
-      (el) => el.type === 'input' || el.type === 'textarea'
+      (el) =>
+        (el.type === 'input' &&
+          el.props?.type !== 'radio' &&
+          el.props?.type !== 'checkbox') ||
+        el.type === 'textarea'
     );
     expect(textInputs.length).toBeGreaterThanOrEqual(4);
     for (const inp of textInputs) {

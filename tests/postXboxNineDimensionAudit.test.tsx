@@ -535,7 +535,7 @@ describe('Post-Xbox 9-Dimension, Dual-OS & WCAG 2.2 AA Regression Suite', () => 
       expect(JSON.stringify(armPreview)).toContain('Apple Silicon');
     });
 
-    it('3. SIP-safe resolveSipSafeWineBinaryAndPreloadEnv mirrors DYLD_INSERT_LIBRARIES into CX_DYLD_INSERT_LIBRARIES for CrossOver Perl wrappers', () => {
+    it('3. SIP-safe resolveSipSafeWineBinaryAndPreloadEnv forwards DYLD_INSERT_LIBRARIES via CX_ENV and strips top-level DYLD_INSERT_LIBRARIES for CrossOver Perl wrappers', () => {
       const fakeCxBinDir = path.join(
         tmpDir,
         'CrossOver.app',
@@ -559,11 +559,14 @@ describe('Post-Xbox 9-Dimension, Dual-OS & WCAG 2.2 AA Regression Suite', () => 
         env
       );
       expect(resolvedBin).toBe(perlWrapperPath);
-      expect(env.CX_DYLD_INSERT_LIBRARIES).toBe(preloadPath);
+      expect(env.DYLD_INSERT_LIBRARIES).toBeUndefined();
+      expect(env.CX_ENV).toBe(`DYLD_INSERT_LIBRARIES="${preloadPath}"`);
 
       // Re-invoking must remain idempotent without duplicating colon-delimited dylib entries
+      env.DYLD_INSERT_LIBRARIES = preloadPath;
       macNativeInstaller.resolveSipSafeWineBinaryAndPreloadEnv(perlWrapperPath, env);
-      expect(env.CX_DYLD_INSERT_LIBRARIES).toBe(preloadPath);
+      expect(env.DYLD_INSERT_LIBRARIES).toBeUndefined();
+      expect(env.CX_ENV).toBe(`DYLD_INSERT_LIBRARIES="${preloadPath}"`);
     });
 
     it('4. parseLaunchArguments preserves spaces inside double/single-quoted flags (--mod="path with spaces")', () => {

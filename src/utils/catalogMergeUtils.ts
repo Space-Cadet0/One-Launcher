@@ -11,6 +11,7 @@ import { reconcileAchievementSummaries } from '../services/storage/achievementRe
 import { applyUserOverrideToGame } from '../services/storage/userOverrideStorage';
 import {
   sanitizeGameCatalog,
+  sanitizePlatformOwnershipOsFlags,
   normalizeCanonicalTitle,
   hasSameStorefrontConflict,
 } from '../services/integrations/catalogSanitizer';
@@ -43,7 +44,7 @@ export function reconcileCatalogTrophiesRecords(
     const normTitle = titleLower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
 
     const updatedPlatforms = game.platforms.map((p) => {
-      const newP = { ...p };
+      const newP = sanitizePlatformOwnershipOsFlags({ ...p });
       const rec = launcherService.getInstalledRecordForGame(game, p.platformId);
       if (rec && rec.platformId === p.platformId) {
         newP.installed = true;
@@ -53,6 +54,21 @@ export function reconcileCatalogTrophiesRecords(
         newP.installSize = rec.installSize ?? newP.installSize;
         newP.version = rec.version || newP.version;
         newP.isWindowsBinaryOnMac = rec.isWindowsBinaryOnMac ?? newP.isWindowsBinaryOnMac;
+        if (rec.isCrossPlatformLauncherRuntime !== undefined) {
+          newP.isCrossPlatformLauncherRuntime = rec.isCrossPlatformLauncherRuntime;
+        }
+        if (rec.externalStorefrontHandoff) {
+          newP.externalStorefrontHandoff =
+            (rec.externalStorefrontHandoff as GamePlatformOwnership['externalStorefrontHandoff']) ||
+            newP.externalStorefrontHandoff;
+        }
+        if (rec.chainedLauncherHandoff) {
+          newP.chainedLauncherHandoff = rec.chainedLauncherHandoff || newP.chainedLauncherHandoff;
+        }
+        if (rec.chainedExternalInstallId) {
+          newP.chainedExternalInstallId =
+            rec.chainedExternalInstallId || newP.chainedExternalInstallId;
+        }
         const recXboxProductId = (rec as typeof rec & { xboxProductId?: string }).xboxProductId;
         if (recXboxProductId) newP.xboxProductId = recXboxProductId || newP.xboxProductId;
         if (rec.packageFamilyName) {
@@ -151,7 +167,7 @@ export function reconcileCatalogTrophiesRecords(
           if (reconciled) newP.achievements = reconciled;
         }
       }
-      return newP;
+      return sanitizePlatformOwnershipOsFlags(newP);
     });
 
     return { ...game, platforms: updatedPlatforms };
@@ -336,7 +352,7 @@ export function captureNativeGameBaseline(game: CanonicalGame): NativeGameBaseli
   };
 }
 
-function recomputeOsFieldsFromPlatforms(
+export function recomputeOsFieldsFromPlatforms(
   platforms?: GamePlatformOwnership[]
 ): Pick<CanonicalGame, 'nativePlatforms' | 'worksOn' | 'platforms_os'> {
   if (!Array.isArray(platforms) || platforms.length === 0) {
@@ -346,12 +362,29 @@ function recomputeOsFieldsFromPlatforms(
       platforms_os: undefined,
     };
   }
-  const hasExplicitOsInfo = platforms.some(
-    (p) =>
-      (Array.isArray(p?.platforms) && p.platforms.length > 0) ||
-      p?.isWindowsBinaryOnMac !== undefined ||
-      p?.platformId === 'xbox'
-  );
+  const hasExplicitOsInfo = platforms.some((p) => {
+    if (!p) return false;
+    if (
+      p.platformId === 'xbox' ||
+      p.platformId === 'ubisoft' ||
+      p.platformId === 'ea' ||
+      p.platformId === 'rockstar' ||
+      (p.platformId as string) === 'riot'
+    ) {
+      return true;
+    }
+    if (p.isWindowsBinaryOnMac !== undefined) return true;
+    if (Array.isArray(p.platforms) && p.platforms.length > 0) return true;
+    if (
+      p.platforms &&
+      typeof p.platforms === 'object' &&
+      !Array.isArray(p.platforms) &&
+      (typeof p.platforms.windows === 'boolean' || typeof p.platforms.mac === 'boolean')
+    ) {
+      return true;
+    }
+    return false;
+  });
   if (!hasExplicitOsInfo) {
     return {
       nativePlatforms: undefined,
@@ -362,15 +395,47 @@ function recomputeOsFieldsFromPlatforms(
 
   let hasWindows = false;
   let hasMac = false;
-  for (const p of platforms) {
-    if (!p) continue;
-    if (p.platformId === 'xbox' || p.isWindowsBinaryOnMac === true) {
+  for (const rawP of platforms) {
+    if (!rawP) continue;
+    const p = sanitizePlatformOwnershipOsFlags(rawP);
+    if (p.platformId === 'xbox') {
+      hasWindows = true;
+      if (
+        (p.isCrossPlatformLauncherRuntime === true ||
+          (p.platforms &&
+            typeof p.platforms === 'object' &&
+            !Array.isArray(p.platforms) &&
+            p.platforms.mac === true)) &&
+        !p.isWindowsBinaryOnMac
+      ) {
+        hasMac = true;
+      }
+      continue;
+    }
+    if (
+      p.platformId === 'ubisoft' ||
+      p.platformId === 'ea' ||
+      p.platformId === 'rockstar' ||
+      (p.platformId as string) === 'riot'
+    ) {
+      hasWindows = true;
+      continue;
+    }
+    if (p.isWindowsBinaryOnMac === true) {
       hasWindows = true;
     }
     if (Array.isArray(p.platforms)) {
-      if (p.platforms.includes('windows')) hasWindows = true;
-      if (p.platforms.includes('mac') && !p.isWindowsBinaryOnMac) hasMac = true;
+      const legacyArr = p.platforms as unknown as string[];
+      if (legacyArr.includes('windows')) hasWindows = true;
+      if (legacyArr.includes('mac') && !p.isWindowsBinaryOnMac) hasMac = true;
+    } else if (p.platforms && typeof p.platforms === 'object') {
+      if (p.platforms.windows !== false) hasWindows = true;
+      if (p.platforms.mac === true && !p.isWindowsBinaryOnMac) hasMac = true;
     }
+  }
+
+  if (!hasWindows && !hasMac) {
+    hasWindows = true;
   }
 
   const nativePlatforms: NativeOsPlatform[] = [];
@@ -461,31 +526,45 @@ export function revertRemovedOverrideInCatalog(
             ? Number(steamPlat.platformGameId)
             : undefined;
 
-      return {
-        ...g,
-        id: restoredId,
-        title: restoredTitle,
-        sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
-        steamAppId: restoredSteamAppId,
-        isExplicitNonSteam: false,
-        matchConfidence: undefined,
-        needsMatchReview: undefined,
-        reviewScoreOverride: undefined,
-        enrichedMetadata: undefined,
-        capsuleImage: nb.capsuleImage,
-        headerImage: nb.headerImage ?? '',
-        iconUrl: nb.iconUrl,
-        shortDescription: nb.shortDescription ?? '',
-        detailedDescription: nb.detailedDescription,
-        developers: Array.isArray(nb.developers) ? [...nb.developers] : [],
-        publishers: Array.isArray(nb.publishers) ? [...nb.publishers] : [],
-        genres: Array.isArray(nb.genres) ? [...nb.genres] : [],
-        tags: Array.isArray(nb.tags) ? [...nb.tags] : [],
-        releaseDate: nb.releaseDate,
-        nativePlatforms: nb.nativePlatforms ?? osFieldsFromPlats.nativePlatforms,
-        worksOn: nb.worksOn ?? osFieldsFromPlats.worksOn,
-        platforms_os: nb.platforms_os ?? osFieldsFromPlats.platforms_os,
-      };
+        const preferRecomputedXboxOs = Boolean(
+          g.platforms?.length &&
+            g.platforms.every(
+              (p) =>
+                String(p.platformId).toLowerCase() === 'xbox' && !p.isCrossPlatformLauncherRuntime
+            )
+        );
+
+        return {
+          ...g,
+          id: restoredId,
+          title: restoredTitle,
+          sortTitle: restoredTitle.replace(/^(The|A|An)\s+/i, '').trim(),
+          steamAppId: restoredSteamAppId,
+          isExplicitNonSteam: false,
+          matchConfidence: undefined,
+          needsMatchReview: undefined,
+          reviewScoreOverride: undefined,
+          enrichedMetadata: undefined,
+          capsuleImage: nb.capsuleImage,
+          headerImage: nb.headerImage ?? '',
+          iconUrl: nb.iconUrl,
+          shortDescription: nb.shortDescription ?? '',
+          detailedDescription: nb.detailedDescription,
+          developers: Array.isArray(nb.developers) ? [...nb.developers] : [],
+          publishers: Array.isArray(nb.publishers) ? [...nb.publishers] : [],
+          genres: Array.isArray(nb.genres) ? [...nb.genres] : [],
+          tags: Array.isArray(nb.tags) ? [...nb.tags] : [],
+          releaseDate: nb.releaseDate,
+          nativePlatforms: preferRecomputedXboxOs
+            ? osFieldsFromPlats.nativePlatforms
+            : (nb.nativePlatforms ?? osFieldsFromPlats.nativePlatforms),
+          worksOn: preferRecomputedXboxOs
+            ? osFieldsFromPlats.worksOn
+            : (nb.worksOn ?? osFieldsFromPlats.worksOn),
+          platforms_os: preferRecomputedXboxOs
+            ? osFieldsFromPlats.platforms_os
+            : (nb.platforms_os ?? osFieldsFromPlats.platforms_os),
+        };
     }
 
     if (!steamPlat) {

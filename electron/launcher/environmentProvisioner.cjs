@@ -10,6 +10,7 @@ const { execFile, spawn } = childProcess;
 
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const {
+  getElectron,
   getMainWindow,
   isTestEnvironment,
   resolveIsolatedHomedirAndUserData,
@@ -17,11 +18,23 @@ const {
   openExternalUri,
   clearMacQuarantineAsync,
   safeIsBottleSlug,
+  activeSessions,
+  pendingBottleLaunches,
+  macCodesignValidCache,
+  evictExecutableDiscoveryCacheForPath,
 } = require('./engineStateRegistry.cjs');
 const {
   resolveBottleSteamExe,
   sandboxWinePrefixUserFoldersAsync,
+  isCrossOverPerlWineWrapperOptions,
+  upsertWineUserRegKey,
+  resolveDriveCPathCaseInsensitive,
+  applyCrossOverEnvironmentHygiene,
+  sanitizeProvisionedBottleGraphicsBackend,
 } = require('./wineAndCrossOverManager.cjs');
+const macNativeInstallerAndCodesign = /** @type {any} */ (
+  require('./macNativeInstallerAndCodesign.cjs')
+);
 const {
   ensureMacExecutablePermissions,
   resolveTargetMacAppBundlePath,
@@ -31,7 +44,13 @@ const {
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
   ensureCompatibilityLayerReady,
-} = require('./macNativeInstallerAndCodesign.cjs');
+  alignWineMsyncWithLiveBottle,
+  resolveSipSafeWineBinaryAndPreloadEnv,
+  prepareCrossOverWineSpawnEnv,
+  parsePlistStringValues,
+  compareRunnerVersions,
+  recordRunnerInstallReceipt,
+} = macNativeInstallerAndCodesign;
 const {
   inspectWindowsExecutableHeader,
 } = require('./binaryAndManifestInspectors.cjs');
@@ -55,6 +74,15 @@ const {
   probeClientLoginStates,
   probeEnvironmentHealth,
 } = require('./environmentHealthProber.cjs');
+const {
+  CHAINED_PUBLISHER_ECOSYSTEMS,
+  normalizeChainedHandoffId,
+  resolveDefaultChainedBottleName,
+  discoverBottlePublisherLauncher,
+  discoverHostPublisherLauncher,
+  sanitizeEaBottleAutostartInUserReg,
+  sanitizeChainedPublisherAutostartInBottleRegs,
+} = require('./chainedPublisherLaunchers.cjs');
 
 /**
  * @typedef {import('./environmentHealthProber.cjs').EnvironmentComponentId} EnvironmentComponentId
@@ -75,6 +103,25 @@ const {
  * @property {'reuse_existing' | 'create_dedicated'} [bottleMode]
  * @property {string} [bottleName]
  * @property {string} [dmgPath]
+ * @property {string} [archivePath]
+ * @property {boolean} [forceUpdate]
+ */
+
+/**
+ * @typedef {'probing' | 'downloading' | 'verifying_signature' | 'extracting' | 'installing' | 'completed' | 'failed' | 'cancelled'} CompatibilityRunnerOperationPhase
+ */
+
+/**
+ * @typedef {object} CompatibilityRunnerProgressEvent
+ * @property {NonNativeRunnerType} runnerType
+ * @property {'install' | 'update'} operation
+ * @property {CompatibilityRunnerOperationPhase} phase
+ * @property {number | null} progressPercent
+ * @property {number} [bytesDownloaded]
+ * @property {number} [totalBytes]
+ * @property {string} message
+ * @property {string} [error]
+ * @property {string} [updatedAt]
  */
 
 /**
@@ -88,6 +135,7 @@ const {
  * @typedef {object} EnvironmentSetupProgressEvent
  * @property {string} runId
  * @property {EnvironmentComponentId | ClientLoginTargetId} componentId
+ * @property {EnvironmentSetupAction} [action]
  * @property {number} stepIndex
  * @property {number} totalSteps
  * @property {EnvironmentSetupPhase} phase
@@ -144,9 +192,84 @@ const {
  */
 
 /**
+ * Prepare an auxiliary Wine / CrossOver command so `WINEMSYNC`, `CX_ENV`, `CX_ROOT`, SIP wrapper
+ * resolution, and optional headless GUI dialog suppression stay aligned with any live `wineserver`.
+ *
+ * @param {{
+ *   wineBinary: string,
+ *   bottlePath?: string | null,
+ *   env?: Record<string, any>,
+ *   suppressGuiDialogs?: boolean,
+ *   layerType?: string | null,
+ * }} params
+ * @returns {{ binaryPath: string, env: Record<string, any> }}
+ */
+function prepareAlignedAuxBottleWineCommand(params) {
+  const {
+    wineBinary = '',
+    bottlePath = '',
+    env: inputEnv = {},
+    suppressGuiDialogs = false,
+    layerType,
+  } = params || {};
+  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
+  if (typeof macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand === 'function') {
+    const res = macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand({
+      wineBinary,
+      bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
+      env: workingEnv,
+      suppressGuiDialogs,
+      layerType,
+    });
+    const resolvedFromHelper =
+      res && typeof res.wineBinary === 'string' && res.wineBinary
+        ? res.wineBinary
+        : res && typeof res.binaryPath === 'string' && res.binaryPath
+          ? res.binaryPath
+          : '';
+    if (resolvedFromHelper) {
+      return {
+        binaryPath: resolvedFromHelper,
+        env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
+      };
+    }
+  }
+  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
+  if (effectivePrefix) {
+    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
+    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
+  }
+  if (suppressGuiDialogs) {
+    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
+    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
+    if (!curDll) {
+      workingEnv.WINEDLLOVERRIDES = disableSpec;
+    } else if (!curDll.includes('winemenubuilder.exe=d')) {
+      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
+    }
+    if (!workingEnv.WINEDEBUG) {
+      workingEnv.WINEDEBUG = '-all';
+    }
+  }
+  const resolvedBin =
+    typeof prepareCrossOverWineSpawnEnv === 'function'
+      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        })
+      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        });
+  return {
+    binaryPath: resolvedBin || wineBinary,
+    env: workingEnv,
+  };
+}
+
+/**
  * Pinned HTTPS vendor hosts allowed for automated installer discovery and downloads.
  */
 const ALLOWED_INSTALLER_HOSTS = [
+  'codeweavers.com',
   'www.codeweavers.com',
   'media.codeweavers.com',
   'cdn.fastly.steamstatic.com',
@@ -168,10 +291,26 @@ const ALLOWED_INSTALLER_HOSTS = [
   'objects.githubusercontent.com',
   'release-assets.githubusercontent.com',
   'api.github.com',
+  'raw.githubusercontent.com',
   'formulae.brew.sh',
   'dl.winehq.org',
   'aka.ms',
   'download.visualstudio.microsoft.com',
+  'ubi.li',
+  'static3.cdn.ubi.com',
+  'ubistatic3-a.akamaihd.net',
+  'origin-a.akamaihd.net',
+  'eaassets-a.akamaihd.net',
+  'download.dm.origin.com',
+  'downloader.battle.net',
+  'download.battle.net',
+  'us.battle.net',
+  'eu.battle.net',
+  'kr.battle.net',
+  'gamedownloads.rockstargames.com',
+  'lol.secure.dyn.riotcdn.net',
+  'valorant.secure.dyn.riotcdn.net',
+  'riotcdn.net',
 ];
 
 /**
@@ -191,7 +330,12 @@ function explicitHomedirOpt(options = {}) {
 const ALLOWED_INSTALLER_HOSTS_SET = new Set(ALLOWED_INSTALLER_HOSTS);
 
 const MAX_INSTALLER_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB ceiling
-const DOWNLOAD_PROGRESS_THROTTLE_MS = 200;
+const DOWNLOAD_PROGRESS_THROTTLE_MS = 150;
+
+/**
+ * Pinned CodeWeavers CrossOver Sparkle Ed25519 `SUPublicEDKey` (base64 raw 32-byte public key).
+ */
+const CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY = 'HtsRMTX0R0Oqe+aWIftCC6Q4Zck7L7n9DpXkbrp7tww=';
 
 /** @type {Record<EnvironmentSetupAction, number>} */
 const ACTION_EXECUTION_ORDER = {
@@ -211,6 +355,15 @@ const VALID_CLIENT_LOGIN_TARGETS = new Set([
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
+  'host_riot',
 ]);
 
 /** @type {Set<(event: EnvironmentSetupProgressEvent) => void>} */
@@ -239,8 +392,30 @@ function onEnvironmentSetupProgress(listener) {
 }
 
 /**
+ * Map an `EnvironmentComponentId` to a `NonNativeRunnerType` when applicable.
+ *
+ * @param {string} componentId
+ * @returns {NonNativeRunnerType | null}
+ */
+function componentIdToRunnerType(componentId) {
+  switch (componentId) {
+    case 'runner_crossover':
+      return 'crossover';
+    case 'runner_crossover_preview':
+      return 'crossover_preview';
+    case 'runner_wine':
+      return 'wine';
+    case 'runner_gptk':
+      return 'gptk';
+    default:
+      return null;
+  }
+}
+
+/**
  * Emit an environment setup progress event to Node listeners and the active Electron renderer
- * (`'launcher:environment-setup-progress'`), throttling `'downloading'` byte ticks to <= 1 per 200ms.
+ * (`'launcher:environment-setup-progress'`), throttling `'downloading'` byte ticks to <= 1 per 150ms.
+ * Also forwards normalized `CompatibilityRunnerProgressEvent` payloads to `options.onRunnerProgress`.
  *
  * @param {EnvironmentSetupProgressEvent} event
  * @param {Record<string, any>} [options]
@@ -274,6 +449,50 @@ function emitEnvironmentSetupProgress(event, options = {}) {
     try {
       listener(event);
     } catch {}
+  }
+
+  if (typeof options.onRunnerProgress === 'function') {
+    const runnerType =
+      (options._runnerProgressMeta && options._runnerProgressMeta.runnerType) ||
+      componentIdToRunnerType(String(event.componentId || ''));
+    const validRunnerPhases = new Set([
+      'probing',
+      'downloading',
+      'verifying_signature',
+      'extracting',
+      'installing',
+      'completed',
+      'failed',
+      'cancelled',
+    ]);
+    const mappedPhase = event.phase === 'skipped' ? 'completed' : event.phase;
+    if (runnerType && validRunnerPhases.has(mappedPhase)) {
+      /** @type {CompatibilityRunnerProgressEvent} */
+      const runnerEvent = {
+        runnerType,
+        operation:
+          options._runnerProgressMeta && options._runnerProgressMeta.operation === 'update'
+            ? 'update'
+            : 'install',
+        phase: /** @type {CompatibilityRunnerOperationPhase} */ (mappedPhase),
+        progressPercent:
+          typeof event.progressPercent === 'number' ? event.progressPercent : null,
+        ...(typeof event.bytesDownloaded === 'number'
+          ? { bytesDownloaded: event.bytesDownloaded }
+          : {}),
+        ...(typeof event.totalBytes === 'number' ? { totalBytes: event.totalBytes } : {}),
+        message: String(event.message || ''),
+        ...(event.error ? { error: String(event.error) } : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      try {
+        options.onRunnerProgress(runnerEvent);
+      } catch {}
+    }
+  }
+
+  if (options._suppressWizardProgressBroadcast === true) {
+    return;
   }
 
   try {
@@ -560,7 +779,7 @@ async function fetchValidatedText(url, options = {}, signal = undefined) {
  *
  * @param {string} url
  * @param {string} destFilePath
- * @param {{ runId: string, componentId: EnvironmentComponentId, stepIndex: number, totalSteps: number, label: string, minFreeBytes?: number }} ctx
+ * @param {{ runId: string, componentId: EnvironmentComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number, label: string, minFreeBytes?: number }} ctx
  * @param {Record<string, any>} [options]
  * @param {AbortSignal} [signal]
  * @returns {Promise<{ filePath: string, bytesDownloaded: number }>}
@@ -590,6 +809,7 @@ async function streamVerifiedDownloadToFile(
     {
       runId: ctx.runId,
       componentId: ctx.componentId,
+      ...(ctx.action ? { action: ctx.action } : {}),
       stepIndex: ctx.stepIndex,
       totalSteps: ctx.totalSteps,
       phase: 'downloading',
@@ -638,6 +858,7 @@ async function streamVerifiedDownloadToFile(
         {
           runId: ctx.runId,
           componentId: ctx.componentId,
+          ...(ctx.action ? { action: ctx.action } : {}),
           stepIndex: ctx.stepIndex,
           totalSteps: ctx.totalSteps,
           phase: 'downloading',
@@ -908,6 +1129,201 @@ async function verifyFileSha256Async(filePath, expectedSha256) {
     } catch {}
     throw new Error(
       `SHA-256 digest mismatch for ${path.basename(filePath)}: expected ${cleanExpected}, got ${actualHex}.`
+    );
+  }
+}
+
+/**
+ * Verify a Sparkle `sparkle:edSignature` Ed25519 signature over `filePath` using a raw 32-byte
+ * base64 `SUPublicEDKey` (wrapped in RFC 8410 SubjectPublicKeyInfo DER `302a300506032b6570032100`).
+ * Immediately unlinks `filePath` and throws on mismatch or malformed signature/key.
+ *
+ * @param {string} filePath
+ * @param {string} signatureBase64
+ * @param {string} [publicKeyBase64]
+ * @returns {Promise<void>}
+ */
+async function verifySparkleEd25519SignatureAsync(
+  filePath,
+  signatureBase64,
+  publicKeyBase64 = CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY
+) {
+  const purgeFile = async () => {
+    try {
+      await fs.promises.rm(filePath, { force: true });
+    } catch {}
+  };
+
+  try {
+    const cleanSigB64 = String(signatureBase64 || '').trim();
+    const cleanPubB64 = String(publicKeyBase64 || '').trim();
+    if (!cleanSigB64 || !cleanPubB64) {
+      throw new Error('Missing Sparkle Ed25519 signature or public key.');
+    }
+
+    const pubKeyRaw = Buffer.from(cleanPubB64, 'base64');
+    const sigBuf = Buffer.from(cleanSigB64, 'base64');
+    if (pubKeyRaw.length !== 32) {
+      throw new Error(`Invalid Sparkle Ed25519 public key length (${pubKeyRaw.length} bytes).`);
+    }
+    if (sigBuf.length !== 64) {
+      throw new Error(`Invalid Sparkle Ed25519 signature length (${sigBuf.length} bytes).`);
+    }
+
+    const spkiDer = Buffer.concat([
+      Buffer.from('302a300506032b6570032100', 'hex'),
+      pubKeyRaw,
+    ]);
+    const keyObj = crypto.createPublicKey({
+      key: spkiDer,
+      format: 'der',
+      type: 'spki',
+    });
+    const payloadBuf = await fs.promises.readFile(filePath);
+    const verified = crypto.verify(null, payloadBuf, keyObj, sigBuf);
+    if (!verified) {
+      throw new Error('Ed25519 signature did not match CodeWeavers Sparkle public key.');
+    }
+  } catch (err) {
+    await purgeFile();
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Sparkle Ed25519 verification failed for ${path.basename(filePath)}: ${msg}`
+    );
+  }
+}
+
+/**
+ * Resolve XNU Darwin kernel major version (`23` = macOS 14 Sonoma, `24` = macOS 15 Sequoia, `25` = macOS 26 Tahoe)
+ * with dependency-injected test overrides (`options.darwinKernelMajor`, `options.osRelease`).
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {number}
+ */
+function resolveDarwinKernelMajor(options = {}) {
+  if (
+    typeof options.darwinKernelMajor === 'number' &&
+    Number.isFinite(options.darwinKernelMajor)
+  ) {
+    return options.darwinKernelMajor;
+  }
+  if (typeof options.osRelease === 'string' && options.osRelease.trim()) {
+    return Number.parseInt(options.osRelease.trim().split('.')[0] || '0', 10) || 0;
+  }
+  if (process.platform === 'darwin') {
+    return Number.parseInt(String(os.release() || '').split('.')[0] || '0', 10) || 0;
+  }
+  return 24;
+}
+
+/**
+ * Locate embedded `D3DMetal.framework` inside a staged Apple Game Porting Toolkit `.app` bundle.
+ *
+ * @param {string} appBundlePath
+ * @returns {string | null}
+ */
+function findEmbeddedD3DMetalFramework(appBundlePath) {
+  if (!appBundlePath || typeof appBundlePath !== 'string') return null;
+  const candidates = [
+    path.join(appBundlePath, 'Contents/Frameworks/D3DMetal.framework'),
+    path.join(appBundlePath, 'Contents/Resources/D3DMetal.framework'),
+    path.join(appBundlePath, 'Contents/Resources/wine/lib/external/D3DMetal.framework'),
+    path.join(appBundlePath, 'lib/external/D3DMetal.framework'),
+  ];
+  for (const cand of candidates) {
+    if (fs.existsSync(cand)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+/**
+ * Verify that an embedded Apple framework (e.g. `D3DMetal.framework` inside Game Porting Toolkit)
+ * carries a genuine Apple code signature BEFORE running ad-hoc `--deep --force` bundle signing.
+ *
+ * @param {string} frameworkPath
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ verified: boolean }>}
+ */
+async function verifyAppleSignedFramework(frameworkPath, options = {}) {
+  const purgeOnFail = async () => {
+    const purgeTarget =
+      typeof options.purgeDirOnFailure === 'string' && options.purgeDirOnFailure
+        ? options.purgeDirOnFailure
+        : '';
+    if (!purgeTarget) return;
+    try {
+      await fs.promises.rm(purgeTarget, { recursive: true, force: true });
+    } catch {}
+  };
+
+  if (typeof options.verifySignatureFn === 'function') {
+    try {
+      const customRes = await options.verifySignatureFn(
+        {
+          artifactPath: frameworkPath,
+          kind: 'framework',
+          expectedTeamIds: [],
+          componentId: options._componentId,
+        },
+        options
+      );
+      if (
+        customRes === false ||
+        (customRes && typeof customRes === 'object' && customRes.valid === false)
+      ) {
+        throw new Error(
+          (customRes && typeof customRes === 'object' && customRes.error) ||
+            `Apple framework signature verification failed for ${path.basename(frameworkPath)}.`
+        );
+      }
+      return { verified: true };
+    } catch (err) {
+      await purgeOnFail();
+      throw err;
+    }
+  }
+
+  const execFileFn = getExecFileFn(options);
+  try {
+    await runExecFileAsync(
+      execFileFn,
+      '/usr/bin/codesign',
+      ['--verify', '--strict', frameworkPath],
+      { timeout: 45000 }
+    );
+    const dvRes = await runExecFileAsync(
+      execFileFn,
+      '/usr/bin/codesign',
+      ['-dv', '--verbose=4', frameworkPath],
+      { timeout: 30000 }
+    );
+    const combined = `${dvRes.stdout}\n${dvRes.stderr}`;
+    if (/code object is not signed/i.test(combined) || /\bSignature=adhoc\b/i.test(combined)) {
+      throw new Error(
+        `Rejected unsigned or ad-hoc signed Apple framework: ${path.basename(frameworkPath)}`
+      );
+    }
+    const authorities = Array.from(combined.matchAll(/^Authority=([^\r\n]+)$/gm)).map((m) =>
+      m[1].trim()
+    );
+    const hasAppleAuthority = authorities.some((auth) =>
+      /^(?:Software Signing|macOS Software Signing|Apple Code Signing|Apple Root CA|Developer ID Application:\s*Apple)\b/i.test(
+        auth
+      )
+    );
+    if (!hasAppleAuthority) {
+      throw new Error(
+        `Rejected framework without Apple certificate authority: ${path.basename(frameworkPath)}`
+      );
+    }
+    return { verified: true };
+  } catch (err) {
+    await purgeOnFail();
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Apple framework signature verification failed for ${path.basename(frameworkPath)}: ${msg}`
     );
   }
 }
@@ -1320,8 +1736,413 @@ async function resolveTargetMacApplicationsDir(homedir, options = {}) {
 }
 
 /**
+ * Resolve human-readable runner label for user-facing busy/status messages.
+ *
+ * @param {string} runnerType
+ * @param {any} [existingLayer]
+ * @returns {string}
+ */
+function formatRunnerDisplayLabel(runnerType, existingLayer = null) {
+  if (existingLayer && typeof existingLayer.name === 'string' && existingLayer.name.trim()) {
+    return existingLayer.name.trim();
+  }
+  switch (String(runnerType || '').trim().toLowerCase()) {
+    case 'crossover':
+      return 'CrossOver';
+    case 'crossover_preview':
+      return 'CrossOver Preview';
+    case 'gptk':
+      return 'Apple Game Porting Toolkit';
+    case 'wine':
+      return 'Wine';
+    default:
+      return 'Compatibility Runner';
+  }
+}
+
+/**
+ * Inspect `activeSessions`, `pendingBottleLaunches`, and live OS processes executing from inside
+ * `targetAppPath` BEFORE replacing a compatibility runner `.app` bundle.
+ *
+ * - Blocks with `RUNNER_BUSY_ACTIVE_SESSION` if any non-finalized bottled game session is active on
+ *   `darwin` or uses `runnerType`.
+ * - Blocks with `RUNNER_BUSY_EXTERNAL_PROCESS` if the runner's GUI app or an external non-daemon
+ *   Windows `.exe` is actively executing from inside `targetAppPath`.
+ * - If ONLY idle `wineserver` / Wine prefix system daemons remain with zero active game session,
+ *   cleanly shuts down known Wine prefixes (`shutdownWinePrefix` / `wineserver -k`) and re-verifies.
+ *
+ * @param {string} runnerType
+ * @param {string | null | undefined} targetAppPath
+ * @param {any} [existingLayer]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ ok: boolean, busyCode?: 'RUNNER_BUSY_ACTIVE_SESSION' | 'RUNNER_BUSY_EXTERNAL_PROCESS', error?: string }>}
+ */
+async function assertRunnerSafeToReplace(
+  runnerType,
+  targetAppPath,
+  existingLayer = null,
+  options = {}
+) {
+  const cleanRunnerType = String(runnerType || 'crossover')
+    .trim()
+    .toLowerCase();
+  const runnerLabel = formatRunnerDisplayLabel(cleanRunnerType, existingLayer);
+  const hostPlatform = String(options.platform || process.platform);
+  const externalExistingMgr =
+    detectExternalRunnerManagerName(existingLayer?.appPath) ||
+    detectExternalRunnerManagerName(existingLayer?.binaryPath);
+  const effectiveAppPath = String(
+    targetAppPath || (!externalExistingMgr ? existingLayer?.appPath : '') || ''
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  const appPrefix = effectiveAppPath ? `${effectiveAppPath}/` : '';
+
+  // 1. Check active One Launcher bottled sessions
+  for (const [gameId, entry] of activeSessions.entries()) {
+    if (!entry || entry.finalized === true) continue;
+    const sessLayer = String(
+      entry.session?.compatibilityLayer || entry.compatibilityLayer || ''
+    )
+      .trim()
+      .toLowerCase();
+    const wineBin = String(entry.wineBinary || '').trim();
+    const winePrefix = String(entry.winePrefix || '').trim();
+    const isBottledSession = Boolean(
+      wineBin ||
+        winePrefix ||
+        entry.launchedViaBottleSteam ||
+        (sessLayer && sessLayer !== 'native')
+    );
+    const matchesTargetRunner =
+      (hostPlatform === 'darwin' && isBottledSession) ||
+      sessLayer === cleanRunnerType ||
+      Boolean(appPrefix && wineBin.startsWith(appPrefix));
+
+    if (matchesTargetRunner) {
+      const gameTitle = String(
+        entry.session?.title || entry.title || entry.session?.gameTitle || gameId || 'a game'
+      ).trim();
+      return {
+        ok: false,
+        busyCode: 'RUNNER_BUSY_ACTIVE_SESSION',
+        error: `Cannot update ${runnerLabel} while "${gameTitle}" is running. Close the game and try again.`,
+      };
+    }
+  }
+
+  // 2. Check pending bottle launches in flight
+  for (const [prefixPath, pendingCount] of pendingBottleLaunches.entries()) {
+    if (Number(pendingCount) > 0 && hostPlatform === 'darwin') {
+      const bottleLabel = path.basename(String(prefixPath || 'bottle')) || 'a game';
+      return {
+        ok: false,
+        busyCode: 'RUNNER_BUSY_ACTIVE_SESSION',
+        error: `Cannot update ${runnerLabel} while "${bottleLabel}" is running. Close the game and try again.`,
+      };
+    }
+  }
+
+  // 3. Inspect live OS processes executing from inside the target `.app` bundle
+  if (!appPrefix || options.skipProcessCheck === true) {
+    return { ok: true };
+  }
+
+  const readProcessListOutput = async () => {
+    if (typeof options.getProcessListOutput === 'function') {
+      return String((await options.getProcessListOutput()) || '');
+    }
+    if (typeof options.mockProcessListOutput === 'string') {
+      return options.mockProcessListOutput;
+    }
+    if (hostPlatform !== 'darwin' || !fs.existsSync(effectiveAppPath)) {
+      return '';
+    }
+    try {
+      const execFileFn = getExecFileFn(options);
+      const psRes = await runExecFileAsync(
+        execFileFn,
+        '/bin/ps',
+        ['-ax', '-o', 'pid=,command='],
+        { timeout: 5000 }
+      );
+      return psRes.stdout || '';
+    } catch {
+      return '';
+    }
+  };
+
+  /**
+   * @param {string} rawPsOutput
+   */
+  const classifyMatchingProcesses = (rawPsOutput) => {
+    /** @type {Array<{ pid: number, command: string }>} */
+    const matched = [];
+    for (const rawLine of String(rawPsOutput || '').split(/\r?\n/)) {
+      const m = rawLine.match(/^\s*(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = Number.parseInt(m[1], 10);
+      const command = m[2].trim();
+      if (!pid || pid === process.pid) continue;
+      if (command.includes(appPrefix)) {
+        matched.push({ pid, command });
+      }
+    }
+
+    let hasGuiOrExternalApp = false;
+    let hasIdleWineserverOrDaemon = false;
+    const idleDaemonRe =
+      /(?:^|[\\/ ])(?:wineserver|services\.exe|plugplay\.exe|svchost\.exe|rpcss\.exe|winedevice\.exe|explorer\.exe|conhost\.exe|tabtip\.exe)(?:\s|$|")/i;
+
+    for (const proc of matched) {
+      const cmdAfterApp = proc.command.slice(proc.command.indexOf(appPrefix) + appPrefix.length);
+      const macOsBinMatch = cmdAfterApp.match(/^Contents\/MacOS\/([^\s"]+)/i);
+      if (macOsBinMatch) {
+        const macBinName = macOsBinMatch[1];
+        if (!/^wine(?:64)?(?:-preloader|server)?$/i.test(macBinName)) {
+          hasGuiOrExternalApp = true;
+          continue;
+        }
+      }
+      if (idleDaemonRe.test(proc.command)) {
+        hasIdleWineserverOrDaemon = true;
+      } else {
+        hasGuiOrExternalApp = true;
+      }
+    }
+
+    return { matched, hasGuiOrExternalApp, hasIdleWineserverOrDaemon };
+  };
+
+  const initialPs = classifyMatchingProcesses(await readProcessListOutput());
+  if (initialPs.matched.length === 0) {
+    return { ok: true };
+  }
+
+  if (initialPs.hasGuiOrExternalApp) {
+    return {
+      ok: false,
+      busyCode: 'RUNNER_BUSY_EXTERNAL_PROCESS',
+      error: `Please quit ${runnerLabel} before installing the update.`,
+    };
+  }
+
+  // Only idle wineserver / prefix system daemons remain with zero active game session:
+  // cleanly shut down known Wine prefixes and wineserver, then re-verify.
+  if (initialPs.hasIdleWineserverOrDaemon) {
+    const { homedir } = resolveIsolatedHomedirAndUserData(options);
+    /** @type {string[]} */
+    const candidatePrefixes = [];
+    if (existingLayer?.bottlesDir && Array.isArray(existingLayer?.availableBottles)) {
+      for (const bName of existingLayer.availableBottles) {
+        candidatePrefixes.push(path.join(existingLayer.bottlesDir, bName));
+      }
+    }
+    const olPrefixesRoot = path.join(homedir, 'Games/OneLauncher/Prefixes');
+    if (fs.existsSync(olPrefixesRoot)) {
+      try {
+        for (const ent of fs.readdirSync(olPrefixesRoot, { withFileTypes: true })) {
+          if (ent.isDirectory()) {
+            candidatePrefixes.push(path.join(olPrefixesRoot, ent.name));
+          }
+        }
+      } catch {}
+    }
+
+    for (const prefixDir of candidatePrefixes) {
+      try {
+        shutdownWinePrefix(prefixDir, existingLayer?.wineserverBinary || null, {
+          waitSeconds: 2,
+        });
+      } catch {}
+    }
+    if (existingLayer?.wineserverBinary && fs.existsSync(existingLayer.wineserverBinary)) {
+      try {
+        const execFileFn = getExecFileFn(options);
+        await runExecFileAsync(execFileFn, existingLayer.wineserverBinary, ['-k'], {
+          timeout: 4000,
+        });
+      } catch {}
+    }
+
+    if (typeof options.getProcessListOutput === 'function' || (!options.mockProcessListOutput && hostPlatform === 'darwin')) {
+      const settleMs = isTestEnvironment(options) ? 15 : 150;
+      await new Promise((r) => setTimeout(r, settleMs));
+      const recheckPs = classifyMatchingProcesses(await readProcessListOutput());
+      if (recheckPs.matched.length > 0) {
+        return {
+          ok: false,
+          busyCode: 'RUNNER_BUSY_EXTERNAL_PROCESS',
+          error: `Please quit ${runnerLabel} before installing the update.`,
+        };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Evict cached codesign and executable discovery entries for a replaced macOS `.app` bundle.
+ *
+ * @param {string} targetAppPath
+ */
+function evictMacAppCachesForPath(targetAppPath) {
+  if (!targetAppPath) return;
+  const normalized = path.resolve(targetAppPath);
+  const slashPrefix = `${normalized}/`;
+  for (const key of Array.from(macCodesignValidCache.keys())) {
+    const kStr = String(key);
+    if (kStr === normalized || kStr === targetAppPath || kStr.startsWith(slashPrefix)) {
+      macCodesignValidCache.delete(key);
+    }
+  }
+  evictExecutableDiscoveryCacheForPath(targetAppPath);
+}
+
+/**
+ * Atomically stage, quarantine-strip, codesign-verify, and swap a macOS `.app` bundle into
+ * `targetDestAppPath` on the destination volume (`O(1)` POSIX `rename(2)` with `.ol-backup` rollback).
+ * Never runs `rm -rf` on a live `.app` BEFORE replacement is verified on the destination volume.
+ *
+ * @param {string} stagedAppPath
+ * @param {string} targetDestAppPath
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string>}
+ */
+async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, options = {}) {
+  const parentDir = path.dirname(targetDestAppPath);
+  const appName = path.basename(targetDestAppPath);
+  await fs.promises.mkdir(parentDir, { recursive: true });
+
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const siblingStagingPath = path.join(parentDir, `.${appName}.ol-staging-${suffix}`);
+  const backupPath = path.join(parentDir, `.${appName}.ol-backup-${suffix}`);
+  const execFileFn = getExecFileFn(options);
+  const signal = /** @type {AbortSignal | undefined} */ (options.signal);
+  let movedExistingToBackup = false;
+
+  try {
+    if (typeof options.onExecDitto === 'function') {
+      await options.onExecDitto(stagedAppPath, siblingStagingPath);
+      if (fs.existsSync(stagedAppPath) && !fs.existsSync(siblingStagingPath)) {
+        await fs.promises.cp(stagedAppPath, siblingStagingPath, {
+          recursive: true,
+          force: true,
+          verbatimSymlinks: true,
+        });
+      }
+    } else {
+      const canUseDitto =
+        process.platform === 'darwin' ||
+        typeof options.execFileFn === 'function' ||
+        typeof options.execFileImpl === 'function';
+      if (canUseDitto) {
+        await runExecFileAsync(
+          execFileFn,
+          '/usr/bin/ditto',
+          [stagedAppPath, siblingStagingPath],
+          { timeout: 300000, signal }
+        );
+      }
+      if (fs.existsSync(stagedAppPath) && !fs.existsSync(siblingStagingPath)) {
+        await fs.promises.cp(stagedAppPath, siblingStagingPath, {
+          recursive: true,
+          force: true,
+          verbatimSymlinks: true,
+        });
+      }
+    }
+
+    ensureMacExecutablePermissions(siblingStagingPath);
+    await clearMacQuarantineAsync(siblingStagingPath, { ...options, force: true });
+
+    const shouldVerifyStagingCodesign =
+      options.skipStagingCodesignVerify !== true &&
+      typeof options.verifySignatureFn !== 'function' &&
+      fs.existsSync(siblingStagingPath) &&
+      (process.platform === 'darwin' ||
+        typeof options.execFileFn === 'function' ||
+        typeof options.execFileImpl === 'function');
+
+    if (shouldVerifyStagingCodesign) {
+      if (options.prepareUnsignedWineBundle === true) {
+        try {
+          await runExecFileAsync(
+            execFileFn,
+            '/usr/bin/codesign',
+            ['--verify', '--deep', '--strict', siblingStagingPath],
+            { timeout: 60000, signal }
+          );
+        } catch (verifyErr) {
+          const errDetail = `${String(verifyErr?.stderr || '')} ${String(verifyErr?.message || '')}`;
+          if (/not signed at all/i.test(errDetail)) {
+            await runExecFileAsync(
+              execFileFn,
+              '/usr/bin/codesign',
+              ['--force', '--deep', '-s', '-', siblingStagingPath],
+              { timeout: 180000, signal }
+            );
+          } else {
+            throw verifyErr;
+          }
+        }
+      }
+      await runExecFileAsync(
+        execFileFn,
+        '/usr/bin/codesign',
+        ['--verify', '--deep', '--strict', siblingStagingPath],
+        { timeout: 60000, signal }
+      );
+    }
+
+    let destinationExists = false;
+    try {
+      await fs.promises.lstat(targetDestAppPath);
+      destinationExists = true;
+    } catch {}
+
+    if (destinationExists) {
+      await fs.promises.rename(targetDestAppPath, backupPath);
+      movedExistingToBackup = true;
+    }
+
+    try {
+      await fs.promises.rename(siblingStagingPath, targetDestAppPath);
+    } catch (swapErr) {
+      if (movedExistingToBackup) {
+        try {
+          if (fs.existsSync(backupPath) && !fs.existsSync(targetDestAppPath)) {
+            await fs.promises.rename(backupPath, targetDestAppPath);
+            movedExistingToBackup = false;
+          }
+        } catch {}
+      }
+      throw swapErr;
+    }
+
+    evictMacAppCachesForPath(targetDestAppPath);
+
+    if (movedExistingToBackup) {
+      try {
+        await fs.promises.rm(backupPath, { recursive: true, force: true });
+      } catch {}
+    }
+
+    return targetDestAppPath;
+  } finally {
+    try {
+      if (fs.existsSync(siblingStagingPath)) {
+        await fs.promises.rm(siblingStagingPath, { recursive: true, force: true });
+      }
+    } catch {}
+  }
+}
+
+/**
  * Copy a verified `.app` bundle into `targetDestDir` preserving `.framework` symlinks via `/usr/bin/ditto`
- * (with `fs.promises.cp` fallback in hermetic test mocks) and clear macOS quarantine attributes.
+ * (with `fs.promises.cp` fallback in hermetic test mocks), clear macOS quarantine attributes, and
+ * perform an atomic same-volume `rename(2)` swap.
  *
  * @param {string} srcApp
  * @param {string} targetDestDir
@@ -1329,40 +2150,16 @@ async function resolveTargetMacApplicationsDir(homedir, options = {}) {
  * @returns {Promise<string>}
  */
 async function copyVerifiedMacAppToApplicationsDir(srcApp, targetDestDir, options = {}) {
-  await fs.promises.mkdir(targetDestDir, { recursive: true });
-  const appName = path.basename(srcApp);
-  const destApp = path.join(targetDestDir, appName);
-
-  if (typeof options.onExecDitto === 'function') {
-    await options.onExecDitto(srcApp, destApp);
-  } else {
-    const execFileFn = getExecFileFn(options);
-    const canUseDitto =
-      process.platform === 'darwin' ||
-      typeof options.execFileFn === 'function' ||
-      typeof options.execFileImpl === 'function';
-    if (canUseDitto) {
-      await runExecFileAsync(execFileFn, '/usr/bin/ditto', [srcApp, destApp], {
-        timeout: 300000,
-      });
-    }
-    if (fs.existsSync(srcApp) && !fs.existsSync(destApp)) {
-      await fs.promises.cp(srcApp, destApp, {
-        recursive: true,
-        force: true,
-        verbatimSymlinks: true,
-      });
-    }
-  }
-
-  ensureMacExecutablePermissions(destApp);
-  await clearMacQuarantineAsync(destApp, { ...options, force: true });
-  return destApp;
+  const destApp =
+    typeof options.targetAppBundlePath === 'string' && options.targetAppBundlePath.trim()
+      ? options.targetAppBundlePath.trim()
+      : path.join(targetDestDir, path.basename(srcApp));
+  return atomicReplaceMacAppBundle(srcApp, destApp, options);
 }
 
 /**
  * Mount a `.dmg` read-only, verify the contained `.app` Developer ID signature BEFORE copying
- * anything to `targetDestDir`, copy via `ditto`, clear quarantine, and ALWAYS detach in `finally`.
+ * anything to `targetDestDir`, atomically stage & swap via `ditto`, clear quarantine, and ALWAYS detach in `finally`.
  *
  * @param {string} dmgPath
  * @param {string} targetDestDir
@@ -1431,23 +2228,45 @@ async function mountVerifyAndInstallDmgApp(
       const matchesGptkName = /^Game Porting Toolkit.*\.app$/i.test(appEntry);
       const hasGptkLayout =
         fs.existsSync(path.join(mountedAppPath, 'Contents/Resources/wine')) ||
-        fs.existsSync(path.join(mountedAppPath, 'Contents/Frameworks/D3DMetal.framework')) ||
-        fs.existsSync(path.join(mountedAppPath, 'Contents/Resources/D3DMetal.framework')) ||
-        fs.existsSync(path.join(mountedAppPath, 'lib/external/D3DMetal.framework'));
+        Boolean(findEmbeddedD3DMetalFramework(mountedAppPath));
       if (!matchesGptkName && !hasGptkLayout) {
         throw new Error(
           `Rejected ${path.basename(dmgPath)}: "${appEntry}" is not an Apple Game Porting Toolkit bundle.`
         );
       }
+      const embeddedD3d = findEmbeddedD3DMetalFramework(mountedAppPath);
+      if (embeddedD3d) {
+        await verifyAppleSignedFramework(embeddedD3d, {
+          ...options,
+          keepOnFailure: true,
+        });
+      }
     }
 
-    await verifyMacAppDeveloperSignature(mountedAppPath, expectedTeamIds, {
-      ...options,
-      keepOnFailure: true,
-      ...(expectedVendorAuthorityPattern
-        ? { expectedVendorAuthorityPattern }
-        : {}),
-    });
+    if (options.prepareUnsignedWineBundle === true && expectedTeamIds.length === 0) {
+      try {
+        await verifyMacAppDeveloperSignature(mountedAppPath, expectedTeamIds, {
+          ...options,
+          keepOnFailure: true,
+          allowAdhocSignature: true,
+          ...(expectedVendorAuthorityPattern ? { expectedVendorAuthorityPattern } : {}),
+        });
+      } catch (verifyErr) {
+        const errDetail = `${String(verifyErr?.stderr || '')} ${String(verifyErr?.message || '')}`;
+        if (!/not signed at all/i.test(errDetail)) {
+          throw verifyErr;
+        }
+      }
+    } else {
+      await verifyMacAppDeveloperSignature(mountedAppPath, expectedTeamIds, {
+        ...options,
+        keepOnFailure: true,
+        ...(options.requireGptkBundle === true ? { allowAdhocSignature: true } : {}),
+        ...(expectedVendorAuthorityPattern
+          ? { expectedVendorAuthorityPattern }
+          : {}),
+      });
+    }
 
     return await copyVerifiedMacAppToApplicationsDir(mountedAppPath, targetDestDir, options);
   } finally {
@@ -1759,29 +2578,1115 @@ async function downloadGogGalaxyInstallerToFile(
 }
 
 /**
- * Direct vendor installation for macOS compatibility runners (`crossover`, `wine`, `gptk`, `crossover_preview`)
- * without requiring Homebrew. Always uses ephemeral `os.tmpdir()` staging, verifies Developer ID
- * signatures BEFORE copying to `Applications`, and cleans up temp artifacts in `finally`.
+ * Validate whether a navigation/SSO URL is permitted inside the sandboxed CodeWeavers Preview
+ * sign-in `BrowserWindow`.
+ *
+ * @param {string} rawUrl
+ * @param {Record<string, any>} [options]
+ * @returns {boolean}
+ */
+function isAllowedCodeWeaversAuthNavigationUrl(rawUrl, options = {}) {
+  try {
+    const parsed = new URL(String(rawUrl || '').trim());
+    const host = parsed.hostname.toLowerCase();
+    if (
+      options.allowLoopbackInstallerUrls === true &&
+      (host === '127.0.0.1' || host === 'localhost')
+    ) {
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    }
+    if (parsed.protocol !== 'https:') return false;
+    return (
+      host === 'codeweavers.com' ||
+      host.endsWith('.codeweavers.com') ||
+      host === 'google.com' ||
+      host.endsWith('.google.com') ||
+      host === 'appleid.apple.com' ||
+      host === 'challenges.cloudflare.com'
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validate whether every redirect hop of a `will-download` item originates from an official
+ * CodeWeavers download host (`codeweavers.com` or `*.codeweavers.com` over HTTPS).
+ *
+ * @param {string} rawUrl
+ * @param {Record<string, any>} [options]
+ * @returns {boolean}
+ */
+function isAllowedCodeWeaversDownloadUrl(rawUrl, options = {}) {
+  try {
+    const parsed = new URL(String(rawUrl || '').trim());
+    const host = parsed.hostname.toLowerCase();
+    if (
+      options.allowLoopbackInstallerUrls === true &&
+      (host === '127.0.0.1' || host === 'localhost')
+    ) {
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    }
+    if (parsed.protocol !== 'https:') return false;
+    return host === 'codeweavers.com' || host.endsWith('.codeweavers.com');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract an optional version or preview build date hint from a CodeWeavers Preview filename.
+ *
+ * @param {string} filename
+ * @returns {string | null}
+ */
+function extractPreviewFilenameVersionHint(filename) {
+  const base = path.basename(String(filename || '').trim()).replace(/\.(?:zip|dmg)$/i, '');
+  if (!base) return null;
+  const semverMatch = base.match(/(\d+\.\d+(?:\.\d+)?)/);
+  if (semverMatch) return semverMatch[1];
+  const dateMatch = base.match(/(?:^|[-_.])(20\d{6})(?:$|[-_.])/);
+  if (dateMatch) return dateMatch[1];
+  return null;
+}
+
+/**
+ * Detect experimental ARM64-only CrossOver Preview builds (`crossover-preview-arm64-YYYYMMDD.zip`,
+ * `*-aarch64*`, etc.), which must be excluded in favor of the standard macOS CrossOver Preview
+ * build (`crossover-preview-YYYYMMDD.zip`).
+ *
+ * @param {string} rawTarget
+ * @returns {boolean}
+ */
+function isExperimentalArm64CrossOverPreviewTarget(rawTarget) {
+  const raw = String(rawTarget || '').trim();
+  if (!raw) return false;
+  let candidate = raw;
+  try {
+    const parsed = new URL(raw, 'https://www.codeweavers.com/preview/download');
+    candidate = decodeURIComponent(parsed.pathname || raw);
+  } catch {
+    try {
+      candidate = decodeURIComponent(raw);
+    } catch {}
+  }
+  const base = path.basename(candidate).toLowerCase();
+  return /(?:^|[-_.])(arm64|aarch64|apple[-_.]?silicon)(?:[-_.]|\.(?:zip|dmg)$|$)/i.test(base);
+}
+
+/**
+ * Deterministically select the newest standard (non-ARM64) macOS CrossOver Preview `.zip` / `.dmg`
+ * download URL from links discovered on the CodeWeavers Preview portal page.
+ *
+ * Explicitly excludes experimental `arm64` / `aarch64` builds (e.g.
+ * `crossover-preview-arm64-20261015.zip`), Linux installers (`.deb`, `.rpm`, `.bin`), source
+ * tarballs, and generic non-Preview trial links.
+ *
+ * @param {unknown[]} candidateUrls
+ * @param {string} [baseUrl]
+ * @param {Record<string, any>} [options]
+ * @returns {string | null}
+ */
+function selectPreferredCrossOverPreviewDownloadUrl(
+  candidateUrls,
+  baseUrl = 'https://www.codeweavers.com/preview/download',
+  options = {}
+) {
+  if (!Array.isArray(candidateUrls) || candidateUrls.length === 0) {
+    return null;
+  }
+
+  /**
+   * @type {Array<{
+   *   url: string,
+   *   hasExplicitPreviewName: boolean,
+   *   buildDateNum: number,
+   *   versionHint: string | null,
+   *   isZip: boolean,
+   * }>}
+   */
+  const ranked = [];
+  const seen = new Set();
+
+  for (const rawItem of candidateUrls) {
+    const rawHref = String(rawItem || '').trim();
+    if (
+      !rawHref ||
+      rawHref.startsWith('#') ||
+      /^javascript:/i.test(rawHref) ||
+      /^mailto:/i.test(rawHref)
+    ) {
+      continue;
+    }
+
+    let resolvedUrl = '';
+    /** @type {URL | null} */
+    let parsed = null;
+    try {
+      parsed = new URL(rawHref, baseUrl);
+      resolvedUrl = parsed.toString();
+    } catch {
+      continue;
+    }
+
+    if (seen.has(resolvedUrl)) continue;
+    seen.add(resolvedUrl);
+
+    if (!isAllowedCodeWeaversDownloadUrl(resolvedUrl, options)) {
+      continue;
+    }
+
+    let decodedPath = parsed.pathname || '';
+    try {
+      decodedPath = decodeURIComponent(decodedPath);
+    } catch {}
+    const filename = path.basename(decodedPath);
+    if (!filename || !/\.(?:zip|dmg)$/i.test(filename)) {
+      continue;
+    }
+
+    if (!/crossover/i.test(filename)) {
+      continue;
+    }
+    if (
+      /(?:^|[-_.])(source|src|linux|debian|ubuntu|rpm)(?:[-_.]|\.(?:zip|dmg)$)/i.test(filename)
+    ) {
+      continue;
+    }
+
+    const hasExplicitPreviewName = /crossover[-_.]?preview/i.test(filename);
+    const isUnderPreviewDownloadPath = /\/preview\/download\/[^/?#]+\.(?:zip|dmg)$/i.test(
+      decodedPath
+    );
+    if (!hasExplicitPreviewName && !isUnderPreviewDownloadPath) {
+      continue;
+    }
+
+    if (
+      options.allowExperimentalArm64Preview !== true &&
+      (isExperimentalArm64CrossOverPreviewTarget(filename) ||
+        isExperimentalArm64CrossOverPreviewTarget(resolvedUrl))
+    ) {
+      continue;
+    }
+
+    const dateMatch = filename.match(/(?:^|[-_.])(20\d{6})(?:[-_.]|\.(?:zip|dmg)$)/i);
+    const buildDateNum = dateMatch ? Number(dateMatch[1]) : 0;
+    const versionHint = extractPreviewFilenameVersionHint(filename);
+    const isZip = /\.zip$/i.test(filename);
+
+    ranked.push({
+      url: resolvedUrl,
+      hasExplicitPreviewName,
+      buildDateNum,
+      versionHint,
+      isZip,
+    });
+  }
+
+  if (ranked.length === 0) {
+    return null;
+  }
+
+  ranked.sort((a, b) => {
+    if (a.hasExplicitPreviewName !== b.hasExplicitPreviewName) {
+      return a.hasExplicitPreviewName ? -1 : 1;
+    }
+    if (a.buildDateNum !== b.buildDateNum) {
+      return b.buildDateNum - a.buildDateNum;
+    }
+    if (a.versionHint && b.versionHint && a.versionHint !== b.versionHint) {
+      const cmp =
+        typeof compareRunnerVersions === 'function'
+          ? compareRunnerVersions(a.versionHint, b.versionHint)
+          : a.versionHint.localeCompare(b.versionHint, undefined, { numeric: true });
+      if (cmp !== 0) return -cmp;
+    } else if (a.versionHint && !b.versionHint) {
+      return -1;
+    } else if (!a.versionHint && b.versionHint) {
+      return 1;
+    }
+    if (a.isZip !== b.isZip) {
+      return a.isZip ? -1 : 1;
+    }
+    return 0;
+  });
+
+  return ranked[0].url;
+}
+
+/**
+ * Resolve canonical semver from a CrossOver Preview `.app` bundle `Info.plist` when the filename
+ * hint was absent or only carried an 8-digit preview date (`YYYYMMDD`).
+ *
+ * @param {string} appBundlePath
+ * @param {string | null} hintVersion
+ * @returns {string | null}
+ */
+function resolvePreviewBundleVersion(appBundlePath, hintVersion) {
+  try {
+    const plistPath = path.join(appBundlePath, 'Contents/Info.plist');
+    if (fs.existsSync(plistPath) && typeof parsePlistStringValues === 'function') {
+      const plistDict = parsePlistStringValues(plistPath);
+      const bundleVer = String(plistDict.CFBundleVersion || '').trim();
+      const shortVer = String(plistDict.CFBundleShortVersionString || '').trim();
+      const semverMatch = bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.\d+)?$/);
+      if (semverMatch) {
+        return semverMatch[1];
+      }
+      if (!hintVersion && (shortVer || bundleVer)) {
+        return shortVer || bundleVer;
+      }
+    }
+  } catch {}
+  return hintVersion || null;
+}
+
+/**
+ * Open a sandboxed in-app CodeWeavers sign-in `BrowserWindow` using persistent partition
+ * `'persist:codeweavers-preview'`, auto-redirect to `/preview/download` after login, intercept
+ * the official `.zip`/`.dmg` download into `destDir` with zero Save-As prompt, immediately close
+ * the sign-in window once capture starts, and stream live byte progress to One Launcher.
+ *
+ * @param {string} destDir
+ * @param {{ runId: string, componentId: EnvironmentComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number }} progressCtx
+ * @param {Record<string, any>} [options]
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{ archivePath: string, resolvedVersion: string | null }>}
+ */
+async function captureCodeWeaversPreviewDownload(
+  destDir,
+  progressCtx,
+  options = {},
+  signal = undefined
+) {
+  if (signal?.aborted) {
+    const abortErr = new Error('CodeWeavers Preview sign-in cancelled.');
+    abortErr.name = 'AbortError';
+    throw abortErr;
+  }
+
+  await fs.promises.mkdir(destDir, { recursive: true });
+
+  const minFreeBytes = Number(options.minFreeBytes || 1200 * 1024 * 1024);
+  const diskInfo = await getDiskSpace(destDir, options);
+  if (
+    typeof diskInfo.availableBytes === 'number' &&
+    diskInfo.availableBytes > 0 &&
+    diskInfo.availableBytes < minFreeBytes
+  ) {
+    throw new Error(
+      `Insufficient disk space (${Math.round(diskInfo.availableBytes / (1024 * 1024))} MB free, need at least ${Math.round(minFreeBytes / (1024 * 1024))} MB).`
+    );
+  }
+
+  if (typeof options.capturePreviewDownloadFn === 'function') {
+    emitEnvironmentSetupProgress(
+      {
+        ...progressCtx,
+        phase: 'probing',
+        message: 'Sign in to CodeWeavers Preview to start automatic download...',
+      },
+      options
+    );
+    const hookRes = await options.capturePreviewDownloadFn({
+      destDir,
+      progressCtx,
+      options,
+      signal,
+    });
+    if (signal?.aborted) {
+      const abortErr = new Error('CodeWeavers Preview sign-in cancelled.');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+    const hookArchivePath =
+      typeof hookRes === 'string'
+        ? hookRes.trim()
+        : hookRes && typeof hookRes.archivePath === 'string'
+          ? hookRes.archivePath.trim()
+          : '';
+    if (!hookArchivePath || !fs.existsSync(hookArchivePath)) {
+      throw new Error('Captured CrossOver Preview installer archive was not found on disk.');
+    }
+    const hookVersion =
+      hookRes &&
+      typeof hookRes === 'object' &&
+      typeof hookRes.version === 'string' &&
+      hookRes.version.trim()
+        ? hookRes.version.trim()
+        : hookRes &&
+            typeof hookRes === 'object' &&
+            typeof hookRes.resolvedVersion === 'string' &&
+            hookRes.resolvedVersion.trim()
+          ? hookRes.resolvedVersion.trim()
+          : extractPreviewFilenameVersionHint(hookArchivePath);
+    return {
+      archivePath: hookArchivePath,
+      resolvedVersion: hookVersion || null,
+    };
+  }
+
+  const electronMod = (options && options.electronMod) || getElectron();
+  const BrowserWindow = electronMod?.BrowserWindow;
+  const sessionMod = electronMod?.session;
+  if (
+    typeof BrowserWindow !== 'function' ||
+    !sessionMod ||
+    typeof sessionMod.fromPartition !== 'function'
+  ) {
+    throw new Error(
+      'In-app CodeWeavers Preview sign-in requires an interactive Electron window session.'
+    );
+  }
+
+  const previewDownloadUrl = String(
+    options.previewPortalUrl || 'https://www.codeweavers.com/preview/download'
+  ).trim();
+  if (!isAllowedCodeWeaversAuthNavigationUrl(previewDownloadUrl, options)) {
+    const urlErr = /** @type {Error & { code?: string }} */ (
+      new Error(`Untrusted CodeWeavers Preview portal URL: ${previewDownloadUrl}`)
+    );
+    urlErr.code = 'INSTALLER_URL_BLOCKED';
+    throw urlErr;
+  }
+
+  const previewSession = sessionMod.fromPartition('persist:codeweavers-preview');
+  const mainWin = typeof getMainWindow === 'function' ? getMainWindow() : null;
+
+  emitEnvironmentSetupProgress(
+    {
+      ...progressCtx,
+      phase: 'probing',
+      message: 'Sign in to CodeWeavers Preview to start automatic download...',
+    },
+    options
+  );
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let downloadCaptured = false;
+    let closingForCapture = false;
+    let sawLoginPage = false;
+    let autoTriggeredDownloadAfterLogin = false;
+    let autoTriggeredArchiveDownload = false;
+    /** @type {string | null} */
+    let lastDiscoveredStandardArchiveUrl = null;
+    /** @type {any} */
+    let activeDownloadItem = null;
+    /** @type {any} */
+    let authWindow = null;
+    /** @type {ReturnType<typeof setTimeout>[]} */
+    const pendingTimers = [];
+
+    /** @type {(event: any, item: any) => void} */
+    let onWillDownload;
+    /** @type {() => void} */
+    let onAbort;
+    /** @type {(currentUrlHint?: string, retryAttempt?: number) => Promise<void>} */
+    let inspectPortalAndTriggerDownload = async () => {};
+
+    const clearPendingTimers = () => {
+      while (pendingTimers.length > 0) {
+        const t = pendingTimers.pop();
+        if (t) clearTimeout(t);
+      }
+    };
+
+    const scheduleBoundedTimer = (/** @type {() => void} */ fn, /** @type {number} */ delayMs) => {
+      const handle = setTimeout(() => {
+        const idx = pendingTimers.indexOf(handle);
+        if (idx >= 0) pendingTimers.splice(idx, 1);
+        fn();
+      }, delayMs);
+      if (handle && typeof handle.unref === 'function') {
+        handle.unref();
+      }
+      pendingTimers.push(handle);
+      return handle;
+    };
+
+    const revealAuthWindow = () => {
+      if (settled || downloadCaptured || closingForCapture) return;
+      try {
+        if (authWindow && !authWindow.isDestroyed()) {
+          if (typeof authWindow.show === 'function') {
+            authWindow.show();
+          }
+          if (typeof authWindow.focus === 'function') {
+            authWindow.focus();
+          }
+        }
+      } catch {}
+    };
+
+    const forceCloseAuthWindow = () => {
+      closingForCapture = true;
+      clearPendingTimers();
+      try {
+        if (authWindow && !authWindow.isDestroyed()) {
+          if (typeof authWindow.hide === 'function') {
+            authWindow.hide();
+          }
+          if (typeof authWindow.destroy === 'function') {
+            const winRef = authWindow;
+            setImmediate(() => {
+              try {
+                if (!winRef.isDestroyed()) {
+                  winRef.close();
+                  if (!winRef.isDestroyed()) {
+                    winRef.destroy();
+                  }
+                }
+              } catch {}
+            });
+          } else {
+            authWindow.close();
+          }
+        }
+      } catch {}
+    };
+
+    const triggerArchiveDownloadUrl = (/** @type {string} */ targetUrl) => {
+      if (
+        !targetUrl ||
+        settled ||
+        downloadCaptured ||
+        closingForCapture ||
+        autoTriggeredArchiveDownload
+      ) {
+        return false;
+      }
+      autoTriggeredArchiveDownload = true;
+      lastDiscoveredStandardArchiveUrl = targetUrl;
+      emitEnvironmentSetupProgress(
+        {
+          ...progressCtx,
+          phase: 'probing',
+          message: 'Authenticated with CodeWeavers — starting CrossOver Preview download...',
+        },
+        options
+      );
+      try {
+        const wcRef = authWindow && !authWindow.isDestroyed() ? authWindow.webContents : null;
+        if (wcRef && typeof wcRef.downloadURL === 'function') {
+          wcRef.downloadURL(targetUrl);
+          scheduleBoundedTimer(() => {
+            if (!settled && !downloadCaptured && !closingForCapture) {
+              autoTriggeredArchiveDownload = false;
+              revealAuthWindow();
+            }
+          }, 4000);
+          return true;
+        }
+        if (authWindow && !authWindow.isDestroyed()) {
+          Promise.resolve(authWindow.loadURL(targetUrl)).catch(() => {});
+          scheduleBoundedTimer(() => {
+            if (!settled && !downloadCaptured && !closingForCapture) {
+              autoTriggeredArchiveDownload = false;
+              revealAuthWindow();
+            }
+          }, 4000);
+          return true;
+        }
+      } catch {
+        autoTriggeredArchiveDownload = false;
+      }
+      return false;
+    };
+
+    const cleanup = () => {
+      clearPendingTimers();
+      try {
+        if (previewSession && onWillDownload) {
+          if (typeof previewSession.removeListener === 'function') {
+            previewSession.removeListener('will-download', onWillDownload);
+          } else if (typeof previewSession.off === 'function') {
+            previewSession.off('will-download', onWillDownload);
+          }
+        }
+      } catch {}
+      try {
+        if (signal && onAbort && typeof signal.removeEventListener === 'function') {
+          signal.removeEventListener('abort', onAbort);
+        }
+      } catch {}
+    };
+
+    const settleResolve = (/** @type {{ archivePath: string, resolvedVersion: string | null }} */ val) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(val);
+    };
+
+    const settleReject = (/** @type {any} */ err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    onWillDownload = (_event, item) => {
+      if (settled || downloadCaptured) {
+        try {
+          if (item && typeof item.cancel === 'function') item.cancel();
+        } catch {}
+        return;
+      }
+
+      const rawChain =
+        item && typeof item.getURLChain === 'function' ? item.getURLChain() : [];
+      const itemUrl =
+        item && typeof item.getURL === 'function' ? String(item.getURL() || '').trim() : '';
+      const filename =
+        item && typeof item.getFilename === 'function'
+          ? String(item.getFilename() || '').trim()
+          : '';
+      const urlsToCheck = Array.from(
+        new Set(
+          [...(Array.isArray(rawChain) ? rawChain : []), itemUrl]
+            .map((u) => String(u || '').trim())
+            .filter(Boolean)
+        )
+      );
+
+      const allUrlsTrusted =
+        urlsToCheck.length > 0 &&
+        urlsToCheck.every((u) => isAllowedCodeWeaversDownloadUrl(u, options));
+      const hasValidArchiveExt =
+        /\.(?:zip|dmg)$/i.test(filename) || /\.(?:zip|dmg)(?:\?|$)/i.test(itemUrl);
+
+      if (!allUrlsTrusted || !hasValidArchiveExt) {
+        try {
+          if (item && typeof item.cancel === 'function') item.cancel();
+        } catch {}
+        forceCloseAuthWindow();
+        const secErr = /** @type {Error & { code?: string }} */ (
+          new Error(
+            `Blocked CrossOver Preview download from untrusted host or unsupported file type (${filename || itemUrl || 'unknown'}).`
+          )
+        );
+        secErr.code = 'INSTALLER_URL_BLOCKED';
+        settleReject(secErr);
+        return;
+      }
+
+      if (
+        options.allowExperimentalArm64Preview !== true &&
+        (isExperimentalArm64CrossOverPreviewTarget(filename) ||
+          urlsToCheck.some((u) => isExperimentalArm64CrossOverPreviewTarget(u)))
+      ) {
+        try {
+          if (item && typeof item.cancel === 'function') item.cancel();
+        } catch {}
+        if (lastDiscoveredStandardArchiveUrl && !autoTriggeredArchiveDownload) {
+          triggerArchiveDownloadUrl(lastDiscoveredStandardArchiveUrl);
+          return;
+        }
+        if (!autoTriggeredArchiveDownload) {
+          void inspectPortalAndTriggerDownload('', 0);
+          return;
+        }
+        forceCloseAuthWindow();
+        const armErr = /** @type {Error & { code?: string }} */ (
+          new Error(
+            `Skipped experimental ARM64 CrossOver Preview build (${filename || itemUrl}); standard macOS CrossOver Preview build is required.`
+          )
+        );
+        armErr.code = 'EXPERIMENTAL_ARM64_PREVIEW_EXCLUDED';
+        settleReject(armErr);
+        return;
+      }
+
+      downloadCaptured = true;
+      activeDownloadItem = item;
+
+      const resolvedVersion =
+        extractPreviewFilenameVersionHint(filename) ||
+        extractPreviewFilenameVersionHint(itemUrl);
+      const isDmgDownload =
+        /\.dmg$/i.test(filename) ||
+        (!/\.(?:zip|dmg)$/i.test(filename) && /\.dmg(?:\?|$)/i.test(itemUrl));
+      const destArchivePath = path.join(
+        destDir,
+        isDmgDownload ? 'CrossOverPreview.dmg' : 'CrossOverPreview.zip'
+      );
+
+      if (typeof item.setSavePath === 'function') {
+        item.setSavePath(destArchivePath);
+      }
+
+      forceCloseAuthWindow();
+
+      const initialTotal =
+        typeof item.getTotalBytes === 'function' ? Number(item.getTotalBytes() || 0) : 0;
+      emitEnvironmentSetupProgress(
+        {
+          ...progressCtx,
+          phase: 'downloading',
+          bytesDownloaded: 0,
+          ...(initialTotal > 0 ? { totalBytes: initialTotal, progressPercent: 0 } : {}),
+          message: 'Downloading CrossOver Preview...',
+        },
+        options
+      );
+
+      if (typeof item.on === 'function') {
+        item.on('updated', (/** @type {any} */ _uEvt, /** @type {string} */ state) => {
+          if (settled || state === 'interrupted') return;
+          const received =
+            typeof item.getReceivedBytes === 'function'
+              ? Number(item.getReceivedBytes() || 0)
+              : 0;
+          const total =
+            typeof item.getTotalBytes === 'function' ? Number(item.getTotalBytes() || 0) : 0;
+          if (
+            received > MAX_INSTALLER_DOWNLOAD_BYTES ||
+            total > MAX_INSTALLER_DOWNLOAD_BYTES
+          ) {
+            try {
+              if (typeof item.cancel === 'function') item.cancel();
+            } catch {}
+            settleReject(
+              new Error('CrossOver Preview download exceeded maximum allowed size.')
+            );
+            return;
+          }
+          const progressPercent =
+            total > 0 ? Math.min(100, Math.round((received / total) * 100)) : undefined;
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'downloading',
+              bytesDownloaded: received,
+              ...(total > 0 ? { totalBytes: total } : {}),
+              ...(progressPercent !== undefined ? { progressPercent } : {}),
+              message: 'Downloading CrossOver Preview...',
+            },
+            options
+          );
+        });
+      }
+
+      const onDownloadDone = (/** @type {any} */ _dEvt, /** @type {string} */ state) => {
+        if (settled) return;
+        if (state === 'completed') {
+          settleResolve({
+            archivePath: destArchivePath,
+            resolvedVersion,
+          });
+          return;
+        }
+        if (state === 'cancelled' || signal?.aborted) {
+          const abortErr = new Error('CrossOver Preview download cancelled.');
+          abortErr.name = 'AbortError';
+          settleReject(abortErr);
+          return;
+        }
+        settleReject(
+          new Error(`CrossOver Preview download failed (${state || 'unknown'}).`)
+        );
+      };
+
+      if (typeof item.once === 'function') {
+        item.once('done', onDownloadDone);
+      } else if (typeof item.on === 'function') {
+        item.on('done', onDownloadDone);
+      }
+    };
+
+    onAbort = () => {
+      if (settled) return;
+      try {
+        if (activeDownloadItem && typeof activeDownloadItem.cancel === 'function') {
+          activeDownloadItem.cancel();
+        }
+      } catch {}
+      forceCloseAuthWindow();
+      const abortErr = new Error('CodeWeavers Preview sign-in cancelled.');
+      abortErr.name = 'AbortError';
+      settleReject(abortErr);
+    };
+
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    try {
+      previewSession.on('will-download', onWillDownload);
+
+      authWindow = new BrowserWindow({
+        width: 560,
+        height: 700,
+        ...(mainWin && typeof mainWin.isDestroyed === 'function' && !mainWin.isDestroyed()
+          ? { parent: mainWin }
+          : {}),
+        modal: false,
+        show: options.showAuthWindowImmediately === true,
+        closable: true,
+        resizable: true,
+        autoHideMenuBar: true,
+        title: 'Sign In to CodeWeavers — CrossOver Preview',
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: true,
+          partition: 'persist:codeweavers-preview',
+        },
+      });
+
+      scheduleBoundedTimer(() => {
+        if (!settled && !downloadCaptured && !closingForCapture && !autoTriggeredArchiveDownload) {
+          revealAuthWindow();
+        }
+      }, 1500);
+
+      const wc = authWindow.webContents;
+
+      inspectPortalAndTriggerDownload = async (currentUrlHint = '', retryAttempt = 0) => {
+        if (
+          settled ||
+          downloadCaptured ||
+          closingForCapture ||
+          autoTriggeredArchiveDownload ||
+          !authWindow ||
+          authWindow.isDestroyed()
+        ) {
+          return;
+        }
+
+        const currentUrl = String(
+          (wc && typeof wc.getURL === 'function' ? wc.getURL() : '') ||
+            currentUrlHint ||
+            previewDownloadUrl
+        ).trim();
+
+        /** @type {URL | null} */
+        let parsed = null;
+        try {
+          parsed = new URL(currentUrl);
+        } catch {
+          if (retryAttempt > 0) revealAuthWindow();
+          return;
+        }
+
+        const host = parsed.hostname.toLowerCase();
+        const pathname = parsed.pathname.toLowerCase();
+        const isCodeWeaversOrigin =
+          host === 'codeweavers.com' ||
+          host.endsWith('.codeweavers.com') ||
+          (options.allowLoopbackInstallerUrls === true &&
+            (host === '127.0.0.1' || host === 'localhost'));
+
+        if (!isCodeWeaversOrigin) {
+          sawLoginPage = true;
+          revealAuthWindow();
+          return;
+        }
+
+        const isLoginRoute =
+          pathname.startsWith('/login') ||
+          pathname.startsWith('/signin') ||
+          pathname.includes('/login/') ||
+          pathname.endsWith('/login');
+        if (isLoginRoute) {
+          sawLoginPage = true;
+          autoTriggeredDownloadAfterLogin = false;
+          revealAuthWindow();
+          return;
+        }
+
+        /** @type {string[]} */
+        let scrapedHrefs = [];
+        let hasPasswordInput = false;
+        if (wc && typeof wc.executeJavaScript === 'function') {
+          try {
+            const pageProbe = await wc.executeJavaScript(
+              `(() => {
+                const hrefs = [];
+                for (const el of document.querySelectorAll('a[href], area[href], [data-download-url]')) {
+                  const val = el.getAttribute('href') || el.getAttribute('data-download-url') || el.href || '';
+                  if (val) hrefs.push(String(val));
+                }
+                const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
+                return { hrefs, hasPasswordInput };
+              })()`,
+              true
+            );
+            if (Array.isArray(pageProbe)) {
+              scrapedHrefs = pageProbe.map((u) => String(u || ''));
+            } else if (pageProbe && typeof pageProbe === 'object') {
+              if (Array.isArray(pageProbe.hrefs)) {
+                scrapedHrefs = pageProbe.hrefs.map((/** @type {any} */ u) => String(u || ''));
+              }
+              hasPasswordInput = Boolean(pageProbe.hasPasswordInput);
+            }
+          } catch {}
+        }
+
+        if (
+          settled ||
+          downloadCaptured ||
+          closingForCapture ||
+          autoTriggeredArchiveDownload ||
+          !authWindow ||
+          authWindow.isDestroyed()
+        ) {
+          return;
+        }
+
+        const bestArchiveUrl = selectPreferredCrossOverPreviewDownloadUrl(
+          scrapedHrefs,
+          currentUrl,
+          options
+        );
+        if (bestArchiveUrl) {
+          lastDiscoveredStandardArchiveUrl = bestArchiveUrl;
+          triggerArchiveDownloadUrl(bestArchiveUrl);
+          return;
+        }
+
+        if (hasPasswordInput) {
+          sawLoginPage = true;
+          autoTriggeredDownloadAfterLogin = false;
+          revealAuthWindow();
+          return;
+        }
+
+        if (!pathname.startsWith('/preview/download') && !autoTriggeredDownloadAfterLogin) {
+          autoTriggeredDownloadAfterLogin = true;
+          if (authWindow && !authWindow.isDestroyed()) {
+            Promise.resolve(authWindow.loadURL(previewDownloadUrl)).catch(() => {});
+          }
+          return;
+        }
+
+        if (retryAttempt === 0) {
+          scheduleBoundedTimer(() => {
+            void inspectPortalAndTriggerDownload(currentUrl, 1);
+          }, 350);
+          return;
+        }
+
+        revealAuthWindow();
+        if (retryAttempt === 1) {
+          scheduleBoundedTimer(() => {
+            void inspectPortalAndTriggerDownload(currentUrl, 2);
+          }, 900);
+        }
+      };
+
+      if (wc) {
+        if (typeof wc.setWindowOpenHandler === 'function') {
+          wc.setWindowOpenHandler((/** @type {any} */ details) => {
+            const popupUrl = String(details?.url || '').trim();
+            if (
+              popupUrl &&
+              isAllowedCodeWeaversAuthNavigationUrl(popupUrl, options) &&
+              authWindow &&
+              !authWindow.isDestroyed()
+            ) {
+              Promise.resolve(authWindow.loadURL(popupUrl)).catch(() => {});
+            }
+            return { action: 'deny' };
+          });
+        }
+
+        if (typeof wc.on === 'function') {
+          wc.on('will-navigate', (/** @type {any} */ event, /** @type {string} */ navUrl) => {
+            if (!isAllowedCodeWeaversAuthNavigationUrl(navUrl, options)) {
+              if (event && typeof event.preventDefault === 'function') {
+                event.preventDefault();
+              }
+            }
+          });
+
+          wc.on('will-redirect', (/** @type {any} */ event, /** @type {string} */ navUrl) => {
+            if (!isAllowedCodeWeaversAuthNavigationUrl(navUrl, options)) {
+              if (event && typeof event.preventDefault === 'function') {
+                event.preventDefault();
+              }
+              return;
+            }
+            try {
+              const parsed = new URL(String(navUrl || '').trim());
+              const pathname = parsed.pathname.toLowerCase();
+              const host = parsed.hostname.toLowerCase();
+              if (
+                pathname.startsWith('/login') ||
+                pathname.startsWith('/signin') ||
+                host === 'challenges.cloudflare.com' ||
+                host === 'google.com' ||
+                host.endsWith('.google.com') ||
+                host === 'appleid.apple.com'
+              ) {
+                sawLoginPage = true;
+                autoTriggeredDownloadAfterLogin = false;
+                revealAuthWindow();
+              }
+            } catch {}
+          });
+
+          wc.on('did-navigate', (/** @type {any} */ _event, /** @type {string} */ navUrl) => {
+            if (settled || downloadCaptured || closingForCapture) return;
+            try {
+              const parsed = new URL(String(navUrl || '').trim());
+              const host = parsed.hostname.toLowerCase();
+              const isCodeWeaversOrigin =
+                host === 'codeweavers.com' ||
+                host.endsWith('.codeweavers.com') ||
+                (options.allowLoopbackInstallerUrls === true &&
+                  (host === '127.0.0.1' || host === 'localhost'));
+              if (!isCodeWeaversOrigin) {
+                sawLoginPage = true;
+                revealAuthWindow();
+                return;
+              }
+              const pathname = parsed.pathname.toLowerCase();
+              if (
+                pathname.startsWith('/login') ||
+                pathname.startsWith('/signin') ||
+                pathname.includes('/login/') ||
+                pathname.endsWith('/login')
+              ) {
+                sawLoginPage = true;
+                autoTriggeredDownloadAfterLogin = false;
+                revealAuthWindow();
+                return;
+              }
+              if (
+                sawLoginPage &&
+                !autoTriggeredDownloadAfterLogin &&
+                !downloadCaptured &&
+                !pathname.startsWith('/preview/download')
+              ) {
+                autoTriggeredDownloadAfterLogin = true;
+                if (authWindow && !authWindow.isDestroyed()) {
+                  Promise.resolve(authWindow.loadURL(previewDownloadUrl)).catch(() => {});
+                }
+              }
+            } catch {}
+          });
+
+          wc.on(
+            'did-navigate-in-page',
+            (/** @type {any} */ _event, /** @type {string} */ navUrl) => {
+              if (settled || downloadCaptured || closingForCapture) return;
+              void inspectPortalAndTriggerDownload(navUrl, 0);
+            }
+          );
+
+          wc.on('did-finish-load', () => {
+            if (settled || downloadCaptured || closingForCapture) return;
+            void inspectPortalAndTriggerDownload('', 0);
+          });
+        }
+      }
+
+      if (typeof authWindow.on === 'function') {
+        authWindow.on('closed', () => {
+          if (!settled && !downloadCaptured && !closingForCapture) {
+            const abortErr = new Error('CodeWeavers Preview sign-in cancelled.');
+            abortErr.name = 'AbortError';
+            settleReject(abortErr);
+          }
+        });
+      }
+
+      Promise.resolve(authWindow.loadURL(previewDownloadUrl)).catch((/** @type {any} */ loadErr) => {
+        if (settled || downloadCaptured || closingForCapture) return;
+        const msg = String(loadErr?.message || '');
+        const isAttachmentAbort =
+          loadErr?.errno === -3 ||
+          loadErr?.code === 'ERR_ABORTED' ||
+          /ERR_ABORTED/i.test(msg);
+        if (isAttachmentAbort) return;
+        if (options.failOnLoadError === true) {
+          forceCloseAuthWindow();
+          settleReject(
+            loadErr instanceof Error
+              ? loadErr
+              : new Error(`Failed to load CodeWeavers Preview sign-in page: ${msg}`)
+          );
+        }
+      });
+    } catch (initErr) {
+      forceCloseAuthWindow();
+      settleReject(initErr);
+    }
+  });
+}
+
+/**
+ * Throw a structured runner-busy Error preserving `busyCode`.
+ *
+ * @param {{ ok: boolean, busyCode?: string, error?: string }} safeRes
+ */
+function throwIfRunnerBusy(safeRes) {
+  if (safeRes && safeRes.ok === false) {
+    const err = /** @type {Error & { busyCode?: string }} */ (
+      new Error(safeRes.error || 'Compatibility runner is currently busy.')
+    );
+    if (safeRes.busyCode) {
+      err.busyCode = safeRes.busyCode;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Check whether an installed runner `.app` path belongs to a third-party external launcher manager.
+ *
+ * @param {string | null | undefined} appPath
+ * @returns {string | null}
+ */
+function detectExternalRunnerManagerName(appPath) {
+  const norm = String(appPath || '').replace(/\\/g, '/');
+  if (!norm) return null;
+  if (/\/heroic\/tools\//i.test(norm)) return 'Heroic Games Launcher';
+  if (
+    /\/Library\/Application Support\/(?:com\.isaacmarovitz\.)?Whisky\//i.test(norm) ||
+    /\/Whisky\.app\//i.test(norm)
+  ) {
+    return 'Whisky';
+  }
+  if (norm.includes('Library/Application Support/Kegworks/Engines')) return 'Kegworks';
+  if (/\/Sikarugir\//i.test(norm)) return 'Sikarugir';
+  if (/\/Library\/Application Support\/Mythic\//i.test(norm)) return 'Mythic';
+  return null;
+}
+
+/**
+ * Direct vendor installation & in-place atomic update for macOS compatibility runners
+ * (`crossover`, `wine`, `gptk`, `crossover_preview`) without requiring Homebrew.
+ * Always uses ephemeral `os.tmpdir()` staging, verifies cryptographic digests/Ed25519/Developer ID
+ * signatures BEFORE atomic `rename(2)` swap into `Applications`, and cleans up temp artifacts in `finally`.
  *
  * @param {string} rawRunnerType
  * @param {Record<string, any>} [options]
- * @returns {Promise<{ success: boolean, installed?: boolean, openedExternal?: boolean, openedExternalUrl?: string, installedPath?: string, message: string }>}
+ * @returns {Promise<{ success: boolean, installed?: boolean, openedExternal?: boolean, openedExternalUrl?: string, switchedToStableCrossOver?: boolean, installedPath?: string, version?: string | null, message: string }>}
  */
 async function installRunnerDirect(rawRunnerType, options = {}) {
-  const runnerType = String(rawRunnerType || 'crossover')
+  const requestedRunnerType = String(rawRunnerType || 'crossover')
     .trim()
     .toLowerCase();
+  const effectiveRunnerType =
+    requestedRunnerType === 'crossover_preview' && options.switchToStableCrossOver === true
+      ? 'crossover'
+      : requestedRunnerType;
+
   const { homedir } = resolveIsolatedHomedirAndUserData(options);
-  const targetAppsDir = await resolveTargetMacApplicationsDir(homedir, options);
+  let targetAppsDir = await resolveTargetMacApplicationsDir(homedir, options);
   const signal = /** @type {AbortSignal | undefined} */ (options.signal);
 
   /** @type {EnvironmentComponentId} */
   const componentId =
-    runnerType === 'crossover_preview'
+    effectiveRunnerType === 'crossover_preview'
       ? 'runner_crossover_preview'
-      : runnerType === 'wine'
+      : effectiveRunnerType === 'wine'
         ? 'runner_wine'
-        : runnerType === 'gptk'
+        : effectiveRunnerType === 'gptk'
           ? 'runner_gptk'
           : 'runner_crossover';
 
@@ -1792,93 +3697,855 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
     totalSteps: 1,
   };
 
-  // GPTK & CrossOver Preview require authenticated portal download unless a local DMG is supplied
-  if (runnerType === 'gptk' || runnerType === 'crossover_preview') {
-    const localDmg = typeof options.dmgPath === 'string' ? options.dmgPath.trim() : '';
-    if (localDmg && fs.existsSync(localDmg)) {
-      emitEnvironmentSetupProgress(
-        {
-          ...progressCtx,
-          phase: 'verifying_signature',
-          message: `Mounting and verifying ${path.basename(localDmg)}...`,
-        },
-        options
+  const detectedBefore = detectCompatibilityLayers({
+    ...options,
+    ...explicitHomedirOpt(options),
+  });
+  const existingLayer =
+    options.existingLayer ||
+    detectedBefore.find((/** @type {any} */ l) => l.type === effectiveRunnerType) ||
+    null;
+
+  const rawLocalArchive =
+    typeof options.archivePath === 'string' && options.archivePath.trim()
+      ? options.archivePath.trim()
+      : '';
+  const rawLocalDmg =
+    typeof options.dmgPath === 'string' && options.dmgPath.trim()
+      ? options.dmgPath.trim()
+      : '';
+  const explicitLocalInstallerPath = rawLocalArchive || rawLocalDmg;
+
+  const externalMgr =
+    detectExternalRunnerManagerName(existingLayer?.appPath) ||
+    detectExternalRunnerManagerName(existingLayer?.binaryPath) ||
+    (/\(Heroic|Whisky|Sikarugir|Kegworks|Mythic\)/i.test(String(existingLayer?.name || ''))
+      ? 'External Manager'
+      : null);
+
+  /** @type {string | null} */
+  let existingTargetAppPath = null;
+  if (
+    existingLayer &&
+    typeof existingLayer.appPath === 'string' &&
+    existingLayer.appPath.toLowerCase().endsWith('.app') &&
+    !externalMgr &&
+    typeof options.customApplicationsDir !== 'string'
+  ) {
+    const existingParent = path.dirname(existingLayer.appPath);
+    try {
+      if (options.homedir) {
+        targetAppsDir = existingParent;
+        existingTargetAppPath = existingLayer.appPath;
+      } else {
+        await fs.promises.access(existingParent, fs.constants.W_OK);
+        targetAppsDir = existingParent;
+        existingTargetAppPath = existingLayer.appPath;
+      }
+    } catch {}
+  }
+
+  // Pre-flight active-session & external OS process safety check before downloading or extracting
+  const preflightSafe = await assertRunnerSafeToReplace(
+    effectiveRunnerType,
+    existingTargetAppPath,
+    existingLayer,
+    options
+  );
+  throwIfRunnerBusy(preflightSafe);
+
+  if (typeof options.mockDirectDownload === 'function') {
+    return await options.mockDirectDownload(effectiveRunnerType, {
+      ...options,
+      requestedRunnerType,
+      targetAppsDir,
+      existingLayer,
+      existingTargetAppPath,
+    });
+  }
+
+  /**
+   * Finalize GPTK bundle staging: verify embedded Apple `D3DMetal.framework` signature BEFORE
+   * stripping quarantine and running deep ad-hoc signing (`codesign --force --deep -s -`).
+   *
+   * @param {string} stagedApp
+   */
+  const verifyAndPrepareStagedGptkApp = async (stagedApp) => {
+    const appBase = path.basename(stagedApp);
+    const matchesGptkName = /^Game Porting Toolkit.*\.app$/i.test(appBase);
+    const embeddedD3d = findEmbeddedD3DMetalFramework(stagedApp);
+    const hasGptkLayout =
+      fs.existsSync(path.join(stagedApp, 'Contents/Resources/wine')) || Boolean(embeddedD3d);
+    if (!matchesGptkName && !hasGptkLayout) {
+      await fs.promises.rm(stagedApp, { recursive: true, force: true }).catch(() => {});
+      throw new Error(`"${appBase}" is not a valid Apple Game Porting Toolkit bundle.`);
+    }
+
+    if (embeddedD3d || options.requireD3DMetalSignatureCheck === true) {
+      if (!embeddedD3d) {
+        await fs.promises.rm(stagedApp, { recursive: true, force: true }).catch(() => {});
+        throw new Error(
+          `Embedded D3DMetal.framework was not found inside ${appBase}.`
+        );
+      }
+      await verifyAppleSignedFramework(embeddedD3d, {
+        ...options,
+        _componentId: componentId,
+        purgeDirOnFailure: stagedApp,
+      });
+    }
+
+    await clearMacQuarantineAsync(stagedApp, { ...options, force: true });
+
+    if (typeof options.verifySignatureFn === 'function') {
+      await verifyMacAppDeveloperSignature(stagedApp, [], {
+        ...options,
+        _componentId: componentId,
+        allowAdhocSignature: true,
+      });
+      return;
+    }
+
+    const execFn = getExecFileFn(options);
+    const canExecCodesign =
+      process.platform === 'darwin' ||
+      typeof options.execFileFn === 'function' ||
+      typeof options.execFileImpl === 'function';
+    if (canExecCodesign) {
+      await runExecFileAsync(
+        execFn,
+        '/usr/bin/codesign',
+        ['--force', '--deep', '-s', '-', stagedApp],
+        { timeout: 120000, signal }
       );
-      const teamIds = runnerType === 'crossover_preview' ? ['2C75U774H4'] : [];
-      const installedPath = await mountVerifyAndInstallDmgApp(
-        localDmg,
-        targetAppsDir,
-        teamIds,
-        runnerType === 'crossover_preview'
-          ? /Developer ID Application:\s*CodeWeavers/i
-          : null,
-        {
-          ...options,
-          _componentId: componentId,
-          ...(runnerType === 'gptk' ? { requireGptkBundle: true } : {}),
+      await runExecFileAsync(
+        execFn,
+        '/usr/bin/codesign',
+        ['--verify', '--deep', '--strict', stagedApp],
+        { timeout: 60000, signal }
+      );
+    }
+  };
+
+  /**
+   * Finalize Open-Source Wine bundle staging after SHA-256 archive verification:
+   * upstream Gcenx `Wine Stable.app` / `Wine Staging.app` / `Wine Devel.app` tarballs ship an
+   * unsigned outer `.app` wrapper around ad-hoc-signed inner `x86_64` binaries (`code object is not signed at all`).
+   * Preserve any existing valid signature; if the outer bundle is unsigned, strip quarantine and apply
+   * local ad-hoc signing (`codesign --force --deep -s -`) before strict verification, while still failing
+   * closed if an existing signature was tampered or corrupted.
+   *
+   * @param {string} stagedApp
+   */
+  const verifyAndPrepareStagedWineApp = async (stagedApp) => {
+    const appBase = path.basename(stagedApp);
+    const hasWineLayout =
+      /wine/i.test(appBase) ||
+      fs.existsSync(path.join(stagedApp, 'Contents/Resources/wine')) ||
+      fs.existsSync(path.join(stagedApp, 'Contents/SharedSupport/wine')) ||
+      fs.existsSync(path.join(stagedApp, 'Contents/MacOS/wine'));
+    if (!hasWineLayout) {
+      await fs.promises.rm(stagedApp, { recursive: true, force: true }).catch(() => {});
+      throw new Error(`"${appBase}" is not a valid macOS Wine bundle.`);
+    }
+
+    await clearMacQuarantineAsync(stagedApp, { ...options, force: true });
+
+    if (typeof options.verifySignatureFn === 'function') {
+      await verifyMacAppDeveloperSignature(stagedApp, [], {
+        ...options,
+        _componentId: componentId,
+        allowAdhocSignature: true,
+      });
+      return;
+    }
+
+    const execFn = getExecFileFn(options);
+    const canExecCodesign =
+      process.platform === 'darwin' ||
+      typeof options.execFileFn === 'function' ||
+      typeof options.execFileImpl === 'function';
+
+    if (canExecCodesign) {
+      try {
+        await runExecFileAsync(
+          execFn,
+          '/usr/bin/codesign',
+          ['--verify', '--deep', '--strict', stagedApp],
+          { timeout: 60000, signal }
+        );
+      } catch (verifyErr) {
+        const errDetail = `${String(verifyErr?.stderr || '')} ${String(verifyErr?.message || '')}`;
+        if (/not signed at all/i.test(errDetail)) {
+          await runExecFileAsync(
+            execFn,
+            '/usr/bin/codesign',
+            ['--force', '--deep', '-s', '-', stagedApp],
+            { timeout: 180000, signal }
+          );
+        } else {
+          await fs.promises.rm(stagedApp, { recursive: true, force: true }).catch(() => {});
+          throw new Error(
+            `Code signature verification failed for ${appBase}: ${String(verifyErr?.stderr || verifyErr?.message || verifyErr)}`
+          );
         }
+      }
+    }
+
+    await verifyMacAppDeveloperSignature(stagedApp, [], {
+      ...options,
+      _componentId: componentId,
+      allowAdhocSignature: true,
+    });
+  };
+
+  /**
+   * Perform pre-swap safety guard and atomic `.app` installation.
+   *
+   * @param {string} stagedApp
+   * @param {string} displayLabel
+   * @param {string | null} [resolvedVersion]
+   */
+  const atomicSwapVerifiedApp = async (stagedApp, displayLabel, resolvedVersion = null) => {
+    const destAppPath =
+      existingTargetAppPath &&
+      path.basename(existingTargetAppPath).toLowerCase() ===
+        path.basename(stagedApp).toLowerCase()
+        ? existingTargetAppPath
+        : path.join(targetAppsDir, path.basename(stagedApp));
+
+    const preSwapSafe = await assertRunnerSafeToReplace(
+      effectiveRunnerType,
+      destAppPath,
+      existingLayer,
+      options
+    );
+    throwIfRunnerBusy(preSwapSafe);
+
+    emitEnvironmentSetupProgress(
+      {
+        ...progressCtx,
+        phase: 'installing',
+        message: `Installing ${path.basename(destAppPath)} to ${path.dirname(destAppPath)}...`,
+      },
+      options
+    );
+
+    const installedPath = await copyVerifiedMacAppToApplicationsDir(stagedApp, targetAppsDir, {
+      ...options,
+      targetAppBundlePath: destAppPath,
+    });
+    if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
+      recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+        ...options,
+        homedir,
+      });
+    }
+    invalidateScanCaches();
+    return {
+      success: true,
+      installed: true,
+      installedPath,
+      ...(resolvedVersion ? { version: resolvedVersion } : {}),
+      message: `Installed ${displayLabel} to ${installedPath}.`,
+    };
+  };
+
+  // -------------------------------------------------------------------------
+  // Local Archive / Disk Image Path (`.dmg`, `.zip`, `.tar.xz`, `.txz`)
+  // -------------------------------------------------------------------------
+  if (explicitLocalInstallerPath) {
+    if (
+      explicitLocalInstallerPath.includes('\0') ||
+      !path.isAbsolute(explicitLocalInstallerPath) ||
+      path.basename(explicitLocalInstallerPath).startsWith('-')
+    ) {
+      throw new Error(
+        `Rejected unsafe or non-absolute runner archive path: ${explicitLocalInstallerPath}`
       );
-      invalidateScanCaches();
+    }
+    if (!fs.existsSync(explicitLocalInstallerPath)) {
+      if (rawLocalArchive) {
+        throw new Error(
+          `Selected runner archive was not found on disk: ${path.basename(explicitLocalInstallerPath)}`
+        );
+      }
+    } else {
+      const lowerLocal = explicitLocalInstallerPath.toLowerCase();
+      const isCodeWeaversRunner =
+        effectiveRunnerType === 'crossover' || effectiveRunnerType === 'crossover_preview';
+
+      if (lowerLocal.endsWith('.dmg')) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: `Mounting and verifying ${path.basename(explicitLocalInstallerPath)}...`,
+          },
+          options
+        );
+        const preSwapSafe = await assertRunnerSafeToReplace(
+          effectiveRunnerType,
+          existingTargetAppPath,
+          existingLayer,
+          options
+        );
+        throwIfRunnerBusy(preSwapSafe);
+
+        const installedPath = await mountVerifyAndInstallDmgApp(
+          explicitLocalInstallerPath,
+          targetAppsDir,
+          isCodeWeaversRunner ? ['2C75U774H4'] : [],
+          isCodeWeaversRunner ? /Developer ID Application:\s*CodeWeavers/i : null,
+          {
+            ...options,
+            _componentId: componentId,
+            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+            ...(effectiveRunnerType === 'gptk' ? { requireGptkBundle: true } : {}),
+            ...(effectiveRunnerType === 'wine'
+              ? { allowAdhocSignature: true, prepareUnsignedWineBundle: true }
+              : {}),
+          }
+        );
+        invalidateScanCaches();
+        return {
+          success: true,
+          installed: true,
+          installedPath,
+          message: `Installed ${path.basename(installedPath)} to ${path.dirname(installedPath)}.`,
+        };
+      }
+
+      if (/\.(?:zip|tar\.xz|txz)$/i.test(lowerLocal)) {
+        const localTempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ol-runner-local-'));
+        const execFn = getExecFileFn(options);
+        try {
+          const stagingDir = path.join(localTempDir, 'staging');
+          await fs.promises.mkdir(stagingDir, { recursive: true });
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'extracting',
+              message: `Extracting ${path.basename(explicitLocalInstallerPath)}...`,
+            },
+            options
+          );
+          if (typeof options.onExtractArchive === 'function') {
+            await options.onExtractArchive(explicitLocalInstallerPath, stagingDir);
+          } else if (lowerLocal.endsWith('.zip')) {
+            await runExecFileAsync(
+              execFn,
+              '/usr/bin/ditto',
+              ['-x', '-k', explicitLocalInstallerPath, stagingDir],
+              { timeout: 300000, signal }
+            );
+          } else {
+            await runExecFileAsync(
+              execFn,
+              '/usr/bin/tar',
+              ['-xf', explicitLocalInstallerPath, '-C', stagingDir],
+              { timeout: 300000, signal }
+            );
+          }
+
+          const stagedApp = await findStagedAppBundle(stagingDir);
+          if (!stagedApp) {
+            throw new Error(
+              `No macOS .app bundle found inside ${path.basename(explicitLocalInstallerPath)}.`
+            );
+          }
+
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'verifying_signature',
+              message: `Verifying ${path.basename(stagedApp)} signature...`,
+            },
+            options
+          );
+
+          if (effectiveRunnerType === 'gptk') {
+            await verifyAndPrepareStagedGptkApp(stagedApp);
+          } else if (isCodeWeaversRunner) {
+            await verifyMacAppDeveloperSignature(stagedApp, ['2C75U774H4'], {
+              ...options,
+              _componentId: componentId,
+              expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
+            });
+          } else if (effectiveRunnerType === 'wine') {
+            await verifyAndPrepareStagedWineApp(stagedApp);
+          } else {
+            await verifyMacAppDeveloperSignature(stagedApp, [], {
+              ...options,
+              _componentId: componentId,
+              allowAdhocSignature: true,
+            });
+          }
+
+          return await atomicSwapVerifiedApp(
+            stagedApp,
+            formatRunnerDisplayLabel(effectiveRunnerType, existingLayer)
+          );
+        } finally {
+          try {
+            await fs.promises.rm(localTempDir, { recursive: true, force: true });
+          } catch {}
+        }
+      }
+
+      throw new Error(
+        `Unsupported runner archive format (${path.basename(explicitLocalInstallerPath)}). Expected .zip, .dmg, .tar.xz, or .txz.`
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // CrossOver Preview:
+  // 1) Explicit local `dmgPath` / `archivePath` (handled above).
+  // 2) Installed `CrossOver Preview.app` Sparkle `SUFeedURL` on an allowed CodeWeavers host.
+  // 3) Installed `existingLayer` where public `cxmac.xml` Stable has strictly surpassed Preview.
+  // 4) Sandboxed in-app CodeWeavers sign-in (`persist:codeweavers-preview`) + auto-captured install.
+  // 5) Headless / `skipNetwork` fallback to official CodeWeavers Preview portal.
+  // -------------------------------------------------------------------------
+  /** @type {{ xml: string, feedUrl: string, sparklePublicEdKey: string } | null} */
+  let resolvedPreviewSparkleFeed = null;
+  if (effectiveRunnerType === 'crossover_preview') {
+    const portalUrl = 'https://www.codeweavers.com/preview/download';
+    if (options.skipNetwork === true) {
+      await openExternalUri(portalUrl, options);
       return {
         success: true,
-        installed: true,
-        installedPath,
-        message: `Installed ${path.basename(installedPath)} to ${targetAppsDir}.`,
+        installed: false,
+        openedExternal: true,
+        openedExternalUrl: portalUrl,
+        message: 'Opened official CodeWeavers Preview download portal in your browser.',
       };
     }
 
-    const portalUrl =
-      runnerType === 'crossover_preview'
-        ? 'https://www.codeweavers.com/preview/download'
-        : 'https://developer.apple.com/games/game-porting-toolkit/';
-    await openExternalUri(portalUrl, options);
-    return {
-      success: true,
-      installed: false,
-      openedExternal: true,
-      openedExternalUrl: portalUrl,
-      message: `Opened official ${runnerType === 'gptk' ? 'Apple Developer' : 'CodeWeavers Preview'} download portal in your browser.`,
-    };
+    if (existingLayer?.appPath && typeof parsePlistStringValues === 'function') {
+      const plistDict = parsePlistStringValues(
+        path.join(existingLayer.appPath, 'Contents/Info.plist')
+      );
+      const rawSuFeedUrl = String(options.previewFeedUrl || plistDict.SUFeedURL || '').trim();
+      const rawSuPubKey = String(
+        options.sparklePublicEdKey ||
+          plistDict.SUPublicEDKey ||
+          CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY
+      ).trim();
+      if (rawSuFeedUrl) {
+        try {
+          const parsedFeedHost = new URL(rawSuFeedUrl).hostname.toLowerCase();
+          const isAllowedPreviewFeedHost =
+            parsedFeedHost === 'codeweavers.com' ||
+            parsedFeedHost === 'www.codeweavers.com' ||
+            parsedFeedHost === 'media.codeweavers.com' ||
+            (options.allowLoopbackInstallerUrls === true &&
+              (parsedFeedHost === '127.0.0.1' || parsedFeedHost === 'localhost'));
+          if (isAllowedPreviewFeedHost) {
+            const safeFeedUrl = validateInstallerUrl(rawSuFeedUrl, options);
+            emitEnvironmentSetupProgress(
+              {
+                ...progressCtx,
+                phase: 'probing',
+                message: 'Resolving latest CrossOver Preview release from CodeWeavers Sparkle feed...',
+              },
+              options
+            );
+            const previewXml = await fetchValidatedText(safeFeedUrl, options, signal);
+            const encCheck = previewXml.match(/<enclosure\b([^>]*)>/i);
+            const urlAttrCheck = encCheck ? encCheck[1].match(/\burl=["']([^"']+)["']/i) : null;
+            if (urlAttrCheck && urlAttrCheck[1].trim()) {
+              validateInstallerUrl(urlAttrCheck[1].trim(), options);
+              resolvedPreviewSparkleFeed = {
+                xml: previewXml,
+                feedUrl: safeFeedUrl,
+                sparklePublicEdKey: rawSuPubKey,
+              };
+            }
+          }
+        } catch (err) {
+          if (isFatalSecurityOrAbortError(err, signal)) {
+            throw err;
+          }
+        }
+      }
+    }
+
+    if (!resolvedPreviewSparkleFeed) {
+      if (existingLayer?.version) {
+        try {
+          const stableXml = await fetchValidatedText(
+            'https://www.codeweavers.com/xml/versions/cxmac.xml',
+            options,
+            signal
+          );
+          const encMatch = stableXml.match(/<enclosure\b([^>]*)>/i);
+          const encAttrs = encMatch ? encMatch[1] : '';
+          const verMatch = encAttrs.match(/\bsparkle:version=["']([^"']+)["']/i);
+          const shortMatch = encAttrs.match(/\bsparkle:shortVersionString=["']([^"']+)["']/i);
+          const rawBundleVer = verMatch ? verMatch[1].trim() : '';
+          const rawShortVer = shortMatch ? shortMatch[1].trim() : '';
+          const semverMatch = rawBundleVer.match(/^(\d+\.\d+\.\d+)(?:\.(\d+))?$/);
+          const stableLatestVer = semverMatch ? semverMatch[1] : rawShortVer || rawBundleVer;
+          if (
+            stableLatestVer &&
+            typeof compareRunnerVersions === 'function' &&
+            compareRunnerVersions(existingLayer.version, stableLatestVer) < 0
+          ) {
+            const existingStableLayer =
+              detectedBefore.find((/** @type {any} */ l) => l.type === 'crossover') || null;
+            const stableRes = await installRunnerDirect('crossover', {
+              ...options,
+              switchToStableCrossOver: true,
+              existingLayer: existingStableLayer,
+              _prefetchedCxMacXml: stableXml,
+            });
+            return {
+              ...stableRes,
+              switchedToStableCrossOver: true,
+            };
+          }
+        } catch (err) {
+          if (isFatalSecurityOrAbortError(err, signal)) {
+            throw err;
+          }
+        }
+      }
+
+      const electronModForCapture = (options && options.electronMod) || getElectron();
+      const canCapturePreviewInApp =
+        typeof options.capturePreviewDownloadFn === 'function' ||
+        (Boolean(electronModForCapture?.BrowserWindow) &&
+          Boolean(electronModForCapture?.session) &&
+          (!isTestEnvironment(options) || options.allowInteractivePreviewCapture === true));
+
+      if (canCapturePreviewInApp) {
+        const previewTempDir = await fs.promises.mkdtemp(
+          path.join(os.tmpdir(), 'ol-cx-preview-')
+        );
+        const execFn = getExecFileFn(options);
+        try {
+          const captured = await captureCodeWeaversPreviewDownload(
+            previewTempDir,
+            progressCtx,
+            options,
+            signal
+          );
+          const capturedArchivePath = captured.archivePath;
+          let resolvedVersion = captured.resolvedVersion || null;
+
+          if (
+            typeof options.expectedSha256 === 'string' &&
+            /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
+          ) {
+            emitEnvironmentSetupProgress(
+              {
+                ...progressCtx,
+                phase: 'verifying_signature',
+                message: 'Verifying CrossOver Preview archive SHA-256 checksum...',
+              },
+              options
+            );
+            await verifyFileSha256Async(
+              capturedArchivePath,
+              options.expectedSha256.trim().toLowerCase()
+            );
+          }
+
+          if (/\.dmg$/i.test(capturedArchivePath)) {
+            emitEnvironmentSetupProgress(
+              {
+                ...progressCtx,
+                phase: 'verifying_signature',
+                message: 'Verifying CodeWeavers Developer ID signature...',
+              },
+              options
+            );
+            const preSwapSafe = await assertRunnerSafeToReplace(
+              effectiveRunnerType,
+              existingTargetAppPath,
+              existingLayer,
+              options
+            );
+            throwIfRunnerBusy(preSwapSafe);
+
+            const installedPath = await mountVerifyAndInstallDmgApp(
+              capturedArchivePath,
+              targetAppsDir,
+              ['2C75U774H4'],
+              /Developer ID Application:\s*CodeWeavers/i,
+              {
+                ...options,
+                _componentId: componentId,
+                ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+              }
+            );
+            resolvedVersion = resolvePreviewBundleVersion(installedPath, resolvedVersion);
+            if (
+              resolvedVersion &&
+              !/^\d{8}$/.test(resolvedVersion) &&
+              typeof recordRunnerInstallReceipt === 'function'
+            ) {
+              recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+                ...options,
+                homedir,
+              });
+            }
+            invalidateScanCaches();
+            return {
+              success: true,
+              installed: true,
+              installedPath,
+              ...(resolvedVersion ? { version: resolvedVersion } : {}),
+              message: `Installed CrossOver Preview to ${installedPath}.`,
+            };
+          }
+
+          const stagingDir = path.join(previewTempDir, 'staging');
+          await fs.promises.mkdir(stagingDir, { recursive: true });
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'extracting',
+              message: 'Extracting CrossOver Preview archive...',
+            },
+            options
+          );
+
+          if (typeof options.onExtractArchive === 'function') {
+            await options.onExtractArchive(capturedArchivePath, stagingDir);
+          } else {
+            await runExecFileAsync(
+              execFn,
+              '/usr/bin/ditto',
+              ['-x', '-k', capturedArchivePath, stagingDir],
+              { timeout: 300000, signal }
+            );
+          }
+
+          const stagedApp = await findStagedAppBundle(stagingDir);
+          if (!stagedApp) {
+            throw new Error(
+              'CrossOver Preview.app was not found inside the downloaded archive.'
+            );
+          }
+
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'verifying_signature',
+              message: 'Verifying CodeWeavers Developer ID signature...',
+            },
+            options
+          );
+          await verifyMacAppDeveloperSignature(stagedApp, ['2C75U774H4'], {
+            ...options,
+            _componentId: componentId,
+            expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
+          });
+
+          resolvedVersion = resolvePreviewBundleVersion(stagedApp, resolvedVersion);
+          return await atomicSwapVerifiedApp(
+            stagedApp,
+            'CrossOver Preview',
+            resolvedVersion && !/^\d{8}$/.test(resolvedVersion) ? resolvedVersion : null
+          );
+        } finally {
+          try {
+            await fs.promises.rm(previewTempDir, { recursive: true, force: true });
+          } catch {}
+        }
+      }
+
+      await openExternalUri(portalUrl, options);
+      return {
+        success: true,
+        installed: false,
+        openedExternal: true,
+        openedExternalUrl: portalUrl,
+        message: 'Opened official CodeWeavers Preview download portal in your browser.',
+      };
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Apple Game Porting Toolkit (`gptk`): Automated GitHub `.tar.xz` on Apple Silicon macOS 14+
+  // -------------------------------------------------------------------------
+  if (effectiveRunnerType === 'gptk') {
+    const hostArch = String(options.arch || process.arch);
+    const darwinKernelMajor = resolveDarwinKernelMajor(options);
+    if (hostArch !== 'arm64' || darwinKernelMajor < 23) {
+      const portalUrl = 'https://developer.apple.com/games/game-porting-toolkit/';
+      await openExternalUri(portalUrl, options);
+      return {
+        success: true,
+        installed: false,
+        openedExternal: true,
+        openedExternalUrl: portalUrl,
+        message:
+          'Apple Game Porting Toolkit automated install requires Apple Silicon on macOS 14 Sonoma or newer; opened Apple Developer portal.',
+      };
+    }
   }
 
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ol-env-setup-'));
   const execFileFn = getExecFileFn(options);
 
   try {
-    if (runnerType === 'crossover') {
-      emitEnvironmentSetupProgress(
-        {
-          ...progressCtx,
-          phase: 'probing',
-          message: 'Resolving latest CrossOver release from CodeWeavers Sparkle feed...',
-        },
-        options
-      );
-      const xml = await fetchValidatedText(
-        'https://www.codeweavers.com/xml/versions/cxmac.xml',
-        options,
-        signal
-      );
-      const encMatch = xml.match(/<enclosure\s+([^>]+)>/i);
-      const urlMatch = encMatch ? encMatch[1].match(/url="([^"]+)"/i) : null;
+    // -----------------------------------------------------------------------
+    // 1. CrossOver Stable (`crossover`) & Sparkle-Enabled CrossOver Preview (`crossover_preview`)
+    // -----------------------------------------------------------------------
+    if (effectiveRunnerType === 'crossover' || effectiveRunnerType === 'crossover_preview') {
+      const isPreviewSparkle =
+        effectiveRunnerType === 'crossover_preview' && Boolean(resolvedPreviewSparkleFeed);
+      const cwLabel = isPreviewSparkle ? 'CrossOver Preview' : 'CrossOver';
+      if (!isPreviewSparkle && !options._prefetchedCxMacXml) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'probing',
+            message: 'Resolving latest CrossOver release from CodeWeavers Sparkle feed...',
+          },
+          options
+        );
+      }
+      const xml = isPreviewSparkle
+        ? String(resolvedPreviewSparkleFeed?.xml || '')
+        : typeof options._prefetchedCxMacXml === 'string' && options._prefetchedCxMacXml
+          ? options._prefetchedCxMacXml
+          : await fetchValidatedText(
+              'https://www.codeweavers.com/xml/versions/cxmac.xml',
+              options,
+              signal
+            );
+      const encMatch = xml.match(/<enclosure\b([^>]*)>/i);
+      const encAttrs = encMatch ? encMatch[1] : '';
+      const urlMatch = encAttrs.match(/\burl=["']([^"']+)["']/i);
       const archiveUrl = urlMatch ? validateInstallerUrl(urlMatch[1].trim(), options) : '';
       if (!archiveUrl) {
-        throw new Error('Could not find CrossOver download URL in CodeWeavers Sparkle feed.');
+        throw new Error(`Could not find ${cwLabel} download URL in CodeWeavers Sparkle feed.`);
+      }
+
+      const lenMatch = encAttrs.match(/\blength=["'](\d+)["']/i);
+      const expectedByteLength =
+        typeof options.expectedByteLength === 'number' && options.expectedByteLength > 0
+          ? options.expectedByteLength
+          : lenMatch
+            ? Number.parseInt(lenMatch[1], 10)
+            : 0;
+      const edSigMatch = encAttrs.match(/\bsparkle:edSignature=["']([^"']+)["']/i);
+      const sparkleEdSignature = String(
+        options.expectedEdSignature || (edSigMatch ? edSigMatch[1] : '') || ''
+      ).trim();
+      const shortVerMatch =
+        encAttrs.match(/\bsparkle:shortVersionString=["']([^"']+)["']/i) ||
+        xml.match(/<sparkle:shortVersionString>([^<]+)<\/sparkle:shortVersionString>/i);
+      const sparkleVerMatch =
+        encAttrs.match(/\bsparkle:version=["']([^"']+)["']/i) ||
+        xml.match(/<sparkle:version>([^<]+)<\/sparkle:version>/i);
+      const rawShortVer = String(shortVerMatch?.[1] || '').trim();
+      const rawSparkleVer = String(sparkleVerMatch?.[1] || '').trim();
+      const sparkleSemverMatch = rawSparkleVer.match(/^(\d+\.\d+\.\d+)(?:\.\d+)?$/);
+      const resolvedVersion =
+        (/^\d{8}$/.test(rawShortVer) && sparkleSemverMatch
+          ? sparkleSemverMatch[1]
+          : rawShortVer || rawSparkleVer) || null;
+
+      let caskSha256 =
+        typeof options.expectedSha256 === 'string' &&
+        /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
+          ? options.expectedSha256.trim().toLowerCase()
+          : '';
+      if (!caskSha256 && !isPreviewSparkle) {
+        try {
+          const caskTxt = await fetchValidatedText(
+            'https://formulae.brew.sh/api/cask/crossover.json',
+            options,
+            signal
+          );
+          const caskJson = JSON.parse(caskTxt);
+          const caskUrl = typeof caskJson?.url === 'string' ? caskJson.url.trim() : '';
+          const caskVer = String(caskJson?.version || '')
+            .split(',')[0]
+            .trim();
+          const rawCaskSha = String(caskJson?.sha256 || '')
+            .trim()
+            .toLowerCase();
+          const matchesRelease =
+            (caskUrl && caskUrl === archiveUrl) ||
+            (resolvedVersion && caskVer && resolvedVersion.startsWith(caskVer));
+          if (matchesRelease && /^[a-f0-9]{64}$/.test(rawCaskSha)) {
+            caskSha256 = rawCaskSha;
+          }
+        } catch (err) {
+          if (isFatalSecurityOrAbortError(err, signal)) {
+            throw err;
+          }
+        }
       }
 
       const isDmg = /\.dmg(?:\?|$)/i.test(archiveUrl);
-      const archivePath = path.join(tempDir, isDmg ? 'CrossOver.dmg' : 'CrossOver.zip');
+      const archiveBaseStem = isPreviewSparkle ? 'CrossOverPreview' : 'CrossOver';
+      const archivePath = path.join(tempDir, isDmg ? `${archiveBaseStem}.dmg` : `${archiveBaseStem}.zip`);
       await streamVerifiedDownloadToFile(
         archiveUrl,
         archivePath,
         {
           ...progressCtx,
-          label: 'CrossOver',
+          label: cwLabel,
           minFreeBytes: 1200 * 1024 * 1024,
         },
         options,
         signal
       );
+
+      if (expectedByteLength > 0) {
+        const archiveStat = await fs.promises.stat(archivePath);
+        if (archiveStat.size !== expectedByteLength) {
+          await fs.promises.rm(archivePath, { force: true }).catch(() => {});
+          throw new Error(
+            `${cwLabel} download size mismatch: expected ${expectedByteLength} bytes, got ${archiveStat.size} bytes.`
+          );
+        }
+      }
+
+      if (caskSha256) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: `Verifying ${cwLabel} archive SHA-256 checksum...`,
+          },
+          options
+        );
+        await verifyFileSha256Async(archivePath, caskSha256);
+      }
+
+      if (sparkleEdSignature) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: 'Verifying CodeWeavers Sparkle Ed25519 signature...',
+          },
+          options
+        );
+        const pubKey = String(
+          options.sparklePublicEdKey ||
+            resolvedPreviewSparkleFeed?.sparklePublicEdKey ||
+            CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY
+        ).trim();
+        await verifySparkleEd25519SignatureAsync(archivePath, sparkleEdSignature, pubKey);
+      } else if (
+        (options.requireSparkleEdSignature === true ||
+          (isPreviewSparkle && !isTestEnvironment(options))) &&
+        !caskSha256
+      ) {
+        await fs.promises.rm(archivePath, { force: true }).catch(() => {});
+        throw new Error(
+          `${cwLabel} Sparkle feed is missing required sparkle:edSignature attribute.`
+        );
+      }
 
       if (isDmg) {
         emitEnvironmentSetupProgress(
@@ -1889,19 +4556,38 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           },
           options
         );
+        const preSwapSafe = await assertRunnerSafeToReplace(
+          effectiveRunnerType,
+          existingTargetAppPath,
+          existingLayer,
+          options
+        );
+        throwIfRunnerBusy(preSwapSafe);
+
         const installedPath = await mountVerifyAndInstallDmgApp(
           archivePath,
           targetAppsDir,
           ['2C75U774H4'],
           /Developer ID Application:\s*CodeWeavers/i,
-          { ...options, _componentId: componentId }
+          {
+            ...options,
+            _componentId: componentId,
+            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+          }
         );
+        if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
+          recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+            ...options,
+            homedir,
+          });
+        }
         invalidateScanCaches();
         return {
           success: true,
           installed: true,
           installedPath,
-          message: `Installed CrossOver to ${installedPath}.`,
+          ...(resolvedVersion ? { version: resolvedVersion } : {}),
+          message: `Installed ${cwLabel} to ${installedPath}.`,
         };
       }
 
@@ -1911,7 +4597,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         {
           ...progressCtx,
           phase: 'extracting',
-          message: 'Extracting CrossOver archive...',
+          message: `Extracting ${cwLabel} archive...`,
         },
         options
       );
@@ -1929,7 +4615,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
 
       const stagedApp = await findStagedAppBundle(stagingDir);
       if (!stagedApp) {
-        throw new Error('CrossOver.app was not found inside the downloaded archive.');
+        throw new Error(`${cwLabel}.app was not found inside the downloaded archive.`);
       }
 
       emitEnvironmentSetupProgress(
@@ -1946,95 +4632,218 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
       });
 
-      emitEnvironmentSetupProgress(
-        {
-          ...progressCtx,
-          phase: 'installing',
-          message: `Installing CrossOver.app to ${targetAppsDir}...`,
-        },
-        options
-      );
-      const installedPath = await copyVerifiedMacAppToApplicationsDir(
-        stagedApp,
-        targetAppsDir,
-        options
-      );
-      invalidateScanCaches();
-      return {
-        success: true,
-        installed: true,
-        installedPath,
-        message: `Installed CrossOver to ${installedPath}.`,
-      };
+      return await atomicSwapVerifiedApp(stagedApp, cwLabel, resolvedVersion);
     }
 
-    if (runnerType === 'wine') {
+    // -----------------------------------------------------------------------
+    // 2. Open-Source Wine (`wine`: `stable` | `staging` | `devel`)
+    // -----------------------------------------------------------------------
+    if (effectiveRunnerType === 'wine') {
+      const existingCombined = `${existingLayer?.name || ''} ${existingLayer?.appPath || ''} ${existingLayer?.binaryPath || ''}`;
+      if (
+        options._runnerOperation === 'update' &&
+        !options.wineChannel &&
+        /wine[-_\s]*crossover/i.test(existingCombined)
+      ) {
+        throw new Error(
+          'Wine Crossover is a retired distribution and cannot be updated in place. Install Wine Stable or CrossOver instead.'
+        );
+      }
+
+      const wineChannel = (() => {
+        const rawChan = String(options.wineChannel || '')
+          .trim()
+          .toLowerCase();
+        if (rawChan === 'staging' || rawChan === 'devel' || rawChan === 'stable') {
+          return rawChan;
+        }
+        if (/wine[-_\s]*staging/i.test(existingCombined)) return 'staging';
+        if (/wine[-_\s]*devel/i.test(existingCombined)) return 'devel';
+        return 'stable';
+      })();
+
+      const wineLabel =
+        wineChannel === 'staging'
+          ? 'Wine Staging'
+          : wineChannel === 'devel'
+            ? 'Wine Devel'
+            : 'Wine Stable';
+      const caskApiUrl =
+        wineChannel === 'staging'
+          ? 'https://formulae.brew.sh/api/cask/wine@staging.json'
+          : wineChannel === 'devel'
+            ? 'https://formulae.brew.sh/api/cask/wine@devel.json'
+            : 'https://formulae.brew.sh/api/cask/wine-stable.json';
+      const assetNameRe =
+        wineChannel === 'staging'
+          ? /wine[-_]?staging.*\.(?:tar\.xz|txz|dmg)$/i
+          : wineChannel === 'devel'
+            ? /wine[-_]?devel.*\.(?:tar\.xz|txz|dmg)$/i
+            : /wine[-_]?stable.*\.(?:tar\.xz|txz|dmg)$/i;
+
       emitEnvironmentSetupProgress(
         {
           ...progressCtx,
           phase: 'probing',
-          message: 'Resolving latest Open-Source Wine Stable release...',
+          message: `Resolving latest Open-Source ${wineLabel} release...`,
         },
         options
       );
 
       let assetUrl = '';
+      let resolvedVersion = /** @type {string | null} */ (null);
       let expectedSha256 =
         typeof options.expectedSha256 === 'string' &&
         /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
           ? options.expectedSha256.trim().toLowerCase()
           : '';
-      try {
-        const caskTxt = await fetchValidatedText(
-          'https://formulae.brew.sh/api/cask/wine-stable.json',
-          options,
-          signal
-        );
-        const caskJson = JSON.parse(caskTxt);
-        if (caskJson && typeof caskJson.url === 'string' && caskJson.url.trim()) {
-          assetUrl = validateInstallerUrl(caskJson.url.trim(), options);
+
+      const tryResolveWineFromCaskApi = async (allowDisabled = false) => {
+        try {
+          const caskTxt = await fetchValidatedText(caskApiUrl, options, signal);
+          const caskJson = JSON.parse(caskTxt);
           if (
-            !expectedSha256 &&
-            typeof caskJson.sha256 === 'string' &&
-            /^[a-f0-9]{64}$/i.test(caskJson.sha256.trim())
+            caskJson &&
+            (allowDisabled || caskJson.disabled !== true) &&
+            typeof caskJson.url === 'string' &&
+            caskJson.url.trim()
           ) {
-            expectedSha256 = caskJson.sha256.trim().toLowerCase();
+            assetUrl = validateInstallerUrl(caskJson.url.trim(), options);
+            if (typeof caskJson.version === 'string' && caskJson.version.trim()) {
+              resolvedVersion = caskJson.version.split(',')[0].trim();
+            }
+            if (
+              !expectedSha256 &&
+              typeof caskJson.sha256 === 'string' &&
+              /^[a-f0-9]{64}$/i.test(caskJson.sha256.trim())
+            ) {
+              expectedSha256 = caskJson.sha256.trim().toLowerCase();
+            }
+          }
+        } catch (err) {
+          if (isFatalSecurityOrAbortError(err, signal)) {
+            throw err;
           }
         }
-      } catch {}
+      };
 
-      if (!assetUrl) {
-        const ghTxt = await fetchValidatedText(
-          'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/latest',
-          options,
-          signal
-        );
-        const ghJson = JSON.parse(ghTxt);
-        const assets = Array.isArray(ghJson?.assets) ? ghJson.assets : [];
+      const extractWineAssetFromReleaseObj = (/** @type {any} */ relObj) => {
+        const assets = Array.isArray(relObj?.assets) ? relObj.assets : [];
         const matchedAsset = assets.find((/** @type {any} */ a) =>
-          /wine[-_]?stable.*\.(?:tar\.xz|dmg)$/i.test(String(a?.name || ''))
+          assetNameRe.test(String(a?.name || ''))
         );
-        if (matchedAsset?.browser_download_url) {
-          assetUrl = validateInstallerUrl(String(matchedAsset.browser_download_url).trim(), options);
-          const rawDigest = String(matchedAsset?.digest || '').trim();
-          if (!expectedSha256 && /^sha256:[a-f0-9]{64}$/i.test(rawDigest)) {
-            expectedSha256 = rawDigest.slice(7).toLowerCase();
+        if (!matchedAsset?.browser_download_url) return false;
+        assetUrl = validateInstallerUrl(
+          String(matchedAsset.browser_download_url).trim(),
+          options
+        );
+        const rawTag = String(relObj?.tag_name || relObj?.name || matchedAsset?.name || '')
+          .replace(/^v/i, '')
+          .trim();
+        const tagVerMatch = rawTag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
+        if (tagVerMatch) resolvedVersion = tagVerMatch[1];
+        else if (rawTag) resolvedVersion = rawTag;
+        const rawDigest = String(matchedAsset?.digest || '').trim();
+        if (!expectedSha256 && /^sha256:[a-f0-9]{64}$/i.test(rawDigest)) {
+          expectedSha256 = rawDigest.slice(7).toLowerCase();
+        }
+        return true;
+      };
+
+      const tryResolveWineFromGitHubReleases = async () => {
+        try {
+          const ghListTxt = await fetchValidatedText(
+            'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases?per_page=20',
+            options,
+            signal
+          );
+          const ghList = JSON.parse(ghListTxt);
+          if (Array.isArray(ghList)) {
+            for (const rel of ghList) {
+              if (rel && !rel.draft && extractWineAssetFromReleaseObj(rel)) {
+                break;
+              }
+            }
+          } else if (ghList && typeof ghList === 'object') {
+            extractWineAssetFromReleaseObj(ghList);
           }
+        } catch (err) {
+          if (isFatalSecurityOrAbortError(err, signal)) {
+            throw err;
+          }
+        }
+
+        if (!assetUrl) {
+          try {
+            const ghLatestTxt = await fetchValidatedText(
+              'https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/latest',
+              options,
+              signal
+            );
+            extractWineAssetFromReleaseObj(JSON.parse(ghLatestTxt));
+          } catch (err) {
+            if (isFatalSecurityOrAbortError(err, signal)) {
+              throw err;
+            }
+          }
+        }
+
+        if (assetUrl && !expectedSha256) {
+          try {
+            const caskRb = await fetchValidatedText(
+              `https://raw.githubusercontent.com/Gcenx/homebrew-wine/master/Casks/wine-${wineChannel}.rb`,
+              options,
+              signal
+            );
+            const shaMatch = caskRb.match(/\bsha256\s+["']([a-f0-9]{64})["']/i);
+            const verMatch = caskRb.match(/\bversion\s+["']([^"']+)["']/i);
+            const caskSha = shaMatch ? shaMatch[1].toLowerCase() : '';
+            const caskVer = verMatch ? verMatch[1].trim() : '';
+            if (
+              caskSha &&
+              (!caskVer ||
+                !resolvedVersion ||
+                resolvedVersion === caskVer ||
+                assetUrl.includes(caskVer))
+            ) {
+              expectedSha256 = caskSha;
+            }
+          } catch (err) {
+            if (isFatalSecurityOrAbortError(err, signal)) {
+              throw err;
+            }
+          }
+        }
+      };
+
+      if (wineChannel === 'stable') {
+        await tryResolveWineFromCaskApi(false);
+        if (!assetUrl) {
+          await tryResolveWineFromGitHubReleases();
+        }
+      } else {
+        await tryResolveWineFromGitHubReleases();
+        if (!assetUrl) {
+          await tryResolveWineFromCaskApi(true);
         }
       }
 
       if (!assetUrl) {
-        throw new Error('Could not resolve Open-Source Wine Stable download asset URL.');
+        throw new Error(`Could not resolve Open-Source ${wineLabel} download asset URL.`);
       }
 
       const isDmg = /\.dmg(?:\?|$)/i.test(assetUrl);
-      const archivePath = path.join(tempDir, isDmg ? 'WineStable.dmg' : 'WineStable.tar.xz');
+      const safeFileStem = wineLabel.replace(/\s+/g, '');
+      const archivePath = path.join(
+        tempDir,
+        isDmg ? `${safeFileStem}.dmg` : `${safeFileStem}.tar.xz`
+      );
       await streamVerifiedDownloadToFile(
         assetUrl,
         archivePath,
         {
           ...progressCtx,
-          label: 'Wine Stable',
+          label: wineLabel,
           minFreeBytes: 800 * 1024 * 1024,
         },
         options,
@@ -2046,11 +4855,16 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           {
             ...progressCtx,
             phase: 'verifying_signature',
-            message: 'Verifying Wine Stable archive SHA-256 checksum...',
+            message: `Verifying ${wineLabel} archive SHA-256 checksum...`,
           },
           options
         );
         await verifyFileSha256Async(archivePath, expectedSha256);
+      } else if (!isTestEnvironment(options) && options.allowUnverifiedArchiveDigest !== true) {
+        await fs.promises.rm(archivePath, { force: true }).catch(() => {});
+        throw new Error(
+          `Refusing to extract ${wineLabel} archive without a cryptographic SHA-256 digest.`
+        );
       }
 
       if (isDmg) {
@@ -2058,23 +4872,44 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           {
             ...progressCtx,
             phase: 'verifying_signature',
-            message: 'Verifying Wine Stable code signature integrity...',
+            message: `Verifying ${wineLabel} code signature integrity...`,
           },
           options
         );
+        const preSwapSafe = await assertRunnerSafeToReplace(
+          effectiveRunnerType,
+          existingTargetAppPath,
+          existingLayer,
+          options
+        );
+        throwIfRunnerBusy(preSwapSafe);
+
         const installedPath = await mountVerifyAndInstallDmgApp(
           archivePath,
           targetAppsDir,
           [],
           null,
-          { ...options, _componentId: componentId, allowAdhocSignature: true }
+          {
+            ...options,
+            _componentId: componentId,
+            allowAdhocSignature: true,
+            prepareUnsignedWineBundle: true,
+            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+          }
         );
+        if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
+          recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+            ...options,
+            homedir,
+          });
+        }
         invalidateScanCaches();
         return {
           success: true,
           installed: true,
           installedPath,
-          message: `Installed Wine Stable to ${installedPath}.`,
+          ...(resolvedVersion ? { version: resolvedVersion } : {}),
+          message: `Installed ${wineLabel} to ${installedPath}.`,
         };
       }
 
@@ -2084,7 +4919,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         {
           ...progressCtx,
           phase: 'extracting',
-          message: 'Extracting Wine Stable archive...',
+          message: `Extracting ${wineLabel} archive...`,
         },
         options
       );
@@ -2102,46 +4937,243 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
 
       const stagedApp = await findStagedAppBundle(stagingDir);
       if (!stagedApp) {
-        throw new Error('Wine Stable.app was not found inside the downloaded archive.');
+        throw new Error(`${wineLabel}.app was not found inside the downloaded archive.`);
       }
 
       emitEnvironmentSetupProgress(
         {
           ...progressCtx,
           phase: 'verifying_signature',
-          message: 'Verifying Wine Stable code signature integrity...',
+          message: `Verifying ${wineLabel} code signature integrity...`,
         },
         options
       );
-      await verifyMacAppDeveloperSignature(stagedApp, [], {
-        ...options,
-        _componentId: componentId,
-        allowAdhocSignature: true,
-      });
+      await verifyAndPrepareStagedWineApp(stagedApp);
+
+      return await atomicSwapVerifiedApp(stagedApp, wineLabel, resolvedVersion);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Apple Game Porting Toolkit (`gptk`: Apple Silicon macOS 14+)
+    // -----------------------------------------------------------------------
+    if (effectiveRunnerType === 'gptk') {
+      emitEnvironmentSetupProgress(
+        {
+          ...progressCtx,
+          phase: 'probing',
+          message: 'Resolving latest Apple Game Porting Toolkit release...',
+        },
+        options
+      );
+
+      let assetUrl = '';
+      let resolvedVersion = /** @type {string | null} */ (null);
+      let expectedSha256 =
+        typeof options.expectedSha256 === 'string' &&
+        /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
+          ? options.expectedSha256.trim().toLowerCase()
+          : '';
+
+      const ghTxt = await fetchValidatedText(
+        'https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest',
+        options,
+        signal
+      );
+      const ghJson = JSON.parse(ghTxt);
+      const rawTag = String(ghJson?.tag_name || ghJson?.name || '')
+        .replace(/^game-porting-toolkit[-_]?v?/i, '')
+        .replace(/^v/i, '')
+        .trim();
+      if (rawTag) {
+        const tagVerMatch = rawTag.match(/(\d+\.\d+(?:\.\d+)?(?:[-_][0-9A-Za-z.]+)?)/);
+        resolvedVersion = tagVerMatch ? tagVerMatch[1] : rawTag;
+      }
+      const assets = Array.isArray(ghJson?.assets) ? ghJson.assets : [];
+      const matchedAsset =
+        assets.find((/** @type {any} */ a) =>
+          /\.(?:tar\.xz|txz)$/i.test(String(a?.name || ''))
+        ) ||
+        assets.find((/** @type {any} */ a) => /\.dmg$/i.test(String(a?.name || '')));
+      if (matchedAsset?.browser_download_url) {
+        assetUrl = validateInstallerUrl(
+          String(matchedAsset.browser_download_url).trim(),
+          options
+        );
+        const rawDigest = String(matchedAsset?.digest || '').trim();
+        if (!expectedSha256 && /^sha256:[a-f0-9]{64}$/i.test(rawDigest)) {
+          expectedSha256 = rawDigest.slice(7).toLowerCase();
+        }
+      }
+
+      if (!assetUrl) {
+        throw new Error(
+          'Could not resolve Apple Game Porting Toolkit download asset from GitHub release feed.'
+        );
+      }
+
+      // Cross-check SHA-256 against Gcenx homebrew-wine cask when available
+      try {
+        const caskRb = await fetchValidatedText(
+          'https://raw.githubusercontent.com/Gcenx/homebrew-wine/master/Casks/game-porting-toolkit.rb',
+          options,
+          signal
+        );
+        const shaMatch = caskRb.match(/\bsha256\s+["']([a-f0-9]{64})["']/i);
+        const verMatch = caskRb.match(/\bversion\s+["']([^"']+)["']/i);
+        const caskSha = shaMatch ? shaMatch[1].toLowerCase() : '';
+        const caskVer = verMatch ? verMatch[1].trim() : '';
+        if (caskSha) {
+          const sameRelease =
+            !caskVer ||
+            !resolvedVersion ||
+            resolvedVersion === caskVer ||
+            assetUrl.includes(caskVer);
+          if (sameRelease) {
+            if (expectedSha256 && expectedSha256 !== caskSha) {
+              throw new Error(
+                `Game Porting Toolkit SHA-256 mismatch between GitHub release (${expectedSha256}) and cask (${caskSha}).`
+              );
+            }
+            if (!expectedSha256) {
+              expectedSha256 = caskSha;
+            }
+          }
+        }
+      } catch (err) {
+        if (
+          isFatalSecurityOrAbortError(err, signal) ||
+          /SHA-256 mismatch between GitHub release/i.test(String(err?.message || ''))
+        ) {
+          throw err;
+        }
+      }
+
+      const isDmg = /\.dmg(?:\?|$)/i.test(assetUrl);
+      const archivePath = path.join(
+        tempDir,
+        isDmg ? 'GamePortingToolkit.dmg' : 'GamePortingToolkit.tar.xz'
+      );
+      await streamVerifiedDownloadToFile(
+        assetUrl,
+        archivePath,
+        {
+          ...progressCtx,
+          label: 'Apple Game Porting Toolkit',
+          minFreeBytes: 900 * 1024 * 1024,
+        },
+        options,
+        signal
+      );
+
+      if (expectedSha256) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: 'Verifying Game Porting Toolkit archive SHA-256 checksum...',
+          },
+          options
+        );
+        await verifyFileSha256Async(archivePath, expectedSha256);
+      } else if (!isTestEnvironment(options) && options.allowUnverifiedArchiveDigest !== true) {
+        await fs.promises.rm(archivePath, { force: true }).catch(() => {});
+        throw new Error(
+          'Refusing to extract Game Porting Toolkit archive without a cryptographic SHA-256 digest.'
+        );
+      }
+
+      if (isDmg) {
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: 'Verifying Apple Game Porting Toolkit bundle...',
+          },
+          options
+        );
+        const preSwapSafe = await assertRunnerSafeToReplace(
+          effectiveRunnerType,
+          existingTargetAppPath,
+          existingLayer,
+          options
+        );
+        throwIfRunnerBusy(preSwapSafe);
+
+        const installedPath = await mountVerifyAndInstallDmgApp(
+          archivePath,
+          targetAppsDir,
+          [],
+          null,
+          {
+            ...options,
+            _componentId: componentId,
+            requireGptkBundle: true,
+            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+          }
+        );
+        if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
+          recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+            ...options,
+            homedir,
+          });
+        }
+        invalidateScanCaches();
+        return {
+          success: true,
+          installed: true,
+          installedPath,
+          ...(resolvedVersion ? { version: resolvedVersion } : {}),
+          message: `Installed Apple Game Porting Toolkit to ${installedPath}.`,
+        };
+      }
+
+      const stagingDir = path.join(tempDir, 'staging');
+      await fs.promises.mkdir(stagingDir, { recursive: true });
+      emitEnvironmentSetupProgress(
+        {
+          ...progressCtx,
+          phase: 'extracting',
+          message: 'Extracting Apple Game Porting Toolkit archive...',
+        },
+        options
+      );
+
+      if (typeof options.onExtractArchive === 'function') {
+        await options.onExtractArchive(archivePath, stagingDir);
+      } else {
+        await runExecFileAsync(
+          execFileFn,
+          '/usr/bin/tar',
+          ['-xf', archivePath, '-C', stagingDir],
+          { timeout: 300000, signal }
+        );
+      }
+
+      const stagedApp = await findStagedAppBundle(stagingDir);
+      if (!stagedApp) {
+        throw new Error(
+          'Game Porting Toolkit.app was not found inside the downloaded archive.'
+        );
+      }
 
       emitEnvironmentSetupProgress(
         {
           ...progressCtx,
-          phase: 'installing',
-          message: `Installing ${path.basename(stagedApp)} to ${targetAppsDir}...`,
+          phase: 'verifying_signature',
+          message: 'Verifying Apple D3DMetal framework signature and preparing bundle...',
         },
         options
       );
-      const installedPath = await copyVerifiedMacAppToApplicationsDir(
+      await verifyAndPrepareStagedGptkApp(stagedApp);
+
+      return await atomicSwapVerifiedApp(
         stagedApp,
-        targetAppsDir,
-        options
+        'Apple Game Porting Toolkit',
+        resolvedVersion
       );
-      invalidateScanCaches();
-      return {
-        success: true,
-        installed: true,
-        installedPath,
-        message: `Installed Wine Stable to ${installedPath}.`,
-      };
     }
 
-    throw new Error(`Unsupported compatibility runner type: ${runnerType}`);
+    throw new Error(`Unsupported compatibility runner type: ${effectiveRunnerType}`);
   } finally {
     try {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -2153,8 +5185,8 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
  * Resolve active runner and bottle path/name for bottle operations on macOS.
  *
  * @param {string} homedir
- * @param {{ runnerType?: string, bottleName?: string }} prefs
- * @param {Record<string, any>} options
+ * @param {{ runnerType?: string, bottleName?: string, gameConfigBottleName?: string }} [prefs]
+ * @param {Record<string, any>} [options]
  * @returns {{ layer: any, bottleName: string, bottlePath: string }}
  */
 function resolveRunnerAndBottleTarget(homedir, prefs = {}, options = {}) {
@@ -2177,14 +5209,13 @@ function resolveRunnerAndBottleTarget(homedir, prefs = {}, options = {}) {
       layer.bottlesDir ||
       path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
     const available = Array.isArray(layer.availableBottles) ? layer.availableBottles : [];
-    const requestedName =
-      prefs.bottleName && safeIsBottleSlug(prefs.bottleName)
-        ? prefs.bottleName.trim()
-        : wizardState.preferredBottleName && safeIsBottleSlug(wizardState.preferredBottleName)
-          ? wizardState.preferredBottleName
-          : available.includes('OneLauncher')
-            ? 'OneLauncher'
-            : available[0] || 'OneLauncher';
+    const requestedName = resolveDefaultChainedBottleName({
+      explicitBottleName: prefs.bottleName,
+      gameConfigBottleName: prefs.gameConfigBottleName,
+      wizardPreferredBottleName: wizardState.preferredBottleName,
+      discoveredBottleNames: available,
+      runnerType: layer.type,
+    });
     return {
       layer,
       bottleName: requestedName,
@@ -2195,12 +5226,65 @@ function resolveRunnerAndBottleTarget(homedir, prefs = {}, options = {}) {
   const prefixSlug =
     prefs.bottleName && safeIsBottleSlug(prefs.bottleName)
       ? prefs.bottleName.trim()
-      : 'default';
+      : wizardState.preferredRunnerType === layer.type &&
+          wizardState.preferredBottleName &&
+          safeIsBottleSlug(wizardState.preferredBottleName)
+        ? wizardState.preferredBottleName
+        : 'default';
   return {
     layer,
     bottleName: prefixSlug,
     bottlePath: path.join(homedir, 'Games/OneLauncher/Prefixes', prefixSlug),
   };
+}
+
+/**
+ * Resolve Battle.net's background `Agent.exe` inside a Wine/CrossOver bottle (`ProgramData/Battle.net/Agent/Agent.exe`).
+ *
+ * @param {string} bottlePath
+ * @param {number} [minBytes=1]
+ * @returns {string | null}
+ */
+function resolveBottleBattleNetAgentExe(bottlePath, minBytes = 1) {
+  if (!bottlePath || typeof bottlePath !== 'string') return null;
+  const candidate = resolveDriveCPathCaseInsensitive(path.join(bottlePath, 'drive_c'), [
+    'ProgramData',
+    'Battle.net',
+    'Agent',
+    'Agent.exe',
+  ]);
+  if (!candidate) return null;
+  try {
+    const st = fs.statSync(candidate);
+    if (st.isFile() && st.size >= Math.max(1, minBytes)) {
+      return candidate;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Determine whether a Windows or Wine/CrossOver installer exit code indicates a benign success
+ * condition (`0`, `3010` reboot required, `1641` reboot initiated, `1638` newer version already
+ * present) — including POSIX 8-bit `waitpid` truncation (`exitCode & 0xFF`: `194`, `105`, `102`)
+ * when executed inside Wine/CrossOver on macOS/Linux.
+ *
+ * @param {unknown} exitCode
+ * @param {boolean} [isWinePosix=false]
+ * @returns {boolean}
+ */
+function isBenignWindowsInstallerExitCode(exitCode, isWinePosix = false) {
+  if (exitCode === null || exitCode === undefined || exitCode === '') return false;
+  if (typeof exitCode === 'boolean') return false;
+  const code = Number(exitCode);
+  if (!Number.isFinite(code)) return false;
+  if (code === 0 || code === 3010 || code === 1641 || code === 1638) {
+    return true;
+  }
+  if (isWinePosix && (code === 194 || code === 105 || code === 102)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -2227,15 +5311,88 @@ async function runBottleInstallerAndWait(
 ) {
   const timeoutMs = Number(options.clientInstallTimeoutMs || 300000);
   const pollMs = Number(options.bottlePollIntervalMs || (isTestEnvironment(options) ? 40 : 600));
+  const minBinaryBytes = Math.max(
+    1,
+    Number(options.minBinaryBytes ?? (isTestEnvironment(options) ? 1 : 4096))
+  );
+  const minBinaryStableMs = Math.max(0, Number(options.minBinaryStableMs || 0));
+  const companionFilesFn =
+    typeof options.companionFilesFn === 'function' ? options.companionFilesFn : null;
   const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
 
+  const customEnvOverrides =
+    options.wineEnvOverrides && typeof options.wineEnvOverrides === 'object'
+      ? options.wineEnvOverrides
+      : {};
+  const installerDefaultDisablePrefix = options.preserveMscoree ? 'mshtml=d' : 'mscoree,mshtml=d';
+  const mergedWineDllOverrides = customEnvOverrides.WINEDLLOVERRIDES
+    ? `${installerDefaultDisablePrefix};${customEnvOverrides.WINEDLLOVERRIDES}`
+    : `${installerDefaultDisablePrefix};winemenubuilder.exe=d`;
+
+  /** @type {Record<string, any>} */
   const env = {
     ...process.env,
     WINEPREFIX: bottlePath,
-    WINEDLLOVERRIDES: 'mscoree,mshtml=d;winemenubuilder.exe=d',
+    ...customEnvOverrides,
+    WINEDLLOVERRIDES: mergedWineDllOverrides,
     ...(layer.type === 'crossover' || layer.type === 'crossover_preview'
       ? { CX_BOTTLE: bottleName }
       : {}),
+  };
+  alignWineMsyncWithLiveBottle(bottlePath, env);
+  prepareCrossOverWineSpawnEnv(layer.binaryPath, env);
+  applyCrossOverEnvironmentHygiene(env, {
+    wineBinaryPath: layer.binaryPath,
+    compatLayer: layer,
+    layerType: layer.type,
+    homedir: options.homedir,
+    platform: 'darwin',
+  });
+
+  const isCxPerlWrapper = isCrossOverPerlWineWrapperOptions({
+    binaryPath: layer.binaryPath,
+    layerType: layer.type,
+  });
+  const trimmedDllOverrides = String(mergedWineDllOverrides || '').trim();
+  const spawnWineArgs =
+    isCxPerlWrapper && trimmedDllOverrides && !wineArgs.includes('--dll')
+      ? ['--dll', trimmedDllOverrides, ...wineArgs]
+      : wineArgs;
+
+  const inspectCandidateStability = () => {
+    const found = checkInstalledFn();
+    if (!found) return null;
+    /** @type {fs.Stats | null} */
+    let st = null;
+    try {
+      st = fs.statSync(found);
+    } catch {
+      st = null;
+    }
+    if (!st || !st.isFile() || st.size < minBinaryBytes) return null;
+    const parts = [`${found}:${st.size}`];
+    if (companionFilesFn) {
+      const companions = companionFilesFn();
+      if (!Array.isArray(companions)) return null;
+      for (const compPath of companions) {
+        if (!compPath || typeof compPath !== 'string') return null;
+        /** @type {fs.Stats | null} */
+        let compStat = null;
+        try {
+          compStat = fs.statSync(compPath);
+        } catch {
+          compStat = null;
+        }
+        if (!compStat || !compStat.isFile() || compStat.size < minBinaryBytes) {
+          return null;
+        }
+        parts.push(`${compPath}:${compStat.size}`);
+      }
+    }
+    return {
+      found,
+      signature: parts.join('|'),
+    };
   };
 
   if (typeof options.execBottleInstallerFn === 'function') {
@@ -2254,6 +5411,9 @@ async function runBottleInstallerAndWait(
     let settled = false;
     let hasRealChildPid = false;
     let childExited = false;
+    let stableSignature = '';
+    let stableSinceMs = 0;
+    let stableCandidateHits = 0;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let postExitTimer = null;
     /** @type {any} */
@@ -2305,37 +5465,83 @@ async function runBottleInstallerAndWait(
     }
 
     const pollTimer = setInterval(() => {
-      if (hasRealChildPid && !childExited && options.resolveOnBinaryAppear !== true) {
+      if (hasRealChildPid && !childExited) {
+        if (options.resolveOnBinaryAppear !== true) {
+          return;
+        }
+        const snap = inspectCandidateStability();
+        if (!snap) {
+          stableSignature = '';
+          stableSinceMs = 0;
+          stableCandidateHits = 0;
+          return;
+        }
+        const now = Date.now();
+        if (snap.signature === stableSignature) {
+          stableCandidateHits += 1;
+        } else {
+          stableSignature = snap.signature;
+          stableSinceMs = now;
+          stableCandidateHits = 1;
+        }
+        const elapsedStableMs = stableSinceMs > 0 ? now - stableSinceMs : 0;
+        if (stableCandidateHits >= 2 && elapsedStableMs >= minBinaryStableMs) {
+          if (child && typeof child.unref === 'function') {
+            try {
+              child.unref();
+            } catch {}
+          }
+          finishOk(snap.found);
+        }
         return;
       }
-      const found = checkInstalledFn();
+      const snap = companionFilesFn ? inspectCandidateStability() : null;
+      const found = companionFilesFn ? snap?.found || null : checkInstalledFn();
       if (found) {
         finishOk(found);
       }
     }, pollMs);
 
     const timeoutTimer = setTimeout(() => {
-      const found = checkInstalledFn();
+      const snap = companionFilesFn ? inspectCandidateStability() : null;
+      const found = companionFilesFn ? snap?.found || null : checkInstalledFn();
       if (found) finishOk(found);
       else finishErr(new Error('Timed out waiting for bottled client installer to complete.'));
     }, timeoutMs);
 
     try {
-      child = spawnImpl(layer.binaryPath, wineArgs, {
+      child = spawnImpl(layer.binaryPath, spawnWineArgs, {
         env,
         stdio: 'ignore',
       });
       hasRealChildPid = Boolean(child && typeof child.pid === 'number');
+      if (!hasRealChildPid || childExited) {
+        const snap = companionFilesFn ? inspectCandidateStability() : null;
+        const syncFound = companionFilesFn ? snap?.found || null : checkInstalledFn();
+        if (syncFound) {
+          finishOk(syncFound);
+          return;
+        }
+      } else if (options.resolveOnBinaryAppear === true) {
+        const snap = inspectCandidateStability();
+        if (snap) {
+          stableSignature = snap.signature;
+          stableSinceMs = Date.now();
+          stableCandidateHits = 1;
+        }
+      }
       if (child && typeof child.on === 'function') {
         child.on('error', (/** @type {any} */ err) => {
           childExited = true;
-          const found = checkInstalledFn();
+          const snap = companionFilesFn ? inspectCandidateStability() : null;
+          const found = companionFilesFn ? snap?.found || null : checkInstalledFn();
           if (found) finishOk(found);
           else finishErr(err instanceof Error ? err : new Error(String(err)));
         });
         child.on('exit', (/** @type {number | null} */ code) => {
           childExited = true;
-          const found = checkInstalledFn();
+          const snap = companionFilesFn ? inspectCandidateStability() : null;
+          const found = companionFilesFn ? snap?.found || null : checkInstalledFn();
           if (found) {
             finishOk(found);
             return;
@@ -2349,10 +5555,11 @@ async function runBottleInstallerAndWait(
           }
           postExitTimer = setTimeout(() => {
             postExitTimer = null;
-            const afterFlush = checkInstalledFn();
+            const afterSnap = companionFilesFn ? inspectCandidateStability() : null;
+            const afterFlush = companionFilesFn ? afterSnap?.found || null : checkInstalledFn();
             if (afterFlush) {
               finishOk(afterFlush);
-            } else if (code !== 0 && code !== null) {
+            } else if (code !== null && !isBenignWindowsInstallerExitCode(code, true)) {
               finishErr(
                 new Error(
                   `Installer exited with code ${code} before client binary was created.`
@@ -2366,6 +5573,321 @@ async function runBottleInstallerAndWait(
       finishErr(err instanceof Error ? err : new Error(String(err)));
     }
   });
+}
+
+/**
+ * Ensure a macOS CrossOver / Wine / GPTK bottle directory is initialized and sandboxed
+ * before installing a bottled storefront or publisher client.
+ *
+ * @param {any} layer
+ * @param {string} bottleName
+ * @param {string} bottlePath
+ * @param {Record<string, any>} [options]
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<void>}
+ */
+async function ensureBottleInitializedInternal(
+  layer,
+  bottleName,
+  bottlePath,
+  options = {},
+  signal = undefined
+) {
+  const execFileFn = getExecFileFn(options);
+  const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
+
+  if (layer.type === 'crossover' || layer.type === 'crossover_preview') {
+    if (!isValidBottleDirectory(bottlePath, isMockHomedir)) {
+      const cxbottleCandidates = [
+        layer.binaryPath ? path.join(path.dirname(layer.binaryPath), 'cxbottle') : '',
+        '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
+        '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
+      ].filter(Boolean);
+      const cxbottleBin =
+        cxbottleCandidates.find((p) => fs.existsSync(p)) ||
+        (typeof options.execFileFn === 'function' ? cxbottleCandidates[0] : '');
+
+      await fs.promises.mkdir(path.dirname(bottlePath), { recursive: true });
+      if (cxbottleBin) {
+        const cxbottleEnv = applyCrossOverEnvironmentHygiene(
+          { ...process.env },
+          {
+            wineBinaryPath: layer.binaryPath || cxbottleBin,
+            compatLayer: layer,
+            layerType: layer.type,
+            homedir: options.homedir,
+            platform: 'darwin',
+          }
+        );
+        try {
+          await runExecFileAsync(
+            execFileFn,
+            cxbottleBin,
+            ['--bottle', bottleName, '--create', '--template', 'win10_64'],
+            { timeout: 60000, env: cxbottleEnv, signal }
+          );
+        } catch {}
+      }
+    }
+    await ensureCompatibilityLayerReady(
+      layer,
+      { wineBottleName: bottleName },
+      {},
+      options
+    );
+    sanitizeProvisionedBottleGraphicsBackend(bottlePath);
+    await sandboxWinePrefixUserFoldersAsync(bottlePath, options);
+    return;
+  }
+
+  await fs.promises.mkdir(bottlePath, { recursive: true });
+  const sysRegPath = path.join(bottlePath, 'system.reg');
+  const sys32Dir = path.join(bottlePath, 'drive_c/windows/system32');
+
+  if (!fs.existsSync(sysRegPath)) {
+    const bootEnv = {
+      ...process.env,
+      WINEPREFIX: bottlePath,
+      WINEDLLOVERRIDES: 'mscoree,mshtml=d;winemenubuilder.exe=d',
+    };
+    const alignedBoot = prepareAlignedAuxBottleWineCommand({
+      wineBinary: layer.binaryPath,
+      bottlePath,
+      env: bootEnv,
+      suppressGuiDialogs: true,
+      layerType: layer.type,
+    });
+    try {
+      await runExecFileAsync(execFileFn, alignedBoot.binaryPath, ['wineboot', '-u'], {
+        timeout: 45000,
+        env: alignedBoot.env,
+        signal,
+      });
+    } catch {}
+
+    const initTimeoutMs = Number(
+      options.bottleInitTimeoutMs ?? (isTestEnvironment(options) ? 200 : 30000)
+    );
+    const pollStepMs = isTestEnvironment(options) ? 25 : 250;
+    const deadline = Date.now() + initTimeoutMs;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      if (fs.existsSync(sysRegPath) && fs.existsSync(sys32Dir)) break;
+      await new Promise((r) => setTimeout(r, pollStepMs));
+    }
+  }
+  await sandboxWinePrefixUserFoldersAsync(bottlePath, options);
+}
+
+/**
+ * Download, Authenticode/PKCS#7-verify, silently install, and post-verify a chained publisher
+ * launcher (`ubisoft`, `ea`, `bnet`, `rockstar`, `riot`) on Windows host or inside a macOS bottle.
+ *
+ * @param {{
+ *   handoffId: 'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot',
+ *   scope: 'host' | 'bottle',
+ *   componentId: EnvironmentComponentId,
+ *   progressBase: { runId: string, componentId: EnvironmentComponentId, stepIndex: number, totalSteps: number },
+ *   tempDir: string,
+ *   layer?: any,
+ *   bottleName?: string,
+ *   bottlePath?: string,
+ *   signal?: AbortSignal,
+ * }} ctx
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ binaryPath: string, installDir: string }>}
+ */
+async function provisionVerifiedChainedPublisherClient(ctx, options = {}) {
+  const {
+    handoffId,
+    scope,
+    componentId,
+    progressBase,
+    tempDir,
+    layer,
+    bottleName = 'OneLauncher',
+    bottlePath = '',
+    signal,
+  } = ctx;
+
+  const ecosystem = CHAINED_PUBLISHER_ECOSYSTEMS[handoffId];
+  if (!ecosystem || !ecosystem.installerUrl || !ecosystem.installerFileName) {
+    throw new Error(`No verified installer descriptor configured for publisher "${handoffId}".`);
+  }
+
+  const stagedExe = path.join(tempDir, ecosystem.installerFileName);
+  const minFreeBytes = Math.max(350, (ecosystem.estimatedDownloadMB || 200) * 2) * 1024 * 1024;
+
+  await streamVerifiedDownloadToFile(
+    ecosystem.installerUrl,
+    stagedExe,
+    {
+      ...progressBase,
+      label: `${ecosystem.displayName} Installer`,
+      minFreeBytes,
+    },
+    options,
+    signal
+  );
+
+  emitEnvironmentSetupProgress(
+    {
+      ...progressBase,
+      phase: 'verifying_signature',
+      message: `Verifying ${ecosystem.displayName} Authenticode signature...`,
+    },
+    options
+  );
+  await verifyWindowsInstallerSignature(stagedExe, {
+    ...options,
+    platform: scope === 'bottle' ? 'darwin' : 'win32',
+    kind: 'exe',
+    _componentId: componentId,
+  });
+
+  if (scope === 'host') {
+    const execFileFn = getExecFileFn(options);
+    emitEnvironmentSetupProgress(
+      {
+        ...progressBase,
+        phase: 'installing',
+        message: `Installing ${ecosystem.displayName} silently...`,
+      },
+      options
+    );
+    try {
+      await runExecFileAsync(execFileFn, stagedExe, [...(ecosystem.silentArgs || [])], {
+        timeout: 300000,
+        windowsHide: true,
+        signal,
+      });
+    } catch (/** @type {any} */ execErr) {
+      if (!isBenignWindowsInstallerExitCode(execErr?.code, false)) {
+        throw execErr;
+      }
+    }
+
+    const hostProbeOpts = {
+      ...options,
+      ...explicitHomedirOpt(options),
+      platform: 'win32',
+    };
+    let afterHost = discoverHostPublisherLauncher(handoffId, hostProbeOpts);
+    if (!afterHost.installed || !afterHost.binaryPath) {
+      const waitMs = Number(
+        options.hostPostInstallWaitMs ?? (isTestEnvironment(options) ? 80 : 12000)
+      );
+      const stepMs = isTestEnvironment(options) ? 20 : 400;
+      const deadline = Date.now() + Math.max(0, waitMs);
+      while (Date.now() < deadline && (!afterHost.installed || !afterHost.binaryPath)) {
+        if (signal?.aborted) break;
+        await new Promise((r) => setTimeout(r, stepMs));
+        afterHost = discoverHostPublisherLauncher(handoffId, hostProbeOpts);
+      }
+    }
+    if (!afterHost.installed || !afterHost.binaryPath) {
+      throw new Error(
+        `${ecosystem.displayName} installer finished, but the launcher executable could not be verified on disk.`
+      );
+    }
+    return {
+      binaryPath: afterHost.binaryPath,
+      installDir: afterHost.installDir || path.dirname(afterHost.binaryPath),
+    };
+  }
+
+  if (handoffId === 'bnet' && bottlePath) {
+    try {
+      upsertWineUserRegKey(
+        bottlePath,
+        'Software\\Wine\\DllOverrides',
+        { 'systemsurvey.exe': '' },
+        { skipLiveWineRegSync: true }
+      );
+    } catch {}
+  }
+
+  const bottleTempDir = path.join(bottlePath, 'drive_c/windows/temp');
+  await fs.promises.mkdir(bottleTempDir, { recursive: true });
+  const bottleSetupExe = path.join(bottleTempDir, ecosystem.installerFileName);
+  await fs.promises.copyFile(stagedExe, bottleSetupExe);
+
+  emitEnvironmentSetupProgress(
+    {
+      ...progressBase,
+      phase: 'installing',
+      message: `Installing ${ecosystem.displayName} inside bottle "${bottleName}"...`,
+    },
+    options
+  );
+
+  const defaultPublisherStableMs =
+    handoffId === 'bnet'
+      ? 4000
+      : handoffId === 'ubisoft' || handoffId === 'rockstar'
+        ? 8000
+        : 0;
+  const effectiveMinStableMs = Number(
+    options.minBinaryStableMs ?? options.bottleBinaryStableMs ?? defaultPublisherStableMs
+  );
+  const minBytesForCheck = Math.max(
+    1,
+    Number(options.minBinaryBytes ?? (isTestEnvironment(options) ? 1 : 4096))
+  );
+
+  try {
+    const installedExe = await runBottleInstallerAndWait(
+      layer,
+      bottleName,
+      bottlePath,
+      [`C:\\windows\\temp\\${ecosystem.installerFileName}`, ...(ecosystem.silentArgs || [])],
+      () => {
+        const probed = discoverBottlePublisherLauncher(bottlePath, handoffId);
+        if (!probed.installed || !probed.binaryPath) return null;
+        if (handoffId === 'bnet' && !resolveBottleBattleNetAgentExe(bottlePath, minBytesForCheck)) {
+          return null;
+        }
+        return probed.binaryPath;
+      },
+      {
+        ...options,
+        resolveOnBinaryAppear: true,
+        minBinaryStableMs: effectiveMinStableMs,
+        ...(handoffId === 'bnet'
+          ? {
+              companionFilesFn: () => [
+                resolveBottleBattleNetAgentExe(bottlePath, minBytesForCheck),
+              ],
+            }
+          : {}),
+        preserveMscoree: Boolean(
+          ecosystem.requiresDotNetMscoreeForInstall || options.preserveMscoree
+        ),
+        wineEnvOverrides: ecosystem.wineEnvOverrides || {},
+      },
+      signal
+    );
+
+    if (bottlePath) {
+      sanitizeChainedPublisherAutostartInBottleRegs(bottlePath);
+    }
+
+    const afterBottle = discoverBottlePublisherLauncher(bottlePath, handoffId);
+    const verifiedBin = (afterBottle.installed && afterBottle.binaryPath) || installedExe;
+    if (!verifiedBin || !fs.existsSync(verifiedBin)) {
+      throw new Error(
+        `${ecosystem.displayName} installer finished, but the launcher executable could not be verified inside bottle "${bottleName}".`
+      );
+    }
+    return {
+      binaryPath: verifiedBin,
+      installDir: afterBottle.installDir || path.dirname(verifiedBin),
+    };
+  } finally {
+    try {
+      await fs.promises.rm(bottleSetupExe, { force: true });
+    } catch {}
+  }
 }
 
 /**
@@ -2463,6 +5985,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
       const progressBase = {
         runId,
         componentId,
+        action: task.action,
         stepIndex,
         totalSteps,
       };
@@ -2659,9 +6182,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   { timeout: 180000, windowsHide: true, signal: controller.signal }
                 );
               } catch (/** @type {any} */ execErr) {
-                const code = Number(execErr?.code);
-                // 3010 = ERROR_SUCCESS_REBOOT_REQUIRED, 1638 = newer version already installed
-                if (code !== 3010 && code !== 1638) {
+                if (!isBenignWindowsInstallerExitCode(execErr?.code, false)) {
                   throw execErr;
                 }
               }
@@ -2720,7 +6241,13 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
             ...explicitHomedirOpt(options),
           });
           const alreadyLayer = existingLayers.find((l) => l.type === runnerType);
-          if (alreadyLayer && !options.forceReinstall && !task.dmgPath) {
+          if (
+            alreadyLayer &&
+            !options.forceReinstall &&
+            !task.forceUpdate &&
+            !task.dmgPath &&
+            !task.archivePath
+          ) {
             saveSetupWizardState({ preferredRunnerType: runnerType }, options);
             succeededComponents.push(componentId);
             emitEnvironmentSetupProgress(
@@ -2744,6 +6271,9 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
           const res = await installRunnerDirect(runnerType, {
             ...options,
             dmgPath: task.dmgPath || options.dmgPath,
+            archivePath: task.archivePath || options.archivePath,
+            existingLayer: alreadyLayer || null,
+            _runnerOperation: alreadyLayer ? 'update' : 'install',
             signal: controller.signal,
             _progressCtx: progressBase,
           });
@@ -2766,7 +6296,23 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               message: res.message,
             });
           } else {
-            saveSetupWizardState({ preferredRunnerType: runnerType }, options);
+            const currentWizardState = getSetupWizardState(options);
+            const nextPreferredRunnerType = res.switchedToStableCrossOver
+              ? 'crossover'
+              : runnerType;
+            const shouldSavePreferredRunner =
+              !task.forceUpdate ||
+              !currentWizardState?.preferredRunnerType ||
+              (res.switchedToStableCrossOver &&
+                currentWizardState.preferredRunnerType === 'crossover_preview');
+            if (shouldSavePreferredRunner) {
+              saveSetupWizardState(
+                {
+                  preferredRunnerType: nextPreferredRunnerType,
+                },
+                options
+              );
+            }
             succeededComponents.push(componentId);
             emitEnvironmentSetupProgress(
               {
@@ -2831,12 +6377,22 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
 
               await fs.promises.mkdir(path.dirname(bottlePath), { recursive: true });
               if (cxbottleBin) {
+                const cxbottleEnv = applyCrossOverEnvironmentHygiene(
+                  { ...process.env },
+                  {
+                    wineBinaryPath: layer.binaryPath || cxbottleBin,
+                    compatLayer: layer,
+                    layerType: layer.type,
+                    homedir: options.homedir,
+                    platform: 'darwin',
+                  }
+                );
                 try {
                   await runExecFileAsync(
                     execFileFn,
                     cxbottleBin,
-                    ['--bottle', bottleName, '--create', '--template', 'win10_64', '--default'],
-                    { timeout: 60000, signal: controller.signal }
+                    ['--bottle', bottleName, '--create', '--template', 'win10_64'],
+                    { timeout: 60000, env: cxbottleEnv, signal: controller.signal }
                   );
                 } catch {}
               }
@@ -2847,6 +6403,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               {},
               options
             );
+            sanitizeProvisionedBottleGraphicsBackend(bottlePath);
             await sandboxWinePrefixUserFoldersAsync(bottlePath, options);
           } else {
             await fs.promises.mkdir(bottlePath, { recursive: true });
@@ -2859,10 +6416,17 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                 WINEPREFIX: bottlePath,
                 WINEDLLOVERRIDES: 'mscoree,mshtml=d;winemenubuilder.exe=d',
               };
+              const alignedBoot = prepareAlignedAuxBottleWineCommand({
+                wineBinary: layer.binaryPath,
+                bottlePath,
+                env: bootEnv,
+                suppressGuiDialogs: true,
+                layerType: layer.type,
+              });
               try {
-                await runExecFileAsync(execFileFn, layer.binaryPath, ['wineboot', '-u'], {
+                await runExecFileAsync(execFileFn, alignedBoot.binaryPath, ['wineboot', '-u'], {
                   timeout: 45000,
-                  env: bootEnv,
+                  env: alignedBoot.env,
                   signal: controller.signal,
                 });
               } catch {}
@@ -3011,11 +6575,17 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   { ...progressBase, phase: 'installing', message: 'Installing Steam silently...' },
                   options
                 );
-                await runExecFileAsync(execFileFn, exePath, ['/S'], {
-                  timeout: 180000,
-                  windowsHide: true,
-                  signal: controller.signal,
-                });
+                try {
+                  await runExecFileAsync(execFileFn, exePath, ['/S'], {
+                    timeout: 180000,
+                    windowsHide: true,
+                    signal: controller.signal,
+                  });
+                } catch (/** @type {any} */ execErr) {
+                  if (!isBenignWindowsInstallerExitCode(execErr?.code, false)) {
+                    throw execErr;
+                  }
+                }
                 const installedBin =
                   resolveSteamClientBinaryPath({
                     ...options,
@@ -3276,12 +6846,18 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   },
                   options
                 );
-                await runExecFileAsync(
-                  execFileFn,
-                  exePath,
-                  ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'],
-                  { timeout: 300000, windowsHide: true, signal: controller.signal }
-                );
+                try {
+                  await runExecFileAsync(
+                    execFileFn,
+                    exePath,
+                    ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'],
+                    { timeout: 300000, windowsHide: true, signal: controller.signal }
+                  );
+                } catch (/** @type {any} */ execErr) {
+                  if (!isBenignWindowsInstallerExitCode(execErr?.code, false)) {
+                    throw execErr;
+                  }
+                }
                 try {
                   syncGogFirstPartyLauncher(options);
                 } catch {}
@@ -3541,12 +7117,18 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   },
                   options
                 );
-                await runExecFileAsync(
-                  execFileFn,
-                  'msiexec.exe',
-                  ['/i', msiPath, '/qn', '/norestart'],
-                  { timeout: 300000, windowsHide: true, signal: controller.signal }
-                );
+                try {
+                  await runExecFileAsync(
+                    execFileFn,
+                    'msiexec.exe',
+                    ['/i', msiPath, '/qn', '/norestart'],
+                    { timeout: 300000, windowsHide: true, signal: controller.signal }
+                  );
+                } catch (/** @type {any} */ execErr) {
+                  if (!isBenignWindowsInstallerExitCode(execErr?.code, false)) {
+                    throw execErr;
+                  }
+                }
                 try {
                   syncEpicFirstPartyLauncher(options);
                 } catch {}
@@ -3690,6 +7272,210 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               continue;
             }
 
+            // G) Chained Publisher Launchers (Ubisoft Connect, EA App, Battle.net, Rockstar, Riot)
+            if (
+              componentId === 'host_ubisoft' ||
+              componentId === 'bottle_ubisoft' ||
+              componentId === 'host_ea' ||
+              componentId === 'bottle_ea' ||
+              componentId === 'host_bnet' ||
+              componentId === 'bottle_bnet' ||
+              componentId === 'host_rockstar' ||
+              componentId === 'bottle_rockstar' ||
+              componentId === 'host_riot'
+            ) {
+              const pubHandoffId = /** @type {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} */ (
+                normalizeChainedHandoffId(componentId)
+              );
+              const pubEcosystem = CHAINED_PUBLISHER_ECOSYSTEMS[pubHandoffId];
+              const isBottleScope = componentId.startsWith('bottle_');
+
+              if (isBottleScope) {
+                if (hostPlatform !== 'darwin') {
+                  emitEnvironmentSetupProgress(
+                    {
+                      ...progressBase,
+                      phase: 'skipped',
+                      message: `${pubEcosystem.displayName} bottle installation is only applicable on macOS.`,
+                    },
+                    options
+                  );
+                  outcomes.push({
+                    componentId,
+                    action: task.action,
+                    status: 'skipped',
+                    message: `${pubEcosystem.displayName} bottle installation is only applicable on macOS.`,
+                  });
+                  continue;
+                }
+
+                const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+                  homedir,
+                  { runnerType: task.runnerType, bottleName: task.bottleName },
+                  options
+                );
+                await ensureBottleInitializedInternal(
+                  layer,
+                  bottleName,
+                  bottlePath,
+                  options,
+                  controller.signal
+                );
+
+                const existingBottlePub = discoverBottlePublisherLauncher(bottlePath, pubHandoffId);
+                if (existingBottlePub.installed && existingBottlePub.binaryPath && !options.forceReinstall) {
+                  succeededComponents.push(componentId);
+                  emitEnvironmentSetupProgress(
+                    {
+                      ...progressBase,
+                      phase: 'skipped',
+                      message: `${pubEcosystem.displayName} is already installed in "${bottleName}".`,
+                    },
+                    options
+                  );
+                  outcomes.push({
+                    componentId,
+                    action: task.action,
+                    status: 'skipped',
+                    installedPath: existingBottlePub.binaryPath,
+                    message: `${pubEcosystem.displayName} is already installed in "${bottleName}".`,
+                  });
+                  continue;
+                }
+
+                const provisionedBottle = await provisionVerifiedChainedPublisherClient(
+                  {
+                    handoffId: pubHandoffId,
+                    scope: 'bottle',
+                    componentId,
+                    progressBase,
+                    tempDir,
+                    layer,
+                    bottleName,
+                    bottlePath,
+                    signal: controller.signal,
+                  },
+                  options
+                );
+
+                succeededComponents.push(componentId);
+                emitEnvironmentSetupProgress(
+                  {
+                    ...progressBase,
+                    phase: 'completed',
+                    progressPercent: 100,
+                    message: `Installed ${pubEcosystem.displayName} in bottle "${bottleName}".`,
+                  },
+                  options
+                );
+                outcomes.push({
+                  componentId,
+                  action: task.action,
+                  status: 'completed',
+                  installedPath: provisionedBottle.binaryPath,
+                  message: `Installed ${pubEcosystem.displayName} in bottle "${bottleName}".`,
+                });
+                continue;
+              }
+
+              // Host scope
+              const existingHostPub = discoverHostPublisherLauncher(pubHandoffId, {
+                ...options,
+                ...explicitHomedirOpt(options),
+                platform: hostPlatform,
+              });
+              if (existingHostPub.installed && existingHostPub.binaryPath && !options.forceReinstall) {
+                succeededComponents.push(componentId);
+                emitEnvironmentSetupProgress(
+                  {
+                    ...progressBase,
+                    phase: 'skipped',
+                    message: `${pubEcosystem.displayName} is already installed.`,
+                  },
+                  options
+                );
+                outcomes.push({
+                  componentId,
+                  action: task.action,
+                  status: 'skipped',
+                  installedPath: existingHostPub.binaryPath,
+                  message: `${pubEcosystem.displayName} is already installed.`,
+                });
+                continue;
+              }
+
+              if (hostPlatform === 'darwin' && componentId === 'host_bnet') {
+                const extUrl = 'https://download.battle.net/?product=bnetdesk';
+                await openExternalUri(extUrl, options);
+                emitEnvironmentSetupProgress(
+                  {
+                    ...progressBase,
+                    phase: 'completed',
+                    openedExternalUrl: extUrl,
+                    message: 'Opened Battle.net for macOS download page.',
+                  },
+                  options
+                );
+                outcomes.push({
+                  componentId,
+                  action: task.action,
+                  status: 'opened_external',
+                  openedExternalUrl: extUrl,
+                  message: 'Opened Battle.net for macOS download page.',
+                });
+                continue;
+              }
+
+              if (hostPlatform !== 'win32') {
+                emitEnvironmentSetupProgress(
+                  {
+                    ...progressBase,
+                    phase: 'skipped',
+                    message: `${pubEcosystem.displayName} native host client is only applicable on Windows.`,
+                  },
+                  options
+                );
+                outcomes.push({
+                  componentId,
+                  action: task.action,
+                  status: 'skipped',
+                  message: `${pubEcosystem.displayName} native host client is only applicable on Windows.`,
+                });
+                continue;
+              }
+
+              const provisionedHost = await provisionVerifiedChainedPublisherClient(
+                {
+                  handoffId: pubHandoffId,
+                  scope: 'host',
+                  componentId,
+                  progressBase,
+                  tempDir,
+                  signal: controller.signal,
+                },
+                options
+              );
+
+              succeededComponents.push(componentId);
+              emitEnvironmentSetupProgress(
+                {
+                  ...progressBase,
+                  phase: 'completed',
+                  progressPercent: 100,
+                  message: `Installed ${pubEcosystem.displayName}.`,
+                },
+                options
+              );
+              outcomes.push({
+                componentId,
+                action: task.action,
+                status: 'completed',
+                installedPath: provisionedHost.binaryPath,
+                message: `Installed ${pubEcosystem.displayName}.`,
+              });
+              continue;
+            }
+
             throw new Error(`Unsupported client componentId: ${componentId}`);
           } finally {
             try {
@@ -3802,6 +7588,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
   invalidateScanCaches();
   const snapshot = await probeEnvironmentHealth({
     ...options,
+    forceRefreshRunnerUpdates: true,
     ...(Array.isArray(payload?.connectedStorefronts)
       ? { connectedStorefronts: payload.connectedStorefronts }
       : {}),
@@ -3877,17 +7664,34 @@ async function closeForegroundClientGracefully(
   const execFileFn = getExecFileFn(options);
   try {
     if (probeState.scope === 'bottle' && probeState.bottlePath && bottleLayer?.binaryPath) {
+      /** @type {Record<string, any>} */
       const bottleEnv = {
         ...process.env,
         WINEPREFIX: probeState.bottlePath,
         ...(probeState.bottleName ? { CX_BOTTLE: probeState.bottleName } : {}),
       };
+      applyCrossOverEnvironmentHygiene(bottleEnv, {
+        wineBinaryPath: bottleLayer.binaryPath,
+        compatLayer: bottleLayer,
+        layerType: bottleLayer.type,
+        homedir: options.homedir,
+        platform: 'darwin',
+      });
+      const alignedClose = prepareAlignedAuxBottleWineCommand({
+        wineBinary: bottleLayer.binaryPath,
+        bottlePath: probeState.bottlePath,
+        env: bottleEnv,
+        suppressGuiDialogs: true,
+        layerType: bottleLayer.type,
+      });
+      const closeWineBin = alignedClose.binaryPath;
+      const closeBottleEnv = alignedClose.env;
       if (targetId === 'bottle_steam' && probeState.binaryPath) {
         await runExecFileAsync(
           execFileFn,
-          bottleLayer.binaryPath,
+          closeWineBin,
           [probeState.binaryPath, '-shutdown'],
-          { timeout: 15000, env: bottleEnv }
+          { timeout: 15000, env: closeBottleEnv }
         ).catch(() => {});
         await shutdownWinePrefix(bottleLayer.binaryPath, probeState.bottlePath, 5000, {
           bottleName: probeState.bottleName,
@@ -3899,9 +7703,9 @@ async function closeForegroundClientGracefully(
         if (probeState.binaryPath) {
           await runExecFileAsync(
             execFileFn,
-            bottleLayer.binaryPath,
+            closeWineBin,
             [probeState.binaryPath, '/command=shutdown'],
-            { timeout: 8000, env: bottleEnv }
+            { timeout: 8000, env: closeBottleEnv }
           ).catch(() => {});
           const settleMs = isTestEnvironment(options) ? 10 : 1200;
           await new Promise((r) => setTimeout(r, settleMs));
@@ -3909,9 +7713,9 @@ async function closeForegroundClientGracefully(
         for (const gogExe of ['GalaxyClient.exe', 'GalaxyCommunication.exe']) {
           await runExecFileAsync(
             execFileFn,
-            bottleLayer.binaryPath,
+            closeWineBin,
             ['taskkill', '/F', '/T', '/IM', gogExe],
-            { timeout: 6000, env: bottleEnv }
+            { timeout: 6000, env: closeBottleEnv }
           ).catch(() => {});
         }
         await shutdownWinePrefix(bottleLayer.binaryPath, probeState.bottlePath, 5000, {
@@ -3920,22 +7724,52 @@ async function closeForegroundClientGracefully(
         }).catch(() => {});
         return true;
       }
-      await runExecFileAsync(
-        execFileFn,
-        bottleLayer.binaryPath,
-        ['taskkill', '/IM', 'EpicGamesLauncher.exe'],
-        { timeout: 5000, env: bottleEnv }
-      ).catch(() => {});
-      await runExecFileAsync(
-        execFileFn,
-        bottleLayer.binaryPath,
-        ['taskkill', '/F', '/T', '/IM', 'EpicGamesLauncher.exe'],
-        { timeout: 6000, env: bottleEnv }
-      ).catch(() => {});
+      /** @type {string[]} */
+      const bottleKillImages =
+        targetId === 'bottle_ubisoft'
+          ? ['upc.exe', 'UbisoftConnect.exe', 'UplayWebCore.exe']
+          : targetId === 'bottle_ea'
+            ? [
+                'EADesktop.exe',
+                'EALauncher.exe',
+                'EACefSubProcess.exe',
+                'EALocalHostSvc.exe',
+                'Link2EA.exe',
+                'EABackgroundService.exe',
+              ]
+            : targetId === 'bottle_bnet'
+              ? ['Battle.net.exe', 'Agent.exe']
+              : targetId === 'bottle_rockstar'
+                ? ['Launcher.exe', 'LauncherPatcher.exe', 'SocialClubHelper.exe']
+                : ['EpicGamesLauncher.exe'];
+
+      for (const img of bottleKillImages) {
+        await runExecFileAsync(
+          execFileFn,
+          closeWineBin,
+          ['taskkill', '/IM', img],
+          { timeout: 5000, env: closeBottleEnv }
+        ).catch(() => {});
+        await runExecFileAsync(
+          execFileFn,
+          closeWineBin,
+          ['taskkill', '/F', '/T', '/IM', img],
+          { timeout: 6000, env: closeBottleEnv }
+        ).catch(() => {});
+      }
       await shutdownWinePrefix(bottleLayer.binaryPath, probeState.bottlePath, 5000, {
         bottleName: probeState.bottleName,
         execFileFn,
       }).catch(() => {});
+      if (
+        probeState.bottlePath &&
+        (targetId === 'bottle_ubisoft' ||
+          targetId === 'bottle_ea' ||
+          targetId === 'bottle_bnet' ||
+          targetId === 'bottle_rockstar')
+      ) {
+        sanitizeChainedPublisherAutostartInBottleRegs(probeState.bottlePath);
+      }
       return true;
     }
 
@@ -3945,7 +7779,13 @@ async function closeForegroundClientGracefully(
           ? 'Steam'
           : targetId === 'host_gog'
             ? 'GOG Galaxy'
-            : 'Epic Games Launcher';
+            : targetId === 'host_ea'
+              ? 'EA app'
+              : targetId === 'host_bnet'
+                ? 'Battle.net'
+                : targetId === 'host_riot'
+                  ? 'Riot Client'
+                  : 'Epic Games Launcher';
       await runExecFileAsync(
         execFileFn,
         '/usr/bin/osascript',
@@ -3980,19 +7820,43 @@ async function closeForegroundClientGracefully(
         }
         return true;
       }
-      await runExecFileAsync(execFileFn, 'taskkill.exe', ['/IM', 'EpicGamesLauncher.exe'], {
-        timeout: 5000,
-        windowsHide: true,
-      }).catch(() => {});
-      await runExecFileAsync(
-        execFileFn,
-        'taskkill.exe',
-        ['/F', '/T', '/IM', 'EpicGamesLauncher.exe'],
-        {
-          timeout: 6000,
+
+      /** @type {string[]} */
+      const winKillImages =
+        targetId === 'host_ubisoft'
+          ? ['upc.exe', 'UbisoftConnect.exe', 'UplayWebCore.exe']
+          : targetId === 'host_ea'
+            ? [
+                'EADesktop.exe',
+                'EALauncher.exe',
+                'EACefSubProcess.exe',
+                'EALocalHostSvc.exe',
+                'Link2EA.exe',
+                'EABackgroundService.exe',
+              ]
+            : targetId === 'host_bnet'
+              ? ['Battle.net.exe']
+              : targetId === 'host_rockstar'
+                ? ['Launcher.exe', 'LauncherPatcher.exe']
+                : targetId === 'host_riot'
+                  ? ['RiotClientServices.exe', 'RiotClientUx.exe', 'RiotClientCrashHandler.exe']
+                  : ['EpicGamesLauncher.exe'];
+
+      for (const img of winKillImages) {
+        await runExecFileAsync(execFileFn, 'taskkill.exe', ['/IM', img], {
+          timeout: 5000,
           windowsHide: true,
-        }
-      ).catch(() => {});
+        }).catch(() => {});
+        await runExecFileAsync(
+          execFileFn,
+          'taskkill.exe',
+          ['/F', '/T', '/IM', img],
+          {
+            timeout: 6000,
+            windowsHide: true,
+          }
+        ).catch(() => {});
+      }
       return true;
     }
   } catch {}
@@ -4101,15 +7965,48 @@ async function startGuidedClientLogin(payload, options = {}) {
       });
     } else if (initialState.scope === 'bottle' && bottleLayer?.binaryPath) {
       const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
-      const child = spawnImpl(bottleLayer.binaryPath, [initialState.binaryPath], {
-        detached: true,
-        stdio: 'ignore',
-        env: {
-          ...process.env,
-          ...(initialState.bottlePath ? { WINEPREFIX: initialState.bottlePath } : {}),
-          ...(initialState.bottleName ? { CX_BOTTLE: initialState.bottleName } : {}),
-        },
+      const pubHandoffId = normalizeChainedHandoffId(targetId);
+      const pubDescriptor = pubHandoffId ? CHAINED_PUBLISHER_ECOSYSTEMS[pubHandoffId] : null;
+      const extraClientArgs = pubDescriptor?.wineClientArgs ? [...pubDescriptor.wineClientArgs] : [];
+      const extraEnvOverrides = pubDescriptor?.wineEnvOverrides
+        ? { ...pubDescriptor.wineEnvOverrides }
+        : {};
+      /** @type {Record<string, any>} */
+      const guidedBottleEnv = {
+        ...process.env,
+        ...(initialState.bottlePath ? { WINEPREFIX: initialState.bottlePath } : {}),
+        ...(initialState.bottleName ? { CX_BOTTLE: initialState.bottleName } : {}),
+        ...extraEnvOverrides,
+      };
+      if (initialState.bottlePath) {
+        alignWineMsyncWithLiveBottle(initialState.bottlePath, guidedBottleEnv);
+      }
+      prepareCrossOverWineSpawnEnv(bottleLayer.binaryPath, guidedBottleEnv);
+      applyCrossOverEnvironmentHygiene(guidedBottleEnv, {
+        wineBinaryPath: bottleLayer.binaryPath,
+        compatLayer: bottleLayer,
+        layerType: bottleLayer.type,
+        homedir,
+        platform: 'darwin',
       });
+      const guidedDllOverrides = String(guidedBottleEnv.WINEDLLOVERRIDES || '').trim();
+      const guidedWineArgs =
+        guidedDllOverrides &&
+        isCrossOverPerlWineWrapperOptions({
+          binaryPath: bottleLayer.binaryPath,
+          layerType: bottleLayer.type,
+        })
+          ? ['--dll', guidedDllOverrides, initialState.binaryPath, ...extraClientArgs]
+          : [initialState.binaryPath, ...extraClientArgs];
+      const child = spawnImpl(
+        bottleLayer.binaryPath,
+        guidedWineArgs,
+        {
+          detached: true,
+          stdio: 'ignore',
+          env: guidedBottleEnv,
+        }
+      );
       if (child && typeof child.unref === 'function') child.unref();
     } else if (hostPlatform === 'darwin') {
       const execFileFn = getExecFileFn(options);
@@ -4278,6 +8175,16 @@ async function startGuidedClientLogin(payload, options = {}) {
           );
         }
 
+        if (
+          latestState.bottlePath &&
+          (targetId === 'bottle_ubisoft' ||
+            targetId === 'bottle_ea' ||
+            targetId === 'bottle_bnet' ||
+            targetId === 'bottle_rockstar')
+        ) {
+          sanitizeChainedPublisherAutostartInBottleRegs(latestState.bottlePath);
+        }
+
         return {
           success: true,
           targetId,
@@ -4436,22 +8343,414 @@ async function ensureRosetta2InBackground(options = {}) {
   return tracked;
 }
 
+/**
+ * Reusable on-demand provisioner for chained publisher launchers (`ubisoft`, `ea`, `bnet`, `rockstar`, `riot`).
+ * - Returns `{ installed: true, provisionedNow: false, binaryPath, installDir }` immediately (`0` network calls)
+ *   when already installed in `bottlePath` (on `darwin`) or on host (on `win32`).
+ * - Otherwise initializes the target bottle (if needed on `darwin`), streams the allowlisted vendor installer,
+ *   verifies its Authenticode / PKCS#7 signature, runs silent installation with `wineEnvOverrides`, forwards
+ *   `{ percent, downloadedBytes, totalBytes, speedBytesPerSec: number, message }` to `onProgress`, and returns
+ *   `{ installed: true, provisionedNow: true, binaryPath, installDir }`.
+ *
+ * @param {{
+ *   handoffId: string,
+ *   platform?: string,
+ *   runnerLayer?: any,
+ *   bottleName?: string,
+ *   bottlePath?: string,
+ *   onProgress?: (progress: { percent: number, downloadedBytes: number, totalBytes: number, speedBytesPerSec: number, message: string }) => void,
+ *   signal?: AbortSignal,
+ * }} params
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ installed: boolean, provisionedNow: boolean, binaryPath: string, installDir: string }>}
+ */
+async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
+  const {
+    handoffId,
+    platform,
+    runnerLayer,
+    bottleName,
+    bottlePath,
+    onProgress,
+    signal,
+  } = params || {};
+
+  const canonical = normalizeChainedHandoffId(handoffId);
+  if (!canonical) {
+    throw new Error(`Unsupported chained publisher handoffId: "${String(handoffId || '')}"`);
+  }
+
+  const rawPlatform = String(platform || options.platform || process.platform).toLowerCase();
+  /** @type {'darwin' | 'win32' | 'linux'} */
+  const targetPlatform =
+    rawPlatform === 'win32' ? 'win32' : rawPlatform === 'linux' ? 'linux' : 'darwin';
+
+  if (canonical === 'riot' && targetPlatform !== 'win32') {
+    if (targetPlatform === 'darwin') {
+      throw new Error(
+        CHAINED_PUBLISHER_ECOSYSTEMS.riot.unsupportedBottleReason ||
+          'Riot Client cannot run inside macOS Wine/CrossOver bottles.'
+      );
+    }
+    throw new Error(
+      `Automatic provisioning of ${CHAINED_PUBLISHER_ECOSYSTEMS.riot.displayName} is not supported on platform "${targetPlatform}".`
+    );
+  }
+
+  const provisionableId = /** @type {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} */ (canonical);
+  const ecosystem = CHAINED_PUBLISHER_ECOSYSTEMS[provisionableId];
+  const { homedir } = resolveIsolatedHomedirAndUserData(options);
+
+  const resolveExplicitOrWizardBottlePath = () => {
+    if (typeof bottlePath === 'string' && bottlePath.trim()) {
+      const cleanPath = bottlePath.trim();
+      const cleanName =
+        typeof bottleName === 'string' && bottleName.trim()
+          ? bottleName.trim()
+          : path.basename(cleanPath);
+      return { bottleName: cleanName, bottlePath: cleanPath };
+    }
+    const explicitRunnerBin = String(runnerLayer?.binaryPath || runnerLayer?.path || '').trim();
+    if (runnerLayer && explicitRunnerBin) {
+      const wizardState = getSetupWizardState(options);
+      if (runnerLayer.type === 'crossover' || runnerLayer.type === 'crossover_preview') {
+        const bottlesDir =
+          runnerLayer.bottlesDir ||
+          path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
+        let discoveredBottles = Array.isArray(runnerLayer.availableBottles)
+          ? runnerLayer.availableBottles
+          : [];
+        if (discoveredBottles.length === 0 && fs.existsSync(bottlesDir)) {
+          try {
+            discoveredBottles = fs
+              .readdirSync(bottlesDir, { withFileTypes: true })
+              .filter((d) => d.isDirectory() && safeIsBottleSlug(d.name))
+              .map((d) => d.name);
+          } catch {}
+        }
+        const resolvedName = resolveDefaultChainedBottleName({
+          explicitBottleName: bottleName,
+          wizardPreferredBottleName: wizardState.preferredBottleName,
+          discoveredBottleNames: discoveredBottles,
+          runnerType: runnerLayer.type,
+        });
+        return {
+          bottleName: resolvedName,
+          bottlePath: path.join(bottlesDir, resolvedName),
+        };
+      }
+      const prefixSlug =
+        bottleName && safeIsBottleSlug(bottleName)
+          ? bottleName.trim()
+          : wizardState.preferredRunnerType === runnerLayer.type &&
+              wizardState.preferredBottleName &&
+              safeIsBottleSlug(wizardState.preferredBottleName)
+            ? wizardState.preferredBottleName
+            : 'default';
+      return {
+        bottleName: prefixSlug,
+        bottlePath: path.join(homedir, 'Games/OneLauncher/Prefixes', prefixSlug),
+      };
+    }
+    const resolvedTarget = resolveRunnerAndBottleTarget(
+      homedir,
+      { runnerType: runnerLayer?.type, bottleName },
+      options
+    );
+    return {
+      bottleName: resolvedTarget.bottleName,
+      bottlePath: resolvedTarget.bottlePath,
+    };
+  };
+
+  // Fast read-only precheck (0 network calls if already installed)
+  if (!options.forceReinstall) {
+    if (targetPlatform === 'darwin') {
+      let checkBottlePath = '';
+      try {
+        checkBottlePath = resolveExplicitOrWizardBottlePath().bottlePath;
+      } catch {}
+      if (checkBottlePath) {
+        const existingBottle = discoverBottlePublisherLauncher(checkBottlePath, provisionableId);
+        if (existingBottle.installed && existingBottle.binaryPath) {
+          return {
+            installed: true,
+            provisionedNow: false,
+            binaryPath: existingBottle.binaryPath,
+            installDir: existingBottle.installDir || path.dirname(existingBottle.binaryPath),
+          };
+        }
+      }
+    } else if (targetPlatform === 'win32') {
+      const existingHost = discoverHostPublisherLauncher(provisionableId, {
+        ...options,
+        ...explicitHomedirOpt(options),
+        platform: 'win32',
+      });
+      if (existingHost.installed && existingHost.binaryPath) {
+        return {
+          installed: true,
+          provisionedNow: false,
+          binaryPath: existingHost.binaryPath,
+          installDir: existingHost.installDir || path.dirname(existingHost.binaryPath),
+        };
+      }
+    }
+  }
+
+  if (signal?.aborted) {
+    const abortErr = new Error('Publisher launcher installation cancelled.');
+    abortErr.name = 'AbortError';
+    throw abortErr;
+  }
+
+  // Offline / hermetic test override hook
+  if (typeof options.provisionChainedLauncherFn === 'function') {
+    const injectedRes = await options.provisionChainedLauncherFn(
+      {
+        handoffId: provisionableId,
+        platform: targetPlatform,
+        runnerLayer,
+        bottleName,
+        bottlePath,
+        onProgress,
+        signal,
+      },
+      options
+    );
+    const bin = String(injectedRes?.binaryPath || '').trim();
+    const dir = String(injectedRes?.installDir || (bin ? path.dirname(bin) : '')).trim();
+    return {
+      installed: injectedRes?.installed !== false,
+      provisionedNow: injectedRes?.provisionedNow !== false,
+      binaryPath: bin,
+      installDir: dir,
+    };
+  }
+
+  if (options.skipNetwork === true && typeof options.fetchFn !== 'function') {
+    throw new Error(
+      `${ecosystem.displayName} is not installed and network provisioning is disabled (skipNetwork: true).`
+    );
+  }
+
+  if (targetPlatform !== 'darwin' && targetPlatform !== 'win32') {
+    throw new Error(
+      `Automatic provisioning of ${ecosystem.displayName} is not supported on platform "${targetPlatform}".`
+    );
+  }
+
+  const scope = targetPlatform === 'darwin' ? 'bottle' : 'host';
+  const componentId = /** @type {EnvironmentComponentId} */ (
+    scope === 'bottle' ? ecosystem.bottleComponentId : ecosystem.hostComponentId
+  );
+  const runId = `chained-pub-${provisionableId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  let prevBytes = 0;
+  let prevTickAt = Date.now();
+  let lastSpeedBytesPerSec = 0;
+
+  const emitProgressCallback = (
+    /** @type {{ percent: number, downloadedBytes: number, totalBytes: number, speedBytesPerSec: number, message: string }} */ info
+  ) => {
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(info);
+      } catch {}
+    }
+  };
+
+  const unsubscribeProgress = onEnvironmentSetupProgress((ev) => {
+    if (ev.runId !== runId) return;
+    const now = Date.now();
+    const dlBytes = typeof ev.bytesDownloaded === 'number' ? ev.bytesDownloaded : prevBytes;
+    const totBytes = typeof ev.totalBytes === 'number' ? ev.totalBytes : 0;
+    const dtSec = (now - prevTickAt) / 1000;
+    if (ev.phase === 'downloading' && dlBytes > prevBytes && dtSec > 0.02) {
+      const instantSpeed = Math.round((dlBytes - prevBytes) / dtSec);
+      lastSpeedBytesPerSec =
+        lastSpeedBytesPerSec > 0
+          ? Math.round(lastSpeedBytesPerSec * 0.65 + instantSpeed * 0.35)
+          : instantSpeed;
+      prevBytes = dlBytes;
+      prevTickAt = now;
+    }
+
+    let pct = typeof ev.progressPercent === 'number' ? ev.progressPercent : 0;
+    if (ev.phase === 'downloading') {
+      pct =
+        typeof ev.progressPercent === 'number'
+          ? Math.min(78, Math.max(5, Math.round(5 + ev.progressPercent * 0.73)))
+          : 25;
+    } else if (ev.phase === 'verifying_signature') {
+      pct = 82;
+      lastSpeedBytesPerSec = 0;
+    } else if (ev.phase === 'installing') {
+      pct = 90;
+      lastSpeedBytesPerSec = 0;
+    } else if (ev.phase === 'completed') {
+      pct = 100;
+      lastSpeedBytesPerSec = 0;
+    }
+
+    emitProgressCallback({
+      percent: pct,
+      downloadedBytes: dlBytes,
+      totalBytes: totBytes,
+      speedBytesPerSec: ev.phase === 'downloading' ? lastSpeedBytesPerSec : 0,
+      message: ev.message,
+    });
+  });
+
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ol-chained-pub-'));
+  try {
+    /** @type {any} */
+    let effectiveLayer = null;
+    let effectiveBottleName = '';
+    let effectiveBottlePath = '';
+
+    if (targetPlatform === 'darwin') {
+      if ((options.arch || process.arch) === 'arm64') {
+        await ensureRosetta2InBackground({ ...options, signal });
+      }
+
+      const explicitRunnerBin = String(runnerLayer?.binaryPath || runnerLayer?.path || '').trim();
+      if (runnerLayer && explicitRunnerBin) {
+        effectiveLayer = {
+          ...runnerLayer,
+          binaryPath: explicitRunnerBin,
+        };
+        const resolvedBottle = resolveExplicitOrWizardBottlePath();
+        effectiveBottleName = resolvedBottle.bottleName;
+        effectiveBottlePath = resolvedBottle.bottlePath;
+      } else {
+        const resolved = resolveRunnerAndBottleTarget(
+          homedir,
+          { runnerType: runnerLayer?.type, bottleName },
+          options
+        );
+        effectiveLayer = resolved.layer;
+        effectiveBottleName =
+          typeof bottleName === 'string' && safeIsBottleSlug(bottleName)
+            ? bottleName.trim()
+            : resolved.bottleName;
+        effectiveBottlePath =
+          typeof bottlePath === 'string' && bottlePath.trim()
+            ? bottlePath.trim()
+            : resolved.bottlePath;
+      }
+
+      const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
+      if (!isValidBottleDirectory(effectiveBottlePath, isMockHomedir)) {
+        emitProgressCallback({
+          percent: 3,
+          downloadedBytes: 0,
+          totalBytes: 0,
+          speedBytesPerSec: 0,
+          message: `Initializing Windows bottle "${effectiveBottleName}"...`,
+        });
+      }
+      await ensureBottleInitializedInternal(
+        effectiveLayer,
+        effectiveBottleName,
+        effectiveBottlePath,
+        options,
+        signal
+      );
+
+      if (!options.forceReinstall) {
+        const postInitProbe = discoverBottlePublisherLauncher(effectiveBottlePath, provisionableId);
+        if (postInitProbe.installed && postInitProbe.binaryPath) {
+          return {
+            installed: true,
+            provisionedNow: false,
+            binaryPath: postInitProbe.binaryPath,
+            installDir: postInitProbe.installDir || path.dirname(postInitProbe.binaryPath),
+          };
+        }
+      }
+    }
+
+    const provisioned = await provisionVerifiedChainedPublisherClient(
+      {
+        handoffId: provisionableId,
+        scope,
+        componentId,
+        progressBase: {
+          runId,
+          componentId,
+          stepIndex: 0,
+          totalSteps: 1,
+        },
+        tempDir,
+        layer: effectiveLayer,
+        bottleName: effectiveBottleName,
+        bottlePath: effectiveBottlePath,
+        signal,
+      },
+      options
+    );
+
+    try {
+      saveSetupWizardState(
+        {
+          addConfiguredComponents: [componentId],
+          lastHealthCheckAt: new Date().toISOString(),
+        },
+        options
+      );
+    } catch {}
+    invalidateScanCaches();
+
+    emitProgressCallback({
+      percent: 100,
+      downloadedBytes: prevBytes,
+      totalBytes: prevBytes,
+      speedBytesPerSec: 0,
+      message: `${ecosystem.displayName} is installed and ready.`,
+    });
+
+    return {
+      installed: true,
+      provisionedNow: true,
+      binaryPath: provisioned.binaryPath,
+      installDir: provisioned.installDir,
+    };
+  } finally {
+    unsubscribeProgress();
+    try {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 module.exports = {
   ALLOWED_INSTALLER_HOSTS,
+  CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY,
   validateInstallerUrl,
+  isBenignWindowsInstallerExitCode,
   resolveGogGalaxyInstallerCandidates,
   resolveGogGalaxyInstallerUrl,
   downloadGogGalaxyInstallerToFile,
   hasEmbeddedPeAuthenticodeCertificate,
+  verifyFileSha256Async,
+  verifySparkleEd25519SignatureAsync,
+  verifyAppleSignedFramework,
   verifyMacAppDeveloperSignature,
   verifyMacPkgSignature,
   verifyWindowsInstallerSignature,
+  assertRunnerSafeToReplace,
+  atomicReplaceMacAppBundle,
   onEnvironmentSetupProgress,
   emitEnvironmentSetupProgress,
   ensureRosetta2InBackground,
+  isExperimentalArm64CrossOverPreviewTarget,
+  selectPreferredCrossOverPreviewDownloadUrl,
+  captureCodeWeaversPreviewDownload,
   installRunnerDirect,
   runEnvironmentSetupTasks,
   cancelEnvironmentSetup,
   startGuidedClientLogin,
   cancelGuidedClientLogin,
+  ensureChainedPublisherLauncherInstalled,
 };

@@ -1,7 +1,12 @@
 import type {
   CanonicalGame,
+  ChainedHandoffTopology,
+  GamePlatformOwnership,
+  PlatformEntry,
+  PlatformOwnership,
   XboxGamePassSyncMode,
   XboxSubscriptionSummary,
+  XboxSubscriptionTierId,
 } from '../contracts/game';
 import type { StorefrontId } from '../contracts/platform';
 import type {
@@ -29,6 +34,7 @@ import type {
   CloudSaveSyncTelemetry,
   CompatibilityLayerInfo,
   CompatibilityLayerUpdateInfo,
+  CompatibilityRunnerProgressEvent,
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
@@ -53,6 +59,16 @@ import type {
 } from '../contracts/launcher';
 
 export type { AppInfoResult, AppUpdateCheckResult } from '../contracts/launcher';
+export type {
+  CanonicalGame,
+  ChainedHandoffTopology,
+  GamePlatformOwnership,
+  PlatformEntry,
+  PlatformOwnership,
+  XboxGamePassSyncMode,
+  XboxSubscriptionSummary,
+  XboxSubscriptionTierId,
+};
 
 export type WindowMenuAction =
   | 'reload'
@@ -167,6 +183,9 @@ export interface StorefrontAuthResult {
   achievements?: Record<string | number, AchievementSummaryEntry>;
   suppressedItems?: any[];
   tokenData?: StorefrontTokenSummary | null;
+  authoritativeComplete?: boolean;
+  subscriptionChanged?: boolean;
+  transientOffline?: boolean;
   syncError?: string;
   error?: string;
   errorCode?: string;
@@ -331,6 +350,9 @@ export interface ElectronAPI {
     games?: CanonicalGame[];
     suppressedItems?: any[];
     achievements?: Record<string | number, AchievementSummaryEntry>;
+    authoritativeComplete?: boolean;
+    subscriptionChanged?: boolean;
+    transientOffline?: boolean;
     error?: string;
   }>;
   exchangeCode: (storefrontId: string, code: string) => Promise<StorefrontAuthResult>;
@@ -426,6 +448,9 @@ export interface ElectronAPI {
   }) => Promise<Record<string, any> | null>;
   getXboxStatus?: (payload?: {
     refreshSubscription?: boolean;
+    forceRefresh?: boolean;
+    market?: string;
+    locale?: string;
   }) => Promise<{
     connected: boolean;
     accountName?: string;
@@ -436,6 +461,8 @@ export interface ElectronAPI {
     gamerpicUrl?: string;
     gamerscore?: number;
     subscription?: XboxSubscriptionSummary | null;
+    subscriptionChanged?: boolean;
+    transientOffline?: boolean;
     syncMode: XboxGamePassSyncMode;
     hasDeviceContext?: boolean;
     error?: string;
@@ -471,6 +498,13 @@ export interface ElectronAPI {
   updateCompatibilityLayer: (
     payload: UpdateCompatibilityLayerPayload
   ) => Promise<UpdateCompatibilityLayerResult>;
+  cancelCompatibilityLayerOperation?: (
+    runnerType: string
+  ) => Promise<{ success: boolean; cancelled: boolean }>;
+  selectRunnerArchiveDialog?: (defaultPath?: string) => Promise<string | null>;
+  onCompatibilityRunnerProgress?: (
+    cb: (event: CompatibilityRunnerProgressEvent) => void
+  ) => () => void;
   getDiskSpace: (targetPath?: string) => Promise<DiskSpaceInfo | null>;
   getGameInstallInfo: (
     payload: GameInstallInfoRequest | Record<string, unknown>,
@@ -637,6 +671,50 @@ export interface ElectronAPI {
   ) => Promise<UserOverrideMutationResult>;
 
   offlineVault?: OfflineVaultBridge;
+}
+
+declare module '../contracts/game' {
+  interface GamePlatformOwnership {
+    externalLauncher?: string;
+    externalLauncherUrl?: string;
+    xboxBottleCompatibilityReason?: string;
+    isExternalLauncherStubPackage?: boolean;
+    maxDownloadSizeBytes?: number;
+    pcMaxInstallSizeBytes?: number;
+    kernelAntiCheatName?: string;
+    executableArchitecture?: string;
+    is32BitExecutable?: boolean;
+  }
+
+  interface CanonicalGame {
+    kernelAntiCheatName?: string;
+    executableArchitecture?: string;
+    is32BitExecutable?: boolean;
+  }
+}
+
+declare module '../contracts/launcher' {
+  interface DiskSpaceInfo {
+    caseSensitive?: boolean;
+  }
+
+  interface AvailableInstaller {
+    kernelAntiCheatName?: string;
+    isExternalLauncherStubPackage?: boolean;
+  }
+
+  interface GameInstallInfo {
+    xboxBottleCompatibilityReason?: string;
+    isExternalLauncherStubPackage?: boolean;
+    maxDownloadSizeBytes?: number;
+    pcMaxInstallSizeBytes?: number;
+    kernelAntiCheatName?: string;
+  }
+
+  interface ResolvedLaunchModePreview {
+    modeLabel?: string;
+    cloudSaveSummary?: string;
+  }
 }
 
 declare global {

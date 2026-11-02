@@ -53,6 +53,7 @@ export interface SystemSetupWizardModalProps {
   initialStep?: SetupWizardStepId;
   focusComponentId?: EnvironmentComponentId;
   connectedStorefronts: StorefrontId[];
+  catalogGames?: CanonicalGame[];
   onClose: () => void;
   onOpenIntegrationsModal?: () => void;
   onLibraryUpdated?: (games: CanonicalGame[]) => void;
@@ -252,11 +253,37 @@ function resolveDefaultRunner(
   return 'crossover';
 }
 
+function readServiceRunnerUpdateOptInSet(
+  focusComponentId?: EnvironmentComponentId,
+  snap?: EnvironmentHealthSnapshot
+): Set<EnvironmentComponentId> {
+  const next = new Set<EnvironmentComponentId>();
+  for (const entry of RUNNER_COMPONENT_MAP) {
+    if (environmentSetupService.getRunnerUpdateOptIn(entry.componentId) === true) {
+      next.add(entry.componentId);
+    }
+  }
+  if (
+    focusComponentId &&
+    RUNNER_COMPONENT_MAP.some((entry) => entry.componentId === focusComponentId) &&
+    snap?.components[focusComponentId]?.status === 'update_available' &&
+    environmentSetupService.getRunnerUpdateOptIn(focusComponentId) === undefined
+  ) {
+    next.add(focusComponentId);
+  }
+  return next;
+}
+
 function collectConfiguredReadyComponents(
   snap: EnvironmentHealthSnapshot,
   selectedIds: ReadonlySet<EnvironmentComponentId>,
   outcomes: ReadonlyArray<EnvironmentSetupTaskOutcome>
 ): EnvironmentComponentId[] {
+  const failedOrCancelledIds = new Set(
+    outcomes
+      .filter((o) => o.status === 'failed' || o.status === 'cancelled')
+      .map((o) => o.componentId)
+  );
   const configured = new Set<EnvironmentComponentId>();
   for (const comp of Object.values(snap.components)) {
     if (comp && comp.status === 'ready') {
@@ -264,12 +291,16 @@ function collectConfiguredReadyComponents(
     }
   }
   for (const outcome of outcomes) {
-    if (outcome.status === 'completed') {
+    if (
+      outcome.status === 'completed' &&
+      outcome.action !== 'sync_first_party_manifests' &&
+      !failedOrCancelledIds.has(outcome.componentId)
+    ) {
       configured.add(outcome.componentId);
     }
   }
   for (const id of selectedIds) {
-    if (snap.components[id]?.status === 'ready') {
+    if (snap.components[id]?.status === 'ready' && !failedOrCancelledIds.has(id)) {
       configured.add(id);
     }
   }
@@ -282,6 +313,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
   initialStep,
   focusComponentId,
   connectedStorefronts,
+  catalogGames,
   onClose,
   onOpenIntegrationsModal,
   onLibraryUpdated,
@@ -353,6 +385,14 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
   const [forceRepairIds, setForceRepairIds] = useState<Set<EnvironmentComponentId>>(
     () => new Set()
   );
+  const [runnerUpdateOptInIds, setRunnerUpdateOptInIds] = useState<Set<EnvironmentComponentId>>(
+    () =>
+      readServiceRunnerUpdateOptInSet(
+        focusComponentId,
+        environmentSetupService.getLastSnapshot() ??
+          buildFallbackEnvironmentSnapshot(connectedStorefronts)
+      )
+  );
   const [isProbing, setIsProbing] = useState<boolean>(false);
   const [isProvisioningRunning, setIsProvisioningRunning] = useState<boolean>(() =>
     environmentSetupService.isSetupRunning()
@@ -412,12 +452,19 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
       if (nextSnap) {
         setSnapshot(nextSnap);
       }
+      setRunnerUpdateOptInIds((prev) => {
+        const synced = readServiceRunnerUpdateOptInSet(focusComponentId, nextSnap ?? undefined);
+        if (prev.size === synced.size && Array.from(prev).every((id) => synced.has(id))) {
+          return prev;
+        }
+        return synced;
+      });
       setIsProvisioningRunning(environmentSetupService.isSetupRunning());
       setActiveGuidedLoginTarget(environmentSetupService.getActiveGuidedLoginTarget());
       setLatestProgress(environmentSetupService.getLatestProgress());
     };
     return environmentSetupService.subscribe(syncFromService);
-  }, [isOpen]);
+  }, [isOpen, focusComponentId]);
 
   useEffect(() => {
     if (!isOpen) return undefined;
@@ -452,8 +499,10 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
           setSelectedIds(
             computeDefaultSelectedComponents(probedSnap, connectedStorefronts, {
               chosenRunner: resolvedRunner,
+              focusComponentId,
             })
           );
+          setRunnerUpdateOptInIds(readServiceRunnerUpdateOptInSet(focusComponentId, probedSnap));
         }
       })
       .catch(() => {})
@@ -497,6 +546,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
         bottleName: effectiveBottleName,
         gptkDmgPath,
         forceRepairIds,
+        runnerUpdateOptInIds,
       }),
     [
       snapshot,
@@ -506,6 +556,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
       effectiveBottleName,
       gptkDmgPath,
       forceRepairIds,
+      runnerUpdateOptInIds,
     ]
   );
 
@@ -553,12 +604,21 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
         next.delete('bottle_steam');
         next.delete('bottle_gog');
         next.delete('bottle_epic');
+        next.delete('bottle_ubisoft');
+        next.delete('bottle_ea');
+        next.delete('bottle_bnet');
+        next.delete('bottle_rockstar');
         return next;
       }
       const match = RUNNER_COMPONENT_MAP.find((e) => e.runner === nextRunner);
       if (match) {
         const comp = snapshot.components[match.componentId];
-        if (comp && comp.status !== 'ready' && comp.status !== 'not_applicable') {
+        if (
+          comp &&
+          comp.status !== 'ready' &&
+          comp.status !== 'update_available' &&
+          comp.status !== 'not_applicable'
+        ) {
           next.add(match.componentId);
         }
       }
@@ -583,6 +643,20 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
         next.delete(id);
       } else {
         next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const handleToggleRunnerUpdate = (id: EnvironmentComponentId, enabled: boolean) => {
+    hasUserCustomizedSelectionRef.current = true;
+    environmentSetupService.setRunnerUpdateOptIn(id, enabled);
+    setRunnerUpdateOptInIds((prev) => {
+      const next = new Set(prev);
+      if (enabled) {
+        next.add(id);
+      } else {
+        next.delete(id);
       }
       return next;
     });
@@ -654,11 +728,31 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
 
     const runOutcomes = result.outcomes || [];
     setOutcomes(runOutcomes);
+    const failedOrCancelledIds = new Set(
+      runOutcomes
+        .filter((o) => o.status === 'failed' || o.status === 'cancelled')
+        .map((o) => o.componentId)
+    );
     const completedComponentIds = runOutcomes
-      .filter((o) => o.status === 'completed')
+      .filter(
+        (o) =>
+          o.status === 'completed' &&
+          o.action !== 'sync_first_party_manifests' &&
+          !failedOrCancelledIds.has(o.componentId)
+      )
       .map((o) => o.componentId);
     if (completedComponentIds.length > 0) {
       setForceRepairIds((prev) => {
+        let changed = false;
+        const next = new Set(prev);
+        for (const id of completedComponentIds) {
+          if (next.delete(id)) {
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      setRunnerUpdateOptInIds((prev) => {
         let changed = false;
         const next = new Set(prev);
         for (const id of completedComponentIds) {
@@ -987,6 +1081,8 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
               onChangeBottleName={setBottleName}
               gptkDmgPath={gptkDmgPath}
               onChangeGptkDmgPath={setGptkDmgPath}
+              runnerUpdateOptInIds={runnerUpdateOptInIds}
+              onToggleRunnerUpdate={handleToggleRunnerUpdate}
             />
           )}
 
@@ -996,6 +1092,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
               mode={mode}
               chosenRunner={chosenRunner}
               connectedStorefronts={liveConnectedStorefronts}
+              catalogGames={catalogGames}
               selectedIds={selectedIds}
               forceRepairIds={forceRepairIds}
               focusComponentId={focusComponentId}

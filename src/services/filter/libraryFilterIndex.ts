@@ -1,4 +1,5 @@
 import { CanonicalGame } from '../../contracts/game';
+import { StorefrontId } from '../../contracts/platform';
 import { SteamCategory, SteamReviewSummary } from '../../contracts/steam';
 import { OpenCriticData } from '../../contracts/critic';
 import {
@@ -19,6 +20,7 @@ import {
   isGameOwnedOnSteam,
 } from '../steam/steamFeatureNormalizer';
 import {
+  getStorefrontNativeOsFlags,
   isNativelyAvailableOnMac,
   isNativelyAvailableOnWindows,
   isPureUwpWindowsGame,
@@ -42,10 +44,13 @@ interface CachedSteamFilterRecord {
 
 const steamCache = (steamEnrichedCache || {}) as Record<string, CachedSteamFilterRecord>;
 
+export type OsSupportFilter = OsCompatibilityFilterOption;
+
 export interface GameFilterIndexEntry {
   gameId: string;
   effectiveSteamAppId?: number;
   osFlags: Set<OsCompatibilityFilterOption>;
+  osFlagsByPlatform: ReadonlyMap<StorefrontId, ReadonlySet<OsCompatibilityFilterOption>>;
   criticData: OpenCriticData | null;
   criticScore: number | null;
   criticPercentRecommended: number | null;
@@ -56,6 +61,8 @@ export interface GameFilterIndexEntry {
   releaseYear: number | null;
   creatorsNormalized: Set<string>;
 }
+
+export type GameFilterEntry = GameFilterIndexEntry;
 
 export interface GenreFacetCount {
   key: string;
@@ -316,14 +323,55 @@ export function buildLibraryFilterIndex(
 
     // Category 1: OS & Compatibility
     const osFlags = new Set<OsCompatibilityFilterOption>();
+    const osFlagsByPlatform = new Map<StorefrontId, Set<OsCompatibilityFilterOption>>();
     const isMacNative = isNativelyAvailableOnMac(game);
     const isWinNative = isNativelyAvailableOnWindows(game);
-    let isCompatLayerEligible = false;
-    if (hostOs !== 'win32') {
-      const hasXboxPlatform = (game.platforms || []).some((p) => p.platformId === 'xbox');
-      const cachedXboxInstallInfo = hasXboxPlatform
+    const hasXboxPlatform = (game.platforms || []).some((p) => p.platformId === 'xbox');
+    const cachedXboxInstallInfo =
+      hostOs !== 'win32' && hasXboxPlatform
         ? launcherService.getCachedInstallInfo(game.id, 'xbox')
         : undefined;
+    const hintIsUwp =
+      typeof game.enrichedMetadata?.xboxDeliveryHints?.packageFormat === 'string' &&
+      game.enrichedMetadata.xboxDeliveryHints.packageFormat.toLowerCase() === 'uwp';
+
+    for (const p of game.platforms || []) {
+      if (!p || !p.platformId) continue;
+      const platSet =
+        osFlagsByPlatform.get(p.platformId) || new Set<OsCompatibilityFilterOption>();
+      const storeFlags = getStorefrontNativeOsFlags(game, p.platformId);
+      if (storeFlags.mac) {
+        platSet.add('mac_native');
+      }
+      if (storeFlags.windows) {
+        platSet.add('windows_native');
+      }
+      if (hostOs !== 'win32') {
+        const isStorePureUwp =
+          p.platformId === 'xbox'
+            ? p.xboxBottleCompatibilityTier === 'tier_b_legacy_uwp' ||
+              cachedXboxInstallInfo?.xboxCompatibility?.tier === 'tier_b_legacy_uwp' ||
+              (typeof p.packageFormat === 'string' && p.packageFormat.toLowerCase() === 'uwp') ||
+              hintIsUwp
+            : typeof p.packageFormat === 'string' && p.packageFormat.toLowerCase() === 'uwp';
+        if (!isStorePureUwp) {
+          const platLaunchCfg = launcherService.getLaunchConfig(game.id, p.platformId);
+          const storeCompatEligible =
+            (!storeFlags.mac && storeFlags.windows) ||
+            Boolean(p.isWindowsBinaryOnMac) ||
+            Boolean(
+              platLaunchCfg?.compatibilityLayer && platLaunchCfg.compatibilityLayer !== 'native'
+            );
+          if (storeCompatEligible) {
+            platSet.add('mac_compat_layer');
+          }
+        }
+      }
+      osFlagsByPlatform.set(p.platformId, platSet);
+    }
+
+    let isCompatLayerEligible = false;
+    if (hostOs !== 'win32') {
       const pureUwpOnly = isPureUwpWindowsGame(
         game,
         cachedXboxInstallInfo?.xboxCompatibility?.tier
@@ -469,6 +517,7 @@ export function buildLibraryFilterIndex(
       gameId: game.id,
       effectiveSteamAppId,
       osFlags,
+      osFlagsByPlatform,
       criticData: oc,
       criticScore,
       criticPercentRecommended,
@@ -528,7 +577,8 @@ export function buildLibraryFilterIndex(
 export function evaluateLibraryFilter(
   games: CanonicalGame[],
   index: LibraryFilterIndex,
-  state: LibraryFilterState
+  state: LibraryFilterState,
+  selectedPlatform?: StorefrontId | 'all'
 ): CanonicalGame[] {
   if (!games || games.length === 0) return [];
   const bounds = { minYear: index.minReleaseYear, maxYear: index.maxReleaseYear };
@@ -557,9 +607,13 @@ export function evaluateLibraryFilter(
     const entry = index.entriesById.get(game.id);
     if (!entry) return false;
 
-    // Category 1: OS & Compatibility (OR within category)
+    // Category 1: OS & Compatibility (OR within category, intersected with selectedPlatform when active)
     if (hasOsFilter) {
-      if (!state.osCompatibility.some((opt) => entry.osFlags.has(opt))) {
+      const targetOsFlags =
+        selectedPlatform && selectedPlatform !== 'all'
+          ? entry.osFlagsByPlatform.get(selectedPlatform)
+          : entry.osFlags;
+      if (!targetOsFlags || !state.osCompatibility.some((opt) => targetOsFlags.has(opt))) {
         return false;
       }
     }

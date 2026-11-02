@@ -40,7 +40,9 @@ function describeTaskAction(
     case 'install_win_vcredist':
       return 'Install Microsoft Visual C++';
     case 'install_runner':
-      return `Install ${compTitle}`;
+      return task.forceUpdate || components[task.componentId]?.status === 'update_available'
+        ? `Update ${compTitle}`
+        : `Install ${compTitle}`;
     case 'ensure_bottle':
       return task.bottleMode === 'reuse_existing'
         ? `Set up existing "${task.bottleName || 'OneLauncher'}" bottle`
@@ -55,14 +57,15 @@ function describeTaskAction(
 }
 
 function renderOutcomeBadge(
-  status: EnvironmentSetupTaskOutcome['status']
+  status: EnvironmentSetupTaskOutcome['status'],
+  action?: EnvironmentSetupTaskOutcome['action']
 ): React.ReactElement {
   switch (status) {
     case 'completed':
       return (
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-bold text-emerald-300">
           <CheckCircle2 className="w-3 h-3 text-emerald-400" aria-hidden="true" />
-          <span>Installed</span>
+          <span>{action === 'sync_first_party_manifests' ? 'Synced' : 'Installed'}</span>
         </span>
       );
     case 'skipped':
@@ -238,7 +241,9 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
           <div className="space-y-1.5">
             {outcomes.map((outcome, idx) => {
               const compTitle =
-                components[outcome.componentId]?.title || outcome.componentId;
+                outcome.action === 'sync_first_party_manifests'
+                  ? 'Sync installed game folders'
+                  : components[outcome.componentId]?.title || outcome.componentId;
               return (
                 <div
                   key={`${outcome.componentId}-${outcome.action}-${idx}`}
@@ -251,7 +256,7 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
                       <div className="text-[11px] text-rose-200">{outcome.error}</div>
                     )}
                   </div>
-                  {renderOutcomeBadge(outcome.status)}
+                  {renderOutcomeBadge(outcome.status, outcome.action)}
                 </div>
               );
             })}
@@ -268,7 +273,9 @@ export const ProvisioningProgressPanel: React.FC<ProvisioningProgressPanelProps>
               <span>Items to Install ({plannedTasks.length})</span>
             </div>
             <span className="text-[11px] text-slate-300">
-              Already-installed apps won&rsquo;t be touched
+              {plannedTasks.some((t) => Boolean(t.forceUpdate))
+                ? 'Updates & installs run automatically in the background'
+                : 'Already-installed apps won\u2019t be touched'}
             </span>
           </div>
 

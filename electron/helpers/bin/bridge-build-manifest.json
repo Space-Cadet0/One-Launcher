@@ -1,32 +1,34 @@
 {
   "schemaVersion": 1,
-  "targetTriple": "x86_64-windows-gnu",
+  "targetTriple": "x86_64-windows-gnu+x86-windows-gnu",
   "compilerVersion": "0.13.0",
   "sources": {
     "appnotify.def": "aa4d0c1bf7d6253a7580d9171a641ccd7f71993d8cd9fb3ba89c0ea8bca3038b",
-    "appnotify_bridge.c": "b9d57b68d84be59aecaa804a7a72e2e2e298813b6b668d845e0ecf491bf9065a",
+    "appnotify_bridge.c": "32e4cdbceae4a137344de6b8b1635dc56850b9996da827cac6e623262084f534",
     "gameinput.def": "d384f79042540f520b5af6697e613897fdba4c2bc90eda7d68cdf314f1e89228",
-    "gameinput_bridge.c": "960ffad497e2a0699948f58196f21a41fe604c8989016f0b1c59bed60256d012",
-    "main.c": "90acaeb4ec8399922138ec297b29ac18b8d0575b9ecdbfda6c6fa7b620347dd7",
-    "win_xgr_launcher.c": "945a1491469d9e8ac84d8ad78af155b32ddb011dae50833fef6353e4131f8124",
+    "gameinput_bridge.c": "2483fe4d25eb74951b875a3a90175b29beb09343c4a2587cfb72bb5c269bf3b9",
+    "main.c": "b21580c2b462181f233653c648e69848eb674c6b52fd391a1141f7a9ae5cc0b8",
+    "win_xgr_launcher.c": "13ecdf2d8b0b759e070c72aabd3a4bc6f9108a90f0e9d5e5027fdc1d0b212a50",
     "xgameruntime.def": "dc7ea71cb12731efba6fb7ef496a6738a0be3c6bde3d8c9816208c93d2f313d3",
     "xgamesave.c": "6bbb893f1379c9fc33280b46b740ad3235fd3ff5864426652fc427e698477d0a",
-    "xgr_internal.h": "55b7762dbb0dc5352b46b92df34a6aa6fcf6df6f02909759907fa93f46dac657",
+    "xgr_internal.h": "58e2e5af11dc2aa65b4a280ff7c51bfb66adf9629cc5344a9248a6c6c408ae48",
+    "xgr_playfab_shim.c": "209337d5b5eee76aa4868b58565e8973c594212351dedcfb0bd89025285616c7",
     "xgr_rpc.c": "5810fae67ff6cd46b329c22d9f5e5e13d129fe0be7e0c767c91774aaad4b8d84",
-    "xgr_xcurl_shim.c": "b4b51dd609e5b8aa9d004b035f3533b2c82878b9d2a36c09e5b51ca23740ffcb",
-    "xgr_xml_pfn.c": "aba160c21c13cf3d61f30159d3b4e0f130084a4793ac5cb52d0e6e5279547038",
-    "xpackage.c": "ebd21277876d05115e93c23572c5eb22c9cd0055311e233e4a0e431741132ba7",
-    "xstore.c": "b87a6f7d6ca20cdabf6084b11872a571e7b75b9129640527b56e4f6605aba334",
-    "xsystem_misc.c": "95d02212cb212828f1d63e9c7c6f53c4adaecb1bf88ec9f51a4ed215e116eeae",
-    "xthreading.c": "bd234ffb5dff3e4b75f8be055ce6252e133896a4894d3a469aeac7b6b9510a09",
-    "xuser.c": "df28d47cb70a82c510040fdf5fc2ff03dc64ebcd9667e260834688fb99a952fa"
+    "xgr_xcurl_shim.c": "c303d0be7907a44c8ba82c05dfaf239e0bc4d4a54b15b80d9b8e0b1777a86cdf",
+    "xgr_xml_pfn.c": "4106d69850e054805dbd6e8ce0dcd8903a6cbf3785d037b6171ef7b9e5f7e4d2",
+    "xpackage.c": "58ffd14987311b05c0b839eaddad4ac0c4369ca63f783036593f1cbe352550d8",
+    "xstore.c": "2476a9fb002faf76484e113a8a273198d725b963c50f0f5dceb12124bc03dc94",
+    "xsystem_misc.c": "56c1e1106275a7f7ae387b351eec7297c1e38c6c9d00e00d201ec618385356b4",
+    "xthreading.c": "6c6127cb23045b3c8da15e1536ce7e9812c0d2d193d3352f5f20a6506d5d6977",
+    "xuser.c": "d31b0a0f3e99b8b3ec6498ce65bdda22339d6f22585e85503d874cc1c3e85613"
   },
   "outputs": {
     "one_xgameruntime_bridge.dll": {
+      "machine": "0x8664",
       "internalName": "Xgameruntime.dll",
-      "sha256": "726267c3a4d6efae1212d0af12b77c1c5364e097c16ab051d6189d31ff777e55",
-      "checkSum": 159107,
-      "sizeBytes": 154112,
+      "sha256": "8602692c709f6172e3a604bc665a865baad837a580397e2df2747409d859627f",
+      "checkSum": 236468,
+      "sizeBytes": 171520,
       "marker": "OneLauncher.XGRBridge.v1",
       "exports": [
         "DllCanUnloadNow",
@@ -39,9 +41,10 @@
       ]
     },
     "one_gameinput_bridge.dll": {
+      "machine": "0x8664",
       "internalName": "GameInput.dll",
-      "sha256": "03f8718df21be1853bd3ba960d0d5ae970c8f824ffed0db86c643a79b030a4a7",
-      "checkSum": 82588,
+      "sha256": "b7f8b7392d6a7c2826beec51a732dfa34e584d92aba579c7a33b70e26f4978a2",
+      "checkSum": 104697,
       "sizeBytes": 51712,
       "marker": "OneLauncher.GameInputBridge.v1",
       "exports": [
@@ -50,9 +53,10 @@
       ]
     },
     "one_appnotify_bridge.dll": {
+      "machine": "0x8664",
       "internalName": "api-ms-win-core-psm-appnotify-l1-1-0.dll",
-      "sha256": "bb19410ffa2b6dfe8aa2881dfd7bd5d8d0d9aab22e1390cc548b210419794d4d",
-      "checkSum": 54499,
+      "sha256": "95b76f0b770d84d6b5c5c66207d0dbacdfe4ea7e1ce073bdc427bbe027ab9fd1",
+      "checkSum": 45082,
       "sizeBytes": 18432,
       "marker": "OneLauncher.AppNotifyBridge.v1",
       "exports": [
@@ -63,11 +67,65 @@
       ]
     },
     "one_xgr_win_launcher.exe": {
+      "machine": "0x8664",
       "internalName": "",
       "subsystem": 2,
-      "sha256": "a49e173462c68a8c1d367cfef5fd6ee0204d9f6403afeee3efe8ecd9d98039b6",
-      "checkSum": 88067,
-      "sizeBytes": 37376,
+      "sha256": "5790a0650827bb9c10c54917e0985cb75c90f1a5ad8e4e13b32d2f37dabe0f05",
+      "checkSum": 72699,
+      "sizeBytes": 39936,
+      "marker": "OneLauncher.XGRWinLauncher.v1",
+      "exports": []
+    },
+    "one_xgameruntime_bridge_x86.dll": {
+      "machine": "0x014c",
+      "internalName": "Xgameruntime.dll",
+      "sha256": "79928155b49e34889e0fffdb28036c467c8415c610c6deaf8e56bb3c1ddb7d6f",
+      "checkSum": 257477,
+      "sizeBytes": 203776,
+      "marker": "OneLauncher.XGRBridge.v1",
+      "exports": [
+        "DllCanUnloadNow",
+        "InitializeApiImpl",
+        "InitializeApiImplEx",
+        "InitializeApiImplEx2",
+        "QueryApiImpl",
+        "UninitializeApiImpl",
+        "XErrorReport"
+      ]
+    },
+    "one_gameinput_bridge_x86.dll": {
+      "machine": "0x014c",
+      "internalName": "GameInput.dll",
+      "sha256": "e7bfa20335603a06c585b0e0863a297b666f1f5ce2eac3d787ec20056da48545",
+      "checkSum": 131314,
+      "sizeBytes": 67584,
+      "marker": "OneLauncher.GameInputBridge.v1",
+      "exports": [
+        "DllCanUnloadNow",
+        "GameInputCreate"
+      ]
+    },
+    "one_appnotify_bridge_x86.dll": {
+      "machine": "0x014c",
+      "internalName": "api-ms-win-core-psm-appnotify-l1-1-0.dll",
+      "sha256": "f26c999c0349d86fa5a15d9ff61b258ea721be41b76af5e1b5c2fe920ffaf271",
+      "checkSum": 61803,
+      "sizeBytes": 30720,
+      "marker": "OneLauncher.AppNotifyBridge.v1",
+      "exports": [
+        "RegisterAppConstrainedChangeNotification",
+        "RegisterAppStateChangeNotification",
+        "UnregisterAppConstrainedChangeNotification",
+        "UnregisterAppStateChangeNotification"
+      ]
+    },
+    "one_xgr_win_launcher_x86.exe": {
+      "machine": "0x014c",
+      "internalName": "",
+      "subsystem": 2,
+      "sha256": "d4e58075fdfe2bbd7b227ebca88177f24e34be05bf241c08003aafdb52201df3",
+      "checkSum": 100129,
+      "sizeBytes": 54784,
       "marker": "OneLauncher.XGRWinLauncher.v1",
       "exports": []
     }

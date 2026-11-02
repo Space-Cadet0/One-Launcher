@@ -38,7 +38,7 @@ const {
   decryptTokensPayloadAsync,
   isMockOrCorruptedToken,
   sanitizeStorefrontTokensObject,
-  projectRedactedXboxSummary,
+  projectRedactedXboxSummary: baseProjectRedactedXboxSummary,
   writeTokensFile,
   writeTokensFileAsync,
   loadSavedTokens,
@@ -49,6 +49,7 @@ const {
   clearTokensAsync,
 } = require('./storefronts/tokenVault.cjs');
 const { classifyNonGameStorefrontItem } = require('./storefronts/nonGameClassifier.cjs');
+const { normalizeChainedHandoffId } = require('./launcher/chainedPublisherLaunchers.cjs');
 const storefrontLocalCacheFederator = require('./launcher/storefrontLocalCacheFederator.cjs');
 const xboxStorefront = require('./storefronts/xbox/index.cjs');
 
@@ -75,6 +76,60 @@ function buildPlatformStoreUserAgent(clientToken = '') {
   return clientToken ? `Mozilla/5.0 (${osPart}) ${clientToken}` : `Mozilla/5.0 (${osPart})`;
 }
 
+function projectSafeXboxSubscription(sub) {
+  if (!sub || typeof sub !== 'object') return undefined;
+  return {
+    hasActiveSubscription: Boolean(sub.hasActiveSubscription),
+    hasPcCatalogAccess: Boolean(sub.hasPcCatalogAccess),
+    ...(sub.primaryProductId ? { primaryProductId: String(sub.primaryProductId) } : {}),
+    tierId: String(sub.tierId || 'none'),
+    tierDisplayName: String(sub.tierDisplayName || 'None'),
+    ...(sub.status ? { status: String(sub.status) } : {}),
+    ...(sub.endDate ? { endDate: String(sub.endDate) } : {}),
+    ...(sub.earliestActivePassEndDate
+      ? { earliestActivePassEndDate: String(sub.earliestActivePassEndDate) }
+      : {}),
+    ...(typeof sub.autoRenew === 'boolean' ? { autoRenew: sub.autoRenew } : {}),
+    ...(typeof sub.isTrial === 'boolean' ? { isTrial: sub.isTrial } : {}),
+    ...(sub.market ? { market: String(sub.market) } : {}),
+    activeProductIds: Array.isArray(sub.activeProductIds)
+      ? sub.activeProductIds.map((x) => String(x))
+      : [],
+    ...(Array.isArray(sub.activeEntitlementKeys)
+      ? { activeEntitlementKeys: sub.activeEntitlementKeys.map((x) => String(x)) }
+      : {}),
+    ...(Array.isArray(sub.expandedCapabilityPassIds)
+      ? { expandedCapabilityPassIds: sub.expandedCapabilityPassIds.map((x) => String(x)) }
+      : {}),
+    ...(typeof sub.includesEaPlayPc === 'boolean'
+      ? { includesEaPlayPc: sub.includesEaPlayPc }
+      : {}),
+    ...(sub.siglMode ? { siglMode: String(sub.siglMode) } : {}),
+    ...(Array.isArray(sub.dynamicSiglIds)
+      ? { dynamicSiglIds: sub.dynamicSiglIds.map((x) => String(x)) }
+      : {}),
+    ...(sub.subscriptionFingerprint
+      ? { subscriptionFingerprint: String(sub.subscriptionFingerprint) }
+      : {}),
+    ...(typeof sub.authoritativeDetection === 'boolean'
+      ? { authoritativeDetection: sub.authoritativeDetection }
+      : {}),
+    ...(sub.checkedAt ? { checkedAt: String(sub.checkedAt) } : {}),
+  };
+}
+
+function projectRedactedXboxSummary(entry) {
+  const base = baseProjectRedactedXboxSummary(entry);
+  if (!base) return null;
+  if (entry?.subscription && typeof entry.subscription === 'object') {
+    base.subscription = projectSafeXboxSubscription(entry.subscription);
+  }
+  if (typeof entry?.market === 'string' && /^[A-Z]{2}$/i.test(entry.market.trim())) {
+    base.market = entry.market.trim().toUpperCase();
+  }
+  return base;
+}
+
 function resolveDefaultStoreLocaleAndCountry(options = {}) {
   let detectedLocale = '';
   let detectedCountry = '';
@@ -89,27 +144,44 @@ function resolveDefaultStoreLocaleAndCountry(options = {}) {
     }
   } catch {}
 
-  if (detectedLocale && !detectedLocale.includes('-')) {
-    const cc = /^[A-Z]{2}$/.test(detectedCountry) ? detectedCountry : 'US';
-    detectedLocale = `${detectedLocale.toLowerCase()}-${cc}`;
-  }
-  if (!detectedCountry && detectedLocale.includes('-')) {
-    const parts = detectedLocale.split('-');
-    const cc = parts[parts.length - 1].toUpperCase();
-    if (/^[A-Z]{2}$/.test(cc)) {
-      detectedCountry = cc;
+  const explicitLocale =
+    typeof options.locale === 'string' && options.locale.trim() ? options.locale.trim() : '';
+  const explicitCountry =
+    (typeof options.market === 'string' && /^[A-Z]{2}$/i.test(options.market.trim())
+      ? options.market.trim().toUpperCase()
+      : '') ||
+    (typeof options.country === 'string' && /^[A-Z]{2}$/i.test(options.country.trim())
+      ? options.country.trim().toUpperCase()
+      : '');
+  const fallbackMarket =
+    typeof options.fallbackMarket === 'string' && /^[A-Z]{2}$/i.test(options.fallbackMarket.trim())
+      ? options.fallbackMarket.trim().toUpperCase()
+      : '';
+
+  if (!detectedCountry) {
+    const locForRegion = explicitLocale || detectedLocale;
+    if (locForRegion && locForRegion.replace(/_/g, '-').includes('-')) {
+      const parts = locForRegion.replace(/_/g, '-').split('-');
+      const cc = parts[parts.length - 1].toUpperCase();
+      if (/^[A-Z]{2}$/.test(cc)) {
+        detectedCountry = cc;
+      }
     }
   }
 
-  const locale =
-    (typeof options.locale === 'string' && options.locale.trim()) ||
-    detectedLocale ||
-    'en-US';
   const country =
-    (typeof options.market === 'string' && options.market.trim().toUpperCase()) ||
-    (typeof options.country === 'string' && options.country.trim().toUpperCase()) ||
+    explicitCountry ||
     (/^[A-Z]{2}$/.test(detectedCountry) ? detectedCountry : '') ||
+    fallbackMarket ||
     'US';
+
+  const rawLocale = explicitLocale || detectedLocale || 'en-US';
+  const locale =
+    typeof xboxStorefront?.alignXboxLocaleWithMarket === 'function'
+      ? xboxStorefront.alignXboxLocaleWithMarket(rawLocale, country)
+      : rawLocale.includes('-')
+        ? rawLocale
+        : `${rawLocale.toLowerCase()}-${country}`;
 
   return { locale, country };
 }
@@ -987,19 +1059,11 @@ function bulkLoadLocalGalaxyMetadataMap(options = {}) {
         cur.reviewScore = Math.round(valObj.criticsScore);
       }
       const works = valObj.worksOn || valObj.osCompatibility;
-      if (works && typeof works === 'object' && !cur.platforms) {
-        cur.platforms = {
-          windows: Boolean(works.Windows ?? works.windows ?? true),
-          mac: Boolean(works.Mac ?? works.mac ?? false),
-          linux: Boolean(works.Linux ?? works.linux ?? false),
-        };
-      } else if (Array.isArray(works) && !cur.platforms) {
-        const lowerSet = new Set(works.map((w) => String(w || '').toLowerCase()));
-        cur.platforms = {
-          windows: lowerSet.has('windows') || lowerSet.has('win'),
-          mac: lowerSet.has('osx') || lowerSet.has('mac') || lowerSet.has('macos'),
-          linux: lowerSet.has('linux'),
-        };
+      if (!cur.platforms) {
+        const parsedOs = parseGogOsFlags(works);
+        if (parsedOs) {
+          cur.platforms = parsedOs;
+        }
       }
 
       byId.set(gogId, cur);
@@ -1018,13 +1082,62 @@ function bulkLoadLocalGalaxyMetadataMap(options = {}) {
 }
 
 /**
+ * Parse GOG `worksOn` / `osCompatibility` arrays or objects into normalized OS flags.
+ * Returns `null` when `works` is empty or resolves to `{ windows: false, mac: false, linux: false }`
+ * so callers fall back cleanly to `{ windows: true, mac: false, linux: false }`.
+ *
+ * @param {any} works
+ * @returns {{ windows: boolean, mac: boolean, linux: boolean } | null}
+ */
+function parseGogOsFlags(works) {
+  if (!works) return null;
+  if (Array.isArray(works)) {
+    if (works.length === 0) return null;
+    const lowerSet = new Set(works.map((w) => String(w || '').trim().toLowerCase()));
+    const flags = {
+      windows: lowerSet.has('windows') || lowerSet.has('win') || lowerSet.has('pc'),
+      mac: lowerSet.has('osx') || lowerSet.has('mac') || lowerSet.has('macos'),
+      linux: lowerSet.has('linux'),
+    };
+    if (!flags.windows && !flags.mac && !flags.linux) return null;
+    return flags;
+  }
+  if (typeof works === 'object') {
+    const hasWinKey = works.Windows !== undefined || works.windows !== undefined;
+    const hasMacKey =
+      works.Mac !== undefined ||
+      works.mac !== undefined ||
+      works.OSX !== undefined ||
+      works.osx !== undefined;
+    const hasLinuxKey = works.Linux !== undefined || works.linux !== undefined;
+    if (!hasWinKey && !hasMacKey && !hasLinuxKey) return null;
+    const flags = {
+      windows: Boolean(works.Windows ?? works.windows ?? false),
+      mac: Boolean(works.Mac ?? works.mac ?? works.OSX ?? works.osx ?? false),
+      linux: Boolean(works.Linux ?? works.linux ?? false),
+    };
+    if (!flags.windows && !flags.mac && !flags.linux) return null;
+    return flags;
+  }
+  return null;
+}
+
+/**
  * Fetch GOG Library using Playnite / Heroic endpoints
  */
 async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
   const games = [];
   const suppressedItems = [];
   /** @type {any} */ (fetchGogOwnedGames).lastSuppressedItems = suppressedItems;
+  /** @type {any} */ (fetchGogOwnedGames).lastAuthoritativeComplete = false;
   let encounteredNetworkOrServerFailure = false;
+  let completedAllPages = false;
+  let abortedPaginationEarly = false;
+
+  if (typeof accessToken !== 'string' || accessToken.trim().length === 0) {
+    /** @type {any} */ (fetchGogOwnedGames).lastAchievementsMap = {};
+    return games;
+  }
 
   // 1. Fetch playtime & achievement stats
   const { achievements: achievementsMap, stats: playtimeMap } = await fetchGogAchievements(
@@ -1053,7 +1166,7 @@ async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
     let currentPage = 1;
     let totalPages = 1;
 
-    while (currentPage <= totalPages && currentPage <= 35) {
+    while (currentPage <= totalPages && currentPage <= 100) {
       const url = `https://embed.gog.com/account/getFilteredProducts?hasHiddenProducts=false&isDefault=true&mediaType=1&page=${currentPage}&limit=100`;
       const res = await fetch(url, {
         headers: {
@@ -1064,18 +1177,26 @@ async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
       });
 
       if (!res.ok) {
-        if (res.status >= 500 || res.status === 429) {
-          encounteredNetworkOrServerFailure = true;
+        if (currentPage === 1 && (res.status === 401 || res.status === 403)) {
+          throw new Error(`GOG getFilteredProducts unauthorized (${res.status})`);
         }
+        encounteredNetworkOrServerFailure = true;
+        abortedPaginationEarly = true;
         console.warn(`GOG getFilteredProducts page ${currentPage} returned status ${res.status}`);
         break;
       }
 
       const data = await res.json();
-      totalPages = data.totalPages || 1;
-      const products = data.products || [];
+      totalPages =
+        typeof data.totalPages === 'number' && data.totalPages >= 0 ? data.totalPages : 1;
+      if (totalPages === 0) {
+        completedAllPages = true;
+        break;
+      }
+      const products = Array.isArray(data.products) ? data.products : [];
 
       for (const p of products) {
+        if (p?.isHidden === true) continue;
         const title = (p.title || '').trim();
         if (!title) continue;
 
@@ -1143,14 +1264,7 @@ async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
         const verticalGogCover = enrichedEntry?.coverVertical || null;
 
         const rawWorksOn = p.worksOn || p.os || enrichedEntry?.worksOn || enrichedEntry?.platforms;
-        const resolvedOsPlatforms =
-          rawWorksOn && typeof rawWorksOn === 'object'
-            ? {
-                windows: Boolean(rawWorksOn.Windows ?? rawWorksOn.windows ?? true),
-                mac: Boolean(rawWorksOn.Mac ?? rawWorksOn.mac ?? false),
-                linux: Boolean(rawWorksOn.Linux ?? rawWorksOn.linux ?? false),
-              }
-            : undefined;
+        const resolvedOsPlatforms = parseGogOsFlags(rawWorksOn) || undefined;
         const resolvedNativePlatforms = resolvedOsPlatforms
           ? [
               ...(resolvedOsPlatforms.windows ? ['windows'] : []),
@@ -1161,7 +1275,10 @@ async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
         const localGogMeta = galaxyDbOpenedOnce
           ? bulkGalaxyMetaMap.get(strId) || null
           : storefrontLocalCacheFederator.resolveLocalGogMetadata(strId, options);
-        const effectiveOsPlatforms = resolvedOsPlatforms || localGogMeta?.platforms || undefined;
+        const effectiveOsPlatforms =
+          resolvedOsPlatforms ||
+          parseGogOsFlags(localGogMeta?.platforms) ||
+          { windows: true, mac: false, linux: false };
         const effectiveNativePlatforms = effectiveOsPlatforms
           ? [
               ...(effectiveOsPlatforms.windows ? ['windows'] : []),
@@ -1215,82 +1332,22 @@ async function fetchGogOwnedGames(accessToken, username, userId, options = {}) {
 
       currentPage++;
     }
+
+    if (!abortedPaginationEarly && !encounteredNetworkOrServerFailure && currentPage > totalPages) {
+      completedAllPages = true;
+    }
   } catch (err) {
     encounteredNetworkOrServerFailure = true;
+    completedAllPages = false;
+    if (String(err?.message || '').includes('GOG getFilteredProducts unauthorized')) {
+      throw err;
+    }
     console.error('Error fetching GOG products:', err.message);
   }
 
-  // Offline / transient network fallback: hydrate owned GOG games from local galaxy-2.0.db
-  if (games.length === 0 && encounteredNetworkOrServerFailure) {
-    try {
-      const localGogList = storefrontLocalCacheFederator.listLocalGogCatalogGames(options);
-      for (const localMeta of localGogList) {
-        const strId = String(localMeta.gogId || '');
-        const title = String(localMeta.title || localMeta.name || '').trim();
-        if (!strId || !title) continue;
-        const nonGameReason = classifyNonGameStorefrontItem({
-          title,
-          platformId: 'gog',
-          platformGameId: strId,
-          isDlc: false,
-        });
-        if (nonGameReason) continue;
-
-        const stats = playtimeMap.get(strId) || {};
-        const lowerTitle = title.toLowerCase();
-        const normTitle = lowerTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-        const gameAch =
-          achievementsMap[strId] ||
-          achievementsMap[`gog-${strId}`] ||
-          achievementsMap[lowerTitle] ||
-          achievementsMap[normTitle];
-
-        const osPlatforms = localMeta.platforms || { windows: true, mac: false, linux: false };
-        const nativePlatforms = [
-          ...(osPlatforms.windows ? ['windows'] : []),
-          ...(osPlatforms.mac ? ['mac'] : []),
-        ];
-
-        games.push({
-          id: `gog-${strId}`,
-          title,
-          sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
-          steamAppId: undefined,
-          isVerifiedEntitlement: true,
-          ...(nativePlatforms.length > 0 ? { nativePlatforms } : {}),
-          worksOn: osPlatforms,
-          platforms: [
-            {
-              platformId: 'gog',
-              platformGameId: strId,
-              installed: false,
-              playtimeMinutes: stats.playtime || 0,
-              lastPlayed: stats.lastSession || undefined,
-              achievements: gameAch || undefined,
-              platforms: osPlatforms,
-            },
-          ],
-          headerImage:
-            localMeta.headerImage ||
-            localMeta.capsuleImage ||
-            'https://images.gog-statics.com/avatars/default.png',
-          capsuleImage: localMeta.capsuleImage || localMeta.headerImage || '',
-          shortDescription: localMeta.shortDescription || '',
-          detailedDescription: localMeta.detailedDescription || undefined,
-          releaseDate: localMeta.releaseDate || '',
-          developers: localMeta.developers || [],
-          publishers: localMeta.publishers || [],
-          genres: localMeta.genres && localMeta.genres.length > 0 ? localMeta.genres : [],
-          tags:
-            localMeta.tags && localMeta.tags.length > 0
-              ? Array.from(new Set(['GOG', 'DRM-Free', ...localMeta.tags]))
-              : ['GOG', 'DRM-Free'],
-          rating: localMeta.reviewScore,
-        });
-      }
-    } catch {}
-  }
-
+  /** @type {any} */ (fetchGogOwnedGames).lastAuthoritativeComplete = Boolean(
+    completedAllPages && !encounteredNetworkOrServerFailure
+  );
   return games;
 }
 
@@ -1553,17 +1610,335 @@ async function fetchEpicAchievements(accessToken, accountId, options = {}) {
 }
 
 /**
+ * Extract Epic `customAttributes` (supporting both `[{ key, value }]` array shape and
+ * `{ Key: { value } | string }` object shape) into a normalized case-insensitive key lookup.
+ *
+ * @param {unknown} rawAttrs
+ * @returns {Record<string, string>}
+ */
+function extractEpicCustomAttributesMap(rawAttrs) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (!rawAttrs || typeof rawAttrs !== 'object') return out;
+  if (Array.isArray(rawAttrs)) {
+    for (const entry of rawAttrs) {
+      if (!entry || typeof entry !== 'object') continue;
+      const k = String(entry.key ?? entry.name ?? '').trim();
+      const rawVal = entry.value;
+      const v =
+        rawVal && typeof rawVal === 'object'
+          ? String(rawVal.value ?? '').trim()
+          : String(rawVal ?? '').trim();
+      if (k && v) {
+        out[k] = v;
+        out[k.toLowerCase()] = v;
+      }
+    }
+    return out;
+  }
+  for (const [kRaw, entry] of Object.entries(rawAttrs)) {
+    const k = String(kRaw || '').trim();
+    if (!k) continue;
+    const v =
+      entry && typeof entry === 'object'
+        ? String(/** @type {any} */ (entry).value ?? '').trim()
+        : String(entry ?? '').trim();
+    if (v) {
+      out[k] = v;
+      out[k.toLowerCase()] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve Epic third-party partner launcher handoff (`'ea'` | `'ubisoft'`) from one or more
+ * `customAttributes` objects/arrays (`ThirdPartyManagedApp`, `PartnerLinkType`, `RegistryPath`, `RegistryKey`).
+ *
+ * @param {...unknown} attrSources
+ * @returns {{
+ *   chainedLauncherHandoff: 'ea' | 'ubisoft',
+ *   externalStorefrontHandoff: 'ea' | 'ubisoft',
+ *   chainedHandoffTopology: 'partner_launcher_link',
+ *   epicPartnerRegistryPath?: string,
+ *   epicPartnerRegistryKey?: string
+ * } | null}
+ */
+function resolveEpicPartnerChainedHandoff(...attrSources) {
+  let thirdPartyManagedApp = '';
+  let partnerLinkType = '';
+  let registryPath = '';
+  let registryKey = '';
+
+  for (const src of attrSources) {
+    if (!src) continue;
+    const map = extractEpicCustomAttributesMap(src);
+    if (!thirdPartyManagedApp && map.thirdpartymanagedapp) {
+      thirdPartyManagedApp = map.thirdpartymanagedapp;
+    }
+    if (!partnerLinkType && map.partnerlinktype) {
+      partnerLinkType = map.partnerlinktype;
+    }
+    if (!registryPath && map.registrypath) {
+      registryPath = map.registrypath;
+    }
+    if (!registryKey && map.registrykey) {
+      registryKey = map.registrykey;
+    }
+  }
+
+  const normalized =
+    normalizeChainedHandoffId(thirdPartyManagedApp) ||
+    normalizeChainedHandoffId(partnerLinkType);
+  if (normalized !== 'ea' && normalized !== 'ubisoft') {
+    return null;
+  }
+
+  return {
+    chainedLauncherHandoff: normalized,
+    externalStorefrontHandoff: normalized,
+    chainedHandoffTopology: 'partner_launcher_link',
+    ...(registryPath ? { epicPartnerRegistryPath: registryPath } : {}),
+    ...(registryKey ? { epicPartnerRegistryKey: registryKey } : {}),
+  };
+}
+
+/**
+ * Read `customAttributes` from local Legendary `metadata/<appName>.json` if present on disk.
+ *
+ * @param {string} appName
+ * @param {string[]} [baseDirs]
+ * @returns {Record<string, any> | null}
+ */
+function readLocalLegendaryCustomAttributes(appName, baseDirs = []) {
+  const cleanApp = String(appName || '')
+    .replace(/^epic-/i, '')
+    .trim();
+  if (!cleanApp || !Array.isArray(baseDirs) || baseDirs.length === 0) return null;
+  for (const baseDir of baseDirs) {
+    if (!baseDir) continue;
+    const metaDir = path.join(baseDir, 'metadata');
+    const directFile = path.join(metaDir, `${cleanApp}.json`);
+    if (fs.existsSync(directFile)) {
+      try {
+        const json = JSON.parse(fs.readFileSync(directFile, 'utf-8'));
+        const attrs = json?.metadata?.customAttributes || json?.customAttributes;
+        if (attrs && typeof attrs === 'object') return attrs;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect whether a Steam `appdetails` data payload requires EA App (`link2ea://`) chained handoff
+ * (`chainedHandoffTopology: 'storefront_depot_uri'`), leaving Steam-native EA titles unchained.
+ *
+ * @param {unknown} appDetailsPayload
+ * @returns {{
+ *   chainedLauncherHandoff: 'ea',
+ *   chainedHandoffTopology: 'storefront_depot_uri',
+ *   drmNotice?: string,
+ *   extUserAccountNotice?: string
+ * } | null}
+ */
+function detectSteamAppDetailsChainedHandoff(appDetailsPayload) {
+  if (!appDetailsPayload || typeof appDetailsPayload !== 'object') return null;
+  /** @type {any} */
+  let data = appDetailsPayload;
+  if (data.data && typeof data.data === 'object') {
+    data = data.data;
+  } else if (
+    !('drm_notice' in data) &&
+    !('drmNotice' in data) &&
+    !('ext_user_account_notice' in data) &&
+    !('extUserAccountNotice' in data)
+  ) {
+    const firstEntry = Object.values(data).find(
+      (v) => v && typeof v === 'object' && ('data' in v || 'drm_notice' in v || 'drmNotice' in v)
+    );
+    if (firstEntry && typeof firstEntry === 'object') {
+      data = /** @type {any} */ (firstEntry).data || firstEntry;
+    }
+  }
+
+  const rawDrm = String(data?.drm_notice ?? data?.drmNotice ?? '').trim();
+  const rawExtAccount = String(
+    data?.ext_user_account_notice ?? data?.extUserAccountNotice ?? ''
+  ).trim();
+
+  const normalizeHtmlNotice = (/** @type {string} */ s) =>
+    s
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanDrm = normalizeHtmlNotice(rawDrm);
+  const cleanExt = normalizeHtmlNotice(rawExtAccount);
+  if (!cleanDrm) return null;
+
+  if (
+    /\b(?:no|without)\s+(?:EA\s+app|Origin)\b/i.test(cleanDrm) ||
+    /\b(?:EA\s+app|Origin(?:\s+client)?)\s+(?:is\s+)?not\s+required\b/i.test(cleanDrm)
+  ) {
+    return null;
+  }
+
+  const hasEaDrmRequirement =
+    /\b(?:EA\s+app|Origin(?:\s+client)?)\b[\s\S]*\b(?:installation|required|activation)\b/i.test(
+      cleanDrm
+    ) ||
+    /\b(?:installation|required|activation)\b[\s\S]*\b(?:EA\s+app|Origin\s+client)\b/i.test(
+      cleanDrm
+    ) ||
+    (/\bEA\s+Account\b/i.test(cleanExt) && /\b(?:EA\s+app|Origin(?:\s+client)?)\b/i.test(cleanDrm));
+
+  if (!hasEaDrmRequirement) {
+    return null;
+  }
+
+  return {
+    chainedLauncherHandoff: 'ea',
+    chainedHandoffTopology: 'storefront_depot_uri',
+    ...(rawDrm ? { drmNotice: rawDrm } : {}),
+    ...(rawExtAccount ? { extUserAccountNotice: rawExtAccount } : {}),
+  };
+}
+
+/**
+ * Enrich a Steam game record, platform entry, or metadata object from Steam `appdetails` data,
+ * stamping `chainedLauncherHandoff: 'ea'` and `chainedHandoffTopology: 'storefront_depot_uri'`
+ * when EA App / Origin installation is required while leaving Steam-native EA titles unchained.
+ *
+ * @param {Record<string, any>} target
+ * @param {unknown} appDetailsPayload
+ * @returns {Record<string, any>}
+ */
+function enrichSteamGameFromAppDetails(target, appDetailsPayload) {
+  if (!target || typeof target !== 'object') return target;
+  const handoff = detectSteamAppDetailsChainedHandoff(appDetailsPayload);
+  if (!handoff) {
+    return target;
+  }
+
+  target.chainedLauncherHandoff = handoff.chainedLauncherHandoff;
+  target.chainedHandoffTopology = handoff.chainedHandoffTopology;
+  if (handoff.drmNotice && !target.drmNotice) {
+    target.drmNotice = handoff.drmNotice;
+  }
+  if (handoff.extUserAccountNotice && !target.extUserAccountNotice) {
+    target.extUserAccountNotice = handoff.extUserAccountNotice;
+  }
+
+  if (Array.isArray(target.platforms)) {
+    target.platforms = target.platforms.map((/** @type {any} */ p) => {
+      if (!p || p.platformId !== 'steam') return p;
+      return {
+        ...p,
+        chainedLauncherHandoff: handoff.chainedLauncherHandoff,
+        chainedHandoffTopology: handoff.chainedHandoffTopology,
+      };
+    });
+  }
+  if (target.enrichedMetadata && typeof target.enrichedMetadata === 'object') {
+    target.enrichedMetadata = {
+      ...target.enrichedMetadata,
+      chainedLauncherHandoff: handoff.chainedLauncherHandoff,
+      chainedHandoffTopology: handoff.chainedHandoffTopology,
+      ...(handoff.drmNotice && !target.enrichedMetadata.drmNotice
+        ? { drmNotice: handoff.drmNotice }
+        : {}),
+      ...(handoff.extUserAccountNotice && !target.enrichedMetadata.extUserAccountNotice
+        ? { extUserAccountNotice: handoff.extUserAccountNotice }
+        : {}),
+    };
+  }
+  return target;
+}
+
+/**
+ * Fetch Steam Store `appdetails` metadata for an AppID and enrich chained launcher handoff fields.
+ *
+ * @param {string | number | { appId?: string | number, steamAppId?: string | number, platformGameId?: string | number, game?: Record<string, any> }} payload
+ * @param {{ fetchFn?: typeof fetch, signal?: AbortSignal, country?: string }} [options]
+ * @returns {Promise<Record<string, any> | null>}
+ */
+async function fetchSteamProductAppDetailsMetadata(payload, options = {}) {
+  const rawId =
+    payload && typeof payload === 'object'
+      ? payload.appId ?? payload.steamAppId ?? payload.platformGameId ?? ''
+      : payload;
+  const cleanId = String(rawId ?? '')
+    .replace(/^steam[-_:]/i, '')
+    .trim();
+  if (!/^\d+$/.test(cleanId)) return null;
+
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
+  const cc = String(options?.country || 'US').trim().toUpperCase() || 'US';
+  const url = `https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(cleanId)}&l=english&cc=${encodeURIComponent(cc)}`;
+  const res = await fetchImpl(url, {
+    headers: {
+      'User-Agent': buildPlatformStoreUserAgent(),
+      Accept: 'application/json',
+    },
+    signal: buildStoreFetchSignal(options?.signal),
+  });
+  if (!res.ok) return null;
+  const json = await res.json();
+  const entry = json?.[cleanId];
+  if (!entry || entry.success === false || !entry.data || typeof entry.data !== 'object') {
+    return null;
+  }
+  const data = entry.data;
+  const handoff = detectSteamAppDetailsChainedHandoff(data);
+  /** @type {Record<string, any>} */
+  const enriched = {
+    appId: Number(cleanId),
+    name: typeof data.name === 'string' ? data.name : undefined,
+    drmNotice: typeof data.drm_notice === 'string' && data.drm_notice ? data.drm_notice : undefined,
+    extUserAccountNotice:
+      typeof data.ext_user_account_notice === 'string' && data.ext_user_account_notice
+        ? data.ext_user_account_notice
+        : undefined,
+    ...(handoff
+      ? {
+          chainedLauncherHandoff: handoff.chainedLauncherHandoff,
+          chainedHandoffTopology: handoff.chainedHandoffTopology,
+        }
+      : {}),
+  };
+  if (payload && typeof payload === 'object' && payload.game) {
+    enrichSteamGameFromAppDetails(payload.game, data);
+  }
+  return enriched;
+}
+
+/**
  * Fetch Epic Games Owned Library & Playtime
  */
 async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
+  /** @type {any} */ (fetchEpicOwnedGames).lastAuthoritativeComplete = false;
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
   const playtimeMap = new Map();
   let encounteredEpicOfflineFailure = false;
+  let completedAllLibraryPages = false;
+  let abortedLibraryPaginationEarly = false;
+  let catalogBatchEncounteredError = false;
+  let hadUnresolvedCatalogFailure = false;
+
+  if (typeof accessToken !== 'string' || accessToken.trim().length === 0) {
+    /** @type {any} */ (fetchEpicOwnedGames).lastAchievementsMap = {};
+    /** @type {any} */ (fetchEpicOwnedGames).lastSuppressedItems = [];
+    return [];
+  }
 
   // 1. Fetch playtime if accountId is available
   if (accountId) {
     try {
       const playtimeUrl = `https://library-service.live.use1a.on.epicgames.com/library/api/public/playtime/account/${encodeURIComponent(accountId)}/all`;
-      const ptRes = await fetch(playtimeUrl, {
+      const ptRes = await fetchImpl(playtimeUrl, {
         headers: {
           Authorization: `bearer ${accessToken}`,
           'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
@@ -1654,12 +2029,12 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
     let pageCount = 0;
     const candidateRecords = [];
 
-    while (hasMore && pageCount < 30) {
+    while (hasMore && pageCount < 100) {
       const fetchUrl = cursor
         ? `https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true&cursor=${encodeURIComponent(cursor)}`
         : 'https://library-service.live.use1a.on.epicgames.com/library/api/public/items?includeMetadata=true';
 
-      const res = await fetch(fetchUrl, {
+      const res = await fetchImpl(fetchUrl, {
         headers: {
           Authorization: `bearer ${accessToken}`,
           'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
@@ -1668,12 +2043,11 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
       });
 
       if (!res.ok) {
-        if (res.status === 401 || res.status === 403) {
-          throw new Error(`Epic library fetch unauthorized (${res.status})`);
+        if (pageCount === 0 && (res.status === 401 || res.status === 403)) {
+          throw new Error(`Epic library API unauthorized (${res.status})`);
         }
-        if (res.status >= 500 || res.status === 429) {
-          encounteredEpicOfflineFailure = true;
-        }
+        encounteredEpicOfflineFailure = true;
+        abortedLibraryPaginationEarly = true;
         console.warn(`Epic library fetch returned status ${res.status}`);
         break;
       }
@@ -1685,6 +2059,10 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
       cursor = data.responseMetadata?.nextCursor;
       hasMore = Boolean(cursor);
       pageCount++;
+    }
+
+    if (!abortedLibraryPaginationEarly && !encounteredEpicOfflineFailure && !hasMore) {
+      completedAllLibraryPages = true;
     }
 
     // Filter candidate records structurally and resolve catalog metadata in parallel batches
@@ -1765,13 +2143,14 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
       filteredItems.push(item);
     }
 
-    const macEpicAppIds = extractEpicMacSupportFromLegendaryDirs(getLocalLegendaryBaseDirs());
+    const localLegendaryDirs = getLocalLegendaryBaseDirs(options);
+    const macEpicAppIds = extractEpicMacSupportFromLegendaryDirs(localLegendaryDirs);
 
     if (accessToken) {
       const macAbort = new AbortController();
       const macTimeout = setTimeout(() => macAbort.abort(), 4000);
       try {
-        const macRes = await fetch(
+        const macRes = await fetchImpl(
           'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Mac?label=Live',
           {
             signal: buildStoreFetchSignal(macAbort.signal, 4000),
@@ -1819,6 +2198,7 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
           let developer = item.metadata?.developer || '';
           let keyImages = item.metadata?.keyImages || [];
           let hasReleaseInfoMac = hasReleaseInfoPlatformMac(item.metadata?.releaseInfo);
+          let catalogCustomAttributes = null;
 
           if (!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
             let resolvedFromCatalog = false;
@@ -1826,7 +2206,7 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             const catTimer = setTimeout(() => catAbort.abort(), 6000);
             try {
               const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${encodeURIComponent(item.namespace)}/bulk/items?id=${encodeURIComponent(item.catalogItemId)}&includeDLCDetails=true&includeMainGameDetails=true`;
-              const cRes = await fetch(catUrl, {
+              const cRes = await fetchImpl(catUrl, {
                 signal: buildStoreFetchSignal(catAbort.signal, 6000),
                 headers: {
                   Authorization: `bearer ${accessToken}`,
@@ -1837,6 +2217,7 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
                 const cData = await cRes.json();
                 const meta = cData[item.catalogItemId];
                 if (meta) {
+                  catalogCustomAttributes = meta.customAttributes || null;
                   if (hasReleaseInfoPlatformMac(meta.releaseInfo)) {
                     hasReleaseInfoMac = true;
                   }
@@ -1870,9 +2251,11 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
                   developer = meta.developer || developer;
                   keyImages = meta.keyImages || keyImages;
                 }
+              } else {
+                catalogBatchEncounteredError = true;
               }
             } catch {
-              // Ignore individual catalog failure
+              catalogBatchEncounteredError = true;
             } finally {
               clearTimeout(catTimer);
             }
@@ -1894,6 +2277,9 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
                   hasReleaseInfoMac = true;
                 }
               } else {
+                if (catalogBatchEncounteredError) {
+                  hadUnresolvedCatalogFailure = true;
+                }
                 return null;
               }
             }
@@ -1905,6 +2291,9 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             /^[0-9a-f]{20,}$/i.test(title) ||
             /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)
           ) {
+            if (catalogBatchEncounteredError) {
+              hadUnresolvedCatalogFailure = true;
+            }
             return null;
           }
 
@@ -1987,6 +2376,32 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             }
           }
 
+          const localLegendaryCustomAttrs = readLocalLegendaryCustomAttributes(
+            item.appName,
+            localLegendaryDirs
+          );
+          const partnerHandoff = resolveEpicPartnerChainedHandoff(
+            item.metadata?.customAttributes,
+            item.customAttributes,
+            catalogCustomAttributes,
+            offerMeta?.customAttributes,
+            localLegendaryCustomAttrs
+          ) ||
+            (offerMeta?.chainedLauncherHandoff === 'ea' ||
+            offerMeta?.chainedLauncherHandoff === 'ubisoft'
+              ? {
+                  chainedLauncherHandoff: offerMeta.chainedLauncherHandoff,
+                  externalStorefrontHandoff: offerMeta.chainedLauncherHandoff,
+                  chainedHandoffTopology: 'partner_launcher_link',
+                  ...(offerMeta.epicPartnerRegistryPath
+                    ? { epicPartnerRegistryPath: offerMeta.epicPartnerRegistryPath }
+                    : {}),
+                  ...(offerMeta.epicPartnerRegistryKey
+                    ? { epicPartnerRegistryKey: offerMeta.epicPartnerRegistryKey }
+                    : {}),
+                }
+              : null);
+
           return {
             item,
             appNameLower,
@@ -1998,6 +2413,7 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             keyImages,
             offerMeta,
             hasReleaseInfoMac,
+            partnerHandoff,
           };
         })
       );
@@ -2015,14 +2431,16 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
           keyImages,
           offerMeta,
           hasReleaseInfoMac,
+          partnerHandoff,
         } = entry;
         const lower = title.toLowerCase().trim();
         if (knownAppIds.has(appNameLower)) continue;
 
-        const hasEpicMac =
-          macEpicAppIds.has(appNameLower) ||
-          Boolean(catalogIdLower && macEpicAppIds.has(catalogIdLower)) ||
-          Boolean(hasReleaseInfoMac);
+        const hasEpicMac = partnerHandoff
+          ? false
+          : macEpicAppIds.has(appNameLower) ||
+            Boolean(catalogIdLower && macEpicAppIds.has(catalogIdLower)) ||
+            Boolean(hasReleaseInfoMac);
 
         const tallCover =
           keyImages.find((img) => img.type === 'DieselGameBoxTall' || img.type === 'OfferImageTall')?.url ||
@@ -2084,6 +2502,19 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
               lastPlayed: pt.lastPlayed || undefined,
               achievements: gameAch || undefined,
               platforms: { windows: true, mac: hasEpicMac, linux: false },
+              ...(partnerHandoff
+                ? {
+                    chainedLauncherHandoff: partnerHandoff.chainedLauncherHandoff,
+                    externalStorefrontHandoff: partnerHandoff.externalStorefrontHandoff,
+                    chainedHandoffTopology: 'partner_launcher_link',
+                    ...(partnerHandoff.epicPartnerRegistryPath
+                      ? { epicPartnerRegistryPath: partnerHandoff.epicPartnerRegistryPath }
+                      : {}),
+                    ...(partnerHandoff.epicPartnerRegistryKey
+                      ? { epicPartnerRegistryKey: partnerHandoff.epicPartnerRegistryKey }
+                      : {}),
+                  }
+                : {}),
             },
           ],
           headerImage: headerImg,
@@ -2119,6 +2550,19 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
                 movies: [],
                 releaseDate: resolvedReleaseDate || 'Available Now',
                 platforms: { windows: true, mac: hasEpicMac, linux: false },
+                ...(partnerHandoff
+                  ? {
+                      chainedLauncherHandoff: partnerHandoff.chainedLauncherHandoff,
+                      externalStorefrontHandoff: partnerHandoff.externalStorefrontHandoff,
+                      chainedHandoffTopology: 'partner_launcher_link',
+                      ...(partnerHandoff.epicPartnerRegistryPath
+                        ? { epicPartnerRegistryPath: partnerHandoff.epicPartnerRegistryPath }
+                        : {}),
+                      ...(partnerHandoff.epicPartnerRegistryKey
+                        ? { epicPartnerRegistryKey: partnerHandoff.epicPartnerRegistryKey }
+                        : {}),
+                    }
+                  : {}),
               }
             : undefined,
         };
@@ -2130,81 +2574,17 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
       }
     }
   } catch (err) {
+    encounteredEpicOfflineFailure = true;
+    completedAllLibraryPages = false;
     console.error('Error fetching Epic library items:', err.message);
-    if (String(err && err.message).includes('unauthorized')) {
+    if (String(err?.message || '').includes('Epic library API unauthorized')) {
       throw err;
     }
-    encounteredEpicOfflineFailure = true;
   }
 
-  // Offline / transient network fallback: populate Epic library from local Legendary metadata/*.json
-  if (gamesMap.size === 0 && encounteredEpicOfflineFailure) {
-    try {
-      const localEpicGames = storefrontLocalCacheFederator.listLocalEpicCatalogGames(options);
-      for (const localMeta of localEpicGames) {
-        const appName = String(localMeta.appName || '').trim();
-        const title = String(localMeta.title || localMeta.name || '').trim();
-        if (!appName || !title) continue;
-        const nonGameReason = classifyNonGameStorefrontItem({
-          title,
-          platformId: 'epic',
-          platformGameId: appName,
-          isDlc: Boolean(localMeta.isDlc),
-        });
-        if (nonGameReason) continue;
-
-        const lower = title.toLowerCase();
-        const normTitle = lower.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
-        const appNameLower = appName.toLowerCase();
-        const namespaceLower = String(localMeta.namespace || '').toLowerCase();
-        const catalogIdLower = String(localMeta.catalogItemId || '').toLowerCase();
-
-        const gameAch =
-          (namespaceLower ? achievementsMap[namespaceLower] : null) ||
-          achievementsMap[lower] ||
-          achievementsMap[normTitle] ||
-          achievementsMap[appNameLower] ||
-          (catalogIdLower ? achievementsMap[catalogIdLower] : null);
-
-        const pt = playtimeMap.get(appName) || playtimeMap.get(localMeta.catalogItemId) || {};
-        const headerImg = localMeta.headerImage || 'https://cdn2.unrealengine.com/egs-badge.png';
-        const capsuleImg =
-          localMeta.capsuleImage || localMeta.headerImage || 'https://cdn2.unrealengine.com/egs-badge.png';
-        const hasMac = Boolean(localMeta.platforms?.mac);
-        const gameId = `epic-${appName}`;
-
-        gamesMap.set(gameId, {
-          id: gameId,
-          title,
-          sortTitle: title.replace(/^(The|A|An)\s+/i, ''),
-          isVerifiedEntitlement: true,
-          platforms: [
-            {
-              platformId: 'epic',
-              platformGameId: appName,
-              namespace: localMeta.namespace || undefined,
-              catalogItemId: localMeta.catalogItemId || undefined,
-              installed: false,
-              playtimeMinutes: pt.totalTime || 0,
-              lastPlayed: pt.lastPlayed || undefined,
-              achievements: gameAch || undefined,
-              platforms: { windows: true, mac: hasMac, linux: false },
-            },
-          ],
-          headerImage: headerImg,
-          capsuleImage: capsuleImg,
-          shortDescription: localMeta.shortDescription || '',
-          detailedDescription: localMeta.detailedDescription || undefined,
-          releaseDate: localMeta.releaseDate || '',
-          developers: localMeta.developers || [],
-          publishers: localMeta.publishers || ['Epic Games Store'],
-          genres: Array.isArray(localMeta.genres) ? localMeta.genres : [],
-          tags: ['Epic Games Store'],
-        });
-      }
-    } catch {}
-  }
-
+  /** @type {any} */ (fetchEpicOwnedGames).lastAuthoritativeComplete = Boolean(
+    completedAllLibraryPages && !encounteredEpicOfflineFailure && !hadUnresolvedCatalogFailure
+  );
   return Array.from(gamesMap.values());
 }
 
@@ -2286,10 +2666,12 @@ function registerEpicNamespaceMapping({ appName, namespace, catalogItemId, title
   }
 }
 
-async function getEpicCatalogAccessToken(forceClientCredentials = false) {
+async function getEpicCatalogAccessToken(forceClientCredentials = false, options = {}) {
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
   if (!forceClientCredentials) {
     try {
-      const saved = (await loadSavedTokensAsync())?.epic;
+      const vaultOpts = options?.userDataDir ? { userDataDir: options.userDataDir } : {};
+      const saved = (await loadSavedTokensAsync(vaultOpts))?.epic;
       if (saved?.access_token) {
         const expiresAtMs = saved.expires_at ? new Date(saved.expires_at).getTime() : 0;
         if (expiresAtMs && expiresAtMs - Date.now() < 60000 && saved.refresh_token) {
@@ -2304,7 +2686,7 @@ async function getEpicCatalogAccessToken(forceClientCredentials = false) {
     } catch {}
   }
 
-  if (cachedEpicClientToken && Date.now() < cachedEpicClientTokenExpiry) {
+  if (!options?.fetchFn && cachedEpicClientToken && Date.now() < cachedEpicClientTokenExpiry) {
     return cachedEpicClientToken;
   }
 
@@ -2313,7 +2695,7 @@ async function getEpicCatalogAccessToken(forceClientCredentials = false) {
       grant_type: 'client_credentials',
       token_type: 'eg1',
     });
-    const res = await fetch('https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token', {
+    const res = await fetchImpl('https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token', {
       method: 'POST',
       headers: {
         Authorization: `basic ${EPIC_CLIENT_AUTH}`,
@@ -2321,13 +2703,15 @@ async function getEpicCatalogAccessToken(forceClientCredentials = false) {
         'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
       },
       body: body.toString(),
-      signal: buildStoreFetchSignal(),
+      signal: buildStoreFetchSignal(options?.signal),
     });
     if (res.ok) {
       const data = await res.json();
       if (data?.access_token) {
-        cachedEpicClientToken = data.access_token;
-        cachedEpicClientTokenExpiry = Date.now() + ((data.expires_in || 3600) - 120) * 1000;
+        if (!options?.fetchFn) {
+          cachedEpicClientToken = data.access_token;
+          cachedEpicClientTokenExpiry = Date.now() + ((data.expires_in || 3600) - 120) * 1000;
+        }
         return data.access_token;
       }
     }
@@ -2413,6 +2797,21 @@ function extractEpicMacSupportFromLegendaryDirs(baseDirs = getLocalLegendaryBase
         for (const f of files) {
           try {
             const json = JSON.parse(fs.readFileSync(path.join(metaDir, f), 'utf-8'));
+            const an = String(json?.app_name || f.replace(/\.json$/i, ''))
+              .toLowerCase()
+              .trim();
+            const cid = String(json?.metadata?.id || json?.catalog_item_id || json?.id || '')
+              .toLowerCase()
+              .trim();
+            const partnerHandoff = resolveEpicPartnerChainedHandoff(
+              json?.metadata?.customAttributes,
+              json?.customAttributes
+            );
+            if (partnerHandoff) {
+              if (an) macEpicAppIds.delete(an);
+              if (cid) macEpicAppIds.delete(cid);
+              continue;
+            }
             const hasMacAssetInfo = Boolean(
               json?.asset_infos?.Mac && Object.keys(json.asset_infos.Mac).length > 0
             );
@@ -2426,12 +2825,6 @@ function extractEpicMacSupportFromLegendaryDirs(baseDirs = getLocalLegendaryBase
                   r.platform.some((p) => /^mac$/i.test(String(p)))
               );
             if (hasMacAssetInfo || hasMacRelease) {
-              const an = String(json?.app_name || f.replace(/\.json$/i, ''))
-                .toLowerCase()
-                .trim();
-              const cid = String(json?.metadata?.id || json?.catalog_item_id || json?.id || '')
-                .toLowerCase()
-                .trim();
               if (an) macEpicAppIds.add(an);
               if (cid) macEpicAppIds.add(cid);
             }
@@ -2696,38 +3089,60 @@ function resolveLocalEpicOfferMetadataFallback(payload = {}, options = {}) {
       title: payload.title,
     };
     const localMeta = storefrontLocalCacheFederator.resolveLocalEpicMetadata(rawAppName, fedOpts);
-    if (!localMeta) return null;
+    const localLegendaryAttrs = readLocalLegendaryCustomAttributes(
+      rawAppName,
+      payload.legendaryDirs || getLocalLegendaryBaseDirs(fedOpts)
+    );
+    const partnerHandoff = resolveEpicPartnerChainedHandoff(
+      localMeta?.customAttributes,
+      localLegendaryAttrs
+    );
+    if (!localMeta && !partnerHandoff) return null;
 
-    const screenshots = Array.isArray(localMeta.screenshots)
+    const screenshots = Array.isArray(localMeta?.screenshots)
       ? localMeta.screenshots
           .map((s) => (typeof s === 'string' ? s : s?.pathFull || s?.pathThumbnail || ''))
           .filter(Boolean)
       : [];
 
     return {
-      title: localMeta.title || payload.title || undefined,
-      shortDescription: localMeta.shortDescription || undefined,
-      detailedDescription: localMeta.detailedDescription || localMeta.shortDescription || undefined,
-      aboutTheGame: localMeta.aboutTheGame || localMeta.detailedDescription || undefined,
+      title: localMeta?.title || payload.title || undefined,
+      shortDescription: localMeta?.shortDescription || undefined,
+      detailedDescription: localMeta?.detailedDescription || localMeta?.shortDescription || undefined,
+      aboutTheGame: localMeta?.aboutTheGame || localMeta?.detailedDescription || undefined,
       screenshots,
       movies: undefined,
-      headerImage: localMeta.headerImage || undefined,
-      capsuleImage: localMeta.capsuleImage || undefined,
-      releaseDate: localMeta.releaseDate || undefined,
+      headerImage: localMeta?.headerImage || undefined,
+      capsuleImage: localMeta?.capsuleImage || undefined,
+      releaseDate: localMeta?.releaseDate || undefined,
       developers:
-        Array.isArray(localMeta.developers) && localMeta.developers.length > 0
+        Array.isArray(localMeta?.developers) && localMeta.developers.length > 0
           ? localMeta.developers
           : undefined,
       publishers:
-        Array.isArray(localMeta.publishers) && localMeta.publishers.length > 0
+        Array.isArray(localMeta?.publishers) && localMeta.publishers.length > 0
           ? localMeta.publishers
           : undefined,
       genres:
-        Array.isArray(localMeta.genres) && localMeta.genres.length > 0
+        Array.isArray(localMeta?.genres) && localMeta.genres.length > 0
           ? localMeta.genres
           : undefined,
-      namespace: localMeta.namespace || payload.namespace || undefined,
-      catalogItemId: localMeta.catalogItemId || payload.catalogItemId || undefined,
+      namespace: localMeta?.namespace || payload.namespace || undefined,
+      catalogItemId: localMeta?.catalogItemId || payload.catalogItemId || undefined,
+      ...(partnerHandoff
+        ? {
+            chainedLauncherHandoff: partnerHandoff.chainedLauncherHandoff,
+            externalStorefrontHandoff: partnerHandoff.externalStorefrontHandoff,
+            chainedHandoffTopology: 'partner_launcher_link',
+            ...(partnerHandoff.epicPartnerRegistryPath
+              ? { epicPartnerRegistryPath: partnerHandoff.epicPartnerRegistryPath }
+              : {}),
+            ...(partnerHandoff.epicPartnerRegistryKey
+              ? { epicPartnerRegistryKey: partnerHandoff.epicPartnerRegistryKey }
+              : {}),
+            platforms: { windows: true, mac: false, linux: false },
+          }
+        : {}),
       fromLocalCache: true,
     };
   } catch {
@@ -2736,6 +3151,7 @@ function resolveLocalEpicOfferMetadataFallback(payload = {}, options = {}) {
 }
 
 async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
+  const fetchImpl = typeof options?.fetchFn === 'function' ? options.fetchFn : fetch;
   try {
     const resolved = await resolveEpicNamespaceAndIds(payload);
     const namespace = resolved?.namespace;
@@ -2745,13 +3161,15 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
     }
 
     const cacheKey = `${namespace}:${String(catalogItemId || resolved?.appName || payload.title || '').toLowerCase()}`;
-    if (epicOfferMetadataCache.has(cacheKey)) {
+    if (!options?.fetchFn && epicOfferMetadataCache.has(cacheKey)) {
       return epicOfferMetadataCache.get(cacheKey);
     }
 
-    let token = await getEpicCatalogAccessToken(false);
+    let token =
+      (typeof options?.accessToken === 'string' && options.accessToken.trim()) ||
+      (await getEpicCatalogAccessToken(false, options));
     if (!token) {
-      token = await getEpicCatalogAccessToken(true);
+      token = await getEpicCatalogAccessToken(true, options);
     }
     if (!token) {
       return resolveLocalEpicOfferMetadataFallback(
@@ -2768,7 +3186,7 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
     });
 
     const offersUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${encodeURIComponent(namespace)}/offers?count=20&locale=${encodeURIComponent(locale)}&country=${encodeURIComponent(country)}`;
-    let res = await fetch(offersUrl, {
+    let res = await fetchImpl(offersUrl, {
       headers: {
         Authorization: `bearer ${token}`,
         'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
@@ -2777,9 +3195,9 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
     });
 
     if (res.status === 401 || res.status === 403) {
-      token = await getEpicCatalogAccessToken(true);
+      token = await getEpicCatalogAccessToken(true, options);
       if (token) {
-        res = await fetch(offersUrl, {
+        res = await fetchImpl(offersUrl, {
           headers: {
             Authorization: `bearer ${token}`,
             'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
@@ -2952,7 +3370,7 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
         let contentData = null;
         for (const contentLoc of contentLocalesToTry) {
           const contentUrl = `https://store-content.ak.epicgames.com/api/${encodeURIComponent(contentLoc)}/content/products/${encodeURIComponent(cSlug)}`;
-          const contentRes = await fetch(contentUrl, {
+          const contentRes = await fetchImpl(contentUrl, {
             headers: {
               'User-Agent': buildPlatformStoreUserAgent('EpicGamesLauncher'),
               Accept: 'application/json',
@@ -3098,6 +3516,15 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
 
     const devName = String(offer.developerDisplayName || offer.seller?.name || '').trim();
     const pubName = String(offer.publisherDisplayName || offer.seller?.name || '').trim();
+    const localLegendaryAttrs = readLocalLegendaryCustomAttributes(
+      payload.appName || resolved?.appName || '',
+      payload.legendaryDirs || getLocalLegendaryBaseDirs(options)
+    );
+    const partnerHandoff = resolveEpicPartnerChainedHandoff(
+      offer.customAttributes,
+      payload.customAttributes,
+      localLegendaryAttrs
+    );
 
     const result = {
       title: offerTitle || undefined,
@@ -3117,9 +3544,26 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
       publishers: pubName ? [pubName] : undefined,
       namespace,
       catalogItemId: catalogItemId || offer.id || undefined,
+      ...(offer.customAttributes ? { customAttributes: offer.customAttributes } : {}),
+      ...(partnerHandoff
+        ? {
+            chainedLauncherHandoff: partnerHandoff.chainedLauncherHandoff,
+            externalStorefrontHandoff: partnerHandoff.externalStorefrontHandoff,
+            chainedHandoffTopology: 'partner_launcher_link',
+            ...(partnerHandoff.epicPartnerRegistryPath
+              ? { epicPartnerRegistryPath: partnerHandoff.epicPartnerRegistryPath }
+              : {}),
+            ...(partnerHandoff.epicPartnerRegistryKey
+              ? { epicPartnerRegistryKey: partnerHandoff.epicPartnerRegistryKey }
+              : {}),
+            platforms: { windows: true, mac: false, linux: false },
+          }
+        : {}),
     };
 
-    setBoundedCacheEntry(epicOfferMetadataCache, cacheKey, result, MAX_STORE_SYNC_CACHE_ENTRIES);
+    if (!options?.fetchFn) {
+      setBoundedCacheEntry(epicOfferMetadataCache, cacheKey, result, MAX_STORE_SYNC_CACHE_ENTRIES);
+    }
     return result;
   } catch (err) {
     console.warn('fetchEpicProductOfferMetadata warning:', err.message);
@@ -3127,9 +3571,65 @@ async function fetchEpicProductOfferMetadata(payload = {}, options = {}) {
   }
 }
 
+const LUTRIS_NATURAL_PC_PREDECESSOR_RE =
+  /(?:^|\s)(?:my|your|our|the|his|her|its|a|an|this|that|new|old|custom|virtual|retro|mini|pocket|super|dream|ultimate|gaming|home|office|build\s+a)\s+pc$/i;
+const LUTRIS_NATURAL_WINDOWS_PREDECESSOR_RE =
+  /(?:^|\s)(?:the|of|in|into|through|behind|between|beyond|under|over|from|with|without|two|three|four|many|broken|stained|open|closed|shattered|dark|rear|glass)\s+windows$/i;
+
+function normalizeIgdbLookupTitle(rawTitle) {
+  if (!rawTitle || typeof rawTitle !== 'string') return '';
+  let cur = rawTitle
+    .replace(/&(?:trade|#8482|#x0*2122|reg|#174|#x0*ae|copy|#169|#x0*a9);/gi, '™')
+    .replace(/&(?:rsquo|lsquo|#8217|#8216|#x0*2019|#x0*2018|apos|#0*39|#x0*27);/gi, "'")
+    .replace(/&(?:ndash|mdash|#8211|#8212|#x0*2013|#x0*2014);/gi, ' ')
+    .replace(/&(?:nbsp|#160|#x0*a0);/gi, ' ')
+    .replace(/&(?:amp|#0*38|#x0*26);/gi, '&')
+    .replace(/([\p{L}\p{N}])(?:[™®©℠℗]+|\(\s*(?:tm|r|c)\s*\))(?=[\p{L}\p{N}])/giu, '$1 ')
+    .replace(/(?:[™®©℠℗]+|\(\s*(?:tm|r|c)\s*\))/gi, '')
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  for (let pass = 0; pass < 3; pass++) {
+    const prev = cur;
+    cur = cur
+      .replace(
+        /\s*[\(\[]\s*(?:pc|windows(?:\s*10|\s*11)?|win\s*10|win\s*11|xbox(?:\s+pc|\s+one|\s+series\s+x\s*[\/|]\s*s|\s+play\s+anywhere)?|microsoft\s+store|game\s+preview|ea\s+play(?:\s+edition)?|base\s+game|(?:pc|windows(?:\s*10|\s*11)?|win\s*10|win\s*11)\s+(?:edition|version))\s*[\)\]]/gi,
+        ''
+      )
+      .replace(
+        /(?:\s*[:\-–—]\s*|\s+for\s+)(?:pc|windows(?:\s*10|\s*11)?|win\s*10|win\s*11|microsoft\s+store|xbox(?:\s+pc|\s+one|\s+series\s+x\s*[\/|]\s*s)?)(?:\s+(?:edition|version))?\s*$/gi,
+        ''
+      )
+      .replace(
+        /(?:[:\-–—]\s*|\s+)(?:pc|windows(?:\s*10|\s*11)?|win\s*10|win\s*11)\s+(?:edition|version)\s*$/gi,
+        ''
+      )
+      .replace(/(?:[:\-–—]\s*|\s+)game\s+preview\s*$/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (/\s+pc$/i.test(cur) && !LUTRIS_NATURAL_PC_PREDECESSOR_RE.test(cur)) {
+      const withoutPc = cur.replace(/\s+pc$/i, '').trim();
+      if (withoutPc.length >= 2) cur = withoutPc;
+    }
+    if (/\s+windows(?:\s*10|\s*11)?$/i.test(cur) && !LUTRIS_NATURAL_WINDOWS_PREDECESSOR_RE.test(cur)) {
+      const withoutWin = cur.replace(/\s+windows(?:\s*10|\s*11)?$/i, '').trim();
+      if (withoutWin.length >= 2) cur = withoutWin;
+    }
+    if (cur === prev) break;
+  }
+
+  return cur
+    .replace(/[:\-–—_+]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function fetchIgdbCover(gameTitle) {
   if (!gameTitle) return null;
-  const cleanTitle = gameTitle.replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleanTitle = normalizeIgdbLookupTitle(String(gameTitle));
+  if (!cleanTitle) return null;
   try {
     const url = `https://lutris.net/api/games?search=${encodeURIComponent(cleanTitle)}`;
     const res = await fetch(url, {
@@ -3141,15 +3641,15 @@ async function fetchIgdbCover(gameTitle) {
     const items = data.results || [];
     if (items.length === 0) return null;
 
-    const normTarget = cleanTitle.toLowerCase();
+    const normTarget = cleanTitle.toLowerCase().replace(/'/g, '');
     let bestCover = null;
     let bestScore = -1;
 
     for (const item of items) {
       if (!item.coverart) continue;
-      const candNorm = (item.name || '').toLowerCase().replace(/[:\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+      const candNorm = normalizeIgdbLookupTitle(item.name || '').toLowerCase().replace(/'/g, '');
       let score = computeTokenSimilarity(normTarget, candNorm) * 100;
-      if (candNorm === normTarget) score += 100;
+      if (candNorm && candNorm === normTarget) score += 100;
 
       if (score > bestScore && score >= 50) {
         bestScore = score;
@@ -3188,6 +3688,31 @@ const epicSchemaFileCache = new Map();
 function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   const resultsMap = new Map();
   const homeDir = customOptions.homedir || process.env.HOME || process.env.USERPROFILE || '';
+  const allowUnverifiedLocalCache = customOptions.allowUnverifiedLocalCache === true;
+
+  let savedTokens = {};
+  try {
+    savedTokens = loadSavedTokens(customOptions) || {};
+  } catch {
+    savedTokens = {};
+  }
+  const rawEpicAccountId =
+    customOptions.epicAccountId !== undefined
+      ? customOptions.epicAccountId
+      : savedTokens?.epic?.account_id;
+  const expectedEpicAccountId =
+    typeof rawEpicAccountId === 'string' ? rawEpicAccountId.trim().toLowerCase() : '';
+  const rawGogUserId =
+    customOptions.gogUserId !== undefined
+      ? customOptions.gogUserId
+      : savedTokens?.gog?.user_id || savedTokens?.gog?.userId;
+  const expectedGogUserId =
+    rawGogUserId !== undefined && rawGogUserId !== null ? String(rawGogUserId).trim() : '';
+  const hasConnectedGogSession = Boolean(
+    expectedGogUserId ||
+      (typeof savedTokens?.gog?.access_token === 'string' &&
+        savedTokens.gog.access_token.trim().length > 0)
+  );
 
   const addSuppressedEntry = (entry) => {
     if (!entry || !entry.platformId || !entry.platformGameId || !entry.rawTitle) return;
@@ -3198,10 +3723,32 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   };
 
   // 1. Scan Legendary / Heroic Epic metadata directories (mtimeMs-cached per JSON file)
-  const legendaryDirs = customOptions.legendaryDirs || getLocalLegendaryBaseDirs();
+  const legendaryDirs =
+    allowUnverifiedLocalCache || expectedEpicAccountId
+      ? customOptions.legendaryDirs || getLocalLegendaryBaseDirs()
+      : [];
   for (const baseDir of legendaryDirs) {
-    const metaDir = path.join(baseDir, 'metadata');
-    if (!fs.existsSync(metaDir)) continue;
+    const metaDir = fs.existsSync(path.join(baseDir, 'metadata'))
+      ? path.join(baseDir, 'metadata')
+      : path.basename(baseDir).toLowerCase() === 'metadata' && fs.existsSync(baseDir)
+        ? baseDir
+        : '';
+    if (!metaDir) continue;
+    if (!allowUnverifiedLocalCache) {
+      const userJsonPath = path.join(path.dirname(metaDir), 'user.json');
+      if (!fs.existsSync(userJsonPath)) {
+        continue;
+      }
+      try {
+        const userJson = JSON.parse(fs.readFileSync(userJsonPath, 'utf-8'));
+        const localAccountId = String(userJson?.account_id || '').trim().toLowerCase();
+        if (!localAccountId || localAccountId !== expectedEpicAccountId) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+    }
     try {
       const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
       for (const file of files) {
@@ -3327,14 +3874,49 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   }
 
   // 2. Scan Heroic GOG library cache (gog_library.json, mtimeMs-cached)
-  const gogCacheFiles = customOptions.gogCacheFiles || [
-    homeDir ? path.join(homeDir, 'Library/Application Support/heroic/store_cache/gog_library.json') : '',
-    homeDir ? path.join(homeDir, '.config/heroic/store_cache/gog_library.json') : '',
-    process.env.APPDATA ? path.join(process.env.APPDATA, 'heroic/store_cache/gog_library.json') : '',
-  ].filter(Boolean);
+  const gogCacheFiles =
+    allowUnverifiedLocalCache || hasConnectedGogSession
+      ? customOptions.gogCacheFiles ||
+        [
+          homeDir
+            ? path.join(homeDir, 'Library/Application Support/heroic/store_cache/gog_library.json')
+            : '',
+          homeDir ? path.join(homeDir, '.config/heroic/store_cache/gog_library.json') : '',
+          process.env.APPDATA
+            ? path.join(process.env.APPDATA, 'heroic/store_cache/gog_library.json')
+            : '',
+        ].filter(Boolean)
+      : [];
 
   for (const gogFile of gogCacheFiles) {
     if (!fs.existsSync(gogFile)) continue;
+    if (!allowUnverifiedLocalCache) {
+      const heroicGogAuthPath = path.join(
+        path.dirname(path.dirname(gogFile)),
+        'gog_store',
+        'auth.json'
+      );
+      if (!fs.existsSync(heroicGogAuthPath)) {
+        continue;
+      }
+      try {
+        const authJson = JSON.parse(fs.readFileSync(heroicGogAuthPath, 'utf-8'));
+        const authEntry =
+          authJson?.[GOG_CLIENT_ID] || authJson?.['46899977096215655'] || authJson;
+        const hasActiveHeroicSession = Boolean(
+          String(authEntry?.access_token || authEntry?.refresh_token || '').trim()
+        );
+        if (!hasActiveHeroicSession) {
+          continue;
+        }
+        const localGogUserId = String(authEntry?.user_id || authEntry?.userId || '').trim();
+        if (expectedGogUserId && (!localGogUserId || localGogUserId !== expectedGogUserId)) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+    }
     try {
       const st = fs.statSync(gogFile);
       const cachedGog = suppressedGogCacheFileCache.get(gogFile);
@@ -3349,6 +3931,9 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
       const json = JSON.parse(fs.readFileSync(gogFile, 'utf-8'));
       const gamesList = Array.isArray(json?.games) ? json.games : [];
       for (const item of gamesList) {
+        if (item?.is_visible_in_library === false || item?.isVisibleInLibrary === false) {
+          continue;
+        }
         const appName = String(item?.app_name || '').trim();
         const title = String(item?.title || '').trim();
         if (!appName || !title) continue;
@@ -3408,7 +3993,6 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
 
   // 3. Also check saved Steam tokens games list for any non-game entries
   try {
-    const savedTokens = loadSavedTokens();
     const steamGames = Array.isArray(savedTokens?.steam?.games) ? savedTokens.steam.games : [];
     for (const g of steamGames) {
       const title = String(g?.title || '').trim();
@@ -3445,8 +4029,10 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
 function trimStoreSyncMemory() {
   /** @type {any} */ (fetchGogOwnedGames).lastAchievementsMap = null;
   /** @type {any} */ (fetchGogOwnedGames).lastSuppressedItems = null;
+  /** @type {any} */ (fetchGogOwnedGames).lastAuthoritativeComplete = null;
   /** @type {any} */ (fetchEpicOwnedGames).lastAchievementsMap = null;
   /** @type {any} */ (fetchEpicOwnedGames).lastSuppressedItems = null;
+  /** @type {any} */ (fetchEpicOwnedGames).lastAuthoritativeComplete = null;
   /** @type {any} */ (syncXboxLibrary).lastAchievementsMap = null;
   /** @type {any} */ (syncXboxLibrary).lastSuppressedItems = null;
   /** @type {any} */ (fetchXboxOwnedGames).lastAchievementsMap = null;
@@ -3663,13 +4249,25 @@ async function syncXboxLibrary(options = {}) {
     options.syncMode || savedXbox.syncMode || 'owned_and_played'
   );
 
-  const [session, storeToken] = await Promise.all([
-    provider.getValidXboxSession({ forceRefresh: Boolean(options.forceRefresh) }),
+  const forceRefresh = Boolean(options.forceRefresh);
+  const [session, storeToken, collectionsToken] = await Promise.all([
+    provider.getValidXboxSession({ forceRefresh }),
     provider.getStoreMsaToken({
       target: 'pcgafd',
-      forceRefresh: Boolean(options.forceRefresh),
+      forceRefresh,
     }),
+    typeof provider.getValidStoreToken === 'function'
+      ? provider.getValidStoreToken({ target: 'collections', forceRefresh }).catch(() => '')
+      : provider.getStoreMsaToken({ target: 'collections', forceRefresh }).catch(() => ''),
   ]);
+
+  // Warm Windows logical drive cache asynchronously before synchronous local XboxGames scan (`BUG-16`)
+  if (
+    (options.platform || process.platform) === 'win32' &&
+    typeof storefrontLocalCacheFederator.discoverWindowsLocalDrivesAsync === 'function'
+  ) {
+    await storefrontLocalCacheFederator.discoverWindowsLocalDrivesAsync(options).catch(() => {});
+  }
 
   // Discover locally installed Xbox games on Windows (`<Drive>:\XboxGames`) or macOS bottles (`drive_c/XboxGames`)
   const localInstallsByPfn = new Map();
@@ -3705,7 +4303,10 @@ async function syncXboxLibrary(options = {}) {
   } catch {}
 
   const fetchImpl = options.fetchFn || globalThis.fetch;
-  const { locale, country } = resolveDefaultStoreLocaleAndCountry(options);
+  const { locale, country } = resolveDefaultStoreLocaleAndCountry({
+    ...options,
+    fallbackMarket: savedXbox.market || savedXbox.subscription?.market || '',
+  });
 
   // 1. Fetch TitleHub played history (strictly for active-SIGL engagement signal + achievement decoration)
   const titleHubDecorations = await xboxStorefront.fetchXboxTitleHubSummaries({
@@ -3715,10 +4316,13 @@ async function syncXboxLibrary(options = {}) {
     fetchImpl,
   });
 
-  // 2. Run catalog sync with 5-Gate PC/Mac filter + Strict Active-Access Gate
+  // 2. Run catalog sync with 5-Gate PC/Mac filter + Layer-3 License Gate + Strict Active-Access Gate
   const catalogResult = await xboxStorefront.syncXboxCatalog({
     authProvider: provider,
     storeToken,
+    collectionsToken,
+    cachedSubscription: savedXbox.subscription || null,
+    forceRefresh,
     syncMode,
     titleHubDecorations,
     localInstallsByPfn,
@@ -3811,16 +4415,22 @@ async function syncXboxLibrary(options = {}) {
       avatarUrl: session.gamerpicUrl || savedXbox.avatarUrl,
       gamerpicUrl: session.gamerpicUrl || savedXbox.gamerpicUrl,
       gamerscore: session.gamerscore || savedXbox.gamerscore || 0,
+      market: catalogResult.subscription?.market || country,
       subscription: catalogResult.subscription,
       syncMode: catalogResult.syncMode,
     },
     vaultOpts
   );
 
+  const authoritativeComplete = Boolean(catalogResult.authoritativeComplete);
+  const subscriptionChanged = Boolean(catalogResult.subscriptionChanged);
+
   /** @type {any} */ (syncXboxLibrary).lastAchievementsMap = mergedAchievementsMap;
   /** @type {any} */ (syncXboxLibrary).lastSuppressedItems = catalogResult.suppressedItems || [];
+  /** @type {any} */ (syncXboxLibrary).lastAuthoritativeComplete = authoritativeComplete;
   /** @type {any} */ (fetchXboxOwnedGames).lastAchievementsMap = mergedAchievementsMap;
   /** @type {any} */ (fetchXboxOwnedGames).lastSuppressedItems = catalogResult.suppressedItems || [];
+  /** @type {any} */ (fetchXboxOwnedGames).lastAuthoritativeComplete = authoritativeComplete;
 
   return {
     accountName: session.gamertag,
@@ -3829,8 +4439,11 @@ async function syncXboxLibrary(options = {}) {
     xuid: session.xuid,
     avatarUrl: session.gamerpicUrl || undefined,
     gamerscore: session.gamerscore || 0,
+    market: catalogResult.subscription?.market || country,
     subscription: catalogResult.subscription,
     syncMode: catalogResult.syncMode,
+    authoritativeComplete,
+    subscriptionChanged,
     games: catalogResult.games,
     achievements: mergedAchievementsMap,
     suppressedItems: catalogResult.suppressedItems || [],
@@ -3967,15 +4580,51 @@ async function getXboxStatus(options = {}) {
       syncMode: 'owned_and_played',
     };
   }
-  if (options.refreshSubscription) {
+
+  const cachedSub = saved?.xbox?.subscription;
+  const expiryIso = cachedSub?.earliestActivePassEndDate || cachedSub?.endDate || '';
+  const expiryTs = expiryIso ? Date.parse(String(expiryIso)) : NaN;
+  const isExpiredByClock = Boolean(
+    cachedSub?.hasActiveSubscription && !Number.isNaN(expiryTs) && Date.now() >= expiryTs
+  );
+
+  if (options.refreshSubscription || isExpiredByClock) {
     try {
       const provider = getXboxAuthProvider(options);
+      const { locale, country } = resolveDefaultStoreLocaleAndCountry({
+        ...options,
+        fallbackMarket: saved?.xbox?.market || cachedSub?.market || '',
+      });
+      const [storeToken, collectionsToken] = await Promise.all([
+        typeof provider.getStoreMsaToken === 'function'
+          ? provider.getStoreMsaToken({ target: 'pcgafd' }).catch(() => '')
+          : Promise.resolve(''),
+        typeof provider.getValidStoreToken === 'function'
+          ? provider.getValidStoreToken({ target: 'collections' }).catch(() => '')
+          : typeof provider.getStoreMsaToken === 'function'
+            ? provider.getStoreMsaToken({ target: 'collections' }).catch(() => '')
+            : Promise.resolve(''),
+      ]);
       const subscription = await xboxStorefront.detectXboxSubscriptions({
         authProvider: provider,
+        storeToken,
+        collectionsToken,
+        market: country,
+        locale,
         fetchImpl: options.fetchFn || globalThis.fetch,
       });
-      await saveTokensAsync('xbox', { subscription }, vaultOpts);
-      redacted.subscription = subscription;
+      if (subscription.authoritativeDetection !== false || isExpiredByClock) {
+        await saveTokensAsync(
+          'xbox',
+          {
+            market: subscription.market || country,
+            subscription,
+          },
+          vaultOpts
+        );
+        redacted.subscription = projectSafeXboxSubscription(subscription);
+        redacted.market = subscription.market || country;
+      }
     } catch {}
   }
   return redacted;
@@ -4013,6 +4662,7 @@ module.exports = {
   renewGogTokens,
   normalizeGogAvatarUrl,
   fetchGogAccount,
+  parseGogOsFlags,
   bulkLoadLocalGalaxyMetadataMap,
   fetchGogOwnedGames,
   fetchGogAchievements,
@@ -4022,6 +4672,12 @@ module.exports = {
   fetchEpicAchievements,
   getEpicGameAchievementSchema,
   fetchEpicProductOfferMetadata,
+  extractEpicCustomAttributesMap,
+  resolveEpicPartnerChainedHandoff,
+  detectSteamAppDetailsChainedHandoff,
+  enrichSteamGameFromAppDetails,
+  applySteamAppDetailsHandoffEnrichment: enrichSteamGameFromAppDetails,
+  fetchSteamProductAppDetailsMetadata,
   resolveEpicNamespaceAndIds,
   extractEpicMacSupportFromLegendaryDirs,
   getXboxAuthProvider,

@@ -26,9 +26,14 @@ let winGamingServicesCache = {
   installed: null,
 };
 
+const MAC_VOLUME_CASE_CACHE_TTL_MS = 60_000;
+/** @type {Map<string, { timestamp: number, caseSensitive: boolean }>} */
+const macVolumeCaseSensitivityCache = new Map();
+
 registerExternalCacheInvalidator(() => {
   winLocalDrivesCache = { timestamp: 0, drives: null, inFlight: null };
   winGamingServicesCache = { timestamp: 0, installed: null };
+  macVolumeCaseSensitivityCache.clear();
 });
 
 function normalizeWindowsDriveRoot(rawDrive) {
@@ -545,6 +550,197 @@ function getDefaultInstallDir(platformId = 'custom', /** @type {any} */ options 
 }
 
 /**
+ * Non-destructive read-only volume case-sensitivity check on macOS (`darwin`).
+ * Compares inode (`st.ino`) + device (`st.dev`) of an existing entry vs its toggled-ASCII-case
+ * twin whose parent directory resides on the same `st.dev` (avoiding `/Volumes/<Name>` rootfs
+ * parent confusion), falling back to cached `diskutil info -plist` only when a volume contains
+ * zero ASCII-letter entries.
+ *
+ * @param {string} targetPath
+ * @param {any} [options={}]
+ * @returns {{ caseSensitive: boolean }}
+ */
+function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {}) {
+  if (typeof options.volumeCaseSensitive === 'boolean') {
+    return { caseSensitive: options.volumeCaseSensitive };
+  }
+  const platform = options.platform || process.platform;
+  if (platform !== 'darwin') {
+    return { caseSensitive: false };
+  }
+
+  const homedir = options.homedir || os.homedir();
+  let curr = toLocalFsPath(targetPath || homedir) || targetPath || homedir;
+  if (!curr || typeof curr !== 'string') {
+    return { caseSensitive: false };
+  }
+
+  if (isExternalVolumeUnmounted(curr, options)) {
+    return { caseSensitive: false };
+  }
+
+  const hasCustomFsMocks =
+    typeof options.statSyncFn === 'function' ||
+    typeof options.readdirSyncFn === 'function' ||
+    typeof options.execFileSyncFn === 'function';
+  const statSyncFn = typeof options.statSyncFn === 'function' ? options.statSyncFn : fs.statSync;
+  const readdirSyncFn =
+    typeof options.readdirSyncFn === 'function' ? options.readdirSyncFn : fs.readdirSync;
+  const execFileSyncFn =
+    typeof options.execFileSyncFn === 'function' ? options.execFileSyncFn : execFileSync;
+
+  const toggleAsciiCase = (/** @type {string} */ value) =>
+    value.replace(/[A-Za-z]/g, (ch) =>
+      ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase()
+    );
+
+  try {
+    let existingPath = path.resolve(curr);
+    /** @type {any} */
+    let targetStat = null;
+    for (let guard = 0; guard < 40 && existingPath; guard += 1) {
+      try {
+        targetStat = statSyncFn(existingPath);
+        if (targetStat) break;
+      } catch {
+        const parent = path.dirname(existingPath);
+        if (!parent || parent === existingPath) {
+          existingPath = '';
+          break;
+        }
+        existingPath = parent;
+      }
+    }
+
+    if (!existingPath || !targetStat) {
+      return { caseSensitive: false };
+    }
+
+    const targetDev = targetStat.dev;
+    const cacheKey =
+      targetDev !== undefined && targetDev !== null ? `dev:${String(targetDev)}` : existingPath;
+    const now = Date.now();
+    if (!hasCustomFsMocks && !options.forceRefresh) {
+      const cached = macVolumeCaseSensitivityCache.get(cacheKey);
+      if (cached && now - cached.timestamp < MAC_VOLUME_CASE_CACHE_TTL_MS) {
+        return { caseSensitive: cached.caseSensitive };
+      }
+    }
+
+    let probeOrigPath = '';
+    /** @type {any} */
+    let probeOrigStat = null;
+
+    // 1. Walk up `existingPath` while parent remains on the exact same `st.dev`
+    let walkNode = existingPath;
+    for (let depth = 0; depth < 40 && walkNode; depth += 1) {
+      const parentDir = path.dirname(walkNode);
+      if (!parentDir || parentDir === walkNode) break;
+      /** @type {any} */
+      let parentStat = null;
+      try {
+        parentStat = statSyncFn(parentDir);
+      } catch {
+        break;
+      }
+      if (!parentStat || parentStat.dev !== targetDev) {
+        // Crossed volume mount boundary (e.g., `/Volumes/ExternalSSD` -> `/Volumes`)
+        break;
+      }
+      const base = path.basename(walkNode);
+      if (base && /[A-Za-z]/.test(base) && toggleAsciiCase(base) !== base) {
+        try {
+          probeOrigStat = walkNode === existingPath ? targetStat : statSyncFn(walkNode);
+          probeOrigPath = walkNode;
+          break;
+        } catch {}
+      }
+      walkNode = parentDir;
+    }
+
+    // 2. If `existingPath` is a mount root (e.g. `/` or `/Volumes/ExternalSSD`), inspect an entry inside it
+    const mountRootDir = walkNode || existingPath;
+    if (!probeOrigPath) {
+      /** @type {any} */
+      let mountDirStat = null;
+      try {
+        mountDirStat = mountRootDir === existingPath ? targetStat : statSyncFn(mountRootDir);
+      } catch {}
+      if (mountDirStat && typeof mountDirStat.isDirectory === 'function' && mountDirStat.isDirectory()) {
+        try {
+          const entries = readdirSyncFn(mountRootDir).slice(0, 64);
+          for (const rawEntry of entries) {
+            const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
+            if (!name || name === '.' || name === '..') continue;
+            if (!/[A-Za-z]/.test(name) || toggleAsciiCase(name) === name) continue;
+            const candidateChild = path.join(mountRootDir, name);
+            try {
+              const childStat = statSyncFn(candidateChild);
+              if (childStat && childStat.dev === targetDev) {
+                probeOrigPath = candidateChild;
+                probeOrigStat = childStat;
+                break;
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    if (probeOrigPath && probeOrigStat) {
+      const parentDir = path.dirname(probeOrigPath);
+      const toggledBase = toggleAsciiCase(path.basename(probeOrigPath));
+      const toggledPath = path.join(parentDir, toggledBase);
+      let caseSensitive = false;
+      try {
+        const toggledStat = statSyncFn(toggledPath);
+        caseSensitive = !(
+          toggledStat &&
+          toggledStat.ino === probeOrigStat.ino &&
+          toggledStat.dev === probeOrigStat.dev
+        );
+      } catch (/** @type {any} */ statErr) {
+        if (statErr && statErr.code === 'ENOENT') {
+          caseSensitive = true;
+        }
+      }
+      if (!hasCustomFsMocks) {
+        macVolumeCaseSensitivityCache.set(cacheKey, { timestamp: now, caseSensitive });
+      }
+      return { caseSensitive };
+    }
+
+    // 3. Empty volume fallback: `diskutil info -plist <mountPoint>`
+    if (process.platform === 'darwin' || typeof options.execFileSyncFn === 'function') {
+      const volMatch = existingPath.match(/^(\/Volumes\/[^/]+)(?:\/|$)/);
+      const mountPoint = volMatch ? volMatch[1] : mountRootDir || '/';
+      try {
+        const plistOut = String(
+          execFileSyncFn('/usr/sbin/diskutil', ['info', '-plist', mountPoint], {
+            timeout: 2000,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          }) || ''
+        );
+        let caseSensitive = false;
+        const csKeyMatch = plistOut.match(/<key>CaseSensitive<\/key>\s*<(true|false)\s*\/>/i);
+        if (csKeyMatch) {
+          caseSensitive = csKeyMatch[1].toLowerCase() === 'true';
+        } else if (/Case-sensitive/i.test(plistOut)) {
+          caseSensitive = true;
+        }
+        if (!hasCustomFsMocks) {
+          macVolumeCaseSensitivityCache.set(cacheKey, { timestamp: now, caseSensitive });
+        }
+        return { caseSensitive };
+      } catch {}
+    }
+  } catch {}
+
+  return { caseSensitive: false };
+}
+
+/**
  * Honest async disk space inspection via `fs.promises.statfs`.
  * Walks up `path.dirname(targetPath)` until reaching an existing directory.
  * Never returns a fake 100 GiB fallback on failure.
@@ -607,6 +803,9 @@ async function getDiskSpace(targetPath, /** @type {any} */ options = {}) {
     const totalBytes = Number(stats.blocks || 0) * bsize;
     const freeBytes = Number(stats.bavail ?? stats.bfree ?? 0) * bsize;
     const usedBytes = Math.max(0, totalBytes - Number(stats.bfree ?? 0) * bsize);
+    const effectivePlatform = options.platform || process.platform;
+    const caseSensitivityInfo =
+      effectivePlatform === 'darwin' ? checkVolumeCaseSensitivity(curr, options) : null;
 
     return {
       targetPath: targetPath || curr,
@@ -614,6 +813,7 @@ async function getDiskSpace(targetPath, /** @type {any} */ options = {}) {
       freeBytes,
       totalBytes,
       usedBytes,
+      ...(caseSensitivityInfo ? { caseSensitive: caseSensitivityInfo.caseSensitive } : {}),
     };
   } catch (/** @type {any} */ err) {
     return {
@@ -674,6 +874,7 @@ module.exports = {
   hasWindowsGamingServicesInstalled,
   getDefaultXboxClientlessWinDir,
   getDefaultInstallDir,
+  checkVolumeCaseSensitivity,
   getDiskSpace,
   getDirectorySizeFast,
 };

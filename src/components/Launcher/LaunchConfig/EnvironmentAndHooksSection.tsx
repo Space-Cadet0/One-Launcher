@@ -2,6 +2,11 @@ import React from 'react';
 import { ResolvedLaunchModePreview } from '../../../contracts/launcher';
 import { Sliders, Terminal } from 'lucide-react';
 import { WINDOWS_QUICK_ENV_TOGGLES } from './launchConfigHelpers';
+import {
+  LAUNCH_BUTTON_FOCUS_CLASSES,
+  LAUNCH_TEXT_INPUT_CLASSES,
+  LAUNCH_TEXTAREA_CLASSES,
+} from './LaunchConfigControls';
 
 export interface EnvironmentAndHooksSectionProps {
   idPrefix?: string;
@@ -30,6 +35,7 @@ function EnvironmentAndHooksSectionImpl({
   postExitCommand,
   onChangePostExitCommand,
 }: EnvironmentAndHooksSectionProps): React.ReactElement | null {
+  const envHeadingId = `${idPrefix}-env-variables-heading`;
   const envTextareaId = `${idPrefix}-env-variables`;
   const preHookInputId = `${idPrefix}-pre-launch-cmd`;
   const postHookInputId = `${idPrefix}-post-exit-cmd`;
@@ -55,21 +61,24 @@ function EnvironmentAndHooksSectionImpl({
   return (
     <>
       {/* Environment Variables & Custom Overrides */}
-      <div
+      <section
         data-section="environment-variables"
+        aria-labelledby={envHeadingId}
         className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
       >
-        <div className="flex items-center justify-between">
-          <label
-            htmlFor={envTextareaId}
-            className="flex items-center gap-2 cursor-pointer"
-          >
-            <Sliders className="w-4 h-4 text-sky-400" />
-            <span className="text-xs font-bold text-white uppercase tracking-wider">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Sliders className="w-4 h-4 text-sky-400" aria-hidden="true" />
+            <h3
+              id={envHeadingId}
+              className="text-xs font-bold text-white uppercase tracking-wider"
+            >
               Environment Variables
-            </span>
+            </h3>
+          </div>
+          <label htmlFor={envTextareaId} className="text-[10px] text-steam-subtext cursor-pointer">
+            Custom KEY=VALUE process overrides
           </label>
-          <span className="text-[10px] text-steam-subtext">Custom KEY=VALUE process overrides</span>
         </div>
 
         {isWindowsHost && (
@@ -81,7 +90,7 @@ function EnvironmentAndHooksSectionImpl({
                   key={item.key}
                   type="button"
                   onClick={() => onToggleQuickEnv(item.key, item.value)}
-                  className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${
+                  className={`min-h-6 min-w-6 px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
                     isActive
                       ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
                       : 'bg-[#141d2b] border-[#26384d] text-steam-subtext hover:text-white'
@@ -97,6 +106,7 @@ function EnvironmentAndHooksSectionImpl({
 
         <textarea
           id={envTextareaId}
+          aria-labelledby={envHeadingId}
           rows={2}
           value={envText}
           onChange={(e) => onChangeEnvText(e.target.value)}
@@ -105,59 +115,72 @@ function EnvironmentAndHooksSectionImpl({
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
-          className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+          className={`${LAUNCH_TEXTAREA_CLASSES} font-mono`}
         />
-      </div>
+      </section>
 
       {/* Pre-Launch & Post-Exit Shell Commands */}
-      <div
+      <section
         data-section="shell-hooks"
-        className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5"
+        aria-label="Shell Lifecycle Hooks"
+        className="bg-[#0e151f] border border-[#223447] rounded-lg p-3.5 space-y-3"
       >
-        <div className="space-y-1">
-          <label
-            htmlFor={preHookInputId}
-            className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
-          >
-            <Terminal className="w-3 h-3 text-sky-400" />
-            <span>Pre-Launch Command</span>
-          </label>
-          <input
-            id={preHookInputId}
-            type="text"
-            value={preLaunchCommand}
-            onChange={(e) => onChangePreLaunchCommand(e.target.value)}
-            placeholder={preHookPlaceholder}
-            autoComplete="off"
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-          />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-sky-400" aria-hidden="true" />
+            <h3 className="text-xs font-bold text-white uppercase tracking-wider">
+              Shell Lifecycle Hooks
+            </h3>
+          </div>
+          <span className="text-[10px] text-steam-subtext">
+            Optional commands run before launch &amp; after exit
+          </span>
         </div>
 
-        <div className="space-y-1">
-          <label
-            htmlFor={postHookInputId}
-            className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
-          >
-            <Terminal className="w-3 h-3 text-sky-400" />
-            <span>Post-Exit Command</span>
-          </label>
-          <input
-            id={postHookInputId}
-            type="text"
-            value={postExitCommand}
-            onChange={(e) => onChangePostExitCommand(e.target.value)}
-            placeholder={postHookPlaceholder}
-            autoComplete="off"
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
-          />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <label
+              htmlFor={preHookInputId}
+              className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+            >
+              Pre-Launch Command
+            </label>
+            <input
+              id={preHookInputId}
+              type="text"
+              value={preLaunchCommand}
+              onChange={(e) => onChangePreLaunchCommand(e.target.value)}
+              placeholder={preHookPlaceholder}
+              autoComplete="off"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={`${LAUNCH_TEXT_INPUT_CLASSES} font-mono`}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label
+              htmlFor={postHookInputId}
+              className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+            >
+              Post-Exit Command
+            </label>
+            <input
+              id={postHookInputId}
+              type="text"
+              value={postExitCommand}
+              onChange={(e) => onChangePostExitCommand(e.target.value)}
+              placeholder={postHookPlaceholder}
+              autoComplete="off"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={`${LAUNCH_TEXT_INPUT_CLASSES} font-mono`}
+            />
+          </div>
         </div>
-      </div>
+      </section>
     </>
   );
 }

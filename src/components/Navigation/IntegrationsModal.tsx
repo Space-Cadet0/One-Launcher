@@ -45,10 +45,15 @@ import {
   disconnectIntegration,
   loadXboxProfileState,
   saveXboxProfileState,
+  formatXboxIntegrationStatusMessage,
   type XboxCachedProfileState,
 } from '../../services/integrations/integrationStorage';
 import type { CanonicalGame, XboxGamePassSyncMode } from '../../contracts/game';
-import { xboxIntegration } from '../../services/integrations/xboxIntegration';
+import {
+  xboxIntegration,
+  formatXboxSubscriptionDate,
+  resolveXboxSyncModeCatalogCopy,
+} from '../../services/integrations/xboxIntegration';
 import { cacheUserXboxAchievements } from '../../services/storage/knownGameAchievements';
 import { StorefrontIcon } from '../Common/StorefrontIcon';
 import { ModalShell } from '../Common/ModalShell';
@@ -126,6 +131,8 @@ interface XboxStatusSnapshot {
 type NativeSyncResultPayload = Partial<StorefrontAuthResult> & {
   gamerpicUrl?: string;
   hasDeviceContext?: boolean;
+  authoritativeComplete?: boolean;
+  transientOffline?: boolean;
   tokenData?: (StorefrontTokenSummary & { expires_at?: string }) | null;
   achievements?: Record<string, AchievementSummaryEntry>;
 };
@@ -349,12 +356,26 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
   useEffect(() => {
     // Sync integrations from storage and Electron native token store when modal opens
     if (isOpen) {
-      setXboxProfile(loadXboxProfileState());
+      const cachedXboxOnOpen = loadXboxProfileState();
+      setXboxProfile(cachedXboxOnOpen);
       if (typeof window !== 'undefined' && window.electronAPI?.getSavedTokens) {
+        const cachedSub = cachedXboxOnOpen?.subscription;
+        const cachedEndIso = cachedSub?.earliestActivePassEndDate || cachedSub?.endDate;
+        const cachedCheckedMs = cachedSub?.checkedAt ? Date.parse(cachedSub.checkedAt) : Number.NaN;
+        const cachedEndMs = cachedEndIso ? Date.parse(cachedEndIso) : Number.NaN;
+        const shouldRefreshXboxSub = Boolean(
+          !cachedSub ||
+            !cachedSub.subscriptionFingerprint?.startsWith('v2|') ||
+            !Number.isFinite(cachedCheckedMs) ||
+            Date.now() - cachedCheckedMs > 15 * 60 * 1000 ||
+            (Number.isFinite(cachedEndMs) && Date.now() >= cachedEndMs)
+        );
         Promise.all([
           window.electronAPI.getSavedTokens().catch((): SavedStoreTokensMap => ({})),
           window.electronAPI.getXboxStatus
-            ? window.electronAPI.getXboxStatus({ refreshSubscription: false }).catch(() => null)
+            ? window.electronAPI
+                .getXboxStatus({ refreshSubscription: shouldRefreshXboxSub })
+                .catch(() => null)
             : Promise.resolve(null),
         ])
           .then(([savedTokens, xboxStatus]: [SavedStoreTokensMap, XboxStatusSnapshot | null]) => {
@@ -586,16 +607,29 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
               saveXboxProfileState(nextProfile);
               setXboxProfile(nextProfile);
 
+              const count =
+                xboxInteg?.gamesCount && xboxInteg.gamesCount > 0
+                  ? xboxInteg.gamesCount
+                  : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'xbox')).length;
+              const nextXboxStatusMessage = formatXboxIntegrationStatusMessage(
+                gamertag,
+                count,
+                nextProfile.subscription
+              );
+              const subscriptionFingerprintChanged =
+                (cachedProfile?.subscription?.subscriptionFingerprint || '') !==
+                  (nextProfile.subscription?.subscriptionFingerprint || '') ||
+                (cachedProfile?.subscription?.tierDisplayName || '') !==
+                  (nextProfile.subscription?.tierDisplayName || '');
+
               if (
                 !xboxInteg ||
                 !xboxInteg.isConnected ||
                 xboxInteg.accountName !== gamertag ||
-                (avatarUrl && xboxInteg.avatarUrl !== avatarUrl)
+                (avatarUrl && xboxInteg.avatarUrl !== avatarUrl) ||
+                xboxInteg.statusMessage !== nextXboxStatusMessage ||
+                subscriptionFingerprintChanged
               ) {
-                const count =
-                  xboxInteg?.gamesCount && xboxInteg.gamesCount > 0
-                    ? xboxInteg.gamesCount
-                    : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'xbox')).length;
                 updatedIntegrations = updatedIntegrations.map((i) =>
                   i.storefrontId === 'xbox'
                     ? {
@@ -608,7 +642,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                         lastSyncedAt: nextProfile.lastSyncedAt,
                         authMethod: 'oauth' as const,
                         credentials: {},
-                        statusMessage: `Connected as ${gamertag} (${count} titles synced)`,
+                        statusMessage: nextXboxStatusMessage,
                       }
                     : i
                 );
@@ -677,9 +711,16 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
     }));
     const current = loadCurrentCatalog();
     const shouldMergeGames =
-      gamesList.length > 0 || (storefrontId === 'xbox' && hasExplicitGamesArray);
+      gamesList.length > 0 ||
+      ((storefrontId === 'xbox' || Boolean(res.authoritativeComplete)) && hasExplicitGamesArray);
+    const resolvedAuthoritativeComplete =
+      res.authoritativeComplete !== undefined
+        ? Boolean(res.authoritativeComplete)
+        : storefrontId === 'xbox';
     const merged = shouldMergeGames
-      ? mergeStorefrontGames(current, gamesList, storefrontId)
+      ? mergeStorefrontGames(current, gamesList, storefrontId, {
+          authoritativeComplete: resolvedAuthoritativeComplete,
+        })
       : current;
     const count = shouldMergeGames
       ? merged.filter((g) => g.platforms.some((p) => p.platformId === storefrontId)).length
@@ -695,6 +736,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         ? res.modernGamertag || res.gamertag || res.accountName || 'Xbox Live User'
         : res.accountName || 'Connected User';
 
+    let nextXboxSubscription: XboxCachedProfileState['subscription'] = null;
     if (storefrontId === 'xbox') {
       if (res.achievements && typeof res.achievements === 'object') {
         cacheUserXboxAchievements(res.achievements);
@@ -717,6 +759,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
             : prevXboxProfile?.hasDeviceContext,
         lastSyncedAt: new Date().toISOString(),
       };
+      nextXboxSubscription = nextXboxProfile.subscription;
       saveXboxProfileState(nextXboxProfile);
       setXboxProfile(nextXboxProfile);
     }
@@ -737,7 +780,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       gamesCount: count,
       lastSyncedAt: new Date().toISOString(),
       authMethod: 'oauth',
-      statusMessage: `Connected as ${resolvedAccountName} (${count} titles synced)`,
+      statusMessage:
+        storefrontId === 'xbox'
+          ? formatXboxIntegrationStatusMessage(resolvedAccountName, count, nextXboxSubscription)
+          : `Connected as ${resolvedAccountName} (${count} titles synced)`,
       credentials: sanitizePublicCredentials(storefrontId, {
         steamId:
           storefrontId === 'steam'
@@ -802,7 +848,10 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       setXboxProfile(optimisticProfile);
 
       if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-        const syncRes = await window.electronAPI.syncStore('xbox', { syncMode: nextMode });
+        const syncRes = await window.electronAPI.syncStore('xbox', {
+          syncMode: nextMode,
+          forceRefresh: true,
+        });
         if (syncRes?.success) {
           handleNativeSyncSuccess('xbox', {
             ...syncRes,
@@ -813,7 +862,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         }
       }
 
-      const { games } = await connectXboxIntegration({ syncMode: nextMode });
+      const { games } = await connectXboxIntegration({ syncMode: nextMode, forceRefresh: true });
       setIntegrations(scrubPersistedIntegrationSecrets());
       setXboxProfile(loadXboxProfileState());
       setSuccessMsg('Updated Game Pass catalog sync mode and refreshed Xbox library.');
@@ -843,7 +892,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         .loginStore(storefrontId)
         .then(async (res: StorefrontAuthResult) => {
           if (res.success) {
-            if (res.games && res.games.length > 0) {
+            if (
+              (res.games && res.games.length > 0) ||
+              (Array.isArray(res.games) &&
+                (Boolean(res.authoritativeComplete) || Boolean(res.tokenData)))
+            ) {
               handleNativeSyncSuccess(storefrontId, {
                 ...res,
                 achievements: res.achievements as Record<string, AchievementSummaryEntry> | undefined,
@@ -958,8 +1011,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
       } else if (storefrontId === 'epic') {
         if (epicInput.trim()) manualCredsPayload.epicAccountId = epicInput.trim();
         if (epicToken.trim()) manualCredsPayload.epicToken = epicToken.trim();
-      } else if (storefrontId === 'xbox' && xboxProfile?.syncMode) {
-        manualCredsPayload.syncMode = xboxProfile.syncMode;
+      } else if (storefrontId === 'xbox') {
+        if (xboxProfile?.syncMode) {
+          manualCredsPayload.syncMode = xboxProfile.syncMode;
+        }
+        manualCredsPayload.forceRefresh = true;
       }
       const hasManualCreds = Object.keys(manualCredsPayload).length > 0;
 
@@ -1023,6 +1079,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         const { integration, games } = await connectXboxIntegration({
           webToken: tokenOrCode || xboxInput.trim() || undefined,
           syncMode: xboxProfile?.syncMode,
+          forceRefresh: true,
         });
         resultGames = games;
         accountName = integration.accountName || 'Xbox Live User';
@@ -1061,8 +1118,11 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
           if (steamApiKey.trim()) credsPayload.steamApiKey = steamApiKey.trim();
         } else if (storefrontId === 'epic' && epicInput.trim()) {
           credsPayload.epicAccountId = epicInput.trim();
-        } else if (storefrontId === 'xbox' && xboxProfile?.syncMode) {
-          credsPayload.syncMode = xboxProfile.syncMode;
+        } else if (storefrontId === 'xbox') {
+          if (xboxProfile?.syncMode) {
+            credsPayload.syncMode = xboxProfile.syncMode;
+          }
+          credsPayload.forceRefresh = true;
         }
         const syncRes = await window.electronAPI.syncStore(storefrontId, credsPayload);
         if (syncRes?.success) {
@@ -1095,6 +1155,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         const { games } = await connectXboxIntegration({
           webToken: xboxInput.trim() || undefined,
           syncMode: xboxProfile?.syncMode,
+          forceRefresh: true,
         });
         resultGames = games;
         setXboxProfile(loadXboxProfileState());
@@ -1513,26 +1574,26 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                       <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                         {(() => {
                           const sub = xboxProfile?.subscription;
+                          const endLabel = formatXboxSubscriptionDate(
+                            sub?.earliestActivePassEndDate || sub?.endDate
+                          );
                           if (sub?.hasActiveSubscription && sub.hasPcCatalogAccess) {
-                            const parsedEnd = sub.endDate ? new Date(sub.endDate) : null;
-                            const endLabel =
-                              parsedEnd && !Number.isNaN(parsedEnd.getTime())
-                                ? parsedEnd.toLocaleDateString(undefined, {
-                                    month: 'short',
-                                    day: 'numeric',
-                                    year: 'numeric',
-                                  })
-                                : null;
+                            const displayTier = sub.tierDisplayName || 'PC Game Pass';
+                            const showTrialSuffix =
+                              Boolean(sub.isTrial) && !/\btrial\b/i.test(displayTier);
                             return (
                               <span
                                 data-testid="xbox-subscription-pill"
-                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 inline-flex items-center gap-1.5"
+                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950/85 text-emerald-200 border border-emerald-500/45 inline-flex items-center gap-1.5"
                               >
-                                <Trophy aria-hidden="true" className="w-3 h-3 text-emerald-400" />
-                                <span>{sub.tierDisplayName || 'PC Game Pass'}</span>
+                                <Trophy aria-hidden="true" className="w-3 h-3 text-emerald-300" />
+                                <span>
+                                  {displayTier}
+                                  {showTrialSuffix ? ' (Trial)' : ''}
+                                </span>
                                 {endLabel && (
-                                  <span className="text-emerald-200/80 font-normal">
-                                    • {sub.autoRenew ? `Renews ${endLabel}` : `Ends ${endLabel}`}
+                                  <span className="text-emerald-200/90 font-normal">
+                                    • {sub.autoRenew ? `Renews ${endLabel}` : `Expires ${endLabel}`}
                                   </span>
                                 )}
                               </span>
@@ -1542,18 +1603,25 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                             return (
                               <span
                                 data-testid="xbox-subscription-pill"
-                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 inline-flex items-center gap-1"
+                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-950/85 text-amber-200 border border-amber-500/45 inline-flex items-center gap-1.5"
                               >
-                                <span>{sub.tierDisplayName || 'Xbox Game Pass'} (No PC Catalog)</span>
+                                <span>
+                                  {sub.tierDisplayName || 'Xbox Game Pass for Console'} (Owned PC Games Only)
+                                </span>
+                                {endLabel && (
+                                  <span className="text-amber-200/90 font-normal">
+                                    • {sub.autoRenew ? `Renews ${endLabel}` : `Expires ${endLabel}`}
+                                  </span>
+                                )}
                               </span>
                             );
                           }
                           return (
                             <span
                               data-testid="xbox-subscription-pill"
-                              className="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800/80 text-slate-300 border border-slate-600/50 inline-flex items-center gap-1"
+                              className="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800/90 text-slate-200 border border-slate-600/60 inline-flex items-center gap-1"
                             >
-                              <span>No Active Game Pass</span>
+                              <span>No Active Game Pass (Owned Games Only)</span>
                             </span>
                           );
                         })()}
@@ -1562,7 +1630,12 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                     <p className="text-xs text-steam-accent mt-1.5 flex items-center gap-1.5 font-medium">
                       <Gamepad2 aria-hidden="true" className="w-3.5 h-3.5" />
                       {currentIntegration.gamesCount}{' '}
-                      {selectedTab === 'xbox' ? 'Xbox & Game Pass Titles Cataloged' : 'Owned Titles Cataloged'}
+                      {selectedTab === 'xbox'
+                        ? xboxProfile?.subscription?.hasActiveSubscription &&
+                          xboxProfile.subscription.hasPcCatalogAccess
+                          ? `Xbox & ${(xboxProfile.subscription.tierDisplayName || 'Game Pass').replace(/^Xbox\s+/i, '')} Titles Cataloged`
+                          : 'Owned & Installed Xbox Titles Cataloged'
+                        : 'Owned Titles Cataloged'}
                     </p>
                   </div>
                 </div>
@@ -1587,6 +1660,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 );
                 const disableFullCatalogOption =
                   hasExplicitNoPcCatalog && activeSyncMode !== 'full_pc_game_pass';
+                const syncCopy = resolveXboxSyncModeCatalogCopy(xboxProfile?.subscription);
 
                 return (
                   <fieldset
@@ -1595,7 +1669,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                     className="bg-[#111923] border border-steam-border/60 rounded-lg p-3.5 space-y-2.5 disabled:opacity-60"
                   >
                     <legend className="px-1.5 text-[11px] font-bold uppercase tracking-wider text-emerald-300">
-                      Game Pass &amp; Library Sync Mode
+                      {syncCopy.legendLabel}
                     </legend>
 
                     <div className="space-y-2">
@@ -1621,13 +1695,13 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                             htmlFor={xboxModePlayedId}
                             className="block text-xs font-semibold text-white cursor-pointer"
                           >
-                            Owned + Played Game Pass (Recommended)
+                            {syncCopy.playedModeLabel}
                           </label>
                           <p
                             id={xboxModePlayedDescId}
                             className="text-[11px] text-steam-subtext leading-snug mt-0.5"
                           >
-                            Syncs permanent Microsoft Store purchases plus Game Pass titles you have played or installed locally.
+                            {syncCopy.playedModeDescription}
                           </p>
                         </div>
                       </div>
@@ -1661,16 +1735,13 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                                 : 'text-white cursor-pointer'
                             }`}
                           >
-                            Full PC Game Pass Catalog
+                            {syncCopy.fullCatalogLabel}
                           </label>
                           <p
                             id={xboxModeFullDescId}
                             className="text-[11px] text-steam-subtext leading-snug mt-0.5"
                           >
-                            Includes the entire active PC Game Pass catalog alongside your permanent purchases.
-                            {disableFullCatalogOption
-                              ? ' Requires an active PC Game Pass or Game Pass Ultimate subscription.'
-                              : ''}
+                            {syncCopy.fullCatalogDescription}
                           </p>
                         </div>
                       </div>

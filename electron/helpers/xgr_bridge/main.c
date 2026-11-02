@@ -205,10 +205,13 @@ HRESULT WINAPI UninitializeApiImpl(void)
         if (observed == prev) {
             if (prev - 1 == 0) {
                 xgr_uninstall_xcurl_shim();
+                xgr_playfab_shim_reset();
+                xgr_invite_callbacks_reset();
                 xgr_gamesave_shutdown();
                 xgr_user_shutdown();
                 xgr_threading_shutdown();
                 xgr_rpc_shutdown();
+                xgr_runtime_config_reset();
             }
             break;
         }

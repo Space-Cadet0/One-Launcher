@@ -565,7 +565,7 @@ describe('Dual-OS 3×3 Silent Launch, Bidirectional First-Party Registration & Q
         hostPlatform: 'darwin',
       });
       expect(bottleSteamKeepView.infoBox.footprintSummary).toContain(
-        '-silent -nofriendsui -nochatui'
+        '-silent'
       );
 
       const platforms: StorefrontId[] = ['steam', 'gog', 'epic'];

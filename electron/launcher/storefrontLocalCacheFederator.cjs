@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
+const { execFile, execFileSync } = require('node:child_process');
 const {
   isContainedWithinRoot,
   resolveHostWindowsKnownFolders,
@@ -201,6 +201,70 @@ function getKnownWindowsLocalDrivesSync(options = {}) {
     }
     return cachedWin32LocalDrives.slice();
   }
+
+  const targetPlatform = options.platform || process.platform;
+  const customExecFileSync =
+    typeof options.execFileSyncFn === 'function'
+      ? options.execFileSyncFn
+      : typeof options.execFileSyncImpl === 'function'
+        ? options.execFileSyncImpl
+        : null;
+
+  if (
+    targetPlatform === 'win32' &&
+    (process.platform === 'win32' || customExecFileSync !== null)
+  ) {
+    const syncRunner = customExecFileSync || execFileSync;
+    const useSharedCache = customExecFileSync === null && !options.bypassDriveCache;
+    try {
+      const stdout = syncRunner(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | Select-Object -ExpandProperty DeviceID',
+        ],
+        {
+          timeout: 1500,
+          windowsHide: true,
+          encoding: 'utf8',
+          maxBuffer: 64 * 1024,
+        }
+      );
+      const drives = new Set();
+      if (typeof stdout === 'string') {
+        for (const rawLine of stdout.split(/\r?\n/)) {
+          const trimmed = rawLine.trim();
+          const m = /^([A-Za-z]):\\?$/.exec(trimmed);
+          if (m) {
+            drives.add(`${m[1].toUpperCase()}:\\`);
+          }
+        }
+      }
+      if (drives.size === 0) {
+        for (const d of resolveFallbackWin32SystemDrives(options)) {
+          drives.add(d);
+        }
+      }
+      const result = Array.from(drives);
+      if (useSharedCache) {
+        cachedWin32LocalDrives = result;
+        cachedWin32LocalDrivesAt = now;
+      }
+      return result.slice();
+    } catch {
+      const fallback = resolveFallbackWin32SystemDrives(options);
+      if (useSharedCache) {
+        cachedWin32LocalDrives = fallback;
+        cachedWin32LocalDrivesAt = now;
+      }
+      return fallback.slice();
+    }
+  }
+
   discoverWindowsLocalDrivesAsync(options).catch(() => {});
   return resolveFallbackWin32SystemDrives(options);
 }
@@ -425,10 +489,11 @@ function discoverStorefrontCacheRoots(options = {}) {
     (!hasExplicitTestIsolation || Boolean(options.homedir || options.bottlePath))
   ) {
     try {
+      const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
       bottlePaths = launcherEngine.listAllInitializedBottlePaths({
         ...options,
         platform,
-        homedir,
+        ...explicitHomedirOpt,
       });
     } catch {
       bottlePaths = [];
@@ -483,9 +548,13 @@ function discoverStorefrontCacheRoots(options = {}) {
   const gogRootsSet = new Set();
   const explicitGogRoots = Array.isArray(options.gogGalaxyRoots)
     ? options.gogGalaxyRoots
-    : options.gogGalaxyRoot
-      ? [options.gogGalaxyRoot]
-      : null;
+    : Array.isArray(options.gogRoots)
+      ? options.gogRoots
+      : options.gogGalaxyRoot
+        ? [options.gogGalaxyRoot]
+        : options.gogRoot
+          ? [options.gogRoot]
+          : null;
 
   if (explicitGogRoots) {
     for (const gr of explicitGogRoots) {
@@ -664,9 +733,22 @@ function discoverStorefrontCacheRoots(options = {}) {
     for (const bottle of bottlePaths) {
       xboxCandidates.push(path.join(bottle, 'drive_c', 'XboxGames'));
     }
-    if (!hasExplicitTestIsolation && platform === 'win32') {
+    const allowWin32Drives =
+      !hasExplicitTestIsolation ||
+      Array.isArray(options.localDrives) ||
+      Boolean(options.driveRootPathMap) ||
+      Boolean(options.allowWin32DriveDiscoveryInTest);
+    if (allowWin32Drives && platform === 'win32') {
       const localDrives = getKnownWindowsLocalDrivesSync(options);
-      for (const driveRoot of localDrives) {
+      const driveMap =
+        options.driveRootPathMap && typeof options.driveRootPathMap === 'object'
+          ? options.driveRootPathMap
+          : null;
+      for (const rawDriveRoot of localDrives) {
+        const driveRoot =
+          driveMap && typeof driveMap[rawDriveRoot] === 'string'
+            ? driveMap[rawDriveRoot]
+            : rawDriveRoot;
         if (!isExistingDirectory(driveRoot)) continue;
         xboxCandidates.push(path.join(driveRoot, 'XboxGames'));
         // Parse `<Drive>:\.GamingRoot` (`RGBX` + u32 LE version 1 + UTF-16LE relative path)
@@ -679,10 +761,12 @@ function discoverStorefrontCacheRoots(options = {}) {
                 .subarray(8)
                 .toString('utf16le')
                 .replace(/\0+$/g, '')
-                .trim();
+                .trim()
+                .replace(/[\\/]+/g, path.sep);
               if (relUtf16 && !relUtf16.includes('..')) {
                 const candidateCustomRoot = path.resolve(driveRoot, relUtf16);
-                if (isContainedWithinRoot(driveRoot, candidateCustomRoot, 'win32')) {
+                const containPlatform = driveMap ? process.platform : 'win32';
+                if (isContainedWithinRoot(driveRoot, candidateCustomRoot, containPlatform)) {
                   xboxCandidates.push(candidateCustomRoot);
                 }
               }
@@ -1625,10 +1709,93 @@ function loadGogGalaxyDbSnapshot(dbPath, DatabaseSync) {
   const webCacheByGogId = new Map();
   const piecesByGogId = new Map();
   const parsedMetaByGogId = new Map();
+  /** @type {Map<string, Set<string>>} */
+  const visibleLibraryUsersByGogId = new Map();
 
   let db = null;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const tableRows = db
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        .all();
+      const tableNamesLower = new Set(
+        tableRows.map((t) => String(t?.name || '').toLowerCase())
+      );
+      const hasLibraryReleases = tableNamesLower.has('libraryreleases');
+      const hasReleaseProperties = tableNamesLower.has('releaseproperties');
+
+      if (hasLibraryReleases) {
+        const lrCols = new Set(
+          db
+            .prepare('PRAGMA table_info(LibraryReleases)')
+            .all()
+            .map((c) => String(c?.name || '').toLowerCase())
+        );
+        const userIdExpr = lrCols.has('userid')
+          ? "CAST(COALESCE(lr.userId, '') AS TEXT) AS userId"
+          : "'' AS userId";
+
+        let lrRows = [];
+        if (hasReleaseProperties) {
+          const rpCols = new Set(
+            db
+              .prepare('PRAGMA table_info(ReleaseProperties)')
+              .all()
+              .map((c) => String(c?.name || '').toLowerCase())
+          );
+          const visClause = rpCols.has('isvisibleinlibrary')
+            ? 'AND COALESCE(rp.isVisibleInLibrary, 1) = 1'
+            : '';
+          const dlcClause = rpCols.has('isdlc')
+            ? 'AND COALESCE(rp.isDlc, 0) = 0'
+            : '';
+          lrRows = db
+            .prepare(
+              `
+              SELECT DISTINCT lr.releaseKey AS releaseKey, ${userIdExpr}
+              FROM LibraryReleases lr
+              LEFT JOIN ReleaseProperties rp ON rp.releaseKey = lr.releaseKey
+              WHERE lr.releaseKey LIKE 'gog_%'
+                ${visClause}
+                ${dlcClause}
+            `
+            )
+            .all();
+        } else {
+          lrRows = db
+            .prepare(
+              `
+              SELECT DISTINCT lr.releaseKey AS releaseKey, ${userIdExpr}
+              FROM LibraryReleases lr
+              WHERE lr.releaseKey LIKE 'gog_%'
+            `
+            )
+            .all();
+        }
+
+        for (const r of lrRows) {
+          if (!r || typeof r.releaseKey !== 'string' || !r.releaseKey.startsWith('gog_')) continue;
+          const gid = r.releaseKey.slice(4).trim();
+          if (!/^\d+$/.test(gid)) continue;
+          let userSet = visibleLibraryUsersByGogId.get(gid);
+          if (!userSet) {
+            userSet = new Set();
+            visibleLibraryUsersByGogId.set(gid, userSet);
+          }
+          const uid = String(r.userId ?? '').trim();
+          if (uid) {
+            userSet.add(uid);
+          } else {
+            userSet.add('');
+            userSet.add('*');
+          }
+        }
+      }
+    } catch (lrErr) {
+      diagLog.debug('federator.gogSnapshotLibraryReleases', lrErr, { dbPath });
+    }
+
     try {
       const wcRows = db
         .prepare(
@@ -1706,6 +1873,7 @@ function loadGogGalaxyDbSnapshot(dbPath, DatabaseSync) {
     webCacheByGogId,
     piecesByGogId,
     parsedMetaByGogId,
+    visibleLibraryUsersByGogId,
   };
   setBoundedCache(gogGalaxyDbSnapshotLookup, sig, snapshot, MAX_GOG_DB_SNAPSHOT_ENTRIES);
   return snapshot;
@@ -2239,6 +2407,16 @@ function parseGogPiecesMapToMetadata(cleanGogId, piecesByType) {
   const reviewScoreObj = getParsed('reviewScore');
   const origImagesObj = getParsed('originalImages');
   const storeImagesObj = getParsed('storeImages');
+  const isDlcPieceObj = getParsed('isDlc');
+  const isDlc = Boolean(
+    isDlcPieceObj === true ||
+      isDlcPieceObj?.isDlc ||
+      metaObj?.isDlc ||
+      origMetaObj?.isDlc ||
+      /^(?:dlc|pack|addon|add-on)$/i.test(
+        String(metaObj?.productType || origMetaObj?.productType || '').trim()
+      )
+  );
 
   const name = String(titleObj?.title || '').trim();
   const rawSummaryHtml = String(summaryObj?.summary || summaryObj?.description || '').trim();
@@ -2368,6 +2546,7 @@ function parseGogPiecesMapToMetadata(cleanGogId, piecesByType) {
   return {
     appId: 0,
     gogId: cleanGogId,
+    isDlc,
     name: name || undefined,
     title: name || undefined,
     shortDescription,
@@ -2434,15 +2613,17 @@ function resolveLocalGogMetadata(gogId, options = {}) {
 }
 
 /**
- * Enumerates owned/installed GOG games from local `galaxy-2.0.db` when `fetchGogOwnedGames` is offline,
+ * Enumerates owned/installed GOG games from local `galaxy-2.0.db` (`LibraryReleases` + `ReleaseProperties`),
  * reusing the single-open read-only `galaxy-2.0.db` snapshot.
  *
- * @param {Record<string, any>} [options]
+ * @param {Record<string, any>} [filterOptions]
  */
-function listLocalGogCatalogGames(options = {}) {
+function listLocalGogCatalogGames(filterOptions = {}) {
+  const options = filterOptions && typeof filterOptions === 'object' ? filterOptions : {};
   const DatabaseSync = getSqliteDatabaseSync();
   if (!DatabaseSync) return [];
 
+  const expectedUserId = String(options.gogUserId || options.userId || '').trim();
   const roots = options._precomputedRoots || discoverStorefrontCacheRoots(options);
   const gamesById = new Map();
 
@@ -2451,16 +2632,23 @@ function listLocalGogCatalogGames(options = {}) {
     if (!dbPath) continue;
 
     const snapshot = loadGogGalaxyDbSnapshot(dbPath, DatabaseSync);
-    if (!snapshot) continue;
+    if (!snapshot || !(snapshot.visibleLibraryUsersByGogId instanceof Map)) continue;
 
     for (const [gogId, piecesMap] of snapshot.piecesByGogId.entries()) {
       if (gamesById.has(gogId)) continue;
+      if (!snapshot.visibleLibraryUsersByGogId.has(gogId)) continue;
+      if (expectedUserId) {
+        const users = snapshot.visibleLibraryUsersByGogId.get(gogId);
+        if (!users || (!users.has(expectedUserId) && !users.has('') && !users.has('*'))) {
+          continue;
+        }
+      }
       let meta = snapshot.parsedMetaByGogId.get(gogId);
       if (meta === undefined) {
         meta = parseGogPiecesMapToMetadata(gogId, piecesMap) || null;
         snapshot.parsedMetaByGogId.set(gogId, meta);
       }
-      if (!meta || !meta.title) continue;
+      if (!meta || !meta.title || meta.isDlc) continue;
       gamesById.set(gogId, meta);
     }
   }
@@ -2473,7 +2661,74 @@ function parseLegendaryMetadataJson(json, fallbackAppName) {
   const meta = json.metadata && typeof json.metadata === 'object' ? json.metadata : json;
   const appName = String(json.app_name || meta.app_name || fallbackAppName || '').trim();
   const title = String(json.app_title || meta.title || '').trim();
-  if (!appName && !title) return null;
+  if (!appName || appName === '1') return null;
+  if (json.sandboxType === 'PRIVATE' || meta.sandboxType === 'PRIVATE') return null;
+  if (appName.startsWith('Fortnite_')) return null;
+
+  const namespace = String(meta.namespace || json.namespace || '').trim();
+  if (
+    namespace === 'ue' ||
+    namespace === '89efe5924d3d467c839449ab6ab52e7f' ||
+    namespace.startsWith('ue-')
+  ) {
+    return null;
+  }
+
+  const itemTypeUpper = String(meta.itemType || json.itemType || '')
+    .trim()
+    .toUpperCase();
+  if (
+    [
+      'ADD_ON',
+      'DLC',
+      'CONSUMABLE',
+      'WALLET',
+      'SUBSCRIPTION',
+      'PLUGIN',
+      'EXTRA',
+      'CURRENCY',
+      'ENGINE',
+      'EDITOR',
+      'LEARNING',
+      'INVALID',
+    ].includes(itemTypeUpper)
+  ) {
+    return null;
+  }
+
+  const rawCategories = Array.isArray(meta.categories)
+    ? meta.categories
+    : Array.isArray(json.categories)
+      ? json.categories
+      : [];
+  const categoryPaths = rawCategories
+    .map((c) => String(typeof c === 'string' ? c : c?.path || '').trim().toLowerCase())
+    .filter(Boolean);
+  if (categoryPaths.length > 0) {
+    const categorySegments = new Set();
+    for (const cp of categoryPaths) {
+      categorySegments.add(cp);
+      for (const seg of cp.split('/')) {
+        if (seg) categorySegments.add(seg);
+      }
+    }
+    const hasNonGameCategory = [
+      'addons',
+      'dlc',
+      'mods',
+      'digitalextras',
+      'consumable',
+      'vault',
+      'engines',
+      'plugins',
+      'assets',
+    ].some((sub) => categorySegments.has(sub));
+    if (hasNonGameCategory) return null;
+
+    if (categorySegments.has('applications') && !categorySegments.has('games')) {
+      return null;
+    }
+  }
 
   // Detect DLC / non-base-game if mainGameItem is present
   const isDlc = Boolean(
@@ -2648,22 +2903,44 @@ function resolveLocalEpicMetadata(appName, options = {}) {
 }
 
 /**
- * Enumerates all local Legendary `metadata/*.json` base games for offline Epic sync fallback.
+ * Enumerates all local Legendary `metadata/*.json` base games with optional Epic account verification.
  *
- * @param {Record<string, any>} [options]
+ * @param {Record<string, any>} [filterOptions]
  */
-function listLocalEpicCatalogGames(options = {}) {
+function listLocalEpicCatalogGames(filterOptions = {}) {
+  const options = filterOptions && typeof filterOptions === 'object' ? filterOptions : {};
+  const expectedAccountId = String(options.epicAccountId || options.accountId || '')
+    .trim()
+    .toLowerCase();
   const roots = options._precomputedRoots || discoverStorefrontCacheRoots(options);
   const byAppName = new Map();
 
   for (const legDir of roots.legendaryDirs) {
-    const metaDir = path.join(legDir, 'metadata');
-    if (!isExistingDirectory(metaDir)) continue;
+    const metaDir = isExistingDirectory(path.join(legDir, 'metadata'))
+      ? path.join(legDir, 'metadata')
+      : path.basename(legDir).toLowerCase() === 'metadata' && isExistingDirectory(legDir)
+        ? legDir
+        : '';
+    if (!metaDir) continue;
+
+    const containRoot = path.dirname(metaDir);
+    const userJsonPath = path.join(containRoot, 'user.json');
+    if (!isExistingFile(userJsonPath)) continue;
+    let localAccountId = '';
+    try {
+      const userJson = JSON.parse(fs.readFileSync(userJsonPath, 'utf8'));
+      localAccountId = String(userJson?.account_id || '').trim().toLowerCase();
+    } catch {
+      localAccountId = '';
+    }
+    if (!localAccountId) continue;
+    if (expectedAccountId && localAccountId !== expectedAccountId) continue;
+
     try {
       for (const f of fs.readdirSync(metaDir)) {
         if (!f.endsWith('.json')) continue;
         const fp = path.join(metaDir, f);
-        if (!isContainedWithinRoot(legDir, fp, options.platform)) continue;
+        if (!isContainedWithinRoot(containRoot, fp, options.platform)) continue;
         try {
           const json = JSON.parse(fs.readFileSync(fp, 'utf8'));
           const parsed = parseLegendaryMetadataJson(json, f.slice(0, -5));
@@ -2915,6 +3192,7 @@ class StorefrontLocalCacheFederator {
    */
   constructor(defaultOptions = {}) {
     this.defaultOptions = { ...defaultOptions };
+    this.options = this.defaultOptions;
     const platform = this.defaultOptions.platform || process.platform;
     if (
       platform === 'win32' &&
@@ -2968,11 +3246,11 @@ class StorefrontLocalCacheFederator {
   }
 
   listLocalEpicCatalogGames(overrides = {}) {
-    return listLocalEpicCatalogGames({ ...this.defaultOptions, ...overrides });
+    return listLocalEpicCatalogGames({ ...this.defaultOptions, ...this.options, ...overrides });
   }
 
   listLocalGogCatalogGames(overrides = {}) {
-    return listLocalGogCatalogGames({ ...this.defaultOptions, ...overrides });
+    return listLocalGogCatalogGames({ ...this.defaultOptions, ...this.options, ...overrides });
   }
 
   listLocalXboxInstalledGames(overrides = {}) {
@@ -2995,6 +3273,7 @@ module.exports = {
   validateFederatedImageFile,
   resolveFederatorUserDataDir,
   discoverWindowsLocalDrivesAsync,
+  getKnownWindowsLocalDrivesSync,
   discoverStorefrontCacheRoots,
   discoverStorefrontCacheRootsAsync,
   parseMicrosoftGameConfigXml,
@@ -3006,6 +3285,7 @@ module.exports = {
   resolveLocalSteamMetadata,
   resolveLocalGogMetadata,
   resolveLocalEpicMetadata,
+  parseLegendaryMetadataJson,
   resolveLocalXboxMetadata,
   resolveLocalAmazonMetadata,
   resolveLocalMetadata,

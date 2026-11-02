@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -10,13 +11,717 @@ const {
   saveWgsSyncSidecar,
   syncXboxTitleStorage,
 } = require('./xboxTitleStorageSync.cjs');
+const {
+  resolveDefaultXboxLocale,
+  postXboxTitlePresenceHeartbeat,
+} = require('./xboxAchievementsAndStats.cjs');
 
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB (authenticated sockets)
 const MAX_UNAUTH_RPC_FRAME_BYTES = 4096; // 4 KiB strict limit until sessionToken/key verified (D8.7)
 const MAX_CONCURRENT_SOCKETS = 16;
 const DEFAULT_SOCKET_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_PRESENCE_HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000; // 4 minutes
+const ENTITLEMENT_CACHE_TTL_MS = 60_000; // 60 seconds
+const MAX_DLC_PACKAGES = 32;
+const CROCKFORD_BASE32 = '0123456789abcdefghjkmnpqrstvwxyz';
 const MINIMAL_1X1_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+function computePublisherHash(publisher) {
+  const clean = String(publisher || '').trim();
+  if (!clean) return '8wekyb3d8bbwe';
+  const utf16le = Buffer.from(clean, 'utf16le');
+  const digest = crypto.createHash('sha256').update(utf16le).digest();
+  let bits = 0n;
+  for (let i = 0; i < 8; i++) {
+    bits = (bits << 8n) | BigInt(digest[i]);
+  }
+  // Pad 64 bits -> 65 bits (13 * 5) with 1 trailing zero bit per MSIX PublisherId spec
+  bits <<= 1n;
+  let out = '';
+  for (let i = 12; i >= 0; i--) {
+    const idx = Number((bits >> BigInt(i * 5)) & 0x1fn);
+    out += CROCKFORD_BASE32[idx];
+  }
+  return out;
+}
+
+function hostPathToWindowsPath(hostPath) {
+  const raw = String(hostPath || '').trim();
+  if (!raw) return '';
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    const win = raw.replace(/\//g, '\\');
+    return win.length > 3 ? win.replace(/\\+$/, '') : win;
+  }
+  if (process.platform === 'win32') {
+    const resolved = path.resolve(raw).replace(/\//g, '\\');
+    return resolved.length > 3 ? resolved.replace(/\\+$/, '') : resolved;
+  }
+  const slashNorm = path.resolve(raw).replace(/\\/g, '/');
+  const lower = slashNorm.toLowerCase();
+  const driveCIdx = lower.lastIndexOf('/drive_c/');
+  if (driveCIdx >= 0) {
+    const rel = slashNorm.slice(driveCIdx + '/drive_c/'.length).replace(/\//g, '\\');
+    return rel ? `C:\\${rel.replace(/\\+$/, '')}` : 'C:\\';
+  }
+  if (lower.endsWith('/drive_c')) {
+    return 'C:\\';
+  }
+  const zRel = slashNorm.replace(/^\/+/, '').replace(/\//g, '\\');
+  return zRel ? `Z:\\${zRel.replace(/\\+$/, '')}` : 'Z:\\';
+}
+
+function decodeBasicXmlEntities(str) {
+  return String(str || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function extractXmlAttr(tagText, attrName) {
+  const re = new RegExp(`\\b${attrName}\\s*=\\s*["']([^"']*)["']`, 'i');
+  const m = re.exec(tagText);
+  return m ? decodeBasicXmlEntities(m[1]).trim() : '';
+}
+
+function extractXmlElementText(xml, tagName) {
+  const re = new RegExp(`<(?:\\w+:)?${tagName}\\b[^>]*>([\\s\\S]*?)<\\/(?:\\w+:)?${tagName}>`, 'i');
+  const m = re.exec(xml);
+  return m ? decodeBasicXmlEntities(m[1]).trim() : '';
+}
+
+function formatGdkPackageIdentifier(rawId, storeId, fallbackSeed) {
+  const cleanRaw = String(rawId || '').trim();
+  if (cleanRaw && cleanRaw.length <= 32) {
+    return cleanRaw;
+  }
+  const cleanStoreId = String(storeId || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 12);
+  const digest = crypto
+    .createHash('sha256')
+    .update(String(fallbackSeed || cleanRaw || cleanStoreId || 'dlc'))
+    .digest('hex');
+  if (cleanStoreId) {
+    return `${cleanStoreId}_dlc_${digest.slice(0, 12)}`;
+  }
+  return `dlc_${digest.slice(0, 24)}`;
+}
+
+/**
+ * Discovers installed Xbox DLC (`XPackageKind_Content`) packages under `<gameRootDir>/.onelauncher-dlc/*`.
+ */
+function discoverInstalledDlcPackages(gameRootDir) {
+  if (!gameRootDir || typeof gameRootDir !== 'string') return [];
+  const dlcRoot = path.join(path.resolve(gameRootDir), '.onelauncher-dlc');
+  let entries;
+  try {
+    if (!fs.existsSync(dlcRoot)) return [];
+    entries = fs.readdirSync(dlcRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const subdirs = entries
+    .filter((e) => e && e.isDirectory() && !e.name.startsWith('.'))
+    .map((e) => e.name)
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, MAX_DLC_PACKAGES);
+
+  const discovered = [];
+  for (const dirName of subdirs) {
+    const baseDir = path.join(dlcRoot, dirName);
+    const candidateRoots = [baseDir, path.join(baseDir, 'Content')];
+
+    let mountHost = baseDir;
+    let xmlContent = '';
+    for (const cand of candidateRoots) {
+      const mgcPath = path.join(cand, 'MicrosoftGame.config');
+      const appxPath = path.join(cand, 'AppxManifest.xml');
+      try {
+        if (fs.existsSync(mgcPath)) {
+          xmlContent = fs.readFileSync(mgcPath, 'utf8');
+          mountHost = cand;
+          break;
+        }
+        if (fs.existsSync(appxPath)) {
+          xmlContent = fs.readFileSync(appxPath, 'utf8');
+          mountHost = cand;
+          break;
+        }
+      } catch {}
+    }
+
+    let metaJson = null;
+    try {
+      const metaPath = path.join(baseDir, '.onelauncher-dlc.json');
+      if (fs.existsSync(metaPath)) {
+        metaJson = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      }
+    } catch {}
+
+    // Strip <DevelopmentOnly> blocks before parsing Identity/StoreId
+    const cleanXml = xmlContent.replace(/<DevelopmentOnly\b[^>]*>[\s\S]*?<\/DevelopmentOnly>/gi, '');
+    const idTagMatch = /<(?:(?:\w+):)?Identity\b([^>]*)>/i.exec(cleanXml);
+    const idAttrs = idTagMatch ? idTagMatch[1] : '';
+
+    const identityName =
+      String(metaJson?.identityName || '').trim() ||
+      extractXmlAttr(idAttrs, 'Name') ||
+      `DLC.${dirName.replace(/[^A-Za-z0-9._-]/g, '') || 'Content'}`;
+    const publisher =
+      String(metaJson?.publisher || '').trim() ||
+      extractXmlAttr(idAttrs, 'Publisher') ||
+      'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US';
+    const version =
+      String(metaJson?.version || '').trim() ||
+      extractXmlAttr(idAttrs, 'Version') ||
+      '1.0.0.0';
+    const arch =
+      String(metaJson?.processorArchitecture || '').trim() ||
+      extractXmlAttr(idAttrs, 'ProcessorArchitecture') ||
+      'x64';
+
+    const shellMatch = /<(?:(?:\w+):)?ShellVisuals\b([^>]*)>/i.exec(cleanXml);
+    const shellDisplayName = shellMatch ? extractXmlAttr(shellMatch[1], 'DefaultDisplayName') : '';
+    const rawDisplayName =
+      String(metaJson?.displayName || '').trim() ||
+      shellDisplayName ||
+      extractXmlElementText(cleanXml, 'DisplayName') ||
+      identityName;
+    const displayName = rawDisplayName.startsWith('ms-resource:') ? identityName : rawDisplayName;
+
+    const xmlStoreId = extractXmlElementText(cleanXml, 'StoreId').toUpperCase();
+    const fallbackStoreId = /^[A-Z0-9]{12}$/i.test(dirName) ? dirName.toUpperCase() : '';
+    const storeId =
+      String(metaJson?.storeId || '').trim().toUpperCase() || xmlStoreId || fallbackStoreId;
+
+    const pubHash = computePublisherHash(publisher);
+    const packageFullName =
+      String(metaJson?.packageFullName || '').trim() ||
+      `${identityName}_${version}_${arch}__${pubHash}`;
+    const packageIdentifier = formatGdkPackageIdentifier(
+      metaJson?.packageIdentifier,
+      storeId,
+      packageFullName
+    );
+
+    const mountPathWin = hostPathToWindowsPath(mountHost);
+    discovered.push({
+      packageIdentifier,
+      packageFullName,
+      storeId,
+      displayName,
+      version,
+      mountPathHost: mountHost,
+      mountPathWin,
+    });
+  }
+
+  return discovered;
+}
+
+/**
+ * Creates a live `XStore` runtime provider backed by `xboxCatalogAndGamePass.cjs` and
+ * `xboxDeviceClep.cjs` with 60s entitlement caching and safe offline fallbacks.
+ */
+function createXboxStoreRuntimeProvider(options = {}) {
+  const {
+    authProvider = null,
+    gameMetadata = {},
+    fetchImpl,
+    tokenVault,
+    userDataDir,
+    cacheStore,
+  } = options;
+
+  let catalogMod = null;
+  let clepMod = null;
+  const getCatalogMod = () => {
+    if (!catalogMod) catalogMod = require('./xboxCatalogAndGamePass.cjs');
+    return catalogMod;
+  };
+  const getClepMod = () => {
+    if (!clepMod) clepMod = require('./xboxDeviceClep.cjs');
+    return clepMod;
+  };
+
+  const resolvedLocale = resolveDefaultXboxLocale(options.locale || gameMetadata.locale);
+  const resolvedMarket =
+    String(
+      options.market ||
+        gameMetadata.market ||
+        (resolvedLocale.includes('-') ? resolvedLocale.split('-').pop() : 'US')
+    )
+      .trim()
+      .toUpperCase() || 'US';
+
+  let cachedEntitlements = null;
+  let cachedEntitlementsAt = 0;
+  let inFlightEntitlements = null;
+
+  async function getCachedEntitlements() {
+    const now = Date.now();
+    if (cachedEntitlements && now - cachedEntitlementsAt < ENTITLEMENT_CACHE_TTL_MS) {
+      return cachedEntitlements;
+    }
+    if (!authProvider) {
+      return {
+        ownedProductIds: new Set(),
+        ownedSkuByProduct: new Map(),
+        subscriptionSatisfiedIds: new Map(),
+        totalRawCount: 0,
+      };
+    }
+    if (inFlightEntitlements) return inFlightEntitlements;
+
+    inFlightEntitlements = (async () => {
+      try {
+        const { fetchXboxOwnedEntitlements } = getCatalogMod();
+        const res = await fetchXboxOwnedEntitlements({
+          authProvider,
+          market: resolvedMarket,
+          locale: resolvedLocale,
+          fetchImpl,
+          includeAddOns: true,
+        });
+        cachedEntitlements = res;
+        cachedEntitlementsAt = Date.now();
+        return res;
+      } catch {
+        return (
+          cachedEntitlements || {
+            ownedProductIds: new Set(),
+            ownedSkuByProduct: new Map(),
+            subscriptionSatisfiedIds: new Map(),
+            totalRawCount: 0,
+          }
+        );
+      } finally {
+        inFlightEntitlements = null;
+      }
+    })();
+
+    return inFlightEntitlements;
+  }
+
+  function mapProductKindBit(rawKind, isBaseGame = false) {
+    const k = String(rawKind || '').trim().toLowerCase();
+    if (k === 'game') return 0x04;
+    if (k === 'durable') return 0x02;
+    if (k === 'consumable') return 0x01;
+    if (k === 'unmanagedconsumable') return 0x10;
+    return isBaseGame ? 0x04 : 0x02;
+  }
+
+  function formatCompactPrice(amount, currencyCode) {
+    const num = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+    const cur = String(currencyCode || 'USD').toUpperCase();
+    const raw = cur === 'USD' ? `$${num.toFixed(2)}` : `${num.toFixed(2)} ${cur}`;
+    return raw.slice(0, 15);
+  }
+
+  function mapCatalogProductToXStore(prod, storeIdFallback, entitlements, isBaseGame = false) {
+    const storeId = String(prod?.ProductId || storeIdFallback || '').trim().toUpperCase();
+    const loc = Array.isArray(prod?.LocalizedProperties) ? prod.LocalizedProperties[0] : null;
+    const dsaList = Array.isArray(prod?.DisplaySkuAvailabilities)
+      ? prod.DisplaySkuAvailabilities
+      : [];
+    const chosenDsa =
+      dsaList.find((d) => !d?.Sku?.Properties?.IsTrial) || dsaList[0] || null;
+    const sku = chosenDsa?.Sku || null;
+    const skuId =
+      String(
+        entitlements?.ownedSkuByProduct?.get?.(storeId) || sku?.SkuId || '0010'
+      ).trim() || '0010';
+    const avail = Array.isArray(chosenDsa?.Availabilities) ? chosenDsa.Availabilities[0] : null;
+    const priceObj = avail?.OrderManagementData?.Price || null;
+
+    const listPrice = Number.isFinite(Number(priceObj?.ListPrice))
+      ? Number(priceObj.ListPrice)
+      : 0;
+    const msrp = Number.isFinite(Number(priceObj?.MSRP)) ? Number(priceObj.MSRP) : listPrice;
+    const currencyCode = String(priceObj?.CurrencyCode || 'USD').trim().toUpperCase() || 'USD';
+    const isOnSale = msrp > listPrice && listPrice >= 0;
+
+    const inAppOfferToken = String(
+      sku?.Properties?.InAppOfferToken || prod?.Properties?.InAppOfferToken || ''
+    ).trim();
+    const productKind = mapProductKindBit(prod?.ProductKind, isBaseGame);
+    const isInUserCollection = Boolean(
+      isBaseGame ||
+        entitlements?.ownedProductIds?.has?.(storeId) ||
+        entitlements?.subscriptionSatisfiedIds?.has?.(storeId)
+    );
+
+    return {
+      storeId,
+      title: String(loc?.ProductTitle || sku?.LocalizedProperties?.[0]?.SkuTitle || storeId).trim(),
+      description: String(loc?.ShortDescription || loc?.ProductDescription || '').trim(),
+      language: resolvedLocale,
+      inAppOfferToken,
+      linkUri: storeId ? `ms-windows-store://pdp/?ProductId=${storeId}` : '',
+      productKind,
+      hasDigitalDownload: true,
+      isInUserCollection,
+      skuId,
+      currencyCode,
+      price: listPrice,
+      basePrice: msrp,
+      formattedPrice: formatCompactPrice(listPrice, currencyCode),
+      formattedBasePrice: formatCompactPrice(msrp, currencyCode),
+      isOnSale,
+    };
+  }
+
+  async function queryLicenseToken({
+    productIds = [],
+    customDeveloperString = '',
+    parentProductId = '',
+  } = {}) {
+    if (!authProvider) return '';
+    try {
+      if (typeof authProvider.queryLicenseToken === 'function') {
+        const direct = await authProvider.queryLicenseToken({
+          productIds,
+          customDeveloperString,
+          parentProductId,
+        });
+        return String(direct?.token || direct || '');
+      }
+
+      const msaStoreToken =
+        typeof authProvider.getStoreMsaToken === 'function'
+          ? await authProvider.getStoreMsaToken({ forLicensing: true })
+          : '';
+      if (!msaStoreToken) return '';
+
+      let deviceContext =
+        typeof authProvider.ensureDeviceContext === 'function'
+          ? await authProvider.ensureDeviceContext()
+          : typeof authProvider.getDeviceLicenseContext === 'function'
+            ? await authProvider.getDeviceLicenseContext()
+            : null;
+      if (!deviceContext && (tokenVault || userDataDir)) {
+        const { ensureDeviceLicenseContext } = getClepMod();
+        deviceContext = await ensureDeviceLicenseContext({
+          tokenVault,
+          userDataDir,
+          fetchImpl,
+          msaStoreToken,
+        });
+      }
+      if (!deviceContext) return '';
+
+      const { acquireStoreLicenseToken } = getClepMod();
+      const baseStoreId = String(parentProductId || gameMetadata.storeId || productIds[0] || '')
+        .trim()
+        .toUpperCase();
+      const res = await acquireStoreLicenseToken({
+        parentProductId: baseStoreId,
+        productIds: Array.isArray(productIds) && productIds.length > 0 ? productIds : baseStoreId ? [baseStoreId] : [],
+        customDeveloperString,
+        msaStoreToken,
+        deviceContext,
+        fetchImpl,
+      });
+      if (typeof res === 'string') return res;
+      return String(res?.token || res?.licenseToken || res?.LicenseToken || '');
+    } catch {
+      return '';
+    }
+  }
+
+  return {
+    async queryEntitlements() {
+      const ent = await getCachedEntitlements();
+      return {
+        ownedProductIds: Array.from(ent.ownedProductIds || []),
+        subscriptionProductIds: Array.from((ent.subscriptionSatisfiedIds || new Map()).keys()),
+      };
+    },
+
+    /** @param {{ storeId?: string }} [params] */
+    async getGameLicense({ storeId } = {}) {
+      const cleanId = String(storeId || gameMetadata.storeId || '').trim().toUpperCase();
+      const ent = await getCachedEntitlements();
+      const skuId = ent.ownedSkuByProduct?.get?.(cleanId) || '0010';
+      return {
+        skuStoreId: cleanId ? `${cleanId}/${skuId}` : '9N0000000000/0010',
+        isActive: true,
+        isTrialOwnedByThisUser: false,
+        isDiscLicense: false,
+        isTrial: false,
+        trialTimeRemainingInSeconds: 0,
+        trialUniqueId: '',
+        expirationDate: Math.floor(Date.now() / 1000) + 30 * 86400,
+      };
+    },
+
+    async queryProducts({
+      mode = 'xstore.queryProducts',
+      productKinds = 0x1f,
+      storeIds = [],
+      maxItems = 25,
+      baseStoreId = '',
+      dlcPackages = [],
+    } = {}) {
+      const ent = await getCachedEntitlements();
+      const effectiveBaseId = String(baseStoreId || gameMetadata.storeId || '')
+        .trim()
+        .toUpperCase();
+      const dlcList = Array.isArray(dlcPackages) && dlcPackages.length > 0
+        ? dlcPackages
+        : Array.isArray(options.dlcPackages)
+          ? options.dlcPackages
+          : [];
+
+      const candidateSet = new Set();
+      if (mode === 'xstore.queryProducts') {
+        for (const id of storeIds || []) {
+          const clean = String(id || '').trim().toUpperCase();
+          if (clean) candidateSet.add(clean);
+        }
+      } else {
+        if (effectiveBaseId) candidateSet.add(effectiveBaseId);
+        for (const id of storeIds || []) {
+          const clean = String(id || '').trim().toUpperCase();
+          if (clean) candidateSet.add(clean);
+        }
+        for (const dlc of dlcList) {
+          const clean = String(dlc?.storeId || '').trim().toUpperCase();
+          if (clean) candidateSet.add(clean);
+        }
+        if (mode === 'xstore.queryEntitledProducts') {
+          for (const id of ent.ownedProductIds || []) candidateSet.add(id);
+          for (const id of (ent.subscriptionSatisfiedIds || new Map()).keys()) {
+            candidateSet.add(id);
+          }
+        }
+      }
+
+      const cap = Math.max(1, Math.min(Number(maxItems) || 25, 100));
+      const candidateIds = Array.from(candidateSet).slice(0, cap);
+      let hydrated = new Map();
+      if (candidateIds.length > 0) {
+        try {
+          const { lookupDisplayCatalogProducts } = getCatalogMod();
+          hydrated = await lookupDisplayCatalogProducts(candidateIds, {
+            market: resolvedMarket,
+            languages: resolvedLocale,
+            cacheStore,
+            fetchImpl,
+          });
+        } catch {}
+      }
+
+      const dlcByStoreId = new Map();
+      for (const dlc of dlcList) {
+        if (dlc?.storeId) dlcByStoreId.set(String(dlc.storeId).toUpperCase(), dlc);
+      }
+
+      const products = [];
+      for (const cid of candidateIds) {
+        const isBase = Boolean(effectiveBaseId && cid === effectiveBaseId);
+        const prod = hydrated.get(cid);
+        if (prod) {
+          const mapped = mapCatalogProductToXStore(prod, cid, ent, isBase);
+          if (dlcByStoreId.has(cid)) {
+            mapped.isInUserCollection = true;
+          }
+          if ((mapped.productKind & productKinds) !== 0) {
+            products.push(mapped);
+          }
+        } else if (isBase || dlcByStoreId.has(cid)) {
+          const dlc = dlcByStoreId.get(cid);
+          const fallbackKind = isBase ? 0x04 : 0x02;
+          if ((fallbackKind & productKinds) !== 0) {
+            products.push({
+              storeId: cid,
+              title: isBase
+                ? String(gameMetadata.displayName || 'Xbox Game')
+                : String(dlc?.displayName || cid),
+              description: '',
+              language: resolvedLocale,
+              inAppOfferToken: '',
+              linkUri: `ms-windows-store://pdp/?ProductId=${cid}`,
+              productKind: fallbackKind,
+              hasDigitalDownload: true,
+              isInUserCollection: true,
+              skuId: '0010',
+              currencyCode: 'USD',
+              price: 0,
+              basePrice: 0,
+              formattedPrice: '$0.00',
+              formattedBasePrice: '$0.00',
+              isOnSale: false,
+            });
+          }
+        }
+      }
+
+      return { products };
+    },
+
+    async queryAddOnLicenses({ storeId = '', dlcPackages = [] } = {}) {
+      const ent = await getCachedEntitlements();
+      const effectiveBaseId = String(storeId || gameMetadata.storeId || '')
+        .trim()
+        .toUpperCase();
+      const dlcList = Array.isArray(dlcPackages) && dlcPackages.length > 0
+        ? dlcPackages
+        : Array.isArray(options.dlcPackages)
+          ? options.dlcPackages
+          : [];
+
+      const addonIds = new Set();
+      for (const dlc of dlcList) {
+        const sid = String(dlc?.storeId || '').trim().toUpperCase();
+        if (sid && sid !== effectiveBaseId) addonIds.add(sid);
+      }
+
+      const entCandidateIds = [];
+      for (const sid of ent.ownedProductIds || []) {
+        if (sid && sid !== effectiveBaseId) entCandidateIds.push(sid);
+      }
+      for (const sid of (ent.subscriptionSatisfiedIds || new Map()).keys()) {
+        if (sid && sid !== effectiveBaseId && !entCandidateIds.includes(sid)) {
+          entCandidateIds.push(sid);
+        }
+      }
+
+      const lookupList = Array.from(new Set([...addonIds, ...entCandidateIds.slice(0, 50)]));
+      let hydrated = new Map();
+      if (lookupList.length > 0) {
+        try {
+          const { lookupDisplayCatalogProducts } = getCatalogMod();
+          hydrated = await lookupDisplayCatalogProducts(lookupList, {
+            market: resolvedMarket,
+            languages: resolvedLocale,
+            cacheStore,
+            fetchImpl,
+          });
+        } catch {}
+      }
+
+      const exp = Math.floor(Date.now() / 1000) + 30 * 86400;
+      const licenses = [];
+      for (const sid of lookupList) {
+        const prod = hydrated.get(sid);
+        const isInstalledDlc = addonIds.has(sid);
+        if (prod) {
+          const kindStr = String(prod.ProductKind || '').trim().toLowerCase();
+          // Exclude unrelated standalone base games from add-on licenses unless installed in .onelauncher-dlc
+          if (kindStr === 'game' && !isInstalledDlc) continue;
+          // If baseStoreId is known and AllowedPlatforms/Satisfying/Related exists, keep add-ons
+          const sku = prod?.DisplaySkuAvailabilities?.[0]?.Sku;
+          const skuId = String(ent.ownedSkuByProduct?.get?.(sid) || sku?.SkuId || '0010').trim() || '0010';
+          const offerToken = String(
+            sku?.Properties?.InAppOfferToken || prod?.Properties?.InAppOfferToken || ''
+          ).trim();
+          licenses.push({
+            skuStoreId: `${sid}/${skuId}`,
+            inAppOfferToken: offerToken,
+            isActive: true,
+            expirationDate: exp,
+          });
+        } else if (isInstalledDlc) {
+          const skuId = String(ent.ownedSkuByProduct?.get?.(sid) || '0010').trim() || '0010';
+          licenses.push({
+            skuStoreId: `${sid}/${skuId}`,
+            inAppOfferToken: '',
+            isActive: true,
+            expirationDate: exp,
+          });
+        }
+      }
+
+      return { licenses };
+    },
+
+    queryLicenseToken,
+
+    async getCollectionsId({ serviceTicket = '', publisherUserId = '' } = {}) {
+      if (authProvider && typeof authProvider.getCollectionsId === 'function') {
+        try {
+          const tok = await authProvider.getCollectionsId({ serviceTicket, publisherUserId });
+          if (tok) return String(tok);
+        } catch {}
+      }
+      const effFetch = fetchImpl || globalThis.fetch;
+      if (authProvider && typeof authProvider.getStoreMsaToken === 'function' && typeof effFetch === 'function') {
+        try {
+          const msaTicket = await authProvider.getStoreMsaToken({ forLicensing: false });
+          if (msaTicket) {
+            const res = await effFetch('https://collections.mp.microsoft.com/v6.0/collections/b2ctoken', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                Authorization: `WLID1.0="${msaTicket}"`,
+              },
+              body: JSON.stringify({
+                serviceTicket: String(serviceTicket || ''),
+                publisherUserId: String(publisherUserId || ''),
+              }),
+            });
+            if (res.ok) {
+              const json = await res.json();
+              const b2c = String(json?.token || json?.b2cToken || json?.collectionsId || '');
+              if (b2c) return b2c;
+            }
+          }
+        } catch {}
+      }
+      return queryLicenseToken({
+        productIds: gameMetadata.storeId ? [String(gameMetadata.storeId)] : [],
+        customDeveloperString: serviceTicket || publisherUserId,
+      });
+    },
+
+    async getPurchaseId({ serviceTicket = '', publisherUserId = '' } = {}) {
+      if (authProvider && typeof authProvider.getPurchaseId === 'function') {
+        try {
+          const tok = await authProvider.getPurchaseId({ serviceTicket, publisherUserId });
+          if (tok) return String(tok);
+        } catch {}
+      }
+      const effFetch = fetchImpl || globalThis.fetch;
+      if (authProvider && typeof authProvider.getStoreMsaToken === 'function' && typeof effFetch === 'function') {
+        try {
+          const msaTicket = await authProvider.getStoreMsaToken({ forLicensing: false });
+          if (msaTicket) {
+            const res = await effFetch('https://purchase.mp.microsoft.com/v6.0/users/me/b2ctoken', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                Authorization: `WLID1.0="${msaTicket}"`,
+              },
+              body: JSON.stringify({
+                serviceTicket: String(serviceTicket || ''),
+                publisherUserId: String(publisherUserId || ''),
+              }),
+            });
+            if (res.ok) {
+              const json = await res.json();
+              const b2c = String(json?.token || json?.b2cToken || json?.purchaseId || '');
+              if (b2c) return b2c;
+            }
+          }
+        } catch {}
+      }
+      return queryLicenseToken({
+        productIds: gameMetadata.storeId ? [String(gameMetadata.storeId)] : [],
+        customDeveloperString: serviceTicket || publisherUserId,
+      });
+    },
+  };
+}
 
 function verifySessionKeyConstantTime(candidateKey, expectedKeyBuf) {
   if (typeof candidateKey !== 'string' || candidateKey.length !== 64) {
@@ -139,6 +844,15 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
   const activeScids = new Set();
 
   const initialRawTitleId = String(gameMetadata.titleId || options.titleId || '');
+  const resolvedLocale = resolveDefaultXboxLocale(options.locale || gameMetadata.locale);
+  const initialInviteUri = String(options.inviteUri || gameMetadata.inviteUri || '').trim();
+  const gameRootDir = String(options.gameRootDir || gameMetadata.gameRootDir || '').trim();
+  const discoveredDlcs = Array.isArray(options.dlcPackages)
+    ? options.dlcPackages
+    : gameRootDir
+      ? discoverInstalledDlcPackages(gameRootDir)
+      : [];
+
   const state = {
     titleId: initialRawTitleId,
     titleIdDecimal: String(
@@ -151,16 +865,72 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       .trim()
       .toLowerCase(),
     msaAppId: String(gameMetadata.msaAppId || options.msaAppId || ''),
-    storeId: String(gameMetadata.storeId || options.storeId || ''),
+    storeId: String(gameMetadata.storeId || options.storeId || '').trim().toUpperCase(),
     packageFamilyName: String(
       gameMetadata.packageFamilyName || options.packageFamilyName || options.pfn || ''
     ),
+    locale: resolvedLocale,
+    inviteUri: initialInviteUri,
+    dlcPackages: discoveredDlcs,
+    lastXuid: String(userProfile?.xuid || ''),
     fullTrust: gameMetadata.fullTrust !== false,
     initializedSaves: new Set(),
     saveQuotas: new Map(),
     /** @type {Promise<any>} */
     pendingSaveChain: Promise.resolve(),
   };
+
+  const effectiveStoreProvider =
+    storeProvider ||
+    (authProvider
+      ? createXboxStoreRuntimeProvider({
+          authProvider,
+          userProfile,
+          gameMetadata: {
+            ...gameMetadata,
+            storeId: state.storeId,
+            locale: state.locale,
+          },
+          fetchImpl,
+          tokenVault: options.tokenVault,
+          userDataDir: options.userDataDir,
+          cacheStore: options.cacheStore,
+          locale: state.locale,
+          market: options.market || gameMetadata.market,
+          dlcPackages: state.dlcPackages,
+        })
+      : null);
+
+  const canSendPresence =
+    options.enablePresenceHeartbeat === true ||
+    (options.enablePresenceHeartbeat !== false &&
+      Boolean(authProvider && typeof authProvider.getXstsToken === 'function'));
+  const presenceIntervalMs =
+    Number(options.presenceHeartbeatIntervalMs) > 0
+      ? Number(options.presenceHeartbeatIntervalMs)
+      : DEFAULT_PRESENCE_HEARTBEAT_INTERVAL_MS;
+  let presenceTimer = null;
+  let presenceActivated = false;
+  let isClosing = false;
+
+  async function sendPresenceUpdate(presenceState) {
+    if (!canSendPresence) return;
+    if (presenceState !== 'inactive' && isClosing) return;
+    const tidDec = state.titleIdDecimal;
+    if (presenceState !== 'inactive' && (!/^\d+$/.test(tidDec) || Number(tidDec) <= 0)) {
+      return;
+    }
+    if (presenceState === 'active') {
+      presenceActivated = true;
+    }
+    await postXboxTitlePresenceHeartbeat({
+      authProvider,
+      xuid: state.lastXuid || userProfile?.xuid,
+      titleIdDecimal: tidDec,
+      state: presenceState,
+      fetchImpl,
+    });
+  }
 
   function resolveSystemAppDataHostDir(pfnOverride) {
     const explicitSaveRoot = saveRootDir || wgsRootDir;
@@ -228,6 +998,9 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
         if (typeof params.fullTrust === 'boolean') state.fullTrust = params.fullTrust;
 
         const profile = await resolveActiveUserProfile();
+        if (profile.xuid) state.lastXuid = profile.xuid;
+        void sendPresenceUpdate('active');
+
         return {
           ...profile,
           titleId: state.titleId,
@@ -236,6 +1009,10 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
           msaAppId: state.msaAppId,
           storeId: state.storeId,
           packageFamilyName: state.packageFamilyName,
+          locale: state.locale,
+          offline: !authProvider,
+          dlcPackages: state.dlcPackages,
+          ...(state.inviteUri ? { inviteUri: state.inviteUri } : {}),
           sandbox: 'RETAIL',
         };
       }
@@ -289,8 +1066,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       }
 
       case 'xstore.getGameLicense': {
-        if (storeProvider && typeof storeProvider.getGameLicense === 'function') {
-          const lic = await storeProvider.getGameLicense({
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.getGameLicense === 'function') {
+          const lic = await effectiveStoreProvider.getGameLicense({
             storeId: state.storeId,
             packageFamilyName: state.packageFamilyName,
           });
@@ -310,8 +1087,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
 
       case 'xstore.acquirePackageLicense': {
         const packageIdentifier = String(params.packageIdentifier || '');
-        if (storeProvider && typeof storeProvider.acquirePackageLicense === 'function') {
-          const res = await storeProvider.acquirePackageLicense({ packageIdentifier });
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.acquirePackageLicense === 'function') {
+          const res = await effectiveStoreProvider.acquirePackageLicense({ packageIdentifier });
           if (res) return res;
         }
         return {
@@ -323,12 +1100,18 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       case 'xstore.queryEntitledProducts':
       case 'xstore.queryAssociatedProducts':
       case 'xstore.queryProducts': {
-        if (storeProvider && typeof storeProvider.queryProducts === 'function') {
-          const res = await storeProvider.queryProducts({
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.queryProducts === 'function') {
+          const res = await effectiveStoreProvider.queryProducts({
             mode: method,
             productKinds: Number(params.productKinds || 0x1f),
-            storeIds: Array.isArray(params.storeIds) ? params.storeIds : [],
+            storeIds: Array.isArray(params.storeIds)
+              ? params.storeIds
+              : Array.isArray(params.productIds)
+                ? params.productIds
+                : [],
             maxItems: Number(params.maxItems || 25),
+            baseStoreId: state.storeId,
+            dlcPackages: state.dlcPackages,
           });
           if (res) return res;
         }
@@ -338,7 +1121,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
             storeId: state.storeId,
             title: gameMetadata.displayName || 'Xbox Game',
             description: '',
-            language: 'en-US',
+            language: state.locale || 'en-US',
             inAppOfferToken: '',
             linkUri: '',
             productKind: 0x04, // XStoreProductKind_Game
@@ -351,16 +1134,35 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       }
 
       case 'xstore.queryAddOnLicenses': {
-        if (storeProvider && typeof storeProvider.queryAddOnLicenses === 'function') {
-          const res = await storeProvider.queryAddOnLicenses({ storeId: state.storeId });
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.queryAddOnLicenses === 'function') {
+          const res = await effectiveStoreProvider.queryAddOnLicenses({
+            storeId: state.storeId,
+            dlcPackages: state.dlcPackages,
+          });
           if (res) return res;
         }
         return { licenses: [] };
       }
 
+      case 'xstore.queryLicenseToken': {
+        const productIds = Array.isArray(params.productIds)
+          ? params.productIds.map((p) => String(p || '').trim()).filter(Boolean)
+          : [];
+        const customDeveloperString = String(params.customDeveloperString || '');
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.queryLicenseToken === 'function') {
+          const token = await effectiveStoreProvider.queryLicenseToken({
+            productIds,
+            customDeveloperString,
+            parentProductId: state.storeId,
+          });
+          return { token: String(token || '') };
+        }
+        return { token: '' };
+      }
+
       case 'xstore.getCollectionsId': {
-        if (storeProvider && typeof storeProvider.getCollectionsId === 'function') {
-          const token = await storeProvider.getCollectionsId({
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.getCollectionsId === 'function') {
+          const token = await effectiveStoreProvider.getCollectionsId({
             serviceTicket: String(params.serviceTicket || ''),
             publisherUserId: String(params.publisherUserId || ''),
           });
@@ -377,8 +1179,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       }
 
       case 'xstore.getPurchaseId': {
-        if (storeProvider && typeof storeProvider.getPurchaseId === 'function') {
-          const token = await storeProvider.getPurchaseId({
+        if (effectiveStoreProvider && typeof effectiveStoreProvider.getPurchaseId === 'function') {
+          const token = await effectiveStoreProvider.getPurchaseId({
             serviceTicket: String(params.serviceTicket || ''),
             publisherUserId: String(params.publisherUserId || ''),
           });
@@ -679,22 +1481,66 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
 
+  if (canSendPresence) {
+    if (/^\d+$/.test(state.titleIdDecimal) && Number(state.titleIdDecimal) > 0) {
+      void sendPresenceUpdate('active');
+    }
+    presenceTimer = setInterval(() => {
+      void sendPresenceUpdate('active');
+    }, presenceIntervalMs);
+    if (typeof presenceTimer.unref === 'function') {
+      presenceTimer.unref();
+    }
+  }
+
+  const initialSaveRootHost = resolveSystemAppDataHostDir(state.packageFamilyName);
+  const initialSaveRootWin = initialSaveRootHost ? hostPathToWindowsPath(initialSaveRootHost) : '';
+
+  let closePromise = null;
+  async function closeServer() {
+    if (closePromise) return closePromise;
+    isClosing = true;
+    if (presenceTimer) {
+      clearInterval(presenceTimer);
+      presenceTimer = null;
+    }
+    closePromise = (async () => {
+      await state.pendingSaveChain.catch(() => {});
+      if (presenceActivated) {
+        await sendPresenceUpdate('inactive');
+      }
+      for (const sock of activeSockets) {
+        sock.destroy();
+      }
+      activeSockets.clear();
+      await new Promise((resolve) => server.close(() => resolve()));
+    })();
+    return closePromise;
+  }
+
   return {
     host: '127.0.0.1',
     port,
     sessionKey,
+    storeProvider: effectiveStoreProvider,
     env: {
       ONE_XGR_PORT: String(port),
       ONE_XGR_KEY: sessionKey,
+      ONE_XGR_LOCALE: state.locale,
+      ...(initialSaveRootWin ? { ONE_XGR_SAVE_ROOT: initialSaveRootWin } : {}),
+      ...(state.inviteUri ? { ONE_XGR_INVITE_URI: state.inviteUri } : {}),
     },
     getState() {
       return {
         titleId: state.titleId,
+        titleIdDecimal: state.titleIdDecimal || undefined,
         scid: state.scid,
         fallbackScid: state.fallbackScid,
         msaAppId: state.msaAppId,
         storeId: state.storeId,
         packageFamilyName: state.packageFamilyName,
+        locale: state.locale,
+        dlcPackages: state.dlcPackages,
       };
     },
     getActiveScids() {
@@ -703,14 +1549,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     async flushPendingSaves() {
       await state.pendingSaveChain.catch(() => {});
     },
-    async close() {
-      await state.pendingSaveChain.catch(() => {});
-      for (const sock of activeSockets) {
-        sock.destroy();
-      }
-      activeSockets.clear();
-      await new Promise((resolve) => server.close(() => resolve()));
-    },
+    close: closeServer,
+    stop: closeServer,
   };
 }
 
@@ -719,9 +1559,13 @@ module.exports = {
   MAX_UNAUTH_RPC_FRAME_BYTES,
   MAX_CONCURRENT_SOCKETS,
   DEFAULT_SOCKET_IDLE_TIMEOUT_MS,
+  DEFAULT_PRESENCE_HEARTBEAT_INTERVAL_MS,
   verifySessionKeyConstantTime,
   encodeRpcFrame,
   resolveTitleSaveDirs,
   resolveTitleSaveRootDir,
+  hostPathToWindowsPath,
+  discoverInstalledDlcPackages,
+  createXboxStoreRuntimeProvider,
   startXboxRuntimeLoopbackServer,
 };

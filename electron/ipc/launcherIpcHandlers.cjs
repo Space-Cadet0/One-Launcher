@@ -48,6 +48,14 @@ const ALLOWED_ENVIRONMENT_COMPONENT_IDS = new Set([
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
   'xbox_runtime',
 ]);
 
@@ -65,6 +73,13 @@ const ALLOWED_NON_NATIVE_RUNNERS = new Set([
   'crossover_preview',
   'gptk',
   'wine',
+]);
+
+const ALLOWED_COMPAT_INSTALL_MODES = new Set([
+  'auto',
+  'brew',
+  'direct',
+  'download',
 ]);
 
 const ALLOWED_PREFERRED_RUNNER_TYPES = new Set([
@@ -87,6 +102,14 @@ const ALLOWED_CLIENT_LOGIN_TARGET_IDS = new Set([
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
 ]);
 
 const ALLOWED_SETUP_WIZARD_STATE_PATCH_KEYS = [
@@ -220,6 +243,183 @@ function validateOptionalDmgPath(rawDmgPath) {
 }
 
 /**
+ * Validate an optional compatibility runner installer archive path from the renderer:
+ * expands leading `~/` via `os.homedir()`, requires an absolute path ending in
+ * `.zip`, `.dmg`, `.tar.xz`, or `.txz` with zero null bytes, zero `..` traversal segments,
+ * and neither path nor basename starting with `-`.
+ *
+ * @param {unknown} rawArchivePath
+ * @returns {{ ok: boolean, value?: string, error?: string }}
+ */
+function validateOptionalRunnerArchivePath(rawArchivePath) {
+  if (rawArchivePath === undefined || rawArchivePath === null || rawArchivePath === '') {
+    return { ok: true };
+  }
+  if (typeof rawArchivePath !== 'string') {
+    return {
+      ok: false,
+      error: 'Invalid archivePath: expected a string ending in .zip, .dmg, .tar.xz, or .txz.',
+    };
+  }
+  if (rawArchivePath.includes('\0')) {
+    return { ok: false, error: 'Invalid archivePath: null bytes are forbidden.' };
+  }
+  const trimmed = rawArchivePath.trim();
+  if (!trimmed || trimmed.length > 1024) {
+    return { ok: false, error: 'Invalid archivePath length.' };
+  }
+  if (trimmed.startsWith('-')) {
+    return { ok: false, error: 'Invalid archivePath: leading hyphen is forbidden.' };
+  }
+  const rawSegments = trimmed.split(/[\\/]+/);
+  if (rawSegments.includes('..')) {
+    return {
+      ok: false,
+      error: 'Invalid archivePath: directory traversal segments are forbidden.',
+    };
+  }
+
+  let resolved = trimmed;
+  if (resolved.startsWith('~/') || resolved.startsWith('~\\')) {
+    const homeDir = os.homedir();
+    if (!homeDir) {
+      return {
+        ok: false,
+        error: 'Invalid archivePath: unable to resolve user home directory.',
+      };
+    }
+    resolved = path.join(homeDir, resolved.slice(2));
+  }
+
+  if (
+    !path.isAbsolute(resolved) ||
+    resolved.startsWith('-') ||
+    path.basename(resolved).startsWith('-')
+  ) {
+    return {
+      ok: false,
+      error:
+        'Invalid archivePath: must be an absolute path whose basename does not start with "-".',
+    };
+  }
+  if (resolved.split(/[\\/]+/).includes('..')) {
+    return {
+      ok: false,
+      error: 'Invalid archivePath: directory traversal segments are forbidden.',
+    };
+  }
+  if (!/\.(?:zip|dmg|tar\.xz|txz)$/i.test(resolved)) {
+    return {
+      ok: false,
+      error: 'Invalid archivePath: path must end in .zip, .dmg, .tar.xz, or .txz.',
+    };
+  }
+  return { ok: true, value: resolved };
+}
+
+/**
+ * Validate and sanitize an `InstallCompatibilityLayerRequest` or `UpdateCompatibilityLayerPayload`
+ * from the renderer, stripping DI hooks/env overrides and validating optional archive/DMG paths.
+ *
+ * @param {unknown} rawPayload
+ * @param {'install' | 'update'} operation
+ * @returns {{ ok: boolean, runnerType: string, payload?: Record<string, any>, error?: string }}
+ */
+function sanitizeCompatLayerPayload(rawPayload, operation) {
+  const effectiveRaw =
+    rawPayload === undefined || rawPayload === null ? {} : rawPayload;
+  if (typeof effectiveRaw !== 'object' || Array.isArray(effectiveRaw)) {
+    return {
+      ok: false,
+      runnerType: 'crossover',
+      error: `Invalid compatibility layer ${operation} payload.`,
+    };
+  }
+  const rawObj = /** @type {Record<string, unknown>} */ (effectiveRaw);
+  if (typeof rawObj.runnerType === 'string' && rawObj.runnerType.includes('\0')) {
+    return {
+      ok: false,
+      runnerType: 'crossover',
+      error: 'Invalid runnerType: null bytes are forbidden.',
+    };
+  }
+  if (typeof rawObj.dmgPath === 'string' && rawObj.dmgPath.includes('\0')) {
+    return {
+      ok: false,
+      runnerType: 'crossover',
+      error: 'Invalid dmgPath: null bytes are forbidden.',
+    };
+  }
+  if (typeof rawObj.archivePath === 'string' && rawObj.archivePath.includes('\0')) {
+    return {
+      ok: false,
+      runnerType: 'crossover',
+      error: 'Invalid archivePath: null bytes are forbidden.',
+    };
+  }
+
+  const clean = sanitizeRendererIpcOptions(effectiveRaw);
+  let runnerType = 'crossover';
+  if (clean.runnerType !== undefined && clean.runnerType !== null && clean.runnerType !== '') {
+    if (typeof clean.runnerType !== 'string') {
+      return {
+        ok: false,
+        runnerType: 'crossover',
+        error: 'Invalid compatibility layer runnerType.',
+      };
+    }
+    const candidate = clean.runnerType.trim().toLowerCase();
+    if (!ALLOWED_NON_NATIVE_RUNNERS.has(candidate)) {
+      return {
+        ok: false,
+        runnerType: 'crossover',
+        error: 'Invalid compatibility layer runnerType.',
+      };
+    }
+    runnerType = candidate;
+  }
+
+  const dmgCheck = validateOptionalDmgPath(clean.dmgPath);
+  if (!dmgCheck.ok) {
+    return { ok: false, runnerType, error: dmgCheck.error };
+  }
+  const archiveCheck = validateOptionalRunnerArchivePath(clean.archivePath);
+  if (!archiveCheck.ok) {
+    return { ok: false, runnerType, error: archiveCheck.error };
+  }
+
+  /** @type {Record<string, any>} */
+  const payloadOut = { runnerType };
+  if (dmgCheck.value) {
+    payloadOut.dmgPath = dmgCheck.value;
+  }
+  if (archiveCheck.value) {
+    payloadOut.archivePath = archiveCheck.value;
+  }
+
+  if (operation === 'install') {
+    if (clean.mode !== undefined && clean.mode !== null && clean.mode !== '') {
+      const modeCandidate =
+        typeof clean.mode === 'string' ? clean.mode.trim().toLowerCase() : '';
+      if (!ALLOWED_COMPAT_INSTALL_MODES.has(modeCandidate)) {
+        return {
+          ok: false,
+          runnerType,
+          error: 'Invalid compatibility layer install mode.',
+        };
+      }
+      payloadOut.mode = modeCandidate;
+    }
+  } else if (operation === 'update') {
+    if (typeof clean.switchToStableCrossOver === 'boolean') {
+      payloadOut.switchToStableCrossOver = clean.switchToStableCrossOver;
+    }
+  }
+
+  return { ok: true, runnerType, payload: payloadOut };
+}
+
+/**
  * Validate and sanitize a `RunEnvironmentSetupRequest` payload from the renderer.
  *
  * @param {unknown} rawPayload
@@ -239,6 +439,9 @@ function sanitizeEnvironmentSetupTasksPayload(rawPayload) {
         const entryRec = /** @type {Record<string, unknown>} */ (rawEntry);
         if (typeof entryRec.dmgPath === 'string' && entryRec.dmgPath.includes('\0')) {
           return { ok: false, runId: '', error: 'Invalid dmgPath: null bytes are forbidden.' };
+        }
+        if (typeof entryRec.archivePath === 'string' && entryRec.archivePath.includes('\0')) {
+          return { ok: false, runId: '', error: 'Invalid archivePath: null bytes are forbidden.' };
         }
         if (typeof entryRec.bottleName === 'string' && entryRec.bottleName.includes('\0')) {
           return { ok: false, runId: '', error: 'Invalid bottleName: null bytes are forbidden.' };
@@ -342,6 +545,18 @@ function sanitizeEnvironmentSetupTasksPayload(rawPayload) {
     }
     if (dmgCheck.value) {
       taskOut.dmgPath = dmgCheck.value;
+    }
+
+    const archiveCheck = validateOptionalRunnerArchivePath(cleanTaskInput.archivePath);
+    if (!archiveCheck.ok) {
+      return { ok: false, runId: cleanRunId, error: archiveCheck.error };
+    }
+    if (archiveCheck.value) {
+      taskOut.archivePath = archiveCheck.value;
+    }
+
+    if (typeof cleanTaskInput.forceUpdate === 'boolean') {
+      taskOut.forceUpdate = cleanTaskInput.forceUpdate;
     }
 
     sanitizedTasks.push(taskOut);
@@ -615,12 +830,103 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
     return launcherEngine.detectInstalledStorefrontClients(sanitizeRendererIpcOptions(options));
   });
 
+  /**
+   * Broadcast a `CompatibilityRunnerProgressEvent` to all live Electron windows
+   * (`BrowserWindow.getAllWindows()` plus any injected `getMainWindow()`).
+   *
+   * @param {Record<string, any>} event
+   */
+  const broadcastCompatRunnerProgress = (event) => {
+    if (!event || typeof event !== 'object') return;
+    /** @type {Set<any>} */
+    const targetWindows = new Set();
+    try {
+      const electronMod = require('electron');
+      const BrowserWindow = electronMod?.BrowserWindow;
+      if (BrowserWindow && typeof BrowserWindow.getAllWindows === 'function') {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (win) targetWindows.add(win);
+        }
+      }
+    } catch {}
+    if (typeof getMainWindow === 'function') {
+      try {
+        const mainWin = getMainWindow();
+        if (mainWin) targetWindows.add(mainWin);
+      } catch {}
+    }
+    for (const win of targetWindows) {
+      try {
+        if (
+          win &&
+          (typeof win.isDestroyed !== 'function' || !win.isDestroyed()) &&
+          win.webContents &&
+          (typeof win.webContents.isDestroyed !== 'function' || !win.webContents.isDestroyed()) &&
+          typeof win.webContents.send === 'function'
+        ) {
+          win.webContents.send('launcher:compat-runner-progress', event);
+        }
+      } catch {}
+    }
+  };
+
+  /** @type {Map<string, { controller: AbortController, promise: Promise<any> }>} */
+  const ipcActiveCompatOps = new Map();
+
   ipcMain.handle('launcher:detect-compat-layers', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
     return launcherEngine.detectCompatibilityLayers(sanitizeRendererIpcOptions(options));
   });
 
   ipcMain.handle('launcher:install-compat-layer', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
-    return await launcherEngine.installCompatibilityLayer(sanitizeRendererIpcOptions(payload));
+    const validation = sanitizeCompatLayerPayload(payload, 'install');
+    if (!validation.ok || !validation.payload) {
+      return {
+        success: false,
+        installed: false,
+        runnerType: validation.runnerType,
+        error: validation.error || 'Invalid compatibility layer install payload.',
+        message: validation.error || 'Invalid compatibility layer install payload.',
+        layers:
+          typeof launcherEngine.detectCompatibilityLayers === 'function'
+            ? launcherEngine.detectCompatibilityLayers({})
+            : [],
+      };
+    }
+    if (typeof launcherEngine.installCompatibilityLayer !== 'function') {
+      return {
+        success: false,
+        installed: false,
+        runnerType: validation.runnerType,
+        error: 'Compatibility layer installer is unavailable.',
+        message: 'Compatibility layer installer is unavailable.',
+        layers: [],
+      };
+    }
+    const cleanPayload = validation.payload;
+    if (cleanPayload.mode === 'download') {
+      return await launcherEngine.installCompatibilityLayer(cleanPayload);
+    }
+    const existing = ipcActiveCompatOps.get(validation.runnerType);
+    if (existing) {
+      return await existing.promise;
+    }
+    const controller = new AbortController();
+    const opPromise = Promise.resolve(
+      launcherEngine.installCompatibilityLayer(cleanPayload, {
+        onRunnerProgress: broadcastCompatRunnerProgress,
+        _skipBroadcastCompatRunnerIpc: true,
+        signal: controller.signal,
+      })
+    );
+    ipcActiveCompatOps.set(validation.runnerType, { controller, promise: opPromise });
+    try {
+      return await opPromise;
+    } finally {
+      const cur = ipcActiveCompatOps.get(validation.runnerType);
+      if (cur && cur.promise === opPromise) {
+        ipcActiveCompatOps.delete(validation.runnerType);
+      }
+    }
   });
 
   ipcMain.handle('launcher:check-compat-updates', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
@@ -628,7 +934,136 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
   });
 
   ipcMain.handle('launcher:update-compat-layer', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
-    return await launcherEngine.updateCompatibilityLayer(sanitizeRendererIpcOptions(payload));
+    const validation = sanitizeCompatLayerPayload(payload, 'update');
+    if (!validation.ok || !validation.payload) {
+      return {
+        success: false,
+        updated: false,
+        runnerType: validation.runnerType,
+        error: validation.error || 'Invalid compatibility layer update payload.',
+        message: validation.error || 'Invalid compatibility layer update payload.',
+        detectedLayers:
+          typeof launcherEngine.detectCompatibilityLayers === 'function'
+            ? launcherEngine.detectCompatibilityLayers({})
+            : [],
+      };
+    }
+    if (typeof launcherEngine.updateCompatibilityLayer !== 'function') {
+      return {
+        success: false,
+        updated: false,
+        runnerType: validation.runnerType,
+        error: 'Compatibility layer updater is unavailable.',
+        message: 'Compatibility layer updater is unavailable.',
+        detectedLayers: [],
+      };
+    }
+    const existing = ipcActiveCompatOps.get(validation.runnerType);
+    if (existing) {
+      return await existing.promise;
+    }
+    const controller = new AbortController();
+    const opPromise = Promise.resolve(
+      launcherEngine.updateCompatibilityLayer(validation.payload, {
+        onRunnerProgress: broadcastCompatRunnerProgress,
+        _skipBroadcastCompatRunnerIpc: true,
+        signal: controller.signal,
+      })
+    );
+    ipcActiveCompatOps.set(validation.runnerType, { controller, promise: opPromise });
+    try {
+      return await opPromise;
+    } finally {
+      const cur = ipcActiveCompatOps.get(validation.runnerType);
+      if (cur && cur.promise === opPromise) {
+        ipcActiveCompatOps.delete(validation.runnerType);
+      }
+    }
+  });
+
+  ipcMain.handle('launcher:cancel-compat-layer-op', async (/** @type {any} */ _event, /** @type {unknown} */ rawRunnerType) => {
+    const rawCandidate =
+      typeof rawRunnerType === 'string'
+        ? rawRunnerType
+        : rawRunnerType &&
+            typeof rawRunnerType === 'object' &&
+            typeof (/** @type {any} */ (rawRunnerType).runnerType) === 'string'
+          ? /** @type {any} */ (rawRunnerType).runnerType
+          : '';
+    if (!rawCandidate || rawCandidate.includes('\0')) {
+      return { success: false, cancelled: false };
+    }
+    const cleanRunnerType = rawCandidate.trim().toLowerCase();
+    if (!ALLOWED_NON_NATIVE_RUNNERS.has(cleanRunnerType)) {
+      return { success: false, cancelled: false };
+    }
+    let cancelledIpc = false;
+    const activeIpc = ipcActiveCompatOps.get(cleanRunnerType);
+    if (activeIpc) {
+      try {
+        activeIpc.controller.abort();
+        cancelledIpc = true;
+      } catch {}
+    }
+    let engineCancelled = false;
+    if (typeof launcherEngine.cancelCompatibilityLayerOperation === 'function') {
+      const res = await Promise.resolve(
+        launcherEngine.cancelCompatibilityLayerOperation(cleanRunnerType)
+      );
+      engineCancelled = Boolean(res && res.cancelled);
+    }
+    return {
+      success: true,
+      cancelled: Boolean(cancelledIpc || engineCancelled),
+    };
+  });
+
+  ipcMain.handle('launcher:select-runner-archive', async (/** @type {any} */ _event, /** @type {unknown} */ rawDefaultPath) => {
+    const cleanDefaultPath =
+      typeof rawDefaultPath === 'string' &&
+      rawDefaultPath.trim() &&
+      !rawDefaultPath.includes('\0') &&
+      rawDefaultPath.trim().length <= 1024
+        ? rawDefaultPath.trim()
+        : undefined;
+
+    const showOpenDialogFn =
+      dialog && typeof dialog.showOpenDialog === 'function'
+        ? (/** @type {Record<string, any>} */ dialogOpts) => {
+            const parentWin = typeof getMainWindow === 'function' ? getMainWindow() : null;
+            return parentWin
+              ? dialog.showOpenDialog(parentWin, dialogOpts)
+              : dialog.showOpenDialog(dialogOpts);
+          }
+        : undefined;
+
+    if (typeof launcherEngine.selectRunnerArchiveDialog === 'function') {
+      return await launcherEngine.selectRunnerArchiveDialog(
+        cleanDefaultPath,
+        showOpenDialogFn ? { showOpenDialogFn } : {}
+      );
+    }
+
+    if (showOpenDialogFn) {
+      const res = await showOpenDialogFn({
+        title: 'Select Compatibility Runner Installer Archive',
+        buttonLabel: 'Select Archive',
+        properties: ['openFile'],
+        filters: [
+          {
+            name: 'Runner Installer Archive',
+            extensions: ['zip', 'dmg', 'xz', 'txz'],
+          },
+        ],
+        ...(cleanDefaultPath ? { defaultPath: cleanDefaultPath } : {}),
+      });
+      if (!res || res.canceled || !Array.isArray(res.filePaths) || !res.filePaths[0]) {
+        return null;
+      }
+      return String(res.filePaths[0]);
+    }
+
+    return null;
   });
 
   ipcMain.handle('launcher:get-disk-space', async (/** @type {any} */ _event, /** @type {unknown} */ targetPath) => {
@@ -814,7 +1249,7 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
 
     /**
      * @param {string} targetId
-     * @param {'steam' | 'gog' | 'epic'} storefrontId
+     * @param {'steam' | 'gog' | 'epic' | 'ubisoft' | 'ea' | 'bnet' | 'rockstar'} storefrontId
      * @param {'host' | 'bottle'} scope
      * @returns {Record<string, any>}
      */
@@ -922,6 +1357,54 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
           isMac ? 'missing' : 'not_applicable',
           'not_needed'
         ),
+        host_ubisoft: mkComp(
+          'host_ubisoft',
+          'host_client',
+          isWin ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        bottle_ubisoft: mkComp(
+          'bottle_ubisoft',
+          'bottle_client',
+          isMac ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        host_ea: mkComp(
+          'host_ea',
+          'host_client',
+          isWin ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        bottle_ea: mkComp(
+          'bottle_ea',
+          'bottle_client',
+          isMac ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        host_bnet: mkComp(
+          'host_bnet',
+          'host_client',
+          isWin || isMac ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        bottle_bnet: mkComp(
+          'bottle_bnet',
+          'bottle_client',
+          isMac ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        host_rockstar: mkComp(
+          'host_rockstar',
+          'host_client',
+          isWin ? 'missing' : 'not_applicable',
+          'optional'
+        ),
+        bottle_rockstar: mkComp(
+          'bottle_rockstar',
+          'bottle_client',
+          isMac ? 'missing' : 'not_applicable',
+          'optional'
+        ),
         xbox_runtime: mkComp(
           'xbox_runtime',
           'built_in_runtime',
@@ -936,6 +1419,14 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
         bottle_gog: mkLogin('bottle_gog', 'gog', 'bottle'),
         host_epic: mkLogin('host_epic', 'epic', 'host'),
         bottle_epic: mkLogin('bottle_epic', 'epic', 'bottle'),
+        host_ubisoft: mkLogin('host_ubisoft', 'ubisoft', 'host'),
+        bottle_ubisoft: mkLogin('bottle_ubisoft', 'ubisoft', 'bottle'),
+        host_ea: mkLogin('host_ea', 'ea', 'host'),
+        bottle_ea: mkLogin('bottle_ea', 'ea', 'bottle'),
+        host_bnet: mkLogin('host_bnet', 'bnet', 'host'),
+        bottle_bnet: mkLogin('bottle_bnet', 'bnet', 'bottle'),
+        host_rockstar: mkLogin('host_rockstar', 'rockstar', 'host'),
+        bottle_rockstar: mkLogin('bottle_rockstar', 'rockstar', 'bottle'),
       },
       localStoreHints: [],
       counts: {
@@ -1111,13 +1602,24 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
   ipcMain.handle(
     'launcher:start-guided-client-login',
     async (/** @type {any} */ _event, /** @type {unknown} */ rawPayload) => {
+      const resolveFallbackLoginStorefront = (/** @type {string} */ tid) =>
+        tid.includes('ubisoft')
+          ? 'ubisoft'
+          : tid.includes('rockstar')
+            ? 'rockstar'
+            : tid.includes('bnet')
+              ? 'bnet'
+              : tid.endsWith('_ea')
+                ? 'ea'
+                : tid.includes('gog')
+                  ? 'gog'
+                  : tid.includes('epic')
+                    ? 'epic'
+                    : 'steam';
+
       const validation = sanitizeGuidedClientLoginPayload(rawPayload);
       if (!validation.ok || !validation.payload) {
-        const fallbackStorefront = validation.targetId.includes('gog')
-          ? 'gog'
-          : validation.targetId.includes('epic')
-            ? 'epic'
-            : 'steam';
+        const fallbackStorefront = resolveFallbackLoginStorefront(validation.targetId);
         const fallbackScope = validation.targetId.startsWith('bottle_') ? 'bottle' : 'host';
         return {
           success: false,
@@ -1138,11 +1640,7 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
         };
       }
       if (typeof launcherEngine.startGuidedClientLogin !== 'function') {
-        const fallbackStorefront = validation.targetId.includes('gog')
-          ? 'gog'
-          : validation.targetId.includes('epic')
-            ? 'epic'
-            : 'steam';
+        const fallbackStorefront = resolveFallbackLoginStorefront(validation.targetId);
         const fallbackScope = validation.targetId.startsWith('bottle_') ? 'bottle' : 'host';
         return {
           success: false,
@@ -1233,6 +1731,8 @@ module.exports = {
   sanitizeLauncherSettingsPayload,
   sanitizeSafeBottleNameSlug,
   validateOptionalDmgPath,
+  validateOptionalRunnerArchivePath,
+  sanitizeCompatLayerPayload,
   sanitizeEnvironmentSetupTasksPayload,
   sanitizeGuidedClientLoginPayload,
   sanitizeSetupWizardStatePatch,

@@ -11,6 +11,7 @@ import {
   type CompatibilityLayerInfo,
   type CompatibilityLayerType,
   type CompatibilityLayerUpdateInfo,
+  type CompatibilityRunnerProgressEvent,
   type DiskSpaceInfo,
   type DownloadTaskState,
   type FastMinimalLaunchAdvisory,
@@ -18,6 +19,7 @@ import {
   type GameLaunchConfig,
   type GameLaunchConfigResetRequest,
   type HibernateStatePayload,
+  type InstallCompatibilityLayerRequest,
   type InstallCompatibilityLayerResult,
   type InstalledGameRecord,
   type InstallGameRequest,
@@ -29,9 +31,11 @@ import {
   type SessionUpdatedPayload,
   type StorefrontLaunchPolicyView,
   type StorefrontLaunchProfile,
+  type UpdateCompatibilityLayerPayload,
   type UpdateCompatibilityLayerResult,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
+import { normalizeTitleKey } from '../common/titleUtils';
 import { requestScheduler } from '../network/requestScheduler';
 import { syncJobManager } from '../network/syncJobManager';
 import {
@@ -62,13 +66,16 @@ import {
 } from './launchConfigStore';
 import {
   COMPATIBILITY_RUNNER_DESCRIPTORS,
+  CROSSOVER_GRAPHICS_BACKEND_POLICIES,
   buildEffectiveLaunchModePreview,
   buildStorefrontLaunchPolicyConfig,
   buildStorefrontLaunchPolicyView,
   computeFastMinimalLaunchAdvisory,
+  getCrossOverGraphicsBackendPolicy,
   type BuildEffectiveLaunchModePreviewParams,
   type BuildLaunchModePreviewParams,
   type BuildStorefrontLaunchPolicyViewParams,
+  type CrossOverGraphicsBackendPolicyDescriptor,
   type FastMinimalLaunchAdvisoryParams,
 } from './launchPolicyPreview';
 import { sanitizeGameInstallSizeBytes } from '../../utils/formatBytes';
@@ -101,6 +108,7 @@ export type {
 } from '../../contracts/launcher';
 export {
   COMPATIBILITY_RUNNER_DESCRIPTORS,
+  CROSSOVER_GRAPHICS_BACKEND_POLICIES,
   LAUNCH_CONFIGS_STORAGE_KEY,
   PERF_SETTINGS_STORAGE_KEY,
   SELECTED_STOREFRONTS_STORAGE_KEY,
@@ -108,6 +116,7 @@ export {
   buildStorefrontLaunchPolicyConfig,
   buildStorefrontLaunchPolicyView,
   computeFastMinimalLaunchAdvisory,
+  getCrossOverGraphicsBackendPolicy,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
   sanitizeGameLaunchConfig,
@@ -118,27 +127,14 @@ export {
   sanitizeWineDebugMode,
   type BuildEffectiveLaunchModePreviewParams,
   type BuildLaunchModePreviewParams,
+  type CrossOverGraphicsBackendPolicyDescriptor,
   type BuildStorefrontLaunchPolicyViewParams,
   type FastMinimalLaunchAdvisoryParams,
 };
 
-const NORMALIZED_TITLE_CACHE = new Map<string, string>();
-const MAX_NORMALIZED_TITLE_CACHE_SIZE = 2500;
-
 function normalizeTitleForMatch(title?: string): string {
   if (!title) return '';
-  const cached = NORMALIZED_TITLE_CACHE.get(title);
-  if (cached !== undefined) return cached;
-  const normalized = title
-    .toLowerCase()
-    .replace(/[™®©]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-  if (NORMALIZED_TITLE_CACHE.size >= MAX_NORMALIZED_TITLE_CACHE_SIZE) {
-    NORMALIZED_TITLE_CACHE.clear();
-  }
-  NORMALIZED_TITLE_CACHE.set(title, normalized);
-  return normalized;
+  return normalizeTitleKey(title);
 }
 
 interface InstalledLookupIndex {
@@ -182,6 +178,14 @@ export class LauncherService {
   private unsubscribeDownload?: () => void;
   private unsubscribeSession?: () => void;
   private unsubscribeHibernate?: () => void;
+  private unsubscribeRunnerProgress?: () => void;
+  private boundRunnerProgressApi?: unknown;
+  private activeRunnerOperations: Map<
+    Exclude<CompatibilityLayerType, 'native'>,
+    CompatibilityRunnerProgressEvent
+  > = new Map();
+  private runnerProgressListeners: Set<(event: CompatibilityRunnerProgressEvent) => void> =
+    new Set();
   private focusListener?: () => void;
   private activeDownloadPollTimer?: ReturnType<typeof setInterval> | null;
   private inFlightScanPromise: Promise<InstalledGameRecord[]> | null = null;
@@ -514,6 +518,8 @@ export class LauncherService {
           this.handleSessionUpdated(data);
         });
       }
+
+      this.ensureRunnerProgressSubscription();
 
       if (!this.unsubscribeHibernate && window.electronAPI.onHibernateStateChanged) {
         this.unsubscribeHibernate = window.electronAPI.onHibernateStateChanged(
@@ -1387,10 +1393,139 @@ export class LauncherService {
     return { ...this.installedStorefrontClients };
   }
 
+  private ensureRunnerProgressSubscription(): void {
+    if (typeof window === 'undefined' || !window.electronAPI) return;
+    const api = window.electronAPI;
+    if (this.boundRunnerProgressApi === api && this.unsubscribeRunnerProgress) {
+      return;
+    }
+    if (this.unsubscribeRunnerProgress) {
+      try {
+        this.unsubscribeRunnerProgress();
+      } catch {}
+      this.unsubscribeRunnerProgress = undefined;
+    }
+    this.boundRunnerProgressApi = api;
+    if (typeof api.onCompatibilityRunnerProgress === 'function') {
+      this.unsubscribeRunnerProgress = api.onCompatibilityRunnerProgress(
+        (event: CompatibilityRunnerProgressEvent) => {
+          this.handleRunnerProgressEvent(event);
+        }
+      );
+    }
+  }
+
+  private handleRunnerProgressEvent(event: CompatibilityRunnerProgressEvent): void {
+    if (!event || !event.runnerType) return;
+    const runnerType = event.runnerType;
+    const isTerminal =
+      event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';
+
+    let nextEvent: CompatibilityRunnerProgressEvent = event;
+    if (!isTerminal) {
+      const prev = this.activeRunnerOperations.get(runnerType);
+      if (
+        prev &&
+        prev.operation === event.operation &&
+        prev.phase === 'downloading' &&
+        event.phase === 'downloading'
+      ) {
+        const progressPercent =
+          typeof event.progressPercent === 'number'
+            ? typeof prev.progressPercent === 'number'
+              ? Math.max(prev.progressPercent, Math.min(100, event.progressPercent))
+              : Math.min(100, Math.max(0, event.progressPercent))
+            : prev.progressPercent;
+        const bytesDownloaded =
+          typeof event.bytesDownloaded === 'number' && typeof prev.bytesDownloaded === 'number'
+            ? Math.max(prev.bytesDownloaded, event.bytesDownloaded)
+            : event.bytesDownloaded ?? prev.bytesDownloaded;
+        const totalBytes = event.totalBytes ?? prev.totalBytes;
+        nextEvent = {
+          ...event,
+          progressPercent,
+          ...(bytesDownloaded !== undefined ? { bytesDownloaded } : {}),
+          ...(totalBytes !== undefined ? { totalBytes } : {}),
+        };
+      }
+      this.activeRunnerOperations.set(runnerType, nextEvent);
+    } else {
+      this.activeRunnerOperations.delete(runnerType);
+    }
+
+    for (const listener of this.runnerProgressListeners) {
+      try {
+        listener(nextEvent);
+      } catch {}
+    }
+    this.notifyStateChanged();
+  }
+
+  public getActiveRunnerOperations(): Partial<
+    Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>
+  > {
+    this.ensureRunnerProgressSubscription();
+    const snapshot: Partial<
+      Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>
+    > = {};
+    for (const [runnerType, ev] of this.activeRunnerOperations.entries()) {
+      snapshot[runnerType] = ev;
+    }
+    return snapshot;
+  }
+
+  public getActiveRunnerOperation(
+    runnerType: Exclude<CompatibilityLayerType, 'native'>
+  ): CompatibilityRunnerProgressEvent | undefined {
+    this.ensureRunnerProgressSubscription();
+    return this.activeRunnerOperations.get(runnerType);
+  }
+
+  public onRunnerProgress(
+    listener: (event: CompatibilityRunnerProgressEvent) => void
+  ): () => void {
+    this.ensureRunnerProgressSubscription();
+    this.runnerProgressListeners.add(listener);
+    return () => {
+      this.runnerProgressListeners.delete(listener);
+    };
+  }
+
+  public async cancelCompatibilityLayerOperation(
+    runnerType: Exclude<CompatibilityLayerType, 'native'>
+  ): Promise<{ success: boolean; cancelled: boolean }> {
+    this.ensureRunnerProgressSubscription();
+    const existing = this.activeRunnerOperations.get(runnerType);
+    let res = { success: true, cancelled: Boolean(existing) };
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.electronAPI?.cancelCompatibilityLayerOperation === 'function'
+    ) {
+      try {
+        res = await window.electronAPI.cancelCompatibilityLayerOperation(runnerType);
+      } catch (err) {
+        console.warn('[LauncherService] cancelCompatibilityLayerOperation failed:', err);
+      }
+    }
+    if (this.activeRunnerOperations.has(runnerType)) {
+      this.handleRunnerProgressEvent({
+        runnerType,
+        operation: existing?.operation || 'install',
+        phase: 'cancelled',
+        progressPercent: null,
+        message: 'Operation cancelled.',
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return res;
+  }
+
   public async installCompatibilityLayer(
     runnerType: Exclude<CompatibilityLayerType, 'native'>,
-    mode: 'auto' | 'download' = 'auto'
+    mode: 'auto' | 'direct' | 'download' = 'auto',
+    options?: { dmgPath?: string; archivePath?: string }
   ): Promise<InstallCompatibilityLayerResult> {
+    this.ensureRunnerProgressSubscription();
     const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
     if (
       mode === 'download' ||
@@ -1412,10 +1547,30 @@ export class LauncherService {
       };
     }
 
+    const requestPayload: InstallCompatibilityLayerRequest = {
+      runnerType,
+      mode,
+      ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
+      ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
+    };
+
+    if (!this.activeRunnerOperations.has(runnerType)) {
+      this.handleRunnerProgressEvent({
+        runnerType,
+        operation: 'install',
+        phase: options?.archivePath || options?.dmgPath ? 'extracting' : 'probing',
+        progressPercent: null,
+        message:
+          options?.archivePath || options?.dmgPath
+            ? `Installing ${descriptor?.shortLabel || runnerType} from local archive...`
+            : `Preparing ${descriptor?.shortLabel || runnerType} download...`,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     try {
-      const res = await window.electronAPI.installCompatibilityLayer({ runnerType, mode });
+      const res = await window.electronAPI.installCompatibilityLayer(requestPayload);
       this.compatibilityLayers = res.layers || (await this.detectCompatibilityLayers());
-      this.notifyStateChanged();
       return res;
     } catch (err: unknown) {
       return {
@@ -1423,6 +1578,9 @@ export class LauncherService {
         runnerType,
         error: this.getErrorMessage(err, 'Failed to install compatibility layer.'),
       };
+    } finally {
+      this.activeRunnerOperations.delete(runnerType);
+      this.notifyStateChanged();
     }
   }
 
@@ -1455,8 +1613,14 @@ export class LauncherService {
   }
 
   public async updateCompatibilityLayer(
-    runnerType: Exclude<CompatibilityLayerType, 'native'>
+    runnerType: Exclude<CompatibilityLayerType, 'native'>,
+    options?: {
+      dmgPath?: string;
+      archivePath?: string;
+      switchToStableCrossOver?: boolean;
+    }
   ): Promise<UpdateCompatibilityLayerResult> {
+    this.ensureRunnerProgressSubscription();
     const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
     if (
       typeof window === 'undefined' ||
@@ -1478,22 +1642,44 @@ export class LauncherService {
       };
     }
 
+    const payload: UpdateCompatibilityLayerPayload = {
+      runnerType,
+      ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
+      ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
+      ...(options?.switchToStableCrossOver ? { switchToStableCrossOver: true } : {}),
+    };
+
+    if (!this.activeRunnerOperations.has(runnerType)) {
+      this.handleRunnerProgressEvent({
+        runnerType,
+        operation: 'update',
+        phase: options?.archivePath || options?.dmgPath ? 'extracting' : 'probing',
+        progressPercent: null,
+        message: options?.switchToStableCrossOver
+          ? 'Downloading newer CrossOver Stable release...'
+          : options?.archivePath || options?.dmgPath
+            ? `Updating ${descriptor?.shortLabel || runnerType} from local archive...`
+            : `Preparing ${descriptor?.shortLabel || runnerType} update...`,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     try {
-      const res = await window.electronAPI.updateCompatibilityLayer({ runnerType });
+      const res = await window.electronAPI.updateCompatibilityLayer(payload);
       if (Array.isArray(res.detectedLayers)) {
         this.compatibilityLayers = res.detectedLayers;
       } else {
         await this.detectCompatibilityLayers();
       }
       if (res.updateInfo) {
+        const resultRunnerKey = res.runnerType || runnerType;
         this.runnerUpdates = {
           ...this.runnerUpdates,
-          [runnerType]: res.updateInfo,
+          [resultRunnerKey]: res.updateInfo,
         };
       } else {
         await this.checkCompatibilityLayerUpdates();
       }
-      this.notifyStateChanged();
       return res;
     } catch (err: unknown) {
       const errMsg = this.getErrorMessage(err, 'Failed to update compatibility layer.');
@@ -1504,6 +1690,12 @@ export class LauncherService {
         message: errMsg,
         error: errMsg,
       };
+    } finally {
+      this.activeRunnerOperations.delete(runnerType);
+      if (options?.switchToStableCrossOver) {
+        this.activeRunnerOperations.delete('crossover');
+      }
+      this.notifyStateChanged();
     }
   }
 
@@ -1878,6 +2070,31 @@ export class LauncherService {
             xboxTitleId: rec.xboxTitleId || found.xboxTitleId,
             scid: rec.scid || found.scid,
             msaAppId: rec.msaAppId || found.msaAppId,
+            ...(rec.isCrossPlatformLauncherRuntime !== undefined ||
+            found.isCrossPlatformLauncherRuntime !== undefined
+              ? {
+                  isCrossPlatformLauncherRuntime:
+                    rec.isCrossPlatformLauncherRuntime ?? found.isCrossPlatformLauncherRuntime,
+                }
+              : {}),
+            ...(rec.externalStorefrontHandoff || found.externalStorefrontHandoff
+              ? {
+                  externalStorefrontHandoff: (rec.externalStorefrontHandoff ||
+                    found.externalStorefrontHandoff) as GamePlatformOwnership['externalStorefrontHandoff'],
+                }
+              : {}),
+            ...(rec.chainedLauncherHandoff || found.chainedLauncherHandoff
+              ? {
+                  chainedLauncherHandoff:
+                    rec.chainedLauncherHandoff || found.chainedLauncherHandoff,
+                }
+              : {}),
+            ...(rec.chainedExternalInstallId || found.chainedExternalInstallId
+              ? {
+                  chainedExternalInstallId:
+                    rec.chainedExternalInstallId || found.chainedExternalInstallId,
+                }
+              : {}),
             isWindowsBinaryOnMac: this.isWindowsHost()
               ? false
               : (rec.isWindowsBinaryOnMac ?? found.isWindowsBinaryOnMac),
@@ -1911,6 +2128,32 @@ export class LauncherService {
           xboxTitleId: installedRecord.xboxTitleId || matchingPlat.xboxTitleId,
           scid: installedRecord.scid || matchingPlat.scid,
           msaAppId: installedRecord.msaAppId || matchingPlat.msaAppId,
+          ...(installedRecord.isCrossPlatformLauncherRuntime !== undefined ||
+          matchingPlat.isCrossPlatformLauncherRuntime !== undefined
+            ? {
+                isCrossPlatformLauncherRuntime:
+                  installedRecord.isCrossPlatformLauncherRuntime ??
+                  matchingPlat.isCrossPlatformLauncherRuntime,
+              }
+            : {}),
+          ...(installedRecord.externalStorefrontHandoff || matchingPlat.externalStorefrontHandoff
+            ? {
+                externalStorefrontHandoff: (installedRecord.externalStorefrontHandoff ||
+                  matchingPlat.externalStorefrontHandoff) as GamePlatformOwnership['externalStorefrontHandoff'],
+              }
+            : {}),
+          ...(installedRecord.chainedLauncherHandoff || matchingPlat.chainedLauncherHandoff
+            ? {
+                chainedLauncherHandoff:
+                  installedRecord.chainedLauncherHandoff || matchingPlat.chainedLauncherHandoff,
+              }
+            : {}),
+          ...(installedRecord.chainedExternalInstallId || matchingPlat.chainedExternalInstallId
+            ? {
+                chainedExternalInstallId:
+                  installedRecord.chainedExternalInstallId || matchingPlat.chainedExternalInstallId,
+              }
+            : {}),
           isWindowsBinaryOnMac: this.isWindowsHost()
             ? false
             : (installedRecord.isWindowsBinaryOnMac ?? matchingPlat.isWindowsBinaryOnMac),
@@ -2035,6 +2278,11 @@ export class LauncherService {
           packageFamilyName: effPlatform?.packageFamilyName,
           appUserModelId: effPlatform?.appUserModelId,
           xboxTitleId: effPlatform?.xboxTitleId,
+          externalStorefrontHandoff: effPlatform?.externalStorefrontHandoff,
+          xboxBottleCompatibilityTier: effPlatform?.xboxBottleCompatibilityTier,
+          isCrossPlatformLauncherRuntime: effPlatform?.isCrossPlatformLauncherRuntime,
+          chainedLauncherHandoff: effPlatform?.chainedLauncherHandoff,
+          chainedExternalInstallId: effPlatform?.chainedExternalInstallId,
           targetInstallDir,
           steamPlatforms,
           storePlatforms: {
@@ -2043,33 +2291,50 @@ export class LauncherService {
           },
         });
         const resHostPlatform = res.hostPlatform || hostPlatform;
-        if (Array.isArray(res.availableInstallers) && res.availableInstallers.length > 0) {
+        const canUpdateStoreOsFromInstallers =
+          resolvedPlatformId !== 'xbox' &&
+          resolvedPlatformId !== 'ubisoft' &&
+          resolvedPlatformId !== 'ea' &&
+          resolvedPlatformId !== 'rockstar' &&
+          (resolvedPlatformId as string) !== 'riot' &&
+          (resolvedPlatformId === 'steam'
+            ? res.authoritativeOsSupport === true
+            : res.authoritativeOsSupport !== false);
+
+        if (
+          canUpdateStoreOsFromInstallers &&
+          Array.isArray(res.availableInstallers) &&
+          res.availableInstallers.length > 0 &&
+          !res.availableInstallers.every((i) => i.authoritativeOsSupport === false)
+        ) {
           const hasMac = res.availableInstallers.some((i) => i.os === 'mac');
           const hasWin = res.availableInstallers.some((i) => i.os === 'windows');
-          const targetPlat = (game.platforms || []).find(
-            (p) => p.platformId === resolvedPlatformId
-          );
-          if (resHostPlatform === 'win32') {
-            if (targetPlat) {
-              targetPlat.platforms = {
-                ...targetPlat.platforms,
-                windows: hasWin,
-                mac: targetPlat.platforms?.mac ?? false,
-              };
-            }
-          } else {
-            if (targetPlat) {
-              targetPlat.platforms = {
-                ...targetPlat.platforms,
-                windows: hasWin,
-                mac: hasMac,
-              };
-            }
-            if (resolvedPlatformId === 'gog') {
-              saveCachedGogOsSupport(resolvedPlatformGameId, game.title, {
-                windows: hasWin,
-                mac: hasMac,
-              });
+          if (hasWin || hasMac) {
+            const targetPlat = (game.platforms || []).find(
+              (p) => p.platformId === resolvedPlatformId
+            );
+            if (resHostPlatform === 'win32') {
+              if (targetPlat) {
+                targetPlat.platforms = {
+                  ...targetPlat.platforms,
+                  windows: hasWin,
+                  mac: targetPlat.platforms?.mac ?? false,
+                };
+              }
+            } else {
+              if (targetPlat) {
+                targetPlat.platforms = {
+                  ...targetPlat.platforms,
+                  windows: hasWin,
+                  mac: hasMac,
+                };
+              }
+              if (resolvedPlatformId === 'gog') {
+                saveCachedGogOsSupport(resolvedPlatformGameId, game.title, {
+                  windows: hasWin,
+                  mac: hasMac,
+                });
+              }
             }
           }
         }
@@ -2287,6 +2552,37 @@ export class LauncherService {
           executablePath,
           launchArguments,
           isWindowsBinaryOnMac,
+          ...(installedRecord?.isCrossPlatformLauncherRuntime !== undefined ||
+          targetPlatformObj?.isCrossPlatformLauncherRuntime !== undefined
+            ? {
+                isCrossPlatformLauncherRuntime:
+                  installedRecord?.isCrossPlatformLauncherRuntime ??
+                  targetPlatformObj?.isCrossPlatformLauncherRuntime,
+              }
+            : {}),
+          ...(installedRecord?.externalStorefrontHandoff ||
+          targetPlatformObj?.externalStorefrontHandoff
+            ? {
+                externalStorefrontHandoff:
+                  installedRecord?.externalStorefrontHandoff ||
+                  targetPlatformObj?.externalStorefrontHandoff,
+              }
+            : {}),
+          ...(installedRecord?.chainedLauncherHandoff || targetPlatformObj?.chainedLauncherHandoff
+            ? {
+                chainedLauncherHandoff:
+                  installedRecord?.chainedLauncherHandoff ||
+                  targetPlatformObj?.chainedLauncherHandoff,
+              }
+            : {}),
+          ...(installedRecord?.chainedExternalInstallId ||
+          targetPlatformObj?.chainedExternalInstallId
+            ? {
+                chainedExternalInstallId:
+                  installedRecord?.chainedExternalInstallId ||
+                  targetPlatformObj?.chainedExternalInstallId,
+              }
+            : {}),
           launchConfig,
           performanceSettings: this.getPerformanceSettings(),
         });
@@ -2857,6 +3153,18 @@ export class LauncherService {
   public async selectExecutable(defaultPath?: string): Promise<string | null> {
     if (typeof window !== 'undefined' && window.electronAPI?.selectExecutableDialog) {
       return await window.electronAPI.selectExecutableDialog(defaultPath);
+    }
+    return null;
+  }
+
+  public async selectRunnerArchive(defaultPath?: string): Promise<string | null> {
+    if (typeof window !== 'undefined') {
+      if (typeof window.electronAPI?.selectRunnerArchiveDialog === 'function') {
+        return await window.electronAPI.selectRunnerArchiveDialog(defaultPath);
+      }
+      if (typeof window.electronAPI?.selectExecutableDialog === 'function') {
+        return await window.electronAPI.selectExecutableDialog(defaultPath);
+      }
     }
     return null;
   }

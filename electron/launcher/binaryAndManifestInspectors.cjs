@@ -13,8 +13,362 @@ const {
 } = require('../storefronts/xbox/msixvcXvdParser.cjs');
 
 /**
+ * Map a PE Relative Virtual Address (RVA) to a physical file offset using COFF section headers.
+ *
+ * @param {number} rva
+ * @param {Array<{ virtualSize: number, virtualAddress: number, rawSize: number, rawPtr: number }>} sections
+ * @param {number} headerLimit
+ * @param {number} fileSize
+ * @returns {number}
+ */
+function mapPeRvaToFileOffset(rva, sections, headerLimit, fileSize) {
+  if (!Number.isFinite(rva) || rva <= 0 || !Number.isFinite(fileSize) || fileSize <= 0) {
+    return -1;
+  }
+  for (let i = 0; i < sections.length; i += 1) {
+    const sec = sections[i];
+    const span = Math.max(sec.virtualSize >>> 0, sec.rawSize >>> 0);
+    if (span > 0 && rva >= sec.virtualAddress && rva < sec.virtualAddress + span) {
+      const delta = rva - sec.virtualAddress;
+      if (sec.rawSize > 0 && delta >= sec.rawSize) {
+        return -1;
+      }
+      const off = sec.rawPtr + delta;
+      return off >= 0 && off < fileSize ? off : -1;
+    }
+  }
+  if (headerLimit > 0 && rva < headerLimit && rva < fileSize) {
+    return rva;
+  }
+  return -1;
+}
+
+/**
+ * Read a NUL-terminated printable ASCII string from an open file descriptor at `fileOffset`.
+ *
+ * @param {number} fd
+ * @param {number} fileOffset
+ * @param {number} maxLen
+ * @param {number} fileSize
+ * @returns {string}
+ */
+function readAsciiCStringFromFd(fd, fileOffset, maxLen, fileSize) {
+  if (fileOffset < 0 || fileOffset >= fileSize || maxLen <= 0) {
+    return '';
+  }
+  const toRead = Math.min(maxLen, fileSize - fileOffset);
+  if (toRead <= 0) return '';
+  const buf = Buffer.alloc(toRead);
+  const bytesRead = fs.readSync(fd, buf, 0, toRead, fileOffset);
+  if (bytesRead <= 0) return '';
+  let end = 0;
+  while (end < bytesRead && buf[end] !== 0) {
+    const b = buf[end];
+    if (b < 0x20 || b > 0x7e) {
+      return '';
+    }
+    end += 1;
+  }
+  if (end === 0) return '';
+  return buf.subarray(0, end).toString('ascii');
+}
+
+/**
+ * Parse COFF section headers and Optional Header Data Directories (Export=0, Import=1, DelayImport=13) from an open PE fd.
+ *
+ * @param {number} fd
+ * @param {number} peOffset
+ * @param {number} fileSize
+ */
+function readPeSectionsAndDataDirectories(fd, peOffset, fileSize) {
+  const empty = {
+    sections: /** @type {Array<{ name: string, virtualSize: number, virtualAddress: number, rawSize: number, rawPtr: number }>} */ ([]),
+    exportDir: { rva: 0, size: 0 },
+    importDir: { rva: 0, size: 0 },
+    delayImportDir: { rva: 0, size: 0 },
+    imageBase: 0n,
+    headerLimit: 0,
+  };
+  if (peOffset + 24 > fileSize) return empty;
+  const coffBuf = Buffer.alloc(24);
+  if (fs.readSync(fd, coffBuf, 0, 24, peOffset) < 24) {
+    return empty;
+  }
+  const numSections = coffBuf.readUInt16LE(6);
+  const sizeOfOptionalHeader = coffBuf.readUInt16LE(20);
+  const optOffset = peOffset + 24;
+  if (sizeOfOptionalHeader < 2 || optOffset + sizeOfOptionalHeader > fileSize) {
+    return empty;
+  }
+
+  const optReadLen = Math.min(sizeOfOptionalHeader, 264);
+  const optBuf = Buffer.alloc(optReadLen);
+  if (fs.readSync(fd, optBuf, 0, optReadLen, optOffset) < 2) {
+    return empty;
+  }
+  const magic = optBuf.readUInt16LE(0);
+  let numDirsOffset = -1;
+  let dataDirOffset = -1;
+  let imageBase = 0n;
+  if (magic === 0x010b) {
+    numDirsOffset = 92;
+    dataDirOffset = 96;
+    if (optBuf.length >= 32) {
+      imageBase = BigInt(optBuf.readUInt32LE(28));
+    }
+  } else if (magic === 0x020b) {
+    numDirsOffset = 108;
+    dataDirOffset = 112;
+    if (optBuf.length >= 32) {
+      imageBase = optBuf.readBigUInt64LE(24);
+    }
+  }
+
+  let headerLimit = optBuf.length >= 64 ? optBuf.readUInt32LE(60) : 0;
+  const exportDir = { rva: 0, size: 0 };
+  const importDir = { rva: 0, size: 0 };
+  const delayImportDir = { rva: 0, size: 0 };
+  if (numDirsOffset >= 0 && optBuf.length >= numDirsOffset + 4) {
+    const numRvaAndSizes = Math.min(optBuf.readUInt32LE(numDirsOffset), 16);
+    if (numRvaAndSizes >= 1 && optBuf.length >= dataDirOffset + 8) {
+      exportDir.rva = optBuf.readUInt32LE(dataDirOffset);
+      exportDir.size = optBuf.readUInt32LE(dataDirOffset + 4);
+    }
+    if (numRvaAndSizes >= 2 && optBuf.length >= dataDirOffset + 16) {
+      importDir.rva = optBuf.readUInt32LE(dataDirOffset + 8);
+      importDir.size = optBuf.readUInt32LE(dataDirOffset + 12);
+    }
+    if (numRvaAndSizes >= 14 && optBuf.length >= dataDirOffset + 112) {
+      delayImportDir.rva = optBuf.readUInt32LE(dataDirOffset + 104);
+      delayImportDir.size = optBuf.readUInt32LE(dataDirOffset + 108);
+    }
+  }
+
+  const boundedSections = Math.min(numSections, 96);
+  const secTableOffset = optOffset + sizeOfOptionalHeader;
+  const sections = [];
+  if (boundedSections > 0 && secTableOffset + boundedSections * 40 <= fileSize) {
+    const secBuf = Buffer.alloc(boundedSections * 40);
+    if (fs.readSync(fd, secBuf, 0, secBuf.length, secTableOffset) === secBuf.length) {
+      for (let i = 0; i < boundedSections; i += 1) {
+        const base = i * 40;
+        const name = secBuf
+          .subarray(base, base + 8)
+          .toString('ascii')
+          .replace(/\0+$/, '');
+        const virtualSize = secBuf.readUInt32LE(base + 8);
+        const virtualAddress = secBuf.readUInt32LE(base + 12);
+        const rawSize = secBuf.readUInt32LE(base + 16);
+        const rawPtr = secBuf.readUInt32LE(base + 20);
+        if (virtualAddress > 0 && (headerLimit === 0 || virtualAddress < headerLimit)) {
+          headerLimit = virtualAddress;
+        }
+        sections.push({ name, virtualSize, virtualAddress, rawSize, rawPtr });
+      }
+    }
+  }
+
+  return { sections, exportDir, importDir, delayImportDir, imageBase, headerLimit };
+}
+
+/**
+ * Read deduplicated lowercase imported DLL names from a PE Import Directory (`IMAGE_DIRECTORY_ENTRY_IMPORT`).
+ *
+ * @param {number} fd
+ * @param {{ sections: Array<{ name: string, virtualSize: number, virtualAddress: number, rawSize: number, rawPtr: number }>, importDir: { rva: number, size: number }, headerLimit: number }} layout
+ * @param {number} fileSize
+ * @returns {string[]}
+ */
+function readPeImportedDllNamesFromFd(fd, layout, fileSize) {
+  if (!layout || !layout.importDir || layout.importDir.rva <= 0) {
+    return [];
+  }
+  const descFileOff = mapPeRvaToFileOffset(
+    layout.importDir.rva,
+    layout.sections,
+    layout.headerLimit,
+    fileSize
+  );
+  if (descFileOff < 0 || descFileOff + 20 > fileSize) {
+    return [];
+  }
+  const maxDescriptors = 256;
+  const maxBytes = Math.min(
+    maxDescriptors * 20,
+    fileSize - descFileOff,
+    layout.importDir.size >= 20 ? Math.max(layout.importDir.size, 20) : maxDescriptors * 20
+  );
+  const descBuf = Buffer.alloc(maxBytes);
+  const bytesRead = fs.readSync(fd, descBuf, 0, maxBytes, descFileOff);
+  if (bytesRead < 20) return [];
+
+  const seen = new Set();
+  const importedDlls = [];
+  const count = Math.floor(bytesRead / 20);
+  for (let i = 0; i < count; i += 1) {
+    const base = i * 20;
+    const origFirstThunk = descBuf.readUInt32LE(base);
+    const timeDateStamp = descBuf.readUInt32LE(base + 4);
+    const forwarderChain = descBuf.readUInt32LE(base + 8);
+    const nameRva = descBuf.readUInt32LE(base + 12);
+    const firstThunk = descBuf.readUInt32LE(base + 16);
+    if (
+      origFirstThunk === 0 &&
+      timeDateStamp === 0 &&
+      forwarderChain === 0 &&
+      nameRva === 0 &&
+      firstThunk === 0
+    ) {
+      break;
+    }
+    if (nameRva === 0) continue;
+    const nameOff = mapPeRvaToFileOffset(nameRva, layout.sections, layout.headerLimit, fileSize);
+    if (nameOff < 0) continue;
+    const rawDllName = readAsciiCStringFromFd(fd, nameOff, 128, fileSize).trim().toLowerCase();
+    if (!rawDllName || rawDllName.length > 120) continue;
+    const baseDll = rawDllName.split(/[\\/]/).pop() || rawDllName;
+    if (baseDll && !seen.has(baseDll)) {
+      seen.add(baseDll);
+      importedDlls.push(baseDll);
+    }
+  }
+  return importedDlls;
+}
+
+/**
+ * Read deduplicated lowercase delay-imported DLL names from a PE Delay-Load Import Directory
+ * (`IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`, DataDirectory[13], 32-byte `ImgDelayDescr` entries).
+ *
+ * @param {number} fd
+ * @param {{ sections: Array<{ name: string, virtualSize: number, virtualAddress: number, rawSize: number, rawPtr: number }>, delayImportDir?: { rva: number, size: number }, imageBase?: bigint, headerLimit: number }} layout
+ * @param {number} fileSize
+ * @returns {string[]}
+ */
+function readPeDelayImportedDllNamesFromFd(fd, layout, fileSize) {
+  if (!layout || !layout.delayImportDir || layout.delayImportDir.rva <= 0) {
+    return [];
+  }
+  const descFileOff = mapPeRvaToFileOffset(
+    layout.delayImportDir.rva,
+    layout.sections,
+    layout.headerLimit,
+    fileSize
+  );
+  if (descFileOff < 0 || descFileOff + 32 > fileSize) {
+    return [];
+  }
+  const maxDescriptors = 256;
+  const maxBytes = Math.min(
+    maxDescriptors * 32,
+    fileSize - descFileOff,
+    layout.delayImportDir.size >= 32
+      ? Math.max(layout.delayImportDir.size, 32)
+      : maxDescriptors * 32
+  );
+  const descBuf = Buffer.alloc(maxBytes);
+  const bytesRead = fs.readSync(fd, descBuf, 0, maxBytes, descFileOff);
+  if (bytesRead < 32) return [];
+
+  const imgBaseBig = typeof layout.imageBase === 'bigint' ? layout.imageBase : 0n;
+  const seen = new Set();
+  const delayDlls = [];
+  const count = Math.floor(bytesRead / 32);
+  for (let i = 0; i < count; i += 1) {
+    const base = i * 32;
+    const grAttrs = descBuf.readUInt32LE(base);
+    const rvaDllName = descBuf.readUInt32LE(base + 4);
+    const rvaHmod = descBuf.readUInt32LE(base + 8);
+    const rvaIat = descBuf.readUInt32LE(base + 12);
+    const rvaInt = descBuf.readUInt32LE(base + 16);
+    if (grAttrs === 0 && rvaDllName === 0 && rvaHmod === 0 && rvaIat === 0 && rvaInt === 0) {
+      break;
+    }
+    if (rvaDllName === 0) continue;
+
+    let effectiveNameRva = rvaDllName;
+    if ((grAttrs & 1) === 0 && imgBaseBig > 0n) {
+      const rvaBig = BigInt(rvaDllName);
+      if (rvaBig >= imgBaseBig) {
+        const diff = rvaBig - imgBaseBig;
+        if (diff <= 0xffffffffn) {
+          effectiveNameRva = Number(diff);
+        }
+      }
+    }
+    const nameOff = mapPeRvaToFileOffset(
+      effectiveNameRva,
+      layout.sections,
+      layout.headerLimit,
+      fileSize
+    );
+    if (nameOff < 0) continue;
+    const rawDllName = readAsciiCStringFromFd(fd, nameOff, 128, fileSize).trim().toLowerCase();
+    if (!rawDllName || rawDllName.length > 120) continue;
+    const baseDll = rawDllName.split(/[\\/]/).pop() || rawDllName;
+    if (baseDll && !seen.has(baseDll)) {
+      seen.add(baseDll);
+      delayDlls.push(baseDll);
+    }
+  }
+  return delayDlls;
+}
+
+/**
+ * Derive normalized graphics & legacy API capability flags from deduplicated lowercase DLL names.
+ *
+ * @param {string[]} importedDlls
+ * @param {{ usesDynamicQgl?: boolean, dynamicallyLoadsDirectDraw?: boolean, hasUe5IoStoreContainer?: boolean }} [extra]
+ */
+function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
+  const dllList = Array.isArray(importedDlls) ? importedDlls : [];
+  const dllSet = new Set(dllList.map((d) => String(d || '').trim().toLowerCase()).filter(Boolean));
+  const usesDynamicQgl = Boolean(extra.usesDynamicQgl);
+  const dynamicallyLoadsDirectDraw = Boolean(extra.dynamicallyLoadsDirectDraw);
+  const hasUe5IoStoreContainer = Boolean(extra.hasUe5IoStoreContainer);
+
+  const importsD3d12 = dllSet.has('d3d12.dll') || dllSet.has('d3d12core.dll');
+  const importsD3d9 =
+    dllSet.has('d3d9.dll') || dllList.some((d) => /^d3dx9(?:_\d+)?\.dll$/i.test(d));
+  const importsVulkan = dllSet.has('vulkan-1.dll');
+  const importsLegacyD3dOrGl =
+    dllSet.has('d3d8.dll') ||
+    dllSet.has('ddraw.dll') ||
+    dllSet.has('d3dim.dll') ||
+    dllSet.has('d3dim700.dll') ||
+    dllSet.has('opengl32.dll') ||
+    usesDynamicQgl ||
+    dynamicallyLoadsDirectDraw;
+  const hasExplicitD3d11Or10 =
+    dllSet.has('d3d11.dll') ||
+    dllSet.has('d3d10.dll') ||
+    dllSet.has('d3d10_1.dll') ||
+    dllSet.has('d3d10core.dll') ||
+    dllList.some((d) => /^d3dx1[01](?:_\d+)?\.dll$/i.test(d));
+  const importsD3d11Or10 =
+    hasExplicitD3d11Or10 ||
+    (dllSet.has('dxgi.dll') && !importsD3d12 && !hasUe5IoStoreContainer);
+  const isD3d12Only =
+    (importsD3d12 || hasUe5IoStoreContainer) &&
+    !importsD3d11Or10 &&
+    !importsD3d9 &&
+    !importsVulkan &&
+    !importsLegacyD3dOrGl;
+
+  return {
+    usesDynamicQgl,
+    importsD3d12,
+    importsD3d11Or10,
+    importsD3d9,
+    importsLegacyD3dOrGl,
+    importsVulkan,
+    hasUe5IoStoreContainer,
+    isD3d12Only,
+  };
+}
+
+/**
  * Inspect Windows executable DOS/PE header to distinguish valid 32/64-bit PE executables
- * from legacy 16-bit MS-DOS MZ executables and identify 64-bit PE32+/ARM64 binaries.
+ * from legacy 16-bit MS-DOS MZ executables and identify 64-bit PE32+/ARM64 binaries and imported DLLs.
  * @param {string} filePath
  * @param {Record<string, any>} [options]
  */
@@ -33,6 +387,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       isX86: false,
       isArm64: false,
       is16BitDos: false,
+      importedDlls: /** @type {string[]} */ ([]),
     };
   }
   let fd = null;
@@ -48,6 +403,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX86: false,
         isArm64: false,
         is16BitDos: false,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
     const size = stat.size;
@@ -61,6 +417,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX86: false,
         isArm64: false,
         is16BitDos: false,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
 
@@ -76,6 +433,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX86: false,
         isArm64: false,
         is16BitDos: false,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
 
@@ -94,6 +452,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
           isX86: false,
           isArm64: false,
           is16BitDos: false,
+          importedDlls: /** @type {string[]} */ ([]),
         };
       }
       return {
@@ -105,6 +464,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isArm64: false,
         is16BitDos: false,
         isSyntheticStub: true,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
 
@@ -122,6 +482,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
           isArm64: false,
           is16BitDos: false,
           isSyntheticStub: true,
+          importedDlls: /** @type {string[]} */ ([]),
         };
       }
       return {
@@ -132,11 +493,13 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX86: false,
         isArm64: false,
         is16BitDos: !isZeroedSyntheticMz && peOffset < 0x40,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
 
-    const peBuf = Buffer.alloc(6);
-    const peBytesRead = fs.readSync(fd, peBuf, 0, 6, peOffset);
+    const peHeaderSliceLen = Math.min(264, size - peOffset);
+    const peBuf = Buffer.alloc(peHeaderSliceLen);
+    const peBytesRead = fs.readSync(fd, peBuf, 0, peHeaderSliceLen, peOffset);
     if (
       peBytesRead < 6 ||
       peBuf[0] !== 0x50 ||
@@ -152,6 +515,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX86: false,
         isArm64: false,
         is16BitDos: true,
+        importedDlls: /** @type {string[]} */ ([]),
       };
     }
 
@@ -161,6 +525,94 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     const isX86 = machine === 0x014c;
     const isArm64 = machine === 0xaa64;
     const is64Bit = isX64 || isArm64;
+    const is32Bit = isX86;
+
+    const sizeOfOptionalHeader = peBytesRead >= 24 ? peBuf.readUInt16LE(20) : 0;
+    const coffCharacteristics = peBytesRead >= 24 ? peBuf.readUInt16LE(22) : 0;
+    const isLargeAddressAware = is64Bit || (coffCharacteristics & 0x0020) !== 0;
+
+    const hasDllCharacteristics = sizeOfOptionalHeader >= 72 && peBytesRead >= 96;
+    const dllCharacteristics = hasDllCharacteristics ? peBuf.readUInt16LE(94) : 0;
+    const isNxCompat = hasDllCharacteristics ? (dllCharacteristics & 0x0100) !== 0 : is64Bit;
+    const isDynamicBase = hasDllCharacteristics ? (dllCharacteristics & 0x0040) !== 0 : false;
+
+    let importedDlls = /** @type {string[]} */ ([]);
+    let delayImportedDlls = /** @type {string[]} */ ([]);
+    let dynamicallyLoadsOpenGl = false;
+    let dynamicallyLoadsDirectDraw = false;
+    let peLayout = null;
+    if (opts.skipImports !== true) {
+      try {
+        peLayout = readPeSectionsAndDataDirectories(fd, peOffset, size);
+        const directImports = readPeImportedDllNamesFromFd(fd, peLayout, size);
+        delayImportedDlls = readPeDelayImportedDllNamesFromFd(fd, peLayout, size);
+        if (delayImportedDlls.length > 0) {
+          const mergedSet = new Set(directImports);
+          for (let dIdx = 0; dIdx < delayImportedDlls.length; dIdx += 1) {
+            mergedSet.add(delayImportedDlls[dIdx]);
+          }
+          importedDlls = Array.from(mergedSet);
+        } else {
+          importedDlls = directImports;
+        }
+        if (
+          isX86 &&
+          opts.skipRdataStringScan !== true &&
+          (!importedDlls.includes('opengl32.dll') || !importedDlls.includes('ddraw.dll')) &&
+          !importedDlls.includes('d3d12.dll') &&
+          !importedDlls.includes('vulkan-1.dll')
+        ) {
+          const dataSections = peLayout.sections.filter(
+            (sec) =>
+              (sec.name === '.rdata' || sec.name === '.data') &&
+              sec.rawPtr > 0 &&
+              sec.rawSize > 0 &&
+              sec.rawPtr < size
+          );
+          const scanRanges =
+            dataSections.length > 0
+              ? dataSections.map((sec) => ({
+                  offset: sec.rawPtr,
+                  length: Math.min(sec.rawSize, 393216, size - sec.rawPtr),
+                }))
+              : [
+                  {
+                    offset: Math.min(peLayout.headerLimit || 4096, size),
+                    length: Math.min(
+                      262144,
+                      Math.max(0, size - Math.min(peLayout.headerLimit || 4096, size))
+                    ),
+                  },
+                ];
+          let sawOpengl32 = false;
+          let sawWglCreateContext = false;
+          let sawDdraw = false;
+          let sawDirectDrawCreate = false;
+          for (let sIdx = 0; sIdx < scanRanges.length; sIdx += 1) {
+            const { offset: dynOffset, length: dynLen } = scanRanges[sIdx];
+            if (dynLen <= 16) continue;
+            const dynBuf = Buffer.alloc(dynLen);
+            const dynRead = fs.readSync(fd, dynBuf, 0, dynLen, dynOffset);
+            if (dynRead <= 16) continue;
+            const dynLatin1 = dynBuf.subarray(0, dynRead).toString('latin1');
+            if (/\bopengl32(?:\.dll)?\x00/i.test(dynLatin1)) sawOpengl32 = true;
+            if (/\bwglCreateContext\x00/.test(dynLatin1)) sawWglCreateContext = true;
+            if (/\bddraw(?:\.dll)?\x00/i.test(dynLatin1)) sawDdraw = true;
+            if (/\bDirectDrawCreate/i.test(dynLatin1)) sawDirectDrawCreate = true;
+          }
+          if (sawOpengl32 && sawWglCreateContext) {
+            dynamicallyLoadsOpenGl = true;
+          }
+          if (sawDdraw && sawDirectDrawCreate) {
+            dynamicallyLoadsDirectDraw = true;
+          }
+        }
+      } catch {
+        importedDlls = [];
+        delayImportedDlls = [];
+      }
+    }
+
     let requiresElevation = false;
     if (opts.inspectElevationManifest) {
       const elevationRe =
@@ -177,34 +629,15 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       if (!requiresElevation) {
         try {
           // Locate .rsrc section if present in COFF section headers, otherwise scan trailing 256 KiB
-          const coffHdrBuf = Buffer.alloc(24);
-          const coffRead = fs.readSync(fd, coffHdrBuf, 0, 24, peOffset);
+          const layout = peLayout || readPeSectionsAndDataDirectories(fd, peOffset, size);
           let scanOffset = Math.max(0, size - 262144);
           let scanLen = Math.min(262144, size - scanOffset);
-          if (coffRead === 24) {
-            const numSections = coffHdrBuf.readUInt16LE(6);
-            const sizeOfOptionalHeader = coffHdrBuf.readUInt16LE(20);
-            const secTableOffset = peOffset + 24 + sizeOfOptionalHeader;
-            if (numSections > 0 && numSections <= 64 && secTableOffset + numSections * 40 <= size) {
-              const secBuf = Buffer.alloc(numSections * 40);
-              if (fs.readSync(fd, secBuf, 0, secBuf.length, secTableOffset) === secBuf.length) {
-                for (let i = 0; i < numSections; i++) {
-                  const base = i * 40;
-                  const secName = secBuf
-                    .subarray(base, base + 8)
-                    .toString('ascii')
-                    .replace(/\0+$/, '');
-                  if (secName === '.rsrc') {
-                    const rawSize = secBuf.readUInt32LE(base + 16);
-                    const rawPtr = secBuf.readUInt32LE(base + 20);
-                    if (rawPtr > 0 && rawSize > 0 && rawPtr < size) {
-                      scanOffset = rawPtr;
-                      scanLen = Math.min(rawSize, 524288, size - rawPtr);
-                    }
-                    break;
-                  }
-                }
-              }
+          for (let i = 0; i < layout.sections.length; i += 1) {
+            const sec = layout.sections[i];
+            if (sec.name === '.rsrc' && sec.rawPtr > 0 && sec.rawSize > 0 && sec.rawPtr < size) {
+              scanOffset = sec.rawPtr;
+              scanLen = Math.min(sec.rawSize, 524288, size - sec.rawPtr);
+              break;
             }
           }
           if (scanLen > 0) {
@@ -220,6 +653,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     return {
       exists: true,
       isValidPe: true,
+      is32Bit,
       is64Bit,
       isX64,
       isX86,
@@ -227,6 +661,15 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       is16BitDos: false,
       machine,
       machineHex,
+      coffCharacteristics,
+      dllCharacteristics,
+      isLargeAddressAware,
+      isNxCompat,
+      isDynamicBase,
+      importedDlls,
+      delayImportedDlls,
+      dynamicallyLoadsOpenGl,
+      dynamicallyLoadsDirectDraw,
       ...(opts.inspectElevationManifest ? { requiresElevation } : {}),
     };
   } catch (err) {
@@ -234,11 +677,17 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     return {
       exists: false,
       isValidPe: false,
+      is32Bit: false,
       is64Bit: false,
       isX64: false,
       isX86: false,
       isArm64: false,
       is16BitDos: false,
+      isLargeAddressAware: false,
+      isNxCompat: false,
+      isDynamicBase: false,
+      importedDlls: /** @type {string[]} */ ([]),
+      delayImportedDlls: /** @type {string[]} */ ([]),
     };
   } finally {
     if (fd !== null) {
@@ -249,6 +698,176 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       }
     }
   }
+}
+
+/**
+ * Inspect PE architecture and imported DLL capabilities for a Windows executable or DLL.
+ *
+ * @param {string} exePath
+ * @param {Record<string, any>} [options]
+ */
+function inspectPeCapabilities(exePath, options = {}) {
+  const pe = /** @type {any} */ (inspectWindowsExecutableHeader(exePath, options));
+  const machineArch = pe.isX64
+    ? 'x64'
+    : pe.isX86
+      ? 'x86'
+      : pe.isArm64
+        ? 'arm64'
+        : 'unknown';
+  const importedDlls = Array.isArray(pe.importedDlls) ? pe.importedDlls : [];
+  const delayImportedDlls = Array.isArray(pe.delayImportedDlls) ? pe.delayImportedDlls : [];
+  const is32Bit = Boolean(pe.isX86);
+  const is64Bit = Boolean(pe.is64Bit);
+  const isLargeAddressAware = is64Bit || Boolean(pe.isLargeAddressAware);
+  const isNxCompat = pe.isValidPe ? Boolean(pe.isNxCompat) : false;
+  const isDynamicBase = Boolean(pe.isDynamicBase);
+  const dynamicallyLoadsOpenGl = Boolean(pe.dynamicallyLoadsOpenGl);
+  const dynamicallyLoadsDirectDraw = Boolean(pe.dynamicallyLoadsDirectDraw);
+  const gfxCaps = derivePeGraphicsCapabilities(importedDlls, {
+    usesDynamicQgl: dynamicallyLoadsOpenGl,
+    dynamicallyLoadsDirectDraw,
+    hasUe5IoStoreContainer: Boolean(options?.hasUe5IoStoreContainer),
+  });
+  return {
+    ...pe,
+    machineArch,
+    is32Bit,
+    is64Bit,
+    isLargeAddressAware,
+    isNxCompat,
+    isDynamicBase,
+    importedDlls,
+    delayImportedDlls,
+    dynamicallyLoadsOpenGl,
+    dynamicallyLoadsDirectDraw,
+    ...gfxCaps,
+  };
+}
+
+/**
+ * Inspect PE Export Directory (`IMAGE_DIRECTORY_ENTRY_EXPORT`) forwarder strings in a DLL.
+ * Detects malformed export forwarders containing literal backslashes (e.g. hardcoded `C:\Windows\System32\...`
+ * forwarders from legacy WinXP/Win7 proxy wrappers that fail on Win10/11 and Wine's PE loader).
+ *
+ * @param {string} dllPath
+ */
+function inspectPeExportForwarders(dllPath) {
+  const empty = {
+    isValidPe: false,
+    forwarders: /** @type {string[]} */ ([]),
+    hasMalformedBackslashForwarder: false,
+  };
+  if (!dllPath || typeof dllPath !== 'string') {
+    return empty;
+  }
+  let fd = null;
+  try {
+    fd = fs.openSync(dllPath, 'r');
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size < 64) {
+      return empty;
+    }
+    const size = stat.size;
+    const dosHeader = Buffer.alloc(64);
+    if (
+      fs.readSync(fd, dosHeader, 0, 64, 0) < 64 ||
+      dosHeader[0] !== 0x4d ||
+      dosHeader[1] !== 0x5a
+    ) {
+      return empty;
+    }
+    const peOffset = dosHeader.readUInt32LE(0x3c);
+    if (peOffset < 0x40 || peOffset + 24 > size) {
+      return empty;
+    }
+    const sigBuf = Buffer.alloc(4);
+    if (
+      fs.readSync(fd, sigBuf, 0, 4, peOffset) < 4 ||
+      sigBuf[0] !== 0x50 ||
+      sigBuf[1] !== 0x45 ||
+      sigBuf[2] !== 0x00 ||
+      sigBuf[3] !== 0x00
+    ) {
+      return empty;
+    }
+    const layout = readPeSectionsAndDataDirectories(fd, peOffset, size);
+    const expRva = layout.exportDir.rva;
+    const expSize = layout.exportDir.size;
+    if (expRva <= 0 || expSize < 40) {
+      return { isValidPe: true, forwarders: [], hasMalformedBackslashForwarder: false };
+    }
+    const expFileOff = mapPeRvaToFileOffset(expRva, layout.sections, layout.headerLimit, size);
+    if (expFileOff < 0 || expFileOff + 40 > size) {
+      return { isValidPe: true, forwarders: [], hasMalformedBackslashForwarder: false };
+    }
+    const expDirBuf = Buffer.alloc(40);
+    if (fs.readSync(fd, expDirBuf, 0, 40, expFileOff) < 40) {
+      return { isValidPe: true, forwarders: [], hasMalformedBackslashForwarder: false };
+    }
+    const numberOfFunctions = Math.min(expDirBuf.readUInt32LE(20), 4096);
+    const addressOfFunctionsRva = expDirBuf.readUInt32LE(28);
+    if (numberOfFunctions === 0 || addressOfFunctionsRva === 0) {
+      return { isValidPe: true, forwarders: [], hasMalformedBackslashForwarder: false };
+    }
+    const funcsOff = mapPeRvaToFileOffset(
+      addressOfFunctionsRva,
+      layout.sections,
+      layout.headerLimit,
+      size
+    );
+    if (funcsOff < 0 || funcsOff + 4 > size) {
+      return { isValidPe: true, forwarders: [], hasMalformedBackslashForwarder: false };
+    }
+    const tableBytes = Math.min(numberOfFunctions * 4, size - funcsOff);
+    const funcsBuf = Buffer.alloc(tableBytes);
+    const funcsRead = fs.readSync(fd, funcsBuf, 0, tableBytes, funcsOff);
+    const count = Math.floor(funcsRead / 4);
+    const forwarders = [];
+    let hasMalformedBackslashForwarder = false;
+    const seen = new Set();
+    for (let i = 0; i < count; i += 1) {
+      const fnRva = funcsBuf.readUInt32LE(i * 4);
+      if (fnRva >= expRva && fnRva < expRva + expSize) {
+        const strOff = mapPeRvaToFileOffset(fnRva, layout.sections, layout.headerLimit, size);
+        if (strOff < 0) continue;
+        const fwdStr = readAsciiCStringFromFd(fd, strOff, 260, size);
+        if (!fwdStr) continue;
+        if (!seen.has(fwdStr)) {
+          seen.add(fwdStr);
+          forwarders.push(fwdStr);
+        }
+        if (fwdStr.includes('\\')) {
+          hasMalformedBackslashForwarder = true;
+        }
+      }
+    }
+    return {
+      isValidPe: true,
+      forwarders,
+      hasMalformedBackslashForwarder,
+    };
+  } catch {
+    return empty;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error
+      }
+    }
+  }
+}
+
+/**
+ * Convenience predicate returning `true` when `dllPath` contains any PE export forwarder with a literal `\`.
+ *
+ * @param {string} dllPath
+ * @returns {boolean}
+ */
+function hasMalformedBackslashExportForwarder(dllPath) {
+  return Boolean(inspectPeExportForwarders(dllPath).hasMalformedBackslashForwarder);
 }
 
 /**
@@ -1390,8 +2009,17 @@ function inspectMicrosoftGameConfig(xmlOrPath) {
   }
 
   const NON_PRIMARY_EXE_BASENAME_RE =
-    /(?:^|[-_])(?:gamelaunchhelper|custominstallexec|custominstallactions|crashreporter|crashhandler|crashpad|unitycrashhandler|bugsplat|unrealcefsubprocess|cefprocess|prerequisites|vc_redist|vcredist|dxsetup|directx|dotnet|unins\d*)/i;
+    /(?:^|[-_])(?:gdkstubgame|gamelaunchhelper|custominstallexec|custominstallactions|crashreporter|crashhandler|crashpad|unitycrashhandler|bugsplat|unrealcefsubprocess|cefprocess|prerequisites|vc_redist|vcredist|dxsetup|directx|dotnet|unins\d*)/i;
   const rawExecutables = Array.isArray(parsed.executables) ? parsed.executables : [];
+  const isExternalLauncherStub = Boolean(
+    /PRPOStubCreator/i.test(xml) ||
+      /\bGDKStubGame\.exe\b/i.test(xml) ||
+      rawExecutables.some((e) =>
+        /^gdkstubgame\.exe$/i.test(
+          path.posix.basename(String(e?.name || '').replace(/\\/g, '/'))
+        )
+      )
+  );
   const executables = rawExecutables.map((e) => {
     const normName = String(e?.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
     const base = path.posix.basename(normName);
@@ -1427,7 +2055,8 @@ function inspectMicrosoftGameConfig(xmlOrPath) {
     }
     return 0;
   };
-  let primaryExecObj = nonHelperExecutables[0] || executables[0] || null;
+  let primaryExecObj =
+    nonHelperExecutables[0] || (isExternalLauncherStub ? null : executables[0] || null);
   if (nonHelperExecutables.length > 1) {
     let bestScore = -Infinity;
     for (const cand of nonHelperExecutables) {
@@ -1438,7 +2067,11 @@ function inspectMicrosoftGameConfig(xmlOrPath) {
       }
     }
   }
-  let primaryExecutable = primaryExecObj ? primaryExecObj.name : parsed.primaryExecutable || '';
+  let primaryExecutable = primaryExecObj
+    ? primaryExecObj.name
+    : isExternalLauncherStub
+      ? ''
+      : parsed.primaryExecutable || '';
   if (primaryExecutable && contentRootDir) {
     const resolvedOnDisk = resolveCaseInsensitiveRelFile(contentRootDir, primaryExecutable);
     if (resolvedOnDisk) {
@@ -1471,6 +2104,34 @@ function inspectMicrosoftGameConfig(xmlOrPath) {
   const rawDisplayName = parsed.shellVisuals?.defaultDisplayName || '';
   const displayName = cleanManifestDisplayName(rawDisplayName);
 
+  let paradoxDirectGameExe = null;
+  if (contentRootDir) {
+    const isDowserPrimary =
+      /^dowser\.exe$/i.test(path.posix.basename(String(primaryExecutable || '').replace(/\\/g, '/'))) ||
+      executables.some((e) =>
+        /^dowser\.exe$/i.test(path.posix.basename(String(e?.name || '').replace(/\\/g, '/')))
+      );
+    if (isDowserPrimary) {
+      const primaryDiskExe = primaryExecutable
+        ? resolveCaseInsensitiveRelFile(contentRootDir, primaryExecutable)
+        : '';
+      const paradoxSettings = resolveParadoxLauncherSettings(
+        primaryDiskExe || contentRootDir,
+        contentRootDir
+      );
+      if (paradoxSettings.paradoxDirectGameExe) {
+        paradoxDirectGameExe = paradoxSettings.paradoxDirectGameExe;
+      }
+    }
+  }
+  const antiCheatInfo = contentRootDir
+    ? detectKernelAntiCheatMarkersInDir(contentRootDir)
+    : {
+        requiresKernelAntiCheat: false,
+        kernelAntiCheatName: null,
+        storyModeBypassAvailable: false,
+      };
+
   return {
     ...parsed,
     executables,
@@ -1485,7 +2146,12 @@ function inspectMicrosoftGameConfig(xmlOrPath) {
     appId,
     appUserModelId,
     gameLaunchHelperExecutable,
+    paradoxDirectGameExe,
+    requiresKernelAntiCheat: antiCheatInfo.requiresKernelAntiCheat,
+    kernelAntiCheatName: antiCheatInfo.kernelAntiCheatName,
+    storyModeBypassAvailable: antiCheatInfo.storyModeBypassAvailable,
     requiresCoreWindow: false,
+    isExternalLauncherStub,
     isDlcAddon,
     isNonGameUtility,
     configFilePath: filePath,
@@ -1607,12 +2273,954 @@ function inspectAppxManifest(xmlOrPath) {
   };
 }
 
+/**
+ * Parse a `launcher_settings.cfg` bootstrap configuration file (common in GOG / classic publisher
+ * wrappers) and resolve its target game executable (`BinaryPath` + `LocalePath`) on disk.
+ *
+ * @param {string} installDirOrExePath
+ * @param {string} [fallbackInstallDir]
+ */
+function parseLauncherSettingsCfg(installDirOrExePath, fallbackInstallDir = '') {
+  const empty = {
+    found: false,
+    configPath: '',
+    binaryPath: '',
+    localePath: '',
+    languages: '',
+    isoLanguage: '',
+    languagePathOnly: '',
+    commandLineArgs: '',
+    environmentVars: '',
+    resolvedTargetExePath: '',
+    resolvedWorkingDir: '',
+  };
+  const candidateDirs = [];
+  const pushDir = (d) => {
+    if (d && typeof d === 'string' && !candidateDirs.includes(d)) {
+      candidateDirs.push(d);
+    }
+  };
+  if (installDirOrExePath && typeof installDirOrExePath === 'string') {
+    const trimmed = installDirOrExePath.trim();
+    if (/\.exe$/i.test(trimmed)) {
+      pushDir(path.dirname(trimmed));
+    } else {
+      try {
+        if (fs.existsSync(trimmed) && fs.statSync(trimmed).isFile()) {
+          pushDir(path.dirname(trimmed));
+        } else {
+          pushDir(trimmed);
+        }
+      } catch {
+        pushDir(trimmed);
+      }
+    }
+  }
+  if (fallbackInstallDir && typeof fallbackInstallDir === 'string') {
+    pushDir(fallbackInstallDir.trim());
+  }
+
+  let cfgPath = '';
+  let cfgDir = '';
+  for (const dir of candidateDirs) {
+    const foundCfg = resolveCaseInsensitiveRelFile(dir, 'launcher_settings.cfg');
+    if (foundCfg) {
+      cfgPath = foundCfg;
+      cfgDir = path.dirname(foundCfg);
+      break;
+    }
+  }
+  if (!cfgPath) {
+    return empty;
+  }
+
+  let rawText = '';
+  try {
+    const st = fs.statSync(cfgPath);
+    if (!st.isFile() || st.size <= 0 || st.size > 131072) {
+      return empty;
+    }
+    rawText = fs.readFileSync(cfgPath, 'utf8');
+  } catch {
+    return empty;
+  }
+
+  /** @type {Record<string, string>} */
+  const kv = {};
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) {
+      continue;
+    }
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const k = line.slice(0, eqIdx).trim().toLowerCase();
+    const v = line
+      .slice(eqIdx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
+    if (k && !(k in kv)) {
+      kv[k] = v;
+    }
+  }
+
+  const binaryPath = kv.binarypath || '';
+  const localePath = kv.localepath || '';
+  const languages = kv.languages || '';
+  const isoLanguage = kv.iso_language || '';
+  const languagePathOnly = kv.language_path_only || '';
+  const commandLineArgs = kv.commandlineargs || '';
+  const environmentVars = kv.environmentvars || '';
+
+  let resolvedTargetExePath = '';
+  if (binaryPath) {
+    const relBin = binaryPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const rawLocale = localePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const relCandidates = [];
+    if (rawLocale && rawLocale !== '.' && rawLocale.toUpperCase() !== 'X') {
+      relCandidates.push(`${rawLocale}/${relBin}`);
+    }
+    relCandidates.push(relBin);
+    relCandidates.push(`EN/${relBin}`);
+    if (languages) {
+      for (const langTok of languages.split(/[,;\s]+/).filter(Boolean).slice(0, 12)) {
+        if (/^[a-z]{2,3}(?:[-_][a-z0-9]{2,4})?$/i.test(langTok)) {
+          relCandidates.push(`${langTok}/${relBin}`);
+        }
+      }
+    }
+
+    for (const cand of relCandidates) {
+      const resolved = resolveCaseInsensitiveRelFile(cfgDir, cand);
+      if (resolved) {
+        resolvedTargetExePath = resolved;
+        break;
+      }
+    }
+
+    if (!resolvedTargetExePath) {
+      try {
+        const subEntries = fs.readdirSync(cfgDir, { withFileTypes: true }).slice(0, 48);
+        for (const dirent of subEntries) {
+          if (!dirent.isDirectory()) continue;
+          if (!/^[a-z]{2,3}(?:[-_][a-z0-9]{2,4})?$/i.test(dirent.name)) continue;
+          const resolved = resolveCaseInsensitiveRelFile(path.join(cfgDir, dirent.name), relBin);
+          if (resolved) {
+            resolvedTargetExePath = resolved;
+            break;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return {
+    found: true,
+    configPath: cfgPath,
+    binaryPath,
+    localePath,
+    languages,
+    isoLanguage,
+    languagePathOnly,
+    commandLineArgs,
+    environmentVars,
+    resolvedTargetExePath,
+    resolvedWorkingDir: resolvedTargetExePath ? path.dirname(resolvedTargetExePath) : '',
+  };
+}
+
+const AUXILIARY_NON_GAME_EXE_RE =
+  /^(?:unins\d+|uninstall.*|setup|dxsetup|vcredist.*|vc_redist.*|dotnet.*|ndp\d+.*|oalinst|physx.*|crashreport.*|crashhandler.*|crashsender.*|unitycrashhandler.*|ue4prereqsetup.*|ueprereqsetup.*|gamelaunchhelper|custominstallexec|galaxycommunication|dosbox|scummvm)\.exe$/i;
+
+/**
+ * Bounded read-only structural scan (`depth <= 3`, `<= 400` total dirents, `0` mutations)
+ * for Windows kernel-mode anti-cheat drivers and services inside a game installation directory:
+ * - Riot Vanguard (`vgk.sys`, `vgc.exe`)
+ * - RICOCHET Anti-Cheat (`randgrid.sys`)
+ * - EA Javelin Anti-Cheat (`EAAntiCheat.GameServiceLauncher.exe`, `EAAntiCheat.Installer.exe`)
+ * - BattlEye (`BEService_x64.exe`, `BEService.exe`, `BEDaisy.sys`) — sets
+ *   `storyModeBypassAvailable: true` and `requiresKernelAntiCheat: false` when a publisher
+ *   `Play*.exe` Story Mode bootstrapper is present so offline/single-player Story Mode
+ *   (`-nobattleye`) remains launchable inside macOS bottles.
+ *
+ * @param {string} installDir
+ * @returns {{
+ *   requiresKernelAntiCheat: boolean,
+ *   kernelAntiCheatName: string | null,
+ *   storyModeBypassAvailable: boolean
+ * }}
+ */
+function detectKernelAntiCheatMarkersInDir(installDir) {
+  const defaultResult = {
+    requiresKernelAntiCheat: false,
+    kernelAntiCheatName: null,
+    storyModeBypassAvailable: false,
+  };
+  if (!installDir || typeof installDir !== 'string') {
+    return defaultResult;
+  }
+  const rootDir = installDir.trim();
+  if (!rootDir) {
+    return defaultResult;
+  }
+  try {
+    const st = fs.statSync(rootDir);
+    if (!st.isDirectory()) {
+      return defaultResult;
+    }
+  } catch {
+    return defaultResult;
+  }
+
+  const STORY_BOOTSTRAPPER_RE = /^play(?!er\.exe$|fab)[a-z0-9_.-]+\.exe$/i;
+  let foundVanguard = false;
+  let foundRicochet = false;
+  let foundEaJavelin = false;
+  let foundBattlEye = false;
+  let hasPlayBootstrapper = false;
+
+  let remainingBudget = 400;
+  /** @type {Array<{ dir: string, depth: number }>} */
+  const queue = [{ dir: rootDir, depth: 0 }];
+
+  while (queue.length > 0 && remainingBudget > 0) {
+    const current = queue.shift();
+    if (!current) break;
+    /** @type {fs.Dirent[]} */
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (let i = 0; i < entries.length && remainingBudget > 0; i += 1) {
+      const entry = entries[i];
+      if (!entry || entry.name === '.' || entry.name === '..') continue;
+      remainingBudget -= 1;
+      const lower = entry.name.toLowerCase();
+      if (entry.isFile()) {
+        if (lower === 'vgk.sys' || lower === 'vgc.exe') {
+          foundVanguard = true;
+        } else if (lower === 'randgrid.sys') {
+          foundRicochet = true;
+        } else if (
+          lower === 'eaanticheat.gameservicelauncher.exe' ||
+          lower === 'eaanticheat.installer.exe'
+        ) {
+          foundEaJavelin = true;
+        } else if (
+          lower === 'beservice_x64.exe' ||
+          lower === 'beservice.exe' ||
+          lower === 'bedaisy.sys'
+        ) {
+          foundBattlEye = true;
+        } else if (STORY_BOOTSTRAPPER_RE.test(lower)) {
+          hasPlayBootstrapper = true;
+        }
+      } else if (entry.isDirectory() && current.depth < 3) {
+        if (lower !== '.git' && lower !== '.spotlight-v100' && lower !== '.fseventsd') {
+          queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+        }
+      }
+    }
+  }
+
+  if (foundVanguard) {
+    return {
+      requiresKernelAntiCheat: true,
+      kernelAntiCheatName: 'Riot Vanguard',
+      storyModeBypassAvailable: false,
+    };
+  }
+  if (foundRicochet) {
+    return {
+      requiresKernelAntiCheat: true,
+      kernelAntiCheatName: 'RICOCHET Anti-Cheat',
+      storyModeBypassAvailable: false,
+    };
+  }
+  if (foundEaJavelin) {
+    return {
+      requiresKernelAntiCheat: true,
+      kernelAntiCheatName: 'EA Javelin Anti-Cheat',
+      storyModeBypassAvailable: false,
+    };
+  }
+  if (foundBattlEye) {
+    if (!hasPlayBootstrapper) {
+      try {
+        const rootEntries = fs.readdirSync(rootDir, { withFileTypes: true });
+        hasPlayBootstrapper = rootEntries.some(
+          (d) => d.isFile() && STORY_BOOTSTRAPPER_RE.test(d.name)
+        );
+      } catch {}
+    }
+    return {
+      requiresKernelAntiCheat: !hasPlayBootstrapper,
+      kernelAntiCheatName: 'BattlEye',
+      storyModeBypassAvailable: hasPlayBootstrapper,
+    };
+  }
+
+  return defaultResult;
+}
+
+/**
+ * Structural Paradox Interactive `dowser.exe` + `launcher-settings.json` inspector.
+ * Parses `exePath` from `launcher-settings.json`, strictly rejects `..` traversal or
+ * paths escaping `installDir`, and resolves `paradoxDirectGameExe` on disk (case-insensitively)
+ * so Wine bottle launches without the Paradox Launcher MSI installed can fall back cleanly
+ * to the real game `.exe` while still tracking `expectedGameExe`.
+ *
+ * @param {string} installDirOrExePath
+ * @param {string} [fallbackInstallDir='']
+ * @returns {{
+ *   found: boolean,
+ *   settingsPath: string,
+ *   rawExePath: string,
+ *   paradoxDirectGameExe: string | null,
+ *   exeArgs: string[],
+ *   distPlatform: string
+ * }}
+ */
+function resolveParadoxLauncherSettings(installDirOrExePath, fallbackInstallDir = '') {
+  const empty = {
+    found: false,
+    settingsPath: '',
+    rawExePath: '',
+    paradoxDirectGameExe: null,
+    exeArgs: /** @type {string[]} */ ([]),
+    distPlatform: '',
+  };
+  const primaryInput = typeof installDirOrExePath === 'string' ? installDirOrExePath.trim() : '';
+  const fallbackInput = typeof fallbackInstallDir === 'string' ? fallbackInstallDir.trim() : '';
+  if (!primaryInput && !fallbackInput) {
+    return empty;
+  }
+
+  let primaryDir = '';
+  let primaryIsExe = false;
+  if (primaryInput) {
+    try {
+      const st = fs.statSync(primaryInput);
+      if (st.isDirectory()) {
+        primaryDir = primaryInput;
+      } else {
+        primaryDir = path.dirname(primaryInput);
+        primaryIsExe = /\.exe$/i.test(primaryInput);
+      }
+    } catch {
+      primaryIsExe = /\.exe$/i.test(primaryInput);
+      primaryDir = primaryIsExe ? path.dirname(primaryInput) : primaryInput;
+    }
+  }
+
+  let containmentRoot = fallbackInput;
+  if (!containmentRoot && primaryDir) {
+    if (
+      primaryIsExe &&
+      /^dowser\.exe$/i.test(path.basename(primaryInput)) &&
+      /^launcher$/i.test(path.basename(primaryDir))
+    ) {
+      containmentRoot = path.dirname(primaryDir);
+    } else {
+      containmentRoot = primaryDir;
+    }
+  }
+  if (!containmentRoot) {
+    return empty;
+  }
+  const resolvedContainmentRoot = path.resolve(containmentRoot);
+
+  /** @type {string[]} */
+  const candidateSettingsPaths = [];
+  const addSettingsCandidate = (/** @type {string | null | undefined} */ p) => {
+    if (!p || typeof p !== 'string') return;
+    const resolved = path.resolve(p);
+    const rel = path.relative(resolvedContainmentRoot, resolved);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return;
+    if (!candidateSettingsPaths.includes(resolved)) {
+      candidateSettingsPaths.push(resolved);
+    }
+  };
+
+  if (primaryDir) {
+    addSettingsCandidate(resolveCaseInsensitiveRelFile(primaryDir, 'launcher-settings.json'));
+    addSettingsCandidate(
+      resolveCaseInsensitiveRelFile(primaryDir, 'launcher/launcher-settings.json')
+    );
+  }
+  addSettingsCandidate(
+    resolveCaseInsensitiveRelFile(resolvedContainmentRoot, 'launcher-settings.json')
+  );
+  addSettingsCandidate(
+    resolveCaseInsensitiveRelFile(resolvedContainmentRoot, 'launcher/launcher-settings.json')
+  );
+
+  for (const settingsPath of candidateSettingsPaths) {
+    /** @type {any} */
+    let parsed = null;
+    try {
+      const st = fs.statSync(settingsPath);
+      if (!st.isFile() || st.size <= 0 || st.size > 262144) continue;
+      parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+
+    const rawExePath = typeof parsed.exePath === 'string' ? parsed.exePath.trim() : '';
+    if (!rawExePath || rawExePath.includes('\0')) continue;
+    if (/^[A-Za-z]:/.test(rawExePath) || /^[\\/]/.test(rawExePath)) continue;
+
+    const normalizedRel = rawExePath.replace(/\\/g, '/').replace(/^\.\/+/, '');
+    if (!normalizedRel || !/\.exe$/i.test(normalizedRel)) continue;
+
+    const settingsDir = path.dirname(settingsPath);
+    /** @type {string[]} */
+    const safeRelCandidates = [];
+    for (const baseDir of [settingsDir, resolvedContainmentRoot]) {
+      const candidateAbs = path.resolve(baseDir, normalizedRel);
+      const relToRoot = path.relative(resolvedContainmentRoot, candidateAbs);
+      if (!relToRoot || relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
+        continue;
+      }
+      const posixRel = relToRoot.split(path.sep).join('/');
+      if (posixRel && !posixRel.split('/').includes('..') && !safeRelCandidates.includes(posixRel)) {
+        safeRelCandidates.push(posixRel);
+      }
+    }
+
+    let resolvedExeCandidate = '';
+    for (const safeRel of safeRelCandidates) {
+      const match = resolveCaseInsensitiveRelFile(resolvedContainmentRoot, safeRel);
+      if (match) {
+        resolvedExeCandidate = match;
+        break;
+      }
+    }
+    if (!resolvedExeCandidate) continue;
+
+    const resolvedExeAbs = path.resolve(resolvedExeCandidate);
+    const relToInstall = path.relative(resolvedContainmentRoot, resolvedExeAbs);
+    if (!relToInstall || relToInstall.startsWith('..') || path.isAbsolute(relToInstall)) {
+      continue;
+    }
+    if (/^dowser\.exe$/i.test(path.basename(resolvedExeAbs))) {
+      continue;
+    }
+
+    /** @type {string[]} */
+    const exeArgs = Array.isArray(parsed.exeArgs)
+      ? parsed.exeArgs
+          .filter((/** @type {any} */ a) => typeof a === 'string' && a.trim())
+          .map((/** @type {string} */ a) => a.trim())
+      : typeof parsed.exeArgs === 'string' && parsed.exeArgs.trim()
+        ? parsed.exeArgs.trim().split(/\s+/)
+        : [];
+    const distPlatform =
+      typeof parsed.distPlatform === 'string' ? parsed.distPlatform.trim() : '';
+
+    return {
+      found: true,
+      settingsPath,
+      rawExePath,
+      paradoxDirectGameExe: resolvedExeAbs,
+      exeArgs,
+      distPlatform,
+    };
+  }
+
+  return empty;
+}
+
+const SYSTEM_GRAPHICS_PROXY_DLL_RE =
+  /^(?:d3d(?:8|9|10|10_1|10core|11|12|12core)|dxgi|ddraw|d3dim|d3dim700|opengl32|vulkan-1|wined3d)\.dll$/i;
+
+const NON_ENGINE_REDIST_DLL_RE =
+  /^(?:msvcp\d+|vcruntime\d+|ucrtbase|concrt\d+|vcomp\d+|mfc\d+|api-ms-win-|ext-ms-win-|xinput|dinput|bink|fmod|steam_api|galaxy|eossdk|nvngx|amd_ags|sl\.|libxess)/i;
+
+/**
+ * Bounded read-only check for Unreal Engine 5 IoStore `.utoc` containers (`<root>/.../Content/Paks/*.utoc`).
+ * Max directory depth: 3, max inspected directory entries: 60 per candidate root.
+ *
+ * @param {string} installDir
+ * @param {string} [targetExePath]
+ * @returns {boolean}
+ */
+function detectUe5IoStoreContainer(installDir, targetExePath = '') {
+  /** @type {string[]} */
+  const candidateRoots = [];
+  const pushRoot = (dir) => {
+    if (!dir || typeof dir !== 'string') return;
+    const resolved = path.resolve(dir);
+    if (!candidateRoots.includes(resolved)) {
+      candidateRoots.push(resolved);
+    }
+  };
+  if (installDir) pushRoot(installDir);
+  if (targetExePath) {
+    const exeParent = path.dirname(targetExePath);
+    // UE shipping layout: `<Project>/Binaries/Win64/<Game>-Win64-Shipping.exe` -> `<Project>`
+    pushRoot(path.resolve(exeParent, '..', '..'));
+    pushRoot(exeParent);
+  }
+  if (candidateRoots.length === 0) return false;
+
+  /**
+   * @param {string} paksDir
+   * @param {{ remaining: number }} budget
+   */
+  const paksDirHasUtoc = (paksDir, budget) => {
+    if (budget.remaining <= 0) return false;
+    try {
+      const entries = fs.readdirSync(paksDir, { withFileTypes: true }).slice(0, 60);
+      for (let i = 0; i < entries.length && budget.remaining > 0; i += 1) {
+        budget.remaining -= 1;
+        const entry = entries[i];
+        if (entry.isFile() && /\.utoc$/i.test(entry.name)) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  };
+
+  /**
+   * @param {string} contentDir
+   * @param {{ remaining: number }} budget
+   */
+  const contentDirHasPaksUtoc = (contentDir, budget) => {
+    if (budget.remaining <= 0) return false;
+    try {
+      const entries = fs.readdirSync(contentDir, { withFileTypes: true }).slice(0, 32);
+      for (let i = 0; i < entries.length && budget.remaining > 0; i += 1) {
+        budget.remaining -= 1;
+        const entry = entries[i];
+        if (entry.isDirectory() && entry.name.toLowerCase() === 'paks') {
+          if (paksDirHasUtoc(path.join(contentDir, entry.name), budget)) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+    return false;
+  };
+
+  const SKIP_UE_SUBDIR_RE =
+    /^(?:binaries|engine|saved|intermediate|deriveddatacache|shadercompileworker|redist|_commonredist|__installer|\.git)$/i;
+
+  for (let rIdx = 0; rIdx < candidateRoots.length; rIdx += 1) {
+    const rootDir = candidateRoots[rIdx];
+    const budget = { remaining: 60 };
+    /** @type {Array<{ dir: string, depth: number }>} */
+    const queue = [{ dir: rootDir, depth: 0 }];
+    while (queue.length > 0 && budget.remaining > 0) {
+      const current = queue.shift();
+      if (!current) break;
+      let entries;
+      try {
+        entries = fs.readdirSync(current.dir, { withFileTypes: true }).slice(0, 60);
+      } catch {
+        continue;
+      }
+      for (let i = 0; i < entries.length && budget.remaining > 0; i += 1) {
+        budget.remaining -= 1;
+        const entry = entries[i];
+        if (!entry.isDirectory()) continue;
+        const lower = entry.name.toLowerCase();
+        if (lower === 'content') {
+          if (contentDirHasPaksUtoc(path.join(current.dir, entry.name), budget)) {
+            return true;
+          }
+        } else if (current.depth < 3 && !SKIP_UE_SUBDIR_RE.test(entry.name)) {
+          queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve effective architecture and graphics API capabilities across a primary executable
+ * and any delegated child game executable (discovered via `launcher_settings.cfg`,
+ * `goggame-*.info` `playTasks`, or sibling game `.exe` binaries alongside a lightweight bootstrapper).
+ *
+ * @param {string} exePath
+ * @param {string} [localInstallDir]
+ * @param {Record<string, any>} [options]
+ */
+function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '', options = {}) {
+  const normalizedExePath = typeof exePath === 'string' ? exePath.trim() : '';
+  const normalizedInstallDir = typeof localInstallDir === 'string' ? localInstallDir.trim() : '';
+  const exeDir = normalizedExePath ? path.dirname(normalizedExePath) : '';
+
+  const primaryPe = normalizedExePath
+    ? inspectPeCapabilities(normalizedExePath, options)
+    : {
+        exists: false,
+        isValidPe: false,
+        is32Bit: false,
+        is64Bit: false,
+        isX64: false,
+        isX86: false,
+        isArm64: false,
+        is16BitDos: false,
+        isLargeAddressAware: false,
+        isNxCompat: false,
+        isDynamicBase: false,
+        machineArch: 'unknown',
+        importedDlls: /** @type {string[]} */ ([]),
+        delayImportedDlls: /** @type {string[]} */ ([]),
+        dynamicallyLoadsOpenGl: false,
+        dynamicallyLoadsDirectDraw: false,
+        usesDynamicQgl: false,
+        importsD3d12: false,
+        importsD3d11Or10: false,
+        importsD3d9: false,
+        importsLegacyD3dOrGl: false,
+        importsVulkan: false,
+        hasUe5IoStoreContainer: false,
+        isD3d12Only: false,
+      };
+
+  const launcherSettings = parseLauncherSettingsCfg(
+    normalizedExePath || normalizedInstallDir,
+    normalizedInstallDir
+  );
+  const paradoxSettings = resolveParadoxLauncherSettings(
+    normalizedExePath || normalizedInstallDir,
+    normalizedInstallDir
+  );
+
+  /** @type {string[]} */
+  const candidateChildExePaths = [];
+  const pushChildCandidate = (p) => {
+    if (!p || typeof p !== 'string') return;
+    if (normalizedExePath && path.resolve(p) === path.resolve(normalizedExePath)) return;
+    const base = path.basename(p);
+    if (AUXILIARY_NON_GAME_EXE_RE.test(base)) return;
+    if (!candidateChildExePaths.some((existing) => path.resolve(existing) === path.resolve(p))) {
+      candidateChildExePaths.push(p);
+    }
+  };
+
+  if (launcherSettings.resolvedTargetExePath) {
+    pushChildCandidate(launcherSettings.resolvedTargetExePath);
+  }
+  if (paradoxSettings.paradoxDirectGameExe) {
+    pushChildCandidate(paradoxSettings.paradoxDirectGameExe);
+  }
+
+  // Inspect bounded `goggame-*.info` manifests in installDir and exeDir for child playTasks & compatibilityFlags
+  /** @type {string[]} */
+  const compatFlagTokens = [];
+  const infoSearchDirs = [];
+  if (normalizedInstallDir) infoSearchDirs.push(normalizedInstallDir);
+  if (exeDir && !infoSearchDirs.includes(exeDir)) infoSearchDirs.push(exeDir);
+
+  for (const searchDir of infoSearchDirs) {
+    try {
+      if (!fs.existsSync(searchDir) || !fs.statSync(searchDir).isDirectory()) continue;
+      const entries = fs.readdirSync(searchDir).slice(0, 64);
+      for (const name of entries) {
+        if (!/^goggame-\d+\.info$/i.test(name)) continue;
+        const infoFile = path.join(searchDir, name);
+        const st = fs.statSync(infoFile);
+        if (!st.isFile() || st.size <= 0 || st.size > 262144) continue;
+        const parsed = JSON.parse(fs.readFileSync(infoFile, 'utf8'));
+        const playTasks = Array.isArray(parsed?.playTasks) ? parsed.playTasks : [];
+        for (const task of playTasks) {
+          if (!task || typeof task !== 'object') continue;
+          if (typeof task.compatibilityFlags === 'string' && task.compatibilityFlags.trim()) {
+            for (const tok of task.compatibilityFlags.trim().split(/\s+/)) {
+              if (tok && !compatFlagTokens.includes(tok)) {
+                compatFlagTokens.push(tok);
+              }
+            }
+          }
+          if (typeof task.path === 'string' && /\.exe$/i.test(task.path.trim())) {
+            const relTaskPath = task.path.trim().replace(/\\/g, '/');
+            let resolvedTaskExe = resolveCaseInsensitiveRelFile(searchDir, relTaskPath);
+            if (!resolvedTaskExe && typeof task.workingDir === 'string' && task.workingDir.trim()) {
+              const relWork = task.workingDir.trim().replace(/\\/g, '/');
+              resolvedTaskExe = resolveCaseInsensitiveRelFile(
+                searchDir,
+                `${relWork}/${relTaskPath}`
+              );
+            }
+            if (resolvedTaskExe) {
+              pushChildCandidate(resolvedTaskExe);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Bounded 1-level sibling `.exe` scan when primary `.exe` looks like a lightweight bootstrapper
+  let isLikelyBootstrapper = Boolean(launcherSettings.found);
+  if (!isLikelyBootstrapper && normalizedExePath && primaryPe.exists) {
+    try {
+      const st = fs.statSync(normalizedExePath);
+      const baseName = path.basename(normalizedExePath);
+      if (
+        st.size < 2 * 1024 * 1024 ||
+        /(?:start|launcher|bootstrap|autorun|play|loader)/i.test(baseName)
+      ) {
+        isLikelyBootstrapper = true;
+      }
+    } catch {}
+  }
+  if (isLikelyBootstrapper) {
+    for (const scanDir of infoSearchDirs) {
+      try {
+        if (!fs.existsSync(scanDir) || !fs.statSync(scanDir).isDirectory()) continue;
+        const dirents = fs.readdirSync(scanDir, { withFileTypes: true }).slice(0, 64);
+        for (const dirent of dirents) {
+          if (dirent.isFile() && /\.exe$/i.test(dirent.name)) {
+            pushChildCandidate(path.join(scanDir, dirent.name));
+          } else if (
+            dirent.isDirectory() &&
+            /^(?:bin|binaries|win32|win64|x86|x64|system|[a-z]{2}(?:-[a-z]{2})?)$/i.test(
+              dirent.name
+            )
+          ) {
+            const subDir = path.join(scanDir, dirent.name);
+            const subEntries = fs.readdirSync(subDir, { withFileTypes: true }).slice(0, 32);
+            for (const sub of subEntries) {
+              if (sub.isFile() && /\.exe$/i.test(sub.name)) {
+                pushChildCandidate(path.join(subDir, sub.name));
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  /** @type {Array<{ exePath: string, pe: ReturnType<typeof inspectPeCapabilities> }>} */
+  const validChildren = [];
+  for (const childPath of candidateChildExePaths.slice(0, 12)) {
+    const cPe = inspectPeCapabilities(childPath, options);
+    if (cPe.isValidPe && isCompatibleX86OrX64PeHeader(cPe, options)) {
+      validChildren.push({ exePath: childPath, pe: cPe });
+    }
+  }
+
+  let effectivePe = primaryPe;
+  let effectiveExePath = normalizedExePath;
+  if (validChildren.length > 0) {
+    const fromLauncherCfg = launcherSettings.resolvedTargetExePath
+      ? validChildren.find(
+          (c) =>
+            path.resolve(c.exePath) === path.resolve(launcherSettings.resolvedTargetExePath)
+        )
+      : paradoxSettings.paradoxDirectGameExe
+        ? validChildren.find(
+            (c) =>
+              path.resolve(c.exePath) === path.resolve(paradoxSettings.paradoxDirectGameExe)
+          )
+        : null;
+    const withGraphicsImports = validChildren.find(
+      (c) =>
+        Boolean(c.pe.dynamicallyLoadsOpenGl || c.pe.dynamicallyLoadsDirectDraw) ||
+        c.pe.importedDlls.some(
+          (d) =>
+            d === 'opengl32.dll' ||
+            d === 'ddraw.dll' ||
+            d === 'd3d8.dll' ||
+            d === 'd3d9.dll' ||
+            d === 'd3d10.dll' ||
+            d === 'd3d10_1.dll' ||
+            d === 'd3d11.dll' ||
+            d === 'd3d12.dll' ||
+            d === 'dxgi.dll' ||
+            d === 'vulkan-1.dll'
+        )
+    );
+    const chosenChild = fromLauncherCfg || withGraphicsImports || validChildren[0];
+    effectivePe = chosenChild.pe;
+    effectiveExePath = chosenChild.exePath;
+  }
+
+  const allInspectedPes = [primaryPe, ...validChildren.map((c) => c.pe)];
+  const dllSet = new Set(primaryPe.importedDlls || []);
+  for (const child of validChildren) {
+    for (const dll of child.pe.importedDlls || []) {
+      dllSet.add(dll);
+    }
+  }
+
+  const hasDirectGraphicsImport =
+    allInspectedPes.some(
+      (p) => Boolean(p.dynamicallyLoadsOpenGl || p.dynamicallyLoadsDirectDraw)
+    ) ||
+    Array.from(dllSet).some(
+      (d) =>
+        d === 'd3d12.dll' ||
+        d === 'd3d12core.dll' ||
+        d === 'd3d11.dll' ||
+        d === 'd3d10.dll' ||
+        d === 'd3d10_1.dll' ||
+        d === 'd3d10core.dll' ||
+        d === 'd3d9.dll' ||
+        d === 'd3d8.dll' ||
+        d === 'ddraw.dll' ||
+        d === 'd3dim.dll' ||
+        d === 'd3dim700.dll' ||
+        d === 'opengl32.dll' ||
+        d === 'vulkan-1.dll' ||
+        /^d3dx(?:9|10|11)(?:_\d+)?\.dll$/i.test(d)
+    );
+
+  // If the primary/child `.exe` does not directly import a D3D/GL/Vulkan DLL, scan up to 20
+  // top-level `.dll` files in `path.dirname(targetExe)` (bounded `< 2 ms`, headers + import tables only).
+  if (!hasDirectGraphicsImport && effectiveExePath) {
+    const targetExeDir = path.dirname(effectiveExePath);
+    try {
+      const rawEntries = fs.readdirSync(targetExeDir, { withFileTypes: true });
+      const candidateDllNames = [];
+      const fallbackDllNames = [];
+      for (let i = 0; i < rawEntries.length; i += 1) {
+        const entry = rawEntries[i];
+        if (!entry.isFile() || !/\.dll$/i.test(entry.name)) continue;
+        if (SYSTEM_GRAPHICS_PROXY_DLL_RE.test(entry.name)) continue;
+        if (NON_ENGINE_REDIST_DLL_RE.test(entry.name)) {
+          fallbackDllNames.push(entry.name);
+        } else {
+          candidateDllNames.push(entry.name);
+        }
+      }
+      const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
+      for (let i = 0; i < orderedDllNames.length; i += 1) {
+        const dllPath = path.join(targetExeDir, orderedDllNames[i]);
+        const dllHeader = inspectWindowsExecutableHeader(dllPath, {
+          ...options,
+          skipRdataStringScan: true,
+        });
+        if (!dllHeader.isValidPe) continue;
+        if (effectivePe.isValidPe && Boolean(dllHeader.is64Bit) !== Boolean(effectivePe.is64Bit)) {
+          continue;
+        }
+        for (const dep of dllHeader.importedDlls || []) {
+          dllSet.add(dep);
+        }
+      }
+    } catch {}
+  }
+
+  const importedDlls = Array.from(dllSet);
+
+  const effectiveMachine =
+    effectivePe.machineArch && effectivePe.machineArch !== 'unknown'
+      ? effectivePe.machineArch
+      : primaryPe.machineArch || 'unknown';
+
+  const is32Bit = effectiveMachine === 'x86' || Boolean(effectivePe.isX86);
+  const is64Bit =
+    effectiveMachine === 'x64' ||
+    effectiveMachine === 'arm64' ||
+    Boolean(effectivePe.is64Bit);
+  const isLargeAddressAware = is64Bit || Boolean(effectivePe.isLargeAddressAware);
+  const isNxCompat = effectivePe.isValidPe ? Boolean(effectivePe.isNxCompat) : is64Bit;
+  const isDynamicBase = Boolean(effectivePe.isDynamicBase);
+
+  const hasUe5IoStoreContainer =
+    Boolean(options?.hasUe5IoStoreContainer) ||
+    detectUe5IoStoreContainer(normalizedInstallDir, effectiveExePath);
+
+  const anyDynamicQgl = allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsOpenGl));
+  const anyDynamicDdraw = allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsDirectDraw));
+  const gfxCaps = derivePeGraphicsCapabilities(importedDlls, {
+    usesDynamicQgl: anyDynamicQgl,
+    dynamicallyLoadsDirectDraw: anyDynamicDdraw,
+    hasUe5IoStoreContainer,
+  });
+
+  const usesOpenGl = importedDlls.includes('opengl32.dll') || anyDynamicQgl;
+  const usesLegacyDirectDrawOrD3d =
+    importedDlls.some(
+      (d) => d === 'ddraw.dll' || d === 'd3dim.dll' || d === 'd3dim700.dll' || d === 'd3d8.dll'
+    ) || anyDynamicDdraw;
+  const usesModernGraphicsApi = importedDlls.some(
+    (d) => d === 'd3d12.dll' || d === 'vulkan-1.dll' || d === 'dxgi.dll' || d === 'd3d11.dll'
+  );
+  const isLegacy32BitOpenGl =
+    effectiveMachine === 'x86' && usesOpenGl && !usesModernGraphicsApi;
+  const needsLegacyDisplayModeSynthesis =
+    effectiveMachine === 'x86' &&
+    (usesOpenGl || usesLegacyDirectDrawOrD3d) &&
+    !usesModernGraphicsApi;
+
+  /** @type {string[]} */
+  const targetExePaths = [];
+  if (normalizedExePath) targetExePaths.push(normalizedExePath);
+  for (const child of validChildren) {
+    if (!targetExePaths.some((p) => path.resolve(p) === path.resolve(child.exePath))) {
+      targetExePaths.push(child.exePath);
+    }
+  }
+
+  const basenameSet = new Set();
+  for (const p of targetExePaths) {
+    const b = path.basename(p).trim().toLowerCase();
+    if (b && /\.exe$/i.test(b)) basenameSet.add(b);
+  }
+  if (launcherSettings.binaryPath) {
+    const cfgBase = path.win32.basename(launcherSettings.binaryPath).trim().toLowerCase();
+    if (cfgBase && /\.exe$/i.test(cfgBase)) basenameSet.add(cfgBase);
+  }
+  if (paradoxSettings.paradoxDirectGameExe) {
+    const pdxBase = path.basename(paradoxSettings.paradoxDirectGameExe).trim().toLowerCase();
+    if (pdxBase && /\.exe$/i.test(pdxBase)) basenameSet.add(pdxBase);
+  }
+
+  return {
+    primaryPe,
+    effectivePe,
+    effectiveMachine,
+    is32Bit,
+    is64Bit,
+    isLargeAddressAware,
+    isNxCompat,
+    isDynamicBase,
+    importedDlls,
+    ...gfxCaps,
+    usesOpenGl,
+    usesLegacyDirectDrawOrD3d,
+    usesModernGraphicsApi,
+    isLegacy32BitOpenGl,
+    needsLegacyDisplayModeSynthesis,
+    hasChildGameExecutable:
+      validChildren.length > 0 ||
+      Boolean(launcherSettings.resolvedTargetExePath) ||
+      Boolean(paradoxSettings.paradoxDirectGameExe),
+    targetExePaths,
+    targetExeBasenamesLower: Array.from(basenameSet),
+    launcherSettings,
+    paradoxLauncherSettings: paradoxSettings,
+    paradoxDirectGameExe: paradoxSettings.paradoxDirectGameExe || null,
+    gogCompatibilityFlags: compatFlagTokens.join(' '),
+  };
+}
+
 module.exports = {
   MAX_PLAUSIBLE_GAME_INSTALL_BYTES,
   sanitizeGameInstallSizeBytes,
   decodeEpicJsonBlobInt,
   parseByteCountOrFormattedSize,
   inspectWindowsExecutableHeader,
+  inspectPeCapabilities,
+  inspectPeExportForwarders,
+  hasMalformedBackslashExportForwarder,
+  parseLauncherSettingsCfg,
+  detectKernelAntiCheatMarkersInDir,
+  resolveParadoxLauncherSettings,
+  detectUe5IoStoreContainer,
+  derivePeGraphicsCapabilities,
+  resolveEffectiveGameExecutableCapabilities,
   isCompatibleX86OrX64PeHeader,
   resolveCaseInsensitiveRelFile,
   inspectMacMachOHeader,

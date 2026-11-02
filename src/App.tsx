@@ -765,13 +765,30 @@ export function App() {
       }
 
       if (activeFilter) {
-        if (!matchesGameFilter(game, activeFilter)) return false;
+        if (activeFilter.type === 'os' && selectedPlatform !== 'all') {
+          const mappedOs = activeGameFilterToLibraryFilterState(activeFilter).osCompatibility;
+          const platOsFlags = libraryFilterIndex.entriesById
+            .get(game.id)
+            ?.osFlagsByPlatform.get(selectedPlatform);
+          if (mappedOs.length > 0) {
+            if (!platOsFlags || !mappedOs.some((opt) => platOsFlags.has(opt))) return false;
+          } else if (!matchesGameFilter(game, activeFilter)) {
+            return false;
+          }
+        } else if (!matchesGameFilter(game, activeFilter)) {
+          return false;
+        }
       }
 
       return true;
     });
 
-    return evaluateLibraryFilter(baseFiltered, libraryFilterIndex, deferredLibraryFilterState);
+    return evaluateLibraryFilter(
+      baseFiltered,
+      libraryFilterIndex,
+      deferredLibraryFilterState,
+      selectedPlatform
+    );
   }, [
     games,
     selectedPlatform,

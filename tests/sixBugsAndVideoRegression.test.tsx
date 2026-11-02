@@ -343,7 +343,18 @@ describe('Phase 3: Six Bugs & Epic Video Regression Verification Suite', () => {
       // Set hoveredGame state (index 2 in LibraryGridView state array: contextMenu=0, criticTick=1, hoveredGame=2)
       gridHarness.states[2] = gameWithHtml;
       const hoveredTree = gridHarness.render();
-      const hoveredText = getTextContent(hoveredTree);
+      const popoutVNode = findElements(
+        hoveredTree,
+        (el) => typeof el.type === 'function' && el.type.name === 'GameHoverPopoutContent'
+      )[0];
+      const popoutHarness = popoutVNode
+        ? createComponentHarness(popoutVNode.type, popoutVNode.props)
+        : null;
+      const hoveredText =
+        getTextContent(hoveredTree) +
+        (popoutHarness ? getTextContent(popoutHarness.render()) : '');
+      popoutHarness?.unmount();
+      gridHarness.unmount();
 
       expect(hoveredText).toContain('A dark "survival" odyssey — forged in fire & brimstone.');
       expect(hoveredText).not.toContain('<img');

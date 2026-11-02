@@ -63,7 +63,10 @@ export function renderLibraryGridCard({
 
   const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
   const isXboxExpiredUnplayable = Boolean(
-    xboxPlat && xboxPlat.subscriptionExpired && xboxPlat.ownershipType === 'subscription'
+    xboxPlat &&
+      xboxPlat.installed &&
+      xboxPlat.subscriptionExpired &&
+      xboxPlat.ownershipType === 'subscription'
   );
   const isXboxActiveGamePass = Boolean(
     xboxPlat &&
@@ -73,7 +76,7 @@ export function renderLibraryGridCard({
   );
   const isXboxLeavingSoon = Boolean(isXboxActiveGamePass && xboxPlat?.isLeavingSoon);
   const hasTopLeftBadge =
-    isRunning || isInstalled || isXboxExpiredUnplayable || isXboxActiveGamePass;
+    isRunning || isInstalled || isXboxExpiredUnplayable || isXboxLeavingSoon;
 
   const oc = resolveGameCriticData(game);
   const cardReleaseYear =
@@ -139,16 +142,18 @@ export function renderLibraryGridCard({
               </div>
             ) : null}
             {isXboxExpiredUnplayable ? (
-              <div className="bg-rose-950/95 border border-rose-500/60 text-rose-200 text-[9px] font-bold uppercase tracking-tight px-1.5 py-0.5 rounded shadow">
+              <div
+                className="bg-rose-950/95 border border-rose-500/60 text-rose-200 text-[9px] font-bold uppercase tracking-tight px-1.5 py-0.5 rounded shadow whitespace-nowrap"
+                title="Game Pass subscription expired"
+              >
                 Expired
               </div>
             ) : isXboxLeavingSoon ? (
-              <div className="bg-amber-950/95 border border-amber-500/60 text-amber-200 text-[9px] font-bold uppercase tracking-tight px-1.5 py-0.5 rounded shadow">
+              <div
+                className="bg-amber-950/95 border border-amber-500/60 text-amber-200 text-[9px] font-bold uppercase tracking-tight px-1.5 py-0.5 rounded shadow whitespace-nowrap"
+                title="Leaving subscription catalog soon"
+              >
                 Leaving Soon
-              </div>
-            ) : isXboxActiveGamePass ? (
-              <div className="bg-emerald-950/95 border border-emerald-500/60 text-emerald-200 text-[9px] font-extrabold uppercase tracking-tight px-1.5 py-0.5 rounded shadow">
-                GP
               </div>
             ) : null}
           </div>

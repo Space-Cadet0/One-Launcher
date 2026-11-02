@@ -1109,7 +1109,7 @@ setTimeout(() => process.exit(0), 40);
       expect(winOnMacPageHtml).toContain('Ready to Play');
       expect(winOnMacPageHtml).not.toContain('CrossOver / Wine');
 
-      // 4. Active Download state on singleton launcherService -> shows Installing X%
+      // 4. Active Download state on singleton launcherService -> shows compact X% without "Installing"
       delete (globalThis as any).window.electronAPI;
       await launcherService.startInstall({
         gameId: multiStoreGame.id,
@@ -1123,7 +1123,8 @@ setTimeout(() => process.exit(0), 40);
           game: multiStoreGame,
         })
       );
-      expect(downloadingHtml).toContain('Installing 0%');
+      expect(downloadingHtml).toContain('>0%</span>');
+      expect(downloadingHtml).not.toContain('Installing 0%');
 
       // Render DownloadManagerDrawer while download is active
       const drawerHtml = renderToString(

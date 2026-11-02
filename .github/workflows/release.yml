@@ -151,6 +151,15 @@ jobs:
 
             ---
 
+            ### ✨ Highlights in v0.2.1
+
+            * **Xbox & PC Game Pass Catalog Authority**: Live SIGL v3 + DisplayCatalog entitlement reconciliation across all subscription tiers (`Ultimate`, `PC Game Pass`, `Standard`, `Essential`), automatic ghost/expired state healing, and chained publisher launcher support (`EA App`, `Ubisoft Connect`, `Battle.net`, `Riot Client`).
+            * **One-Click Runner Updates & CrossOver Preview Auto-Install**: Single-click automated downloading, verification, and atomic installation for **Apple Game Porting Toolkit**, **Open-Source Wine**, **CrossOver**, and **CrossOver Preview** (automatically selecting the standard non-experimental build after CodeWeavers sign-in) in both the **Setup Wizard** and **Launch & Compatibility Settings**.
+            * **32-Bit (`PE32`) & 64-Bit (`PE32+`) Bottled Launch Engine**: Deterministic `x86` (`0x014c`) and `x86_64` (`0x8664`) Xbox GDK, GameInput, and AppNotify bridges, declarative `goggame-*.script` interpreter, and streamlined **Launch & Compatibility Settings** UI.
+            * **HowLongToBeat `™` / `®` / Typography Normalization & Self-Healing**: Multi-pass query tokenization for trademark/copyright symbols, curly quotes, en/em-dashes, release years, and storefront edition suffixes with automatic in-place negative-cache self-healing and SQLite offline vault persistence.
+
+            ---
+
             ### 📥 Downloads
 
             * 🍎 **Mac Users (Apple Silicon M1/M2/M3/M4):**

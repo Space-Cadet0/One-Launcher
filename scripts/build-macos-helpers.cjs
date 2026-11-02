@@ -38,6 +38,10 @@ function main() {
   execFileSync(
     '/usr/bin/clang',
     [
+      '-std=c11',
+      '-Wall',
+      '-Wextra',
+      '-Werror',
       '-dynamiclib',
       '-O2',
       '-fno-objc-arc',

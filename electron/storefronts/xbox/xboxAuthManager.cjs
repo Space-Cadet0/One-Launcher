@@ -27,6 +27,7 @@ const MSA_INLINE_LOGIN_URL = 'https://login.live.com/ppsecure/InlineLogin.srf';
 
 const SCOPE_XBL_MBI_SSL = 'service::user.auth.xboxlive.com::MBI_SSL';
 const SCOPE_MSSTORE_MBI_SSL = 'service::www.microsoft.com::MBI_SSL';
+const SCOPE_DCAT_MBI_SSL = 'service::dcat.update.microsoft.com::MBI_SSL';
 const XBOX_TOKEN_BROKER_SCOPE = 'scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0';
 
 const CXH_USER_AGENT =
@@ -202,28 +203,45 @@ function isCompactJwe(candidate) {
 }
 
 /**
- * Normalizes a Microsoft Store MSA ticket across `licensing.mp.microsoft.com` and `PCGAFD`:
+ * Normalizes a Microsoft Store MSA ticket across `licensing.mp.microsoft.com`, `PCGAFD`, and `collections.mp.microsoft.com`:
  * - Default (`target = 'licensing'`):
  *   - 5-dot Compact JWE (`d=eyJ...` or `t=eyJ...` or bare `eyJ...`) -> strips prefix, returns bare JWE
  *   - Non-JWE delegation/compact ticket (`d=opaque` or bare `opaque`) -> returns `t=opaque`
  * - When `options.target === 'pcgafd'` / `'store'`:
- *   - Always returns `t=<unprefixed>` (rewriting `d=` -> `t=`, keeping `t=`)
+ *   - Always returns `t=<unprefixed>` (rewriting `d=` -> `t=`, keeping `t=`) or preserves `XBL3.0 x=...`
+ * - When `options.target === 'collections'`:
+ *   - Returns `WLID1.0="<unprefixed>"` (rejecting `XBL3.0` / `Bearer` tokens)
+ * - When `options.target === 'collections_bare'`:
+ *   - Returns `<unprefixed>` MSA compact ticket (for `beneficiaries[].identityValue`)
  *
  * @param {string} rawTicket
- * @param {{ target?: 'licensing' | 'pcgafd' | 'store' }} [options]
+ * @param {{ target?: 'licensing' | 'pcgafd' | 'store' | 'collections' | 'collections_bare' } | string} [options]
  * @returns {string}
  */
 function normalizeStoreMsaTicket(rawTicket, options = {}) {
   const trimmed = String(rawTicket || '').trim();
   if (!trimmed) return '';
-  const target = options.target || 'licensing';
+  const target =
+    typeof options === 'string' ? options : options?.target || 'licensing';
 
-  // Preserve `XBL3.0 x=<uhs>;<jwt>` verbatim for PCGAFD/Store queries, and never forward XBL3.0 to Msa-only licensing
-  if (/^xbl3\.0\s+/i.test(trimmed)) {
+  // Preserve `XBL3.0 x=<uhs>;<jwt>` verbatim for PCGAFD/Store queries, and never forward XBL3.0/Bearer to MSA-only endpoints
+  if (/^(?:xbl3\.0|bearer)\s+/i.test(trimmed)) {
     return target === 'pcgafd' || target === 'store' ? trimmed : '';
   }
 
-  const bare = trimmed.replace(/^[td]=/i, '');
+  const unwrapped = trimmed
+    .replace(/^WLID1\.0=/i, '')
+    .replace(/^["']+|["']+$/g, '')
+    .trim();
+  const bare = unwrapped.replace(/^[td]=/i, '').trim();
+  if (!bare) return '';
+
+  if (target === 'collections') {
+    return `WLID1.0="${bare}"`;
+  }
+  if (target === 'collections_bare') {
+    return bare;
+  }
 
   if (target === 'pcgafd' || target === 'store') {
     return `t=${bare}`;
@@ -258,6 +276,8 @@ function formatStoreAuthTickets(rawTicket) {
   return {
     pcgafdTicket: normalizeStoreMsaTicket(rawTicket, { target: 'pcgafd' }),
     licensingTicket: normalizeStoreMsaTicket(rawTicket, { target: 'licensing' }),
+    collectionsTicket: normalizeStoreMsaTicket(rawTicket, { target: 'collections' }),
+    collectionsBareTicket: normalizeStoreMsaTicket(rawTicket, { target: 'collections_bare' }),
   };
 }
 
@@ -1176,6 +1196,47 @@ function createXboxAuthProvider(config = {}) {
     const promise = (async () => {
       const saved = loadXboxVaultRecord();
 
+      if (plane === 'collections') {
+        if (saved.userStsLegacyTokenXml) {
+          try {
+            const devCtx = await xboxDeviceClep.ensureDeviceLicenseContext({
+              tokenVault: vault,
+              userDataDir,
+              fetchImpl,
+              requireLegacyToken: true,
+            });
+            if (devCtx?.deviceLegacyTokenXml && devCtx?.clepHmacSecret) {
+              const ex = await xboxDeviceClep.exchangeUserTokenOnRst2({
+                userLegacyTokenXml: saved.userStsLegacyTokenXml,
+                username: saved.msaUsername || saved.accountName || 'user@example.com',
+                deviceLegacyTokenXml: devCtx.deviceLegacyTokenXml,
+                clepHmacSecret: devCtx.clepHmacSecret,
+                inlineUx: 'Silent',
+                hostingApp: xboxDeviceClep.HOSTING_APP_MS_STORE,
+                scopes: [{ scopeAddress: 'dcat.update.microsoft.com', policy: 'mbi_ssl' }],
+                fetchImpl,
+              });
+              const colTok = !ex.fault ? ex.tokens?.[0]?.compactToken : '';
+              if (colTok) {
+                const rawExp = ex.tokens?.[0]?.expires;
+                const expiresAtIso =
+                  rawExp && !Number.isNaN(Date.parse(rawExp))
+                    ? new Date(Date.parse(rawExp)).toISOString()
+                    : new Date(Date.now() + 8 * 3600_000).toISOString();
+                return saveXboxVaultRecordAsync({
+                  collectionsTicket: colTok,
+                  collectionsTicketExpiresAt: expiresAtIso,
+                });
+              }
+            }
+          } catch {
+            // Fall through to `www.microsoft.com` (`store`) plane renewal below
+          }
+          return refreshMsaPlane('store', signal);
+        }
+        return saved;
+      }
+
       if (plane === 'store') {
         if (saved.userStsLegacyTokenXml) {
           try {
@@ -1403,9 +1464,11 @@ function createXboxAuthProvider(config = {}) {
 
     const xui = json?.DisplayClaims?.xui?.[0] || {};
     const uhs = xui.uhs || '';
+    const resolvedNotAfter =
+      json.NotAfter || new Date(Date.now() + 16 * 3600_000).toISOString();
     return {
       token: json.Token,
-      notAfter: json.NotAfter,
+      notAfter: resolvedNotAfter,
       issueInstant: json.IssueInstant,
       uhs,
       xuid: xui.xid || '',
@@ -1889,7 +1952,13 @@ function createXboxAuthProvider(config = {}) {
         }
       }
 
+      const staleMpTokenPatch =
+        current.xstsMpNotAfter && !isFutureIsoTimestamp(current.xstsMpNotAfter, 0)
+          ? { xstsMpToken: '', xstsMpNotAfter: '' }
+          : {};
+
       await saveXboxVaultRecordAsync({
+        ...staleMpTokenPatch,
         xuid: resolvedXuid,
         gamertag: resolvedGamertag,
         modernGamertag: resolvedModernGt,
@@ -1936,10 +2005,67 @@ function createXboxAuthProvider(config = {}) {
    *   transparently returns `XBL3.0 x=<uhs>;<mpXsts>` (`http://mp.microsoft.com/`), which `PCGAFD`
    *   accepts natively for owned entitlements and subscription tier queries!
    */
-  const getStoreMsaToken = async (options = {}) => {
+  const getStoreMsaToken = async (rawOptions = {}) => {
+    const options =
+      typeof rawOptions === 'string' ? { target: rawOptions } : rawOptions || {};
     const forceRefresh = Boolean(options.forceRefresh);
     const target = options.forLicensing ? 'licensing' : options.target || 'pcgafd';
     let saved = loadXboxVaultRecord();
+
+    if (target === 'collections' || target === 'collections_bare') {
+      const hasValidSavedCollectionsTicket =
+        !forceRefresh &&
+        Boolean(saved.collectionsTicket) &&
+        (!saved.collectionsTicketExpiresAt ||
+          isFutureIsoTimestamp(saved.collectionsTicketExpiresAt, 5 * 60_000));
+      const hasValidSavedStoreTicketForCol =
+        !forceRefresh &&
+        Boolean(saved.storeTicket) &&
+        (!saved.storeTicketExpiresAt ||
+          isFutureIsoTimestamp(saved.storeTicketExpiresAt, 5 * 60_000));
+
+      if (!hasValidSavedCollectionsTicket && !hasValidSavedStoreTicketForCol && saved.userStsLegacyTokenXml) {
+        saved = await refreshMsaPlane('collections', options.signal);
+      }
+
+      const usableCollectionsTicket =
+        saved.collectionsTicket &&
+        (!saved.collectionsTicketExpiresAt ||
+          isFutureIsoTimestamp(saved.collectionsTicketExpiresAt, 60_000))
+          ? saved.collectionsTicket
+          : saved.storeTicket &&
+              (!saved.storeTicketExpiresAt ||
+                isFutureIsoTimestamp(saved.storeTicketExpiresAt, 60_000))
+            ? saved.storeTicket
+            : '';
+
+      if (usableCollectionsTicket) {
+        if (options.returnBundle) {
+          const formatted = formatStoreAuthTickets(usableCollectionsTicket);
+          return {
+            rawTicket: usableCollectionsTicket,
+            pcgafdTicket: formatted.pcgafdTicket,
+            licensingTicket: formatted.licensingTicket,
+            collectionsTicket: formatted.collectionsTicket,
+            collectionsBareTicket: formatted.collectionsBareTicket,
+            expiresAt: saved.collectionsTicketExpiresAt || saved.storeTicketExpiresAt || '',
+          };
+        }
+        return normalizeStoreMsaTicket(usableCollectionsTicket, { target });
+      }
+
+      if (options.returnBundle) {
+        return {
+          rawTicket: '',
+          pcgafdTicket: '',
+          licensingTicket: '',
+          collectionsTicket: '',
+          collectionsBareTicket: '',
+          expiresAt: '',
+        };
+      }
+      return '';
+    }
 
     const hasValidSavedStoreTicket =
       !forceRefresh &&
@@ -1963,6 +2089,8 @@ function createXboxAuthProvider(config = {}) {
           rawTicket: usableStoreTicket,
           pcgafdTicket: formatted.pcgafdTicket,
           licensingTicket: formatted.licensingTicket,
+          collectionsTicket: formatted.collectionsTicket,
+          collectionsBareTicket: formatted.collectionsBareTicket,
           expiresAt: saved.storeTicketExpiresAt,
         };
       }
@@ -1979,6 +2107,8 @@ function createXboxAuthProvider(config = {}) {
           rawTicket: mpXsts.authorizationHeader,
           pcgafdTicket: mpXsts.authorizationHeader,
           licensingTicket: '',
+          collectionsTicket: '',
+          collectionsBareTicket: '',
           expiresAt: mpXsts.notAfter,
         };
       }
@@ -1990,11 +2120,18 @@ function createXboxAuthProvider(config = {}) {
         rawTicket: '',
         pcgafdTicket: '',
         licensingTicket: '',
+        collectionsTicket: '',
+        collectionsBareTicket: '',
         expiresAt: '',
       };
     }
     return '';
   };
+
+  const getValidStoreToken = (targetOrOptions = 'pcgafd') =>
+    getStoreMsaToken(
+      typeof targetOrOptions === 'string' ? { target: targetOrOptions } : targetOrOptions
+    );
 
   /**
    * Mints or returns a cached XSTS token for any Relying Party URI (`http://xboxlive.com`,
@@ -2045,11 +2182,32 @@ function createXboxAuthProvider(config = {}) {
     const subjectType = subjectParts.join('+');
     const cacheKey = buildRpXstsCacheKey(rp, sandboxId, subjectType);
 
+    const isVaultPersistableMpXsts =
+      rp === XSTS_RELYING_PARTIES.MS_STORE &&
+      sandboxId === 'RETAIL' &&
+      !options.titleToken &&
+      !options.userTokenOverride;
+
     if (forceRefresh) {
       rpXstsCache.delete(cacheKey);
     } else {
       const cached = rpXstsCache.get(cacheKey);
       if (cached && isFutureIsoTimestamp(cached.notAfter, 10 * 60_000)) {
+        if (isVaultPersistableMpXsts && cached.token && cached.uhs && cached.notAfter) {
+          const curSaved = loadXboxVaultRecord();
+          if (curSaved.xstsMpNotAfter !== cached.notAfter) {
+            const mpPatch = {
+              xstsMpToken: cached.token,
+              xstsMpUhs: cached.uhs,
+              xstsMpNotAfter: cached.notAfter,
+            };
+            await saveXboxVaultRecordAsync(mpPatch).catch(() => {
+              try {
+                saveXboxVaultRecord(mpPatch);
+              } catch {}
+            });
+          }
+        }
         return cached;
       }
     }
@@ -2058,8 +2216,7 @@ function createXboxAuthProvider(config = {}) {
     const saved = loadXboxVaultRecord();
     if (
       !forceRefresh &&
-      rp === XSTS_RELYING_PARTIES.MS_STORE &&
-      sandboxId === 'RETAIL' &&
+      isVaultPersistableMpXsts &&
       subjectType === 'user' &&
       saved.xstsMpToken &&
       saved.xstsMpUhs &&
@@ -2088,11 +2245,16 @@ function createXboxAuthProvider(config = {}) {
       signal: options.signal,
     });
 
-    if (rp === XSTS_RELYING_PARTIES.MS_STORE && sandboxId === 'RETAIL' && subjectType === 'user') {
-      await saveXboxVaultRecordAsync({
+    if (isVaultPersistableMpXsts && minted.token && minted.uhs) {
+      const mpPatch = {
         xstsMpToken: minted.token,
         xstsMpUhs: minted.uhs,
         xstsMpNotAfter: minted.notAfter,
+      };
+      await saveXboxVaultRecordAsync(mpPatch).catch(() => {
+        try {
+          saveXboxVaultRecord(mpPatch);
+        } catch {}
       });
     }
 
@@ -2910,6 +3072,7 @@ function createXboxAuthProvider(config = {}) {
     exchangeTokenBrokerDaProperty,
     getValidXboxSession,
     getStoreMsaToken,
+    getValidStoreToken,
     getXstsToken,
     getXblDeviceToken,
     getSisuTitleSession,
@@ -2930,6 +3093,7 @@ module.exports = {
   TRUSTED_XBOX_AUTH_HOSTS,
   SCOPE_XBL_MBI_SSL,
   SCOPE_MSSTORE_MBI_SSL,
+  SCOPE_DCAT_MBI_SSL,
   XSTS_RELYING_PARTIES,
   MINECRAFT_ENTITLEMENT_CACHE_TTL_MS,
   buildRpXstsCacheKey,

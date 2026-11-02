@@ -8,6 +8,9 @@ import {
   isSequelMismatch,
   normalizeTitleKey,
   extractSequelIdentifier,
+  stripStorefrontPlatformDisambiguators,
+  stripTrademarkSymbols,
+  decodeTitleHtmlEntities,
   EDITION_TOKENS,
 } from '../common/titleUtils';
 import { computeAdaptive404RetryDelayMs, isWafOrChallengeResponse } from '../../contracts/network';
@@ -146,12 +149,13 @@ export function isUnsuitableHeaderUrl(url?: string | null): boolean {
 
 
 export function normalizeKey(str: string): string {
-  return str
+  return stripStorefrontPlatformDisambiguators(
+    stripTrademarkSymbols(decodeTitleHtmlEntities(str))
+  )
     .toLowerCase()
-    .replace(/[™®©]/g, '')
-    .replace(/['’]/g, '')
+    .replace(/['\u2018\u2019\u02BC]/g, '')
     .replace(/\s*\((?:19|20)\d{2}\)/g, '')
-    .replace(/[:\-–—]/g, ' ')
+    .replace(/[:\-–—_]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1035,9 +1039,11 @@ export class IgdbCoverService {
       let receivedOkResponse = false;
       // Query search endpoint via Vite proxy or direct HTTPS with full sequel, compatibility, and releaseYear verification
       try {
-        const query = cleanRaw
-          .replace(/[™®©]/g, '')
-          .replace(/[:\-–—]/g, ' ')
+        const query = stripStorefrontPlatformDisambiguators(
+          stripTrademarkSymbols(decodeTitleHtmlEntities(cleanRaw))
+        )
+          .replace(/[\u2018\u2019\u02BC]/g, "'")
+          .replace(/[:\-–—_]/g, ' ')
           .replace(/\s+/g, ' ')
           .trim();
         const searchUrl =

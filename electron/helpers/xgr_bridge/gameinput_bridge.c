@@ -12,11 +12,25 @@
 #define COBJMACROS
 #include <windows.h>
 #include <unknwn.h>
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+
+static inline void gi_sync_teb_last_error(void)
+{
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+    DWORD err = GetLastError();
+    __writegsdword(0x68, err);
+#elif defined(_WIN32) && (defined(__i386__) || defined(_M_IX86))
+    DWORD err = GetLastError();
+    __writefsdword(0x34, err);
+#endif
+}
 
 /* Embedded PE binary marker verified by `scripts/build-xbox-bridge.cjs` */
 #if defined(__GNUC__) || defined(__clang__)
@@ -3089,12 +3103,17 @@ static HRESULT WINAPI gi_mgr_v0_RegisterSystemOrGuideCallback(
     GameInputCallbackToken *arg6)
 {
     (void)iface;
+    gi_sync_teb_last_error();
+#if defined(_WIN64)
     /* Check if 4-arg RegisterGuideButtonCallback(dev, ctx=arg3, cb=arg4, tok=arg5) */
     if (gi_is_executable_ptr(arg4) && !gi_is_executable_ptr(arg5)) {
         return gi_register_callback_common(
             GI_VER_0, 3, raw_device, GI_KindUnknown, 0,
             arg4, (void *)arg3, (GameInputCallbackToken *)arg5);
     }
+#else
+    (void)gi_is_executable_ptr;
+#endif
     /* Otherwise 5-arg RegisterSystemButtonCallback(dev, filter=arg3, ctx=arg4, cb=arg5, tok=arg6) */
     if (arg3 == 0) {
         if (arg6) *arg6 = 0;

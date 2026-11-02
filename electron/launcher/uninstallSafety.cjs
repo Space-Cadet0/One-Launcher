@@ -101,6 +101,21 @@ const BLOCKED_CONTAINER_LEAF_NAMES = new Set([
   '.gamingroot',
   'msixvc',
   'wudownloadcache',
+  // Chained publisher launchers & shared publisher game roots
+  'ea desktop',
+  'ea app',
+  'electronic arts',
+  'ea games',
+  'origin',
+  'origin games',
+  'ubisoft',
+  'ubisoft game launcher',
+  'ubisoft connect',
+  'battle.net',
+  'blizzard entertainment',
+  'rockstar games',
+  'riot games',
+  'riot client',
   // Wine / CrossOver / GPTK prefix containers
   'bottles',
   'prefixes',
@@ -109,7 +124,7 @@ const BLOCKED_CONTAINER_LEAF_NAMES = new Set([
 ]);
 
 const PROTECTED_MAC_APP_BUNDLES_RE =
-  /^(?:steam|gog galaxy|epic games launcher|heroic|crossover|whisky|mythic|lutris|one launcher|safari|mail|messages|music|tv|photos|preview|finder|terminal|system settings|system preferences|activity monitor|app store|xcode|automator|console|disk utility|keychain access|migration assistant|screenshot|script editor|time machine)\.app$/i;
+  /^(?:steam|gog galaxy|epic games launcher|ea app|battle\.net|ubisoft connect|riot client|heroic|crossover|whisky|mythic|lutris|one launcher|safari|mail|messages|music|tv|photos|preview|finder|terminal|system settings|system preferences|activity monitor|app store|xcode|automator|console|disk utility|keychain access|migration assistant|screenshot|script editor|time machine)\.app$/i;
 
 const MULTI_GAME_CONTAINER_SENTINEL_FILES = [
   '.GamingRoot',
@@ -117,6 +132,10 @@ const MULTI_GAME_CONTAINER_SENTINEL_FILES = [
   'cxbottle.conf',
   'Steam.exe',
   'steam.dll',
+  'EADesktop.exe',
+  'EALauncher.exe',
+  'upc.exe',
+  'Battle.net.exe',
 ];
 
 /**

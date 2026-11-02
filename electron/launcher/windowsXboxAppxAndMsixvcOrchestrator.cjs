@@ -261,7 +261,11 @@ function findBestX86OrX64WindowsExe(rootDir, options = {}) {
           walk(fullPath, depth + 1);
         }
       } else if (ent.isFile() && ent.name.toLowerCase().endsWith('.exe')) {
-        if (ent.name.toLowerCase().endsWith('.olpart') || isExcludedExecutable(ent.name)) {
+        if (
+          ent.name.toLowerCase().endsWith('.olpart') ||
+          /^gdkstubgame\.exe$/i.test(ent.name) ||
+          isExcludedExecutable(ent.name)
+        ) {
           continue;
         }
         const pe = inspectWindowsExecutableHeader(fullPath, {
@@ -474,7 +478,12 @@ function collectXboxScanDirectories(/** @type {any} */ options = {}) {
 
   if (platform === 'darwin') {
     try {
-      const bottles = listAllInitializedBottlePaths({ platform, homedir });
+      const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
+      const bottles = listAllInitializedBottlePaths({
+        ...options,
+        platform,
+        ...explicitHomedirOpt,
+      });
       for (const bottlePath of bottles) {
         const bottleXbox = path.join(bottlePath, 'drive_c', 'XboxGames');
         if (fs.existsSync(bottleXbox)) {
@@ -591,16 +600,18 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
         : rawInstalledTitle;
 
     let executablePath = '';
+    const isGdkStubExeBasename = (/** @type {string} */ candidatePath) =>
+      /^gdkstubgame\.exe$/i.test(path.posix.basename(String(candidatePath || '').replace(/\\/g, '/')));
     /** @type {string[]} */
     const exeCandidates = [];
     const pushExeCandidateRel = (/** @type {string} */ baseDir, /** @type {string} */ relExe) => {
-      if (!baseDir || !relExe) return;
+      if (!baseDir || !relExe || isGdkStubExeBasename(relExe)) return;
       const normRel = String(relExe).replace(/\\/g, path.sep);
       const exact = path.join(baseDir, normRel);
       exeCandidates.push(exact);
       if (!fs.existsSync(exact)) {
         const ciResolved = resolveCaseInsensitiveRelFile(baseDir, normRel);
-        if (ciResolved) exeCandidates.push(ciResolved);
+        if (ciResolved && !isGdkStubExeBasename(ciResolved)) exeCandidates.push(ciResolved);
       }
     };
     if (gameCfg?.primaryExecutable) {
@@ -616,7 +627,10 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
     }
     if (receipt?.executableRelPath) {
       const relStr = String(receipt.executableRelPath);
-      if (!isExcludedExecutable(path.posix.basename(relStr.replace(/\\/g, '/')))) {
+      if (
+        !isGdkStubExeBasename(relStr) &&
+        !isExcludedExecutable(path.posix.basename(relStr.replace(/\\/g, '/')))
+      ) {
         pushExeCandidateRel(gameDir, relStr);
       }
     }
@@ -626,7 +640,12 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
     }
     let fallbackArm64Candidate = '';
     for (const cand of exeCandidates) {
-      if (cand && !cand.toLowerCase().endsWith('.olpart') && fs.existsSync(cand)) {
+      if (
+        cand &&
+        !isGdkStubExeBasename(cand) &&
+        !cand.toLowerCase().endsWith('.olpart') &&
+        fs.existsSync(cand)
+      ) {
         const pe = inspectWindowsExecutableHeader(cand, {
           strictPe: Boolean(options.strictPe),
         });
@@ -644,10 +663,12 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
         platform,
         hintName: title,
         preferWindowsExecutable: true,
+        readOnly: true,
       });
       if (
         fallbackDisc &&
         fallbackDisc.executablePath &&
+        !isGdkStubExeBasename(fallbackDisc.executablePath) &&
         !fallbackDisc.executablePath.toLowerCase().endsWith('.olpart') &&
         fs.existsSync(fallbackDisc.executablePath)
       ) {
@@ -669,10 +690,28 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
           platform,
         });
         executablePath = x64Alt || fallbackArm64Candidate;
+      } else {
+        const x64Alt = findBestX86OrX64WindowsExe(gameDir, {
+          strictPe: Boolean(options.strictPe),
+          platform,
+        });
+        if (x64Alt && !isGdkStubExeBasename(x64Alt)) {
+          executablePath = x64Alt;
+        }
       }
     }
 
-    if (!requiresCoreWindow) {
+    const hasStubExeOnDisk = Boolean(
+      resolveCaseInsensitiveRelFile(gameCfg?.contentRootDir || gameDir, 'GDKStubGame.exe') ||
+        resolveCaseInsensitiveRelFile(gameDir, 'GDKStubGame.exe')
+    );
+    const isExternalLauncherStub = Boolean(
+      gameCfg?.isExternalLauncherStub || (hasStubExeOnDisk && !executablePath)
+    );
+
+    if (isExternalLauncherStub && !executablePath) {
+      // Propagate stub metadata with primaryExecutablePath: null so callers never treat GDKStubGame.exe as playable
+    } else if (!requiresCoreWindow) {
       if (
         !executablePath ||
         !fs.existsSync(executablePath) ||
@@ -731,10 +770,12 @@ function inspectInstalledXboxGameDir(gameDir, /** @type {any} */ options = {}) {
       ...(version ? { version } : {}),
       title,
       installPath: gameDir,
+      primaryExecutablePath: executablePath || null,
       ...(executablePath ? { executablePath } : {}),
       ...(installSize ? { installSize } : {}),
       runner,
       isWindowsBinaryOnMac: platform === 'darwin',
+      ...(isExternalLauncherStub ? { isExternalLauncherStub: true } : {}),
       ...(isClientlessExtraction ? { isClientlessXboxInstall: true } : {}),
       ...(requiresCoreWindow ? { requiresCoreWindow: true } : {}),
     };

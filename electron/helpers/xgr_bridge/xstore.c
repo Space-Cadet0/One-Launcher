@@ -62,6 +62,31 @@ static const char *find_json_array(const char *json, const char *key)
     return (*p == '[') ? p : NULL;
 }
 
+static bool parse_json_float_field(const char *json, const char *key, float *out_val)
+{
+    if (!json || !key || !out_val) return false;
+    char pat[128];
+    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return false;
+    const char *cursor = json;
+    const char *p = NULL;
+    while ((p = strstr(cursor, pat)) != NULL) {
+        cursor = p + (size_t)plen;
+        const char *v = cursor;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v != ':') continue;
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v == '"') v++;
+        char *endp = NULL;
+        double val = strtod(v, &endp);
+        if (endp == v) continue;
+        *out_val = (float)val;
+        return true;
+    }
+    return false;
+}
+
 static const char *next_json_object_in_array(const char *cursor, char **out_obj_str)
 {
     if (!cursor || !out_obj_str) return NULL;
@@ -185,11 +210,25 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
         bool has_dl = true;
         xgr_json_get_bool(obj, "hasDigitalDownload", &has_dl);
 
+        float list_price = 0.0f;
+        float base_price = 0.0f;
+        bool on_sale = false;
+        parse_json_float_field(obj, "price", &list_price);
+        if (!parse_json_float_field(obj, "basePrice", &base_price)) {
+            base_price = list_price;
+        }
+        xgr_json_get_bool(obj, "isOnSale", &on_sale);
+
         op->sku.skuId = op->sku_id;
         op->sku.title = op->title;
         op->sku.description = op->description;
         op->sku.language = op->language;
+        op->sku.price.price = list_price;
+        op->sku.price.basePrice = base_price;
+        op->sku.price.isOnSale = on_sale;
         op->sku.price.currencyCode = op->currency;
+        xgr_json_get_string(obj, "formattedPrice", op->sku.price.formattedPrice, sizeof(op->sku.price.formattedPrice));
+        xgr_json_get_string(obj, "formattedBasePrice", op->sku.price.formattedBasePrice, sizeof(op->sku.price.formattedBasePrice));
         op->sku.isInUserCollection = in_coll;
         op->sku.collectionData.quantity = in_coll ? 1 : 0;
 
@@ -200,7 +239,7 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
         op->prod.inAppOfferToken = op->offer_token;
         op->prod.linkUri = op->link_uri;
         op->prod.productKind = (uint32_t)kind;
-        op->prod.price.currencyCode = op->currency;
+        op->prod.price = op->sku.price;
         op->prod.hasDigitalDownload = has_dl;
         op->prod.isInUserCollection = in_coll;
         op->prod.skusCount = 1;
@@ -487,6 +526,7 @@ struct store_str_ctx {
     char method[64];
     char *ticket;
     char *pub_uid;
+    char *raw_params_json;
     char *result_str;
     size_t result_size;
 };
@@ -499,14 +539,20 @@ static HRESULT CALLBACK store_str_provider(XAsyncOp op, const XAsyncProviderData
             return xgr_async_schedule(data->async, 0);
         case XAsyncOp_DoWork: {
             if (xgr_rpc_is_configured()) {
-                XgrStrBuf sb;
-                xgr_sb_init(&sb);
-                xgr_sb_append_cstr(&sb, "{\"serviceTicket\":");
-                xgr_sb_append_json_str(&sb, ctx->ticket ? ctx->ticket : "");
-                xgr_sb_append_cstr(&sb, ",\"publisherUserId\":");
-                xgr_sb_append_json_str(&sb, ctx->pub_uid ? ctx->pub_uid : "");
-                xgr_sb_append_char(&sb, '}');
-                char *params = xgr_sb_detach(&sb);
+                char *params = NULL;
+                if (ctx->raw_params_json) {
+                    params = ctx->raw_params_json;
+                    ctx->raw_params_json = NULL;
+                } else {
+                    XgrStrBuf sb;
+                    xgr_sb_init(&sb);
+                    xgr_sb_append_cstr(&sb, "{\"serviceTicket\":");
+                    xgr_sb_append_json_str(&sb, ctx->ticket ? ctx->ticket : "");
+                    xgr_sb_append_cstr(&sb, ",\"publisherUserId\":");
+                    xgr_sb_append_json_str(&sb, ctx->pub_uid ? ctx->pub_uid : "");
+                    xgr_sb_append_char(&sb, '}');
+                    params = xgr_sb_detach(&sb);
+                }
                 if (params) {
                     char *res = NULL;
                     if (SUCCEEDED(xgr_rpc_call(ctx->method, params, &res)) && res) {
@@ -530,6 +576,7 @@ static HRESULT CALLBACK store_str_provider(XAsyncOp op, const XAsyncProviderData
         case XAsyncOp_Cleanup:
             free(ctx->ticket);
             free(ctx->pub_uid);
+            free(ctx->raw_params_json);
             free(ctx->result_str);
             free(ctx);
             return S_OK;
@@ -899,13 +946,13 @@ static HRESULT WINAPI xs_XStoreGetUserCollectionsIdAsync(void *iface, const XSto
     return start_store_str_async("xstore.getCollectionsId", ticket, pubUid, (const void *)xs_XStoreGetUserCollectionsIdAsync, "XStoreGetUserCollectionsIdAsync", async);
 }
 
-static HRESULT WINAPI xs_XStoreGetUserCollectionsIdResultSize(void *iface, XAsyncBlock *async, SIZE_T *size)
+static HRESULT WINAPI xs_XStoreGetUserCollectionsIdResultSize(void *iface, XAsyncBlock *async, size_t *size)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result_size(async, size));
 }
 
-static HRESULT WINAPI xs_XStoreGetUserCollectionsIdResult(void *iface, XAsyncBlock *async, SIZE_T size, char *result)
+static HRESULT WINAPI xs_XStoreGetUserCollectionsIdResult(void *iface, XAsyncBlock *async, size_t size, char *result)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreGetUserCollectionsIdAsync, size, result, NULL));
@@ -917,31 +964,68 @@ static HRESULT WINAPI xs_XStoreGetUserPurchaseIdAsync(void *iface, const XStoreC
     return start_store_str_async("xstore.getPurchaseId", ticket, pubUid, (const void *)xs_XStoreGetUserPurchaseIdAsync, "XStoreGetUserPurchaseIdAsync", async);
 }
 
-static HRESULT WINAPI xs_XStoreGetUserPurchaseIdResultSize(void *iface, XAsyncBlock *async, SIZE_T *size)
+static HRESULT WINAPI xs_XStoreGetUserPurchaseIdResultSize(void *iface, XAsyncBlock *async, size_t *size)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result_size(async, size));
 }
 
-static HRESULT WINAPI xs_XStoreGetUserPurchaseIdResult(void *iface, XAsyncBlock *async, SIZE_T size, char *result)
+static HRESULT WINAPI xs_XStoreGetUserPurchaseIdResult(void *iface, XAsyncBlock *async, size_t size, char *result)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreGetUserPurchaseIdAsync, size, result, NULL));
 }
 
-static HRESULT WINAPI xs_XStoreQueryLicenseTokenAsync(void *iface, const XStoreContextHandle sc, const char **pids, SIZE_T cnt, const char *devStr, XAsyncBlock *async)
+static HRESULT WINAPI xs_XStoreQueryLicenseTokenAsync(void *iface, const XStoreContextHandle sc, const char **pids, size_t cnt, const char *devStr, XAsyncBlock *async)
 {
-    (void)iface; (void)sc; (void)pids; (void)cnt;
-    return start_store_str_async("xstore.getCollectionsId", "", devStr, (const void *)xs_XStoreQueryLicenseTokenAsync, "XStoreQueryLicenseTokenAsync", async);
+    (void)iface; (void)sc;
+    if (!async) return xgr_return_hr(E_INVALIDARG);
+    if (cnt > 0 && !pids) return xgr_return_hr(E_INVALIDARG);
+    if (cnt > 4096) return xgr_return_hr(E_INVALIDARG);
+
+    XgrStrBuf sb;
+    xgr_sb_init(&sb);
+    xgr_sb_append_cstr(&sb, "{\"productIds\":[");
+    for (size_t i = 0; i < cnt; i++) {
+        if (i > 0) xgr_sb_append_char(&sb, ',');
+        xgr_sb_append_json_str(&sb, pids[i] ? pids[i] : "");
+    }
+    xgr_sb_append_cstr(&sb, "],\"customDeveloperString\":");
+    xgr_sb_append_json_str(&sb, devStr ? devStr : "");
+    xgr_sb_append_char(&sb, '}');
+
+    char *raw_params = xgr_sb_detach(&sb);
+    if (!raw_params) return xgr_return_hr(E_OUTOFMEMORY);
+
+    struct store_str_ctx *ctx = (struct store_str_ctx *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        free(raw_params);
+        return xgr_return_hr(E_OUTOFMEMORY);
+    }
+    strcpy(ctx->method, "xstore.queryLicenseToken");
+    ctx->raw_params_json = raw_params;
+
+    HRESULT hr = xgr_async_begin(
+        async,
+        ctx,
+        (const void *)xs_XStoreQueryLicenseTokenAsync,
+        "XStoreQueryLicenseTokenAsync",
+        store_str_provider
+    );
+    if (FAILED(hr)) {
+        free(ctx->raw_params_json);
+        free(ctx);
+    }
+    return xgr_return_hr(hr);
 }
 
-static HRESULT WINAPI xs_XStoreQueryLicenseTokenResultSize(void *iface, XAsyncBlock *async, SIZE_T *size)
+static HRESULT WINAPI xs_XStoreQueryLicenseTokenResultSize(void *iface, XAsyncBlock *async, size_t *size)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result_size(async, size));
 }
 
-static HRESULT WINAPI xs_XStoreQueryLicenseTokenResult(void *iface, XAsyncBlock *async, SIZE_T size, char *result)
+static HRESULT WINAPI xs_XStoreQueryLicenseTokenResult(void *iface, XAsyncBlock *async, size_t size, char *result)
 {
     (void)iface;
     return xgr_return_hr(xgr_async_get_result(async, (const void *)xs_XStoreQueryLicenseTokenAsync, size, result, NULL));

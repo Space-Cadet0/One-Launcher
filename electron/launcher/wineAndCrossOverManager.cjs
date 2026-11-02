@@ -939,25 +939,17 @@ async function findFilesMatching(
   return matches;
 }
 
-/**
- * Resolves the bundled 64-bit PE `one_xgameruntime_bridge.dll` across dev, unpacked ASAR, and test overrides.
- * @param {Record<string, any>} [options]
- * @returns {string}
- */
-function resolveXboxBridgeDllPath(options = {}) {
-  const customOverride =
-    options?.xboxBridgeDllPath ||
-    options?.xboxRuntimeBridgeDllPath ||
-    process.env.ONE_LAUNCHER_XBOX_BRIDGE_DLL ||
-    '';
-  if (typeof customOverride === 'string' && customOverride.trim()) {
-    const custom = customOverride.trim();
-    if (fs.existsSync(custom)) return custom;
-  }
+function isX86BridgeArchOption(options) {
+  const raw = String(options?.arch || options?.processorArchitecture || '')
+    .trim()
+    .toLowerCase();
+  return raw === 'x86' || raw === 'i386' || raw === 'i686' || raw === 'win32';
+}
 
+function resolveBundledHelperBinCandidate(fileName) {
   const unpackedDir = __dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1');
   const candidates = [
-    path.join(unpackedDir, '..', 'helpers', 'bin', 'one_xgameruntime_bridge.dll'),
+    path.join(unpackedDir, '..', 'helpers', 'bin', fileName),
     process.resourcesPath
       ? path.join(
           process.resourcesPath,
@@ -965,13 +957,11 @@ function resolveXboxBridgeDllPath(options = {}) {
           'electron',
           'helpers',
           'bin',
-          'one_xgameruntime_bridge.dll'
+          fileName
         )
       : '',
-    process.resourcesPath
-      ? path.join(process.resourcesPath, 'helpers', 'bin', 'one_xgameruntime_bridge.dll')
-      : '',
-    path.join(__dirname, '..', 'helpers', 'bin', 'one_xgameruntime_bridge.dll'),
+    process.resourcesPath ? path.join(process.resourcesPath, 'helpers', 'bin', fileName) : '',
+    path.join(__dirname, '..', 'helpers', 'bin', fileName),
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -985,11 +975,82 @@ function resolveXboxBridgeDllPath(options = {}) {
 }
 
 /**
- * Resolves the bundled 64-bit PE `one_gameinput_bridge.dll` across dev, unpacked ASAR, and test overrides.
+ * Resolves the bundled 32-bit PE (`0x014c`) `one_xgameruntime_bridge_x86.dll` across dev, unpacked ASAR, and test overrides.
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function resolveXboxBridgeX86DllPath(options = {}) {
+  const customOverride =
+    options?.xboxBridgeX86DllPath ||
+    options?.xboxRuntimeBridgeX86DllPath ||
+    process.env.ONE_LAUNCHER_XBOX_BRIDGE_X86_DLL ||
+    (isX86BridgeArchOption(options)
+      ? options?.xboxBridgeDllPath || options?.xboxRuntimeBridgeDllPath || ''
+      : '');
+  if (typeof customOverride === 'string' && customOverride.trim()) {
+    const custom = customOverride.trim();
+    if (fs.existsSync(custom)) return custom;
+  }
+  return resolveBundledHelperBinCandidate('one_xgameruntime_bridge_x86.dll');
+}
+
+/**
+ * Resolves the bundled PE `one_xgameruntime_bridge.dll` (or `one_xgameruntime_bridge_x86.dll` when `options.arch === 'x86'`)
+ * across dev, unpacked ASAR, and test overrides.
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function resolveXboxBridgeDllPath(options = {}) {
+  if (isX86BridgeArchOption(options)) {
+    return resolveXboxBridgeX86DllPath(options);
+  }
+  const customOverride =
+    options?.xboxBridgeDllPath ||
+    options?.xboxRuntimeBridgeDllPath ||
+    process.env.ONE_LAUNCHER_XBOX_BRIDGE_DLL ||
+    '';
+  if (typeof customOverride === 'string' && customOverride.trim()) {
+    const custom = customOverride.trim();
+    if (fs.existsSync(custom)) return custom;
+  }
+
+  return resolveBundledHelperBinCandidate('one_xgameruntime_bridge.dll');
+}
+
+/**
+ * Resolves the bundled 32-bit PE (`0x014c`) `one_gameinput_bridge_x86.dll` across dev, unpacked ASAR, and test overrides.
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function resolveBundledGameInputBridgeX86DllPath(options = {}) {
+  const customOverride =
+    options?.gameInputBridgeX86DllPath ||
+    options?.xboxGameInputBridgeX86DllPath ||
+    options?.bundledGameInputX86DllPath ||
+    process.env.ONE_LAUNCHER_XBOX_GAMEINPUT_BRIDGE_X86_DLL ||
+    (isX86BridgeArchOption(options)
+      ? options?.gameInputBridgeDllPath ||
+        options?.xboxGameInputBridgeDllPath ||
+        options?.bundledGameInputDllPath ||
+        ''
+      : '');
+  if (typeof customOverride === 'string' && customOverride.trim()) {
+    const custom = customOverride.trim();
+    if (fs.existsSync(custom)) return custom;
+  }
+  return resolveBundledHelperBinCandidate('one_gameinput_bridge_x86.dll');
+}
+
+/**
+ * Resolves the bundled PE `one_gameinput_bridge.dll` (or `one_gameinput_bridge_x86.dll` when `options.arch === 'x86'`)
+ * across dev, unpacked ASAR, and test overrides.
  * @param {Record<string, any>} [options]
  * @returns {string}
  */
 function resolveBundledGameInputBridgeDllPath(options = {}) {
+  if (isX86BridgeArchOption(options)) {
+    return resolveBundledGameInputBridgeX86DllPath(options);
+  }
   const customOverride =
     options?.gameInputBridgeDllPath ||
     options?.xboxGameInputBridgeDllPath ||
@@ -1001,43 +1062,44 @@ function resolveBundledGameInputBridgeDllPath(options = {}) {
     if (fs.existsSync(custom)) return custom;
   }
 
-  const unpackedDir = __dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1');
-  const candidates = [
-    path.join(unpackedDir, '..', 'helpers', 'bin', 'one_gameinput_bridge.dll'),
-    process.resourcesPath
-      ? path.join(
-          process.resourcesPath,
-          'app.asar.unpacked',
-          'electron',
-          'helpers',
-          'bin',
-          'one_gameinput_bridge.dll'
-        )
-      : '',
-    process.resourcesPath
-      ? path.join(process.resourcesPath, 'helpers', 'bin', 'one_gameinput_bridge.dll')
-      : '',
-    path.join(__dirname, '..', 'helpers', 'bin', 'one_gameinput_bridge.dll'),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-        return candidate;
-      }
-    } catch {}
-  }
-  return '';
+  return resolveBundledHelperBinCandidate('one_gameinput_bridge.dll');
 }
 
 /**
- * Resolves the bundled 64-bit PE `one_appnotify_bridge.dll` (`api-ms-win-core-psm-appnotify-l1-1-0.dll`)
+ * Resolves the bundled 32-bit PE (`0x014c`) `one_appnotify_bridge_x86.dll` (`api-ms-win-core-psm-appnotify-l1-1-0.dll`)
+ * across env overrides, unpacked ASAR, and dev paths, returning `null` gracefully if absent.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string | null}
+ */
+function resolveBundledXboxAppNotifyBridgeX86DllPath(options = {}) {
+  const customOverride =
+    options?.xboxAppNotifyBridgeX86DllPath ||
+    options?.appNotifyBridgeX86DllPath ||
+    process.env.ONE_LAUNCHER_XBOX_APPNOTIFY_BRIDGE_X86_DLL ||
+    (isX86BridgeArchOption(options)
+      ? options?.xboxAppNotifyBridgeDllPath || options?.appNotifyBridgeDllPath || ''
+      : '');
+  if (typeof customOverride === 'string' && customOverride.trim()) {
+    const custom = customOverride.trim();
+    try {
+      if (fs.existsSync(custom) && fs.statSync(custom).isFile()) return custom;
+    } catch {}
+  }
+  return resolveBundledHelperBinCandidate('one_appnotify_bridge_x86.dll') || null;
+}
+
+/**
+ * Resolves the bundled PE `one_appnotify_bridge.dll` (or `one_appnotify_bridge_x86.dll` when `options.arch === 'x86'`)
  * across env overrides, unpacked ASAR, and dev paths, returning `null` gracefully if absent.
  *
  * @param {Record<string, any>} [options]
  * @returns {string | null}
  */
 function resolveBundledXboxAppNotifyBridgeDllPath(options = {}) {
+  if (isX86BridgeArchOption(options)) {
+    return resolveBundledXboxAppNotifyBridgeX86DllPath(options);
+  }
   const customOverride =
     options?.xboxAppNotifyBridgeDllPath ||
     options?.appNotifyBridgeDllPath ||
@@ -1050,43 +1112,44 @@ function resolveBundledXboxAppNotifyBridgeDllPath(options = {}) {
     } catch {}
   }
 
-  const unpackedDir = __dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1');
-  const candidates = [
-    path.join(unpackedDir, '..', 'helpers', 'bin', 'one_appnotify_bridge.dll'),
-    process.resourcesPath
-      ? path.join(
-          process.resourcesPath,
-          'app.asar.unpacked',
-          'electron',
-          'helpers',
-          'bin',
-          'one_appnotify_bridge.dll'
-        )
-      : '',
-    process.resourcesPath
-      ? path.join(process.resourcesPath, 'helpers', 'bin', 'one_appnotify_bridge.dll')
-      : '',
-    path.join(__dirname, '..', 'helpers', 'bin', 'one_appnotify_bridge.dll'),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-        return candidate;
-      }
-    } catch {}
-  }
-  return null;
+  return resolveBundledHelperBinCandidate('one_appnotify_bridge.dll') || null;
 }
 
 /**
- * Resolves the bundled 64-bit PE `one_xgr_win_launcher.exe` helper for clientless Windows GDK
- * launches (`LOAD_LIBRARY_SEARCH_SYSTEM32` preloader), returning `null` gracefully if absent.
+ * Resolves the bundled 32-bit PE (`0x014c`) `one_xgr_win_launcher_x86.exe` helper for clientless
+ * 32-bit Windows GDK launches, returning `null` gracefully if absent.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string | null}
+ */
+function resolveBundledXboxWinLauncherX86ExePath(options = {}) {
+  const customOverride =
+    options?.xboxWinLauncherX86ExePath ||
+    options?.winLauncherX86ExePath ||
+    process.env.ONE_LAUNCHER_XBOX_WIN_LAUNCHER_X86_EXE ||
+    (isX86BridgeArchOption(options)
+      ? options?.xboxWinLauncherExePath || options?.winLauncherExePath || ''
+      : '');
+  if (typeof customOverride === 'string' && customOverride.trim()) {
+    const custom = customOverride.trim();
+    try {
+      if (fs.existsSync(custom) && fs.statSync(custom).isFile()) return custom;
+    } catch {}
+  }
+  return resolveBundledHelperBinCandidate('one_xgr_win_launcher_x86.exe') || null;
+}
+
+/**
+ * Resolves the bundled PE `one_xgr_win_launcher.exe` (or `one_xgr_win_launcher_x86.exe` when `options.arch === 'x86'`)
+ * helper for clientless Windows GDK launches (`LOAD_LIBRARY_SEARCH_SYSTEM32` preloader), returning `null` gracefully if absent.
  *
  * @param {Record<string, any>} [options]
  * @returns {string | null}
  */
 function resolveBundledXboxWinLauncherExePath(options = {}) {
+  if (isX86BridgeArchOption(options)) {
+    return resolveBundledXboxWinLauncherX86ExePath(options);
+  }
   const customOverride =
     options?.xboxWinLauncherExePath ||
     options?.winLauncherExePath ||
@@ -1099,33 +1162,32 @@ function resolveBundledXboxWinLauncherExePath(options = {}) {
     } catch {}
   }
 
-  const unpackedDir = __dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1');
-  const candidates = [
-    path.join(unpackedDir, '..', 'helpers', 'bin', 'one_xgr_win_launcher.exe'),
-    process.resourcesPath
-      ? path.join(
-          process.resourcesPath,
-          'app.asar.unpacked',
-          'electron',
-          'helpers',
-          'bin',
-          'one_xgr_win_launcher.exe'
-        )
-      : '',
-    process.resourcesPath
-      ? path.join(process.resourcesPath, 'helpers', 'bin', 'one_xgr_win_launcher.exe')
-      : '',
-    path.join(__dirname, '..', 'helpers', 'bin', 'one_xgr_win_launcher.exe'),
-  ].filter(Boolean);
+  return resolveBundledHelperBinCandidate('one_xgr_win_launcher.exe') || null;
+}
 
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-        return candidate;
-      }
-    } catch {}
+/**
+ * Atomically upserts multiple keys inside `<bottleDir>/user.reg` in a single read/write pass
+ * and a single coalesced live `reg.exe import` (or pushes into `options.liveSyncAccumulator`).
+ *
+ * @param {string} bottleDir
+ * @param {Array<{ subKeyPath: string, entries: Array<[string, any]> | Record<string, any> }>} keySpecs
+ * @param {Record<string, any>} [options]
+ */
+function upsertWineUserRegKeysBatch(bottleDir, keySpecs, options = {}) {
+  const regFilePath =
+    typeof options.regFilePath === 'string' && options.regFilePath
+      ? options.regFilePath
+      : bottleDir
+        ? path.join(bottleDir, 'user.reg')
+        : '';
+  if (!regFilePath || !Array.isArray(keySpecs) || keySpecs.length === 0) {
+    return { updated: false, regFilePath: '' };
   }
-  return null;
+  const { upsertWineSystemRegKeysBatch } = require('./firstPartyRegistration.cjs');
+  return upsertWineSystemRegKeysBatch(bottleDir, keySpecs, {
+    ...options,
+    regFilePath,
+  });
 }
 
 /**
@@ -1136,56 +1198,208 @@ function resolveBundledXboxWinLauncherExePath(options = {}) {
  * @param {Record<string, any>} [options]
  */
 function upsertWineUserRegKey(bottleDir, keyPath, valuesObj, options = {}) {
-  const regFilePath =
-    typeof options.regFilePath === 'string' && options.regFilePath
-      ? options.regFilePath
-      : bottleDir
-        ? path.join(bottleDir, 'user.reg')
-        : '';
-  if (!regFilePath || !keyPath) {
+  if (!keyPath) {
     return { updated: false, regFilePath: '' };
   }
-  let hasNonEmptyHeader = false;
-  if (fs.existsSync(regFilePath)) {
-    try {
-      hasNonEmptyHeader = Boolean(fs.readFileSync(regFilePath, 'utf8').trim());
-    } catch {
-      hasNonEmptyHeader = false;
-    }
-  }
-  if (!hasNonEmptyHeader) {
-    fs.mkdirSync(path.dirname(regFilePath), { recursive: true });
-    fs.writeFileSync(
-      regFilePath,
-      'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n',
-      'utf8'
-    );
-  }
-  const { upsertWineSystemRegKey } = require('./firstPartyRegistration.cjs');
-  return upsertWineSystemRegKey(bottleDir, keyPath, valuesObj, {
-    ...options,
-    regFilePath,
-  });
+  return upsertWineUserRegKeysBatch(bottleDir, [{ subKeyPath: keyPath, entries: valuesObj }], options);
 }
 
 /**
- * Enforces Apple Rosetta AVX environment variable semantics:
- * Rosetta checks `getenv("ROSETTA_ADVERTISE_AVX") != NULL`, so `'0'` MUST NEVER be set;
- * when disabled, the variable is strictly deleted from `env`.
+ * Detects whether a Wine invocation targets CrossOver's Perl `bin/wine` wrapper
+ * (as opposed to a direct `wineloader`/`wine64` Mach-O binary).
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {boolean}
+ */
+function isCrossOverPerlWineWrapperOptions(options = {}) {
+  if (!options || typeof options !== 'object') return false;
+  if (typeof options.isCrossOverWrapper === 'boolean') {
+    return options.isCrossOverWrapper;
+  }
+  const binPath = String(
+    options.wineBinaryPath || options.binaryPath || options.compatLayer?.binaryPath || ''
+  ).trim();
+  if (binPath) {
+    if (/\/(?:wineloader(?:64|2)?|wine64|wine-preloader)$/i.test(binPath)) {
+      return false;
+    }
+    if (
+      /\/CrossOver[^/]*\/bin\/wine$/i.test(binPath) ||
+      (/\/bin\/wine$/i.test(binPath) && /crossover/i.test(binPath))
+    ) {
+      return true;
+    }
+  }
+  const layerType = String(
+    options.layerType || options.compatLayer?.type || ''
+  )
+    .trim()
+    .toLowerCase();
+  if (layerType === 'crossover' || layerType === 'crossover_preview') {
+    return !binPath || /\/bin\/wine$/i.test(binPath);
+  }
+  return false;
+}
+
+/**
+ * Derives CrossOver's `Contents/SharedSupport/CrossOver` (`CX_ROOT`) directory from a CrossOver
+ * `wine` / `wineloader` / `cxbottle` binary path or compatibility-layer descriptor.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function deriveCrossOverRootPath(options = {}) {
+  if (!options || typeof options !== 'object') return '';
+  if (typeof options.cxRoot === 'string' && options.cxRoot.trim()) {
+    return options.cxRoot.trim().replace(/\/+$/, '');
+  }
+  const binPath = String(
+    options.wineBinaryPath || options.binaryPath || options.compatLayer?.binaryPath || ''
+  ).trim();
+  if (binPath) {
+    const normalized = binPath.replace(/\\/g, '/');
+    const sharedSupportMatch = normalized.match(
+      /^(.*?\/Contents\/SharedSupport\/CrossOver)(?:\/|$)/i
+    );
+    if (sharedSupportMatch && sharedSupportMatch[1]) {
+      return sharedSupportMatch[1];
+    }
+    const appBundleMatch = normalized.match(/^(.*?\/CrossOver[^/]*\.app)(?:\/|$)/i);
+    if (appBundleMatch && appBundleMatch[1]) {
+      return `${appBundleMatch[1]}/Contents/SharedSupport/CrossOver`;
+    }
+    const directBinMatch = normalized.match(
+      /^(.*?\/CrossOver)\/bin\/(?:wine(?:64)?|wineloader(?:64|2)?|wineserver(?:64)?|cxbottle)$/i
+    );
+    if (directBinMatch && directBinMatch[1]) {
+      return directBinMatch[1];
+    }
+  }
+  const layerType = String(options.layerType || options.compatLayer?.type || '')
+    .trim()
+    .toLowerCase();
+  if (layerType === 'crossover' || layerType === 'crossover_preview') {
+    const home = String(options.homedir || os.homedir() || '').trim();
+    const appNames =
+      layerType === 'crossover_preview'
+        ? ['CrossOver Preview.app', 'CrossOver.app']
+        : ['CrossOver.app', 'CrossOver Preview.app'];
+    const roots = [
+      typeof options.customApplicationsDir === 'string' ? options.customApplicationsDir.trim() : '',
+      '/Applications',
+      home ? path.join(home, 'Applications') : '',
+    ].filter(Boolean);
+    for (const rootDir of roots) {
+      for (const appName of appNames) {
+        const cand = path.join(rootDir, appName, 'Contents', 'SharedSupport', 'CrossOver');
+        try {
+          if (fs.existsSync(cand)) return cand;
+        } catch {}
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Ensures CrossOver 26.x environment hygiene on `darwin` whenever targeting a CrossOver
+ * `wineloader` / `wine` binary: populates `CX_ROOT`, `CX_HOME` (`$HOME/Library/Application Support/CrossOver`),
+ * and `DOTNET_EnableWriteXorExecute='0'` if not already set so `cxcompatdb.so` rules activate reliably.
+ *
+ * @param {Record<string, any>} [env]
+ * @param {Record<string, any>} [options]
+ */
+function applyCrossOverEnvironmentHygiene(env = {}, options = {}) {
+  if (!env || typeof env !== 'object') return env;
+  const platform = String(options?.platform || process.platform).trim() || process.platform;
+  if (platform !== 'darwin') return env;
+
+  const binPath = String(
+    options?.wineBinaryPath || options?.binaryPath || options?.compatLayer?.binaryPath || ''
+  ).trim();
+  const layerType = String(options?.layerType || options?.compatLayer?.type || '')
+    .trim()
+    .toLowerCase();
+  const cxRoot = deriveCrossOverRootPath(options);
+  const isCrossOverTarget =
+    Boolean(cxRoot) ||
+    layerType === 'crossover' ||
+    layerType === 'crossover_preview' ||
+    isCrossOverPerlWineWrapperOptions(options) ||
+    /crossover/i.test(binPath);
+  if (!isCrossOverTarget) return env;
+
+  if (!env.CX_ROOT && cxRoot) {
+    env.CX_ROOT = cxRoot;
+  }
+  if (!env.CX_HOME) {
+    const home = String(options?.homedir || env.HOME || os.homedir() || '').trim();
+    if (home) {
+      env.CX_HOME = path.join(home, 'Library', 'Application Support', 'CrossOver');
+    }
+  }
+  if (env.DOTNET_EnableWriteXorExecute === undefined || env.DOTNET_EnableWriteXorExecute === '') {
+    env.DOTNET_EnableWriteXorExecute = '0';
+  }
+  return env;
+}
+
+/**
+ * Strips any global `"CX_GRAPHICS_BACKEND" = "wined3d"` entry from `<bottlePath>/cxbottle.conf`
+ * during bottle provisioning so bottles never default globally to software/OpenGL WineD3D.
+ *
+ * @param {string} bottlePath
+ * @returns {boolean}
+ */
+function sanitizeProvisionedBottleGraphicsBackend(bottlePath) {
+  if (!bottlePath || typeof bottlePath !== 'string' || !bottlePath.trim()) return false;
+  const confPath = path.join(bottlePath.trim(), 'cxbottle.conf');
+  try {
+    if (!fs.existsSync(confPath)) return false;
+    const raw = fs.readFileSync(confPath, 'utf8');
+    const globalWineD3dRe = /^[ \t]*"CX_GRAPHICS_BACKEND"[ \t]*=[ \t]*"wined3d"[ \t]*\r?\n?/gim;
+    if (!globalWineD3dRe.test(raw)) return false;
+    const cleaned = raw.replace(
+      /^[ \t]*"CX_GRAPHICS_BACKEND"[ \t]*=[ \t]*"wined3d"[ \t]*\r?\n?/gim,
+      ''
+    );
+    if (cleaned === raw) return false;
+    const tmpPath = `${confPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpPath, cleaned, 'utf8');
+    fs.renameSync(tmpPath, confPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Enforces Apple Rosetta AVX environment variable semantics across both raw `wine64`/`wineloader`
+ * and CrossOver's Perl `bin/wine` wrapper:
+ * - Raw `wine64`/`wineloader`: Rosetta checks `getenv("ROSETTA_ADVERTISE_AVX") != NULL`, so when
+ *   disabled (`advertiseAvx === false`) the variable must be deleted from `env`.
+ * - CrossOver Perl `bin/wine` (`bin/wine:726-738`): defaults missing `ROSETTA_ADVERTISE_AVX` to `'1'`,
+ *   and only deletes `$ENV{ROSETTA_ADVERTISE_AVX}` before `exec(wineloader)` when set to `'0'`.
+ *
  * @param {Record<string, any>} [env]
  * @param {boolean|string|number} [advertiseAvx]
+ * @param {{ isCrossOverWrapper?: boolean, wineBinaryPath?: string, binaryPath?: string, layerType?: string, compatLayer?: any, platform?: string, homedir?: string, cxRoot?: string }} [options]
  */
-function applyStrictRosettaAvxEnv(env = {}, advertiseAvx = undefined) {
+function applyStrictRosettaAvxEnv(env = {}, advertiseAvx = undefined, options = {}) {
   if (!env || typeof env !== 'object') return env;
+  applyCrossOverEnvironmentHygiene(env, options);
+  const isCrossOverWrapper = isCrossOverPerlWineWrapperOptions(options);
   if (advertiseAvx === true || advertiseAvx === '1' || advertiseAvx === 1) {
     env.ROSETTA_ADVERTISE_AVX = '1';
-  } else if (
-    advertiseAvx === false ||
-    advertiseAvx === '0' ||
-    advertiseAvx === 0 ||
-    env.ROSETTA_ADVERTISE_AVX === '0' ||
-    env.ROSETTA_ADVERTISE_AVX === ''
-  ) {
+  } else if (advertiseAvx === false || advertiseAvx === '0' || advertiseAvx === 0) {
+    if (isCrossOverWrapper) {
+      env.ROSETTA_ADVERTISE_AVX = '0';
+    } else {
+      delete env.ROSETTA_ADVERTISE_AVX;
+    }
+  } else if (!isCrossOverWrapper && (env.ROSETTA_ADVERTISE_AVX === '0' || env.ROSETTA_ADVERTISE_AVX === '')) {
+    delete env.ROSETTA_ADVERTISE_AVX;
+  } else if (isCrossOverWrapper && env.ROSETTA_ADVERTISE_AVX === '') {
     delete env.ROSETTA_ADVERTISE_AVX;
   }
   return env;
@@ -1246,10 +1460,16 @@ async function readVerifiedBridgeDllBuffer(dllPath, options = {}) {
   try {
     const buf = await fs.promises.readFile(dllPath);
     const actualHash = sha256Buffer(buf).toLowerCase();
-    const sidecarPath = `${dllPath}.sha256`;
+    const directSidecar = `${dllPath}.sha256`;
+    const stemSidecar = dllPath.replace(/\.(?:dll|exe)$/i, '.sha256');
+    const sidecarPath = fs.existsSync(directSidecar)
+      ? directSidecar
+      : stemSidecar !== dllPath && fs.existsSync(stemSidecar)
+        ? stemSidecar
+        : '';
     let sidecarVerified = false;
     try {
-      if (fs.existsSync(sidecarPath)) {
+      if (sidecarPath) {
         const rawSidecar = await fs.promises.readFile(sidecarPath, 'utf8');
         const m = String(rawSidecar || '').trim().match(/^([0-9a-fA-F]{64})\b/);
         if (m && m[1]) {
@@ -1274,6 +1494,464 @@ async function readVerifiedBridgeDllBuffer(dllPath, options = {}) {
     diagLog.warn('wine.readBridgeDllFailed', err, { dllPath });
     return { buf: null, sha256: '', sidecarVerified: false };
   }
+}
+
+const XBOX_GDK_IMPORT_DLL_NAMES = new Set([
+  'xgameruntime.dll',
+  'xgameruntime.thunks.dll',
+  'xgamingruntimethunks.dll',
+  'gameinput.dll',
+  'gameinputredist.dll',
+  'xcurl.dll',
+  'partywin.dll',
+  'partywin7.dll',
+  'partyxboxlive.dll',
+]);
+
+function isXboxGdkDllName(dllName) {
+  const lower = String(dllName || '').trim().toLowerCase();
+  if (!lower) return false;
+  if (XBOX_GDK_IMPORT_DLL_NAMES.has(lower)) return true;
+  if (lower.startsWith('microsoft.xbox.services')) return true;
+  if (lower.startsWith('libhttpclient')) return true;
+  if (lower.startsWith('xsapi')) return true;
+  return false;
+}
+
+/**
+ * Bounded Win32 PE32 (`0x010b`) / PE32+ (`0x020b`) header & import-table inspector.
+ * Uses slice reads via `fs.openSync` / `fs.readSync` so multi-hundred-MB game binaries are never
+ * loaded into memory.
+ *
+ * @param {string | Buffer} filePathOrBuf
+ * @param {{ skipRdataStringScan?: boolean }} [options]
+ * @returns {{
+ *   validPe: boolean,
+ *   rawMachine: number,
+ *   machine: 'x86' | 'x64' | 'arm64' | '',
+ *   importedDlls: string[],
+ *   referencesXgrApi: boolean
+ * }}
+ */
+function inspectPeBinaryImportsSync(filePathOrBuf, options = {}) {
+  const emptyResult = {
+    validPe: false,
+    rawMachine: 0,
+    machine: /** @type {'x86' | 'x64' | 'arm64' | ''} */ (''),
+    importedDlls: /** @type {string[]} */ ([]),
+    referencesXgrApi: false,
+  };
+  if (!filePathOrBuf) return emptyResult;
+
+  /** @type {number | null} */
+  let fd = null;
+  let totalSize = 0;
+  /** @type {Buffer | null} */
+  let inMemBuf = null;
+  /** @type {Buffer} */
+  let headWindow = Buffer.alloc(0);
+
+  try {
+    if (Buffer.isBuffer(filePathOrBuf)) {
+      inMemBuf = filePathOrBuf;
+      totalSize = inMemBuf.length;
+      if (totalSize < 96) return emptyResult;
+      headWindow = inMemBuf.subarray(0, Math.min(totalSize, 65536));
+    } else if (typeof filePathOrBuf === 'string' && filePathOrBuf.trim()) {
+      fd = fs.openSync(filePathOrBuf.trim(), 'r');
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size < 96) return emptyResult;
+      totalSize = st.size;
+      const headLen = Math.min(totalSize, 65536);
+      headWindow = Buffer.allocUnsafe(headLen);
+      const bytesRead = fs.readSync(fd, headWindow, 0, headLen, 0);
+      if (bytesRead < 96) return emptyResult;
+      if (bytesRead < headLen) headWindow = headWindow.subarray(0, bytesRead);
+    } else {
+      return emptyResult;
+    }
+
+    const readSlice = (/** @type {number} */ offset, /** @type {number} */ length) => {
+      if (!Number.isFinite(offset) || offset < 0 || length <= 0 || offset >= totalSize) {
+        return null;
+      }
+      const clampedLen = Math.min(length, totalSize - offset);
+      if (clampedLen <= 0) return null;
+      if (inMemBuf) {
+        return inMemBuf.subarray(offset, offset + clampedLen);
+      }
+      if (offset + clampedLen <= headWindow.length) {
+        return headWindow.subarray(offset, offset + clampedLen);
+      }
+      if (fd === null) return null;
+      const slice = Buffer.allocUnsafe(clampedLen);
+      const got = fs.readSync(fd, slice, 0, clampedLen, offset);
+      return got > 0 ? slice.subarray(0, got) : null;
+    };
+
+    if (headWindow.readUInt16LE(0) !== 0x5a4d) return emptyResult;
+    const eLfanew = headWindow.readUInt32LE(0x3c);
+    if (eLfanew < 0x40 || eLfanew + 24 > totalSize) return emptyResult;
+
+    const peHdr = readSlice(eLfanew, 4096);
+    if (!peHdr || peHdr.length < 24 || peHdr.readUInt32LE(0) !== 0x00004550) {
+      return emptyResult;
+    }
+
+    const rawMachine = peHdr.readUInt16LE(4);
+    /** @type {'x86' | 'x64' | 'arm64' | ''} */
+    const machine =
+      rawMachine === 0x014c
+        ? 'x86'
+        : rawMachine === 0x8664
+          ? 'x64'
+          : rawMachine === 0xaa64
+            ? 'arm64'
+            : '';
+    const numSections = Math.min(peHdr.readUInt16LE(6), 96);
+    const sizeOfOptionalHeader = peHdr.readUInt16LE(20);
+    if (sizeOfOptionalHeader < 96) {
+      return {
+        validPe: true,
+        rawMachine,
+        machine,
+        importedDlls: [],
+        referencesXgrApi: false,
+      };
+    }
+
+    const optAndSecLen = 24 + sizeOfOptionalHeader + numSections * 40;
+    const fullPeHdr = peHdr.length >= optAndSecLen ? peHdr : readSlice(eLfanew, optAndSecLen);
+    if (!fullPeHdr || fullPeHdr.length < 24 + sizeOfOptionalHeader) {
+      return {
+        validPe: true,
+        rawMachine,
+        machine,
+        importedDlls: [],
+        referencesXgrApi: false,
+      };
+    }
+
+    const optOffset = 24;
+    const magic = fullPeHdr.readUInt16LE(optOffset);
+    let numRvaOffset = 0;
+    let dataDirOffset = 0;
+    if (magic === 0x010b) {
+      numRvaOffset = optOffset + 92;
+      dataDirOffset = optOffset + 96;
+    } else if (magic === 0x020b) {
+      numRvaOffset = optOffset + 108;
+      dataDirOffset = optOffset + 112;
+    } else {
+      return {
+        validPe: true,
+        rawMachine,
+        machine,
+        importedDlls: [],
+        referencesXgrApi: false,
+      };
+    }
+
+    if (numRvaOffset + 4 > optOffset + sizeOfOptionalHeader) {
+      return {
+        validPe: true,
+        rawMachine,
+        machine,
+        importedDlls: [],
+        referencesXgrApi: false,
+      };
+    }
+    const numberOfRvaAndSizes = Math.min(fullPeHdr.readUInt32LE(numRvaOffset), 32);
+
+    const secTableOffset = optOffset + sizeOfOptionalHeader;
+    /** @type {Array<{ name: string, virtualSize: number, virtualAddress: number, sizeOfRawData: number, pointerToRawData: number }>} */
+    const sections = [];
+    for (let i = 0; i < numSections; i++) {
+      const sOff = secTableOffset + i * 40;
+      if (sOff + 40 > fullPeHdr.length) break;
+      const rawName = fullPeHdr.subarray(sOff, sOff + 8);
+      const nulIdx = rawName.indexOf(0);
+      const secName = rawName.subarray(0, nulIdx >= 0 ? nulIdx : 8).toString('ascii');
+      sections.push({
+        name: secName,
+        virtualSize: fullPeHdr.readUInt32LE(sOff + 8),
+        virtualAddress: fullPeHdr.readUInt32LE(sOff + 12),
+        sizeOfRawData: fullPeHdr.readUInt32LE(sOff + 16),
+        pointerToRawData: fullPeHdr.readUInt32LE(sOff + 20),
+      });
+    }
+
+    const headerSpan = eLfanew + secTableOffset + sections.length * 40;
+    const rvaToRaw = (/** @type {number} */ rva) => {
+      if (!rva || rva < 0) return null;
+      for (const sec of sections) {
+        const span = Math.max(sec.virtualSize, sec.sizeOfRawData);
+        if (span > 0 && rva >= sec.virtualAddress && rva < sec.virtualAddress + span) {
+          const delta = rva - sec.virtualAddress;
+          if (sec.sizeOfRawData > 0 && delta >= sec.sizeOfRawData) return null;
+          const raw = sec.pointerToRawData + delta;
+          return raw >= 0 && raw < totalSize ? raw : null;
+        }
+      }
+      if (rva > 0 && rva < headerSpan && rva < totalSize) {
+        return rva;
+      }
+      return null;
+    };
+
+    const readAsciiCStringAtRva = (/** @type {number} */ rva) => {
+      const rawOff = rvaToRaw(rva);
+      if (rawOff === null) return '';
+      const nameBuf = readSlice(rawOff, 260);
+      if (!nameBuf || nameBuf.length === 0) return '';
+      let end = 0;
+      while (end < nameBuf.length && nameBuf[end] !== 0) {
+        const b = nameBuf[end];
+        if (b < 0x20 || b > 0x7e) return '';
+        end += 1;
+      }
+      if (end === 0 || end >= 260) return '';
+      return nameBuf.subarray(0, end).toString('ascii');
+    };
+
+    const importedSet = new Set();
+
+    // Standard Import Directory (DataDirectory[1])
+    if (
+      numberOfRvaAndSizes >= 2 &&
+      dataDirOffset + 16 <= optOffset + sizeOfOptionalHeader
+    ) {
+      const importRva = fullPeHdr.readUInt32LE(dataDirOffset + 8);
+      if (importRva > 0) {
+        for (let idx = 0; idx < 512; idx++) {
+          const descRaw = rvaToRaw(importRva + idx * 20);
+          if (descRaw === null) break;
+          const descBuf = readSlice(descRaw, 20);
+          if (!descBuf || descBuf.length < 20) break;
+          const origFirstThunk = descBuf.readUInt32LE(0);
+          const nameRva = descBuf.readUInt32LE(12);
+          const firstThunk = descBuf.readUInt32LE(16);
+          if (origFirstThunk === 0 && nameRva === 0 && firstThunk === 0) break;
+          if (nameRva > 0) {
+            const dllName = readAsciiCStringAtRva(nameRva).trim().toLowerCase();
+            if (dllName) importedSet.add(dllName);
+          }
+        }
+      }
+    }
+
+    // Delay-Load Import Directory (DataDirectory[13])
+    if (
+      numberOfRvaAndSizes >= 14 &&
+      dataDirOffset + 14 * 8 <= optOffset + sizeOfOptionalHeader
+    ) {
+      const delayRva = fullPeHdr.readUInt32LE(dataDirOffset + 13 * 8);
+      if (delayRva > 0) {
+        for (let idx = 0; idx < 256; idx++) {
+          const descRaw = rvaToRaw(delayRva + idx * 32);
+          if (descRaw === null) break;
+          const descBuf = readSlice(descRaw, 32);
+          if (!descBuf || descBuf.length < 32) break;
+          const attrs = descBuf.readUInt32LE(0);
+          const dllNameRva = descBuf.readUInt32LE(4);
+          const modHandleRva = descBuf.readUInt32LE(8);
+          if (attrs === 0 && dllNameRva === 0 && modHandleRva === 0) break;
+          if ((attrs & 1) !== 0 && dllNameRva > 0) {
+            const dllName = readAsciiCStringAtRva(dllNameRva).trim().toLowerCase();
+            if (dllName) importedSet.add(dllName);
+          }
+        }
+      }
+    }
+
+    const importedDlls = Array.from(importedSet);
+    let referencesXgrApi = importedDlls.some((name) => isXboxGdkDllName(name));
+
+    // Statically linked xgameruntime.lib resolves Xgameruntime.dll via LoadLibraryExW +
+    // GetProcAddress(..., "InitializeApiImpl") without listing xgameruntime.dll in imports.
+    if (!referencesXgrApi && options.skipRdataStringScan !== true && sections.length > 0) {
+      const needle = Buffer.from('InitializeApiImpl', 'ascii');
+      let remainingBudget = 8 * 1024 * 1024;
+      const rdataCandidates = sections.filter(
+        (s) => s.sizeOfRawData > 0 && (s.name.startsWith('.rdata') || s.name === '.rodata')
+      );
+      const scanSections = rdataCandidates.length > 0 ? rdataCandidates : sections.slice(0, 4);
+      for (const sec of scanSections) {
+        if (remainingBudget <= 0 || referencesXgrApi) break;
+        const secBytes = Math.min(sec.sizeOfRawData, remainingBudget);
+        let pos = 0;
+        const chunkLen = 256 * 1024;
+        while (pos < secBytes) {
+          const toRead = Math.min(chunkLen, secBytes - pos);
+          const chunk = readSlice(sec.pointerToRawData + pos, toRead);
+          if (!chunk || chunk.length < needle.length) break;
+          if (chunk.includes(needle)) {
+            referencesXgrApi = true;
+            break;
+          }
+          if (pos + toRead >= secBytes) break;
+          pos += Math.max(1, toRead - needle.length);
+        }
+        remainingBudget -= secBytes;
+      }
+    }
+
+    return {
+      validPe: true,
+      rawMachine,
+      machine,
+      importedDlls,
+      referencesXgrApi,
+    };
+  } catch {
+    return emptyResult;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Resolves a child game executable referenced by `launcher_settings.cfg` (`BinaryPath=...`, `LocalePath=...`)
+ * located alongside `executablePath` or inside `installDir`.
+ *
+ * @param {string} [executablePath]
+ * @param {string} [installDir]
+ * @returns {string}
+ */
+function resolveLauncherSettingsChildExecutable(executablePath = '', installDir = '') {
+  const exeDir =
+    typeof executablePath === 'string' && executablePath.trim()
+      ? path.dirname(path.resolve(executablePath.trim()))
+      : '';
+  const resolvedInstall =
+    typeof installDir === 'string' && installDir.trim() ? path.resolve(installDir.trim()) : '';
+
+  const searchDirs = Array.from(new Set([exeDir, resolvedInstall].filter(Boolean)));
+  if (searchDirs.length === 0) return '';
+
+  let cfgPath = '';
+  let cfgDir = '';
+  for (const dir of searchDirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const entries = fs.readdirSync(dir);
+      const match = entries.find((n) => n.toLowerCase() === 'launcher_settings.cfg');
+      if (match) {
+        const full = path.join(dir, match);
+        if (fs.statSync(full).isFile()) {
+          cfgPath = full;
+          cfgDir = dir;
+          break;
+        }
+      }
+    } catch {}
+  }
+  if (!cfgPath) return '';
+
+  let rawText = '';
+  try {
+    rawText = fs.readFileSync(cfgPath, 'utf8');
+  } catch {
+    return '';
+  }
+  if (!rawText.trim()) return '';
+
+  let rawBinaryPath = '';
+  let rawLocalePath = '';
+  const trimmed = rawText.replace(/^\uFEFF/, '').trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsedJson = JSON.parse(trimmed);
+      rawBinaryPath = String(parsedJson?.BinaryPath || parsedJson?.binaryPath || '').trim();
+      rawLocalePath = String(parsedJson?.LocalePath || parsedJson?.localePath || '').trim();
+    } catch {}
+  }
+  if (!rawBinaryPath) {
+    for (const line of trimmed.split(/\r?\n/)) {
+      const cleanLine = line.trim();
+      if (!cleanLine || cleanLine.startsWith('#') || cleanLine.startsWith(';')) continue;
+      const eqIdx = cleanLine.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const key = cleanLine.slice(0, eqIdx).trim().toLowerCase();
+      const val = cleanLine
+        .slice(eqIdx + 1)
+        .trim()
+        .replace(/^["']|["']$/g, '')
+        .trim();
+      if (key === 'binarypath' && val) rawBinaryPath = val;
+      else if (key === 'localepath' && val) rawLocalePath = val;
+    }
+  }
+
+  const normBinRel = rawBinaryPath
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\/|\/)+/, '')
+    .trim();
+  if (!normBinRel || normBinRel.includes('..')) return '';
+
+  const normLocaleRel = rawLocalePath
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\/|\/)+/, '')
+    .trim();
+
+  const roots = Array.from(new Set([cfgDir, resolvedInstall, exeDir].filter(Boolean)));
+  const isContainedRegularFile = (/** @type {string} */ rootDir, /** @type {string} */ candidate) => {
+    const resolvedRoot = path.resolve(rootDir);
+    const resolvedCand = path.resolve(candidate);
+    if (
+      resolvedCand !== resolvedRoot &&
+      !resolvedCand.startsWith(`${resolvedRoot}${path.sep}`)
+    ) {
+      return false;
+    }
+    try {
+      return fs.existsSync(resolvedCand) && fs.statSync(resolvedCand).isFile();
+    } catch {
+      return false;
+    }
+  };
+
+  for (const root of roots) {
+    if (
+      normLocaleRel &&
+      normLocaleRel.toUpperCase() !== 'X' &&
+      !normLocaleRel.includes('..')
+    ) {
+      const explicitLocaleCand = path.join(root, normLocaleRel, normBinRel);
+      if (isContainedRegularFile(root, explicitLocaleCand)) {
+        return path.resolve(explicitLocaleCand);
+      }
+    }
+
+    const directCand = path.join(root, normBinRel);
+    if (isContainedRegularFile(root, directCand)) {
+      return path.resolve(directCand);
+    }
+
+    const enCand = path.join(root, 'EN', normBinRel);
+    if (isContainedRegularFile(root, enCand)) {
+      return path.resolve(enCand);
+    }
+
+    try {
+      const subEntries = fs.readdirSync(root, { withFileTypes: true });
+      subEntries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const sub of subEntries) {
+        if (!sub.isDirectory() || sub.isSymbolicLink()) continue;
+        if (!/^[a-zA-Z]{2,5}(?:[-_][a-zA-Z]{2,4})?$/.test(sub.name)) continue;
+        const subCand = path.join(root, sub.name, normBinRel);
+        if (isContainedRegularFile(root, subCand)) {
+          return path.resolve(subCand);
+        }
+      }
+    } catch {}
+  }
+
+  return '';
 }
 
 async function copyBufferIfChanged(targetPath, srcBuf, expectedSha256) {
@@ -1436,24 +2114,50 @@ async function restoreWindowsClientlessXboxBridgeDlls(installDir) {
   return { restoredCount, removedCount };
 }
 
+function determineLocalDllArch(
+  localDllPath,
+  existingBuf,
+  genericOneLauncherMarkerBuf,
+  defaultArch = 'x64'
+) {
+  const backupPath = `${localDllPath}.msft.bak`;
+  if (fs.existsSync(backupPath)) {
+    const bakInfo = inspectPeBinaryImportsSync(backupPath, { skipRdataStringScan: true });
+    if (bakInfo.machine === 'x86' || bakInfo.machine === 'x64') {
+      return bakInfo.machine;
+    }
+  }
+  if (existingBuf && !existingBuf.includes(genericOneLauncherMarkerBuf)) {
+    const curInfo = inspectPeBinaryImportsSync(existingBuf, { skipRdataStringScan: true });
+    if (curInfo.machine === 'x86' || curInfo.machine === 'x64') {
+      return curInfo.machine;
+    }
+  }
+  return defaultArch === 'x86' ? 'x86' : 'x64';
+}
+
 /**
  * Stages SHA-256-verified `Xgameruntime.dll`, `GameInput.dll`, and `GameInputRedist.dll` into
- * a Windows clientless `xbox-msixvc-win` game directory (backing up any original Microsoft DLLs to
- * `.msft.bak` and automatically upgrading any outdated One Launcher bridge DLLs on SHA-256 mismatch).
+ * a Windows clientless `xbox-msixvc-win` game directory (matching `x86` vs `x64` PE architecture,
+ * backing up original Microsoft DLLs to `.msft.bak`, skipping non-GDK classic Win32 titles, and
+ * selecting the matching `one_xgr_win_launcher*.exe` preloader).
  *
  * @param {Record<string, any>} [options]
  */
 async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
-  const bridgeDllPath = resolveXboxBridgeDllPath(options);
-  const gameInputBridgeDllPath = resolveBundledGameInputBridgeDllPath(options);
-  const [bridgeVerified, gameInputVerified] = await Promise.all([
-    readVerifiedBridgeDllBuffer(bridgeDllPath, options),
-    readVerifiedBridgeDllBuffer(gameInputBridgeDllPath, options),
-  ]);
-  const bridgeBuf = bridgeVerified.buf;
-  const bridgeHash = bridgeVerified.sha256;
-  const gameInputBuf = gameInputVerified.buf;
-  const gameInputHash = gameInputVerified.sha256;
+  const x64LookupOpts = { ...options, arch: 'x64' };
+  const bridgeX64DllPath = resolveXboxBridgeDllPath(x64LookupOpts);
+  const gameInputX64DllPath = resolveBundledGameInputBridgeDllPath(x64LookupOpts);
+  const bridgeX86DllPath = resolveXboxBridgeX86DllPath(options);
+  const gameInputX86DllPath = resolveBundledGameInputBridgeX86DllPath(options);
+
+  const [bridgeX64Verified, gameInputX64Verified, bridgeX86Verified, gameInputX86Verified] =
+    await Promise.all([
+      readVerifiedBridgeDllBuffer(bridgeX64DllPath, options),
+      readVerifiedBridgeDllBuffer(gameInputX64DllPath, options),
+      readVerifiedBridgeDllBuffer(bridgeX86DllPath, options),
+      readVerifiedBridgeDllBuffer(gameInputX86DllPath, options),
+    ]);
 
   const maxDepth = Number.isFinite(options.maxDllSearchDepth)
     ? Math.max(0, Math.floor(Number(options.maxDllSearchDepth)))
@@ -1487,16 +2191,168 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
   if (resolvedInstallRoot) {
     await walkInstallDirs(resolvedInstallRoot, 0);
   }
+  const resolvedExePath =
+    typeof options.executablePath === 'string' && options.executablePath.trim()
+      ? path.resolve(options.executablePath.trim())
+      : '';
   let primaryExeDir = '';
-  if (typeof options.executablePath === 'string' && options.executablePath.trim()) {
-    primaryExeDir = path.dirname(path.resolve(options.executablePath.trim()));
+  if (resolvedExePath) {
+    primaryExeDir = path.dirname(resolvedExePath);
     candidateDirs.add(primaryExeDir);
   } else if (resolvedInstallRoot) {
     primaryExeDir = resolvedInstallRoot;
   }
 
+  const childExecutablePath = resolveLauncherSettingsChildExecutable(
+    resolvedExePath,
+    resolvedInstallRoot
+  );
+  if (childExecutablePath) {
+    candidateDirs.add(path.dirname(childExecutablePath));
+  }
+
+  const exeInfo = resolvedExePath
+    ? inspectPeBinaryImportsSync(resolvedExePath)
+    : { validPe: false, rawMachine: 0, machine: /** @type {''} */ (''), importedDlls: [], referencesXgrApi: false };
+  const childExeInfo = childExecutablePath
+    ? inspectPeBinaryImportsSync(childExecutablePath)
+    : { validPe: false, rawMachine: 0, machine: /** @type {''} */ (''), importedDlls: [], referencesXgrApi: false };
+
+  /** @type {'x86' | 'x64'} */
+  const targetMachine =
+    exeInfo.machine === 'x86' || exeInfo.machine === 'x64'
+      ? exeInfo.machine
+      : childExeInfo.machine === 'x86' || childExeInfo.machine === 'x64'
+        ? childExeInfo.machine
+        : isX86BridgeArchOption(options)
+          ? 'x86'
+          : 'x64';
+
   const xgrMarkerBuf = Buffer.from(XGR_BRIDGE_MARKER, 'utf8');
   const genericOneLauncherMarkerBuf = Buffer.from('OneLauncher.', 'utf8');
+
+  /** @type {Map<string, string[]>} */
+  const entriesByDir = new Map();
+  let hasRetailOrBackedUpXgameruntime = false;
+  let hasGdkCompanionDllInTree = false;
+  /** @type {string[]} */
+  const nonMarkerDllPathsForImportCheck = [];
+
+  for (const dirPath of candidateDirs) {
+    try {
+      if (!fs.existsSync(dirPath)) continue;
+      const entries = await fs.promises.readdir(dirPath);
+      entriesByDir.set(dirPath, entries);
+      for (const entryName of entries) {
+        const lowerName = entryName.toLowerCase();
+        if (!lowerName.endsWith('.dll')) continue;
+        const fullDllPath = path.join(dirPath, entryName);
+        const hasMsftBak = fs.existsSync(`${fullDllPath}.msft.bak`);
+        if (lowerName === 'xgameruntime.dll') {
+          if (hasMsftBak) {
+            hasRetailOrBackedUpXgameruntime = true;
+          } else {
+            const existingBuf = await fs.promises.readFile(fullDllPath).catch(() => null);
+            if (
+              existingBuf &&
+              !existingBuf.includes(xgrMarkerBuf) &&
+              !existingBuf.includes(genericOneLauncherMarkerBuf)
+            ) {
+              hasRetailOrBackedUpXgameruntime = true;
+            }
+          }
+        } else if (isXboxGdkDllName(lowerName)) {
+          if (hasMsftBak) {
+            hasGdkCompanionDllInTree = true;
+          } else {
+            const existingBuf = await fs.promises.readFile(fullDllPath).catch(() => null);
+            if (existingBuf && !existingBuf.includes(genericOneLauncherMarkerBuf)) {
+              hasGdkCompanionDllInTree = true;
+            }
+          }
+        } else if (nonMarkerDllPathsForImportCheck.length < 48) {
+          nonMarkerDllPathsForImportCheck.push(fullDllPath);
+        }
+      }
+    } catch {}
+  }
+
+  let hasPluginDllImportingGdk = false;
+  const candidateForClassicWin32 =
+    exeInfo.validPe &&
+    (exeInfo.machine === 'x86' || exeInfo.machine === 'x64') &&
+    exeInfo.importedDlls.length > 0 &&
+    !exeInfo.referencesXgrApi &&
+    (!childExecutablePath || (childExeInfo.validPe && !childExeInfo.referencesXgrApi)) &&
+    !hasRetailOrBackedUpXgameruntime &&
+    !hasGdkCompanionDllInTree;
+
+  if (candidateForClassicWin32) {
+    for (const dllPath of nonMarkerDllPathsForImportCheck) {
+      const dllInfo = inspectPeBinaryImportsSync(dllPath, { skipRdataStringScan: true });
+      if (dllInfo.referencesXgrApi) {
+        hasPluginDllImportingGdk = true;
+        break;
+      }
+    }
+  }
+
+  const isPureClassicWin32WithoutGdk = candidateForClassicWin32 && !hasPluginDllImportingGdk;
+
+  const selectBridgeForArch = (/** @type {'x86' | 'x64'} */ arch) => {
+    if (arch === 'x86' && bridgeX86Verified.buf) {
+      return {
+        dllPath: bridgeX86DllPath,
+        buf: bridgeX86Verified.buf,
+        sha256: bridgeX86Verified.sha256,
+      };
+    }
+    return {
+      dllPath: bridgeX64DllPath,
+      buf: bridgeX64Verified.buf,
+      sha256: bridgeX64Verified.sha256,
+    };
+  };
+
+  const selectGameInputForArch = (/** @type {'x86' | 'x64'} */ arch) => {
+    if (arch === 'x86' && gameInputX86Verified.buf) {
+      return {
+        dllPath: gameInputX86DllPath,
+        buf: gameInputX86Verified.buf,
+        sha256: gameInputX86Verified.sha256,
+      };
+    }
+    return {
+      dllPath: gameInputX64DllPath,
+      buf: gameInputX64Verified.buf,
+      sha256: gameInputX64Verified.sha256,
+    };
+  };
+
+  const primaryBridgeSelection = selectBridgeForArch(targetMachine);
+  const primaryGameInputSelection = selectGameInputForArch(targetMachine);
+
+  if (isPureClassicWin32WithoutGdk) {
+    const manifestRoot = resolvedInstallRoot || primaryExeDir;
+    if (manifestRoot && fs.existsSync(path.join(manifestRoot, XGR_STAGED_MANIFEST_FILENAME))) {
+      await restoreWindowsClientlessXboxBridgeDlls(manifestRoot);
+    }
+    return {
+      bridgeDllPath: primaryBridgeSelection.dllPath,
+      bridgeStaged: false,
+      gameInputBridgeDllPath: primaryGameInputSelection.dllPath,
+      gameInputStaged: false,
+      primaryExeDir,
+      primaryXgameruntimeDllPath: '',
+      backedUpLocalDlls: [],
+      stagedLocalFiles: [],
+      targetMachine,
+      requiresXgrInjection: false,
+      winLauncherExePath: '',
+      childExecutablePath,
+    };
+  }
+
   /** @type {Array<{ localDllPath: string, backupPath: string }>} */
   const backedUpLocalDlls = [];
   /** @type {string[]} */
@@ -1507,18 +2363,24 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
     ? path.join(primaryExeDir, 'xgameruntime.dll')
     : '';
 
-  for (const dirPath of candidateDirs) {
+  for (const [dirPath, entries] of entriesByDir.entries()) {
     try {
-      if (!fs.existsSync(dirPath)) continue;
-      const entries = await fs.promises.readdir(dirPath);
       for (const entryName of entries) {
         const lowerName = entryName.toLowerCase();
-        if (lowerName === 'xgameruntime.dll' && bridgeBuf) {
+        if (lowerName === 'xgameruntime.dll') {
           const localDllPath = path.join(dirPath, entryName);
           const existingBuf = await fs.promises.readFile(localDllPath);
+          const dllArch = determineLocalDllArch(
+            localDllPath,
+            existingBuf,
+            genericOneLauncherMarkerBuf,
+            targetMachine
+          );
+          const chosenBridge = selectBridgeForArch(dllArch);
+          if (!chosenBridge.buf) continue;
           const existingHash = sha256Buffer(existingBuf).toLowerCase();
           if (
-            existingHash !== bridgeHash &&
+            existingHash !== chosenBridge.sha256 &&
             !existingBuf.includes(xgrMarkerBuf) &&
             !existingBuf.includes(genericOneLauncherMarkerBuf)
           ) {
@@ -1528,21 +2390,26 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
             }
             backedUpLocalDlls.push({ localDllPath, backupPath });
           }
-          await copyBufferIfChanged(localDllPath, bridgeBuf, bridgeHash);
+          await copyBufferIfChanged(localDllPath, chosenBridge.buf, chosenBridge.sha256);
           stagedLocalFiles.push(localDllPath);
           if (primaryExeDir && path.resolve(dirPath) === path.resolve(primaryExeDir)) {
             primaryXgameruntimeDllPath = localDllPath;
           }
           bridgeStaged = true;
-        } else if (
-          gameInputBuf &&
-          (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll')
-        ) {
+        } else if (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll') {
           const localDllPath = path.join(dirPath, entryName);
           const existingBuf = await fs.promises.readFile(localDllPath);
+          const dllArch = determineLocalDllArch(
+            localDllPath,
+            existingBuf,
+            genericOneLauncherMarkerBuf,
+            targetMachine
+          );
+          const chosenGi = selectGameInputForArch(dllArch);
+          if (!chosenGi.buf) continue;
           const existingHash = sha256Buffer(existingBuf).toLowerCase();
           if (
-            existingHash !== gameInputHash &&
+            existingHash !== chosenGi.sha256 &&
             !existingBuf.includes(genericOneLauncherMarkerBuf)
           ) {
             const backupPath = `${localDllPath}.msft.bak`;
@@ -1551,7 +2418,7 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
             }
             backedUpLocalDlls.push({ localDllPath, backupPath });
           }
-          await copyBufferIfChanged(localDllPath, gameInputBuf, gameInputHash);
+          await copyBufferIfChanged(localDllPath, chosenGi.buf, chosenGi.sha256);
           stagedLocalFiles.push(localDllPath);
           gameInputStaged = true;
         }
@@ -1561,35 +2428,58 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
     }
   }
 
-  // Ensure primary executable directory always has app-local bridge DLLs on Win32 clientless launches
-  if (primaryExeDir && fs.existsSync(primaryExeDir)) {
+  const stageDirWithArch = async (
+    /** @type {string} */ targetDir,
+    /** @type {'x86' | 'x64'} */ arch,
+    /** @type {boolean} */ isPrimary
+  ) => {
+    if (!targetDir || !fs.existsSync(targetDir)) return;
+    const chosenBridge = selectBridgeForArch(arch);
+    const chosenGi = selectGameInputForArch(arch);
     try {
-      const existingNames = await fs.promises.readdir(primaryExeDir).catch(() => []);
-      const findCaseMatch = (/** @type {string} */ targetLower, /** @type {string} */ defaultName) =>
-        existingNames.find((n) => n.toLowerCase() === targetLower) || defaultName;
-      if (bridgeBuf) {
+      const existingNames = await fs.promises.readdir(targetDir).catch(() => []);
+      const findCaseMatch = (
+        /** @type {string} */ targetLower,
+        /** @type {string} */ defaultName
+      ) => existingNames.find((n) => n.toLowerCase() === targetLower) || defaultName;
+      if (chosenBridge.buf) {
         const targetXgr = path.join(
-          primaryExeDir,
+          targetDir,
           findCaseMatch('xgameruntime.dll', 'xgameruntime.dll')
         );
-        await copyBufferIfChanged(targetXgr, bridgeBuf, bridgeHash);
-        primaryXgameruntimeDllPath = targetXgr;
+        await copyBufferIfChanged(targetXgr, chosenBridge.buf, chosenBridge.sha256);
+        if (isPrimary) {
+          primaryXgameruntimeDllPath = targetXgr;
+        }
         stagedLocalFiles.push(targetXgr);
         bridgeStaged = true;
       }
-      if (gameInputBuf) {
-        const targetGi = path.join(primaryExeDir, findCaseMatch('gameinput.dll', 'GameInput.dll'));
+      if (chosenGi.buf) {
+        const targetGi = path.join(targetDir, findCaseMatch('gameinput.dll', 'GameInput.dll'));
         const targetGir = path.join(
-          primaryExeDir,
+          targetDir,
           findCaseMatch('gameinputredist.dll', 'GameInputRedist.dll')
         );
-        await copyBufferIfChanged(targetGi, gameInputBuf, gameInputHash);
-        await copyBufferIfChanged(targetGir, gameInputBuf, gameInputHash);
+        await copyBufferIfChanged(targetGi, chosenGi.buf, chosenGi.sha256);
+        await copyBufferIfChanged(targetGir, chosenGi.buf, chosenGi.sha256);
         stagedLocalFiles.push(targetGi, targetGir);
         gameInputStaged = true;
       }
     } catch (err) {
-      diagLog.warn('wine.stagePrimaryExeBridgeFailed', err, { primaryExeDir });
+      diagLog.warn('wine.stagePrimaryExeBridgeFailed', err, { primaryExeDir: targetDir });
+    }
+  };
+
+  // Ensure primary executable directory (and any distinct child executable directory) has matching-arch app-local bridges
+  await stageDirWithArch(primaryExeDir, targetMachine, true);
+  if (childExecutablePath) {
+    const childExeDir = path.dirname(childExecutablePath);
+    if (!primaryExeDir || path.resolve(childExeDir) !== path.resolve(primaryExeDir)) {
+      const childArch =
+        childExeInfo.machine === 'x86' || childExeInfo.machine === 'x64'
+          ? childExeInfo.machine
+          : targetMachine;
+      await stageDirWithArch(childExeDir, childArch, false);
     }
   }
 
@@ -1601,15 +2491,22 @@ async function stageWindowsClientlessXboxBridgeDlls(options = {}) {
     );
   }
 
+  const winLauncherExePath =
+    resolveBundledXboxWinLauncherExePath({ ...options, arch: targetMachine }) || '';
+
   return {
-    bridgeDllPath,
+    bridgeDllPath: primaryBridgeSelection.dllPath,
     bridgeStaged,
-    gameInputBridgeDllPath,
+    gameInputBridgeDllPath: primaryGameInputSelection.dllPath,
     gameInputStaged,
     primaryExeDir,
     primaryXgameruntimeDllPath,
     backedUpLocalDlls,
     stagedLocalFiles,
+    targetMachine,
+    requiresXgrInjection: true,
+    winLauncherExePath,
+    childExecutablePath,
   };
 }
 
@@ -1648,16 +2545,47 @@ async function prepareXboxBottleEnvironment(options = {}) {
     env.WINEDLLOVERRIDES,
     XBOX_DEFAULT_WINE_DLL_OVERRIDES
   );
-  applyStrictRosettaAvxEnv(env, options.advertiseAvx);
+  applyStrictRosettaAvxEnv(env, options.advertiseAvx, {
+    isCrossOverWrapper: options.isCrossOverWrapper,
+    wineBinaryPath: options.wineBinaryPath,
+    compatLayer: options.compatLayer,
+    layerType: options.layerType,
+    platform: options.platform,
+    homedir: options.homedir,
+    cxRoot: options.cxRoot,
+  });
+  if (
+    resolvedBottle &&
+    String(options.crossoverGraphicsBackend || '').trim().toLowerCase() !== 'wined3d'
+  ) {
+    sanitizeProvisionedBottleGraphicsBackend(resolvedBottle);
+  }
 
-  const bridgeDllPath = resolveXboxBridgeDllPath(options);
-  const gameInputBridgeDllPath = resolveBundledGameInputBridgeDllPath(options);
-  const appNotifyBridgeDllPath = resolveBundledXboxAppNotifyBridgeDllPath(options);
-  const [bridgeVerified, gameInputVerified, appNotifyVerified] = await Promise.all([
+  const x64Opts = { ...options, arch: 'x64' };
+  const bridgeDllPath = resolveXboxBridgeDllPath(x64Opts);
+  const gameInputBridgeDllPath = resolveBundledGameInputBridgeDllPath(x64Opts);
+  const appNotifyBridgeDllPath = resolveBundledXboxAppNotifyBridgeDllPath(x64Opts);
+  const bridgeX86DllPath = resolveXboxBridgeX86DllPath(options);
+  const gameInputBridgeX86DllPath = resolveBundledGameInputBridgeX86DllPath(options);
+  const appNotifyBridgeX86DllPath = resolveBundledXboxAppNotifyBridgeX86DllPath(options);
+
+  const [
+    bridgeVerified,
+    gameInputVerified,
+    appNotifyVerified,
+    bridgeX86Verified,
+    gameInputX86Verified,
+    appNotifyX86Verified,
+  ] = await Promise.all([
     readVerifiedBridgeDllBuffer(bridgeDllPath, options),
     readVerifiedBridgeDllBuffer(gameInputBridgeDllPath, options),
     appNotifyBridgeDllPath
       ? readVerifiedBridgeDllBuffer(appNotifyBridgeDllPath, options)
+      : Promise.resolve({ buf: null, sha256: '', sidecarVerified: false }),
+    readVerifiedBridgeDllBuffer(bridgeX86DllPath, options),
+    readVerifiedBridgeDllBuffer(gameInputBridgeX86DllPath, options),
+    appNotifyBridgeX86DllPath
+      ? readVerifiedBridgeDllBuffer(appNotifyBridgeX86DllPath, options)
       : Promise.resolve({ buf: null, sha256: '', sidecarVerified: false }),
   ]);
   const bridgeBuf = bridgeVerified.buf;
@@ -1667,22 +2595,39 @@ async function prepareXboxBottleEnvironment(options = {}) {
   const appNotifyBuf = appNotifyVerified.buf;
   const appNotifyHash = appNotifyVerified.sha256;
 
+  const bridgeX86Buf = bridgeX86Verified.buf;
+  const bridgeX86Hash = bridgeX86Verified.sha256;
+  const gameInputX86Buf = gameInputX86Verified.buf;
+  const gameInputX86Hash = gameInputX86Verified.sha256;
+  const appNotifyX86Buf = appNotifyX86Verified.buf;
+  const appNotifyX86Hash = appNotifyX86Verified.sha256;
+
   let system32DllPath = '';
   let system32AppNotifyDllPath = '';
+  let syswow64DllPath = '';
+  let syswow64AppNotifyDllPath = '';
   let bridgeStaged = false;
   let gameInputStaged = false;
   let appNotifyStaged = false;
+  let bridgeX86Staged = false;
+  let gameInputX86Staged = false;
+  let appNotifyX86Staged = false;
   /** @type {Array<{ localDllPath: string, backupPath: string }>} */
   const backedUpLocalDlls = [];
   /** @type {string[]} */
   const stagedLocalFiles = [];
   const stagedVcLibsAppDlls = [];
+  const stagedVcLibsSyswow64Dlls = [];
 
   if (resolvedBottle) {
     const driveC = path.join(resolvedBottle, 'drive_c');
     await fs.promises.mkdir(driveC, { recursive: true });
     const system32Dir = resolveDriveCPathCaseInsensitive(driveC, ['windows', 'system32']);
-    await fs.promises.mkdir(system32Dir, { recursive: true });
+    const syswow64Dir = resolveDriveCPathCaseInsensitive(driveC, ['windows', 'syswow64']);
+    await Promise.all([
+      fs.promises.mkdir(system32Dir, { recursive: true }),
+      fs.promises.mkdir(syswow64Dir, { recursive: true }),
+    ]);
     system32DllPath = path.join(system32Dir, 'xgameruntime.dll');
 
     if (bridgeBuf) {
@@ -1710,7 +2655,39 @@ async function prepareXboxBottleEnvironment(options = {}) {
       appNotifyStaged = true;
     }
 
-    // Provision UWP VCLibs *_app.dll CRT aliases from bottle system32 or CrossOver/Wine x86_64-windows donor DLLs
+    // Stage 32-bit (`0x014c`) bridges into `drive_c/windows/syswow64` for WoW64 GDK execution
+    if (bridgeX86Buf) {
+      syswow64DllPath = path.join(syswow64Dir, 'xgameruntime.dll');
+      await copyBufferIfChanged(syswow64DllPath, bridgeX86Buf, bridgeX86Hash);
+      bridgeX86Staged = true;
+    }
+
+    if (gameInputX86Buf) {
+      await copyBufferIfChanged(
+        path.join(syswow64Dir, 'gameinput.dll'),
+        gameInputX86Buf,
+        gameInputX86Hash
+      );
+      await copyBufferIfChanged(
+        path.join(syswow64Dir, 'gameinputredist.dll'),
+        gameInputX86Buf,
+        gameInputX86Hash
+      );
+      gameInputX86Staged = true;
+    }
+
+    if (appNotifyX86Buf) {
+      syswow64AppNotifyDllPath = path.join(syswow64Dir, 'api-ms-win-core-psm-appnotify-l1-1-0.dll');
+      await copyBufferIfChanged(syswow64AppNotifyDllPath, appNotifyX86Buf, appNotifyX86Hash);
+      appNotifyX86Staged = true;
+    }
+
+    const compatBinPath = String(
+      options.compatLayer?.binaryPath || options.wineBinaryPath || ''
+    ).trim();
+
+    // Provision UWP VCLibs *_app.dll CRT aliases in `system32` (`x64`) and `syswow64` (`x86`),
+    // plus fresh-bottle `x86` VC14 runtime donor fallback from Wine/CrossOver `lib/wine/i386-windows`
     try {
       const vcLibPairs = [
         ['vcruntime140.dll', 'vcruntime140_app.dll'],
@@ -1723,13 +2700,19 @@ async function prepareXboxBottleEnvironment(options = {}) {
       const sys32ByLower = new Map(
         sys32Entries.map((name) => /** @type {[string, string]} */ ([name.toLowerCase(), name]))
       );
-      const compatBinPath = String(
-        options.compatLayer?.binaryPath || options.wineBinaryPath || ''
-      ).trim();
       const extraWineWin64Dirs = compatBinPath
         ? [
             path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'x86_64-windows'),
             path.resolve(path.dirname(compatBinPath), '..', 'lib64', 'wine', 'x86_64-windows'),
+            path.resolve(
+              path.dirname(compatBinPath),
+              '..',
+              'SharedSupport',
+              'CrossOver',
+              'lib',
+              'wine',
+              'x86_64-windows'
+            ),
           ]
         : [];
 
@@ -1755,12 +2738,79 @@ async function prepareXboxBottleEnvironment(options = {}) {
           stagedVcLibsAppDlls.push(targetAppPath);
         }
       }
+
+      const vcLibPairsX86 = [
+        ['vcruntime140.dll', 'vcruntime140_app.dll'],
+        ['msvcp140.dll', 'msvcp140_app.dll'],
+        ['concrt140.dll', 'concrt140_app.dll'],
+        ['vccorlib140.dll', 'vccorlib140_app.dll'],
+      ];
+      const syswowEntries = await fs.promises.readdir(syswow64Dir).catch(() => []);
+      const syswowByLower = new Map(
+        syswowEntries.map((name) => /** @type {[string, string]} */ ([name.toLowerCase(), name]))
+      );
+      const extraWineWin32Dirs = compatBinPath
+        ? [
+            path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'i386-windows'),
+            path.resolve(path.dirname(compatBinPath), '..', 'lib32', 'wine', 'i386-windows'),
+            path.resolve(
+              path.dirname(compatBinPath),
+              '..',
+              'SharedSupport',
+              'CrossOver',
+              'lib',
+              'wine',
+              'i386-windows'
+            ),
+          ]
+        : [];
+
+      // Ensure base x86 VC14 runtime DLLs exist in syswow64 on fresh prefixes when Wine/CrossOver provides them
+      for (const [baseDllName] of vcLibPairsX86) {
+        if (syswowByLower.has(baseDllName.toLowerCase())) continue;
+        for (const wineLibDir of extraWineWin32Dirs) {
+          const cand = path.join(wineLibDir, baseDllName);
+          if (fs.existsSync(cand)) {
+            const targetBasePath = path.join(syswow64Dir, baseDllName);
+            const donorBuf = await fs.promises.readFile(cand);
+            await copyBufferIfChanged(targetBasePath, donorBuf, sha256Buffer(donorBuf));
+            syswowByLower.set(baseDllName.toLowerCase(), baseDllName);
+            stagedVcLibsSyswow64Dlls.push(targetBasePath);
+            break;
+          }
+        }
+      }
+
+      // Synthesize x86 *_app.dll CRT aliases in syswow64
+      for (const [donorName, targetAppName] of vcLibPairsX86) {
+        if (syswowByLower.has(targetAppName.toLowerCase())) continue;
+        let donorPath = '';
+        const existingDonorEntry = syswowByLower.get(donorName.toLowerCase());
+        if (existingDonorEntry) {
+          donorPath = path.join(syswow64Dir, existingDonorEntry);
+        } else {
+          for (const wineLibDir of extraWineWin32Dirs) {
+            const cand = path.join(wineLibDir, donorName);
+            if (fs.existsSync(cand)) {
+              donorPath = cand;
+              break;
+            }
+          }
+        }
+        if (donorPath && fs.existsSync(donorPath)) {
+          const targetAppPath = path.join(syswow64Dir, targetAppName);
+          const donorBuf = await fs.promises.readFile(donorPath);
+          await copyBufferIfChanged(targetAppPath, donorBuf, sha256Buffer(donorBuf));
+          stagedVcLibsAppDlls.push(targetAppPath);
+          stagedVcLibsSyswow64Dlls.push(targetAppPath);
+        }
+      }
     } catch (err) {
-      diagLog.warn('wine.provisionVcLibsAppDllsFailed', err, { system32Dir });
+      diagLog.warn('wine.provisionVcLibsAppDllsFailed', err, { system32Dir, syswow64Dir });
     }
 
     // Back up and replace any game-local Microsoft xgameruntime.dll, GameInput/GameInputRedist.dll,
-    // and api-ms-win-core-psm-appnotify-l1-1-0.dll (up to depth 8)
+    // and api-ms-win-core-psm-appnotify-l1-1-0.dll (up to depth 8), matching PE architecture (`0x014c` vs `0x8664`)
     const maxDepth = Number.isFinite(options.maxDllSearchDepth)
       ? Math.max(0, Math.floor(Number(options.maxDllSearchDepth)))
       : DEFAULT_XBOX_DLL_SEARCH_MAX_DEPTH;
@@ -1792,9 +2842,36 @@ async function prepareXboxBottleEnvironment(options = {}) {
     if (resolvedInstallRoot) {
       await walkInstallDirs(resolvedInstallRoot, 0);
     }
-    if (typeof options.executablePath === 'string' && options.executablePath.trim()) {
-      candidateDirs.add(path.dirname(path.resolve(options.executablePath.trim())));
+    const resolvedExePath =
+      typeof options.executablePath === 'string' && options.executablePath.trim()
+        ? path.resolve(options.executablePath.trim())
+        : '';
+    if (resolvedExePath) {
+      candidateDirs.add(path.dirname(resolvedExePath));
     }
+    const childExecutablePath = resolveLauncherSettingsChildExecutable(
+      resolvedExePath,
+      resolvedInstallRoot
+    );
+    if (childExecutablePath) {
+      candidateDirs.add(path.dirname(childExecutablePath));
+    }
+
+    const exeInfo = resolvedExePath
+      ? inspectPeBinaryImportsSync(resolvedExePath, { skipRdataStringScan: true })
+      : { machine: '' };
+    const childInfo = childExecutablePath
+      ? inspectPeBinaryImportsSync(childExecutablePath, { skipRdataStringScan: true })
+      : { machine: '' };
+    /** @type {'x86' | 'x64'} */
+    const defaultLocalArch =
+      exeInfo.machine === 'x86' || exeInfo.machine === 'x64'
+        ? exeInfo.machine
+        : childInfo.machine === 'x86' || childInfo.machine === 'x64'
+          ? childInfo.machine
+          : isX86BridgeArchOption(options)
+            ? 'x86'
+            : 'x64';
 
     const xgrMarkerBuf = Buffer.from(XGR_BRIDGE_MARKER, 'utf8');
     const genericOneLauncherMarkerBuf = Buffer.from('OneLauncher.', 'utf8');
@@ -1807,9 +2884,17 @@ async function prepareXboxBottleEnvironment(options = {}) {
           if (lowerName === 'xgameruntime.dll') {
             const localDllPath = path.join(dirPath, entryName);
             const existingBuf = await fs.promises.readFile(localDllPath);
+            const dllArch = determineLocalDllArch(
+              localDllPath,
+              existingBuf,
+              genericOneLauncherMarkerBuf,
+              defaultLocalArch
+            );
+            const chosenBuf = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Buf : bridgeBuf;
+            const chosenHash = dllArch === 'x86' && bridgeX86Buf ? bridgeX86Hash : bridgeHash;
             const existingHash = sha256Buffer(existingBuf).toLowerCase();
             if (
-              existingHash !== bridgeHash &&
+              existingHash !== chosenHash &&
               !existingBuf.includes(xgrMarkerBuf) &&
               !existingBuf.includes(genericOneLauncherMarkerBuf)
             ) {
@@ -1819,18 +2904,25 @@ async function prepareXboxBottleEnvironment(options = {}) {
               }
               backedUpLocalDlls.push({ localDllPath, backupPath });
             }
-            if (bridgeBuf) {
-              await copyBufferIfChanged(localDllPath, bridgeBuf, bridgeHash);
+            if (chosenBuf) {
+              await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
               stagedLocalFiles.push(localDllPath);
             }
-          } else if (
-            gameInputBuf &&
-            (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll')
-          ) {
+          } else if (lowerName === 'gameinput.dll' || lowerName === 'gameinputredist.dll') {
             const localDllPath = path.join(dirPath, entryName);
             const existingBuf = await fs.promises.readFile(localDllPath);
+            const dllArch = determineLocalDllArch(
+              localDllPath,
+              existingBuf,
+              genericOneLauncherMarkerBuf,
+              defaultLocalArch
+            );
+            const chosenBuf = dllArch === 'x86' && gameInputX86Buf ? gameInputX86Buf : gameInputBuf;
+            const chosenHash =
+              dllArch === 'x86' && gameInputX86Buf ? gameInputX86Hash : gameInputHash;
+            if (!chosenBuf) continue;
             if (
-              sha256Buffer(existingBuf).toLowerCase() !== gameInputHash &&
+              sha256Buffer(existingBuf).toLowerCase() !== chosenHash &&
               !existingBuf.includes(genericOneLauncherMarkerBuf)
             ) {
               const backupPath = `${localDllPath}.msft.bak`;
@@ -1839,13 +2931,23 @@ async function prepareXboxBottleEnvironment(options = {}) {
               }
               backedUpLocalDlls.push({ localDllPath, backupPath });
             }
-            await copyBufferIfChanged(localDllPath, gameInputBuf, gameInputHash);
+            await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
             stagedLocalFiles.push(localDllPath);
-          } else if (appNotifyBuf && lowerName === 'api-ms-win-core-psm-appnotify-l1-1-0.dll') {
+          } else if (lowerName === 'api-ms-win-core-psm-appnotify-l1-1-0.dll') {
             const localDllPath = path.join(dirPath, entryName);
             const existingBuf = await fs.promises.readFile(localDllPath);
+            const dllArch = determineLocalDllArch(
+              localDllPath,
+              existingBuf,
+              genericOneLauncherMarkerBuf,
+              defaultLocalArch
+            );
+            const chosenBuf = dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Buf : appNotifyBuf;
+            const chosenHash =
+              dllArch === 'x86' && appNotifyX86Buf ? appNotifyX86Hash : appNotifyHash;
+            if (!chosenBuf) continue;
             if (
-              sha256Buffer(existingBuf).toLowerCase() !== appNotifyHash &&
+              sha256Buffer(existingBuf).toLowerCase() !== chosenHash &&
               !existingBuf.includes(genericOneLauncherMarkerBuf)
             ) {
               const backupPath = `${localDllPath}.msft.bak`;
@@ -1854,7 +2956,7 @@ async function prepareXboxBottleEnvironment(options = {}) {
               }
               backedUpLocalDlls.push({ localDllPath, backupPath });
             }
-            await copyBufferIfChanged(localDllPath, appNotifyBuf, appNotifyHash);
+            await copyBufferIfChanged(localDllPath, chosenBuf, chosenHash);
             stagedLocalFiles.push(localDllPath);
           }
         }
@@ -1876,14 +2978,20 @@ async function prepareXboxBottleEnvironment(options = {}) {
     // and GameInput/SDL controller harmony
     try {
       const {
-        upsertWineSystemRegKey,
-        isBottleWineserverActive,
-        syncLiveWineRegistryAsync,
+        upsertWineSystemRegKeysBatch,
+        flushLiveWineRegistryAccumulator,
       } = require('./firstPartyRegistration.cjs');
+      /** @type {any[]} */
+      const liveSyncAccumulator = [];
       const regSyncOptions = {
         compatLayer: options.compatLayer,
-        wineBinaryPath: options.wineBinaryPath,
-        skipLiveWineRegSync: true,
+        wineBinaryPath: options.wineBinaryPath || options.wineBinary,
+        wineBinary: options.wineBinary || options.wineBinaryPath,
+        skipLiveWineRegSync: options.skipLiveWineRegSync === true,
+        wineserverActive: options.wineserverActive,
+        execFileFn: options.execFileFn,
+        execFileImpl: options.execFileImpl,
+        liveSyncAccumulator,
       };
       const gsEntries = {
         ForceUseInprocGameSaves: { type: 'dword', value: 1 },
@@ -1901,22 +3009,13 @@ async function prepareXboxBottleEnvironment(options = {}) {
         concrt140: 'native,builtin',
       };
 
-      upsertWineSystemRegKey(
+      upsertWineSystemRegKeysBatch(
         resolvedBottle,
-        'Software\\Microsoft\\GamingServices',
-        gsEntries,
-        regSyncOptions
-      );
-      upsertWineSystemRegKey(
-        resolvedBottle,
-        'Software\\Wow6432Node\\Microsoft\\GamingServices',
-        gsEntries,
-        regSyncOptions
-      );
-      upsertWineSystemRegKey(
-        resolvedBottle,
-        'System\\CurrentControlSet\\Services\\winebus',
-        winebusEntries,
+        [
+          { subKeyPath: 'Software\\Microsoft\\GamingServices', entries: gsEntries },
+          { subKeyPath: 'Software\\Wow6432Node\\Microsoft\\GamingServices', entries: gsEntries },
+          { subKeyPath: 'System\\CurrentControlSet\\Services\\winebus', entries: winebusEntries },
+        ],
         regSyncOptions
       );
       upsertWineUserRegKey(
@@ -1926,43 +3025,12 @@ async function prepareXboxBottleEnvironment(options = {}) {
         regSyncOptions
       );
 
-      if (options.skipLiveWineRegSync !== true && isBottleWineserverActive(resolvedBottle, options)) {
-        const liveOpts = {
-          compatLayer: options.compatLayer,
-          wineBinaryPath: options.wineBinaryPath,
-          execFileFn: options.execFileFn,
-          execFileImpl: options.execFileImpl,
-        };
-        await Promise.all([
-          syncLiveWineRegistryAsync(
-            resolvedBottle,
-            'HKEY_LOCAL_MACHINE',
-            'Software\\Microsoft\\GamingServices',
-            Object.entries(gsEntries),
-            liveOpts
-          ),
-          syncLiveWineRegistryAsync(
-            resolvedBottle,
-            'HKEY_LOCAL_MACHINE',
-            'Software\\Wow6432Node\\Microsoft\\GamingServices',
-            Object.entries(gsEntries),
-            liveOpts
-          ),
-          syncLiveWineRegistryAsync(
-            resolvedBottle,
-            'HKEY_LOCAL_MACHINE',
-            'System\\CurrentControlSet\\Services\\winebus',
-            Object.entries(winebusEntries),
-            liveOpts
-          ),
-          syncLiveWineRegistryAsync(
-            resolvedBottle,
-            'HKEY_CURRENT_USER',
-            'Software\\Wine\\DllOverrides',
-            Object.entries(dllOverrideEntries),
-            liveOpts
-          ),
-        ]).catch(() => {});
+      if (liveSyncAccumulator.length > 0 && options.skipLiveWineRegSync !== true) {
+        await flushLiveWineRegistryAccumulator(
+          resolvedBottle,
+          liveSyncAccumulator,
+          regSyncOptions
+        ).catch(() => {});
       }
     } catch (err) {
       diagLog.warn('wine.xboxRegistryUpsertFailed', err, { resolvedBottle });
@@ -2023,11 +3091,20 @@ async function prepareXboxBottleEnvironment(options = {}) {
     gameInputStaged,
     appNotifyBridgeDllPath,
     appNotifyStaged,
+    bridgeX86DllPath,
+    bridgeX86Staged,
+    gameInputBridgeX86DllPath,
+    gameInputX86Staged,
+    appNotifyBridgeX86DllPath,
+    appNotifyX86Staged,
     system32DllPath,
     system32AppNotifyDllPath,
+    syswow64DllPath,
+    syswow64AppNotifyDllPath,
     backedUpLocalDlls,
     stagedLocalFiles,
     stagedVcLibsAppDlls,
+    stagedVcLibsSyswow64Dlls,
     bottleUser,
     bottleUsersDir,
     appDataLocal,
@@ -2055,14 +3132,27 @@ module.exports = {
   sandboxWinePrefixUserFoldersAsync,
   resolveXboxBridgeDllPath,
   resolveBundledXboxRuntimeBridgeDllPath: resolveXboxBridgeDllPath,
+  resolveXboxBridgeX86DllPath,
+  resolveBundledXboxRuntimeBridgeX86DllPath: resolveXboxBridgeX86DllPath,
   resolveBundledGameInputBridgeDllPath,
   resolveBundledXboxGameInputBridgeDllPath: resolveBundledGameInputBridgeDllPath,
+  resolveBundledGameInputBridgeX86DllPath,
+  resolveBundledXboxGameInputBridgeX86DllPath: resolveBundledGameInputBridgeX86DllPath,
   resolveBundledXboxAppNotifyBridgeDllPath,
+  resolveBundledXboxAppNotifyBridgeX86DllPath,
   resolveBundledXboxWinLauncherExePath,
+  resolveBundledXboxWinLauncherX86ExePath,
   readVerifiedBridgeDllBuffer,
+  inspectPeBinaryImportsSync,
+  resolveLauncherSettingsChildExecutable,
   stageWindowsClientlessXboxBridgeDlls,
   restoreWindowsClientlessXboxBridgeDlls,
   upsertWineUserRegKey,
+  upsertWineUserRegKeysBatch,
+  isCrossOverPerlWineWrapperOptions,
+  deriveCrossOverRootPath,
+  applyCrossOverEnvironmentHygiene,
+  sanitizeProvisionedBottleGraphicsBackend,
   applyStrictRosettaAvxEnv,
   mergeWineDllOverrides,
   prepareXboxBottleEnvironment,

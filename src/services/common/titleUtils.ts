@@ -69,6 +69,113 @@ const DISAMBIGUATOR_HINT_RE =
 const YEAR_EDITION_HINT_RE = /\b(?:year|anniversary|edition)\b/i;
 const NON_ASCII_RE = /[^\x00-\x7f]/;
 
+const HTML_ENTITY_LOOKUP: Record<string, string> = {
+  trade: '™',
+  '#8482': '™',
+  '#x2122': '™',
+  reg: '®',
+  '#174': '®',
+  '#xae': '®',
+  copy: '©',
+  '#169': '©',
+  '#xa9': '©',
+  rsquo: '\u2019',
+  '#8217': '\u2019',
+  '#x2019': '\u2019',
+  lsquo: '\u2018',
+  '#8216': '\u2018',
+  '#x2018': '\u2018',
+  apos: "'",
+  '#39': "'",
+  '#x27': "'",
+  quot: '"',
+  '#34': '"',
+  '#x22': '"',
+  ldquo: '\u201c',
+  '#8220': '\u201c',
+  '#x201c': '\u201c',
+  rdquo: '\u201d',
+  '#8221': '\u201d',
+  '#x201d': '\u201d',
+  ndash: '\u2013',
+  '#8211': '\u2013',
+  '#x2013': '\u2013',
+  mdash: '\u2014',
+  '#8212': '\u2014',
+  '#x2014': '\u2014',
+  nbsp: ' ',
+  '#160': ' ',
+  '#xa0': ' ',
+  amp: '&',
+  '#38': '&',
+  '#x26': '&',
+};
+
+const LATIN_LIGATURE_MAP: Record<string, string> = {
+  Ø: 'O',
+  ø: 'o',
+  ẞ: 'SS',
+  ß: 'ss',
+  Æ: 'AE',
+  æ: 'ae',
+  Œ: 'OE',
+  œ: 'oe',
+  Ł: 'L',
+  ł: 'l',
+  Đ: 'D',
+  đ: 'd',
+  Ð: 'D',
+  ð: 'd',
+  Þ: 'TH',
+  þ: 'th',
+};
+
+const LATIN_LIGATURE_RE = /[ØøẞßÆæŒœŁłĐđÐðÞþ]/g;
+
+/**
+ * Decodes common HTML entities (&trade;, &reg;, &copy;, &rsquo;, &ndash;, &mdash;, &amp;, etc.)
+ * found in raw storefront catalog titles before symbol stripping and normalization.
+ */
+export function decodeTitleHtmlEntities(input: string): string {
+  if (!input || !input.includes('&')) return input || '';
+  return input.replace(/&(?:#x0*([0-9a-f]+)|#0*(\d+)|([a-z0-9]+));/gi, (full, hex, dec, named) => {
+    if (hex !== undefined) {
+      const key = `#x${String(hex).toLowerCase()}`;
+      return HTML_ENTITY_LOOKUP[key] ?? full;
+    }
+    if (dec !== undefined) {
+      const key = `#${String(dec)}`;
+      return HTML_ENTITY_LOOKUP[key] ?? full;
+    }
+    const key = String(named).toLowerCase();
+    return HTML_ENTITY_LOOKUP[key] ?? full;
+  });
+}
+
+/**
+ * Strips trademark/registration symbols ([™®©℠℗] and (TM)/(R)/(C)) BEFORE Unicode normalization
+ * or apostrophe stripping so NFKC never expands '™' -> 'TM' and "Tony Hawk™'s" -> "Tony Hawk's"
+ * while preserving word separation when glued between alphanumerics ("Watch Dogs®2" -> "Watch Dogs 2").
+ */
+export function stripTrademarkSymbols(input: string): string {
+  if (!input) return '';
+  return input
+    .replace(/([\p{L}\p{N}])(?:[™®©℠℗]+|\(\s*(?:tm|r|c)\s*\))(?=[\p{L}\p{N}])/giu, '$1 ')
+    .replace(/(?:[™®©℠℗]+|\(\s*(?:tm|r|c)\s*\))/gi, '');
+}
+
+/**
+ * Folds non-decomposing Latin ligatures/letters (ø, ß, æ, œ, ł, đ, ð, þ) and strips NFD
+ * combining diacritical marks without invoking NFKC/NFKD compatibility expansion.
+ */
+export function foldLatinLigaturesAndDiacritics(input: string): string {
+  if (!input || !NON_ASCII_RE.test(input)) return input || '';
+  return input
+    .replace(LATIN_LIGATURE_RE, (ch) => LATIN_LIGATURE_MAP[ch] ?? ch)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
 /**
  * Strips universal Microsoft Store / Xbox PC platform disambiguators
  * (e.g. "(PC)", "- PC", ": PC", "for PC", "(Windows)", "- Windows", "for Windows",
@@ -171,13 +278,13 @@ export function normalizeTitleKey(title: string): string {
   const cached = normalizeTitleKeyMemo.get(title);
   if (cached !== undefined) return cached;
 
-  let working = stripStorefrontPlatformDisambiguators(title);
+  let working = stripStorefrontPlatformDisambiguators(
+    stripTrademarkSymbols(decodeTitleHtmlEntities(title))
+  );
   if (NON_ASCII_RE.test(working)) {
-    working = working
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/['’‘ʼ`"“”]/g, '')
-      .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ');
+    working = foldLatinLigaturesAndDiacritics(working)
+      .replace(/['’‘ʼ`´"“”]/g, '')
+      .replace(/[•·𝄞★☆–—−‑]/g, ' ');
   } else {
     working = working.replace(/['`"]/g, '');
   }
@@ -249,13 +356,11 @@ export function stripEditionSuffix(title: string): string {
   const cached = stripEditionSuffixMemo.get(title);
   if (cached !== undefined) return cached;
 
-  let preStripped = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(title));
+  let preStripped = stripYearEditionPhrases(stripPlatformAndDistributionNoise(title));
   if (NON_ASCII_RE.test(preStripped)) {
-    preStripped = preStripped
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/['’‘ʼ`"“”]/g, '')
-      .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ');
+    preStripped = foldLatinLigaturesAndDiacritics(preStripped)
+      .replace(/['’‘ʼ`´"“”]/g, '')
+      .replace(/[•·𝄞★☆–—−‑]/g, ' ');
   } else {
     preStripped = preStripped.replace(/['`"]/g, '');
   }
@@ -396,10 +501,15 @@ const COMPILATION_CLAUSE_STOP_WORDS = new Set([
 ]);
 
 function tokenizeCompilationClause(str: string): string[] {
-  const baseTokens = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(str))
+  const preCleaned = foldLatinLigaturesAndDiacritics(
+    stripYearEditionPhrases(
+      stripStorefrontPlatformDisambiguators(stripTrademarkSymbols(decodeTitleHtmlEntities(str)))
+    )
+  );
+  const baseTokens = preCleaned
     .toLowerCase()
-    .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
-    .replace(/['’‘ʼ`]/g, '')
+    .replace(/['’‘ʼ`´"“”]/g, '')
+    .replace(/[•·𝄞★☆–—−‑]/g, ' ')
     .replace(/(\d),(\d)/g, '$1$2')
     .replace(/([a-z])(\d)/g, '$1 $2')
     .replace(/(\d)([a-z])/g, '$1 $2')
@@ -416,9 +526,15 @@ const sequelTokensMemo = new Map<string, string[]>();
 function getNormalizedSequelTokens(str: string): string[] {
   const cached = sequelTokensMemo.get(str);
   if (cached !== undefined) return cached;
-  const tokens = stripYearEditionPhrases(stripStorefrontPlatformDisambiguators(str))
+  const preCleaned = foldLatinLigaturesAndDiacritics(
+    stripYearEditionPhrases(
+      stripStorefrontPlatformDisambiguators(stripTrademarkSymbols(decodeTitleHtmlEntities(str)))
+    )
+  );
+  const tokens = preCleaned
     .toLowerCase()
-    .replace(/[™®©℠•·𝄞★☆–—−‑]/g, ' ')
+    .replace(/['’‘ʼ`´"“”]/g, '')
+    .replace(/[•·𝄞★☆–—−‑]/g, ' ')
     .replace(/(\d),(\d)/g, '$1$2')
     .replace(/([a-z])(\d)/g, '$1 $2')
     .replace(/(\d)([a-z])/g, '$1 $2')
@@ -646,4 +762,145 @@ export function isMicrosoftStoreCdnUrl(url?: string | null): boolean {
 export function isSteamCdnAssetUrl(url?: string | null): boolean {
   if (!url || typeof url !== 'string') return false;
   return /(?:steamstatic\.com|steamcdn-a\.akamaihd\.net|steamcommunity\.com)/i.test(url);
+}
+
+function stripStorefrontDistributionSuffixes(input: string): string {
+  if (!input) return '';
+  return input
+    .replace(
+      /(?:[:\-–—]\s*|\s+)(?:amazon\s+prime(?:\s+gaming)?|prime\s+gaming|ea\s+play(?:\s+pro)?|ubisoft\s+connect|xbox\s+game\s+pass)(?:\s+(?:edition|version))?\s*$/gi,
+      ''
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripPlatformAndDistributionNoise(rawTitle: string): string {
+  if (!rawTitle || typeof rawTitle !== 'string') return '';
+  let cur = stripTrademarkSymbols(decodeTitleHtmlEntities(rawTitle));
+  for (let pass = 0; pass < 3; pass++) {
+    const prev = cur;
+    cur = stripStorefrontDistributionSuffixes(stripStorefrontPlatformDisambiguators(cur));
+    if (cur === prev) break;
+  }
+  return cur;
+}
+
+function sanitizeSearchQueryClause(
+  rawTitle: string,
+  options?: { stripEditions?: boolean; splitHyphens?: boolean }
+): string {
+  if (!rawTitle || typeof rawTitle !== 'string') return '';
+
+  let working = stripPlatformAndDistributionNoise(rawTitle);
+  if (options?.stripEditions) {
+    working = stripYearEditionPhrases(working);
+  }
+
+  // Unwrap pure 4-digit release years "(2016)" -> "2016", preserve "(Remastered)"/"(Remake)" on Pass 1,
+  // and strip noisy multi-token or platform parens/brackets such as "(Classic, 2005)" or "(PC)".
+  working = working.replace(/[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]/g, ' $1 ');
+  if (!options?.stripEditions) {
+    working = working.replace(/[\(\[]\s*(remastered|remaster|remake)\s*[\)\]]/gi, ' $1 ');
+  }
+  working = working.replace(/[\(\[][^\)\]]*[\)\]]/g, ' ');
+
+  working = foldLatinLigaturesAndDiacritics(working);
+  if (working.includes('.')) {
+    working = working.replace(/\b(?:[A-Za-z]\.){2,}[A-Za-z]?\.?/g, (m) => m.replace(/\./g, ''));
+  }
+
+  working = working.replace(/['’‘ʼ`´"“”]/g, (ch, offset: number, str: string) => {
+    if ("'’‘ʼ`´".includes(ch)) {
+      const prev = offset > 0 ? str[offset - 1] : '';
+      const next = offset + 1 < str.length ? str[offset + 1] : '';
+      if (/[A-Za-z0-9]/.test(prev) && /[A-Za-z0-9]/.test(next)) {
+        return "'";
+      }
+    }
+    return '';
+  });
+
+  if (options?.stripEditions) {
+    const beforeEditionStrip = working;
+    const editionStripped = working
+      .replace(
+        /\b(?:vault|launch|founders?|royal|original|cross[\s\-]?gen|celebration|international)\s+(?:edition|bundle|pack|collection)\b.*$/i,
+        ''
+      )
+      .replace(
+        /\b(?:digital\s+)?(?:the\s+)?(?:standard|deluxe|gold|silver|platinum|diamond|premium|collector'?s|ultimate|complete|extended|special|limited|definitive|enhanced|anniversary|celebration|director'?s\s+cut|final\s+cut|classic\s+and\s+uncut|royal\s+edition|original\s+edition|drm[\s\-]?free(?:\s+edition)?|goty|game\s+of\s+the\s+year|remastered|remaster|remake)\b.*$/i,
+        ''
+      )
+      .replace(/[\s\-]+(?:edition|pack|bundle|collection)\s*$/i, '')
+      .trim();
+    working =
+      editionStripped.replace(/[^A-Za-z0-9]/g, '').length >= 2
+        ? editionStripped
+        : beforeEditionStrip;
+  }
+
+  if (options?.splitHyphens) {
+    working = working.replace(/[^A-Za-z0-9']+/g, ' ');
+  } else {
+    working = working
+      .replace(/[\u2010\u2011]/g, '-')
+      .replace(/[^A-Za-z0-9'-]+/g, ' ');
+  }
+
+  return working
+    .replace(/(^|\s)[-']+|[-']+(\s|$)/g, ' ')
+    .replace(/-{2,}/g, ' ')
+    .replace(/'{2,}/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Produces a clean, human- and search-API-friendly query string from a raw storefront title:
+ * decodes HTML entities, strips [™®©℠℗] & (TM)/(R)/(C), strips storefront/platform/subscription
+ * disambiguators, unwraps pure release years "(2016)" -> "2016", strips noisy parentheticals,
+ * folds Latin ligatures/diacritics, and preserves word-internal ASCII apostrophes and hyphens.
+ */
+export function sanitizeTitleForSearchQuery(rawTitle: string): string {
+  return sanitizeSearchQueryClause(rawTitle, { stripEditions: false, splitHyphens: false });
+}
+
+/**
+ * Generates up to 3 deduplicated token-array search passes for HowLongToBeat `/api/search/site`:
+ * - Pass 1: Platform-cleaned, year-unwrapped, preserving edition words and ASCII word-internal hyphens.
+ * - Pass 2: Edition-stripped and hyphen-split.
+ * - Pass 3: Pre-colon / pre-dash base franchise clause (when >= 2 alphanumeric characters).
+ */
+export function buildHltbSearchTermPasses(rawTitle: string): string[][] {
+  if (!rawTitle || typeof rawTitle !== 'string') return [];
+
+  const passes: string[][] = [];
+  const seen = new Set<string>();
+  const addPass = (clause: string): void => {
+    if (!clause) return;
+    const tokens = clause.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return;
+    const key = tokens.map((t) => t.toLowerCase()).join(' ');
+    if (seen.has(key)) return;
+    seen.add(key);
+    passes.push(tokens);
+  };
+
+  addPass(sanitizeTitleForSearchQuery(rawTitle));
+  addPass(sanitizeSearchQueryClause(rawTitle, { stripEditions: true, splitHyphens: true }));
+
+  const preCleaned = stripPlatformAndDistributionNoise(rawTitle);
+  const delimiterMatch = preCleaned.match(/^(.*?)(?::|\s+[\-–—−]\s+)/);
+  if (delimiterMatch && delimiterMatch[1]) {
+    const baseClause = sanitizeSearchQueryClause(delimiterMatch[1], {
+      stripEditions: true,
+      splitHyphens: true,
+    });
+    if (baseClause.replace(/[^A-Za-z0-9]/g, '').length >= 2) {
+      addPass(baseClause);
+    }
+  }
+
+  return passes.slice(0, 3);
 }

@@ -561,7 +561,8 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
       expect(snapshot.components.runner_wine.defaultSelected).toBe(false);
       expect(snapshot.components.runner_gptk.recommendationTier).toBe('optional');
       expect(snapshot.components.runner_gptk.defaultSelected).toBe(false);
-      expect(snapshot.components.runner_gptk.requiresExternalDownload).toBe(true);
+      expect(snapshot.components.runner_gptk.canAutoInstall).toBe(true);
+      expect(snapshot.components.runner_gptk.requiresExternalDownload).toBe(false);
 
       expect(snapshot.components.bottle_default.status).toBe('missing');
       expect(snapshot.components.bottle_default.recommendationTier).toBe('recommended');

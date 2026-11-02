@@ -26,13 +26,16 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Synchronize Win32 LastError into x86_64 TEB LastErrorValue (%gs:0x68)
- * to prevent Rosetta 2 / older Wine inline GetLastError() desyncs. */
+/* Synchronize Win32 LastError into TEB LastErrorValue (%gs:0x68 on x64, %fs:0x34 on x86)
+ * to prevent Rosetta 2 / WoW64 / older Wine inline GetLastError() desyncs. */
 static inline void xgr_sync_teb_last_error(void)
 {
 #if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
     DWORD err = GetLastError();
     __writegsdword(0x68, err);
+#elif defined(_WIN32) && (defined(__i386__) || defined(_M_IX86))
+    DWORD err = GetLastError();
+    __writefsdword(0x34, err);
 #endif
 }
 
@@ -407,12 +410,25 @@ struct xgr_initialize_options {
     const char *gameConfig;
 };
 
+#define XGR_MAX_DLC_PACKAGES 32
+
+struct xgr_dlc_package_entry {
+    char id[128];
+    char store_id[32];
+    char display_name[128];
+    XVersion version;
+    char mount_path_win[MAX_PATH];
+};
+
 /* Global Parsed Runtime Configuration */
 struct xgr_runtime_config {
     SRWLOCK lock;
     bool initialized;
     bool packaged;
     bool fullTrust;
+    bool offline;
+    bool sessionMetadataLoaded;
+    uint64_t sessionXuid;
     uint32_t titleId;
     char titleIdHex[16];
     char scid[128];
@@ -423,7 +439,12 @@ struct xgr_runtime_config {
     char packageFamilyName[256];
     char packageIdentifier[XGR_PACKAGE_IDENTIFIER_MAX_LEN];
     char displayName[256];
+    char locale[32];
+    char saveRootUtf8[MAX_PATH];
+    char inviteUri[1024];
     XVersion version;
+    uint32_t dlcCount;
+    struct xgr_dlc_package_entry dlcPackages[XGR_MAX_DLC_PACKAGES];
     char gameRootUtf8[4096];
     wchar_t gameRootWide[4096];
 };
@@ -433,6 +454,8 @@ struct xgr_runtime_config_snapshot {
     bool initialized;
     bool packaged;
     bool fullTrust;
+    bool offline;
+    uint64_t sessionXuid;
     uint32_t titleId;
     char titleIdHex[16];
     char scid[128];
@@ -443,6 +466,8 @@ struct xgr_runtime_config_snapshot {
     char packageFamilyName[256];
     char packageIdentifier[XGR_PACKAGE_IDENTIFIER_MAX_LEN];
     char displayName[256];
+    char locale[32];
+    char saveRootUtf8[MAX_PATH];
     XVersion version;
 };
 
@@ -574,8 +599,15 @@ extern const GUID IID_IXGameEventImpl;
 void xgr_sha256(const uint8_t *data, size_t len, uint8_t out_digest[32]);
 bool xgr_compute_package_family_name(const char *identity_name, const char *publisher, char *out_pfn, size_t out_size);
 void xgr_load_runtime_config(const struct xgr_initialize_options *options);
+void xgr_runtime_config_reset(void);
 void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_snap);
 void xgr_copy_game_root_utf8(char *out_buf, size_t out_size);
+void xgr_apply_session_init_json(const char *res_json);
+void xgr_ensure_session_metadata_loaded(void);
+bool xgr_is_offline_mode(void);
+void xgr_set_offline_mode(bool offline);
+uint32_t xgr_copy_dlc_packages(struct xgr_dlc_package_entry *out_entries, uint32_t max_entries);
+bool xgr_find_dlc_mount_path(const char *pkg_id, char *out_mount_path, size_t out_cap);
 
 /* xgr_rpc.c */
 typedef struct XgrStrBuf {
@@ -616,6 +648,65 @@ void xgr_ensure_xcurl_shim(void);
 bool xgr_is_xcurl_shim_active(void);
 void xgr_uninstall_xcurl_shim(void);
 
+/* xgr_playfab_shim.c */
+typedef struct XGR_PFGameSaveInitArgs {
+    XTaskQueueHandle backgroundQueue;
+    uint64_t options;
+    const char *saveFolder;
+} XGR_PFGameSaveInitArgs;
+
+typedef void (CALLBACK XGR_PFGameSaveFilesUiProgressCallback)(
+    XUserHandle localUser,
+    uint32_t syncState,
+    void *context
+);
+typedef void (CALLBACK XGR_PFGameSaveFilesUiSyncFailedCallback)(
+    XUserHandle localUser,
+    uint32_t syncState,
+    HRESULT error,
+    void *context
+);
+typedef void (CALLBACK XGR_PFGameSaveFilesUiActiveDeviceContentionCallback)(
+    XUserHandle localUser,
+    void *localGameSave,
+    void *remoteGameSave,
+    void *context
+);
+typedef void (CALLBACK XGR_PFGameSaveFilesUiConflictCallback)(
+    XUserHandle localUser,
+    void *localGameSave,
+    void *remoteGameSave,
+    void *context
+);
+typedef void (CALLBACK XGR_PFGameSaveFilesUiOutOfStorageCallback)(
+    XUserHandle localUser,
+    uint64_t requiredBytes,
+    void *context
+);
+
+typedef struct XGR_PFGameSaveUICallbacks {
+    XGR_PFGameSaveFilesUiProgressCallback *progressCallback;
+    void *progressContext;
+    XGR_PFGameSaveFilesUiSyncFailedCallback *syncFailedCallback;
+    void *syncFailedContext;
+    XGR_PFGameSaveFilesUiActiveDeviceContentionCallback *activeDeviceContentionCallback;
+    void *activeDeviceContentionContext;
+    XGR_PFGameSaveFilesUiConflictCallback *conflictCallback;
+    void *conflictContext;
+    XGR_PFGameSaveFilesUiOutOfStorageCallback *outOfStorageCallback;
+    void *outOfStorageContext;
+} XGR_PFGameSaveUICallbacks;
+
+typedef void *(WINAPI *xgr_playfab_proc_resolver_fn)(const char *proc_name);
+void *xgr_playfab_resolve_iat_replacement(const char *fn_name, void *orig_proc);
+void xgr_playfab_set_symbol_resolver_for_test(xgr_playfab_proc_resolver_fn resolver);
+void xgr_playfab_shim_reset(void);
+HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesInitialize(const XGR_PFGameSaveInitArgs *args);
+HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesSetUiCallbacks(const XGR_PFGameSaveUICallbacks *callbacks);
+HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(XUserHandle localUser, uint32_t options, XAsyncBlock *async);
+HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUploadWithUiAsync(XUserHandle localUser, uint32_t option, XAsyncBlock *async);
+HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUninitializeAsync(XAsyncBlock *async);
+
 /* xthreading.c */
 HRESULT xgr_query_threading(REFIID iid, void **ppv);
 void xgr_threading_shutdown(void);
@@ -638,6 +729,7 @@ HRESULT xgr_query_user(REFIID iid, void **ppv);
 HRESULT xgr_query_user_device(REFIID iid, void **ppv);
 void xgr_user_shutdown(void);
 uint64_t xgr_user_get_xuid(XUserHandle user);
+uint64_t xgr_user_get_primary_xuid(void);
 HRESULT xgr_user_duplicate(XUserHandle user, XUserHandle *out_user);
 void xgr_user_close(XUserHandle user);
 
@@ -655,6 +747,8 @@ HRESULT xgr_package_mount_internal(const char *pkg_id, XPackageMountHandle *out)
 /* xsystem_misc.c */
 HRESULT xgr_query_error(REFIID iid, void **ppv);
 BOOL xgr_invoke_error_report(HRESULT error, const char *message);
+void xgr_set_pending_invite_uri(const char *uri);
+void xgr_invite_callbacks_reset(void);
 HRESULT xgr_query_display(REFIID iid, void **ppv);
 HRESULT xgr_query_launcher(REFIID iid, void **ppv);
 HRESULT xgr_query_game(REFIID iid, void **ppv);

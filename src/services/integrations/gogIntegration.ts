@@ -20,6 +20,7 @@ export interface GogProductItem {
   };
   category?: string;
   rating?: number;
+  isHidden?: boolean;
 }
 
 export interface GogAvatarMap {
@@ -510,16 +511,22 @@ export class GogIntegrationService {
   }
 
   /**
-   * Fetches the user's complete library across all paginated products from getFilteredProducts
+   * Fetches the user's complete library across all paginated products from getFilteredProducts,
+   * tracking whether all pages finished cleanly with zero errors.
    */
-  async fetchOwnedGames(accessToken: string): Promise<CanonicalGame[]> {
-    if (!accessToken || accessToken === 'saved_in_electron') return [];
+  async fetchOwnedGamesDetailed(
+    accessToken: string
+  ): Promise<{ games: CanonicalGame[]; authoritativeComplete: boolean }> {
+    if (!accessToken || accessToken === 'saved_in_electron') {
+      return { games: [], authoritativeComplete: false };
+    }
     const games: CanonicalGame[] = [];
+    let completedAllPages = false;
     try {
       let currentPage = 1;
       let totalPages = 1;
 
-      while (currentPage <= totalPages && currentPage <= 25) {
+      while (currentPage <= totalPages && currentPage <= 100) {
         const res = await axios.get<{
           products?: GogProductItem[];
           totalPages?: number;
@@ -532,9 +539,10 @@ export class GogIntegrationService {
         );
 
         const products: GogProductItem[] = res.data?.products || [];
-        totalPages = res.data?.totalPages || 1;
+        totalPages = typeof res.data?.totalPages === 'number' ? res.data.totalPages : 1;
 
         for (const p of products) {
+          if (p.isHidden === true) continue;
           const gameTitle = p.title?.trim();
           if (!gameTitle) continue;
 
@@ -570,10 +578,21 @@ export class GogIntegrationService {
 
         currentPage++;
       }
+
+      completedAllPages = currentPage > totalPages;
     } catch (err) {
+      completedAllPages = false;
       console.warn('Failed fetching paginated GOG products:', err);
     }
 
+    return { games, authoritativeComplete: completedAllPages };
+  }
+
+  /**
+   * Fetches the user's complete library across all paginated products from getFilteredProducts
+   */
+  async fetchOwnedGames(accessToken: string): Promise<CanonicalGame[]> {
+    const { games } = await this.fetchOwnedGamesDetailed(accessToken);
     return games;
   }
 
@@ -582,7 +601,12 @@ export class GogIntegrationService {
    */
   async connectAccount(
     credentials: StorefrontCredentials
-  ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[] }> {
+  ): Promise<{
+    accountName: string;
+    avatarUrl?: string;
+    games: CanonicalGame[];
+    authoritativeComplete?: boolean;
+  }> {
     const rawInput = (credentials.gogUsername || '').trim();
     let accountName = 'GOG User';
     let avatarUrl: string | undefined = undefined;
@@ -599,6 +623,8 @@ export class GogIntegrationService {
 
     // Try OAuth authorization code exchange if token/code is present
     let liveGames: CanonicalGame[] = [];
+    let authoritativeComplete = false;
+    let isElectronTransientOffline = false;
     if (credentials.gogToken) {
       let accessToken = credentials.gogToken;
       // If gogToken looks like an authorization code (or URL), exchange it via IPC
@@ -616,10 +642,13 @@ export class GogIntegrationService {
       if (accessToken === 'saved_in_electron' && typeof window !== 'undefined' && window.electronAPI?.syncStore) {
         try {
           const ipcSync = await window.electronAPI.syncStore('gog');
-          if (ipcSync?.success) {
-            if (ipcSync.accountName) accountName = ipcSync.accountName;
-            if (ipcSync.avatarUrl) avatarUrl = ipcSync.avatarUrl;
+          if (ipcSync?.accountName) accountName = ipcSync.accountName;
+          if (ipcSync?.avatarUrl) avatarUrl = ipcSync.avatarUrl;
+          if (ipcSync?.transientOffline) {
+            isElectronTransientOffline = true;
+          } else if (ipcSync?.success) {
             if (Array.isArray(ipcSync.games)) liveGames = ipcSync.games;
+            authoritativeComplete = Boolean(ipcSync.authoritativeComplete);
           }
         } catch (ipcErr) {
           console.warn('Electron GOG sync fallback failed:', ipcErr);
@@ -633,7 +662,9 @@ export class GogIntegrationService {
         }
 
         // Fetch all real owned products
-        liveGames = await this.fetchOwnedGames(accessToken);
+        const ownedRes = await this.fetchOwnedGamesDetailed(accessToken);
+        liveGames = ownedRes.games;
+        authoritativeComplete = ownedRes.authoritativeComplete;
       }
     } else {
       // Fetch public profile user details (avatar, username confirmation)
@@ -644,10 +675,20 @@ export class GogIntegrationService {
       }
     }
 
+    if (isElectronTransientOffline) {
+      return {
+        accountName,
+        avatarUrl,
+        games: [],
+        authoritativeComplete: false,
+      };
+    }
+
     let games: CanonicalGame[];
-    if (liveGames.length > 0) {
+    if (liveGames.length > 0 || authoritativeComplete) {
       games = liveGames;
     } else {
+      authoritativeComplete = false;
       let profileGames: CanonicalGame[] = [];
       try {
         profileGames = await this.fetchProfileGames(accountName);
@@ -705,6 +746,7 @@ export class GogIntegrationService {
       accountName,
       avatarUrl,
       games,
+      authoritativeComplete,
     };
   }
 }

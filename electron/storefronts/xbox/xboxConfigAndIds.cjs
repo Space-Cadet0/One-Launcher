@@ -259,6 +259,25 @@ function deriveDefaultScidFromTitleId(titleId, options = {}) {
 }
 
 /**
+ * Normalizes a processor architecture string from `MicrosoftGame.config` or `AppxManifest.xml`
+ * into `'x86' | 'x64' | 'arm64' | 'neutral' | ''`.
+ *
+ * @param {string|null|undefined} rawArch
+ * @returns {'x86' | 'x64' | 'arm64' | 'neutral' | ''}
+ */
+function normalizeProcessorArchitecture(rawArch) {
+  const clean = String(rawArch || '').trim().toLowerCase();
+  if (!clean) return '';
+  if (clean === 'x86' || clean === 'i386' || clean === 'i686' || clean === 'win32') return 'x86';
+  if (clean === 'x64' || clean === 'amd64' || clean === 'x86_64' || clean === 'x86-64') {
+    return 'x64';
+  }
+  if (clean === 'arm64' || clean === 'aarch64') return 'arm64';
+  if (clean === 'neutral') return 'neutral';
+  return '';
+}
+
+/**
  * Parses `MicrosoftGame.config` XML text into canonical One Launcher Xbox metadata.
  * Strips `<!-- ... -->` XML comments and `<DevelopmentOnly>...</DevelopmentOnly>` blocks,
  * decodes XML character/entity references, and enforces `<TitleId>` vs `<ExtendedAttribute Name="Scid">`
@@ -340,6 +359,37 @@ function parseMicrosoftGameConfigXml(xmlInput) {
   const advancedUserModel = aumText ? /^true$/i.test(aumText) : false;
 
   const desktopRegMatch = /<DesktopRegistration\b[^>]*>([\s\S]*?)<\/DesktopRegistration>/i.exec(xml);
+  const rawIdentityArch = identityMatch
+    ? extractXmlAttr(identityMatch[1], 'ProcessorArchitecture')
+    : '';
+  const rawDesktopArch = desktopRegMatch
+    ? extractXmlTagText(desktopRegMatch[1], 'ProcessorArchitecture')
+    : '';
+  const rawTopArch = extractXmlTagText(xml, 'ProcessorArchitecture');
+  const processorArchitecture = normalizeProcessorArchitecture(
+    rawIdentityArch || rawDesktopArch || rawTopArch
+  );
+
+  const knownDependenciesSet = new Set();
+  const depListRegex = /<DependencyList\b[^>]*>([\s\S]*?)<\/DependencyList>/gi;
+  let depListMatch;
+  while ((depListMatch = depListRegex.exec(xml)) !== null) {
+    const depBody = depListMatch[1];
+    const kdRegex = /<KnownDependency\b([^>]*)\/?>/gi;
+    let kdMatch;
+    while ((kdMatch = kdRegex.exec(depBody)) !== null) {
+      const depName = extractXmlAttr(kdMatch[1], 'Name').trim();
+      if (depName) knownDependenciesSet.add(depName);
+    }
+  }
+  const standaloneKdRegex = /<KnownDependency\b([^>]*)\/?>/gi;
+  let standaloneKdMatch;
+  while ((standaloneKdMatch = standaloneKdRegex.exec(xml)) !== null) {
+    const depName = extractXmlAttr(standaloneKdMatch[1], 'Name').trim();
+    if (depName) knownDependenciesSet.add(depName);
+  }
+  const knownDependencies = Array.from(knownDependenciesSet);
+
   const desktopRegistration = desktopRegMatch
     ? {
         modFolder: extractXmlAttr(
@@ -350,6 +400,8 @@ function parseMicrosoftGameConfigXml(xmlInput) {
           desktopRegMatch[1]
         ),
         enableWritesToPackageRoot: /<EnableWritesToPackageRoot\b/i.test(desktopRegMatch[1]),
+        processorArchitecture,
+        knownDependencies,
       }
     : null;
 
@@ -413,6 +465,8 @@ function parseMicrosoftGameConfigXml(xmlInput) {
       version,
     },
     packageFamilyName,
+    processorArchitecture,
+    knownDependencies,
     titleId: rawTitleId,
     titleIdDecimal,
     scid,
@@ -517,6 +571,7 @@ module.exports = {
   deriveScidFromHexTitleId,
   deriveScidFromDecimalTitleId,
   deriveDefaultScidFromTitleId,
+  normalizeProcessorArchitecture,
   parseMicrosoftGameConfigXml,
   parseMicrosoftGameConfig: parseMicrosoftGameConfigXml,
   parseAppxManifestXml,

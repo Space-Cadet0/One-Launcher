@@ -31,6 +31,7 @@ export interface OpenSystemSetupEventDetail {
 
 export interface ComputeDefaultSelectedOptions {
   chosenRunner?: Exclude<CompatibilityLayerType, 'native'> | 'skip';
+  focusComponentId?: EnvironmentComponentId;
 }
 
 export interface BuildProvisioningTasksParams {
@@ -41,6 +42,7 @@ export interface BuildProvisioningTasksParams {
   bottleName: string;
   gptkDmgPath?: string;
   forceRepairIds?: ReadonlySet<EnvironmentComponentId>;
+  runnerUpdateOptInIds?: ReadonlySet<EnvironmentComponentId>;
 }
 
 export interface ShouldAutoOpenSetupWizardParams {
@@ -65,6 +67,14 @@ const ALL_ENVIRONMENT_COMPONENT_IDS: ReadonlySet<EnvironmentComponentId> = new S
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
   'xbox_runtime',
 ]);
 
@@ -86,12 +96,46 @@ const RUNNER_COMPONENT_TO_TYPE: ReadonlyArray<{
 ];
 
 const HOST_CLIENT_ORDER: ReadonlyArray<
-  Extract<EnvironmentComponentId, 'host_steam' | 'host_gog' | 'host_epic'>
-> = ['host_steam', 'host_gog', 'host_epic'];
+  Extract<
+    EnvironmentComponentId,
+    | 'host_steam'
+    | 'host_gog'
+    | 'host_epic'
+    | 'host_ubisoft'
+    | 'host_ea'
+    | 'host_bnet'
+    | 'host_rockstar'
+  >
+> = [
+  'host_steam',
+  'host_gog',
+  'host_epic',
+  'host_ubisoft',
+  'host_ea',
+  'host_bnet',
+  'host_rockstar',
+];
 
 const BOTTLE_CLIENT_ORDER: ReadonlyArray<
-  Extract<EnvironmentComponentId, 'bottle_steam' | 'bottle_gog' | 'bottle_epic'>
-> = ['bottle_steam', 'bottle_gog', 'bottle_epic'];
+  Extract<
+    EnvironmentComponentId,
+    | 'bottle_steam'
+    | 'bottle_gog'
+    | 'bottle_epic'
+    | 'bottle_ubisoft'
+    | 'bottle_ea'
+    | 'bottle_bnet'
+    | 'bottle_rockstar'
+  >
+> = [
+  'bottle_steam',
+  'bottle_gog',
+  'bottle_epic',
+  'bottle_ubisoft',
+  'bottle_ea',
+  'bottle_bnet',
+  'bottle_rockstar',
+];
 
 const CLIENT_LOGIN_TARGET_IDS: ReadonlySet<ClientLoginTargetId> = new Set([
   'host_steam',
@@ -100,6 +144,14 @@ const CLIENT_LOGIN_TARGET_IDS: ReadonlySet<ClientLoginTargetId> = new Set([
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
 ]);
 
 function isValidComponentId(value: unknown): value is EnvironmentComponentId {
@@ -385,7 +437,7 @@ export function buildFallbackEnvironmentSnapshot(
       status: isMac ? 'missing' : 'not_applicable',
       canAutoInstall: false,
       requiresExternalDownload: true,
-      externalDownloadUrl: 'https://www.codeweavers.com/preview',
+      externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
       recommendationTier: isMac ? 'optional' : 'not_needed',
       recommendationBadge: isMac ? 'Optional' : 'Not Needed',
       defaultSelected: false,
@@ -415,16 +467,16 @@ export function buildFallbackEnvironmentSnapshot(
       title: 'Apple Game Porting Toolkit',
       shortLabel: 'GPTK',
       status: isAppleSiliconMac ? 'missing' : 'not_applicable',
-      canAutoInstall: false,
-      requiresExternalDownload: true,
-      externalDownloadUrl: 'https://developer.apple.com/games/game-porting-toolkit/',
+      canAutoInstall: isAppleSiliconMac,
+      requiresExternalDownload: false,
+      externalDownloadUrl: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
       recommendationTier: isAppleSiliconMac ? 'optional' : 'not_needed',
       recommendationBadge: isAppleSiliconMac ? 'Advanced' : 'Not Needed',
       defaultSelected: false,
       whyExplanation:
         'Apple’s developer tool. Not needed if you use CrossOver, which already includes it.',
       statusDetail: isAppleSiliconMac
-        ? 'Not installed.'
+        ? 'Not installed yet.'
         : isMac
           ? 'Requires Apple Silicon.'
           : 'Not needed on Windows.',
@@ -540,6 +592,134 @@ export function buildFallbackEnvironmentSnapshot(
         'Downloads, cloud saves, achievements, and multiplayer already work without it (via built-in legendary). Only install if you want the Epic social overlay.',
       statusDetail: isMac ? 'Not installed (not needed).' : 'Not needed on Windows.',
     },
+    host_ubisoft: {
+      id: 'host_ubisoft',
+      category: 'host_client',
+      storefrontId: 'ubisoft',
+      scope: 'host',
+      title: 'Ubisoft Connect',
+      shortLabel: 'Ubisoft Connect',
+      status: isWin ? 'missing' : 'not_applicable',
+      canAutoInstall: isWin,
+      recommendationTier: isWin ? 'optional' : 'not_needed',
+      recommendationBadge: isWin ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed for Xbox Game Pass or cross-store titles that delegate launch and sign-in through Ubisoft Connect.',
+      statusDetail: isWin ? 'Not installed (optional).' : 'Not needed on Mac.',
+    },
+    bottle_ubisoft: {
+      id: 'bottle_ubisoft',
+      category: 'bottle_client',
+      storefrontId: 'ubisoft',
+      scope: 'bottle',
+      title: 'Ubisoft Connect (Windows)',
+      shortLabel: 'Ubisoft Connect (Windows)',
+      status: isMac ? 'missing' : 'not_applicable',
+      canAutoInstall: isMac,
+      recommendationTier: isMac ? 'optional' : 'not_needed',
+      recommendationBadge: isMac ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed on Mac for Windows titles that delegate launch and sign-in through Ubisoft Connect.',
+      statusDetail: isMac ? 'Not installed (optional).' : 'Not needed on Windows.',
+    },
+    host_ea: {
+      id: 'host_ea',
+      category: 'host_client',
+      storefrontId: 'ea',
+      scope: 'host',
+      title: 'EA App',
+      shortLabel: 'EA App',
+      status: isWin ? 'missing' : 'not_applicable',
+      canAutoInstall: isWin,
+      recommendationTier: isWin ? 'optional' : 'not_needed',
+      recommendationBadge: isWin ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed for EA Play / PC Game Pass or cross-store titles that delegate launch and sign-in through EA App.',
+      statusDetail: isWin ? 'Not installed (optional).' : 'Not needed on Mac.',
+    },
+    bottle_ea: {
+      id: 'bottle_ea',
+      category: 'bottle_client',
+      storefrontId: 'ea',
+      scope: 'bottle',
+      title: 'EA App (Windows)',
+      shortLabel: 'EA App (Windows)',
+      status: isMac ? 'missing' : 'not_applicable',
+      canAutoInstall: isMac,
+      recommendationTier: isMac ? 'optional' : 'not_needed',
+      recommendationBadge: isMac ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed on Mac for Windows titles that delegate launch and sign-in through EA App.',
+      statusDetail: isMac ? 'Not installed (optional).' : 'Not needed on Windows.',
+    },
+    host_bnet: {
+      id: 'host_bnet',
+      category: 'host_client',
+      storefrontId: 'bnet',
+      scope: 'host',
+      title: isMac ? 'Battle.net (Mac)' : 'Battle.net',
+      shortLabel: 'Battle.net',
+      status: isWin ? 'missing' : 'not_applicable',
+      canAutoInstall: isWin,
+      recommendationTier: isWin ? 'optional' : 'not_needed',
+      recommendationBadge: isWin ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed for Activision Blizzard / PC Game Pass titles that delegate launch and sign-in through Battle.net.',
+      statusDetail: isWin ? 'Not installed (optional).' : 'Not needed on Mac.',
+    },
+    bottle_bnet: {
+      id: 'bottle_bnet',
+      category: 'bottle_client',
+      storefrontId: 'bnet',
+      scope: 'bottle',
+      title: 'Battle.net (Windows)',
+      shortLabel: 'Battle.net (Windows)',
+      status: isMac ? 'missing' : 'not_applicable',
+      canAutoInstall: isMac,
+      recommendationTier: isMac ? 'optional' : 'not_needed',
+      recommendationBadge: isMac ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed on Mac for Windows titles that delegate launch and sign-in through Battle.net.',
+      statusDetail: isMac ? 'Not installed (optional).' : 'Not needed on Windows.',
+    },
+    host_rockstar: {
+      id: 'host_rockstar',
+      category: 'host_client',
+      storefrontId: 'rockstar',
+      scope: 'host',
+      title: 'Rockstar Games Launcher',
+      shortLabel: 'Rockstar Launcher',
+      status: isWin ? 'missing' : 'not_applicable',
+      canAutoInstall: isWin,
+      recommendationTier: isWin ? 'optional' : 'not_needed',
+      recommendationBadge: isWin ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed for Rockstar titles that delegate launch and sign-in through Rockstar Games Launcher.',
+      statusDetail: isWin ? 'Not installed (optional).' : 'Not needed on Mac.',
+    },
+    bottle_rockstar: {
+      id: 'bottle_rockstar',
+      category: 'bottle_client',
+      storefrontId: 'rockstar',
+      scope: 'bottle',
+      title: 'Rockstar Games Launcher (Windows)',
+      shortLabel: 'Rockstar Launcher (Windows)',
+      status: isMac ? 'missing' : 'not_applicable',
+      canAutoInstall: isMac,
+      recommendationTier: isMac ? 'optional' : 'not_needed',
+      recommendationBadge: isMac ? 'Optional — Delegated Games' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Only needed on Mac for Windows titles that delegate launch and sign-in through Rockstar Games Launcher.',
+      statusDetail: isMac ? 'Not installed (optional).' : 'Not needed on Windows.',
+    },
     xbox_runtime: {
       id: 'xbox_runtime',
       category: 'built_in_runtime',
@@ -620,6 +800,86 @@ export function buildFallbackEnvironmentSnapshot(
       accountMatchesOneLauncher: null,
       statusSummary: 'Not installed',
     },
+    host_ubisoft: {
+      targetId: 'host_ubisoft',
+      storefrontId: 'ubisoft',
+      scope: 'host',
+      label: 'Ubisoft Connect',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    bottle_ubisoft: {
+      targetId: 'bottle_ubisoft',
+      storefrontId: 'ubisoft',
+      scope: 'bottle',
+      label: 'Ubisoft Connect (Windows)',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    host_ea: {
+      targetId: 'host_ea',
+      storefrontId: 'ea',
+      scope: 'host',
+      label: 'EA App',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    bottle_ea: {
+      targetId: 'bottle_ea',
+      storefrontId: 'ea',
+      scope: 'bottle',
+      label: 'EA App (Windows)',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    host_bnet: {
+      targetId: 'host_bnet',
+      storefrontId: 'bnet',
+      scope: 'host',
+      label: isMac ? 'Battle.net (Mac)' : 'Battle.net',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    bottle_bnet: {
+      targetId: 'bottle_bnet',
+      storefrontId: 'bnet',
+      scope: 'bottle',
+      label: 'Battle.net (Windows)',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    host_rockstar: {
+      targetId: 'host_rockstar',
+      storefrontId: 'rockstar',
+      scope: 'host',
+      label: 'Rockstar Games Launcher',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
+    bottle_rockstar: {
+      targetId: 'bottle_rockstar',
+      storefrontId: 'rockstar',
+      scope: 'bottle',
+      label: 'Rockstar Games Launcher (Windows)',
+      installed: false,
+      authenticated: false,
+      accountMatchesOneLauncher: null,
+      statusSummary: 'Not installed',
+    },
   };
 
   return {
@@ -669,7 +929,7 @@ export function computeDefaultSelectedComponents(
     selected.add('win_vcredist');
   }
 
-  // 2. Compatibility runner on macOS
+  // 2. Compatibility runner on macOS (missing/partially_configured auto-selected; update_available stays opt-in)
   if (isMac && !skipRunner) {
     if (chosenRunner) {
       const explicitRunnerEntry = RUNNER_COMPONENT_TO_TYPE.find(
@@ -677,7 +937,12 @@ export function computeDefaultSelectedComponents(
       );
       if (explicitRunnerEntry) {
         const comp = snapshot.components[explicitRunnerEntry.componentId];
-        if (comp && comp.status !== 'ready' && comp.status !== 'not_applicable') {
+        if (
+          comp &&
+          comp.status !== 'ready' &&
+          comp.status !== 'update_available' &&
+          comp.status !== 'not_applicable'
+        ) {
           selected.add(explicitRunnerEntry.componentId);
         }
       }
@@ -691,6 +956,7 @@ export function computeDefaultSelectedComponents(
       } else if (
         snapshot.components.runner_crossover &&
         snapshot.components.runner_crossover.status !== 'ready' &&
+        snapshot.components.runner_crossover.status !== 'update_available' &&
         snapshot.components.runner_crossover.status !== 'not_applicable'
       ) {
         selected.add('runner_crossover');
@@ -733,8 +999,8 @@ export function computeDefaultSelectedComponents(
   }
 
   // 5. Re-select any previously configured components that were removed since last setup
-  //    (including host_gog, bottle_gog, host_epic, bottle_epic when in repair/health-check mode;
-  //    on fresh installs those remain unselected by default).
+  //    (including optional storefront and chained publisher launchers when in repair/health-check
+  //    mode; on fresh installs those remain unselected by default).
   for (const comp of Object.values(snapshot.components)) {
     if (!comp || comp.wasPreviouslyConfigured !== true || comp.status !== 'missing') {
       continue;
@@ -751,6 +1017,29 @@ export function computeDefaultSelectedComponents(
       continue;
     }
     selected.add(comp.id);
+  }
+
+  // 6. Pre-select an explicitly focused component (e.g., when opened from a chained publisher
+  //    launcher install/play prompt) while keeping publisher launchers unselected by default.
+  const focusedId = options?.focusComponentId;
+  if (focusedId) {
+    const focusedComp = snapshot.components[focusedId];
+    if (
+      focusedComp &&
+      focusedComp.status !== 'ready' &&
+      focusedComp.status !== 'not_applicable'
+    ) {
+      const requiresMacRunner =
+        focusedComp.category === 'compatibility_runner' ||
+        focusedComp.category === 'bottle' ||
+        focusedComp.category === 'bottle_client';
+      if (
+        (!requiresMacRunner || (isMac && !skipRunner)) &&
+        (focusedComp.category !== 'bottle_client' || hasRunnerInstalledOrSelected)
+      ) {
+        selected.add(focusedId);
+      }
+    }
   }
 
   return selected;
@@ -777,6 +1066,7 @@ export function buildProvisioningTasksFromSelection(
     bottleName,
     gptkDmgPath,
     forceRepairIds,
+    runnerUpdateOptInIds,
   } = params;
 
   const isMac = snapshot.hostPlatform === 'darwin';
@@ -785,9 +1075,19 @@ export function buildProvisioningTasksFromSelection(
   const trimmedBottleName = bottleName.trim() || snapshot.bottleSummary?.recommendedBottleName || 'OneLauncher';
 
   const shouldProvision = (id: EnvironmentComponentId): boolean => {
-    if (!selectedIds.has(id)) return false;
     const comp = snapshot.components[id];
     if (comp?.status === 'not_applicable') return false;
+    const isRunnerComponent = RUNNER_COMPONENT_TO_TYPE.some((entry) => entry.componentId === id);
+    if (comp?.status === 'update_available' && isRunnerComponent) {
+      if (runnerUpdateOptInIds) {
+        return runnerUpdateOptInIds.has(id);
+      }
+      const serviceOptIn = environmentSetupService.getRunnerUpdateOptIn(id);
+      if (serviceOptIn !== undefined) {
+        return serviceOptIn;
+      }
+    }
+    if (!selectedIds.has(id)) return false;
     if (comp?.status === 'ready' && !forceRepairIds?.has(id)) {
       return false;
     }
@@ -833,13 +1133,22 @@ export function buildProvisioningTasksFromSelection(
 
     for (const entry of orderedRunnerEntries) {
       if (shouldProvision(entry.componentId)) {
+        const comp = snapshot.components[entry.componentId];
         const runnerTask: EnvironmentSetupTaskRequest = {
           action: 'install_runner',
           componentId: entry.componentId,
           runnerType: entry.runnerType,
         };
+        if (comp?.status === 'update_available' || forceRepairIds?.has(entry.componentId)) {
+          runnerTask.forceUpdate = true;
+        }
         if (entry.componentId === 'runner_gptk' && gptkDmgPath && gptkDmgPath.trim()) {
-          runnerTask.dmgPath = gptkDmgPath.trim();
+          const trimmedPath = gptkDmgPath.trim();
+          if (/\.dmg$/i.test(trimmedPath)) {
+            runnerTask.dmgPath = trimmedPath;
+          } else {
+            runnerTask.archivePath = trimmedPath;
+          }
         }
         tasks.push(runnerTask);
       }
@@ -886,11 +1195,7 @@ export function buildProvisioningTasksFromSelection(
   if (tasks.length > 0) {
     const anchorTask = tasks[tasks.length - 1];
     const hasBottleScopeTask = tasks.some(
-      (t) =>
-        t.action === 'ensure_bottle' ||
-        t.componentId === 'bottle_steam' ||
-        t.componentId === 'bottle_gog' ||
-        t.componentId === 'bottle_epic'
+      (t) => t.action === 'ensure_bottle' || t.componentId.startsWith('bottle_')
     );
     tasks.push({
       action: 'sync_first_party_manifests',
@@ -956,6 +1261,7 @@ export class EnvironmentSetupService {
   private inFlightProbePromise: Promise<EnvironmentHealthSnapshot> | null = null;
   private activeRunId: string | null = null;
   private activeGuidedLoginTarget: ClientLoginTargetId | null = null;
+  private runnerUpdateOptIn: Map<EnvironmentComponentId, boolean> = new Map();
   private runSeq = 0;
   private boundElectronApiRef: unknown = null;
   private unsubscribeProgress: (() => void) | null = null;
@@ -1000,8 +1306,14 @@ export class EnvironmentSetupService {
     if (this.progressHistory.length > MAX_SETUP_PROGRESS_HISTORY) {
       this.progressHistory = this.progressHistory.slice(-MAX_SETUP_PROGRESS_HISTORY);
     }
+    const isManifestSyncEvent =
+      event.action === 'sync_first_party_manifests' ||
+      /sync.*manifest|installed game folders|local storefront game folders/i.test(
+        event.message || ''
+      );
     if (
       event.phase === 'completed' &&
+      !isManifestSyncEvent &&
       isValidComponentId(event.componentId) &&
       this.lastSnapshot
     ) {
@@ -1026,14 +1338,20 @@ export class EnvironmentSetupService {
     };
 
     for (const id of completedIds) {
+      this.runnerUpdateOptIn.delete(id);
       const existing = nextComponents[id];
       if (
         existing &&
-        (existing.status === 'missing' || existing.status === 'partially_configured')
+        (existing.status === 'missing' ||
+          existing.status === 'partially_configured' ||
+          existing.status === 'update_available')
       ) {
         nextComponents[id] = {
           ...existing,
           status: 'ready',
+          ...(existing.status === 'update_available' && existing.latestVersion
+            ? { version: existing.latestVersion }
+            : {}),
           defaultSelected: false,
           statusDetail: 'Installed.',
         };
@@ -1113,11 +1431,39 @@ export class EnvironmentSetupService {
     return getRemovedComponents(this.lastSnapshot);
   }
 
+  public getRunnerUpdateOptIn(componentId: EnvironmentComponentId): boolean | undefined {
+    return this.runnerUpdateOptIn.get(componentId);
+  }
+
+  public setRunnerUpdateOptIn(componentId: EnvironmentComponentId, enabled: boolean): void {
+    const prev = this.runnerUpdateOptIn.get(componentId);
+    this.runnerUpdateOptIn.set(componentId, enabled);
+    if (prev === enabled) {
+      return;
+    }
+    if (this.lastSnapshot) {
+      this.lastSnapshot = { ...this.lastSnapshot };
+    }
+    this.notifyListeners();
+  }
+
+  public clearRunnerUpdateOptIn(): void {
+    if (this.runnerUpdateOptIn.size === 0) return;
+    this.runnerUpdateOptIn.clear();
+    if (this.lastSnapshot) {
+      this.lastSnapshot = { ...this.lastSnapshot };
+    }
+    this.notifyListeners();
+  }
+
   public probeHealth(
     connectedStorefronts?: StorefrontId[],
     options?: { forceFresh?: boolean }
   ): Promise<EnvironmentHealthSnapshot> {
     this.ensureProgressSubscription();
+    if (options?.forceFresh) {
+      this.runnerUpdateOptIn.clear();
+    }
     if (this.inFlightProbePromise) {
       if (!options?.forceFresh) {
         return this.inFlightProbePromise;
@@ -1295,10 +1641,17 @@ export class EnvironmentSetupService {
         }
 
         const normalizedOutcomes = Array.isArray(result?.outcomes) ? result.outcomes : [];
+        const failedIds = new Set(
+          normalizedOutcomes
+            .filter((o) => o.status === 'failed' || o.status === 'cancelled')
+            .map((o) => o.componentId)
+        );
         const completedIds = normalizedOutcomes
           .filter(
             (o) =>
-              o.status === 'completed' || (o.status === 'skipped' && Boolean(o.installedPath))
+              o.action !== 'sync_first_party_manifests' &&
+              !failedIds.has(o.componentId) &&
+              (o.status === 'completed' || (o.status === 'skipped' && Boolean(o.installedPath)))
           )
           .map((o) => o.componentId);
 
@@ -1421,11 +1774,19 @@ export class EnvironmentSetupService {
         return result;
       }
 
-      const storefrontId: 'steam' | 'gog' | 'epic' = req.targetId.includes('gog')
+      const storefrontId: ClientAuthProbeState['storefrontId'] = req.targetId.includes('gog')
         ? 'gog'
         : req.targetId.includes('epic')
           ? 'epic'
-          : 'steam';
+          : req.targetId.includes('ubisoft')
+            ? 'ubisoft'
+            : req.targetId.includes('ea')
+              ? 'ea'
+              : req.targetId.includes('bnet')
+                ? 'bnet'
+                : req.targetId.includes('rockstar')
+                  ? 'rockstar'
+                  : 'steam';
       const scope: 'host' | 'bottle' = req.targetId.startsWith('bottle_') ? 'bottle' : 'host';
       return {
         success: false,

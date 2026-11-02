@@ -94,6 +94,7 @@ export function saveCachedGogOsSupport(
   flags?: { windows: boolean; mac: boolean }
 ): void {
   if (!flags || typeof flags !== 'object') return;
+  if (flags.windows === false && flags.mac !== true) return;
   const normalizedFlags = {
     windows: flags.windows !== false,
     mac: flags.mac === true,
@@ -173,32 +174,81 @@ function extractExplicitOsFlags(raw?: RawOsFlags | null): { windows: boolean; ma
   if (typeof winVal !== 'boolean' && typeof macVal !== 'boolean') {
     return null;
   }
+  const windows = winVal !== false;
+  const mac = macVal === true;
+  if (!windows && !mac) {
+    return null;
+  }
   return {
-    windows: winVal !== false,
-    mac: macVal === true,
+    windows,
+    mac,
   };
 }
 
 /**
  * Resolves native OS support flags strictly isolated to a single storefront (`platformId`).
- * Prevents cross-store OS metadata bleed (e.g., Epic-only or Windows-only GOG builds inheriting
+ * Prevents cross-store OS metadata bleed (e.g., Epic-only or Windows-only GOG/Xbox builds inheriting
  * Steam's `mac: true` from `game.enrichedMetadata` or `steamCache`).
  */
 export function getStorefrontNativeOsFlags(
   game: CanonicalGame,
-  platformId: StorefrontId
+  platformId: StorefrontId | 'riot'
 ): { windows: boolean; mac: boolean; isExplicit: boolean } {
   if (!game) {
     return { windows: true, mac: false, isExplicit: false };
   }
 
-  const platObj = (game.platforms || []).find((p) => p.platformId === platformId);
+  const platObj = (game.platforms || []).find((p) => (p.platformId as string) === platformId);
   const combinedPaths = `${platObj?.installPath || ''} ${platObj?.executablePath || ''}`;
   const isNativeMacApp =
     Boolean(platObj?.installed) &&
     platObj?.isWindowsBinaryOnMac !== true &&
     !/crossover|bottles|drive_c|wine|gptk|\.exe$/i.test(combinedPaths) &&
     /\.app(\/|$)/i.test(combinedPaths);
+
+  // Xbox PC Store / PC Game Pass distributes Windows GDK/MSIXVC/UWP packages exclusively,
+  // with the sole exception of verified package-less cross-platform launcher runtimes
+  // (e.g., DisplayCatalog entries with `isCrossPlatformLauncherRuntime: true` or `{ windows: true, mac: true, linux: true }` and no PFN/handoff).
+  if (platformId === 'xbox') {
+    const rawXboxPlat = platObj?.platforms;
+    const isVerifiedCrossPlatformLauncher =
+      !platObj?.externalStorefrontHandoff &&
+      !platObj?.chainedLauncherHandoff &&
+      platObj?.xboxBottleCompatibilityTier !== 'tier_b_legacy_uwp' &&
+      platObj?.xboxBottleCompatibilityTier !== 'tier_c_external_launcher' &&
+      platObj?.xboxBottleCompatibilityTier !== 'tier_c_kernel_anticheat' &&
+      platObj?.isWindowsBinaryOnMac !== true &&
+      (platObj?.isCrossPlatformLauncherRuntime === true ||
+        (platObj?.isCrossPlatformLauncherRuntime !== false &&
+          !platObj?.packageFamilyName &&
+          !platObj?.appUserModelId &&
+          Boolean(
+            rawXboxPlat &&
+              typeof rawXboxPlat === 'object' &&
+              rawXboxPlat.windows === true &&
+              rawXboxPlat.mac === true &&
+              rawXboxPlat.linux === true
+          )));
+    return {
+      windows: true,
+      mac: Boolean(isNativeMacApp || isVerifiedCrossPlatformLauncher),
+      isExplicit: true,
+    };
+  }
+
+  // Windows-only publisher launcher storefronts
+  if (
+    platformId === 'ubisoft' ||
+    platformId === 'ea' ||
+    platformId === 'rockstar' ||
+    platformId === 'riot'
+  ) {
+    return {
+      windows: true,
+      mac: isNativeMacApp,
+      isExplicit: true,
+    };
+  }
 
   const normTitle = normalizeLookupTitle(game.title);
 
@@ -213,7 +263,9 @@ export function getStorefrontNativeOsFlags(
     const steamCandidates: Array<RawOsFlags | undefined | null> = [
       platObj?.platforms,
       effectiveSteamId ? steamApi.getCachedMetadata(effectiveSteamId)?.platforms : undefined,
-      game.enrichedMetadata?.platforms,
+      game.enrichedMetadata?.metadataQuality !== 'skeleton_fallback'
+        ? game.enrichedMetadata?.platforms
+        : undefined,
       effectiveSteamId ? steamCache[String(effectiveSteamId)]?.platforms : undefined,
       normTitle && !game.isExplicitNonSteam ? getSteamPlatformsByTitle(normTitle) : undefined,
     ];
@@ -303,24 +355,7 @@ export function getStorefrontNativeOsFlags(
     };
   }
 
-  if (platformId === 'xbox') {
-    const xboxExtracted = extractExplicitOsFlags(platObj?.platforms);
-    if (xboxExtracted) {
-      return {
-        windows: xboxExtracted.windows,
-        mac: xboxExtracted.mac || isNativeMacApp,
-        isExplicit: true,
-      };
-    }
-
-    return {
-      windows: true,
-      mac: isNativeMacApp,
-      isExplicit: true,
-    };
-  }
-
-  // 'custom'
+  // 'bnet', 'amazon', 'itch', 'humble', 'custom'
   const customExtracted = extractExplicitOsFlags(platObj?.platforms);
   if (customExtracted) {
     return {
@@ -333,7 +368,7 @@ export function getStorefrontNativeOsFlags(
   return {
     windows: !isNativeMacApp,
     mac: isNativeMacApp,
-    isExplicit: Boolean(platObj?.platforms),
+    isExplicit: false,
   };
 }
 
@@ -342,7 +377,7 @@ export function getStorefrontNativeOsFlags(
  */
 export function getStorefrontNativeOsPlatforms(
   game: CanonicalGame,
-  platformId: StorefrontId
+  platformId: StorefrontId | 'riot'
 ): NativeOsPlatform[] {
   if (!game) return ['windows'];
   const flags = getStorefrontNativeOsFlags(game, platformId);

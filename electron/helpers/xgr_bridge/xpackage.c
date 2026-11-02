@@ -29,7 +29,10 @@ HRESULT xgr_package_mount_internal(const char *pkg_id, XPackageMountHandle *out)
     if (!m) return E_OUTOFMEMORY;
     m->ref = 1;
 
-    xgr_copy_game_root_utf8(m->path, sizeof(m->path));
+    xgr_ensure_session_metadata_loaded();
+    if (!xgr_find_dlc_mount_path(pkg_id, m->path, sizeof(m->path))) {
+        xgr_copy_game_root_utf8(m->path, sizeof(m->path));
+    }
     if (m->path[0]) {
         /* Trim trailing backslash unless drive root like "C:\" */
         size_t len = strlen(m->path);
@@ -219,7 +222,18 @@ static BOOLEAN WINAPI xp_XPackageUnregisterInstallationProgressChanged(void *ifa
 static HRESULT WINAPI xp_XPackageGetUserLocale(void *iface, SIZE_T localeSize, char *locale)
 {
     (void)iface;
-    if (!locale) return E_INVALIDARG;
+    if (!locale) return xgr_return_hr(E_INVALIDARG);
+
+    xgr_ensure_session_metadata_loaded();
+    struct xgr_runtime_config_snapshot cfg;
+    xgr_copy_runtime_config_snapshot(&cfg);
+    if (cfg.locale[0]) {
+        size_t cfg_need = strlen(cfg.locale) + 1;
+        if (localeSize < cfg_need) return xgr_return_hr(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+        memcpy(locale, cfg.locale, cfg_need);
+        return xgr_return_hr(S_OK);
+    }
+
     wchar_t wloc[LOCALE_NAME_MAX_LENGTH] = { 0 };
     char utf8[LOCALE_NAME_MAX_LENGTH * 2] = "en-US";
     if (GetUserDefaultLocaleName(wloc, LOCALE_NAME_MAX_LENGTH) > 0) {
@@ -227,7 +241,7 @@ static HRESULT WINAPI xp_XPackageGetUserLocale(void *iface, SIZE_T localeSize, c
         if (n <= 0 || !utf8[0]) strcpy(utf8, "en-US");
     }
     size_t need = strlen(utf8) + 1;
-    if (localeSize < need) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (localeSize < need) return xgr_return_hr(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
     memcpy(locale, utf8, need);
     return xgr_return_hr(S_OK);
 }
@@ -296,6 +310,8 @@ static HRESULT enumerate_packages_common(uint32_t kind, uint32_t scope, void *co
 {
     (void)scope;
     if (!callback) return E_INVALIDARG;
+
+    xgr_ensure_session_metadata_loaded();
     struct xgr_runtime_config_snapshot cfg;
     xgr_copy_runtime_config_snapshot(&cfg);
 
@@ -316,6 +332,29 @@ static HRESULT enumerate_packages_common(uint32_t kind, uint32_t scope, void *co
         det.ageRestricted = false;
         det.titleID = cfg.titleIdHex;
         callback(context, &det);
+    } else if (kind == 1) {
+        /* XPackageKind_Content == 1 (Installed DLC Packages) */
+        struct xgr_dlc_package_entry dlcs[XGR_MAX_DLC_PACKAGES];
+        uint32_t dlc_count = xgr_copy_dlc_packages(dlcs, XGR_MAX_DLC_PACKAGES);
+        for (uint32_t i = 0; i < dlc_count; i++) {
+            XPackageDetails det;
+            memset(&det, 0, sizeof(det));
+            det.packageIdentifier = dlcs[i].id;
+            det.version = dlcs[i].version;
+            det.kind = 1;
+            det.displayName = dlcs[i].display_name[0] ? dlcs[i].display_name : dlcs[i].id;
+            det.description = det.displayName;
+            det.publisher = cfg.publisher;
+            det.storeId = dlcs[i].store_id;
+            det.installing = false;
+            det.index = i;
+            det.count = dlc_count;
+            det.ageRestricted = false;
+            det.titleID = cfg.titleIdHex;
+            if (!callback(context, &det)) {
+                break;
+            }
+        }
     }
     return S_OK;
 }
@@ -376,6 +415,17 @@ static HRESULT WINAPI xp_XPackageGetIdentifierLegacy(void *iface, const char *st
     (void)iface;
     if (!storeId || !identifier) return E_INVALIDARG;
     if (size < XGR_PACKAGE_IDENTIFIER_MAX_LEN) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+
+    xgr_ensure_session_metadata_loaded();
+    struct xgr_dlc_package_entry dlcs[XGR_MAX_DLC_PACKAGES];
+    uint32_t dlc_count = xgr_copy_dlc_packages(dlcs, XGR_MAX_DLC_PACKAGES);
+    for (uint32_t i = 0; i < dlc_count; i++) {
+        if (dlcs[i].store_id[0] && _stricmp(storeId, dlcs[i].store_id) == 0 && dlcs[i].id[0]) {
+            snprintf(identifier, size, "%s", dlcs[i].id);
+            return S_OK;
+        }
+    }
+
     struct xgr_runtime_config_snapshot cfg;
     xgr_copy_runtime_config_snapshot(&cfg);
     snprintf(identifier, size, "%s", cfg.packageIdentifier);

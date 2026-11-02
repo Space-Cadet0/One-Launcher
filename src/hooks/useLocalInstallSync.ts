@@ -1,5 +1,9 @@
 import { useEffect, useRef, Dispatch, SetStateAction, MutableRefObject } from 'react';
-import { CanonicalGame, XboxGamePassSyncMode } from '../contracts/game';
+import {
+  CanonicalGame,
+  XboxGamePassSyncMode,
+  XboxSubscriptionSummary,
+} from '../contracts/game';
 import { StorefrontId } from '../contracts/platform';
 import { InstalledGameRecord } from '../contracts/launcher';
 import { SavedStoreTokensMap, StorefrontTokenSummary } from '../types/electron';
@@ -29,6 +33,7 @@ import {
   normalizePlatformGameIdForLookup,
   loadXboxProfileState,
   saveXboxProfileState,
+  formatXboxIntegrationStatusMessage,
 } from '../services/integrations/integrationStorage';
 import {
   normalizeCanonicalTitle,
@@ -380,10 +385,15 @@ export function reconcileLocalInstallationsPure(
         const cfg = launcherService.getLaunchConfig(game.id, p.platformId);
         const hasCustomExe = Boolean(cfg?.customExecutablePath);
         if (authoritativeScanSucceeded) {
+          const isDisconnectedExternal = Boolean(
+            (p as CanonicalGame['platforms'][number] & { driveDisconnected?: boolean })
+              .driveDisconnected && p.installPath
+          );
           const shouldBeInstalled =
-            p.platformId === 'steam' && installedSteamAppIds
+            isDisconnectedExternal ||
+            (p.platformId === 'steam' && installedSteamAppIds
               ? Boolean(targetAppId && installedSteamAppIds.has(targetAppId)) || hasCustomExe
-              : hasCustomExe;
+              : hasCustomExe);
           if (
             p.installed !== shouldBeInstalled ||
             (!shouldBeInstalled &&
@@ -391,6 +401,7 @@ export function reconcileLocalInstallationsPure(
                 p.installPath ||
                   p.executablePath ||
                   p.launchArguments ||
+                  p.version ||
                   p.isWindowsBinaryOnMac ||
                   p.installSize !== undefined
               ))
@@ -400,6 +411,10 @@ export function reconcileLocalInstallationsPure(
               delete newP.installPath;
               delete newP.executablePath;
               delete newP.launchArguments;
+              delete newP.version;
+              delete (
+                newP as CanonicalGame['platforms'][number] & { driveDisconnected?: boolean }
+              ).driveDisconnected;
               delete newP.isWindowsBinaryOnMac;
               delete newP.installSize;
             }
@@ -740,13 +755,21 @@ function computeDirtyCatalogGameIds(
       prevById.set(g.id, g);
     }
   }
+  let matchedPrevCount = 0;
   const dirtyIds: string[] = [];
   for (let i = 0; i < nextGames.length; i++) {
     const g = nextGames[i];
     if (!g?.id) continue;
-    if (prevById.get(g.id) !== g) {
+    const prev = prevById.get(g.id);
+    if (prev !== undefined) {
+      matchedPrevCount++;
+    }
+    if (prev !== g) {
       dirtyIds.push(g.id);
     }
+  }
+  if (matchedPrevCount < prevById.size) {
+    return null;
   }
   return dirtyIds;
 }
@@ -822,7 +845,7 @@ export function useLocalInstallSync({
         .then((info) => {
           if (cancelled) return;
           const previousVersion = localStorage.getItem('one_launcher_last_run_version');
-          const currentVersion = info?.version || '0.2.0';
+          const currentVersion = info?.version || '0.2.1';
           localStorage.setItem('one_launcher_last_run_version', currentVersion);
           if (
             (previousVersion && previousVersion !== currentVersion) ||
@@ -1001,6 +1024,8 @@ export function useLocalInstallSync({
               cachedXboxProfile?.avatarUrl;
             const syncMode: XboxGamePassSyncMode =
               savedTokens.xbox.syncMode || cachedXboxProfile?.syncMode || 'owned_and_played';
+            const resolvedSub =
+              savedTokens.xbox.subscription ?? cachedXboxProfile?.subscription ?? null;
             saveXboxProfileState({
               connected: true,
               gamertag: savedTokens.xbox.gamertag || gamertag,
@@ -1008,11 +1033,13 @@ export function useLocalInstallSync({
               xuid,
               avatarUrl,
               gamerscore: savedTokens.xbox.gamerscore ?? cachedXboxProfile?.gamerscore,
-              subscription:
-                savedTokens.xbox.subscription ?? cachedXboxProfile?.subscription ?? null,
+              subscription: resolvedSub,
               syncMode,
               lastSyncedAt: savedTokens.xbox.updatedAt || new Date().toISOString(),
             });
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('ol:xbox-profile-updated'));
+            }
             if (
               !xboxInteg ||
               !xboxInteg.isConnected ||
@@ -1037,7 +1064,11 @@ export function useLocalInstallSync({
                       lastSyncedAt: savedTokens.xbox?.updatedAt || new Date().toISOString(),
                       authMethod: 'oauth' as const,
                       credentials: {},
-                      statusMessage: `Connected as ${gamertag} (${count} titles synced)`,
+                      statusMessage: formatXboxIntegrationStatusMessage(
+                        gamertag,
+                        count,
+                        resolvedSub
+                      ),
                     }
                   : i
               );
@@ -1094,6 +1125,69 @@ export function useLocalInstallSync({
                 } catch {}
               }
 
+              const refreshSyncedIntegrationCount = (
+                storefrontId: 'gog' | 'epic' | 'xbox',
+                catalog: CanonicalGame[],
+                syncAccountName?: string,
+                syncAvatarUrl?: string,
+                syncSubscription?: XboxSubscriptionSummary | null
+              ) => {
+                const postMergeCount = catalog.filter((g) =>
+                  g.platforms?.some((p) => p.platformId === storefrontId)
+                ).length;
+                const currentIntegrations = loadIntegrations();
+                let changed = false;
+                const effectiveXboxSub =
+                  storefrontId === 'xbox'
+                    ? syncSubscription !== undefined
+                      ? syncSubscription
+                      : loadXboxProfileState()?.subscription
+                    : undefined;
+                const nextIntegrations = currentIntegrations.map((integ) => {
+                  if (integ.storefrontId !== storefrontId || !integ.isConnected) return integ;
+                  const resolvedName =
+                    syncAccountName ||
+                    integ.accountName ||
+                    (storefrontId === 'gog'
+                      ? 'GOG User'
+                      : storefrontId === 'epic'
+                      ? 'Epic User'
+                      : 'Xbox Live User');
+                  const resolvedAvatar =
+                    storefrontId === 'gog'
+                      ? normalizeGogAvatarUrlSafe(syncAvatarUrl) || integ.avatarUrl
+                      : syncAvatarUrl || integ.avatarUrl;
+                  const nextStatus =
+                    storefrontId === 'xbox'
+                      ? formatXboxIntegrationStatusMessage(
+                          resolvedName,
+                          postMergeCount,
+                          effectiveXboxSub
+                        )
+                      : `Connected as ${resolvedName} (${postMergeCount} titles synced)`;
+                  if (
+                    integ.gamesCount === postMergeCount &&
+                    integ.statusMessage === nextStatus &&
+                    integ.accountName === resolvedName &&
+                    integ.avatarUrl === resolvedAvatar
+                  ) {
+                    return integ;
+                  }
+                  changed = true;
+                  return {
+                    ...integ,
+                    accountName: resolvedName,
+                    avatarUrl: resolvedAvatar,
+                    gamesCount: postMergeCount,
+                    lastSyncedAt: new Date().toISOString(),
+                    statusMessage: nextStatus,
+                  };
+                });
+                if (changed) {
+                  saveIntegrations(nextIntegrations);
+                }
+              };
+
               if (savedTokens.gog?.access_token && !cancelled) {
                 try {
                   await yieldToMainThread();
@@ -1108,20 +1202,38 @@ export function useLocalInstallSync({
                       syncRes.achievements as Record<string, CachedAchievementEntry>
                     );
                   }
-                  if (syncRes?.success && syncRes.games && syncRes.games.length > 0) {
+                  if (
+                    syncRes?.success &&
+                    Array.isArray(syncRes.games) &&
+                    (syncRes.games.length > 0 || syncRes.authoritativeComplete === true)
+                  ) {
                     await waitUntilScrollIdle(1500);
                     await yieldToMainThread();
                     if (cancelled) return;
+                    const isAuthoritativeComplete = Boolean(syncRes.authoritativeComplete);
                     const verifiedGames = syncRes.games.map((g) => ({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
-                    commitCatalog((prev) => ({
-                      nextGames: overlayLauncherInstalledState(
-                        mergeStorefrontGames(prev, verifiedGames, 'gog')
-                      ),
-                      changed: true,
-                    }));
+                    commitCatalog((prev) => {
+                      const nextGames = overlayLauncherInstalledState(
+                        mergeStorefrontGames(prev, verifiedGames, 'gog', {
+                          authoritativeComplete: isAuthoritativeComplete,
+                        })
+                      );
+                      if (isAuthoritativeComplete || verifiedGames.length > 0) {
+                        refreshSyncedIntegrationCount(
+                          'gog',
+                          nextGames,
+                          syncRes.accountName,
+                          syncRes.avatarUrl
+                        );
+                      }
+                      return {
+                        nextGames,
+                        changed: true,
+                      };
+                    });
                   }
                 } catch {}
               }
@@ -1140,20 +1252,38 @@ export function useLocalInstallSync({
                       syncRes.achievements as Record<string, CachedAchievementEntry>
                     );
                   }
-                  if (syncRes?.success && syncRes.games && syncRes.games.length > 0) {
+                  if (
+                    syncRes?.success &&
+                    Array.isArray(syncRes.games) &&
+                    (syncRes.games.length > 0 || syncRes.authoritativeComplete === true)
+                  ) {
                     await waitUntilScrollIdle(1500);
                     await yieldToMainThread();
                     if (cancelled) return;
+                    const isAuthoritativeComplete = Boolean(syncRes.authoritativeComplete);
                     const verifiedGames = syncRes.games.map((g) => ({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
-                    commitCatalog((prev) => ({
-                      nextGames: overlayLauncherInstalledState(
-                        mergeStorefrontGames(prev, verifiedGames, 'epic')
-                      ),
-                      changed: true,
-                    }));
+                    commitCatalog((prev) => {
+                      const nextGames = overlayLauncherInstalledState(
+                        mergeStorefrontGames(prev, verifiedGames, 'epic', {
+                          authoritativeComplete: isAuthoritativeComplete,
+                        })
+                      );
+                      if (isAuthoritativeComplete || verifiedGames.length > 0) {
+                        refreshSyncedIntegrationCount(
+                          'epic',
+                          nextGames,
+                          syncRes.accountName,
+                          syncRes.avatarUrl
+                        );
+                      }
+                      return {
+                        nextGames,
+                        changed: true,
+                      };
+                    });
                   }
                 } catch {}
               }
@@ -1175,7 +1305,21 @@ export function useLocalInstallSync({
                     savedTokens.xbox?.syncMode ||
                     cachedProfile?.syncMode ||
                     'owned_and_played';
-                  const syncRes = await syncStore('xbox', { syncMode });
+                  const cachedEndIso =
+                    cachedProfile?.subscription?.earliestActivePassEndDate ||
+                    cachedProfile?.subscription?.endDate;
+                  const cachedEndElapsed = Boolean(
+                    cachedEndIso &&
+                      Number.isFinite(Date.parse(cachedEndIso)) &&
+                      Date.now() >= Date.parse(cachedEndIso)
+                  );
+                  const shouldForceRefresh =
+                    !cachedProfile?.subscription?.subscriptionFingerprint?.startsWith('v2|') ||
+                    cachedEndElapsed;
+                  const syncRes = await syncStore('xbox', {
+                    syncMode,
+                    ...(shouldForceRefresh ? { forceRefresh: true } : {}),
+                  });
                   if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
                     registerSuppressedCatalogEntries(
                       syncRes.suppressedItems as SuppressedCatalogEntry[]
@@ -1208,6 +1352,9 @@ export function useLocalInstallSync({
                       syncMode: syncRes.syncMode || syncMode,
                       lastSyncedAt: new Date().toISOString(),
                     });
+                    if (typeof window !== 'undefined') {
+                      window.dispatchEvent(new CustomEvent('ol:xbox-profile-updated'));
+                    }
                   }
                   if (syncRes?.success && Array.isArray(syncRes.games)) {
                     await waitUntilScrollIdle(1500);
@@ -1217,17 +1364,42 @@ export function useLocalInstallSync({
                       ...g,
                       isVerifiedEntitlement: true,
                     }));
+                    const xboxAuthoritativeComplete =
+                      syncRes.authoritativeComplete !== undefined
+                        ? Boolean(syncRes.authoritativeComplete)
+                        : undefined;
                     commitCatalog((prev) => {
                       if (
                         verifiedGames.length === 0 &&
                         !prev.some((g) => g.platforms.some((p) => p.platformId === 'xbox'))
                       ) {
+                        if (xboxAuthoritativeComplete !== false) {
+                          refreshSyncedIntegrationCount(
+                            'xbox',
+                            prev,
+                            syncRes.modernGamertag || syncRes.gamertag || syncRes.accountName,
+                            syncRes.avatarUrl,
+                            syncRes.subscription
+                          );
+                        }
                         return { nextGames: prev, changed: false };
                       }
+                      const nextGames = overlayLauncherInstalledState(
+                        mergeStorefrontGames(prev, verifiedGames, 'xbox', {
+                          authoritativeComplete: xboxAuthoritativeComplete,
+                        })
+                      );
+                      if (xboxAuthoritativeComplete !== false || verifiedGames.length > 0) {
+                        refreshSyncedIntegrationCount(
+                          'xbox',
+                          nextGames,
+                          syncRes.modernGamertag || syncRes.gamertag || syncRes.accountName,
+                          syncRes.avatarUrl,
+                          syncRes.subscription
+                        );
+                      }
                       return {
-                        nextGames: overlayLauncherInstalledState(
-                          mergeStorefrontGames(prev, verifiedGames, 'xbox')
-                        ),
+                        nextGames,
                         changed: true,
                       };
                     });
@@ -1394,4 +1566,306 @@ export function useLocalInstallSync({
       cancelled = true;
     };
   }, [gamesRef, setGames, overlayLauncherInstalledState, showSyncNotice]);
+
+  // Keep connected Xbox subscription tier & entitled catalog current across expiry boundaries and window focus/online recovery (zero polling loops)
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI) return;
+
+    const XBOX_FOCUS_CHECK_TTL_MS = 30 * 60 * 1000;
+    const MAX_EXPIRY_TIMER_WINDOW_MS = 24 * 24 * 60 * 60 * 1000; // 24 days (< 2^31 - 1 ms)
+    const EXPIRY_GRACE_BUFFER_MS = 15_000;
+
+    let cancelled = false;
+    let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let lastFocusCheckMs = 0;
+
+    const commitXboxLifecycleCatalog = (compute: DeferredCatalogUpdater) => {
+      if (cancelled) return;
+      if (isModalOpenRef.current) {
+        deferredUpdatersRef.current.push(compute);
+        return;
+      }
+      const base = gamesRef.current.length > 0 ? gamesRef.current : loadCurrentCatalog();
+      const res = compute(base);
+      if (res.changed) {
+        const dirtyIds = computeDirtyCatalogGameIds(base, res.nextGames);
+        gamesRef.current = res.nextGames;
+        if (dirtyIds !== null) {
+          saveCurrentCatalog(res.nextGames, { skipSanitize: true, dirtyGameIds: dirtyIds });
+        } else {
+          saveCurrentCatalog(res.nextGames, { skipSanitize: true });
+        }
+        setGames(res.nextGames);
+      }
+    };
+
+    const updateXboxIntegrationStatus = (
+      catalog: CanonicalGame[],
+      syncAccountName?: string,
+      syncAvatarUrl?: string,
+      syncSubscription?: XboxSubscriptionSummary | null
+    ) => {
+      const postMergeCount = catalog.filter((g) =>
+        g.platforms?.some((p) => p.platformId === 'xbox')
+      ).length;
+      const currentIntegrations = loadIntegrations();
+      const effectiveSub =
+        syncSubscription !== undefined
+          ? syncSubscription
+          : loadXboxProfileState()?.subscription;
+      let changed = false;
+      const nextIntegrations = currentIntegrations.map((integ) => {
+        if (integ.storefrontId !== 'xbox' || !integ.isConnected) return integ;
+        const resolvedName = syncAccountName || integ.accountName || 'Xbox Live User';
+        const resolvedAvatar = syncAvatarUrl || integ.avatarUrl;
+        const nextStatus = formatXboxIntegrationStatusMessage(
+          resolvedName,
+          postMergeCount,
+          effectiveSub
+        );
+        if (
+          integ.gamesCount === postMergeCount &&
+          integ.statusMessage === nextStatus &&
+          integ.accountName === resolvedName &&
+          integ.avatarUrl === resolvedAvatar
+        ) {
+          return integ;
+        }
+        changed = true;
+        return {
+          ...integ,
+          accountName: resolvedName,
+          avatarUrl: resolvedAvatar,
+          gamesCount: postMergeCount,
+          lastSyncedAt: new Date().toISOString(),
+          statusMessage: nextStatus,
+        };
+      });
+      if (changed) {
+        saveIntegrations(nextIntegrations);
+      }
+    };
+
+    const isXboxAccountConnected = (): boolean => {
+      const profile = loadXboxProfileState();
+      if (profile?.connected) return true;
+      return loadIntegrations().some((i) => i.storefrontId === 'xbox' && i.isConnected);
+    };
+
+    const clearScheduledExpiryTimer = () => {
+      if (expiryTimer !== null) {
+        clearTimeout(expiryTimer);
+        expiryTimer = null;
+      }
+    };
+
+    const runAuthoritativeXboxRefresh = async () => {
+      if (
+        cancelled ||
+        inFlight ||
+        !window.electronAPI?.syncStore ||
+        launcherService.getRunningGames().length > 0
+      ) {
+        return;
+      }
+      if (!isXboxAccountConnected()) return;
+      inFlight = true;
+      try {
+        const cachedProfile = loadXboxProfileState();
+        const activeXboxInteg = loadIntegrations().find((i) => i.storefrontId === 'xbox');
+        const syncMode: XboxGamePassSyncMode = cachedProfile?.syncMode || 'owned_and_played';
+        const syncRes = await window.electronAPI.syncStore('xbox', {
+          syncMode,
+          forceRefresh: true,
+        });
+        if (cancelled || !syncRes) return;
+        if (Array.isArray(syncRes.suppressedItems) && syncRes.suppressedItems.length > 0) {
+          registerSuppressedCatalogEntries(syncRes.suppressedItems as SuppressedCatalogEntry[]);
+        }
+        if (syncRes.achievements && Object.keys(syncRes.achievements).length > 0) {
+          cacheUserXboxAchievements(
+            syncRes.achievements as Record<string, CachedAchievementEntry>
+          );
+        }
+        if (
+          syncRes.gamertag ||
+          syncRes.modernGamertag ||
+          syncRes.xuid ||
+          syncRes.avatarUrl ||
+          typeof syncRes.gamerscore === 'number' ||
+          syncRes.subscription
+        ) {
+          saveXboxProfileState({
+            connected: true,
+            gamertag: syncRes.gamertag || activeXboxInteg?.accountName || cachedProfile?.gamertag,
+            modernGamertag:
+              syncRes.modernGamertag ||
+              syncRes.gamertag ||
+              activeXboxInteg?.accountName ||
+              cachedProfile?.modernGamertag,
+            xuid: syncRes.xuid || activeXboxInteg?.accountId || cachedProfile?.xuid,
+            avatarUrl: syncRes.avatarUrl || activeXboxInteg?.avatarUrl || cachedProfile?.avatarUrl,
+            gamerscore: syncRes.gamerscore ?? cachedProfile?.gamerscore,
+            subscription: syncRes.subscription ?? cachedProfile?.subscription ?? null,
+            syncMode: syncRes.syncMode || syncMode,
+            lastSyncedAt: new Date().toISOString(),
+          });
+        }
+        if (syncRes.success && Array.isArray(syncRes.games)) {
+          await waitUntilScrollIdle(1500);
+          await yieldToMainThread();
+          if (cancelled) return;
+          const verifiedGames = syncRes.games.map((g) => ({
+            ...g,
+            isVerifiedEntitlement: true,
+          }));
+          const xboxAuthoritativeComplete =
+            syncRes.authoritativeComplete !== undefined
+              ? Boolean(syncRes.authoritativeComplete)
+              : undefined;
+          commitXboxLifecycleCatalog((prev) => {
+            const nextGames = overlayLauncherInstalledState(
+              mergeStorefrontGames(prev, verifiedGames, 'xbox', {
+                authoritativeComplete: xboxAuthoritativeComplete,
+              })
+            );
+            if (xboxAuthoritativeComplete !== false || verifiedGames.length > 0) {
+              updateXboxIntegrationStatus(
+                nextGames,
+                syncRes.modernGamertag || syncRes.gamertag || syncRes.accountName,
+                syncRes.avatarUrl,
+                syncRes.subscription
+              );
+            }
+            return {
+              nextGames,
+              changed: true,
+            };
+          });
+        }
+      } catch {
+        // Ignore background refresh errors
+      } finally {
+        inFlight = false;
+        if (!cancelled) {
+          scheduleExpiryTimer();
+        }
+      }
+    };
+
+    const scheduleExpiryTimer = () => {
+      clearScheduledExpiryTimer();
+      if (cancelled || !isXboxAccountConnected()) return;
+      const sub = loadXboxProfileState()?.subscription;
+      const endIso = sub?.earliestActivePassEndDate || sub?.endDate;
+      if (!endIso) return;
+      const endMs = Date.parse(endIso);
+      if (!Number.isFinite(endMs)) return;
+      const deltaMs = endMs - Date.now();
+      if (deltaMs > 0 && deltaMs <= MAX_EXPIRY_TIMER_WINDOW_MS) {
+        const delayMs = Math.min(deltaMs + EXPIRY_GRACE_BUFFER_MS, 2_147_483_647);
+        expiryTimer = setTimeout(() => {
+          expiryTimer = null;
+          if (!cancelled) {
+            void runAuthoritativeXboxRefresh();
+          }
+        }, delayMs);
+      }
+    };
+
+    const handleWindowFocusOrOnline = () => {
+      if (
+        cancelled ||
+        inFlight ||
+        !window.electronAPI?.getXboxStatus ||
+        launcherService.getRunningGames().length > 0
+      ) {
+        return;
+      }
+      if (!isXboxAccountConnected()) return;
+      const profile = loadXboxProfileState();
+      const sub = profile?.subscription;
+      const nowMs = Date.now();
+      const endIso = sub?.earliestActivePassEndDate || sub?.endDate;
+      const endMs = endIso ? Date.parse(endIso) : NaN;
+      const endElapsed = Number.isFinite(endMs) && nowMs >= endMs;
+
+      if (!endElapsed && nowMs - lastFocusCheckMs < XBOX_FOCUS_CHECK_TTL_MS) {
+        return;
+      }
+
+      const checkedMs = sub?.checkedAt ? Date.parse(sub.checkedAt) : NaN;
+      const checkedStale =
+        !Number.isFinite(checkedMs) || nowMs - checkedMs > XBOX_FOCUS_CHECK_TTL_MS;
+      if (!checkedStale && !endElapsed) {
+        return;
+      }
+
+      lastFocusCheckMs = nowMs;
+      inFlight = true;
+      void (async () => {
+        let shouldSyncCatalog = false;
+        try {
+          const statusRes = await window.electronAPI!.getXboxStatus!({
+            refreshSubscription: true,
+          });
+          if (cancelled || !statusRes?.connected) return;
+          const prevFp = loadXboxProfileState()?.subscription?.subscriptionFingerprint;
+          const nextFp = statusRes.subscription?.subscriptionFingerprint;
+          if (statusRes.subscription !== undefined) {
+            const currentProfile = loadXboxProfileState();
+            saveXboxProfileState({
+              ...(currentProfile || { connected: true }),
+              connected: true,
+              gamertag: statusRes.gamertag || currentProfile?.gamertag,
+              modernGamertag:
+                statusRes.modernGamertag ||
+                statusRes.gamertag ||
+                currentProfile?.modernGamertag,
+              xuid: statusRes.xuid || currentProfile?.xuid,
+              avatarUrl:
+                statusRes.avatarUrl || statusRes.gamerpicUrl || currentProfile?.avatarUrl,
+              gamerscore:
+                typeof statusRes.gamerscore === 'number'
+                  ? statusRes.gamerscore
+                  : currentProfile?.gamerscore,
+              subscription: statusRes.subscription,
+              syncMode: statusRes.syncMode || currentProfile?.syncMode,
+            });
+          }
+          if (
+            Boolean(statusRes.subscriptionChanged) ||
+            (nextFp !== undefined && nextFp !== prevFp)
+          ) {
+            shouldSyncCatalog = true;
+          }
+        } catch {
+          // Ignore transient focus status errors
+        } finally {
+          inFlight = false;
+        }
+        if (!cancelled) {
+          if (shouldSyncCatalog) {
+            await runAuthoritativeXboxRefresh();
+          } else {
+            scheduleExpiryTimer();
+          }
+        }
+      })();
+    };
+
+    scheduleExpiryTimer();
+    window.addEventListener('focus', handleWindowFocusOrOnline);
+    window.addEventListener('online', handleWindowFocusOrOnline);
+    window.addEventListener('ol:xbox-profile-updated', scheduleExpiryTimer);
+
+    return () => {
+      cancelled = true;
+      clearScheduledExpiryTimer();
+      window.removeEventListener('focus', handleWindowFocusOrOnline);
+      window.removeEventListener('online', handleWindowFocusOrOnline);
+      window.removeEventListener('ol:xbox-profile-updated', scheduleExpiryTimer);
+    };
+  }, [gamesRef, setGames, overlayLauncherInstalledState]);
 }

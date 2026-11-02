@@ -9,6 +9,7 @@ import { launcherService } from '../../../services/launcher/launcherService';
 import { StorefrontIcon, getStorefrontDisplayName } from '../../Common/StorefrontIcon';
 import { CheckCircle2 } from 'lucide-react';
 import { getBadgeToneClasses } from './launchConfigHelpers';
+import { LAUNCH_BUTTON_FOCUS_CLASSES } from './LaunchConfigControls';
 
 export interface DetectedPipelineBannerProps {
   game: CanonicalGame;
@@ -61,7 +62,10 @@ function DetectedPipelineBannerImpl({
         )}
 
         <div className="flex items-start gap-2 text-xs text-steam-text pt-0.5">
-          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
+          <CheckCircle2
+            className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5"
+            aria-hidden="true"
+          />
           <div>
             <span className="font-semibold text-white">
               {isNativeInstalled ? 'Active Launch Pipeline: ' : 'Auto-Detect Pipeline: '}
@@ -75,11 +79,11 @@ function DetectedPipelineBannerImpl({
       {game.platforms.length >= 1 &&
         !(game.platforms.length === 1 && game.platforms[0]?.platformId === 'custom') && (
           <div className="space-y-1.5">
-            <label className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+            <h3 className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
               {game.platforms.length > 1
                 ? 'Storefront Installation Profile — Settings apply per storefront'
                 : 'Active Storefront Profile'}
-            </label>
+            </h3>
             <div className="flex flex-wrap gap-2">
               {game.platforms.map((plat) => {
                 const isSelected = plat.platformId === preferredPlatformId;
@@ -96,7 +100,7 @@ function DetectedPipelineBannerImpl({
                     data-storefront-pill={plat.platformId}
                     aria-pressed={isSelected}
                     onClick={() => onSelectStorefront(plat.platformId)}
-                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
+                    className={`min-h-6 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
                       isSelected
                         ? plat.platformId === 'xbox'
                           ? 'bg-[#107c10]/25 border-[#52d652] text-white shadow-sm'
@@ -117,17 +121,17 @@ function DetectedPipelineBannerImpl({
                     />
                     <span>{getStorefrontDisplayName(plat.platformId)}</span>
                     {isPlatInstalled ? (
-                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
                         Installed
                       </span>
                     ) : (
-                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-500/15 text-steam-subtext border border-slate-500/30">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-500/15 text-steam-subtext border border-slate-500/30">
                         Not Installed
                       </span>
                     )}
                     {hasCustomProfile && (
                       <span
-                        className="text-[9px] px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40"
+                        className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40"
                         title="Custom launch profile configured for this storefront"
                       >
                         Configured

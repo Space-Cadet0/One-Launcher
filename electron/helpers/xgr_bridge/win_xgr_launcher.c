@@ -1,11 +1,14 @@
 /*
- * One Launcher Clean-Room Win64 Suspended-APC GDK Runtime Preloader (`one_xgr_win_launcher.exe`)
+ * One Launcher Clean-Room Win32/Win64 Suspended-APC GDK Runtime Preloader
+ * (`one_xgr_win_launcher.exe` / `one_xgr_win_launcher_x86.exe`)
  *
  * Launches a clientless Windows Xbox GDK game executable in `CREATE_SUSPENDED` mode,
  * queues an early user-mode APC (`kernel32!LoadLibraryW`) on the primary thread to
- * map One Launcher's clean-room `Xgameruntime.dll` (`one_xgameruntime_bridge.dll`)
+ * map One Launcher's architecture-matched `Xgameruntime.dll`
+ * (`one_xgameruntime_bridge.dll` on x64 or `one_xgameruntime_bridge_x86.dll` on x86)
  * into `PEB->Ldr.InLoadOrderModuleList` BEFORE `LdrInitializeThunk` runs static
- * constructors or `WinMain`, then resumes the process and propagates its exit code.
+ * constructors or `WinMain`, then resumes the process and supervises the entire
+ * Job Object process tree until all descendant processes exit.
  *
  * Why this is required on clientless Windows (`GamingServices` absent):
  * Retail `XGameRuntime.Thunks.dll` / `XGamingRuntimeThunks.dll` load `Xgameruntime.dll`
@@ -25,7 +28,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <wchar.h>
+
+#ifndef JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO
+#define JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO 4
+#endif
+
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
 
 /* Embedded PE binary marker verified by `scripts/build-xbox-bridge.cjs` */
 #if defined(__GNUC__) || defined(__clang__)
@@ -145,6 +157,93 @@ static WCHAR *dup_wstr_heap(const WCHAR *src) {
     return copy;
 }
 
+/*
+ * Queries whether the Job Object still contains any live descendant processes
+ * after the root process (`exited_root_pid`) has exited. Uses dynamically grown
+ * `JobObjectBasicProcessIdList` buffers (handling `ERROR_MORE_DATA`) and caches
+ * a handle to a live descendant process so its exit code can be propagated cleanly.
+ */
+static bool job_has_live_descendants(HANDLE job, DWORD exited_root_pid, HANDLE *inout_descendant) {
+    if (!job) return false;
+
+    if (inout_descendant && *inout_descendant != NULL) {
+        if (WaitForSingleObject(*inout_descendant, 0) == WAIT_TIMEOUT) {
+            return true;
+        }
+    }
+
+    HANDLE heap = GetProcessHeap();
+    size_t pid_cap = 64;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        size_t buf_bytes = sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + pid_cap * sizeof(ULONG_PTR);
+        JOBOBJECT_BASIC_PROCESS_ID_LIST *list =
+            (JOBOBJECT_BASIC_PROCESS_ID_LIST *)HeapAlloc(heap, HEAP_ZERO_MEMORY, buf_bytes);
+        if (!list) {
+            break;
+        }
+
+        DWORD ret_len = 0;
+        BOOL ok = QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            list,
+            (DWORD)buf_bytes,
+            &ret_len);
+        DWORD q_err = ok ? ERROR_SUCCESS : GetLastError();
+
+        if (!ok && q_err == ERROR_MORE_DATA) {
+            size_t needed = (size_t)list->NumberOfAssignedProcesses;
+            HeapFree(heap, 0, list);
+            pid_cap = (needed >= pid_cap) ? (needed + 64) : (pid_cap * 2);
+            continue;
+        }
+
+        if (!ok) {
+            HeapFree(heap, 0, list);
+            break;
+        }
+
+        bool any_alive = false;
+        DWORD count = list->NumberOfProcessIdsInList;
+        for (DWORD i = 0; i < count; i++) {
+            DWORD pid = (DWORD)list->ProcessIdList[i];
+            if (pid == 0 || pid == exited_root_pid) {
+                continue;
+            }
+            HANDLE hp = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!hp) {
+                if (GetLastError() == ERROR_ACCESS_DENIED) {
+                    any_alive = true;
+                }
+                continue;
+            }
+            if (WaitForSingleObject(hp, 0) == WAIT_TIMEOUT) {
+                any_alive = true;
+                if (inout_descendant) {
+                    if (*inout_descendant != NULL) {
+                        CloseHandle(*inout_descendant);
+                    }
+                    *inout_descendant = hp;
+                    hp = NULL;
+                }
+                if (hp) CloseHandle(hp);
+                break;
+            }
+            CloseHandle(hp);
+        }
+
+        HeapFree(heap, 0, list);
+        return any_alive;
+    }
+
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    memset(&acct, 0, sizeof(acct));
+    if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &acct, sizeof(acct), NULL)) {
+        return acct.ActiveProcesses > 0;
+    }
+    return false;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
     (void)hInstance;
     (void)hPrevInstance;
@@ -246,17 +345,52 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ExitProcess(err != 0 ? (UINT)err : XGR_LAUNCH_ERR_CREATE_PROCESS);
     }
 
-    /* Best-effort Job Object assignment so terminating the launcher cleans up child processes */
+    /*
+     * Job Object + IOCP process-tree supervision:
+     * 1. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ensures terminating this launcher (e.g., user
+     *    clicks Stop in One Launcher) cleanly terminates all child/descendant processes.
+     * 2. Associating an I/O Completion Port BEFORE assigning `pi.hProcess` guarantees kernel
+     *    delivery of `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` at 0% CPU when a detached bootstrapper
+     *    exits `0` after spawning the actual game process!
+     */
     HANDLE job = CreateJobObjectW(NULL, NULL);
+    HANDLE job_iocp = NULL;
+    bool job_iocp_associated = false;
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
         memset(&jeli, 0, sizeof(jeli));
         jeli.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)) ||
-            !AssignProcessToJobObject(job, pi.hProcess)) {
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
             CloseHandle(job);
             job = NULL;
+        } else {
+            job_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+            if (job_iocp) {
+                JOBOBJECT_ASSOCIATE_COMPLETION_PORT jacp;
+                memset(&jacp, 0, sizeof(jacp));
+                jacp.CompletionKey = (PVOID)job;
+                jacp.CompletionPort = job_iocp;
+                if (SetInformationJobObject(
+                        job,
+                        JobObjectAssociateCompletionPortInformation,
+                        &jacp,
+                        sizeof(jacp))) {
+                    job_iocp_associated = true;
+                } else {
+                    CloseHandle(job_iocp);
+                    job_iocp = NULL;
+                }
+            }
+            if (!AssignProcessToJobObject(job, pi.hProcess)) {
+                if (job_iocp) {
+                    CloseHandle(job_iocp);
+                    job_iocp = NULL;
+                }
+                job_iocp_associated = false;
+                CloseHandle(job);
+                job = NULL;
+            }
         }
     }
 
@@ -284,6 +418,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         TerminateProcess(pi.hProcess, XGR_LAUNCH_ERR_APC_INJECT);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        if (job_iocp) CloseHandle(job_iocp);
         if (job) CloseHandle(job);
         ExitProcess(XGR_LAUNCH_ERR_APC_INJECT);
     }
@@ -292,6 +427,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         TerminateProcess(pi.hProcess, XGR_LAUNCH_ERR_RESUME_THREAD);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        if (job_iocp) CloseHandle(job_iocp);
         if (job) CloseHandle(job);
         ExitProcess(XGR_LAUNCH_ERR_RESUME_THREAD);
     }
@@ -303,9 +439,59 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         child_exit = 1;
     }
 
+    DWORD root_pid = pi.dwProcessId;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    /*
+     * Do NOT immediately close `job` (which carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+     * if a bootstrapper exited after spawning a live descendant game process inside `job`.
+     * Wait at 0% CPU via `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` on `job_iocp` (with safe
+     * fallback to `JobObjectBasicProcessIdList` polling) until all descendants exit!
+     */
     if (job) {
+        HANDLE descendant_proc = NULL;
+        if (job_has_live_descendants(job, root_pid, &descendant_proc)) {
+            bool had_descendant = true;
+            while (job_has_live_descendants(job, root_pid, &descendant_proc)) {
+                if (job_iocp_associated && job_iocp) {
+                    DWORD msg_id = 0;
+                    ULONG_PTR comp_key = 0;
+                    LPOVERLAPPED overlapped = NULL;
+                    BOOL gq_ok = GetQueuedCompletionStatus(
+                        job_iocp,
+                        &msg_id,
+                        &comp_key,
+                        &overlapped,
+                        1000);
+                    if (gq_ok) {
+                        if (comp_key == (ULONG_PTR)job &&
+                            msg_id == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO &&
+                            !job_has_live_descendants(job, root_pid, &descendant_proc)) {
+                            break;
+                        }
+                    } else if (GetLastError() != WAIT_TIMEOUT) {
+                        job_iocp_associated = false;
+                    }
+                } else {
+                    Sleep(250);
+                }
+            }
+            if (had_descendant && child_exit == 0) {
+                if (descendant_proc != NULL) {
+                    DWORD desc_exit = 0;
+                    if (GetExitCodeProcess(descendant_proc, &desc_exit) && desc_exit != STILL_ACTIVE) {
+                        child_exit = desc_exit;
+                    }
+                }
+            }
+        }
+        if (descendant_proc != NULL) {
+            CloseHandle(descendant_proc);
+        }
+        if (job_iocp) {
+            CloseHandle(job_iocp);
+        }
         CloseHandle(job);
     }
 

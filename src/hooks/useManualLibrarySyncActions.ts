@@ -22,6 +22,7 @@ import {
   connectXboxIntegration,
   loadXboxProfileState,
   saveXboxProfileState,
+  formatXboxIntegrationStatusMessage,
 } from '../services/integrations/integrationStorage';
 import {
   sanitizeGameCatalog,
@@ -206,19 +207,31 @@ export function useManualLibrarySyncActions({
                 };
                 cacheUserGogAchievements(gogAchs);
               }
-              if (gogRes?.success && gogRes.games && gogRes.games.length > 0) {
-                const verifiedGogGames = gogRes.games.map((g) => ({
-                  ...g,
-                  isVerifiedEntitlement: true,
-                }));
-                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedGogGames, 'gog');
+              if (gogRes?.success && Array.isArray(gogRes.games)) {
+                if (gogRes.games.length > 0 || gogRes.authoritativeComplete === true) {
+                  const verifiedGogGames = gogRes.games.map((g) => ({
+                    ...g,
+                    isVerifiedEntitlement: true,
+                  }));
+                  currentCatalog = mergeStorefrontGames(currentCatalog, verifiedGogGames, 'gog', {
+                    authoritativeComplete: Boolean(gogRes.authoritativeComplete),
+                  });
+                }
+              }
+              if (gogRes?.success || gogRes?.transientOffline) {
                 syncedGog = true;
               }
             }
             if (!syncedGog) {
-              const { games: gogGames } = await connectGogIntegration(gogInteg.credentials || {});
-              if (gogGames && gogGames.length > 0) {
-                currentCatalog = mergeStorefrontGames(currentCatalog, gogGames, 'gog');
+              const { games: gogGames, authoritativeComplete: gogAuthComplete } =
+                await connectGogIntegration(gogInteg.credentials || {});
+              const onlyGogGames = Array.isArray(gogGames)
+                ? gogGames.filter((g) => g.platforms?.some((p) => p.platformId === 'gog'))
+                : [];
+              if (onlyGogGames.length > 0 || gogAuthComplete === true) {
+                currentCatalog = mergeStorefrontGames(currentCatalog, onlyGogGames, 'gog', {
+                  authoritativeComplete: Boolean(gogAuthComplete),
+                });
               }
             }
           } catch (e) {
@@ -246,21 +259,31 @@ export function useManualLibrarySyncActions({
                 };
                 cacheUserEpicAchievements(epicAchs);
               }
-              if (epicRes?.success && epicRes.games && epicRes.games.length > 0) {
-                const verifiedEpicGames = epicRes.games.map((g) => ({
-                  ...g,
-                  isVerifiedEntitlement: true,
-                }));
-                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedEpicGames, 'epic');
+              if (epicRes?.success && Array.isArray(epicRes.games)) {
+                if (epicRes.games.length > 0 || epicRes.authoritativeComplete === true) {
+                  const verifiedEpicGames = epicRes.games.map((g) => ({
+                    ...g,
+                    isVerifiedEntitlement: true,
+                  }));
+                  currentCatalog = mergeStorefrontGames(currentCatalog, verifiedEpicGames, 'epic', {
+                    authoritativeComplete: Boolean(epicRes.authoritativeComplete),
+                  });
+                }
+              }
+              if (epicRes?.success || epicRes?.transientOffline) {
                 syncedEpic = true;
               }
             }
             if (!syncedEpic) {
-              const { games: epicGames } = await connectEpicIntegration(
-                epicInteg.credentials || {}
-              );
-              if (epicGames && epicGames.length > 0) {
-                currentCatalog = mergeStorefrontGames(currentCatalog, epicGames, 'epic');
+              const { games: epicGames, authoritativeComplete: epicAuthComplete } =
+                await connectEpicIntegration(epicInteg.credentials || {});
+              const onlyEpicGames = Array.isArray(epicGames)
+                ? epicGames.filter((g) => g.platforms?.some((p) => p.platformId === 'epic'))
+                : [];
+              if (onlyEpicGames.length > 0 || epicAuthComplete === true) {
+                currentCatalog = mergeStorefrontGames(currentCatalog, onlyEpicGames, 'epic', {
+                  authoritativeComplete: Boolean(epicAuthComplete),
+                });
               }
             }
           } catch (e) {
@@ -281,6 +304,7 @@ export function useManualLibrarySyncActions({
               const xboxRes = await window.electronAPI.syncStore('xbox', {
                 ...(xboxInteg.credentials || {}),
                 syncMode,
+                forceRefresh: true,
               });
               if (Array.isArray(xboxRes?.suppressedItems) && xboxRes.suppressedItems.length > 0) {
                 registerSuppressedCatalogEntries(
@@ -320,16 +344,29 @@ export function useManualLibrarySyncActions({
                   ...g,
                   isVerifiedEntitlement: true,
                 }));
-                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedXboxGames, 'xbox');
+                const xboxAuthoritativeComplete =
+                  xboxRes.authoritativeComplete !== undefined
+                    ? Boolean(xboxRes.authoritativeComplete)
+                    : true;
+                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedXboxGames, 'xbox', {
+                  authoritativeComplete: xboxAuthoritativeComplete,
+                });
+                syncedXbox = true;
+              } else if (xboxRes?.transientOffline) {
                 syncedXbox = true;
               }
             }
             if (!syncedXbox) {
-              const { games: xboxGames } = await connectXboxIntegration({
-                ...(xboxInteg.credentials || {}),
-                syncMode,
+              const { games: xboxGames, authoritativeComplete: xboxAuthComplete } =
+                await connectXboxIntegration({
+                  ...(xboxInteg.credentials || {}),
+                  syncMode,
+                  forceRefresh: true,
+                });
+              currentCatalog = mergeStorefrontGames(currentCatalog, xboxGames, 'xbox', {
+                authoritativeComplete:
+                  xboxAuthComplete !== undefined ? Boolean(xboxAuthComplete) : true,
               });
-              currentCatalog = mergeStorefrontGames(currentCatalog, xboxGames, 'xbox');
             }
           } catch (e) {
             console.warn('Xbox sync warning:', e);
@@ -365,14 +402,33 @@ export function useManualLibrarySyncActions({
         g.platforms?.some((p) => p.platformId === 'xbox')
       ).length;
 
+      const refreshedXboxProfile = loadXboxProfileState();
       const nowIso = new Date().toISOString();
       const updatedIntegrations = integrations.map((item) => {
         if (!item.isConnected) return item;
+        if (item.storefrontId === 'xbox') {
+          const resolvedXboxName =
+            refreshedXboxProfile?.modernGamertag ||
+            refreshedXboxProfile?.gamertag ||
+            item.accountName ||
+            'Xbox Live User';
+          return {
+            ...item,
+            accountName: resolvedXboxName,
+            avatarUrl: refreshedXboxProfile?.avatarUrl || item.avatarUrl,
+            gamesCount: xboxCount,
+            lastSyncedAt: nowIso,
+            statusMessage: formatXboxIntegrationStatusMessage(
+              resolvedXboxName,
+              xboxCount,
+              refreshedXboxProfile?.subscription
+            ),
+          };
+        }
         let count = item.gamesCount;
         if (item.storefrontId === 'steam') count = steamCount;
         else if (item.storefrontId === 'gog') count = gogCount;
         else if (item.storefrontId === 'epic') count = epicCount;
-        else if (item.storefrontId === 'xbox') count = xboxCount;
         return {
           ...item,
           gamesCount: count,

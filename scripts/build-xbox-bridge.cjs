@@ -2,22 +2,23 @@
 'use strict';
 
 /**
- * Reproducible cross-compiler & PE32+ ABI verifier for One Launcher's Xbox runtime bridges:
- *   1. `one_xgameruntime_bridge.dll` (`Xgameruntime.dll` clean-room provider)
- *   2. `one_gameinput_bridge.dll` (`GameInput.dll` / `GameInputRedist.dll` v0/v1/v2 COM bridge)
- *   3. `one_appnotify_bridge.dll` (`api-ms-win-core-psm-appnotify-l1-1-0.dll` PSM bridge)
- *   4. `one_xgr_win_launcher.exe` (Win64 GUI-subsystem suspended-APC preloader for clientless Windows)
- * Compiles pure C11 Win32 sources in `electron/helpers/xgr_bridge/` to `x86_64-windows-gnu`
- * via `zig cc`, normalizes PE timestamps and computes deterministic Win32 PE `CheckSum`s,
- * verifies PE Machine `0x8664`, Export Directory `LIBRARY` internal names, exact retail exports,
- * clean Win32 imports, embedded markers, `.sha256` sidecars, and `bridge-build-manifest.json`.
+ * Reproducible cross-compiler & PE32/PE32+ ABI verifier for One Launcher's Xbox runtime bridges:
+ *   1. `one_xgameruntime_bridge.dll` / `one_xgameruntime_bridge_x86.dll` (`Xgameruntime.dll` provider)
+ *   2. `one_gameinput_bridge.dll` / `one_gameinput_bridge_x86.dll` (`GameInput.dll` v0/v1/v2 COM bridge)
+ *   3. `one_appnotify_bridge.dll` / `one_appnotify_bridge_x86.dll` (`api-ms-win-core-psm-appnotify-l1-1-0.dll`)
+ *   4. `one_xgr_win_launcher.exe` / `one_xgr_win_launcher_x86.exe` (Win64/Win32 suspended-APC preloader)
+ * Compiles pure C11 Win32 sources in `electron/helpers/xgr_bridge/` to `x86_64-windows-gnu` and
+ * `x86-windows-gnu` via `zig cc`, normalizes PE timestamps and computes deterministic Win32 PE
+ * `CheckSum`s, verifies PE Machine (`0x8664` / `0x014c`), Export Directory `LIBRARY` internal names,
+ * exact undecorated retail exports, clean Win32 imports, embedded markers, `.sha256` sidecars,
+ * and `bridge-build-manifest.json`.
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const SRC_DIR = path.join(REPO_ROOT, 'electron', 'helpers', 'xgr_bridge');
@@ -30,6 +31,16 @@ const APPNOTIFY_DLL_PATH = path.join(OUT_DIR, 'one_appnotify_bridge.dll');
 const APPNOTIFY_SHA256_PATH = path.join(OUT_DIR, 'one_appnotify_bridge.sha256');
 const WIN_LAUNCHER_EXE_PATH = path.join(OUT_DIR, 'one_xgr_win_launcher.exe');
 const WIN_LAUNCHER_SHA256_PATH = path.join(OUT_DIR, 'one_xgr_win_launcher.sha256');
+
+const DLL_X86_PATH = path.join(OUT_DIR, 'one_xgameruntime_bridge_x86.dll');
+const SHA256_X86_PATH = path.join(OUT_DIR, 'one_xgameruntime_bridge_x86.sha256');
+const GAMEINPUT_DLL_X86_PATH = path.join(OUT_DIR, 'one_gameinput_bridge_x86.dll');
+const GAMEINPUT_SHA256_X86_PATH = path.join(OUT_DIR, 'one_gameinput_bridge_x86.sha256');
+const APPNOTIFY_DLL_X86_PATH = path.join(OUT_DIR, 'one_appnotify_bridge_x86.dll');
+const APPNOTIFY_SHA256_X86_PATH = path.join(OUT_DIR, 'one_appnotify_bridge_x86.sha256');
+const WIN_LAUNCHER_EXE_X86_PATH = path.join(OUT_DIR, 'one_xgr_win_launcher_x86.exe');
+const WIN_LAUNCHER_SHA256_X86_PATH = path.join(OUT_DIR, 'one_xgr_win_launcher_x86.sha256');
+
 const MANIFEST_PATH = path.join(OUT_DIR, 'bridge-build-manifest.json');
 
 const EXPECTED_DLL_NAME = 'Xgameruntime.dll';
@@ -80,6 +91,7 @@ const C_SOURCES = [
   'xgr_xml_pfn.c',
   'xgr_rpc.c',
   'xgr_xcurl_shim.c',
+  'xgr_playfab_shim.c',
   'xthreading.c',
   'xuser.c',
   'xstore.c',
@@ -206,19 +218,72 @@ function computePeCheckSum(buf, checkSumOffset) {
   return (sum + len) >>> 0;
 }
 
+/** @type {Map<string, { targetTriple: string, extraLinkerFlags: string[] }>} */
+const x86ToolchainCache = new Map();
+
+function resolveX86WinGnuToolchain(zigBin) {
+  if (x86ToolchainCache.has(zigBin)) {
+    return x86ToolchainCache.get(zigBin);
+  }
+  // Probe whether compiler expects `x86-windows-gnu` (Zig 0.11+) or `i686-windows-gnu` (GCC/Clang),
+  // and whether its COFF linker accepts `-Wl,--kill-at` (GNU ld) or handles `.def` undecoration natively (Zig LLD).
+  let targetTriple = 'x86-windows-gnu';
+  const tmpProbeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-zig-x86-probe-'));
+  try {
+    const srcProbe = path.join(tmpProbeDir, 'probe.c');
+    const outProbe = path.join(tmpProbeDir, 'probe.dll');
+    fs.writeFileSync(srcProbe, 'int __stdcall ProbeFn(int x) { return x; }\n', 'utf8');
+    const i686Res = spawnSync(
+      zigBin,
+      ['cc', '-target', 'i686-windows-gnu', '-shared', srcProbe, '-Wl,--kill-at', '-o', outProbe],
+      { encoding: 'utf8' }
+    );
+    if (i686Res.status === 0) {
+      const cfg = { targetTriple: 'i686-windows-gnu', extraLinkerFlags: ['-Wl,--kill-at'] };
+      x86ToolchainCache.set(zigBin, cfg);
+      return cfg;
+    }
+    const x86KillAtRes = spawnSync(
+      zigBin,
+      ['cc', '-target', 'x86-windows-gnu', '-shared', srcProbe, '-Wl,--kill-at', '-o', outProbe],
+      { encoding: 'utf8' }
+    );
+    if (x86KillAtRes.status === 0) {
+      const cfg = { targetTriple: 'x86-windows-gnu', extraLinkerFlags: ['-Wl,--kill-at'] };
+      x86ToolchainCache.set(zigBin, cfg);
+      return cfg;
+    }
+    if (
+      String(i686Res.stderr || '').includes('UnknownArchitecture') === false &&
+      spawnSync(zigBin, ['cc', '-target', 'i686-windows-gnu', '-shared', srcProbe, '-o', outProbe], {
+        encoding: 'utf8',
+      }).status === 0
+    ) {
+      targetTriple = 'i686-windows-gnu';
+    }
+  } finally {
+    fs.rmSync(tmpProbeDir, { recursive: true, force: true });
+  }
+  const cfg = { targetTriple, extraLinkerFlags: [] };
+  x86ToolchainCache.set(zigBin, cfg);
+  return cfg;
+}
+
 /**
  * Zeroes COFF TimeDateStamp, Export Directory TimeDateStamp, and any Debug Directory
  * TimeDateStamps, then writes the exact deterministic Win32 PE `OptionalHeader.CheckSum`
- * so PE64 outputs are 100% bit-for-bit reproducible and pass strict PE checksum validators.
+ * so PE32 (`0x010b`) and PE32+ (`0x020b`) outputs are 100% bit-for-bit reproducible.
  */
-function normalizePeDeterminism(pePath) {
-  const buf = Buffer.from(fs.readFileSync(pePath));
+function normalizePeDeterminism(pePathOrBuf) {
+  const isBufferInput = Buffer.isBuffer(pePathOrBuf);
+  const buf = isBufferInput ? pePathOrBuf : Buffer.from(fs.readFileSync(pePathOrBuf));
+  const label = isBufferInput ? '<buffer>' : pePathOrBuf;
   if (buf.length < 512 || buf.readUInt16LE(0) !== 0x5a4d) {
-    throw new Error(`Cannot normalize invalid PE image: ${pePath}`);
+    throw new Error(`Cannot normalize invalid PE image: ${label}`);
   }
   const peOffset = buf.readUInt32LE(0x3c);
   if (peOffset + 24 > buf.length || buf.readUInt32LE(peOffset) !== 0x00004550) {
-    throw new Error(`Missing PE signature in ${pePath}`);
+    throw new Error(`Missing PE signature in ${label}`);
   }
 
   const coffOffset = peOffset + 4;
@@ -241,7 +306,16 @@ function normalizePeDeterminism(pePath) {
     });
   }
 
-  const dataDirOffset = optOffset + 112;
+  const magic = buf.readUInt16LE(optOffset);
+  let dataDirOffset;
+  if (magic === 0x010b) {
+    dataDirOffset = optOffset + 96;
+  } else if (magic === 0x020b) {
+    dataDirOffset = optOffset + 112;
+  } else {
+    throw new Error(`Unsupported PE OptionalHeader magic 0x${magic.toString(16)} in ${label}`);
+  }
+
   if (dataDirOffset + 8 <= buf.length) {
     const exportRva = buf.readUInt32LE(dataDirOffset);
     const exportSize = buf.readUInt32LE(dataDirOffset + 4);
@@ -274,13 +348,26 @@ function normalizePeDeterminism(pePath) {
     buf.writeUInt32LE(checkSum, optOffset + 64);
   }
 
-  fs.writeFileSync(pePath, buf);
+  if (!isBufferInput) {
+    fs.writeFileSync(pePathOrBuf, buf);
+  }
   return buf;
+}
+
+function normalizeExpectedMachine(expectedMachine) {
+  if (expectedMachine === 0x014c || expectedMachine === '0x014c' || expectedMachine === 'x86') {
+    return 0x014c;
+  }
+  if (expectedMachine === 0x8664 || expectedMachine === '0x8664' || expectedMachine === 'x64') {
+    return 0x8664;
+  }
+  return Number(expectedMachine);
 }
 
 function parseAndVerifyPeDll(
   dllBuffer,
   {
+    expectedMachine = 0x8664,
     expectedExports = EXPECTED_EXPORTS,
     expectedMarker = EXPECTED_MARKER,
     expectedDllName = null,
@@ -302,10 +389,17 @@ function parseAndVerifyPeDll(
     throw new Error('Missing PE\\0\\0 signature');
   }
 
+  const targetMachine = normalizeExpectedMachine(expectedMachine);
+  const isPe32 = targetMachine === 0x014c;
+  const expectedMagic = isPe32 ? 0x010b : 0x020b;
+  const machineHex = `0x${targetMachine.toString(16).padStart(4, '0')}`;
+
   const coffOffset = peOffset + 4;
   const machine = dllBuffer.readUInt16LE(coffOffset);
-  if (machine !== 0x8664) {
-    throw new Error(`Unexpected PE Machine 0x${machine.toString(16)} (expected 0x8664 AMD64)`);
+  if (machine !== targetMachine) {
+    throw new Error(
+      `Unexpected PE Machine 0x${machine.toString(16).padStart(4, '0')} (expected ${machineHex})`
+    );
   }
 
   const numSections = dllBuffer.readUInt16LE(coffOffset + 2);
@@ -322,8 +416,10 @@ function parseAndVerifyPeDll(
 
   const optOffset = coffOffset + 20;
   const magic = dllBuffer.readUInt16LE(optOffset);
-  if (magic !== 0x020b) {
-    throw new Error(`Expected PE32+ OptionalHeader magic 0x020b, got 0x${magic.toString(16)}`);
+  if (magic !== expectedMagic) {
+    throw new Error(
+      `Expected ${isPe32 ? 'PE32' : 'PE32+'} OptionalHeader magic 0x${expectedMagic.toString(16).padStart(4, '0')}, got 0x${magic.toString(16)}`
+    );
   }
 
   const checkSumOffset = optOffset + 64;
@@ -344,7 +440,7 @@ function parseAndVerifyPeDll(
     );
   }
 
-  const dataDirOffset = optOffset + 112;
+  const dataDirOffset = isPe32 ? optOffset + 96 : optOffset + 112;
   const exportRva = dllBuffer.readUInt32LE(dataDirOffset);
   const exportSize = dllBuffer.readUInt32LE(dataDirOffset + 4);
   const importRva = dllBuffer.readUInt32LE(dataDirOffset + 8);
@@ -412,6 +508,13 @@ function parseAndVerifyPeDll(
       exportsList.push(readAsciiCString(dllBuffer, nameOff));
     }
 
+    const decoratedExport = exportsList.find((name) => name.includes('@'));
+    if (decoratedExport) {
+      throw new Error(
+        `Decorated __stdcall export detected ("${decoratedExport}"); exports must be undecorated C names`
+      );
+    }
+
     const sortedActual = [...exportsList].sort();
     const sortedExpected = [...expectedExports].sort();
     if (
@@ -452,7 +555,7 @@ function parseAndVerifyPeDll(
 
   const sha256 = sha256Hex(dllBuffer);
   return {
-    machine: '0x8664',
+    machine: machineHex,
     internalName,
     subsystem,
     checkSum: actualCheckSum,
@@ -480,14 +583,25 @@ function computeSourceManifestDigests() {
   return sources;
 }
 
-function buildManifestObject({ compilerVersion, xgrInfo, giInfo, appNotifyInfo, winLauncherInfo }) {
+function buildManifestObject({
+  compilerVersion,
+  xgrInfo,
+  giInfo,
+  appNotifyInfo,
+  winLauncherInfo,
+  xgrX86Info,
+  giX86Info,
+  appNotifyX86Info,
+  winLauncherX86Info,
+}) {
   return {
     schemaVersion: 1,
-    targetTriple: 'x86_64-windows-gnu',
+    targetTriple: 'x86_64-windows-gnu+x86-windows-gnu',
     compilerVersion: compilerVersion || 'prebuilt',
     sources: computeSourceManifestDigests(),
     outputs: {
       'one_xgameruntime_bridge.dll': {
+        machine: xgrInfo.machine,
         internalName: xgrInfo.internalName,
         sha256: xgrInfo.sha256,
         checkSum: xgrInfo.checkSum,
@@ -496,6 +610,7 @@ function buildManifestObject({ compilerVersion, xgrInfo, giInfo, appNotifyInfo, 
         exports: [...xgrInfo.exports].sort(),
       },
       'one_gameinput_bridge.dll': {
+        machine: giInfo.machine,
         internalName: giInfo.internalName,
         sha256: giInfo.sha256,
         checkSum: giInfo.checkSum,
@@ -504,6 +619,7 @@ function buildManifestObject({ compilerVersion, xgrInfo, giInfo, appNotifyInfo, 
         exports: [...giInfo.exports].sort(),
       },
       'one_appnotify_bridge.dll': {
+        machine: appNotifyInfo.machine,
         internalName: appNotifyInfo.internalName,
         sha256: appNotifyInfo.sha256,
         checkSum: appNotifyInfo.checkSum,
@@ -512,12 +628,50 @@ function buildManifestObject({ compilerVersion, xgrInfo, giInfo, appNotifyInfo, 
         exports: [...appNotifyInfo.exports].sort(),
       },
       'one_xgr_win_launcher.exe': {
+        machine: winLauncherInfo.machine,
         internalName: '',
         subsystem: winLauncherInfo.subsystem,
         sha256: winLauncherInfo.sha256,
         checkSum: winLauncherInfo.checkSum,
         sizeBytes: winLauncherInfo.sizeBytes,
         marker: winLauncherInfo.marker,
+        exports: [],
+      },
+      'one_xgameruntime_bridge_x86.dll': {
+        machine: xgrX86Info.machine,
+        internalName: xgrX86Info.internalName,
+        sha256: xgrX86Info.sha256,
+        checkSum: xgrX86Info.checkSum,
+        sizeBytes: xgrX86Info.sizeBytes,
+        marker: xgrX86Info.marker,
+        exports: [...xgrX86Info.exports].sort(),
+      },
+      'one_gameinput_bridge_x86.dll': {
+        machine: giX86Info.machine,
+        internalName: giX86Info.internalName,
+        sha256: giX86Info.sha256,
+        checkSum: giX86Info.checkSum,
+        sizeBytes: giX86Info.sizeBytes,
+        marker: giX86Info.marker,
+        exports: [...giX86Info.exports].sort(),
+      },
+      'one_appnotify_bridge_x86.dll': {
+        machine: appNotifyX86Info.machine,
+        internalName: appNotifyX86Info.internalName,
+        sha256: appNotifyX86Info.sha256,
+        checkSum: appNotifyX86Info.checkSum,
+        sizeBytes: appNotifyX86Info.sizeBytes,
+        marker: appNotifyX86Info.marker,
+        exports: [...appNotifyX86Info.exports].sort(),
+      },
+      'one_xgr_win_launcher_x86.exe': {
+        machine: winLauncherX86Info.machine,
+        internalName: '',
+        subsystem: winLauncherX86Info.subsystem,
+        sha256: winLauncherX86Info.sha256,
+        checkSum: winLauncherX86Info.checkSum,
+        sizeBytes: winLauncherX86Info.sizeBytes,
+        marker: winLauncherX86Info.marker,
         exports: [],
       },
     },
@@ -541,6 +695,10 @@ function verifyBridgeBuildManifest({
   giInfo,
   appNotifyInfo,
   winLauncherInfo,
+  xgrX86Info,
+  giX86Info,
+  appNotifyX86Info,
+  winLauncherX86Info,
   manifestPath = MANIFEST_PATH,
 } = {}) {
   if (!fs.existsSync(manifestPath)) {
@@ -578,6 +736,10 @@ function verifyBridgeBuildManifest({
   const giOut = manifest.outputs['one_gameinput_bridge.dll'];
   const appNotifyOut = manifest.outputs['one_appnotify_bridge.dll'];
   const winLauncherOut = manifest.outputs['one_xgr_win_launcher.exe'];
+  const xgrX86Out = manifest.outputs['one_xgameruntime_bridge_x86.dll'];
+  const giX86Out = manifest.outputs['one_gameinput_bridge_x86.dll'];
+  const appNotifyX86Out = manifest.outputs['one_appnotify_bridge_x86.dll'];
+  const winLauncherX86Out = manifest.outputs['one_xgr_win_launcher_x86.exe'];
 
   if (!xgrOut || xgrOut.sha256 !== xgrInfo.sha256 || xgrOut.internalName !== EXPECTED_DLL_NAME) {
     throw new Error('Bridge build manifest output entry mismatch for one_xgameruntime_bridge.dll');
@@ -601,6 +763,38 @@ function verifyBridgeBuildManifest({
   ) {
     throw new Error('Bridge build manifest output entry mismatch for one_xgr_win_launcher.exe');
   }
+  if (
+    xgrX86Info &&
+    (!xgrX86Out ||
+      xgrX86Out.sha256 !== xgrX86Info.sha256 ||
+      xgrX86Out.internalName !== EXPECTED_DLL_NAME)
+  ) {
+    throw new Error('Bridge build manifest output entry mismatch for one_xgameruntime_bridge_x86.dll');
+  }
+  if (
+    giX86Info &&
+    (!giX86Out ||
+      giX86Out.sha256 !== giX86Info.sha256 ||
+      giX86Out.internalName !== GAMEINPUT_EXPECTED_DLL_NAME)
+  ) {
+    throw new Error('Bridge build manifest output entry mismatch for one_gameinput_bridge_x86.dll');
+  }
+  if (
+    appNotifyX86Info &&
+    (!appNotifyX86Out ||
+      appNotifyX86Out.sha256 !== appNotifyX86Info.sha256 ||
+      appNotifyX86Out.internalName !== APPNOTIFY_EXPECTED_DLL_NAME)
+  ) {
+    throw new Error('Bridge build manifest output entry mismatch for one_appnotify_bridge_x86.dll');
+  }
+  if (
+    winLauncherX86Info &&
+    (!winLauncherX86Out ||
+      winLauncherX86Out.sha256 !== winLauncherX86Info.sha256 ||
+      winLauncherX86Out.marker !== WIN_LAUNCHER_EXPECTED_MARKER)
+  ) {
+    throw new Error('Bridge build manifest output entry mismatch for one_xgr_win_launcher_x86.exe');
+  }
 
   return manifest;
 }
@@ -617,6 +811,7 @@ function cleanTransientLinkerOutputs() {
 function verifyGameInputBridgeDll(dllPath = GAMEINPUT_DLL_PATH) {
   const buf = fs.readFileSync(dllPath);
   return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x8664,
     expectedExports: GAMEINPUT_EXPECTED_EXPORTS,
     expectedMarker: GAMEINPUT_EXPECTED_MARKER,
     expectedDllName: dllPath === GAMEINPUT_DLL_PATH ? GAMEINPUT_EXPECTED_DLL_NAME : null,
@@ -624,9 +819,21 @@ function verifyGameInputBridgeDll(dllPath = GAMEINPUT_DLL_PATH) {
   });
 }
 
+function verifyGameInputBridgeX86Dll(dllPath = GAMEINPUT_DLL_X86_PATH) {
+  const buf = fs.readFileSync(dllPath);
+  return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x014c,
+    expectedExports: GAMEINPUT_EXPECTED_EXPORTS,
+    expectedMarker: GAMEINPUT_EXPECTED_MARKER,
+    expectedDllName: dllPath === GAMEINPUT_DLL_X86_PATH ? GAMEINPUT_EXPECTED_DLL_NAME : null,
+    requireDeterministicTimestamps: dllPath === GAMEINPUT_DLL_X86_PATH,
+  });
+}
+
 function verifyAppNotifyBridgeDll(dllPath = APPNOTIFY_DLL_PATH) {
   const buf = fs.readFileSync(dllPath);
   return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x8664,
     expectedExports: APPNOTIFY_EXPECTED_EXPORTS,
     expectedMarker: APPNOTIFY_EXPECTED_MARKER,
     expectedDllName: dllPath === APPNOTIFY_DLL_PATH ? APPNOTIFY_EXPECTED_DLL_NAME : null,
@@ -634,9 +841,21 @@ function verifyAppNotifyBridgeDll(dllPath = APPNOTIFY_DLL_PATH) {
   });
 }
 
+function verifyAppNotifyBridgeX86Dll(dllPath = APPNOTIFY_DLL_X86_PATH) {
+  const buf = fs.readFileSync(dllPath);
+  return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x014c,
+    expectedExports: APPNOTIFY_EXPECTED_EXPORTS,
+    expectedMarker: APPNOTIFY_EXPECTED_MARKER,
+    expectedDllName: dllPath === APPNOTIFY_DLL_X86_PATH ? APPNOTIFY_EXPECTED_DLL_NAME : null,
+    requireDeterministicTimestamps: dllPath === APPNOTIFY_DLL_X86_PATH,
+  });
+}
+
 function verifyWinXgrLauncherExe(exePath = WIN_LAUNCHER_EXE_PATH) {
   const buf = fs.readFileSync(exePath);
   return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x8664,
     expectedExports: [],
     expectedMarker: WIN_LAUNCHER_EXPECTED_MARKER,
     expectedDllName: null,
@@ -647,9 +866,35 @@ function verifyWinXgrLauncherExe(exePath = WIN_LAUNCHER_EXE_PATH) {
   });
 }
 
+function verifyWinXgrLauncherX86Exe(exePath = WIN_LAUNCHER_EXE_X86_PATH) {
+  const buf = fs.readFileSync(exePath);
+  return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x014c,
+    expectedExports: [],
+    expectedMarker: WIN_LAUNCHER_EXPECTED_MARKER,
+    expectedDllName: null,
+    requireDeterministicTimestamps: exePath === WIN_LAUNCHER_EXE_X86_PATH,
+    requireDllFlag: false,
+    requireExports: false,
+    expectedSubsystem: 2, // IMAGE_SUBSYSTEM_WINDOWS_GUI
+  });
+}
+
+function verifyXboxBridgeX86Dll(dllPath = DLL_X86_PATH) {
+  const buf = fs.readFileSync(dllPath);
+  return parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x014c,
+    expectedExports: EXPECTED_EXPORTS,
+    expectedMarker: EXPECTED_MARKER,
+    expectedDllName: dllPath === DLL_X86_PATH ? EXPECTED_DLL_NAME : null,
+    requireDeterministicTimestamps: dllPath === DLL_X86_PATH,
+  });
+}
+
 function verifyXboxBridgeDll(dllPath = DLL_PATH) {
   const buf = fs.readFileSync(dllPath);
   const xgrInfo = parseAndVerifyPeDll(buf, {
+    expectedMachine: 0x8664,
     expectedExports: EXPECTED_EXPORTS,
     expectedMarker: EXPECTED_MARKER,
     expectedDllName: dllPath === DLL_PATH ? EXPECTED_DLL_NAME : null,
@@ -659,15 +904,29 @@ function verifyXboxBridgeDll(dllPath = DLL_PATH) {
     const giInfo = verifyGameInputBridgeDll(GAMEINPUT_DLL_PATH);
     const appNotifyInfo = verifyAppNotifyBridgeDll(APPNOTIFY_DLL_PATH);
     const winLauncherInfo = verifyWinXgrLauncherExe(WIN_LAUNCHER_EXE_PATH);
+    const xgrX86Info = verifyXboxBridgeX86Dll(DLL_X86_PATH);
+    const giX86Info = verifyGameInputBridgeX86Dll(GAMEINPUT_DLL_X86_PATH);
+    const appNotifyX86Info = verifyAppNotifyBridgeX86Dll(APPNOTIFY_DLL_X86_PATH);
+    const winLauncherX86Info = verifyWinXgrLauncherX86Exe(WIN_LAUNCHER_EXE_X86_PATH);
+
     verifySidecarSha256(SHA256_PATH, xgrInfo.sha256, 'one_xgameruntime_bridge.dll');
     verifySidecarSha256(GAMEINPUT_SHA256_PATH, giInfo.sha256, 'one_gameinput_bridge.dll');
     verifySidecarSha256(APPNOTIFY_SHA256_PATH, appNotifyInfo.sha256, 'one_appnotify_bridge.dll');
     verifySidecarSha256(WIN_LAUNCHER_SHA256_PATH, winLauncherInfo.sha256, 'one_xgr_win_launcher.exe');
+    verifySidecarSha256(SHA256_X86_PATH, xgrX86Info.sha256, 'one_xgameruntime_bridge_x86.dll');
+    verifySidecarSha256(GAMEINPUT_SHA256_X86_PATH, giX86Info.sha256, 'one_gameinput_bridge_x86.dll');
+    verifySidecarSha256(APPNOTIFY_SHA256_X86_PATH, appNotifyX86Info.sha256, 'one_appnotify_bridge_x86.dll');
+    verifySidecarSha256(WIN_LAUNCHER_SHA256_X86_PATH, winLauncherX86Info.sha256, 'one_xgr_win_launcher_x86.exe');
+
     const manifest = verifyBridgeBuildManifest({
       xgrInfo,
       giInfo,
       appNotifyInfo,
       winLauncherInfo,
+      xgrX86Info,
+      giX86Info,
+      appNotifyX86Info,
+      winLauncherX86Info,
       manifestPath: MANIFEST_PATH,
     });
     return {
@@ -688,6 +947,26 @@ function verifyXboxBridgeDll(dllPath = DLL_PATH) {
         exePath: WIN_LAUNCHER_EXE_PATH,
         sha256Path: WIN_LAUNCHER_SHA256_PATH,
         ...winLauncherInfo,
+      },
+      xgrBridgeX86: {
+        dllPath: DLL_X86_PATH,
+        sha256Path: SHA256_X86_PATH,
+        ...xgrX86Info,
+      },
+      gameInputBridgeX86: {
+        dllPath: GAMEINPUT_DLL_X86_PATH,
+        sha256Path: GAMEINPUT_SHA256_X86_PATH,
+        ...giX86Info,
+      },
+      appNotifyBridgeX86: {
+        dllPath: APPNOTIFY_DLL_X86_PATH,
+        sha256Path: APPNOTIFY_SHA256_X86_PATH,
+        ...appNotifyX86Info,
+      },
+      winXgrLauncherX86: {
+        exePath: WIN_LAUNCHER_EXE_X86_PATH,
+        sha256Path: WIN_LAUNCHER_SHA256_X86_PATH,
+        ...winLauncherX86Info,
       },
     };
   }
@@ -897,6 +1176,292 @@ function buildWinXgrLauncherExe({ forceRebuild = false, zigBin: providedZigBin =
   };
 }
 
+function buildGameInputBridgeX86Dll({ forceRebuild = false, zigBin: providedZigBin = null } = {}) {
+  const zigBin = providedZigBin || resolveZigBinary({ optional: !forceRebuild });
+  if (!zigBin) {
+    if (fs.existsSync(GAMEINPUT_DLL_X86_PATH) && fs.existsSync(GAMEINPUT_SHA256_X86_PATH)) {
+      const info = verifyGameInputBridgeX86Dll(GAMEINPUT_DLL_X86_PATH);
+      verifySidecarSha256(GAMEINPUT_SHA256_X86_PATH, info.sha256, 'one_gameinput_bridge_x86.dll');
+      return {
+        zigBin: null,
+        prebuiltVerified: true,
+        dllPath: GAMEINPUT_DLL_X86_PATH,
+        sha256Path: GAMEINPUT_SHA256_X86_PATH,
+        ...info,
+      };
+    }
+    resolveZigBinary({ optional: false });
+  }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  const { targetTriple, extraLinkerFlags } = resolveX86WinGnuToolchain(zigBin);
+  const defPath = path.join(SRC_DIR, 'gameinput.def');
+  const srcPaths = GAMEINPUT_C_SOURCES.map((f) => path.join(SRC_DIR, f));
+  const stageDir = path.join(OUT_DIR, '.pe-stage-x86');
+  const stagedDllPath = path.join(stageDir, GAMEINPUT_EXPECTED_DLL_NAME);
+  fs.mkdirSync(stageDir, { recursive: true });
+
+  const args = [
+    'cc',
+    '-target',
+    targetTriple,
+    '-shared',
+    '-std=c11',
+    '-O2',
+    '-Wall',
+    '-Wextra',
+    '-Werror',
+    '-fno-ident',
+    `-ffile-prefix-map=${REPO_ROOT}=.`,
+    `-I${SRC_DIR}`,
+    ...srcPaths,
+    defPath,
+    ...extraLinkerFlags,
+    '-Wl,--strip-all',
+    '-lkernel32',
+    '-luser32',
+    '-o',
+    stagedDllPath,
+  ];
+
+  try {
+    execFileSync(zigBin, args, {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+    });
+    fs.renameSync(stagedDllPath, GAMEINPUT_DLL_X86_PATH);
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  cleanTransientLinkerOutputs();
+  normalizePeDeterminism(GAMEINPUT_DLL_X86_PATH);
+
+  const info = verifyGameInputBridgeX86Dll(GAMEINPUT_DLL_X86_PATH);
+  fs.writeFileSync(GAMEINPUT_SHA256_X86_PATH, `${info.sha256}  one_gameinput_bridge_x86.dll\n`, 'utf8');
+  return {
+    zigBin,
+    dllPath: GAMEINPUT_DLL_X86_PATH,
+    sha256Path: GAMEINPUT_SHA256_X86_PATH,
+    ...info,
+  };
+}
+
+function buildAppNotifyBridgeX86Dll({ forceRebuild = false, zigBin: providedZigBin = null } = {}) {
+  const zigBin = providedZigBin || resolveZigBinary({ optional: !forceRebuild });
+  if (!zigBin) {
+    if (fs.existsSync(APPNOTIFY_DLL_X86_PATH) && fs.existsSync(APPNOTIFY_SHA256_X86_PATH)) {
+      const info = verifyAppNotifyBridgeX86Dll(APPNOTIFY_DLL_X86_PATH);
+      verifySidecarSha256(APPNOTIFY_SHA256_X86_PATH, info.sha256, 'one_appnotify_bridge_x86.dll');
+      return {
+        zigBin: null,
+        prebuiltVerified: true,
+        dllPath: APPNOTIFY_DLL_X86_PATH,
+        sha256Path: APPNOTIFY_SHA256_X86_PATH,
+        ...info,
+      };
+    }
+    resolveZigBinary({ optional: false });
+  }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  const { targetTriple, extraLinkerFlags } = resolveX86WinGnuToolchain(zigBin);
+  const defPath = path.join(SRC_DIR, 'appnotify.def');
+  const srcPaths = APPNOTIFY_C_SOURCES.map((f) => path.join(SRC_DIR, f));
+  const stageDir = path.join(OUT_DIR, '.pe-stage-x86');
+  const stagedDllPath = path.join(stageDir, APPNOTIFY_EXPECTED_DLL_NAME);
+  fs.mkdirSync(stageDir, { recursive: true });
+
+  const args = [
+    'cc',
+    '-target',
+    targetTriple,
+    '-shared',
+    '-std=c11',
+    '-O2',
+    '-Wall',
+    '-Wextra',
+    '-Werror',
+    '-fno-ident',
+    `-ffile-prefix-map=${REPO_ROOT}=.`,
+    `-I${SRC_DIR}`,
+    ...srcPaths,
+    defPath,
+    ...extraLinkerFlags,
+    '-Wl,--strip-all',
+    '-lkernel32',
+    '-o',
+    stagedDllPath,
+  ];
+
+  try {
+    execFileSync(zigBin, args, {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+    });
+    fs.renameSync(stagedDllPath, APPNOTIFY_DLL_X86_PATH);
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  cleanTransientLinkerOutputs();
+  normalizePeDeterminism(APPNOTIFY_DLL_X86_PATH);
+
+  const info = verifyAppNotifyBridgeX86Dll(APPNOTIFY_DLL_X86_PATH);
+  fs.writeFileSync(APPNOTIFY_SHA256_X86_PATH, `${info.sha256}  one_appnotify_bridge_x86.dll\n`, 'utf8');
+  return {
+    zigBin,
+    dllPath: APPNOTIFY_DLL_X86_PATH,
+    sha256Path: APPNOTIFY_SHA256_X86_PATH,
+    ...info,
+  };
+}
+
+function buildWinXgrLauncherX86Exe({ forceRebuild = false, zigBin: providedZigBin = null } = {}) {
+  const zigBin = providedZigBin || resolveZigBinary({ optional: !forceRebuild });
+  if (!zigBin) {
+    if (fs.existsSync(WIN_LAUNCHER_EXE_X86_PATH) && fs.existsSync(WIN_LAUNCHER_SHA256_X86_PATH)) {
+      const info = verifyWinXgrLauncherX86Exe(WIN_LAUNCHER_EXE_X86_PATH);
+      verifySidecarSha256(WIN_LAUNCHER_SHA256_X86_PATH, info.sha256, 'one_xgr_win_launcher_x86.exe');
+      return {
+        zigBin: null,
+        prebuiltVerified: true,
+        exePath: WIN_LAUNCHER_EXE_X86_PATH,
+        sha256Path: WIN_LAUNCHER_SHA256_X86_PATH,
+        ...info,
+      };
+    }
+    resolveZigBinary({ optional: false });
+  }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  const { targetTriple } = resolveX86WinGnuToolchain(zigBin);
+  const srcPaths = WIN_LAUNCHER_C_SOURCES.map((f) => path.join(SRC_DIR, f));
+  const stageDir = path.join(OUT_DIR, '.pe-stage-x86');
+  const stagedExePath = path.join(stageDir, 'one_xgr_win_launcher_x86.exe');
+  fs.mkdirSync(stageDir, { recursive: true });
+
+  const args = [
+    'cc',
+    '-target',
+    targetTriple,
+    '-std=c11',
+    '-O2',
+    '-Wall',
+    '-Wextra',
+    '-Werror',
+    '-fno-ident',
+    `-ffile-prefix-map=${REPO_ROOT}=.`,
+    `-I${SRC_DIR}`,
+    ...srcPaths,
+    '-Wl,--subsystem,windows',
+    '-Wl,--strip-all',
+    '-lkernel32',
+    '-o',
+    stagedExePath,
+  ];
+
+  try {
+    execFileSync(zigBin, args, {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+    });
+    fs.renameSync(stagedExePath, WIN_LAUNCHER_EXE_X86_PATH);
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  cleanTransientLinkerOutputs();
+  normalizePeDeterminism(WIN_LAUNCHER_EXE_X86_PATH);
+
+  const info = verifyWinXgrLauncherX86Exe(WIN_LAUNCHER_EXE_X86_PATH);
+  fs.writeFileSync(
+    WIN_LAUNCHER_SHA256_X86_PATH,
+    `${info.sha256}  one_xgr_win_launcher_x86.exe\n`,
+    'utf8'
+  );
+  return {
+    zigBin,
+    exePath: WIN_LAUNCHER_EXE_X86_PATH,
+    sha256Path: WIN_LAUNCHER_SHA256_X86_PATH,
+    ...info,
+  };
+}
+
+function buildXboxBridgeX86Dll({ forceRebuild = false, zigBin: providedZigBin = null } = {}) {
+  const zigBin = providedZigBin || resolveZigBinary({ optional: !forceRebuild });
+  if (!zigBin) {
+    if (fs.existsSync(DLL_X86_PATH) && fs.existsSync(SHA256_X86_PATH)) {
+      const info = verifyXboxBridgeX86Dll(DLL_X86_PATH);
+      verifySidecarSha256(SHA256_X86_PATH, info.sha256, 'one_xgameruntime_bridge_x86.dll');
+      return {
+        zigBin: null,
+        prebuiltVerified: true,
+        dllPath: DLL_X86_PATH,
+        sha256Path: SHA256_X86_PATH,
+        ...info,
+      };
+    }
+    resolveZigBinary({ optional: false });
+  }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  const { targetTriple, extraLinkerFlags } = resolveX86WinGnuToolchain(zigBin);
+  const defPath = path.join(SRC_DIR, 'xgameruntime.def');
+  const srcPaths = C_SOURCES.map((f) => path.join(SRC_DIR, f));
+  const stageDir = path.join(OUT_DIR, '.pe-stage-x86');
+  const stagedDllPath = path.join(stageDir, EXPECTED_DLL_NAME);
+  fs.mkdirSync(stageDir, { recursive: true });
+
+  const args = [
+    'cc',
+    '-target',
+    targetTriple,
+    '-shared',
+    '-std=c11',
+    '-O2',
+    '-Wall',
+    '-Wextra',
+    '-Werror',
+    '-fno-ident',
+    `-ffile-prefix-map=${REPO_ROOT}=.`,
+    `-I${SRC_DIR}`,
+    ...srcPaths,
+    defPath,
+    ...extraLinkerFlags,
+    '-Wl,--strip-all',
+    '-lkernel32',
+    '-lws2_32',
+    '-ladvapi32',
+    '-lole32',
+    '-lntdll',
+    '-o',
+    stagedDllPath,
+  ];
+
+  try {
+    execFileSync(zigBin, args, {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+    });
+    fs.renameSync(stagedDllPath, DLL_X86_PATH);
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  cleanTransientLinkerOutputs();
+  normalizePeDeterminism(DLL_X86_PATH);
+
+  const info = verifyXboxBridgeX86Dll(DLL_X86_PATH);
+  fs.writeFileSync(SHA256_X86_PATH, `${info.sha256}  one_xgameruntime_bridge_x86.dll\n`, 'utf8');
+  return {
+    zigBin,
+    dllPath: DLL_X86_PATH,
+    sha256Path: SHA256_X86_PATH,
+    ...info,
+  };
+}
+
 function buildXboxBridgeDll({ forceRebuild = false } = {}) {
   const zigBin = resolveZigBinary({ optional: !forceRebuild });
   if (!zigBin) {
@@ -909,6 +1474,14 @@ function buildXboxBridgeDll({ forceRebuild = false } = {}) {
       fs.existsSync(APPNOTIFY_SHA256_PATH) &&
       fs.existsSync(WIN_LAUNCHER_EXE_PATH) &&
       fs.existsSync(WIN_LAUNCHER_SHA256_PATH) &&
+      fs.existsSync(DLL_X86_PATH) &&
+      fs.existsSync(SHA256_X86_PATH) &&
+      fs.existsSync(GAMEINPUT_DLL_X86_PATH) &&
+      fs.existsSync(GAMEINPUT_SHA256_X86_PATH) &&
+      fs.existsSync(APPNOTIFY_DLL_X86_PATH) &&
+      fs.existsSync(APPNOTIFY_SHA256_X86_PATH) &&
+      fs.existsSync(WIN_LAUNCHER_EXE_X86_PATH) &&
+      fs.existsSync(WIN_LAUNCHER_SHA256_X86_PATH) &&
       fs.existsSync(MANIFEST_PATH)
     ) {
       const verified = verifyXboxBridgeDll(DLL_PATH);
@@ -932,6 +1505,26 @@ function buildXboxBridgeDll({ forceRebuild = false } = {}) {
           zigBin: null,
           prebuiltVerified: true,
           ...verified.winXgrLauncher,
+        },
+        xgrBridgeX86: {
+          zigBin: null,
+          prebuiltVerified: true,
+          ...verified.xgrBridgeX86,
+        },
+        gameInputBridgeX86: {
+          zigBin: null,
+          prebuiltVerified: true,
+          ...verified.gameInputBridgeX86,
+        },
+        appNotifyBridgeX86: {
+          zigBin: null,
+          prebuiltVerified: true,
+          ...verified.appNotifyBridgeX86,
+        },
+        winXgrLauncherX86: {
+          zigBin: null,
+          prebuiltVerified: true,
+          ...verified.winXgrLauncherX86,
         },
       };
     }
@@ -987,7 +1580,13 @@ function buildXboxBridgeDll({ forceRebuild = false } = {}) {
   const appNotifyBridge = buildAppNotifyBridgeDll({ forceRebuild: true, zigBin });
   const winXgrLauncher = buildWinXgrLauncherExe({ forceRebuild: true, zigBin });
 
+  const xgrBridgeX86 = buildXboxBridgeX86Dll({ forceRebuild: true, zigBin });
+  const gameInputBridgeX86 = buildGameInputBridgeX86Dll({ forceRebuild: true, zigBin });
+  const appNotifyBridgeX86 = buildAppNotifyBridgeX86Dll({ forceRebuild: true, zigBin });
+  const winXgrLauncherX86 = buildWinXgrLauncherX86Exe({ forceRebuild: true, zigBin });
+
   const info = parseAndVerifyPeDll(normalizedXgrBuf, {
+    expectedMachine: 0x8664,
     expectedExports: EXPECTED_EXPORTS,
     expectedMarker: EXPECTED_MARKER,
     expectedDllName: EXPECTED_DLL_NAME,
@@ -1002,6 +1601,10 @@ function buildXboxBridgeDll({ forceRebuild = false } = {}) {
     giInfo: gameInputBridge,
     appNotifyInfo: appNotifyBridge,
     winLauncherInfo: winXgrLauncher,
+    xgrX86Info: xgrBridgeX86,
+    giX86Info: gameInputBridgeX86,
+    appNotifyX86Info: appNotifyBridgeX86,
+    winLauncherX86Info: winXgrLauncherX86,
   });
   fs.writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
@@ -1015,6 +1618,10 @@ function buildXboxBridgeDll({ forceRebuild = false } = {}) {
     gameInputBridge,
     appNotifyBridge,
     winXgrLauncher,
+    xgrBridgeX86,
+    gameInputBridgeX86,
+    appNotifyBridgeX86,
+    winXgrLauncherX86,
   };
 }
 
@@ -1044,6 +1651,14 @@ module.exports = {
   APPNOTIFY_SHA256_PATH,
   WIN_LAUNCHER_EXE_PATH,
   WIN_LAUNCHER_SHA256_PATH,
+  DLL_X86_PATH,
+  SHA256_X86_PATH,
+  GAMEINPUT_DLL_X86_PATH,
+  GAMEINPUT_SHA256_X86_PATH,
+  APPNOTIFY_DLL_X86_PATH,
+  APPNOTIFY_SHA256_X86_PATH,
+  WIN_LAUNCHER_EXE_X86_PATH,
+  WIN_LAUNCHER_SHA256_X86_PATH,
   MANIFEST_PATH,
   EXPECTED_DLL_NAME,
   EXPECTED_EXPORTS,
@@ -1063,11 +1678,19 @@ module.exports = {
   computeSourceManifestDigests,
   verifyBridgeBuildManifest,
   verifyXboxBridgeDll,
+  verifyXboxBridgeX86Dll,
   verifyGameInputBridgeDll,
+  verifyGameInputBridgeX86Dll,
   verifyAppNotifyBridgeDll,
+  verifyAppNotifyBridgeX86Dll,
   verifyWinXgrLauncherExe,
+  verifyWinXgrLauncherX86Exe,
   buildXboxBridgeDll,
+  buildXboxBridgeX86Dll,
   buildGameInputBridgeDll,
+  buildGameInputBridgeX86Dll,
   buildAppNotifyBridgeDll,
+  buildAppNotifyBridgeX86Dll,
   buildWinXgrLauncherExe,
+  buildWinXgrLauncherX86Exe,
 };

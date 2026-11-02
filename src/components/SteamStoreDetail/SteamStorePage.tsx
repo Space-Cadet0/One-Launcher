@@ -20,12 +20,20 @@ import { MediaGallery } from './MediaGallery';
 import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
 import { HowLongToBeatCard } from './HowLongToBeatCard';
+import {
+  getHowLongToBeat,
+  seedHltbFromVaultIfMissing,
+  type HltbData,
+} from '../../services/hltb/howLongToBeat';
 import { getOpenCriticData } from '../../services/critic/criticScoreService';
 import { OpenCriticCard } from './OpenCriticCard';
 import { SystemRequirements } from './SystemRequirements';
 import { PlatformBadges } from './PlatformBadges';
 import { NativeOsBadges } from '../Common/NativeOsBadges';
-import { getNativeOsPlatforms } from '../../services/platform/nativeOsService';
+import {
+  getNativeOsPlatforms,
+  getStorefrontNativeOsPlatforms,
+} from '../../services/platform/nativeOsService';
 import { SteamLanguagesTable } from './SteamLanguagesTable';
 import { SteamFeaturesList } from './SteamFeaturesList';
 import { SteamSidebarNotices } from './SteamSidebarNotices';
@@ -525,6 +533,49 @@ const AboutThisGameHtml: React.FC<AboutThisGameHtmlProps> = ({
   );
 };
 
+function parseVaultHltb(raw: unknown): HltbData | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Partial<HltbData> & { unmatched?: boolean };
+  if (candidate.isAccurate === false || candidate.unmatched === true) return null;
+  const mainStoryHours = typeof candidate.mainStoryHours === 'number' ? candidate.mainStoryHours : 0;
+  const mainExtraHours = typeof candidate.mainExtraHours === 'number' ? candidate.mainExtraHours : 0;
+  const completionistHours =
+    typeof candidate.completionistHours === 'number' ? candidate.completionistHours : 0;
+  const allStylesHours = typeof candidate.allStylesHours === 'number' ? candidate.allStylesHours : 0;
+  if (
+    mainStoryHours <= 0 &&
+    mainExtraHours <= 0 &&
+    completionistHours <= 0 &&
+    allStylesHours <= 0
+  ) {
+    return null;
+  }
+  return {
+    mainStoryHours,
+    mainExtraHours,
+    completionistHours,
+    allStylesHours,
+    gameplayType: typeof candidate.gameplayType === 'string' ? candidate.gameplayType : undefined,
+    hltbGameId: typeof candidate.hltbGameId === 'number' ? candidate.hltbGameId : undefined,
+    isAccurate: true,
+  };
+}
+
+function resolveInitialDetailPlatformId(targetGame: CanonicalGame): StorefrontId {
+  const persisted = launcherService.getSelectedStorefrontForGame(targetGame.id);
+  const validPersisted =
+    persisted && (targetGame.platforms || []).some((p) => p.platformId === persisted)
+      ? persisted
+      : undefined;
+  return (
+    validPersisted ||
+    launcherService.getSelectedStorefrontForGame(targetGame) ||
+    launcherService.getEffectivePlatformForGame(targetGame)?.platformId ||
+    targetGame.platforms?.[0]?.platformId ||
+    (targetGame.steamAppId ? 'steam' : 'custom')
+  );
+}
+
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   game,
   collections,
@@ -541,10 +592,14 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentGame, setCurrentGame] = useState<CanonicalGame>(game);
+  const [activePlatformId, setActivePlatformId] = useState<StorefrontId>(() =>
+    resolveInitialDetailPlatformId(game)
+  );
   const [, setLauncherTick] = useState(0);
   const [metadata, setMetadata] = useState<SteamEnrichedMetadata | null>(
     game.enrichedMetadata || null
   );
+  const [vaultHltb, setVaultHltb] = useState<HltbData | null>(null);
   const [currentSteamAppId, setCurrentSteamAppId] = useState<number | undefined>(game.steamAppId);
   const [isLoading, setIsLoading] = useState(!game.enrichedMetadata);
   const [isOnline, setIsOnline] = useState<boolean>(() => onlineLifecycleManager.isOnline());
@@ -573,6 +628,13 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
     const offHydrated = onlineLifecycleManager.onGameHydrated((payload) => {
       if (payload.gameId !== game.id) return;
+      if (payload.detail?.hltb) {
+        const hydratedVaultHltb = parseVaultHltb(payload.detail.hltb);
+        if (hydratedVaultHltb) {
+          seedHltbFromVaultIfMissing(game.title, game.steamAppId, hydratedVaultHltb);
+          setVaultHltb(hydratedVaultHltb);
+        }
+      }
       const hydratedMeta = payload.detail?.enrichedMetadata;
       if (hydratedMeta && hasRichMetadata(hydratedMeta)) {
         if (
@@ -599,6 +661,29 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
       offHydrated();
     };
   }, [game.id]);
+
+  useEffect(() => {
+    setActivePlatformId(resolveInitialDetailPlatformId(game));
+  }, [game.id]);
+
+  useEffect(() => {
+    if (
+      Array.isArray(currentGame.platforms) &&
+      currentGame.platforms.length > 0 &&
+      !currentGame.platforms.some((p) => p.platformId === activePlatformId)
+    ) {
+      setActivePlatformId(resolveInitialDetailPlatformId(currentGame));
+    }
+  }, [currentGame, activePlatformId]);
+
+  const activeStoreNativePlatforms = useMemo(
+    () =>
+      Array.isArray(currentGame.platforms) && currentGame.platforms.length > 0
+        ? getStorefrontNativeOsPlatforms(currentGame, activePlatformId)
+        : getNativeOsPlatforms(currentGame),
+    [currentGame, activePlatformId]
+  );
+  const activeStoreSupportsMac = activeStoreNativePlatforms.includes('mac');
 
   useEffect(() => {
     const computePageLauncherSig = () => {
@@ -710,6 +795,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     activeOverrideStampRef.current = userOverride?.updatedAt;
 
     if (isNewGame) {
+      setVaultHltb(null);
       latestRichMetadataRef.current = hasRichMetadata(game.enrichedMetadata)
         ? game.enrichedMetadata!
         : null;
@@ -730,15 +816,31 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         ? latestRichMetadataRef.current
         : null;
 
-      // Hydrate cached detail from SQLite offlineVault when game.enrichedMetadata was stripped, missing, or non-authoritative storefront_native
+      // Hydrate cached detail from SQLite offlineVault when game.enrichedMetadata or HLTB is missing
+      const needsRichMetaFromVault =
+        !existingRichMeta || !isAuthoritativeSteamMetadata(existingRichMeta, game.steamAppId);
+      const needsHltbFromVault = !getHowLongToBeat(game.title, game.steamAppId);
       if (
-        (!existingRichMeta || !isAuthoritativeSteamMetadata(existingRichMeta, game.steamAppId)) &&
+        (needsRichMetaFromVault || needsHltbFromVault) &&
         typeof window !== 'undefined' &&
         window.electronAPI?.offlineVault?.getGameDetail
       ) {
         try {
           const vaultDetail = await window.electronAPI.offlineVault.getGameDetail(game.id);
-          if (vaultDetail?.enrichedMetadata && hasRichMetadata(vaultDetail.enrichedMetadata)) {
+          if (vaultDetail?.hltb) {
+            const hydratedVaultHltb = parseVaultHltb(vaultDetail.hltb);
+            if (hydratedVaultHltb) {
+              seedHltbFromVaultIfMissing(game.title, game.steamAppId, hydratedVaultHltb);
+              if (isMounted) {
+                setVaultHltb(hydratedVaultHltb);
+              }
+            }
+          }
+          if (
+            needsRichMetaFromVault &&
+            vaultDetail?.enrichedMetadata &&
+            hasRichMetadata(vaultDetail.enrichedMetadata)
+          ) {
             const shouldAdoptVault =
               !existingRichMeta ||
               (isAuthoritativeSteamMetadata(vaultDetail.enrichedMetadata) &&
@@ -1802,28 +1904,24 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 size="md"
                 connectedStorefronts={connectedStorefronts}
               />
-              {(() => {
-                const nativePlatforms = getNativeOsPlatforms(currentGame);
-                if (nativePlatforms.length === 0) return null;
-                return (
-                  <div className="inline-flex items-center gap-1.5 ml-2 pl-2.5 border-l border-white/15">
-                    <span className="text-xs uppercase tracking-wider text-steam-subtext font-semibold">
-                      Native OS:
-                    </span>
-                    <NativeOsBadges
-                      platforms={nativePlatforms}
-                      variant="detail-pill"
-                      onSelectOs={(os) =>
-                        onApplyFilter?.({
-                          type: 'os',
-                          label: 'Native OS',
-                          value: os === 'mac' ? 'macOS' : 'Windows',
-                        })
-                      }
-                    />
-                  </div>
-                );
-              })()}
+              {activeStoreNativePlatforms.length > 0 && (
+                <div className="inline-flex items-center gap-1.5 ml-2 pl-2.5 border-l border-white/15">
+                  <span className="text-xs uppercase tracking-wider text-steam-subtext font-semibold">
+                    Native OS:
+                  </span>
+                  <NativeOsBadges
+                    platforms={activeStoreNativePlatforms}
+                    variant="detail-pill"
+                    onSelectOs={(os) =>
+                      onApplyFilter?.({
+                        type: 'os',
+                        label: 'Native OS',
+                        value: os === 'mac' ? 'macOS' : 'Windows',
+                      })
+                    }
+                  />
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1840,6 +1938,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           onFixMatch={onFixMatch}
           onHideGame={onHideGame}
           onViewAchievements={onViewAchievements}
+          onSelectedPlatformChange={setActivePlatformId}
         />
 
         {/* Main Steam Highlight Showcase (1:1 Steam 2-Column Split: Media Player + Details) */}
@@ -1896,10 +1995,12 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
 
         {/* Gameplay Completion Dashboard (HowLongToBeat) */}
         <HowLongToBeatCard
+          gameId={game.id}
           gameTitle={game.title}
           appId={currentSteamAppId || game.steamAppId}
           genres={game.genres}
           tags={game.tags}
+          hltb={vaultHltb ?? undefined}
         />
 
         {/* Critic Consensus Dashboard (OpenCritic / Metacritic) */}
@@ -1953,8 +2054,10 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               <SystemRequirements
                 gameId={currentGame.id}
                 requirements={metadata?.systemRequirements}
-                macRequirements={metadata?.macRequirements}
-                linuxRequirements={metadata?.linuxRequirements}
+                macRequirements={activeStoreSupportsMac ? metadata?.macRequirements : undefined}
+                linuxRequirements={
+                  activePlatformId === 'steam' ? metadata?.linuxRequirements : undefined
+                }
                 metadataQuality={
                   metadata?.metadataQuality === 'storefront_native'
                     ? isOnline
@@ -1972,9 +2075,18 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               categories={metadata?.categories}
               title={game.title}
               isOwnedOnSteam={isOwnedOnSteam}
-              hasAntiCheat={Boolean(metadata?.drmNotice?.toLowerCase().includes('anti-cheat'))}
+              hasAntiCheat={Boolean(
+                currentGame.requiresKernelAntiCheat ||
+                  metadata?.drmNotice?.toLowerCase().includes('anti-cheat') ||
+                  metadata?.drmNotice?.toLowerCase().includes('anticheat')
+              )}
               antiCheatName={
-                metadata?.drmNotice?.includes('Easy') ? 'Easy Anti-Cheat' : 'Anti-Cheat Software'
+                currentGame.antiCheatName ||
+                (metadata?.drmNotice?.includes('Javelin')
+                  ? 'EA Javelin Anticheat'
+                  : metadata?.drmNotice?.includes('Easy')
+                    ? 'Easy Anti-Cheat'
+                    : 'Anti-Cheat Software')
               }
               hasEula={Boolean(
                 metadata?.drmNotice?.toLowerCase().includes('eula') ||
@@ -2004,6 +2116,13 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 publishers={publishers}
                 releaseDate={releaseDate}
                 legalNotice={metadata?.legalNotice}
+                game={currentGame}
+                platforms={currentGame.platforms}
+                activePlatformId={activePlatformId}
+                drmNotice={metadata?.drmNotice}
+                extUserAccountNotice={
+                  (metadata as { extUserAccountNotice?: string } | undefined)?.extUserAccountNotice
+                }
                 onApplyFilter={onApplyFilter}
               />
             </div>

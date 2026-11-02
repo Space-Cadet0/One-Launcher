@@ -1,11 +1,16 @@
 import axios from 'axios';
-import { CanonicalGame, StoreAchievementSummary } from '../../contracts/game';
+import {
+  CanonicalGame,
+  GamePlatformOwnership,
+  StoreAchievementSummary,
+} from '../../contracts/game';
 import { StorefrontCredentials } from '../../contracts/integration';
 import { EPIC_USER_LIBRARY } from '../storage/storefrontLibraries';
 import {
   hasStructuralEpicCodenameTraits,
   KNOWN_EPIC_APP_NAMES,
 } from './epicCodenames';
+import { normalizeChainedHandoffId } from './catalogSanitizer';
 import { steamMatcher } from '../steam/steamMatcher';
 import { cacheUserEpicAchievements } from '../storage/knownGameAchievements';
 import { reconcileAchievementSummaries } from '../storage/achievementReconciliation';
@@ -24,6 +29,15 @@ interface EpicMainGameRef {
   namespace?: string;
 }
 
+type EpicCustomAttributeValue =
+  | { type?: string; value?: string }
+  | string
+  | undefined;
+
+type EpicCustomAttributes =
+  | Record<string, EpicCustomAttributeValue>
+  | Array<{ key?: string; type?: string; value?: string }>;
+
 interface EpicCatalogItemMetadata {
   title?: string;
   description?: string;
@@ -34,6 +48,63 @@ interface EpicCatalogItemMetadata {
   categories?: EpicCategoryItem[];
   keyImages?: EpicKeyImage[];
   mainGameItem?: EpicMainGameRef;
+  customAttributes?: EpicCustomAttributes;
+}
+
+/**
+ * Extracts partner launcher handoff metadata (e.g., EA App / Origin `ThirdPartyManagedApp`,
+ * `PartnerLinkType`, and `RegistryPath`) from Epic `metadata.customAttributes`.
+ */
+export function extractEpicPartnerHandoffMetadata(
+  ...sources: Array<EpicCustomAttributes | undefined | null>
+): Partial<GamePlatformOwnership> | null {
+  const attrMap = new Map<string, string>();
+  for (const src of sources) {
+    if (!src || typeof src !== 'object') continue;
+    if (Array.isArray(src)) {
+      for (const entry of src) {
+        const key = String(entry?.key || '').trim().toLowerCase();
+        const val = String(entry?.value || '').trim();
+        if (key && val && !attrMap.has(key)) {
+          attrMap.set(key, val);
+        }
+      }
+    } else {
+      for (const [rawKey, rawVal] of Object.entries(src)) {
+        const key = String(rawKey || '').trim().toLowerCase();
+        const val =
+          typeof rawVal === 'string'
+            ? rawVal.trim()
+            : rawVal && typeof rawVal === 'object' && typeof rawVal.value === 'string'
+            ? rawVal.value.trim()
+            : '';
+        if (key && val && !attrMap.has(key)) {
+          attrMap.set(key, val);
+        }
+      }
+    }
+  }
+
+  if (attrMap.size === 0) return null;
+
+  const thirdPartyManagedApp = attrMap.get('thirdpartymanagedapp');
+  const partnerLinkType = attrMap.get('partnerlinktype');
+  const registryPath = attrMap.get('registrypath');
+
+  const handoff =
+    normalizeChainedHandoffId(thirdPartyManagedApp) ||
+    normalizeChainedHandoffId(partnerLinkType);
+  if (!handoff) return null;
+
+  return {
+    chainedLauncherHandoff: handoff,
+    externalStorefrontHandoff: handoff,
+    chainedHandoffTopology: 'partner_launcher_link',
+    ...(registryPath ? { epicPartnerRegistryPath: registryPath } : {}),
+    ...(handoff !== 'bnet'
+      ? { platforms: { windows: true, mac: false, linux: false } }
+      : {}),
+  };
 }
 
 interface EpicLibraryRecord {
@@ -265,11 +336,18 @@ export class EpicIntegrationService {
   }
 
   /**
-   * Fetches real owned games from Epic Games Library API
+   * Fetches real owned games from Epic Games Library API, tracking whether all
+   * cursor pages finished cleanly with zero errors.
    */
-  async fetchOwnedGames(accessToken: string): Promise<CanonicalGame[]> {
+  async fetchOwnedGamesDetailed(
+    accessToken: string
+  ): Promise<{ games: CanonicalGame[]; authoritativeComplete: boolean }> {
+    if (!accessToken || accessToken === 'saved_in_electron') {
+      return { games: [], authoritativeComplete: false };
+    }
     const games: CanonicalGame[] = [];
     const seenIds = new Set<string>();
+    let completedAllPages = false;
 
     // Build lookup maps from verified Epic catalog
     const epicCatalogById = new Map<string, CanonicalGame>();
@@ -286,8 +364,9 @@ export class EpicIntegrationService {
       let cursor: string | undefined = undefined;
       let hasMore = true;
       let pageCount = 0;
+      let hadUnresolvedCatalogFailure = false;
 
-      while (hasMore && pageCount < 30) {
+      while (hasMore && pageCount < 100) {
         const fetchUrl: string = cursor
           ? `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true&cursor=${cursor}`
           : `${this.getLibraryBaseUrl()}/library/api/public/items?includeMetadata=true`;
@@ -349,7 +428,28 @@ export class EpicIntegrationService {
           if (catalogGame) {
             if (!seenIds.has(catalogGame.id)) {
               seenIds.add(catalogGame.id);
-              games.push({ ...catalogGame, isVerifiedEntitlement: true });
+              const partnerMeta = extractEpicPartnerHandoffMetadata(
+                item.metadata?.customAttributes
+              );
+              const nextCatalogGame: CanonicalGame = partnerMeta
+                ? {
+                    ...catalogGame,
+                    isVerifiedEntitlement: true,
+                    platforms: (catalogGame.platforms || []).map((p) =>
+                      p.platformId === 'epic'
+                        ? {
+                            ...p,
+                            ...(item.namespace && !p.namespace ? { namespace: item.namespace } : {}),
+                            ...(item.catalogItemId && !p.catalogItemId
+                              ? { catalogItemId: item.catalogItemId }
+                              : {}),
+                            ...partnerMeta,
+                          }
+                        : p
+                    ),
+                  }
+                : { ...catalogGame, isVerifiedEntitlement: true };
+              games.push(nextCatalogGame);
             }
             continue;
           }
@@ -367,9 +467,11 @@ export class EpicIntegrationService {
           let keyImages: EpicKeyImage[] = item.metadata?.keyImages || [];
           let metaDescription = item.metadata?.description || '';
           let metaDeveloper = item.metadata?.developer || '';
+          let catalogFallbackCustomAttributes: EpicCustomAttributes | undefined;
 
           if ((!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) && item.namespace && item.catalogItemId) {
             let resolvedFromCatalog = false;
+            let catalogLookupFailed = false;
             try {
               const catUrl = `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${item.namespace}/bulk/items?id=${item.catalogItemId}&includeDLCDetails=true&includeMainGameDetails=true`;
               const cRes = await axios.get<Record<string, EpicCatalogItemMetadata>>(catUrl, {
@@ -390,12 +492,25 @@ export class EpicIntegrationService {
                 metaDescription = meta.description || metaDescription;
                 metaDeveloper = meta.developer || metaDeveloper;
                 keyImages = meta.keyImages || keyImages;
+                catalogFallbackCustomAttributes = meta.customAttributes;
               }
             } catch {
-              // Ignore catalog lookup error
+              catalogLookupFailed = true;
             }
             if (!resolvedFromCatalog && !codename && !item.metadata?.title) {
+              if (catalogLookupFailed) {
+                hadUnresolvedCatalogFailure = true;
+              }
               continue;
+            }
+            if (
+              catalogLookupFailed &&
+              (!title ||
+                title === 'Live' ||
+                /^[0-9a-f]{20,}$/i.test(title) ||
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title))
+            ) {
+              hadUnresolvedCatalogFailure = true;
             }
           }
 
@@ -468,6 +583,11 @@ export class EpicIntegrationService {
             ? codename.description
             : (metaDescription || '');
 
+          const partnerHandoffMeta = extractEpicPartnerHandoffMetadata(
+            item.metadata?.customAttributes,
+            catalogFallbackCustomAttributes
+          );
+
           const constructedGame: CanonicalGame = {
             id: steamAppId ? `steam-${steamAppId}` : `epic-${appId}`,
             title,
@@ -478,8 +598,12 @@ export class EpicIntegrationService {
               {
                 platformId: 'epic',
                 platformGameId: appId,
+                ...(item.appName ? { storefrontAppId: item.appName } : {}),
+                ...(item.namespace ? { namespace: item.namespace } : {}),
+                ...(item.catalogItemId ? { catalogItemId: item.catalogItemId } : {}),
                 installed: false,
                 playtimeMinutes: 0,
+                ...(partnerHandoffMeta || {}),
               },
             ],
             headerImage: headerImg,
@@ -503,13 +627,24 @@ export class EpicIntegrationService {
         hasMore = Boolean(cursor);
         pageCount++;
       }
+
+      completedAllPages = !hasMore && !hadUnresolvedCatalogFailure;
     } catch (err: unknown) {
+      completedAllPages = false;
       const axErr = (err && typeof err === 'object' ? err : {}) as AxiosErrorLike;
       if (axErr.response?.status === 401) {
         throw err;
       }
       console.warn('Failed to fetch Epic library records:', err);
     }
+    return { games, authoritativeComplete: completedAllPages };
+  }
+
+  /**
+   * Fetches real owned games from Epic Games Library API
+   */
+  async fetchOwnedGames(accessToken: string): Promise<CanonicalGame[]> {
+    const { games } = await this.fetchOwnedGamesDetailed(accessToken);
     return games;
   }
 
@@ -518,7 +653,13 @@ export class EpicIntegrationService {
    */
   async connectAccount(
     credentials: StorefrontCredentials
-  ): Promise<{ accountName: string; avatarUrl?: string; games: CanonicalGame[]; updatedCredentials?: StorefrontCredentials }> {
+  ): Promise<{
+    accountName: string;
+    avatarUrl?: string;
+    games: CanonicalGame[];
+    updatedCredentials?: StorefrontCredentials;
+    authoritativeComplete?: boolean;
+  }> {
     let accountName = credentials.epicAccountId?.trim() || 'Epic Games User';
     let targetAccountId = this.extractEpicAccountId(credentials.epicAccountId) || '';
     const avatarUrl = 'https://cdn2.unrealengine.com/egs-badge.png';
@@ -581,9 +722,13 @@ export class EpicIntegrationService {
 
     // Fetch live owned games if access token is available, otherwise fall back to verified baseline
     let liveGames: CanonicalGame[] = [];
+    let authoritativeComplete = false;
+    let isElectronTransientOffline = false;
     if (accessToken && accessToken !== 'saved_in_electron') {
       try {
-        liveGames = await this.fetchOwnedGames(accessToken);
+        const ownedRes = await this.fetchOwnedGamesDetailed(accessToken);
+        liveGames = ownedRes.games;
+        authoritativeComplete = ownedRes.authoritativeComplete;
       } catch (err) {
         // If 401 and refresh token is available, try one renewal attempt
         if (updatedCredentials.epicRefreshToken) {
@@ -596,34 +741,68 @@ export class EpicIntegrationService {
               if (renewed.expiresIn) {
                 updatedCredentials.epicTokenExpiresAt = new Date(Date.now() + renewed.expiresIn * 1000).toISOString();
               }
-              liveGames = await this.fetchOwnedGames(accessToken);
+              const retryRes = await this.fetchOwnedGamesDetailed(accessToken);
+              liveGames = retryRes.games;
+              authoritativeComplete = retryRes.authoritativeComplete;
+            } else if (
+              renewed?.accessToken === 'saved_in_electron' &&
+              typeof window !== 'undefined' &&
+              window.electronAPI?.syncStore
+            ) {
+              const ipcSync = await window.electronAPI.syncStore('epic');
+              if (ipcSync?.accountName) accountName = ipcSync.accountName;
+              if (ipcSync?.accountId) targetAccountId = ipcSync.accountId;
+              if (ipcSync?.transientOffline) {
+                isElectronTransientOffline = true;
+              } else if (ipcSync?.success) {
+                if (Array.isArray(ipcSync.games)) liveGames = ipcSync.games;
+                authoritativeComplete = Boolean(ipcSync.authoritativeComplete);
+              }
             }
           } catch (renewErr) {
             console.warn('Epic token renewal fallback failed:', renewErr);
           }
         }
-        if (liveGames.length === 0) {
+        if (liveGames.length === 0 && !authoritativeComplete && !isElectronTransientOffline) {
           console.warn('Live Epic games fetch failed, using baseline catalog:', err);
         }
       }
     } else if (accessToken === 'saved_in_electron' && typeof window !== 'undefined' && window.electronAPI?.syncStore) {
       try {
         const ipcSync = await window.electronAPI.syncStore('epic');
-        if (ipcSync?.success && Array.isArray(ipcSync.games)) {
-          liveGames = ipcSync.games;
+        if (ipcSync?.accountName) accountName = ipcSync.accountName;
+        if (ipcSync?.accountId) targetAccountId = ipcSync.accountId;
+        if (ipcSync?.transientOffline) {
+          isElectronTransientOffline = true;
+        } else if (ipcSync?.success) {
+          if (Array.isArray(ipcSync.games)) {
+            liveGames = ipcSync.games;
+          }
+          authoritativeComplete = Boolean(ipcSync.authoritativeComplete);
         }
       } catch (ipcErr) {
         console.warn('Electron Epic sync fallback failed:', ipcErr);
       }
     }
 
+    if (isElectronTransientOffline) {
+      return {
+        accountName,
+        avatarUrl,
+        games: [],
+        updatedCredentials,
+        authoritativeComplete: false,
+      };
+    }
+
     let baseGames: CanonicalGame[] = [];
-    if (liveGames.length > 0) {
+    if (liveGames.length > 0 || authoritativeComplete) {
       baseGames = liveGames.map((g) => ({
         ...g,
         isVerifiedEntitlement: true,
       }));
     } else {
+      authoritativeComplete = false;
       baseGames = EPIC_USER_LIBRARY.map((g) => ({
         ...g,
         isVerifiedEntitlement: true,
@@ -662,7 +841,13 @@ export class EpicIntegrationService {
       return game;
     });
 
-    return { accountName, avatarUrl, games: gamesWithAchievements, updatedCredentials };
+    return {
+      accountName,
+      avatarUrl,
+      games: gamesWithAchievements,
+      updatedCredentials,
+      authoritativeComplete,
+    };
   }
 }
 

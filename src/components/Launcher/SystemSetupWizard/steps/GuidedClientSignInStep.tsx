@@ -42,6 +42,14 @@ const ORDERED_TARGETS: ReadonlyArray<ClientLoginTargetId> = [
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
 ];
 
 export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
@@ -607,6 +615,40 @@ export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
                   )}
                 </div>
               </div>
+
+              {/* EA App Cross-Store SSO Tip (Xbox Game Pass / Epic / Steam) */}
+              {(targetId === 'bottle_ea' || targetId === 'host_ea' || probe.storefrontId === 'ea') && (
+                <div
+                  role="note"
+                  data-testid={`guided-login-ea-sso-tip-${targetId}`}
+                  className="rounded bg-sky-950/50 border border-sky-400/45 px-3 py-2 text-[11px] text-sky-100 leading-relaxed"
+                >
+                  <strong className="text-sky-200">Xbox Game Pass, Epic &amp; Steam tip:</strong>{' '}
+                  Sign in using the Xbox, Epic Games, or Steam SSO icon in the EA App login window
+                  (or your linked EA Account) so your cross-store EA games appear automatically.
+                </div>
+              )}
+
+              {/* Ubisoft Connect / Battle.net / Rockstar Xbox Game Pass Account-Link Tip */}
+              {(targetId === 'bottle_ubisoft' ||
+                targetId === 'host_ubisoft' ||
+                targetId === 'bottle_bnet' ||
+                targetId === 'host_bnet' ||
+                targetId === 'bottle_rockstar' ||
+                targetId === 'host_rockstar') && (
+                <div
+                  role="note"
+                  data-testid={`guided-login-publisher-link-tip-${targetId}`}
+                  className="rounded bg-sky-950/50 border border-sky-400/45 px-3 py-2 text-[11px] text-sky-100 leading-relaxed"
+                >
+                  <strong className="text-sky-200">
+                    Xbox ↔ {probe.label.replace(/^Bottle\s+/i, '')} Account Link:
+                  </strong>{' '}
+                  Xbox Game Pass unlocks titles inside {probe.label.replace(/^Bottle\s+/i, '')} via
+                  server-side account linking. Sign in with the account linked to your Xbox profile
+                  so your Game Pass entitlements appear automatically.
+                </div>
+              )}
 
               {/* Remember Me hint */}
               {probe.authenticated && probe.autoLoginEnabled === false && (

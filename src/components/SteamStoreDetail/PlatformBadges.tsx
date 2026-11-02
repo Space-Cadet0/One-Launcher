@@ -4,6 +4,8 @@ import { STOREFRONT_REGISTRY, StorefrontId } from '../../contracts/platform';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
 import { CheckCircle2, Cloud } from 'lucide-react';
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
+import { normalizeChainedHandoffId } from '../../services/integrations/catalogSanitizer';
+import { resolveXboxDetailTierBadgeLabel } from '../../services/integrations/xboxIntegration';
 
 export interface StorefrontUrlOptions {
   storefrontUrl?: string;
@@ -119,20 +121,21 @@ function getXboxOwnershipStatus(p: GamePlatformOwnership) {
     };
   }
   const isXboxExpiredUnplayable = Boolean(
-    p.subscriptionExpired && p.ownershipType === 'subscription'
+    p.installed && p.subscriptionExpired && p.ownershipType === 'subscription'
   );
   const isXboxActiveGamePass = Boolean(
     !p.subscriptionExpired &&
       (p.ownershipType === 'subscription' || p.ownershipType === 'owned_and_subscription')
   );
   const isLeavingSoon = Boolean(isXboxActiveGamePass && p.isLeavingSoon);
+  const tierLabel = resolveXboxDetailTierBadgeLabel(p, 'Game Pass');
   let tooltipSuffix = '';
   if (isXboxExpiredUnplayable) {
     tooltipSuffix = ' • Game Pass Subscription Expired';
   } else if (isXboxActiveGamePass && p.ownershipType === 'owned_and_subscription') {
-    tooltipSuffix = ` • Owned + Game Pass${isLeavingSoon ? ' (Leaving Soon)' : ''}`;
+    tooltipSuffix = ` • Owned + ${tierLabel}${isLeavingSoon ? ' (Leaving Soon)' : ''}`;
   } else if (isXboxActiveGamePass && p.ownershipType === 'subscription') {
-    tooltipSuffix = ` • Included with Game Pass${isLeavingSoon ? ' (Leaving Soon)' : ''}`;
+    tooltipSuffix = ` • Included with ${tierLabel}${isLeavingSoon ? ' (Leaving Soon)' : ''}`;
   }
   return {
     isXboxActiveGamePass,
@@ -140,6 +143,50 @@ function getXboxOwnershipStatus(p: GamePlatformOwnership) {
     isLeavingSoon,
     tooltipSuffix,
   };
+}
+
+export function getChainedLauncherBadgeInfo(p: GamePlatformOwnership): {
+  handoffId: string;
+  launcherName: string;
+  pillLabel: string;
+} | null {
+  if (!p) return null;
+  const handoffId = normalizeChainedHandoffId(
+    p.chainedLauncherHandoff || p.externalStorefrontHandoff
+  );
+  if (!handoffId || handoffId === String(p.platformId || '').toLowerCase()) {
+    return null;
+  }
+  switch (handoffId) {
+    case 'ea':
+      return { handoffId: 'ea', launcherName: 'EA App', pillLabel: 'Requires EA App' };
+    case 'ubisoft':
+      return {
+        handoffId: 'ubisoft',
+        launcherName: 'Ubisoft Connect',
+        pillLabel: 'Requires Ubisoft Connect',
+      };
+    case 'bnet':
+      return {
+        handoffId: 'bnet',
+        launcherName: 'Battle.net',
+        pillLabel: 'Requires Battle.net',
+      };
+    case 'rockstar':
+      return {
+        handoffId: 'rockstar',
+        launcherName: 'Rockstar Launcher',
+        pillLabel: 'Requires Rockstar Launcher',
+      };
+    case 'riot':
+      return {
+        handoffId: 'riot',
+        launcherName: 'Riot Client',
+        pillLabel: 'Requires Riot Client',
+      };
+    default:
+      return null;
+  }
 }
 
 interface PlatformBadgesProps {
@@ -207,6 +254,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
           const isInstalled = Boolean(p.installed);
           const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
           const xboxStatus = getXboxOwnershipStatus(p);
+          const chainedInfo = getChainedLauncherBadgeInfo(p);
+          const chainedTooltipSuffix = chainedInfo ? ` • ${chainedInfo.pillLabel}` : '';
           const targetUrl = getStorefrontUrl(
             p.platformId,
             effectiveTitle,
@@ -230,8 +279,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
               : 'border-amber-600/50 bg-amber-950/30 text-amber-200 hover:border-amber-500'
           }`;
           const badgeTitle = targetUrl
-            ? `Open on ${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`
-            : `${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`;
+            ? `Open on ${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`
+            : `${name} • ${isPlatConnected ? (isInstalled ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`;
 
           const badgeInner = (
             <>
@@ -293,6 +342,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
           const name = getStorefrontDisplayName(p.platformId);
           const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
           const xboxStatus = getXboxOwnershipStatus(p);
+          const chainedInfo = getChainedLauncherBadgeInfo(p);
+          const chainedTooltipSuffix = chainedInfo ? ` • ${chainedInfo.pillLabel}` : '';
           const targetUrl = getStorefrontUrl(
             p.platformId,
             effectiveTitle,
@@ -312,8 +363,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
             targetUrl ? 'cursor-pointer active:scale-95' : 'cursor-default'
           }`;
           const stackedTitle = targetUrl
-            ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}`
-            : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}`;
+            ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}`
+            : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}`;
 
           const stackedInner = (
             <>
@@ -324,9 +375,19 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
                 {name}
               </span>
               {!isPlatConnected ? (
-                <span className="text-[9px] text-amber-400 font-semibold mt-0.5">
-                  Not Connected
-                </span>
+                <div className="flex flex-col items-center gap-0.5 mt-0.5">
+                  <span className="text-[9px] text-amber-300 font-semibold">
+                    Not Connected
+                  </span>
+                  {chainedInfo && (
+                    <span
+                      data-testid={`chained-launcher-pill-${p.platformId}-${chainedInfo.handoffId}`}
+                      className="text-[8px] px-1 py-0.2 rounded bg-amber-950/85 text-amber-200 border border-amber-400/55 font-bold tracking-tight whitespace-nowrap"
+                    >
+                      {chainedInfo.pillLabel}
+                    </span>
+                  )}
+                </div>
               ) : (
                 <div className="flex flex-col items-center gap-0.5 mt-0.5">
                   <div className="flex items-center gap-1">
@@ -335,24 +396,41 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
                         <CheckCircle2 aria-hidden="true" className="w-2.5 h-2.5" /> Installed
                       </span>
                     ) : (
-                      <span className="text-[9px] text-sky-400/80 font-medium flex items-center gap-0.5">
+                      <span className="text-[9px] text-sky-300 font-medium flex items-center gap-0.5">
                         <Cloud aria-hidden="true" className="w-2.5 h-2.5" /> Cloud
                       </span>
                     )}
                   </div>
                   {xboxStatus.isXboxExpiredUnplayable ? (
-                    <span className="text-[8px] px-1 py-0.2 rounded bg-rose-950/80 text-rose-300 border border-rose-500/50 font-bold uppercase tracking-tight">
+                    <span
+                      className="text-[8px] px-1 py-0.2 rounded bg-rose-950/85 text-rose-200 border border-rose-500/55 font-bold uppercase tracking-tight whitespace-nowrap"
+                      title="Game Pass subscription expired"
+                    >
                       Expired
                     </span>
                   ) : xboxStatus.isLeavingSoon ? (
-                    <span className="text-[8px] px-1 py-0.2 rounded bg-amber-950/80 text-amber-300 border border-amber-500/50 font-bold uppercase tracking-tight">
+                    <span
+                      className="text-[8px] px-1 py-0.2 rounded bg-amber-950/85 text-amber-200 border border-amber-500/55 font-bold uppercase tracking-tight whitespace-nowrap"
+                      title="Leaving subscription catalog soon"
+                    >
                       Leaving Soon
                     </span>
                   ) : xboxStatus.isXboxActiveGamePass ? (
-                    <span className="text-[8px] px-1 py-0.2 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/50 font-bold uppercase tracking-tight">
-                      Game Pass
+                    <span
+                      className="text-[8px] px-1 py-0.2 rounded bg-emerald-950/85 text-emerald-200 border border-emerald-500/55 font-bold uppercase tracking-tight whitespace-nowrap"
+                      title={p.gamePassTier || 'Included with Xbox Game Pass'}
+                    >
+                      {resolveXboxDetailTierBadgeLabel(p, 'Game Pass')}
                     </span>
                   ) : null}
+                  {chainedInfo && (
+                    <span
+                      data-testid={`chained-launcher-pill-${p.platformId}-${chainedInfo.handoffId}`}
+                      className="text-[8px] px-1 py-0.2 rounded bg-amber-950/85 text-amber-200 border border-amber-400/55 font-bold tracking-tight whitespace-nowrap"
+                    >
+                      {chainedInfo.pillLabel}
+                    </span>
+                  )}
                 </div>
               )}
             </>
@@ -383,6 +461,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
       {platforms.map((p) => {
         const isPlatConnected = connectedSet.has(p.platformId as StorefrontId);
         const xboxStatus = getXboxOwnershipStatus(p);
+        const chainedInfo = getChainedLauncherBadgeInfo(p);
+        const chainedTooltipSuffix = chainedInfo ? ` • ${chainedInfo.pillLabel}` : '';
         const meta = STOREFRONT_REGISTRY[p.platformId as StorefrontId] || {
           name: p.platformId.toUpperCase(),
           badgeBg: 'bg-zinc-800 border-zinc-700',
@@ -411,8 +491,8 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
             : 'cursor-default'
         }`;
         const pillTitle = targetUrl
-          ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`
-          : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`;
+          ? `Open on ${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`
+          : `${name} • ${isPlatConnected ? (p.installed ? 'Installed locally' : 'In Cloud Library') : 'Not Connected'}${xboxStatus.tooltipSuffix}${chainedTooltipSuffix}${p.installPath ? ` (${p.installPath})` : ''}`;
 
         const pillInner = (
           <>
@@ -422,21 +502,38 @@ export const PlatformBadges: React.FC<PlatformBadgesProps> = ({
             />
             <span>{name}</span>
             {xboxStatus.isXboxExpiredUnplayable ? (
-              <span className="text-[9px] px-1 py-0.2 rounded bg-rose-950/80 text-rose-300 border border-rose-500/50 font-bold uppercase tracking-tight">
+              <span
+                className="text-[9px] px-1 py-0.2 rounded bg-rose-950/85 text-rose-200 border border-rose-500/55 font-bold uppercase tracking-tight whitespace-nowrap"
+                title="Game Pass subscription expired"
+              >
                 Expired
               </span>
             ) : xboxStatus.isXboxActiveGamePass ? (
               <>
-                <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/50 font-bold uppercase tracking-tight">
-                  GP
+                <span
+                  className="text-[9px] px-1 py-0.2 rounded bg-emerald-950/85 text-emerald-200 border border-emerald-500/55 font-bold uppercase tracking-tight whitespace-nowrap"
+                  title={p.gamePassTier || 'Included with Xbox Game Pass'}
+                >
+                  {resolveXboxDetailTierBadgeLabel(p, 'GP')}
                 </span>
                 {xboxStatus.isLeavingSoon && (
-                  <span className="text-[9px] px-1 py-0.2 rounded bg-amber-950/80 text-amber-300 border border-amber-500/50 font-semibold">
+                  <span
+                    className="text-[9px] px-1 py-0.2 rounded bg-amber-950/85 text-amber-200 border border-amber-500/55 font-semibold whitespace-nowrap"
+                    title="Leaving subscription catalog soon"
+                  >
                     Leaving Soon
                   </span>
                 )}
               </>
             ) : null}
+            {chainedInfo && (
+              <span
+                data-testid={`chained-launcher-pill-${p.platformId}-${chainedInfo.handoffId}`}
+                className="text-[9px] px-1.5 py-0.2 rounded bg-amber-950/85 text-amber-200 border border-amber-400/55 font-semibold tracking-tight whitespace-nowrap"
+              >
+                {chainedInfo.pillLabel}
+              </span>
+            )}
             {!isPlatConnected && (
               <span className="text-[9px] px-1 py-0.2 rounded bg-amber-950/70 text-amber-300 border border-amber-500/50 font-semibold">
                 Not Connected

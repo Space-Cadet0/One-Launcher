@@ -450,7 +450,7 @@ describe('13. Tasks 1–3 End-to-End UI & Entitlement Regressions (Clean Ready t
         cardNode,
         (el) => el.type === 'div' && getTextContent(el).trim() === 'Expired'
       );
-      expect(coverGpBadges.length > 0, `${scenario.label} cover GP`).toBe(scenario.expectGp);
+      expect(coverGpBadges.length, `${scenario.label} cover GP removed`).toBe(0);
       expect(coverExpiredBadges.length > 0, `${scenario.label} cover Expired`).toBe(
         scenario.expectExpired
       );
@@ -485,7 +485,7 @@ describe('13. Tasks 1–3 End-to-End UI & Entitlement Regressions (Clean Ready t
       );
       grid.unmount();
 
-      // 2. LibrarySidebar row
+      // 2. LibrarySidebar row (compact Game Pass tier badges removed from sidebar rows)
       const sidebar = createDomain12DeepRenderer(LibrarySidebar, {
         games: [game],
         selectedGameId: null,
@@ -510,7 +510,7 @@ describe('13. Tasks 1–3 End-to-End UI & Entitlement Regressions (Clean Ready t
         sidebarTree,
         (el) => el.type === 'span' && getTextContent(el).trim() === 'Expired'
       );
-      expect(sidebarGpSpans.length > 0, `${scenario.label} sidebar GP`).toBe(scenario.expectGp);
+      expect(sidebarGpSpans.length, `${scenario.label} sidebar GP removed`).toBe(0);
       expect(sidebarExpiredSpans.length > 0, `${scenario.label} sidebar Expired`).toBe(
         scenario.expectExpired
       );

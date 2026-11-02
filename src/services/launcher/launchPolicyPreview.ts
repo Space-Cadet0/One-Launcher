@@ -7,6 +7,7 @@ import {
   type CompatibilityLayerInfo,
   type CompatibilityLayerType,
   type CompatibilityRunnerDescriptor,
+  type CrossOverGraphicsBackend,
   type FastMinimalLaunchAdvisory,
   type GameInstallInfo,
   type GameLaunchConfig,
@@ -21,9 +22,28 @@ import {
 import type { StorefrontId } from '../../contracts/platform';
 import { getStorefrontNativeOsFlags } from '../platform/nativeOsService';
 import {
+  detectStructuralKernelAntiCheatFromNotices,
+  isBattlEyeKernelAntiCheat,
+  mapChainedHandoffIdToExternalLauncher,
+  normalizeChainedHandoffId,
+  resolveCanonicalKernelAntiCheatDisplayName,
+  type NormalizedChainedHandoffId,
+} from '../integrations/catalogSanitizer';
+import {
   sanitizeLegacyCompatLayer,
   sanitizeStorefrontLifecycleOverride,
 } from './launchConfigStore';
+
+function resolveChainedPublisherDisplayName(
+  handoffId?: NormalizedChainedHandoffId,
+  explicitExternalLauncher?: string | null
+): string | undefined {
+  if (explicitExternalLauncher && explicitExternalLauncher.trim()) {
+    const mapped = mapChainedHandoffIdToExternalLauncher(explicitExternalLauncher);
+    return mapped || explicitExternalLauncher.trim();
+  }
+  return mapChainedHandoffIdToExternalLauncher(handoffId);
+}
 
 export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] = [
   {
@@ -32,14 +52,15 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
     shortLabel: 'CrossOver',
     vendor: 'CodeWeavers',
     description:
-      'Commercial Windows compatibility layer for macOS with built-in Bottle management, D3DMetal, DXMT, DXVK, and MetalFX DLSS upscaling.',
+      'Commercial Windows compatibility layer for macOS with built-in Bottle management, automatic 64-bit/32-bit graphics routing (D3DMetal, DXMT, DXVK, Vulkan WineD3D), and MetalFX DLSS upscaling.',
     bestFor:
-      'Best overall compatibility for DirectX 9/10/11/12 Windows games and Windows Steam/GOG/Epic bottles.',
+      'Best overall compatibility for 64-bit and 32-bit DirectX 9/10/11/12 Windows games and Windows Steam/GOG/Epic bottles on Apple Silicon.',
     downloadUrl: 'https://www.codeweavers.com/crossover/download',
-    downloadLabel: 'Download CrossOver Installer',
+    downloadLabel: 'Open CrossOver Download Page',
     brewCask: 'crossover',
-    brewCommandDisplay: 'brew install --cask crossover',
     canAutoInstallViaBrew: true,
+    canAutoInstallDirect: true,
+    estimatedDownloadMB: 480,
   },
   {
     type: 'crossover_preview',
@@ -47,12 +68,14 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
     shortLabel: 'CrossOver Preview',
     vendor: 'CodeWeavers',
     description:
-      'Early-access preview build of CrossOver featuring the latest experimental Wine, D3DMetal, and DXMT updates.',
+      'Early-access preview build of CrossOver featuring the latest experimental Wine, D3DMetal (64-bit DX11/DX12), and DXMT (32-bit & 64-bit Metal DX10/DX11) updates.',
     bestFor:
-      'Testing newly released Windows titles that need bleeding-edge graphics translation fixes.',
+      'Testing newly released 64-bit and 32-bit Windows titles that need bleeding-edge graphics translation fixes.',
     downloadUrl: 'https://www.codeweavers.com/preview/download',
-    downloadLabel: 'Open CrossOver Preview Download',
+    downloadLabel: 'Open Preview Portal',
     canAutoInstallViaBrew: false,
+    canAutoInstallDirect: true,
+    estimatedDownloadMB: 480,
   },
   {
     type: 'gptk',
@@ -60,32 +83,95 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
     shortLabel: 'Apple GPTK',
     vendor: 'Apple',
     description:
-      'Apple’s DirectX 11/12-to-Metal 3 runtime (D3DMetal), detected from /Applications/Game Porting Toolkit.app or Heroic GPTK tools.',
+      'Apple’s 64-bit DirectX 11/12-to-Metal 3 runtime (D3DMetal), detected from /Applications/Game Porting Toolkit.app or Heroic GPTK tools.',
     bestFor:
-      'Running DirectX 12 Windows executables on Apple Silicon using Apple’s standalone D3DMetal runtime.',
-    downloadUrl: 'https://developer.apple.com/games/game-porting-toolkit/',
-    downloadLabel: 'Open Apple GPTK Downloads',
+      'Running 64-bit DirectX 11/12 Windows executables on Apple Silicon using Apple’s standalone D3DMetal runtime.',
+    downloadUrl: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
+    downloadLabel: 'Open GPTK Releases',
     brewCask: 'game-porting-toolkit',
-    brewCommandDisplay:
-      'brew tap apple/apple http://github.com/apple/homebrew-apple && brew install --cask game-porting-toolkit',
     canAutoInstallViaBrew: false,
+    canAutoInstallDirect: true,
+    estimatedDownloadMB: 228,
   },
   {
     type: 'wine',
-    label: 'Open-Source Wine (Wine-CrossOver / Wine Stable)',
+    label: 'Open-Source Wine (Wine Stable / Staging)',
     shortLabel: 'Open-Source Wine',
-    vendor: 'WineHQ / Homebrew / Gcenx',
+    vendor: 'WineHQ / Gcenx',
     description:
-      'Free, open-source Windows API translation layer (wine64) installed via Homebrew, WineHQ (.app), or Heroic Wine-CrossOver builds.',
+      'Free, open-source Windows API translation layer (wine64) installed directly into /Applications or Heroic Wine-CrossOver builds.',
     bestFor:
       'Running DRM-free or standalone DirectX 9/10/11 Windows .exe games without a paid CrossOver license.',
-    downloadUrl: 'https://gitlab.winehq.org/wine/wine/-/wikis/MacOS',
-    downloadLabel: 'Open Official WineHQ macOS Guide',
+    downloadUrl: 'https://github.com/Gcenx/macOS_Wine_builds/releases/latest',
+    downloadLabel: 'Open Wine macOS Releases',
     brewCask: 'wine-stable',
-    brewCommandDisplay: 'brew install --cask --no-quarantine wine-stable',
     canAutoInstallViaBrew: true,
+    canAutoInstallDirect: true,
+    estimatedDownloadMB: 240,
   },
 ];
+
+export interface CrossOverGraphicsBackendPolicyDescriptor {
+  value: CrossOverGraphicsBackend;
+  optionLabel: string;
+  architectureBadge: string;
+  guidance: string;
+}
+
+export const CROSSOVER_GRAPHICS_BACKEND_POLICIES: Record<
+  CrossOverGraphicsBackend,
+  CrossOverGraphicsBackendPolicyDescriptor
+> = {
+  auto: {
+    value: 'auto',
+    optionLabel: 'Auto (Recommended — Smart 64-bit & 32-bit routing)',
+    architectureBadge: '64-bit & 32-bit Auto-Routing',
+    guidance:
+      'Automatically routes 64-bit DX11/DX12 games to D3DMetal, 32-bit DX10/DX11 games to DXMT (native Metal), 32-bit DX9 games to Vulkan-accelerated WineD3D (with non-LAA memory & DEP trap guards), and legacy OpenGL/DirectDraw games to WineD3D OpenGL.',
+  },
+  d3dmetal: {
+    value: 'd3dmetal',
+    optionLabel: 'D3DMetal (Apple GPTK — 64-bit DirectX 11 & 12)',
+    architectureBadge: '64-bit DX11/DX12 • 32-bit Fallback',
+    guidance:
+      "Apple's D3DMetal is 64-bit DX11/DX12 only (32-bit games automatically fall back to DXMT/Vulkan so they don't stall on legacy OpenGL).",
+  },
+  dxmt: {
+    value: 'dxmt',
+    optionLabel: 'DXMT (Native Metal — 32-bit & 64-bit DirectX 10/11)',
+    architectureBadge: '32-bit (DEP) & 64-bit Metal',
+    guidance:
+      'Native Metal DirectX 10/11 layer supporting both 32-bit (DEP-enabled) and 64-bit games.',
+  },
+  dxvk: {
+    value: 'dxvk',
+    optionLabel: 'DXVK (Vulkan / MoltenVK — 32-bit & 64-bit DirectX 9/10/11)',
+    architectureBadge: '32-bit & 64-bit Vulkan',
+    guidance:
+      'Vulkan/MoltenVK layer supporting 32-bit and 64-bit DirectX 9/10/11 games.',
+  },
+  wined3d: {
+    value: 'wined3d',
+    optionLabel: 'WineD3D (Vulkan / OpenGL — DirectX 9 & Legacy DirectDraw)',
+    architectureBadge: '32-bit & 64-bit Legacy',
+    guidance:
+      'Wine DirectX-to-Vulkan/OpenGL translation layer supporting 32-bit and 64-bit DirectX 9, DirectDraw, and legacy OpenGL games.',
+  },
+};
+
+export function getCrossOverGraphicsBackendPolicy(
+  backend?: CrossOverGraphicsBackend | string
+): CrossOverGraphicsBackendPolicyDescriptor {
+  if (
+    backend === 'd3dmetal' ||
+    backend === 'dxmt' ||
+    backend === 'dxvk' ||
+    backend === 'wined3d'
+  ) {
+    return CROSSOVER_GRAPHICS_BACKEND_POLICIES[backend];
+  }
+  return CROSSOVER_GRAPHICS_BACKEND_POLICIES.auto;
+}
 
 export interface FastMinimalLaunchAdvisoryParams {
   platformId: StorefrontId;
@@ -96,6 +182,13 @@ export interface FastMinimalLaunchAdvisoryParams {
   globalStorefrontLifecycle?: StorefrontClientLifecyclePolicy;
   isInstalled?: boolean;
   executablePath?: string;
+  chainedLauncherHandoff?: string | null;
+  externalStorefrontHandoff?: string | null;
+  externalLauncher?: string | null;
+  requiresKernelAntiCheat?: boolean;
+  kernelAntiCheatName?: string | null;
+  antiCheatName?: string | null;
+  hasNativeMacBuild?: boolean;
 }
 
 export function computeFastMinimalLaunchAdvisory(
@@ -115,6 +208,86 @@ export function computeFastMinimalLaunchAdvisory(
 
   const isBottle =
     params.hostPlatform === 'darwin' && params.detectedBuildType === 'windows_exe_on_mac';
+
+  const normalizedHandoff = normalizeChainedHandoffId(
+    params.chainedLauncherHandoff ||
+      params.externalStorefrontHandoff ||
+      params.externalLauncher
+  );
+  const publisherName = resolveChainedPublisherDisplayName(
+    normalizedHandoff,
+    params.externalLauncher
+  );
+  const kernelAntiCheatLabel =
+    resolveCanonicalKernelAntiCheatDisplayName(
+      params.kernelAntiCheatName || params.antiCheatName
+    ) ||
+    params.kernelAntiCheatName ||
+    params.antiCheatName ||
+    (normalizedHandoff === 'riot' ? 'Riot Vanguard' : undefined);
+  const hasMacKernelAntiCheat =
+    params.hostPlatform !== 'win32' &&
+    !params.hasNativeMacBuild &&
+    Boolean(params.requiresKernelAntiCheat || kernelAntiCheatLabel);
+
+  if (hasMacKernelAntiCheat && !isBattlEyeKernelAntiCheat(kernelAntiCheatLabel)) {
+    const label = kernelAntiCheatLabel || 'Windows Kernel Anti-Cheat';
+    const title = `Unsupported on macOS Bottle (${label})`;
+    const footprintBenefit = `${label} requires a Windows ring-0 kernel driver`;
+    const warnings = [
+      `${label} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`,
+      ...(publisherName && params.platformId === 'xbox'
+        ? [
+            `Cloud saves & Game Pass entitlement sync managed by ${publisherName} on native Windows (requires one-time Xbox ↔ ${publisherName} account link).`,
+          ]
+        : []),
+    ];
+    return {
+      isActive: false,
+      title,
+      footprintBenefit,
+      warnings,
+      recommendation:
+        'Install and play on native Windows where Windows ring-0 kernel anti-cheat drivers are supported.',
+      severity: 'warning',
+      badgeLabel: footprintBenefit,
+      headline: title,
+      consequences: warnings,
+    };
+  }
+
+  if (params.platformId === 'xbox' && normalizedHandoff && publisherName) {
+    const title =
+      params.hostPlatform === 'win32'
+        ? `Chained Host Publisher Handoff (Xbox Game Pass → ${publisherName})`
+        : `Chained Compatibility Bottle (Xbox Game Pass → ${publisherName} inside CrossOver / Wine)`;
+    const footprintBenefit = `Cloud saves & Game Pass entitlement sync managed by ${publisherName} (requires one-time Xbox ↔ ${publisherName} account link)`;
+    const warnings = [
+      `Cloud saves & Game Pass entitlement sync managed by ${publisherName} (requires one-time Xbox ↔ ${publisherName} account link).`,
+      ...(hasMacKernelAntiCheat && isBattlEyeKernelAntiCheat(kernelAntiCheatLabel)
+        ? [
+            'Online multiplayer sessions requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
+          ]
+        : []),
+    ];
+    return {
+      isActive: policy.isFastDirectBypass,
+      title,
+      footprintBenefit,
+      warnings,
+      recommendation:
+        params.hostPlatform === 'win32'
+          ? `Sign in to ${publisherName} on Windows with the account linked to your Xbox profile.`
+          : `Sign in to ${publisherName} inside your CrossOver / Wine bottle with the account linked to your Xbox profile.`,
+      severity:
+        hasMacKernelAntiCheat && isBattlEyeKernelAntiCheat(kernelAntiCheatLabel)
+          ? 'warning'
+          : 'info',
+      badgeLabel: footprintBenefit,
+      headline: title,
+      consequences: warnings,
+    };
+  }
 
   if (params.platformId === 'steam') {
     const title = isBottle
@@ -242,6 +415,13 @@ export interface BuildStorefrontLaunchPolicyViewParams {
   effectiveLifecycle: StorefrontClientLifecyclePolicy;
   isInstalled: boolean;
   hostPlatform: 'darwin' | 'win32' | 'linux';
+  chainedLauncherHandoff?: string | null;
+  externalStorefrontHandoff?: string | null;
+  externalLauncher?: string | null;
+  requiresKernelAntiCheat?: boolean;
+  kernelAntiCheatName?: string | null;
+  antiCheatName?: string | null;
+  hasNativeMacBuild?: boolean;
 }
 
 export function buildStorefrontLaunchPolicyView(
@@ -288,6 +468,27 @@ export function buildStorefrontLaunchPolicyView(
   const isWinHost = hostPlatform === 'win32';
   const trayOrMenuLabel = isWinHost ? 'System Tray' : 'Menu Bar';
 
+  const normalizedViewHandoff = normalizeChainedHandoffId(
+    params.chainedLauncherHandoff ||
+      params.externalStorefrontHandoff ||
+      params.externalLauncher
+  );
+  const viewPublisherName = resolveChainedPublisherDisplayName(
+    normalizedViewHandoff,
+    params.externalLauncher
+  );
+  const viewKernelAntiCheatLabel =
+    resolveCanonicalKernelAntiCheatDisplayName(
+      params.kernelAntiCheatName || params.antiCheatName
+    ) ||
+    params.kernelAntiCheatName ||
+    params.antiCheatName ||
+    (normalizedViewHandoff === 'riot' ? 'Riot Vanguard' : undefined);
+  const hasMacViewKernelAntiCheat =
+    !isWinHost &&
+    !params.hasNativeMacBuild &&
+    Boolean(params.requiresKernelAntiCheat || viewKernelAntiCheatLabel);
+
   // Custom / standalone non-storefront game
   if (platformId === 'custom') {
     return {
@@ -313,8 +514,94 @@ export function buildStorefrontLaunchPolicyView(
     };
   }
 
-  // Xbox / PC Game Pass (Native Windows ActivateApplication + macOS Bottle Clientless XGR)
+  if (hasMacViewKernelAntiCheat && !isBattlEyeKernelAntiCheat(viewKernelAntiCheatLabel)) {
+    const antiCheatLabel = viewKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat';
+    return {
+      cardHeading,
+      isBottleContext: true,
+      showDropdown: false,
+      dropdownOptions: [],
+      selectedDropdownValue: cleanLifecycle,
+      infoBox: {
+        policyKey: 'fast_direct_bypass',
+        cardHeading,
+        severity: 'warning',
+        badgeLabel: `${antiCheatLabel} • Ring-0 Kernel Driver Required`,
+        headline: `Unsupported on macOS Bottle (${antiCheatLabel})`,
+        footprintSummary: `${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`,
+        includedFeatures:
+          viewPublisherName && platformId === 'xbox'
+            ? [
+                `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} on native Windows (requires one-time Xbox ↔ ${viewPublisherName} account link)`,
+              ]
+            : ['Supported on native Windows where ring-0 kernel drivers can load'],
+        excludedOrTradeoffs: [
+          `${antiCheatLabel} blocks game startup inside macOS CrossOver / Wine bottles`,
+        ],
+      },
+    };
+  }
+
+  // Xbox / PC Game Pass (Chained Publisher Handoff + Native Windows ActivateApplication + macOS Bottle Clientless XGR)
   if (platformId === 'xbox') {
+    if (normalizedViewHandoff && viewPublisherName) {
+      if (!isWinHost) {
+        return {
+          cardHeading,
+          isBottleContext: true,
+          showDropdown: false,
+          dropdownOptions: [],
+          selectedDropdownValue: cleanLifecycle,
+          infoBox: {
+            policyKey: 'fast_direct_bypass',
+            cardHeading,
+            severity:
+              hasMacViewKernelAntiCheat && isBattlEyeKernelAntiCheat(viewKernelAntiCheatLabel)
+                ? 'warning'
+                : 'info',
+            badgeLabel: `Chained Bottle • ${viewPublisherName}`,
+            headline: `Chained Compatibility Bottle (Xbox Game Pass → ${viewPublisherName} inside CrossOver / Wine)`,
+            footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link).`,
+            includedFeatures: [
+              `One Launcher sets up and launches ${viewPublisherName} inside your CrossOver / Wine bottle`,
+              `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link)`,
+            ],
+            excludedOrTradeoffs:
+              hasMacViewKernelAntiCheat && isBattlEyeKernelAntiCheat(viewKernelAntiCheatLabel)
+                ? [
+                    'Online multiplayer requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported',
+                  ]
+                : [
+                    `Sign in to ${viewPublisherName} inside the bottle with the account linked to your Xbox profile`,
+                  ],
+          },
+        };
+      }
+
+      return {
+        cardHeading,
+        isBottleContext: false,
+        showDropdown: false,
+        dropdownOptions: [],
+        selectedDropdownValue: cleanLifecycle,
+        infoBox: {
+          policyKey: 'protocol_delegated',
+          cardHeading,
+          severity: 'info',
+          badgeLabel: `Chained Publisher • ${viewPublisherName}`,
+          headline: `Chained Host Publisher Handoff (Xbox Game Pass → ${viewPublisherName})`,
+          footprintSummary: `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link).`,
+          includedFeatures: [
+            `Delegates download, launch, and entitlement verification to ${viewPublisherName} on Windows`,
+            `Cloud saves & Game Pass entitlement sync managed by ${viewPublisherName} (requires one-time Xbox ↔ ${viewPublisherName} account link)`,
+          ],
+          excludedOrTradeoffs: [
+            `Requires signing in to ${viewPublisherName} with the account linked to your Xbox profile`,
+          ],
+        },
+      };
+    }
+
     if (activeDisplayMethod === 'storefront_uri') {
       return {
         cardHeading,
@@ -705,7 +992,7 @@ export function buildStorefrontLaunchPolicyView(
           includedFeatures: [
             '0 MB Bottle GOG Galaxy / Chromium RAM overhead & instant cold bottle .exe startup',
             'Two-way GOG Cloud Save Sync mapped into your bottle via standalone gogdl CLI',
-            'GOG playtime sync & full CrossOver D3DMetal / DXMT / MetalFX overrides',
+            'GOG playtime sync & full CrossOver 64-bit/32-bit D3DMetal / DXMT / Vulkan WineD3D / MetalFX overrides',
           ],
           excludedOrTradeoffs: [
             'GOG Achievements / Trophies DO NOT work when Bottle GOG Galaxy is bypassed',
@@ -936,7 +1223,7 @@ export function buildStorefrontLaunchPolicyView(
           'Spawns the Windows .exe directly in Wine/CrossOver without starting steam.exe or steamwebhelper.exe (5–12s faster cold boot).',
         includedFeatures: [
           '0 MB bottle Steam / steamwebhelper.exe RAM & CPU overhead',
-          'Instant bottle .exe startup with CrossOver D3DMetal / DXMT / MetalFX overrides',
+          'Instant bottle .exe startup with CrossOver 64-bit/32-bit D3DMetal / DXMT / Vulkan WineD3D / MetalFX overrides',
           'Local playtime tracking inside One Launcher',
         ],
         excludedOrTradeoffs: [
@@ -974,10 +1261,10 @@ export function buildStorefrontLaunchPolicyView(
         badgeLabel: 'Silent Bottle Steam • Fast Re-Launch',
         headline: 'Silent Bottle Steam — Kept Warm Inside Bottle',
         footprintSummary:
-          'Runs Windows steam.exe in silent headless mode (-silent -nofriendsui -nochatui) and keeps it warm in the bottle.',
+          'Runs Windows steam.exe in silent background mode (-silent), suppressing the main Steam browser window while preserving Steam Overlay and Friends IPC, and keeps it warm in the bottle.',
         includedFeatures: [
           'Two-way Steam Cloud Save Sync inside the bottle',
-          'Live Steam Achievements / Trophies, Steam Input & Steamworks DRM handshake',
+          'Live Steam Achievements / Trophies, Steam Overlay, Friends IPC, Steam Input & Steamworks DRM handshake',
           'Faster subsequent launches of games in the same bottle',
         ],
         excludedOrTradeoffs: [
@@ -1091,7 +1378,7 @@ export function buildStorefrontLaunchPolicyView(
       severity: 'info',
       badgeLabel: 'Reduced Footprint • Silent Background Steam',
       headline: `Silent Background Steam — Kept Warm in ${trayOrMenuLabel}`,
-      footprintSummary: `Boots Steam silently in the ${trayOrMenuLabel} (-silent -nofriendsui -nochatui) and keeps it warm between sessions.`,
+      footprintSummary: `Boots Steam silently in the ${trayOrMenuLabel} (-silent), suppressing the main Steam browser window while preserving Steam Overlay and Friends IPC, and keeps it warm between sessions.`,
       includedFeatures: [
         'Two-way Steam Cloud Save Sync (pre-launch download + post-exit upload)',
         'Live Steam Achievements / Trophies, Steam Input, Workshop Mods & Steamworks DRM',
@@ -1156,6 +1443,75 @@ export function resolveMacArchitectureLabel(hostArch?: string): 'Intel Mac' | 'A
     return 'Intel Mac';
   }
   return 'Apple Silicon';
+}
+
+interface ExecutableArchitectureProbeSource {
+  executableArchitecture?: string;
+  peArchitecture?: string;
+  binaryArchitecture?: string;
+  binaryArch?: string;
+  is32BitExecutable?: boolean;
+  peCapabilities?: {
+    is32Bit?: boolean;
+    effectiveMachine?: string;
+    machine?: string;
+  };
+}
+
+function normalizeExecutableArchitectureMetadata(
+  rawArch?: string,
+  rawIs32Bit?: boolean
+): { executableArchitecture?: string; is32BitExecutable?: boolean } {
+  const trimmed = typeof rawArch === 'string' ? rawArch.trim().toLowerCase() : '';
+  if (trimmed) {
+    if (/^(x86|ia32|i386|i686|win32|pe32|32-bit|32bit)$/.test(trimmed)) {
+      return { executableArchitecture: 'x86', is32BitExecutable: true };
+    }
+    if (/^(x64|amd64|x86_64|win64|pe32\+|64-bit|64bit)$/.test(trimmed)) {
+      return { executableArchitecture: 'x64', is32BitExecutable: false };
+    }
+    if (/^(arm64|aarch64)$/.test(trimmed)) {
+      return { executableArchitecture: 'arm64', is32BitExecutable: false };
+    }
+    return {
+      executableArchitecture: trimmed,
+      ...(typeof rawIs32Bit === 'boolean' ? { is32BitExecutable: rawIs32Bit } : {}),
+    };
+  }
+  if (typeof rawIs32Bit === 'boolean') {
+    return {
+      executableArchitecture: rawIs32Bit ? 'x86' : undefined,
+      is32BitExecutable: rawIs32Bit,
+    };
+  }
+  return {};
+}
+
+function resolvePreviewExecutableArchitecture(
+  sources: Array<ExecutableArchitectureProbeSource | undefined>
+): { executableArchitecture?: string; is32BitExecutable?: boolean } {
+  for (const src of sources) {
+    if (!src) continue;
+    const candidateArch =
+      src.executableArchitecture ||
+      src.peArchitecture ||
+      src.binaryArchitecture ||
+      src.binaryArch ||
+      src.peCapabilities?.effectiveMachine ||
+      src.peCapabilities?.machine;
+    const candidateIs32Bit =
+      typeof src.is32BitExecutable === 'boolean'
+        ? src.is32BitExecutable
+        : src.peCapabilities?.is32Bit;
+    const normalized = normalizeExecutableArchitectureMetadata(candidateArch, candidateIs32Bit);
+    if (
+      normalized.executableArchitecture !== undefined ||
+      normalized.is32BitExecutable !== undefined
+    ) {
+      return normalized;
+    }
+  }
+  return {};
 }
 
 export function buildEffectiveLaunchModePreview(
@@ -1536,70 +1892,296 @@ export function buildEffectiveLaunchModePreview(
       return `Fast Direct Binary Bypass (Minimal Footprint): spawns ${targetSubject} directly${viaClause} while bypassing GOG Galaxy — still syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI (GOG Achievements/Trophies disabled).`;
     }
     if (platformId === 'epic') {
+      if (isChainedHandoff && chainedPublisherName) {
+        return `Chained Publisher Handoff (${storeName} → ${chainedPublisherName}): delegates launch${viaClause} to ${chainedPublisherName} — Cloud saves & entitlement sync managed by ${chainedPublisherName}.`;
+      }
       return `Clientless EOS Direct Mode: spawns ${targetSubject} directly${viaClause} while bypassing Epic Games Launcher — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone legendary CLI.`;
     }
     if (platformId === 'xbox') {
+      if (isChainedHandoff && chainedPublisherName) {
+        return hostPlatform === 'win32'
+          ? `Chained Host Publisher Handoff (Xbox Game Pass → ${chainedPublisherName}): launches ${targetSubject}${viaClause} via ${chainedPublisherName} — Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link).`
+          : `Chained Compatibility Bottle (Xbox Game Pass → ${chainedPublisherName} inside CrossOver / Wine): runs ${targetSubject}${viaClause} via ${chainedPublisherName} — Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link).`;
+      }
       return `Clientless Xbox / Game Pass Mode: spawns ${targetSubject} directly${viaClause} while bypassing XboxPcApp.exe — syncs Xbox Connected Storage Cloud Saves and Achievements natively.`;
     }
     return `Spawns ${targetSubject} directly${viaClause} with minimal footprint.`;
   };
+
+  const matchedGamePlatform =
+    effPlatform || game?.platforms?.find((p) => p?.platformId === platformId);
+  const canUseDiscoveredBinaryMetadata =
+    !customExecPath ||
+    customExecPath === installedRecord?.executablePath ||
+    customExecPath === matchedGamePlatform?.executablePath;
+  const resolvedExecArch = resolvePreviewExecutableArchitecture([
+    draftConfig as ExecutableArchitectureProbeSource | undefined,
+    ...(canUseDiscoveredBinaryMetadata
+      ? [
+          installedRecord as ExecutableArchitectureProbeSource | undefined,
+          matchedGamePlatform as ExecutableArchitectureProbeSource | undefined,
+          cachedInstallInfo as ExecutableArchitectureProbeSource | undefined,
+          game as ExecutableArchitectureProbeSource | undefined,
+        ]
+      : []),
+  ]);
+  const previewExecArchFields: Pick<
+    ResolvedLaunchModePreview,
+    'executableArchitecture' | 'is32BitExecutable'
+  > = {
+    ...(resolvedExecArch.executableArchitecture !== undefined
+      ? { executableArchitecture: resolvedExecArch.executableArchitecture }
+      : {}),
+    ...(resolvedExecArch.is32BitExecutable !== undefined
+      ? { is32BitExecutable: resolvedExecArch.is32BitExecutable }
+      : {}),
+  };
+  const chainedHandoffId = normalizeChainedHandoffId(
+    matchedGamePlatform?.chainedLauncherHandoff ||
+      matchedGamePlatform?.externalStorefrontHandoff ||
+      cachedInstallInfo?.chainedLauncherHandoff ||
+      cachedInstallInfo?.externalStorefrontHandoff ||
+      cachedInstallInfo?.xboxCompatibility?.chainedLauncherHandoff ||
+      cachedInstallInfo?.xboxCompatibility?.externalStorefrontHandoff ||
+      matchedGamePlatform?.externalLauncher ||
+      cachedInstallInfo?.externalLauncher
+  );
+  const isChainedHandoff = Boolean(
+    chainedHandoffId && chainedHandoffId !== String(platformId).toLowerCase()
+  );
+  const chainedPublisherName = isChainedHandoff
+    ? resolveChainedPublisherDisplayName(
+        chainedHandoffId,
+        matchedGamePlatform?.externalLauncher ||
+          cachedInstallInfo?.externalLauncher ||
+          cachedInstallInfo?.xboxCompatibility?.externalLauncher ||
+          cachedInstallInfo?.xboxCompatibility?.externalStorefront
+      )
+    : undefined;
+
+  const structuralDrmAntiCheat = detectStructuralKernelAntiCheatFromNotices(
+    game?.enrichedMetadata?.drmNotice,
+    (game as { drmNotice?: string } | undefined)?.drmNotice,
+    matchedGamePlatform?.xboxBottleCompatibilityReason,
+    cachedInstallInfo?.xboxBottleCompatibilityReason
+  );
+  const resolvedKernelAntiCheatLabel =
+    matchedGamePlatform?.kernelAntiCheatName ||
+    cachedInstallInfo?.kernelAntiCheatName ||
+    (!hasMacInstaller ? game?.kernelAntiCheatName : undefined) ||
+    resolveCanonicalKernelAntiCheatDisplayName(
+      matchedGamePlatform?.antiCheatName ||
+        cachedInstallInfo?.antiCheatName ||
+        cachedInstallInfo?.xboxCompatibility?.antiCheatName ||
+        (!hasMacInstaller ? game?.antiCheatName : undefined)
+    ) ||
+    structuralDrmAntiCheat?.kernelAntiCheatName ||
+    matchedGamePlatform?.antiCheatName ||
+    cachedInstallInfo?.antiCheatName ||
+    cachedInstallInfo?.xboxCompatibility?.antiCheatName ||
+    (!hasMacInstaller ? game?.antiCheatName : undefined) ||
+    (chainedHandoffId === 'riot' ? 'Riot Vanguard' : undefined);
+
+  const hasKernelAntiCheat = Boolean(
+    matchedGamePlatform?.requiresKernelAntiCheat ||
+      cachedInstallInfo?.requiresKernelAntiCheat ||
+      cachedInstallInfo?.xboxCompatibility?.antiCheatDetected ||
+      cachedInstallInfo?.xboxCompatibility?.tier === 'tier_c_kernel_anticheat' ||
+      (!hasMacInstaller && game?.requiresKernelAntiCheat) ||
+      structuralDrmAntiCheat ||
+      chainedHandoffId === 'riot'
+  );
+  const hasMacKernelAntiCheat =
+    hostPlatform !== 'win32' && !hasMacInstaller && hasKernelAntiCheat;
+  const hasMacRing0HardBlock =
+    hasMacKernelAntiCheat && !isBattlEyeKernelAntiCheat(resolvedKernelAntiCheatLabel);
+  const hasMacBattlEyeWarning =
+    hasMacKernelAntiCheat && isBattlEyeKernelAntiCheat(resolvedKernelAntiCheatLabel);
+
+  const computeModeLabelAndCloudSummary = (): {
+    modeLabel: string;
+    cloudSaveSummary: string;
+  } => {
+    if (hasMacRing0HardBlock) {
+      const antiCheatName = resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat';
+      return {
+        modeLabel: `Unsupported on macOS Bottle (${antiCheatName} Ring-0 Kernel Driver Required)`,
+        cloudSaveSummary:
+          platformId === 'xbox' && chainedPublisherName
+            ? `${antiCheatName} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles. Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} on native Windows.`
+            : `${antiCheatName} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles (requires native Windows).`,
+      };
+    }
+
+    if (platformId === 'xbox' && isChainedHandoff && chainedPublisherName) {
+      if (hostPlatform === 'win32') {
+        return {
+          modeLabel: `Chained Host Publisher Handoff (Xbox Game Pass → ${chainedPublisherName})`,
+          cloudSaveSummary: `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link)`,
+        };
+      }
+      return {
+        modeLabel: `Chained Compatibility Bottle (Xbox Game Pass → ${chainedPublisherName} inside CrossOver / Wine)`,
+        cloudSaveSummary: hasMacBattlEyeWarning
+          ? `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link; BattlEye BEDaisy.sys online multiplayer blocked on macOS)`
+          : `Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} (requires one-time Xbox ↔ ${chainedPublisherName} account link)`,
+      };
+    }
+
+    if (isChainedHandoff && chainedPublisherName) {
+      if (hostPlatform === 'win32') {
+        return {
+          modeLabel: `Chained Host Publisher Handoff (${storeName} → ${chainedPublisherName})`,
+          cloudSaveSummary: `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account)`,
+        };
+      }
+      return {
+        modeLabel: `Chained Compatibility Bottle (${storeName} → ${chainedPublisherName} inside CrossOver / Wine)`,
+        cloudSaveSummary: hasMacBattlEyeWarning
+          ? `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account; BattlEye BEDaisy.sys online multiplayer blocked on macOS)`
+          : `Cloud saves & entitlement sync managed by ${chainedPublisherName} (requires linked ${storeName} ↔ ${chainedPublisherName} account)`,
+      };
+    }
+
+    if (hasMacBattlEyeWarning) {
+      return {
+        modeLabel: `Compatibility Bottle (${layerName} • BattlEye Online Multiplayer Warning)`,
+        cloudSaveSummary:
+          'Online multiplayer requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
+      };
+    }
+
+    if (platformId === 'xbox') {
+      return hostPlatform === 'win32'
+        ? {
+            modeLabel: 'Native Windows GamingServices / GDK Pipeline',
+            cloudSaveSummary:
+              'Two-way Xbox Connected Storage Cloud Save Sync & Achievements via Windows GamingServices',
+          }
+        : {
+            modeLabel: `Clientless CrossOver / Wine Xbox Pipeline (${layerName})`,
+            cloudSaveSummary:
+              'Two-way Xbox Connected Storage (TitleStorage) Cloud Save Sync inside CrossOver / Wine',
+          };
+    }
+
+    if (platformId === 'epic') {
+      return {
+        modeLabel:
+          hostPlatform === 'win32' || hasMacInstaller
+            ? 'Clientless EOS Exchange Code Pipeline'
+            : `Bottle Epic EOS Pipeline (${layerName})`,
+        cloudSaveSummary:
+          'Two-way Cloud Save Sync via standalone legendary CLI',
+      };
+    }
+
+    if (platformId === 'gog') {
+      return {
+        modeLabel:
+          hostPlatform === 'win32' || hasMacInstaller
+            ? 'Direct GOG DRM-Free Pipeline'
+            : `Bottle GOG Pipeline (${layerName})`,
+        cloudSaveSummary: 'Two-way Cloud Save Sync via standalone gogdl CLI',
+      };
+    }
+
+    if (platformId === 'steam') {
+      return {
+        modeLabel:
+          hostPlatform === 'win32' || hasMacInstaller
+            ? 'Steam Client Pipeline'
+            : `Bottle Steam Pipeline (${layerName})`,
+        cloudSaveSummary: isLifecycleFastBypass
+          ? 'Fast Direct Binary Bypass (bypasses Steam Cloud Sync)'
+          : 'Two-way Steam Cloud Save Sync',
+      };
+    }
+
+    return {
+      modeLabel: 'Standalone Executable Pipeline',
+      cloudSaveSummary: 'Local save files (no storefront cloud daemon)',
+    };
+  };
+
+  const { modeLabel, cloudSaveSummary } = computeModeLabelAndCloudSummary();
 
   if (detectedBuildType === 'windows_exe_on_mac') {
     const bottleSuffix = bottleName ? ` (Bottle: "${bottleName}")` : '';
     const targetExeLabel = executablePath
       ? executablePath.split(/[\\/]/).pop() || 'the game executable'
       : 'the game executable';
+    const antiCheatLabel = resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat';
 
-    const bottleAutoDesc =
-      platformId === 'custom'
-        ? `Automatically runs this Windows (.exe) build through ${layerName}${bottleSuffix} with your configured graphics and bottle settings.`
-        : isFastDirectActive
-          ? formatDirectBypassCloudNote(targetExeLabel, `via ${layerName}${bottleSuffix}`)
-          : platformId === 'steam'
-            ? `Silent Client + Cloud Sync: runs via ${layerName}${bottleSuffix} using silent bottle Steam (steam.exe -silent -applaunch) — syncs Steam Cloud Saves both ways (two-stage pre-launch download + post-exit upload) with Achievements & DRM support.`
-            : platformId === 'gog'
-              ? `Bottle GOG + Cloud Sync: runs via ${layerName}${bottleSuffix} with Bottle GOG Galaxy SDK support (governed by Bottle GOG Launch Policy below) and syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
-              : platformId === 'xbox'
-                ? `Bottle Xbox + Cloud Sync: runs via ${layerName}${bottleSuffix} in clientless XGR mode with Xbox XSTS token injection and two-way Xbox Connected Storage Cloud Save Sync.`
-                : `Bottle Epic + Cloud Sync: runs via ${layerName}${bottleSuffix} with EOS Exchange Code auth, Bottle Epic Launcher support (governed by Bottle Epic Games Store Launch Policy below), and two-way Cloud Save Sync via One Launcher's standalone legendary CLI.`;
+    const bottleAutoDesc = hasMacRing0HardBlock
+      ? `Unsupported on macOS Bottle: ${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.${
+          platformId === 'xbox' && chainedPublisherName
+            ? ` Cloud saves & Game Pass entitlement sync managed by ${chainedPublisherName} on native Windows.`
+            : ''
+        }`
+      : platformId === 'xbox' && isChainedHandoff && chainedPublisherName
+        ? `Chained Compatibility Bottle (Xbox Game Pass → ${chainedPublisherName} inside CrossOver / Wine): runs via ${layerName}${bottleSuffix}. ${cloudSaveSummary}.`
+        : isChainedHandoff && chainedPublisherName
+          ? `Chained Compatibility Bottle (${storeName} → ${chainedPublisherName} inside CrossOver / Wine): runs via ${layerName}${bottleSuffix}. ${cloudSaveSummary}.`
+          : platformId === 'custom'
+            ? `Automatically runs this Windows (.exe) build through ${layerName}${bottleSuffix} with your configured graphics and bottle settings.`
+            : isFastDirectActive
+              ? formatDirectBypassCloudNote(targetExeLabel, `via ${layerName}${bottleSuffix}`)
+              : platformId === 'steam'
+                ? `Silent Client + Cloud Sync: runs via ${layerName}${bottleSuffix} using silent bottle Steam (steam.exe -silent -applaunch) — syncs Steam Cloud Saves both ways (two-stage pre-launch download + post-exit upload) with Achievements & DRM support.`
+                : platformId === 'gog'
+                  ? `Bottle GOG + Cloud Sync: runs via ${layerName}${bottleSuffix} with Bottle GOG Galaxy SDK support (governed by Bottle GOG Launch Policy below) and syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
+                  : platformId === 'xbox'
+                    ? `Bottle Xbox + Cloud Sync: runs via ${layerName}${bottleSuffix} in clientless XGR mode with Xbox XSTS token injection and two-way Xbox Connected Storage Cloud Save Sync.`
+                    : `Bottle Epic + Cloud Sync: runs via ${layerName}${bottleSuffix} with EOS Exchange Code auth, Bottle Epic Launcher support (governed by Bottle Epic Games Store Launch Policy below), and two-way Cloud Save Sync via One Launcher's standalone legendary CLI.`;
 
-    const bottleCompatDesc =
-      platformId === 'custom'
-        ? `Explicitly pin a specific compatibility runner (${layerName}), target bottle / WinePrefix, and per-game graphics overrides.`
-        : isFastDirectActive
-          ? platformId === 'steam'
-            ? `Pin ${layerName}${bottleSuffix} and graphics overrides using Fast Bottle Direct Bypass — skips bottle Steam and bypasses Steam Cloud Sync, overlay, and achievements.`
-            : platformId === 'gog'
-              ? `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses GOG Galaxy while syncing Cloud Saves both ways via standalone gogdl CLI.`
-              : platformId === 'xbox'
-                ? `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Xbox App while syncing Xbox Connected Storage Cloud Saves both ways.`
-                : `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Epic Games Launcher while syncing Cloud Saves both ways via standalone legendary CLI.`
-          : platformId === 'steam'
-            ? `Pin ${layerName}${bottleSuffix} and graphics overrides with Silent Bottle Steam + Cloud Sync — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
-            : platformId === 'gog'
-              ? `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
-              : platformId === 'xbox'
-                ? `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Xbox Connected Storage Cloud Saves both ways (pre-launch download + post-exit upload).`
-                : `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone legendary CLI.`;
+    const bottleCompatDesc = hasMacRing0HardBlock
+      ? `${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside ${layerName}${bottleSuffix} on macOS.`
+      : platformId === 'xbox' && isChainedHandoff && chainedPublisherName
+        ? `Pin ${layerName}${bottleSuffix} and graphics overrides for ${chainedPublisherName} — ${cloudSaveSummary}.`
+        : isChainedHandoff && chainedPublisherName
+          ? `Pin ${layerName}${bottleSuffix} and graphics overrides for ${chainedPublisherName} — ${cloudSaveSummary}.`
+          : platformId === 'custom'
+            ? `Explicitly pin a specific compatibility runner (${layerName}), target bottle / WinePrefix, and per-game graphics overrides.`
+            : isFastDirectActive
+              ? platformId === 'steam'
+                ? `Pin ${layerName}${bottleSuffix} and graphics overrides using Fast Bottle Direct Bypass — skips bottle Steam and bypasses Steam Cloud Sync, overlay, and achievements.`
+                : platformId === 'gog'
+                  ? `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses GOG Galaxy while syncing Cloud Saves both ways via standalone gogdl CLI.`
+                  : platformId === 'xbox'
+                    ? `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Xbox App while syncing Xbox Connected Storage Cloud Saves both ways.`
+                    : `Pin ${layerName}${bottleSuffix} and graphics overrides — bypasses Epic Games Launcher while syncing Cloud Saves both ways via standalone legendary CLI.`
+              : platformId === 'steam'
+                ? `Pin ${layerName}${bottleSuffix} and graphics overrides with Silent Bottle Steam + Cloud Sync — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
+                : platformId === 'gog'
+                  ? `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone gogdl CLI.`
+                  : platformId === 'xbox'
+                    ? `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Xbox Connected Storage Cloud Saves both ways (pre-launch download + post-exit upload).`
+                    : `Pin ${layerName}${bottleSuffix} and graphics overrides — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via One Launcher's standalone legendary CLI.`;
 
-    const bottleAutoSummary =
-      platformId === 'custom'
-        ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix}.`
-        : isFastDirectActive
-          ? platformId === 'steam'
-            ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} using Fast Direct Binary Bypass (bypasses bottle Steam & Steam Cloud Sync).`
-            : platformId === 'gog'
-              ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} using Fast Direct Binary Bypass (syncs Cloud Saves both ways via standalone gogdl CLI).`
-              : platformId === 'xbox'
-                ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless XGR mode (syncs Xbox Connected Storage Cloud Saves both ways).`
-                : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless EOS mode (syncs Cloud Saves both ways via standalone legendary CLI).`
-          : platformId === 'steam'
-            ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
-            : platformId === 'gog'
-              ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via standalone gogdl CLI.`
-              : platformId === 'xbox'
-                ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Xbox Connected Storage Cloud Saves both ways (pre-launch download + post-exit upload).`
-                : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via standalone legendary CLI.`;
+    const bottleAutoSummary = hasMacRing0HardBlock
+      ? `Unsupported on macOS Bottle: ${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside ${layerName}${bottleSuffix}.`
+      : platformId === 'xbox' && isChainedHandoff && chainedPublisherName
+        ? `${modeLabel} — ${cloudSaveSummary}.`
+        : isChainedHandoff && chainedPublisherName
+          ? `${modeLabel} — ${cloudSaveSummary}.`
+          : platformId === 'custom'
+            ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix}.`
+            : isFastDirectActive
+              ? platformId === 'steam'
+                ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} using Fast Direct Binary Bypass (bypasses bottle Steam & Steam Cloud Sync).`
+                : platformId === 'gog'
+                  ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} using Fast Direct Binary Bypass (syncs Cloud Saves both ways via standalone gogdl CLI).`
+                  : platformId === 'xbox'
+                    ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless XGR mode (syncs Xbox Connected Storage Cloud Saves both ways).`
+                    : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} in clientless EOS mode (syncs Cloud Saves both ways via standalone legendary CLI).`
+              : platformId === 'steam'
+                ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Steam Cloud Saves both ways (pre-launch download + post-exit upload) via silent bottle Steam.`
+                : platformId === 'gog'
+                  ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via standalone gogdl CLI.`
+                  : platformId === 'xbox'
+                    ? `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Xbox Connected Storage Cloud Saves both ways (pre-launch download + post-exit upload).`
+                    : `Launches Windows executable (.exe) via ${layerName}${bottleSuffix} — syncs Cloud Saves both ways (pre-launch download + post-exit upload) via standalone legendary CLI.`;
 
     return {
       isInstalled,
@@ -1607,12 +2189,15 @@ export function buildEffectiveLaunchModePreview(
       platformId,
       installPath,
       executablePath,
+      ...previewExecArchFields,
       detectedBuildType,
       detectedBuildLabel,
       detectedBuildDetail,
       hasDualMacAndWinBuild,
       autoResolvedMethod: resolvedPolicy.autoResolvedMethod,
       autoResolvedSummary: bottleAutoSummary,
+      modeLabel,
+      cloudSaveSummary,
       defaultLaunchMethod,
       recommendedModes: ['auto', 'compatibility_layer'],
       availableModes,
@@ -1620,9 +2205,23 @@ export function buildEffectiveLaunchModePreview(
       visibleSections,
       modeNotes: {
         auto: {
-          badge: 'Recommended',
-          badgeTone: 'emerald',
+          badge: hasMacRing0HardBlock
+            ? 'Unsupported on macOS'
+            : hasMacBattlEyeWarning
+              ? 'Multiplayer Blocked'
+              : 'Recommended',
+          badgeTone: hasMacRing0HardBlock || hasMacBattlEyeWarning ? 'amber' : 'emerald',
           dynamicDesc: bottleAutoDesc,
+          ...(hasMacRing0HardBlock
+            ? {
+                warning: `${antiCheatLabel} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`,
+              }
+            : hasMacBattlEyeWarning
+              ? {
+                  warning:
+                    'Online multiplayer requiring BattlEye (BEDaisy.sys) is blocked inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
+                }
+              : {}),
         },
         custom: {
           badge: 'Legacy',
@@ -1630,8 +2229,8 @@ export function buildEffectiveLaunchModePreview(
           dynamicDesc: bottleAutoDesc,
         },
         compatibility_layer: {
-          badge: 'Custom Runner & Bottle',
-          badgeTone: 'sky',
+          badge: hasMacRing0HardBlock ? 'Unsupported on macOS' : 'Custom Runner & Bottle',
+          badgeTone: hasMacRing0HardBlock ? 'amber' : 'sky',
           dynamicDesc: bottleCompatDesc,
         },
         direct: {
@@ -1746,12 +2345,15 @@ export function buildEffectiveLaunchModePreview(
       platformId,
       installPath,
       executablePath,
+      ...previewExecArchFields,
       detectedBuildType,
       detectedBuildLabel,
       detectedBuildDetail,
       hasDualMacAndWinBuild,
       autoResolvedMethod: resolvedPolicy.autoResolvedMethod,
       autoResolvedSummary: macAutoResolvedSummary,
+      modeLabel,
+      cloudSaveSummary,
       defaultLaunchMethod,
       recommendedModes: [defaultLaunchMethod],
       availableModes,
@@ -1788,37 +2390,49 @@ export function buildEffectiveLaunchModePreview(
     const winTargetLabel = exeName || 'the native Windows executable';
 
     const winDirectNote: ResolvedLaunchModePreview['modeNotes']['direct'] =
-      platformId === 'steam'
+      platformId === 'xbox' && isChainedHandoff && chainedPublisherName
         ? {
-            badge: 'Direct Binary',
-            badgeTone: 'amber',
-            dynamicDesc: `Fast Direct Launch: spawns ${winTargetLabel} directly without Steam — enables custom launch arguments and environment overrides, but bypasses Steam Cloud Save Sync, Achievements/Trophies, and Steamworks DRM.`,
+            badge: 'Recommended',
+            badgeTone: 'emerald',
+            dynamicDesc: `${modeLabel}: launches ${winTargetLabel} via ${chainedPublisherName} on Windows — ${cloudSaveSummary}.`,
           }
-        : platformId === 'epic'
+        : isChainedHandoff && chainedPublisherName
           ? {
               badge: 'Recommended',
               badgeTone: 'emerald',
-              dynamicDesc: `Launches ${winTargetLabel} directly in clientless EOS Exchange Code mode with two-way Cloud Save Sync (pre-launch download + post-exit upload) via standalone legendary CLI and 0 MB Epic Launcher overhead.`,
+              dynamicDesc: `${modeLabel}: launches ${winTargetLabel} via ${chainedPublisherName} on Windows — ${cloudSaveSummary}.`,
             }
-          : platformId === 'gog'
+          : platformId === 'steam'
             ? {
-                badge: 'Recommended',
-                badgeTone: 'emerald',
-                dynamicDesc: isFastDirectActive
-                  ? `Launches ${winTargetLabel} directly with Fast Direct Bypass — preserves two-way gogdl Cloud Save Sync while skipping GOG Galaxy (Achievements/Trophies disabled; governed by GOG Galaxy Launch Policy below).`
-                  : `Launches ${winTargetLabel} directly while preserving two-way gogdl Cloud Save Sync and silent GOG Galaxy SDK Trophies/Achievements (governed by GOG Galaxy Launch Policy below).`,
+                badge: 'Direct Binary',
+                badgeTone: 'amber',
+                dynamicDesc: `Fast Direct Launch: spawns ${winTargetLabel} directly without Steam — enables custom launch arguments and environment overrides, but bypasses Steam Cloud Save Sync, Achievements/Trophies, and Steamworks DRM.`,
               }
-            : platformId === 'xbox'
+            : platformId === 'epic'
               ? {
                   badge: 'Recommended',
                   badgeTone: 'emerald',
-                  dynamicDesc: `Launches ${winTargetLabel} via Windows GamingServices (IApplicationActivationManager::ActivateApplication / direct GDK binary) with Xbox Cloud Saves, Achievements / Gamerscore, and Game Pass license validation (governed by Xbox / Game Pass Launch Policy below).`,
+                  dynamicDesc: `Launches ${winTargetLabel} directly in clientless EOS Exchange Code mode with two-way Cloud Save Sync (pre-launch download + post-exit upload) via standalone legendary CLI and 0 MB Epic Launcher overhead.`,
                 }
-              : {
-                  badge: 'Recommended',
-                  badgeTone: 'emerald',
-                  dynamicDesc: `Directly spawns ${winTargetLabel} with custom launch arguments and environment variables.`,
-                };
+              : platformId === 'gog'
+                ? {
+                    badge: 'Recommended',
+                    badgeTone: 'emerald',
+                    dynamicDesc: isFastDirectActive
+                      ? `Launches ${winTargetLabel} directly with Fast Direct Bypass — preserves two-way gogdl Cloud Save Sync while skipping GOG Galaxy (Achievements/Trophies disabled; governed by GOG Galaxy Launch Policy below).`
+                      : `Launches ${winTargetLabel} directly while preserving two-way gogdl Cloud Save Sync and silent GOG Galaxy SDK Trophies/Achievements (governed by GOG Galaxy Launch Policy below).`,
+                  }
+                : platformId === 'xbox'
+                  ? {
+                      badge: 'Recommended',
+                      badgeTone: 'emerald',
+                      dynamicDesc: `Launches ${winTargetLabel} via Windows GamingServices (IApplicationActivationManager::ActivateApplication / direct GDK binary) with Xbox Cloud Saves, Achievements / Gamerscore, and Game Pass license validation (governed by Xbox / Game Pass Launch Policy below).`,
+                    }
+                  : {
+                      badge: 'Recommended',
+                      badgeTone: 'emerald',
+                      dynamicDesc: `Directly spawns ${winTargetLabel} with custom launch arguments and environment variables.`,
+                    };
 
     const winStorefrontUriNote: ResolvedLaunchModePreview['modeNotes']['storefront_uri'] =
       platformId === 'steam'
@@ -1840,9 +2454,17 @@ export function buildEffectiveLaunchModePreview(
             }
           : platformId === 'xbox'
             ? {
-                badge: isClientInstalled === false ? 'Client Not Installed' : 'Xbox PC App',
+                badge:
+                  isClientInstalled === false
+                    ? 'Client Not Installed'
+                    : isChainedHandoff && chainedPublisherName
+                      ? chainedPublisherName
+                      : 'Xbox PC App',
                 badgeTone: isClientInstalled === false ? 'slate' : 'sky',
-                dynamicDesc: storefrontUriDelegationDesc,
+                dynamicDesc:
+                  isChainedHandoff && chainedPublisherName
+                    ? `Delegates launch and entitlement check to ${chainedPublisherName} (${cloudSaveSummary}).`
+                    : storefrontUriDelegationDesc,
                 disabled: isClientInstalled === false,
                 disabledReason: missingClientDisabledReason,
               }
@@ -1855,25 +2477,29 @@ export function buildEffectiveLaunchModePreview(
               };
 
     const winAutoResolvedSummary =
-      activeMode === 'storefront_uri' || !executablePath
-        ? platformId === 'steam'
-          ? 'Launches via Steam protocol (steam://rungameid) with silent background Steam and bidirectional Steam Cloud Sync.'
-          : platformId === 'gog'
-            ? 'Delegates launch and Cloud Save Sync to the GOG Galaxy desktop client (goggalaxy://launchGame).'
-            : platformId === 'xbox'
-              ? 'Activates the Xbox / Game Pass package via Windows GamingServices or Xbox PC App protocol (msxbox://).'
-              : `Launches via ${storeName} client protocol (${storeProtocol}).`
-        : platformId === 'steam'
-          ? `Launches native Windows executable (${exeName}) directly (Fast Direct Bypass — bypasses Steam Cloud Sync & Achievements).`
-          : platformId === 'gog'
-            ? isFastDirectActive
-              ? `Launches native Windows executable (${exeName}) directly (Fast Direct Bypass — syncs Cloud Saves both ways via standalone gogdl CLI).`
-              : `Launches native Windows executable (${exeName}) directly with bidirectional standalone gogdl Cloud Save Sync.`
-            : platformId === 'epic'
-              ? `Launches native Windows executable (${exeName}) directly in clientless EOS mode with bidirectional standalone legendary Cloud Save Sync.`
-              : platformId === 'xbox'
-                ? `Launches native Windows Xbox / Game Pass build (${exeName}) via Windows GamingServices with Xbox Cloud Saves & Achievements.`
-                : `Launches native Windows executable (${exeName}) directly.`;
+      platformId === 'xbox' && isChainedHandoff && chainedPublisherName
+        ? `${modeLabel} — ${cloudSaveSummary}.`
+        : isChainedHandoff && chainedPublisherName
+          ? `${modeLabel} — ${cloudSaveSummary}.`
+          : activeMode === 'storefront_uri' || !executablePath
+            ? platformId === 'steam'
+              ? 'Launches via Steam protocol (steam://rungameid) with silent background Steam and bidirectional Steam Cloud Sync.'
+              : platformId === 'gog'
+                ? 'Delegates launch and Cloud Save Sync to the GOG Galaxy desktop client (goggalaxy://launchGame).'
+                : platformId === 'xbox'
+                  ? 'Activates the Xbox / Game Pass package via Windows GamingServices or Xbox PC App protocol (msxbox://).'
+                  : `Launches via ${storeName} client protocol (${storeProtocol}).`
+            : platformId === 'steam'
+              ? `Launches native Windows executable (${exeName}) directly (Fast Direct Bypass — bypasses Steam Cloud Sync & Achievements).`
+              : platformId === 'gog'
+                ? isFastDirectActive
+                  ? `Launches native Windows executable (${exeName}) directly (Fast Direct Bypass — syncs Cloud Saves both ways via standalone gogdl CLI).`
+                  : `Launches native Windows executable (${exeName}) directly with bidirectional standalone gogdl Cloud Save Sync.`
+                : platformId === 'epic'
+                  ? `Launches native Windows executable (${exeName}) directly in clientless EOS mode with bidirectional standalone legendary Cloud Save Sync.`
+                  : platformId === 'xbox'
+                    ? `Launches native Windows Xbox / Game Pass build (${exeName}) via Windows GamingServices with Xbox Cloud Saves & Achievements.`
+                    : `Launches native Windows executable (${exeName}) directly.`;
 
     return {
       isInstalled,
@@ -1881,12 +2507,15 @@ export function buildEffectiveLaunchModePreview(
       platformId,
       installPath,
       executablePath,
+      ...previewExecArchFields,
       detectedBuildType,
       detectedBuildLabel,
       detectedBuildDetail,
       hasDualMacAndWinBuild,
       autoResolvedMethod: resolvedPolicy.autoResolvedMethod,
       autoResolvedSummary: winAutoResolvedSummary,
+      modeLabel,
+      cloudSaveSummary,
       defaultLaunchMethod,
       recommendedModes: [defaultLaunchMethod],
       availableModes,
@@ -1921,17 +2550,25 @@ export function buildEffectiveLaunchModePreview(
   // not_installed
   const isDualBuildMacPreview = hostPlatform !== 'win32' && hasDualMacAndWinBuild;
   const preInstallCloudDesc =
-    platformId === 'steam'
-      ? isLifecycleFastBypass
-        ? 'Fast Direct Binary Bypass (bypasses Steam Cloud Sync)'
-        : 'bidirectional Steam Cloud Sync (pre-launch download + post-exit upload)'
-      : platformId === 'gog'
-        ? 'bidirectional standalone gogdl Cloud Save Sync (pre-launch download + post-exit upload)'
-        : platformId === 'epic'
-          ? 'bidirectional standalone legendary Cloud Save Sync (pre-launch download + post-exit upload)'
-          : platformId === 'xbox'
-            ? 'bidirectional Xbox Connected Storage Cloud Save Sync (pre-launch download + post-exit upload)'
-            : 'Silent Client + Cloud Sync';
+    isChainedHandoff && chainedPublisherName
+      ? cloudSaveSummary
+      : platformId === 'steam'
+        ? isLifecycleFastBypass
+          ? 'Fast Direct Binary Bypass (bypasses Steam Cloud Sync)'
+          : 'bidirectional Steam Cloud Sync (pre-launch download + post-exit upload)'
+        : platformId === 'gog'
+          ? 'bidirectional standalone gogdl Cloud Save Sync (pre-launch download + post-exit upload)'
+          : platformId === 'epic'
+            ? 'bidirectional standalone legendary Cloud Save Sync (pre-launch download + post-exit upload)'
+            : platformId === 'xbox'
+              ? 'bidirectional Xbox Connected Storage Cloud Save Sync (pre-launch download + post-exit upload)'
+              : 'Silent Client + Cloud Sync';
+
+  const notInstalledAutoSummary = hasMacRing0HardBlock
+    ? `Unsupported on macOS Bottle: ${resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat'} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`
+    : isChainedHandoff && chainedPublisherName
+      ? `${modeLabel} — ${cloudSaveSummary}.`
+      : 'Game is not installed locally yet. Install via One Launcher or link an existing executable below.';
 
   return {
     isInstalled: false,
@@ -1939,34 +2576,52 @@ export function buildEffectiveLaunchModePreview(
     platformId,
     installPath,
     executablePath,
+    ...previewExecArchFields,
     detectedBuildType: 'not_installed',
     detectedBuildLabel,
     detectedBuildDetail,
     hasDualMacAndWinBuild,
     autoResolvedMethod: resolvedPolicy.autoResolvedMethod,
-    autoResolvedSummary:
-      'Game is not installed locally yet. Install via One Launcher or link an existing executable below.',
+    autoResolvedSummary: notInstalledAutoSummary,
+    modeLabel,
+    cloudSaveSummary,
     defaultLaunchMethod,
     recommendedModes: ['auto', 'storefront_uri'],
     availableModes,
     resolvedPolicy,
     visibleSections,
     modeNotes: {
-      auto: isDualBuildMacPreview
+      auto: hasMacRing0HardBlock
         ? {
-            badge: 'Recommended • Native macOS',
-            badgeTone: 'emerald',
-            dynamicDesc: isLifecycleFastBypass
-              ? `Installs the official Native macOS build and launches via Fast Direct Binary Bypass with ${preInstallCloudDesc} and zero translation overhead.`
-              : `Installs and launches the official Native macOS build automatically with ${preInstallCloudDesc} and zero translation overhead.`,
+            badge: 'Unsupported on macOS',
+            badgeTone: 'amber',
+            dynamicDesc: notInstalledAutoSummary,
+            warning: `${resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat'} requires a Windows ring-0 kernel driver that cannot load inside macOS Wine/CrossOver bottles.`,
           }
-        : {
-            badge: 'Recommended',
-            badgeTone: 'emerald',
-            dynamicDesc: isLifecycleFastBypass
-              ? `Automatically selects the optimal native or CrossOver pipeline using Fast Direct Binary Bypass with ${preInstallCloudDesc} once installed or linked.`
-              : `Automatically selects the optimal native or CrossOver pipeline with ${preInstallCloudDesc} once installed or linked.`,
-          },
+        : isDualBuildMacPreview
+          ? {
+              badge: 'Recommended • Native macOS',
+              badgeTone: 'emerald',
+              dynamicDesc: isLifecycleFastBypass
+                ? `Installs the official Native macOS build and launches via Fast Direct Binary Bypass with ${preInstallCloudDesc} and zero translation overhead.`
+                : `Installs and launches the official Native macOS build automatically with ${preInstallCloudDesc} and zero translation overhead.`,
+            }
+          : {
+              badge: hasMacBattlEyeWarning ? 'Multiplayer Blocked' : 'Recommended',
+              badgeTone: hasMacBattlEyeWarning ? 'amber' : 'emerald',
+              dynamicDesc:
+                isChainedHandoff && chainedPublisherName
+                  ? `${modeLabel}: ${preInstallCloudDesc}.`
+                  : isLifecycleFastBypass
+                    ? `Automatically selects the optimal native or CrossOver pipeline using Fast Direct Binary Bypass with ${preInstallCloudDesc} once installed or linked.`
+                    : `Automatically selects the optimal native or CrossOver pipeline with ${preInstallCloudDesc} once installed or linked.`,
+              ...(hasMacBattlEyeWarning
+                ? {
+                    warning:
+                      'Online multiplayer requiring BattlEye (BEDaisy.sys) cannot load inside macOS Wine/CrossOver bottles; offline Story Mode (-nobattleye) remains playable where supported.',
+                  }
+                : {}),
+            },
       custom: {
         badge: 'Legacy',
         badgeTone: 'slate',
@@ -1983,17 +2638,22 @@ export function buildEffectiveLaunchModePreview(
         ? {
             badge: 'Windows Translation',
             badgeTone: 'sky',
-            dynamicDesc: `Use the Windows (.exe) build via ${layerName} with ${preInstallCloudDesc} instead of the native macOS build — pre-configure runner, bottle, and graphics settings.`,
+            dynamicDesc: `Use the Windows (.exe) build via ${layerName} with ${preInstallCloudDesc} instead of the native macOS build — pre-configure runner, bottle, and 64-bit/32-bit graphics settings.`,
           }
         : {
-            badge: 'Pre-Configure',
-            badgeTone: 'sky',
-            dynamicDesc: `Pre-configure ${layerName} bottle, CrossOver 26 graphics backend, and ${preInstallCloudDesc} before installing or linking a Windows .exe.`,
+            badge: hasMacRing0HardBlock ? 'Unsupported on macOS' : 'Pre-Configure',
+            badgeTone: hasMacRing0HardBlock ? 'amber' : 'sky',
+            dynamicDesc: hasMacRing0HardBlock
+              ? notInstalledAutoSummary
+              : `Pre-configure ${layerName} bottle, CrossOver 64-bit/32-bit graphics backend, and ${preInstallCloudDesc} before installing or linking a Windows .exe.`,
           },
       storefront_uri: {
         badge: isClientInstalled === false ? 'Client Not Installed' : 'Store Fallback',
         badgeTone: isClientInstalled === false ? 'slate' : 'sky',
-        dynamicDesc: storefrontUriUninstalledDesc,
+        dynamicDesc:
+          platformId === 'xbox' && isChainedHandoff && chainedPublisherName
+            ? `Delegates install, launch, and entitlement verification to ${chainedPublisherName} (${cloudSaveSummary}).`
+            : storefrontUriUninstalledDesc,
         ...(isClientInstalled === false
           ? { disabled: true, disabledReason: missingClientDisabledReason }
           : {}),
@@ -2001,3 +2661,5 @@ export function buildEffectiveLaunchModePreview(
     },
   };
 }
+
+export const buildLaunchPolicyPreview = buildEffectiveLaunchModePreview;

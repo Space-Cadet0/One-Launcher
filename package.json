@@ -1,7 +1,7 @@
 {
   "name": "one-launcher",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MIT",
   "description": "Universal game library and launcher for Steam, GOG.com, Epic Games Store, and Xbox / PC Game Pass on macOS and Windows.",
   "author": "One Launcher Contributors",

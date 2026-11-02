@@ -137,37 +137,47 @@ function escapeWineRegString(raw) {
  * @returns {string}
  */
 function formatWineRegEntryLine(key, valOrType, maybeValue) {
-  const escapedKey = escapeWineRegString(key);
+  const isDefaultValue = key === '' || key === '@';
+  const lhs = isDefaultValue ? '@' : `"${escapeWineRegString(key)}"`;
   const val =
     arguments.length >= 3 && typeof valOrType === 'string'
       ? { type: valOrType, value: maybeValue }
       : valOrType;
   if (val && typeof val === 'object') {
+    if (typeof val.rawRegLine === 'string') {
+      return val.rawRegLine;
+    }
+    if (val.delete === true) {
+      return `${lhs}=-`;
+    }
+    if (typeof val.rawRegRhs === 'string') {
+      return `${lhs}=${val.rawRegRhs}`;
+    }
     const rawType = String(val.type || '').trim().toLowerCase();
     const rawPayload = val.value !== undefined ? val.value : val.data;
     if (rawType === 'dword' || rawType === 'reg_dword') {
       const num = (Number(rawPayload) >>> 0).toString(16).padStart(8, '0');
-      return `"${escapedKey}"=dword:${num}`;
+      return `${lhs}=dword:${num}`;
     }
     if (rawType === 'qword' || rawType === 'reg_qword') {
       if (
         typeof rawPayload === 'string' &&
         /^hex\(b\):[0-9a-f]{2}(?:,[0-9a-f]{2}){7}$/i.test(rawPayload.trim())
       ) {
-        return `"${escapedKey}"=${rawPayload.trim().toLowerCase()}`;
+        return `${lhs}=${rawPayload.trim().toLowerCase()}`;
       }
       const u64 = BigInt(rawPayload ?? 0) & 0xffffffffffffffffn;
       const bytes = [];
       for (let i = 0; i < 8; i += 1) {
         bytes.push(Number((u64 >> BigInt(i * 8)) & 0xffn).toString(16).padStart(2, '0'));
       }
-      return `"${escapedKey}"=hex(b):${bytes.join(',')}`;
+      return `${lhs}=hex(b):${bytes.join(',')}`;
     }
     if (rawType === 'sz' || rawType === 'reg_sz') {
-      return `"${escapedKey}"="${escapeWineRegString(String(rawPayload ?? ''))}"`;
+      return `${lhs}="${escapeWineRegString(String(rawPayload ?? ''))}"`;
     }
   }
-  return `"${escapedKey}"="${escapeWineRegString(String(val ?? ''))}"`;
+  return `${lhs}="${escapeWineRegString(String(val ?? ''))}"`;
 }
 
 /**
@@ -237,9 +247,14 @@ function isBottleWineserverActive(bottlePath, options = {}) {
  */
 function resolveWineBinaryForBottle(bottlePath, options = {}) {
   const explicit = String(
-    options.wineBinaryPath || options.compatLayer?.binaryPath || ''
+    options.wineBinaryPath || options.wineBinary || options.compatLayer?.binaryPath || ''
   ).trim();
-  if (explicit && (typeof options.execFileFn === 'function' || fs.existsSync(explicit))) {
+  if (
+    explicit &&
+    (typeof options.execFileFn === 'function' ||
+      typeof options.execFileImpl === 'function' ||
+      fs.existsSync(explicit))
+  ) {
     return explicit;
   }
   const homedir = options.homedir || os.homedir();
@@ -271,6 +286,239 @@ function resolveWineBinaryForBottle(bottlePath, options = {}) {
 }
 
 /**
+ * Coalesce and import registry section updates/deletions into a running `wineserver` in a single
+ * UTF-16LE `Windows Registry Editor Version 5.00` `reg.exe import` call, aligned via
+ * `prepareAlignedBottleWineCommand` and tracked in `pendingWineRegSyncByPrefix`.
+ *
+ * @param {string} bottlePath
+ * @param {'HKEY_LOCAL_MACHINE' | 'HKEY_CURRENT_USER'} hiveName
+ * @param {Array<{ hiveName?: 'HKEY_LOCAL_MACHINE' | 'HKEY_CURRENT_USER', normalizedSubKey: string, entryPairsOrNullForDelete: Array<[string, any]> | null }>} sectionUpdates
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+function syncLiveWineRegistryBatchAsync(bottlePath, hiveName, sectionUpdates, options = {}) {
+  if (
+    !bottlePath ||
+    !Array.isArray(sectionUpdates) ||
+    sectionUpdates.length === 0 ||
+    !isBottleWineserverActive(bottlePath, options)
+  ) {
+    return Promise.resolve(false);
+  }
+  const wineBin = resolveWineBinaryForBottle(bottlePath, options);
+  const execFileImpl =
+    typeof options.execFileFn === 'function'
+      ? options.execFileFn
+      : typeof options.execFileImpl === 'function'
+        ? options.execFileImpl
+        : execFile;
+  if (!wineBin) return Promise.resolve(false);
+
+  // Coalesce non-delete updates per (hiveName, subKeyLower) in order while flushing on whole-section deletes
+  /** @type {Array<{ hive: string, subKey: string, isSectionDelete: boolean, entriesMap: Map<string, [string, any]> }>} */
+  const orderedBlocks = [];
+  /** @type {Map<string, number>} */
+  const activeBlockIndexByKey = new Map();
+
+  for (const item of sectionUpdates) {
+    if (!item || !item.normalizedSubKey) continue;
+    const itemHive =
+      item.hiveName === 'HKEY_CURRENT_USER' || item.hiveName === 'HKEY_LOCAL_MACHINE'
+        ? item.hiveName
+        : hiveName || 'HKEY_LOCAL_MACHINE';
+    const normSub = String(item.normalizedSubKey)
+      .trim()
+      .replace(/^\\+|\\+$/g, '')
+      .replace(/\\+/g, '\\');
+    if (!normSub) continue;
+    const blockKey = `${itemHive}\\${normSub.toLowerCase()}`;
+
+    if (item.entryPairsOrNullForDelete === null) {
+      activeBlockIndexByKey.delete(blockKey);
+      const wowMatch = normSub.match(/^software\\wow6432node\\(.+)$/i);
+      if (wowMatch && wowMatch[1]) {
+        activeBlockIndexByKey.delete(`${itemHive}\\software\\${wowMatch[1].toLowerCase()}`);
+      } else {
+        const softMatch = normSub.match(/^software\\(.+)$/i);
+        if (softMatch && softMatch[1]) {
+          activeBlockIndexByKey.delete(
+            `${itemHive}\\software\\wow6432node\\${softMatch[1].toLowerCase()}`
+          );
+        }
+      }
+      orderedBlocks.push({
+        hive: itemHive,
+        subKey: normSub,
+        isSectionDelete: true,
+        entriesMap: new Map(),
+      });
+    } else if (Array.isArray(item.entryPairsOrNullForDelete)) {
+      let blockIdx = activeBlockIndexByKey.get(blockKey);
+      if (blockIdx === undefined) {
+        blockIdx = orderedBlocks.length;
+        activeBlockIndexByKey.set(blockKey, blockIdx);
+        orderedBlocks.push({
+          hive: itemHive,
+          subKey: normSub,
+          isSectionDelete: false,
+          entriesMap: new Map(),
+        });
+      }
+      const targetMap = orderedBlocks[blockIdx].entriesMap;
+      for (const [k, v] of item.entryPairsOrNullForDelete) {
+        const keyStr = String(k ?? '');
+        const normValKey = keyStr === '' || keyStr === '@' ? '@' : keyStr.toLowerCase();
+        targetMap.set(normValKey, [keyStr, v]);
+      }
+    }
+  }
+
+  if (orderedBlocks.length === 0) {
+    return Promise.resolve(false);
+  }
+
+  const regLines = ['Windows Registry Editor Version 5.00', ''];
+  for (const block of orderedBlocks) {
+    if (block.isSectionDelete) {
+      regLines.push(`[-${block.hive}\\${block.subKey}]`);
+      const wowMatch = block.subKey.match(/^software\\wow6432node\\(.+)$/i);
+      if (wowMatch && wowMatch[1]) {
+        regLines.push(`[-${block.hive}\\Software\\${wowMatch[1]}]`);
+      } else {
+        const softMatch = block.subKey.match(/^software\\(.+)$/i);
+        if (softMatch && softMatch[1]) {
+          regLines.push(`[-${block.hive}\\Software\\Wow6432Node\\${softMatch[1]}]`);
+        }
+      }
+      regLines.push('');
+    } else {
+      regLines.push(`[${block.hive}\\${block.subKey}]`);
+      for (const [k, v] of block.entriesMap.values()) {
+        regLines.push(formatWineRegEntryLine(k, v));
+      }
+      regLines.push('');
+    }
+  }
+  if (regLines[regLines.length - 1] !== '') {
+    regLines.push('');
+  }
+
+  const tempRegPath = path.join(
+    os.tmpdir(),
+    `one-launcher-winereg-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.reg`
+  );
+  const isCrossOverBottle = /\/Bottles\/([^/]+)$/i.exec(bottlePath.replace(/\\/g, '/'));
+  /** @type {Record<string, any>} */
+  const rawBottleEnv = {
+    ...process.env,
+    ...(options.env && typeof options.env === 'object' ? options.env : {}),
+    WINEPREFIX: bottlePath,
+    ...(isCrossOverBottle && isCrossOverBottle[1] ? { CX_BOTTLE: isCrossOverBottle[1] } : {}),
+  };
+
+  let spawnBin = wineBin;
+  /** @type {Record<string, any>} */
+  let spawnEnv = rawBottleEnv;
+  try {
+    const { prepareAlignedBottleWineCommand } = require('./macNativeInstallerAndCodesign.cjs');
+    if (typeof prepareAlignedBottleWineCommand === 'function') {
+      const aligned = prepareAlignedBottleWineCommand({
+        wineBinary: wineBin,
+        bottlePath,
+        env: rawBottleEnv,
+        suppressGuiDialogs: true,
+        layerType: options.layerType || options.compatLayer?.type,
+        wineserverActive: options.wineserverActive,
+      });
+      if (aligned && aligned.wineBinary) {
+        spawnBin = aligned.wineBinary;
+        spawnEnv = aligned.env || rawBottleEnv;
+      }
+    }
+  } catch {}
+
+  /** @type {Map<string, Promise<any>> | null} */
+  let pendingMap = null;
+  try {
+    pendingMap = require('./engineStateRegistry.cjs').pendingWineRegSyncByPrefix || null;
+  } catch {}
+  const prefixKey = path.resolve(bottlePath);
+  const priorPending = pendingMap ? pendingMap.get(prefixKey) : undefined;
+
+  const runImport = () =>
+    new Promise((resolve) => {
+      try {
+        fs.writeFileSync(tempRegPath, '\uFEFF' + regLines.join('\r\n'), 'utf16le');
+      } catch {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const cleanup = () => {
+        fs.promises.unlink(tempRegPath).catch(() => {});
+      };
+      const finish = (/** @type {boolean} */ ok) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(ok);
+      };
+      const safetyTimer = setTimeout(() => finish(false), 5500);
+      if (typeof safetyTimer.unref === 'function') {
+        safetyTimer.unref();
+      }
+      try {
+        execFileImpl(
+          spawnBin,
+          ['reg.exe', 'import', tempRegPath],
+          { env: spawnEnv, timeout: 5000 },
+          (/** @type {any} */ err) => {
+            clearTimeout(safetyTimer);
+            finish(!err);
+          }
+        );
+      } catch {
+        clearTimeout(safetyTimer);
+        finish(false);
+      }
+    });
+
+  const trackedPromise = (
+    priorPending ? Promise.resolve(priorPending).catch(() => {}).then(runImport) : runImport()
+  ).finally(() => {
+    if (pendingMap && pendingMap.get(prefixKey) === trackedPromise) {
+      pendingMap.delete(prefixKey);
+    }
+  });
+
+  if (pendingMap) {
+    pendingMap.set(prefixKey, trackedPromise);
+  }
+  return trackedPromise;
+}
+
+/**
+ * Flush all coalesced HKLM/HKCU registry updates, value deletions, and raw patches accumulated
+ * in `accumulator` into a single `syncLiveWineRegistryBatchAsync` (`reg.exe import`) invocation
+ * registered on `pendingWineRegSyncByPrefix`.
+ *
+ * @param {string} bottlePath
+ * @param {Array<{ hiveName?: 'HKEY_LOCAL_MACHINE' | 'HKEY_CURRENT_USER', normalizedSubKey: string, entryPairsOrNullForDelete: Array<[string, any]> | null }>} accumulator
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+function flushLiveWineRegistryAccumulator(bottlePath, accumulator, options = {}) {
+  if (!Array.isArray(accumulator) || accumulator.length === 0) {
+    return Promise.resolve(false);
+  }
+  const snapshot = accumulator.splice(0, accumulator.length);
+  if (!bottlePath || options.skipLiveWineRegSync === true) {
+    return Promise.resolve(false);
+  }
+  return syncLiveWineRegistryBatchAsync(bottlePath, 'HKEY_LOCAL_MACHINE', snapshot, options);
+}
+
+/**
  * Import a registry key update or deletion into a running `wineserver` asynchronously via `reg.exe import`.
  *
  * @param {string} bottlePath
@@ -287,127 +535,26 @@ function syncLiveWineRegistryAsync(
   entryPairsOrNullForDelete,
   options = {}
 ) {
-  if (!bottlePath || !normalizedSubKey || !isBottleWineserverActive(bottlePath, options)) {
+  if (!bottlePath || !normalizedSubKey) {
     return Promise.resolve(false);
   }
-  const wineBin = resolveWineBinaryForBottle(bottlePath, options);
-  const execFileImpl =
-    typeof options.execFileFn === 'function'
-      ? options.execFileFn
-      : typeof options.execFileImpl === 'function'
-        ? options.execFileImpl
-        : execFile;
-  if (!wineBin) return Promise.resolve(false);
-
-  const regLines = ['Windows Registry Editor Version 5.00', ''];
-  if (entryPairsOrNullForDelete === null) {
-    regLines.push(`[-${hiveName}\\${normalizedSubKey}]`);
-    const wowMatch = normalizedSubKey.match(/^software\\wow6432node\\(.+)$/i);
-    if (wowMatch && wowMatch[1]) {
-      regLines.push(`[-${hiveName}\\Software\\${wowMatch[1]}]`);
-    } else {
-      const softMatch = normalizedSubKey.match(/^software\\(.+)$/i);
-      if (softMatch && softMatch[1]) {
-        regLines.push(`[-${hiveName}\\Software\\Wow6432Node\\${softMatch[1]}]`);
-      }
-    }
-  } else {
-    regLines.push(`[${hiveName}\\${normalizedSubKey}]`);
-    for (const [k, v] of entryPairsOrNullForDelete) {
-      regLines.push(formatWineRegEntryLine(String(k), v));
-    }
-  }
-  regLines.push('');
-
-  const tempRegPath = path.join(
-    os.tmpdir(),
-    `one-launcher-winereg-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.reg`
+  return syncLiveWineRegistryBatchAsync(
+    bottlePath,
+    hiveName,
+    [{ hiveName, normalizedSubKey, entryPairsOrNullForDelete }],
+    options
   );
-  const isCrossOverBottle = /\/Bottles\/([^/]+)$/i.exec(bottlePath.replace(/\\/g, '/'));
-  const bottleEnv = {
-    ...process.env,
-    WINEPREFIX: bottlePath,
-    ...(isCrossOverBottle && isCrossOverBottle[1] ? { CX_BOTTLE: isCrossOverBottle[1] } : {}),
-  };
-
-  return new Promise((resolve) => {
-    try {
-      fs.writeFileSync(tempRegPath, '\uFEFF' + regLines.join('\r\n'), 'utf16le');
-    } catch {
-      resolve(false);
-      return;
-    }
-    const cleanup = () => {
-      fs.promises.unlink(tempRegPath).catch(() => {});
-    };
-    try {
-      execFileImpl(
-        wineBin,
-        ['reg.exe', 'import', tempRegPath],
-        { env: bottleEnv, timeout: 5000 },
-        (/** @type {any} */ err) => {
-          cleanup();
-          resolve(!err);
-        }
-      );
-    } catch {
-      cleanup();
-      resolve(false);
-    }
-  });
 }
 
 /**
- * Upserts a registry key and values inside a Wine bottle `.reg` file (`system.reg` by default).
- * Preserves `WINE REGISTRY Version 2` header, `#arch=` directive, and any unrelated keys.
- *
- * @param {string} bottlePath
- * @param {string} subKeyPath
- * @param {Array<[string, any]> | Record<string, any>} entries
- * @param {Record<string, any>} [options]
- * @returns {{ updated: boolean, regFilePath: string }}
+ * @param {string} content
+ * @param {string} normalizedSubKey
+ * @param {Array<[string, any]>} entryPairs
+ * @param {number} unixSec
+ * @returns {string}
  */
-function upsertWineSystemRegKey(bottlePath, subKeyPath, entries, options = {}) {
-  const regFilePath =
-    typeof options.regFilePath === 'string' && options.regFilePath
-      ? options.regFilePath
-      : bottlePath
-        ? path.join(bottlePath, 'system.reg')
-        : '';
-  if (!regFilePath || !subKeyPath) {
-    return { updated: false, regFilePath: '' };
-  }
-
-  const normalizedSubKey = String(subKeyPath)
-    .trim()
-    .replace(/^\\+|\\+$/g, '')
-    .replace(/\\+/g, '\\');
-  if (!normalizedSubKey) {
-    return { updated: false, regFilePath };
-  }
-
+function applyWineRegSectionUpsertToContent(content, normalizedSubKey, entryPairs, unixSec) {
   const escapedSectionPath = normalizedSubKey.replace(/\\/g, '\\\\');
-  /** @type {Array<[string, any]>} */
-  const entryPairs = Array.isArray(entries)
-    ? entries
-    : entries && typeof entries === 'object'
-      ? Object.entries(entries)
-      : [];
-
-  let content = '';
-  if (fs.existsSync(regFilePath)) {
-    try {
-      content = fs.readFileSync(regFilePath, 'utf8');
-    } catch {
-      content = '';
-    }
-  }
-
-  if (!content.trim()) {
-    content = 'WINE REGISTRY Version 2\n;; All keys relative to \\\\Machine\n\n#arch=win64\n';
-  }
-
-  const unixSec = Math.floor(Date.now() / 1000);
   const sectionHeaderRe = new RegExp(
     `^\\[${escapeRegExp(escapedSectionPath)}\\](?:\\s+\\d+)?[^\\r\\n]*$`,
     'im'
@@ -425,30 +572,49 @@ function upsertWineSystemRegKey(bottlePath, subKeyPath, entries, options = {}) {
     /** @type {Map<string, [string, any]>} */
     const pendingByLower = new Map();
     for (const [k, v] of entryPairs) {
-      pendingByLower.set(String(k).toLowerCase(), [String(k), v]);
+      const kStr = String(k ?? '');
+      const normKey = kStr === '' || kStr === '@' ? '@' : kStr.toLowerCase();
+      pendingByLower.set(normKey, [kStr, v]);
     }
 
     /** @type {Set<string>} */
     const updatedLower = new Set();
-    const nextBodyLines = bodyLines.map((line) => {
+    /** @type {string[]} */
+    const nextBodyLines = [];
+    for (const line of bodyLines) {
+      if (/^\s*@=/.test(line) && pendingByLower.has('@')) {
+        const pair = pendingByLower.get('@');
+        updatedLower.add('@');
+        if (pair && !(pair[1] && typeof pair[1] === 'object' && pair[1].delete === true)) {
+          nextBodyLines.push(formatWineRegEntryLine(pair[0], pair[1]));
+        }
+        continue;
+      }
       const kvMatch = line.match(/^\s*"((?:[^"\\]|\\.)+)"\s*=/);
-      if (!kvMatch) return line;
+      if (!kvMatch) {
+        nextBodyLines.push(line);
+        continue;
+      }
       const unescapedKey = kvMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
       const lowerKey = unescapedKey.toLowerCase();
       if (pendingByLower.has(lowerKey)) {
         const pair = pendingByLower.get(lowerKey);
-        if (pair) {
-          updatedLower.add(lowerKey);
-          return formatWineRegEntryLine(pair[0], pair[1]);
+        updatedLower.add(lowerKey);
+        if (pair && !(pair[1] && typeof pair[1] === 'object' && pair[1].delete === true)) {
+          nextBodyLines.push(formatWineRegEntryLine(pair[0], pair[1]));
         }
+        continue;
       }
-      return line;
-    });
+      nextBodyLines.push(line);
+    }
 
     /** @type {string[]} */
     const toAppend = [];
     for (const [lowerKey, pair] of pendingByLower.entries()) {
-      if (!updatedLower.has(lowerKey)) {
+      if (
+        !updatedLower.has(lowerKey) &&
+        !(pair[1] && typeof pair[1] === 'object' && pair[1].delete === true)
+      ) {
         toAppend.push(formatWineRegEntryLine(pair[0], pair[1]));
       }
     }
@@ -472,25 +638,145 @@ function upsertWineSystemRegKey(bottlePath, subKeyPath, entries, options = {}) {
     }
 
     const updatedHeader = `[${escapedSectionPath}] ${unixSec}`;
-    content = content.slice(0, match.index) + updatedHeader + rebuiltBody + rest;
-  } else {
-    const formattedLines = entryPairs.map(([k, v]) => formatWineRegEntryLine(String(k), v));
-    const sep = content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
-    content = `${content}${sep}[${escapedSectionPath}] ${unixSec}\n${formattedLines.join('\n')}\n`;
+    return content.slice(0, match.index) + updatedHeader + rebuiltBody + rest;
+  }
+
+  const formattedLines = entryPairs
+    .filter(([, v]) => !(v && typeof v === 'object' && v.delete === true))
+    .map(([k, v]) => formatWineRegEntryLine(String(k), v));
+  const sep = content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
+  const bodyPart = formattedLines.length > 0 ? `${formattedLines.join('\n')}\n` : '';
+  return `${content}${sep}[${escapedSectionPath}] ${unixSec}\n${bodyPart}`;
+}
+
+function normalizeWineRegContentIgnoringSectionTimestamps(raw) {
+  return String(raw || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/^(\[[^\r\n\]]+\])\s+\d+\s*$/gm, '$1')
+    .trimEnd();
+}
+
+/**
+ * Upserts multiple registry keys inside a Wine bottle `.reg` file (`system.reg` by default)
+ * in a single read/write pass and a single live `reg.exe import` when `wineserver` is active.
+ *
+ * @param {string} bottlePath
+ * @param {Array<{ subKeyPath: string, entries: Array<[string, any]> | Record<string, any> }>} keySpecs
+ * @param {Record<string, any>} [options]
+ * @returns {{ updated: boolean, regFilePath: string }}
+ */
+function upsertWineSystemRegKeysBatch(bottlePath, keySpecs, options = {}) {
+  const regFilePath =
+    typeof options.regFilePath === 'string' && options.regFilePath
+      ? options.regFilePath
+      : bottlePath
+        ? path.join(bottlePath, 'system.reg')
+        : '';
+  if (!regFilePath || !Array.isArray(keySpecs) || keySpecs.length === 0) {
+    return { updated: false, regFilePath: '' };
+  }
+
+  /** @type {'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE'} */
+  const hiveName =
+    path.basename(regFilePath).toLowerCase() === 'user.reg'
+      ? 'HKEY_CURRENT_USER'
+      : 'HKEY_LOCAL_MACHINE';
+
+  /** @type {Array<{ hiveName: 'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE', normalizedSubKey: string, entryPairsOrNullForDelete: Array<[string, any]> }>} */
+  const normalizedSpecs = [];
+  for (const spec of keySpecs) {
+    if (!spec || !spec.subKeyPath) continue;
+    const normalizedSubKey = String(spec.subKeyPath)
+      .trim()
+      .replace(/^\\+|\\+$/g, '')
+      .replace(/\\+/g, '\\');
+    if (!normalizedSubKey) continue;
+    /** @type {Array<[string, any]>} */
+    const entryPairs = Array.isArray(spec.entries)
+      ? spec.entries
+      : spec.entries && typeof spec.entries === 'object'
+        ? Object.entries(spec.entries)
+        : [];
+    normalizedSpecs.push({
+      hiveName,
+      normalizedSubKey,
+      entryPairsOrNullForDelete: entryPairs,
+    });
+  }
+  if (normalizedSpecs.length === 0) {
+    return { updated: false, regFilePath };
+  }
+
+  let content = '';
+  let hadExistingFile = false;
+  if (fs.existsSync(regFilePath)) {
+    try {
+      content = fs.readFileSync(regFilePath, 'utf8');
+      hadExistingFile = true;
+    } catch {
+      content = '';
+    }
+  }
+  const priorContent = content;
+
+  if (!content.trim()) {
+    content =
+      hiveName === 'HKEY_CURRENT_USER'
+        ? 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n'
+        : 'WINE REGISTRY Version 2\n;; All keys relative to \\\\Machine\n\n#arch=win64\n';
+  }
+
+  const unixSec = Math.floor(Date.now() / 1000);
+  for (const spec of normalizedSpecs) {
+    content = applyWineRegSectionUpsertToContent(
+      content,
+      spec.normalizedSubKey,
+      spec.entryPairsOrNullForDelete,
+      unixSec
+    );
+  }
+
+  if (
+    hadExistingFile &&
+    priorContent.trim() &&
+    options.forceLiveWineRegSync !== true &&
+    normalizeWineRegContentIgnoringSectionTimestamps(content) ===
+      normalizeWineRegContentIgnoringSectionTimestamps(priorContent)
+  ) {
+    return { updated: false, regFilePath };
   }
 
   fs.mkdirSync(path.dirname(regFilePath), { recursive: true });
   atomicWriteFileSync(regFilePath, content);
-  if (bottlePath && options.skipLiveWineRegSync !== true) {
-    const hiveName =
-      path.basename(regFilePath).toLowerCase() === 'user.reg'
-        ? 'HKEY_CURRENT_USER'
-        : 'HKEY_LOCAL_MACHINE';
-    syncLiveWineRegistryAsync(bottlePath, hiveName, normalizedSubKey, entryPairs, options).catch(
-      () => {}
-    );
+  if (Array.isArray(options.liveSyncAccumulator)) {
+    options.liveSyncAccumulator.push(...normalizedSpecs);
+  } else if (bottlePath && options.skipLiveWineRegSync !== true) {
+    syncLiveWineRegistryBatchAsync(bottlePath, hiveName, normalizedSpecs, options).catch(() => {});
   }
   return { updated: true, regFilePath };
+}
+
+/**
+ * Upserts a registry key and values inside a Wine bottle `.reg` file (`system.reg` by default).
+ * Preserves `WINE REGISTRY Version 2` header, `#arch=` directive, and any unrelated keys.
+ *
+ * @param {string} bottlePath
+ * @param {string} subKeyPath
+ * @param {Array<[string, any]> | Record<string, any>} entries
+ * @param {Record<string, any>} [options]
+ * @returns {{ updated: boolean, regFilePath: string }}
+ */
+function upsertWineSystemRegKey(bottlePath, subKeyPath, entries, options = {}) {
+  if (!subKeyPath) {
+    const regFilePath =
+      typeof options.regFilePath === 'string' && options.regFilePath
+        ? options.regFilePath
+        : bottlePath
+          ? path.join(bottlePath, 'system.reg')
+          : '';
+    return { updated: false, regFilePath: regFilePath ? '' : '' };
+  }
+  return upsertWineSystemRegKeysBatch(bottlePath, [{ subKeyPath, entries }], options);
 }
 
 /**
@@ -570,11 +856,18 @@ function deleteWineSystemRegKey(bottlePath, subKeyPath, options = {}) {
   if (removed > 0) {
     const cleaned = outLines.join('\n').replace(/\n{3,}/g, '\n\n');
     atomicWriteFileSync(regFilePath, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`);
-    if (bottlePath && options.skipLiveWineRegSync !== true) {
-      const hiveName =
-        path.basename(regFilePath).toLowerCase() === 'user.reg'
-          ? 'HKEY_CURRENT_USER'
-          : 'HKEY_LOCAL_MACHINE';
+    /** @type {'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE'} */
+    const hiveName =
+      path.basename(regFilePath).toLowerCase() === 'user.reg'
+        ? 'HKEY_CURRENT_USER'
+        : 'HKEY_LOCAL_MACHINE';
+    if (Array.isArray(options.liveSyncAccumulator)) {
+      options.liveSyncAccumulator.push({
+        hiveName,
+        normalizedSubKey,
+        entryPairsOrNullForDelete: null,
+      });
+    } else if (bottlePath && options.skipLiveWineRegSync !== true) {
       syncLiveWineRegistryAsync(bottlePath, hiveName, normalizedSubKey, null, options).catch(
         () => {}
       );
@@ -865,7 +1158,10 @@ module.exports = {
   isBottleWineserverActive,
   resolveWineBinaryForBottle,
   syncLiveWineRegistryAsync,
+  syncLiveWineRegistryBatchAsync,
+  flushLiveWineRegistryAccumulator,
   upsertWineSystemRegKey,
+  upsertWineSystemRegKeysBatch,
   deleteWineSystemRegKey,
   computeDotNetUtcTicksBigInt,
   syncEpicEoshInstalledItem,

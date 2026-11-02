@@ -761,6 +761,21 @@ void xgr_load_runtime_config(const struct xgr_initialize_options *options)
             snprintf(g_xgr_cfg.titleIdHex, sizeof(g_xgr_cfg.titleIdHex), "%08X", g_xgr_cfg.titleId);
         }
     }
+    if (read_first_nonempty_env(L"ONE_XGR_LOCALE", L"ONE_LAUNCHER_XBOX_LOCALE", env_buf, sizeof(env_buf))) {
+        snprintf(g_xgr_cfg.locale, sizeof(g_xgr_cfg.locale), "%s", env_buf);
+    }
+    if (read_first_nonempty_env(L"ONE_XGR_SAVE_ROOT", L"ONE_LAUNCHER_XBOX_SAVE_ROOT", env_buf, sizeof(env_buf))) {
+        snprintf(g_xgr_cfg.saveRootUtf8, sizeof(g_xgr_cfg.saveRootUtf8), "%s", env_buf);
+    }
+
+    char startup_invite_uri[1024] = {0};
+    if (read_first_nonempty_env(L"ONE_XGR_INVITE_URI", L"ONE_LAUNCHER_XBOX_INVITE_URI", startup_invite_uri, sizeof(startup_invite_uri))) {
+        snprintf(g_xgr_cfg.inviteUri, sizeof(g_xgr_cfg.inviteUri), "%s", startup_invite_uri);
+    }
+
+    if (!xgr_rpc_is_configured()) {
+        g_xgr_cfg.offline = true;
+    }
 
     /* 4. Fall back to Store catalog metadata in .onelauncher-xbox-{receipt,install}.json before hashing CN=... */
     if (!g_xgr_cfg.packageFamilyName[0] && receipt_pfn[0]) {
@@ -810,6 +825,19 @@ void xgr_load_runtime_config(const struct xgr_initialize_options *options)
 
     g_xgr_cfg.initialized = true;
     ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+
+    if (startup_invite_uri[0]) {
+        xgr_set_pending_invite_uri(startup_invite_uri);
+    }
+}
+
+void xgr_runtime_config_reset(void)
+{
+    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    SRWLOCK saved_lock = g_xgr_cfg.lock;
+    memset(&g_xgr_cfg, 0, sizeof(g_xgr_cfg));
+    g_xgr_cfg.lock = saved_lock;
+    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
 }
 
 void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_snap)
@@ -826,6 +854,8 @@ void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_sn
     out_snap->initialized = g_xgr_cfg.initialized;
     out_snap->packaged = g_xgr_cfg.packaged;
     out_snap->fullTrust = g_xgr_cfg.fullTrust;
+    out_snap->offline = g_xgr_cfg.offline;
+    out_snap->sessionXuid = g_xgr_cfg.sessionXuid;
     out_snap->titleId = g_xgr_cfg.titleId;
     memcpy(out_snap->titleIdHex, g_xgr_cfg.titleIdHex, sizeof(out_snap->titleIdHex));
     memcpy(out_snap->scid, g_xgr_cfg.scid, sizeof(out_snap->scid));
@@ -836,6 +866,8 @@ void xgr_copy_runtime_config_snapshot(struct xgr_runtime_config_snapshot *out_sn
     memcpy(out_snap->packageFamilyName, g_xgr_cfg.packageFamilyName, sizeof(out_snap->packageFamilyName));
     memcpy(out_snap->packageIdentifier, g_xgr_cfg.packageIdentifier, sizeof(out_snap->packageIdentifier));
     memcpy(out_snap->displayName, g_xgr_cfg.displayName, sizeof(out_snap->displayName));
+    memcpy(out_snap->locale, g_xgr_cfg.locale, sizeof(out_snap->locale));
+    memcpy(out_snap->saveRootUtf8, g_xgr_cfg.saveRootUtf8, sizeof(out_snap->saveRootUtf8));
     out_snap->version = g_xgr_cfg.version;
     ReleaseSRWLockShared(&g_xgr_cfg.lock);
 }
@@ -853,4 +885,317 @@ void xgr_copy_game_root_utf8(char *out_buf, size_t out_size)
     AcquireSRWLockShared(&g_xgr_cfg.lock);
     snprintf(out_buf, out_size, "%s", g_xgr_cfg.gameRootUtf8);
     ReleaseSRWLockShared(&g_xgr_cfg.lock);
+}
+
+static const char *cfg_find_json_array(const char *json, const char *key)
+{
+    if (!json || !key) return NULL;
+    char pat[128];
+    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return NULL;
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *after = p + plen;
+        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+        if (*after == ':') {
+            after++;
+            while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+            return (*after == '[') ? after : NULL;
+        }
+        p += plen;
+    }
+    return NULL;
+}
+
+static const char *cfg_next_json_object_in_array(const char *cursor, char **out_obj_str)
+{
+    if (!cursor || !out_obj_str) return NULL;
+    *out_obj_str = NULL;
+    const char *p = cursor;
+    while (*p && *p != '{' && *p != ']') p++;
+    if (*p != '{') return NULL;
+
+    const char *start = p;
+    int depth = 0;
+    bool in_str = false;
+    while (*p) {
+        char c = *p;
+        if (in_str) {
+            if (c == '\\' && p[1]) {
+                p += 2;
+                continue;
+            }
+            if (c == '"') in_str = false;
+        } else {
+            if (c == '"') in_str = true;
+            else if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    size_t len = (size_t)(p - start + 1);
+                    char *buf = (char *)malloc(len + 1);
+                    if (!buf) return NULL;
+                    memcpy(buf, start, len);
+                    buf[len] = '\0';
+                    *out_obj_str = buf;
+                    return p + 1;
+                }
+            }
+        }
+        p++;
+    }
+    return NULL;
+}
+
+void xgr_apply_session_init_json(const char *res_json)
+{
+    if (!res_json || !res_json[0]) return;
+
+    bool offline_val = false;
+    bool has_offline = xgr_json_get_bool(res_json, "offline", &offline_val);
+
+    uint64_t sess_xuid = 0;
+    bool has_xuid = xgr_json_get_uint64(res_json, "xuid", &sess_xuid) && sess_xuid != 0ULL;
+
+    char sess_scid[128] = {0};
+    bool has_scid = xgr_json_get_string(res_json, "scid", sess_scid, sizeof(sess_scid)) && sess_scid[0] != '\0';
+
+    char sess_store_id[32] = {0};
+    bool has_store_id = xgr_json_get_string(res_json, "storeId", sess_store_id, sizeof(sess_store_id)) && sess_store_id[0] != '\0';
+
+    char sess_pfn[256] = {0};
+    bool has_pfn = xgr_json_get_string(res_json, "packageFamilyName", sess_pfn, sizeof(sess_pfn)) && sess_pfn[0] != '\0';
+
+    char sess_pkg_id[256] = {0};
+    bool has_pkg_id = xgr_json_get_string(res_json, "packageIdentifier", sess_pkg_id, sizeof(sess_pkg_id)) && sess_pkg_id[0] != '\0';
+
+    char loc_buf[32] = {0};
+    bool has_locale = xgr_json_get_string(res_json, "locale", loc_buf, sizeof(loc_buf)) && loc_buf[0] != '\0';
+
+    char inv_buf[1024] = {0};
+    bool has_invite = xgr_json_get_string(res_json, "inviteUri", inv_buf, sizeof(inv_buf)) && inv_buf[0] != '\0';
+
+    struct xgr_dlc_package_entry parsed_dlcs[XGR_MAX_DLC_PACKAGES];
+    memset(parsed_dlcs, 0, sizeof(parsed_dlcs));
+    uint32_t parsed_dlc_count = 0;
+    bool has_dlc_array = false;
+
+    const char *dlc_arr = cfg_find_json_array(res_json, "dlcPackages");
+    if (dlc_arr) {
+        has_dlc_array = true;
+        const char *scan = dlc_arr + 1;
+        char *obj = NULL;
+        while (parsed_dlc_count < XGR_MAX_DLC_PACKAGES &&
+               (scan = cfg_next_json_object_in_array(scan, &obj)) != NULL) {
+            struct xgr_dlc_package_entry *ent = &parsed_dlcs[parsed_dlc_count];
+            char raw_id[256] = {0};
+            if (!xgr_json_get_string(obj, "packageIdentifier", raw_id, sizeof(raw_id)) || !raw_id[0]) {
+                xgr_json_get_string(obj, "id", raw_id, sizeof(raw_id));
+            }
+            if (raw_id[0]) {
+                snprintf(ent->id, sizeof(ent->id), "%.32s", raw_id);
+            }
+            xgr_json_get_string(obj, "storeId", ent->store_id, sizeof(ent->store_id));
+            xgr_json_get_string(obj, "displayName", ent->display_name, sizeof(ent->display_name));
+            char ver_str[64] = {0};
+            if (xgr_json_get_string(obj, "version", ver_str, sizeof(ver_str)) && ver_str[0]) {
+                parse_version_quad(ver_str, &ent->version);
+            } else {
+                ent->version.major = 1;
+            }
+            if (!xgr_json_get_string(obj, "mountPathWin", ent->mount_path_win, sizeof(ent->mount_path_win)) ||
+                !ent->mount_path_win[0]) {
+                if (!xgr_json_get_string(obj, "mountPath", ent->mount_path_win, sizeof(ent->mount_path_win)) ||
+                    !ent->mount_path_win[0]) {
+                    xgr_json_get_string(obj, "mountPathHost", ent->mount_path_win, sizeof(ent->mount_path_win));
+                }
+            }
+            if (ent->id[0] && ent->mount_path_win[0]) {
+                if (!ent->display_name[0]) {
+                    snprintf(ent->display_name, sizeof(ent->display_name), "%s", ent->id);
+                }
+                parsed_dlc_count++;
+            }
+            free(obj);
+        }
+    }
+
+    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    g_xgr_cfg.sessionMetadataLoaded = true;
+    if (has_offline) {
+        g_xgr_cfg.offline = offline_val;
+    } else {
+        g_xgr_cfg.offline = false;
+    }
+    if (has_xuid) {
+        g_xgr_cfg.sessionXuid = sess_xuid;
+    }
+    if (has_scid && !g_xgr_cfg.scid[0]) {
+        for (size_t i = 0; sess_scid[i]; i++) sess_scid[i] = (char)tolower((unsigned char)sess_scid[i]);
+        snprintf(g_xgr_cfg.scid, sizeof(g_xgr_cfg.scid), "%s", sess_scid);
+    }
+    if (has_store_id && !g_xgr_cfg.storeId[0]) {
+        for (size_t i = 0; sess_store_id[i]; i++) sess_store_id[i] = (char)toupper((unsigned char)sess_store_id[i]);
+        snprintf(g_xgr_cfg.storeId, sizeof(g_xgr_cfg.storeId), "%s", sess_store_id);
+    }
+    if (has_pfn &&
+        (!g_xgr_cfg.packageFamilyName[0] ||
+         strcmp(g_xgr_cfg.packageFamilyName, "OneLauncher.XboxTitle_8wekyb3d8bbwe") == 0)) {
+        snprintf(g_xgr_cfg.packageFamilyName, sizeof(g_xgr_cfg.packageFamilyName), "%s", sess_pfn);
+    }
+    if (has_pkg_id &&
+        (!g_xgr_cfg.packageIdentifier[0] ||
+         strncmp(g_xgr_cfg.packageIdentifier, "OneLauncher.XboxTitle_", 22) == 0)) {
+        snprintf(g_xgr_cfg.packageIdentifier, sizeof(g_xgr_cfg.packageIdentifier), "%.32s", sess_pkg_id);
+    }
+    if (has_locale) {
+        snprintf(g_xgr_cfg.locale, sizeof(g_xgr_cfg.locale), "%s", loc_buf);
+    }
+    if (has_invite) {
+        snprintf(g_xgr_cfg.inviteUri, sizeof(g_xgr_cfg.inviteUri), "%s", inv_buf);
+    }
+    if (has_dlc_array) {
+        g_xgr_cfg.dlcCount = parsed_dlc_count;
+        memcpy(g_xgr_cfg.dlcPackages, parsed_dlcs, sizeof(parsed_dlcs));
+    }
+    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+
+    if (has_invite) {
+        xgr_set_pending_invite_uri(inv_buf);
+    }
+}
+
+void xgr_ensure_session_metadata_loaded(void)
+{
+    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    bool init = g_xgr_cfg.initialized;
+    bool loaded = g_xgr_cfg.sessionMetadataLoaded;
+    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+
+    if (!init) {
+        xgr_load_runtime_config(NULL);
+        AcquireSRWLockShared(&g_xgr_cfg.lock);
+        loaded = g_xgr_cfg.sessionMetadataLoaded;
+        ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    }
+    if (loaded || !xgr_rpc_is_configured()) {
+        return;
+    }
+
+    struct xgr_runtime_config_snapshot cfg;
+    xgr_copy_runtime_config_snapshot(&cfg);
+
+    XgrStrBuf sb;
+    xgr_sb_init(&sb);
+    xgr_sb_append_fmt(&sb, "{\"titleId\":%u,\"scid\":", cfg.titleId);
+    xgr_sb_append_json_str(&sb, cfg.scid);
+    xgr_sb_append_cstr(&sb, ",\"pfn\":");
+    xgr_sb_append_json_str(&sb, cfg.packageFamilyName);
+    xgr_sb_append_cstr(&sb, ",\"storeId\":");
+    xgr_sb_append_json_str(&sb, cfg.storeId);
+    xgr_sb_append_char(&sb, '}');
+
+    char *params = xgr_sb_detach(&sb);
+    if (!params) return;
+
+    char *res = NULL;
+    if (SUCCEEDED(xgr_rpc_call("session.init", params, &res)) && res) {
+        xgr_apply_session_init_json(res);
+    } else {
+        AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+        g_xgr_cfg.sessionMetadataLoaded = true;
+        g_xgr_cfg.offline = true;
+        ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+    }
+    free(res);
+    free(params);
+}
+
+bool xgr_is_offline_mode(void)
+{
+    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    bool init = g_xgr_cfg.initialized;
+    bool off = g_xgr_cfg.offline;
+    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    if (!init) {
+        xgr_load_runtime_config(NULL);
+        AcquireSRWLockShared(&g_xgr_cfg.lock);
+        off = g_xgr_cfg.offline;
+        ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    }
+    if (!xgr_rpc_is_configured()) return true;
+    return off;
+}
+
+void xgr_set_offline_mode(bool offline)
+{
+    AcquireSRWLockExclusive(&g_xgr_cfg.lock);
+    g_xgr_cfg.offline = offline;
+    ReleaseSRWLockExclusive(&g_xgr_cfg.lock);
+}
+
+uint32_t xgr_copy_dlc_packages(struct xgr_dlc_package_entry *out_entries, uint32_t max_entries)
+{
+    xgr_ensure_session_metadata_loaded();
+    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    uint32_t count = g_xgr_cfg.dlcCount;
+    if (out_entries && max_entries > 0 && count > 0) {
+        uint32_t n = count < max_entries ? count : max_entries;
+        memcpy(out_entries, g_xgr_cfg.dlcPackages, n * sizeof(*out_entries));
+        count = n;
+    }
+    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+    return count;
+}
+
+static bool dlc_id_matches(const char *query_id, const struct xgr_dlc_package_entry *ent)
+{
+    if (!query_id || !query_id[0] || !ent || !ent->id[0]) return false;
+    if (_stricmp(query_id, ent->id) == 0) return true;
+    if (ent->store_id[0] && _stricmp(query_id, ent->store_id) == 0) return true;
+
+    const char *q_us = strchr(query_id, '_');
+    size_t q_plen = q_us ? (size_t)(q_us - query_id) : strlen(query_id);
+
+    const char *e_us = strchr(ent->id, '_');
+    size_t e_plen = e_us ? (size_t)(e_us - ent->id) : strlen(ent->id);
+
+    if (q_plen >= 3 && q_plen == e_plen && _strnicmp(query_id, ent->id, q_plen) == 0) {
+        return true;
+    }
+    if (ent->store_id[0]) {
+        size_t s_len = strlen(ent->store_id);
+        if (q_plen >= 3 && q_plen == s_len && _strnicmp(query_id, ent->store_id, q_plen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool xgr_find_dlc_mount_path(const char *pkg_id, char *out_mount_path, size_t out_cap)
+{
+    if (!pkg_id || !pkg_id[0] || !out_mount_path || out_cap == 0) return false;
+    out_mount_path[0] = '\0';
+
+    xgr_ensure_session_metadata_loaded();
+
+    bool found = false;
+    AcquireSRWLockShared(&g_xgr_cfg.lock);
+    for (uint32_t i = 0; i < g_xgr_cfg.dlcCount && i < XGR_MAX_DLC_PACKAGES; i++) {
+        const struct xgr_dlc_package_entry *ent = &g_xgr_cfg.dlcPackages[i];
+        if (ent->mount_path_win[0] && dlc_id_matches(pkg_id, ent)) {
+            snprintf(out_mount_path, out_cap, "%s", ent->mount_path_win);
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_xgr_cfg.lock);
+
+    if (found) {
+        size_t len = strlen(out_mount_path);
+        while (len > 3 && (out_mount_path[len - 1] == '\\' || out_mount_path[len - 1] == '/')) {
+            out_mount_path[--len] = '\0';
+        }
+    }
+    return found;
 }

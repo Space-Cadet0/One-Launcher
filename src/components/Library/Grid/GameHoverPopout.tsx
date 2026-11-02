@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   Clock,
@@ -13,7 +13,13 @@ import { toOlMediaUrl } from '../../../contracts/network';
 import { steamMatcher } from '../../../services/steam/steamMatcher';
 import { steamApi } from '../../../services/steam/steamApi';
 import { getOpenCriticData, getTierColor } from '../../../services/opencritic/openCritic';
-import { getHowLongToBeat } from '../../../services/hltb/howLongToBeat';
+import {
+  fetchAndCacheHltb,
+  getHowLongToBeat,
+  hasAttemptedHltbLookup,
+  seedHltbFromVaultIfMissing,
+  type HltbData,
+} from '../../../services/hltb/howLongToBeat';
 import { getUserOverrideForGame } from '../../../services/storage/userOverrideStorage';
 import { StorefrontIcon, getStorefrontDisplayName } from '../../Common/StorefrontIcon';
 import {
@@ -38,7 +44,7 @@ export interface RenderGameHoverPopoutArgs {
   onContextMenu: (game: CanonicalGame, e: React.MouseEvent) => void;
 }
 
-export function renderGameHoverPopout({
+const GameHoverPopoutContent: React.FC<RenderGameHoverPopoutArgs> = ({
   hoveredGame,
   previewPos,
   popoutRef,
@@ -51,7 +57,7 @@ export function renderGameHoverPopout({
   onPopoutMouseLeave,
   onSelectGame,
   onContextMenu,
-}: RenderGameHoverPopoutArgs): React.ReactElement {
+}) => {
   const hoveredOverride =
     userOverridesMap[hoveredGame.id] || getUserOverrideForGame(hoveredGame, userOverridesMap);
   const targetAppId =
@@ -118,12 +124,76 @@ export function renderGameHoverPopout({
     hoveredGame.title,
     hoveredGame.reviewSummary?.positivePercent
   );
-  const hltb = getHowLongToBeat(
+  const syncHltb = getHowLongToBeat(
     hoveredGame.title,
     targetAppId,
     hoveredGame.genres,
     hoveredGame.tags
   );
+  const [asyncHltbState, setAsyncHltbState] = useState<{
+    gameId: string;
+    data: HltbData;
+  } | null>(null);
+  const hltb =
+    syncHltb ?? (asyncHltbState?.gameId === hoveredGame.id ? asyncHltbState.data : null);
+
+  useEffect(() => {
+    if (syncHltb || hasAttemptedHltbLookup(hoveredGame.title, targetAppId)) {
+      return;
+    }
+    let cancelled = false;
+    const activeGameId = hoveredGame.id;
+    const activeTitle = hoveredGame.title;
+
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          if (
+            activeGameId &&
+            typeof window !== 'undefined' &&
+            window.electronAPI?.offlineVault?.getGameDetail
+          ) {
+            const vaultDetail = await window.electronAPI.offlineVault
+              .getGameDetail(activeGameId)
+              .catch(() => null);
+            if (vaultDetail?.hltb) {
+              const seeded = seedHltbFromVaultIfMissing(activeTitle, targetAppId, vaultDetail.hltb);
+              if (seeded) {
+                if (!cancelled) {
+                  setAsyncHltbState({ gameId: activeGameId, data: seeded });
+                }
+                return;
+              }
+            }
+          }
+
+          const live = await fetchAndCacheHltb(activeTitle, targetAppId);
+          if (!live) return;
+          if (activeGameId && typeof window !== 'undefined') {
+            window.electronAPI?.offlineVault
+              ?.saveGameDetail?.({
+                gameId: activeGameId,
+                steamAppId: targetAppId ?? null,
+                canonicalTitle: activeTitle,
+                hltb: { ...live },
+              })
+              ?.catch?.(() => {});
+          }
+          if (!cancelled) {
+            setAsyncHltbState({ gameId: activeGameId, data: live });
+          }
+        } catch {
+          // Ignore hover HLTB fetch error
+        }
+      })();
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [hoveredGame.id, hoveredGame.title, targetAppId, Boolean(syncHltb)]);
+
   const displayedSynopsis =
     dynamicBlurb?.id === hoveredGame.id ? dynamicBlurb.blurb : cleanSynopsis;
 
@@ -363,6 +433,7 @@ export function renderGameHoverPopout({
               const isConnected = connectedSet.has(p.platformId);
               const isXboxExpiredUnplayable = Boolean(
                 p.platformId === 'xbox' &&
+                  p.installed &&
                   p.subscriptionExpired &&
                   p.ownershipType === 'subscription'
               );
@@ -436,4 +507,8 @@ export function renderGameHoverPopout({
       </div>
     </div>
   );
+};
+
+export function renderGameHoverPopout(args: RenderGameHoverPopoutArgs): React.ReactElement {
+  return <GameHoverPopoutContent {...args} />;
 }

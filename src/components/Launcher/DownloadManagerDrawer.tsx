@@ -197,7 +197,13 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
     );
   };
 
-  const totalSpeed = activeTasks.reduce((sum, t) => sum + (t.speedBytesPerSec || 0), 0);
+  const totalSpeed = activeTasks.reduce(
+    (sum, t) =>
+      t.status === 'downloading' || t.status === 'extracting' || t.status === 'verifying'
+        ? sum + (t.speedBytesPerSec || 0)
+        : sum,
+    0
+  );
 
   return (
     <ModalShell
@@ -228,7 +234,10 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
               </div>
               {totalSpeed > 0 && (
                 <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-mono mt-0.5">
-                  <Activity className="w-3 h-3 animate-pulse" aria-hidden="true" />
+                  <Activity
+                    className="w-3 h-3 animate-pulse motion-reduce:animate-none"
+                    aria-hidden="true"
+                  />
                   <span>{formatSpeed(totalSpeed)}</span>
                 </div>
               )}
@@ -336,22 +345,22 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                       value={Math.round(pct)}
                       max={100}
                       aria-label={`${task.title} download progress`}
-                    >
-                      {pct.toFixed(0)}%
-                    </progress>
+                    />
                     <div
                       aria-hidden="true"
                       className="w-full h-2 rounded-full bg-[#0d131b] overflow-hidden border border-white/5"
                     >
                       <div
-                        className={`h-full rounded-full transition-all duration-300 ${
+                        className={`h-full rounded-full transition-all duration-300 motion-reduce:transition-none ${
                           isDone
                             ? 'bg-emerald-400'
                             : isFailed
                               ? 'bg-red-500'
                               : isPaused
                                 ? 'bg-amber-400'
-                                : 'bg-gradient-to-r from-sky-400 to-blue-500'
+                                : task.status === 'extracting' || task.status === 'verifying'
+                                  ? 'bg-gradient-to-r from-indigo-400 to-purple-500'
+                                  : 'bg-gradient-to-r from-sky-400 to-blue-500'
                         }`}
                         style={{ width: `${pct}%` }}
                       />
@@ -363,8 +372,12 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                     <div className="flex flex-wrap items-center gap-2.5 font-mono">
                       {(() => {
                         const validTotalBytes = sanitizeGameInstallSizeBytes(task.totalBytes) ?? 0;
-                        const validBytesDownloaded =
+                        const rawBytesDownloaded =
                           sanitizeGameInstallSizeBytes(task.bytesDownloaded) ?? 0;
+                        const validBytesDownloaded =
+                          validTotalBytes > 0
+                            ? Math.min(rawBytesDownloaded, validTotalBytes)
+                            : rawBytesDownloaded;
                         if (validTotalBytes > 0) {
                           return (
                             <span>
@@ -383,13 +396,28 @@ export const DownloadManagerDrawer: React.FC<DownloadManagerDrawerProps> = ({
                         }
                         return <span>{formatBytes(validBytesDownloaded)}</span>;
                       })()}
-                      {task.status === 'downloading' && task.speedBytesPerSec > 0 && (
-                        <span className="text-sky-400">{formatSpeed(task.speedBytesPerSec)}</span>
-                      )}
-                      {task.status === 'downloading' &&
-                        task.speedBytesPerSec > 0 &&
+                      {(task.status === 'downloading' ||
+                        task.status === 'extracting' ||
+                        task.status === 'verifying') &&
+                        task.speedBytesPerSec > 0 && (
+                          <span
+                            className={
+                              task.status === 'extracting' || task.status === 'verifying'
+                                ? 'text-indigo-300'
+                                : 'text-sky-400'
+                            }
+                          >
+                            {task.status === 'extracting' || task.status === 'verifying'
+                              ? `Disk ${formatSpeed(task.speedBytesPerSec)}`
+                              : formatSpeed(task.speedBytesPerSec)}
+                          </span>
+                        )}
+                      {(task.status === 'downloading' ||
+                        task.status === 'extracting' ||
+                        task.status === 'verifying') &&
                         task.etaSeconds !== undefined &&
-                        task.etaSeconds > 0 && (
+                        task.etaSeconds > 0 &&
+                        Number.isFinite(task.etaSeconds) && (
                           <span className="flex items-center gap-1 text-steam-subtext">
                             <Clock className="w-2.5 h-2.5" aria-hidden="true" />
                             <span>ETA {formatEta(task.etaSeconds)}</span>

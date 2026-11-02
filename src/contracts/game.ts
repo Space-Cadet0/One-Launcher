@@ -38,23 +38,41 @@ export type XboxBottleCompatibilityTier =
   | 'tier_c_kernel_anticheat'
   | 'tier_c_external_launcher';
 
+export type ChainedHandoffTopology =
+  | 'publisher_managed'
+  | 'partner_launcher_link'
+  | 'storefront_depot_uri';
+
+export type XboxSubscriptionTierId =
+  | 'ultimate'
+  | 'pc'
+  | 'premium'
+  | 'essential'
+  | 'ea_play'
+  | 'ubisoft_classics'
+  | 'starter'
+  | 'console_only'
+  | 'custom_pass'
+  | 'none';
+
 export interface XboxSubscriptionSummary {
   hasActiveSubscription: boolean;
   hasPcCatalogAccess: boolean;
   primaryProductId?: string;
-  tierId?:
-    | 'ultimate'
-    | 'pc'
-    | 'premium'
-    | 'essential'
-    | 'ea_play'
-    | 'console_only'
-    | 'none';
+  tierId?: XboxSubscriptionTierId;
   tierDisplayName: string;
   status?: string;
   endDate?: string;
+  earliestActivePassEndDate?: string;
   autoRenew?: boolean;
+  isTrial?: boolean;
+  market?: string;
   activeProductIds?: string[];
+  activeEntitlementKeys?: string[];
+  expandedCapabilityPassIds?: string[];
+  subscriptionFingerprint?: string;
+  authoritativeDetection?: boolean;
+  checkedAt?: string;
 }
 
 export interface GamePlatformOwnership {
@@ -85,11 +103,20 @@ export interface GamePlatformOwnership {
   msaAppId?: string;
   ownershipType?: XboxOwnershipType;
   gamePassTier?: string;
+  satisfyingPassIds?: string[];
+  subscriptionTierId?: XboxSubscriptionTierId;
   isLeavingSoon?: boolean;
   isRecentlyAddedToGamePass?: boolean;
   subscriptionExpired?: boolean;
+  isCrossPlatformLauncherRuntime?: boolean;
   externalStorefrontHandoff?: StorefrontId | 'riot';
   xboxBottleCompatibilityTier?: XboxBottleCompatibilityTier;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   packageFormat?: 'uwp' | 'gdk' | 'win32' | string;
   lastPlayed?: string;
   playtimeMinutes?: number;
@@ -97,6 +124,7 @@ export interface GamePlatformOwnership {
 }
 
 export type PlatformOwnership = GamePlatformOwnership;
+export type PlatformEntry = GamePlatformOwnership;
 
 export interface CanonicalGame {
   id: string; // canonical slug / uuid
@@ -139,5 +167,7 @@ export interface CanonicalGame {
   matchConfidence?: number;
   needsMatchReview?: boolean;
   isVerifiedEntitlement?: boolean;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
 }
 

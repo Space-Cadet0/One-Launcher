@@ -13,7 +13,9 @@
 const TITLEHUB_BASE_URL = 'https://titlehub.xboxlive.com';
 const ACHIEVEMENTS_BASE_URL = 'https://achievements.xboxlive.com';
 const USERSTATS_BATCH_URL = 'https://userstats.xboxlive.com/batch';
+const USERPRESENCE_BASE_URL = 'https://userpresence.xboxlive.com';
 const XBOX_HTTP_TIMEOUT_MS = 20_000;
+const XBOX_PRESENCE_TIMEOUT_MS = 5_000;
 
 function buildXboxFetchSignal(callerSignal, timeoutMs = XBOX_HTTP_TIMEOUT_MS) {
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -723,6 +725,102 @@ async function fetchXboxDetailedAchievements(params = /** @type {any} */ ({})) {
   return buildAchievementsContainer([], 'v2');
 }
 
+/**
+ * Posts or clears an active Xbox Live title presence heartbeat on `userpresence.xboxlive.com`
+ * (`x-xbl-contract-version: 3`). Strictly best-effort (5s timeout, never throws).
+ */
+async function postXboxTitlePresenceHeartbeat(params = {}) {
+  try {
+    const fetchImpl = params.fetchImpl || globalThis.fetch;
+    if (typeof fetchImpl !== 'function') {
+      return { ok: false, skipped: true };
+    }
+
+    const normalizedState = String(params.state || 'active').trim().toLowerCase();
+    const isInactive = normalizedState === 'inactive';
+    const cleanTitleId = normalizeTitleIdString(params.titleIdDecimal ?? params.titleId);
+
+    if (!isInactive && (!/^\d+$/.test(cleanTitleId) || Number(cleanTitleId) <= 0)) {
+      return { ok: false, skipped: true };
+    }
+
+    let cleanXuid = String(params.xuid || '').trim();
+    let authHeader = String(params.authorizationHeader || '').trim();
+    if (!authHeader && params.uhs && params.xstsToken) {
+      authHeader = `XBL3.0 x=${String(params.uhs).trim()};${String(params.xstsToken).trim()}`;
+    }
+
+    const authProvider = params.authProvider;
+    if ((!cleanXuid || !authHeader) && authProvider) {
+      if (!cleanXuid && typeof authProvider.getUserProfile === 'function') {
+        try {
+          const prof = await authProvider.getUserProfile();
+          if (prof?.xuid) cleanXuid = String(prof.xuid).trim();
+        } catch {}
+      }
+      if (typeof authProvider.getXstsToken === 'function') {
+        try {
+          const xsts = await authProvider.getXstsToken('http://xboxlive.com');
+          if (!cleanXuid && xsts?.xuid) cleanXuid = String(xsts.xuid).trim();
+          if (!authHeader) {
+            if (xsts?.authorizationHeader) {
+              authHeader = String(xsts.authorizationHeader).trim();
+            } else if (xsts?.uhs && (xsts?.token || xsts?.xstsToken)) {
+              authHeader = `XBL3.0 x=${String(xsts.uhs).trim()};${String(xsts.token || xsts.xstsToken).trim()}`;
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (!cleanXuid) {
+      return { ok: false, skipped: true };
+    }
+
+    const url = `${USERPRESENCE_BASE_URL}/users/xuid(${encodeURIComponent(cleanXuid)})/devices/current/titles/current`;
+
+    if (!authHeader && authProvider && typeof authProvider.getTokenAndSignatureForUrl === 'function') {
+      try {
+        const tokRes = await authProvider.getTokenAndSignatureForUrl({
+          method: isInactive ? 'DELETE' : 'POST',
+          url,
+          headers: { 'x-xbl-contract-version': '3' },
+          titleId: cleanTitleId || undefined,
+        });
+        authHeader = String(tokRes?.token || tokRes?.authorization || '').trim();
+      } catch {}
+    }
+
+    if (!authHeader) {
+      return { ok: false, skipped: true };
+    }
+
+    const res = await fetchImpl(url, {
+      method: isInactive ? 'DELETE' : 'POST',
+      headers: {
+        Authorization: authHeader,
+        'x-xbl-contract-version': '3',
+        Accept: 'application/json',
+        ...(isInactive ? {} : { 'Content-Type': 'application/json' }),
+      },
+      ...(isInactive
+        ? {}
+        : {
+            body: JSON.stringify({
+              id: Number(cleanTitleId),
+              state: 'active',
+              placement: String(params.placement || 'full'),
+            }),
+          }),
+      signal: buildXboxFetchSignal(params.signal, XBOX_PRESENCE_TIMEOUT_MS),
+    });
+
+    return { ok: Boolean(res?.ok), status: Number(res?.status || 0) };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
 module.exports = {
   resolveDefaultXboxLocale,
   isValidNonSentinelTimestamp,
@@ -735,4 +833,5 @@ module.exports = {
   mapXboxV1Achievement,
   buildAchievementsContainer,
   fetchXboxDetailedAchievements,
+  postXboxTitlePresenceHeartbeat,
 };

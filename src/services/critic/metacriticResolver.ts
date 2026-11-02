@@ -1,7 +1,15 @@
 import { CriticScoreData, StorefrontReviewAnchor } from '../../contracts/critic';
 import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/network';
 import { calculateTier, isSequelMismatch, stripEditionSuffix } from './criticUtils';
-import { ROMAN_TO_ARABIC, NUMERIC_SEQUELS, extractSequelIdentifier, normalizeTitleKey } from '../common/titleUtils';
+import {
+  ROMAN_TO_ARABIC,
+  NUMERIC_SEQUELS,
+  decodeTitleHtmlEntities,
+  extractSequelIdentifier,
+  foldLatinLigaturesAndDiacritics,
+  normalizeTitleKey,
+  stripTrademarkSymbols,
+} from '../common/titleUtils';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
 
@@ -33,14 +41,14 @@ export const SPECIAL_CHAR_TRANSLITERATION: Record<string, string> = {
  */
 export function toCanonicalMetacriticSlug(title: string): string {
   if (!title) return '';
-  let clean = title;
+  let clean = decodeTitleHtmlEntities(title);
   for (const [char, rep] of Object.entries(SPECIAL_CHAR_TRANSLITERATION)) {
     clean = clean.replace(new RegExp(char, 'g'), ` ${rep} `);
   }
+  clean = foldLatinLigaturesAndDiacritics(stripTrademarkSymbols(clean));
   return clean
     .toLowerCase()
-    .replace(/[®™©]/g, '')
-    .replace(/['’ʼ`]/g, '')
+    .replace(/['’‘ʼ`´"“”]/g, '')
     .replace(/\s*\((?:[^)]*,\s*)?((?:19|20)\d{2})[^)]*\)/g, ' $1')
     .replace(/\s*\([a-z0-9\s,]+\)/gi, '')
     .replace(/[^a-z0-9]+/g, '-')

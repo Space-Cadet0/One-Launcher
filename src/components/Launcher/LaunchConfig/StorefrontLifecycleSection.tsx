@@ -10,15 +10,25 @@ import {
   StorefrontLaunchPolicyView,
 } from '../../../contracts/launcher';
 import { launcherService } from '../../../services/launcher/launcherService';
-import { Activity, AlertTriangle, CheckCircle2, ExternalLink, Info, Zap } from 'lucide-react';
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  ExternalLink,
+  Globe,
+  Info,
+  Zap,
+} from 'lucide-react';
 import {
   computeInGameFootprintBadge,
   formatGlobalInGameBehaviorDefaultLabel,
   getBadgeToneClasses,
   resolveEffectiveUiStorefrontLifecycle,
 } from './launchConfigHelpers';
+import { LaunchSelect, SwitchControl } from './LaunchConfigControls';
 
 export interface StorefrontLifecycleSectionProps {
+  idPrefix?: string;
   isWindowsHost: boolean;
   preview: ResolvedLaunchModePreview;
   activeDisplayMethod: LaunchMethod;
@@ -36,6 +46,7 @@ export interface StorefrontLifecycleSectionProps {
 }
 
 function StorefrontLifecycleSectionImpl({
+  idPrefix = 'launch-cfg',
   isWindowsHost,
   preview,
   activeDisplayMethod,
@@ -134,18 +145,26 @@ function StorefrontLifecycleSectionImpl({
           ? 'fast-minimal-launch-warning'
           : undefined;
 
+  const pauseSyncLabelId = `${idPrefix}-pause-sync-label`;
+  const pauseSyncHintId = `${idPrefix}-pause-sync-hint`;
+  const pauseDownloadsLabelId = `${idPrefix}-pause-downloads-label`;
+  const pauseDownloadsHintId = `${idPrefix}-pause-downloads-hint`;
+  const autoShutdownWineLabelId = `${idPrefix}-auto-shutdown-wine-label`;
+  const autoShutdownWineHintId = `${idPrefix}-auto-shutdown-wine-hint`;
+
   return (
-    <div
+    <section
       data-section="in-game-performance"
       data-testid="in-game-performance-section"
+      aria-label="In-Game Footprint & Performance"
       className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-3.5"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <Activity className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span className="text-xs font-bold text-white uppercase tracking-wider">
+          <Activity className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
+          <h3 className="text-xs font-bold text-white uppercase tracking-wider">
             In-Game Footprint &amp; Performance
-          </span>
+          </h3>
         </div>
         <span
           data-testid="in-game-footprint-mode-badge"
@@ -157,76 +176,45 @@ function StorefrontLifecycleSectionImpl({
         </span>
       </div>
 
-      {/* Per-Game One Launcher Window Footprint + Post-Exit Behavior */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <div className="space-y-1">
+      {/* Per-Game One Launcher Window Footprint */}
+      <div className="space-y-1.5">
+        <div className="flex flex-wrap items-center justify-between gap-1">
           <label
             htmlFor="in-game-launcher-behavior-select"
-            className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+            className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
           >
             One Launcher During Gameplay
           </label>
-          <select
-            id="in-game-launcher-behavior-select"
-            aria-label="In-Game Launcher Behavior"
-            data-testid="in-game-launcher-behavior-select"
-            value={inGameLauncherBehavior}
-            onChange={(e) => {
-              const val = e.target.value as 'default' | InGameLauncherBehavior;
-              onChangeInGameLauncherBehavior(val);
-            }}
-            className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
-          >
-            <option value="default">
-              {formatGlobalInGameBehaviorDefaultLabel(perfSettings.inGameLauncherBehavior)}
-            </option>
-            <option value="hide_tray_hibernate">
-              {isWindowsHost
-                ? 'Hide to System Tray & Hibernate UI (Recommended — 0% GPU)'
-                : 'Hide to Menu Bar & Hibernate UI (Recommended — 0% GPU)'}
-            </option>
-            <option value="zero_renderer_daemon">
-              Zero-Renderer Background Mode (Lowest RAM ~45 MB)
-            </option>
-            <option value="minimize_taskbar">
-              {isWindowsHost ? 'Minimize Window to Taskbar' : 'Minimize Window to Dock'}
-            </option>
-            <option value="keep_open">Keep One Launcher Window Open</option>
-          </select>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300 font-semibold">
+            Per-Game Profile
+          </span>
         </div>
-
-        <div className="space-y-1">
-          <label
-            htmlFor="post-game-launcher-behavior-select"
-            className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-          >
-            When Game Exits
-          </label>
-          <select
-            id="post-game-launcher-behavior-select"
-            aria-label="When Game Exits"
-            data-testid="post-game-launcher-behavior-select"
-            value={perfSettings.postGameLauncherBehavior}
-            onChange={(e) =>
-              onChangePostGameBehavior(e.target.value as PostGameLauncherBehavior)
-            }
-            className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
-          >
-            <option value="restore_window">
-              {effectiveInGameBehavior === 'keep_open'
-                ? 'Keep One Launcher Window Open'
-                : 'Restore One Launcher Window'}
-            </option>
-            {showStayMinimizedPostExitOption && (
-              <option value="stay_minimized">
-                {isWindowsHost
-                  ? 'Keep Hidden in System Tray'
-                  : 'Keep Hidden in Menu Bar'}
-              </option>
-            )}
-            <option value="exit_launcher">Quit One Launcher Automatically</option>
-          </select>
-        </div>
+        <LaunchSelect
+          id="in-game-launcher-behavior-select"
+          aria-label="In-Game Launcher Behavior"
+          data-testid="in-game-launcher-behavior-select"
+          value={inGameLauncherBehavior}
+          onChange={(e) => {
+            const val = e.target.value as 'default' | InGameLauncherBehavior;
+            onChangeInGameLauncherBehavior(val);
+          }}
+        >
+          <option value="default">
+            {formatGlobalInGameBehaviorDefaultLabel(perfSettings.inGameLauncherBehavior)}
+          </option>
+          <option value="hide_tray_hibernate">
+            {isWindowsHost
+              ? 'Hide to System Tray & Hibernate UI (Recommended — 0% GPU)'
+              : 'Hide to Menu Bar & Hibernate UI (Recommended — 0% GPU)'}
+          </option>
+          <option value="zero_renderer_daemon">
+            Zero-Renderer Background Mode (Lowest RAM ~45 MB)
+          </option>
+          <option value="minimize_taskbar">
+            {isWindowsHost ? 'Minimize Window to Taskbar' : 'Minimize Window to Dock'}
+          </option>
+          <option value="keep_open">Keep One Launcher Window Open</option>
+        </LaunchSelect>
       </div>
 
       {/* Unified Dynamic Storefront Launch Policy Card (filtered out for non-storefront custom games) */}
@@ -239,9 +227,10 @@ function StorefrontLifecycleSectionImpl({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-1.5">
               {infoBox.policyKey === 'protocol_delegated' ? (
-                <ExternalLink className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <ExternalLink className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
               ) : (
                 <Zap
+                  aria-hidden="true"
                   className={`w-3.5 h-3.5 shrink-0 ${
                     infoBox.severity === 'warning'
                       ? 'text-orange-400'
@@ -281,11 +270,17 @@ function StorefrontLifecycleSectionImpl({
               <div className="space-y-1">
                 <div className="flex items-start gap-2">
                   {infoBox.severity === 'warning' ? (
-                    <AlertTriangle className="w-4 h-4 text-orange-400 shrink-0 mt-0.5" />
+                    <AlertTriangle
+                      className="w-4 h-4 text-orange-400 shrink-0 mt-0.5"
+                      aria-hidden="true"
+                    />
                   ) : infoBox.severity === 'optimal' ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    <CheckCircle2
+                      className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <Info className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                    <Info className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" aria-hidden="true" />
                   )}
                   <span className={`font-bold leading-snug ${infoBoxHeadlineClasses}`}>
                     {infoBox.headline}
@@ -316,6 +311,7 @@ function StorefrontLifecycleSectionImpl({
                         className="flex items-start gap-1.5 text-[11px] leading-snug"
                       >
                         <span
+                          aria-hidden="true"
                           className={`font-bold shrink-0 ${
                             infoBox.severity === 'info' ? 'text-sky-400' : 'text-emerald-400'
                           }`}
@@ -365,6 +361,7 @@ function StorefrontLifecycleSectionImpl({
                         }`}
                       >
                         <span
+                          aria-hidden="true"
                           className={`font-bold shrink-0 ${
                             infoBox.severity === 'warning' ? 'text-orange-400' : 'opacity-80'
                           }`}
@@ -382,14 +379,14 @@ function StorefrontLifecycleSectionImpl({
 
           {/* Policy Dropdown (below Info Box) */}
           {resolvedPolicyView.showDropdown && (
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <label
                 htmlFor="storefront-client-lifecycle-select"
                 className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
               >
                 {resolvedPolicyView.cardHeading} Mode
               </label>
-              <select
+              <LaunchSelect
                 id="storefront-client-lifecycle-select"
                 aria-label={resolvedPolicyView.cardHeading}
                 data-testid="storefront-client-lifecycle-select"
@@ -399,103 +396,140 @@ function StorefrontLifecycleSectionImpl({
                     e.target.value as StorefrontClientLifecyclePolicy
                   )
                 }
-                className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
               >
                 {resolvedPolicyView.dropdownOptions.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
                   </option>
                 ))}
-              </select>
+              </LaunchSelect>
             </div>
           )}
         </div>
       )}
 
-      {/* Background Resource Controls (Wine cleanup strictly filtered to bottle/compatibility contexts) */}
-      <div className="space-y-2 pt-0.5">
-        <div className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext">
-          Background Activity During Gameplay
-        </div>
-
-        <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-white">
-              Pause Background Store Artwork &amp; Review Scans While Playing
-            </div>
-            <div className="text-[10px] text-steam-subtext">
-              Suspends library metadata and critic score crawlers during gameplay (game Cloud Saves
-              are unaffected)
-            </div>
+      {/* Global Gameplay Performance Defaults Sub-Card (distinctly badged as global scope) */}
+      <div
+        data-testid="global-gameplay-performance-card"
+        className="rounded-lg bg-[#121a27] border border-[#24364b] p-3.5 space-y-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Globe className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+            <h4 className="text-[11px] font-bold uppercase tracking-wider text-white">
+              Global Gameplay Performance Defaults
+            </h4>
           </div>
-          <button
-            type="button"
-            data-testid="toggle-pause-sync-in-game"
-            aria-pressed={perfSettings.pauseBackgroundSyncInGame}
-            onClick={onTogglePauseSyncInGame}
-            className={`px-3 py-1 rounded-md text-xs font-bold border transition-colors shrink-0 cursor-pointer ${
-              perfSettings.pauseBackgroundSyncInGame
-                ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:text-white'
-            }`}
+          <span
+            data-testid="global-performance-scope-badge"
+            className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-amber-300 font-semibold"
           >
-            {perfSettings.pauseBackgroundSyncInGame ? 'ON' : 'OFF'}
-          </button>
+            Applies to all games
+          </span>
         </div>
 
-        <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-white">
-              Pause Active Game Downloads While Playing
-            </div>
-            <div className="text-[10px] text-steam-subtext">
-              Pauses One Launcher downloads to free bandwidth and disk I/O during gameplay, then
-              resumes on exit
-            </div>
-          </div>
-          <button
-            type="button"
-            data-testid="toggle-pause-downloads-in-game"
-            aria-pressed={perfSettings.pauseDownloadsInGame}
-            onClick={onTogglePauseDownloadsInGame}
-            className={`px-3 py-1 rounded-md text-xs font-bold border transition-colors shrink-0 cursor-pointer ${
-              perfSettings.pauseDownloadsInGame
-                ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:text-white'
-            }`}
+        <div className="space-y-1.5">
+          <label
+            htmlFor="post-game-launcher-behavior-select"
+            className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
           >
-            {perfSettings.pauseDownloadsInGame ? 'ON' : 'OFF'}
-          </button>
+            When Game Exits
+          </label>
+          <LaunchSelect
+            id="post-game-launcher-behavior-select"
+            aria-label="When Game Exits"
+            data-testid="post-game-launcher-behavior-select"
+            surface="panel"
+            value={perfSettings.postGameLauncherBehavior}
+            onChange={(e) =>
+              onChangePostGameBehavior(e.target.value as PostGameLauncherBehavior)
+            }
+          >
+            <option value="restore_window">
+              {effectiveInGameBehavior === 'keep_open'
+                ? 'Keep One Launcher Window Open'
+                : 'Restore One Launcher Window'}
+            </option>
+            {showStayMinimizedPostExitOption && (
+              <option value="stay_minimized">
+                {isWindowsHost ? 'Keep Hidden in System Tray' : 'Keep Hidden in Menu Bar'}
+              </option>
+            )}
+            <option value="exit_launcher">Quit One Launcher Automatically</option>
+          </LaunchSelect>
         </div>
 
-        {isBottleContext && (
-          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-white">
-                Close Idle Bottle Background Daemons After Exit (wineserver -k)
-              </div>
-              <div className="text-[10px] text-steam-subtext">
-                Waits for Cloud Save uploads and active Bottle downloads to finish, then terminates
-                leftover wineserver / winedevice processes and silences Wine debug logs
-              </div>
+        <div className="space-y-2 pt-0.5">
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
+            <div className="min-w-0 space-y-0.5">
+              <span id={pauseSyncLabelId} className="block text-xs font-semibold text-white">
+                Pause Background Store Artwork &amp; Review Scans While Playing
+              </span>
+              <p id={pauseSyncHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Suspends library metadata and critic score crawlers during gameplay (game Cloud
+                Saves are unaffected)
+              </p>
             </div>
-            <button
-              type="button"
-              data-testid="toggle-auto-shutdown-wine"
-              aria-pressed={perfSettings.autoShutdownWinePrefixOnExit}
-              onClick={onToggleAutoShutdownWine}
-              className={`px-3 py-1 rounded-md text-xs font-bold border transition-colors shrink-0 cursor-pointer ${
-                perfSettings.autoShutdownWinePrefixOnExit
-                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                  : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:text-white'
-              }`}
-            >
-              {perfSettings.autoShutdownWinePrefixOnExit ? 'ON' : 'OFF'}
-            </button>
+            <SwitchControl
+              dataTestId="toggle-pause-sync-in-game"
+              checked={perfSettings.pauseBackgroundSyncInGame}
+              ariaLabelledBy={pauseSyncLabelId}
+              ariaDescribedBy={pauseSyncHintId}
+              onChange={onTogglePauseSyncInGame}
+              tone="emerald"
+            />
           </div>
-        )}
+
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
+            <div className="min-w-0 space-y-0.5">
+              <span id={pauseDownloadsLabelId} className="block text-xs font-semibold text-white">
+                Pause Active Game Downloads While Playing
+              </span>
+              <p id={pauseDownloadsHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Pauses One Launcher downloads to free bandwidth and disk I/O during gameplay, then
+                resumes on exit
+              </p>
+            </div>
+            <SwitchControl
+              dataTestId="toggle-pause-downloads-in-game"
+              checked={perfSettings.pauseDownloadsInGame}
+              ariaLabelledBy={pauseDownloadsLabelId}
+              ariaDescribedBy={pauseDownloadsHintId}
+              onChange={onTogglePauseDownloadsInGame}
+              tone="emerald"
+            />
+          </div>
+
+          {isBottleContext && (
+            <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
+              <div className="min-w-0 space-y-0.5">
+                <span
+                  id={autoShutdownWineLabelId}
+                  className="block text-xs font-semibold text-white"
+                >
+                  Close Idle Bottle Background Daemons After Exit (wineserver -k)
+                </span>
+                <p
+                  id={autoShutdownWineHintId}
+                  className="text-[10px] text-steam-subtext leading-snug"
+                >
+                  Waits for Cloud Save uploads and active Bottle downloads to finish, then
+                  terminates leftover wineserver / winedevice processes and silences Wine debug logs
+                </p>
+              </div>
+              <SwitchControl
+                dataTestId="toggle-auto-shutdown-wine"
+                checked={perfSettings.autoShutdownWinePrefixOnExit}
+                ariaLabelledBy={autoShutdownWineLabelId}
+                ariaDescribedBy={autoShutdownWineHintId}
+                onChange={onToggleAutoShutdownWine}
+                tone="emerald"
+              />
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </section>
   );
 }
 

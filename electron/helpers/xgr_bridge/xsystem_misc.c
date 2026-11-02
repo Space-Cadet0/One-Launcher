@@ -638,13 +638,13 @@ static HRESULT WINAPI xnet_QuerySecUrlAsync(void *iface, const void *url, XAsync
     return xgr_async_begin(ab, NULL, (const void *)xnet_QuerySecUrlAsync, "XNetworkingQuerySecurityInformationForUrlAsync", net_sec_provider);
 }
 
-static HRESULT WINAPI xnet_QuerySecUrlResultSize(void *iface, XAsyncBlock *ab, SIZE_T *sz)
+static HRESULT WINAPI xnet_QuerySecUrlResultSize(void *iface, XAsyncBlock *ab, size_t *sz)
 {
     (void)iface;
     return xgr_async_get_result_size(ab, sz);
 }
 
-static HRESULT WINAPI xnet_QuerySecUrlResult(void *iface, XAsyncBlock *ab, SIZE_T sz, SIZE_T *used, uint8_t *buf, void **ptrOut)
+static HRESULT WINAPI xnet_QuerySecUrlResult(void *iface, XAsyncBlock *ab, size_t sz, size_t *used, uint8_t *buf, void **ptrOut)
 {
     (void)iface;
     HRESULT hr = xgr_async_get_result(ab, (const void *)xnet_QuerySecUrlAsync, sz, buf, used);
@@ -1085,6 +1085,235 @@ static struct { const void *lpVtbl; } g_xcapm_singleton = { g_xcapm_vtbl };
 HRESULT xgr_query_app_capture_metadata(REFIID iid, void **ppv) { return xcapm_QueryInterface(&g_xcapm_singleton, iid, ppv); }
 
 /* GameProtocol (5 slots), GameActivation (6 slots), GameInvite (8 slots) */
+typedef void (CALLBACK XgrUriActivationCallback)(void *context, const char *uri);
+
+#define XGR_MAX_INVITE_CALLBACKS 8
+
+struct xgr_invite_slot {
+    bool in_use;
+    uint64_t token;
+    XTaskQueueHandle queue;
+    void *context;
+    XgrUriActivationCallback *callback;
+    char last_dispatched_uri[1024];
+};
+
+struct xgr_invite_dispatch_item {
+    uint64_t token;
+    char uri[1024];
+};
+
+static SRWLOCK g_invite_lock = SRWLOCK_INIT;
+static struct xgr_invite_slot g_invite_slots[XGR_MAX_INVITE_CALLBACKS];
+static char g_pending_invite_uri[1024] = { 0 };
+
+static void CALLBACK xinvite_dispatch_task_cb(void *ctx, bool canceled)
+{
+    struct xgr_invite_dispatch_item *item = (struct xgr_invite_dispatch_item *)ctx;
+    if (!item) return;
+
+    if (!canceled) {
+        XgrUriActivationCallback *cb = NULL;
+        void *cb_ctx = NULL;
+
+        AcquireSRWLockShared(&g_invite_lock);
+        for (size_t i = 0; i < XGR_MAX_INVITE_CALLBACKS; i++) {
+            if (g_invite_slots[i].in_use && g_invite_slots[i].token == item->token) {
+                cb = g_invite_slots[i].callback;
+                cb_ctx = g_invite_slots[i].context;
+                break;
+            }
+        }
+        ReleaseSRWLockShared(&g_invite_lock);
+
+        if (cb) {
+            cb(cb_ctx, item->uri);
+        }
+    }
+    free(item);
+}
+
+static void schedule_invite_dispatch_unlocked(XTaskQueueHandle slot_queue, uint64_t token, const char *uri)
+{
+    if (!uri || !uri[0]) return;
+
+    struct xgr_invite_dispatch_item *item =
+        (struct xgr_invite_dispatch_item *)calloc(1, sizeof(*item));
+    if (!item) return;
+    item->token = token;
+    snprintf(item->uri, sizeof(item->uri), "%s", uri);
+
+    XTaskQueueHandle target_q = slot_queue;
+    bool close_target = false;
+    if (!target_q) {
+        if (xgr_task_queue_get_process(&target_q) && target_q) {
+            close_target = true;
+        }
+    }
+
+    HRESULT hr = target_q
+        ? xgr_task_queue_submit_delayed(target_q, XTaskQueuePort_Completion, 0, item, xinvite_dispatch_task_cb)
+        : E_FAIL;
+    if (close_target && target_q) {
+        xgr_task_queue_close(target_q);
+    }
+    if (FAILED(hr)) {
+        free(item);
+    }
+}
+
+void xgr_set_pending_invite_uri(const char *uri)
+{
+    struct {
+        XTaskQueueHandle queue;
+        uint64_t token;
+    } pending_targets[XGR_MAX_INVITE_CALLBACKS];
+    size_t target_count = 0;
+    char uri_snapshot[1024] = { 0 };
+
+    AcquireSRWLockExclusive(&g_invite_lock);
+    if (!uri || !uri[0]) {
+        g_pending_invite_uri[0] = '\0';
+        ReleaseSRWLockExclusive(&g_invite_lock);
+        return;
+    }
+    snprintf(g_pending_invite_uri, sizeof(g_pending_invite_uri), "%s", uri);
+    snprintf(uri_snapshot, sizeof(uri_snapshot), "%s", g_pending_invite_uri);
+
+    for (size_t i = 0; i < XGR_MAX_INVITE_CALLBACKS; i++) {
+        if (!g_invite_slots[i].in_use || !g_invite_slots[i].callback) continue;
+        if (strcmp(g_invite_slots[i].last_dispatched_uri, uri_snapshot) == 0) continue;
+
+        snprintf(
+            g_invite_slots[i].last_dispatched_uri,
+            sizeof(g_invite_slots[i].last_dispatched_uri),
+            "%s",
+            uri_snapshot
+        );
+        XTaskQueueHandle q_dup = NULL;
+        if (g_invite_slots[i].queue) {
+            (void)xgr_task_queue_duplicate(g_invite_slots[i].queue, &q_dup);
+        }
+        pending_targets[target_count].queue = q_dup;
+        pending_targets[target_count].token = g_invite_slots[i].token;
+        target_count++;
+    }
+    ReleaseSRWLockExclusive(&g_invite_lock);
+
+    for (size_t i = 0; i < target_count; i++) {
+        schedule_invite_dispatch_unlocked(pending_targets[i].queue, pending_targets[i].token, uri_snapshot);
+        if (pending_targets[i].queue) {
+            xgr_task_queue_close(pending_targets[i].queue);
+        }
+    }
+}
+
+void xgr_invite_callbacks_reset(void)
+{
+    XTaskQueueHandle to_close[XGR_MAX_INVITE_CALLBACKS];
+    size_t close_count = 0;
+
+    AcquireSRWLockExclusive(&g_invite_lock);
+    g_pending_invite_uri[0] = '\0';
+    for (size_t i = 0; i < XGR_MAX_INVITE_CALLBACKS; i++) {
+        if (g_invite_slots[i].in_use && g_invite_slots[i].queue) {
+            to_close[close_count++] = g_invite_slots[i].queue;
+        }
+        memset(&g_invite_slots[i], 0, sizeof(g_invite_slots[i]));
+    }
+    ReleaseSRWLockExclusive(&g_invite_lock);
+
+    for (size_t i = 0; i < close_count; i++) {
+        xgr_task_queue_close(to_close[i]);
+    }
+}
+
+static HRESULT WINAPI xinvite_Reg(
+    void *iface,
+    XTaskQueueHandle q,
+    void *c,
+    void *cb,
+    XTaskQueueRegistrationToken *t
+)
+{
+    (void)iface;
+    if (!cb || !t) return xgr_return_hr(E_INVALIDARG);
+
+    xgr_ensure_session_metadata_loaded();
+
+    XTaskQueueHandle q_dup = NULL;
+    if (q) {
+        HRESULT qhr = xgr_task_queue_duplicate(q, &q_dup);
+        if (FAILED(qhr)) return xgr_return_hr(qhr);
+    }
+
+    uint64_t tok = (uint64_t)InterlockedIncrement64((volatile LONGLONG *)&g_misc_reg_token);
+    char uri_to_dispatch[1024] = { 0 };
+    XTaskQueueHandle dispatch_q_dup = NULL;
+    bool stored = false;
+
+    AcquireSRWLockExclusive(&g_invite_lock);
+    for (size_t i = 0; i < XGR_MAX_INVITE_CALLBACKS; i++) {
+        if (!g_invite_slots[i].in_use) {
+            g_invite_slots[i].in_use = true;
+            g_invite_slots[i].token = tok;
+            g_invite_slots[i].queue = q_dup;
+            g_invite_slots[i].context = c;
+            g_invite_slots[i].callback = (XgrUriActivationCallback *)cb;
+            g_invite_slots[i].last_dispatched_uri[0] = '\0';
+            if (g_pending_invite_uri[0]) {
+                snprintf(uri_to_dispatch, sizeof(uri_to_dispatch), "%s", g_pending_invite_uri);
+                snprintf(
+                    g_invite_slots[i].last_dispatched_uri,
+                    sizeof(g_invite_slots[i].last_dispatched_uri),
+                    "%s",
+                    g_pending_invite_uri
+                );
+                if (q_dup) {
+                    (void)xgr_task_queue_duplicate(q_dup, &dispatch_q_dup);
+                }
+            }
+            stored = true;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_invite_lock);
+
+    if (!stored) {
+        if (q_dup) xgr_task_queue_close(q_dup);
+        return xgr_return_hr(E_OUTOFMEMORY);
+    }
+
+    t->token = tok;
+    if (uri_to_dispatch[0]) {
+        schedule_invite_dispatch_unlocked(dispatch_q_dup, tok, uri_to_dispatch);
+        if (dispatch_q_dup) xgr_task_queue_close(dispatch_q_dup);
+    }
+    return xgr_return_hr(S_OK);
+}
+
+static BOOLEAN WINAPI xinvite_Unreg(void *iface, XTaskQueueRegistrationToken t, BOOLEAN w)
+{
+    (void)iface;
+    (void)w;
+    XTaskQueueHandle q_to_close = NULL;
+
+    AcquireSRWLockExclusive(&g_invite_lock);
+    for (size_t i = 0; i < XGR_MAX_INVITE_CALLBACKS; i++) {
+        if (g_invite_slots[i].in_use && g_invite_slots[i].token == t.token) {
+            q_to_close = g_invite_slots[i].queue;
+            memset(&g_invite_slots[i], 0, sizeof(g_invite_slots[i]));
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_invite_lock);
+
+    if (q_to_close) {
+        xgr_task_queue_close(q_to_close);
+    }
+    return TRUE;
+}
+
 static HRESULT WINAPI xprot_QueryInterface(void *iface, REFIID riid, void **ppv)
 {
     if (!ppv) return E_POINTER;
@@ -1093,7 +1322,7 @@ static HRESULT WINAPI xprot_QueryInterface(void *iface, REFIID riid, void **ppv)
 }
 static const void *const g_xprot_vtbl[5] = {
     (const void *)xprot_QueryInterface, (const void *)misc_AddRef, (const void *)misc_Release,
-    (const void *)xcapm_Reg, (const void *)xcapm_Unreg
+    (const void *)xinvite_Reg, (const void *)xinvite_Unreg
 };
 static struct { const void *lpVtbl; } g_xprot_singleton = { g_xprot_vtbl };
 HRESULT xgr_query_game_protocol(REFIID iid, void **ppv) { return xprot_QueryInterface(&g_xprot_singleton, iid, ppv); }
@@ -1121,8 +1350,8 @@ static HRESULT WINAPI xinv_QueryInterface(void *iface, REFIID riid, void **ppv)
 }
 static const void *const g_xinv_vtbl[8] = {
     (const void *)xinv_QueryInterface, (const void *)misc_AddRef, (const void *)misc_Release,
-    (const void *)xcapm_Reg, (const void *)xcapm_Unreg,
-    (const void *)xcapm_Reg, (const void *)xcapm_Unreg, (const void *)misc_Ok0
+    (const void *)xinvite_Reg, (const void *)xinvite_Unreg,
+    (const void *)xinvite_Reg, (const void *)xinvite_Unreg, (const void *)misc_Ok0
 };
 static struct { const void *lpVtbl; } g_xinv_singleton = { g_xinv_vtbl };
 HRESULT xgr_query_game_invite(REFIID iid, void **ppv) { return xinv_QueryInterface(&g_xinv_singleton, iid, ppv); }

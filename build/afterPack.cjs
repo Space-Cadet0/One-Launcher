@@ -12,13 +12,17 @@ const MACHO_MAGICS = new Set([
 ]);
 
 /**
- * Win32 PE64 bridge DLLs required on BOTH Windows native and macOS CrossOver/GPTK/Wine
- * bottles (injected into bottled Xbox GDK games). Never strip these on darwin or win32!
+ * Win32 PE64 & PE32 (`_x86`) bridge DLLs required on BOTH Windows native and macOS
+ * CrossOver/GPTK/Wine bottles (injected into 64-bit and 32-bit bottled Xbox GDK games).
+ * Never strip these on darwin or win32!
  */
 const KEEP_CROSSOVER_BRIDGE_DLLS = new Set([
   'one_xgameruntime_bridge.dll',
+  'one_xgameruntime_bridge_x86.dll',
   'one_gameinput_bridge.dll',
+  'one_gameinput_bridge_x86.dll',
   'one_appnotify_bridge.dll',
+  'one_appnotify_bridge_x86.dll',
 ]);
 
 const ALLOWED_LOCALES = new Set(['en-us.pak']);

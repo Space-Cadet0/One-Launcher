@@ -17,6 +17,8 @@
  *   mainGameItem?: unknown,
  *   type?: string,
  *   itemType?: string,
+ *   productType?: string,
+ *   productKind?: string,
  *   categories?: Array<{ path?: string }>
  * }} [params]
  * @returns {string | null}
@@ -30,6 +32,8 @@ function classifyNonGameStorefrontItem({
   mainGameItem = null,
   type = '',
   itemType = '',
+  productType = '',
+  productKind = '',
   categories = [],
 } = {}) {
   // Never suppress an entry the user explicitly installed locally (e.g. installed Demo/Prologue/Playtest).
@@ -41,13 +45,17 @@ function classifyNonGameStorefrontItem({
   const lower = cleanTitle.toLowerCase();
   const compact = lower.replace(/[^a-z0-9]/g, '');
   const platIdLower = String(platformGameId || '').toLowerCase().trim();
-  const isStandaloneGameType =
-    String(type || itemType || '').trim().toLowerCase() === 'game';
+  const rawType = String(type || itemType || productType || productKind || '').trim();
+  const normType = rawType.toLowerCase();
+  const isStandaloneGameType = normType === 'game' || normType === 'base_game';
 
-  // 1. Tools / Editors / Redistributables / Servers / SDKs
+  // 1. Tools / Editors / Redistributables / Servers / SDKs / Standalone Storefront Launcher Utilities
   if (
     platIdLower === 'gog-redist' ||
     /\b(pre-game\s+editor|resource\s+archiver|dedicated\s+server|authoring\s+tools|mod\s+kit|modkit|sdk|redistributables?|common\s+redistributables|benchmark\s+tool)\b/i.test(
+      cleanTitle
+    ) ||
+    /^(?:minecraft\s+launcher|ea\s+app|ubisoft\s+connect|rockstar\s+games\s+launcher|battle\.net|riot\s+client|gog\s+galaxy|epic\s+games\s+launcher)$/i.test(
       cleanTitle
     )
   ) {
@@ -102,10 +110,11 @@ function classifyNonGameStorefrontItem({
         String(c?.path || '').toLowerCase().includes(sub)
       )
     );
-  const typeUpper = String(itemType || '').toUpperCase();
+  const typeUpper = rawType.toUpperCase();
   const isDlcType = [
     'ADD_ON',
     'DLC',
+    'DURABLE',
     'CONSUMABLE',
     'WALLET',
     'SUBSCRIPTION',
@@ -123,9 +132,16 @@ function classifyNonGameStorefrontItem({
     hasParentMainGame ||
     catHasDlc ||
     isDlcType ||
-    /\b(dlc|season\s+pass|expansion\s+pass|add-on|addon|starter\s+pack|upgrade\s+pack|supporter\s+pack|cosmetic\s+pack|weapon\s+pack|skin\s+pack)\b/i.test(
+    /\b(dlc|season\s+pass|expansion\s+pass|add-on|addon|upgrade\s+pack|supporter\s+pack|cosmetic\s+pack|weapon\s+pack|skin\s+pack)\b/i.test(
       cleanTitle
     )
+  ) {
+    return 'Filtered: DLC / Add-On / Expansion Content';
+  }
+
+  if (
+    /\bstarter\s+pack\b/i.test(cleanTitle) &&
+    !(isStandaloneGameType === true && !isDlc && !hasParentMainGame && !catHasDlc && !isDlcType)
   ) {
     return 'Filtered: DLC / Add-On / Expansion Content';
   }

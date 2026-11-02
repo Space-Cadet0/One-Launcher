@@ -1,6 +1,11 @@
 import React from 'react';
 import { ResolvedLaunchModePreview } from '../../../contracts/launcher';
 import { Activity, FileCode, FolderOpen } from 'lucide-react';
+import {
+  LAUNCH_BUTTON_FOCUS_CLASSES,
+  LAUNCH_TEXT_INPUT_CLASSES,
+  SwitchControl,
+} from './LaunchConfigControls';
 
 export interface ExecutableAndArgsSectionProps {
   idPrefix?: string;
@@ -40,6 +45,8 @@ function ExecutableAndArgsSectionImpl({
   const exeInputId = `${idPrefix}-exe-path-${sectionFilter}`;
   const workDirInputId = `${idPrefix}-work-dir-${sectionFilter}`;
   const launchArgsInputId = `${idPrefix}-launch-args-${sectionFilter}`;
+  const nativeMetalHudLabelId = `${idPrefix}-native-metal-hud-label-${sectionFilter}`;
+  const nativeMetalHudHintId = `${idPrefix}-native-metal-hud-hint-${sectionFilter}`;
 
   const showExeSection =
     sectionFilter !== 'native_mac_only' && preview.visibleSections.executableAndArgs;
@@ -71,23 +78,30 @@ function ExecutableAndArgsSectionImpl({
   return (
     <>
       {showExeSection && (
-        <div
+        <section
           data-section="executable-and-args"
+          aria-label="Executable & Launch Parameters"
           className="grid grid-cols-1 gap-3.5 bg-[#0e151f] border border-[#223447] rounded-lg p-3.5"
         >
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <label
-                htmlFor={exeInputId}
-                className="text-[11px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1.5"
-              >
-                <FileCode className="w-3.5 h-3.5 text-sky-400" />
-                <span>{executablePathLabel}</span>
-              </label>
-              <span className="text-[10px] text-steam-subtext">
-                Also links existing local installations
-              </span>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-sky-400" aria-hidden="true" />
+              <h3 className="text-xs font-bold text-white uppercase tracking-wider">
+                Executable &amp; Launch Parameters
+              </h3>
             </div>
+            <span className="text-[10px] text-steam-subtext">
+              Also links existing local installations
+            </span>
+          </div>
+
+          <div className="space-y-1.5">
+            <label
+              htmlFor={exeInputId}
+              className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+            >
+              {executablePathLabel}
+            </label>
             <div className="flex items-center gap-2">
               <input
                 id={exeInputId}
@@ -99,14 +113,14 @@ function ExecutableAndArgsSectionImpl({
                 spellCheck={false}
                 autoCorrect="off"
                 autoCapitalize="off"
-                className="flex-1 rounded-lg bg-[#141d2b] border border-[#2a475e] px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                className={`${LAUNCH_TEXT_INPUT_CLASSES} flex-1 font-mono`}
               />
               <button
                 type="button"
                 onClick={onBrowseExecutable}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+                className={`min-h-6 h-9 inline-flex items-center gap-1.5 px-3 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
               >
-                <FolderOpen className="w-3.5 h-3.5" />
+                <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Browse Executable...</span>
               </button>
             </div>
@@ -115,10 +129,10 @@ function ExecutableAndArgsSectionImpl({
           {(preview.isInstalled || Boolean(customExecutablePath.trim())) && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {/* Working Directory */}
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 <label
                   htmlFor={workDirInputId}
-                  className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext"
+                  className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
                 >
                   Working Directory
                 </label>
@@ -133,12 +147,12 @@ function ExecutableAndArgsSectionImpl({
                     spellCheck={false}
                     autoCorrect="off"
                     autoCapitalize="off"
-                    className="flex-1 min-w-0 rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                    className={`${LAUNCH_TEXT_INPUT_CLASSES} flex-1 min-w-0 font-mono`}
                   />
                   <button
                     type="button"
                     onClick={onBrowseWorkingDir}
-                    className="px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0"
+                    className={`min-h-6 h-9 px-3 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
                   >
                     Browse...
                   </button>
@@ -146,10 +160,10 @@ function ExecutableAndArgsSectionImpl({
               </div>
 
               {/* Command-Line Arguments */}
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 <label
                   htmlFor={launchArgsInputId}
-                  className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext"
+                  className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
                 >
                   Launch Arguments
                 </label>
@@ -163,55 +177,55 @@ function ExecutableAndArgsSectionImpl({
                   spellCheck={false}
                   autoCorrect="off"
                   autoCapitalize="off"
-                  className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                  className={`${LAUNCH_TEXT_INPUT_CLASSES} font-mono`}
                 />
               </div>
             </div>
           )}
-        </div>
+        </section>
       )}
 
       {/* Native macOS Performance & Overlay Card (shown for native macOS .app / Mach-O builds) */}
       {showNativeMacHud && (
-        <div
+        <section
           data-section="native-mac-settings"
+          aria-label="macOS Native Performance & Overlay"
           className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
         >
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-emerald-400" />
-              <span className="text-xs font-bold text-white uppercase tracking-wider">
+              <Activity className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+              <h3 className="text-xs font-bold text-white uppercase tracking-wider">
                 macOS Native Performance &amp; Overlay
-              </span>
+              </h3>
             </div>
             <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
               Apple Silicon / Metal Native
             </span>
           </div>
 
-          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-white">
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2.5">
+            <div className="min-w-0 space-y-0.5">
+              <span
+                id={nativeMetalHudLabelId}
+                className="block text-xs font-semibold text-white"
+              >
                 Apple Metal Performance HUD (MTL_HUD_ENABLED=1)
-              </div>
-              <div className="text-[10px] text-steam-subtext">
+              </span>
+              <p id={nativeMetalHudHintId} className="text-[10px] text-steam-subtext leading-snug">
                 Displays real-time Apple Metal FPS, frame timing, and GPU memory overlay
-              </div>
+              </p>
             </div>
-            <button
-              type="button"
-              aria-pressed={metalHud}
-              onClick={onToggleMetalHud}
-              className={`px-3 py-1 rounded-md text-xs font-bold border transition-colors shrink-0 cursor-pointer ${
-                metalHud
-                  ? 'bg-sky-500/20 border-sky-400 text-sky-300'
-                  : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:text-white'
-              }`}
-            >
-              {metalHud ? 'ON' : 'OFF'}
-            </button>
+            <SwitchControl
+              dataTestId="toggle-metal-hud"
+              checked={metalHud}
+              ariaLabelledBy={nativeMetalHudLabelId}
+              ariaDescribedBy={nativeMetalHudHintId}
+              onChange={onToggleMetalHud}
+              tone="sky"
+            />
           </div>
-        </div>
+        </section>
       )}
     </>
   );

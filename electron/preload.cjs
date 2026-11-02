@@ -53,6 +53,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('launcher:check-compat-updates', opts),
   updateCompatibilityLayer: (payload) =>
     ipcRenderer.invoke('launcher:update-compat-layer', payload),
+  cancelCompatibilityLayerOperation: (runnerType) =>
+    ipcRenderer.invoke('launcher:cancel-compat-layer-op', runnerType),
+  selectRunnerArchiveDialog: (defaultPath) =>
+    ipcRenderer.invoke('launcher:select-runner-archive', defaultPath),
+  onCompatibilityRunnerProgress: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('launcher:compat-runner-progress', handler);
+    return () => ipcRenderer.removeListener('launcher:compat-runner-progress', handler);
+  },
   getDiskSpace: (targetPath) => ipcRenderer.invoke('launcher:get-disk-space', targetPath),
   getGameInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
   getInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),

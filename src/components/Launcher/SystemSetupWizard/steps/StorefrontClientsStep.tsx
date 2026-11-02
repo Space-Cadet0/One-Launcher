@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useMemo } from 'react';
+import type { CanonicalGame } from '../../../../contracts/game';
 import type {
   EnvironmentComponentId,
   EnvironmentComponentState,
@@ -7,7 +8,11 @@ import type {
 } from '../../../../contracts/environmentSetup';
 import type { CompatibilityLayerType } from '../../../../contracts/launcher';
 import type { StorefrontId } from '../../../../contracts/platform';
-import { StorefrontIcon } from '../../../Common/StorefrontIcon';
+import {
+  EA_DRM_BACKGROUND_REQUIRED_RE,
+  normalizeChainedHandoffId,
+} from '../../../../services/integrations/catalogSanitizer';
+import { StorefrontIcon, getStorefrontDisplayName } from '../../../Common/StorefrontIcon';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -20,6 +25,7 @@ export interface StorefrontClientsStepProps {
   mode: SetupWizardOpenMode;
   chosenRunner: Exclude<CompatibilityLayerType, 'native'> | 'skip';
   connectedStorefronts: StorefrontId[];
+  catalogGames?: CanonicalGame[];
   selectedIds: ReadonlySet<EnvironmentComponentId>;
   forceRepairIds: ReadonlySet<EnvironmentComponentId>;
   focusComponentId?: EnvironmentComponentId;
@@ -33,16 +39,28 @@ interface ClientCopyOverride {
   explanation: string;
 }
 
+type RenderableClientComponentId = Extract<
+  EnvironmentComponentId,
+  | 'bottle_steam'
+  | 'host_steam'
+  | 'bottle_gog'
+  | 'host_gog'
+  | 'bottle_epic'
+  | 'host_epic'
+  | 'bottle_ubisoft'
+  | 'host_ubisoft'
+  | 'bottle_ea'
+  | 'host_ea'
+  | 'bottle_bnet'
+  | 'host_bnet'
+  | 'bottle_rockstar'
+  | 'host_rockstar'
+>;
+
 function getClientCopyOverrides(
   isMac: boolean,
   showBottleSection: boolean
-): Record<
-  Extract<
-    EnvironmentComponentId,
-    'bottle_steam' | 'host_steam' | 'bottle_gog' | 'host_gog' | 'bottle_epic' | 'host_epic'
-  >,
-  ClientCopyOverride
-> {
+): Record<RenderableClientComponentId, ClientCopyOverride> {
   return {
     bottle_steam: {
       badge: 'Recommended',
@@ -82,6 +100,54 @@ function getClientCopyOverrides(
       explanation:
         'Not needed — downloads, cloud saves, achievements, and multiplayer already work without it. Only install if you want the Epic social overlay.',
     },
+    host_ubisoft: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Xbox Game Pass or cross-store titles that delegate launch and sign-in through Ubisoft Connect (installs headlessly in the background).',
+    },
+    bottle_ubisoft: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Windows titles that delegate launch and sign-in through Ubisoft Connect (installs headlessly in the background).',
+    },
+    host_ea: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for EA Play / PC Game Pass or cross-store titles that delegate launch and sign-in through EA App (installs headlessly in the background).',
+    },
+    bottle_ea: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Windows titles that delegate launch and sign-in through EA App (installs headlessly in the background).',
+    },
+    host_bnet: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Activision Blizzard / PC Game Pass titles that delegate launch and sign-in through Battle.net (runs automated Battle.net-Setup.exe --installpath setup and opens Battle.net ready for sign-in).',
+    },
+    bottle_bnet: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Windows titles that delegate launch and sign-in through Battle.net (runs automated Battle.net-Setup.exe --installpath setup inside your bottle and opens Battle.net ready for sign-in).',
+    },
+    host_rockstar: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Rockstar titles that delegate launch and sign-in through Rockstar Games Launcher (installs headlessly in the background).',
+    },
+    bottle_rockstar: {
+      badge: 'Optional — Delegated Games',
+      badgeTone: 'optional',
+      explanation:
+        'Only needed for Windows titles that delegate launch and sign-in through Rockstar Games Launcher (installs headlessly in the background).',
+    },
   };
 }
 
@@ -93,11 +159,26 @@ const HOST_CLIENT_IDS: ReadonlyArray<
   Extract<EnvironmentComponentId, 'host_steam' | 'host_gog' | 'host_epic'>
 > = ['host_steam', 'host_gog', 'host_epic'];
 
+const BOTTLE_PUBLISHER_CLIENT_IDS: ReadonlyArray<
+  Extract<
+    EnvironmentComponentId,
+    'bottle_ubisoft' | 'bottle_ea' | 'bottle_bnet' | 'bottle_rockstar'
+  >
+> = ['bottle_ubisoft', 'bottle_ea', 'bottle_bnet', 'bottle_rockstar'];
+
+const HOST_PUBLISHER_CLIENT_IDS: ReadonlyArray<
+  Extract<
+    EnvironmentComponentId,
+    'host_ubisoft' | 'host_ea' | 'host_bnet' | 'host_rockstar'
+  >
+> = ['host_ubisoft', 'host_ea', 'host_bnet', 'host_rockstar'];
+
 export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
   snapshot,
   mode,
   chosenRunner,
   connectedStorefronts,
+  catalogGames,
   selectedIds,
   forceRepairIds,
   focusComponentId,
@@ -111,6 +192,59 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
   const connectedSet = new Set<StorefrontId>(connectedStorefronts);
   const copyMap = getClientCopyOverrides(isMac, showBottleSection);
 
+  const eaDelegatedSummary = useMemo(() => {
+    let sourceGames: CanonicalGame[] = [];
+    if (Array.isArray(catalogGames)) {
+      sourceGames = catalogGames;
+    } else {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          const raw =
+            localStorage.getItem('universal_game_library_catalog') ||
+            localStorage.getItem('master_game_catalog_v1');
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              sourceGames = parsed as CanonicalGame[];
+            }
+          }
+        }
+      } catch {
+        // Ignore storage parse failures
+      }
+    }
+
+    let count = 0;
+    const storeIds = new Set<StorefrontId>();
+    for (const g of sourceGames) {
+      if (!g || typeof g !== 'object') continue;
+      const drmRaw =
+        g.enrichedMetadata?.drmNotice ||
+        (g as { drmNotice?: string }).drmNotice ||
+        '';
+      const drmPlain = typeof drmRaw === 'string' ? drmRaw.replace(/<[^>]+>/g, ' ') : '';
+      const hasEaDrm = Boolean(drmPlain && EA_DRM_BACKGROUND_REQUIRED_RE.test(drmPlain));
+
+      let matchedGame = false;
+      for (const p of g.platforms || []) {
+        if (!p || p.platformId === 'ea' || p.platformId === 'gog') continue;
+        const handoff = normalizeChainedHandoffId(
+          p.chainedLauncherHandoff || p.externalStorefrontHandoff
+        );
+        if (handoff === 'ea' || (hasEaDrm && (p.platformId === 'epic' || p.platformId === 'steam'))) {
+          matchedGame = true;
+          storeIds.add(p.platformId);
+        }
+      }
+      if (matchedGame) {
+        count += 1;
+      }
+    }
+
+    const storeLabels = Array.from(storeIds).map((sid) => getStorefrontDisplayName(sid));
+    return { count, storeLabels };
+  }, [catalogGames]);
+
   const handleOpenExternal = (url?: string) => {
     if (!url) return;
     const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
@@ -123,16 +257,50 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
     }
   };
 
-  const renderClientCard = (
-    compId: Extract<
-      EnvironmentComponentId,
-      'bottle_steam' | 'host_steam' | 'bottle_gog' | 'host_gog' | 'bottle_epic' | 'host_epic'
-    >
-  ) => {
-    const comp: EnvironmentComponentState | undefined = snapshot.components[compId];
-    if (!comp) return null;
+  const renderClientCard = (compId: RenderableClientComponentId) => {
+    const rawComp: EnvironmentComponentState | undefined = snapshot.components[compId];
+    const isEaClient = compId === 'bottle_ea' || compId === 'host_ea';
+    const comp: EnvironmentComponentState | undefined =
+      rawComp ||
+      (isEaClient &&
+      eaDelegatedSummary.count > 0 &&
+      ((isMac && compId === 'bottle_ea') || (isWin && compId === 'host_ea'))
+        ? {
+            id: compId,
+            category: compId === 'bottle_ea' ? 'bottle_client' : 'host_client',
+            storefrontId: 'ea',
+            scope: compId === 'bottle_ea' ? 'bottle' : 'host',
+            title: compId === 'bottle_ea' ? 'EA App (Windows Bottle)' : 'EA App',
+            shortLabel: 'EA App',
+            status: 'missing',
+            canAutoInstall: true,
+            recommendationTier: 'optional',
+            recommendationBadge: 'Optional — Delegated Games',
+            defaultSelected: false,
+            whyExplanation:
+              'Needed for EA Play / cross-store titles that delegate launch and sign-in through EA App.',
+            statusDetail: 'Not installed yet.',
+          }
+        : undefined);
+    if (!comp || comp.status === 'not_applicable') return null;
 
-    const copy = copyMap[compId];
+    const baseCopy = copyMap[compId];
+    const hasEaLibraryRelevance = isEaClient && eaDelegatedSummary.count > 0;
+    const copy: ClientCopyOverride = hasEaLibraryRelevance
+      ? {
+          badge: baseCopy.badge,
+          badgeTone: baseCopy.badgeTone,
+          explanation: `Your library includes ${
+            eaDelegatedSummary.count === 1
+              ? '1 EA-delegated game'
+              : `${eaDelegatedSummary.count} EA-delegated games`
+          } via ${
+            eaDelegatedSummary.storeLabels.length > 0
+              ? eaDelegatedSummary.storeLabels.join(' / ')
+              : 'Xbox / Epic / Steam'
+          } that require EA App and your linked EA Account.`,
+        }
+      : baseCopy;
     const isReady = comp.status === 'ready';
     const isRemoved = Boolean(comp.wasPreviouslyConfigured && comp.status === 'missing');
     const isForceRepair = forceRepairIds.has(compId);
@@ -196,6 +364,16 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
                 <span className={`text-[10px] px-2 py-0.5 rounded border font-bold ${badgeClasses}`}>
                   {copy.badge}
                 </span>
+                {hasEaLibraryRelevance && (
+                  <span
+                    data-testid={`ea-library-relevance-badge-${compId}`}
+                    className="text-[10px] px-2 py-0.5 rounded bg-amber-950/75 border border-amber-400/55 text-amber-200 font-bold"
+                  >
+                    {eaDelegatedSummary.count === 1
+                      ? '1 EA Game in Library'
+                      : `${eaDelegatedSummary.count} EA Games in Library`}
+                  </span>
+                )}
                 {storeConnected && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
                     Account Connected
@@ -262,32 +440,101 @@ export const StorefrontClientsStep: React.FC<StorefrontClientsStepProps> = ({
 
       {/* Section 1: Windows Launchers on Mac (macOS with active runner only) */}
       {showBottleSection && (
-        <div className="space-y-2.5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-              Launchers for Windows Games (on Mac)
-            </span>
-            <span className="text-[11px] text-slate-300">Steam is usually all you need</span>
+        <div className="space-y-3">
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                Launchers for Windows Games (on Mac)
+              </span>
+              <span className="text-[11px] text-slate-300">Steam is usually all you need</span>
+            </div>
+
+            <div className="space-y-2.5">
+              {BOTTLE_CLIENT_IDS.map((id) => renderClientCard(id))}
+            </div>
           </div>
 
-          <div className="space-y-2.5">
-            {BOTTLE_CLIENT_IDS.map((id) => renderClientCard(id))}
-          </div>
+          {(eaDelegatedSummary.count > 0 ||
+            BOTTLE_PUBLISHER_CLIENT_IDS.some(
+              (id) =>
+                snapshot.components[id] && snapshot.components[id].status !== 'not_applicable'
+            )) && (
+            <div
+              data-testid="chained-publisher-launchers-bottle-group"
+              className="rounded-lg bg-[#131c27]/75 border border-[#2a475e]/70 p-3 space-y-2.5"
+            >
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+                    Chained Publisher Launchers (Optional — Xbox Game Pass / Cross-Store)
+                  </span>
+                  <span className="text-[11px] text-slate-300">Unselected by default</span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  Only needed for games that delegate download, launch, or sign-in through Ubisoft
+                  Connect, EA App, Battle.net, or Rockstar Games Launcher. EA App, Ubisoft Connect,
+                  and Rockstar Games Launcher install headlessly in the background, while
+                  Battle.net-Setup.exe runs automated setup (--installpath) and opens Battle.net
+                  ready for sign-in. One Launcher can also install these automatically on demand
+                  when you install a delegated game.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                {BOTTLE_PUBLISHER_CLIENT_IDS.map((id) => renderClientCard(id))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
       {/* Section 2: Host Launchers (Mac Launchers on macOS, Game Launchers on Windows) */}
-      <div className="space-y-2.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-            {isMac ? 'Launchers for Mac Games' : 'Game Launchers'}
-          </span>
-          <span className="text-[11px] text-slate-300">GOG and Epic are optional</span>
+      <div className="space-y-3">
+        <div className="space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+              {isMac ? 'Launchers for Mac Games' : 'Game Launchers'}
+            </span>
+            <span className="text-[11px] text-slate-300">GOG and Epic are optional</span>
+          </div>
+
+          <div className="space-y-2.5">
+            {HOST_CLIENT_IDS.map((id) => renderClientCard(id))}
+          </div>
         </div>
 
-        <div className="space-y-2.5">
-          {HOST_CLIENT_IDS.map((id) => renderClientCard(id))}
-        </div>
+        {isWin &&
+          (eaDelegatedSummary.count > 0 ||
+            HOST_PUBLISHER_CLIENT_IDS.some(
+              (id) =>
+                snapshot.components[id] && snapshot.components[id].status !== 'not_applicable'
+            )) && (
+            <div
+              data-testid="chained-publisher-launchers-host-group"
+              className="rounded-lg bg-[#131c27]/75 border border-[#2a475e]/70 p-3 space-y-2.5"
+            >
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+                    Chained Publisher Launchers (Optional — Xbox Game Pass / Cross-Store)
+                  </span>
+                  <span className="text-[11px] text-slate-300">Unselected by default</span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  Only needed for games that delegate download, launch, or sign-in through Ubisoft
+                  Connect, EA App, Battle.net, or Rockstar Games Launcher. EA App, Ubisoft Connect,
+                  and Rockstar Games Launcher install headlessly in the background, while
+                  Battle.net-Setup.exe runs automated setup (--installpath) and opens Battle.net
+                  ready for sign-in. One Launcher can also install these automatically on demand
+                  when you install a delegated game.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                {HOST_PUBLISHER_CLIENT_IDS.map((id) => renderClientCard(id))}
+              </div>
+            </div>
+          )}
       </div>
 
       {/* Actionable-only Windows Gaming Services card when missing on Windows */}

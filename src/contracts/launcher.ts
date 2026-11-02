@@ -1,4 +1,5 @@
 import { StorefrontId } from './platform';
+import type { ChainedHandoffTopology } from './game';
 import type { ResolvedEffectiveLaunchPolicy } from './launchPolicyResolver';
 
 export {
@@ -30,6 +31,17 @@ export type CrossOverD3DMetalVersion = 'auto' | '4' | '3';
 
 export type WineDebugMode = 'off' | 'fixme_err' | 'warn_err' | 'relay';
 
+export const MANAGED_ENV_VAR_KEYS = [
+  'CX_GRAPHICS_BACKEND_VERSION',
+  'DXVK_CONFIG_FILE',
+  'DXMT_METALFX_SPATIAL_SWAPCHAIN',
+  'DXVK_FRAME_RATE',
+  'D3DM_MAX_FPS',
+  'CX_FWD_COMPAT_GL_CTX',
+] as const;
+
+export type ManagedEnvVarKey = (typeof MANAGED_ENV_VAR_KEYS)[number];
+
 export interface BundledD3DMetalVersionInfo {
   /** Selector key used for CX_GRAPHICS_BACKEND_VERSION ('4', '3', or 'default') */
   id: string;
@@ -54,6 +66,41 @@ export interface CompatibilityLayerInfo {
   displayVersion?: string;
   d3dmetalVersion?: string;
   availableD3DMetalVersions?: BundledD3DMetalVersionInfo[];
+  hostArch?: string;
+  darwinKernelMajor?: number;
+  supportsMetalFxDlssD3dMetal?: boolean;
+  supportsMetalFxDlssDxmt?: boolean;
+  vulkanDriver?: string;
+}
+
+export type CompatibilityLayerUpdateMethod =
+  | 'direct_download'
+  | 'homebrew_cask'
+  | 'vendor_portal'
+  | 'external_manager'
+  | 'brew_upgrade'
+  | 'direct_zip_app';
+
+export type CompatibilityRunnerOperationPhase =
+  | 'probing'
+  | 'downloading'
+  | 'verifying_signature'
+  | 'extracting'
+  | 'installing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface CompatibilityRunnerProgressEvent {
+  runnerType: Exclude<CompatibilityLayerType, 'native'>;
+  operation: 'install' | 'update';
+  phase: CompatibilityRunnerOperationPhase;
+  progressPercent: number | null;
+  bytesDownloaded?: number;
+  totalBytes?: number;
+  message: string;
+  error?: string;
+  updatedAt?: string;
 }
 
 export interface CompatibilityLayerUpdateInfo {
@@ -69,22 +116,31 @@ export interface CompatibilityLayerUpdateInfo {
   downloadUrl?: string;
   releaseNotesUrl?: string;
   canAutoUpdate: boolean;
-  updateMethod?: 'brew_upgrade' | 'direct_zip_app' | 'vendor_portal';
+  updateMethod?: CompatibilityLayerUpdateMethod;
+  estimatedDownloadBytes?: number;
+  stableSurpassesPreview?: boolean;
+  stableFallbackVersion?: string;
   statusMessage?: string;
   checkedAt: string;
 }
 
 export interface UpdateCompatibilityLayerPayload {
   runnerType: Exclude<CompatibilityLayerType, 'native'>;
+  dmgPath?: string;
+  archivePath?: string;
+  switchToStableCrossOver?: boolean;
 }
 
 export interface UpdateCompatibilityLayerResult {
   success: boolean;
   runnerType: CompatibilityLayerType;
   updated: boolean;
+  cancelled?: boolean;
   previousVersion?: string;
   newVersion?: string;
-  openedExternalUrl?: string;
+  installedPath?: string;
+  openedExternalUrl?: boolean | string;
+  busyCode?: 'RUNNER_BUSY_ACTIVE_SESSION' | 'RUNNER_BUSY_EXTERNAL_PROCESS';
   message: string;
   error?: string;
   detectedLayers?: CompatibilityLayerInfo[];
@@ -103,18 +159,25 @@ export interface CompatibilityRunnerDescriptor {
   brewCask?: string;
   brewCommandDisplay?: string;
   canAutoInstallViaBrew?: boolean;
+  canAutoInstallDirect?: boolean;
+  estimatedDownloadMB?: number;
 }
 
 export interface InstallCompatibilityLayerRequest {
   runnerType: Exclude<CompatibilityLayerType, 'native'>;
-  mode?: 'auto' | 'download';
+  mode?: 'auto' | 'direct' | 'download';
+  dmgPath?: string;
+  archivePath?: string;
 }
 
 export interface InstallCompatibilityLayerResult {
   success: boolean;
   installed?: boolean;
+  cancelled?: boolean;
   openedExternalInstaller?: boolean;
   runnerType: string;
+  installedPath?: string;
+  busyCode?: 'RUNNER_BUSY_ACTIVE_SESSION' | 'RUNNER_BUSY_EXTERNAL_PROCESS';
   message?: string;
   error?: string;
   layers?: CompatibilityLayerInfo[];
@@ -138,6 +201,14 @@ export interface InstalledGameRecord {
   xboxTitleId?: string;
   scid?: string;
   msaAppId?: string;
+  isCrossPlatformLauncherRuntime?: boolean;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   runner?:
     | 'steam'
     | 'gog'
@@ -151,7 +222,11 @@ export interface InstalledGameRecord {
     | 'one_launcher'
     | 'custom';
   isWindowsBinaryOnMac?: boolean;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
 }
+
+export type InstalledGameInfo = InstalledGameRecord;
 
 export type CrossOverGraphicsBackend = 'auto' | 'd3dmetal' | 'dxmt' | 'dxvk' | 'wined3d';
 
@@ -242,6 +317,20 @@ export interface StorefrontLaunchProfile {
   metalHud?: boolean;
   /** DXVK FPS & frametime HUD overlay (DXVK_HUD=devinfo,fps,frametimes) */
   dxvkHud?: boolean;
+  /** Target maximum frame rate cap (DXVK_FRAME_RATE / D3DM_MAX_FPS / dxvk.maxFrameRate) */
+  preferredMaxFrameRate?: number;
+  /** DXMT MetalFX spatial swapchain upscale factor (DXMT_METALFX_SPATIAL_SWAPCHAIN: 1.33 | 1.5 | 1.7 | 2.0) */
+  metalfxSpatialUpscaleFactor?: number;
+  /** Wine / CrossOver virtual desktop containment */
+  virtualDesktop?: boolean;
+  /** Wine Mac Driver display mode emulation override (EmulateModeset) */
+  emulateModeset?: boolean;
+  /** 32-bit PE32 4 GB address space override (WINE_LARGE_ADDRESS_AWARE) */
+  forceLargeAddressAware?: boolean;
+  /** Clamp legacy DirectSound / CoreAudio buffer sizing for Wine compatibility */
+  audioBufferClamp?: boolean;
+  /** Advertise x86 AVX instruction set inside Rosetta 2 / Wine (ROSETTA_ADVERTISE_AVX) */
+  advertiseAvx?: boolean;
   preLaunchCommand?: string;
   postExitCommand?: string;
   /** Per-game override for in-game launcher behavior ('default' inherits global LauncherPerformanceSettings) */
@@ -322,6 +411,8 @@ export interface ResolvedLaunchModePreview {
   platformId: StorefrontId;
   installPath?: string;
   executablePath?: string;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
   detectedBuildType:
     | 'mac_native_app'
     | 'mac_native_bin'
@@ -451,6 +542,14 @@ export interface DownloadTaskState {
   launchArguments?: string;
   runner?: InstalledGameRecord['runner'];
   isWindowsBinaryOnMac?: boolean;
+  isCrossPlatformLauncherRuntime?: boolean;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   installRequest?: InstallGameRequest;
   tempBinPath?: string;
 }
@@ -463,6 +562,29 @@ export interface DiskSpaceInfo {
   volumeMissing?: boolean;
 }
 
+export interface AvailableInstaller {
+  id: string;
+  name: string;
+  label?: string;
+  os: 'mac' | 'windows' | 'linux';
+  language?: string;
+  sizeBytes?: number;
+  totalSizeBytes?: number;
+  downloadSizeBytes?: number;
+  dlcSizeBytes?: number;
+  version?: string;
+  authoritativeOsSupport?: boolean;
+  externalLauncher?: string;
+  externalLauncherUrl?: string;
+  externalStorefrontHandoff?: string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
+}
+
 export interface GameInstallInfo {
   platformId: StorefrontId;
   platformGameId: string;
@@ -472,18 +594,22 @@ export interface GameInstallInfo {
   dlcSizeBytes?: number;
   defaultInstallDir: string;
   availableInstallDirs: string[];
-  availableInstallers?: {
-    id: string;
-    name: string;
-    os: 'mac' | 'windows' | 'linux';
-    language?: string;
-    totalSizeBytes?: number;
-    downloadSizeBytes?: number;
-    dlcSizeBytes?: number;
-    version?: string;
-  }[];
+  availableInstallers?: AvailableInstaller[];
   canDirectDownload: boolean;
   requiresStoreClientFallback?: boolean;
+  authoritativeOsSupport?: boolean;
+  isCrossPlatformBottleInstall?: boolean;
+  executableArchitecture?: string;
+  is32BitExecutable?: boolean;
+  externalLauncher?: string;
+  externalLauncherUrl?: string;
+  externalStorefrontHandoff?: string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   diskSpace?: DiskSpaceInfo;
   xboxCompatibility?: {
     tier:
@@ -491,12 +617,26 @@ export interface GameInstallInfo {
       | 'tier_b_legacy_uwp'
       | 'tier_c_kernel_anticheat'
       | 'tier_c_external_launcher';
-    label: string;
+    label?: string;
+    summary?: string;
     detail?: string;
+    canExtractAndRun?: boolean;
+    supportedOnMacBottle?: boolean;
+    requiresCoreWindow?: boolean;
+    antiCheatDetected?: boolean;
+    antiCheatSignals?: string[];
     externalStorefront?: string;
+    externalLauncher?: string;
+    externalLauncherUrl?: string;
+    externalStorefrontHandoff?: string;
+    chainedLauncherHandoff?: string;
+    chainedExternalInstallId?: string;
     antiCheatName?: string;
+    encryption?: string;
   };
 }
+
+export type GameInstallInfoResponse = GameInstallInfo;
 
 export interface LauncherActionResult {
   success: boolean;
@@ -516,6 +656,18 @@ export interface GameInstallInfoRequest {
   platformGameId: string;
   steamAppId?: number;
   xboxProductId?: string;
+  packageFamilyName?: string;
+  appUserModelId?: string;
+  xboxTitleId?: string;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  xboxBottleCompatibilityTier?: string;
+  isCrossPlatformLauncherRuntime?: boolean;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   targetInstallDir?: string;
   steamPlatforms?: {
     windows?: boolean;
@@ -547,6 +699,14 @@ export interface LaunchGameRequest {
   scid?: string;
   msaAppId?: string;
   isWindowsBinaryOnMac?: boolean;
+  isCrossPlatformLauncherRuntime?: boolean;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
   launchConfig?: GameLaunchConfig;
   performanceSettings?: LauncherPerformanceSettings;
 }
@@ -574,6 +734,15 @@ export interface InstallGameRequest {
   wineBottleName?: string;
   includeDlcs?: boolean;
   preferClientlessExtraction?: boolean;
+  externalLauncher?: string;
+  externalLauncherUrl?: string;
+  externalStorefrontHandoff?: StorefrontId | 'riot' | string;
+  chainedLauncherHandoff?: string;
+  chainedExternalInstallId?: string;
+  chainedHandoffTopology?: ChainedHandoffTopology;
+  epicPartnerRegistryPath?: string;
+  requiresKernelAntiCheat?: boolean;
+  antiCheatName?: string;
 }
 
 export interface UninstallGameRequest {

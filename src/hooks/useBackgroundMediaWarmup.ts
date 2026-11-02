@@ -3,6 +3,7 @@ import { CanonicalGame } from '../contracts/game';
 import { launcherService } from '../services/launcher/launcherService';
 import { onlineLifecycleManager } from '../services/network/onlineLifecycleManager';
 import { mergeUpdatedGamePreservingLivePlatformState } from '../services/integrations/integrationStorage';
+import { isUserActivelyScrolling } from '../utils/scrollActivityTracker';
 
 export interface UseBackgroundMediaWarmupParams {
   games: CanonicalGame[];
@@ -17,6 +18,7 @@ export interface UseBackgroundMediaWarmupParams {
 
 interface WarmupWindowFlags extends Window {
   __ENABLE_AUTO_STORE_MEDIA_WARMUP__?: boolean;
+  __ENABLE_AUTO_HLTB_WARMUP__?: boolean;
 }
 
 function isVitestRuntime(): boolean {
@@ -42,8 +44,11 @@ export function useBackgroundMediaWarmup({
   setIsSyncingAllMedia,
 }: UseBackgroundMediaWarmupParams): void {
   const autoMediaWarmupRunningRef = useRef<boolean>(false);
+  const autoHltbTrickleRunningRef = useRef<boolean>(false);
   const attemptedWarmupIdsRef = useRef<Set<string>>(new Set());
   const offlineSkippedIdsRef = useRef<Set<string>>(new Set());
+  const attemptedHltbIdsRef = useRef<Set<string>>(new Set());
+  const offlineSkippedHltbIdsRef = useRef<Set<string>>(new Set());
   const pendingWarmupUpdatesRef = useRef<Map<string, CanonicalGame>>(new Map());
   const batchFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isModalSuspendedRef = useRef<boolean>(Boolean(isModalSuspended));
@@ -136,7 +141,14 @@ export function useBackgroundMediaWarmup({
     const allowWarmupInTest =
       typeof window !== 'undefined' &&
       Boolean((window as WarmupWindowFlags).__ENABLE_AUTO_STORE_MEDIA_WARMUP__);
-    if (isVitestEnv && !allowWarmupInTest) return;
+    const allowHltbTrickleInTest =
+      typeof window !== 'undefined' &&
+      Boolean((window as WarmupWindowFlags).__ENABLE_AUTO_HLTB_WARMUP__);
+    const canRunHltbTrickle =
+      (!isVitestEnv || allowHltbTrickleInTest) &&
+      typeof window !== 'undefined' &&
+      Boolean(window.electronAPI?.searchHltb);
+    if (isVitestEnv && !allowWarmupInTest && !allowHltbTrickleInTest) return;
 
     const isSessionSuspended = isHibernating || runningGamesCount > 0;
 
@@ -182,13 +194,131 @@ export function useBackgroundMediaWarmup({
 
     if (isSessionSuspended || games.length === 0) return;
 
+    let cancelled = false;
     let warmupTimer: ReturnType<typeof setTimeout> | null = null;
+    let hltbTrickleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleHltbTrickle = (delayMs = 900) => {
+      if (hltbTrickleTimer !== null) {
+        clearTimeout(hltbTrickleTimer);
+        hltbTrickleTimer = null;
+      }
+      if (!canRunHltbTrickle || cancelled) return;
+      if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
+      if (!onlineLifecycleManager.isOnline()) return;
+
+      hltbTrickleTimer = setTimeout(() => {
+        hltbTrickleTimer = null;
+        if (!canRunHltbTrickle || cancelled) return;
+        if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
+        if (!onlineLifecycleManager.isOnline()) return;
+        if (launcherService.getRunningGames().length > 0) return;
+        if (launcherService.isInGameHibernating()) return;
+        if (autoHltbTrickleRunningRef.current) return;
+        if (isUserActivelyScrolling()) {
+          scheduleHltbTrickle(1200);
+          return;
+        }
+
+        void Promise.all([
+          import('../services/network/syncJobManager'),
+          import('../services/hltb/howLongToBeat'),
+        ])
+          .then(
+            ([
+              { syncJobManager },
+              { hasAttemptedHltbLookup, fetchAndCacheHltb, seedHltbFromVaultIfMissing },
+            ]) => {
+              if (!canRunHltbTrickle || cancelled) return;
+              if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
+              if (!onlineLifecycleManager.isOnline()) return;
+              if (launcherService.getRunningGames().length > 0) return;
+              if (launcherService.isInGameHibernating()) return;
+              if (autoHltbTrickleRunningRef.current) return;
+              if (isUserActivelyScrolling()) {
+                scheduleHltbTrickle(1200);
+                return;
+              }
+
+              const activeJob = syncJobManager.getState();
+              const hasActiveManualJob = Boolean(
+                activeJob &&
+                  !activeJob.id.startsWith('auto-') &&
+                  (activeJob.status === 'running' ||
+                    activeJob.status === 'paused' ||
+                    activeJob.status === 'rate_limited')
+              );
+              if (hasActiveManualJob || autoMediaWarmupRunningRef.current) {
+                scheduleHltbTrickle(2500);
+                return;
+              }
+
+              const nextGame = gamesRef.current.find((g) => {
+                if (!g?.id || !g?.title) return false;
+                if (attemptedHltbIdsRef.current.has(g.id)) return false;
+                return !hasAttemptedHltbLookup(g.title, g.steamAppId);
+              });
+
+              if (!nextGame) return;
+
+              attemptedHltbIdsRef.current.add(nextGame.id);
+              autoHltbTrickleRunningRef.current = true;
+
+              void (async () => {
+                try {
+                  if (
+                    typeof window !== 'undefined' &&
+                    window.electronAPI?.offlineVault?.getGameDetail
+                  ) {
+                    const vaultDetail = await window.electronAPI.offlineVault
+                      .getGameDetail(nextGame.id)
+                      .catch(() => null);
+                    if (vaultDetail?.hltb) {
+                      const seeded = seedHltbFromVaultIfMissing(
+                        nextGame.title,
+                        nextGame.steamAppId,
+                        vaultDetail.hltb
+                      );
+                      if (seeded) return;
+                    }
+                  }
+
+                  const liveHltb = await fetchAndCacheHltb(nextGame.title, nextGame.steamAppId);
+                  if (liveHltb && typeof window !== 'undefined') {
+                    window.electronAPI?.offlineVault
+                      ?.saveGameDetail?.({
+                        gameId: nextGame.id,
+                        steamAppId: nextGame.steamAppId ?? null,
+                        canonicalTitle: nextGame.title,
+                        hltb: { ...liveHltb },
+                      })
+                      ?.catch?.(() => {});
+                  }
+                } catch {
+                  // Ignore background HLTB trickle error
+                } finally {
+                  autoHltbTrickleRunningRef.current = false;
+                  if (!onlineLifecycleManager.isOnline()) {
+                    offlineSkippedHltbIdsRef.current.add(nextGame.id);
+                    return;
+                  }
+                  if (!cancelled) {
+                    scheduleHltbTrickle(isVitestEnv ? 30 : 900);
+                  }
+                }
+              })();
+            }
+          )
+          .catch(() => {});
+      }, delayMs);
+    };
 
     const scheduleMediaWarmup = (delayMs = 6000) => {
       if (warmupTimer !== null) {
         clearTimeout(warmupTimer);
         warmupTimer = null;
       }
+      if (isVitestEnv && !allowWarmupInTest) return;
       if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
       if (!onlineLifecycleManager.isOnline()) return;
 
@@ -224,7 +354,10 @@ export function useBackgroundMediaWarmup({
               return evaluateGameNeedsStoreMediaSync(g, false).eligible;
             });
 
-            if (gamesNeedingWarmup.length === 0) return;
+            if (gamesNeedingWarmup.length === 0) {
+              scheduleHltbTrickle(900);
+              return;
+            }
 
             for (const g of gamesNeedingWarmup) {
               attemptedWarmupIdsRef.current.add(g.id);
@@ -266,6 +399,7 @@ export function useBackgroundMediaWarmup({
                 }
                 if (!isModalSuspendedRef.current) {
                   flushWarmupBatch();
+                  scheduleHltbTrickle(900);
                 }
               });
           })
@@ -274,6 +408,9 @@ export function useBackgroundMediaWarmup({
     };
 
     scheduleMediaWarmup(isVitestEnv ? 120 : 6000);
+    if (canRunHltbTrickle) {
+      scheduleHltbTrickle(isVitestEnv ? 60 : 6500);
+    }
 
     let unsubscribeOnline: (() => void) | null = null;
     try {
@@ -284,15 +421,28 @@ export function useBackgroundMediaWarmup({
           }
           offlineSkippedIdsRef.current.clear();
         }
+        if (offlineSkippedHltbIdsRef.current.size > 0) {
+          for (const id of offlineSkippedHltbIdsRef.current) {
+            attemptedHltbIdsRef.current.delete(id);
+          }
+          offlineSkippedHltbIdsRef.current.clear();
+        }
         if (!isBootHydratingRef.current && !isModalSuspendedRef.current) {
           scheduleMediaWarmup(isVitestEnv ? 120 : 2500);
+          if (canRunHltbTrickle) {
+            scheduleHltbTrickle(isVitestEnv ? 60 : 3000);
+          }
         }
       });
     } catch {}
 
     return () => {
+      cancelled = true;
       if (warmupTimer !== null) {
         clearTimeout(warmupTimer);
+      }
+      if (hltbTrickleTimer !== null) {
+        clearTimeout(hltbTrickleTimer);
       }
       unsubscribeOnline?.();
     };

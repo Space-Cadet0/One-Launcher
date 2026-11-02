@@ -1,8 +1,81 @@
 import React from 'react';
-import { ChevronRight, ExternalLink, Globe } from 'lucide-react';
+import { AlertTriangle, ChevronRight, ExternalLink, Globe, Link2, ShieldCheck } from 'lucide-react';
 import { ActiveGameFilter } from '../../contracts/filter';
+import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
+import type { StorefrontId } from '../../contracts/platform';
+import {
+  EA_DRM_BACKGROUND_REQUIRED_RE,
+  detectStructuralKernelAntiCheatFromNotices,
+  isBattlEyeKernelAntiCheat,
+  normalizeChainedHandoffId,
+  resolveCanonicalKernelAntiCheatDisplayName,
+  type NormalizedChainedHandoffId,
+} from '../../services/integrations/catalogSanitizer';
+import { launcherService } from '../../services/launcher/launcherService';
 
-interface SteamSidebarNoticesProps {
+function stripNoticeHtml(raw?: string | null): string {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw
+    .replace(/<br\s*\/?>/gi, ' • ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&rsquo;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:\s*•\s*)+|(?:\s*•\s*)+$/g, '')
+    .trim();
+}
+
+function getSourceStoreLabel(platformId?: string | null): string {
+  const pid = String(platformId || '').trim().toLowerCase();
+  switch (pid) {
+    case 'xbox':
+      return 'Xbox';
+    case 'epic':
+      return 'Epic Games';
+    case 'steam':
+      return 'Steam';
+    default:
+      return 'Xbox / Epic / Steam';
+  }
+}
+
+export function synthesizeChainedLauncherNotice(
+  handoffId: NormalizedChainedHandoffId,
+  sourcePlatformId?: string | null
+): { heading: string; message: string } {
+  const storeLabel = getSourceStoreLabel(sourcePlatformId);
+  switch (handoffId) {
+    case 'ea':
+      return {
+        heading: 'Requires EA App',
+        message: `Requires EA App and an EA Account linked to your ${storeLabel} account.`,
+      };
+    case 'ubisoft':
+      return {
+        heading: 'Requires Ubisoft Connect',
+        message: `Requires Ubisoft Connect and a Ubisoft Account linked to your ${storeLabel} account.`,
+      };
+    case 'bnet':
+      return {
+        heading: 'Requires Battle.net',
+        message: `Requires Battle.net and a Battle.net Account linked to your ${storeLabel} account.`,
+      };
+    case 'rockstar':
+      return {
+        heading: 'Requires Rockstar Launcher',
+        message: `Requires Rockstar Games Launcher and a Rockstar Games account linked to your ${storeLabel} account.`,
+      };
+    case 'riot':
+      return {
+        heading: 'Requires Riot Client',
+        message: `Requires Riot Client and a Riot Account linked to your ${storeLabel} account.`,
+      };
+  }
+}
+
+export interface SteamSidebarNoticesProps {
   title: string;
   steamAppId?: number;
   genres: string[];
@@ -14,6 +87,14 @@ interface SteamSidebarNoticesProps {
   website?: string;
   deckCompatibility?: 'verified' | 'playable' | 'unsupported' | 'unknown';
   onApplyFilter?: (filter: ActiveGameFilter) => void;
+  game?: CanonicalGame;
+  platforms?: GamePlatformOwnership[];
+  activePlatform?: GamePlatformOwnership | null;
+  activePlatformId?: StorefrontId | string | null;
+  drmNotice?: string | null;
+  extUserAccountNotice?: string | null;
+  chainedLauncherHandoff?: string | null;
+  externalStorefrontHandoff?: string | null;
 }
 
 export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
@@ -28,11 +109,119 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
   website,
   deckCompatibility,
   onApplyFilter,
+  game,
+  platforms,
+  activePlatform,
+  activePlatformId,
+  drmNotice,
+  extUserAccountNotice,
+  chainedLauncherHandoff,
+  externalStorefrontHandoff,
 }) => {
   const validWebsiteUrl =
     typeof website === 'string' && /^https?:\/\//i.test(website.trim())
       ? website.trim()
       : null;
+
+  const candidatePlatforms = platforms || game?.platforms || [];
+  const resolvedActivePlat =
+    activePlatform ||
+    (activePlatformId
+      ? candidatePlatforms.find((p) => p?.platformId === activePlatformId)
+      : undefined) ||
+    candidatePlatforms.find((p) =>
+      Boolean(p?.chainedLauncherHandoff || p?.externalStorefrontHandoff)
+    ) ||
+    candidatePlatforms[0];
+
+  const rawDrmNotice =
+    drmNotice ??
+    game?.enrichedMetadata?.drmNotice ??
+    (game as { drmNotice?: string } | undefined)?.drmNotice ??
+    null;
+  const plainDrmNotice = stripNoticeHtml(rawDrmNotice);
+
+  const rawExtAccountNotice =
+    extUserAccountNotice ?? game?.enrichedMetadata?.extUserAccountNotice ?? null;
+  const plainExtAccountNotice = stripNoticeHtml(rawExtAccountNotice);
+
+  const inferredDrmHandoff =
+    plainDrmNotice && EA_DRM_BACKGROUND_REQUIRED_RE.test(plainDrmNotice) && resolvedActivePlat?.platformId !== 'gog'
+      ? 'ea'
+      : undefined;
+
+  const resolvedHandoffId = normalizeChainedHandoffId(
+    chainedLauncherHandoff ||
+      externalStorefrontHandoff ||
+      resolvedActivePlat?.chainedLauncherHandoff ||
+      resolvedActivePlat?.externalStorefrontHandoff ||
+      inferredDrmHandoff
+  );
+
+  const activeSourcePid = resolvedActivePlat?.platformId || activePlatformId || null;
+  const shouldShowChainedNotice = Boolean(
+    resolvedHandoffId &&
+      resolvedHandoffId !== String(activeSourcePid || '').toLowerCase()
+  );
+
+  const synthesizedChainedNotice =
+    shouldShowChainedNotice && resolvedHandoffId
+      ? synthesizeChainedLauncherNotice(resolvedHandoffId, activeSourcePid)
+      : null;
+
+  const showSupplementalDrmText = Boolean(
+    plainDrmNotice &&
+      (!synthesizedChainedNotice ||
+        plainDrmNotice.toLowerCase() !== synthesizedChainedNotice.message.toLowerCase()) &&
+      !(
+        resolvedHandoffId === 'ea' &&
+        /^incorporates 3rd-party drm:\s*(?:ea\s+app|origin(?:\s+client)?)\s+software\s+installation\s+and\s+background\s+use\s+required\.?$/i.test(
+          plainDrmNotice
+        )
+      )
+  );
+  const showSupplementalAccountText = Boolean(
+    plainExtAccountNotice &&
+      (!synthesizedChainedNotice ||
+        !synthesizedChainedNotice.message
+          .toLowerCase()
+          .includes(plainExtAccountNotice.toLowerCase()))
+  );
+
+  const isWindowsHost =
+    (typeof (launcherService as { isWindowsHost?: () => boolean }).isWindowsHost === 'function' &&
+      (launcherService as { isWindowsHost: () => boolean }).isWindowsHost()) ||
+    (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
+
+  const hasNativeMacForActiveEntry = Boolean(
+    resolvedActivePlat?.isCrossPlatformLauncherRuntime ||
+      resolvedActivePlat?.platforms?.mac === true ||
+      (!resolvedActivePlat && game?.platforms_os?.mac === true)
+  );
+  const structuralAntiCheat = detectStructuralKernelAntiCheatFromNotices(
+    plainDrmNotice,
+    resolvedActivePlat?.xboxBottleCompatibilityReason
+  );
+  const rawKernelAntiCheatLabel =
+    resolvedActivePlat?.kernelAntiCheatName ||
+    game?.kernelAntiCheatName ||
+    resolvedActivePlat?.antiCheatName ||
+    game?.antiCheatName ||
+    structuralAntiCheat?.kernelAntiCheatName ||
+    (resolvedHandoffId === 'riot' ? 'Riot Vanguard' : undefined);
+  const resolvedKernelAntiCheatLabel =
+    resolveCanonicalKernelAntiCheatDisplayName(rawKernelAntiCheatLabel) ||
+    rawKernelAntiCheatLabel;
+  const shouldShowMacKernelAntiCheatNotice = Boolean(
+    !isWindowsHost &&
+      !hasNativeMacForActiveEntry &&
+      (resolvedHandoffId === 'riot' ||
+        resolvedActivePlat?.xboxBottleCompatibilityTier === 'tier_c_kernel_anticheat' ||
+        resolvedActivePlat?.requiresKernelAntiCheat ||
+        game?.requiresKernelAntiCheat ||
+        structuralAntiCheat)
+  );
+  const isBattlEyeNotice = isBattlEyeKernelAntiCheat(resolvedKernelAntiCheatLabel);
 
   const handleOpenExternalLink = (e: React.MouseEvent<HTMLAnchorElement>, url: string) => {
     if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
@@ -43,6 +232,82 @@ export const SteamSidebarNotices: React.FC<SteamSidebarNoticesProps> = ({
 
   return (
     <div className="space-y-4">
+      {(synthesizedChainedNotice || showSupplementalDrmText || showSupplementalAccountText) && (
+        <div
+          role="note"
+          data-testid="sidebar-chained-launcher-notice"
+          className="p-3 bg-[#1b2838] border border-amber-400/55 rounded-sm space-y-1.5"
+        >
+          {synthesizedChainedNotice && (
+            <>
+              <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-amber-200">
+                <Link2 aria-hidden="true" className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                <span>{synthesizedChainedNotice.heading}</span>
+              </div>
+              <p className="text-xs text-amber-100 leading-relaxed">
+                {synthesizedChainedNotice.message}
+              </p>
+            </>
+          )}
+          {showSupplementalDrmText && (
+            <p className="text-[11px] text-amber-200 leading-relaxed">{plainDrmNotice}</p>
+          )}
+          {showSupplementalAccountText && !synthesizedChainedNotice && (
+            <p className="text-[11px] text-amber-200 leading-relaxed">
+              Requires 3rd-Party Account: {plainExtAccountNotice}
+            </p>
+          )}
+        </div>
+      )}
+
+      {shouldShowMacKernelAntiCheatNotice && (
+        <div
+          role="status"
+          data-testid="sidebar-kernel-anticheat-notice"
+          className={
+            isBattlEyeNotice
+              ? 'p-3 bg-[#2b1f0e] border border-amber-400/55 rounded-sm space-y-1.5'
+              : 'p-3 bg-[#2a1219] border border-rose-500/50 rounded-sm space-y-1.5'
+          }
+        >
+          <div
+            className={`flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider ${
+              isBattlEyeNotice ? 'text-amber-200' : 'text-rose-200'
+            }`}
+          >
+            {isBattlEyeNotice ? (
+              <AlertTriangle
+                aria-hidden="true"
+                className="w-3.5 h-3.5 shrink-0 text-amber-300"
+              />
+            ) : (
+              <ShieldCheck
+                aria-hidden="true"
+                className="w-3.5 h-3.5 shrink-0 text-rose-300"
+              />
+            )}
+            <span>
+              {isBattlEyeNotice
+                ? 'BattlEye Online Anti-Cheat Notice (macOS Bottle)'
+                : `Kernel Anti-Cheat Required (${
+                    resolvedKernelAntiCheatLabel || 'Windows Kernel Anti-Cheat'
+                  })`}
+            </span>
+          </div>
+          <p
+            className={`text-xs leading-relaxed ${
+              isBattlEyeNotice ? 'text-amber-100' : 'text-rose-100'
+            }`}
+          >
+            {isBattlEyeNotice
+              ? 'Online multiplayer sessions requiring BattlEye (BEDaisy.sys Windows kernel driver) cannot load inside macOS CrossOver / Wine bottles, while offline Story Mode (-nobattleye) remains playable where supported.'
+              : `Requires ${
+                  resolvedKernelAntiCheatLabel || 'Windows kernel anti-cheat'
+                }, whose Windows ring-0 kernel driver cannot load inside macOS CrossOver / Wine bottles.`}
+          </p>
+        </div>
+      )}
+
       {/* Steam Deck Compatibility Section (Only shown when real compatibility status is known) */}
       {deckCompatibility && deckCompatibility !== 'unknown' && (
         <div className="mb-4">

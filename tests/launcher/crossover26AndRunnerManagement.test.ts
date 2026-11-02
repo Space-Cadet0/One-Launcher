@@ -510,7 +510,12 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
           return acc;
         }
         if (predicate(node)) acc.push(node);
-        if (node.props && node.props.children) {
+        if (
+          typeof node.type === 'function' &&
+          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+        ) {
+          findElements(node.type(node.props || {}), predicate, acc);
+        } else if (node.props && node.props.children) {
           findElements(node.props.children, predicate, acc);
         }
         return acc;
@@ -589,34 +594,34 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
           'Exposes NVIDIA DLSS to the game (powered by Apple MetalFX) for D3DMetal &amp; DXMT — select Quality / Balanced / Performance inside the game’s graphics settings.'
         );
 
-        // Verify default MSync/ESync mutual exclusion state (MSync: ON, ESync: OFF)
-        const getMsyncBtn = (vnode: any) =>
+        // Verify default MSync/ESync mutual exclusion state (MSync: checked, ESync: unchecked)
+        const getMsyncRadio = (vnode: any) =>
           findElements(
             vnode,
-            (el) => el.type === 'button' && getTextContent(el).startsWith('MSync')
+            (el) => el.type === 'input' && el.props?.type === 'radio' && el.props?.value === 'msync'
           )[0];
-        const getEsyncBtn = (vnode: any) =>
+        const getEsyncRadio = (vnode: any) =>
           findElements(
             vnode,
-            (el) => el.type === 'button' && getTextContent(el).startsWith('ESync')
+            (el) => el.type === 'input' && el.props?.type === 'radio' && el.props?.value === 'esync'
           )[0];
 
-        expect(getTextContent(getMsyncBtn(r1.vnode))).toBe('MSyncON');
-        expect(getTextContent(getEsyncBtn(r1.vnode))).toBe('ESyncOFF');
+        expect(getMsyncRadio(r1.vnode)?.props?.checked).toBe(true);
+        expect(getEsyncRadio(r1.vnode)?.props?.checked).toBe(false);
 
-        // Click ESync button -> turns ESync ON and automatically turns MSync OFF
-        getEsyncBtn(r1.vnode).props.onClick();
+        // Select ESync radio -> turns ESync ON and automatically turns MSync OFF
+        getEsyncRadio(r1.vnode).props.onChange();
 
         const rEsync = renderConfigModal();
-        expect(getTextContent(getEsyncBtn(rEsync.vnode))).toBe('ESyncON');
-        expect(getTextContent(getMsyncBtn(rEsync.vnode))).toBe('MSyncOFF');
+        expect(getEsyncRadio(rEsync.vnode)?.props?.checked).toBe(true);
+        expect(getMsyncRadio(rEsync.vnode)?.props?.checked).toBe(false);
 
-        // Click MSync button -> turns MSync ON and automatically turns ESync OFF
-        getMsyncBtn(rEsync.vnode).props.onClick();
+        // Select MSync radio -> turns MSync ON and automatically turns ESync OFF
+        getMsyncRadio(rEsync.vnode).props.onChange();
 
         const rMsync = renderConfigModal();
-        expect(getTextContent(getMsyncBtn(rMsync.vnode))).toBe('MSyncON');
-        expect(getTextContent(getEsyncBtn(rMsync.vnode))).toBe('ESyncOFF');
+        expect(getMsyncRadio(rMsync.vnode)?.props?.checked).toBe(true);
+        expect(getEsyncRadio(rMsync.vnode)?.props?.checked).toBe(false);
 
         // Switch Launch Mode to 'compatibility_layer' -> verify Custom Compatibility Runner & Bottle mode selects cleanly
         const compatModeBtn = findElements(
@@ -631,7 +636,7 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         const r2 = renderConfigModal();
         expect(r2.html).toContain('Custom Compatibility Runner &amp; Bottle');
 
-        // Select Graphics Backend = 'dxvk' -> verify DLSS button becomes disabled ('Unavailable')
+        // Select Graphics Backend = 'dxvk' -> verify DLSS switch becomes disabled ('Unavailable')
         const backendSelect = findElements(
           r2.vnode,
           (el) => el.type === 'select' && el.props?.['aria-label'] === 'Graphics Backend'
@@ -659,11 +664,10 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         const r4 = renderConfigModal();
         const dlssBtn = findElements(
           r4.vnode,
-          (el) =>
-            el.type === 'button' &&
-            (getTextContent(el) === 'Disabled' || getTextContent(el) === 'Enabled')
+          (el) => el.type === 'button' && el.props?.['data-testid'] === 'toggle-crossover-dlss'
         )[0];
         expect(dlssBtn).toBeDefined();
+        expect(dlssBtn.props['aria-checked']).toBe(false);
         dlssBtn.props.onClick();
 
         const r5 = renderConfigModal();
@@ -887,7 +891,12 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
             return acc;
           }
           if (predicate(node)) acc.push(node);
-          if (node.props && node.props.children) {
+          if (
+            typeof node.type === 'function' &&
+            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          ) {
+            findElements(node.type(node.props || {}), predicate, acc);
+          } else if (node.props && node.props.children) {
             findElements(node.props.children, predicate, acc);
           }
           return acc;
@@ -1235,7 +1244,12 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
             return acc;
           }
           if (predicate(node)) acc.push(node);
-          if (node.props && node.props.children) {
+          if (
+            typeof node.type === 'function' &&
+            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          ) {
+            findElements(node.type(node.props || {}), predicate, acc);
+          } else if (node.props && node.props.children) {
             findElements(node.props.children, predicate, acc);
           }
           return acc;
@@ -1349,7 +1363,7 @@ describe("Universal Game Launcher QA — CrossOver 26, Bottle Uninstall & D3DMet
         expect(steamRender.html).toContain('DLSS (MetalFX Upscaling)');
         expect(steamRender.html).toContain('MSync');
         expect(steamRender.html).toContain('ESync');
-        expect(steamRender.html).toContain('DXVK HUD');
+        expect(steamRender.html).toContain('DXVK / DXMT HUD');
 
         // 5. Switch Compatibility Runner on the Steam storefront to 'gptk'
         const runnerSelect = findElements(
@@ -2198,7 +2212,12 @@ setTimeout(() => process.exit(0), 1000);
           return acc;
         }
         if (predicate(node)) acc.push(node);
-        if (node.props && node.props.children) {
+        if (
+          typeof node.type === 'function' &&
+          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+        ) {
+          findElements(node.type(node.props || {}), predicate, acc);
+        } else if (node.props && node.props.children) {
           findElements(node.props.children, predicate, acc);
         }
         return acc;
@@ -2266,7 +2285,7 @@ setTimeout(() => process.exit(0), 1000);
         const r1 = renderModal();
 
         // 1. Verify <select data-testid="compat-runner-select"> options:
-        // Must contain ONLY crossover, crossover_preview, gptk, wine (never 'native' or 'whisky')
+        // Always includes all 4 macOS compatibility runners; never 'native' or 'whisky'
         const runnerSelect = findElements(
           r1.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
@@ -2278,23 +2297,36 @@ setTimeout(() => process.exit(0), 1000);
         expect(optionValues).not.toContain('native');
         expect(optionValues).not.toContain('whisky');
 
-        // 2. When 'crossover' (installed) is selected, runner-details-card shows Installed & Ready
+        // 2. When 'crossover' (installed) is selected, runner-details-card shows Up to Date
         expect(r1.html).toContain('data-testid="runner-details-card"');
-        expect(r1.html).toContain('Installed &amp; Ready');
+        expect(r1.html).toContain('Up to Date');
         expect(r1.html).not.toContain('data-testid="runner-not-installed-callout"');
 
-        // 3. Switch runner to uninstalled 'wine' -> renders runner-not-installed-callout + Homebrew installer button + WineHQ guide button
-        runnerSelect.props.onChange({ target: { value: 'wine' } });
+        // 2b. Switch runner to uninstalled 'crossover_preview' -> renders in-app Sign In & Install button
+        runnerSelect.props.onChange({ target: { value: 'crossover_preview' } });
+        const rPreview = renderModal();
+        expect(rPreview.html).toContain('data-testid="runner-not-installed-callout"');
+        expect(rPreview.html).toContain('data-testid="install-runner-brew-btn"');
+        expect(rPreview.html).toContain('Sign In &amp; Install CrossOver Preview (~480 MB)');
+        expect(rPreview.html).not.toContain('data-testid="download-runner-btn"');
+        expect(rPreview.html).not.toContain('data-testid="install-runner-archive-btn"');
+
+        // 3. Switch runner to uninstalled 'wine' -> renders runner-not-installed-callout + 1-click Install button
+        const runnerSelectFromPreview = findElements(
+          rPreview.vnode,
+          (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
+        )[0];
+        runnerSelectFromPreview.props.onChange({ target: { value: 'wine' } });
         const rWine = renderModal();
         expect(rWine.html).toContain('data-testid="runner-details-card"');
         expect(rWine.html).toContain('data-testid="runner-not-installed-callout"');
         expect(rWine.html).toContain('Runner Not Installed on This Mac');
-        expect(rWine.html).toContain('Install Open-Source Wine Automatically (Homebrew)');
-        expect(rWine.html).toContain('Open Official WineHQ macOS Guide');
+        expect(rWine.html).toContain('Install Open-Source Wine (~240 MB)');
         expect(rWine.html).toContain('Re-Scan Installed Runners');
-        expect(rWine.html).toContain('brew install --cask --no-quarantine wine-stable');
+        expect(rWine.html).not.toContain('data-testid="download-runner-btn"');
+        expect(rWine.html).not.toContain('data-testid="install-runner-archive-btn"');
 
-        // 4. Switch runner to uninstalled 'gptk' -> renders runner-not-installed-callout + Open Apple GPTK Downloads button
+        // 4. Switch runner to uninstalled 'gptk' -> renders runner-not-installed-callout + 1-click Install button
         const runnerSelect2 = findElements(
           rWine.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
@@ -2303,8 +2335,9 @@ setTimeout(() => process.exit(0), 1000);
         const rGptk = renderModal();
         expect(rGptk.html).toContain('data-testid="runner-details-card"');
         expect(rGptk.html).toContain('data-testid="runner-not-installed-callout"');
-        expect(rGptk.html).toContain('Open Apple GPTK Downloads');
+        expect(rGptk.html).toContain('Install Apple GPTK (~228 MB)');
         expect(rGptk.html).toContain('Re-Scan Installed Runners');
+        expect(rGptk.html).not.toContain('data-testid="download-runner-btn"');
 
         // 5. Verify launcherEngine.installCompatibilityLayer & launcherService.installCompatibilityLayer
         const installHome = path.join(tmpRoot, 'runner-install-home');
@@ -2698,7 +2731,12 @@ setTimeout(() => process.exit(0), 1000);
           return acc;
         }
         if (predicate(node)) acc.push(node);
-        if (node.props && node.props.children) {
+        if (
+          typeof node.type === 'function' &&
+          (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+        ) {
+          findElements(node.type(node.props || {}), predicate, acc);
+        } else if (node.props && node.props.children) {
           findElements(node.props.children, predicate, acc);
         }
         return acc;
@@ -2779,17 +2817,17 @@ setTimeout(() => process.exit(0), 1000);
         );
         expect(optionTexts).toContain('CrossOver Preview — v27.0.0 Installed');
 
-        // 2. Verify runner-version-update-row and runner-installed-version show v26.3.0
+        // 2. Verify runner-version-update-row and runner-installed-version show deduplicated v26.3.0 · Build 39832
         expect(r1.html).toContain('data-testid="runner-version-update-row"');
         expect(r1.html).toContain('data-testid="runner-installed-version"');
-        expect(r1.html).toContain('Installed Version: v26.3.0');
-        expect(r1.html).toContain('26.3.0 (Build 39832)');
+        expect(r1.html).toContain('v26.3.0 · Build 39832');
 
         // 3. Verify runner-update-available-badge and update-runner-btn render and trigger updateCompatibilityLayer('crossover')
         expect(r1.html).toContain('data-testid="runner-update-available-badge"');
         expect(r1.html).toContain('Update Available: v26.4.0');
         expect(r1.html).toContain('data-testid="update-runner-btn"');
-        expect(r1.html).toContain('Update to v26.4.0');
+        expect(r1.html).toContain('aria-label="Update CrossOver to v26.4.0"');
+        expect(r1.html).toContain('>Update<');
 
         const updateBtn = findElements(
           r1.vnode,
@@ -2799,7 +2837,7 @@ setTimeout(() => process.exit(0), 1000);
         await updateBtn.props.onClick();
         expect(updateRunnerSpy).toHaveBeenCalledWith('crossover');
 
-        // 4. Switch to crossover_preview -> shows v27.0.0, runner-up-to-date-badge ("Up to Date (v27.0.0)"), and check-runner-updates-btn
+        // 4. Switch to crossover_preview -> shows deduplicated v27.0.0 · Preview 20261006, runner-up-to-date-badge ("Up to Date"), and check-runner-updates-btn
         const runnerSelectAfter = findElements(
           r1.vnode,
           (el) => el.type === 'select' && el.props?.['data-testid'] === 'compat-runner-select'
@@ -2807,10 +2845,9 @@ setTimeout(() => process.exit(0), 1000);
         runnerSelectAfter.props.onChange({ target: { value: 'crossover_preview' } });
 
         const rPreview = renderModal();
-        expect(rPreview.html).toContain('Installed Version: v27.0.0');
-        expect(rPreview.html).toContain('27.0.0 (Preview 20261006)');
+        expect(rPreview.html).toContain('v27.0.0 · Preview 20261006');
         expect(rPreview.html).toContain('data-testid="runner-up-to-date-badge"');
-        expect(rPreview.html).toContain('Up to Date (v27.0.0)');
+        expect(rPreview.html).toContain('Up to Date');
         expect(rPreview.html).toContain('data-testid="check-runner-updates-btn"');
       } finally {
         detectSpy.mockRestore();
@@ -3151,13 +3188,12 @@ setTimeout(() => process.exit(0), 1000);
         }
         if (typeof node === 'object') {
           if (predicate(node)) acc.push(node);
-          if (typeof node.type === 'function') {
-            try {
-              const rendered = node.type(node.props || {});
-              findElements(rendered, predicate, acc);
-            } catch {}
-          }
-          if (node.props && node.props.children) {
+          if (
+            typeof node.type === 'function' &&
+            (node.type.name === 'LaunchSelect' || node.type.name === 'SwitchControl')
+          ) {
+            findElements(node.type(node.props || {}), predicate, acc);
+          } else if (node.props && node.props.children) {
             findElements(node.props.children, predicate, acc);
           }
         }
@@ -3222,9 +3258,9 @@ setTimeout(() => process.exit(0), 1000);
         await new Promise((r) => setTimeout(r, 20));
         const rStable = renderModal();
 
-        // Standard CrossOver (single D3DMetal 3.0) shows "D3DMetal: v3.0" badge and hides the dual version switcher
+        // Standard CrossOver (single D3DMetal 3.0) shows "D3DMetal 3.0" badge and hides the dual version switcher
         expect(rStable.html).toContain('data-testid="runner-d3dmetal-version"');
-        expect(rStable.html).toContain('D3DMetal: v3.0');
+        expect(rStable.html).toContain('D3DMetal 3.0');
         expect(rStable.html).not.toContain('data-testid="crossover-d3dmetal-version-section"');
 
         // Switch compatibilityLayer to crossover_preview
@@ -3237,9 +3273,9 @@ setTimeout(() => process.exit(0), 1000);
 
         const rPreview = renderModal();
 
-        // 1. Verify runner-d3dmetal-version badge shows "D3DMetal: v4.0b3 (Default) / v3.0"
+        // 1. Verify runner-d3dmetal-version badge shows "D3DMetal 4.0b3 / 3.0"
         expect(rPreview.html).toContain('data-testid="runner-d3dmetal-version"');
-        expect(rPreview.html).toContain('D3DMetal: v4.0b3 (Default) / v3.0');
+        expect(rPreview.html).toContain('D3DMetal 4.0b3 / 3.0');
 
         // 2. Verify crossover-d3dmetal-version-section renders with auto, 4, and 3 buttons
         expect(rPreview.html).toContain('data-testid="crossover-d3dmetal-version-section"');

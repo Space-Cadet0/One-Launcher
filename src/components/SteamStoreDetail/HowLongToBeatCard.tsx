@@ -1,8 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { HltbData, getHowLongToBeat, fetchAndCacheHltb } from '../../services/hltb/howLongToBeat';
+import {
+  HltbData,
+  getHowLongToBeat,
+  fetchAndCacheHltb,
+  seedHltbFromVaultIfMissing,
+} from '../../services/hltb/howLongToBeat';
+import { sanitizeTitleForSearchQuery } from '../../services/common/titleUtils';
 import { Clock, ExternalLink, Trophy, Compass, Flag, Layers, CheckCircle2, Loader2 } from 'lucide-react';
 
 interface HowLongToBeatCardProps {
+  gameId?: string;
   gameTitle: string;
   appId?: number;
   genres?: string[];
@@ -11,6 +18,7 @@ interface HowLongToBeatCardProps {
 }
 
 export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
+  gameId,
   gameTitle,
   appId,
   genres = [],
@@ -24,39 +32,70 @@ export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
 
   useEffect(() => {
     let isMounted = true;
-    const immediate = initialHltb ?? getHowLongToBeat(gameTitle, appId, genres, tags);
+    const immediate = initialHltb
+      ? (seedHltbFromVaultIfMissing(gameTitle, appId, initialHltb) ?? initialHltb)
+      : getHowLongToBeat(gameTitle, appId, genres, tags);
     setHltb(immediate);
 
     if (immediate?.isAccurate) {
-      return;
+      setIsLoading(false);
+      return () => {
+        isMounted = false;
+      };
     }
 
     setIsLoading(true);
-    fetchAndCacheHltb(gameTitle, appId)
-      .then((live) => {
-        if (isMounted && live) {
+    void (async () => {
+      try {
+        if (gameId && typeof window !== 'undefined' && window.electronAPI?.offlineVault?.getGameDetail) {
+          const vaultDetail = await window.electronAPI.offlineVault.getGameDetail(gameId).catch(() => null);
+          if (vaultDetail?.hltb) {
+            const seeded = seedHltbFromVaultIfMissing(gameTitle, appId, vaultDetail.hltb);
+            if (seeded) {
+              if (isMounted) {
+                setHltb(seeded);
+                setIsLoading(false);
+              }
+              return;
+            }
+          }
+        }
+
+        const live = await fetchAndCacheHltb(gameTitle, appId);
+        if (!live) return;
+        if (gameId && typeof window !== 'undefined') {
+          window.electronAPI?.offlineVault
+            ?.saveGameDetail?.({
+              gameId,
+              steamAppId: appId ?? null,
+              canonicalTitle: gameTitle,
+              hltb: { ...live },
+            })
+            ?.catch?.(() => {});
+        }
+        if (isMounted) {
           setHltb(live);
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         console.warn('[HLTB] Async fetch error:', err);
-      })
-      .finally(() => {
+      } finally {
         if (isMounted) setIsLoading(false);
-      });
+      }
+    })();
 
     return () => {
       isMounted = false;
     };
-  }, [gameTitle, appId, initialHltb]);
+  }, [gameId, gameTitle, appId, initialHltb]);
 
   if (!hltb && !isLoading) {
     return null;
   }
 
+  const sanitizedSearchQuery = sanitizeTitleForSearchQuery(gameTitle) || gameTitle;
   const hltbUrl = hltb?.hltbGameId
     ? `https://howlongtobeat.com/game/${hltb.hltbGameId}`
-    : `https://howlongtobeat.com/?q=${encodeURIComponent(gameTitle)}`;
+    : `https://howlongtobeat.com/?q=${encodeURIComponent(sanitizedSearchQuery)}`;
 
   const formatHours = (hours?: number): string => {
     if (!hours || hours <= 0) return '--';
@@ -101,7 +140,7 @@ export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
                 </span>
               )}
               {hltb?.gameplayType && (
-                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.2 rounded bg-[#1f2b38] text-steam-subtext border border-steam-border/40">
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[#1f2b38] text-steam-subtext border border-steam-border/40">
                   {hltb.gameplayType}
                 </span>
               )}

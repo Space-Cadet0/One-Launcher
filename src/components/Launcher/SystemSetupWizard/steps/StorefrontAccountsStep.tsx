@@ -10,6 +10,7 @@ import type {
   StorefrontTokenSummary,
 } from '../../../../types/electron';
 import {
+  formatXboxIntegrationStatusMessage,
   loadCurrentCatalog,
   loadIntegrations,
   loadXboxProfileState,
@@ -19,6 +20,7 @@ import {
   saveXboxProfileState,
   type XboxCachedProfileState,
 } from '../../../../services/integrations/integrationStorage';
+import { formatXboxSubscriptionDate } from '../../../../services/integrations/xboxIntegration';
 import { normalizeGogAvatarUrl } from '../../../../services/integrations/gogIntegration';
 import { cacheUserXboxAchievements } from '../../../../services/storage/knownGameAchievements';
 import { environmentSetupService } from '../../../../services/launcher/environmentSetupService';
@@ -49,6 +51,8 @@ type ExtendedAuthBridge = ElectronAPI & {
 type NativeSyncPayload = Partial<StorefrontAuthResult> & {
   gamerpicUrl?: string;
   hasDeviceContext?: boolean;
+  authoritativeComplete?: boolean;
+  transientOffline?: boolean;
   tokenData?: (StorefrontTokenSummary & { expires_at?: string }) | null;
   achievements?: Record<string, AchievementSummaryEntry>;
 };
@@ -82,10 +86,10 @@ const CORE_STOREFRONTS: ReadonlyArray<CoreStoreCardSpec> = [
   },
   {
     id: 'xbox',
-    title: 'Xbox / PC Game Pass',
-    badge: 'Game Pass & Microsoft Store',
+    title: 'Xbox & Game Pass',
+    badge: 'Game Pass, EA Play & Microsoft Store',
     bridgingNote:
-      'Imports your Xbox and PC Game Pass library with achievements and cloud saves.',
+      'Imports your Microsoft Store purchases and active Game Pass or partner PC subscription library with achievements and cloud saves.',
   },
 ];
 
@@ -156,8 +160,69 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
   } | null>(null);
 
   useEffect(() => {
-    setIntegrations(scrubLoadedIntegrations());
-    setXboxProfile(loadXboxProfileState());
+    const loadedIntegrations = scrubLoadedIntegrations();
+    const cachedXbox = loadXboxProfileState();
+    setIntegrations(loadedIntegrations);
+    setXboxProfile(cachedXbox);
+
+    const isXboxConnected =
+      connectedStorefronts.includes('xbox') ||
+      loadedIntegrations.some((i) => i.storefrontId === 'xbox' && i.isConnected);
+    if (
+      !isXboxConnected ||
+      typeof window === 'undefined' ||
+      typeof window.electronAPI?.getXboxStatus !== 'function'
+    ) {
+      return;
+    }
+
+    const sub = cachedXbox?.subscription;
+    const endIso = sub?.earliestActivePassEndDate || sub?.endDate;
+    const checkedMs = sub?.checkedAt ? Date.parse(sub.checkedAt) : Number.NaN;
+    const endMs = endIso ? Date.parse(endIso) : Number.NaN;
+    const needsSubRefresh = Boolean(
+      !sub ||
+        !sub.subscriptionFingerprint?.startsWith('v2|') ||
+        !Number.isFinite(checkedMs) ||
+        Date.now() - checkedMs > 15 * 60 * 1000 ||
+        (Number.isFinite(endMs) && Date.now() >= endMs)
+    );
+    let cancelled = false;
+    window.electronAPI
+      .getXboxStatus({ refreshSubscription: needsSubRefresh })
+      .then((status) => {
+        if (cancelled || !status?.connected) return;
+        const latestCached = loadXboxProfileState();
+        const nextProfile: XboxCachedProfileState = {
+          connected: true,
+          gamertag: status.gamertag || latestCached?.gamertag,
+          modernGamertag:
+            status.modernGamertag || status.gamertag || latestCached?.modernGamertag,
+          xuid: status.xuid || latestCached?.xuid,
+          avatarUrl: status.avatarUrl || latestCached?.avatarUrl,
+          gamerscore:
+            typeof status.gamerscore === 'number'
+              ? status.gamerscore
+              : latestCached?.gamerscore,
+          subscription:
+            status.subscription !== undefined
+              ? status.subscription
+              : (latestCached?.subscription ?? null),
+          syncMode: status.syncMode || latestCached?.syncMode || 'owned_and_played',
+          hasDeviceContext:
+            typeof status.hasDeviceContext === 'boolean'
+              ? status.hasDeviceContext
+              : latestCached?.hasDeviceContext,
+          lastSyncedAt: latestCached?.lastSyncedAt || new Date().toISOString(),
+        };
+        saveXboxProfileState(nextProfile);
+        setXboxProfile(nextProfile);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [connectedStorefronts]);
 
   const applyNativeAuthSuccess = async (
@@ -173,9 +238,16 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
     }));
     const current = loadCurrentCatalog();
     const shouldMergeGames =
-      gamesList.length > 0 || (storefrontId === 'xbox' && hasExplicitGamesArray);
+      gamesList.length > 0 ||
+      ((storefrontId === 'xbox' || Boolean(res.authoritativeComplete)) && hasExplicitGamesArray);
+    const resolvedAuthoritativeComplete =
+      res.authoritativeComplete !== undefined
+        ? Boolean(res.authoritativeComplete)
+        : storefrontId === 'xbox';
     const merged = shouldMergeGames
-      ? mergeStorefrontGames(current, gamesList, storefrontId)
+      ? mergeStorefrontGames(current, gamesList, storefrontId, {
+          authoritativeComplete: resolvedAuthoritativeComplete,
+        })
       : current;
     const count = shouldMergeGames
       ? merged.filter((g) => g.platforms.some((p) => p.platformId === storefrontId)).length
@@ -191,6 +263,7 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
         ? res.modernGamertag || res.gamertag || res.accountName || 'Xbox User'
         : res.accountName || 'Connected User';
 
+    let nextXboxSubscription: XboxCachedProfileState['subscription'] = null;
     if (storefrontId === 'xbox') {
       if (res.achievements && typeof res.achievements === 'object') {
         cacheUserXboxAchievements(res.achievements);
@@ -215,6 +288,7 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
             : prevXboxProfile?.hasDeviceContext,
         lastSyncedAt: new Date().toISOString(),
       };
+      nextXboxSubscription = nextXboxProfile.subscription;
       saveXboxProfileState(nextXboxProfile);
       setXboxProfile(nextXboxProfile);
     }
@@ -235,7 +309,10 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
       gamesCount: count,
       lastSyncedAt: new Date().toISOString(),
       authMethod: 'oauth',
-      statusMessage: `Connected as ${resolvedAccountName} (${count} games)`,
+      statusMessage:
+        storefrontId === 'xbox'
+          ? formatXboxIntegrationStatusMessage(resolvedAccountName, count, nextXboxSubscription)
+          : `Connected as ${resolvedAccountName} (${count} games)`,
       credentials: sanitizePublicCredentials(storefrontId, {
         steamId:
           storefrontId === 'steam'
@@ -321,7 +398,11 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
       };
 
       if (!Array.isArray(authRes.games) || authRes.games.length === 0) {
-        if (authRes.code && typeof api?.exchangeCode === 'function') {
+        const alreadyExchangedInMain =
+          Boolean(authRes.authoritativeComplete) ||
+          Boolean(authRes.tokenData) ||
+          authRes.code === 'xbox_token_broker';
+        if (!alreadyExchangedInMain && authRes.code && typeof api?.exchangeCode === 'function') {
           const exchanged = await api.exchangeCode(spec.id, authRes.code);
           if (exchanged?.success) {
             finalPayload = {
@@ -339,7 +420,10 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
           !authRes.gamertag &&
           typeof api?.syncStore === 'function'
         ) {
-          const synced = await api.syncStore(spec.id);
+          const synced =
+            spec.id === 'xbox'
+              ? await api.syncStore('xbox', { forceRefresh: true })
+              : await api.syncStore(spec.id);
           if (synced?.success) {
             finalPayload = {
               ...authRes,
@@ -416,6 +500,19 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
               ? xboxProfile?.modernGamertag || xboxProfile?.gamertag || integ?.accountName
               : integ?.accountName;
 
+          const xboxSub = spec.id === 'xbox' && isConnected ? xboxProfile?.subscription : null;
+          const xboxSubEndLabel = xboxSub
+            ? formatXboxSubscriptionDate(xboxSub.earliestActivePassEndDate || xboxSub.endDate)
+            : null;
+          const effectiveBadge =
+            spec.id === 'xbox' && xboxSub
+              ? xboxSub.hasActiveSubscription
+                ? xboxSub.hasPcCatalogAccess
+                  ? xboxSub.tierDisplayName || 'PC Game Pass'
+                  : `${xboxSub.tierDisplayName || 'Xbox Game Pass for Console'} (Console Only)`
+                : 'Microsoft Store (Owned PC Games)'
+              : spec.badge;
+
           return (
             <div
               key={spec.id}
@@ -441,7 +538,7 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
                     <div className="min-w-0">
                       <div className="text-xs font-bold text-white truncate">{spec.title}</div>
                       <div className="text-[10px] text-sky-300 font-medium truncate">
-                        {spec.badge}
+                        {effectiveBadge}
                       </div>
                     </div>
                   </div>
@@ -466,6 +563,32 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
                     {typeof integ?.gamesCount === 'number' && integ.gamesCount > 0 && (
                       <span className="text-[10px] font-mono text-slate-300 shrink-0">
                         {integ.gamesCount} games
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {spec.id === 'xbox' && isConnected && xboxSub && (
+                  <div
+                    data-testid="setup-xbox-subscription-pill"
+                    className={`rounded px-2.5 py-1 text-[10px] font-semibold border flex flex-wrap items-center gap-1.5 ${
+                      xboxSub.hasActiveSubscription && xboxSub.hasPcCatalogAccess
+                        ? 'bg-emerald-950/85 border-emerald-500/45 text-emerald-200'
+                        : xboxSub.hasActiveSubscription
+                        ? 'bg-amber-950/85 border-amber-500/45 text-amber-200'
+                        : 'bg-slate-800/90 border-slate-600/60 text-slate-200'
+                    }`}
+                  >
+                    <span>
+                      {xboxSub.hasActiveSubscription
+                        ? xboxSub.hasPcCatalogAccess
+                          ? xboxSub.tierDisplayName || 'PC Game Pass'
+                          : `${xboxSub.tierDisplayName || 'Xbox Game Pass for Console'} (Owned PC Games Only)`
+                        : 'No Active Game Pass (Owned Games Only)'}
+                    </span>
+                    {xboxSub.hasActiveSubscription && xboxSubEndLabel && (
+                      <span className="font-normal opacity-90">
+                        • {xboxSub.autoRenew ? `Renews ${xboxSubEndLabel}` : `Expires ${xboxSubEndLabel}`}
                       </span>
                     )}
                   </div>

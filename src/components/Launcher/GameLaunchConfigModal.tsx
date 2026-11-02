@@ -12,6 +12,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { getBadgeToneClasses } from './LaunchConfig/launchConfigHelpers';
+import { LAUNCH_BUTTON_FOCUS_CLASSES } from './LaunchConfig/LaunchConfigControls';
 import {
   DetectedPipelineBanner,
   DetectedPipelineBannerBase,
@@ -73,11 +74,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
   ): React.ReactElement | null =>
     isRealClientRenderer ? React.createElement(MemoComp, props) : BaseFn(props);
 
-  const isBusy =
-    form.isSaving ||
-    form.isInstallingRunner ||
-    form.isUpdatingRunner ||
-    form.isRescanningRunners;
+  const isBusy = form.isSaving;
 
   return (
     <ModalShell
@@ -128,7 +125,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             type="button"
             onClick={onClose}
             disabled={isBusy}
-            className="min-w-6 min-h-6 p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+            className={`min-w-6 min-h-6 p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
             aria-label="Close launch settings modal"
           >
             <X className="w-4 h-4" aria-hidden="true" />
@@ -136,7 +133,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
         </div>
 
         {/* Scrollable Content */}
-        <div className="p-5 space-y-5 overflow-y-auto overscroll-contain flex-1 bg-[#131b26] modal-scroll-body">
+        <div className="p-5 space-y-5 overflow-y-auto overscroll-contain [scrollbar-gutter:stable] flex-1 bg-[#131b26] modal-scroll-body">
           {renderSection(DetectedPipelineBanner, DetectedPipelineBannerBase, {
             game,
             preview: form.preview,
@@ -149,9 +146,9 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
           {/* Launch Mode */}
           <div className="space-y-2">
-            <span className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
+            <h3 className="block text-[11px] font-bold uppercase tracking-wider text-steam-subtext">
               Launch Mode
-            </span>
+            </h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {form.visibleLaunchModes.map((mode) => {
                 const modeNote = form.preview.modeNotes[mode.value];
@@ -185,7 +182,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
                         }
                       }
                     }}
-                    className={`p-3 rounded-lg border text-left transition-colors flex flex-col justify-between ${
+                    className={`min-h-6 p-3 rounded-lg border text-left transition-colors flex flex-col justify-between ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
                       isModeDisabled
                         ? 'bg-[#121923] border-[#1f2e40] text-steam-subtext/60 opacity-55 cursor-not-allowed'
                         : isSelected
@@ -289,10 +286,14 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             activeUpdateInfo: form.activeUpdateInfo,
             activeInstalledVer: form.activeInstalledVer,
             activeSecondaryBuildText: form.activeSecondaryBuildText,
+            activeRunnerProgress: form.activeRunnerProgress,
             isCheckingUpdates: form.isCheckingUpdates,
             isUpdatingRunner: form.isUpdatingRunner,
             onUpdateRunner: form.handleUpdateRunner,
             onCheckRunnerUpdates: form.handleCheckRunnerUpdates,
+            onCancelRunnerOperation: form.handleCancelRunnerOperation,
+            onInstallRunnerFromArchive: form.handleInstallRunnerFromArchive,
+            onSwitchToStableCrossOver: form.handleSwitchToStableCrossOver,
             resolvedBottleFolderPath: form.resolvedBottleFolderPath,
             onOpenBottleFolder: form.handleOpenBottleFolder,
             isRescanningRunners: form.isRescanningRunners,
@@ -315,13 +316,24 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             crossoverHighResolutionMode: form.crossoverHighResolutionMode,
             onChangeCrossoverHighResolutionMode: form.setCrossoverHighResolutionMode,
             isDlssSupportedBackend: form.isDlssSupportedBackend,
+            dlssUnavailableReason: form.dlssUnavailableReason,
             isDxvkHudSupported: form.isDxvkHudSupported,
             crossoverDlss: form.crossoverDlss,
             onToggleCrossoverDlss: form.handleToggleCrossoverDlss,
+            metalfxSpatialUpscaleFactor: form.metalfxSpatialUpscaleFactor,
+            onChangeMetalfxSpatialUpscaleFactor: form.setMetalfxSpatialUpscaleFactor,
+            preferredMaxFrameRate: form.preferredMaxFrameRate,
+            onChangePreferredMaxFrameRate: form.setPreferredMaxFrameRate,
+            emulateModeset: form.emulateModeset,
+            onChangeEmulateModeset: form.setEmulateModeset,
+            forceLargeAddressAware: form.forceLargeAddressAware,
+            onToggleForceLargeAddressAware: form.handleToggleForceLargeAddressAware,
             wineMsync: form.wineMsync,
             onToggleWineMsync: form.handleToggleWineMsync,
             wineEsync: form.wineEsync,
             onToggleWineEsync: form.handleToggleWineEsync,
+            wineSyncMode: form.wineSyncMode,
+            onSelectWineSyncMode: form.handleSelectWineSyncMode,
             metalHud: form.metalHud,
             onToggleMetalHud: form.handleToggleMetalHud,
             dxvkHud: form.dxvkHud,
@@ -347,6 +359,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
           })}
 
           {renderSection(StorefrontLifecycleSection, StorefrontLifecycleSectionBase, {
+            idPrefix,
             isWindowsHost: form.isWindowsHost,
             preview: form.preview,
             activeDisplayMethod: form.activeDisplayMethod,
@@ -404,7 +417,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             data-testid="reset-launch-config-btn"
             onClick={form.handleResetDefaults}
             disabled={isBusy}
-            className="inline-flex items-center gap-1.5 min-h-6 px-3 py-2 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+            className={`inline-flex items-center gap-1.5 min-h-6 px-3 py-2 rounded-lg bg-[#17212e] hover:bg-[#223144] border border-[#2a475e] text-xs font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
           >
             <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
             <span>
@@ -417,7 +430,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               type="button"
               onClick={onClose}
               disabled={isBusy}
-              className="min-h-6 px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+              className={`min-h-6 px-4 py-2 rounded-lg bg-[#1b2838] hover:bg-[#24354a] text-xs font-semibold text-steam-text hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
             >
               Cancel
             </button>
@@ -425,7 +438,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               type="button"
               onClick={form.handleSave}
               disabled={form.isSaving}
-              className="inline-flex items-center gap-1.5 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer"
+              className={`inline-flex items-center gap-1.5 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
               style={{
                 background: 'linear-gradient(to right, #059669 0%, #047857 100%)',
                 boxShadow: '0 0 16px rgba(16, 185, 129, 0.35)',

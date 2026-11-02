@@ -11,6 +11,8 @@ const {
   getElectron,
   getStoreSync,
   getConfiguredUserDataDir,
+  isTestEnvironment,
+  registerExternalCacheInvalidator,
   resolveIsolatedHomedirAndUserData,
   findGogdlBinary,
   findLegendaryBinary,
@@ -54,15 +56,30 @@ const {
 const {
   steamId64ToAccountId32,
 } = require('../storefronts/steamLocalScanner.cjs');
+const {
+  CHAINED_PUBLISHER_ECOSYSTEMS,
+  parseWineRegistrySections,
+  resolveDefaultChainedBottleName,
+  discoverBottlePublisherLauncher,
+  discoverHostPublisherLauncher,
+} = require('./chainedPublisherLaunchers.cjs');
+
+const PROBER_RUNNER_UPDATES_TTL_MS = 15 * 60 * 1000; // 15-minute in-memory TTL
+/** @type {{ key: string, expiresAt: number, value: Record<string, any> | null }} */
+let cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
+
+registerExternalCacheInvalidator(() => {
+  cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
+});
 
 /**
- * @typedef {'rosetta2' | 'win_vcredist' | 'win_webview2' | 'runner_crossover' | 'runner_crossover_preview' | 'runner_wine' | 'runner_gptk' | 'bottle_default' | 'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'xbox_runtime'} EnvironmentComponentId
+ * @typedef {'rosetta2' | 'win_vcredist' | 'win_webview2' | 'runner_crossover' | 'runner_crossover_preview' | 'runner_wine' | 'runner_gptk' | 'bottle_default' | 'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'host_ubisoft' | 'bottle_ubisoft' | 'host_ea' | 'bottle_ea' | 'host_bnet' | 'bottle_bnet' | 'host_rockstar' | 'bottle_rockstar' | 'host_riot' | 'xbox_runtime'} EnvironmentComponentId
  * @typedef {'os_prerequisite' | 'compatibility_runner' | 'bottle' | 'host_client' | 'bottle_client' | 'built_in_runtime'} EnvironmentComponentCategory
  * @typedef {'ready' | 'partially_configured' | 'missing' | 'update_available' | 'not_applicable'} EnvironmentComponentStatus
  * @typedef {'required' | 'recommended' | 'optional' | 'not_needed' | 'built_in'} RecommendationTier
- * @typedef {'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic'} ClientLoginTargetId
+ * @typedef {'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'host_ubisoft' | 'bottle_ubisoft' | 'host_ea' | 'bottle_ea' | 'host_bnet' | 'bottle_bnet' | 'host_rockstar' | 'bottle_rockstar' | 'host_riot'} ClientLoginTargetId
  * @typedef {'crossover' | 'crossover_preview' | 'gptk' | 'wine'} NonNativeRunnerType
- * @typedef {'steam' | 'gog' | 'epic' | 'amazon' | 'xbox' | 'ubisoft' | 'ea' | 'bnet' | 'itch' | 'rockstar' | 'humble' | 'custom'} StorefrontId
+ * @typedef {'steam' | 'gog' | 'epic' | 'amazon' | 'xbox' | 'ubisoft' | 'ea' | 'bnet' | 'itch' | 'rockstar' | 'riot' | 'humble' | 'custom'} StorefrontId
  */
 
 /**
@@ -89,7 +106,7 @@ const {
 /**
  * @typedef {object} ClientAuthProbeState
  * @property {ClientLoginTargetId} targetId
- * @property {'steam' | 'gog' | 'epic'} storefrontId
+ * @property {'steam' | 'gog' | 'epic' | 'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} storefrontId
  * @property {'host' | 'bottle'} scope
  * @property {string} label
  * @property {boolean} installed
@@ -179,6 +196,15 @@ const VALID_ENVIRONMENT_COMPONENT_IDS = new Set([
   'bottle_gog',
   'host_epic',
   'bottle_epic',
+  'host_ubisoft',
+  'bottle_ubisoft',
+  'host_ea',
+  'bottle_ea',
+  'host_bnet',
+  'bottle_bnet',
+  'host_rockstar',
+  'bottle_rockstar',
+  'host_riot',
   'xbox_runtime',
 ]);
 
@@ -203,6 +229,7 @@ const VALID_STOREFRONT_IDS = new Set([
   'bnet',
   'itch',
   'rockstar',
+  'riot',
   'humble',
   'custom',
 ]);
@@ -1206,13 +1233,20 @@ function buildBottleEnvironmentSummary(
   }
 
   if (availableBottles.length > 0) {
-    const oneLauncherBottle = availableBottles.find((b) => b.name === 'OneLauncher');
-    const userPreferredBottle = wizardState.preferredBottleName
-      ? availableBottles.find((b) => b.name === wizardState.preferredBottleName)
-      : null;
-    const steamBottle = availableBottles.find((b) => b.hasSteam);
+    const preferredExisting =
+      wizardState.preferredBottleName && safeIsBottleSlug(wizardState.preferredBottleName)
+        ? availableBottles.find(
+            (b) =>
+              b.name.toLowerCase() === String(wizardState.preferredBottleName).trim().toLowerCase()
+          )
+        : null;
+    const resolvedExistingName = resolveDefaultChainedBottleName({
+      wizardPreferredBottleName: preferredExisting ? preferredExisting.name : undefined,
+      discoveredBottleNames: availableBottles,
+      runnerType: activeRunner?.type,
+    });
     const chosenBottle =
-      oneLauncherBottle || userPreferredBottle || steamBottle || availableBottles[0];
+      availableBottles.find((b) => b.name === resolvedExistingName) || availableBottles[0];
 
     return {
       runnerType: activeRunner
@@ -1227,12 +1261,11 @@ function buildBottleEnvironmentSummary(
     };
   }
 
-  const defaultBottleName =
-    wizardState.preferredBottleName && safeIsBottleSlug(wizardState.preferredBottleName)
-      ? wizardState.preferredBottleName
-      : activeRunner && (activeRunner.type === 'wine' || activeRunner.type === 'gptk')
-        ? 'default'
-        : 'OneLauncher';
+  const defaultBottleName = resolveDefaultChainedBottleName({
+    wizardPreferredBottleName: wizardState.preferredBottleName,
+    discoveredBottleNames: [],
+    runnerType: activeRunner?.type,
+  });
 
   return {
     runnerType: activeRunner ? /** @type {NonNativeRunnerType} */ (activeRunner.type) : null,
@@ -1954,19 +1987,171 @@ async function probeClientLoginStates(options = {}) {
     ),
   ]);
 
-  // Strip internal _steamId64 helper tag before returning public contract object
-  const cleanSteamState = (/** @type {any} */ st) => {
-    const { _steamId64, ...pub } = st;
+  // Read & parse bottle system.reg once (< 5ms) and share across all 4 bottle publisher probes
+  /** @type {Map<string, Record<string, string>> | undefined} */
+  let parsedBottleSystemReg;
+  if (hostPlatform === 'darwin' && activeBottlePath) {
+    try {
+      const sysRegPath = path.join(activeBottlePath, 'system.reg');
+      if (fs.existsSync(sysRegPath)) {
+        parsedBottleSystemReg = parseWineRegistrySections(
+          await fs.promises.readFile(sysRegPath, 'utf8')
+        );
+      }
+    } catch {}
+  }
+
+  /**
+   * Build `ClientAuthProbeState` for a chained publisher launcher (`ubisoft`, `ea`, `bnet`, `rockstar`, `riot`).
+   *
+   * @param {ClientLoginTargetId} targetId
+   * @param {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} storefrontId
+   * @param {'host' | 'bottle'} scope
+   * @param {string} label
+   * @param {boolean} applicable
+   * @param {{ allowMacNativeDiscovery?: boolean }} [opts]
+   * @returns {ClientAuthProbeState}
+   */
+  const probePublisherTarget = (targetId, storefrontId, scope, label, applicable, opts = {}) => {
+    const canProbeOnCurrentHost =
+      applicable || (opts.allowMacNativeDiscovery === true && hostPlatform === 'darwin');
+    const discovered = !canProbeOnCurrentHost
+      ? { installed: false, hasLocalSession: false }
+      : scope === 'bottle'
+        ? activeBottlePath
+          ? discoverBottlePublisherLauncher(activeBottlePath, storefrontId, {
+              parsedSystemReg: parsedBottleSystemReg,
+            })
+          : { installed: false, hasLocalSession: false }
+        : discoverHostPublisherLauncher(storefrontId, clientResolverOpts);
+
+    const effectiveApplicable =
+      applicable ||
+      Boolean(
+        opts.allowMacNativeDiscovery === true &&
+          hostPlatform === 'darwin' &&
+          discovered.installed &&
+          discovered.binaryPath
+      );
+
+    const installed = Boolean(effectiveApplicable && discovered.installed && discovered.binaryPath);
+    const authenticated = Boolean(installed && discovered.hasLocalSession);
+    const statusSummary = !effectiveApplicable
+      ? scope === 'bottle'
+        ? 'Not needed on Windows'
+        : 'Not available natively on Mac'
+      : !installed
+        ? 'Not installed'
+        : !authenticated
+          ? 'Sign-in needed'
+          : 'Signed in';
+
+    /** @type {ClientAuthProbeState} */
+    const state = {
+      targetId,
+      storefrontId,
+      scope,
+      label,
+      installed,
+      ...(installed && discovered.binaryPath ? { binaryPath: discovered.binaryPath } : {}),
+      ...(scope === 'bottle' && activeBottleName ? { bottleName: activeBottleName } : {}),
+      ...(scope === 'bottle' && activeBottlePath ? { bottlePath: activeBottlePath } : {}),
+      authenticated,
+      accountMatchesOneLauncher: null,
+      statusSummary,
+      ...(discovered.version ? { _version: discovered.version } : {}),
+    };
+    return state;
+  };
+
+  const hostUbisoft = probePublisherTarget(
+    'host_ubisoft',
+    'ubisoft',
+    'host',
+    'Ubisoft Connect',
+    hostPlatform === 'win32'
+  );
+  const bottleUbisoft = probePublisherTarget(
+    'bottle_ubisoft',
+    'ubisoft',
+    'bottle',
+    'Ubisoft Connect (Windows)',
+    hostPlatform === 'darwin'
+  );
+  const hostEa = probePublisherTarget(
+    'host_ea',
+    'ea',
+    'host',
+    'EA App',
+    hostPlatform === 'win32',
+    { allowMacNativeDiscovery: true }
+  );
+  const bottleEa = probePublisherTarget(
+    'bottle_ea',
+    'ea',
+    'bottle',
+    'EA App (Windows)',
+    hostPlatform === 'darwin'
+  );
+  const hostBnet = probePublisherTarget(
+    'host_bnet',
+    'bnet',
+    'host',
+    hostPlatform === 'darwin' ? 'Battle.net (Mac)' : 'Battle.net',
+    hostPlatform === 'win32' || hostPlatform === 'darwin'
+  );
+  const bottleBnet = probePublisherTarget(
+    'bottle_bnet',
+    'bnet',
+    'bottle',
+    'Battle.net (Windows)',
+    hostPlatform === 'darwin'
+  );
+  const hostRockstar = probePublisherTarget(
+    'host_rockstar',
+    'rockstar',
+    'host',
+    'Rockstar Games Launcher',
+    hostPlatform === 'win32'
+  );
+  const bottleRockstar = probePublisherTarget(
+    'bottle_rockstar',
+    'rockstar',
+    'bottle',
+    'Rockstar Games Launcher (Windows)',
+    hostPlatform === 'darwin'
+  );
+  const hostRiot = probePublisherTarget(
+    'host_riot',
+    'riot',
+    'host',
+    hostPlatform === 'darwin' ? 'Riot Client (Mac)' : 'Riot Client',
+    hostPlatform === 'win32',
+    { allowMacNativeDiscovery: true }
+  );
+
+  // Strip internal _steamId64 / _version helper tags before returning public contract object
+  const cleanProbeState = (/** @type {any} */ st) => {
+    const { _steamId64, _version, ...pub } = st;
     return pub;
   };
 
   return {
-    host_steam: cleanSteamState(hostSteam),
-    bottle_steam: cleanSteamState(bottleSteam),
+    host_steam: cleanProbeState(hostSteam),
+    bottle_steam: cleanProbeState(bottleSteam),
     host_gog: hostGog,
     bottle_gog: bottleGog,
     host_epic: hostEpic,
     bottle_epic: bottleEpic,
+    host_ubisoft: cleanProbeState(hostUbisoft),
+    bottle_ubisoft: cleanProbeState(bottleUbisoft),
+    host_ea: cleanProbeState(hostEa),
+    bottle_ea: cleanProbeState(bottleEa),
+    host_bnet: cleanProbeState(hostBnet),
+    bottle_bnet: cleanProbeState(bottleBnet),
+    host_rockstar: cleanProbeState(hostRockstar),
+    bottle_rockstar: cleanProbeState(bottleRockstar),
+    host_riot: cleanProbeState(hostRiot),
   };
 }
 
@@ -2224,6 +2409,15 @@ async function probeEnvironmentHealth(options = {}) {
     rawPlatform === 'win32' ? 'win32' : rawPlatform === 'linux' ? 'linux' : 'darwin';
   const hostArch = String(options.arch || process.arch || 'arm64');
   const isAppleSiliconMac = hostPlatform === 'darwin' && hostArch === 'arm64';
+  const darwinKernelMajor =
+    typeof options.darwinKernelMajor === 'number' && Number.isFinite(options.darwinKernelMajor)
+      ? options.darwinKernelMajor
+      : typeof options.osRelease === 'string' && options.osRelease.trim()
+        ? Number.parseInt(options.osRelease.trim().split('.')[0] || '0', 10) || 24
+        : process.platform === 'darwin'
+          ? Number.parseInt(String(os.release() || '24.0.0').split('.')[0] || '24', 10) || 24
+          : 24;
+  const isGptkAutoInstallSupported = isAppleSiliconMac && darwinKernelMajor >= 23;
 
   const { homedir, userDataDir } = resolveReadOnlyPaths(options);
   const wizardState = getSetupWizardState(options);
@@ -2418,15 +2612,57 @@ async function probeEnvironmentHealth(options = {}) {
   }
 
   /** @type {Record<string, any>} */
-  const runnerUpdates =
-    hostPlatform === 'darwin' && options.mockFeeds
-      ? await checkCompatibilityLayerUpdates({
+  let runnerUpdates = {};
+  if (hostPlatform === 'darwin') {
+    if (
+      options.mockFeeds ||
+      typeof options.httpGetText === 'function' ||
+      (typeof options.fetchFn === 'function' && options.skipNetwork !== true)
+    ) {
+      try {
+        runnerUpdates = await checkCompatibilityLayerUpdates({
           ...options,
           ...explicitHomedirOpt(options),
           layers: detectedRunners,
-          skipNetwork: true,
-        })
-      : {};
+          timeoutMs: Number(options.runnerUpdateTimeoutMs || 3500),
+          ...(options.mockFeeds ? { skipNetwork: true } : {}),
+        });
+      } catch {
+        runnerUpdates = {};
+      }
+    } else if (!isTestEnvironment(options) && options.skipNetwork !== true) {
+      const layersCacheKey = detectedRunners
+        .map(
+          (r) =>
+            `${r.type}:${r.version || ''}:${r.buildVersion || ''}:${r.appPath || r.binaryPath || ''}`
+        )
+        .join('|');
+      const nowMs = Date.now();
+      if (
+        options.forceRefreshRunnerUpdates !== true &&
+        cachedProberRunnerUpdates.value &&
+        cachedProberRunnerUpdates.key === layersCacheKey &&
+        nowMs < cachedProberRunnerUpdates.expiresAt
+      ) {
+        runnerUpdates = cachedProberRunnerUpdates.value;
+      } else {
+        try {
+          runnerUpdates = await checkCompatibilityLayerUpdates({
+            ...options,
+            layers: detectedRunners,
+            timeoutMs: Number(options.runnerUpdateTimeoutMs || 3500),
+          });
+          cachedProberRunnerUpdates = {
+            key: layersCacheKey,
+            expiresAt: nowMs + PROBER_RUNNER_UPDATES_TTL_MS,
+            value: runnerUpdates,
+          };
+        } catch {
+          runnerUpdates = {};
+        }
+      }
+    }
+  }
 
   const bottleSummary = buildBottleEnvironmentSummary(
     hostPlatform,
@@ -2549,6 +2785,12 @@ async function probeEnvironmentHealth(options = {}) {
         ? 'Not installed — requires manual download'
         : 'Not installed';
 
+    const canAutoInstallOrUpdate = Boolean(
+      meta.canAutoInstall || (layer && upd?.canAutoUpdate === true)
+    );
+    const effectiveRequiresExternal =
+      layer && upd?.canAutoUpdate === true ? false : meta.requiresExternalDownload;
+
     return {
       id,
       category: 'compatibility_runner',
@@ -2565,8 +2807,10 @@ async function probeEnvironmentHealth(options = {}) {
       ...(layer?.binaryPath ? { binaryPath: layer.binaryPath } : {}),
       ...(layer?.appPath ? { installLocation: layer.appPath } : {}),
       wasPreviouslyConfigured: configuredSet.has(id),
-      canAutoInstall: meta.canAutoInstall,
-      ...(meta.requiresExternalDownload ? { requiresExternalDownload: true } : {}),
+      canAutoInstall: canAutoInstallOrUpdate,
+      ...(typeof effectiveRequiresExternal === 'boolean'
+        ? { requiresExternalDownload: effectiveRequiresExternal }
+        : {}),
       ...(meta.externalDownloadUrl ? { externalDownloadUrl: meta.externalDownloadUrl } : {}),
       ...(meta.estimatedDownloadMB ? { estimatedDownloadMB: meta.estimatedDownloadMB } : {}),
       recommendationTier: meta.tier,
@@ -2649,6 +2893,95 @@ async function probeEnvironmentHealth(options = {}) {
           ? 'ready'
           : 'missing'
         : 'not_applicable';
+
+  /**
+   * Build `EnvironmentComponentState` for chained publisher launchers (`ubisoft`, `ea`, `bnet`, `rockstar`).
+   *
+   * @param {EnvironmentComponentId & ClientLoginTargetId} id
+   * @param {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} handoffId
+   * @param {'host' | 'bottle'} scope
+   * @param {string} title
+   * @param {string} shortLabel
+   * @param {string} whyExplanation
+   * @returns {EnvironmentComponentState}
+   */
+  const buildPublisherClientComponent = (
+    id,
+    handoffId,
+    scope,
+    title,
+    shortLabel,
+    whyExplanation
+  ) => {
+    const ecosystem = CHAINED_PUBLISHER_ECOSYSTEMS[handoffId];
+    const loginProbe = clientLogins[id];
+    const applicable =
+      scope === 'bottle'
+        ? hostPlatform === 'darwin'
+        : handoffId === 'bnet'
+          ? hostPlatform === 'win32' || hostPlatform === 'darwin'
+          : handoffId === 'ea' || handoffId === 'riot'
+            ? hostPlatform === 'win32' || Boolean(hostPlatform === 'darwin' && loginProbe?.installed)
+            : hostPlatform === 'win32';
+
+    /** @type {EnvironmentComponentStatus} */
+    const status = !applicable
+      ? 'not_applicable'
+      : loginProbe?.installed
+        ? 'ready'
+        : 'missing';
+
+    const canAutoInstall =
+      scope === 'bottle' ? hostPlatform === 'darwin' : hostPlatform === 'win32';
+
+    const requiresMacExternalBnet =
+      scope === 'host' &&
+      handoffId === 'bnet' &&
+      hostPlatform === 'darwin' &&
+      status === 'missing';
+
+    const rawDetail = !applicable
+      ? scope === 'bottle'
+        ? 'Not needed on Windows.'
+        : 'Windows-only publisher client (use bottled version on Mac).'
+      : status === 'ready'
+        ? loginProbe.statusSummary
+        : formatRemovedPrefix(id, status, 'Not installed (optional).');
+
+    return {
+      id,
+      category: scope === 'bottle' ? 'bottle_client' : 'host_client',
+      storefrontId: handoffId,
+      scope,
+      title,
+      shortLabel,
+      status,
+      ...(loginProbe?.binaryPath ? { binaryPath: loginProbe.binaryPath } : {}),
+      ...(scope === 'bottle' && bottleSummary.activeBottlePath
+        ? { installLocation: bottleSummary.activeBottlePath }
+        : {}),
+      wasPreviouslyConfigured: configuredSet.has(id),
+      canAutoInstall,
+      ...(requiresMacExternalBnet
+        ? {
+            requiresExternalDownload: true,
+            externalDownloadUrl: 'https://download.battle.net/?product=bnetdesk',
+          }
+        : {}),
+      ...(canAutoInstall && ecosystem.estimatedDownloadMB
+        ? { estimatedDownloadMB: ecosystem.estimatedDownloadMB }
+        : {}),
+      recommendationTier: 'optional',
+      recommendationBadge: !applicable
+        ? scope === 'bottle'
+          ? 'Mac Only'
+          : 'Windows Only'
+        : 'Optional — Chained Games Only',
+      defaultSelected: false,
+      whyExplanation,
+      statusDetail: rawDetail,
+    };
+  };
 
   /** @type {Record<EnvironmentComponentId, EnvironmentComponentState>} */
   const components = {
@@ -2758,13 +3091,14 @@ async function probeEnvironmentHealth(options = {}) {
         title: 'CrossOver Preview',
         shortLabel: 'CrossOver Preview',
         tier: 'optional',
-        badge: 'Optional',
+        badge: 'Preview',
         defaultSelected: false,
-        canAutoInstall: false,
-        requiresExternalDownload: true,
+        canAutoInstall: true,
+        requiresExternalDownload: false,
+        estimatedDownloadMB: 480,
         externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
         whyExplanation:
-          'Early-access version of CrossOver for active subscribers.',
+          'Early-access CodeWeavers build with bleeding-edge D3DMetal and DXMT fixes. Sign in to CodeWeavers Preview in-app to auto-install.',
       }
     ),
 
@@ -2787,9 +3121,10 @@ async function probeEnvironmentHealth(options = {}) {
       tier: 'optional',
       badge: 'Advanced',
       defaultSelected: false,
-      canAutoInstall: false,
-      requiresExternalDownload: true,
-      externalDownloadUrl: 'https://developer.apple.com/games/game-porting-toolkit/',
+      canAutoInstall: isGptkAutoInstallSupported,
+      requiresExternalDownload: !isGptkAutoInstallSupported,
+      estimatedDownloadMB: 228,
+      externalDownloadUrl: 'https://github.com/Gcenx/game-porting-toolkit/releases/latest',
       whyExplanation:
         'Apple’s developer tool. Not needed if you use CrossOver, which already includes it.',
     }),
@@ -3034,6 +3369,87 @@ async function probeEnvironmentHealth(options = {}) {
                 'Not installed (not needed).'
               ),
     },
+
+    host_ubisoft: buildPublisherClientComponent(
+      'host_ubisoft',
+      'ubisoft',
+      'host',
+      'Ubisoft Connect',
+      'Ubisoft Connect',
+      'Only needed for Xbox Game Pass, Steam, or Epic games that delegate launch and DRM through Ubisoft Connect.'
+    ),
+
+    bottle_ubisoft: buildPublisherClientComponent(
+      'bottle_ubisoft',
+      'ubisoft',
+      'bottle',
+      'Ubisoft Connect (Windows)',
+      'Ubisoft Connect (Windows)',
+      'Only needed on Mac for Windows games (including Xbox Game Pass & Steam titles) that delegate through Ubisoft Connect.'
+    ),
+
+    host_ea: buildPublisherClientComponent(
+      'host_ea',
+      'ea',
+      'host',
+      'EA App',
+      'EA App',
+      'Only needed for EA Play / Xbox Game Pass, Steam, or Epic games that delegate launch through EA App.'
+    ),
+
+    bottle_ea: buildPublisherClientComponent(
+      'bottle_ea',
+      'ea',
+      'bottle',
+      'EA App (Windows)',
+      'EA App (Windows)',
+      'Only needed on Mac for Windows games (including EA Play / Game Pass & Steam titles) that delegate through EA App.'
+    ),
+
+    host_bnet: buildPublisherClientComponent(
+      'host_bnet',
+      'bnet',
+      'host',
+      hostPlatform === 'darwin' ? 'Battle.net (Mac)' : 'Battle.net',
+      hostPlatform === 'darwin' ? 'Battle.net (Mac)' : 'Battle.net',
+      'Only needed for Blizzard / Activision titles (including Xbox Game Pass titles) that install and launch through Battle.net.'
+    ),
+
+    bottle_bnet: buildPublisherClientComponent(
+      'bottle_bnet',
+      'bnet',
+      'bottle',
+      'Battle.net (Windows)',
+      'Battle.net (Windows)',
+      'Only needed on Mac for Windows-only Blizzard / Activision games that launch through Battle.net.'
+    ),
+
+    host_rockstar: buildPublisherClientComponent(
+      'host_rockstar',
+      'rockstar',
+      'host',
+      'Rockstar Games Launcher',
+      'Rockstar Launcher',
+      'Only needed for Rockstar Games titles that delegate authentication and launch through Rockstar Games Launcher.'
+    ),
+
+    bottle_rockstar: buildPublisherClientComponent(
+      'bottle_rockstar',
+      'rockstar',
+      'bottle',
+      'Rockstar Games Launcher (Windows)',
+      'Rockstar Launcher (Windows)',
+      'Only needed on Mac for Windows Rockstar Games titles that delegate through Rockstar Games Launcher.'
+    ),
+
+    host_riot: buildPublisherClientComponent(
+      'host_riot',
+      'riot',
+      'host',
+      hostPlatform === 'darwin' ? 'Riot Client (Mac)' : 'Riot Client',
+      hostPlatform === 'darwin' ? 'Riot Client (Mac)' : 'Riot Client',
+      'Only needed for Riot Games / PC Game Pass titles that delegate install, sign-in, and launch through Riot Client.'
+    ),
 
     xbox_runtime: {
       id: 'xbox_runtime',

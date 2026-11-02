@@ -12,7 +12,38 @@ const {
   resolveFederatorUserDataDir,
 } = require('./storefrontLocalCacheFederator.cjs');
 const { isContainedWithinRoot } = require('./securityAndPathUtils.cjs');
+const { classifyNonGameStorefrontItem } = require('../storefronts/nonGameClassifier.cjs');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
+
+const STANDALONE_LAUNCHER_UTILITY_TITLE_RE =
+  /^(?:minecraft\s+launcher|ea\s+app|ubisoft\s+connect|rockstar\s+games\s+launcher|battle\.net|riot\s+client|gog\s+galaxy|epic\s+games\s+launcher)$/i;
+
+function isStandaloneStorefrontLauncherUtility(title, platforms) {
+  const cleanTitle = String(title || '').trim();
+  if (cleanTitle && STANDALONE_LAUNCHER_UTILITY_TITLE_RE.test(cleanTitle)) {
+    return Boolean(
+      classifyNonGameStorefrontItem({
+        title: cleanTitle,
+        platformId: String(platforms?.[0]?.platformId || '').toLowerCase() || 'xbox',
+        platformGameId: String(platforms?.[0]?.platformGameId || ''),
+        isDlc: false,
+      })
+    );
+  }
+  if (
+    Array.isArray(platforms) &&
+    platforms.length > 0 &&
+    platforms.every((ep) =>
+      String(ep?.packageFamilyName || '')
+        .trim()
+        .toLowerCase()
+        .startsWith('microsoft.4297127d64ec6')
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
 
 let electron = {};
 try {
@@ -541,6 +572,502 @@ function matchesCdnHost(hostname, allowedDomains) {
     }
   }
   return false;
+}
+
+const WINDOWS_ONLY_CHAINED_HANDOFFS = new Set(['ea', 'ubisoft', 'rockstar', 'riot']);
+const EPIC_EA_DRM_NOTICE_RE =
+  /\b(?:(?:The\s+)?EA\s+app|Origin(?:\s+client)?)\s+software\s+installation\s+and\s+background\s+use\s+required/i;
+
+/**
+ * Normalize raw publisher handoff strings stored in vault platform/game records.
+ *
+ * @param {unknown} raw
+ * @returns {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot' | null}
+ */
+function normalizeVaultChainedHandoffId(raw) {
+  if (typeof raw !== 'string') return null;
+  const clean = raw.trim().toLowerCase();
+  if (!clean) return null;
+  if (
+    clean === 'ea' ||
+    clean === 'theeaapp' ||
+    clean === 'the ea app' ||
+    clean === 'origin' ||
+    clean === 'origin client' ||
+    clean === 'ea app' ||
+    clean === 'eadesktop' ||
+    clean === 'ea desktop' ||
+    clean === 'eaplay' ||
+    clean === 'ea play' ||
+    clean === 'electronicarts' ||
+    clean === 'electronic arts' ||
+    clean === 'link2ea'
+  ) {
+    return 'ea';
+  }
+  if (
+    clean === 'ubisoft' ||
+    clean === 'uplay' ||
+    clean === 'ubisoft connect' ||
+    clean === 'ubisoftconnect'
+  ) {
+    return 'ubisoft';
+  }
+  if (
+    clean === 'bnet' ||
+    clean === 'battlenet' ||
+    clean === 'battle.net' ||
+    clean === 'blizzard'
+  ) {
+    return 'bnet';
+  }
+  if (
+    clean === 'rockstar' ||
+    clean === 'rockstargames' ||
+    clean === 'rockstar games' ||
+    clean === 'rgl'
+  ) {
+    return 'rockstar';
+  }
+  if (
+    clean === 'riot' ||
+    clean === 'riotclient' ||
+    clean === 'riot games' ||
+    clean === 'riotgames'
+  ) {
+    return 'riot';
+  }
+  return null;
+}
+
+const CANONICAL_XBOX_CHAINED_PUBLISHER_META = Object.freeze({
+  ea: Object.freeze({
+    externalLauncher: 'EA App',
+    externalLauncherUrl: 'https://www.ea.com/ea-app',
+  }),
+  ubisoft: Object.freeze({
+    externalLauncher: 'Ubisoft Connect',
+    externalLauncherUrl: 'https://www.ubisoft.com/ubisoft-connect',
+  }),
+  bnet: Object.freeze({
+    externalLauncher: 'Battle.net',
+    externalLauncherUrl: 'https://download.battle.net/',
+  }),
+  rockstar: Object.freeze({
+    externalLauncher: 'Rockstar Games Launcher',
+    externalLauncherUrl: 'https://socialclub.rockstargames.com/rockstar-games-launcher',
+  }),
+  riot: Object.freeze({
+    externalLauncher: 'Riot Client',
+    externalLauncherUrl: 'https://www.riotgames.com/',
+  }),
+});
+
+/**
+ * Pure self-healing sanitizer for a single storefront platform entry in `vault_games`.
+ * Bi-directionally syncs `chainedLauncherHandoff` <-> `externalStorefrontHandoff`,
+ * preserves `chainedHandoffTopology`, `chainedExternalInstallId`, `epicPartnerRegistryPath`,
+ * `isExternalLauncherStubPackage`, `externalLauncher`, `externalLauncherUrl`,
+ * `xboxBottleCompatibilityReason`, `maxDownloadSizeBytes`, `pcMaxInstallSizeBytes`,
+ * `requiresKernelAntiCheat`, and `kernelAntiCheatName`, self-heals legacy Xbox chained
+ * entries (`chainedHandoffTopology = 'publisher_managed'` + canonical `externalLauncher` /
+ * `externalLauncherUrl` backfill) and Epic EA DRM-notice entries, and enforces `mac: false`
+ * on Windows-only chained handoffs while never stripping `mac: true` from GOG or native Mac builds.
+ *
+ * @param {any} p
+ * @param {{
+ *   hasEnrichedJson?: boolean,
+ *   drmNotice?: string | null,
+ *   isSinglePlatform?: boolean,
+ *   gameChainedLauncherHandoff?: string | null,
+ *   gameExternalStorefrontHandoff?: string | null,
+ *   gameExternalLauncher?: string | null,
+ *   gameExternalLauncherUrl?: string | null,
+ *   gameIsExternalLauncherStubPackage?: boolean,
+ *   gameXboxBottleCompatibilityReason?: string | null,
+ *   gameMaxDownloadSizeBytes?: number | null,
+ *   gamePcMaxInstallSizeBytes?: number | null,
+ *   gameRequiresKernelAntiCheat?: boolean,
+ *   gameKernelAntiCheatName?: string | null
+ * } | null} [context=null]
+ * @returns {{ entry: any, repaired: boolean }}
+ */
+function sanitizeVaultPlatformEntry(p, context = null) {
+  if (!p || typeof p !== 'object') {
+    return { entry: p, repaired: false };
+  }
+  const pid = String(p.platformId || p.id || '').trim().toLowerCase();
+  const hasEnrichedJson = Boolean(context?.hasEnrichedJson);
+  let current = p;
+  let repaired = false;
+  const ensureCloned = () => {
+    if (current === p) {
+      current = { ...p };
+    }
+  };
+
+  const isPhysicallyInstalled = Boolean(
+    current.installed ||
+      (typeof current.installPath === 'string' && current.installPath.trim()) ||
+      (typeof current.executablePath === 'string' && current.executablePath.trim())
+  );
+  if (!isPhysicallyInstalled && pid === 'xbox') {
+    if (current.ownershipType === 'subscription' && current.subscriptionExpired === true) {
+      return { entry: null, repaired: true };
+    }
+    if (current.version !== undefined) {
+      ensureCloned();
+      delete current.version;
+      repaired = true;
+    }
+  }
+
+  let canonicalHandoff =
+    normalizeVaultChainedHandoffId(p.chainedLauncherHandoff) ||
+    normalizeVaultChainedHandoffId(p.chainedRequiresLauncherHandoff) ||
+    normalizeVaultChainedHandoffId(p.externalStorefrontHandoff) ||
+    (pid === 'xbox' ? normalizeVaultChainedHandoffId(p.externalLauncher) : null) ||
+    ((pid === 'xbox' || pid === 'epic') && context?.isSinglePlatform
+      ? normalizeVaultChainedHandoffId(
+          context?.gameChainedLauncherHandoff ||
+            context?.gameExternalStorefrontHandoff ||
+            (pid === 'xbox' ? context?.gameExternalLauncher : null)
+        )
+      : null);
+
+  let inferredEpicPartnerLink = false;
+  if (pid === 'epic' && !canonicalHandoff) {
+    const effectiveDrmNotice = String(p.drmNotice || context?.drmNotice || '').trim();
+    if (effectiveDrmNotice && EPIC_EA_DRM_NOTICE_RE.test(effectiveDrmNotice)) {
+      canonicalHandoff = 'ea';
+      inferredEpicPartnerLink = true;
+    }
+  }
+
+  // Preserve and backfill platform-level delivery, compatibility, size, and anti-cheat metadata
+  if (context?.isSinglePlatform) {
+    if (
+      typeof current.isExternalLauncherStubPackage !== 'boolean' &&
+      typeof context.gameIsExternalLauncherStubPackage === 'boolean'
+    ) {
+      ensureCloned();
+      current.isExternalLauncherStubPackage = context.gameIsExternalLauncherStubPackage;
+      repaired = true;
+    }
+    if (
+      (!current.externalLauncher || !String(current.externalLauncher).trim()) &&
+      typeof context.gameExternalLauncher === 'string' &&
+      context.gameExternalLauncher.trim()
+    ) {
+      ensureCloned();
+      current.externalLauncher = context.gameExternalLauncher.trim();
+      repaired = true;
+    }
+    if (
+      (!current.externalLauncherUrl || !String(current.externalLauncherUrl).trim()) &&
+      typeof context.gameExternalLauncherUrl === 'string' &&
+      /^https:\/\//i.test(context.gameExternalLauncherUrl.trim())
+    ) {
+      ensureCloned();
+      current.externalLauncherUrl = context.gameExternalLauncherUrl.trim();
+      repaired = true;
+    }
+    if (
+      (!current.xboxBottleCompatibilityReason ||
+        !String(current.xboxBottleCompatibilityReason).trim()) &&
+      typeof context.gameXboxBottleCompatibilityReason === 'string' &&
+      context.gameXboxBottleCompatibilityReason.trim()
+    ) {
+      ensureCloned();
+      current.xboxBottleCompatibilityReason = context.gameXboxBottleCompatibilityReason.trim();
+      repaired = true;
+    }
+    if (
+      !(Number(current.maxDownloadSizeBytes) > 0) &&
+      typeof context.gameMaxDownloadSizeBytes === 'number' &&
+      Number.isFinite(context.gameMaxDownloadSizeBytes) &&
+      context.gameMaxDownloadSizeBytes > 0
+    ) {
+      ensureCloned();
+      current.maxDownloadSizeBytes = Math.round(context.gameMaxDownloadSizeBytes);
+      repaired = true;
+    }
+    if (
+      !(Number(current.pcMaxInstallSizeBytes) > 0) &&
+      typeof context.gamePcMaxInstallSizeBytes === 'number' &&
+      Number.isFinite(context.gamePcMaxInstallSizeBytes) &&
+      context.gamePcMaxInstallSizeBytes > 0
+    ) {
+      ensureCloned();
+      current.pcMaxInstallSizeBytes = Math.round(context.gamePcMaxInstallSizeBytes);
+      repaired = true;
+    }
+    if (
+      typeof current.requiresKernelAntiCheat !== 'boolean' &&
+      typeof context.gameRequiresKernelAntiCheat === 'boolean'
+    ) {
+      ensureCloned();
+      current.requiresKernelAntiCheat = context.gameRequiresKernelAntiCheat;
+      repaired = true;
+    }
+    if (
+      (!current.kernelAntiCheatName || !String(current.kernelAntiCheatName).trim()) &&
+      typeof context.gameKernelAntiCheatName === 'string' &&
+      context.gameKernelAntiCheatName.trim()
+    ) {
+      ensureCloned();
+      current.kernelAntiCheatName = context.gameKernelAntiCheatName.trim();
+      repaired = true;
+    }
+  }
+
+  if (canonicalHandoff) {
+    if (
+      current.chainedLauncherHandoff !== canonicalHandoff ||
+      current.externalStorefrontHandoff !== canonicalHandoff
+    ) {
+      ensureCloned();
+      current.chainedLauncherHandoff = canonicalHandoff;
+      current.externalStorefrontHandoff = canonicalHandoff;
+      repaired = true;
+    }
+    if (pid === 'xbox') {
+      if (current.chainedHandoffTopology !== 'publisher_managed') {
+        ensureCloned();
+        current.chainedHandoffTopology = 'publisher_managed';
+        repaired = true;
+      }
+      const canonicalPubMeta =
+        /** @type {Record<string, { externalLauncher: string, externalLauncherUrl: string }>} */ (
+          CANONICAL_XBOX_CHAINED_PUBLISHER_META
+        )[canonicalHandoff];
+      if (canonicalPubMeta) {
+        if (
+          typeof current.externalLauncher !== 'string' ||
+          !current.externalLauncher.trim()
+        ) {
+          ensureCloned();
+          current.externalLauncher = canonicalPubMeta.externalLauncher;
+          repaired = true;
+        }
+        if (
+          typeof current.externalLauncherUrl !== 'string' ||
+          !/^https:\/\//i.test(current.externalLauncherUrl.trim())
+        ) {
+          ensureCloned();
+          current.externalLauncherUrl = canonicalPubMeta.externalLauncherUrl;
+          repaired = true;
+        }
+      }
+    }
+    if (
+      pid === 'epic' &&
+      (inferredEpicPartnerLink || canonicalHandoff === 'ea' || canonicalHandoff === 'ubisoft') &&
+      current.chainedHandoffTopology !== 'partner_launcher_link'
+    ) {
+      ensureCloned();
+      current.chainedHandoffTopology = 'partner_launcher_link';
+      repaired = true;
+    }
+  }
+
+  if (pid === 'xbox') {
+    if (
+      current.ownershipType !== 'owned' &&
+      typeof current.gamePassTier === 'string' &&
+      current.gamePassTier.trim() &&
+      !current.subscriptionTierId
+    ) {
+      const gpLower = current.gamePassTier.trim().toLowerCase();
+      let inferredTierId = '';
+      if (gpLower.includes('ultimate')) inferredTierId = 'ultimate';
+      else if (gpLower.includes('starter')) inferredTierId = 'starter';
+      else if (gpLower.includes('pc game pass')) inferredTierId = 'pc';
+      else if (gpLower.includes('premium') && gpLower.includes('game pass'))
+        inferredTierId = 'premium';
+      else if (gpLower.includes('essential')) inferredTierId = 'essential';
+      else if (gpLower.includes('ubisoft')) inferredTierId = 'ubisoft_classics';
+      else if (gpLower.includes('ea play')) inferredTierId = 'ea_play';
+      if (inferredTierId) {
+        ensureCloned();
+        current.subscriptionTierId = inferredTierId;
+        repaired = true;
+      }
+    }
+    if (Array.isArray(current.satisfyingPassIds)) {
+      const cleanedPassIds = Array.from(
+        new Set(
+          current.satisfyingPassIds
+            .map((p) => String(p || '').trim().toUpperCase())
+            .filter((p) => /^[A-Z0-9]{12}$/.test(p))
+        )
+      );
+      if (
+        cleanedPassIds.length !== current.satisfyingPassIds.length ||
+        cleanedPassIds.some((p, idx) => p !== current.satisfyingPassIds[idx])
+      ) {
+        ensureCloned();
+        current.satisfyingPassIds = cleanedPassIds;
+        repaired = true;
+      }
+    }
+    if (!current.isCrossPlatformLauncherRuntime) {
+      if (canonicalHandoff && WINDOWS_ONLY_CHAINED_HANDOFFS.has(canonicalHandoff)) {
+        if (
+          !current.platforms ||
+          typeof current.platforms !== 'object' ||
+          current.platforms.windows !== true ||
+          current.platforms.mac !== false
+        ) {
+          ensureCloned();
+          current.platforms = {
+            linux: Boolean(current.platforms?.linux),
+            ...current.platforms,
+            windows: true,
+            mac: false,
+          };
+          repaired = true;
+        }
+      } else if (
+        current.platforms &&
+        typeof current.platforms === 'object' &&
+        (current.platforms.windows === false || current.platforms.mac === true)
+      ) {
+        ensureCloned();
+        current.platforms = { windows: true, mac: false, linux: false };
+        repaired = true;
+      }
+    }
+    return { entry: current, repaired };
+  }
+
+  if (pid === 'ubisoft' || pid === 'ea' || pid === 'rockstar' || pid === 'riot') {
+    if (
+      !current.platforms ||
+      typeof current.platforms !== 'object' ||
+      current.platforms.windows !== true ||
+      current.platforms.mac !== false
+    ) {
+      ensureCloned();
+      current.platforms = {
+        linux: Boolean(current.platforms?.linux),
+        ...current.platforms,
+        windows: true,
+        mac: false,
+      };
+      repaired = true;
+    }
+    return { entry: current, repaired };
+  }
+
+  if (pid === 'epic') {
+    if (canonicalHandoff && WINDOWS_ONLY_CHAINED_HANDOFFS.has(canonicalHandoff)) {
+      if (
+        !current.platforms ||
+        typeof current.platforms !== 'object' ||
+        current.platforms.windows !== true ||
+        current.platforms.mac !== false
+      ) {
+        ensureCloned();
+        current.platforms = {
+          linux: Boolean(current.platforms?.linux),
+          ...current.platforms,
+          windows: true,
+          mac: false,
+        };
+        repaired = true;
+      }
+      return { entry: current, repaired };
+    }
+    if (
+      current.platforms &&
+      typeof current.platforms === 'object' &&
+      !current.platforms.windows &&
+      !current.platforms.mac &&
+      !current.platforms.linux
+    ) {
+      ensureCloned();
+      current.platforms = { windows: true, mac: false, linux: false };
+      repaired = true;
+    }
+    return { entry: current, repaired };
+  }
+
+  if (pid === 'gog') {
+    if (
+      current.platforms &&
+      typeof current.platforms === 'object' &&
+      !current.platforms.windows &&
+      !current.platforms.mac &&
+      !current.platforms.linux
+    ) {
+      ensureCloned();
+      current.platforms = { windows: true, mac: false, linux: false };
+      repaired = true;
+    }
+    return { entry: current, repaired };
+  }
+
+  if (pid === 'steam') {
+    if (
+      !hasEnrichedJson &&
+      current.platforms &&
+      typeof current.platforms === 'object' &&
+      current.platforms.mac === true &&
+      current.platforms.windows === true &&
+      !current.installed
+    ) {
+      ensureCloned();
+      delete current.platforms;
+      repaired = true;
+    }
+    return { entry: current, repaired };
+  }
+
+  return { entry: current, repaired };
+}
+
+/**
+ * Pure self-healing sanitizer for per-storefront `platforms` entries stored in `vault_games`.
+ * Repairs poisoned OS support flags (`windows: false` on non-Minecraft Xbox, all-false GOG/Epic,
+ * Windows-only chained publisher clients marked Mac, and unenriched Steam `{ windows: true, mac: true }`
+ * skeleton fallbacks), bi-directionally syncs `chainedLauncherHandoff` <-> `externalStorefrontHandoff`,
+ * and self-heals Epic EA DRM-notice entries.
+ *
+ * @param {any[] | null | undefined} platforms
+ * @param {boolean} [hasEnrichedJson=false]
+ * @param {Record<string, any> | null} [context=null]
+ * @returns {{ platforms: any[] | null | undefined, repaired: boolean }}
+ */
+function sanitizeVaultPlatformEntriesOsFlags(platforms, hasEnrichedJson = false, context = null) {
+  if (!Array.isArray(platforms)) {
+    return { platforms, repaired: false };
+  }
+  let repaired = false;
+  const isSinglePlatform = platforms.length === 1;
+  const entryContext = {
+    hasEnrichedJson,
+    drmNotice: context?.drmNotice || null,
+    isSinglePlatform,
+    gameChainedLauncherHandoff: context?.gameChainedLauncherHandoff || null,
+    gameExternalStorefrontHandoff: context?.gameExternalStorefrontHandoff || null,
+  };
+  const next = [];
+  for (const p of platforms) {
+    const res = sanitizeVaultPlatformEntry(p, entryContext);
+    if (res.repaired) {
+      repaired = true;
+    }
+    if (res.entry === null) {
+      repaired = true;
+      continue;
+    }
+    next.push(res.entry);
+  }
+  return {
+    platforms: repaired ? next : platforms,
+    repaired,
+  };
 }
 
 /**
@@ -1234,6 +1761,155 @@ class OfflineVaultService {
           }
         }
       }
+      // Self-heal poisoned platform OS flags across vault_games in a single fast transaction
+      const osCandidates = db
+        .prepare('SELECT game_id, platforms_json, summary_json, enriched_json FROM vault_games')
+        .all();
+      /** @type {Array<{ gameId: string, platformsJson: string | null, summaryJson: string | null }>} */
+      const osRepairs = [];
+      /** @type {string[]} */
+      const orphanPruneIds = [];
+      for (const row of osCandidates) {
+        if (!row || !row.game_id) continue;
+        const summary = parseVaultJson(row.summary_json);
+        const rawPlats = parseVaultJson(row.platforms_json) || summary?.platforms;
+        if (!Array.isArray(rawPlats)) continue;
+        const enrichedObj = row.enriched_json ? parseVaultJson(row.enriched_json) : null;
+        const hasEnrichedForOs = Boolean(
+          enrichedObj &&
+            !(enrichedObj.enrichedSource === 'xbox' && !(Number(enrichedObj.appId) > 0))
+        );
+        const sanitized = sanitizeVaultPlatformEntriesOsFlags(rawPlats, hasEnrichedForOs, {
+          drmNotice: enrichedObj?.drmNotice || summary?.drmNotice || null,
+          gameChainedLauncherHandoff:
+            summary?.chainedLauncherHandoff || summary?.chainedRequiresLauncherHandoff || null,
+          gameExternalStorefrontHandoff: summary?.externalStorefrontHandoff || null,
+          gameExternalLauncher: summary?.externalLauncher || enrichedObj?.externalLauncher || null,
+          gameExternalLauncherUrl:
+            summary?.externalLauncherUrl || enrichedObj?.externalLauncherUrl || null,
+          gameIsExternalLauncherStubPackage:
+            typeof summary?.isExternalLauncherStubPackage === 'boolean'
+              ? summary.isExternalLauncherStubPackage
+              : typeof enrichedObj?.isExternalLauncherStubPackage === 'boolean'
+                ? enrichedObj.isExternalLauncherStubPackage
+                : undefined,
+          gameXboxBottleCompatibilityReason:
+            summary?.xboxBottleCompatibilityReason ||
+            enrichedObj?.xboxBottleCompatibilityReason ||
+            null,
+          gameMaxDownloadSizeBytes:
+            summary?.maxDownloadSizeBytes ?? enrichedObj?.maxDownloadSizeBytes ?? null,
+          gamePcMaxInstallSizeBytes:
+            summary?.pcMaxInstallSizeBytes ?? enrichedObj?.pcMaxInstallSizeBytes ?? null,
+          gameRequiresKernelAntiCheat:
+            typeof summary?.requiresKernelAntiCheat === 'boolean'
+              ? summary.requiresKernelAntiCheat
+              : typeof enrichedObj?.requiresKernelAntiCheat === 'boolean'
+                ? enrichedObj.requiresKernelAntiCheat
+                : undefined,
+          gameKernelAntiCheatName:
+            summary?.kernelAntiCheatName ||
+            summary?.antiCheatName ||
+            enrichedObj?.kernelAntiCheatName ||
+            enrichedObj?.antiCheatName ||
+            null,
+        });
+        const finalPlats = sanitized.platforms || rawPlats;
+        if (rawPlats.length > 0 && Array.isArray(finalPlats) && finalPlats.length === 0) {
+          orphanPruneIds.push(String(row.game_id));
+          continue;
+        }
+        const allPlatsExplicitlyNonMac = Boolean(
+          Array.isArray(finalPlats) &&
+            finalPlats.length > 0 &&
+            finalPlats.every(
+              (ep) =>
+                ep &&
+                !ep.isCrossPlatformLauncherRuntime &&
+                ep.platforms &&
+                typeof ep.platforms === 'object' &&
+                ep.platforms.mac === false
+            )
+        );
+        const worksOnPoisoned = Boolean(
+          summary?.worksOn &&
+            typeof summary.worksOn === 'object' &&
+            ((!summary.worksOn.windows &&
+              !summary.worksOn.mac &&
+              !summary.worksOn.linux) ||
+              (summary.worksOn.mac === true && allPlatsExplicitlyNonMac))
+        );
+        if (sanitized.repaired || worksOnPoisoned) {
+          const updatedPlatsJson = sanitized.platforms
+            ? compressVaultJson(JSON.stringify(sanitized.platforms))
+            : null;
+          let updatedSummaryJson = row.summary_json;
+          if (summary && typeof summary === 'object') {
+            const nextSummary = { ...summary, platforms: sanitized.platforms };
+            if (worksOnPoisoned) {
+              nextSummary.worksOn = {
+                windows: true,
+                mac: false,
+                linux: Boolean(summary?.worksOn?.linux),
+              };
+            }
+            if (
+              Array.isArray(finalPlats) &&
+              finalPlats.length === 1 &&
+              finalPlats[0]?.chainedLauncherHandoff &&
+              (nextSummary.externalStorefrontHandoff || nextSummary.chainedLauncherHandoff)
+            ) {
+              nextSummary.chainedLauncherHandoff = finalPlats[0].chainedLauncherHandoff;
+              nextSummary.externalStorefrontHandoff = finalPlats[0].externalStorefrontHandoff;
+            }
+            updatedSummaryJson = compressVaultJson(JSON.stringify(nextSummary));
+          }
+          osRepairs.push({
+            gameId: String(row.game_id),
+            platformsJson: updatedPlatsJson,
+            summaryJson: updatedSummaryJson,
+          });
+        }
+      }
+      if ((osRepairs.length > 0 || orphanPruneIds.length > 0) && !this.options?.readOnly) {
+        const qOnly = db.prepare('PRAGMA query_only').get();
+        if (!Number(qOnly?.query_only)) {
+          db.exec('BEGIN IMMEDIATE');
+          try {
+            if (osRepairs.length > 0) {
+              const updateOsStmt = db.prepare(
+                'UPDATE vault_games SET platforms_json = ?, summary_json = ? WHERE game_id = ?'
+              );
+              for (const rep of osRepairs) {
+                updateOsStmt.run(rep.platformsJson, rep.summaryJson, rep.gameId);
+              }
+            }
+            if (orphanPruneIds.length > 0) {
+              const delAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
+              const delGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
+              let delFtsStmt = null;
+              try {
+                delFtsStmt = db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?');
+              } catch {}
+              for (const gid of orphanPruneIds) {
+                delAssetsStmt.run(gid);
+                delGameStmt.run(gid);
+                if (delFtsStmt) {
+                  try {
+                    delFtsStmt.run(gid);
+                  } catch {}
+                }
+              }
+            }
+            db.exec('COMMIT');
+          } catch (txErr) {
+            try {
+              db.exec('ROLLBACK');
+            } catch {}
+            throw txErr;
+          }
+        }
+      }
     } catch (healErr) {
       diagLog.debug('offlineVault.startupSelfHeal', healErr);
     }
@@ -1609,7 +2285,98 @@ class OfflineVaultService {
         if (!gameId) continue;
 
         const existing = selectExistingStmt.get(gameId);
-        const platforms = Array.isArray(g.platforms) ? g.platforms : null;
+        const rawPlatforms = Array.isArray(g.platforms) ? g.platforms : null;
+        const incomingEnrichedPreview =
+          g.enrichedMetadata && typeof g.enrichedMetadata === 'object' ? g.enrichedMetadata : null;
+        const existingEnrichedObj =
+          existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
+        const hasEnrichedForOsSanitize = Boolean(
+          (incomingEnrichedPreview &&
+            !(
+              incomingEnrichedPreview.enrichedSource === 'xbox' &&
+              !(Number(incomingEnrichedPreview.appId) > 0)
+            )) ||
+            (existingEnrichedObj &&
+              !(
+                existingEnrichedObj.enrichedSource === 'xbox' &&
+                !(Number(existingEnrichedObj.appId) > 0)
+              ))
+        );
+        const platforms = rawPlatforms
+          ? sanitizeVaultPlatformEntriesOsFlags(rawPlatforms, hasEnrichedForOsSanitize, {
+              drmNotice:
+                incomingEnrichedPreview?.drmNotice ||
+                existingEnrichedObj?.drmNotice ||
+                g.drmNotice ||
+                null,
+              gameChainedLauncherHandoff:
+                g.chainedLauncherHandoff || g.chainedRequiresLauncherHandoff || null,
+              gameExternalStorefrontHandoff: g.externalStorefrontHandoff || null,
+              gameExternalLauncher:
+                g.externalLauncher ||
+                incomingEnrichedPreview?.externalLauncher ||
+                existingEnrichedObj?.externalLauncher ||
+                null,
+              gameExternalLauncherUrl:
+                g.externalLauncherUrl ||
+                incomingEnrichedPreview?.externalLauncherUrl ||
+                existingEnrichedObj?.externalLauncherUrl ||
+                null,
+              gameIsExternalLauncherStubPackage:
+                typeof g.isExternalLauncherStubPackage === 'boolean'
+                  ? g.isExternalLauncherStubPackage
+                  : typeof incomingEnrichedPreview?.isExternalLauncherStubPackage === 'boolean'
+                    ? incomingEnrichedPreview.isExternalLauncherStubPackage
+                    : typeof existingEnrichedObj?.isExternalLauncherStubPackage === 'boolean'
+                      ? existingEnrichedObj.isExternalLauncherStubPackage
+                      : undefined,
+              gameXboxBottleCompatibilityReason:
+                g.xboxBottleCompatibilityReason ||
+                incomingEnrichedPreview?.xboxBottleCompatibilityReason ||
+                existingEnrichedObj?.xboxBottleCompatibilityReason ||
+                null,
+              gameMaxDownloadSizeBytes:
+                g.maxDownloadSizeBytes ??
+                incomingEnrichedPreview?.maxDownloadSizeBytes ??
+                existingEnrichedObj?.maxDownloadSizeBytes ??
+                null,
+              gamePcMaxInstallSizeBytes:
+                g.pcMaxInstallSizeBytes ??
+                incomingEnrichedPreview?.pcMaxInstallSizeBytes ??
+                existingEnrichedObj?.pcMaxInstallSizeBytes ??
+                null,
+              gameRequiresKernelAntiCheat:
+                typeof g.requiresKernelAntiCheat === 'boolean'
+                  ? g.requiresKernelAntiCheat
+                  : typeof incomingEnrichedPreview?.requiresKernelAntiCheat === 'boolean'
+                    ? incomingEnrichedPreview.requiresKernelAntiCheat
+                    : typeof existingEnrichedObj?.requiresKernelAntiCheat === 'boolean'
+                      ? existingEnrichedObj.requiresKernelAntiCheat
+                      : undefined,
+              gameKernelAntiCheatName:
+                g.kernelAntiCheatName ||
+                g.antiCheatName ||
+                incomingEnrichedPreview?.kernelAntiCheatName ||
+                existingEnrichedObj?.kernelAntiCheatName ||
+                null,
+            }).platforms || null
+          : null;
+
+        if (
+          Array.isArray(rawPlatforms) &&
+          rawPlatforms.length > 0 &&
+          Array.isArray(platforms) &&
+          platforms.length === 0
+        ) {
+          if (existing) {
+            try {
+              deleteOrphanAssetsStmt.run(gameId);
+              deleteOrphanGameStmt.run(gameId);
+              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(gameId);
+            } catch {}
+          }
+          continue;
+        }
 
         // Clean up stale duplicate `xbox-<BigId>` rows when upserting a cross-merged canonical game
         if (!/^xbox[-_]/i.test(gameId)) {
@@ -1635,6 +2402,15 @@ class OfflineVaultService {
           Boolean(platforms && platforms.some((p) => p && p.installed === true))
             ? 1
             : 0;
+        if (!isInstalled && isStandaloneStorefrontLauncherUtility(g.title, platforms)) {
+          if (existing) {
+            try {
+              db.prepare('DELETE FROM vault_games WHERE game_id = ?').run(gameId);
+              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(gameId);
+            } catch {}
+          }
+          continue;
+        }
         const isFavorited =
           typeof g.isFavorited === 'boolean'
             ? g.isFavorited
@@ -1658,6 +2434,38 @@ class OfflineVaultService {
 
         const summaryCopy = { ...g };
         delete summaryCopy.enrichedMetadata;
+        if (platforms) {
+          summaryCopy.platforms = platforms;
+        }
+        if (
+          Array.isArray(platforms) &&
+          platforms.some((ep) => ep && ep.isCrossPlatformLauncherRuntime === true)
+        ) {
+          const supportsLinux = platforms.some(
+            (ep) => ep && ep.platforms && ep.platforms.linux === true
+          );
+          if (
+            !summaryCopy.worksOn ||
+            typeof summaryCopy.worksOn !== 'object' ||
+            summaryCopy.worksOn.mac !== true ||
+            summaryCopy.worksOn.windows === false
+          ) {
+            summaryCopy.worksOn = {
+              ...(summaryCopy.worksOn || {}),
+              windows: true,
+              mac: true,
+              linux: Boolean(summaryCopy.worksOn?.linux || supportsLinux),
+            };
+          }
+        } else if (
+          summaryCopy.worksOn &&
+          typeof summaryCopy.worksOn === 'object' &&
+          !summaryCopy.worksOn.windows &&
+          !summaryCopy.worksOn.mac &&
+          !summaryCopy.worksOn.linux
+        ) {
+          summaryCopy.worksOn = { windows: true, mac: false, linux: false };
+        }
         const summaryJson = compressVaultJson(JSON.stringify(summaryCopy));
         const platformsJson = platforms ? compressVaultJson(JSON.stringify(platforms)) : null;
 
@@ -1670,9 +2478,6 @@ class OfflineVaultService {
         if (!Object.prototype.hasOwnProperty.call(METADATA_QUALITY_RANK, incomingQuality)) {
           incomingQuality = 'skeleton_fallback';
         }
-
-        const existingEnrichedObj =
-          existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
 
         if (
           incomingEnriched &&
@@ -2469,6 +3274,14 @@ class OfflineVaultService {
     };
   }
 
+  getAllHydratedGames(options = {}) {
+    return this.getCatalogSnapshot(options);
+  }
+
+  getBootstrapCatalog(options = {}) {
+    return this.getCatalogSnapshot(options);
+  }
+
   getCatalogSnapshot(options = {}) {
     const db = this.ensureOpen();
     const includeArchived = Boolean(options && options.includeArchived);
@@ -2487,17 +3300,157 @@ class OfflineVaultService {
     const games = [];
     /** @type {Record<string, any>} */
     const details = {};
+    /** @type {Array<{ gameId: string, platformsJson: string | null, summaryJson: string | null }>} */
+    const pendingOsRepairs = [];
+    /** @type {string[]} */
+    const pendingOrphanPruneIds = [];
 
     for (const row of rows) {
       const isArchivedRotation = Number(row.archived_by_subscription_rotation || 0) === 1;
       const isRowInstalled = Number(row.is_installed || 0) === 1;
+
+      const summary = parseVaultJson(row.summary_json) || {};
+      const rawPlatforms = parseVaultJson(row.platforms_json) || summary.platforms || [];
+      const enrichedMetadata = parseVaultJson(row.enriched_json);
+      const hasEnrichedForOs = Boolean(
+        enrichedMetadata &&
+          !(enrichedMetadata.enrichedSource === 'xbox' && !(Number(enrichedMetadata.appId) > 0))
+      );
+      const sanitizedPlatRes = sanitizeVaultPlatformEntriesOsFlags(rawPlatforms, hasEnrichedForOs, {
+        drmNotice: enrichedMetadata?.drmNotice || summary.drmNotice || null,
+        gameChainedLauncherHandoff:
+          summary.chainedLauncherHandoff || summary.chainedRequiresLauncherHandoff || null,
+        gameExternalStorefrontHandoff: summary.externalStorefrontHandoff || null,
+        gameExternalLauncher:
+          summary.externalLauncher || enrichedMetadata?.externalLauncher || null,
+        gameExternalLauncherUrl:
+          summary.externalLauncherUrl || enrichedMetadata?.externalLauncherUrl || null,
+        gameIsExternalLauncherStubPackage:
+          typeof summary.isExternalLauncherStubPackage === 'boolean'
+            ? summary.isExternalLauncherStubPackage
+            : typeof enrichedMetadata?.isExternalLauncherStubPackage === 'boolean'
+              ? enrichedMetadata.isExternalLauncherStubPackage
+              : undefined,
+        gameXboxBottleCompatibilityReason:
+          summary.xboxBottleCompatibilityReason ||
+          enrichedMetadata?.xboxBottleCompatibilityReason ||
+          null,
+        gameMaxDownloadSizeBytes:
+          summary.maxDownloadSizeBytes ?? enrichedMetadata?.maxDownloadSizeBytes ?? null,
+        gamePcMaxInstallSizeBytes:
+          summary.pcMaxInstallSizeBytes ?? enrichedMetadata?.pcMaxInstallSizeBytes ?? null,
+        gameRequiresKernelAntiCheat:
+          typeof summary.requiresKernelAntiCheat === 'boolean'
+            ? summary.requiresKernelAntiCheat
+            : typeof enrichedMetadata?.requiresKernelAntiCheat === 'boolean'
+              ? enrichedMetadata.requiresKernelAntiCheat
+              : undefined,
+        gameKernelAntiCheatName:
+          summary.kernelAntiCheatName ||
+          summary.antiCheatName ||
+          enrichedMetadata?.kernelAntiCheatName ||
+          null,
+      });
+      const platforms = sanitizedPlatRes.platforms || [];
+      if (
+        Array.isArray(rawPlatforms) &&
+        rawPlatforms.length > 0 &&
+        Array.isArray(platforms) &&
+        platforms.length === 0
+      ) {
+        if (row.game_id) {
+          pendingOrphanPruneIds.push(String(row.game_id));
+        }
+        continue;
+      }
+      const rowTitle = String(summary?.title || row.canonical_title || '');
+      if (!isRowInstalled && isStandaloneStorefrontLauncherUtility(rowTitle, platforms)) {
+        if (!this.options?.readOnly && !options?.readOnly && row.game_id) {
+          try {
+            const qOnly = db.prepare('PRAGMA query_only').get();
+            if (!Number(qOnly?.query_only)) {
+              db.prepare('DELETE FROM vault_games WHERE game_id = ?').run(String(row.game_id));
+              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(String(row.game_id));
+            }
+          } catch {}
+        }
+        continue;
+      }
+      const anyPlatCrossPlatformMac = Boolean(
+        Array.isArray(platforms) &&
+          platforms.some(
+            (ep) =>
+              ep &&
+              (ep.isCrossPlatformLauncherRuntime === true ||
+                Boolean(ep.platforms && ep.platforms.mac === true))
+          )
+      );
+      const allPlatsExplicitlyNonMac = Boolean(
+        Array.isArray(platforms) &&
+          platforms.length > 0 &&
+          platforms.every(
+            (ep) =>
+              ep &&
+              !ep.isCrossPlatformLauncherRuntime &&
+              ep.platforms &&
+              typeof ep.platforms === 'object' &&
+              ep.platforms.mac === false
+          )
+      );
+      const worksOnMissingCrossPlatMac = Boolean(
+        anyPlatCrossPlatformMac &&
+          summary?.worksOn &&
+          typeof summary.worksOn === 'object' &&
+          summary.worksOn.mac === false
+      );
+      const worksOnPoisoned = Boolean(
+        summary?.worksOn &&
+          typeof summary.worksOn === 'object' &&
+          ((!summary.worksOn.windows &&
+            !summary.worksOn.mac &&
+            !summary.worksOn.linux) ||
+            (summary.worksOn.mac === true && allPlatsExplicitlyNonMac))
+      );
+      if (worksOnPoisoned) {
+        summary.worksOn = {
+          windows: true,
+          mac: false,
+          linux: Boolean(summary?.worksOn?.linux),
+        };
+      } else if (worksOnMissingCrossPlatMac) {
+        summary.worksOn = {
+          windows: summary.worksOn.windows !== false,
+          mac: true,
+          linux: Boolean(summary?.worksOn?.linux),
+        };
+      }
+      if (
+        Array.isArray(platforms) &&
+        platforms.length === 1 &&
+        platforms[0]?.chainedLauncherHandoff &&
+        (summary.externalStorefrontHandoff || summary.chainedLauncherHandoff)
+      ) {
+        summary.chainedLauncherHandoff = platforms[0].chainedLauncherHandoff;
+        summary.externalStorefrontHandoff = platforms[0].externalStorefrontHandoff;
+      }
+      if (
+        (sanitizedPlatRes.repaired || worksOnPoisoned || worksOnMissingCrossPlatMac) &&
+        row.game_id
+      ) {
+        const nextPlatsJson = compressVaultJson(JSON.stringify(platforms));
+        const nextSummary = { ...summary, platforms };
+        const nextSummaryJson = compressVaultJson(JSON.stringify(nextSummary));
+        pendingOsRepairs.push({
+          gameId: String(row.game_id),
+          platformsJson: nextPlatsJson,
+          summaryJson: nextSummaryJson,
+        });
+      }
+
       if (isArchivedRotation && !isRowInstalled && !includeArchived) {
         continue;
       }
 
-      const summary = parseVaultJson(row.summary_json) || {};
-      const platforms = parseVaultJson(row.platforms_json) || summary.platforms || [];
-      const enrichedMetadata = parseVaultJson(row.enriched_json);
       const achievements = parseVaultJson(row.achievements_json);
       const hltb = parseVaultJson(row.hltb_json);
       const criticScore = parseVaultJson(row.critic_json);
@@ -2579,6 +3532,45 @@ class OfflineVaultService {
           ...(isArchivedRotation ? { archivedBySubscriptionRotation: true } : {}),
         };
       }
+    }
+
+    if (pendingOsRepairs.length > 0 && !this.options?.readOnly && !options?.readOnly) {
+      try {
+        const qOnly = db.prepare('PRAGMA query_only').get();
+        if (!Number(qOnly?.query_only)) {
+          db.exec('BEGIN IMMEDIATE');
+          try {
+            const repairStmt = db.prepare(
+              'UPDATE vault_games SET platforms_json = ?, summary_json = ? WHERE game_id = ?'
+            );
+            for (const rep of pendingOsRepairs) {
+              repairStmt.run(rep.platformsJson, rep.summaryJson, rep.gameId);
+            }
+            db.exec('COMMIT');
+          } catch (txErr) {
+            try {
+              db.exec('ROLLBACK');
+            } catch {}
+            throw txErr;
+          }
+        }
+      } catch (err) {
+        diagLog.debug('offlineVault.repairHydratedOsFlags', err);
+      }
+    }
+
+    if (pendingOrphanPruneIds.length > 0 && !this.options?.readOnly && !options?.readOnly) {
+      const idsToPrune = pendingOrphanPruneIds.slice();
+      setImmediate(() => {
+        try {
+          if (!this.db) return;
+          const qOnly = this.db.prepare('PRAGMA query_only').get();
+          if (Number(qOnly?.query_only)) return;
+          this.deleteGames(idsToPrune);
+        } catch (err) {
+          diagLog.debug('offlineVault.pruneOrphanExpiredRows', err);
+        }
+      });
     }
 
     return {
@@ -4495,5 +5487,8 @@ module.exports = {
   isRejectedVideoUrl,
   validateFederatedImageFile,
   isExplicitOverrideParam,
+  normalizeVaultChainedHandoffId,
+  sanitizeVaultPlatformEntry,
+  sanitizeVaultPlatformEntriesOsFlags,
   isFederatedAssetRowCompatible,
 };

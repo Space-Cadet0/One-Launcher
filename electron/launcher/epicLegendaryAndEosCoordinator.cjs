@@ -4,6 +4,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const https = require('node:https');
 const http = require('node:http');
+const { execFile } = require('node:child_process');
 
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const {
@@ -37,6 +38,8 @@ const {
   toLocalFsPath,
   resolveHostLocaleInfo,
   loadManagedInstalledGames,
+  findLegendaryBinary,
+  resolveWindowsNodeShebangSpawn,
 } = require('./engineStateRegistry.cjs');
 const {
   findPrimaryExecutable,
@@ -1501,6 +1504,194 @@ async function ensureLegendaryConfigAndAuth(/** @type {any} */ options = {}) {
   };
 }
 
+const EPIC_PARTNER_DRM_EA_RE =
+  /\b(?:(?:The\s+)?EA\s+app|Origin(?:\s+client)?)\s+software\s+installation\s+and\s+background\s+use\s+required/i;
+
+/**
+ * Extract Epic third-party partner launcher metadata (`ThirdPartyManagedApp`, `PartnerLinkType`,
+ * `PartnerLinkId`, `RegistryPath`, `RegistryKey`) from Legendary metadata or `legendary info --json`.
+ *
+ * @param {any} rawObj
+ * @returns {{
+ *   chainedLauncherHandoff?: 'ea' | 'ubisoft',
+ *   externalStorefrontHandoff?: 'ea' | 'ubisoft',
+ *   chainedHandoffTopology?: 'partner_launcher_link',
+ *   epicPartnerRegistryPath?: string,
+ *   epicPartnerRegistryKey?: string,
+ *   chainedExternalInstallId?: string,
+ *   thirdPartyManagedApp?: string,
+ *   partnerLinkType?: string,
+ *   macSupported?: boolean
+ * }}
+ */
+function extractEpicThirdPartyPartnerMetadata(rawObj) {
+  if (!rawObj || typeof rawObj !== 'object') return {};
+
+  const attrSources = [
+    rawObj.metadata?.customAttributes,
+    rawObj.customAttributes,
+    rawObj.game?.metadata?.customAttributes,
+    rawObj.game?.customAttributes,
+  ].filter((src) => src && typeof src === 'object');
+
+  const readAttr = (/** @type {string} */ targetKey) => {
+    const lowerTarget = targetKey.toLowerCase();
+    for (const src of attrSources) {
+      for (const [k, rawVal] of Object.entries(src)) {
+        if (k.toLowerCase() !== lowerTarget) continue;
+        if (typeof rawVal === 'string' && rawVal.trim()) {
+          return rawVal.trim();
+        }
+        if (rawVal && typeof rawVal === 'object' && typeof rawVal.value === 'string' && rawVal.value.trim()) {
+          return rawVal.value.trim();
+        }
+      }
+    }
+    return '';
+  };
+
+  const thirdPartyManagedApp = readAttr('ThirdPartyManagedApp');
+  const partnerLinkType = readAttr('PartnerLinkType');
+  const partnerLinkId = readAttr('PartnerLinkId');
+  const registryPath = readAttr('RegistryPath') || String(rawObj.epicPartnerRegistryPath || '').trim();
+  const registryKey = readAttr('RegistryKey') || String(rawObj.epicPartnerRegistryKey || '').trim();
+
+  /** @type {'ea' | 'ubisoft' | undefined} */
+  let handoff;
+  if (
+    /^(?:the\s+ea\s+app|theeaapp|ea\s*app|ea\s*desktop|eadesktop|origin(?:\s+client)?|electronic\s*arts|ea)$/i.test(
+      thirdPartyManagedApp
+    ) ||
+    /^(?:origin|ea|theeaapp|eadesktop|eaplay)$/i.test(partnerLinkType)
+  ) {
+    handoff = 'ea';
+  } else if (
+    /^(?:ubisoft(?:\s+connect)?|ubisoftconnect|uplay)$/i.test(thirdPartyManagedApp) ||
+    /^(?:ubisoft|uplay|ubisoftconnect)$/i.test(partnerLinkType)
+  ) {
+    handoff = 'ubisoft';
+  } else {
+    const rawHandoff = String(
+      rawObj.chainedLauncherHandoff || rawObj.externalStorefrontHandoff || ''
+    )
+      .trim()
+      .toLowerCase();
+    if (
+      rawHandoff === 'ea' ||
+      rawHandoff === 'theeaapp' ||
+      rawHandoff === 'the ea app' ||
+      rawHandoff === 'origin'
+    ) {
+      handoff = 'ea';
+    } else if (rawHandoff === 'ubisoft' || rawHandoff === 'uplay' || rawHandoff === 'ubisoft connect') {
+      handoff = 'ubisoft';
+    } else if (typeof rawObj.drmNotice === 'string' && EPIC_PARTNER_DRM_EA_RE.test(rawObj.drmNotice)) {
+      handoff = 'ea';
+    }
+  }
+
+  if (!handoff) {
+    return {
+      ...(registryPath ? { epicPartnerRegistryPath: registryPath } : {}),
+      ...(registryKey ? { epicPartnerRegistryKey: registryKey } : {}),
+    };
+  }
+
+  const externalInstallId =
+    partnerLinkId || String(rawObj.chainedExternalInstallId || '').trim() || undefined;
+
+  return {
+    chainedLauncherHandoff: handoff,
+    externalStorefrontHandoff: handoff,
+    chainedHandoffTopology: 'partner_launcher_link',
+    ...(registryPath ? { epicPartnerRegistryPath: registryPath } : {}),
+    ...(registryKey ? { epicPartnerRegistryKey: registryKey } : {}),
+    ...(externalInstallId ? { chainedExternalInstallId: externalInstallId } : {}),
+    ...(thirdPartyManagedApp ? { thirdPartyManagedApp } : {}),
+    ...(partnerLinkType ? { partnerLinkType } : {}),
+    macSupported: false,
+  };
+}
+
+/**
+ * Asynchronously refresh local Legendary metadata (`metadata/*.json`, `assets.json`)
+ * including third-party partner titles (`legendary list --third-party --json` with safe
+ * fallback to `legendary list --json` when `--third-party` is unsupported by an older binary).
+ *
+ * @param {any} [options={}]
+ * @returns {Promise<{ ok: boolean, reason?: string, itemsCount: number, usedThirdPartyFlag?: boolean }>}
+ */
+async function refreshLocalLegendaryMetadata(options = {}) {
+  const legendaryBin = findLegendaryBinary(options);
+  if (!legendaryBin) {
+    return { ok: false, reason: 'legendary-missing', itemsCount: 0 };
+  }
+  const authInfo = await ensureLegendaryConfigAndAuth({
+    ...options,
+    skipNetwork: Boolean(options.skipNetwork),
+  });
+  const execEnv = authInfo?.env || {
+    ...process.env,
+    LEGENDARY_CONFIG_PATH: getLegendaryConfigDir(options),
+  };
+  const execFn = typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
+  const timeoutMs = Number(options.timeoutMs || 25000);
+
+  const runLegendaryArgs = (/** @type {string[]} */ cliArgs) =>
+    new Promise((resolve) => {
+      const target =
+        (options.platform || process.platform) === 'win32'
+          ? resolveWindowsNodeShebangSpawn(legendaryBin, cliArgs)
+          : { cmd: legendaryBin, args: cliArgs };
+      execFn(
+        target.cmd,
+        target.args,
+        {
+          env: execEnv,
+          timeout: timeoutMs,
+          maxBuffer: 32 * 1024 * 1024,
+          windowsHide: true,
+        },
+        (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+          resolve({
+            err,
+            stdout: String(stdout || ''),
+            stderr: String(stderr || ''),
+          });
+        }
+      );
+    });
+
+  let usedThirdPartyFlag = true;
+  let res = await runLegendaryArgs(['list', '--third-party', '--json']);
+  if (res.err) {
+    usedThirdPartyFlag = false;
+    res = await runLegendaryArgs(['list', '--json']);
+  }
+
+  legendaryMetadataDirCache.clear();
+  legendaryAssetsFileCache.clear();
+  legendaryAliasesFileCache.clear();
+
+  if (res.err && !res.stdout.trim()) {
+    return { ok: false, reason: String(res.err.message || 'legendary-list-failed'), itemsCount: 0 };
+  }
+
+  let itemsCount = 0;
+  try {
+    const parsed = JSON.parse(res.stdout);
+    if (Array.isArray(parsed)) {
+      itemsCount = parsed.length;
+    }
+  } catch {}
+
+  return {
+    ok: true,
+    itemsCount,
+    usedThirdPartyFlag,
+  };
+}
+
 /**
  * Scan and cache local Legendary assets.json, aliases.json, and metadata/*.json
  * to resolve per-game Epic macOS and Windows build availability with <1ms cached lookups.
@@ -1668,6 +1859,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
         let dirSummaries = null;
         if (
           cachedMeta &&
+          cachedMeta.schemaVersion === 2 &&
           cachedMeta.mtimeMs === mtimeMs &&
           cachedMeta.fileCount === fileCount &&
           Array.isArray(cachedMeta.summaries)
@@ -1693,6 +1885,8 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
                 ).trim() || undefined;
               const appTitle = String(json.app_title || json.metadata?.title || '').trim();
               const normTitle = norm(appTitle);
+              const partnerMeta = extractEpicThirdPartyPartnerMetadata(json);
+              const isPartnerManaged = Boolean(partnerMeta.chainedLauncherHandoff);
               const hasMacAsset = Boolean(
                 json.asset_infos?.Mac && Object.keys(json.asset_infos.Mac).length > 0
               );
@@ -1716,8 +1910,8 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
                     Array.isArray(r.platform) &&
                     r.platform.some((/** @type {any} */ p) => /^(windows|win32)$/i.test(String(p)))
                 );
-              const hasMac = hasMacAsset || hasMacRelease;
-              const hasWin = hasWinAsset || hasWinRelease || !hasMac;
+              const hasMac = isPartnerManaged ? false : hasMacAsset || hasMacRelease;
+              const hasWin = isPartnerManaged ? true : hasWinAsset || hasWinRelease || !hasMac;
               dirSummaries.push({
                 appName,
                 catalogItemId,
@@ -1727,8 +1921,29 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
                 normTitle,
                 hasMac,
                 hasWin,
-                macVersion: json.asset_infos?.Mac?.build_version || undefined,
+                macVersion: isPartnerManaged
+                  ? undefined
+                  : json.asset_infos?.Mac?.build_version || undefined,
                 winVersion: json.asset_infos?.Windows?.build_version || undefined,
+                ...(partnerMeta.chainedLauncherHandoff
+                  ? {
+                      chainedLauncherHandoff: partnerMeta.chainedLauncherHandoff,
+                      externalStorefrontHandoff: partnerMeta.externalStorefrontHandoff,
+                      chainedHandoffTopology: partnerMeta.chainedHandoffTopology,
+                    }
+                  : {}),
+                ...(partnerMeta.epicPartnerRegistryPath
+                  ? { epicPartnerRegistryPath: partnerMeta.epicPartnerRegistryPath }
+                  : {}),
+                ...(partnerMeta.epicPartnerRegistryKey
+                  ? { epicPartnerRegistryKey: partnerMeta.epicPartnerRegistryKey }
+                  : {}),
+                ...(partnerMeta.chainedExternalInstallId
+                  ? { chainedExternalInstallId: partnerMeta.chainedExternalInstallId }
+                  : {}),
+                ...(partnerMeta.thirdPartyManagedApp
+                  ? { thirdPartyManagedApp: partnerMeta.thirdPartyManagedApp }
+                  : {}),
               });
             } catch {}
           }
@@ -1736,6 +1951,7 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
             legendaryMetadataDirCache,
             metaDir,
             {
+              schemaVersion: 2,
               mtimeMs,
               fileCount,
               summaries: dirSummaries,
@@ -1755,6 +1971,22 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
               if (!existing.namespace && s.namespace) existing.namespace = s.namespace;
               if (!existing.catalogItemId && s.catalogItemId) {
                 existing.catalogItemId = s.catalogItemId;
+              }
+              if (!existing.chainedLauncherHandoff && s.chainedLauncherHandoff) {
+                existing.chainedLauncherHandoff = s.chainedLauncherHandoff;
+                existing.externalStorefrontHandoff = s.externalStorefrontHandoff;
+                existing.chainedHandoffTopology = s.chainedHandoffTopology;
+                existing.hasMac = false;
+                existing.hasWin = true;
+              }
+              if (!existing.epicPartnerRegistryPath && s.epicPartnerRegistryPath) {
+                existing.epicPartnerRegistryPath = s.epicPartnerRegistryPath;
+              }
+              if (!existing.epicPartnerRegistryKey && s.epicPartnerRegistryKey) {
+                existing.epicPartnerRegistryKey = s.epicPartnerRegistryKey;
+              }
+              if (!existing.chainedExternalInstallId && s.chainedExternalInstallId) {
+                existing.chainedExternalInstallId = s.chainedExternalInstallId;
               }
             }
           }
@@ -1798,9 +2030,22 @@ function collectLocalEpicMetadataAndSupport(/** @type {any} */ options = {}) {
     }
   }
   for (const s of metaSummaries) {
+    const forcePartnerWinOnly = Boolean(s.chainedLauncherHandoff);
     const existingByApp = epicPlatformSupport[s.appName.toLowerCase()];
-    const hasWin = Boolean(s.hasWin || existingByApp?.windows);
-    const hasMac = Boolean(s.hasMac || existingByApp?.mac);
+    const hasWin = forcePartnerWinOnly ? true : Boolean(s.hasWin || existingByApp?.windows);
+    const hasMac = forcePartnerWinOnly ? false : Boolean(s.hasMac || existingByApp?.mac);
+    if (forcePartnerWinOnly) {
+      const overrideKeys = [s.appName, s.catalogItemId, s.normTitle, s.appTitle];
+      for (const rk of overrideKeys) {
+        const k = String(rk || '')
+          .toLowerCase()
+          .trim();
+        if (k) {
+          epicPlatformSupport[k] = { windows: true, mac: false };
+        }
+      }
+      continue;
+    }
     mergeSupport(s.appName, hasWin, hasMac);
     mergeSupport(s.catalogItemId, hasWin, hasMac);
     if (s.normTitle) {
@@ -1934,12 +2179,31 @@ function resolveEpicAppAndPlatforms(/** @type {any} */ payload = {}, /** @type {
     metaSummary?.winVersion ||
     undefined;
 
+  const payloadPartnerMeta = extractEpicThirdPartyPartnerMetadata(payload);
+  let chainedLauncherHandoff =
+    metaSummary?.chainedLauncherHandoff || payloadPartnerMeta.chainedLauncherHandoff;
+  let externalStorefrontHandoff =
+    metaSummary?.externalStorefrontHandoff || payloadPartnerMeta.externalStorefrontHandoff;
+  let chainedHandoffTopology =
+    metaSummary?.chainedHandoffTopology || payloadPartnerMeta.chainedHandoffTopology;
+  let epicPartnerRegistryPath =
+    metaSummary?.epicPartnerRegistryPath || payloadPartnerMeta.epicPartnerRegistryPath;
+  let epicPartnerRegistryKey =
+    metaSummary?.epicPartnerRegistryKey || payloadPartnerMeta.epicPartnerRegistryKey;
+  let chainedExternalInstallId =
+    metaSummary?.chainedExternalInstallId || payloadPartnerMeta.chainedExternalInstallId;
+  let thirdPartyManagedApp =
+    metaSummary?.thirdPartyManagedApp || payloadPartnerMeta.thirdPartyManagedApp;
+
   let namespace = macEntry?.namespace || winEntry?.namespace || metaSummary?.namespace;
   let catalogItemId =
     macEntry?.catalog_item_id || winEntry?.catalog_item_id || metaSummary?.catalogItemId;
   let deploymentId = metaSummary?.deploymentId;
 
-  if ((!namespace || !catalogItemId || !deploymentId) && resolvedAppName) {
+  if (
+    (!namespace || !catalogItemId || !deploymentId || !chainedLauncherHandoff) &&
+    resolvedAppName
+  ) {
     for (const dir of configDirs) {
       if (!dir) continue;
       const metaFile = path.join(dir, 'metadata', `${resolvedAppName}.json`);
@@ -1960,22 +2224,49 @@ function resolveEpicAppAndPlatforms(/** @type {any} */ payload = {}, /** @type {
                 ''
             ).trim() ||
             undefined;
-          if (namespace && catalogItemId && deploymentId) break;
+          const filePartner = extractEpicThirdPartyPartnerMetadata(metaJson);
+          if (!chainedLauncherHandoff && filePartner.chainedLauncherHandoff) {
+            chainedLauncherHandoff = filePartner.chainedLauncherHandoff;
+            externalStorefrontHandoff = filePartner.externalStorefrontHandoff;
+            chainedHandoffTopology = filePartner.chainedHandoffTopology;
+          }
+          epicPartnerRegistryPath = epicPartnerRegistryPath || filePartner.epicPartnerRegistryPath;
+          epicPartnerRegistryKey = epicPartnerRegistryKey || filePartner.epicPartnerRegistryKey;
+          chainedExternalInstallId =
+            chainedExternalInstallId || filePartner.chainedExternalInstallId;
+          thirdPartyManagedApp = thirdPartyManagedApp || filePartner.thirdPartyManagedApp;
+          if (namespace && catalogItemId && deploymentId && chainedLauncherHandoff) break;
         } catch {}
       }
     }
   }
 
+  const isPartnerManaged = Boolean(chainedLauncherHandoff);
+  const finalHasMacBuild = isPartnerManaged ? false : hasMacBuild;
+  const finalHasWindowsBuild = isPartnerManaged ? true : hasWindowsBuild;
+
   return {
     resolvedAppName,
     appName: resolvedAppName,
-    hasMacBuild,
-    hasWindowsBuild,
-    macVersion,
+    hasMacBuild: finalHasMacBuild,
+    hasWindowsBuild: finalHasWindowsBuild,
+    macSupported: finalHasMacBuild,
+    macVersion: isPartnerManaged ? undefined : macVersion,
     winVersion,
     namespace,
     catalogItemId,
     deploymentId,
+    ...(chainedLauncherHandoff
+      ? {
+          chainedLauncherHandoff,
+          externalStorefrontHandoff: externalStorefrontHandoff || chainedLauncherHandoff,
+          chainedHandoffTopology: chainedHandoffTopology || 'partner_launcher_link',
+        }
+      : {}),
+    ...(epicPartnerRegistryPath ? { epicPartnerRegistryPath } : {}),
+    ...(epicPartnerRegistryKey ? { epicPartnerRegistryKey } : {}),
+    ...(chainedExternalInstallId ? { chainedExternalInstallId } : {}),
+    ...(thirdPartyManagedApp ? { thirdPartyManagedApp } : {}),
   };
 }
 
@@ -2473,6 +2764,8 @@ module.exports = {
   getLegendaryConfigDir,
   sanitizeEpicCandidateRecord,
   ensureLegendaryConfigAndAuth,
+  extractEpicThirdPartyPartnerMetadata,
+  refreshLocalLegendaryMetadata,
   collectLocalEpicMetadataAndSupport,
   resolveEpicAppAndPlatforms,
   performJsonHttpRequest,

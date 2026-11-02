@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { DatabaseSync } = require('node:sqlite');
 
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const { recordImportedEpicInstall } = require('./securityAndPathUtils.cjs');
@@ -10,9 +11,12 @@ const {
   parseByteCountOrFormattedSize,
   inspectMacMachOHeader,
   parseSteamAcf,
+  detectKernelAntiCheatMarkersInDir,
+  resolveParadoxLauncherSettings,
 } = require('./binaryAndManifestInspectors.cjs');
 const {
   getUserDataDir,
+  getXboxStorefrontModules,
   getLastProductionScanCache,
   setLastProductionScanCache,
   getLastSyncedEpicFingerprint,
@@ -21,8 +25,11 @@ const {
   setLastSyncedGogFingerprint,
   toLocalFsPath,
   loadManagedInstalledGames,
+  saveManagedInstalledGames,
   resolvePlatformLaunchConfig,
   getGameLaunchConfigs,
+  isPathUnderActiveDownload,
+  isPathOrGameUnderIncompleteDownload,
 } = require('./engineStateRegistry.cjs');
 const { isExternalVolumeUnmounted } = require('./diskAndVolumeInspector.cjs');
 const {
@@ -32,7 +39,10 @@ const {
   resolveSteamAppInfoLaunchSpec,
   resolveDefaultEngineLaunchArguments,
   discoverSteamLocations,
+  normalizeComparableTitle,
   extractBottleRootFromPath,
+  listAllInitializedBottlePaths,
+  detectCompatibilityLayers,
 } = require('./macNativeInstallerAndCodesign.cjs');
 const {
   primeXboxDiscoveryCachesAsync,
@@ -44,6 +54,370 @@ const {
   collectLocalEpicMetadataAndSupport,
 } = require('./epicLegendaryAndEosCoordinator.cjs');
 const { syncGogFirstPartyLauncher } = require('./gogRegistryAndDirectInstaller.cjs');
+const {
+  normalizeChainedHandoffId,
+  scanBottlePublisherInstalledGames,
+  scanHostPublisherInstalledGames,
+} = require('./chainedPublisherLaunchers.cjs');
+const {
+  parseVaultJson,
+  normalizeVaultChainedHandoffId,
+  sanitizeVaultPlatformEntriesOsFlags,
+} = require('./offlineVaultService.cjs');
+const { parseSteamEaInstallerDataXml } = require('../storefronts/steamLocalScanner.cjs');
+
+function resolveAnyChainedHandoffId(/** @type {any} */ raw) {
+  return normalizeChainedHandoffId(raw) || normalizeVaultChainedHandoffId(raw);
+}
+
+function extractRegistryPathLeafKeys(/** @type {any} */ rawRegistryPath) {
+  if (!rawRegistryPath || typeof rawRegistryPath !== 'string') return [];
+  const parts = rawRegistryPath
+    .split(/[\\/]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return [];
+  const leaf = parts[parts.length - 1];
+  return buildChainedTitleMatchKeys(leaf);
+}
+
+const EDITION_SUFFIX_STRIP_RE =
+  /\b(?:standard|deluxe|gold|ultimate|complete|definitive|collector'?s|limited|anniversary|remastered|game\s+of\s+the\s+year|goty|director'?s\s+cut|digital)\s+edition\b|\b(?:goty|for\s+windows|pc\s+version|windows\s+edition)\b|\((?:pc|windows|mac|xbox|game\s*pass|ubisoft\s*connect|ea\s*play)\)/gi;
+
+function isGdkStubExecutablePath(exePath) {
+  if (!exePath || typeof exePath !== 'string') return false;
+  const base = path.posix.basename(exePath.replace(/\\/g, '/'));
+  return /^gdkstubgame\.exe$/i.test(base);
+}
+
+/**
+ * Generates deterministic comparable title keys (full + edition-stripped) with Roman numeral
+ * (`II` <-> `2`, `III` <-> `3`, `IV` <-> `4`, `VI` <-> `6`, etc.) and trademark symbol normalization.
+ *
+ * @param {string} rawTitle
+ * @returns {string[]}
+ */
+function buildChainedTitleMatchKeys(rawTitle) {
+  if (!rawTitle || typeof rawTitle !== 'string') return [];
+  const xboxMods = getXboxStorefrontModules();
+  let cleaned = rawTitle.replace(/[™®©℠]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (typeof xboxMods?.stripXboxPlatformDisambiguators === 'function') {
+    cleaned = xboxMods.stripXboxPlatformDisambiguators(cleaned);
+  }
+  const fullKey = normalizeComparableTitle(cleaned);
+  const stripped = cleaned
+    .replace(EDITION_SUFFIX_STRIP_RE, ' ')
+    .replace(/[:\-–—|]+\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const baseKey = normalizeComparableTitle(stripped);
+  /** @type {string[]} */
+  const keys = [];
+  if (fullKey && fullKey.length >= 2) keys.push(fullKey);
+  if (baseKey && baseKey.length >= 2 && baseKey !== fullKey) keys.push(baseKey);
+  return keys;
+}
+
+/**
+ * Checks whether two game titles match under comparable Roman-numeral / edition-stripped normalization.
+ *
+ * @param {string} titleA
+ * @param {string} titleB
+ * @returns {boolean}
+ */
+function doChainedPublisherTitlesMatch(titleA, titleB) {
+  const keysA = buildChainedTitleMatchKeys(titleA);
+  const keysB = buildChainedTitleMatchKeys(titleB);
+  if (keysA.length === 0 || keysB.length === 0) return false;
+  for (const ka of keysA) {
+    for (const kb of keysB) {
+      if (ka === kb) return true;
+    }
+  }
+  return false;
+}
+
+function loadChainedCatalogIndex(userDataDir, /** @type {any} */ options = {}, /** @type {any[]} */ managedRecords = []) {
+  /** @type {Map<string, { platformGameId: string, xboxProductId?: string, title: string }>} */
+  const xboxHandoffByFullKey = new Map();
+  /** @type {Map<string, { platformGameId: string, xboxProductId?: string, title: string }>} */
+  const xboxHandoffByBaseKey = new Map();
+  /** @type {Map<string, { platformGameId: string, title: string, epicPartnerRegistryPath?: string }>} */
+  const epicHandoffByFullKey = new Map();
+  /** @type {Map<string, { platformGameId: string, title: string, epicPartnerRegistryPath?: string }>} */
+  const epicHandoffByBaseKey = new Map();
+  /** @type {Map<string, { platformId: string, platformGameId: string, title: string }>} */
+  const standaloneByFullKey = new Map();
+  /** @type {Map<string, { platformId: string, platformGameId: string, title: string }>} */
+  const standaloneByBaseKey = new Map();
+  /** @type {Map<string, { platformId: string, platformGameId: string, xboxProductId?: string, title?: string }>} */
+  const byExternalId = new Map();
+  /** @type {Map<string, { platformId: string, platformGameId: string, xboxProductId?: string, title?: string }>} */
+  const managedByInstallPath = new Map();
+
+  const customRoots = Array.isArray(options.customRoots) ? options.customRoots : [];
+
+  for (const rec of managedRecords) {
+    if (!rec || !rec.platformId || !rec.platformGameId) continue;
+    const hId = resolveAnyChainedHandoffId(
+      rec.chainedLauncherHandoff || rec.externalStorefrontHandoff || rec.platformId
+    );
+    if (!hId) continue;
+    if (rec.installPath) {
+      const localManagedPath = toLocalFsPath(rec.installPath, customRoots);
+      if (localManagedPath) {
+        managedByInstallPath.set(path.resolve(localManagedPath).toLowerCase(), {
+          platformId: String(rec.platformId),
+          platformGameId: String(rec.platformGameId),
+          ...(rec.xboxProductId ? { xboxProductId: String(rec.xboxProductId) } : {}),
+          ...(rec.title ? { title: String(rec.title) } : {}),
+        });
+      }
+    }
+    if (rec.chainedExternalInstallId) {
+      byExternalId.set(`${hId}:${String(rec.chainedExternalInstallId).toLowerCase()}`, {
+        platformId: String(rec.platformId),
+        platformGameId: String(rec.platformGameId),
+        ...(rec.xboxProductId ? { xboxProductId: String(rec.xboxProductId) } : {}),
+        ...(rec.title ? { title: String(rec.title) } : {}),
+      });
+    }
+    if (String(rec.platformId).toLowerCase() === 'epic' && rec.epicPartnerRegistryPath) {
+      const leafKeys = extractRegistryPathLeafKeys(rec.epicPartnerRegistryPath);
+      const epicEntry = {
+        platformGameId: String(rec.platformGameId),
+        title: String(rec.title || rec.platformGameId),
+        epicPartnerRegistryPath: String(rec.epicPartnerRegistryPath),
+      };
+      if (leafKeys[0] && !epicHandoffByFullKey.has(`${hId}:${leafKeys[0]}`)) {
+        epicHandoffByFullKey.set(`${hId}:${leafKeys[0]}`, epicEntry);
+      }
+      const baseLeaf = leafKeys[1] || leafKeys[0];
+      if (baseLeaf && !epicHandoffByBaseKey.has(`${hId}:${baseLeaf}`)) {
+        epicHandoffByBaseKey.set(`${hId}:${baseLeaf}`, epicEntry);
+      }
+    }
+  }
+
+  const indexEpicPartnerEntry = (
+    /** @type {string} */ eHandoff,
+    /** @type {string} */ pgid,
+    /** @type {string} */ title,
+    /** @type {string | undefined} */ regPath,
+    /** @type {string | undefined} */ extId
+  ) => {
+    const keys = buildChainedTitleMatchKeys(title);
+    const leafKeys = extractRegistryPathLeafKeys(regPath);
+    const entry = {
+      platformGameId: pgid,
+      title: title || pgid,
+      ...(regPath ? { epicPartnerRegistryPath: regPath } : {}),
+    };
+    if (keys[0] && !epicHandoffByFullKey.has(`${eHandoff}:${keys[0]}`)) {
+      epicHandoffByFullKey.set(`${eHandoff}:${keys[0]}`, entry);
+    }
+    const baseKey = keys[1] || keys[0];
+    if (baseKey && !epicHandoffByBaseKey.has(`${eHandoff}:${baseKey}`)) {
+      epicHandoffByBaseKey.set(`${eHandoff}:${baseKey}`, entry);
+    }
+    if (leafKeys[0] && !epicHandoffByFullKey.has(`${eHandoff}:${leafKeys[0]}`)) {
+      epicHandoffByFullKey.set(`${eHandoff}:${leafKeys[0]}`, entry);
+    }
+    const baseLeaf = leafKeys[1] || leafKeys[0];
+    if (baseLeaf && !epicHandoffByBaseKey.has(`${eHandoff}:${baseLeaf}`)) {
+      epicHandoffByBaseKey.set(`${eHandoff}:${baseLeaf}`, entry);
+    }
+    if (extId && !byExternalId.has(`${eHandoff}:${String(extId).toLowerCase()}`)) {
+      byExternalId.set(`${eHandoff}:${String(extId).toLowerCase()}`, {
+        platformId: 'epic',
+        platformGameId: pgid,
+        title: title || pgid,
+      });
+    }
+  };
+
+  const indexGameEntry = (/** @type {any} */ game) => {
+    if (!game || typeof game !== 'object') return;
+    const title = String(game.title || game.canonical_title || '').trim();
+    const keys = buildChainedTitleMatchKeys(title);
+    const fullKey = keys[0] || '';
+    const baseKey = keys[1] || keys[0] || '';
+    const rawPlats = Array.isArray(game.platforms) ? game.platforms : [];
+    const sanitizedPlats =
+      sanitizeVaultPlatformEntriesOsFlags(rawPlats, false, {
+        drmNotice: game.drmNotice || game.enrichedMetadata?.drmNotice || null,
+        gameChainedLauncherHandoff: game.chainedLauncherHandoff || null,
+        gameExternalStorefrontHandoff: game.externalStorefrontHandoff || null,
+      }).platforms || rawPlats;
+
+    for (const p of sanitizedPlats) {
+      if (!p || typeof p !== 'object') continue;
+      const pid = String(p.platformId || '').trim().toLowerCase();
+      const pgid = String(p.platformGameId || p.xboxProductId || '').trim();
+      if (!pgid) continue;
+      if (pid === 'xbox') {
+        const xHandoff = resolveAnyChainedHandoffId(
+          p.chainedLauncherHandoff ||
+            p.externalStorefrontHandoff ||
+            (sanitizedPlats.length === 1
+              ? game.chainedLauncherHandoff || game.externalStorefrontHandoff
+              : null)
+        );
+        if (xHandoff && fullKey) {
+          const entry = {
+            platformGameId: pgid,
+            xboxProductId: String(p.xboxProductId || pgid),
+            title,
+          };
+          if (!xboxHandoffByFullKey.has(`${xHandoff}:${fullKey}`)) {
+            xboxHandoffByFullKey.set(`${xHandoff}:${fullKey}`, entry);
+          }
+          if (!xboxHandoffByBaseKey.has(`${xHandoff}:${baseKey}`)) {
+            xboxHandoffByBaseKey.set(`${xHandoff}:${baseKey}`, entry);
+          }
+          if (p.chainedExternalInstallId) {
+            byExternalId.set(`${xHandoff}:${String(p.chainedExternalInstallId).toLowerCase()}`, {
+              platformId: 'xbox',
+              platformGameId: pgid,
+              xboxProductId: String(p.xboxProductId || pgid),
+              title,
+            });
+          }
+        }
+      } else if (pid === 'epic') {
+        const eHandoff = resolveAnyChainedHandoffId(
+          p.chainedLauncherHandoff ||
+            p.externalStorefrontHandoff ||
+            (sanitizedPlats.length === 1
+              ? game.chainedLauncherHandoff || game.externalStorefrontHandoff
+              : null)
+        );
+        if (eHandoff) {
+          indexEpicPartnerEntry(
+            eHandoff,
+            pgid,
+            String(p.originalTitle || title),
+            p.epicPartnerRegistryPath ? String(p.epicPartnerRegistryPath) : undefined,
+            p.chainedExternalInstallId ? String(p.chainedExternalInstallId) : undefined
+          );
+        }
+      } else {
+        const standaloneHandoff = resolveAnyChainedHandoffId(pid);
+        if (standaloneHandoff && fullKey) {
+          const entry = {
+            platformId: standaloneHandoff,
+            platformGameId: pgid,
+            title,
+          };
+          if (!standaloneByFullKey.has(`${standaloneHandoff}:${fullKey}`)) {
+            standaloneByFullKey.set(`${standaloneHandoff}:${fullKey}`, entry);
+          }
+          if (!standaloneByBaseKey.has(`${standaloneHandoff}:${baseKey}`)) {
+            standaloneByBaseKey.set(`${standaloneHandoff}:${baseKey}`, entry);
+          }
+        }
+      }
+    }
+  };
+
+  if (Array.isArray(options.catalogGames)) {
+    for (const cg of options.catalogGames) {
+      indexGameEntry(cg);
+    }
+  }
+
+  try {
+    const epicLocal = collectLocalEpicMetadataAndSupport(options);
+    if (Array.isArray(epicLocal?.metaSummaries)) {
+      for (const s of epicLocal.metaSummaries) {
+        if (!s || !s.appName) continue;
+        const eHandoff = resolveAnyChainedHandoffId(
+          s.chainedLauncherHandoff || s.externalStorefrontHandoff
+        );
+        if (!eHandoff) continue;
+        indexEpicPartnerEntry(
+          eHandoff,
+          String(s.appName),
+          String(s.appTitle || s.appName),
+          s.epicPartnerRegistryPath ? String(s.epicPartnerRegistryPath) : undefined,
+          s.chainedExternalInstallId ? String(s.chainedExternalInstallId) : undefined
+        );
+      }
+    }
+  } catch {}
+
+  try {
+    const vaultDbPath = path.join(userDataDir, 'offline-vault', 'catalog_metadata.sqlite');
+    if (fs.existsSync(vaultDbPath)) {
+      const vaultDb = new DatabaseSync(vaultDbPath, { readOnly: true });
+      try {
+        const rows = vaultDb
+          .prepare(
+            'SELECT game_id, canonical_title, platforms_json, summary_json, enriched_json FROM vault_games'
+          )
+          .all();
+        for (const row of rows) {
+          if (!row) continue;
+          const summary = parseVaultJson(row.summary_json) || {};
+          const platforms = parseVaultJson(row.platforms_json) || summary.platforms || [];
+          const enrichedMetadata = row.enriched_json ? parseVaultJson(row.enriched_json) : null;
+          indexGameEntry({
+            ...summary,
+            id: summary.id || row.game_id,
+            title: summary.title || row.canonical_title || '',
+            platforms,
+            ...(enrichedMetadata ? { enrichedMetadata } : {}),
+          });
+        }
+      } finally {
+        try {
+          vaultDb.close();
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return {
+    xboxHandoffByFullKey,
+    xboxHandoffByBaseKey,
+    epicHandoffByFullKey,
+    epicHandoffByBaseKey,
+    standaloneByFullKey,
+    standaloneByBaseKey,
+    byExternalId,
+    managedByInstallPath,
+  };
+}
+
+function resolveBottleLayerMetadata(bottlePath, /** @type {any[]} */ detectedLayers) {
+  const resolvedBottle = path.resolve(bottlePath);
+  const normBottle = resolvedBottle.replace(/\\/g, '/');
+  for (const layer of detectedLayers) {
+    if (!layer || !layer.bottlesDir) continue;
+    const resolvedBottlesDir = path.resolve(layer.bottlesDir);
+    if (
+      resolvedBottle === resolvedBottlesDir ||
+      resolvedBottle.startsWith(`${resolvedBottlesDir}${path.sep}`)
+    ) {
+      return {
+        compatibilityLayer: layer.type,
+        wineBottle: path.basename(resolvedBottle),
+      };
+    }
+  }
+  if (/\/CrossOver Preview\/Bottles\//i.test(normBottle)) {
+    return { compatibilityLayer: 'crossover_preview', wineBottle: path.basename(resolvedBottle) };
+  }
+  if (/\/(?:CrossOver|Whisky)\/Bottles\//i.test(normBottle)) {
+    return { compatibilityLayer: 'crossover', wineBottle: path.basename(resolvedBottle) };
+  }
+  const preferredReady =
+    detectedLayers.find((l) => l && l.available) || detectedLayers[0] || null;
+  return {
+    compatibilityLayer: preferredReady?.type || 'wine',
+    wineBottle: path.basename(resolvedBottle),
+  };
+}
 
 /**
  * Multi-Storefront & Multi-Drive Read-Only Installation Scanner.
@@ -64,6 +438,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
       !options.xboxGamesDirs &&
       !options.windowsDriveRoots &&
       !options.gamingServicesRegistryOutput &&
+      !options.catalogGames &&
+      !options.bottlePath &&
+      !options.bottlePaths &&
       !options.strictPe;
 
     const lastProductionScanCache = getLastProductionScanCache();
@@ -120,8 +497,42 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     /** @type {number[]} */
     const installedSteamAppIds = [];
 
+    /** @type {any[]} */
+    let preloadedManagedRecords = [];
+    /** @type {Set<string>} */
+    const managedCompletedKeys = new Set();
+    try {
+      const rawManagedRecords = loadManagedInstalledGames(userDataDir);
+      preloadedManagedRecords = rawManagedRecords.filter(
+        (rec) => !isGdkStubExecutablePath(rec?.executablePath)
+      );
+      if (preloadedManagedRecords.length !== rawManagedRecords.length) {
+        saveManagedInstalledGames(preloadedManagedRecords, userDataDir);
+      }
+      for (const rec of preloadedManagedRecords) {
+        if (!rec || !rec.platformId || !rec.platformGameId) continue;
+        const cleanManagedId = String(rec.platformGameId)
+          .replace(/^(gog|steam|epic|xbox)-/i, '')
+          .toLowerCase();
+        managedCompletedKeys.add(`${String(rec.platformId).toLowerCase()}:${cleanManagedId}`);
+      }
+    } catch {}
+
     const addRecord = (/** @type {any} */ record) => {
       if (!record || !record.platformId || !record.platformGameId) return;
+      const cleanRecordId = String(record.platformGameId)
+        .replace(/^(gog|steam|epic|xbox)-/i, '')
+        .toLowerCase();
+      if (
+        !managedCompletedKeys.has(`${String(record.platformId).toLowerCase()}:${cleanRecordId}`) &&
+        isPathOrGameUnderIncompleteDownload(
+          record.installPath,
+          record.platformId,
+          record.platformGameId
+        )
+      ) {
+        return;
+      }
       const key = `${record.platformId}:${record.platformGameId}`;
       const existing = discoveredMap.get(key);
       if (existing) {
@@ -207,6 +618,8 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     // =========================================================================
     // 1. STEAM MULTI-LIBRARY SCANNER (Read-only; never mutates manifests or common/)
     // =========================================================================
+    /** @type {Set<string>} */
+    const steamInstalledDirPaths = new Set();
     try {
       const { steamappsDirs } = discoverSteamLocations(options);
 
@@ -281,22 +694,51 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             installPath,
             { platform }
           );
+          let installerDataParsed = null;
+          const installerXmlCandidates = [
+            path.join(installPath, '__Installer', 'installerdata.xml'),
+            path.join(installPath, '__installer', 'installerdata.xml'),
+          ];
+          for (const xmlPath of installerXmlCandidates) {
+            if (!fs.existsSync(xmlPath)) continue;
+            try {
+              installerDataParsed = parseSteamEaInstallerDataXml(fs.readFileSync(xmlPath, 'utf8'));
+              if (installerDataParsed) break;
+            } catch {}
+          }
+
+          const steamChainedHandoff = resolveAnyChainedHandoffId(
+            appInfoSpec?.chainedLauncherHandoff ||
+              (installerDataParsed?.isEaChained ? 'ea' : null)
+          );
+          const steamRequiresProtocolLaunch = Boolean(
+            appInfoSpec?.requiresStorefrontProtocolLaunch || steamChainedHandoff
+          );
+          const steamChainedContentId = installerDataParsed?.contentId || undefined;
+
           const exeDiscovery =
             appInfoSpec && appInfoSpec.executablePath
               ? {
                   executablePath: appInfoSpec.executablePath,
                   isWindowsBinaryOnMac: appInfoSpec.isWindowsBinaryOnMac,
                 }
-              : findPrimaryExecutable(installPath, { platform, hintName: parsed.name });
+              : findPrimaryExecutable(installPath, {
+                  platform,
+                  hintName: parsed.name,
+                  readOnly: true,
+                });
 
-          if (!exeDiscovery.executablePath) {
+          if (!exeDiscovery.executablePath && !steamRequiresProtocolLaunch) {
             continue;
           }
 
+          steamInstalledDirPaths.add(path.resolve(installPath).toLowerCase());
           const isInsideBottle = /(?:^|[\\/])(Bottles|drive_c)(?:[\\/]|$)/i.test(installPath);
           const launchArguments =
             appInfoSpec?.launchArguments ||
-            resolveDefaultEngineLaunchArguments(installPath, exeDiscovery.executablePath);
+            (exeDiscovery.executablePath
+              ? resolveDefaultEngineLaunchArguments(installPath, exeDiscovery.executablePath)
+              : undefined);
 
           addRecord({
             platformId: 'steam',
@@ -305,15 +747,25 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             title: parsed.name,
             name: parsed.name,
             installPath,
-            executablePath: exeDiscovery.executablePath,
+            ...(exeDiscovery.executablePath ? { executablePath: exeDiscovery.executablePath } : {}),
             ...(launchArguments ? { launchArguments } : {}),
+            ...(steamChainedHandoff
+              ? {
+                  chainedLauncherHandoff: steamChainedHandoff,
+                  externalStorefrontHandoff: steamChainedHandoff,
+                  chainedHandoffTopology: 'storefront_depot_uri',
+                }
+              : {}),
+            ...(steamRequiresProtocolLaunch ? { requiresStorefrontProtocolLaunch: true } : {}),
+            ...(steamChainedContentId ? { chainedExternalInstallId: steamChainedContentId } : {}),
+            ...(appInfoSpec?.protocolUri ? { protocolUri: appInfoSpec.protocolUri } : {}),
             installSize: parseByteCountOrFormattedSize(parsed.SizeOnDisk),
             version: parsed.buildid ? String(parsed.buildid) : undefined,
             manifestPath,
             runner: 'steam',
             isWindowsBinaryOnMac:
               Boolean(exeDiscovery.isWindowsBinaryOnMac) ||
-              (platform === 'darwin' && isInsideBottle),
+              (platform === 'darwin' && (isInsideBottle || Boolean(steamChainedHandoff))),
           });
         }
       }
@@ -426,6 +878,16 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           if (/^(steam|epic|custom)-\d+$/i.test(title)) return;
           let installPath = path.dirname(infoFilePath);
 
+          if (isPathUnderActiveDownload(installPath)) return;
+          if (
+            !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
+            (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
+              fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
+              fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
+          ) {
+            return;
+          }
+
           const normInfoDir = installPath.replace(/\\/g, '/');
           if (normInfoDir.endsWith('/Contents/Resources')) {
             const candidateParentDir = path.resolve(installPath, '..', '..');
@@ -445,6 +907,14 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               }
             } else {
               installPath = candidateParentDir;
+            }
+            if (
+              !managedCompletedKeys.has(`gog:${gameId.toLowerCase()}`) &&
+              (fs.existsSync(path.join(installPath, '.gogdl-resume')) ||
+                fs.existsSync(path.join(installPath, '.gogdl-download-cache')) ||
+                fs.existsSync(path.join(installPath, '.onelauncher-gog-v2-resume.json')))
+            ) {
+              return;
             }
           }
 
@@ -495,7 +965,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           }
 
           if (!executablePath) {
-            const discovered = findPrimaryExecutable(installPath, { platform, hintName: title });
+            const discovered = findPrimaryExecutable(installPath, {
+              platform,
+              hintName: title,
+              readOnly: true,
+            });
             executablePath = discovered.executablePath;
             isWindowsBinaryOnMac = discovered.isWindowsBinaryOnMac;
           } else if (platform === 'darwin' && executablePath.toLowerCase().endsWith('.exe')) {
@@ -523,6 +997,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
 
       const scanDirForGogInfo = (/** @type {string} */ dirPath, depth = 0) => {
         if (depth > 3 || !dirPath || !fs.existsSync(dirPath)) return;
+        if (isPathUnderActiveDownload(dirPath)) return;
         /** @type {fs.Dirent[]} */
         let entries = [];
         try {
@@ -619,6 +1094,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               platform,
               hintName: title,
               preferWindowsExecutable: isWindowsGogItem,
+              readOnly: true,
             });
             const itemExeCandidate = item.executable
               ? toLocalFsPath(item.executable, customRoots)
@@ -754,12 +1230,17 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                 const discovered = findPrimaryExecutable(installPath, {
                   platform,
                   hintName: title,
+                  readOnly: true,
                 });
                 executablePath = discovered.executablePath;
                 isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
               }
             } else {
-              const discovered = findPrimaryExecutable(installPath, { platform, hintName: title });
+              const discovered = findPrimaryExecutable(installPath, {
+                platform,
+                hintName: title,
+                readOnly: true,
+              });
               executablePath = discovered.executablePath;
               isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
             }
@@ -858,7 +1339,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               continue;
             }
 
-            const discovered = findPrimaryExecutable(installPath, { platform, hintName: appName });
+            const discovered = findPrimaryExecutable(installPath, {
+              platform,
+              hintName: appName,
+              readOnly: true,
+            });
             if (!discovered.executablePath || !fs.existsSync(discovered.executablePath)) continue;
 
             if (Boolean(options.userDataDir) || !isIsolatedTest) {
@@ -960,7 +1445,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                 : path.join(installPath, cleanExe);
               executablePath = toLocalFsPath(candidate, customRoots);
             }
-            const discovered = findPrimaryExecutable(installPath, { platform, hintName: title });
+            const discovered = findPrimaryExecutable(installPath, {
+              platform,
+              hintName: title,
+              readOnly: true,
+            });
             if (!executablePath || !fs.existsSync(executablePath)) {
               executablePath = discovered.executablePath;
             }
@@ -1025,7 +1514,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           platform,
           strictPe: Boolean(options.strictPe),
         });
-        if (xboxRecord) {
+        if (
+          xboxRecord &&
+          !(xboxRecord.isExternalLauncherStub && !xboxRecord.executablePath) &&
+          !isGdkStubExecutablePath(xboxRecord.executablePath)
+        ) {
           addRecord(xboxRecord);
         }
       }
@@ -1039,12 +1532,251 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     }
 
     // =========================================================================
+    // 3.6 CHAINED PUBLISHER LAUNCHERS SCANNER (Ubisoft Connect / EA App / Battle.net / Rockstar / Riot)
+    // =========================================================================
+    try {
+      /** @type {Array<{ found: any, isBottle: boolean, compatibilityLayer?: string, wineBottle?: string }>} */
+      const discoveredPublisherEntries = [];
+
+      if (platform === 'darwin') {
+        const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
+        const detectedLayers = detectCompatibilityLayers({
+          ...options,
+          platform: 'darwin',
+          ...explicitHomedirOpt,
+        });
+        const bottleSet = new Set(
+          listAllInitializedBottlePaths({
+            ...options,
+            platform: 'darwin',
+            ...explicitHomedirOpt,
+          })
+        );
+        for (const cr of customRoots) {
+          if (!cr || typeof cr !== 'string') continue;
+          const bRoot = extractBottleRootFromPath(cr);
+          if (bRoot && fs.existsSync(bRoot)) {
+            bottleSet.add(path.resolve(bRoot));
+          } else if (
+            fs.existsSync(path.join(cr, 'drive_c')) ||
+            fs.existsSync(path.join(cr, 'system.reg'))
+          ) {
+            bottleSet.add(path.resolve(cr));
+          }
+        }
+        for (const bottlePath of bottleSet) {
+          const layerMeta = resolveBottleLayerMetadata(bottlePath, detectedLayers);
+          const bottleGames = scanBottlePublisherInstalledGames(bottlePath, {
+            ...options,
+            homedir,
+          });
+          for (const found of bottleGames) {
+            discoveredPublisherEntries.push({
+              found,
+              isBottle: true,
+              compatibilityLayer: layerMeta.compatibilityLayer,
+              wineBottle: found.bottleName || layerMeta.wineBottle,
+            });
+          }
+        }
+        const hostMacPublisherGames = scanHostPublisherInstalledGames({
+          ...options,
+          platform: 'darwin',
+          homedir,
+        });
+        for (const found of hostMacPublisherGames) {
+          discoveredPublisherEntries.push({ found, isBottle: false });
+        }
+      } else if (platform === 'win32') {
+        const hostWinPublisherGames = scanHostPublisherInstalledGames({
+          ...options,
+          platform: 'win32',
+          homedir,
+        });
+        for (const found of hostWinPublisherGames) {
+          discoveredPublisherEntries.push({ found, isBottle: false });
+        }
+      }
+
+      if (discoveredPublisherEntries.length > 0) {
+        const catalogIndex = loadChainedCatalogIndex(
+          userDataDir,
+          options,
+          preloadedManagedRecords
+        );
+        for (const item of discoveredPublisherEntries) {
+          const { found, isBottle, compatibilityLayer, wineBottle } = item;
+          if (
+            !found ||
+            !found.handoffId ||
+            !found.installPath ||
+            !found.executablePath ||
+            isGdkStubExecutablePath(found.executablePath)
+          ) {
+            continue;
+          }
+
+          const resolvedFoundPathLower = path.resolve(found.installPath).toLowerCase();
+          // Skip Steam depots (`steamapps/common/*`) that register in EA/Ubisoft Windows registry
+          // so Steam `storefront_depot_uri` games never emit duplicate `ea:<contentId>` cards or hijack other stores.
+          if (
+            /(?:^|[\\/])steamapps[\\/]common(?:[\\/]|$)/i.test(found.installPath) ||
+            steamInstalledDirPaths.has(resolvedFoundPathLower)
+          ) {
+            continue;
+          }
+
+          const handoffId = resolveAnyChainedHandoffId(found.handoffId) || found.handoffId;
+          const extId = found.externalInstallId ? String(found.externalInstallId) : '';
+          const matchKeys = Array.from(
+            new Set([
+              ...buildChainedTitleMatchKeys(found.title || ''),
+              ...buildChainedTitleMatchKeys(path.basename(found.installPath)),
+            ])
+          );
+
+          const managedPathMatch =
+            catalogIndex.managedByInstallPath.get(resolvedFoundPathLower) || null;
+          const extMatch =
+            !managedPathMatch && extId
+              ? catalogIndex.byExternalId.get(`${handoffId}:${extId.toLowerCase()}`) || null
+              : null;
+          let xboxMatch = null;
+          let epicMatch = null;
+          let standaloneMatch = null;
+          if (!managedPathMatch && !extMatch) {
+            for (const mk of matchKeys) {
+              xboxMatch = catalogIndex.xboxHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
+              if (xboxMatch) break;
+            }
+            if (!xboxMatch) {
+              for (const mk of matchKeys) {
+                epicMatch = catalogIndex.epicHandoffByFullKey.get(`${handoffId}:${mk}`) || null;
+                if (epicMatch) break;
+              }
+            }
+            if (!xboxMatch && !epicMatch) {
+              for (const mk of matchKeys) {
+                xboxMatch = catalogIndex.xboxHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
+                if (xboxMatch) break;
+              }
+            }
+            if (!xboxMatch && !epicMatch) {
+              for (const mk of matchKeys) {
+                epicMatch = catalogIndex.epicHandoffByBaseKey.get(`${handoffId}:${mk}`) || null;
+                if (epicMatch) break;
+              }
+            }
+            if (!xboxMatch && !epicMatch) {
+              for (const mk of matchKeys) {
+                standaloneMatch =
+                  catalogIndex.standaloneByFullKey.get(`${handoffId}:${mk}`) || null;
+                if (standaloneMatch) break;
+              }
+            }
+            if (!xboxMatch && !epicMatch && !standaloneMatch) {
+              for (const mk of matchKeys) {
+                standaloneMatch =
+                  catalogIndex.standaloneByBaseKey.get(`${handoffId}:${mk}`) || null;
+                if (standaloneMatch) break;
+              }
+            }
+          }
+
+          let targetPlatformId = handoffId;
+          let targetPlatformGameId =
+            extId ||
+            normalizeComparableTitle(found.title || '') ||
+            path.basename(found.installPath);
+          /** @type {string | undefined} */
+          let xboxProductId = undefined;
+          let resolvedTitle = found.title || path.basename(found.installPath);
+          /** @type {string | undefined} */
+          let chainedHandoffTopology = undefined;
+
+          if (managedPathMatch) {
+            targetPlatformId = managedPathMatch.platformId;
+            targetPlatformGameId = managedPathMatch.platformGameId;
+            xboxProductId = managedPathMatch.xboxProductId;
+            if (managedPathMatch.title) resolvedTitle = managedPathMatch.title;
+            if (targetPlatformId === 'epic') {
+              chainedHandoffTopology = 'partner_launcher_link';
+            } else if (targetPlatformId === 'xbox') {
+              chainedHandoffTopology = 'publisher_managed';
+            }
+          } else if (extMatch) {
+            targetPlatformId = extMatch.platformId;
+            targetPlatformGameId = extMatch.platformGameId;
+            xboxProductId = extMatch.xboxProductId;
+            if (extMatch.title) resolvedTitle = extMatch.title;
+            if (targetPlatformId === 'epic') {
+              chainedHandoffTopology = 'partner_launcher_link';
+            } else if (targetPlatformId === 'xbox') {
+              chainedHandoffTopology = 'publisher_managed';
+            }
+          } else if (xboxMatch) {
+            targetPlatformId = 'xbox';
+            targetPlatformGameId = xboxMatch.platformGameId;
+            xboxProductId = xboxMatch.xboxProductId || xboxMatch.platformGameId;
+            if (xboxMatch.title) resolvedTitle = xboxMatch.title;
+            chainedHandoffTopology = 'publisher_managed';
+          } else if (epicMatch) {
+            targetPlatformId = 'epic';
+            targetPlatformGameId = epicMatch.platformGameId;
+            if (epicMatch.title) resolvedTitle = epicMatch.title;
+            chainedHandoffTopology = 'partner_launcher_link';
+          } else if (standaloneMatch) {
+            targetPlatformId = standaloneMatch.platformId;
+            targetPlatformGameId = standaloneMatch.platformGameId;
+            if (standaloneMatch.title) resolvedTitle = standaloneMatch.title;
+          }
+
+          const installSize = parseByteCountOrFormattedSize(found.installSizeBytes);
+          addRecord({
+            platformId: targetPlatformId,
+            platformGameId: targetPlatformGameId,
+            storefrontAppId: targetPlatformGameId,
+            ...(xboxProductId ? { xboxProductId } : {}),
+            title: resolvedTitle,
+            installPath: found.installPath,
+            executablePath: found.executablePath,
+            ...(installSize ? { installSize } : {}),
+            chainedLauncherHandoff: handoffId,
+            externalStorefrontHandoff: handoffId,
+            ...(chainedHandoffTopology ? { chainedHandoffTopology } : {}),
+            ...(extId ? { chainedExternalInstallId: extId } : {}),
+            runner: isBottle ? 'chained_bottle' : 'chained_host',
+            ...(isBottle
+              ? {
+                  ...(compatibilityLayer ? { compatibilityLayer } : {}),
+                  ...(wineBottle ? { wineBottle } : {}),
+                  isWindowsBinaryOnMac: true,
+                }
+              : {
+                  isWindowsBinaryOnMac:
+                    platform === 'darwin' &&
+                    String(found.executablePath).toLowerCase().endsWith('.exe'),
+                }),
+          });
+        }
+      }
+    } catch (stageErr) {
+      diagLog.warn(
+        'scanAllInstalledGames.stageError',
+        stageErr,
+        { stage: 'chained_publisher_launchers' },
+        { userDataDir }
+      );
+    }
+
+    // =========================================================================
     // 4. ONE LAUNCHER MANAGED INSTALLS (Read-only; never wipes unmounted external drives)
     // =========================================================================
     try {
-      const managedRecords = loadManagedInstalledGames(userDataDir);
+      const managedRecords = preloadedManagedRecords;
       for (const rec of managedRecords) {
         if (!rec || !rec.platformId || !rec.platformGameId) continue;
+        if (isGdkStubExecutablePath(rec.executablePath)) continue;
         const localInstall = toLocalFsPath(rec.installPath, customRoots);
         if (localInstall && fs.existsSync(localInstall)) {
           const existingKey = `${rec.platformId}:${rec.platformGameId}`;
@@ -1056,15 +1788,21 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               path.resolve(existingDiscovered.installPath) === path.resolve(localInstall)
           );
           const matchedDiscovered = isSameInstallDir ? existingDiscovered : null;
-          if (
-            rec.platformId === 'xbox' &&
-            !matchedDiscovered &&
-            !inspectInstalledXboxGameDir(localInstall, {
+          const isChainedManagedRecord = Boolean(
+            rec.chainedLauncherHandoff || rec.externalStorefrontHandoff
+          );
+          if (rec.platformId === 'xbox' && !matchedDiscovered && !isChainedManagedRecord) {
+            const inspectedManagedXbox = inspectInstalledXboxGameDir(localInstall, {
               platform,
               strictPe: Boolean(options.strictPe),
-            })
-          ) {
-            continue;
+            });
+            if (
+              !inspectedManagedXbox ||
+              (inspectedManagedXbox.isExternalLauncherStub &&
+                !inspectedManagedXbox.executablePath)
+            ) {
+              continue;
+            }
           }
           const recExeLocal = rec.executablePath
             ? toLocalFsPath(rec.executablePath, customRoots)
@@ -1072,6 +1810,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           const isRecExeValid =
             Boolean(recExeLocal) &&
             fs.existsSync(recExeLocal) &&
+            !isGdkStubExecutablePath(recExeLocal) &&
             !isExcludedExecutable(path.basename(recExeLocal)) &&
             !/\.com$/i.test(recExeLocal);
           const discovered =
@@ -1080,12 +1819,20 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                   executablePath: matchedDiscovered.executablePath,
                   isWindowsBinaryOnMac: matchedDiscovered.isWindowsBinaryOnMac,
                 }
-              : findPrimaryExecutable(localInstall, { platform, hintName: rec.title });
+              : findPrimaryExecutable(localInstall, {
+                  platform,
+                  hintName: rec.title,
+                  readOnly: true,
+                });
           const effectiveExe =
             matchedDiscovered?.executablePath ||
             (isRecExeValid ? recExeLocal : undefined) ||
             discovered.executablePath;
-          if (!effectiveExe || !fs.existsSync(effectiveExe)) {
+          if (
+            !effectiveExe ||
+            !fs.existsSync(effectiveExe) ||
+            isGdkStubExecutablePath(effectiveExe)
+          ) {
             continue;
           }
           const effectiveLaunchArgs =
@@ -1227,6 +1974,43 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     }
 
     const installedGames = Array.from(discoveredMap.values());
+    for (const g of installedGames) {
+      if (!g || g.driveDisconnected || !g.installPath || typeof g.installPath !== 'string') {
+        continue;
+      }
+      try {
+        const localInstallDir = toLocalFsPath(g.installPath);
+        if (!localInstallDir || !fs.existsSync(localInstallDir)) continue;
+        const acMarkers = detectKernelAntiCheatMarkersInDir(localInstallDir);
+        if (
+          acMarkers.kernelAntiCheatName ||
+          acMarkers.requiresKernelAntiCheat ||
+          acMarkers.storyModeBypassAvailable
+        ) {
+          if (g.requiresKernelAntiCheat === undefined) {
+            g.requiresKernelAntiCheat = acMarkers.requiresKernelAntiCheat;
+          }
+          if (!g.kernelAntiCheatName && acMarkers.kernelAntiCheatName) {
+            g.kernelAntiCheatName = acMarkers.kernelAntiCheatName;
+          }
+          if (acMarkers.storyModeBypassAvailable) {
+            g.storyModeBypassAvailable = true;
+          }
+        }
+        if (g.executablePath && !g.paradoxDirectGameExe) {
+          const exeBase = path.posix.basename(String(g.executablePath).replace(/\\/g, '/'));
+          if (/^dowser\.exe$/i.test(exeBase)) {
+            const pdx = resolveParadoxLauncherSettings(
+              toLocalFsPath(g.executablePath) || localInstallDir,
+              localInstallDir
+            );
+            if (pdx.paradoxDirectGameExe) {
+              g.paradoxDirectGameExe = pdx.paradoxDirectGameExe;
+            }
+          }
+        }
+      } catch {}
+    }
     let epicPlatformSupport = {};
     try {
       const metaRes = collectLocalEpicMetadataAndSupport(options);
@@ -1260,7 +2044,8 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             !g.driveDisconnected &&
             g.runner !== 'custom' &&
             g.runner !== 'gog_galaxy' &&
-            g.installPath
+            g.installPath &&
+            !isPathUnderActiveDownload(g.installPath)
         );
       const gogFingerprint = installedGames
         .filter(isSyncableGogInstall)
@@ -1339,4 +2124,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
 
 module.exports = {
   scanAllInstalledGames,
+  buildChainedTitleMatchKeys,
+  doChainedPublisherTitlesMatch,
+  isGdkStubExecutablePath,
+  detectKernelAntiCheatMarkersInDir,
+  resolveParadoxLauncherSettings,
 };

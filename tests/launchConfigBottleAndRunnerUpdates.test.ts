@@ -114,12 +114,16 @@ function createStatefulRenderer<P extends object>(
         n.forEach(walk);
         return;
       }
+      if (
+        typeof n.type === 'function' &&
+        (n.type.name === 'LaunchSelect' || n.type.name === 'SwitchControl')
+      ) {
+        walk(n.type(n.props || {}));
+        return;
+      }
       if (predicate(n)) out.push(n);
-      if (n.props?.children) walk(n.props.children);
-      if (typeof n.type === 'function' && !n.type.$$typeof) {
-        try {
-          walk(n.type(n.props || {}));
-        } catch {}
+      if (n.props?.children) {
+        walk(n.props.children);
       }
     };
     walk(node);
@@ -1002,7 +1006,8 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
 
       expect(modalNeedsUpdate.html).toContain('data-testid="runner-update-available-badge"');
       expect(modalNeedsUpdate.html).toContain('data-testid="update-runner-btn"');
-      expect(modalNeedsUpdate.html).toContain('Update to v26.4.0');
+      expect(modalNeedsUpdate.html).toContain('aria-label="Update CrossOver Preview to v26.4.0"');
+      expect(modalNeedsUpdate.html).toContain('>Update<');
       modalNeedsUpdate.unmount();
     });
 
@@ -1145,7 +1150,8 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         ).toBe(true);
         expect(heroicCheck.wine.updateAvailable).toBe(true);
         expect(heroicCheck.wine.latestVersion).toBe('11.2');
-        expect(heroicCheck.wine.updateMethod).toBe('vendor_portal');
+        expect(heroicCheck.wine.canAutoUpdate).toBe(true);
+        expect(heroicCheck.wine.updateMethod).toBe('direct_download');
 
         // 2. Retired Wine-CrossOver -> skips Wine feed completely & reports updateAvailable: false
         requestedUrls.length = 0;
@@ -1203,9 +1209,9 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         ).toBe(true);
         expect(brewStagingCheck.wine.updateAvailable).toBe(true);
         expect(brewStagingCheck.wine.latestVersion).toBe('11.4');
-        expect(brewStagingCheck.wine.updateMethod).toBe('homebrew_cask');
+        expect(brewStagingCheck.wine.updateMethod).toBe('direct_download');
 
-        // 4. Homebrew Wine Stable.app -> queries wine-stable.json ('homebrew_cask')
+        // 4. Standalone /Applications/Wine Stable.app -> queries wine-stable.json ('direct_download')
         requestedUrls.length = 0;
         const brewStableCheck = await launcherEngine.checkCompatibilityLayerUpdates({
           layers: [
@@ -1235,7 +1241,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         ).toBe(true);
         expect(brewStableCheck.wine.updateAvailable).toBe(true);
         expect(brewStableCheck.wine.latestVersion).toBe('10.0');
-        expect(brewStableCheck.wine.updateMethod).toBe('homebrew_cask');
+        expect(brewStableCheck.wine.updateMethod).toBe('direct_download');
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }

@@ -16,6 +16,14 @@ export type EnvironmentComponentId =
   | 'bottle_gog'
   | 'host_epic'
   | 'bottle_epic'
+  | 'host_ubisoft'
+  | 'bottle_ubisoft'
+  | 'host_ea'
+  | 'bottle_ea'
+  | 'host_bnet'
+  | 'bottle_bnet'
+  | 'host_rockstar'
+  | 'bottle_rockstar'
   | 'xbox_runtime';
 
 export type EnvironmentComponentCategory =
@@ -46,7 +54,15 @@ export type ClientLoginTargetId =
   | 'host_gog'
   | 'bottle_gog'
   | 'host_epic'
-  | 'bottle_epic';
+  | 'bottle_epic'
+  | 'host_ubisoft'
+  | 'bottle_ubisoft'
+  | 'host_ea'
+  | 'bottle_ea'
+  | 'host_bnet'
+  | 'bottle_bnet'
+  | 'host_rockstar'
+  | 'bottle_rockstar';
 
 export type SetupWizardStepId =
   | 'prerequisites'
@@ -69,7 +85,7 @@ export interface DiscoveredLocalStoreHint {
 
 export interface ClientAuthProbeState {
   targetId: ClientLoginTargetId;
-  storefrontId: 'steam' | 'gog' | 'epic';
+  storefrontId: 'steam' | 'gog' | 'epic' | 'ubisoft' | 'ea' | 'bnet' | 'rockstar';
   scope: 'host' | 'bottle';
   label: string;
   installed: boolean;
@@ -178,6 +194,8 @@ export interface EnvironmentSetupTaskRequest {
   bottleMode?: 'reuse_existing' | 'create_dedicated';
   bottleName?: string;
   dmgPath?: string;
+  archivePath?: string;
+  forceUpdate?: boolean;
 }
 
 export interface RunEnvironmentSetupRequest {
@@ -204,6 +222,7 @@ export type EnvironmentSetupPhase =
 export interface EnvironmentSetupProgressEvent {
   runId: string;
   componentId: EnvironmentComponentId | ClientLoginTargetId;
+  action?: EnvironmentSetupTaskRequest['action'];
   stepIndex: number;
   totalSteps: number;
   phase: EnvironmentSetupPhase;

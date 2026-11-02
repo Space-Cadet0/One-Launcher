@@ -694,7 +694,10 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
     const isFav = favoriteIdsSet.has(game.id);
     const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
     const isXboxExpiredUnplayable = Boolean(
-      xboxPlat && xboxPlat.subscriptionExpired && xboxPlat.ownershipType === 'subscription'
+      xboxPlat &&
+        xboxPlat.installed &&
+        xboxPlat.subscriptionExpired &&
+        xboxPlat.ownershipType === 'subscription'
     );
     const isXboxActiveGamePass = Boolean(
       xboxPlat &&
@@ -763,24 +766,17 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             </span>
             {isXboxExpiredUnplayable ? (
               <span
-                className="px-1 py-0.2 rounded text-[8px] font-bold uppercase tracking-tight bg-rose-950/80 text-rose-300 border border-rose-500/40 flex-shrink-0"
+                className="px-1 py-0.5 rounded text-[8px] font-bold uppercase tracking-tight bg-rose-950/85 text-rose-200 border border-rose-500/50 flex-shrink-0 whitespace-nowrap"
                 title="Game Pass subscription expired"
               >
                 Expired
               </span>
             ) : isXboxLeavingSoon ? (
               <span
-                className="px-1 py-0.2 rounded text-[8px] font-bold uppercase tracking-tight bg-amber-950/80 text-amber-300 border border-amber-500/40 flex-shrink-0"
-                title="Leaving Xbox Game Pass soon"
+                className="px-1 py-0.5 rounded text-[8px] font-bold uppercase tracking-tight bg-amber-950/85 text-amber-200 border border-amber-500/50 flex-shrink-0 whitespace-nowrap"
+                title="Leaving subscription catalog soon"
               >
                 Leaving
-              </span>
-            ) : isXboxActiveGamePass ? (
-              <span
-                className="px-1 py-0.2 rounded text-[8px] font-bold uppercase tracking-tight bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 flex-shrink-0"
-                title="Included with Xbox Game Pass"
-              >
-                GP
               </span>
             ) : null}
             {activeSession ? (

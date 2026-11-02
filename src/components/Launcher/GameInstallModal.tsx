@@ -19,8 +19,10 @@ import {
   HardDrive,
   X,
   AlertCircle,
+  AlertTriangle,
   Cpu,
   Info,
+  Link2,
   Loader2,
   CheckCircle2,
   Wrench,
@@ -35,6 +37,12 @@ export interface GameInstallModalProps {
 }
 
 import { formatBytes, sanitizeGameInstallSizeBytes } from '../../utils/formatBytes';
+import {
+  detectKernelAntiCheatFromNotice,
+  detectStructuralKernelAntiCheatFromNotices,
+  isBattlEyeKernelAntiCheat,
+  normalizeChainedHandoffId,
+} from '../../services/integrations/catalogSanitizer';
 
 function formatVersion(v?: string): string {
   if (!v) return '';
@@ -44,18 +52,88 @@ function formatVersion(v?: string): string {
 
 type InstallerItem = NonNullable<GameInstallInfo['availableInstallers']>[number];
 
+const CHAINED_INSTALLER_ID_RE = /-chained-(?:bottle|host|win)-launcher$/i;
+
+function isChainedInstallerItem(ins?: InstallerItem | null): boolean {
+  if (!ins) return false;
+  return Boolean(
+    ins.chainedLauncherHandoff ||
+      ins.externalStorefrontHandoff ||
+      CHAINED_INSTALLER_ID_RE.test(String(ins.id || ''))
+  );
+}
+
+function mapHandoffIdToLauncherName(id?: string): string | null {
+  switch (id) {
+    case 'ubisoft':
+      return 'Ubisoft Connect';
+    case 'ea':
+      return 'EA App';
+    case 'bnet':
+      return 'Battle.net';
+    case 'rockstar':
+      return 'Rockstar Games Launcher';
+    case 'riot':
+      return 'Riot Client';
+    default:
+      return null;
+  }
+}
+
+function resolveChainedPublisherLauncherName(params: {
+  selectedInstaller?: InstallerItem;
+  installInfo?: GameInstallInfo | null;
+  activePlatformObj?: CanonicalGame['platforms'][number];
+}): string {
+  const explicit =
+    params.selectedInstaller?.externalLauncher ||
+    params.installInfo?.externalLauncher ||
+    params.activePlatformObj?.externalLauncher ||
+    params.installInfo?.xboxCompatibility?.externalLauncher ||
+    params.installInfo?.xboxCompatibility?.externalStorefront;
+  if (explicit && explicit.trim()) {
+    const normalizedExplicit = normalizeChainedHandoffId(explicit);
+    const mappedExplicit = mapHandoffIdToLauncherName(normalizedExplicit);
+    if (mappedExplicit) return mappedExplicit;
+    return explicit.trim();
+  }
+  const rawKey =
+    params.selectedInstaller?.chainedLauncherHandoff ||
+    params.selectedInstaller?.externalStorefrontHandoff ||
+    params.installInfo?.chainedLauncherHandoff ||
+    params.installInfo?.externalStorefrontHandoff ||
+    params.installInfo?.xboxCompatibility?.chainedLauncherHandoff ||
+    params.installInfo?.xboxCompatibility?.externalStorefrontHandoff ||
+    params.activePlatformObj?.chainedLauncherHandoff ||
+    params.activePlatformObj?.externalStorefrontHandoff ||
+    '';
+  const normalizedKey =
+    normalizeChainedHandoffId(rawKey) || String(rawKey).trim().toLowerCase();
+  return mapHandoffIdToLauncherName(normalizedKey) || 'Publisher Launcher';
+}
+
 function deduplicateInstallers(
   installers?: GameInstallInfo['availableInstallers'],
   winHost = false
 ): InstallerItem[] {
   if (!installers || installers.length === 0) return [];
 
-  let filtered = installers;
+  const normalizedInstallers = installers.map((ins) => {
+    if (CHAINED_INSTALLER_ID_RE.test(String(ins.id || ''))) {
+      return { ...ins, os: 'windows' as const };
+    }
+    if (ins.id === 'xbox-external-mac-launcher') {
+      return { ...ins, os: 'mac' as const };
+    }
+    return ins;
+  });
+
+  let filtered = normalizedInstallers;
   if (winHost) {
-    const winOnly = installers.filter((i) => i.os === 'windows');
+    const winOnly = normalizedInstallers.filter((i) => i.os === 'windows');
     if (winOnly.length > 0) filtered = winOnly;
   } else {
-    const nonLinux = installers.filter((i) => i.os !== 'linux');
+    const nonLinux = normalizedInstallers.filter((i) => i.os !== 'linux');
     if (nonLinux.length > 0) filtered = nonLinux;
   }
 
@@ -70,6 +148,9 @@ function deduplicateInstallers(
   const bestPerGroup: InstallerItem[] = [];
   for (const [, candidates] of byGroup.entries()) {
     const sorted = [...candidates].sort((a, b) => {
+      const chainedDiff =
+        (isChainedInstallerItem(a) ? 0 : 1) - (isChainedInstallerItem(b) ? 0 : 1);
+      if (chainedDiff !== 0) return chainedDiff;
       const langDiff =
         (/^en/i.test(a.language || '') ? 0 : 1) - (/^en/i.test(b.language || '') ? 0 : 1);
       if (langDiff !== 0) return langDiff;
@@ -512,13 +593,113 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   const isInstallBlockedByDiskSpace =
     !isExternalClientManagedDriveSelection && !hasEnoughSpaceOnTargetVolume;
   const xboxCompat = selectedPlatformId === 'xbox' ? installInfo?.xboxCompatibility : undefined;
+  const rawHandoffCandidate =
+    selectedInstaller?.chainedLauncherHandoff ||
+    selectedInstaller?.externalStorefrontHandoff ||
+    installInfo?.chainedLauncherHandoff ||
+    installInfo?.externalStorefrontHandoff ||
+    xboxCompat?.chainedLauncherHandoff ||
+    xboxCompat?.externalStorefrontHandoff ||
+    activePlatformObj?.chainedLauncherHandoff ||
+    activePlatformObj?.externalStorefrontHandoff ||
+    '';
+  const handoffKeyLower =
+    normalizeChainedHandoffId(rawHandoffCandidate) ||
+    String(rawHandoffCandidate).trim().toLowerCase();
+  const hasStoreChainedHandoff = Boolean(
+    handoffKeyLower &&
+      handoffKeyLower !== String(selectedPlatformId || '').toLowerCase() &&
+      (selectedPlatformId === 'xbox' || selectedPlatformId === 'epic')
+  );
+  const isCrossPlatformMacLauncher =
+    !isWindowsHost && selectedInstaller?.id === 'xbox-external-mac-launcher';
+  const isRiotKernelAntiCheat = handoffKeyLower === 'riot';
+  const hasChainedBottleInstaller =
+    !isRiotKernelAntiCheat &&
+    (uniqueInstallers.some((i) => isChainedInstallerItem(i)) ||
+      (!isCrossPlatformMacLauncher && hasStoreChainedHandoff));
+  const isChainedBottleInstaller =
+    !isWindowsHost &&
+    !isCrossPlatformMacLauncher &&
+    !isRiotKernelAntiCheat &&
+    (isChainedInstallerItem(selectedInstaller) ||
+      (selectedOs === 'windows' && hasStoreChainedHandoff));
+  const isChainedWinInstaller =
+    isWindowsHost &&
+    (isChainedInstallerItem(selectedInstaller) || hasStoreChainedHandoff);
+  const chainedLauncherName = resolveChainedPublisherLauncherName({
+    selectedInstaller,
+    installInfo,
+    activePlatformObj,
+  });
+  const rawNoticeText =
+    game.enrichedMetadata?.drmNotice ||
+    (game as { drmNotice?: string }).drmNotice ||
+    null;
+  const drmAntiCheatInfo = detectKernelAntiCheatFromNotice(rawNoticeText);
+  const structuralAntiCheatInfo = detectStructuralKernelAntiCheatFromNotices(
+    rawNoticeText,
+    activePlatformObj?.xboxBottleCompatibilityReason,
+    installInfo?.xboxBottleCompatibilityReason
+  );
+  const detectedAntiCheatName =
+    selectedInstaller?.kernelAntiCheatName ||
+    installInfo?.kernelAntiCheatName ||
+    selectedInstaller?.antiCheatName ||
+    installInfo?.antiCheatName ||
+    xboxCompat?.antiCheatName ||
+    activePlatformObj?.kernelAntiCheatName ||
+    activePlatformObj?.antiCheatName ||
+    game.kernelAntiCheatName ||
+    game.antiCheatName ||
+    drmAntiCheatInfo?.antiCheatName ||
+    structuralAntiCheatInfo?.kernelAntiCheatName ||
+    (isRiotKernelAntiCheat ? 'Riot Vanguard' : undefined);
+  const hasKernelAntiCheatRequirement = Boolean(
+    activePlatformObj?.requiresKernelAntiCheat ||
+      game.requiresKernelAntiCheat ||
+      installInfo?.requiresKernelAntiCheat ||
+      selectedInstaller?.requiresKernelAntiCheat ||
+      xboxCompat?.antiCheatDetected ||
+      xboxCompat?.tier === 'tier_c_kernel_anticheat' ||
+      drmAntiCheatInfo ||
+      structuralAntiCheatInfo ||
+      isRiotKernelAntiCheat
+  );
+  const isBattlEyeAntiCheat = isBattlEyeKernelAntiCheat(detectedAntiCheatName);
+  const isMacBottleTarget =
+    !isWindowsHost &&
+    !isCrossPlatformMacLauncher &&
+    (selectedOs === 'windows' || selectedPlatformId === 'xbox');
+  const showMacKernelAntiCheatWarning = Boolean(
+    isMacBottleTarget && hasKernelAntiCheatRequirement
+  );
+  const isCaseSensitiveTargetVolume = Boolean(
+    !isWindowsHost &&
+      isMacBottleTarget &&
+      (diskSpace?.caseSensitive === true ||
+        (diskSpace === null && installInfo?.diskSpace?.caseSensitive === true))
+  );
+  const showXboxPublisherAccountLinkCallout = Boolean(
+    selectedPlatformId === 'xbox' &&
+      !isCrossPlatformMacLauncher &&
+      (handoffKeyLower === 'ea' ||
+        handoffKeyLower === 'ubisoft' ||
+        handoffKeyLower === 'bnet' ||
+        handoffKeyLower === 'rockstar' ||
+        handoffKeyLower === 'riot')
+  );
   const isXboxMacBlocked =
     selectedPlatformId === 'xbox' &&
     !isWindowsHost &&
     Boolean(
-      xboxCompat &&
-        (xboxCompat.tier === 'tier_c_kernel_anticheat' ||
-          xboxCompat.tier === 'tier_c_external_launcher')
+      isRiotKernelAntiCheat ||
+        (xboxCompat &&
+          (xboxCompat.tier === 'tier_c_kernel_anticheat' ||
+            (xboxCompat.tier === 'tier_c_external_launcher' &&
+              !hasChainedBottleInstaller &&
+              xboxCompat.canExtractAndRun !== true &&
+              xboxCompat.supportedOnMacBottle !== true)))
     );
 
   const handleStartInstall = async () => {
@@ -530,7 +711,10 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       launcherService.setSelectedStorefrontForGame(game.id, selectedPlatformId);
 
       if (!isWindowsHost) {
-        if (selectedOs === 'windows' || selectedPlatformId === 'xbox') {
+        if (
+          selectedOs === 'windows' ||
+          (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher)
+        ) {
           await launcherService.saveLaunchConfig(
             {
               ...(existingLaunchCfg || { gameId: game.id, launchMethod: 'compatibility_layer' }),
@@ -588,6 +772,35 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         compatibilityLayer?: CompatibilityLayerType;
         wineBottleName?: string;
       };
+      const resolvedExternalLauncher =
+        selectedInstaller?.externalLauncher || installInfo?.externalLauncher;
+      const resolvedExternalLauncherUrl =
+        selectedInstaller?.externalLauncherUrl || installInfo?.externalLauncherUrl;
+      const rawExternalHandoff =
+        selectedInstaller?.externalStorefrontHandoff ||
+        installInfo?.externalStorefrontHandoff ||
+        activePlatformObj?.externalStorefrontHandoff;
+      const rawChainedHandoff =
+        selectedInstaller?.chainedLauncherHandoff ||
+        installInfo?.chainedLauncherHandoff ||
+        activePlatformObj?.chainedLauncherHandoff;
+      const normalizedPayloadHandoff = normalizeChainedHandoffId(
+        rawChainedHandoff || rawExternalHandoff
+      );
+      const resolvedExternalHandoff = normalizedPayloadHandoff || rawExternalHandoff;
+      const resolvedChainedHandoff = normalizedPayloadHandoff || rawChainedHandoff;
+      const resolvedChainedExternalId =
+        selectedInstaller?.chainedExternalInstallId ||
+        installInfo?.chainedExternalInstallId ||
+        activePlatformObj?.chainedExternalInstallId;
+      const resolvedChainedTopology =
+        selectedInstaller?.chainedHandoffTopology ||
+        installInfo?.chainedHandoffTopology ||
+        activePlatformObj?.chainedHandoffTopology;
+      const resolvedEpicRegistryPath =
+        selectedInstaller?.epicPartnerRegistryPath ||
+        installInfo?.epicPartnerRegistryPath ||
+        activePlatformObj?.epicPartnerRegistryPath;
       const installPayload: InstallReq = {
         gameId: game.id,
         title: game.title,
@@ -603,23 +816,50 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         xboxTitleId: activePlatformObj?.xboxTitleId,
         scid: activePlatformObj?.scid,
         msaAppId: activePlatformObj?.msaAppId,
+        ...(resolvedExternalLauncher ? { externalLauncher: resolvedExternalLauncher } : {}),
+        ...(resolvedExternalLauncherUrl
+          ? { externalLauncherUrl: resolvedExternalLauncherUrl }
+          : {}),
+        ...(resolvedExternalHandoff
+          ? { externalStorefrontHandoff: resolvedExternalHandoff }
+          : {}),
+        ...(resolvedChainedHandoff
+          ? { chainedLauncherHandoff: resolvedChainedHandoff }
+          : {}),
+        ...(resolvedChainedExternalId
+          ? { chainedExternalInstallId: resolvedChainedExternalId }
+          : {}),
+        ...(resolvedChainedTopology
+          ? { chainedHandoffTopology: resolvedChainedTopology }
+          : {}),
+        ...(resolvedEpicRegistryPath
+          ? { epicPartnerRegistryPath: resolvedEpicRegistryPath }
+          : {}),
         preferClientlessExtraction:
           selectedPlatformId === 'xbox'
             ? isWindowsHost
               ? preferClientlessExtraction
-              : true
+              : !isChainedBottleInstaller && !isCrossPlatformMacLauncher
             : undefined,
         steamAppId: selectedPlatformId === 'steam' ? game.steamAppId : undefined,
         headerImage: game.headerImage,
         installDir:
           installDir.trim() || (isWindowsHost ? 'C:\\Games\\OneLauncher' : '~/Games/OneLauncher'),
         installerId: selectedInstallerId,
-        os: isWindowsHost || selectedPlatformId === 'xbox' ? 'windows' : selectedOs,
+        os: isWindowsHost
+          ? 'windows'
+          : isCrossPlatformMacLauncher
+            ? 'mac'
+            : selectedPlatformId === 'xbox'
+              ? 'windows'
+              : selectedOs,
         createShortcut,
         includeDlcs: selectedPlatformId === 'epic' || selectedPlatformId === 'gog' ? includeDlcs : false,
         estimatedSizeBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
         totalBytes: estimatedSizeBytes > 0 ? estimatedSizeBytes : undefined,
-        ...(!isWindowsHost && (selectedOs === 'windows' || selectedPlatformId === 'xbox')
+        ...(!isWindowsHost &&
+        (selectedOs === 'windows' ||
+          (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher))
           ? {
               compatibilityLayer: selectedCompatRunner as CompatibilityLayerType,
               wineBottleName: selectedBottleName.trim() || undefined,
@@ -653,6 +893,18 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             : 'Installs via native gogdl integration with automatic credential bridging from your authenticated GOG session, or downloads and extracts DRM-free offline installer packages (.pkg / .dmg / .exe) directly into your target directory.',
         };
       case 'epic':
+        if (isWindowsHost && isChainedWinInstaller) {
+          return {
+            title: `Chained ${chainedLauncherName} + Epic Partner Link Pipeline (Windows)`,
+            desc: `One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`,
+          };
+        }
+        if (!isWindowsHost && isChainedBottleInstaller) {
+          return {
+            title: `Chained ${chainedLauncherName} Bottle Pipeline (CrossOver / Wine)`,
+            desc: `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`,
+          };
+        }
         return {
           title: 'Native Legendary CLI / Epic Games Store Pipeline',
           desc: isWindowsHost
@@ -661,6 +913,12 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         };
       case 'xbox':
         if (isWindowsHost) {
+          if (isChainedWinInstaller) {
+            return {
+              title: `Chained ${chainedLauncherName} Pipeline (Windows)`,
+              desc: `One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`,
+            };
+          }
           if (preferClientlessExtraction && installInfo?.canDirectDownload) {
             return {
               title: 'Clientless MSIXVC Extraction Pipeline (Advanced)',
@@ -670,6 +928,28 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           return {
             title: 'Microsoft Store / GamingServices Native Pipeline',
             desc: 'Triggers official Microsoft Store / Xbox App installation (ms-windows-store://pdp/?ProductId=...) and monitors GamingServices .GamingRoot drives (such as C:\\XboxGames) for completion.',
+          };
+        }
+        if (isXboxMacBlocked) {
+          return {
+            title: hasKernelAntiCheatRequirement
+              ? `Blocked on macOS (${detectedAntiCheatName || 'Kernel Anti-Cheat'})`
+              : 'Native Windows Required (Blocked on macOS)',
+            desc: hasKernelAntiCheatRequirement
+              ? `Bottle installation is disabled on macOS because ${detectedAntiCheatName || 'this title'} requires a Windows ring-0 kernel driver that cannot load under Wine / CrossOver.`
+              : 'Bottle installation is disabled on macOS because this title requires native Windows components unavailable inside Wine / CrossOver.',
+          };
+        }
+        if (isChainedBottleInstaller) {
+          return {
+            title: `Chained ${chainedLauncherName} Bottle Pipeline (CrossOver / Wine)`,
+            desc: `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`,
+          };
+        }
+        if (isCrossPlatformMacLauncher) {
+          return {
+            title: `Native macOS ${chainedLauncherName} Pipeline`,
+            desc: `Sets up the official macOS ${chainedLauncherName} client so you can sign in with your linked account and play natively on your Mac.`,
           };
         }
         return {
@@ -821,53 +1101,176 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           )}
 
           {/* Xbox / MSIXVC Compatibility Tier Banner on macOS */}
-          {selectedPlatformId === 'xbox' && !isWindowsHost && xboxCompat && (
-            <div
-              data-testid="xbox-compat-tier-banner"
-              role={isXboxMacBlocked ? 'alert' : 'status'}
-              className={`rounded-lg border p-3.5 space-y-1.5 text-xs ${
-                xboxCompat.tier === 'tier_a_supported'
-                  ? 'bg-emerald-950/40 border-emerald-500/45 text-emerald-100'
-                  : xboxCompat.tier === 'tier_b_legacy_uwp'
-                    ? 'bg-amber-950/45 border-amber-500/50 text-amber-100'
-                    : 'bg-rose-950/55 border-rose-500/55 text-rose-100'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span
-                  className={`inline-flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
-                    xboxCompat.tier === 'tier_a_supported'
-                      ? 'text-emerald-300'
-                      : xboxCompat.tier === 'tier_b_legacy_uwp'
-                        ? 'text-amber-300'
-                        : 'text-rose-300'
-                  }`}
-                >
-                  {xboxCompat.tier === 'tier_a_supported' ? (
-                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  ) : (
-                    <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+          {selectedPlatformId === 'xbox' && !isWindowsHost && xboxCompat && (() => {
+            const isTierASupportedWithoutAntiCheat =
+              xboxCompat.tier === 'tier_a_supported' && !hasKernelAntiCheatRequirement;
+            const isChainedBottleSupportedTier =
+              xboxCompat.tier === 'tier_c_external_launcher' &&
+              hasChainedBottleInstaller &&
+              !isRiotKernelAntiCheat &&
+              !hasKernelAntiCheatRequirement;
+            const isAmberTier =
+              xboxCompat.tier === 'tier_b_legacy_uwp' ||
+              (hasKernelAntiCheatRequirement && isBattlEyeAntiCheat);
+            return (
+              <div
+                data-testid="xbox-compat-tier-banner"
+                role={isXboxMacBlocked ? 'alert' : 'status'}
+                className={`rounded-lg border p-3.5 space-y-1.5 text-xs ${
+                  isTierASupportedWithoutAntiCheat
+                    ? 'bg-emerald-950/40 border-emerald-500/45 text-emerald-100'
+                    : isChainedBottleSupportedTier
+                      ? 'bg-sky-950/45 border-sky-500/45 text-sky-100'
+                      : isAmberTier
+                        ? 'bg-amber-950/55 border-amber-400/55 text-amber-100'
+                        : 'bg-rose-950/55 border-rose-500/55 text-rose-100'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className={`inline-flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
+                      isTierASupportedWithoutAntiCheat
+                        ? 'text-emerald-300'
+                        : isChainedBottleSupportedTier
+                          ? 'text-sky-300'
+                          : isAmberTier
+                            ? 'text-amber-200'
+                            : 'text-rose-200'
+                    }`}
+                  >
+                    {isTierASupportedWithoutAntiCheat ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    ) : isChainedBottleSupportedTier ? (
+                      <Cpu className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    )}
+                    <span>
+                      {isTierASupportedWithoutAntiCheat
+                        ? 'Tier A • Win32 GDK Package (CrossOver / Wine Supported)'
+                        : isChainedBottleSupportedTier
+                          ? `Chained Partner Launcher • Bottle Setup Supported (${chainedLauncherName})`
+                          : hasKernelAntiCheatRequirement && isBattlEyeAntiCheat
+                            ? 'Kernel Anti-Cheat Notice • BattlEye Online Multiplayer Blocked on macOS'
+                            : hasKernelAntiCheatRequirement ||
+                                xboxCompat.tier === 'tier_c_kernel_anticheat'
+                              ? `Tier C • Kernel Anti-Cheat Blocker on macOS${
+                                  detectedAntiCheatName ? ` (${detectedAntiCheatName})` : ''
+                                }`
+                              : xboxCompat.tier === 'tier_b_legacy_uwp'
+                                ? 'Tier B • Legacy UWP / AppContainer Warning'
+                                : 'Tier C • External Partner Launcher Required (Windows Only)'}
+                    </span>
+                  </span>
+                  {(xboxCompat.externalStorefront || xboxCompat.externalLauncher) && (
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-black/35 border border-white/15 font-bold uppercase tracking-wider">
+                      {xboxCompat.externalStorefront || xboxCompat.externalLauncher}
+                    </span>
                   )}
-                  <span>
-                    {xboxCompat.tier === 'tier_a_supported'
-                      ? 'Tier A • Win32 GDK Package (CrossOver / Wine Supported)'
-                      : xboxCompat.tier === 'tier_b_legacy_uwp'
-                        ? 'Tier B • Legacy UWP / AppContainer Warning'
-                        : xboxCompat.tier === 'tier_c_kernel_anticheat'
-                          ? 'Tier C • Kernel Anti-Cheat Blocker on macOS'
-                          : 'Tier C • External Partner Launcher Required (Windows Only)'}
-                  </span>
-                </span>
-                {xboxCompat.externalStorefront && (
-                  <span className="text-[10px] px-2 py-0.5 rounded bg-black/35 border border-white/15 font-bold uppercase tracking-wider">
-                    {xboxCompat.externalStorefront}
-                  </span>
+                </div>
+                {(xboxCompat.label || xboxCompat.summary) && !hasKernelAntiCheatRequirement && (
+                  <p className="font-semibold leading-snug">
+                    {xboxCompat.label || xboxCompat.summary}
+                  </p>
+                )}
+                {xboxCompat.detail && !hasKernelAntiCheatRequirement && (
+                  <p className="text-[11px] opacity-90 leading-relaxed">{xboxCompat.detail}</p>
                 )}
               </div>
-              <p className="font-semibold leading-snug">{xboxCompat.label}</p>
-              {xboxCompat.detail && (
-                <p className="text-[11px] opacity-90 leading-relaxed">{xboxCompat.detail}</p>
-              )}
+            );
+          })()}
+
+          {/* Windows Chained Publisher Launcher Notice */}
+          {isWindowsHost && isChainedWinInstaller && (
+            <div
+              data-testid="chained-launcher-install-notice"
+              role="status"
+              className="rounded-lg bg-[#101e2e] border border-sky-500/45 p-3.5 space-y-1 text-xs text-slate-100"
+            >
+              <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-300">
+                <Info className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Chained Publisher Launcher ({chainedLauncherName})</span>
+              </div>
+              <p className="text-xs text-slate-200 leading-relaxed">
+                {`One Launcher will set up or open ${chainedLauncherName} on Windows so you can sign in with your linked account and install ${game.title}.`}
+              </p>
+            </div>
+          )}
+
+          {/* Xbox <-> Publisher Account-Link Guidance (EA App / Ubisoft Connect / Battle.net / Rockstar / Riot) */}
+          {showXboxPublisherAccountLinkCallout && (
+            <div
+              data-testid="xbox-publisher-account-link-callout"
+              role="note"
+              className="rounded-lg bg-sky-950/60 border border-sky-400/55 p-3.5 space-y-1 text-xs text-sky-100"
+            >
+              <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-sky-200">
+                <Link2 className="w-3.5 h-3.5 text-sky-300 shrink-0" aria-hidden="true" />
+                <span>{`Xbox ↔ ${chainedLauncherName} Account Link Required`}</span>
+              </div>
+              <p className="text-xs text-sky-100 leading-relaxed">
+                {`Xbox Game Pass unlocks this title inside ${chainedLauncherName} via server-side account linking. Sign in to ${chainedLauncherName} with the account linked to your Xbox profile to download and play.`}
+              </p>
+            </div>
+          )}
+
+          {/* EA Account SSO Linking Guidance (Epic / Steam -> EA App) */}
+          {handoffKeyLower === 'ea' &&
+            selectedPlatformId !== 'ea' &&
+            selectedPlatformId !== 'xbox' && (
+              <div
+                data-testid="ea-sso-linking-guidance"
+                role="note"
+                className="rounded-lg bg-sky-950/55 border border-sky-400/50 px-3.5 py-2.5 flex items-start gap-2 text-xs text-sky-100"
+              >
+                <Info className="w-4 h-4 text-sky-300 shrink-0 mt-0.5" aria-hidden="true" />
+                <p className="leading-relaxed">
+                  Sign in to EA App with the EA Account linked to your Xbox / Epic / Steam account so your game entitlement activates.
+                </p>
+              </div>
+            )}
+
+          {/* macOS Bottled Kernel Anti-Cheat Pre-Download Compatibility Warning (never shown on win32 native) */}
+          {showMacKernelAntiCheatWarning && (
+            <div
+              data-testid="macos-kernel-anticheat-warning"
+              role={isXboxMacBlocked ? 'note' : 'status'}
+              className={
+                isBattlEyeAntiCheat
+                  ? 'rounded-lg bg-amber-950/65 border border-amber-400/60 p-3.5 space-y-1.5 text-xs text-amber-100'
+                  : 'rounded-lg bg-rose-950/65 border border-rose-500/60 p-3.5 space-y-1.5 text-xs text-rose-100'
+              }
+            >
+              <div
+                className={`flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
+                  isBattlEyeAntiCheat ? 'text-amber-200' : 'text-rose-200'
+                }`}
+              >
+                <AlertCircle
+                  className={`w-4 h-4 shrink-0 ${
+                    isBattlEyeAntiCheat ? 'text-amber-300' : 'text-rose-300'
+                  }`}
+                  aria-hidden="true"
+                />
+                <span>
+                  {isBattlEyeAntiCheat
+                    ? 'BattlEye Online Anti-Cheat Warning (macOS Bottle)'
+                    : `Kernel Anti-Cheat Compatibility Warning${
+                        detectedAntiCheatName ? ` (${detectedAntiCheatName})` : ''
+                      }`}
+                </span>
+              </div>
+              <p
+                className={`text-xs leading-relaxed ${
+                  isBattlEyeAntiCheat ? 'text-amber-100' : 'text-rose-100'
+                }`}
+              >
+                {isBattlEyeAntiCheat
+                  ? 'Online multiplayer sessions requiring BattlEye (BEDaisy.sys Windows kernel driver) cannot load inside macOS Wine / CrossOver bottles, while offline single-player Story Mode (-nobattleye) remains playable where supported. Review compatibility before starting a large bottle download.'
+                  : `This Windows title requires ${
+                      detectedAntiCheatName || 'kernel-level anti-cheat'
+                    }, whose Windows ring-0 kernel driver cannot load inside macOS Wine / CrossOver bottles. Review compatibility before starting a large bottle download, as startup or online play is blocked on macOS.`}
+              </p>
             </div>
           )}
 
@@ -887,21 +1290,62 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                   {selectedOs === 'mac' ? (
                     <div className="rounded-lg bg-emerald-950/40 border border-emerald-500/40 p-3 space-y-1">
                       <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-emerald-400">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>★ AUTO-DETECTED • NATIVE MACOS BUILD</span>
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                        <span>
+                          {isCrossPlatformMacLauncher
+                            ? `★ AUTO-DETECTED • NATIVE MACOS LAUNCHER (${chainedLauncherName.toUpperCase()})`
+                            : '★ AUTO-DETECTED • NATIVE MACOS BUILD'}
+                        </span>
                       </div>
                       <p className="text-xs text-emerald-100/90 leading-relaxed">
-                        {`Official macOS build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} — runs natively on your Mac without translation layers.`}
+                        {isCrossPlatformMacLauncher
+                          ? `Official macOS ${chainedLauncherName} build — runs natively on your Mac without translation layers.`
+                          : `Official macOS build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} — runs natively on your Mac without translation layers.`}
                       </p>
                     </div>
                   ) : selectedOs === 'windows' ? (
-                    <div className="rounded-lg bg-amber-950/50 border border-amber-500/40 p-3 space-y-1">
-                      <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-amber-400">
-                        <Cpu className="w-3.5 h-3.5 shrink-0" />
-                        <span>AUTO-DETECTED • WINDOWS BUILD (CROSSOVER / WINE)</span>
+                    <div
+                      data-testid={
+                        isChainedBottleInstaller ? 'chained-launcher-install-notice' : undefined
+                      }
+                      className={
+                        isXboxMacBlocked
+                          ? 'rounded-lg bg-rose-950/45 border border-rose-500/45 p-3 space-y-1'
+                          : 'rounded-lg bg-amber-950/50 border border-amber-500/40 p-3 space-y-1'
+                      }
+                    >
+                      <div
+                        className={`flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider ${
+                          isXboxMacBlocked ? 'text-rose-200' : 'text-amber-400'
+                        }`}
+                      >
+                        {isXboxMacBlocked ? (
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                        ) : (
+                          <Cpu className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                        )}
+                        <span>
+                          {isXboxMacBlocked
+                            ? hasKernelAntiCheatRequirement
+                              ? `WINDOWS BUILD • BLOCKED ON MACOS (${(detectedAntiCheatName || 'KERNEL ANTI-CHEAT').toUpperCase()})`
+                              : 'WINDOWS BUILD • NATIVE WINDOWS REQUIRED'
+                            : isChainedBottleInstaller
+                              ? `WINDOWS BUILD • CHAINED BOTTLE LAUNCHER (${chainedLauncherName.toUpperCase()})`
+                              : 'AUTO-DETECTED • WINDOWS BUILD (CROSSOVER / WINE)'}
+                        </span>
                       </div>
-                      <p className="text-xs text-amber-100/90 leading-relaxed">
-                        {`No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will automatically install the Windows build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} and run it via CrossOver / Wine.`}
+                      <p
+                        className={`text-xs leading-relaxed ${
+                          isXboxMacBlocked ? 'text-rose-100/95' : 'text-amber-100/90'
+                        }`}
+                      >
+                        {isXboxMacBlocked
+                          ? hasKernelAntiCheatRequirement
+                            ? `This Windows build requires ${detectedAntiCheatName || 'a Windows ring-0 kernel driver'} and cannot run inside macOS Wine / CrossOver bottles. Install and play on native Windows instead.`
+                            : 'This Windows title cannot be installed or launched inside a macOS CrossOver / Wine bottle. Install and play on native Windows instead.'
+                          : isChainedBottleInstaller
+                            ? `One Launcher will automatically set up ${chainedLauncherName} inside your bottle if needed and open it so you can sign in with your linked account and install ${game.title}.`
+                            : `No native macOS build exists for this game on ${getStorefrontDisplayName(selectedPlatformId)}. One Launcher will automatically install the Windows build${formatVersion(selectedInstaller?.version) ? ` (${formatVersion(selectedInstaller?.version)})` : ''}${sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes) ? ` • ${formatBytes(sanitizeGameInstallSizeBytes(selectedInstaller?.totalSizeBytes))}` : ''} and run it via CrossOver / Wine.`}
                       </p>
                     </div>
                   ) : (
@@ -1535,6 +1979,29 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                 </span>
               </div>
             )}
+            {isCaseSensitiveTargetVolume && (
+              <div
+                data-testid="macos-case-sensitive-volume-warning"
+                role="status"
+                className="mt-1.5 rounded-lg bg-amber-950/60 border border-amber-400/55 p-2.5 flex items-start gap-2 text-xs text-amber-100"
+              >
+                <AlertTriangle
+                  className="w-4 h-4 text-amber-300 shrink-0 mt-0.5"
+                  aria-hidden="true"
+                />
+                <div className="space-y-0.5 leading-relaxed">
+                  <div className="font-bold text-amber-200 uppercase tracking-wider text-[10px]">
+                    Case-Sensitive APFS Volume Detected
+                  </div>
+                  <p className="text-[11px] text-amber-100">
+                    This target drive uses Case-Sensitive APFS. Many Windows games and publisher
+                    launchers expect case-insensitive paths and may fail to locate assets inside
+                    Wine / CrossOver. Selecting a standard case-insensitive APFS volume is
+                    recommended.
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Installation Method Notice */}
@@ -1644,7 +2111,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             type="button"
             onClick={handleStartInstall}
             disabled={isStarting || isInstallBlockedByDiskSpace || isXboxMacBlocked}
-            className="inline-flex items-center gap-2 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer"
+            className="inline-flex items-center gap-2 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             style={{
               background: 'linear-gradient(to right, #0284c7 0%, #1d4ed8 100%)',
               boxShadow: '0 0 18px rgba(14, 165, 233, 0.4)',

@@ -11,6 +11,7 @@ const {
   atomicWriteFileSync,
   atomicWriteSecureFileSync,
 } = require('./securityAndPathUtils.cjs');
+const { fromWineWindowsPath } = require('./firstPartyRegistration.cjs');
 const {
   MAX_PLAUSIBLE_GAME_INSTALL_BYTES,
   sanitizeGameInstallSizeBytes,
@@ -24,7 +25,10 @@ const {
   inspectMicrosoftGameConfig,
 } = require('./binaryAndManifestInspectors.cjs');
 const { isProcessAlive, signalSubprocessTree } = require('./processTreeUtils.cjs');
-const { resolveBottleSteamExe } = require('./wineAndCrossOverManager.cjs');
+const {
+  resolveBottleSteamExe,
+  isCrossOverPerlWineWrapperOptions,
+} = require('./wineAndCrossOverManager.cjs');
 
 const {
   diagLog,
@@ -33,6 +37,7 @@ const {
   getXboxStoreLicenseRecoveryHook,
   getConfiguredUserDataDir,
   getUserDataDir,
+  getMainWindow,
   isTestEnvironment,
   resolveIsolatedHomedirAndUserData,
   emitDownloadUpdated,
@@ -46,6 +51,7 @@ const {
   xboxCompatibilityProbeCache,
   registerExternalCacheInvalidator,
   setBoundedMapEntry,
+  evictExecutableDiscoveryCacheForPath,
   invalidateScanCaches,
   toLocalFsPath,
   resolveWindowsNodeShebangSpawn,
@@ -76,6 +82,9 @@ const {
   resolveXboxClientBinaryPath,
 } = require('./windowsXboxAppxAndMsixvcOrchestrator.cjs');
 
+const macNativeInstallerAndCodesign = /** @type {any} */ (
+  require('./macNativeInstallerAndCodesign.cjs')
+);
 const {
   resolveMacAppBundleBinary,
   ensureMacAppCodeSignatureValid,
@@ -85,13 +94,19 @@ const {
   resolveDefaultEngineLaunchArguments,
   discoverSteamLocations,
   normalizeComparableTitle,
+  extractBottleRootFromPath,
   detectCompatibilityLayers,
+  resolveSipSafeWineBinaryAndPreloadEnv,
+  prepareCrossOverWineSpawnEnv,
   ensureCompatibilityLayerReady,
-} = require('./macNativeInstallerAndCodesign.cjs');
+  alignWineMsyncWithLiveBottle,
+} = macNativeInstallerAndCodesign;
 
 const {
   syncEpicFirstPartyLauncher,
   ensureLegendaryConfigAndAuth,
+  extractEpicThirdPartyPartnerMetadata,
+  refreshLocalLegendaryMetadata,
   resolveEpicAppAndPlatforms,
 } = require('./epicLegendaryAndEosCoordinator.cjs');
 
@@ -102,8 +117,134 @@ const {
   ensureGogdlAuthConfig,
   clearStaleGogdlManifestCache,
   fetchGogV1Json,
+  resolveGogDepotSizesDirectHttp,
   downloadGogV1Depot,
+  downloadGogV2Depot,
 } = require('./gogRegistryAndDirectInstaller.cjs');
+const chainedPublisherLaunchers = /** @type {any} */ (require('./chainedPublisherLaunchers.cjs'));
+const {
+  CHAINED_PUBLISHER_ECOSYSTEMS,
+  normalizeChainedHandoffId,
+  discoverHostPublisherLauncher,
+  scanBottlePublisherInstalledGames,
+  scanHostPublisherInstalledGames,
+  buildChainedLauncherLaunchSpec,
+} = chainedPublisherLaunchers;
+const {
+  doChainedPublisherTitlesMatch,
+  isGdkStubExecutablePath,
+} = require('./installedGameScanner.cjs');
+const { normalizeVaultChainedHandoffId } = require('./offlineVaultService.cjs');
+const { parseSteamEaInstallerDataXml } = require('../storefronts/steamLocalScanner.cjs');
+
+function resolveAnyChainedHandoffId(/** @type {any} */ raw) {
+  return normalizeChainedHandoffId(raw) || normalizeVaultChainedHandoffId(raw);
+}
+
+function extractEpicRegistryLeaf(/** @type {any} */ regPath) {
+  if (!regPath || typeof regPath !== 'string') return '';
+  const parts = regPath
+    .split(/[\\/]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : '';
+}
+
+/**
+ * Prepare an auxiliary Wine / CrossOver command so `WINEMSYNC`, `CX_ENV`, `CX_ROOT`, SIP wrapper
+ * resolution, and optional headless GUI dialog suppression stay aligned with any live `wineserver`.
+ *
+ * @param {{
+ *   wineBinary: string,
+ *   bottlePath?: string | null,
+ *   env?: Record<string, any>,
+ *   suppressGuiDialogs?: boolean,
+ *   layerType?: string | null,
+ * }} params
+ * @returns {{ binaryPath: string, env: Record<string, any> }}
+ */
+function prepareAlignedAuxBottleWineCommand(params) {
+  const {
+    wineBinary = '',
+    bottlePath = '',
+    env: inputEnv = {},
+    suppressGuiDialogs = false,
+    layerType,
+  } = params || {};
+  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
+  if (typeof macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand === 'function') {
+    const res = macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand({
+      wineBinary,
+      bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
+      env: workingEnv,
+      suppressGuiDialogs,
+      layerType,
+    });
+    const resolvedFromHelper =
+      res && typeof res.wineBinary === 'string' && res.wineBinary
+        ? res.wineBinary
+        : res && typeof res.binaryPath === 'string' && res.binaryPath
+          ? res.binaryPath
+          : '';
+    if (resolvedFromHelper) {
+      return {
+        binaryPath: resolvedFromHelper,
+        env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
+      };
+    }
+  }
+  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
+  if (effectivePrefix) {
+    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
+    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
+  }
+  if (suppressGuiDialogs) {
+    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
+    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
+    if (!curDll) {
+      workingEnv.WINEDLLOVERRIDES = disableSpec;
+    } else if (!curDll.includes('winemenubuilder.exe=d')) {
+      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
+    }
+    if (!workingEnv.WINEDEBUG) {
+      workingEnv.WINEDEBUG = '-all';
+    }
+  }
+  const resolvedBin =
+    typeof prepareCrossOverWineSpawnEnv === 'function'
+      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        })
+      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        });
+  return {
+    binaryPath: resolvedBin || wineBinary,
+    env: workingEnv,
+  };
+}
+
+/** @type {((params: any, options?: any) => Promise<{ installed: boolean, provisionedNow: boolean, binaryPath: string, installDir: string, bottlePath?: string }>) | null} */
+let cachedEnsureChainedPublisherLauncherInstalled = null;
+
+function getEnsureChainedPublisherLauncherInstalled() {
+  if (!cachedEnsureChainedPublisherLauncherInstalled) {
+    const provMod = /** @type {any} */ (require('./environmentProvisioner.cjs'));
+    cachedEnsureChainedPublisherLauncherInstalled = provMod.ensureChainedPublisherLauncherInstalled;
+  }
+  return cachedEnsureChainedPublisherLauncherInstalled;
+}
+
+function notifyInstalledGamesUpdated() {
+  invalidateScanCaches();
+  try {
+    const win = getMainWindow();
+    if (win && typeof win.isDestroyed === 'function' && !win.isDestroyed() && win.webContents) {
+      win.webContents.send('launcher:installed-games-updated');
+      win.webContents.send('installed-games-updated');
+    }
+  } catch {}
+}
 
 /** @type {((vdfText: string) => { steamId64: string, accountName: string, personaName: string, allowAutoLogin: boolean } | null) | null} */
 let cachedParseSteamLoginUsersVdfDetails = null;
@@ -124,6 +265,17 @@ function getLoadSavedTokensReadOnly() {
     cachedLoadSavedTokensReadOnly = proberMod.loadSavedTokensReadOnly;
   }
   return cachedLoadSavedTokensReadOnly;
+}
+
+/** @type {((options?: any) => any) | null} */
+let cachedGetSetupWizardState = null;
+
+function getSetupWizardStateLazy() {
+  if (!cachedGetSetupWizardState) {
+    const proberMod = /** @type {any} */ (require('./environmentHealthProber.cjs'));
+    cachedGetSetupWizardState = proberMod.getSetupWizardState;
+  }
+  return cachedGetSetupWizardState;
 }
 
 /**
@@ -190,6 +342,7 @@ const TRUSTED_EXTERNAL_LAUNCHER_DOMAINS = Object.freeze([
   'ubisoftconnect.com',
   'ubisoft.com',
   'riotgames.com',
+  'rockstargames.com',
   'battle.net',
   'blizzard.com',
   'minecraft.net',
@@ -556,7 +709,8 @@ function updateDownloadTask(
         title: task.title,
         installPath: task.finalInstallPath,
         executablePath: task.executablePath,
-        installSize: task.totalBytes,
+        installSize:
+          sanitizeGameInstallSizeBytes(task.installSize || task.diskSizeBytes) || task.totalBytes,
         runner: task.runner || 'one_launcher',
         isWindowsBinaryOnMac: task.isWindowsBinaryOnMac,
       },
@@ -1018,6 +1172,23 @@ function startSteamInstallMonitor(
           appInfoSpec?.launchArguments ||
           resolveDefaultEngineLaunchArguments(commonInstallPath, exeDiscovery.executablePath);
 
+        let steamInstallerData = null;
+        for (const xmlRel of ['__Installer/installerdata.xml', '__installer/installerdata.xml']) {
+          const xmlFull = path.join(commonInstallPath, xmlRel);
+          if (!fs.existsSync(xmlFull)) continue;
+          try {
+            steamInstallerData = parseSteamEaInstallerDataXml(fs.readFileSync(xmlFull, 'utf8'));
+            if (steamInstallerData) break;
+          } catch {}
+        }
+        const steamChainedHandoff = resolveAnyChainedHandoffId(
+          appInfoSpec?.chainedLauncherHandoff ||
+            (steamInstallerData?.isEaChained ? 'ea' : null)
+        );
+        const steamRequiresProtocol = Boolean(
+          appInfoSpec?.requiresStorefrontProtocolLaunch || steamChainedHandoff
+        );
+
         const finalSize =
           Number(parsed.SizeOnDisk || 0) ||
           getDirectorySizeFast(commonInstallPath, 3) ||
@@ -1033,10 +1204,21 @@ function startSteamInstallMonitor(
             installPath: commonInstallPath,
             executablePath: exeDiscovery.executablePath,
             ...(launchArguments ? { launchArguments } : {}),
+            ...(steamChainedHandoff
+              ? {
+                  chainedLauncherHandoff: steamChainedHandoff,
+                  externalStorefrontHandoff: steamChainedHandoff,
+                  chainedHandoffTopology: 'storefront_depot_uri',
+                }
+              : {}),
+            ...(steamRequiresProtocol ? { requiresStorefrontProtocolLaunch: true } : {}),
+            ...(steamInstallerData?.contentId
+              ? { chainedExternalInstallId: steamInstallerData.contentId }
+              : {}),
             installSize: finalSize,
             version: parsed.buildid ? String(parsed.buildid) : undefined,
             runner: 'steam',
-            isWindowsBinaryOnMac: isWinOnMac,
+            isWindowsBinaryOnMac: isWinOnMac || (hostPlat === 'darwin' && Boolean(steamChainedHandoff)),
           },
           options.userDataDir
         );
@@ -1357,7 +1539,11 @@ function startXboxInstallMonitor(
             ...options,
             platform: options.platform || process.platform,
           });
-          if (inspected) {
+          if (
+            inspected &&
+            !(inspected.isExternalLauncherStub && !inspected.executablePath) &&
+            !isGdkStubExecutablePath(inspected.executablePath)
+          ) {
             const matchesId =
               (cleanStoreId &&
                 String(inspected.xboxProductId || '').toUpperCase() === cleanStoreId) ||
@@ -1374,7 +1560,11 @@ function startXboxInstallMonitor(
               matchedInspected = inspected;
               break;
             }
-          } else if (targetTitleNorm && normalizeComparableTitle(ent.name) === targetTitleNorm) {
+          } else if (
+            !inspected?.isExternalLauncherStub &&
+            targetTitleNorm &&
+            normalizeComparableTitle(ent.name) === targetTitleNorm
+          ) {
             matchedDir = candidateDir;
           }
         }
@@ -1383,11 +1573,81 @@ function startXboxInstallMonitor(
 
       const appxInfo = await queryAppxStatusAsync();
       if (!matchedDir && appxInfo?.InstallLocation) {
-        matchedDir = String(appxInfo.InstallLocation).trim();
-        matchedInspected = inspectInstalledXboxGameDir(matchedDir, {
+        const candidateAppxLoc = String(appxInfo.InstallLocation).trim();
+        const appxInspected = inspectInstalledXboxGameDir(candidateAppxLoc, {
           ...options,
           platform: options.platform || process.platform,
         });
+        if (
+          appxInspected &&
+          !(appxInspected.isExternalLauncherStub && !appxInspected.executablePath) &&
+          !isGdkStubExecutablePath(appxInspected.executablePath)
+        ) {
+          matchedDir = candidateAppxLoc;
+          matchedInspected = appxInspected;
+        }
+      }
+
+      // Also check chained publisher installations on Windows (Ubisoft Connect / EA App / Battle.net / Rockstar)
+      if ((options.platform || process.platform) === 'win32' && !matchedInspected) {
+        const expectedHandoff = normalizeChainedHandoffId(
+          payload.chainedLauncherHandoff || payload.externalStorefrontHandoff || ''
+        );
+        const hostPublisherGames = scanHostPublisherInstalledGames({
+          ...options,
+          platform: 'win32',
+        });
+        const matchedHostGame = hostPublisherGames.find(
+          (g) =>
+            g &&
+            g.executablePath &&
+            !isGdkStubExecutablePath(g.executablePath) &&
+            (!expectedHandoff || g.handoffId === expectedHandoff) &&
+            ((payload.chainedExternalInstallId &&
+              String(g.externalInstallId || '').toLowerCase() ===
+                String(payload.chainedExternalInstallId).toLowerCase()) ||
+              doChainedPublisherTitlesMatch(g.title, payload.title || ''))
+        );
+        if (matchedHostGame && fs.existsSync(matchedHostGame.executablePath)) {
+          stopMonitor();
+          const finalHostSize = sanitizeGameInstallSizeBytes(matchedHostGame.installSizeBytes);
+          upsertManagedInstallRecord(
+            {
+              platformId: 'xbox',
+              platformGameId: cleanStoreId || payload.platformGameId,
+              ...(cleanStoreId ? { xboxProductId: cleanStoreId } : {}),
+              title: matchedHostGame.title || payload.title,
+              installPath: matchedHostGame.installPath,
+              executablePath: matchedHostGame.executablePath,
+              ...(finalHostSize ? { installSize: finalHostSize } : {}),
+              chainedLauncherHandoff: matchedHostGame.handoffId,
+              ...(matchedHostGame.externalInstallId
+                ? { chainedExternalInstallId: String(matchedHostGame.externalInstallId) }
+                : {}),
+              runner: 'chained_host',
+              isWindowsBinaryOnMac: false,
+            },
+            options.userDataDir
+          );
+          notifyInstalledGamesUpdated();
+          updateDownloadTask(
+            taskId,
+            {
+              status: 'completed',
+              progressPercent: 100,
+              bytesDownloaded: finalHostSize || Number(task.totalBytes || 0),
+              totalBytes: finalHostSize || Number(task.totalBytes || 0),
+              speedBytesPerSec: 0,
+              etaSeconds: undefined,
+              finalInstallPath: matchedHostGame.installPath,
+              executablePath: matchedHostGame.executablePath,
+              runner: 'chained_host',
+              statusMessage: `Installed via ${CHAINED_PUBLISHER_ECOSYSTEMS[matchedHostGame.handoffId]?.displayName || matchedHostGame.handoffId}`,
+            },
+            options
+          );
+          return;
+        }
       }
 
       const latestTask = downloadQueueMap.get(taskId);
@@ -1505,6 +1765,802 @@ function startXboxInstallMonitor(
   if (typeof timer.unref === 'function') timer.unref();
   downloadControllers.set(taskId, { type: 'timer', timer });
   Promise.resolve().then(runTick);
+  return timer;
+}
+
+/**
+ * Checks asynchronously whether any publisher launcher process is alive inside `bottlePath` on macOS.
+ *
+ * @param {string} bottlePath
+ * @param {any} [options]
+ * @returns {Promise<boolean>}
+ */
+/**
+ * Build a regex matching ONLY foreground publisher UI executables (excluding headless background
+ * services such as `EABackgroundService.exe`, `Agent.exe`, or `SocialClubHelper.exe`).
+ *
+ * @param {string} [handoffId]
+ * @returns {RegExp}
+ */
+function getPublisherForegroundUiProcessRegex(handoffId = '') {
+  const clean = String(handoffId || '').trim().toLowerCase();
+  if (clean === 'ea') {
+    return /(?:^|[\\/\s"'])(?:eadesktop|ealauncher|origin)\.exe(?:\b|["']|$)/i;
+  }
+  if (clean === 'ubisoft') {
+    return /(?:^|[\\/\s"'])(?:upc|ubisoftconnect|ubisoftgamelauncher)\.exe(?:\b|["']|$)/i;
+  }
+  if (clean === 'bnet') {
+    return /(?:^|[\\/\s"'])battle\.net\.exe(?:\b|["']|$)/i;
+  }
+  if (clean === 'rockstar') {
+    return /(?:^|[\\/\s"'])(?:launcher|rockstarservice)\.exe(?:\b|["']|$)/i;
+  }
+  if (clean === 'riot') {
+    return /(?:^|[\\/\s"'])(?:riotclientux|riotclientservices)\.exe(?:\b|["']|$)/i;
+  }
+  return /(?:^|[\\/\s"'])(?:upc|ubisoftconnect|ubisoftgamelauncher|eadesktop|ealauncher|origin|battle\.net|launcher|riotclientux|riotclientservices)\.exe(?:\b|["']|$)/i;
+}
+
+/**
+ * Checks asynchronously whether any foreground publisher launcher UI process is alive inside `bottlePath` on macOS.
+ * Never treats `wineserver` or headless `EABackgroundService.exe` alone as UI-alive.
+ *
+ * @param {string} bottlePath
+ * @param {any} [options]
+ * @param {string} [handoffId]
+ * @returns {Promise<boolean>}
+ */
+function checkBottlePublisherLauncherAliveAsync(bottlePath, options = {}, handoffId = '') {
+  if (typeof options.isBottleLauncherAliveFn === 'function') {
+    return Promise.resolve(Boolean(options.isBottleLauncherAliveFn(bottlePath, handoffId)));
+  }
+  if (isTestEnvironment(options) && typeof options.execFileFn !== 'function') {
+    return Promise.resolve(true);
+  }
+  const execFileImpl = typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
+  const resolvedBottle = path.resolve(bottlePath);
+  const publisherUiRe = getPublisherForegroundUiProcessRegex(handoffId);
+  return new Promise((resolve) => {
+    try {
+      execFileImpl(
+        '/bin/ps',
+        ['-axo', 'command='],
+        { timeout: 3000 },
+        (/** @type {any} */ err, /** @type {any} */ stdout) => {
+          if (err) {
+            resolve(true);
+            return;
+          }
+          const lines = String(stdout || '').split(/\r?\n/);
+          for (const line of lines) {
+            if (!line) continue;
+            if (!publisherUiRe.test(line)) continue;
+            // If the command line explicitly embeds a macOS bottle path, ensure it matches `resolvedBottle`
+            if (
+              /\/(?:Bottles|Prefixes)\//i.test(line) &&
+              !line.includes(resolvedBottle)
+            ) {
+              continue;
+            }
+            resolve(true);
+            return;
+          }
+          resolve(false);
+        }
+      );
+    } catch {
+      resolve(true);
+    }
+  });
+}
+
+/**
+ * Checks asynchronously whether the foreground publisher launcher UI process is alive on Windows (`win32`).
+ * Never treats headless `EABackgroundService.exe` alone as UI-alive.
+ *
+ * @param {string} handoffId
+ * @param {any} [options]
+ * @returns {Promise<boolean>}
+ */
+function checkHostWinPublisherLauncherAliveAsync(handoffId, options = {}) {
+  if (typeof options.isHostLauncherAliveFn === 'function') {
+    return Promise.resolve(Boolean(options.isHostLauncherAliveFn(handoffId)));
+  }
+  if (isTestEnvironment(options) && typeof options.execFileFn !== 'function') {
+    return Promise.resolve(true);
+  }
+  const execFileImpl = typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
+  const publisherUiRe = getPublisherForegroundUiProcessRegex(handoffId);
+  return new Promise((resolve) => {
+    try {
+      execFileImpl(
+        'tasklist.exe',
+        ['/FO', 'CSV', '/NH'],
+        { timeout: 4000, windowsHide: true },
+        (/** @type {any} */ err, /** @type {any} */ stdout) => {
+          if (err) {
+            resolve(true);
+            return;
+          }
+          const lines = String(stdout || '').split(/\r?\n/);
+          for (const line of lines) {
+            if (line && publisherUiRe.test(line)) {
+              resolve(true);
+              return;
+            }
+          }
+          resolve(false);
+        }
+      );
+    } catch {
+      resolve(true);
+    }
+  });
+}
+
+/**
+ * Inline fallback reader for EA App configured custom download/library directories
+ * (`%PROGRAMDATA%\EA Desktop\machine.ini` `machine.downloadinplacedir` and
+ * `%LOCALAPPDATA%\Electronic Arts\EA Desktop\user_*.ini` `user.downloadinplacedir`).
+ *
+ * @param {string} platform
+ * @param {string | undefined} bottlePath
+ * @param {any} [options]
+ * @returns {string[]}
+ */
+function readInlineEaConfiguredLibraryRoots(platform, bottlePath, options = {}) {
+  /** @type {string[]} */
+  const roots = [];
+  const parseIniDirLines = (/** @type {string} */ iniText, /** @type {boolean} */ isBottle) => {
+    const lineRe =
+      /^\s*(?:machine\.downloadinplacedir|user\.downloadinplacedir)\s*=\s*(.+?)\s*$/gim;
+    let m;
+    while ((m = lineRe.exec(iniText)) !== null) {
+      const rawDir = String(m[1] || '')
+        .replace(/^"+|"+$/g, '')
+        .trim();
+      if (!rawDir) continue;
+      if (isBottle && bottlePath) {
+        const mapped = fromWineWindowsPath(rawDir, bottlePath);
+        if (mapped) roots.push(mapped);
+      } else {
+        roots.push(rawDir);
+      }
+    }
+  };
+
+  if (platform === 'darwin' && bottlePath) {
+    const driveC = path.join(bottlePath, 'drive_c');
+    roots.push(
+      path.join(driveC, 'Program Files', 'EA Games'),
+      path.join(driveC, 'Program Files (x86)', 'EA Games'),
+      path.join(driveC, 'Program Files', 'Origin Games'),
+      path.join(driveC, 'Program Files (x86)', 'Origin Games')
+    );
+    const machineIni = path.join(driveC, 'ProgramData', 'EA Desktop', 'machine.ini');
+    if (fs.existsSync(machineIni)) {
+      try {
+        parseIniDirLines(fs.readFileSync(machineIni, 'utf8'), true);
+      } catch {}
+    }
+    const usersDir = path.join(driveC, 'users');
+    if (fs.existsSync(usersDir)) {
+      try {
+        for (const u of fs.readdirSync(usersDir)) {
+          if (/^(?:Public|All Users|Default|Default User)$/i.test(u)) continue;
+          const eaLocalDir = path.join(
+            usersDir,
+            u,
+            'AppData',
+            'Local',
+            'Electronic Arts',
+            'EA Desktop'
+          );
+          if (!fs.existsSync(eaLocalDir)) continue;
+          for (const f of fs.readdirSync(eaLocalDir)) {
+            if (!/^user_.*\.ini$/i.test(f)) continue;
+            try {
+              parseIniDirLines(fs.readFileSync(path.join(eaLocalDir, f), 'utf8'), true);
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+  } else if (platform === 'win32') {
+    const env = options.env && typeof options.env === 'object' ? options.env : process.env;
+    const progFiles =
+      options.programFiles ||
+      options.programFilesDir ||
+      env.ProgramFiles ||
+      env.PROGRAMFILES ||
+      'C:\\Program Files';
+    const progFilesX86 =
+      options.programFilesX86 ||
+      options.programFilesX86Dir ||
+      env['ProgramFiles(x86)'] ||
+      env['PROGRAMFILES(X86)'] ||
+      'C:\\Program Files (x86)';
+    const progData = env.ProgramData || env.PROGRAMDATA || 'C:\\ProgramData';
+    const localAppData =
+      env.LOCALAPPDATA ||
+      (options.homedir ? path.join(options.homedir, 'AppData', 'Local') : '');
+
+    roots.push(
+      path.join(progFiles, 'EA Games'),
+      path.join(progFilesX86, 'EA Games'),
+      path.join(progFiles, 'Origin Games'),
+      path.join(progFilesX86, 'Origin Games')
+    );
+    const machineIni = path.join(progData, 'EA Desktop', 'machine.ini');
+    if (fs.existsSync(machineIni)) {
+      try {
+        parseIniDirLines(fs.readFileSync(machineIni, 'utf8'), false);
+      } catch {}
+    }
+    if (localAppData) {
+      const eaLocalDir = path.join(localAppData, 'Electronic Arts', 'EA Desktop');
+      if (fs.existsSync(eaLocalDir)) {
+        try {
+          for (const f of fs.readdirSync(eaLocalDir)) {
+            if (!/^user_.*\.ini$/i.test(f)) continue;
+            try {
+              parseIniDirLines(fs.readFileSync(path.join(eaLocalDir, f), 'utf8'), false);
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+    if (Array.isArray(options.customRoots)) {
+      for (const cr of options.customRoots) {
+        if (!cr || typeof cr !== 'string') continue;
+        roots.push(path.join(cr, 'EA Games'), path.join(cr, 'Origin Games'));
+      }
+    }
+  }
+  return roots;
+}
+
+function isBroadStagingContainerPath(/** @type {string} */ candidatePath, /** @type {string | undefined} */ bottlePath) {
+  if (!candidatePath || typeof candidatePath !== 'string') return true;
+  const resolved = path.resolve(candidatePath);
+  const norm = resolved.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (!norm || norm === '/' || /^[a-z]:$/.test(norm)) return true;
+  if (bottlePath) {
+    const driveCNorm = path
+      .resolve(bottlePath, 'drive_c')
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '')
+      .toLowerCase();
+    if (
+      norm === driveCNorm ||
+      norm === `${driveCNorm}/program files` ||
+      norm === `${driveCNorm}/program files (x86)` ||
+      norm === `${driveCNorm}/windows` ||
+      norm === `${driveCNorm}/users`
+    ) {
+      return true;
+    }
+  }
+  const base = path.posix.basename(norm);
+  if (
+    base === 'program files' ||
+    base === 'program files (x86)' ||
+    base === 'windows' ||
+    base === 'users' ||
+    base === 'drive_c'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function readBattleNetStagingRoots(
+  /** @type {string} */ platform,
+  /** @type {string | undefined} */ bottlePath,
+  /** @type {any} */ options = {}
+) {
+  /** @type {string[]} */
+  const roots = [];
+  /** @type {string[]} */
+  const configFiles = [];
+  /** @type {string[]} */
+  const sharedInstallContainers = [];
+
+  if (platform === 'darwin' && bottlePath) {
+    const driveC = path.join(bottlePath, 'drive_c');
+    roots.push(path.join(driveC, 'ProgramData', 'Battle.net'));
+    sharedInstallContainers.push(
+      path.join(driveC, 'Program Files (x86)'),
+      path.join(driveC, 'Program Files')
+    );
+    const usersDir = path.join(driveC, 'users');
+    try {
+      if (fs.existsSync(usersDir)) {
+        for (const uEntry of fs.readdirSync(usersDir, { withFileTypes: true }).slice(0, 16)) {
+          if (!uEntry.isDirectory() || /^public$/i.test(uEntry.name)) continue;
+          configFiles.push(
+            path.join(
+              usersDir,
+              uEntry.name,
+              'AppData',
+              'Roaming',
+              'Battle.net',
+              'Battle.net.config'
+            )
+          );
+        }
+      }
+    } catch {}
+  } else if (platform === 'win32') {
+    const env = options.env && typeof options.env === 'object' ? options.env : process.env;
+    const progData =
+      options.programData || env.ProgramData || env.PROGRAMDATA || 'C:\\ProgramData';
+    const progFiles =
+      options.programFiles ||
+      options.programFilesDir ||
+      env.ProgramFiles ||
+      env.PROGRAMFILES ||
+      'C:\\Program Files';
+    const progFilesX86 =
+      options.programFilesX86 ||
+      options.programFilesX86Dir ||
+      env['ProgramFiles(x86)'] ||
+      env['PROGRAMFILES(X86)'] ||
+      'C:\\Program Files (x86)';
+    const appData =
+      options.appData ||
+      env.APPDATA ||
+      (options.homedir
+        ? path.join(options.homedir, 'AppData', 'Roaming')
+        : path.join(os.homedir(), 'AppData', 'Roaming'));
+    roots.push(path.join(progData, 'Battle.net'));
+    sharedInstallContainers.push(progFilesX86, progFiles);
+    if (appData) {
+      configFiles.push(path.join(appData, 'Battle.net', 'Battle.net.config'));
+    }
+  }
+
+  for (const cfgFile of configFiles) {
+    try {
+      if (!fs.existsSync(cfgFile)) continue;
+      const st = fs.statSync(cfgFile);
+      if (!st.isFile() || st.size <= 0 || st.size > 524288) continue;
+      const parsed = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+      const rawDefaultPath = String(
+        parsed?.Client?.Install?.DefaultInstallPath || parsed?.DefaultInstallPath || ''
+      ).trim();
+      if (!rawDefaultPath) continue;
+      const localDefaultPath =
+        platform === 'darwin' && bottlePath
+          ? fromWineWindowsPath(rawDefaultPath, bottlePath)
+          : rawDefaultPath;
+      if (!localDefaultPath) continue;
+      if (isBroadStagingContainerPath(localDefaultPath, bottlePath)) {
+        sharedInstallContainers.unshift(localDefaultPath);
+      } else {
+        roots.push(localDefaultPath);
+      }
+    } catch {}
+  }
+
+  // For shared containers like `Program Files (x86)`, NEVER walk unrelated vendor folders:
+  // include only direct child folders that carry a Blizzard `.build.info` / `.product.db` marker.
+  const seenContainers = new Set();
+  for (const container of sharedInstallContainers) {
+    if (!container) continue;
+    const key = path.resolve(container).toLowerCase();
+    if (seenContainers.has(key)) continue;
+    seenContainers.add(key);
+    try {
+      if (!fs.existsSync(container)) continue;
+      const entries = fs.readdirSync(container, { withFileTypes: true }).slice(0, 96);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (/^battle\.net$/i.test(entry.name)) continue;
+        const childDir = path.join(container, entry.name);
+        if (
+          fs.existsSync(path.join(childDir, '.build.info')) ||
+          fs.existsSync(path.join(childDir, '.product.db'))
+        ) {
+          roots.push(childDir);
+        }
+      }
+    } catch {}
+  }
+
+  return roots;
+}
+
+function measurePublisherStagingBytes(
+  /** @type {string} */ handoffId,
+  /** @type {string | Record<string, any>} */ platformOrOptions,
+  /** @type {string | undefined} */ bottlePathArg,
+  /** @type {any} */ optionsArg = {}
+) {
+  const isTwoArgObjectCall =
+    platformOrOptions !== null && typeof platformOrOptions === 'object';
+  const options = isTwoArgObjectCall ? platformOrOptions : optionsArg || {};
+  const platform = isTwoArgObjectCall
+    ? String(options.platform || options.hostPlatform || process.platform)
+    : String(platformOrOptions || options.platform || process.platform);
+  const bottlePath = isTwoArgObjectCall ? options.bottlePath : bottlePathArg;
+
+  /** @type {string[]} */
+  const candidateRoots = [];
+
+  if (typeof chainedPublisherLaunchers.resolvePublisherStagingDirs === 'function') {
+    try {
+      const helperDirs = chainedPublisherLaunchers.resolvePublisherStagingDirs(handoffId, {
+        ...options,
+        platform,
+        hostPlatform: platform,
+        bottlePath,
+        env: options.env && typeof options.env === 'object' ? options.env : process.env,
+      });
+      if (Array.isArray(helperDirs)) {
+        for (const d of helperDirs) {
+          if (typeof d === 'string' && d.trim() && !isBroadStagingContainerPath(d, bottlePath)) {
+            candidateRoots.push(d.trim());
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (handoffId === 'ea') {
+    if (typeof chainedPublisherLaunchers.readEaConfiguredLibraryRoots === 'function') {
+      try {
+        const helperRoots =
+          platform === 'darwin' && bottlePath
+            ? chainedPublisherLaunchers.readEaConfiguredLibraryRoots({
+                ...options,
+                platform: 'darwin',
+                bottlePath,
+              })
+            : chainedPublisherLaunchers.readEaConfiguredLibraryRoots({
+                ...options,
+                platform: 'win32',
+              });
+        if (Array.isArray(helperRoots)) {
+          candidateRoots.push(...helperRoots);
+        }
+      } catch {}
+    }
+    candidateRoots.push(...readInlineEaConfiguredLibraryRoots(platform, bottlePath, options));
+  } else if (handoffId === 'bnet') {
+    candidateRoots.push(...readBattleNetStagingRoots(platform, bottlePath, options));
+  } else if (platform === 'darwin' && bottlePath) {
+    const driveC = path.join(bottlePath, 'drive_c');
+    if (handoffId === 'ubisoft') {
+      candidateRoots.push(
+        path.join(driveC, 'Program Files (x86)', 'Ubisoft', 'Ubisoft Game Launcher', 'games'),
+        path.join(driveC, 'Program Files', 'Ubisoft', 'Ubisoft Game Launcher', 'games')
+      );
+    } else if (handoffId === 'rockstar') {
+      candidateRoots.push(
+        path.join(driveC, 'Program Files', 'Rockstar Games'),
+        path.join(driveC, 'Program Files (x86)', 'Rockstar Games')
+      );
+    } else if (handoffId === 'riot') {
+      candidateRoots.push(
+        path.join(driveC, 'Riot Games'),
+        path.join(driveC, 'ProgramData', 'Riot Games')
+      );
+    }
+  } else if (platform === 'win32') {
+    const env = options.env && typeof options.env === 'object' ? options.env : process.env;
+    const progFiles =
+      options.programFiles ||
+      options.programFilesDir ||
+      env.ProgramFiles ||
+      env.PROGRAMFILES ||
+      'C:\\Program Files';
+    const progFilesX86 =
+      options.programFilesX86 ||
+      options.programFilesX86Dir ||
+      env['ProgramFiles(x86)'] ||
+      env['PROGRAMFILES(X86)'] ||
+      'C:\\Program Files (x86)';
+    const progData =
+      options.programData || env.ProgramData || env.PROGRAMDATA || 'C:\\ProgramData';
+    const sysDrive = String(options.systemDrive || env.SYSTEMDRIVE || env.SystemDrive || 'C:\\')
+      .trim()
+      .replace(/[\\/]+$/, '');
+    const sysDriveRoot = /^[A-Za-z]:$/.test(sysDrive) ? `${sysDrive}\\` : sysDrive || 'C:\\';
+    if (handoffId === 'ubisoft') {
+      candidateRoots.push(
+        path.join(progFilesX86, 'Ubisoft', 'Ubisoft Game Launcher', 'games'),
+        path.join(progFiles, 'Ubisoft', 'Ubisoft Game Launcher', 'games')
+      );
+    } else if (handoffId === 'rockstar') {
+      candidateRoots.push(
+        path.join(progFiles, 'Rockstar Games'),
+        path.join(progFilesX86, 'Rockstar Games')
+      );
+    } else if (handoffId === 'riot') {
+      candidateRoots.push(
+        path.join(sysDriveRoot, 'Riot Games'),
+        path.join(progData, 'Riot Games')
+      );
+    }
+  }
+  const uniqueResolved = [];
+  const seenResolved = new Set();
+  for (const r of candidateRoots) {
+    if (!r || typeof r !== 'string') continue;
+    if (isBroadStagingContainerPath(r, bottlePath)) continue;
+    const resolvedPath = path.resolve(r).replace(/[\\/]+$/, '');
+    const normKey = resolvedPath.toLowerCase();
+    if (seenResolved.has(normKey)) continue;
+    seenResolved.add(normKey);
+    uniqueResolved.push({ raw: r, normKey });
+  }
+  uniqueResolved.sort((a, b) => a.normKey.length - b.normKey.length);
+
+  /** @type {string[]} */
+  const countedNormPrefixes = [];
+  let total = 0;
+  for (const item of uniqueResolved) {
+    if (
+      countedNormPrefixes.some(
+        (parent) =>
+          item.normKey.startsWith(`${parent}/`) || item.normKey.startsWith(`${parent}\\`)
+      )
+    ) {
+      continue;
+    }
+    try {
+      if (fs.existsSync(item.raw)) {
+        countedNormPrefixes.push(item.normKey);
+        total += Math.max(0, getDirectorySizeFast(item.raw, 3));
+      }
+    } catch {}
+  }
+  return total;
+}
+
+/**
+ * Monitors a bottle or Windows host chained publisher launcher (`Ubisoft Connect`, `EA App`,
+ * `Battle.net`, `Rockstar Games Launcher`) until the target game finishes installing or the
+ * launcher exits cleanly without installing.
+ *
+ * @param {string} taskId
+ * @param {any} monitorCfg
+ * @param {any} [options]
+ */
+function startChainedLauncherInstallMonitor(taskId, monitorCfg, options = {}) {
+  const intervalMs = Math.max(250, Number(options.chainedInstallPollIntervalMs || 4000));
+  const gracePeriodMs = Math.max(0, Number(options.chainedLauncherGracePeriodMs ?? 45000));
+  const startedAt = Date.now();
+  const {
+    handoffId,
+    ecosystem,
+    platform,
+    bottlePath,
+    bottleName,
+    compatibilityLayer,
+    title,
+    platformId,
+    platformGameId,
+    cleanStoreId,
+    externalInstallId,
+    chainedHandoffTopology,
+    epicPartnerRegistryPath,
+    signal,
+  } = monitorCfg;
+  const epicRegLeaf = extractEpicRegistryLeaf(epicPartnerRegistryPath);
+
+  const baselineBytes =
+    typeof monitorCfg.baselineStagingBytes === 'number' &&
+    Number.isFinite(monitorCfg.baselineStagingBytes)
+      ? Math.max(0, monitorCfg.baselineStagingBytes)
+      : measurePublisherStagingBytes(handoffId, platform, bottlePath, options);
+  let lastGrowthBytes = 0;
+  let lastTickTime = Date.now();
+  let consecutiveDeadLauncherPolls = 0;
+  let inFlightTick = false;
+  /** @type {NodeJS.Timeout | null} */
+  let timer = null;
+
+  const stopMonitor = () => {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    downloadControllers.delete(taskId);
+  };
+
+  if (signal && typeof signal.addEventListener === 'function') {
+    signal.addEventListener('abort', stopMonitor, { once: true });
+  }
+
+  const runTick = () => {
+    if (inFlightTick) return;
+    inFlightTick = true;
+    (async () => {
+      const task = downloadQueueMap.get(taskId);
+      if (
+        !task ||
+        task.status === 'cancelled' ||
+        task.status === 'completed' ||
+        task.status === 'failed'
+      ) {
+        stopMonitor();
+        return;
+      }
+      if (task.status === 'paused') return;
+
+      const discovered =
+        platform === 'darwin' && bottlePath
+          ? scanBottlePublisherInstalledGames(bottlePath, options)
+          : scanHostPublisherInstalledGames({ ...options, platform });
+
+      const matched = discovered.find(
+        (/** @type {any} */ g) =>
+          g &&
+          g.handoffId === handoffId &&
+          g.executablePath &&
+          !isGdkStubExecutablePath(g.executablePath) &&
+          !/steamapps[\\/]common/i.test(String(g.installPath || '')) &&
+          ((externalInstallId &&
+            String(g.externalInstallId || '').toLowerCase() ===
+              String(externalInstallId).toLowerCase()) ||
+            doChainedPublisherTitlesMatch(g.title, title) ||
+            (epicRegLeaf &&
+              g.installPath &&
+              doChainedPublisherTitlesMatch(path.basename(g.installPath), epicRegLeaf)))
+      );
+
+      if (matched && fs.existsSync(matched.executablePath)) {
+        stopMonitor();
+        const finalSize =
+          sanitizeGameInstallSizeBytes(matched.installSizeBytes) ||
+          sanitizeGameInstallSizeBytes(task.totalBytes);
+        const effectiveTopology =
+          chainedHandoffTopology ||
+          (platformId === 'epic'
+            ? 'partner_launcher_link'
+            : platformId === 'xbox'
+              ? 'publisher_managed'
+              : undefined);
+        upsertManagedInstallRecord(
+          {
+            platformId: platformId || 'xbox',
+            platformGameId,
+            ...(cleanStoreId ? { xboxProductId: cleanStoreId } : {}),
+            title: matched.title || title,
+            installPath: matched.installPath,
+            executablePath: matched.executablePath,
+            ...(finalSize ? { installSize: finalSize } : {}),
+            chainedLauncherHandoff: handoffId,
+            externalStorefrontHandoff: handoffId,
+            ...(effectiveTopology ? { chainedHandoffTopology: effectiveTopology } : {}),
+            ...(epicPartnerRegistryPath ? { epicPartnerRegistryPath } : {}),
+            ...(matched.externalInstallId
+              ? { chainedExternalInstallId: String(matched.externalInstallId) }
+              : {}),
+            runner: platform === 'darwin' ? 'chained_bottle' : 'chained_host',
+            ...(platform === 'darwin'
+              ? {
+                  ...(compatibilityLayer ? { compatibilityLayer } : {}),
+                  ...(bottleName ? { wineBottle: bottleName } : {}),
+                  isWindowsBinaryOnMac: true,
+                }
+              : { isWindowsBinaryOnMac: false }),
+          },
+          options.userDataDir
+        );
+        notifyInstalledGamesUpdated();
+        updateDownloadTask(
+          taskId,
+          {
+            status: 'completed',
+            progressPercent: 100,
+            bytesDownloaded: finalSize || Number(task.totalBytes || 0),
+            totalBytes: finalSize || Number(task.totalBytes || 0),
+            speedBytesPerSec: 0,
+            etaSeconds: undefined,
+            finalInstallPath: matched.installPath,
+            executablePath: matched.executablePath,
+            runner: platform === 'darwin' ? 'chained_bottle' : 'chained_host',
+            statusMessage: `Installed via ${ecosystem?.displayName || handoffId}`,
+          },
+          options
+        );
+        return;
+      }
+
+      const currentStagingBytes = measurePublisherStagingBytes(
+        handoffId,
+        platform,
+        bottlePath,
+        options
+      );
+      const deltaBytes = Math.max(0, currentStagingBytes - baselineBytes);
+      const grewThisTick = deltaBytes > lastGrowthBytes;
+      if (deltaBytes > 0) {
+        if (grewThisTick) {
+          consecutiveDeadLauncherPolls = 0;
+        }
+        const now = Date.now();
+        const rawSpeed =
+          grewThisTick && now > lastTickTime
+            ? Math.round(((deltaBytes - lastGrowthBytes) * 1000) / (now - lastTickTime))
+            : 0;
+        lastGrowthBytes = deltaBytes;
+        lastTickTime = now;
+        const speedBytesPerSec = computeSmoothedDownloadSpeed(taskId, {
+          bytesDownloaded: deltaBytes,
+          rawSpeedBytesPerSec: rawSpeed,
+          nowMs: now,
+        });
+        const expectedTotal = Math.max(Number(task.totalBytes || 0), deltaBytes);
+        const pct =
+          expectedTotal > deltaBytes
+            ? Math.min(99, Math.round((deltaBytes / expectedTotal) * 100))
+            : Math.min(95, Number(task.progressPercent || 0));
+        updateDownloadTask(
+          taskId,
+          {
+            status: 'downloading',
+            progressPercent: pct,
+            bytesDownloaded: deltaBytes,
+            deltaStagingBytes: deltaBytes,
+            totalBytes: expectedTotal,
+            speedBytesPerSec,
+            statusMessage: `${ecosystem?.displayName || handoffId}: Installing ${title}...`,
+          },
+          options
+        );
+        if (grewThisTick) {
+          return;
+        }
+      }
+
+      if (Date.now() - startedAt >= gracePeriodMs) {
+        const alive =
+          platform === 'darwin' && bottlePath
+            ? await checkBottlePublisherLauncherAliveAsync(bottlePath, options, handoffId)
+            : platform === 'win32'
+              ? await checkHostWinPublisherLauncherAliveAsync(handoffId, options)
+              : true;
+        if (!alive) {
+          consecutiveDeadLauncherPolls += 1;
+          if (consecutiveDeadLauncherPolls >= 2) {
+            stopMonitor();
+            const curTask = downloadQueueMap.get(taskId);
+            if (curTask) {
+              const { _persistedUserDataDir: _ig, ...pubTask } = curTask;
+              downloadQueueMap.delete(taskId);
+              persistDownloadQueueToDisk(options.userDataDir || curTask._persistedUserDataDir);
+              emitDownloadUpdated({
+                task: {
+                  ...pubTask,
+                  status: 'cancelled',
+                  speedBytesPerSec: 0,
+                  statusMessage: `${ecosystem?.displayName || 'Publisher launcher'} closed without installing ${title}.`,
+                },
+                queue: getDownloadQueue(options),
+              });
+            }
+          }
+        } else {
+          consecutiveDeadLauncherPolls = 0;
+        }
+      }
+    })()
+      .catch((tickErr) => {
+        diagLog.debug('startChainedLauncherInstallMonitor.tick', tickErr, { taskId, handoffId });
+      })
+      .finally(() => {
+        inFlightTick = false;
+      });
+  };
+
+  timer = setInterval(runTick, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  downloadControllers.set(taskId, { type: 'timer', timer });
   return timer;
 }
 
@@ -1650,6 +2706,706 @@ async function sweepStaleGogTempBinsAsync(/** @type {string[]} */ targetDirs = [
 }
 
 /**
+ * Shared Dual-OS (`darwin` Wine/CrossOver bottle + `win32` native host) installation orchestrator
+ * for chained publisher games (`xbox` `publisher_managed`, `epic` `partner_launcher_link`, and
+ * standalone publisher storefronts).
+ *
+ * @param {{
+ *   taskId: string,
+ *   task: any,
+ *   payload: any,
+ *   platform: string,
+ *   platformId: string,
+ *   platformGameId: string,
+ *   title: string,
+ *   cleanStoreId?: string,
+ *   chainedHandoffId: string | null | undefined,
+ *   chainedHandoffTopology?: string,
+ *   epicPartnerRegistryPath?: string
+ * }} flowParams
+ * @param {any} [options={}]
+ */
+async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
+  const {
+    taskId,
+    task,
+    payload,
+    platform,
+    platformId,
+    platformGameId,
+    title,
+    cleanStoreId = '',
+    chainedHandoffId,
+    chainedHandoffTopology,
+    epicPartnerRegistryPath,
+  } = flowParams;
+
+  const chainedEcosystem = chainedHandoffId
+    ? CHAINED_PUBLISHER_ECOSYSTEMS[chainedHandoffId]
+    : null;
+  if (!chainedHandoffId || !chainedEcosystem) {
+    const unknownErr = `Unable to determine publisher launcher ecosystem for ${title}.`;
+    updateDownloadTask(
+      taskId,
+      {
+        status: 'failed',
+        speedBytesPerSec: 0,
+        etaSeconds: undefined,
+        error: unknownErr,
+        statusMessage: unknownErr,
+      },
+      options
+    );
+    return { success: false, error: unknownErr };
+  }
+
+  const epicRegLeaf = extractEpicRegistryLeaf(epicPartnerRegistryPath);
+  const effectiveTopology =
+    chainedHandoffTopology ||
+    (platformId === 'epic'
+      ? 'partner_launcher_link'
+      : platformId === 'xbox'
+        ? 'publisher_managed'
+        : undefined);
+  const effectiveExternalInstallId =
+    payload.chainedExternalInstallId || undefined;
+  const isXboxChainedHandoff = String(platformId || '').toLowerCase() === 'xbox';
+  const accountLinkHint = isXboxChainedHandoff
+    ? `Ensure your Xbox account is linked to your ${chainedEcosystem.displayName} account so your Game Pass entitlement appears in ${chainedEcosystem.displayName}.`
+    : undefined;
+
+  if (platform === 'darwin') {
+    if (!chainedEcosystem.supportedInWineBottle) {
+      const unsupportedReason =
+        chainedEcosystem.unsupportedBottleReason ||
+        `${chainedEcosystem.displayName} requires Windows kernel anti-cheat and cannot run inside a macOS compatibility bottle.`;
+      updateDownloadTask(
+        taskId,
+        {
+          status: 'failed',
+          speedBytesPerSec: 0,
+          etaSeconds: undefined,
+          error: unsupportedReason,
+          statusMessage: unsupportedReason,
+        },
+        options
+      );
+      return { success: false, error: unsupportedReason };
+    }
+
+    const controller = new AbortController();
+    downloadControllers.set(taskId, {
+      type: 'abort',
+      controller,
+      cancelRequested: false,
+    });
+
+    try {
+      const homedir = options.homedir || os.homedir();
+      const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
+      const detectedLayers = detectCompatibilityLayers({
+        ...options,
+        platform: 'darwin',
+        ...explicitHomedirOpt,
+      });
+      const requestedLayerType = payload.compatibilityLayer || options.compatibilityLayer;
+      const chosenLayer =
+        options.compatibilityLayerObj ||
+        (requestedLayerType
+          ? detectedLayers.find(
+              (l) => l && (l.type === requestedLayerType || l.id === requestedLayerType)
+            )
+          : null) ||
+        detectedLayers.find(
+          (l) => l && (l.type === 'crossover' || l.type === 'crossover_preview')
+        ) ||
+        detectedLayers[0] ||
+        null;
+
+      const explicitBottleName = String(
+        payload.wineBottle || payload.wineBottleName || options.bottleName || ''
+      ).trim();
+      let gameCfgBottleName = '';
+      try {
+        const allLaunchCfgs = getGameLaunchConfigs(options) || {};
+        const lookupId = String(payload.gameId || `${platformId}_${platformGameId}`).trim();
+        const rawSavedCfg =
+          allLaunchCfgs[lookupId] ||
+          allLaunchCfgs[`${platformId}-${platformGameId}`] ||
+          allLaunchCfgs[String(platformGameId || '')] ||
+          null;
+        const resolvedSavedCfg = resolvePlatformLaunchConfig(rawSavedCfg || {}, platformId);
+        gameCfgBottleName = String(resolvedSavedCfg?.wineBottleName || '').trim();
+      } catch {}
+      let wizardPreferredBottleName = '';
+      try {
+        const getWizardStateFn = getSetupWizardStateLazy();
+        const wizardState =
+          typeof getWizardStateFn === 'function' ? getWizardStateFn(options) : null;
+        wizardPreferredBottleName = String(wizardState?.preferredBottleName || '').trim();
+      } catch {}
+      const discoveredBottleNames = Array.isArray(chosenLayer?.availableBottles)
+        ? chosenLayer.availableBottles
+        : [];
+      const helperBottleName =
+        typeof chainedPublisherLaunchers.resolveDefaultChainedBottleName === 'function'
+          ? String(
+              chainedPublisherLaunchers.resolveDefaultChainedBottleName({
+                explicitBottleName,
+                gameConfigBottleName: gameCfgBottleName,
+                wizardPreferredBottleName,
+                discoveredBottleNames,
+              }) || ''
+            ).trim()
+          : '';
+      const requestedBottleName =
+        helperBottleName ||
+        explicitBottleName ||
+        gameCfgBottleName ||
+        wizardPreferredBottleName ||
+        'OneLauncher';
+      /** @type {Record<string, any>} */
+      const bottleInitEnv = {};
+      let compatReadyRes = null;
+      if (chosenLayer && !payload.bottlePath && !options.bottlePath) {
+        try {
+          compatReadyRes = await ensureCompatibilityLayerReady(
+            chosenLayer,
+            { wineBottleName: requestedBottleName },
+            bottleInitEnv,
+            { ...options, platform: 'darwin', ...explicitHomedirOpt }
+          );
+        } catch {}
+      }
+      const resolvedBottlesRoot =
+        chosenLayer?.bottlesDir ||
+        path.join(homedir, 'Games', 'OneLauncher', 'Prefixes');
+      let targetBottlePath = String(
+        payload.bottlePath ||
+          options.bottlePath ||
+          compatReadyRes?.winePrefix ||
+          bottleInitEnv.WINEPREFIX ||
+          path.join(resolvedBottlesRoot, requestedBottleName)
+      );
+
+      const ensurePublisherFn =
+        options.ensureChainedPublisherLauncherInstalledFn ||
+        getEnsureChainedPublisherLauncherInstalled();
+      if (typeof ensurePublisherFn !== 'function') {
+        throw new Error('Publisher launcher provisioner is unavailable.');
+      }
+
+      const ensured = await ensurePublisherFn(
+        {
+          handoffId: chainedHandoffId,
+          platform: 'darwin',
+          runnerLayer: chosenLayer,
+          bottleName: requestedBottleName,
+          bottlePath: targetBottlePath,
+          signal: controller.signal,
+          onProgress: (/** @type {any} */ prog) => {
+            if (!prog || typeof prog !== 'object') return;
+            updateDownloadTask(
+              taskId,
+              {
+                status: 'downloading',
+                ...(typeof prog.percent === 'number'
+                  ? {
+                      progressPercent: Math.min(99, Math.max(0, Math.round(prog.percent))),
+                    }
+                  : {}),
+                ...(prog.downloadedBytes ? { bytesDownloaded: prog.downloadedBytes } : {}),
+                ...(prog.totalBytes ? { totalBytes: prog.totalBytes } : {}),
+                ...(typeof prog.speedBytesPerSec === 'number'
+                  ? { speedBytesPerSec: prog.speedBytesPerSec }
+                  : {}),
+                ...(prog.message ? { statusMessage: prog.message } : {}),
+              },
+              options
+            );
+          },
+        },
+        options
+      );
+
+      targetBottlePath = path.resolve(
+        ensured?.bottlePath ||
+          extractBottleRootFromPath(ensured?.binaryPath || '') ||
+          targetBottlePath
+      );
+      const effectiveBottleName = path.basename(targetBottlePath) || requestedBottleName;
+      const effectiveLayerType = chosenLayer?.type || 'crossover';
+
+      // Fast-path: check if user already installed this game inside targetBottlePath
+      const existingInBottle = scanBottlePublisherInstalledGames(targetBottlePath, {
+        ...options,
+        homedir,
+      });
+      const preInstalledMatch = existingInBottle.find(
+        (/** @type {any} */ g) =>
+          g &&
+          g.handoffId === chainedHandoffId &&
+          g.executablePath &&
+          !isGdkStubExecutablePath(g.executablePath) &&
+          !/steamapps[\\/]common/i.test(String(g.installPath || '')) &&
+          ((effectiveExternalInstallId &&
+            String(g.externalInstallId || '').toLowerCase() ===
+              String(effectiveExternalInstallId).toLowerCase()) ||
+            doChainedPublisherTitlesMatch(g.title, title) ||
+            (epicRegLeaf &&
+              g.installPath &&
+              doChainedPublisherTitlesMatch(path.basename(g.installPath), epicRegLeaf)))
+      );
+      if (preInstalledMatch && fs.existsSync(preInstalledMatch.executablePath)) {
+        const preSize = sanitizeGameInstallSizeBytes(preInstalledMatch.installSizeBytes);
+        upsertManagedInstallRecord(
+          {
+            platformId,
+            platformGameId,
+            ...(cleanStoreId ? { xboxProductId: cleanStoreId } : {}),
+            title: preInstalledMatch.title || title,
+            installPath: preInstalledMatch.installPath,
+            executablePath: preInstalledMatch.executablePath,
+            ...(preSize ? { installSize: preSize } : {}),
+            chainedLauncherHandoff: chainedHandoffId,
+            externalStorefrontHandoff: chainedHandoffId,
+            ...(effectiveTopology ? { chainedHandoffTopology: effectiveTopology } : {}),
+            ...(epicPartnerRegistryPath ? { epicPartnerRegistryPath } : {}),
+            ...(preInstalledMatch.externalInstallId
+              ? { chainedExternalInstallId: String(preInstalledMatch.externalInstallId) }
+              : {}),
+            runner: 'chained_bottle',
+            compatibilityLayer: effectiveLayerType,
+            wineBottle: effectiveBottleName,
+            isWindowsBinaryOnMac: true,
+          },
+          options.userDataDir
+        );
+        downloadControllers.delete(taskId);
+        notifyInstalledGamesUpdated();
+        updateDownloadTask(
+          taskId,
+          {
+            status: 'completed',
+            progressPercent: 100,
+            bytesDownloaded: preSize || Number(task.totalBytes || 0),
+            totalBytes: preSize || Number(task.totalBytes || 0),
+            speedBytesPerSec: 0,
+            etaSeconds: undefined,
+            finalInstallPath: preInstalledMatch.installPath,
+            executablePath: preInstalledMatch.executablePath,
+            runner: 'chained_bottle',
+            statusMessage: `Installed via ${chainedEcosystem.displayName}`,
+          },
+          options
+        );
+        const completedTask = downloadQueueMap.get(taskId) || task;
+        const { _persistedUserDataDir: _igPre, ...pubCompleted } = completedTask;
+        return {
+          success: true,
+          status: 'installed',
+          installPath: preInstalledMatch.installPath,
+          executablePath: preInstalledMatch.executablePath,
+          task: { ...pubCompleted },
+        };
+      }
+
+      // Capture staging baseline BEFORE spawning publisher launcher so delta growth is exact
+      const baselineStagingBytes = measurePublisherStagingBytes(
+        chainedHandoffId,
+        'darwin',
+        targetBottlePath,
+        options
+      );
+
+      // Spawn publisher launcher inside the bottle (NEVER opening a macOS browser webpage!)
+      const launchSpec = buildChainedLauncherLaunchSpec({
+        handoffId: chainedHandoffId,
+        externalInstallId: effectiveExternalInstallId,
+        launcherBinaryPath: ensured.binaryPath,
+        installDir: payload.targetInstallDir || payload.installPath || '',
+        bottlePath: targetBottlePath,
+        platform: 'darwin',
+        compatibilityLayerType: effectiveLayerType,
+      });
+      const isCrossOverRunner =
+        effectiveLayerType === 'crossover' || effectiveLayerType === 'crossover_preview';
+      const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
+      /** @type {Record<string, any>} */
+      const childEnv = {
+        ...process.env,
+        WINEPREFIX: targetBottlePath,
+        ...(isCrossOverRunner ? { CX_BOTTLE: effectiveBottleName } : {}),
+        ...(launchSpec.envOverrides || {}),
+      };
+      const alignedLaunch = chosenLayer?.binaryPath
+        ? prepareAlignedAuxBottleWineCommand({
+            wineBinary: chosenLayer.binaryPath,
+            bottlePath: targetBottlePath,
+            env: childEnv,
+            layerType: effectiveLayerType,
+          })
+        : { binaryPath: '', env: childEnv };
+      const wineBin = alignedLaunch.binaryPath;
+      const effectiveChildEnv = alignedLaunch.env;
+      if (!wineBin) {
+        throw new Error(
+          `No Wine / CrossOver runner binary available to launch ${chainedEcosystem.displayName}.`
+        );
+      }
+      const trimmedChildDll =
+        typeof effectiveChildEnv.WINEDLLOVERRIDES === 'string'
+          ? effectiveChildEnv.WINEDLLOVERRIDES.trim()
+          : '';
+      const childDllArgs =
+        trimmedChildDll &&
+        isCrossOverPerlWineWrapperOptions({
+          binaryPath: wineBin,
+          layerType: effectiveLayerType,
+        })
+          ? ['--dll', trimmedChildDll]
+          : [];
+      const spawnedLauncher = spawnImpl(
+        wineBin,
+        [...childDllArgs, launchSpec.launcherExe, ...(launchSpec.args || [])],
+        {
+          cwd: path.dirname(ensured.binaryPath),
+          env: effectiveChildEnv,
+          detached: true,
+          stdio: 'ignore',
+        }
+      );
+      if (spawnedLauncher && typeof spawnedLauncher.on === 'function') {
+        spawnedLauncher.on('error', (/** @type {any} */ spawnErr) => {
+          diagLog.warn('installGame.chainedBottleLauncherSpawnError', spawnErr, {
+            handoffId: chainedHandoffId,
+            wineBin,
+          });
+        });
+      }
+      if (spawnedLauncher && typeof spawnedLauncher.unref === 'function') {
+        spawnedLauncher.unref();
+      }
+
+      const openedMsg = isXboxChainedHandoff
+        ? `Opened ${chainedEcosystem.displayName} in bottle — ensure your Xbox account is linked to your ${chainedEcosystem.displayName} account and click Install for ${title}...`
+        : `Opened ${chainedEcosystem.displayName} in bottle — sign in with your linked account and click Install for ${title}...`;
+      updateDownloadTask(
+        taskId,
+        {
+          status: 'downloading',
+          speedBytesPerSec: 0,
+          etaSeconds: undefined,
+          statusMessage: openedMsg,
+          ...(accountLinkHint ? { accountLinkHint } : {}),
+        },
+        options
+      );
+
+      if (!options.skipInstallMonitor) {
+        startChainedLauncherInstallMonitor(
+          taskId,
+          {
+            handoffId: chainedHandoffId,
+            ecosystem: chainedEcosystem,
+            platform: 'darwin',
+            bottlePath: targetBottlePath,
+            bottleName: effectiveBottleName,
+            compatibilityLayer: effectiveLayerType,
+            title,
+            platformId,
+            platformGameId,
+            cleanStoreId,
+            externalInstallId: effectiveExternalInstallId,
+            chainedHandoffTopology: effectiveTopology,
+            epicPartnerRegistryPath,
+            baselineStagingBytes,
+            signal: controller.signal,
+          },
+          options
+        );
+      } else {
+        downloadControllers.delete(taskId);
+      }
+
+      const curBottleTask = downloadQueueMap.get(taskId) || task;
+      const { _persistedUserDataDir: _igCur, ...pubCurBottleTask } = curBottleTask;
+      return {
+        success: true,
+        status: 'chained_launcher_opened',
+        handoffId: chainedHandoffId,
+        externalLauncher: chainedEcosystem.displayName,
+        bottlePath: targetBottlePath,
+        message: openedMsg,
+        ...(accountLinkHint ? { accountLinkHint } : {}),
+        task: { ...pubCurBottleTask },
+      };
+    } catch (/** @type {any} */ chainedMacErr) {
+      downloadControllers.delete(taskId);
+      const errMsg = chainedMacErr?.message || String(chainedMacErr);
+      updateDownloadTask(
+        taskId,
+        {
+          status: 'failed',
+          speedBytesPerSec: 0,
+          etaSeconds: undefined,
+          error: errMsg,
+          statusMessage: `${chainedEcosystem.displayName} setup failed: ${errMsg}`,
+        },
+        options
+      );
+      return { success: false, error: errMsg };
+    }
+  }
+
+  // Windows Native (`win32`) Chained Publisher Pipeline
+  const controller = new AbortController();
+  downloadControllers.set(taskId, {
+    type: 'abort',
+    controller,
+    cancelRequested: false,
+  });
+  try {
+    let hostLauncherBinary = '';
+    if (chainedHandoffId !== 'riot' && !options.skipPublisherProvisioning) {
+      const ensurePublisherFn =
+        options.ensureChainedPublisherLauncherInstalledFn ||
+        getEnsureChainedPublisherLauncherInstalled();
+      if (typeof ensurePublisherFn === 'function') {
+        const ensuredWin = await ensurePublisherFn(
+          {
+            handoffId: chainedHandoffId,
+            platform: 'win32',
+            signal: controller.signal,
+            onProgress: (/** @type {any} */ prog) => {
+              if (!prog || typeof prog !== 'object') return;
+              updateDownloadTask(
+                taskId,
+                {
+                  status: 'downloading',
+                  ...(typeof prog.percent === 'number'
+                    ? {
+                        progressPercent: Math.min(99, Math.max(0, Math.round(prog.percent))),
+                      }
+                    : {}),
+                  ...(prog.downloadedBytes ? { bytesDownloaded: prog.downloadedBytes } : {}),
+                  ...(prog.totalBytes ? { totalBytes: prog.totalBytes } : {}),
+                  ...(typeof prog.speedBytesPerSec === 'number'
+                    ? { speedBytesPerSec: prog.speedBytesPerSec }
+                    : {}),
+                  ...(prog.message ? { statusMessage: prog.message } : {}),
+                },
+                options
+              );
+            },
+          },
+          options
+        );
+        hostLauncherBinary = ensuredWin?.binaryPath || '';
+      }
+    }
+
+    if (!hostLauncherBinary) {
+      const discHost = discoverHostPublisherLauncher(chainedHandoffId, {
+        ...options,
+        platform: 'win32',
+      });
+      hostLauncherBinary = discHost?.binaryPath || '';
+    }
+
+    const existingWinGames = scanHostPublisherInstalledGames({
+      ...options,
+      platform: 'win32',
+    });
+    const preInstalledWin = existingWinGames.find(
+      (/** @type {any} */ g) =>
+        g &&
+        g.handoffId === chainedHandoffId &&
+        g.executablePath &&
+        !isGdkStubExecutablePath(g.executablePath) &&
+        !/steamapps[\\/]common/i.test(String(g.installPath || '')) &&
+        ((effectiveExternalInstallId &&
+          String(g.externalInstallId || '').toLowerCase() ===
+            String(effectiveExternalInstallId).toLowerCase()) ||
+          doChainedPublisherTitlesMatch(g.title, title) ||
+          (epicRegLeaf &&
+            g.installPath &&
+            doChainedPublisherTitlesMatch(path.basename(g.installPath), epicRegLeaf)))
+    );
+    if (preInstalledWin && fs.existsSync(preInstalledWin.executablePath)) {
+      const preWinSize = sanitizeGameInstallSizeBytes(preInstalledWin.installSizeBytes);
+      upsertManagedInstallRecord(
+        {
+          platformId,
+          platformGameId,
+          ...(cleanStoreId ? { xboxProductId: cleanStoreId } : {}),
+          title: preInstalledWin.title || title,
+          installPath: preInstalledWin.installPath,
+          executablePath: preInstalledWin.executablePath,
+          ...(preWinSize ? { installSize: preWinSize } : {}),
+          chainedLauncherHandoff: chainedHandoffId,
+          externalStorefrontHandoff: chainedHandoffId,
+          ...(effectiveTopology ? { chainedHandoffTopology: effectiveTopology } : {}),
+          ...(epicPartnerRegistryPath ? { epicPartnerRegistryPath } : {}),
+          ...(preInstalledWin.externalInstallId
+            ? { chainedExternalInstallId: String(preInstalledWin.externalInstallId) }
+            : {}),
+          runner: 'chained_host',
+          isWindowsBinaryOnMac: false,
+        },
+        options.userDataDir
+      );
+      downloadControllers.delete(taskId);
+      notifyInstalledGamesUpdated();
+      updateDownloadTask(
+        taskId,
+        {
+          status: 'completed',
+          progressPercent: 100,
+          bytesDownloaded: preWinSize || Number(task.totalBytes || 0),
+          totalBytes: preWinSize || Number(task.totalBytes || 0),
+          speedBytesPerSec: 0,
+          etaSeconds: undefined,
+          finalInstallPath: preInstalledWin.installPath,
+          executablePath: preInstalledWin.executablePath,
+          runner: 'chained_host',
+          statusMessage: `Installed via ${chainedEcosystem.displayName}`,
+        },
+        options
+      );
+      const completedWinTask = downloadQueueMap.get(taskId) || task;
+      const { _persistedUserDataDir: _igWinPre, ...pubWinCompleted } = completedWinTask;
+      return {
+        success: true,
+        status: 'installed',
+        installPath: preInstalledWin.installPath,
+        executablePath: preInstalledWin.executablePath,
+        task: { ...pubWinCompleted },
+      };
+    }
+
+    const hasWinGamingServices =
+      options.hasGamingServices !== undefined
+        ? Boolean(options.hasGamingServices)
+        : hasWindowsGamingServicesInstalled(options);
+
+    // Capture staging baseline BEFORE spawning publisher handoff on Windows
+    const baselineStagingBytes = measurePublisherStagingBytes(
+      chainedHandoffId,
+      'win32',
+      undefined,
+      options
+    );
+
+    if (platformId === 'xbox' && cleanStoreId && hasWinGamingServices) {
+      await openExternalUri(
+        `msxbox://game/?productId=${encodeURIComponent(cleanStoreId)}`,
+        options
+      );
+    } else {
+      const winSpec = buildChainedLauncherLaunchSpec({
+        handoffId: chainedHandoffId,
+        externalInstallId: effectiveExternalInstallId,
+        launcherBinaryPath: hostLauncherBinary,
+        installDir: payload.targetInstallDir || payload.installPath || '',
+        bottlePath: '',
+        platform: 'win32',
+      });
+      if (winSpec.launcherExe && fs.existsSync(winSpec.launcherExe)) {
+        const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
+        const child = spawnImpl(winSpec.launcherExe, [...(winSpec.args || [])], {
+          cwd: path.dirname(winSpec.launcherExe),
+          env: {
+            ...process.env,
+            ...(winSpec.envOverrides || {}),
+          },
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+        });
+        if (child && typeof child.on === 'function') {
+          child.on('error', (/** @type {any} */ err) => {
+            diagLog.warn('installGame.chainedWinLauncherSpawnError', err, {
+              handoffId: chainedHandoffId,
+            });
+          });
+        }
+        if (child && typeof child.unref === 'function') {
+          child.unref();
+        }
+      } else if (winSpec.uri) {
+        await openExternalUri(winSpec.uri, options);
+      }
+    }
+
+    const winStatusMsg = isXboxChainedHandoff
+      ? `Opened ${chainedEcosystem.displayName} — ensure your Xbox account is linked to your ${chainedEcosystem.displayName} account and install ${title} to continue (monitoring installation)...`
+      : `Opened ${chainedEcosystem.displayName} — install ${title} to continue (monitoring installation)...`;
+    updateDownloadTask(
+      taskId,
+      {
+        status: 'downloading',
+        speedBytesPerSec: 0,
+        etaSeconds: undefined,
+        statusMessage: winStatusMsg,
+        ...(accountLinkHint ? { accountLinkHint } : {}),
+      },
+      options
+    );
+
+    if (!options.skipInstallMonitor) {
+      startChainedLauncherInstallMonitor(
+        taskId,
+        {
+          handoffId: chainedHandoffId,
+          ecosystem: chainedEcosystem,
+          platform: 'win32',
+          title,
+          platformId,
+          platformGameId,
+          cleanStoreId,
+          externalInstallId: effectiveExternalInstallId,
+          chainedHandoffTopology: effectiveTopology,
+          epicPartnerRegistryPath,
+          baselineStagingBytes,
+          signal: controller.signal,
+        },
+        options
+      );
+    } else {
+      downloadControllers.delete(taskId);
+    }
+
+    const curWinTask = downloadQueueMap.get(taskId) || task;
+    const { _persistedUserDataDir: _igWinCur, ...pubCurWinTask } = curWinTask;
+    return {
+      success: true,
+      status: 'chained_launcher_opened',
+      handoffId: chainedHandoffId,
+      externalLauncher: chainedEcosystem.displayName,
+      message: winStatusMsg,
+      ...(accountLinkHint ? { accountLinkHint } : {}),
+      task: { ...pubCurWinTask },
+    };
+  } catch (/** @type {any} */ chainedWinErr) {
+    downloadControllers.delete(taskId);
+    const errMsg = chainedWinErr?.message || String(chainedWinErr);
+    updateDownloadTask(
+      taskId,
+      {
+        status: 'failed',
+        speedBytesPerSec: 0,
+        etaSeconds: undefined,
+        error: errMsg,
+        statusMessage: `${chainedEcosystem.displayName} setup failed: ${errMsg}`,
+      },
+      options
+    );
+    return { success: false, error: errMsg };
+  }
+}
+
+/**
  * Resolve installation options, disk space, platform builds, and size telemetry for a game.
  */
 async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {any} */ options = {}) {
@@ -1698,6 +3454,14 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
   /** @type {string | undefined} */
   let externalLauncherUrl = undefined;
   let isCrossPlatformBottleInstall = false;
+  /** @type {boolean | undefined} */
+  let authoritativeOsSupport = undefined;
+  /** @type {string | undefined} */
+  let resolvedChainedHandoff = undefined;
+  /** @type {string | undefined} */
+  let resolvedChainedTopology = undefined;
+  /** @type {string | undefined} */
+  let resolvedEpicRegistryPath = undefined;
   const cacheScope =
     options.userDataDir || options.homedir ? `${options.userDataDir || options.homedir}:` : '';
 
@@ -1769,6 +3533,10 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
 
     /** @type {any} */
     let productData = null;
+    /** @type {any} */
+    let fetchedOsxBuilds = null;
+    /** @type {any} */
+    let fetchedWinBuilds = null;
     if (cleanId && (!options.skipNetwork || options.mockGogProductData)) {
       productData = options.mockGogProductData || (await fetchGogProduct(gogToken));
       if (!options.mockGogProductData && (!productData || !productData.downloads) && gogToken) {
@@ -1868,11 +3636,12 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       }
 
       if (availableInstallers.length === 0 && !options.skipNetwork && !options.mockGogProductData) {
+        const fetchFn = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch;
         const fetchBuilds = async (/** @type {string} */ osType) => {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), 3000);
           try {
-            const res = await fetch(
+            const res = await fetchFn(
               `https://content-system.gog.com/products/${encodeURIComponent(cleanId)}/os/${osType}/builds?generation=2`,
               { signal: controller.signal }
             );
@@ -1888,6 +3657,8 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
             platform === 'win32' ? Promise.resolve(null) : fetchBuilds('osx'),
             fetchBuilds('windows'),
           ]);
+          fetchedOsxBuilds = osxBuilds;
+          fetchedWinBuilds = winBuilds;
           const hasMacDepot =
             platform !== 'win32' && Array.isArray(osxBuilds?.items) && osxBuilds.items.length > 0;
           const hasWinDepot = Array.isArray(winBuilds?.items) && winBuilds.items.length > 0;
@@ -1958,117 +3729,181 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       (needsMacGogdl || needsWinGogdl) &&
       cleanId &&
       !options.skipNetwork &&
-      !options.mockGogProductData &&
-      (!options.homedir || typeof options.execFileFn === 'function')
+      !options.mockGogProductData
     ) {
-      try {
-        const execFileImpl = typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
-        const gogdlBin = findGogdlBinary(options);
-        const gogAuthPath = authRes?.configPath || authRes?.gogAuthPath;
-        if (gogdlBin && gogAuthPath && fs.existsSync(gogAuthPath)) {
-          const extractNodeSizes = (/** @type {any} */ node) => {
-            if (!node || typeof node !== 'object') return { diskSize: undefined, downloadSize: undefined };
-            let rawDisk = Number(node.disk_size || node.download_size || 0);
-            let rawDl = Number(node.download_size || node.disk_size || 0);
-            if ((!Number.isFinite(rawDisk) || rawDisk <= 0) && node.size && typeof node.size === 'object') {
-              const starNode =
-                node.size['*'] && typeof node.size['*'] === 'object' ? node.size['*'] : null;
-              const starDisk = Math.max(
-                0,
-                Number(starNode?.disk_size ?? starNode?.download_size ?? 0) || 0
-              );
-              const starDl = Math.max(
-                0,
-                Number(starNode?.download_size ?? starNode?.disk_size ?? 0) || 0
-              );
-
-              const langKeys = Object.keys(node.size).filter((k) => k !== '*');
-              const enKey = langKeys.find((k) => /^en(?:[-_][a-z]+)?$|^english$/i.test(k));
-              let langNode = enKey ? node.size[enKey] : null;
-              if (!langNode && langKeys.length > 0) {
-                let bestDisk = 0;
-                for (const k of langKeys) {
-                  const val = node.size[k];
-                  const candDisk = Number(val?.disk_size ?? val?.download_size ?? 0) || 0;
-                  if (candDisk > bestDisk) {
-                    bestDisk = candDisk;
-                    langNode = val;
-                  }
-                }
-              }
-
-              const langDisk = Math.max(
-                0,
-                Number(langNode?.disk_size ?? langNode?.download_size ?? 0) || 0
-              );
-              const langDl = Math.max(
-                0,
-                Number(langNode?.download_size ?? langNode?.disk_size ?? 0) || 0
-              );
-
-              rawDisk = starDisk + langDisk;
-              rawDl = starDl + langDl;
-            }
-            const validDisk = sanitizeGameInstallSizeBytes(rawDisk);
-            const validDl = sanitizeGameInstallSizeBytes(rawDl);
-            return { diskSize: validDisk, downloadSize: validDl || validDisk };
-          };
-
-          const runGogdlInfo = (/** @type {string} */ osFlag) =>
-            new Promise((resolve) => {
-              execFileImpl(
-                gogdlBin,
-                ['--auth-config-path', gogAuthPath, 'info', cleanId, '--platform', osFlag],
-                { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
-                (/** @type {any} */ err, /** @type {any} */ stdout) => {
-                  if (err || !stdout) return resolve(null);
-                  try {
-                    const jsonLine =
-                      String(stdout || '')
-                        .split(/\r?\n/)
-                        .map((l) => l.trim())
-                        .filter((l) => l.startsWith('{'))
-                        .pop() || String(stdout || '').trim();
-                    const infoJson = JSON.parse(jsonLine);
-                    const baseSizes = extractNodeSizes(infoJson);
-                    if (!baseSizes.diskSize) return resolve(null);
-                    let dlcSum = 0;
-                    if (Array.isArray(infoJson?.dlcs)) {
-                      for (const dlc of infoJson.dlcs) {
-                        const dlcSizes = extractNodeSizes(dlc);
-                        if (dlcSizes.diskSize) dlcSum += dlcSizes.diskSize;
-                      }
-                    }
-                    resolve({
-                      diskSize: baseSizes.diskSize,
-                      downloadSize: baseSizes.downloadSize,
-                      dlcSize: sanitizeGameInstallSizeBytes(dlcSum),
-                    });
-                  } catch {
-                    resolve(null);
-                  }
-                }
-              );
-            });
-
-          const [macInfoRes, winInfoRes] = await Promise.all([
-            needsMacGogdl ? runGogdlInfo('osx') : Promise.resolve(null),
-            needsWinGogdl ? runGogdlInfo('windows') : Promise.resolve(null),
+      if (
+        typeof options.execFileFn !== 'function' &&
+        (!options.homedir ||
+          options.useDirectGogHttpSizes === true ||
+          typeof options.fetchImpl === 'function')
+      ) {
+        try {
+          const [directMacRes, directWinRes] = await Promise.all([
+            needsMacGogdl
+              ? resolveGogDepotSizesDirectHttp(cleanId, 'osx', {
+                  ...options,
+                  ...(fetchedOsxBuilds ? { buildsJson: fetchedOsxBuilds } : {}),
+                })
+              : Promise.resolve(null),
+            needsWinGogdl
+              ? resolveGogDepotSizesDirectHttp(cleanId, 'windows', {
+                  ...options,
+                  ...(fetchedWinBuilds ? { buildsJson: fetchedWinBuilds } : {}),
+                })
+              : Promise.resolve(null),
           ]);
-          if (macInfoRes?.diskSize) {
-            macSizeBytes = macInfoRes.diskSize;
-            macDownloadBytes = macInfoRes.downloadSize;
-            macDlcBytes = macInfoRes.dlcSize;
+          if (directMacRes?.diskSize) {
+            macSizeBytes = directMacRes.diskSize;
+            macDownloadBytes = directMacRes.downloadSize;
+            macDlcBytes = directMacRes.dlcSize;
             hasAuthoritativeMacDisk = true;
           }
-          if (winInfoRes?.diskSize) {
-            winSizeBytes = winInfoRes.diskSize;
-            winDownloadBytes = winInfoRes.downloadSize;
-            winDlcBytes = winInfoRes.dlcSize;
+          if (directWinRes?.diskSize) {
+            winSizeBytes = directWinRes.diskSize;
+            winDownloadBytes = directWinRes.downloadSize;
+            winDlcBytes = directWinRes.dlcSize;
             hasAuthoritativeWinDisk = true;
           }
-        }
-      } catch {}
+          if (availableInstallers.length > 0 && (directMacRes || directWinRes)) {
+            availableInstallers = availableInstallers.map((ins) => {
+              const isMac = ins.os === 'mac';
+              const directForOs = isMac ? directMacRes : directWinRes;
+              if (!directForOs) return ins;
+              return {
+                ...ins,
+                totalSizeBytes: ins.totalSizeBytes || directForOs.diskSize,
+                ...(ins.version || !directForOs.versionName
+                  ? {}
+                  : { version: normalizeInstallerVersion(directForOs.versionName) }),
+              };
+            });
+          }
+        } catch {}
+      }
+
+      const stillNeedsMacGogdl = needsMacGogdl && !hasAuthoritativeMacDisk;
+      const stillNeedsWinGogdl = needsWinGogdl && !hasAuthoritativeWinDisk;
+
+      if (
+        (stillNeedsMacGogdl || stillNeedsWinGogdl) &&
+        (!options.homedir || typeof options.execFileFn === 'function')
+      ) {
+        try {
+          const execFileImpl =
+            typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
+          const gogdlBin = findGogdlBinary(options);
+          const gogAuthPath = authRes?.configPath || authRes?.gogAuthPath;
+          if (gogdlBin && gogAuthPath && fs.existsSync(gogAuthPath)) {
+            const extractNodeSizes = (/** @type {any} */ node) => {
+              if (!node || typeof node !== 'object') {
+                return { diskSize: undefined, downloadSize: undefined };
+              }
+              let rawDisk = Number(node.disk_size || node.download_size || 0);
+              let rawDl = Number(node.download_size || node.disk_size || 0);
+              if (
+                (!Number.isFinite(rawDisk) || rawDisk <= 0) &&
+                node.size &&
+                typeof node.size === 'object'
+              ) {
+                const starNode =
+                  node.size['*'] && typeof node.size['*'] === 'object' ? node.size['*'] : null;
+                const starDisk = Math.max(
+                  0,
+                  Number(starNode?.disk_size ?? starNode?.download_size ?? 0) || 0
+                );
+                const starDl = Math.max(
+                  0,
+                  Number(starNode?.download_size ?? starNode?.disk_size ?? 0) || 0
+                );
+
+                const langKeys = Object.keys(node.size).filter((k) => k !== '*');
+                const enKey = langKeys.find((k) => /^en(?:[-_][a-z]+)?$|^english$/i.test(k));
+                let langNode = enKey ? node.size[enKey] : null;
+                if (!langNode && langKeys.length > 0) {
+                  let bestDisk = 0;
+                  for (const k of langKeys) {
+                    const val = node.size[k];
+                    const candDisk = Number(val?.disk_size ?? val?.download_size ?? 0) || 0;
+                    if (candDisk > bestDisk) {
+                      bestDisk = candDisk;
+                      langNode = val;
+                    }
+                  }
+                }
+
+                const langDisk = Math.max(
+                  0,
+                  Number(langNode?.disk_size ?? langNode?.download_size ?? 0) || 0
+                );
+                const langDl = Math.max(
+                  0,
+                  Number(langNode?.download_size ?? langNode?.disk_size ?? 0) || 0
+                );
+
+                rawDisk = starDisk + langDisk;
+                rawDl = starDl + langDl;
+              }
+              const validDisk = sanitizeGameInstallSizeBytes(rawDisk);
+              const validDl = sanitizeGameInstallSizeBytes(rawDl);
+              return { diskSize: validDisk, downloadSize: validDl || validDisk };
+            };
+
+            const runGogdlInfo = (/** @type {string} */ osFlag) =>
+              new Promise((resolve) => {
+                execFileImpl(
+                  gogdlBin,
+                  ['--auth-config-path', gogAuthPath, 'info', cleanId, '--platform', osFlag],
+                  { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+                  (/** @type {any} */ err, /** @type {any} */ stdout) => {
+                    if (err || !stdout) return resolve(null);
+                    try {
+                      const jsonLine =
+                        String(stdout || '')
+                          .split(/\r?\n/)
+                          .map((l) => l.trim())
+                          .filter((l) => l.startsWith('{'))
+                          .pop() || String(stdout || '').trim();
+                      const infoJson = JSON.parse(jsonLine);
+                      const baseSizes = extractNodeSizes(infoJson);
+                      if (!baseSizes.diskSize) return resolve(null);
+                      let dlcSum = 0;
+                      if (Array.isArray(infoJson?.dlcs)) {
+                        for (const dlc of infoJson.dlcs) {
+                          const dlcSizes = extractNodeSizes(dlc);
+                          if (dlcSizes.diskSize) dlcSum += dlcSizes.diskSize;
+                        }
+                      }
+                      resolve({
+                        diskSize: baseSizes.diskSize,
+                        downloadSize: baseSizes.downloadSize,
+                        dlcSize: sanitizeGameInstallSizeBytes(dlcSum),
+                      });
+                    } catch {
+                      resolve(null);
+                    }
+                  }
+                );
+              });
+
+            const [macInfoRes, winInfoRes] = await Promise.all([
+              stillNeedsMacGogdl ? runGogdlInfo('osx') : Promise.resolve(null),
+              stillNeedsWinGogdl ? runGogdlInfo('windows') : Promise.resolve(null),
+            ]);
+            if (macInfoRes?.diskSize) {
+              macSizeBytes = macInfoRes.diskSize;
+              macDownloadBytes = macInfoRes.downloadSize;
+              macDlcBytes = macInfoRes.dlcSize;
+              hasAuthoritativeMacDisk = true;
+            }
+            if (winInfoRes?.diskSize) {
+              winSizeBytes = winInfoRes.diskSize;
+              winDownloadBytes = winInfoRes.downloadSize;
+              winDlcBytes = winInfoRes.dlcSize;
+              hasAuthoritativeWinDisk = true;
+            }
+          }
+        } catch {}
+      }
     }
 
     if (cleanId) {
@@ -2218,14 +4053,31 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
     canDirectDownload = Boolean(legendaryBin);
     requiresStoreClientFallback = !canDirectDownload;
 
+    if (options.refreshLegendaryMetadata === true) {
+      try {
+        await refreshLocalLegendaryMetadata(options);
+      } catch {}
+    }
+
     const epicInfo = resolveEpicAppAndPlatforms(payload, options);
     const titleLabel = payload.title || 'Game';
     const resolvedAppName =
       epicInfo.resolvedAppName || epicInfo.appName || platformGameId.replace(/^epic-/i, '');
 
     const userDataDir = getUserDataDir(options.userDataDir);
-    let hasMacBuild = Boolean(epicInfo.hasMacBuild);
-    let hasWindowsBuild = epicInfo.hasWindowsBuild !== false;
+    let epicPartnerHandoff = resolveAnyChainedHandoffId(
+      epicInfo.chainedLauncherHandoff ||
+        payload.chainedLauncherHandoff ||
+        payload.externalStorefrontHandoff ||
+        ''
+    );
+    let epicPartnerRegPath =
+      epicInfo.epicPartnerRegistryPath ||
+      (typeof payload.epicPartnerRegistryPath === 'string' && payload.epicPartnerRegistryPath.trim()
+        ? payload.epicPartnerRegistryPath.trim()
+        : undefined);
+    let hasMacBuild = epicPartnerHandoff ? false : Boolean(epicInfo.hasMacBuild);
+    let hasWindowsBuild = epicPartnerHandoff ? true : epicInfo.hasWindowsBuild !== false;
     let namespace = epicInfo.namespace;
     let catalogItemId = epicInfo.catalogItemId;
     /** @type {{ Mac: Set<string>, Windows: Set<string> }} */
@@ -2638,6 +4490,15 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
                     if (err || !stdout) return resolve(undefined);
                     try {
                       const infoJson = JSON.parse(String(stdout).trim());
+                      const infoPartner = extractEpicThirdPartyPartnerMetadata(infoJson);
+                      if (!epicPartnerHandoff && infoPartner.chainedLauncherHandoff) {
+                        epicPartnerHandoff = infoPartner.chainedLauncherHandoff;
+                        hasMacBuild = false;
+                        hasWindowsBuild = true;
+                      }
+                      if (!epicPartnerRegPath && infoPartner.epicPartnerRegistryPath) {
+                        epicPartnerRegPath = infoPartner.epicPartnerRegistryPath;
+                      }
                       const validDisk = sanitizeGameInstallSizeBytes(
                         Number(
                           infoJson?.manifest?.disk_size || infoJson?.manifest?.download_size || 0
@@ -2776,7 +4637,66 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       }
     }
 
-    if (platform === 'darwin') {
+    const epicPartnerEcosystem = epicPartnerHandoff
+      ? CHAINED_PUBLISHER_ECOSYSTEMS[epicPartnerHandoff]
+      : null;
+
+    if (epicPartnerHandoff && epicPartnerEcosystem) {
+      hasMacBuild = false;
+      hasWindowsBuild = true;
+      authoritativeOsSupport = true;
+      resolvedChainedHandoff = epicPartnerHandoff;
+      resolvedChainedTopology = 'partner_launcher_link';
+      resolvedEpicRegistryPath = epicPartnerRegPath;
+      externalLauncher = epicPartnerEcosystem.displayName;
+      externalLauncherUrl = '';
+      if (platform === 'darwin') {
+        isCrossPlatformBottleInstall = Boolean(epicPartnerEcosystem.supportedInWineBottle);
+        canDirectDownload = Boolean(epicPartnerEcosystem.supportedInWineBottle);
+        requiresStoreClientFallback = false;
+        availableInstallers = [
+          {
+            id: 'epic-chained-bottle-launcher',
+            label: `Windows (${epicPartnerEcosystem.displayName} in Bottle)`,
+            name: `${titleLabel} — Windows (${epicPartnerEcosystem.displayName} in Bottle)`,
+            os: 'windows',
+            sizeBytes: platStats.Windows.diskSize || estimatedSizeBytes,
+            totalSizeBytes: platStats.Windows.diskSize || estimatedSizeBytes,
+            ...(platStats.Windows.downloadSize
+              ? { downloadSizeBytes: platStats.Windows.downloadSize }
+              : {}),
+            ...(platStats.Windows.dlcSize ? { dlcSizeBytes: platStats.Windows.dlcSize } : {}),
+            externalLauncher: epicPartnerEcosystem.displayName,
+            externalStorefrontHandoff: epicPartnerHandoff,
+            chainedLauncherHandoff: epicPartnerHandoff,
+            chainedHandoffTopology: 'partner_launcher_link',
+            ...(epicPartnerRegPath ? { epicPartnerRegistryPath: epicPartnerRegPath } : {}),
+          },
+        ];
+      } else {
+        canDirectDownload = true;
+        requiresStoreClientFallback = false;
+        availableInstallers = [
+          {
+            id: 'epic-chained-host-launcher',
+            label: `Windows (${epicPartnerEcosystem.displayName})`,
+            name: `${titleLabel} — Windows (${epicPartnerEcosystem.displayName})`,
+            os: 'windows',
+            sizeBytes: platStats.Windows.diskSize || estimatedSizeBytes,
+            totalSizeBytes: platStats.Windows.diskSize || estimatedSizeBytes,
+            ...(platStats.Windows.downloadSize
+              ? { downloadSizeBytes: platStats.Windows.downloadSize }
+              : {}),
+            ...(platStats.Windows.dlcSize ? { dlcSizeBytes: platStats.Windows.dlcSize } : {}),
+            externalLauncher: epicPartnerEcosystem.displayName,
+            externalStorefrontHandoff: epicPartnerHandoff,
+            chainedLauncherHandoff: epicPartnerHandoff,
+            chainedHandoffTopology: 'partner_launcher_link',
+            ...(epicPartnerRegPath ? { epicPartnerRegistryPath: epicPartnerRegPath } : {}),
+          },
+        ];
+      }
+    } else if (platform === 'darwin') {
       if (hasMacBuild) {
         availableInstallers = [
           {
@@ -2915,9 +4835,17 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       }
     }
 
-    let macSupported = true;
-    let winSupported = true;
+    let macSupported = Boolean(
+      payload?.platforms?.mac || payload?.storePlatforms?.mac || payload?.steamPlatforms?.mac
+    );
+    let winSupported = Boolean(
+      payload?.platforms?.windows ??
+        payload?.storePlatforms?.windows ??
+        payload?.steamPlatforms?.windows ??
+        true
+    );
     let platformSupportResolved = false;
+    let resolvedFromSteamApi = false;
 
     if (options.mockSteamAppDetails) {
       if (options.mockSteamAppDetails.platforms) {
@@ -2925,6 +4853,7 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
         macSupported = Boolean(platData.mac);
         winSupported = Boolean(platData.windows);
         platformSupportResolved = true;
+        resolvedFromSteamApi = true;
       }
       const mockMacReq =
         options.mockSteamAppDetails.mac_requirements?.minimum ||
@@ -2950,6 +4879,7 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       macSupported = Boolean(cachedPlat.macSupported);
       winSupported = Boolean(cachedPlat.winSupported);
       platformSupportResolved = true;
+      resolvedFromSteamApi = true;
     }
 
     if (
@@ -2986,6 +4916,7 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
               2000
             );
             platformSupportResolved = true;
+            resolvedFromSteamApi = true;
           }
           if (appData) {
             const macReqText =
@@ -3011,6 +4942,8 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       } catch {}
       clearTimeout(timeout);
     }
+
+    authoritativeOsSupport = Boolean(payload?.steamPlatforms || resolvedFromSteamApi);
 
     const resolvedSteamMacTotal =
       installedMacDiskSize || installedDiskSize || macParsedSize || winParsedSize || estimatedSizeBytes;
@@ -3127,6 +5060,11 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
               packageFamilyName: meta.packageFamilyName,
               packageFullName: meta.packageFullName,
               maxDownloadSizeBytes: meta.maxDownloadSizeBytes,
+              pcMaxInstallSizeBytes: meta.pcMaxInstallSizeBytes,
+              isExternalLauncherStubPackage: Boolean(meta.isExternalLauncherStubPackage),
+              xboxBottleCompatibilityTier: meta.xboxBottleCompatibilityTier,
+              xboxBottleCompatibilityReason: meta.xboxBottleCompatibilityReason,
+              isCrossPlatformLauncherRuntime: Boolean(meta.isCrossPlatformLauncherRuntime),
               externalLauncher: meta.externalLauncher,
               externalLauncherUrl: meta.externalLauncherUrl,
               externalStorefrontHandoff: meta.externalStorefrontHandoff,
@@ -3137,8 +5075,30 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       }
     }
 
-    if (deliveryInfo?.maxDownloadSizeBytes) {
-      const sanitizedMaxDl = sanitizeGameInstallSizeBytes(deliveryInfo.maxDownloadSizeBytes);
+    const handoffId = normalizeChainedHandoffId(
+      payload.chainedLauncherHandoff ||
+        payload.chainedRequiresLauncherHandoff ||
+        payload.externalStorefrontHandoff ||
+        deliveryInfo?.chainedLauncherHandoff ||
+        deliveryInfo?.chainedRequiresLauncherHandoff ||
+        deliveryInfo?.externalStorefrontHandoff ||
+        ''
+    );
+    const ecosystem = handoffId ? CHAINED_PUBLISHER_ECOSYSTEMS[handoffId] : null;
+    const STUB_PACKAGE_MAX_BYTES = 32 * 1024 * 1024;
+    const isChainedOrStubPackage = Boolean(
+      handoffId || deliveryInfo?.isExternalLauncherStubPackage
+    );
+
+    if (deliveryInfo?.maxDownloadSizeBytes || deliveryInfo?.pcMaxInstallSizeBytes) {
+      const candidateDlBytes = isChainedOrStubPackage
+        ? Number(deliveryInfo?.pcMaxInstallSizeBytes || 0) > STUB_PACKAGE_MAX_BYTES
+          ? deliveryInfo.pcMaxInstallSizeBytes
+          : Number(deliveryInfo?.maxDownloadSizeBytes || 0) > STUB_PACKAGE_MAX_BYTES
+            ? deliveryInfo.maxDownloadSizeBytes
+            : undefined
+        : deliveryInfo?.maxDownloadSizeBytes;
+      const sanitizedMaxDl = sanitizeGameInstallSizeBytes(candidateDlBytes);
       if (sanitizedMaxDl) {
         resolvedDlBytes = resolvedDlBytes || sanitizedMaxDl;
         resolvedDiskBytes = resolvedDiskBytes || sanitizedMaxDl;
@@ -3146,13 +5106,17 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
     }
 
     const probeKey = cleanStoreId || payload.msixvcPath || deliveryInfo?.primaryDownloadUrl || '';
-    let rawProbe = probeKey ? xboxCompatibilityProbeCache.get(probeKey) : null;
+    let rawProbe =
+      probeKey && (!isChainedOrStubPackage || options.mockXboxCompatibilityProbe)
+        ? xboxCompatibilityProbeCache.get(probeKey)
+        : null;
     const canProbeContainer = Boolean(
-      payload.msixvcPath ||
-        options.mockXboxCompatibilityProbe ||
-        (!options.skipNetwork &&
-          Array.isArray(deliveryInfo?.downloadUrls) &&
-          deliveryInfo.downloadUrls.length > 0)
+      options.mockXboxCompatibilityProbe ||
+        (!isChainedOrStubPackage &&
+          (payload.msixvcPath ||
+            (!options.skipNetwork &&
+              Array.isArray(deliveryInfo?.downloadUrls) &&
+              deliveryInfo.downloadUrls.length > 0)))
     );
 
     if (!rawProbe && canProbeContainer) {
@@ -3179,8 +5143,12 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
     if (rawProbe) {
       const extractedSz = sanitizeGameInstallSizeBytes(rawProbe.totalExtractedBytes);
       const containerSz = sanitizeGameInstallSizeBytes(rawProbe.totalContainerBytes);
-      if (extractedSz) resolvedDiskBytes = extractedSz;
-      if (containerSz) resolvedDlBytes = containerSz;
+      if (!isChainedOrStubPackage || (extractedSz && extractedSz > STUB_PACKAGE_MAX_BYTES)) {
+        if (extractedSz) resolvedDiskBytes = extractedSz;
+      }
+      if (!isChainedOrStubPackage || (containerSz && containerSz > STUB_PACKAGE_MAX_BYTES)) {
+        if (containerSz) resolvedDlBytes = containerSz;
+      }
 
       xboxCompatibility = {
         tier: rawProbe.tier || 'tier_a_supported',
@@ -3219,15 +5187,109 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
         ''
     );
 
-    if (platform === 'darwin') {
-      if (declaredExternalLauncher) {
+    if (handoffId && ecosystem) {
+      resolvedChainedHandoff = handoffId;
+      externalLauncher = ecosystem.displayName;
+      externalLauncherUrl = '';
+      if (platform === 'darwin') {
+        if (!ecosystem.supportedInWineBottle) {
+          canDirectDownload = false;
+          requiresStoreClientFallback = false;
+          xboxCompatibility = {
+            tier: 'tier_c_kernel_anticheat',
+            canExtractAndRun: false,
+            requiresCoreWindow: false,
+            antiCheatDetected: true,
+            antiCheatSignals: ['Riot Vanguard (vgk.sys)'],
+            externalLauncher: ecosystem.displayName,
+            externalStorefrontHandoff: handoffId,
+            chainedLauncherHandoff: handoffId,
+            summary:
+              ecosystem.unsupportedBottleReason ||
+              'Requires Riot Vanguard kernel anti-cheat (Windows native only).',
+          };
+          availableInstallers = [
+            {
+              id: 'xbox-chained-bottle-launcher',
+              label: `Windows (${ecosystem.displayName})`,
+              name: `${titleLabel} — Windows (${ecosystem.displayName})`,
+              os: 'windows',
+              externalLauncher: ecosystem.displayName,
+              externalStorefrontHandoff: handoffId,
+              chainedLauncherHandoff: handoffId,
+            },
+          ];
+        } else {
+          isCrossPlatformBottleInstall = true;
+          canDirectDownload = true;
+          requiresStoreClientFallback = false;
+          xboxCompatibility = {
+            tier: 'tier_c_external_launcher',
+            canExtractAndRun: true,
+            requiresCoreWindow: false,
+            antiCheatDetected: false,
+            antiCheatSignals: [],
+            externalLauncher: ecosystem.displayName,
+            externalStorefrontHandoff: handoffId,
+            chainedLauncherHandoff: handoffId,
+            summary: `Runs in Compatibility Bottle via ${ecosystem.displayName}. One Launcher automatically installs and opens ${ecosystem.displayName} inside your bottle.`,
+          };
+          availableInstallers = [
+            {
+              id: 'xbox-chained-bottle-launcher',
+              label: `Windows (${ecosystem.displayName} in Bottle)`,
+              name: `${titleLabel} — Windows (${ecosystem.displayName} in Bottle)`,
+              os: 'windows',
+              sizeBytes: resolvedDiskBytes,
+              totalSizeBytes: resolvedDiskBytes,
+              externalLauncher: ecosystem.displayName,
+              externalStorefrontHandoff: handoffId,
+              chainedLauncherHandoff: handoffId,
+            },
+          ];
+        }
+      } else {
+        canDirectDownload = true;
+        requiresStoreClientFallback = false;
+        xboxCompatibility = {
+          tier: 'tier_c_external_launcher',
+          canExtractAndRun: true,
+          requiresCoreWindow: false,
+          antiCheatDetected: false,
+          antiCheatSignals: [],
+          externalLauncher: ecosystem.displayName,
+          externalStorefrontHandoff: handoffId,
+          chainedLauncherHandoff: handoffId,
+          summary: `Installs via ${ecosystem.displayName} on Windows.`,
+        };
+        availableInstallers = [
+          {
+            id: 'xbox-chained-win-launcher',
+            label: `Windows (${ecosystem.displayName})`,
+            name: `${titleLabel} — Windows (${ecosystem.displayName})`,
+            os: 'windows',
+            sizeBytes: resolvedDiskBytes,
+            totalSizeBytes: resolvedDiskBytes,
+            externalLauncher: ecosystem.displayName,
+            externalStorefrontHandoff: handoffId,
+            chainedLauncherHandoff: handoffId,
+          },
+        ];
+      }
+    } else if (platform === 'darwin') {
+      const isCrossPlatformLauncher =
+        deliveryInfo?.isCrossPlatformLauncherRuntime === true ||
+        Boolean(
+          declaredExternalLauncher &&
+            (!deliveryInfo?.downloadUrls || deliveryInfo.downloadUrls.length === 0) &&
+            !deliveryInfo?.externalStorefrontHandoff &&
+            !/ubisoft|ea\s*app|origin|battle\.net|blizzard|riot|rockstar/i.test(
+              declaredExternalLauncher
+            )
+        );
+      if (isCrossPlatformLauncher && declaredExternalLauncher) {
         externalLauncher = declaredExternalLauncher;
         externalLauncherUrl = declaredExternalLauncherUrl;
-      }
-      if (
-        declaredExternalLauncher &&
-        (!deliveryInfo?.downloadUrls || deliveryInfo.downloadUrls.length === 0)
-      ) {
         canDirectDownload = false;
         requiresStoreClientFallback = true;
         xboxCompatibility = xboxCompatibility
@@ -3331,6 +5393,53 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
       resolvedDiskBytes || availableInstallers[0]?.totalSizeBytes || estimatedSizeBytes
     );
     downloadSizeBytes = sanitizeGameInstallSizeBytes(resolvedDlBytes);
+  } else if (resolveAnyChainedHandoffId(platformId)) {
+    const standaloneHandoff = resolveAnyChainedHandoffId(platformId);
+    const ecosystem = standaloneHandoff ? CHAINED_PUBLISHER_ECOSYSTEMS[standaloneHandoff] : null;
+    const titleLabel = payload.title || 'Game';
+    if (standaloneHandoff && ecosystem) {
+      resolvedChainedHandoff = standaloneHandoff;
+      externalLauncher = ecosystem.displayName;
+      externalLauncherUrl = '';
+      if (platform === 'darwin') {
+        isCrossPlatformBottleInstall = Boolean(ecosystem.supportedInWineBottle);
+        canDirectDownload = Boolean(ecosystem.supportedInWineBottle);
+        requiresStoreClientFallback = false;
+        availableInstallers = [
+          {
+            id: 'xbox-chained-bottle-launcher',
+            label: ecosystem.supportedInWineBottle
+              ? `Windows (${ecosystem.displayName} in Bottle)`
+              : `Windows (${ecosystem.displayName})`,
+            name: ecosystem.supportedInWineBottle
+              ? `${titleLabel} — Windows (${ecosystem.displayName} in Bottle)`
+              : `${titleLabel} — Windows (${ecosystem.displayName})`,
+            os: 'windows',
+            sizeBytes: estimatedSizeBytes,
+            totalSizeBytes: estimatedSizeBytes,
+            externalLauncher: ecosystem.displayName,
+            externalStorefrontHandoff: standaloneHandoff,
+            chainedLauncherHandoff: standaloneHandoff,
+          },
+        ];
+      } else {
+        canDirectDownload = true;
+        requiresStoreClientFallback = false;
+        availableInstallers = [
+          {
+            id: 'xbox-chained-win-launcher',
+            label: `Windows (${ecosystem.displayName})`,
+            name: `${titleLabel} — Windows (${ecosystem.displayName})`,
+            os: 'windows',
+            sizeBytes: estimatedSizeBytes,
+            totalSizeBytes: estimatedSizeBytes,
+            externalLauncher: ecosystem.displayName,
+            externalStorefrontHandoff: standaloneHandoff,
+            chainedLauncherHandoff: standaloneHandoff,
+          },
+        ];
+      }
+    }
   }
 
   return {
@@ -3340,6 +5449,7 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
     estimatedSizeBytes,
     ...(downloadSizeBytes ? { downloadSizeBytes } : {}),
     ...(dlcSizeBytes ? { dlcSizeBytes } : {}),
+    ...(authoritativeOsSupport !== undefined ? { authoritativeOsSupport } : {}),
     defaultInstallDir,
     availableInstallDirs,
     availableInstallers,
@@ -3347,6 +5457,14 @@ async function getGameInstallInfo(/** @type {any} */ payload = {}, /** @type {an
     requiresStoreClientFallback,
     ...(isCrossPlatformBottleInstall ? { isCrossPlatformBottleInstall: true } : {}),
     ...(xboxCompatibility ? { xboxCompatibility } : {}),
+    ...(resolvedChainedHandoff
+      ? {
+          externalStorefrontHandoff: resolvedChainedHandoff,
+          chainedLauncherHandoff: resolvedChainedHandoff,
+        }
+      : {}),
+    ...(resolvedChainedTopology ? { chainedHandoffTopology: resolvedChainedTopology } : {}),
+    ...(resolvedEpicRegistryPath ? { epicPartnerRegistryPath: resolvedEpicRegistryPath } : {}),
     ...(externalLauncher !== undefined
       ? { externalLauncher, externalLauncherUrl: externalLauncherUrl ?? '' }
       : {}),
@@ -3486,6 +5604,31 @@ async function installGame(
       installDir,
       ...(payload.os ? { os: payload.os } : {}),
       ...(payload.installerId ? { installerId: payload.installerId } : {}),
+      ...(payload.compatibilityLayer ? { compatibilityLayer: payload.compatibilityLayer } : {}),
+      ...(payload.wineBottle ? { wineBottle: payload.wineBottle } : {}),
+      ...(payload.wineBottleName ? { wineBottleName: payload.wineBottleName } : {}),
+      ...(payload.chainedLauncherHandoff || payload.chainedRequiresLauncherHandoff
+        ? {
+            chainedLauncherHandoff:
+              payload.chainedLauncherHandoff || payload.chainedRequiresLauncherHandoff,
+          }
+        : {}),
+      ...(typeof payload.isExternalLauncherStubPackage === 'boolean'
+        ? { isExternalLauncherStubPackage: payload.isExternalLauncherStubPackage }
+        : {}),
+      ...(payload.externalStorefrontHandoff
+        ? { externalStorefrontHandoff: payload.externalStorefrontHandoff }
+        : {}),
+      ...(payload.externalLauncher ? { externalLauncher: payload.externalLauncher } : {}),
+      ...(payload.chainedExternalInstallId
+        ? { chainedExternalInstallId: payload.chainedExternalInstallId }
+        : {}),
+      ...(payload.chainedHandoffTopology
+        ? { chainedHandoffTopology: payload.chainedHandoffTopology }
+        : {}),
+      ...(payload.epicPartnerRegistryPath
+        ? { epicPartnerRegistryPath: payload.epicPartnerRegistryPath }
+        : {}),
       includeDlcs: Boolean(payload.includeDlcs),
       ...(payload.headerImage ? { headerImage: payload.headerImage } : {}),
       ...(totalBytes > 0 ? { estimatedSizeBytes: totalBytes } : {}),
@@ -3926,6 +6069,87 @@ async function installGame(
       const resolvedAppName =
         epicInfo.resolvedAppName || platformGameId.replace(/^epic-/i, '') || platformGameId;
 
+      const isExplicitEpicChainedInstaller = /^epic-chained-(?:bottle|host|win)-launcher$/i.test(
+        String(payload.installerId || '')
+      );
+      let epicChainedHandoff = resolveAnyChainedHandoffId(
+        epicInfo.chainedLauncherHandoff ||
+          payload.chainedLauncherHandoff ||
+          payload.externalStorefrontHandoff ||
+          (isExplicitEpicChainedInstaller ? payload.externalLauncher : '')
+      );
+      let epicPartnerRegPath =
+        epicInfo.epicPartnerRegistryPath ||
+        (typeof payload.epicPartnerRegistryPath === 'string' &&
+        payload.epicPartnerRegistryPath.trim()
+          ? payload.epicPartnerRegistryPath.trim()
+          : undefined);
+
+      if (
+        !epicChainedHandoff &&
+        (payload.chainedHandoffTopology === 'partner_launcher_link' ||
+          isExplicitEpicChainedInstaller) &&
+        legendaryBin &&
+        resolvedAppName &&
+        !options.skipNetwork &&
+        !options.disableLegendarySpawn
+      ) {
+        try {
+          const execFileImpl =
+            typeof options.execFileFn === 'function' ? options.execFileFn : execFile;
+          const legAuth = await ensureLegendaryConfigAndAuth(options);
+          const probedPartner = await new Promise((resolve) => {
+            execFileImpl(
+              legendaryBin,
+              ['info', resolvedAppName, '--platform', 'Windows', '--json'],
+              { env: legAuth.env, timeout: 10000 },
+              (/** @type {any} */ err, /** @type {any} */ stdout) => {
+                if (err || !stdout) return resolve(null);
+                try {
+                  resolve(extractEpicThirdPartyPartnerMetadata(JSON.parse(String(stdout).trim())));
+                } catch {
+                  resolve(null);
+                }
+              }
+            );
+          });
+          if (probedPartner?.chainedLauncherHandoff) {
+            epicChainedHandoff = probedPartner.chainedLauncherHandoff;
+          }
+          if (!epicPartnerRegPath && probedPartner?.epicPartnerRegistryPath) {
+            epicPartnerRegPath = probedPartner.epicPartnerRegistryPath;
+          }
+        } catch {}
+      }
+
+      if (
+        epicChainedHandoff ||
+        isExplicitEpicChainedInstaller ||
+        payload.chainedHandoffTopology === 'partner_launcher_link'
+      ) {
+        return await executeChainedPublisherInstallFlow(
+          {
+            taskId,
+            task,
+            payload: {
+              ...payload,
+              ...(epicInfo.chainedExternalInstallId && !payload.chainedExternalInstallId
+                ? { chainedExternalInstallId: epicInfo.chainedExternalInstallId }
+                : {}),
+            },
+            platform,
+            platformId: 'epic',
+            platformGameId: platformGameId || resolvedAppName,
+            title,
+            cleanStoreId: '',
+            chainedHandoffId: epicChainedHandoff,
+            chainedHandoffTopology: 'partner_launcher_link',
+            epicPartnerRegistryPath: epicPartnerRegPath,
+          },
+          options
+        );
+      }
+
       let epicPlatformFlag = 'Windows';
       if (platform === 'darwin') {
         if (payload.os === 'windows' || payload.installerId === 'epic-win-compat') {
@@ -4261,6 +6485,31 @@ async function installGame(
                 options
               );
             } else {
+              if (
+                !payload._retriedThirdPartyChained &&
+                /(?:third[- ]party\s+launcher|ThirdPartyManagedApp|(?:The\s+)?EA\s+App|Origin\s+client|Ubisoft\s+Connect|Uplay)/i.test(
+                  lastErrorLine
+                )
+              ) {
+                const fallbackHandoff = /ubisoft|uplay/i.test(lastErrorLine) ? 'ubisoft' : 'ea';
+                await executeChainedPublisherInstallFlow(
+                  {
+                    taskId,
+                    task,
+                    payload: { ...payload, _retriedThirdPartyChained: true },
+                    platform,
+                    platformId: 'epic',
+                    platformGameId: platformGameId || resolvedAppName,
+                    title,
+                    cleanStoreId: '',
+                    chainedHandoffId: fallbackHandoff,
+                    chainedHandoffTopology: 'partner_launcher_link',
+                    epicPartnerRegistryPath: epicPartnerRegPath,
+                  },
+                  options
+                );
+                return;
+              }
               if (sawAuthFailure && !payload._retriedAfterReauth) {
                 updateDownloadTask(
                   taskId,
@@ -4364,8 +6613,11 @@ async function installGame(
       const gogToken = options.gogAccessToken || authRes?.accessToken || savedTokens?.gog?.access_token;
       const gogdlBin = findGogdlBinary(options);
       const cleanId = platformGameId.replace(/^gog-/i, '');
+      const canUseNativeDepot =
+        Boolean(options.useNativeGogDepotDownloader) ||
+        (!options.homedir && !options.skipNetwork && typeof options.spawnFn !== 'function');
 
-      if (gogdlBin && gogToken && !options.disableGogdlSpawn) {
+      if (gogToken && !options.disableGogdlSpawn && (gogdlBin || canUseNativeDepot)) {
         try {
           const gogAuthPath =
             authRes?.configPath ||
@@ -4386,21 +6638,64 @@ async function installGame(
             }
           } catch {}
 
+          /** @type {any} */
+          let buildsCheck = null;
           let isV1Build = false;
-          if (!options.homedir && !options.skipNetwork) {
+          let isV2Build = false;
+          if (canUseNativeDepot) {
             try {
-              const buildsCheck = await fetchGogV1Json(
+              buildsCheck = await fetchGogV1Json(
                 `https://content-system.gog.com/products/${encodeURIComponent(cleanId)}/os/${encodeURIComponent(gogPlatformFlag)}/builds?generation=2`,
                 {},
-                4000
+                4000,
+                options.fetchImpl || fetch
               );
               if (buildsCheck?.items?.[0]?.generation === 1) {
                 isV1Build = true;
+              } else if (
+                Array.isArray(buildsCheck?.items) &&
+                buildsCheck.items.some((/** @type {any} */ b) => b && b.generation === 2)
+              ) {
+                isV2Build = true;
               }
             } catch {}
           }
 
-          if (isV1Build) {
+          if (canUseNativeDepot && isV2Build) {
+            downloadGogV2Depot(
+              {
+                taskId,
+                cleanId,
+                platformGameId,
+                title,
+                gogPlatformFlag,
+                finalInstallPath,
+                gogToken,
+                gogdlBin,
+                gogAuthPath,
+                platform,
+                totalBytes,
+                includeDlcs: payload.includeDlcs === true,
+                buildsJson: buildsCheck,
+              },
+              options
+            ).catch((/** @type {any} */ v2Err) => {
+              if (v2Err && (v2Err.isPausedByUser || v2Err.isCancelledByUser)) return;
+              const curTask = downloadQueueMap.get(taskId);
+              if (curTask && curTask.status === 'cancelled') return;
+              updateDownloadTask(
+                taskId,
+                {
+                  status: 'failed',
+                  speedBytesPerSec: 0,
+                  etaSeconds: undefined,
+                  error: v2Err.message,
+                  statusMessage: `V2 depot installation failed: ${v2Err.message}`,
+                },
+                options
+              );
+            });
+          } else if (canUseNativeDepot && isV1Build) {
             downloadGogV1Depot(
               {
                 taskId,
@@ -4418,7 +6713,9 @@ async function installGame(
               },
               options
             ).catch((/** @type {any} */ v1Err) => {
-              if (v1Err && v1Err.isPausedByUser) return;
+              if (v1Err && (v1Err.isPausedByUser || v1Err.isCancelledByUser)) return;
+              const curTask = downloadQueueMap.get(taskId);
+              if (curTask && curTask.status === 'cancelled') return;
               updateDownloadTask(
                 taskId,
                 {
@@ -4431,11 +6728,12 @@ async function installGame(
                 options
               );
             });
-          } else {
+          } else if (gogdlBin) {
             const existingExeCheck = findPrimaryExecutable(finalInstallPath, {
               platform,
               hintName: title,
               preferWindowsExecutable: platform === 'darwin' && gogPlatformFlag === 'windows',
+              readOnly: true,
             });
             if (!existingExeCheck.executablePath && !payload._resumingPausedInstall) {
               clearStaleGogdlManifestCache(cleanId, options);
@@ -4455,6 +6753,12 @@ async function installGame(
               '--lang',
               gogLocale,
             ];
+            if (typeof options.spawnFn !== 'function' && !options.homedir) {
+              gogArgs.push(
+                '--max-workers',
+                String(Math.min(6, Math.max(2, os.cpus()?.length || 4)))
+              );
+            }
 
             const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
             const resolvedGogdlSpawn =
@@ -4474,6 +6778,7 @@ async function installGame(
             const ctrl = {
               type: 'process',
               child,
+              gogV2InstallPath: finalInstallPath,
               pausedByUser: false,
               cancelRequested: false,
               exitedWhilePaused: false,
@@ -4495,6 +6800,8 @@ async function installGame(
 
             let lastErrorLine = '';
             let gogReportedDiskSizeBytes = 0;
+            let bareSizeTupleCount = 0;
+            let lastWrittenBytes = 0;
 
             const onGogOutput = (/** @type {any} */ chunk) => {
               const text = String(chunk || '');
@@ -4514,7 +6821,12 @@ async function installGame(
                 if (sizeTupleMatch && currentTask) {
                   const parsedBytes = Number(sizeTupleMatch[1]);
                   if (parsedBytes > 0) {
-                    if (/Disk size:/i.test(line) && !/Download size:/i.test(line)) {
+                    const isExplicitDisk = /Disk size:/i.test(line) && !/Download size:/i.test(line);
+                    const isExplicitDownload = /Download size:/i.test(line);
+                    if (!isExplicitDisk && !isExplicitDownload) {
+                      bareSizeTupleCount += 1;
+                    }
+                    if (isExplicitDisk || (!isExplicitDownload && bareSizeTupleCount >= 2)) {
                       const validDisk = sanitizeGameInstallSizeBytes(parsedBytes);
                       if (validDisk) {
                         gogReportedDiskSizeBytes = validDisk;
@@ -4567,13 +6879,36 @@ async function installGame(
 
                 const progressBytesMatch = line.match(/Progress:\s*[\d.]+\s+(\d+)\/(\d+)/i);
                 if (progressBytesMatch && currentTask && Number(progressBytesMatch[2]) > 0) {
-                  currentTask.totalBytes = Number(progressBytesMatch[2]);
-                  const dlBytesVal = Math.max(
-                    currentTask.downloadedBytes || currentTask.bytesDownloaded || 0,
-                    Number(progressBytesMatch[1]) || 0
-                  );
-                  currentTask.downloadedBytes = dlBytesVal;
-                  currentTask.bytesDownloaded = dlBytesVal;
+                  const reportedDenominator = Number(progressBytesMatch[2]);
+                  const reportedNumerator = Number(progressBytesMatch[1]) || 0;
+                  if (currentTask.hasExactDownloadSize && currentTask.totalBytes > 0) {
+                    const validDisk = sanitizeGameInstallSizeBytes(reportedDenominator);
+                    if (validDisk && validDisk > currentTask.totalBytes) {
+                      gogReportedDiskSizeBytes = Math.max(gogReportedDiskSizeBytes, validDisk);
+                      currentTask.diskSizeBytes = Math.max(
+                        Number(currentTask.diskSizeBytes || 0),
+                        validDisk
+                      );
+                    }
+                    const ratio = Math.min(1, Math.max(0, reportedNumerator / reportedDenominator));
+                    const dlBytesVal = Math.min(
+                      currentTask.totalBytes,
+                      Math.max(
+                        currentTask.downloadedBytes || currentTask.bytesDownloaded || 0,
+                        Math.round(ratio * currentTask.totalBytes)
+                      )
+                    );
+                    currentTask.downloadedBytes = dlBytesVal;
+                    currentTask.bytesDownloaded = dlBytesVal;
+                  } else {
+                    currentTask.totalBytes = reportedDenominator;
+                    const dlBytesVal = Math.max(
+                      currentTask.downloadedBytes || currentTask.bytesDownloaded || 0,
+                      reportedNumerator
+                    );
+                    currentTask.downloadedBytes = dlBytesVal;
+                    currentTask.bytesDownloaded = dlBytesVal;
+                  }
                   resolvedSizeOnChunk = true;
                 }
               }
@@ -4609,6 +6944,16 @@ async function installGame(
 
               const pctMatch = matchLast(text, /Progress:\s*([\d.]+)%?/gi);
               const dlMiBMatch = matchLast(text, /Downloaded:\s*([\d.]+)\s*(KiB|MiB|GiB|B)?/gi);
+              const writtenMatch = matchLast(text, /Written:\s*([\d.]+)\s*(KiB|MiB|GiB|B)?/gi);
+              if (writtenMatch) {
+                const parsedWritten = parseCliSizeToBytes(
+                  writtenMatch[1],
+                  writtenMatch[2] || 'MiB'
+                );
+                if (parsedWritten > lastWrittenBytes) {
+                  lastWrittenBytes = parsedWritten;
+                }
+              }
               const speedMatch =
                 matchLast(text, /\+\s*Download\s*-\s*([\d.]+)\s*(KiB|MiB|GiB|B)\/s/gi) ||
                 matchLast(text, /Download\s*-\s*([\d.]+)\s*(KiB|MiB|GiB|B)?/gi);
@@ -4616,9 +6961,13 @@ async function installGame(
                 text,
                 /\/\s*([\d.]+)\s*(KiB|MiB|GiB|B)\/s\s*\(decompressed\)/gi
               );
+              const diskWriteMatch = matchLast(
+                text,
+                /\+\s*Disk\s*-\s*([\d.]+)\s*(KiB|MiB|GiB|B)\/s(?:\s*\(write\))?/gi
+              );
               const etaMatch = matchLast(text, /ETA:\s*(\d+):(\d+):(\d+)/gi);
 
-              if (pctMatch || dlMiBMatch || speedMatch || etaMatch) {
+              if (pctMatch || dlMiBMatch || speedMatch || etaMatch || diskWriteMatch) {
                 /** @type {any} */
                 const partialUpdate = {};
                 if (pctMatch) {
@@ -4629,10 +6978,14 @@ async function installGame(
                 }
                 if (dlMiBMatch) {
                   currentTask.hasExplicitCliBytes = true;
-                  partialUpdate.bytesDownloaded = parseCliSizeToBytes(
+                  const parsedDlBytes = parseCliSizeToBytes(
                     dlMiBMatch[1],
                     dlMiBMatch[2] || 'MiB'
                   );
+                  partialUpdate.bytesDownloaded =
+                    currentTask.hasExactDownloadSize && currentTask.totalBytes > 0
+                      ? Math.min(currentTask.totalBytes, parsedDlBytes)
+                      : parsedDlBytes;
                 } else if (
                   pctMatch &&
                   !currentTask.hasExplicitCliBytes &&
@@ -4647,6 +7000,9 @@ async function installGame(
                   : 0;
                 const decompCliSpeed = decompMatch
                   ? parseCliSizeToBytes(decompMatch[1], decompMatch[2] || 'MiB')
+                  : 0;
+                const diskWriteSpeed = diskWriteMatch
+                  ? parseCliSizeToBytes(diskWriteMatch[1], diskWriteMatch[2] || 'MiB')
                   : 0;
                 if (speedMatch || partialUpdate.bytesDownloaded !== undefined) {
                   const smoothedSpeed = computeSmoothedDownloadSpeed(taskId, {
@@ -4686,11 +7042,35 @@ async function installGame(
                     partialUpdate.etaSeconds = cliEta;
                   }
                 }
+
+                const knownDiskTotal =
+                  gogReportedDiskSizeBytes || Number(currentTask.diskSizeBytes || 0) || 0;
+                const activeDlBytes =
+                  partialUpdate.bytesDownloaded !== undefined
+                    ? partialUpdate.bytesDownloaded
+                    : Number(currentTask.bytesDownloaded || currentTask.downloadedBytes || 0);
+                const isTailDiskWritePhase =
+                  currentTask.totalBytes > 0 &&
+                  activeDlBytes >= currentTask.totalBytes * 0.99 &&
+                  knownDiskTotal > 0 &&
+                  lastWrittenBytes < knownDiskTotal &&
+                  diskWriteSpeed > 0;
+
                 const displayPct =
                   partialUpdate.progressPercent !== undefined
                     ? partialUpdate.progressPercent
                     : currentTask.progressPercent;
-                partialUpdate.statusMessage = `Installing via gogdl (${displayPct}%)...`;
+                if (isTailDiskWritePhase) {
+                  partialUpdate.status = 'extracting';
+                  partialUpdate.speedBytesPerSec = diskWriteSpeed;
+                  partialUpdate.etaSeconds = Math.max(
+                    1,
+                    Math.round((knownDiskTotal - lastWrittenBytes) / diskWriteSpeed)
+                  );
+                  partialUpdate.statusMessage = `Installing game files to disk (${displayPct}%)...`;
+                } else {
+                  partialUpdate.statusMessage = `Downloading via gogdl (${displayPct}%)...`;
+                }
                 updateDownloadTask(taskId, partialUpdate, options);
               }
             };
@@ -4709,7 +7089,9 @@ async function installGame(
 
               if (code === 0) {
                 const targetScanDir = fs.existsSync(finalInstallPath) ? finalInstallPath : installDir;
+                evictExecutableDiscoveryCacheForPath(targetScanDir);
                 flattenGogNestedInstallDir(targetScanDir, cleanId);
+                evictExecutableDiscoveryCacheForPath(targetScanDir);
                 const exeDiscovery = findPrimaryExecutable(targetScanDir, {
                   platform,
                   hintName: title,
@@ -4737,7 +7119,12 @@ async function installGame(
                     );
                     return;
                   } catch (/** @type {any} */ v1FallbackErr) {
-                    if (v1FallbackErr && v1FallbackErr.isPausedByUser) return;
+                    if (
+                      v1FallbackErr &&
+                      (v1FallbackErr.isPausedByUser || v1FallbackErr.isCancelledByUser)
+                    ) {
+                      return;
+                    }
                   }
                 }
 
@@ -4771,7 +7158,11 @@ async function installGame(
 
                 upsertManagedInstallRecord(gogRecord, options.userDataDir);
                 try {
-                  syncGogFirstPartyLauncher(gogRecord, options);
+                  syncGogFirstPartyLauncher(gogRecord, {
+                    ...options,
+                    alreadyFlattened: true,
+                    ignoreActiveDownloadGuard: true,
+                  });
                 } catch {}
 
                 updateDownloadTask(
@@ -4779,6 +7170,7 @@ async function installGame(
                   {
                     status: 'completed',
                     progressPercent: 100,
+                    installSize: resolvedGogInstallSize,
                     finalInstallPath: targetScanDir,
                     executablePath: exeDiscovery.executablePath,
                     runner: 'gogdl',
@@ -4816,7 +7208,12 @@ async function installGame(
                     );
                     return;
                   } catch (/** @type {any} */ v1FallbackErr) {
-                    if (v1FallbackErr && v1FallbackErr.isPausedByUser) return;
+                    if (
+                      v1FallbackErr &&
+                      (v1FallbackErr.isPausedByUser || v1FallbackErr.isCancelledByUser)
+                    ) {
+                      return;
+                    }
                   }
                 }
 
@@ -4834,6 +7231,18 @@ async function installGame(
                 );
               }
             });
+          } else {
+            updateDownloadTask(
+              taskId,
+              {
+                status: 'failed',
+                speedBytesPerSec: 0,
+                error:
+                  'Unable to reach GOG Content System and no local gogdl fallback binary is available.',
+                statusMessage: 'Failed to reach GOG Content System',
+              },
+              options
+            );
           }
         } catch (/** @type {any} */ err) {
           updateDownloadTask(
@@ -4857,13 +7266,14 @@ async function installGame(
           options
         );
       }
-    } else if (platformId === 'xbox') {
-      const cleanStoreId = String(
-        payload.xboxProductId || payload.storeId || platformGameId || ''
-      )
-        .replace(/^xbox[-_:]/i, '')
-        .trim()
-        .toUpperCase();
+    } else if (platformId === 'xbox' || resolveAnyChainedHandoffId(platformId)) {
+      const cleanStoreId =
+        platformId === 'xbox'
+          ? String(payload.xboxProductId || payload.storeId || platformGameId || '')
+              .replace(/^xbox[-_:]/i, '')
+              .trim()
+              .toUpperCase()
+          : '';
 
       const rawPayloadExternalUrl =
         typeof payload.externalLauncherUrl === 'string' ? payload.externalLauncherUrl.trim() : '';
@@ -4893,13 +7303,18 @@ async function installGame(
       /** @type {any} */
       let preResolveError = null;
 
-      if (
-        platform === 'darwin' &&
+      const needsDeliveryPreResolve =
+        platformId === 'xbox' &&
         !validatedPayloadExternalUrl &&
         !payload.msixvcPath &&
         (!Array.isArray(payload.downloadUrls) || payload.downloadUrls.length === 0) &&
-        !preResolvedDeliveryInfo
-      ) {
+        !preResolvedDeliveryInfo &&
+        (platform === 'darwin' ||
+          !options.skipNetwork ||
+          typeof options.xboxPackageDeliveryResolver === 'function' ||
+          typeof options.resolveXboxDeliveryFn === 'function');
+
+      if (needsDeliveryPreResolve) {
         const userDataDir = getUserDataDir(options.userDataDir);
         const xboxMods = getXboxStorefrontModules();
         const activeStoreSync = options.storeSync || storeSync;
@@ -4931,7 +7346,6 @@ async function installGame(
 
         if (
           !preResolvedDeliveryInfo &&
-          payload.installerId === 'xbox-external-mac-launcher' &&
           typeof xboxMods?.fetchXboxProductMetadata === 'function' &&
           !options.skipNetwork
         ) {
@@ -4948,6 +7362,9 @@ async function installGame(
                 packageFamilyName: meta.packageFamilyName,
                 packageFullName: meta.packageFullName,
                 maxDownloadSizeBytes: meta.maxDownloadSizeBytes,
+                pcMaxInstallSizeBytes: meta.pcMaxInstallSizeBytes,
+                isExternalLauncherStubPackage: Boolean(meta.isExternalLauncherStubPackage),
+                isCrossPlatformLauncherRuntime: Boolean(meta.isCrossPlatformLauncherRuntime),
                 externalLauncher: meta.externalLauncher,
                 externalLauncherUrl: meta.externalLauncherUrl,
                 externalStorefrontHandoff: meta.externalStorefrontHandoff,
@@ -4967,13 +7384,76 @@ async function installGame(
       const validatedDeliveryExternalUrl = validateTrustedExternalLauncherUrl(
         preResolvedDeliveryInfo?.externalLauncherUrl || ''
       );
-      const externalLauncherUrl =
-        validatedPayloadExternalUrl ||
-        (platform === 'darwin' &&
-        (payload.installerId === 'xbox-external-mac-launcher' ||
-          (!payload.msixvcPath && preResolvedDownloadUrls.length === 0))
-          ? validatedDeliveryExternalUrl
-          : '');
+
+      const isExternalLauncherStubPkg = Boolean(
+        payload.isExternalLauncherStubPackage === true ||
+          preResolvedDeliveryInfo?.isExternalLauncherStubPackage === true
+      );
+
+      let chainedHandoffId = resolveAnyChainedHandoffId(
+        payload.chainedLauncherHandoff ||
+          payload.chainedRequiresLauncherHandoff ||
+          payload.externalStorefrontHandoff ||
+          preResolvedDeliveryInfo?.chainedLauncherHandoff ||
+          preResolvedDeliveryInfo?.chainedRequiresLauncherHandoff ||
+          preResolvedDeliveryInfo?.externalStorefrontHandoff ||
+          (isExternalLauncherStubPkg
+            ? preResolvedDeliveryInfo?.externalLauncher || payload.externalLauncher || ''
+            : '') ||
+          (platformId !== 'xbox' ? platformId : '')
+      );
+      if (
+        !chainedHandoffId &&
+        (payload.installerId === 'xbox-chained-bottle-launcher' ||
+          payload.installerId === 'xbox-chained-win-launcher' ||
+          payload.installerId === 'xbox-chained-host-launcher')
+      ) {
+        chainedHandoffId = resolveAnyChainedHandoffId(payload.externalLauncher || '');
+      }
+      const isChainedInstallFlow = Boolean(
+        chainedHandoffId ||
+          payload.installerId === 'xbox-chained-bottle-launcher' ||
+          payload.installerId === 'xbox-chained-win-launcher' ||
+          payload.installerId === 'xbox-chained-host-launcher'
+      );
+
+      const externalLauncherUrl = isChainedInstallFlow
+        ? ''
+        : preResolvedDeliveryInfo?.isCrossPlatformLauncherRuntime === true ||
+            (isExternalLauncherStubPkg &&
+              !chainedHandoffId &&
+              Boolean(validatedPayloadExternalUrl || validatedDeliveryExternalUrl))
+          ? validatedPayloadExternalUrl || validatedDeliveryExternalUrl
+          : platform === 'darwin' &&
+              payload.installerId === 'xbox-external-mac-launcher' &&
+              !chainedHandoffId
+            ? validatedPayloadExternalUrl ||
+              (!/ubisoft|ea\.com|battle\.net|blizzard\.com|riotgames|rockstargames/i.test(
+                validatedDeliveryExternalUrl
+              )
+                ? validatedDeliveryExternalUrl
+                : '')
+            : '';
+
+      if (isChainedInstallFlow) {
+        return await executeChainedPublisherInstallFlow(
+          {
+            taskId,
+            task,
+            payload,
+            platform,
+            platformId,
+            platformGameId,
+            title,
+            cleanStoreId,
+            chainedHandoffId,
+            chainedHandoffTopology:
+              payload.chainedHandoffTopology ||
+              (platformId === 'xbox' ? 'publisher_managed' : undefined),
+          },
+          options
+        );
+      }
 
       const explicitlyRequestedClientless =
         payload.installerId === 'xbox-msixvc-win' ||
@@ -5116,10 +7596,50 @@ async function installGame(
               : Array.isArray(deliveryInfo?.downloadUrls)
                 ? deliveryInfo.downloadUrls
                 : [];
-            if (!payload.msixvcPath && downloadUrls.length === 0) {
+            if (
+              !payload.msixvcPath &&
+              (downloadUrls.length === 0 || deliveryInfo?.isExternalLauncherStubPackage === true)
+            ) {
+              const deferredChainedHandoffId = resolveAnyChainedHandoffId(
+                deliveryInfo?.externalStorefrontHandoff ||
+                  deliveryInfo?.chainedLauncherHandoff ||
+                  deliveryInfo?.chainedRequiresLauncherHandoff ||
+                  deliveryInfo?.externalLauncher ||
+                  payload.externalLauncher
+              );
+              if (deferredChainedHandoffId) {
+                downloadControllers.delete(taskId);
+                await installGame(
+                  {
+                    ...payload,
+                    taskId,
+                    isExternalLauncherStubPackage: Boolean(
+                      deliveryInfo?.isExternalLauncherStubPackage
+                    ),
+                    externalStorefrontHandoff: deferredChainedHandoffId,
+                    chainedLauncherHandoff: deferredChainedHandoffId,
+                    installerId:
+                      platform === 'darwin'
+                        ? 'xbox-chained-bottle-launcher'
+                        : 'xbox-chained-win-launcher',
+                  },
+                  options
+                );
+                return;
+              }
+
+              const candidateFallbackUrl = validateTrustedExternalLauncherUrl(
+                deliveryInfo?.externalLauncherUrl || ''
+              );
+              const isPublisherWebUrl =
+                /ubisoft|ea\.com|battle\.net|blizzard\.com|riotgames|rockstargames/i.test(
+                  candidateFallbackUrl
+                );
               const fallbackHandoffUrl =
-                platform === 'darwin'
-                  ? validateTrustedExternalLauncherUrl(deliveryInfo?.externalLauncherUrl || '')
+                platform === 'darwin' &&
+                candidateFallbackUrl &&
+                (deliveryInfo?.isCrossPlatformLauncherRuntime === true || !isPublisherWebUrl)
+                  ? candidateFallbackUrl
                   : '';
               if (fallbackHandoffUrl) {
                 const fallbackLauncher =
@@ -6006,6 +8526,67 @@ function cleanupCancelledXboxPartialInstall(/** @type {any} */ task, /** @type {
   }
 }
 
+function cleanupCancelledGogV2PartialInstall(/** @type {any} */ task, /** @type {any} */ ctrl) {
+  if (!task || task.platformId !== 'gog') return;
+  /** @type {Set<string>} */
+  const candidateRoots = new Set();
+  for (const rawDir of [ctrl?.gogV2InstallPath, task.finalInstallPath]) {
+    if (typeof rawDir === 'string' && rawDir.trim()) {
+      candidateRoots.add(toHostFilesystemPath(rawDir));
+    }
+  }
+
+  const sweepOlPartFiles = (/** @type {string} */ dir, depth = 0) => {
+    if (depth > 8 || !fs.existsSync(dir)) return;
+    /** @type {fs.Dirent[]} */
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const fullPath = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        sweepOlPartFiles(fullPath, depth + 1);
+      } else if (ent.isFile() && ent.name.endsWith('.olpart')) {
+        try {
+          fs.unlinkSync(fullPath);
+        } catch {}
+      }
+    }
+  };
+
+  const removeStagingArtifacts = (/** @type {string} */ dir) => {
+    for (const metaName of [
+      '.onelauncher-gog-v2-resume.json',
+      '.gogdl-resume',
+      '.gogdl-download-cache',
+    ]) {
+      const target = path.join(dir, metaName);
+      try {
+        if (fs.existsSync(target)) {
+          fs.rmSync(target, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  };
+
+  for (const targetDir of candidateRoots) {
+    if (!targetDir || !fs.existsSync(targetDir)) continue;
+    sweepOlPartFiles(targetDir, 0);
+    removeStagingArtifacts(targetDir);
+    try {
+      const children = fs.readdirSync(targetDir, { withFileTypes: true });
+      for (const child of children) {
+        if (child.isDirectory() && !child.name.startsWith('.')) {
+          removeStagingArtifacts(path.join(targetDir, child.name));
+        }
+      }
+    } catch {}
+  }
+}
+
 function cancelDownload(/** @type {string} */ taskId, /** @type {any} */ options = {}) {
   ensureDownloadQueueRehydrated(options);
   pausedByInGameTaskIds.delete(taskId);
@@ -6021,10 +8602,12 @@ function cancelDownload(/** @type {string} */ taskId, /** @type {any} */ options
     downloadControllers.delete(taskId);
   }
   cleanupCancelledGogTempBins(task, ctrl);
+  cleanupCancelledGogV2PartialInstall(task, ctrl);
   cleanupCancelledXboxPartialInstall(task, ctrl);
   if (termPromise) {
     termPromise
       .finally(() => {
+        cleanupCancelledGogV2PartialInstall(task, ctrl);
         cleanupCancelledXboxPartialInstall(task, ctrl);
         return cleanupCancelledGogTempBinsAsync(task, ctrl);
       })
@@ -6049,6 +8632,7 @@ function clearDownloadQueue(/** @type {any} */ options = {}) {
     const task = downloadQueueMap.get(taskId);
     terminateDownloadController(ctrl, options);
     cleanupCancelledGogTempBins(task, ctrl);
+    cleanupCancelledGogV2PartialInstall(task, ctrl);
     cleanupCancelledXboxPartialInstall(task, ctrl);
   }
   downloadControllers.clear();
@@ -6116,8 +8700,12 @@ module.exports = {
   getDownloadQueue,
   updateDownloadTask,
   hasAuthenticatedSteamSessionInVdfCandidates,
+  measurePublisherStagingBytes,
   startSteamInstallMonitor,
   startXboxInstallMonitor,
+  startChainedLauncherInstallMonitor,
+  checkBottlePublisherLauncherAliveAsync,
+  checkHostWinPublisherLauncherAliveAsync,
   ensureWindowsSteamInBottle,
   sweepStaleGogTempBinsAsync,
   getGameInstallInfo,

@@ -21,6 +21,9 @@ const cachedLocalSteamPlaytimesByScope = new Map();
 /** @type {Map<string, { at: number, data: Record<number, { unlocked: number, total: number, percentage: number, isMastered: boolean }> }>} */
 const cachedLocalSteamAchievementsByScope = new Map();
 
+/** @type {Map<string, { at: number, data: Record<number, { chainedLauncherHandoff: 'ea', externalStorefrontHandoff: 'ea', chainedHandoffTopology: 'storefront_depot_uri', chainedExternalInstallId?: string }> }>} */
+const cachedLocalSteamEaChainedByScope = new Map();
+
 /** @type {Map<string, { mtimeMs: number, size: number, playtimes: Record<number, { playtimeMinutes: number, lastPlayedEpoch: number }> }>} */
 const steamLocalVdfMtimeCache = new Map();
 /** @type {Map<string, { mtimeMs: number, size: number, data: any }>} */
@@ -29,6 +32,7 @@ const steamLocalAchFileMtimeCache = new Map();
 function trimSteamLocalScannerMemory() {
   cachedLocalSteamPlaytimesByScope.clear();
   cachedLocalSteamAchievementsByScope.clear();
+  cachedLocalSteamEaChainedByScope.clear();
   steamLocalVdfMtimeCache.clear();
   steamLocalAchFileMtimeCache.clear();
 }
@@ -255,10 +259,168 @@ async function resolveLocalSteamUserdataDirs(options = {}) {
 function buildScannerScopeKey(options = {}) {
   const homeKey = String(options.homedir || '');
   const customDirs = Array.isArray(options.userdataDirs) ? options.userdataDirs.join(';') : '';
+  const customSteamapps = Array.isArray(options.steamappsDirs)
+    ? options.steamappsDirs.join(';')
+    : '';
   const acctKey = String(
     options.activeAccountId32 || options.activeSteamId64 || options.steamId || 'auto'
   );
-  return `${homeKey}|${customDirs}|${acctKey}`;
+  return `${homeKey}|${customDirs}|${customSteamapps}|${acctKey}`;
+}
+
+/**
+ * Parse EA `__Installer/installerdata.xml` inside an installed Steam depot to extract
+ * EA `<contentID>` (`Origin.OFR.*` / `EA.*` / numeric) and verify EA `storefront_depot_uri` topology.
+ *
+ * @param {string} xmlContent
+ * @returns {{ isEaChained: true, isEaInstaller: true, contentId?: string, primaryContentId?: string, contentIds: string[] } | null}
+ */
+function parseSteamEaInstallerDataXml(xmlContent) {
+  if (!xmlContent || typeof xmlContent !== 'string') return null;
+  const contentIds = [];
+  const cidRegex = /<contentID>\s*([^<\s][^<]*?)\s*<\/contentID>/gi;
+  let m;
+  while ((m = cidRegex.exec(xmlContent)) !== null) {
+    const val = String(m[1] || '').trim();
+    if (val) contentIds.push(val);
+  }
+  const hasEaManifestSignature =
+    contentIds.length > 0 ||
+    /<DiPManifest\b/i.test(xmlContent) ||
+    /\b(?:EA\s*Desktop|Origin\s*Games|Link2EA|Origin\.OFR\.)/i.test(xmlContent);
+  if (!hasEaManifestSignature) return null;
+
+  const preferredContentId =
+    contentIds.find((cid) => /^(?:Origin\.OFR\.|EA\.)/i.test(cid)) || contentIds[0] || undefined;
+  return {
+    isEaChained: true,
+    isEaInstaller: true,
+    ...(preferredContentId
+      ? { contentId: preferredContentId, primaryContentId: preferredContentId }
+      : {}),
+    contentIds,
+  };
+}
+
+/**
+ * Resolve all local Steam `steamapps` directories asynchronously (primary + `libraryfolders.vdf`
+ * secondary drives + CrossOver/Wine bottles on macOS) with zero mutations.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string[]>}
+ */
+async function resolveLocalSteamAppsDirs(options = {}) {
+  if (Array.isArray(options.steamappsDirs) && options.steamappsDirs.length > 0) {
+    return Array.from(new Set(options.steamappsDirs.filter(Boolean)));
+  }
+  const userdataDirs = await resolveLocalSteamUserdataDirs(options);
+  /** @type {Set<string>} */
+  const steamappsDirs = new Set();
+  for (const ud of userdataDirs) {
+    if (!ud) continue;
+    steamappsDirs.add(path.join(path.dirname(ud), 'steamapps'));
+  }
+
+  const initialList = Array.from(steamappsDirs);
+  for (const saDir of initialList) {
+    const libVdfPath = path.join(saDir, 'libraryfolders.vdf');
+    try {
+      const vdfContent = await fs.promises.readFile(libVdfPath, 'utf8');
+      const isBottleDir = /(?:^|[\\/])drive_c(?:[\\/]|$)/i.test(saDir);
+      const driveCMatch = isBottleDir ? saDir.match(/^(.*?[\\/]drive_c)(?:[\\/]|$)/i) : null;
+      const pathRe = /"path"\s+"([^"]+)"/gi;
+      let pm;
+      while ((pm = pathRe.exec(vdfContent)) !== null) {
+        const rawLibPath = String(pm[1] || '').replace(/\\\\/g, '\\').trim();
+        if (!rawLibPath) continue;
+        if (driveCMatch && /^[a-zA-Z]:[\\/]/.test(rawLibPath)) {
+          const driveLetter = rawLibPath[0].toLowerCase();
+          const relWin = rawLibPath.slice(2).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+          if (driveLetter === 'c') {
+            steamappsDirs.add(path.join(driveCMatch[1], relWin, 'steamapps'));
+          } else if (driveLetter === 'z') {
+            steamappsDirs.add(path.join('/', relWin, 'steamapps'));
+          }
+        } else {
+          steamappsDirs.add(path.join(rawLibPath, 'steamapps'));
+        }
+      }
+    } catch {}
+  }
+
+  return Array.from(steamappsDirs);
+}
+
+/**
+ * Asynchronously scan installed Steam games for `<steamGameInstallDir>/__Installer/installerdata.xml`
+ * to stamp EA `storefront_depot_uri` topology (`chainedLauncherHandoff: 'ea'`).
+ * Zero filesystem mutations (read-only).
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Record<number, { chainedLauncherHandoff: 'ea', externalStorefrontHandoff: 'ea', chainedHandoffTopology: 'storefront_depot_uri', chainedExternalInstallId?: string }>>}
+ */
+async function scanLocalSteamEaChainedGames(options = {}) {
+  const scopeKey = buildScannerScopeKey(options);
+  const cached = cachedLocalSteamEaChainedByScope.get(scopeKey);
+  if (!options?.force && cached && Date.now() - cached.at < STEAM_LOCAL_SCAN_TTL_MS) {
+    return { ...cached.data };
+  }
+
+  /** @type {Record<number, { chainedLauncherHandoff: 'ea', externalStorefrontHandoff: 'ea', chainedHandoffTopology: 'storefront_depot_uri', chainedExternalInstallId?: string }>} */
+  const detected = {};
+  try {
+    const steamappsDirs = await resolveLocalSteamAppsDirs(options);
+    for (const saDir of steamappsDirs) {
+      /** @type {string[]} */
+      let entries = [];
+      try {
+        entries = await fs.promises.readdir(saDir);
+      } catch {
+        continue;
+      }
+      for (const file of entries) {
+        const acfMatch = file.match(/^appmanifest_(\d+)\.acf$/i);
+        if (!acfMatch) continue;
+        const fallbackAppId = Number(acfMatch[1]);
+        try {
+          const acfRaw = await fs.promises.readFile(path.join(saDir, file), 'utf8');
+          const idMatch = acfRaw.match(/"appid"\s+"(\d+)"/i);
+          const dirMatch = acfRaw.match(/"installdir"\s+"([^"]+)"/i);
+          const appId = idMatch ? Number(idMatch[1]) : fallbackAppId;
+          const installDirName = dirMatch ? String(dirMatch[1] || '').trim() : '';
+          if (!appId || !installDirName) continue;
+          const gameDir = path.join(saDir, 'common', installDirName);
+          let xmlContent = '';
+          try {
+            xmlContent = await fs.promises.readFile(
+              path.join(gameDir, '__Installer', 'installerdata.xml'),
+              'utf8'
+            );
+          } catch {
+            try {
+              xmlContent = await fs.promises.readFile(
+                path.join(gameDir, '__installer', 'installerdata.xml'),
+                'utf8'
+              );
+            } catch {}
+          }
+          if (!xmlContent) continue;
+          const parsedEa = parseSteamEaInstallerDataXml(xmlContent);
+          if (parsedEa && parsedEa.isEaChained) {
+            detected[appId] = {
+              chainedLauncherHandoff: 'ea',
+              externalStorefrontHandoff: 'ea',
+              chainedHandoffTopology: 'storefront_depot_uri',
+              ...(parsedEa.contentId ? { chainedExternalInstallId: parsedEa.contentId } : {}),
+            };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  cachedLocalSteamEaChainedByScope.set(scopeKey, { at: Date.now(), data: detected });
+  return { ...detected };
 }
 
 /**
@@ -645,9 +807,10 @@ async function parseSteamGamesListJson(
   }
   const resolvedName = parsed?.strProfileName || personaName || 'Steam User';
   const scanOpts = { ...options, activeSteamId64: steamId || options.activeSteamId64 };
-  const [localPlaytimes, localAchievements] = await Promise.all([
+  const [localPlaytimes, localAchievements, localEaChained] = await Promise.all([
     readLocalSteamPlaytimes(scanOpts),
     scanLocalSteamAchievements(scanOpts),
+    scanLocalSteamEaChainedGames(scanOpts),
   ]);
   const games = [];
   const suppressedItems = [];
@@ -669,6 +832,23 @@ async function parseSteamGamesListJson(
 
     const si = storeItems[String(appId)];
     const existingGame = existingByAppId.get(appId);
+    const existingSteamPlat = Array.isArray(existingGame?.platforms)
+      ? existingGame.platforms.find((/** @type {any} */ p) => p && p.platformId === 'steam')
+      : null;
+    const eaChainedMeta = localEaChained[appId] || null;
+    const effectiveSteamHandoff =
+      eaChainedMeta?.chainedLauncherHandoff ||
+      existingSteamPlat?.chainedLauncherHandoff ||
+      existingSteamPlat?.externalStorefrontHandoff ||
+      undefined;
+    const effectiveSteamTopology =
+      eaChainedMeta?.chainedHandoffTopology ||
+      existingSteamPlat?.chainedHandoffTopology ||
+      (effectiveSteamHandoff ? 'storefront_depot_uri' : undefined);
+    const effectiveSteamExtId =
+      eaChainedMeta?.chainedExternalInstallId ||
+      existingSteamPlat?.chainedExternalInstallId ||
+      undefined;
     const assetFormat = (si && si.asset_url_format) || `steam/apps/${appId}/\${FILENAME}`;
     /** @param {string} filename */
     const buildAssetUrl = (filename) =>
@@ -724,6 +904,14 @@ async function parseSteamGamesListJson(
           installed: false,
           playtimeMinutes,
           lastPlayed,
+          ...(effectiveSteamHandoff
+            ? {
+                chainedLauncherHandoff: effectiveSteamHandoff,
+                externalStorefrontHandoff: effectiveSteamHandoff,
+              }
+            : {}),
+          ...(effectiveSteamTopology ? { chainedHandoffTopology: effectiveSteamTopology } : {}),
+          ...(effectiveSteamExtId ? { chainedExternalInstallId: effectiveSteamExtId } : {}),
           achievements: ach
             ? {
                 unlocked: ach.unlocked,
@@ -788,6 +976,8 @@ module.exports = {
   readLocalSteamPlaytimes,
   readLocalSteamShortcuts,
   scanLocalSteamAchievements,
+  parseSteamEaInstallerDataXml,
+  scanLocalSteamEaChainedGames,
   fetchSteamBatchAchievements,
   fetchSteamStoreBrowseItemsMap,
   parseSteamGamesListJson,
