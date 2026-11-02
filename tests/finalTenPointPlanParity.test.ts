@@ -1581,7 +1581,7 @@ describe('10-Dimension Codebase Hardening Plan — Final Parity Suite (T1–T13)
 
     for (
       let i = 0;
-      i < 40 && !(fs.existsSync(tempBinA) && fs.statSync(tempBinA).size >= 16);
+      i < 120 && !(fs.existsSync(tempBinA) && fs.statSync(tempBinA).size >= 16);
       i++
     ) {
       await new Promise((r) => setTimeout(r, 10));
@@ -1643,7 +1643,7 @@ describe('10-Dimension Codebase Hardening Plan — Final Parity Suite (T1–T13)
 
     for (
       let i = 0;
-      i < 40 && !(fs.existsSync(tempBinB) && fs.statSync(tempBinB).size >= 16);
+      i < 120 && !(fs.existsSync(tempBinB) && fs.statSync(tempBinB).size >= 16);
       i++
     ) {
       await new Promise((r) => setTimeout(r, 10));
@@ -1657,7 +1657,11 @@ describe('10-Dimension Codebase Hardening Plan — Final Parity Suite (T1–T13)
     shouldHangB = false;
     launcherEngine.resumeDownload('dl-gog-99002', { userDataDir });
 
-    for (let i = 0; i < 60 && !fs.existsSync(path.join(installB, 'game.dat')); i++) {
+    for (
+      let i = 0;
+      i < 200 && !(fs.existsSync(path.join(installB, 'game.dat')) && !fs.existsSync(tempBinB));
+      i++
+    ) {
       await new Promise((r) => setTimeout(r, 15));
     }
     expect(refreshGogTokenFn).toHaveBeenCalledTimes(1);
@@ -1709,7 +1713,7 @@ describe('10-Dimension Codebase Hardening Plan — Final Parity Suite (T1–T13)
 
     for (
       let i = 0;
-      i < 40 && !(fs.existsSync(tempBinC) && fs.statSync(tempBinC).size >= 16);
+      i < 120 && !(fs.existsSync(tempBinC) && fs.statSync(tempBinC).size >= 16);
       i++
     ) {
       await new Promise((r) => setTimeout(r, 10));

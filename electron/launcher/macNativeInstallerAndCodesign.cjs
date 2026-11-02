@@ -44,9 +44,7 @@ const {
   upsertWineUserRegKeysBatch,
   applyStrictRosettaAvxEnv,
 } = require('./wineAndCrossOverManager.cjs');
-const {
-  discoverWindowsSteamRegistryPaths,
-} = require('../utils/windowsRegistryDiscovery.cjs');
+const windowsRegistryDiscovery = require('../utils/windowsRegistryDiscovery.cjs');
 const {
   inspectWindowsExecutableHeader,
   inspectMacMachOHeader,
@@ -1890,7 +1888,7 @@ function discoverSteamLocations(/** @type {any} */ options = {}) {
   if (!isIsolatedTest) {
     candidateSteamRoots.push('C:\\Program Files (x86)\\Steam', 'C:\\Program Files\\Steam');
     if (platform === 'win32') {
-      const regSteam = discoverWindowsSteamRegistryPaths(options);
+      const regSteam = windowsRegistryDiscovery.discoverWindowsSteamRegistryPaths(options);
       const regSteamRoot = regSteam.steamRoot || regSteam.steamPath;
       if (regSteamRoot) {
         candidateSteamRoots.unshift(regSteamRoot);
