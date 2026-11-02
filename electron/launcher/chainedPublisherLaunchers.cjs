@@ -5504,11 +5504,6 @@ function toRockstarWindowsInstallDir(rawInstallDir, bottlePath = '', isWineBottl
     .replace(/^["']+|["']+$/g, '');
   if (!clean) return '';
 
-  if (/^[A-Za-z]:[\\/]/.test(clean)) {
-    const winNorm = clean.replace(/\//g, '\\');
-    return /^[A-Za-z]:\\$/.test(winNorm) ? winNorm : winNorm.replace(/\\+$/, '');
-  }
-
   const slashNorm = clean.replace(/\\/g, '/').replace(/\/+$/, '');
   if (bottlePath) {
     const cleanBottleDriveC = `${bottlePath.replace(/\\/g, '/').replace(/\/+$/, '')}/drive_c`;
@@ -5525,6 +5520,11 @@ function toRockstarWindowsInstallDir(rawInstallDir, bottlePath = '', isWineBottl
   if (driveCMatch) {
     const rel = String(driveCMatch[1] || '').replace(/\//g, '\\');
     return rel ? `C:\\${rel}` : 'C:\\';
+  }
+
+  if (/^[A-Za-z]:[\\/]/.test(clean)) {
+    const winNorm = clean.replace(/\//g, '\\');
+    return /^[A-Za-z]:\\$/.test(winNorm) ? winNorm : winNorm.replace(/\\+$/, '');
   }
 
   if (slashNorm.startsWith('/') && isWineBottleExecution) {

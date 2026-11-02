@@ -852,7 +852,9 @@ describe('Xbox Chained Publisher Launchers & XGR Runtime Audit (Wave 3A)', () =>
         version: '1.4.2.0',
         mountPathHost: dlcAlphaContentDir,
       });
-      expect(discovered[0].mountPathWin).toMatch(/^Z:\\/i);
+      expect(discovered[0].mountPathWin).toMatch(
+        process.platform === 'win32' ? /^[A-Z]:\\/i : /^Z:\\/i
+      );
       expect(discovered[1]).toMatchObject({
         storeId: '9NDLCBETA002',
         displayName: 'Synthetic Touring Pack',
@@ -1678,8 +1680,10 @@ describe('Xbox Chained Publisher Launchers & XGR Runtime Audit (Wave 3A)', () =>
         wineBinaryPath: cxWineBin,
         layerType: 'crossover',
       });
-      expect(envObj.CX_ROOT).toBe(cxRootDir);
-      expect(envObj.CX_HOME).toBe(path.join(synthHome, 'Library', 'Application Support', 'CrossOver'));
+      expect(path.normalize(envObj.CX_ROOT)).toBe(path.normalize(cxRootDir));
+      expect(path.normalize(envObj.CX_HOME)).toBe(
+        path.normalize(path.join(synthHome, 'Library', 'Application Support', 'CrossOver'))
+      );
       expect(envObj.DOTNET_EnableWriteXorExecute).toBe('0');
 
       // cxbottle.conf global wined3d stripping

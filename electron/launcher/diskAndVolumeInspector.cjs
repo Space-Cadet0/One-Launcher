@@ -594,8 +594,10 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
       ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase()
     );
 
+  const pMod = platform === 'darwin' && curr.startsWith('/') ? path.posix : path;
+
   try {
-    let existingPath = path.resolve(curr);
+    let existingPath = pMod.resolve(curr);
     /** @type {any} */
     let targetStat = null;
     for (let guard = 0; guard < 40 && existingPath; guard += 1) {
@@ -603,7 +605,7 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
         targetStat = statSyncFn(existingPath);
         if (targetStat) break;
       } catch {
-        const parent = path.dirname(existingPath);
+        const parent = pMod.dirname(existingPath);
         if (!parent || parent === existingPath) {
           existingPath = '';
           break;
@@ -634,7 +636,7 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
     // 1. Walk up `existingPath` while parent remains on the exact same `st.dev`
     let walkNode = existingPath;
     for (let depth = 0; depth < 40 && walkNode; depth += 1) {
-      const parentDir = path.dirname(walkNode);
+      const parentDir = pMod.dirname(walkNode);
       if (!parentDir || parentDir === walkNode) break;
       /** @type {any} */
       let parentStat = null;
@@ -647,7 +649,7 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
         // Crossed volume mount boundary (e.g., `/Volumes/ExternalSSD` -> `/Volumes`)
         break;
       }
-      const base = path.basename(walkNode);
+      const base = pMod.basename(walkNode);
       if (base && /[A-Za-z]/.test(base) && toggleAsciiCase(base) !== base) {
         try {
           probeOrigStat = walkNode === existingPath ? targetStat : statSyncFn(walkNode);
@@ -673,7 +675,7 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
             const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
             if (!name || name === '.' || name === '..') continue;
             if (!/[A-Za-z]/.test(name) || toggleAsciiCase(name) === name) continue;
-            const candidateChild = path.join(mountRootDir, name);
+            const candidateChild = pMod.join(mountRootDir, name);
             try {
               const childStat = statSyncFn(candidateChild);
               if (childStat && childStat.dev === targetDev) {
@@ -688,9 +690,9 @@ function checkVolumeCaseSensitivity(targetPath, /** @type {any} */ options = {})
     }
 
     if (probeOrigPath && probeOrigStat) {
-      const parentDir = path.dirname(probeOrigPath);
-      const toggledBase = toggleAsciiCase(path.basename(probeOrigPath));
-      const toggledPath = path.join(parentDir, toggledBase);
+      const parentDir = pMod.dirname(probeOrigPath);
+      const toggledBase = toggleAsciiCase(pMod.basename(probeOrigPath));
+      const toggledPath = pMod.join(parentDir, toggledBase);
       let caseSensitive = false;
       try {
         const toggledStat = statSyncFn(toggledPath);
