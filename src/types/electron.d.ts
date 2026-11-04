@@ -52,6 +52,8 @@ import type {
   SessionUpdatedEventType,
   SessionUpdatedPayload,
   StopGameRequest,
+  ToggleSessionFullscreenRequest,
+  ToggleSessionFullscreenResult,
   UninstallGameRequest,
   UpdateCompatibilityLayerPayload,
   UpdateCompatibilityLayerResult,
@@ -518,6 +520,9 @@ export interface ElectronAPI {
   stopGame: (
     payload: StopGameRequest | string | Record<string, unknown>
   ) => Promise<LauncherActionResult>;
+  toggleSessionFullscreen?: (
+    payload: ToggleSessionFullscreenRequest | string | Record<string, unknown>
+  ) => Promise<ToggleSessionFullscreenResult>;
   getRunningGames: () => Promise<ActiveGameSession[]>;
   installGame: (payload: InstallGameRequest | Record<string, unknown>) => Promise<LauncherActionResult>;
   pauseDownload: (taskId: string) => Promise<LauncherActionResult>;

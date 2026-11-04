@@ -230,6 +230,28 @@ export type InstalledGameInfo = InstalledGameRecord;
 
 export type CrossOverGraphicsBackend = 'auto' | 'd3dmetal' | 'dxmt' | 'dxvk' | 'wined3d';
 
+export type BottleDisplayScalingMode =
+  | 'default'
+  | 'auto_fullscreen'
+  | 'force_fullscreen'
+  | 'native_driver'
+  | 'windowed'
+  | 'virtual_desktop';
+
+export type GlobalBottleDisplayScalingMode = Exclude<BottleDisplayScalingMode, 'default'>;
+
+export type DisplayAspectRatioMode = 'default' | 'preserve_aspect' | 'integer' | 'stretch';
+
+export type GlobalDisplayAspectRatioMode = Exclude<DisplayAspectRatioMode, 'default'>;
+
+export type VirtualDesktopResolutionPreset =
+  | 'auto'
+  | '1920x1080'
+  | '1600x900'
+  | '1280x720'
+  | '1024x768'
+  | '800x600';
+
 export type InGameLauncherBehavior =
   | 'keep_open'
   | 'minimize_taskbar'
@@ -278,6 +300,9 @@ export interface LauncherPerformanceSettings {
   storefrontClientLifecycle: StorefrontClientLifecyclePolicy;
   autoShutdownWinePrefixOnExit: boolean;
   suppressWineDebugLogging: boolean;
+  defaultBottleDisplayScalingMode?: GlobalBottleDisplayScalingMode;
+  defaultDisplayAspectRatio?: GlobalDisplayAspectRatioMode;
+  enableFullscreenHotkey?: boolean;
 }
 
 export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings = {
@@ -288,6 +313,9 @@ export const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS: LauncherPerformanceSettings 
   storefrontClientLifecycle: 'minimal_and_close_if_started',
   autoShutdownWinePrefixOnExit: true,
   suppressWineDebugLogging: true,
+  defaultBottleDisplayScalingMode: 'auto_fullscreen',
+  defaultDisplayAspectRatio: 'preserve_aspect',
+  enableFullscreenHotkey: true,
 };
 
 export interface StorefrontLaunchProfile {
@@ -323,6 +351,12 @@ export interface StorefrontLaunchProfile {
   metalfxSpatialUpscaleFactor?: number;
   /** Wine / CrossOver virtual desktop containment */
   virtualDesktop?: boolean;
+  /** Wine virtual desktop resolution preset (e.g. 'auto' | '1920x1080' | '1280x720') */
+  virtualDesktopResolution?: VirtualDesktopResolutionPreset | string;
+  /** Bottled macOS fullscreen & legacy resolution scaling mode ('default' inherits global LauncherPerformanceSettings) */
+  displayScalingMode?: BottleDisplayScalingMode;
+  /** Bottled macOS fullscreen aspect ratio & filter policy ('default' inherits global LauncherPerformanceSettings) */
+  displayAspectRatio?: DisplayAspectRatioMode;
   /** Wine Mac Driver display mode emulation override (EmulateModeset) */
   emulateModeset?: boolean;
   /** 32-bit PE32 4 GB address space override (WINE_LARGE_ADDRESS_AWARE) */
@@ -471,6 +505,10 @@ export interface ActiveGameSession {
   launchMethod: string;
   executablePath?: string;
   status: ActiveGameSessionStatus;
+  isBottledSession?: boolean;
+  fullscreenActive?: boolean;
+  displayScalingMode?: GlobalBottleDisplayScalingMode;
+  displayAspectRatio?: GlobalDisplayAspectRatioMode;
   cloudSync?: CloudSaveSyncTelemetry;
   statusMessage?: string;
 }
@@ -479,6 +517,7 @@ export type SessionUpdatedEventType =
   | 'started'
   | 'stopping'
   | 'stopped'
+  | 'fullscreen_updated'
   | 'playtime_synced'
   | 'cloud_sync_warning'
   | 'cloud_sync_complete';
@@ -715,6 +754,23 @@ export interface StopGameRequest {
   sessionId?: string;
   gameId?: string;
   pid?: number;
+}
+
+export interface ToggleSessionFullscreenRequest {
+  sessionId?: string;
+  gameId?: string;
+  fullscreen?: boolean;
+  aspectRatio?: GlobalDisplayAspectRatioMode;
+}
+
+export interface ToggleSessionFullscreenResult {
+  success: boolean;
+  sessionId?: string;
+  gameId?: string;
+  fullscreenActive?: boolean;
+  displayAspectRatio?: GlobalDisplayAspectRatioMode;
+  message?: string;
+  error?: string;
 }
 
 export interface InstallGameRequest {

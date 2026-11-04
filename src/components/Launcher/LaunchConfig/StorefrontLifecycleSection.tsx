@@ -1,6 +1,8 @@
 import React from 'react';
 import { StorefrontId } from '../../../contracts/platform';
 import {
+  GlobalBottleDisplayScalingMode,
+  GlobalDisplayAspectRatioMode,
   InGameLauncherBehavior,
   LauncherPerformanceSettings,
   LaunchMethod,
@@ -17,6 +19,8 @@ import {
   ExternalLink,
   Globe,
   Info,
+  Maximize2,
+  Monitor,
   Zap,
 } from 'lucide-react';
 import {
@@ -43,7 +47,12 @@ export interface StorefrontLifecycleSectionProps {
   onTogglePauseSyncInGame: () => void;
   onTogglePauseDownloadsInGame: () => void;
   onToggleAutoShutdownWine: () => void;
+  onChangeDefaultBottleDisplayScalingMode?: (value: GlobalBottleDisplayScalingMode) => void;
+  onChangeDefaultDisplayAspectRatio?: (value: GlobalDisplayAspectRatioMode) => void;
+  onToggleFullscreenHotkey?: () => void;
 }
+
+const NOOP = () => {};
 
 function StorefrontLifecycleSectionImpl({
   idPrefix = 'launch-cfg',
@@ -61,6 +70,9 @@ function StorefrontLifecycleSectionImpl({
   onTogglePauseSyncInGame,
   onTogglePauseDownloadsInGame,
   onToggleAutoShutdownWine,
+  onChangeDefaultBottleDisplayScalingMode = NOOP,
+  onChangeDefaultDisplayAspectRatio = NOOP,
+  onToggleFullscreenHotkey = NOOP,
 }: StorefrontLifecycleSectionProps): React.ReactElement {
   const isBottleContext =
     !isWindowsHost &&
@@ -151,6 +163,18 @@ function StorefrontLifecycleSectionImpl({
   const pauseDownloadsHintId = `${idPrefix}-pause-downloads-hint`;
   const autoShutdownWineLabelId = `${idPrefix}-auto-shutdown-wine-label`;
   const autoShutdownWineHintId = `${idPrefix}-auto-shutdown-wine-hint`;
+  const globalDisplayModeSelectId = `${idPrefix}-global-bottle-display-mode`;
+  const globalDisplayModeHintId = `${idPrefix}-global-bottle-display-mode-hint`;
+  const globalDisplayAspectSelectId = `${idPrefix}-global-display-aspect`;
+  const globalDisplayAspectHintId = `${idPrefix}-global-display-aspect-hint`;
+  const fullscreenHotkeyLabelId = `${idPrefix}-fullscreen-hotkey-label`;
+  const fullscreenHotkeyHintId = `${idPrefix}-fullscreen-hotkey-hint`;
+
+  const effectiveGlobalDisplayMode: GlobalBottleDisplayScalingMode =
+    perfSettings.defaultBottleDisplayScalingMode ?? 'auto_fullscreen';
+  const effectiveGlobalAspectRatio: GlobalDisplayAspectRatioMode =
+    perfSettings.defaultDisplayAspectRatio ?? 'preserve_aspect';
+  const effectiveFullscreenHotkey: boolean = perfSettings.enableFullscreenHotkey ?? true;
 
   return (
     <section
@@ -501,31 +525,138 @@ function StorefrontLifecycleSectionImpl({
           </div>
 
           {isBottleContext && (
-            <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
-              <div className="min-w-0 space-y-0.5">
-                <span
-                  id={autoShutdownWineLabelId}
-                  className="block text-xs font-semibold text-white"
-                >
-                  Close Idle Bottle Background Daemons After Exit (wineserver -k)
-                </span>
-                <p
-                  id={autoShutdownWineHintId}
-                  className="text-[10px] text-steam-subtext leading-snug"
-                >
-                  Waits for Cloud Save uploads and active Bottle downloads to finish, then
-                  terminates leftover wineserver / winedevice processes and silences Wine debug logs
-                </p>
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-0.5">
+                <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 ol-subgrid-field">
+                  <label
+                    htmlFor={globalDisplayModeSelectId}
+                    className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+                  >
+                    <Maximize2 className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                    <span>Default Bottled Display Mode</span>
+                  </label>
+                  <LaunchSelect
+                    id={globalDisplayModeSelectId}
+                    data-testid="global-bottle-display-mode-select"
+                    surface="panel"
+                    aria-label="Default Bottled Display Mode"
+                    aria-describedby={globalDisplayModeHintId}
+                    value={effectiveGlobalDisplayMode}
+                    onChange={(e) =>
+                      onChangeDefaultBottleDisplayScalingMode(
+                        e.target.value as GlobalBottleDisplayScalingMode
+                      )
+                    }
+                  >
+                    <option value="auto_fullscreen">
+                      Auto Fullscreen &amp; Upscale (Recommended)
+                    </option>
+                    <option value="force_fullscreen">
+                      Force Fullscreen (All Bottled Windows)
+                    </option>
+                    <option value="native_driver">Native Wine Driver</option>
+                    <option value="windowed">Windowed</option>
+                    <option value="virtual_desktop">Wine Virtual Desktop</option>
+                  </LaunchSelect>
+                  <p
+                    id={globalDisplayModeHintId}
+                    className="text-[10px] text-steam-subtext leading-snug"
+                  >
+                    Global fallback for bottled Windows games set to Use Global Default.
+                  </p>
+                </div>
+
+                <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 ol-subgrid-field">
+                  <label
+                    htmlFor={globalDisplayAspectSelectId}
+                    className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+                  >
+                    <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                    <span>Default Fullscreen Aspect Ratio</span>
+                  </label>
+                  <LaunchSelect
+                    id={globalDisplayAspectSelectId}
+                    data-testid="global-display-aspect-select"
+                    surface="panel"
+                    aria-label="Default Fullscreen Aspect Ratio"
+                    aria-describedby={globalDisplayAspectHintId}
+                    value={effectiveGlobalAspectRatio}
+                    onChange={(e) =>
+                      onChangeDefaultDisplayAspectRatio(
+                        e.target.value as GlobalDisplayAspectRatioMode
+                      )
+                    }
+                  >
+                    <option value="preserve_aspect">
+                      Preserve Aspect Ratio (4:3 Pillarbox / Notch-Safe)
+                    </option>
+                    <option value="integer">Integer Pixel-Perfect</option>
+                    <option value="stretch">Stretch to Fill Screen</option>
+                  </LaunchSelect>
+                  <p
+                    id={globalDisplayAspectHintId}
+                    className="text-[10px] text-steam-subtext leading-snug"
+                  >
+                    Controls fullscreen geometry and upscaling filter across all bottled games.
+                  </p>
+                </div>
               </div>
-              <SwitchControl
-                dataTestId="toggle-auto-shutdown-wine"
-                checked={perfSettings.autoShutdownWinePrefixOnExit}
-                ariaLabelledBy={autoShutdownWineLabelId}
-                ariaDescribedBy={autoShutdownWineHintId}
-                onChange={onToggleAutoShutdownWine}
-                tone="emerald"
-              />
-            </div>
+
+              <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
+                <div className="min-w-0 space-y-0.5">
+                  <span
+                    id={fullscreenHotkeyLabelId}
+                    className="block text-xs font-semibold text-white"
+                  >
+                    In-Game Fullscreen Shortcut (Ctrl+Option+F)
+                  </span>
+                  <p
+                    id={fullscreenHotkeyHintId}
+                    className="text-[10px] text-steam-subtext leading-snug"
+                  >
+                    Registers global macOS shortcuts during active bottled sessions (
+                    <kbd className="font-mono text-sky-300">Ctrl+Option+F</kbd> toggles Fullscreen /
+                    Windowed; <kbd className="font-mono text-sky-300">Ctrl+Option+A</kbd> cycles
+                    Aspect Ratio)
+                  </p>
+                </div>
+                <SwitchControl
+                  dataTestId="toggle-fullscreen-hotkey"
+                  checked={effectiveFullscreenHotkey}
+                  ariaLabelledBy={fullscreenHotkeyLabelId}
+                  ariaDescribedBy={fullscreenHotkeyHintId}
+                  onChange={onToggleFullscreenHotkey}
+                  tone="emerald"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-3 rounded-lg bg-[#0e151f] border border-[#223447] px-3 py-2.5">
+                <div className="min-w-0 space-y-0.5">
+                  <span
+                    id={autoShutdownWineLabelId}
+                    className="block text-xs font-semibold text-white"
+                  >
+                    Close Idle Bottle Background Daemons After Exit (wineserver -k)
+                  </span>
+                  <p
+                    id={autoShutdownWineHintId}
+                    className="text-[10px] text-steam-subtext leading-snug"
+                  >
+                    Waits for Cloud Save uploads and active Bottle downloads to finish, then
+                    terminates leftover wineserver / winedevice processes and silences Wine debug
+                    logs
+                  </p>
+                </div>
+                <SwitchControl
+                  dataTestId="toggle-auto-shutdown-wine"
+                  checked={perfSettings.autoShutdownWinePrefixOnExit}
+                  ariaLabelledBy={autoShutdownWineLabelId}
+                  ariaDescribedBy={autoShutdownWineHintId}
+                  onChange={onToggleAutoShutdownWine}
+                  tone="emerald"
+                />
+              </div>
+            </>
           )}
         </div>
       </div>

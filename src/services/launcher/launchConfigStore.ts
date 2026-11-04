@@ -1,11 +1,16 @@
 import {
   DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
   sanitizeLaunchMethod,
+  type BottleDisplayScalingMode,
   type CompatibilityLayerType,
+  type DisplayAspectRatioMode,
   type GameLaunchConfig,
+  type GlobalBottleDisplayScalingMode,
+  type GlobalDisplayAspectRatioMode,
   type LauncherPerformanceSettings,
   type StorefrontClientLifecyclePolicy,
   type StorefrontLaunchProfile,
+  type VirtualDesktopResolutionPreset,
   type WineDebugMode,
 } from '../../contracts/launcher';
 import type { StorefrontId } from '../../contracts/platform';
@@ -46,8 +51,73 @@ export function sanitizeWineDebugMode(val?: unknown): WineDebugMode | string | u
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+export function sanitizeGlobalBottleDisplayScalingMode(
+  val?: unknown
+): GlobalBottleDisplayScalingMode {
+  if (
+    val === 'auto_fullscreen' ||
+    val === 'force_fullscreen' ||
+    val === 'native_driver' ||
+    val === 'windowed' ||
+    val === 'virtual_desktop'
+  ) {
+    return val;
+  }
+  return DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultBottleDisplayScalingMode ?? 'auto_fullscreen';
+}
+
+export function sanitizeBottleDisplayScalingMode(
+  val?: unknown
+): BottleDisplayScalingMode | undefined {
+  if (!val) return undefined;
+  if (
+    val === 'default' ||
+    val === 'auto_fullscreen' ||
+    val === 'force_fullscreen' ||
+    val === 'native_driver' ||
+    val === 'windowed' ||
+    val === 'virtual_desktop'
+  ) {
+    return val;
+  }
+  return 'default';
+}
+
+export function sanitizeGlobalDisplayAspectRatio(val?: unknown): GlobalDisplayAspectRatioMode {
+  if (val === 'preserve_aspect' || val === 'integer' || val === 'stretch') {
+    return val;
+  }
+  return DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultDisplayAspectRatio ?? 'preserve_aspect';
+}
+
+export function sanitizeDisplayAspectRatio(val?: unknown): DisplayAspectRatioMode | undefined {
+  if (!val) return undefined;
+  if (
+    val === 'default' ||
+    val === 'preserve_aspect' ||
+    val === 'integer' ||
+    val === 'stretch'
+  ) {
+    return val;
+  }
+  return 'default';
+}
+
+export function sanitizeVirtualDesktopResolution(
+  val?: unknown
+): VirtualDesktopResolutionPreset | string | undefined {
+  if (typeof val !== 'string') return undefined;
+  const trimmed = val.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (trimmed === 'auto' || /^\d{3,5}x\d{3,5}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return undefined;
+}
+
 export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfig {
   if (!cfg || typeof cfg !== 'object') return cfg;
+  const cleanVdRes = sanitizeVirtualDesktopResolution(cfg.virtualDesktopResolution);
   const nextCfg: GameLaunchConfig = {
     ...cfg,
     launchMethod: sanitizeLaunchMethod(cfg.launchMethod),
@@ -64,11 +134,21 @@ export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfi
     ...(cfg.wineDebug !== undefined
       ? { wineDebug: sanitizeWineDebugMode(cfg.wineDebug) }
       : {}),
+    ...(cfg.displayScalingMode !== undefined
+      ? { displayScalingMode: sanitizeBottleDisplayScalingMode(cfg.displayScalingMode) }
+      : {}),
+    ...(cfg.displayAspectRatio !== undefined
+      ? { displayAspectRatio: sanitizeDisplayAspectRatio(cfg.displayAspectRatio) }
+      : {}),
+    ...(cfg.virtualDesktopResolution !== undefined
+      ? { virtualDesktopResolution: cleanVdRes }
+      : {}),
   };
   if (cfg.platformConfigs && typeof cfg.platformConfigs === 'object') {
     const nextPlatCfgs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
     for (const [platId, p] of Object.entries(cfg.platformConfigs)) {
       if (p) {
+        const cleanPlatVdRes = sanitizeVirtualDesktopResolution(p.virtualDesktopResolution);
         nextPlatCfgs[platId as StorefrontId] = {
           ...p,
           ...(p.launchMethod !== undefined
@@ -86,6 +166,15 @@ export function sanitizeGameLaunchConfig(cfg: GameLaunchConfig): GameLaunchConfi
             : {}),
           ...(p.wineDebug !== undefined
             ? { wineDebug: sanitizeWineDebugMode(p.wineDebug) }
+            : {}),
+          ...(p.displayScalingMode !== undefined
+            ? { displayScalingMode: sanitizeBottleDisplayScalingMode(p.displayScalingMode) }
+            : {}),
+          ...(p.displayAspectRatio !== undefined
+            ? { displayAspectRatio: sanitizeDisplayAspectRatio(p.displayAspectRatio) }
+            : {}),
+          ...(p.virtualDesktopResolution !== undefined
+            ? { virtualDesktopResolution: cleanPlatVdRes }
             : {}),
         };
       }
@@ -137,6 +226,14 @@ export function sanitizePerformanceSettings(
       typeof raw.suppressWineDebugLogging === 'boolean'
         ? raw.suppressWineDebugLogging
         : base.suppressWineDebugLogging,
+    defaultBottleDisplayScalingMode: sanitizeGlobalBottleDisplayScalingMode(
+      raw.defaultBottleDisplayScalingMode
+    ),
+    defaultDisplayAspectRatio: sanitizeGlobalDisplayAspectRatio(raw.defaultDisplayAspectRatio),
+    enableFullscreenHotkey:
+      typeof raw.enableFullscreenHotkey === 'boolean'
+        ? raw.enableFullscreenHotkey
+        : (base.enableFullscreenHotkey ?? true),
   };
 }
 
@@ -160,6 +257,9 @@ export function extractStorefrontProfile(
     'preferredMaxFrameRate',
     'metalfxSpatialUpscaleFactor',
     'virtualDesktop',
+    'virtualDesktopResolution',
+    'displayScalingMode',
+    'displayAspectRatio',
     'emulateModeset',
     'forceLargeAddressAware',
     'audioBufferClamp',
@@ -188,6 +288,21 @@ export function extractStorefrontProfile(
         const cleanDebug = sanitizeWineDebugMode(val);
         if (cleanDebug !== undefined) {
           profile.wineDebug = cleanDebug;
+        }
+      } else if (key === 'displayScalingMode') {
+        const cleanMode = sanitizeBottleDisplayScalingMode(val);
+        if (cleanMode !== undefined) {
+          profile.displayScalingMode = cleanMode;
+        }
+      } else if (key === 'displayAspectRatio') {
+        const cleanAspect = sanitizeDisplayAspectRatio(val);
+        if (cleanAspect !== undefined) {
+          profile.displayAspectRatio = cleanAspect;
+        }
+      } else if (key === 'virtualDesktopResolution') {
+        const cleanVdRes = sanitizeVirtualDesktopResolution(val);
+        if (cleanVdRes !== undefined) {
+          profile.virtualDesktopResolution = cleanVdRes;
         }
       } else {
         (profile as Record<string, unknown>)[key] = val;

@@ -63,6 +63,7 @@ For Mac gamers running both native Apple Silicon titles and Windows games alongs
 - **CrossOver 26 Rendering & Display Controls**:
   - **Graphics Backend**: Choose `Auto`, `D3DMetal` (Apple GPTK DirectX 11/12), `DXMT` (Metal-based DirectX 11), `DXVK` (Vulkan/MoltenVK), or `WineD3D` (OpenGL).
   - **High Resolution Mode (Retina 192 DPI)**: Toggle crisp Retina UI and text rendering per bottle.
+  - **Universal Bottled Fullscreen & HiDPI Display Scaling**: Automatically presents legacy 32-bit (`PE32`) and modern 64-bit (`PE32+`) DirectDraw, Direct3D, OpenGL, GDI, SDL, and DOSBox games in centered, aspect-preserved (`4:3`, `16:10`, `16:9`, integer, or stretch) Retina fullscreen across any CrossOver, GPTK, or Wine bottle—with live in-game `Ctrl+Option+F` toggling to `2x` Retina Windowed mode and zero-drift 3D/2D mouse input virtualization.
   - **DLSS (MetalFX Upscaling)**: Expose NVIDIA DLSS powered by Apple MetalFX for supported D3DMetal & DXMT titles.
   - **Synchronization & Performance Overlays**: Toggle **MSync**, **ESync**, **Apple Metal HUD** (`MTL_HUD_ENABLED=1`), and **DXVK HUD** (`DXVK_HUD=fps,devinfo`) per game.
 
@@ -112,8 +113,9 @@ cd One-Launcher
 # 2. Install dependencies
 npm install
 
-# 3. Verify or rebuild native Xbox GDK bridge DLLs (and macOS Metal helper on macOS)
+# 3. Verify or rebuild native Xbox GDK bridges, display scaler helpers, and macOS helpers
 npm run build:xbox-bridge
+npm run build:display-scaler
 npm run build:macos-helpers   # macOS only
 
 # 4. Start the Vite renderer dev server (and launch the Electron desktop shell in a second terminal)

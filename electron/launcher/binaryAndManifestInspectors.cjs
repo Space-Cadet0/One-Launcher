@@ -326,18 +326,22 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const dynamicallyLoadsDirectDraw = Boolean(extra.dynamicallyLoadsDirectDraw);
   const hasUe5IoStoreContainer = Boolean(extra.hasUe5IoStoreContainer);
 
+  const importsDdraw2d = dllSet.has('ddraw.dll') || dynamicallyLoadsDirectDraw;
+  const importsD3dImmediateMode = dllSet.has('d3dim.dll') || dllSet.has('d3dim700.dll');
+  const usesLegacyDdraw = Boolean(importsDdraw2d || importsD3dImmediateMode);
+  const importsD3d8 = dllSet.has('d3d8.dll');
+  const importsOpenGl = dllSet.has('opengl32.dll') || usesDynamicQgl;
+  const importsSdl1 = dllSet.has('sdl.dll');
+  const importsModernSdl = dllSet.has('sdl2.dll') || dllSet.has('sdl3.dll');
+
   const importsD3d12 = dllSet.has('d3d12.dll') || dllSet.has('d3d12core.dll');
   const importsD3d9 =
     dllSet.has('d3d9.dll') || dllList.some((d) => /^d3dx9(?:_\d+)?\.dll$/i.test(d));
   const importsVulkan = dllSet.has('vulkan-1.dll');
   const importsLegacyD3dOrGl =
-    dllSet.has('d3d8.dll') ||
-    dllSet.has('ddraw.dll') ||
-    dllSet.has('d3dim.dll') ||
-    dllSet.has('d3dim700.dll') ||
-    dllSet.has('opengl32.dll') ||
-    usesDynamicQgl ||
-    dynamicallyLoadsDirectDraw;
+    importsD3d8 ||
+    usesLegacyDdraw ||
+    importsOpenGl;
   const hasExplicitD3d11Or10 =
     dllSet.has('d3d11.dll') ||
     dllSet.has('d3d10.dll') ||
@@ -356,6 +360,13 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
 
   return {
     usesDynamicQgl,
+    importsDdraw2d,
+    importsD3dImmediateMode,
+    usesLegacyDdraw,
+    importsD3d8,
+    importsOpenGl,
+    importsSdl1,
+    importsModernSdl,
     importsD3d12,
     importsD3d11Or10,
     importsD3d9,
@@ -382,6 +393,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     return {
       exists: false,
       isValidPe: false,
+      arch: 'unknown',
       is64Bit: false,
       isX64: false,
       isX86: false,
@@ -555,16 +567,23 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         } else {
           importedDlls = directImports;
         }
+        const hasModernGfxImports = importedDlls.some(
+          (d) =>
+            d === 'd3d11.dll' ||
+            d === 'd3d12.dll' ||
+            d === 'd3d12core.dll' ||
+            d === 'dxgi.dll' ||
+            d === 'vulkan-1.dll'
+        );
         if (
-          isX86 &&
+          (isX86 || isX64) &&
           opts.skipRdataStringScan !== true &&
           (!importedDlls.includes('opengl32.dll') || !importedDlls.includes('ddraw.dll')) &&
-          !importedDlls.includes('d3d12.dll') &&
-          !importedDlls.includes('vulkan-1.dll')
+          !hasModernGfxImports
         ) {
           const dataSections = peLayout.sections.filter(
             (sec) =>
-              (sec.name === '.rdata' || sec.name === '.data') &&
+              (sec.name === '.rdata' || sec.name === '.data' || sec.name === '.idata') &&
               sec.rawPtr > 0 &&
               sec.rawSize > 0 &&
               sec.rawPtr < size
@@ -584,8 +603,34 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
                     ),
                   },
                 ];
+          if (peLayout.importDir && peLayout.importDir.rva > 0 && peLayout.importDir.size > 0) {
+            const importFileOff = mapPeRvaToFileOffset(
+              peLayout.importDir.rva,
+              peLayout.sections,
+              peLayout.headerLimit,
+              size
+            );
+            if (importFileOff > 0 && importFileOff < size) {
+              const coveredBySection = scanRanges.some(
+                (r) => importFileOff >= r.offset && importFileOff < r.offset + r.length
+              );
+              if (!coveredBySection) {
+                scanRanges.push({
+                  offset: importFileOff,
+                  length: Math.min(
+                    Math.max(peLayout.importDir.size, 65536),
+                    262144,
+                    size - importFileOff
+                  ),
+                });
+              }
+            }
+          }
           let sawOpengl32 = false;
+          let sawOpengl32DllLiteral = false;
           let sawWglCreateContext = false;
+          let sawPixelFormatSymbol = false;
+          let sawSwapBuffersSymbol = false;
           let sawDdraw = false;
           let sawDirectDrawCreate = false;
           for (let sIdx = 0; sIdx < scanRanges.length; sIdx += 1) {
@@ -595,15 +640,28 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
             const dynRead = fs.readSync(fd, dynBuf, 0, dynLen, dynOffset);
             if (dynRead <= 16) continue;
             const dynLatin1 = dynBuf.subarray(0, dynRead).toString('latin1');
+            if (/\bopengl32\.dll\x00/i.test(dynLatin1)) sawOpengl32DllLiteral = true;
             if (/\bopengl32(?:\.dll)?\x00/i.test(dynLatin1)) sawOpengl32 = true;
-            if (/\bwglCreateContext\x00/.test(dynLatin1)) sawWglCreateContext = true;
+            if (/\bwgl(?:CreateContext|MakeCurrent|GetProcAddress)\x00/.test(dynLatin1)) {
+              sawWglCreateContext = true;
+            }
+            if (/\b(?:ChoosePixelFormat|SetPixelFormat)\x00/.test(dynLatin1)) {
+              sawPixelFormatSymbol = true;
+            }
+            if (/\bSwapBuffers\x00/.test(dynLatin1)) {
+              sawSwapBuffersSymbol = true;
+            }
             if (/\bddraw(?:\.dll)?\x00/i.test(dynLatin1)) sawDdraw = true;
             if (/\bDirectDrawCreate/i.test(dynLatin1)) sawDirectDrawCreate = true;
           }
-          if (sawOpengl32 && sawWglCreateContext) {
+          if (
+            sawOpengl32DllLiteral ||
+            (sawOpengl32 && sawWglCreateContext) ||
+            (importedDlls.includes('gdi32.dll') && sawPixelFormatSymbol && sawSwapBuffersSymbol)
+          ) {
             dynamicallyLoadsOpenGl = true;
           }
-          if (sawDdraw && sawDirectDrawCreate) {
+          if (isX86 && sawDdraw && sawDirectDrawCreate) {
             dynamicallyLoadsDirectDraw = true;
           }
         }
@@ -650,9 +708,11 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         } catch {}
       }
     }
+    const arch = isX86 ? 'x86' : isX64 ? 'x64' : isArm64 ? 'arm64' : 'unknown';
     return {
       exists: true,
       isValidPe: true,
+      arch,
       is32Bit,
       is64Bit,
       isX64,
@@ -677,6 +737,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     return {
       exists: false,
       isValidPe: false,
+      arch: 'unknown',
       is32Bit: false,
       is64Bit: false,
       isX64: false,
@@ -729,6 +790,8 @@ function inspectPeCapabilities(exePath, options = {}) {
     dynamicallyLoadsDirectDraw,
     hasUe5IoStoreContainer: Boolean(options?.hasUe5IoStoreContainer),
   });
+  const isDosboxExecutable =
+    typeof exePath === 'string' && /^dosbox[^\\/]*\.exe$/i.test(path.win32.basename(exePath.trim()));
   return {
     ...pe,
     machineArch,
@@ -741,6 +804,7 @@ function inspectPeCapabilities(exePath, options = {}) {
     delayImportedDlls,
     dynamicallyLoadsOpenGl,
     dynamicallyLoadsDirectDraw,
+    isDosboxExecutable,
     ...gfxCaps,
   };
 }
@@ -2894,12 +2958,42 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     normalizedInstallDir
   );
 
+  const DOSBOX_EXE_RE = /^dosbox[^\\/]*\.exe$/i;
+  const hasPrimaryDirectGfx = Boolean(
+    primaryPe.importsD3d12 ||
+      primaryPe.importsD3d11Or10 ||
+      primaryPe.importsD3d9 ||
+      primaryPe.importsLegacyD3dOrGl ||
+      primaryPe.importsVulkan ||
+      primaryPe.importsSdl1 ||
+      primaryPe.importsModernSdl
+  );
+  const isLauncherStubCandidate = Boolean(
+    primaryPe.exists && primaryPe.isValidPe && !hasPrimaryDirectGfx && !primaryPe.isDosboxExecutable
+  );
+
   /** @type {string[]} */
   const candidateChildExePaths = [];
-  const pushChildCandidate = (p) => {
+  /** @type {string[]} */
+  const fallbackEmulatorChildPaths = [];
+  /** @type {Set<string>} */
+  const discoveredTaskBasenamesLower = new Set();
+  const pushChildCandidate = (p, opts = {}) => {
     if (!p || typeof p !== 'string') return;
     if (normalizedExePath && path.resolve(p) === path.resolve(normalizedExePath)) return;
     const base = path.basename(p);
+    if (DOSBOX_EXE_RE.test(base)) {
+      if (opts && opts.allowEmulator) {
+        if (!candidateChildExePaths.some((existing) => path.resolve(existing) === path.resolve(p))) {
+          candidateChildExePaths.push(p);
+        }
+      } else if (
+        !fallbackEmulatorChildPaths.some((existing) => path.resolve(existing) === path.resolve(p))
+      ) {
+        fallbackEmulatorChildPaths.push(p);
+      }
+      return;
+    }
     if (AUXILIARY_NON_GAME_EXE_RE.test(base)) return;
     if (!candidateChildExePaths.some((existing) => path.resolve(existing) === path.resolve(p))) {
       candidateChildExePaths.push(p);
@@ -2907,7 +3001,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   };
 
   if (launcherSettings.resolvedTargetExePath) {
-    pushChildCandidate(launcherSettings.resolvedTargetExePath);
+    pushChildCandidate(launcherSettings.resolvedTargetExePath, { allowEmulator: true });
   }
   if (paradoxSettings.paradoxDirectGameExe) {
     pushChildCandidate(paradoxSettings.paradoxDirectGameExe);
@@ -2916,6 +3010,8 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   // Inspect bounded `goggame-*.info` manifests in installDir and exeDir for child playTasks & compatibilityFlags
   /** @type {string[]} */
   const compatFlagTokens = [];
+  /** @type {string[]} */
+  const gogGameCategoryPaths = [];
   const infoSearchDirs = [];
   if (normalizedInstallDir) infoSearchDirs.push(normalizedInstallDir);
   if (exeDir && !infoSearchDirs.includes(exeDir)) infoSearchDirs.push(exeDir);
@@ -2942,6 +3038,17 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           }
           if (typeof task.path === 'string' && /\.exe$/i.test(task.path.trim())) {
             const relTaskPath = task.path.trim().replace(/\\/g, '/');
+            const rawTaskBase = path.posix.basename(relTaskPath).trim().toLowerCase();
+            const isGameTask =
+              String(task.category || '').trim().toLowerCase() === 'game' ||
+              task.isPrimary === true;
+            if (
+              rawTaskBase &&
+              /\.exe$/i.test(rawTaskBase) &&
+              (DOSBOX_EXE_RE.test(rawTaskBase) || !AUXILIARY_NON_GAME_EXE_RE.test(rawTaskBase))
+            ) {
+              discoveredTaskBasenamesLower.add(rawTaskBase);
+            }
             let resolvedTaskExe = resolveCaseInsensitiveRelFile(searchDir, relTaskPath);
             if (!resolvedTaskExe && typeof task.workingDir === 'string' && task.workingDir.trim()) {
               const relWork = task.workingDir.trim().replace(/\\/g, '/');
@@ -2951,7 +3058,14 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
               );
             }
             if (resolvedTaskExe) {
-              pushChildCandidate(resolvedTaskExe);
+              pushChildCandidate(resolvedTaskExe, { allowEmulator: true });
+              if (
+                isGameTask &&
+                (!normalizedExePath ||
+                  path.resolve(resolvedTaskExe) !== path.resolve(normalizedExePath))
+              ) {
+                gogGameCategoryPaths.push(resolvedTaskExe);
+              }
             }
           }
         }
@@ -2959,8 +3073,8 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     } catch {}
   }
 
-  // Bounded 1-level sibling `.exe` scan when primary `.exe` looks like a lightweight bootstrapper
-  let isLikelyBootstrapper = Boolean(launcherSettings.found);
+  // Bounded 1-level sibling `.exe` scan when primary `.exe` looks like a lightweight bootstrapper or stub
+  let isLikelyBootstrapper = Boolean(launcherSettings.found || isLauncherStubCandidate);
   if (!isLikelyBootstrapper && normalizedExePath && primaryPe.exists) {
     try {
       const st = fs.statSync(normalizedExePath);
@@ -2983,7 +3097,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
             pushChildCandidate(path.join(scanDir, dirent.name));
           } else if (
             dirent.isDirectory() &&
-            /^(?:bin|binaries|win32|win64|x86|x64|system|[a-z]{2}(?:-[a-z]{2})?)$/i.test(
+            /^(?:bin|binaries|win32|win64|x86|x64|system|dosbox|[a-z]{2}(?:-[a-z]{2})?)$/i.test(
               dirent.name
             )
           ) {
@@ -2997,6 +3111,11 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           }
         }
       } catch {}
+    }
+  }
+  if (candidateChildExePaths.length === 0 && fallbackEmulatorChildPaths.length > 0) {
+    for (const emuPath of fallbackEmulatorChildPaths) {
+      candidateChildExePaths.push(emuPath);
     }
   }
 
@@ -3022,7 +3141,11 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
             (c) =>
               path.resolve(c.exePath) === path.resolve(paradoxSettings.paradoxDirectGameExe)
           )
-        : null;
+        : gogGameCategoryPaths.length > 0 && !hasPrimaryDirectGfx
+          ? validChildren.find((c) =>
+              gogGameCategoryPaths.some((gp) => path.resolve(c.exePath) === path.resolve(gp))
+            )
+          : null;
     const withGraphicsImports = validChildren.find(
       (c) =>
         Boolean(c.pe.dynamicallyLoadsOpenGl || c.pe.dynamicallyLoadsDirectDraw) ||
@@ -3030,6 +3153,8 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           (d) =>
             d === 'opengl32.dll' ||
             d === 'ddraw.dll' ||
+            d === 'd3dim.dll' ||
+            d === 'd3dim700.dll' ||
             d === 'd3d8.dll' ||
             d === 'd3d9.dll' ||
             d === 'd3d10.dll' ||
@@ -3037,12 +3162,17 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
             d === 'd3d11.dll' ||
             d === 'd3d12.dll' ||
             d === 'dxgi.dll' ||
-            d === 'vulkan-1.dll'
+            d === 'vulkan-1.dll' ||
+            d === 'sdl.dll' ||
+            d === 'sdl2.dll' ||
+            d === 'sdl3.dll'
         )
     );
-    const chosenChild = fromLauncherCfg || withGraphicsImports || validChildren[0];
-    effectivePe = chosenChild.pe;
-    effectiveExePath = chosenChild.exePath;
+    if (fromLauncherCfg || !hasPrimaryDirectGfx) {
+      const chosenChild = fromLauncherCfg || withGraphicsImports || validChildren[0];
+      effectivePe = chosenChild.pe;
+      effectiveExePath = chosenChild.exePath;
+    }
   }
 
   const allInspectedPes = [primaryPe, ...validChildren.map((c) => c.pe)];
@@ -3053,6 +3183,8 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     }
   }
 
+  let dllDynamicOpenGl = false;
+  let dllDynamicDdraw = false;
   const hasDirectGraphicsImport =
     allInspectedPes.some(
       (p) => Boolean(p.dynamicallyLoadsOpenGl || p.dynamicallyLoadsDirectDraw)
@@ -3076,39 +3208,63 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     );
 
   // If the primary/child `.exe` does not directly import a D3D/GL/Vulkan DLL, scan up to 20
-  // top-level `.dll` files in `path.dirname(targetExe)` (bounded `< 2 ms`, headers + import tables only).
-  if (!hasDirectGraphicsImport && effectiveExePath) {
-    const targetExeDir = path.dirname(effectiveExePath);
-    try {
-      const rawEntries = fs.readdirSync(targetExeDir, { withFileTypes: true });
-      const candidateDllNames = [];
-      const fallbackDllNames = [];
-      for (let i = 0; i < rawEntries.length; i += 1) {
-        const entry = rawEntries[i];
-        if (!entry.isFile() || !/\.dll$/i.test(entry.name)) continue;
-        if (SYSTEM_GRAPHICS_PROXY_DLL_RE.test(entry.name)) continue;
-        if (NON_ENGINE_REDIST_DLL_RE.test(entry.name)) {
-          fallbackDllNames.push(entry.name);
-        } else {
-          candidateDllNames.push(entry.name);
+  // top-level `.dll` files in `path.dirname(targetExe)` (and `exeDir` / `installDir` when distinct).
+  if (!hasDirectGraphicsImport && (effectiveExePath || normalizedInstallDir)) {
+    /** @type {string[]} */
+    const dllScanDirs = [];
+    const pushDllDir = (d) => {
+      if (!d || typeof d !== 'string') return;
+      const res = path.resolve(d);
+      if (!dllScanDirs.includes(res)) dllScanDirs.push(res);
+    };
+    if (effectiveExePath) pushDllDir(path.dirname(effectiveExePath));
+    if (exeDir) pushDllDir(exeDir);
+    if (normalizedInstallDir) pushDllDir(normalizedInstallDir);
+
+    for (const targetExeDir of dllScanDirs) {
+      try {
+        if (!fs.existsSync(targetExeDir) || !fs.statSync(targetExeDir).isDirectory()) continue;
+        const rawEntries = fs.readdirSync(targetExeDir, { withFileTypes: true });
+        const candidateDllNames = [];
+        const fallbackDllNames = [];
+        for (let i = 0; i < rawEntries.length; i += 1) {
+          const entry = rawEntries[i];
+          if (!entry.isFile() || !/\.dll$/i.test(entry.name)) continue;
+          if (SYSTEM_GRAPHICS_PROXY_DLL_RE.test(entry.name)) continue;
+          if (NON_ENGINE_REDIST_DLL_RE.test(entry.name)) {
+            fallbackDllNames.push(entry.name);
+          } else {
+            candidateDllNames.push(entry.name);
+          }
         }
-      }
-      const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
-      for (let i = 0; i < orderedDllNames.length; i += 1) {
-        const dllPath = path.join(targetExeDir, orderedDllNames[i]);
-        const dllHeader = inspectWindowsExecutableHeader(dllPath, {
-          ...options,
-          skipRdataStringScan: true,
-        });
-        if (!dllHeader.isValidPe) continue;
-        if (effectivePe.isValidPe && Boolean(dllHeader.is64Bit) !== Boolean(effectivePe.is64Bit)) {
-          continue;
+        const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
+        for (let i = 0; i < orderedDllNames.length; i += 1) {
+          const dllName = orderedDllNames[i];
+          const dllPath = path.join(targetExeDir, dllName);
+          const isRedistDll = NON_ENGINE_REDIST_DLL_RE.test(dllName);
+          const dllHeader = inspectWindowsExecutableHeader(dllPath, {
+            ...options,
+            skipRdataStringScan: isRedistDll ? true : Boolean(options?.skipRdataStringScan),
+          });
+          if (!dllHeader.isValidPe) continue;
+          if (
+            effectivePe.isValidPe &&
+            Boolean(dllHeader.is64Bit) !== Boolean(effectivePe.is64Bit)
+          ) {
+            continue;
+          }
+          if ('dynamicallyLoadsOpenGl' in dllHeader && dllHeader.dynamicallyLoadsOpenGl) {
+            dllDynamicOpenGl = true;
+          }
+          if ('dynamicallyLoadsDirectDraw' in dllHeader && dllHeader.dynamicallyLoadsDirectDraw) {
+            dllDynamicDdraw = true;
+          }
+          for (const dep of dllHeader.importedDlls || []) {
+            dllSet.add(dep);
+          }
         }
-        for (const dep of dllHeader.importedDlls || []) {
-          dllSet.add(dep);
-        }
-      }
-    } catch {}
+      } catch {}
+    }
   }
 
   const importedDlls = Array.from(dllSet);
@@ -3131,8 +3287,10 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     Boolean(options?.hasUe5IoStoreContainer) ||
     detectUe5IoStoreContainer(normalizedInstallDir, effectiveExePath);
 
-  const anyDynamicQgl = allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsOpenGl));
-  const anyDynamicDdraw = allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsDirectDraw));
+  const anyDynamicQgl =
+    dllDynamicOpenGl || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsOpenGl));
+  const anyDynamicDdraw =
+    dllDynamicDdraw || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsDirectDraw));
   const gfxCaps = derivePeGraphicsCapabilities(importedDlls, {
     usesDynamicQgl: anyDynamicQgl,
     dynamicallyLoadsDirectDraw: anyDynamicDdraw,
@@ -3168,6 +3326,9 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     const b = path.basename(p).trim().toLowerCase();
     if (b && /\.exe$/i.test(b)) basenameSet.add(b);
   }
+  for (const taskBase of discoveredTaskBasenamesLower) {
+    basenameSet.add(taskBase);
+  }
   if (launcherSettings.binaryPath) {
     const cfgBase = path.win32.basename(launcherSettings.binaryPath).trim().toLowerCase();
     if (cfgBase && /\.exe$/i.test(cfgBase)) basenameSet.add(cfgBase);
@@ -3176,6 +3337,12 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     const pdxBase = path.basename(paradoxSettings.paradoxDirectGameExe).trim().toLowerCase();
     if (pdxBase && /\.exe$/i.test(pdxBase)) basenameSet.add(pdxBase);
   }
+
+  const isDosboxExecutable = Boolean(
+    primaryPe.isDosboxExecutable ||
+      effectivePe.isDosboxExecutable ||
+      Array.from(basenameSet).some((b) => DOSBOX_EXE_RE.test(b))
+  );
 
   return {
     primaryPe,
@@ -3193,6 +3360,8 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     usesModernGraphicsApi,
     isLegacy32BitOpenGl,
     needsLegacyDisplayModeSynthesis,
+    isDosboxExecutable,
+    isLauncherStubCandidate,
     hasChildGameExecutable:
       validChildren.length > 0 ||
       Boolean(launcherSettings.resolvedTargetExePath) ||

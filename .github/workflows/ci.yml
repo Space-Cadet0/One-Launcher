@@ -48,16 +48,24 @@ jobs:
       - name: Build & verify deterministic Win32 PE64 Xbox GDK bridges
         run: node scripts/build-xbox-bridge.cjs --verify
 
-      - name: Build & verify macOS universal Metal helper
+      - name: Build & verify deterministic Win32 PE32/PE64 Display Scaler helpers
+        run: node scripts/build-display-scaler.cjs --verify
+
+      - name: Build & verify macOS universal Metal & cooperative activation helpers
         if: runner.os == 'macOS'
         run: |
           npm run build:macos-helpers
           lipo -archs electron/helpers/libone_metal_preload.dylib
           codesign --verify --verbose=2 electron/helpers/libone_metal_preload.dylib
+          lipo -archs electron/helpers/libone_coop_activate.dylib
+          codesign --verify --verbose=2 electron/helpers/libone_coop_activate.dylib
 
-      - name: Run Layer 1 Host Clang C11 ASan + UBSan native harness
+      - name: Run Layer 1 Host Clang C11 ASan + UBSan native harness & fullscreen E2E suite
         if: runner.os == 'macOS'
-        run: npm run test:native-asan
+        run: |
+          npm run test:native-asan
+          node tests/e2e_fullscreen/run_all.cjs
+          node tests/adversarial_m1_challenger2.test.cjs
 
       - name: Typecheck source, electron & test suites
         run: npm run typecheck

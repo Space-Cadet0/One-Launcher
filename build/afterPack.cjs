@@ -12,9 +12,8 @@ const MACHO_MAGICS = new Set([
 ]);
 
 /**
- * Win32 PE64 & PE32 (`_x86`) bridge DLLs required on BOTH Windows native and macOS
- * CrossOver/GPTK/Wine bottles (injected into 64-bit and 32-bit bottled Xbox GDK games).
- * Never strip these on darwin or win32!
+ * Win32 PE64 & PE32 (`_x86`) bridge and display virtualization DLLs required on macOS
+ * CrossOver/GPTK/Wine bottles (and Xbox GDK bridges required on native Windows).
  */
 const KEEP_CROSSOVER_BRIDGE_DLLS = new Set([
   'one_xgameruntime_bridge.dll',
@@ -23,6 +22,36 @@ const KEEP_CROSSOVER_BRIDGE_DLLS = new Set([
   'one_gameinput_bridge_x86.dll',
   'one_appnotify_bridge.dll',
   'one_appnotify_bridge_x86.dll',
+  'one_display_scaler_x86.dll',
+  'one_display_scaler_x64.dll',
+]);
+
+/**
+ * Win32 PE32/PE64 helper launcher EXEs executed inside macOS CrossOver/GPTK/Wine bottles
+ * to inject `one_display_scaler_{x86,x64}.dll` into bottled Win32/Win64 games.
+ */
+const KEEP_DARWIN_BOTTLE_HELPER_EXES = new Set([
+  'one_display_launcher_x86.exe',
+  'one_display_launcher_x64.exe',
+]);
+
+/**
+ * Bottle-only display virtualization artifacts never used by native Windows/Linux builds.
+ */
+const MACOS_ONLY_BOTTLE_DISPLAY_ASSETS = new Set([
+  'one_display_scaler_x86.dll',
+  'one_display_scaler_x86.sha256',
+  'one_display_scaler_x86.dll.sha256',
+  'one_display_scaler_x64.dll',
+  'one_display_scaler_x64.sha256',
+  'one_display_scaler_x64.dll.sha256',
+  'one_display_launcher_x86.exe',
+  'one_display_launcher_x86.sha256',
+  'one_display_launcher_x86.exe.sha256',
+  'one_display_launcher_x64.exe',
+  'one_display_launcher_x64.sha256',
+  'one_display_launcher_x64.exe.sha256',
+  'display-scaler-manifest.json',
 ]);
 
 const ALLOWED_LOCALES = new Set(['en-us.pak']);
@@ -207,7 +236,11 @@ function pruneUnpackedCrossOsAssets(unpackedDir, platformName) {
       let shouldRemove = false;
 
       if (platformName !== 'darwin') {
-        if (lowerName.endsWith('.dylib') || lowerName.endsWith('.icns')) {
+        if (
+          lowerName.endsWith('.dylib') ||
+          lowerName.endsWith('.icns') ||
+          MACOS_ONLY_BOTTLE_DISPLAY_ASSETS.has(lowerName)
+        ) {
           shouldRemove = true;
         }
       } else {
@@ -215,7 +248,7 @@ function pruneUnpackedCrossOsAssets(unpackedDir, platformName) {
           shouldRemove = true;
         } else if (lowerName.endsWith('.dll') && !KEEP_CROSSOVER_BRIDGE_DLLS.has(lowerName)) {
           shouldRemove = true;
-        } else if (lowerName.endsWith('.exe')) {
+        } else if (lowerName.endsWith('.exe') && !KEEP_DARWIN_BOTTLE_HELPER_EXES.has(lowerName)) {
           shouldRemove = true;
         }
       }
@@ -474,6 +507,8 @@ exports.default = async function afterPack(context) {
 
 exports._testHelpers = {
   KEEP_CROSSOVER_BRIDGE_DLLS,
+  KEEP_DARWIN_BOTTLE_HELPER_EXES,
+  MACOS_ONLY_BOTTLE_DISPLAY_ASSETS,
   pruneChromiumLocalePaks,
   pruneMacLprojDirs,
   pruneUnpackedCrossOsAssets,

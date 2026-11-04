@@ -1764,13 +1764,15 @@ int main(void) {
       let userReg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
       expect(userReg).toContain('"RetinaMode"="y"');
 
-      // 4b. Legacy DirectDraw 32-bit game temporarily forces RetinaMode="n" and records OneLauncherPriorRetina="y"
+      // 4b. Legacy DirectDraw 32-bit game scopes RetinaMode="n" strictly to AppDefaults\synthddraw32.exe\Mac Driver
+      // while preserving global Mac Driver RetinaMode="y" (and enables EmulateModeset when explicitly requested)
       macNativeInstaller.applyCrossOverPerGameSettings(
         bottleDir,
         'SynthDdraw32.exe',
         {
           crossoverGraphicsBackend: 'wined3d',
           crossoverHighResolutionMode: undefined,
+          emulateModeset: true,
         },
         {
           usesLegacyDirectDraw: true,
@@ -1779,9 +1781,20 @@ int main(void) {
         }
       );
       userReg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
-      expect(userReg).toContain('"RetinaMode"="n"');
-      expect(userReg).toContain('"OneLauncherManagedRetina"="1"');
-      expect(userReg).toContain('"OneLauncherPriorRetina"="y"');
+      expect(userReg).toMatch(/\[Software\\\\Wine\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m);
+      expect(userReg).toMatch(
+        /\[Software\\\\Wine\\\\AppDefaults\\\\synthddraw32\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m
+      );
+      expect(userReg).toMatch(
+        /\[Software\\\\Wine\\\\AppDefaults\\\\synthddraw32\.exe\\\\Mac Driver\][^\[]*"CaptureDisplaysForFullscreen"="n"/m
+      );
+
+      // Seed a legacy-managed global RetinaMode="n" state to verify 4c also heals pre-existing markers
+      const poisonedReg = userReg.replace(
+        /(\[Software\\\\Wine\\\\Mac Driver\][^\n]*\n)"RetinaMode"="y"/m,
+        '$1"RetinaMode"="n"\n"OneLauncherManagedRetina"="1"\n"OneLauncherPriorRetina"="y"'
+      );
+      fs.writeFileSync(path.join(bottleDir, 'user.reg'), poisonedReg, 'utf8');
 
       // 4c. Subsequent 64-bit game in the SAME shared bottle with crossoverHighResolutionMode: undefined:
       //  - Restores RetinaMode="y" and removes OneLauncherManagedRetina / OneLauncherPriorRetina!

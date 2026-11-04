@@ -449,6 +449,9 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           storefrontClientLifecycle: 'minimal_and_close_if_started',
           autoShutdownWinePrefixOnExit: true,
           suppressWineDebugLogging: true,
+          defaultBottleDisplayScalingMode: 'auto_fullscreen',
+          defaultDisplayAspectRatio: 'preserve_aspect',
+          enableFullscreenHotkey: true,
         });
 
         const saved = launcherEngine.saveLauncherPerformanceSettings(
@@ -460,6 +463,9 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
             storefrontClientLifecycle: 'minimal_keep_running',
             autoShutdownWinePrefixOnExit: false,
             suppressWineDebugLogging: false,
+            defaultBottleDisplayScalingMode: 'force_fullscreen',
+            defaultDisplayAspectRatio: 'integer',
+            enableFullscreenHotkey: false,
           },
           { userDataDir: tempDir }
         );
@@ -472,6 +478,9 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           storefrontClientLifecycle: 'minimal_keep_running',
           autoShutdownWinePrefixOnExit: false,
           suppressWineDebugLogging: false,
+          defaultBottleDisplayScalingMode: 'force_fullscreen',
+          defaultDisplayAspectRatio: 'integer',
+          enableFullscreenHotkey: false,
         });
 
         const reloaded = launcherEngine.getLauncherPerformanceSettings({ userDataDir: tempDir });

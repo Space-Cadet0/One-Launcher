@@ -4,10 +4,14 @@ import {
   CompatibilityLayerUpdateInfo,
   CompatibilityRunnerOperationPhase,
   CrossOverGraphicsBackend,
+  GlobalBottleDisplayScalingMode,
+  GlobalDisplayAspectRatioMode,
   InGameLauncherBehavior,
   LauncherPerformanceSettings,
   LaunchMethod,
   StorefrontClientLifecyclePolicy,
+  StorefrontLaunchProfile,
+  VirtualDesktopResolutionPreset,
 } from '../../../contracts/launcher';
 import { StorefrontId } from '../../../contracts/platform';
 import {
@@ -202,6 +206,73 @@ export function formatGlobalInGameBehaviorDefaultLabel(behavior: InGameLauncherB
     default:
       return 'Use Global Default — Hide & Hibernate UI';
   }
+}
+
+export function formatGlobalBottleDisplayModeLabel(
+  mode?: GlobalBottleDisplayScalingMode
+): string {
+  switch (mode) {
+    case 'force_fullscreen':
+      return 'Force Fullscreen';
+    case 'native_driver':
+      return 'Native Wine Driver';
+    case 'windowed':
+      return 'Windowed';
+    case 'virtual_desktop':
+      return 'Wine Virtual Desktop';
+    case 'auto_fullscreen':
+    default:
+      return 'Auto Fullscreen & Upscale';
+  }
+}
+
+export function formatGlobalDisplayAspectLabel(
+  aspect?: GlobalDisplayAspectRatioMode
+): string {
+  switch (aspect) {
+    case 'integer':
+      return 'Integer Pixel-Perfect';
+    case 'stretch':
+      return 'Stretch to Fill Screen';
+    case 'preserve_aspect':
+    default:
+      return 'Preserve Aspect Ratio';
+  }
+}
+
+export const VIRTUAL_DESKTOP_RESOLUTION_OPTIONS: readonly {
+  value: VirtualDesktopResolutionPreset;
+  label: string;
+}[] = [
+  { value: 'auto', label: 'Match Display Automatically' },
+  { value: '1920x1080', label: '1920 × 1080 (16:9 FHD)' },
+  { value: '1600x900', label: '1600 × 900 (16:9 HD+)' },
+  { value: '1280x720', label: '1280 × 720 (16:9 HD)' },
+  { value: '1024x768', label: '1024 × 768 (4:3 XGA)' },
+  { value: '800x600', label: '800 × 600 (4:3 SVGA)' },
+];
+
+export function serializeStorefrontProfileCanonical(
+  profile?: StorefrontLaunchProfile
+): string {
+  if (!profile) return '{}';
+  const entries: [string, unknown][] = [];
+  for (const key of Object.keys(profile).sort()) {
+    const val = (profile as Record<string, unknown>)[key];
+    if (val === undefined) continue;
+    if (key === 'environmentVariables' && val && typeof val === 'object') {
+      const envObj = val as Record<string, string>;
+      const envEntries = Object.keys(envObj)
+        .sort()
+        .map((ek) => [ek, envObj[ek]]);
+      if (envEntries.length > 0) {
+        entries.push([key, Object.fromEntries(envEntries)]);
+      }
+      continue;
+    }
+    entries.push([key, val]);
+  }
+  return JSON.stringify(Object.fromEntries(entries));
 }
 
 export interface InGameFootprintBadgeInput {

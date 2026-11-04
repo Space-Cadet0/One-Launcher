@@ -30,6 +30,8 @@ import {
   Activity,
   Loader2,
   EyeOff,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 import { getOpenCriticData } from '../../services/critic/criticScoreService';
 import { getTierColor } from '../../services/critic/criticUtils';
@@ -145,6 +147,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   const [isLaunchConfigModalOpen, setIsLaunchConfigModalOpen] = useState(false);
   const [isLaunchPending, setIsLaunchPending] = useState(false);
   const [isStopPending, setIsStopPending] = useState(false);
+  const [isFullscreenTogglePending, setIsFullscreenTogglePending] = useState(false);
   const [collectionStorageTick, setCollectionStorageTick] = useState(0);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [fetchedInstallSize, setFetchedInstallSize] = useState<number | undefined>(undefined);
@@ -172,6 +175,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     setShowAchievementPopover(false);
     setIsLaunchPending(false);
     setIsStopPending(false);
+    setIsFullscreenTogglePending(false);
     setActionFeedback(null);
     return () => {
       if (feedbackTimerRef.current) {
@@ -204,6 +208,9 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         running,
         sess?.sessionId || '',
         sess?.status || '',
+        sess?.isBottledSession === true ? '1' : sess?.isBottledSession === false ? '0' : '',
+        sess?.fullscreenActive ? '1' : '0',
+        sess?.displayAspectRatio || '',
         dl?.taskId || '',
         dl?.status || '',
         dl ? String(Math.round(dl.progressPercent || 0)) : '',
@@ -213,6 +220,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         rec?.platformId || '',
         rec?.installPath || '',
         rec?.executablePath || '',
+        rec?.isWindowsBinaryOnMac ? '1' : '0',
         String(rec?.installSize || ''),
         cfg?.customExecutablePath || '',
         cfg?.workingDirectory || '',
@@ -330,6 +338,41 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       (launcherService as { isWindowsHost: () => boolean }).isWindowsHost()) ||
     (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
 
+  const isBottledRunningSession = useMemo(() => {
+    if (!isRunning || isWindowsHost) return false;
+    if (activeSession?.isBottledSession === true) return true;
+    if (activeSession?.isBottledSession === false) return false;
+    if (installedRecord?.isWindowsBinaryOnMac) return true;
+    if (activeSession?.launchMethod === 'compatibility_layer') return true;
+    const candidateExe =
+      activeSession?.executablePath ||
+      installedRecord?.executablePath ||
+      activePlatform?.executablePath ||
+      launchConfig?.customExecutablePath ||
+      '';
+    if (/\.exe$/i.test(candidateExe)) return true;
+    if (typeof launcherService.resolveEffectiveLaunchModePreview === 'function') {
+      const modePreview = launcherService.resolveEffectiveLaunchModePreview(
+        game,
+        selectedPlatformId
+      );
+      if (modePreview?.detectedBuildType === 'windows_exe_on_mac') return true;
+    }
+    return false;
+  }, [
+    isRunning,
+    isWindowsHost,
+    activeSession?.isBottledSession,
+    activeSession?.launchMethod,
+    activeSession?.executablePath,
+    installedRecord?.isWindowsBinaryOnMac,
+    installedRecord?.executablePath,
+    activePlatform?.executablePath,
+    launchConfig?.customExecutablePath,
+    game,
+    selectedPlatformId,
+  ]);
+
   const hasLocalFilesPath = Boolean(
     isInstalled &&
       (installedRecord?.installPath ||
@@ -384,6 +427,21 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
       }
     } finally {
       setIsStopPending(false);
+    }
+  };
+
+  const handleToggleSessionFullscreen = async () => {
+    if (isFullscreenTogglePending || isStopPending) return;
+    setIsFullscreenTogglePending(true);
+    try {
+      const res = await launcherService.toggleSessionFullscreen(game.id);
+      if (res && !res.success && res.error) {
+        showTempFeedback(res.error);
+      } else if (res?.message) {
+        showTempFeedback(res.message, 2500);
+      }
+    } finally {
+      setIsFullscreenTogglePending(false);
     }
   };
 
@@ -686,6 +744,39 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                       <Square className="w-3.5 h-3.5 fill-white" />
                       <span>Stop</span>
                     </button>
+                    {isBottledRunningSession && (
+                      <button
+                        type="button"
+                        data-testid="live-session-fullscreen-toggle"
+                        aria-pressed={Boolean(activeSession?.fullscreenActive)}
+                        title="Toggle Bottled Game Fullscreen / Windowed (Ctrl+Option+F)"
+                        disabled={isFullscreenTogglePending || isStopPending}
+                        onClick={handleToggleSessionFullscreen}
+                        className={`min-h-[38px] inline-flex items-center justify-center gap-1.5 px-3.5 xl:px-4 py-2 xl:py-2.5 rounded border font-bold text-xs xl:text-sm tracking-wider uppercase transition-colors shrink-0 cursor-pointer disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
+                          activeSession?.fullscreenActive
+                            ? 'bg-sky-950/75 hover:bg-sky-900/80 border-sky-400/60 text-sky-100 hover:text-white'
+                            : 'bg-[#16202d] hover:bg-[#1f2c3d] border-[#3878a8]/80 text-white'
+                        }`}
+                      >
+                        {activeSession?.fullscreenActive ? (
+                          <>
+                            <Minimize2
+                              className="w-3.5 h-3.5 text-sky-300 shrink-0"
+                              aria-hidden="true"
+                            />
+                            <span>Windowed</span>
+                          </>
+                        ) : (
+                          <>
+                            <Maximize2
+                              className="w-3.5 h-3.5 text-sky-400 shrink-0"
+                              aria-hidden="true"
+                            />
+                            <span>Fullscreen</span>
+                          </>
+                        )}
+                      </button>
+                    )}
                   </>
                 )}
               </div>

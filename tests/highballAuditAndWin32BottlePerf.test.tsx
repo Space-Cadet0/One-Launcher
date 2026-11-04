@@ -1473,6 +1473,8 @@ describe('Clean-Room Launch Engine Hardening & 32-Bit PE32 Bottled Performance R
           'WINE REGISTRY Version 2',
           '[Software\\\\Wine\\\\Mac Driver]',
           '"RetinaMode"="y"',
+          '[Software\\\\Wine\\\\Fonts]',
+          '"LogPixels"=dword:000000c0',
           '[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw.exe\\\\Mac Driver]',
           '"RetinaMode"="n"',
           '',
@@ -1483,8 +1485,9 @@ describe('Clean-Room Launch Engine Hardening & 32-Bit PE32 Bottled Performance R
       fs.writeFileSync(perlWineWrapper, '#!/usr/bin/perl\n# synthetic wrapper\n', { mode: 0o755 });
 
       // 1. Legacy 32-bit DirectDraw game with `crossoverHighResolutionMode: true` in config:
-      // Must force 96 DPI (`RetinaMode="n"`, `LogPixels=dword:00000060`, `1512x982` 1x logical desktop)
-      // consistently across global Mac Driver, explorer.exe, and target exe so explorer.exe never scales 2x!
+      // Scopes 96 DPI (`RetinaMode="n"`, `CaptureDisplaysForFullscreen="y"`, `UseConfinementCursorClipping="y"`)
+      // strictly to per-exe AppDefaults\<exe>\Mac Driver + `1512x982` 1x logical desktop without poisoning
+      // shared bottle global `Mac Driver` or `explorer.exe`!
       const envLegacyDpi: Record<string, string> = {};
       macInstaller.applyCrossOverPerGameSettings(
         { id: 'crossover', name: 'CrossOver', type: 'crossover', binaryPath: perlWineWrapper, bottlesDir },
@@ -1517,20 +1520,28 @@ describe('Clean-Room Launch Engine Hardening & 32-Bit PE32 Bottled Performance R
       );
 
       const regLegacy = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
-      expect(regLegacy).toContain('"OneLauncher"="1512x982"');
-      expect(regLegacy).not.toContain('"OneLauncher"="3024x1964"');
-      expect(regLegacy).toMatch(/\[Software\\\\Wine\\\\Mac Driver\][^\[]*"RetinaMode"="n"/m);
+      expect(regLegacy).toContain('"OneLauncher"="3024x1964"');
+      expect(regLegacy).toMatch(/\[Software\\\\Wine\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m);
+      const explorerLegacyMacDrvSec =
+        /\[Software\\\\Wine\\\\AppDefaults\\\\explorer\.exe\\\\Mac Driver\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(
+          regLegacy
+        );
+      expect(explorerLegacyMacDrvSec?.[1] || '').not.toContain('"RetinaMode"');
       expect(regLegacy).toMatch(
-        /\[Software\\\\Wine\\\\AppDefaults\\\\explorer\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="n"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\legacystart\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m
       );
       expect(regLegacy).toMatch(
-        /\[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="n"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m
       );
-      expect(regLegacy).toMatch(/\[Control Panel\\\\Desktop\][^\[]*"LogPixels"=dword:00000060/m);
-      expect(regLegacy).toMatch(/\[Software\\\\Wine\\\\Fonts\][^\[]*"LogPixels"=dword:00000060/m);
+      expect(regLegacy).toMatch(
+        /\[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw\.exe\\\\Mac Driver\][^\[]*"CaptureDisplaysForFullscreen"="n"/m
+      );
+      expect(regLegacy).toMatch(
+        /\[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw\.exe\\\\Mac Driver\][^\[]*"UseConfinementCursorClipping"="y"/m
+      );
 
       // Switching back to a modern 64-bit game with `crossoverHighResolutionMode: true` restores RetinaMode="y"
-      // AND purges stale AppDefaults\<exe>\Mac Driver RetinaMode="n" so explorer.exe and <exe> stay synchronized!
+      // across global Mac Driver and target exes while keeping explorer.exe\Mac Driver clean!
       macInstaller.applyCrossOverPerGameSettings(
         { id: 'crossover', name: 'CrossOver', type: 'crossover', binaryPath: perlWineWrapper, bottlesDir },
         {
@@ -1574,7 +1585,8 @@ describe('Clean-Room Launch Engine Hardening & 32-Bit PE32 Bottled Performance R
         /\[Software\\\\Wine\\\\AppDefaults\\\\legacyddraw\.exe\\\\Mac Driver\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(
           regModern
         );
-      expect(legacyExeMacDrvSec?.[1] || '').not.toContain('"RetinaMode"');
+      expect(legacyExeMacDrvSec?.[1] || '').not.toContain('"RetinaMode"="n"');
+      expect(legacyExeMacDrvSec?.[1] || '').toContain('"RetinaMode"="y"');
 
       // 2. End-to-end launchGame on darwin + CrossOver Perl bin/wine:
       // Pre-set user WINEDLLOVERRIDES + enableAudioBufferClamp (which moves DYLD_INSERT_LIBRARIES into CX_ENV

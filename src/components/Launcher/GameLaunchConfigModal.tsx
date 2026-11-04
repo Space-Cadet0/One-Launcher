@@ -324,6 +324,15 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             onChangeMetalfxSpatialUpscaleFactor: form.setMetalfxSpatialUpscaleFactor,
             preferredMaxFrameRate: form.preferredMaxFrameRate,
             onChangePreferredMaxFrameRate: form.setPreferredMaxFrameRate,
+            displayScalingMode: form.displayScalingMode,
+            onChangeDisplayScalingMode: form.setDisplayScalingMode,
+            displayAspectRatio: form.displayAspectRatio,
+            onChangeDisplayAspectRatio: form.setDisplayAspectRatio,
+            virtualDesktopResolution: form.virtualDesktopResolution,
+            onChangeVirtualDesktopResolution: form.setVirtualDesktopResolution,
+            defaultBottleDisplayScalingMode: form.perfSettings.defaultBottleDisplayScalingMode,
+            defaultDisplayAspectRatio: form.perfSettings.defaultDisplayAspectRatio,
+            enableFullscreenHotkey: form.perfSettings.enableFullscreenHotkey,
             emulateModeset: form.emulateModeset,
             onChangeEmulateModeset: form.setEmulateModeset,
             forceLargeAddressAware: form.forceLargeAddressAware,
@@ -374,6 +383,10 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             onTogglePauseSyncInGame: form.handleTogglePauseSyncInGame,
             onTogglePauseDownloadsInGame: form.handleTogglePauseDownloadsInGame,
             onToggleAutoShutdownWine: form.handleToggleAutoShutdownWine,
+            onChangeDefaultBottleDisplayScalingMode:
+              form.handleChangeDefaultBottleDisplayScalingMode,
+            onChangeDefaultDisplayAspectRatio: form.handleChangeDefaultDisplayAspectRatio,
+            onToggleFullscreenHotkey: form.handleToggleFullscreenHotkey,
           })}
 
           {form.preview.isInstalled &&
@@ -436,6 +449,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             </button>
             <button
               type="button"
+              data-has-unsaved-changes={form.hasUnsavedChanges ? 'true' : 'false'}
               onClick={form.handleSave}
               disabled={form.isSaving}
               className={`inline-flex items-center gap-1.5 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}

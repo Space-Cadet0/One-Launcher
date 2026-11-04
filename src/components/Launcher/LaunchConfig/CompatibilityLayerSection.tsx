@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  BottleDisplayScalingMode,
   CompatibilityLayerInfo,
   CompatibilityLayerType,
   CompatibilityLayerUpdateInfo,
@@ -7,8 +8,12 @@ import {
   CompatibilityRunnerProgressEvent,
   CrossOverD3DMetalVersion,
   CrossOverGraphicsBackend,
+  DisplayAspectRatioMode,
+  GlobalBottleDisplayScalingMode,
+  GlobalDisplayAspectRatioMode,
   LaunchMethod,
   ResolvedLaunchModePreview,
+  VirtualDesktopResolutionPreset,
 } from '../../../contracts/launcher';
 import {
   Activity,
@@ -20,6 +25,7 @@ import {
   FolderOpen,
   Gauge,
   Loader2,
+  Maximize2,
   Monitor,
   RefreshCw,
   Sparkles,
@@ -31,6 +37,9 @@ import { formatBytes } from '../../../utils/formatBytes';
 import {
   COMPAT_LAYER_OPTIONS,
   CROSSOVER_BACKEND_OPTIONS,
+  VIRTUAL_DESKTOP_RESOLUTION_OPTIONS,
+  formatGlobalBottleDisplayModeLabel,
+  formatGlobalDisplayAspectLabel,
   formatRunnerOptionLabel,
   formatRunnerPhaseLabel,
   formatRunnerSecondaryBuildText,
@@ -180,6 +189,15 @@ export interface CompatibilityLayerSectionProps {
   onChangeMetalfxSpatialUpscaleFactor?: (value: number | undefined) => void;
   preferredMaxFrameRate?: number;
   onChangePreferredMaxFrameRate?: (value: number | undefined) => void;
+  displayScalingMode?: BottleDisplayScalingMode;
+  onChangeDisplayScalingMode?: (value: BottleDisplayScalingMode) => void;
+  displayAspectRatio?: DisplayAspectRatioMode;
+  onChangeDisplayAspectRatio?: (value: DisplayAspectRatioMode) => void;
+  virtualDesktopResolution?: VirtualDesktopResolutionPreset | string;
+  onChangeVirtualDesktopResolution?: (value: VirtualDesktopResolutionPreset | string) => void;
+  defaultBottleDisplayScalingMode?: GlobalBottleDisplayScalingMode;
+  defaultDisplayAspectRatio?: GlobalDisplayAspectRatioMode;
+  enableFullscreenHotkey?: boolean;
   emulateModeset?: boolean;
   onChangeEmulateModeset?: (value: boolean | undefined) => void;
   forceLargeAddressAware?: boolean;
@@ -271,6 +289,35 @@ function CompatibilityLayerSectionImpl(
   const effectivePreferredMaxFrameRate = props.preferredMaxFrameRate;
   const handlePreferredMaxFrameRateChange = props.onChangePreferredMaxFrameRate ?? NOOP;
 
+  const effectiveDisplayScalingMode: BottleDisplayScalingMode =
+    props.displayScalingMode ?? 'default';
+  const handleDisplayScalingModeChange = props.onChangeDisplayScalingMode ?? NOOP;
+
+  const effectiveDisplayAspectRatio: DisplayAspectRatioMode =
+    props.displayAspectRatio ?? 'default';
+  const handleDisplayAspectRatioChange = props.onChangeDisplayAspectRatio ?? NOOP;
+
+  const effectiveVirtualDesktopResolution =
+    (props.virtualDesktopResolution ?? 'auto').trim().toLowerCase() || 'auto';
+  const handleVirtualDesktopResolutionChange = props.onChangeVirtualDesktopResolution ?? NOOP;
+
+  const globalScalingMode: GlobalBottleDisplayScalingMode =
+    props.defaultBottleDisplayScalingMode ?? 'auto_fullscreen';
+  const globalAspectRatio: GlobalDisplayAspectRatioMode =
+    props.defaultDisplayAspectRatio ?? 'preserve_aspect';
+  const effectiveFullscreenHotkeyEnabled = props.enableFullscreenHotkey ?? true;
+
+  const resolvedScalingMode: GlobalBottleDisplayScalingMode =
+    effectiveDisplayScalingMode === 'default' ? globalScalingMode : effectiveDisplayScalingMode;
+  const showAspectRatioSelect =
+    resolvedScalingMode === 'auto_fullscreen' || resolvedScalingMode === 'force_fullscreen';
+  const showVirtualDesktopResolutionSelect = resolvedScalingMode === 'virtual_desktop';
+  const globalModeLabel = formatGlobalBottleDisplayModeLabel(globalScalingMode);
+  const globalAspectLabel = formatGlobalDisplayAspectLabel(globalAspectRatio);
+  const hasCustomVdResValue = !VIRTUAL_DESKTOP_RESOLUTION_OPTIONS.some(
+    (opt) => opt.value === effectiveVirtualDesktopResolution
+  );
+
   const effectiveEmulateModeset = props.emulateModeset;
   const handleEmulateModesetChange = props.onChangeEmulateModeset ?? NOOP;
 
@@ -308,6 +355,12 @@ function CompatibilityLayerSectionImpl(
   const metalfxSpatialHintId = `${idPrefix}-metalfx-spatial-upscale-hint`;
   const preferredMaxFpsSelectId = `${idPrefix}-preferred-max-fps`;
   const preferredMaxFpsHintId = `${idPrefix}-preferred-max-fps-hint`;
+  const displayScalingSelectId = `${idPrefix}-display-scaling-mode`;
+  const displayScalingHintId = `${idPrefix}-display-scaling-mode-hint`;
+  const displayAspectSelectId = `${idPrefix}-display-aspect-ratio`;
+  const displayAspectHintId = `${idPrefix}-display-aspect-ratio-hint`;
+  const virtualDesktopResSelectId = `${idPrefix}-virtual-desktop-res`;
+  const virtualDesktopResHintId = `${idPrefix}-virtual-desktop-res-hint`;
   const emulateModesetSelectId = `${idPrefix}-emulate-modeset`;
   const emulateModesetHintId = `${idPrefix}-emulate-modeset-hint`;
   const forceLaaLabelId = `${idPrefix}-force-laa-label`;
@@ -898,101 +951,58 @@ function CompatibilityLayerSectionImpl(
           </span>
         </div>
 
-        {/* Multi-column Select Row 1 (CSS Subgrid aligned across label / select / helper hint) */}
-        <div
-          className={`grid grid-cols-1 ${
-            preview.visibleSections.crossoverRendering ? 'sm:grid-cols-2' : ''
-          } gap-x-3 gap-y-3`}
-        >
-          {/* Graphics Backend (CrossOver only) */}
-          {preview.visibleSections.crossoverRendering && (
-            <div className="ol-subgrid-field">
-              <div className="flex flex-wrap items-center justify-between gap-1 self-end">
-                <label
-                  htmlFor={graphicsBackendSelectId}
-                  className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-                >
-                  Graphics Backend
-                </label>
-                <span
-                  data-testid="graphics-backend-arch-badge"
-                  className="text-[10px] font-semibold text-sky-300"
-                >
-                  {activeBackendPolicy.architectureBadge}
-                </span>
-              </div>
-              <LaunchSelect
-                id={graphicsBackendSelectId}
-                surface="panel"
-                aria-label="Graphics Backend"
-                aria-describedby={graphicsBackendHintId}
-                value={crossoverGraphicsBackend}
-                onChange={(e) =>
-                  onChangeCrossoverGraphicsBackend(e.target.value as CrossOverGraphicsBackend)
-                }
+        {/* Graphics Backend (CrossOver only) */}
+        {preview.visibleSections.crossoverRendering && (
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <label
+                htmlFor={graphicsBackendSelectId}
+                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
               >
-                {CROSSOVER_BACKEND_OPTIONS.map((opt) => {
-                  const dynamicLabel =
-                    opt.value === 'd3dmetal' && activeLayer?.d3dmetalVersion
-                      ? `D3DMetal (v${
-                          crossoverD3DMetalVersion === '3' && showD3DMetalVersionSelector
-                            ? fallbackD3DVer
-                            : activeLayer.d3dmetalVersion
-                        } — Apple GPTK 64-bit DirectX 11 & 12)`
-                      : opt.label;
-                  return (
-                    <option key={opt.value} value={opt.value}>
-                      {dynamicLabel}
-                    </option>
-                  );
-                })}
-              </LaunchSelect>
-              <p
-                id={graphicsBackendHintId}
-                data-testid="graphics-backend-guidance"
-                className="text-[10px] text-[#cbd5e1] leading-snug"
+                Graphics Backend
+              </label>
+              <span
+                data-testid="graphics-backend-arch-badge"
+                className="text-[10px] font-semibold text-sky-300"
               >
-                {activeBackendPolicy.guidance}
-              </p>
+                {activeBackendPolicy.architectureBadge}
+              </span>
             </div>
-          )}
-
-          {/* High Resolution Mode (Retina 192 DPI) */}
-          <div className="ol-subgrid-field">
-            <label
-              htmlFor={highResModeSelectId}
-              className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
-            >
-              <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-              <span>High Resolution Mode (Retina 192 DPI)</span>
-            </label>
             <LaunchSelect
-              id={highResModeSelectId}
+              id={graphicsBackendSelectId}
               surface="panel"
-              aria-label="High Resolution Mode"
-              aria-describedby={highResModeHintId}
-              value={
-                crossoverHighResolutionMode === undefined
-                  ? ''
-                  : crossoverHighResolutionMode
-                    ? 'true'
-                    : 'false'
+              aria-label="Graphics Backend"
+              aria-describedby={graphicsBackendHintId}
+              value={crossoverGraphicsBackend}
+              onChange={(e) =>
+                onChangeCrossoverGraphicsBackend(e.target.value as CrossOverGraphicsBackend)
               }
-              onChange={(e) => {
-                const val = e.target.value;
-                onChangeCrossoverHighResolutionMode(val === '' ? undefined : val === 'true');
-              }}
             >
-              <option value="">Bottle Default</option>
-              <option value="true">Enabled (192 DPI Retina — Crisp UI/Text)</option>
-              <option value="false">Disabled (96 DPI Standard — Higher FPS)</option>
+              {CROSSOVER_BACKEND_OPTIONS.map((opt) => {
+                const dynamicLabel =
+                  opt.value === 'd3dmetal' && activeLayer?.d3dmetalVersion
+                    ? `D3DMetal (v${
+                        crossoverD3DMetalVersion === '3' && showD3DMetalVersionSelector
+                          ? fallbackD3DVer
+                          : activeLayer.d3dmetalVersion
+                      } — Apple GPTK 64-bit DirectX 11 & 12)`
+                    : opt.label;
+                return (
+                  <option key={opt.value} value={opt.value}>
+                    {dynamicLabel}
+                  </option>
+                );
+              })}
             </LaunchSelect>
-            <p id={highResModeHintId} className="text-[10px] text-steam-subtext leading-snug">
-              Renders game menus and text at full Retina resolution (192 DPI) instead of upscaled 96
-              DPI.
+            <p
+              id={graphicsBackendHintId}
+              data-testid="graphics-backend-guidance"
+              className="text-[10px] text-[#cbd5e1] leading-snug"
+            >
+              {activeBackendPolicy.guidance}
             </p>
           </div>
-        </div>
+        )}
 
         {/* Per-Game D3DMetal Version Switcher (CrossOver Preview / Dual-D3DMetal Runners) */}
         {preview.visibleSections.crossoverRendering && showD3DMetalVersionSelector && (
@@ -1103,10 +1113,10 @@ function CompatibilityLayerSectionImpl(
           </div>
         )}
 
-        {/* Multi-column Select Row 2 (CSS Subgrid aligned across MetalFX Spatial, Frame Rate Limit & Display Mode Emulation) */}
+        {/* Rendering Pacing Row (MetalFX Spatial & Frame Rate Limit) */}
         <div
           className={`grid grid-cols-1 ${
-            showMetalfxSpatialControl ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+            showMetalfxSpatialControl ? 'sm:grid-cols-2' : ''
           } gap-x-3 gap-y-3`}
         >
           {showMetalfxSpatialControl && (
@@ -1200,40 +1210,230 @@ function CompatibilityLayerSectionImpl(
               lower MacBook thermals.
             </p>
           </div>
+        </div>
 
-          <div className="ol-subgrid-field">
-            <label
-              htmlFor={emulateModesetSelectId}
-              className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
-            >
-              <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-              <span>Display Mode Emulation</span>
-            </label>
-            <LaunchSelect
-              id={emulateModesetSelectId}
-              data-testid="emulate-modeset-select"
-              surface="panel"
-              aria-describedby={emulateModesetHintId}
-              value={
-                effectiveEmulateModeset === undefined
-                  ? ''
-                  : effectiveEmulateModeset
-                    ? 'true'
-                    : 'false'
-              }
-              onChange={(e) => {
-                const val = e.target.value;
-                handleEmulateModesetChange(val === '' ? undefined : val === 'true');
-              }}
-            >
-              <option value="">Bottle / Auto Default</option>
-              <option value="true">Enabled (Fix Exclusive Fullscreen Loops)</option>
-              <option value="false">Disabled</option>
-            </LaunchSelect>
-            <p id={emulateModesetHintId} className="text-[10px] text-steam-subtext leading-snug">
-              Emulates Win32 display mode switches inside Wine Mac Driver without altering macOS
-              desktop resolution.
-            </p>
+        {/* Dedicated Display, Fullscreen & Scaling Sub-Panel */}
+        <div
+          data-testid="display-fullscreen-scaling-panel"
+          className="rounded-lg bg-[#0e151f] border border-[#223447] p-3 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <Maximize2 className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
+              <h5 className="text-[10px] font-bold uppercase tracking-wider text-white">
+                Display, Fullscreen &amp; Scaling
+              </h5>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300 font-semibold">
+              {effectiveFullscreenHotkeyEnabled
+                ? 'Live Toggle: Ctrl+Option+F'
+                : 'Per-Game Display Profile'}
+            </span>
+          </div>
+
+          <div
+            className={`grid grid-cols-1 ${
+              showAspectRatioSelect || showVirtualDesktopResolutionSelect ? 'sm:grid-cols-2' : ''
+            } gap-x-3 gap-y-3`}
+          >
+            <div className="ol-subgrid-field">
+              <label
+                htmlFor={displayScalingSelectId}
+                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+              >
+                <Maximize2 className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                <span>Fullscreen &amp; Legacy Upscaling</span>
+              </label>
+              <LaunchSelect
+                id={displayScalingSelectId}
+                data-testid="display-scaling-mode-select"
+                surface="panel"
+                aria-label="Fullscreen & Legacy Upscaling"
+                aria-describedby={displayScalingHintId}
+                value={effectiveDisplayScalingMode}
+                onChange={(e) =>
+                  handleDisplayScalingModeChange(e.target.value as BottleDisplayScalingMode)
+                }
+              >
+                <option value="default">Use Global Default ({globalModeLabel})</option>
+                <option value="auto_fullscreen">
+                  Auto Fullscreen &amp; Upscale Legacy Resolutions (Recommended)
+                </option>
+                <option value="force_fullscreen">
+                  Force Fullscreen (Include Small Windowed Games)
+                </option>
+                <option value="native_driver">
+                  Native Wine Window / Exclusive Fullscreen
+                </option>
+                <option value="windowed">Windowed (Movable macOS Window)</option>
+                <option value="virtual_desktop">
+                  Wine Virtual Desktop (Isolated Container)
+                </option>
+              </LaunchSelect>
+              <p id={displayScalingHintId} className="text-[10px] text-steam-subtext leading-snug">
+                {resolvedScalingMode === 'force_fullscreen'
+                  ? 'Promotes both legacy CRT display modes and fixed small windowed games into notch-safe macOS fullscreen.'
+                  : resolvedScalingMode === 'virtual_desktop'
+                    ? 'Contains legacy DirectDraw / DirectX titles inside an isolated Wine virtual desktop window.'
+                    : resolvedScalingMode === 'windowed'
+                      ? 'Keeps bottled games in a movable, standard macOS window instead of entering fullscreen.'
+                      : resolvedScalingMode === 'native_driver'
+                        ? 'Delegates window management directly to Wine Mac Driver without automatic legacy upscaling.'
+                        : 'Automatically upscales 640×480 / 800×600 / 1024×768 games into crisp, notch-safe macOS fullscreen.'}
+              </p>
+            </div>
+
+            {showAspectRatioSelect && (
+              <div className="ol-subgrid-field">
+                <label
+                  htmlFor={displayAspectSelectId}
+                  className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+                >
+                  <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>Aspect Ratio &amp; Scaling Filter</span>
+                </label>
+                <LaunchSelect
+                  id={displayAspectSelectId}
+                  data-testid="display-aspect-ratio-select"
+                  surface="panel"
+                  aria-label="Aspect Ratio & Scaling Filter"
+                  aria-describedby={displayAspectHintId}
+                  value={effectiveDisplayAspectRatio}
+                  onChange={(e) =>
+                    handleDisplayAspectRatioChange(e.target.value as DisplayAspectRatioMode)
+                  }
+                >
+                  <option value="default">Use Global Default ({globalAspectLabel})</option>
+                  <option value="preserve_aspect">
+                    Preserve Aspect Ratio (4:3 Pillarbox / Notch-Safe)
+                  </option>
+                  <option value="integer">
+                    Integer Pixel-Perfect (Crisp Nearest-Neighbor)
+                  </option>
+                  <option value="stretch">Stretch to Fill Screen</option>
+                </LaunchSelect>
+                <p id={displayAspectHintId} className="text-[10px] text-steam-subtext leading-snug">
+                  In-game shortcuts:{' '}
+                  <kbd className="font-mono text-sky-300">Ctrl+Option+F</kbd> toggles Fullscreen /
+                  Windowed; <kbd className="font-mono text-sky-300">Ctrl+Option+A</kbd> cycles
+                  Aspect Ratio.
+                </p>
+              </div>
+            )}
+
+            {showVirtualDesktopResolutionSelect && (
+              <div className="ol-subgrid-field">
+                <label
+                  htmlFor={virtualDesktopResSelectId}
+                  className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+                >
+                  <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>Virtual Desktop Resolution</span>
+                </label>
+                <LaunchSelect
+                  id={virtualDesktopResSelectId}
+                  data-testid="virtual-desktop-resolution-select"
+                  surface="panel"
+                  aria-label="Virtual Desktop Resolution"
+                  aria-describedby={virtualDesktopResHintId}
+                  value={effectiveVirtualDesktopResolution}
+                  onChange={(e) => handleVirtualDesktopResolutionChange(e.target.value)}
+                >
+                  {VIRTUAL_DESKTOP_RESOLUTION_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                  {hasCustomVdResValue && (
+                    <option value={effectiveVirtualDesktopResolution}>
+                      {effectiveVirtualDesktopResolution} (Custom)
+                    </option>
+                  )}
+                </LaunchSelect>
+                <p
+                  id={virtualDesktopResHintId}
+                  className="text-[10px] text-steam-subtext leading-snug"
+                >
+                  Sets the fixed container resolution reported to legacy Win32 games inside Wine
+                  Virtual Desktop.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-3 pt-1 border-t border-[#223447]/80">
+            {/* High Resolution Mode (Retina 192 DPI) */}
+            <div className="ol-subgrid-field">
+              <label
+                htmlFor={highResModeSelectId}
+                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+              >
+                <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                <span>High Resolution Mode (Retina 192 DPI)</span>
+              </label>
+              <LaunchSelect
+                id={highResModeSelectId}
+                data-testid="toggle-high-res-retina"
+                surface="panel"
+                aria-label="High Resolution Mode"
+                aria-describedby={highResModeHintId}
+                value={
+                  crossoverHighResolutionMode === undefined
+                    ? ''
+                    : crossoverHighResolutionMode
+                      ? 'true'
+                      : 'false'
+                }
+                onChange={(e) => {
+                  const val = e.target.value;
+                  onChangeCrossoverHighResolutionMode(val === '' ? undefined : val === 'true');
+                }}
+              >
+                <option value="">Bottle Default</option>
+                <option value="true">Enabled (192 DPI Retina — Crisp UI/Text)</option>
+                <option value="false">Disabled (96 DPI Standard — Higher FPS)</option>
+              </LaunchSelect>
+              <p id={highResModeHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Renders game menus and text at full Retina resolution (192 DPI) instead of upscaled
+                96 DPI.
+              </p>
+            </div>
+
+            {/* Display Mode Emulation */}
+            <div className="ol-subgrid-field">
+              <label
+                htmlFor={emulateModesetSelectId}
+                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1 self-end"
+              >
+                <Monitor className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                <span>Display Mode Emulation</span>
+              </label>
+              <LaunchSelect
+                id={emulateModesetSelectId}
+                data-testid="emulate-modeset-select"
+                surface="panel"
+                aria-describedby={emulateModesetHintId}
+                value={
+                  effectiveEmulateModeset === undefined
+                    ? ''
+                    : effectiveEmulateModeset
+                      ? 'true'
+                      : 'false'
+                }
+                onChange={(e) => {
+                  const val = e.target.value;
+                  handleEmulateModesetChange(val === '' ? undefined : val === 'true');
+                }}
+              >
+                <option value="">Bottle / Auto Default</option>
+                <option value="true">Enabled (Fix Exclusive Fullscreen Loops)</option>
+                <option value="false">Disabled</option>
+              </LaunchSelect>
+              <p id={emulateModesetHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Emulates Win32 display mode switches inside Wine Mac Driver without altering macOS
+                desktop resolution.
+              </p>
+            </div>
           </div>
         </div>
 

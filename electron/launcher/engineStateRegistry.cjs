@@ -1277,6 +1277,16 @@ const LAUNCH_PROFILE_KEYS = [
   'metalHud',
   'dxvkHud',
   'wineDebug',
+  'preferredMaxFrameRate',
+  'metalfxSpatialUpscaleFactor',
+  'virtualDesktop',
+  'virtualDesktopResolution',
+  'displayScalingMode',
+  'displayAspectRatio',
+  'emulateModeset',
+  'forceLargeAddressAware',
+  'audioBufferClamp',
+  'advertiseAvx',
   'inGameLauncherBehavior',
   'storefrontClientLifecycle',
   'preLaunchCommand',
@@ -1528,6 +1538,9 @@ const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS = {
   storefrontClientLifecycle: 'minimal_and_close_if_started',
   autoShutdownWinePrefixOnExit: true,
   suppressWineDebugLogging: true,
+  defaultBottleDisplayScalingMode: 'auto_fullscreen',
+  defaultDisplayAspectRatio: 'preserve_aspect',
+  enableFullscreenHotkey: true,
 };
 
 const VALID_IN_GAME_BEHAVIORS = new Set([
@@ -1548,6 +1561,20 @@ const VALID_STOREFRONT_LIFECYCLES = new Set([
   'minimal_keep_running',
   'minimal_and_close_if_started',
   'fast_direct_bypass',
+]);
+
+const VALID_BOTTLE_DISPLAY_SCALING_MODES = new Set([
+  'auto_fullscreen',
+  'force_fullscreen',
+  'native_driver',
+  'windowed',
+  'virtual_desktop',
+]);
+
+const VALID_DISPLAY_ASPECT_RATIOS = new Set([
+  'preserve_aspect',
+  'integer',
+  'stretch',
 ]);
 
 function normalizeStorefrontClientLifecycle(val) {
@@ -1594,6 +1621,18 @@ function sanitizeLauncherPerformanceSettings(/** @type {any} */ raw = {}) {
       typeof src.suppressWineDebugLogging === 'boolean'
         ? src.suppressWineDebugLogging
         : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.suppressWineDebugLogging,
+    defaultBottleDisplayScalingMode: VALID_BOTTLE_DISPLAY_SCALING_MODES.has(
+      src.defaultBottleDisplayScalingMode
+    )
+      ? src.defaultBottleDisplayScalingMode
+      : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultBottleDisplayScalingMode,
+    defaultDisplayAspectRatio: VALID_DISPLAY_ASPECT_RATIOS.has(src.defaultDisplayAspectRatio)
+      ? src.defaultDisplayAspectRatio
+      : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultDisplayAspectRatio,
+    enableFullscreenHotkey:
+      typeof src.enableFullscreenHotkey === 'boolean'
+        ? src.enableFullscreenHotkey
+        : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.enableFullscreenHotkey,
   };
 }
 
@@ -1626,8 +1665,39 @@ function saveLauncherPerformanceSettings(/** @type {any} */ settings = {}, /** @
   return result;
 }
 
-function resolveEffectivePerformancePolicy(/** @type {any} */ launchConfig = {}, /** @type {any} */ options = {}) {
-  const base = getLauncherPerformanceSettings(options);
+function resolveEffectivePerformancePolicy(
+  /** @type {any} */ launchConfig = {},
+  /** @type {any} */ perfSettingsOrOptions = {},
+  /** @type {any} */ maybeOptions = undefined
+) {
+  const isExplicitPerfObject =
+    maybeOptions !== undefined ||
+    Boolean(
+      perfSettingsOrOptions &&
+        typeof perfSettingsOrOptions === 'object' &&
+        ('inGameLauncherBehavior' in perfSettingsOrOptions ||
+          'defaultBottleDisplayScalingMode' in perfSettingsOrOptions ||
+          'defaultDisplayAspectRatio' in perfSettingsOrOptions ||
+          'storefrontClientLifecycle' in perfSettingsOrOptions ||
+          'enableFullscreenHotkey' in perfSettingsOrOptions)
+    );
+  const effectiveOpts =
+    maybeOptions !== undefined
+      ? maybeOptions
+      : isExplicitPerfObject &&
+          perfSettingsOrOptions &&
+          typeof perfSettingsOrOptions === 'object' &&
+          ('userDataDir' in perfSettingsOrOptions || 'baseDir' in perfSettingsOrOptions)
+        ? perfSettingsOrOptions
+        : isExplicitPerfObject
+          ? {}
+          : perfSettingsOrOptions;
+
+  const diskBase = getLauncherPerformanceSettings(effectiveOpts);
+  const base =
+    isExplicitPerfObject && perfSettingsOrOptions && typeof perfSettingsOrOptions === 'object'
+      ? sanitizeLauncherPerformanceSettings({ ...diskBase, ...perfSettingsOrOptions })
+      : diskBase;
   const cfg = launchConfig && typeof launchConfig === 'object' ? launchConfig : {};
 
   const inGameOverride =
@@ -1647,10 +1717,31 @@ function resolveEffectivePerformancePolicy(/** @type {any} */ launchConfig = {},
     base.storefrontClientLifecycle
   );
 
+  const effectiveDisplayScalingMode =
+    cfg.displayScalingMode &&
+    cfg.displayScalingMode !== 'default' &&
+    VALID_BOTTLE_DISPLAY_SCALING_MODES.has(cfg.displayScalingMode)
+      ? cfg.displayScalingMode
+      : cfg.virtualDesktop === true
+        ? 'virtual_desktop'
+        : base.defaultBottleDisplayScalingMode || 'auto_fullscreen';
+
+  const effectiveDisplayAspectRatio =
+    cfg.displayAspectRatio &&
+    cfg.displayAspectRatio !== 'default' &&
+    VALID_DISPLAY_ASPECT_RATIOS.has(cfg.displayAspectRatio)
+      ? cfg.displayAspectRatio
+      : base.defaultDisplayAspectRatio || 'preserve_aspect';
+
+  const enableFullscreenHotkey = base.enableFullscreenHotkey !== false;
+
   return {
     ...base,
     inGameLauncherBehavior: inGameOverride,
     storefrontClientLifecycle: storefrontOverride,
+    effectiveDisplayScalingMode,
+    effectiveDisplayAspectRatio,
+    enableFullscreenHotkey,
   };
 }
 

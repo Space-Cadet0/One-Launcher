@@ -44,6 +44,7 @@ const {
   hasMalformedBackslashExportForwarder,
   resolveEffectiveGameExecutableCapabilities,
   resolveParadoxLauncherSettings,
+  resolveCaseInsensitiveRelFile,
   isCompatibleX86OrX64PeHeader,
   parseSteamAcf,
   deriveDefaultScidFromTitleId,
@@ -60,6 +61,7 @@ const {
 } = require('./cloudSaveEngine.cjs');
 
 const {
+  getElectron,
   getStoreSync,
   getXboxStorefrontModules,
   diagLog,
@@ -178,6 +180,7 @@ const {
   resumeDownloadsPausedByInGame,
 } = require('./downloadQueueCoordinator.cjs');
 const {
+  toWineWindowsPath,
   deleteWineSystemRegKey,
   isBottleWineserverActive,
 } = require('./firstPartyRegistration.cjs');
@@ -421,6 +424,249 @@ function stripKeysFromCxEnv(cxEnvStr, keysToRemove) {
   return tokens.join(' ');
 }
 
+const DISPLAY_SCALER_ENV_KEYS = Object.freeze([
+  'ONE_LAUNCHER_DISPLAY_SCALING_MODE',
+  'ONE_LAUNCHER_DISPLAY_ASPECT',
+  'ONE_LAUNCHER_SAFE_INSET_TOP',
+  'ONE_LAUNCHER_FULLSCREEN_HOTKEY',
+  'ONE_LAUNCHER_SCALER_DLL_X86',
+  'ONE_LAUNCHER_SCALER_DLL_X64',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X86',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X64',
+  'ONE_LAUNCHER_DISPLAY_CONTROL_FILE',
+  'ONE_LAUNCHER_DISPLAY_STATUS_FILE',
+]);
+
+const VALID_DISPLAY_ASPECT_MODES = new Set(['preserve_aspect', 'stretch', 'integer']);
+
+/**
+ * Resolve a bundled Win32 display scaler helper binary (`one_display_scaler_{x86,x64}.dll` or
+ * `one_display_launcher_{x86,x64}.exe`) across dev, unpacked ASAR, and test overrides.
+ *
+ * @param {string} fileName
+ * @param {Record<string, any> | null | undefined} [options]
+ * @returns {string}
+ */
+function resolveBundledDisplayScalerBinPath(fileName, options = {}) {
+  if (!fileName || typeof fileName !== 'string') return '';
+  const customDir = String(
+    options?.displayScalerBinDir || process.env.ONE_LAUNCHER_DISPLAY_SCALER_BIN_DIR || ''
+  ).trim();
+  const rawLocalBin = path.join(__dirname, '..', 'helpers', 'bin', fileName);
+  const unpackedLocalBin = rawLocalBin.replace(/app\.asar([\\/])/i, 'app.asar.unpacked$1');
+  const candidates = [
+    customDir ? path.join(customDir, fileName) : '',
+    process.resourcesPath
+      ? path.join(
+          process.resourcesPath,
+          'app.asar.unpacked',
+          'electron',
+          'helpers',
+          'bin',
+          fileName
+        )
+      : '',
+    process.resourcesPath ? path.join(process.resourcesPath, 'helpers', 'bin', fileName) : '',
+    unpackedLocalBin !== rawLocalBin ? unpackedLocalBin : '',
+    rawLocalBin,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+/**
+ * Stage the universal Win32 display scaler DLLs and launcher EXEs into
+ * `<targetWinePrefix>/drive_c/ProgramData/OneLauncher/display_scaler/`, copying only when missing
+ * or changed so warm launches perform zero redundant disk writes.
+ *
+ * @param {string} targetWinePrefix
+ * @param {Record<string, any> | null | undefined} [options]
+ */
+function stageBottleDisplayScalerBinaries(targetWinePrefix, options = {}) {
+  const stageDirPosix = targetWinePrefix
+    ? path.join(targetWinePrefix, 'drive_c', 'ProgramData', 'OneLauncher', 'display_scaler')
+    : '';
+  const winStageRoot = 'C:\\ProgramData\\OneLauncher\\display_scaler';
+  const result = {
+    stageDirPosix,
+    allPresent: false,
+    dllX86Posix: '',
+    dllX64Posix: '',
+    launcherX86Posix: '',
+    launcherX64Posix: '',
+    winDllX86: `${winStageRoot}\\one_display_scaler_x86.dll`,
+    winDllX64: `${winStageRoot}\\one_display_scaler_x64.dll`,
+    winLauncherX86: `${winStageRoot}\\one_display_launcher_x86.exe`,
+    winLauncherX64: `${winStageRoot}\\one_display_launcher_x64.exe`,
+  };
+  if (!stageDirPosix || !fs.existsSync(targetWinePrefix)) {
+    return result;
+  }
+
+  try {
+    fs.mkdirSync(stageDirPosix, { recursive: true });
+  } catch {
+    return result;
+  }
+
+  /** @type {Array<{ prop: 'dllX86Posix' | 'dllX64Posix' | 'launcherX86Posix' | 'launcherX64Posix', fileName: string }>} */
+  const specs = [
+    { prop: 'dllX86Posix', fileName: 'one_display_scaler_x86.dll' },
+    { prop: 'dllX64Posix', fileName: 'one_display_scaler_x64.dll' },
+    { prop: 'launcherX86Posix', fileName: 'one_display_launcher_x86.exe' },
+    { prop: 'launcherX64Posix', fileName: 'one_display_launcher_x64.exe' },
+  ];
+
+  for (const { prop, fileName } of specs) {
+    const srcPath = resolveBundledDisplayScalerBinPath(fileName, options);
+    const dstPath = path.join(stageDirPosix, fileName);
+    if (!srcPath) {
+      try {
+        if (fs.existsSync(dstPath) && fs.statSync(dstPath).isFile()) {
+          result[prop] = dstPath;
+        }
+      } catch {}
+      continue;
+    }
+    try {
+      const srcStat = fs.statSync(srcPath);
+      let needsCopy = true;
+      if (fs.existsSync(dstPath)) {
+        try {
+          const dstStat = fs.statSync(dstPath);
+          if (
+            dstStat.isFile() &&
+            dstStat.size === srcStat.size &&
+            Math.abs(dstStat.mtimeMs - srcStat.mtimeMs) < 1000
+          ) {
+            needsCopy = false;
+          }
+        } catch {}
+      }
+      if (needsCopy) {
+        const tmpDst = `${dstPath}.tmp-${process.pid}-${Date.now()}`;
+        fs.copyFileSync(srcPath, tmpDst);
+        try {
+          fs.chmodSync(tmpDst, 0o755);
+        } catch {}
+        try {
+          fs.utimesSync(tmpDst, srcStat.atime, srcStat.mtime);
+        } catch {}
+        fs.renameSync(tmpDst, dstPath);
+      }
+      result[prop] = dstPath;
+    } catch {}
+  }
+
+  result.allPresent = Boolean(
+    result.dllX86Posix &&
+      result.dllX64Posix &&
+      result.launcherX86Posix &&
+      result.launcherX64Posix
+  );
+  return result;
+}
+
+/**
+ * Compute top notch safe-area inset (`0..80` px) on the primary macOS display so borderless
+ * fullscreen viewports never clip HUD text under MacBook Pro/Air camera housings.
+ *
+ * @param {boolean} [highResMode]
+ * @param {Record<string, any> | null | undefined} [options]
+ * @returns {number}
+ */
+function computeMacPrimaryDisplaySafeInsetTop(highResMode = false, options = {}) {
+  if (typeof options?.safeInsetTop === 'number' && Number.isFinite(options.safeInsetTop)) {
+    return Math.max(0, Math.min(80, Math.round(options.safeInsetTop)));
+  }
+  try {
+    const electronMod = getElectron();
+    const primary = electronMod?.screen?.getPrimaryDisplay?.();
+    if (primary && primary.bounds && primary.workArea) {
+      const boundsY = Number(primary.bounds.y) || 0;
+      const workAreaY = Number(primary.workArea.y) || 0;
+      const topMenuHeight = boundsY === 0 ? Math.max(0, workAreaY - boundsY) : 0;
+      const notchLogical = topMenuHeight > 28 ? topMenuHeight : 0;
+      if (notchLogical <= 0) return 0;
+      const scale = highResMode ? Math.max(1, Number(primary.scaleFactor) || 1) : 1;
+      return Math.max(0, Math.min(80, Math.round(notchLogical * scale)));
+    }
+  } catch {}
+  return 0;
+}
+
+/**
+ * Decide whether a bottled macOS session should wrap with `one_display_launcher`:
+ * - `'windowed'` / `'virtual_desktop'` -> never wrap (`false`)
+ * - `'force_fullscreen'` -> always wrap (`true`)
+ * - `'auto_fullscreen'` -> skip modern 64-bit self-scaling D3D11/D3D12/Vulkan/SDL2+ titles so
+ *   D3DMetal/DXMT/MoltenVK run unhooked; wrap all 32-bit, legacy DDraw/D3D8/D3D9, OpenGL, GDI,
+ *   SDL1, and launcher-stub titles (`true`).
+ *
+ * @param {Record<string, any> | null | undefined} effectiveCaps
+ * @param {string} effectiveDisplayScalingMode
+ * @returns {boolean}
+ */
+function shouldWrapBottleSessionWithDisplayLauncher(effectiveCaps, effectiveDisplayScalingMode) {
+  if (
+    effectiveDisplayScalingMode === 'windowed' ||
+    effectiveDisplayScalingMode === 'virtual_desktop' ||
+    effectiveDisplayScalingMode === 'off'
+  ) {
+    return false;
+  }
+  if (effectiveDisplayScalingMode === 'force_fullscreen') {
+    return true;
+  }
+  if (
+    effectiveDisplayScalingMode !== 'auto_fullscreen' &&
+    effectiveDisplayScalingMode !== 'auto'
+  ) {
+    return false;
+  }
+  const isModernSelfScaling64Bit = Boolean(
+    effectiveCaps &&
+      !effectiveCaps.is32Bit &&
+      effectiveCaps.is64Bit &&
+      (effectiveCaps.importsD3d12 ||
+        effectiveCaps.importsD3d11Or10 ||
+        effectiveCaps.importsVulkan ||
+        effectiveCaps.importsModernSdl) &&
+      !effectiveCaps.usesLegacyDirectDrawOrD3d &&
+      !effectiveCaps.usesOpenGl &&
+      !effectiveCaps.importsSdl1 &&
+      !effectiveCaps.isLauncherStubCandidate
+  );
+  return !isModernSelfScaling64Bit;
+}
+
+/**
+ * Format the `display_ctl_<sessionId>.ini` control file consumed by `one_display_scaler`.
+ * Interface Contract 1: display_ctl writes safe_inset_top = 0 under universal fullscreen.
+ *
+ * @param {number} seq
+ * @param {boolean} fullscreen
+ * @param {string} aspect
+ * @param {number} [safeInsetTop=0]
+ * @returns {string}
+ */
+function formatDisplayScalerControlIni(seq, fullscreen, aspect, safeInsetTop = 0) {
+  const safeSeq = Math.max(1, Math.floor(Number(seq) || 1));
+  const safeAspect = VALID_DISPLAY_ASPECT_MODES.has(aspect) ? aspect : 'preserve_aspect';
+  let safe_inset_top = 0;
+  if (typeof safeInsetTop === 'number' && Number.isFinite(safeInsetTop)) {
+    safe_inset_top = Math.max(0, Math.min(80, Math.round(safeInsetTop)));
+  }
+  return `seq=${safeSeq}\nfullscreen=${fullscreen ? 1 : 0}\naspect=${safeAspect}\nsafe_inset_top=${safe_inset_top}\n`;
+}
+
 /**
  * Clean background storefront daemon (`GalaxyClient.exe` / `EpicGamesLauncher.exe`) wake env so
  * game-specific HUD overlays and 32-bit auto-routed `CX_GRAPHICS_BACKEND` overrides never pollute
@@ -434,7 +680,10 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
   delete clientEnv.MTL_HUD_ENABLED;
   delete clientEnv.DXVK_HUD;
   delete clientEnv.ONE_LAUNCHER_MOLTENVK_PATH;
-  const keysToStrip = ['MTL_HUD_ENABLED', 'DXVK_HUD'];
+  const keysToStrip = ['MTL_HUD_ENABLED', 'DXVK_HUD', ...DISPLAY_SCALER_ENV_KEYS];
+  for (const dispKey of DISPLAY_SCALER_ENV_KEYS) {
+    delete clientEnv[dispKey];
+  }
   if (
     (launchConfig?.crossoverGraphicsBackend === undefined ||
       launchConfig?.crossoverGraphicsBackend === 'auto') &&
@@ -1923,6 +2172,26 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
   if (entry.pollTimer) {
     clearInterval(entry.pollTimer);
     entry.pollTimer = null;
+  }
+  if (entry.displayStatusTimer) {
+    clearInterval(entry.displayStatusTimer);
+    entry.displayStatusTimer = null;
+  }
+
+  if (entry.displayWatcherChild && typeof entry.displayWatcherChild.kill === 'function') {
+    try {
+      entry.displayWatcherChild.kill('SIGTERM');
+    } catch {}
+    entry.displayWatcherChild = null;
+  }
+  for (const tempScalerFile of [entry.displayControlFilePosix, entry.displayStatusFilePosix]) {
+    if (typeof tempScalerFile === 'string' && tempScalerFile) {
+      try {
+        if (fs.existsSync(tempScalerFile)) {
+          fs.unlinkSync(tempScalerFile);
+        }
+      } catch {}
+    }
   }
 
   const normalizedGameId = String(gameId || entry.session?.gameId || '');
@@ -3434,6 +3703,7 @@ async function launchChainedPublisherGame(ctx) {
         ].filter((n) => n && n.endsWith('.exe'))
       )
     );
+    const earlyChainedPerfPolicy = resolveEffectivePerformancePolicy(launchConfig || {}, options);
     const chainedCompatCapOptions = {
       ...options,
       skipBottleProvisioning: true,
@@ -3446,6 +3716,8 @@ async function launchChainedPublisherGame(ctx) {
       ),
       limitLegacy32BitGlExtensions: Boolean(chainedEffectiveCaps?.isLegacy32BitOpenGl),
       usesLegacyDirectDraw: Boolean(chainedEffectiveCaps?.usesLegacyDirectDrawOrD3d),
+      displayScalingMode: earlyChainedPerfPolicy.effectiveDisplayScalingMode,
+      displayAspectRatio: earlyChainedPerfPolicy.effectiveDisplayAspectRatio,
       exeName: realGameExe ? path.basename(realGameExe) : '',
       targetExeNames: mergedChainedTargetExes,
       ...(chainedProxyInfo.hasOverrides
@@ -3573,6 +3845,71 @@ async function launchChainedPublisherGame(ctx) {
       );
     }
 
+    const chainedPerfPolicy = resolveEffectivePerformancePolicy(launchConfig || {}, options);
+    const chainedDisplayScalingMode =
+      chainedPerfPolicy.effectiveDisplayScalingMode || 'auto_fullscreen';
+    const chainedDisplayAspectRatio =
+      chainedPerfPolicy.effectiveDisplayAspectRatio || 'preserve_aspect';
+    const chainedFullscreenHotkey = chainedPerfPolicy.enableFullscreenHotkey !== false;
+    const chainedInitialFullscreen =
+      chainedDisplayScalingMode === 'auto_fullscreen' ||
+      chainedDisplayScalingMode === 'force_fullscreen';
+    const chainedSessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let chainedDisplayControlFilePosix = '';
+    let chainedDisplayStatusFilePosix = '';
+    if (
+      chainedPerfPolicy.suppressWineDebugLogging !== false &&
+      !launchConfig?.wineDebug &&
+      !launchConfig?.environmentVariables?.WINEDEBUG &&
+      (!bottleEnv.WINEDEBUG || bottleEnv.WINEDEBUG === '-all')
+    ) {
+      bottleEnv.WINEDEBUG = '-all,err+system';
+      if (bottleEnv.CX_DEBUGMSG === '-all' && !launchConfig?.environmentVariables?.CX_DEBUGMSG) {
+        bottleEnv.CX_DEBUGMSG = '-all,err+system';
+      }
+    }
+    // Interface Contract 1: Pure Edge-to-Edge Symmetric Panel Span (ONE_LAUNCHER_SAFE_INSET_TOP: '0')
+    const chainedSafeInsetTop =
+      chainedDisplayScalingMode !== 'off' && chainedDisplayScalingMode !== 'windowed'
+        ? 0
+        : (typeof options?.safeInsetTop === 'number' && Number.isFinite(options.safeInsetTop)
+            ? Math.max(0, Math.min(80, Math.round(options.safeInsetTop)))
+            : 0);
+    bottleEnv.ONE_LAUNCHER_DISPLAY_SCALING_MODE = chainedDisplayScalingMode;
+    bottleEnv.ONE_LAUNCHER_DISPLAY_ASPECT = chainedDisplayAspectRatio;
+    bottleEnv.ONE_LAUNCHER_SAFE_INSET_TOP = String(chainedSafeInsetTop);
+    bottleEnv.ONE_LAUNCHER_FULLSCREEN_HOTKEY = chainedFullscreenHotkey ? '1' : '0';
+    if (bottlePath && fs.existsSync(bottlePath)) {
+      const stagedChainedDisp = stageBottleDisplayScalerBinaries(bottlePath, options);
+      if (stagedChainedDisp.stageDirPosix) {
+        chainedDisplayControlFilePosix = path.join(
+          stagedChainedDisp.stageDirPosix,
+          `display_ctl_${chainedSessionId}.ini`
+        );
+        chainedDisplayStatusFilePosix = path.join(
+          stagedChainedDisp.stageDirPosix,
+          `display_status_${chainedSessionId}.json`
+        );
+        try {
+          atomicWriteFileSync(
+            chainedDisplayControlFilePosix,
+            formatDisplayScalerControlIni(
+              1,
+              chainedInitialFullscreen,
+              chainedDisplayAspectRatio,
+              chainedSafeInsetTop
+            )
+          );
+        } catch {}
+        bottleEnv.ONE_LAUNCHER_SCALER_DLL_X86 = stagedChainedDisp.winDllX86;
+        bottleEnv.ONE_LAUNCHER_SCALER_DLL_X64 = stagedChainedDisp.winDllX64;
+        bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X86 = stagedChainedDisp.winLauncherX86;
+        bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X64 = stagedChainedDisp.winLauncherX64;
+        bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${chainedSessionId}.ini`;
+        bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${chainedSessionId}.json`;
+      }
+    }
+
     let wineSpawnCmd = chosenLayer.binaryPath;
     alignWineMsyncWithLiveBottle(bottlePath, bottleEnv);
     /** @type {Record<string, any>} */
@@ -3627,7 +3964,7 @@ async function launchChainedPublisherGame(ctx) {
     });
 
     const session = {
-      sessionId: `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      sessionId: chainedSessionId,
       gameId,
       title: String(payload.title || gameId),
       platformId: payload.platformId || chainedHandoffId,
@@ -3637,6 +3974,10 @@ async function launchChainedPublisherGame(ctx) {
       launchMethod: 'compatibility_layer',
       executablePath: realGameExe || spec.launcherExe,
       status: 'running',
+      isBottledSession: true,
+      fullscreenActive: chainedInitialFullscreen,
+      displayScalingMode: chainedDisplayScalingMode,
+      displayAspectRatio: chainedDisplayAspectRatio,
     };
 
     const resolvedWineBinary = chosenLayer.binaryPath || null;
@@ -3673,6 +4014,12 @@ async function launchChainedPublisherGame(ctx) {
       wineserverBinary: resolvedWineserverBinary,
       winePrefix: bottlePath,
       launchEnv: bottleEnv,
+      displayControlSeq: 1,
+      displayControlFilePosix: chainedDisplayControlFilePosix || null,
+      displayStatusFilePosix: chainedDisplayStatusFilePosix || null,
+      displayScalerWrapped: false,
+      displayWatcherChild: null,
+      chosenCompatLayerType: chosenLayer?.type || null,
       installPath: realInstallPath || localInstallDir || '',
       platformGameId: String(payload.platformGameId || gameId),
       launchOptions: options,
@@ -4132,6 +4479,7 @@ async function launchChainedPublisherGame(ctx) {
     launchMethod: winLaunchMethod,
     executablePath: realGameExe || winSpec.launcherExe || undefined,
     status: 'running',
+    isBottledSession: false,
   };
 
   /** @type {any} */
@@ -4419,7 +4767,9 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         : {}),
       ...platformPayloadConfig,
     };
-    const effectivePerfPolicy = resolveEffectivePerformancePolicy(launchConfig, options);
+    const effectivePerfPolicy = payload.performanceSettings
+      ? resolveEffectivePerformancePolicy(launchConfig, payload.performanceSettings, options)
+      : resolveEffectivePerformancePolicy(launchConfig, options);
     /** @type {any} */
     let gogWakeResult = null;
     /** @type {any} */
@@ -4880,6 +5230,56 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         isWindowsBinaryOnMac = false;
       }
     }
+    if (
+      platform === 'darwin' &&
+      !launchConfig.customExecutablePath &&
+      resolvedExePath &&
+      /\.exe$/i.test(resolvedExePath)
+    ) {
+      const candidateGogDir = localInstallDir || path.dirname(resolvedExePath);
+      if (candidateGogDir && fs.existsSync(path.join(candidateGogDir, 'GOGLauncher.exe'))) {
+        try {
+          const gogInfoFile = fs
+            .readdirSync(candidateGogDir)
+            .find((f) => /^\.?goggame-\d+\.info$/i.test(f));
+          if (gogInfoFile) {
+            const parsedInfo = JSON.parse(
+              fs.readFileSync(path.join(candidateGogDir, gogInfoFile), 'utf8')
+            );
+            if (Array.isArray(parsedInfo?.playTasks)) {
+              const resolvedBaseLower = path.basename(resolvedExePath).toLowerCase();
+              const matchedLauncherTask = parsedInfo.playTasks.find(
+                (/** @type {any} */ t) =>
+                  t &&
+                  typeof t.path === 'string' &&
+                  String(t.category || '').trim().toLowerCase() === 'launcher' &&
+                  !t.arguments &&
+                  path.win32.basename(t.path.trim()).toLowerCase() === resolvedBaseLower
+              );
+              const gameTask = matchedLauncherTask
+                ? parsedInfo.playTasks.find(
+                    (/** @type {any} */ t) =>
+                      t &&
+                      typeof t.path === 'string' &&
+                      (!t.type || String(t.type) === 'FileTask') &&
+                      String(t.category || '').trim().toLowerCase() === 'game'
+                  )
+                : null;
+              if (gameTask && gameTask.path) {
+                const directGameExe = resolveCaseInsensitiveRelFile(
+                  candidateGogDir,
+                  String(gameTask.path).trim().replace(/\\/g, '/')
+                );
+                if (directGameExe && fs.existsSync(directGameExe)) {
+                  resolvedExePath = directGameExe;
+                  isWindowsBinaryOnMac = true;
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    }
 
     if (
       resolvedExePath &&
@@ -5189,6 +5589,25 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       let spawnCmd = resolvedExePath;
       let spawnArgs = [...args];
       let actualLaunchMethod = 'direct';
+      const preGeneratedSessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const effectiveDisplayScalingMode =
+        effectivePerfPolicy.effectiveDisplayScalingMode || 'auto_fullscreen';
+      const effectiveDisplayAspectRatio =
+        effectivePerfPolicy.effectiveDisplayAspectRatio || 'preserve_aspect';
+      const enableFullscreenHotkey = effectivePerfPolicy.enableFullscreenHotkey !== false;
+      const initialBottleFullscreen =
+        effectiveDisplayScalingMode === 'auto_fullscreen' ||
+        effectiveDisplayScalingMode === 'force_fullscreen';
+      let bottleDisplayControlFilePosix = '';
+      let bottleDisplayStatusFilePosix = '';
+      /** @type {ReturnType<typeof stageBottleDisplayScalerBinaries> | null} */
+      let bottleDisplayStagedInfo = null;
+      let bottleDisplayScalerWrapped = false;
+      let bottleShouldWatchSteamGameDir = false;
+      /** @type {string[]} */
+      let bottleSteamDisplayDllArgs = [];
+      /** @type {any} */
+      let bottleDisplayWatcherChild = null;
       /** @type {any} */
       let compatResult = null;
       /** @type {any} */
@@ -5394,6 +5813,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             ),
             limitLegacy32BitGlExtensions: Boolean(effectiveCaps?.isLegacy32BitOpenGl),
             usesLegacyDirectDraw: Boolean(effectiveCaps?.usesLegacyDirectDrawOrD3d),
+            displayScalingMode: effectivePerfPolicy.effectiveDisplayScalingMode,
+            displayAspectRatio: effectivePerfPolicy.effectiveDisplayAspectRatio,
             exeName: resolvedExePath ? path.basename(resolvedExePath) : '',
             targetExeNames: mergedCompatTargetExeNames,
             ...(initialAppLocalProxyInfo.hasOverrides
@@ -5731,7 +6152,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               compatLayerCapOptions.usesLegacyDirectDraw
                 ? false
                 : launchConfig.crossoverHighResolutionMode;
-            const sanitizeKey = `${path.resolve(targetWinePrefix)}:${String(effectiveSanitizeHighRes)}:${installDirKey}`;
+            const sanitizeKey = `${path.resolve(targetWinePrefix)}:${String(effectiveSanitizeHighRes)}:${String(effectivePerfPolicy.effectiveDisplayScalingMode)}:${String(effectivePerfPolicy.effectiveDisplayAspectRatio)}:${installDirKey}`;
             const lastSanitizedAt = recentDisplaySanitizeCache.get(sanitizeKey) || 0;
             if (
               options.forceSanitizeDisplayConfigs === true ||
@@ -5744,6 +6165,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                   ...(typeof effectiveSanitizeHighRes === 'boolean'
                     ? { highResolutionMode: effectiveSanitizeHighRes }
                     : {}),
+                  displayScalingMode: effectivePerfPolicy.effectiveDisplayScalingMode,
+                  displayAspectRatio: effectivePerfPolicy.effectiveDisplayAspectRatio,
                 });
                 setBoundedMapEntry(recentDisplaySanitizeCache, sanitizeKey, Date.now(), 256);
               } catch {}
@@ -6297,6 +6720,76 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
 
         // Finalize spawn command & arguments (incorporating any Epic auth flags added to `args`)
         if (useCompatLayer && chosenCompatLayer) {
+          let wantDisplayLauncherWrap = false;
+          if (platform === 'darwin' || (!options.platform && process.platform === 'darwin')) {
+            if (
+              effectivePerfPolicy.suppressWineDebugLogging !== false &&
+              !launchConfig.wineDebug &&
+              !launchConfig.environmentVariables?.WINEDEBUG &&
+              (!env.WINEDEBUG || env.WINEDEBUG === '-all')
+            ) {
+              env.WINEDEBUG = '-all,err+system';
+              if (
+                env.CX_DEBUGMSG === '-all' &&
+                !launchConfig.environmentVariables?.CX_DEBUGMSG
+              ) {
+                env.CX_DEBUGMSG = '-all,err+system';
+              }
+            }
+            // Interface Contract 1: Pure Edge-to-Edge Symmetric Panel Span (ONE_LAUNCHER_SAFE_INSET_TOP: '0')
+            const safeInsetTop =
+              effectiveDisplayScalingMode !== 'off' && effectiveDisplayScalingMode !== 'windowed'
+                ? 0
+                : (typeof options?.safeInsetTop === 'number' && Number.isFinite(options.safeInsetTop)
+                    ? Math.max(0, Math.min(80, Math.round(options.safeInsetTop)))
+                    : 0);
+            env.ONE_LAUNCHER_DISPLAY_SCALING_MODE = effectiveDisplayScalingMode;
+            env.ONE_LAUNCHER_DISPLAY_ASPECT = effectiveDisplayAspectRatio;
+            env.ONE_LAUNCHER_SAFE_INSET_TOP = String(safeInsetTop);
+            env.ONE_LAUNCHER_FULLSCREEN_HOTKEY = enableFullscreenHotkey ? '1' : '0';
+
+            if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
+              bottleDisplayStagedInfo = stageBottleDisplayScalerBinaries(targetWinePrefix, options);
+              if (bottleDisplayStagedInfo.stageDirPosix) {
+                bottleDisplayControlFilePosix = path.join(
+                  bottleDisplayStagedInfo.stageDirPosix,
+                  `display_ctl_${preGeneratedSessionId}.ini`
+                );
+                bottleDisplayStatusFilePosix = path.join(
+                  bottleDisplayStagedInfo.stageDirPosix,
+                  `display_status_${preGeneratedSessionId}.json`
+                );
+                try {
+                  atomicWriteFileSync(
+                    bottleDisplayControlFilePosix,
+                    formatDisplayScalerControlIni(
+                      1,
+                      initialBottleFullscreen,
+                      effectiveDisplayAspectRatio,
+                      safeInsetTop
+                    )
+                  );
+                } catch {}
+                env.ONE_LAUNCHER_SCALER_DLL_X86 = bottleDisplayStagedInfo.winDllX86;
+                env.ONE_LAUNCHER_SCALER_DLL_X64 = bottleDisplayStagedInfo.winDllX64;
+                env.ONE_LAUNCHER_LAUNCHER_EXE_X86 = bottleDisplayStagedInfo.winLauncherX86;
+                env.ONE_LAUNCHER_LAUNCHER_EXE_X64 = bottleDisplayStagedInfo.winLauncherX64;
+                env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${preGeneratedSessionId}.ini`;
+                env.ONE_LAUNCHER_DISPLAY_STATUS_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${preGeneratedSessionId}.json`;
+              }
+            }
+
+            const canInjectDisplayScaler =
+              (!isTestEnvironment(options) || options.enableDisplayScalerInTests === true) &&
+              Boolean(bottleDisplayStagedInfo && bottleDisplayStagedInfo.allPresent);
+            wantDisplayLauncherWrap =
+              canInjectDisplayScaler &&
+              shouldWrapBottleSessionWithDisplayLauncher(
+                effectiveCaps,
+                effectiveDisplayScalingMode
+              );
+          }
+
           if (shouldLaunchViaBottleSteam && bottleSteamExe) {
             const execFileImpl =
               typeof options.execFileImpl === 'function'
@@ -6509,6 +7002,10 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               String(effectiveSteamAppId),
               ...args,
             ];
+            bottleSteamDisplayDllArgs = steamDllArgs;
+            bottleShouldWatchSteamGameDir = Boolean(
+              wantDisplayLauncherWrap && localInstallDir && targetWinePrefix
+            );
             actualLaunchMethod = `compatibility_layer:${chosenCompatLayer.type}`;
           } else {
             spawnCmd = chosenCompatLayer.binaryPath;
@@ -6616,7 +7113,29 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 realCrossOverPerlWrapper)
                 ? ['--dll', trimmedDllOverrides]
                 : [];
-            spawnArgs = [...waitChildrenArgs, ...dllOverrideArgs, resolvedExePath, ...args];
+            if (wantDisplayLauncherWrap && bottleDisplayStagedInfo && resolvedExePath) {
+              const chosenDisplayLauncherPosix = effectiveCaps?.is32Bit
+                ? bottleDisplayStagedInfo.launcherX86Posix
+                : bottleDisplayStagedInfo.launcherX64Posix;
+              const winTargetExePath = targetWinePrefix
+                ? toWineWindowsPath(resolvedExePath, targetWinePrefix)
+                : resolvedExePath;
+              spawnArgs = [
+                ...waitChildrenArgs,
+                ...dllOverrideArgs,
+                chosenDisplayLauncherPosix,
+                '--dll-x86',
+                bottleDisplayStagedInfo.winDllX86,
+                '--dll-x64',
+                bottleDisplayStagedInfo.winDllX64,
+                '--',
+                winTargetExePath,
+                ...args,
+              ];
+              bottleDisplayScalerWrapped = true;
+            } else {
+              spawnArgs = [...waitChildrenArgs, ...dllOverrideArgs, resolvedExePath, ...args];
+            }
             actualLaunchMethod = `compatibility_layer:${chosenCompatLayer.type}`;
           }
         } else if (platform === 'darwin' && resolvedExePath) {
@@ -6717,6 +7236,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           let xboxDefaultCwd = '';
           if (
             payload.platformId === 'xbox' &&
+            !launchConfig.customExecutablePath &&
             !launchConfig.workingDirectory &&
             xboxGameCfg?.contentRootDir
           ) {
@@ -7198,8 +7718,52 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           }
 
           if (!shouldFallthroughToStorefrontUri && child) {
+            if (
+              bottleShouldWatchSteamGameDir &&
+              bottleDisplayStagedInfo &&
+              targetWinePrefix &&
+              localInstallDir
+            ) {
+              try {
+                const winWatchDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
+                if (winWatchDir) {
+                  bottleDisplayWatcherChild = gameSpawnImpl(
+                    spawnCmd,
+                    [
+                      ...bottleSteamDisplayDllArgs,
+                      bottleDisplayStagedInfo.launcherX86Posix,
+                      '--watch-dir',
+                      winWatchDir,
+                      '--dll-x86',
+                      bottleDisplayStagedInfo.winDllX86,
+                      '--dll-x64',
+                      bottleDisplayStagedInfo.winDllX64,
+                      '--timeout-ms',
+                      '120000',
+                    ],
+                    {
+                      cwd: effectiveCwd,
+                      env: spawnEnv,
+                      stdio: 'ignore',
+                      detached: true,
+                    }
+                  );
+                  if (
+                    bottleDisplayWatcherChild &&
+                    typeof bottleDisplayWatcherChild.unref === 'function'
+                  ) {
+                    bottleDisplayWatcherChild.unref();
+                  }
+                  bottleDisplayScalerWrapped = true;
+                }
+              } catch (watchSpawnErr) {
+                diagLog.warn('launchGame.bottleSteamDisplayWatcher', watchSpawnErr, { gameId });
+              }
+            }
+
+            const isBottledMacSession = Boolean(useCompatLayer && platform === 'darwin');
             const session = {
-              sessionId: `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              sessionId: preGeneratedSessionId,
               gameId,
               title: String(payload.title || gameId),
               platformId: payload.platformId || 'custom',
@@ -7209,6 +7773,14 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               launchMethod: actualLaunchMethod,
               executablePath: resolvedExePath,
               status: 'running',
+              isBottledSession: isBottledMacSession,
+              ...(isBottledMacSession
+                ? {
+                    fullscreenActive: initialBottleFullscreen,
+                    displayScalingMode: effectiveDisplayScalingMode,
+                    displayAspectRatio: effectiveDisplayAspectRatio,
+                  }
+                : {}),
             };
 
             const resolvedWineBinary =
@@ -7261,6 +7833,12 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               wineserverBinary: resolvedWineserverBinary,
               winePrefix: resolvedWinePrefix,
               launchEnv: env,
+              displayControlSeq: 1,
+              displayControlFilePosix: bottleDisplayControlFilePosix || null,
+              displayStatusFilePosix: bottleDisplayStatusFilePosix || null,
+              displayScalerWrapped: bottleDisplayScalerWrapped,
+              displayWatcherChild: bottleDisplayWatcherChild,
+              chosenCompatLayerType: chosenCompatLayer?.type || null,
               installPath: localInstallDir || payload.installPath || '',
               platformGameId: String(payload.platformGameId || payload.steamAppId || gameId),
               steamAppId: effectiveSteamAppId || undefined,
@@ -7299,7 +7877,62 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               appUserModelId: resolvedXboxAumid || undefined,
               wasXboxAppRunningAtStart,
               wokeXboxAppByLauncher: false,
+              displayStatusTimer: null,
+              lastObservedDisplayStatusMtimeMs: 0,
             };
+
+            if (
+              entry.displayStatusFilePosix &&
+              isBottledMacSession &&
+              (!isTestEnvironment(options) || options.enableDisplayStatusSyncInTests === true)
+            ) {
+              const statusPollMs = Math.max(100, Number(options.displayStatusPollMs) || 600);
+              const statusTimer = setInterval(() => {
+                if (entry.finalized || !entry.displayStatusFilePosix) {
+                  clearInterval(statusTimer);
+                  return;
+                }
+                try {
+                  if (!fs.existsSync(entry.displayStatusFilePosix)) return;
+                  const st = fs.statSync(entry.displayStatusFilePosix);
+                  if (!st.isFile() || st.mtimeMs <= (entry.lastObservedDisplayStatusMtimeMs || 0)) {
+                    return;
+                  }
+                  entry.lastObservedDisplayStatusMtimeMs = st.mtimeMs;
+                  const parsed = JSON.parse(fs.readFileSync(entry.displayStatusFilePosix, 'utf8'));
+                  if (!parsed || typeof parsed !== 'object') return;
+                  let updated = false;
+                  if (
+                    typeof parsed.fullscreen === 'boolean' &&
+                    parsed.fullscreen !== entry.session.fullscreenActive
+                  ) {
+                    entry.session.fullscreenActive = parsed.fullscreen;
+                    updated = true;
+                  }
+                  if (
+                    typeof parsed.aspect === 'string' &&
+                    VALID_DISPLAY_ASPECT_MODES.has(parsed.aspect) &&
+                    parsed.aspect !== entry.session.displayAspectRatio
+                  ) {
+                    entry.session.displayAspectRatio = parsed.aspect;
+                    updated = true;
+                  }
+                  if (updated) {
+                    emitSessionUpdated(
+                      {
+                        session: { ...entry.session },
+                        event: 'fullscreen_updated',
+                      },
+                      options
+                    );
+                  }
+                } catch {}
+              }, statusPollMs);
+              if (typeof statusTimer.unref === 'function') {
+                statusTimer.unref();
+              }
+              entry.displayStatusTimer = statusTimer;
+            }
 
             if (
               child._isPowerShellStartProcessWrapper &&
@@ -8264,6 +8897,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       launchMethod: 'storefront_uri',
       executablePath: resolvedExePath || payload.executablePath,
       status: 'running',
+      isBottledSession: false,
     };
 
     /** @type {any} */
@@ -8523,6 +9157,15 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
     targetEntry.stopping = true;
     targetEntry.stoppedByUser = true;
     targetEntry.session.status = 'stopping';
+    if (
+      targetEntry.displayWatcherChild &&
+      typeof targetEntry.displayWatcherChild.kill === 'function'
+    ) {
+      try {
+        targetEntry.displayWatcherChild.kill('SIGTERM');
+      } catch {}
+      targetEntry.displayWatcherChild = null;
+    }
     emitSessionUpdated({
       session: { ...targetEntry.session },
       event: 'stopping',
@@ -8807,6 +9450,198 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
 
 function getRunningGames() {
   return Array.from(activeSessions.values()).map((entry) => ({ ...entry.session }));
+}
+
+/**
+ * Dynamically toggle or update fullscreen state & aspect ratio on an active bottled macOS game
+ * session without restarting the game (`seq=<N>\nfullscreen=0|1\naspect=...\n`).
+ *
+ * @param {any} payload
+ * @param {Record<string, any>} [options]
+ */
+function toggleSessionFullscreen(payload = {}, options = {}) {
+  try {
+    const reqObj =
+      typeof payload === 'string'
+        ? { gameId: payload, sessionId: payload }
+        : payload && typeof payload === 'object'
+          ? payload
+          : {};
+    /** @type {any} */
+    let targetEntry = null;
+    if (reqObj.gameId && activeSessions.has(reqObj.gameId)) {
+      targetEntry = activeSessions.get(reqObj.gameId);
+    } else {
+      for (const [, entry] of activeSessions.entries()) {
+        if (
+          (reqObj.sessionId && entry.session?.sessionId === reqObj.sessionId) ||
+          (reqObj.gameId &&
+            (entry.session?.gameId === String(reqObj.gameId) ||
+              entry.session?.platformGameId === String(reqObj.gameId)))
+        ) {
+          targetEntry = entry;
+          break;
+        }
+      }
+    }
+
+    if (!targetEntry || targetEntry.finalized || !targetEntry.session) {
+      return {
+        success: false,
+        error: 'No active running game session found.',
+      };
+    }
+
+    const isBottled = Boolean(targetEntry.session.isBottledSession || targetEntry.winePrefix);
+    if (!isBottled) {
+      return {
+        success: false,
+        sessionId: targetEntry.session.sessionId,
+        gameId: targetEntry.session.gameId,
+        error: 'Live fullscreen toggle is only supported for bottled macOS sessions.',
+      };
+    }
+
+    const nextFullscreen =
+      typeof reqObj.fullscreen === 'boolean'
+        ? reqObj.fullscreen
+        : !Boolean(targetEntry.session.fullscreenActive);
+    const nextAspect =
+      typeof reqObj.aspectRatio === 'string' && VALID_DISPLAY_ASPECT_MODES.has(reqObj.aspectRatio)
+        ? reqObj.aspectRatio
+        : String(targetEntry.session.displayAspectRatio || 'preserve_aspect');
+
+    const nextSeq = (Number(targetEntry.displayControlSeq) || 1) + 1;
+    targetEntry.displayControlSeq = nextSeq;
+
+    const mergedOpts = {
+      ...(targetEntry.launchOptions || {}),
+      ...(options || {}),
+    };
+
+    const targetPrefix = String(targetEntry.winePrefix || '').trim();
+    let controlFilePosix = String(targetEntry.displayControlFilePosix || '').trim();
+    if (!controlFilePosix && targetPrefix && fs.existsSync(targetPrefix)) {
+      const stageDir = path.join(
+        targetPrefix,
+        'drive_c',
+        'ProgramData',
+        'OneLauncher',
+        'display_scaler'
+      );
+      try {
+        fs.mkdirSync(stageDir, { recursive: true });
+        controlFilePosix = path.join(
+          stageDir,
+          `display_ctl_${targetEntry.session.sessionId}.ini`
+        );
+        targetEntry.displayControlFilePosix = controlFilePosix;
+      } catch {}
+    }
+
+    if (controlFilePosix) {
+      try {
+        atomicWriteFileSync(
+          controlFilePosix,
+          formatDisplayScalerControlIni(nextSeq, nextFullscreen, nextAspect)
+        );
+      } catch (/** @type {any} */ writeErr) {
+        return {
+          success: false,
+          sessionId: targetEntry.session.sessionId,
+          gameId: targetEntry.session.gameId,
+          error: `Failed to write display control file: ${writeErr?.message || String(writeErr)}`,
+        };
+      }
+    }
+
+    if (
+      !targetEntry.displayScalerWrapped &&
+      !targetEntry.displayWatcherChild &&
+      targetPrefix &&
+      fs.existsSync(targetPrefix) &&
+      targetEntry.wineBinary &&
+      targetEntry.installPath &&
+      (!isTestEnvironment(mergedOpts) || mergedOpts.enableDisplayScalerInTests === true)
+    ) {
+      try {
+        const staged = stageBottleDisplayScalerBinaries(targetPrefix, mergedOpts);
+        const winWatchDir = toWineWindowsPath(targetEntry.installPath, targetPrefix);
+        if (staged.allPresent && winWatchDir) {
+          const auxEnv = {
+            ...(targetEntry.launchEnv || process.env),
+            WINEPREFIX: targetPrefix,
+            ONE_LAUNCHER_DISPLAY_SCALING_MODE: nextFullscreen ? 'force_fullscreen' : 'windowed',
+            ONE_LAUNCHER_DISPLAY_ASPECT: nextAspect,
+            ONE_LAUNCHER_SAFE_INSET_TOP: '0',
+            ONE_LAUNCHER_SCALER_DLL_X86: staged.winDllX86,
+            ONE_LAUNCHER_SCALER_DLL_X64: staged.winDllX64,
+            ONE_LAUNCHER_LAUNCHER_EXE_X86: staged.winLauncherX86,
+            ONE_LAUNCHER_LAUNCHER_EXE_X64: staged.winLauncherX64,
+            ONE_LAUNCHER_DISPLAY_CONTROL_FILE: `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${targetEntry.session.sessionId}.ini`,
+            ONE_LAUNCHER_DISPLAY_STATUS_FILE: `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${targetEntry.session.sessionId}.json`,
+          };
+          const alignedWatch = prepareAlignedAuxBottleWineCommand({
+            wineBinary: targetEntry.wineBinary,
+            bottlePath: targetPrefix,
+            env: auxEnv,
+            suppressGuiDialogs: true,
+            layerType: targetEntry.chosenCompatLayerType || null,
+          });
+          const watchSpawnFn = mergedOpts.gameSpawnFn || mergedOpts.spawnFn || spawn;
+          const watcherChild = watchSpawnFn(
+            alignedWatch.binaryPath,
+            [
+              staged.launcherX86Posix,
+              '--watch-dir',
+              winWatchDir,
+              '--dll-x86',
+              staged.winDllX86,
+              '--dll-x64',
+              staged.winDllX64,
+              '--timeout-ms',
+              '15000',
+            ],
+            {
+              cwd: fs.existsSync(targetEntry.installPath) ? targetEntry.installPath : process.cwd(),
+              env: alignedWatch.env,
+              stdio: 'ignore',
+              detached: true,
+            }
+          );
+          if (watcherChild && typeof watcherChild.unref === 'function') {
+            watcherChild.unref();
+          }
+          targetEntry.displayWatcherChild = watcherChild;
+          targetEntry.displayScalerWrapped = true;
+        }
+      } catch {}
+    }
+
+    targetEntry.session.fullscreenActive = nextFullscreen;
+    targetEntry.session.displayAspectRatio = nextAspect;
+
+    emitSessionUpdated(
+      {
+        session: { ...targetEntry.session },
+        event: 'fullscreen_updated',
+      },
+      mergedOpts
+    );
+
+    return {
+      success: true,
+      sessionId: targetEntry.session.sessionId,
+      gameId: targetEntry.session.gameId,
+      fullscreenActive: nextFullscreen,
+      displayAspectRatio: nextAspect,
+    };
+  } catch (/** @type {any} */ err) {
+    return {
+      success: false,
+      error: err?.message || String(err),
+    };
+  }
 }
 
 /**
@@ -11720,6 +12555,12 @@ function shutdownLauncherEngine(/** @type {any} */ options = {}) {
       } catch {}
       entry.pollTimer = null;
     }
+    if (entry && entry.displayWatcherChild && typeof entry.displayWatcherChild.kill === 'function') {
+      try {
+        entry.displayWatcherChild.kill('SIGTERM');
+      } catch {}
+      entry.displayWatcherChild = null;
+    }
   }
   const vaultHooks = getOfflineVaultLifecycleHooks();
   if (vaultHooks && typeof vaultHooks.shutdown === 'function') {
@@ -11756,6 +12597,10 @@ module.exports = {
   launchGame,
   stopGame,
   getRunningGames,
+  toggleSessionFullscreen,
+  stageBottleDisplayScalerBinaries,
+  computeMacPrimaryDisplaySafeInsetTop,
+  shouldWrapBottleSessionWithDisplayLauncher,
   resolveSteamClientBinaryPath,
   detectInstalledStorefrontClients,
   resolveSteamClientLaunchCommand,

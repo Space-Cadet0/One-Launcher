@@ -1024,7 +1024,7 @@ describe('Universal Legacy Win32, GOG .script, WoW64 Display/GL & Dual-Arch Xbox
   // 3. Registry Display Mode Synthesis, EnabledExtensions Guard & r_mode Sanitizer
   // --------------------------------------------------------------------------
   describe('3. Registry Display Mode Synthesis, EnabledExtensions Buffer Guard & <installDir> r_mode Sanitizer (macNativeInstallerAndCodesign.cjs)', () => {
-    it('writes OneLauncher Desktop mode, RetinaMode=n, and <1,800-char EnabledExtensions for legacy 32-bit GL, then cleanly removes Desktop on subsequent 64-bit launch', () => {
+    it('writes OneLauncher Desktop mode, RetinaMode=y, and <1,800-char EnabledExtensions for legacy 32-bit GL, then cleanly removes Desktop on subsequent 64-bit launch', () => {
       const bottleDir = makeTempDir('bottle-display-gl');
       createSyntheticBottle(bottleDir);
       const userRegPath = path.join(bottleDir, 'user.reg');
@@ -1055,24 +1055,63 @@ describe('Universal Legacy Win32, GOG .script, WoW64 Display/GL & Dual-Arch Xbox
       const regAfterLegacy = fs.readFileSync(userRegPath, 'utf8');
       expect(regAfterLegacy).toContain('[Software\\\\Wine\\\\Explorer\\\\Desktops]');
       expect(regAfterLegacy).toContain('"OneLauncher"="1512x982"');
+      // Default auto_fullscreen mode must NOT force Explorer Virtual Desktop globally or per-exe
+      const legacyExplorerSec =
+        /\[Software\\\\Wine\\\\Explorer\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(regAfterLegacy);
+      expect(legacyExplorerSec?.[1] || '').not.toContain('"Desktop"');
+      const legacyAppDefExplorerSec =
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Explorer\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(
+          regAfterLegacy
+        );
+      expect(legacyAppDefExplorerSec?.[1] || '').not.toContain('"Desktop"');
       expect(regAfterLegacy).toMatch(
-        /\[Software\\\\Wine\\\\Explorer\][^\[]*"Desktop"="OneLauncher"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m
       );
       expect(regAfterLegacy).toMatch(
-        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Explorer\][^\[]*"Desktop"="OneLauncher"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Mac Driver\][^\[]*"CaptureDisplaysForFullscreen"="n"/m
       );
       expect(regAfterLegacy).toMatch(
-        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Mac Driver\][^\[]*"RetinaMode"="n"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Mac Driver\][^\[]*"UseConfinementCursorClipping"="y"/m
       );
       expect(regAfterLegacy).toMatch(
         /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Direct3D\][^\[]*"DirectDrawRenderer"="opengl"/m
       );
       expect(regAfterLegacy).toMatch(
-        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\DllOverrides\][^\[]*"winmm"="native,builtin"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Direct3D\][^\[]*"renderer"="gl"/m
       );
       expect(regAfterLegacy).toMatch(
-        /\[Software\\\\Wine\\\\Mac Driver\][^\[]*"RetinaMode"="n"/m
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\DllOverrides\][^\[]*"winmm"="native,builtin"/m
       );
+      // Shared bottle global Mac Driver stays RetinaMode="y" so other 64-bit apps are never poisoned
+      expect(regAfterLegacy).toMatch(
+        /\[Software\\\\Wine\\\\Mac Driver\][^\[]*"RetinaMode"="y"/m
+      );
+
+      // Explicit `virtual_desktop` mode scopes "Desktop"="OneLauncher" strictly to AppDefaults\<exe>\Explorer
+      macInstaller.applyCrossOverPerGameSettings(
+        mockLayer,
+        { crossoverGraphicsBackend: 'auto', displayScalingMode: 'virtual_desktop' },
+        {},
+        bottleDir,
+        {
+          skipRegistrySpawn: true,
+          skipLiveWineRegSync: true,
+          maxWidth: 1512,
+          maxHeight: 982,
+          logicalWidth: 1512,
+          logicalHeight: 982,
+          enableLegacyDisplayModeSynthesis: true,
+          usesLegacyDirectDraw: true,
+          targetExeNames: ['launcher.exe', 'engine32gl.exe'],
+        }
+      );
+      const regAfterExplicitVd = fs.readFileSync(userRegPath, 'utf8');
+      expect(regAfterExplicitVd).toMatch(
+        /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\Explorer\][^\[]*"Desktop"="OneLauncher"/m
+      );
+      const vdGlobalExplorerSec =
+        /\[Software\\\\Wine\\\\Explorer\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(regAfterExplicitVd);
+      expect(vdGlobalExplorerSec?.[1] || '').not.toContain('"Desktop"');
 
       const glSecMatch =
         /\[Software\\\\Wine\\\\AppDefaults\\\\engine32gl\.exe\\\\OpenGL\][^\n]*\n([\s\S]*?)(?=\n\[|$)/.exec(
@@ -1124,7 +1163,7 @@ describe('Universal Legacy Win32, GOG .script, WoW64 Display/GL & Dual-Arch Xbox
       expect(macDriverSecMatch?.[1] || '').not.toContain('"RetinaMode"="n"');
     });
 
-    it('sanitizeWinePrefixDisplayConfigs with installDir clamps fullscreen seta r_mode "17" (1920x1080) to universal VESA r_mode "5" (1024x768) on a 1512x982 host display', () => {
+    it('sanitizeWinePrefixDisplayConfigs preserves seta r_mode "17" in auto_fullscreen mode and clamps it to r_mode "9" (1280x720) in windowed mode on a 1512x982 host display', () => {
       const bottleDir = makeTempDir('bottle-rmode');
       const installDir = makeTempDir('install-rmode');
       createSyntheticBottle(bottleDir);
@@ -1150,8 +1189,25 @@ describe('Universal Legacy Win32, GOG .script, WoW64 Display/GL & Dual-Arch Xbox
         'utf8'
       );
 
+      // Default `auto_fullscreen` preserves high-resolution id Tech `r_mode` targets for the display scaler
+      const resAuto = macInstaller.sanitizeWinePrefixDisplayConfigs(bottleDir, {
+        installDir,
+        maxWidth: 1512,
+        maxHeight: 982,
+        logicalWidth: 1512,
+        logicalHeight: 982,
+        highResolutionMode: false,
+        skipDisplayProbe: true,
+      });
+      expect(resAuto.maxWidth).toBe(1512);
+      expect(resAuto.maxHeight).toBe(982);
+      expect(resAuto.sanitizedFiles).toEqual([]);
+      expect(fs.readFileSync(fullscreenCfgPath, 'utf8')).toContain('seta r_mode "17"');
+
+      // Explicit `windowed` mode clamps out-of-bounds fullscreen `r_mode "17"` (1920x1080) to `r_mode "9"` (1280x720)
       const res = macInstaller.sanitizeWinePrefixDisplayConfigs(bottleDir, {
         installDir,
+        displayScalingMode: 'windowed',
         maxWidth: 1512,
         maxHeight: 982,
         logicalWidth: 1512,
@@ -1168,14 +1224,14 @@ describe('Universal Legacy Win32, GOG .script, WoW64 Display/GL & Dual-Arch Xbox
             filePath: fullscreenCfgPath,
             previousWidth: 1920,
             previousHeight: 1080,
-            clampedWidth: 1024,
-            clampedHeight: 768,
+            clampedWidth: 1280,
+            clampedHeight: 720,
           }),
         ])
       );
 
       const updatedFullscreen = fs.readFileSync(fullscreenCfgPath, 'utf8');
-      expect(updatedFullscreen).toContain('seta r_mode "5"');
+      expect(updatedFullscreen).toContain('seta r_mode "9"');
       expect(updatedFullscreen).not.toContain('seta r_mode "17"');
 
       // Windowed config (r_fullscreen "0") remains untouched

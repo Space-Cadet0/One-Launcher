@@ -16,6 +16,7 @@ const {
   getGameLaunchConfigs,
   resolvePlatformLaunchConfig,
   getLauncherPerformanceSettings,
+  resolveEffectivePerformancePolicy,
   safeIsBottleSlug,
   MAX_DISCOVERY_CACHE_ENTRIES,
   MAX_STEAM_LAUNCH_SPEC_CACHE_ENTRIES,
@@ -1114,9 +1115,27 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
           if (!Array.isArray(parsed?.playTasks)) continue;
           const isFileTask = (/** @type {any} */ t) =>
             Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
+          const hasLegacyGogLauncherExe =
+            platform === 'darwin' &&
+            (fs.existsSync(path.join(localInstallPath, 'GOGLauncher.exe')) ||
+              fs.existsSync(path.join(dir, 'GOGLauncher.exe')));
+          const primaryTask = parsed.playTasks.find(
+            (/** @type {any} */ t) => isFileTask(t) && t.isPrimary
+          );
+          const gameCategoryTask = parsed.playTasks.find(
+            (/** @type {any} */ t) =>
+              isFileTask(t) && String(t.category || '').trim().toLowerCase() === 'game'
+          );
+          const preferGameOverLegacyLauncher = Boolean(
+            hasLegacyGogLauncherExe &&
+              primaryTask &&
+              String(primaryTask.category || '').trim().toLowerCase() === 'launcher' &&
+              !primaryTask.arguments &&
+              gameCategoryTask
+          );
           const task =
-            parsed.playTasks.find((/** @type {any} */ t) => isFileTask(t) && t.isPrimary) ||
-            parsed.playTasks.find((/** @type {any} */ t) => isFileTask(t) && t.category === 'game') ||
+            (preferGameOverLegacyLauncher ? gameCategoryTask : primaryTask) ||
+            gameCategoryTask ||
             parsed.playTasks.find((/** @type {any} */ t) => isFileTask(t));
           if (task && task.path) {
             const relTaskPath = String(task.path).replace(/\\/g, path.sep);
@@ -5862,6 +5881,16 @@ const CX_ENV_MANAGED_FORWARD_KEYS = [
   'ONE_LAUNCHER_AUDIO_BUFFER_CLAMP',
   'ONE_LAUNCHER_AUDIO_RT_THREAD',
   'ONE_LAUNCHER_SUPPRESS_PRELOAD',
+  'ONE_LAUNCHER_DISPLAY_SCALING_MODE',
+  'ONE_LAUNCHER_DISPLAY_ASPECT',
+  'ONE_LAUNCHER_SAFE_INSET_TOP',
+  'ONE_LAUNCHER_FULLSCREEN_HOTKEY',
+  'ONE_LAUNCHER_SCALER_DLL_X86',
+  'ONE_LAUNCHER_SCALER_DLL_X64',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X86',
+  'ONE_LAUNCHER_LAUNCHER_EXE_X64',
+  'ONE_LAUNCHER_DISPLAY_CONTROL_FILE',
+  'ONE_LAUNCHER_DISPLAY_STATUS_FILE',
   'MTL_HUD_ENABLED',
   'WINEMSYNC',
   'WINEESYNC',
@@ -6971,8 +7000,10 @@ function applyCrossOverPerGameSettings(
   /** @type {any} */ options = {}
 ) {
   const isStringBottleFirstArg = typeof chosenLayerOrBottlePath === 'string';
-  const isSecondArgExeString = isStringBottleFirstArg && typeof launchConfig === 'string';
-  const effectiveOptions = isSecondArgExeString
+  const isSecondArgExe =
+    isStringBottleFirstArg &&
+    (typeof launchConfig === 'string' || Array.isArray(launchConfig));
+  const effectiveOptions = isSecondArgExe
     ? bottlePath && typeof bottlePath === 'object'
       ? bottlePath
       : options && typeof options === 'object'
@@ -6999,9 +7030,14 @@ function applyCrossOverPerGameSettings(
     : typeof bottlePath === 'string'
       ? bottlePath
       : '';
-  const explicitExeNameFromArg = isSecondArgExeString ? launchConfig.trim() : '';
+  const explicitExeNamesFromArg = isSecondArgExe
+    ? Array.isArray(launchConfig)
+      ? launchConfig.map((s) => String(s || '').trim()).filter(Boolean)
+      : [String(launchConfig || '').trim()].filter(Boolean)
+    : [];
+  const explicitExeNameFromArg = explicitExeNamesFromArg[0] || '';
 
-  const cfg = isSecondArgExeString
+  const cfg = isSecondArgExe
     ? envOrOptions && typeof envOrOptions === 'object'
       ? envOrOptions
       : {}
@@ -7594,6 +7630,21 @@ function applyCrossOverPerGameSettings(
             .replace(/^"OneLauncherManagedPreview"\s*=\s*"[^"]*"\s*\r?\n?/gm, '');
         }
 
+        if (
+          !cfg.windowsVersion &&
+          !effectiveOptions.windowsVersion &&
+          /^"WindowsVersion"\s*=\s*"(?:winxp|winxp64|win7|vista|win2k)"/im.test(existingConf) &&
+          (/"WineArch"\s*=\s*"win64"/i.test(existingConf) ||
+            /"Template"\s*=\s*"win10_64"/i.test(existingConf) ||
+            !hasPeCaps ||
+            peCaps.is64Bit)
+        ) {
+          existingConf = existingConf.replace(
+            /^("WindowsVersion"\s*=\s*)"(?:winxp|winxp64|win7|vista|win2k)"/im,
+            '$1"win10"'
+          );
+        }
+
         const updates = new Map();
         const removals = new Set();
 
@@ -7719,18 +7770,39 @@ function applyCrossOverPerGameSettings(
     effectiveOptions.enableLegacyDisplayModeSynthesis || cfg.enableLegacyDisplayModeSynthesis
   );
   const usesLegacyDdraw = Boolean(
-    effectiveOptions.usesLegacyDirectDraw || cfg.usesLegacyDirectDraw
+    effectiveOptions.usesLegacyDirectDraw ||
+      cfg.usesLegacyDirectDraw ||
+      (hasPeCaps && Boolean(peCaps.usesLegacyDdraw))
   );
-  const forceLegacy96Dpi = Boolean(enableLegacyDisplay || usesLegacyDdraw);
-  const effectiveHighResolutionMode = forceLegacy96Dpi
-    ? false
-    : typeof cfg.crossoverHighResolutionMode === 'boolean'
+  const usesLegacyDdrawOrD3d8 = Boolean(
+    usesLegacyDdraw || (hasPeCaps && Boolean(peCaps.importsD3d8))
+  );
+  const resolvedDisplayPolicy = resolveEffectivePerformancePolicy(cfg, effectiveOptions);
+  const validBottleScalingModes = new Set([
+    'auto_fullscreen',
+    'force_fullscreen',
+    'native_driver',
+    'windowed',
+    'virtual_desktop',
+  ]);
+  const effectiveScalingMode =
+    typeof effectiveOptions.displayScalingMode === 'string' &&
+    validBottleScalingModes.has(effectiveOptions.displayScalingMode)
+      ? effectiveOptions.displayScalingMode
+      : typeof cfg.displayScalingMode === 'string' &&
+          validBottleScalingModes.has(cfg.displayScalingMode)
+        ? cfg.displayScalingMode
+        : resolvedDisplayPolicy.effectiveDisplayScalingMode || 'auto_fullscreen';
+
+  const effectiveHighResolutionMode =
+    typeof cfg.crossoverHighResolutionMode === 'boolean'
       ? cfg.crossoverHighResolutionMode
       : undefined;
 
-  // Coalesced bottle registry hygiene: RetinaMode (non-destructive), LogPixels, Desktops, AppDefaults,
-  // Direct3D VideoMemorySize / Vulkan routing, reference-counted EmulateModeset, LargeAddressAware,
-  // and baseline system.reg / user.reg prefix hygiene flushed in a single `reg.exe import` call.
+  // Coalesced bottle registry hygiene: RetinaMode (per-exe scoped for legacy 32-bit), LogPixels,
+  // Desktops, AppDefaults, Direct3D VideoMemorySize / Vulkan / GL routing, reference-counted
+  // EmulateModeset, LargeAddressAware, and baseline system.reg / user.reg prefix hygiene flushed
+  // in a single `reg.exe import` call.
   if (isBottleDir) {
     try {
       const {
@@ -7758,7 +7830,7 @@ function applyCrossOverPerGameSettings(
       const userRegBatchSpecs = [];
 
       const rawExeInputs = [
-        explicitExeNameFromArg,
+        ...explicitExeNamesFromArg,
         effectiveOptions.exeName,
         cfg.exeName,
         ...(Array.isArray(effectiveOptions.targetExeNames) ? effectiveOptions.targetExeNames : []),
@@ -7860,38 +7932,22 @@ function applyCrossOverPerGameSettings(
         } catch {}
       }
 
-      // 1. Non-destructive RetinaMode + LogPixels DPI synchronization
-      if (forceLegacy96Dpi) {
-        /** @type {Array<[string, any]>} */
-        const macDriverEntries = [
-          ['RetinaMode', { type: 'sz', value: 'n' }],
-          ['OneLauncherManagedRetina', { type: 'sz', value: '1' }],
-        ];
-        if (!priorMacDriverManaged && priorRetinaModeVal !== null) {
-          macDriverEntries.push(['OneLauncherPriorRetina', { type: 'sz', value: priorRetinaModeVal }]);
-        }
-        userRegBatchSpecs.push(
-          { subKeyPath: 'Software\\Wine\\Mac Driver', entries: macDriverEntries },
-          { subKeyPath: 'Control Panel\\Desktop', entries: [['LogPixels', { type: 'dword', value: 0x60 }]] },
-          { subKeyPath: 'Software\\Wine\\Fonts', entries: [['LogPixels', { type: 'dword', value: 0x60 }]] },
-          {
-            subKeyPath: 'Software\\Wine\\AppDefaults\\explorer.exe\\Mac Driver',
-            entries: [['RetinaMode', { type: 'sz', value: 'n' }]],
-          }
-        );
-        for (const tExe of targetExes) {
-          userRegBatchSpecs.push({
-            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
-            entries: [['RetinaMode', { type: 'sz', value: 'n' }]],
-          });
-        }
-      } else if (typeof effectiveHighResolutionMode === 'boolean') {
+      // 1. Per-exe AppDefaults\Mac Driver + Non-destructive global RetinaMode & LogPixels DPI hygiene
+      const captureDisplaysVal = 'n';
+      const commonMacDriverEntries = /** @type {Array<[string, any]>} */ ([
+        ['CaptureDisplaysForFullscreen', { type: 'sz', value: captureDisplaysVal }],
+        ['UseConfinementCursorClipping', { type: 'sz', value: 'y' }],
+        ['OpenGLSurfaceMode', { type: 'sz', value: 'infront' }],
+        ['LeftOptionIsAlt', { type: 'sz', value: 'y' }],
+        ['RightOptionIsAlt', { type: 'sz', value: 'y' }],
+      ]);
+      if (typeof effectiveHighResolutionMode === 'boolean') {
         const retinaVal = effectiveHighResolutionMode ? 'y' : 'n';
         const logPixelsVal = effectiveHighResolutionMode ? 0xc0 : 0x60;
         userRegBatchSpecs.push(
           {
             subKeyPath: 'Software\\Wine\\Mac Driver',
-            entries: [['RetinaMode', { type: 'sz', value: retinaVal }]],
+            entries: [['RetinaMode', { type: 'sz', value: retinaVal }], ...commonMacDriverEntries],
           },
           {
             subKeyPath: 'Control Panel\\Desktop',
@@ -7904,17 +7960,45 @@ function applyCrossOverPerGameSettings(
             entries: [['LogPixels', { type: 'dword', value: logPixelsVal }]],
           });
         }
-      } else if (priorMacDriverManaged && savedPriorRetinaVal !== null) {
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
+            entries: [
+              ['RetinaMode', { type: 'sz', value: retinaVal }],
+              ...commonMacDriverEntries,
+            ],
+          });
+        }
+      } else {
+        const healedGlobalRetina =
+          priorMacDriverManaged && savedPriorRetinaVal !== null
+            ? savedPriorRetinaVal
+            : priorRetinaModeVal === 'n' && !priorMacDriverManaged
+              ? 'n'
+              : 'y';
         userRegBatchSpecs.push({
           subKeyPath: 'Software\\Wine\\Mac Driver',
-          entries: [['RetinaMode', { type: 'sz', value: savedPriorRetinaVal }]],
+          entries: [
+            ...(priorMacDriverManaged || priorRetinaModeVal === null
+              ? /** @type {Array<[string, any]>} */ ([['RetinaMode', { type: 'sz', value: healedGlobalRetina }]])
+              : []),
+            ...commonMacDriverEntries,
+          ],
         });
+        for (const tExe of targetExes) {
+          userRegBatchSpecs.push({
+            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
+            entries: [
+              ['RetinaMode', { type: 'sz', value: 'y' }],
+              ...commonMacDriverEntries,
+            ],
+          });
+        }
       }
 
       // 2. Global `[Software\\Wine]` `"Version"` poisoning recovery for 64-bit launches
       if (
-        hasPeCaps &&
-        peCaps.is64Bit &&
+        (!hasPeCaps || peCaps.is64Bit) &&
         !cfg.windowsVersion &&
         !effectiveOptions.windowsVersion &&
         globalWineVersionVal &&
@@ -7930,29 +8014,39 @@ function applyCrossOverPerGameSettings(
         });
       }
 
-      // 3. Virtual Desktop synthesis & per-exe AppDefaults
+      // 3. Per-exe Virtual Desktop containment (NEVER forced globally on Explorer\Desktop)
       const displayProbeOpts = skipLiveSync
         ? { ...effectiveOptions, skipDisplayProbe: true }
         : effectiveOptions;
-      const hostRes = getHostMaxDisplayResolution(
-        Boolean(effectiveHighResolutionMode),
-        displayProbeOpts
+      const effectiveRetinaCoordSpace =
+        typeof effectiveHighResolutionMode === 'boolean'
+          ? effectiveHighResolutionMode
+          : true;
+      const hostRes = getHostMaxDisplayResolution(effectiveRetinaCoordSpace, displayProbeOpts);
+      const autoDesktopWidth = Math.max(640, Math.round(Number(hostRes?.width) || 1512));
+      const autoDesktopHeight = Math.max(480, Math.round(Number(hostRes?.height) || 982));
+
+      const wantVirtualDesktop = Boolean(
+        effectiveScalingMode === 'virtual_desktop' ||
+          (cfg.virtualDesktop === true &&
+            (!cfg.displayScalingMode || cfg.displayScalingMode === 'default') &&
+            !effectiveOptions.displayScalingMode)
       );
-      const desktopWidth = Math.max(640, Math.round(Number(hostRes?.width) || 1512));
-      const desktopHeight = Math.max(480, Math.round(Number(hostRes?.height) || 982));
-      const desktopModeStr = `${desktopWidth}x${desktopHeight}`;
+
+      let desktopModeStr = `${autoDesktopWidth}x${autoDesktopHeight}`;
+      if (wantVirtualDesktop && typeof cfg.virtualDesktopResolution === 'string') {
+        const presetTrimmed = cfg.virtualDesktopResolution.trim().toLowerCase();
+        if (presetTrimmed !== 'auto' && /^\d{3,5}x\d{3,5}$/.test(presetTrimmed)) {
+          desktopModeStr = presetTrimmed;
+        }
+      }
 
       userRegBatchSpecs.push({
         subKeyPath: 'Software\\Wine\\Explorer\\Desktops',
         entries: [['OneLauncher', { type: 'sz', value: desktopModeStr }]],
       });
 
-      const wantVirtualDesktop = Boolean(cfg.virtualDesktop === true || enableLegacyDisplay);
       if (wantVirtualDesktop) {
-        userRegBatchSpecs.push({
-          subKeyPath: 'Software\\Wine\\Explorer',
-          entries: [['Desktop', { type: 'sz', value: 'OneLauncher' }]],
-        });
         for (const tExe of targetExes) {
           userRegBatchSpecs.push({
             subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Explorer`,
@@ -7973,12 +8067,22 @@ function applyCrossOverPerGameSettings(
         }
       }
 
-      if (usesLegacyDdraw) {
+      if (usesLegacyDdrawOrD3d8) {
         for (const tExe of targetExes) {
-          userRegBatchSpecs.push({
-            subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
-            entries: [['DirectDrawRenderer', { type: 'sz', value: 'opengl' }]],
-          });
+          /** @type {Array<[string, any]>} */
+          const legacyD3dEntries = [];
+          if (usesLegacyDdraw) {
+            legacyD3dEntries.push(['DirectDrawRenderer', { type: 'sz', value: 'opengl' }]);
+          }
+          if (backendRoute.direct3dRenderer !== 'vulkan') {
+            legacyD3dEntries.push(['renderer', { type: 'sz', value: 'gl' }]);
+          }
+          if (legacyD3dEntries.length > 0) {
+            userRegBatchSpecs.push({
+              subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Direct3D`,
+              entries: legacyD3dEntries,
+            });
+          }
         }
       }
 
@@ -8012,11 +8116,11 @@ function applyCrossOverPerGameSettings(
       }
 
       const wantEmulateModeset =
-        cfg.emulateModeset === true ||
-        effectiveOptions.emulateModeset === true ||
-        (cfg.emulateModeset !== false &&
-          effectiveOptions.emulateModeset !== false &&
-          enableLegacyDisplay);
+        cfg.emulateModeset === true || effectiveOptions.emulateModeset === true
+          ? true
+          : cfg.emulateModeset === false || effectiveOptions.emulateModeset === false
+            ? false
+            : effectiveScalingMode === 'windowed';
       if (wantEmulateModeset) {
         userRegBatchSpecs.push({
           subKeyPath: 'Software\\Wine\\AppDefaults\\explorer.exe\\X11 Driver',
@@ -8054,8 +8158,9 @@ function applyCrossOverPerGameSettings(
       }
 
       // 4. Value removals in `user.reg` (zero-write when absent; recorded into `liveSyncAccumulator` when removed)
+      // ALWAYS delete global `HKCU\Software\Wine\Explorer` -> `"Desktop"` so previously poisoned bottles self-heal!
+      removeWineRegNamedValue(userRegPath, 'Software\\Wine\\Explorer', 'Desktop', regUpsertOpts);
       if (!wantVirtualDesktop) {
-        removeWineRegNamedValue(userRegPath, 'Software\\Wine\\Explorer', 'Desktop', regUpsertOpts);
         for (const tExe of targetExes) {
           removeWineRegNamedValue(
             userRegPath,
@@ -8066,59 +8171,36 @@ function applyCrossOverPerGameSettings(
         }
       }
 
-      if (!forceLegacy96Dpi) {
-        removeWineRegNamedValue(
-          userRegPath,
-          'Software\\Wine\\AppDefaults\\explorer.exe\\Mac Driver',
-          'RetinaMode',
-          regUpsertOpts
-        );
-        for (const tExe of targetExes) {
+      removeWineRegNamedValue(
+        userRegPath,
+        'Software\\Wine\\AppDefaults\\explorer.exe\\Mac Driver',
+        'RetinaMode',
+        regUpsertOpts
+      );
+      if (priorMacDriverManaged) {
+        if (typeof effectiveHighResolutionMode !== 'boolean' && savedPriorRetinaVal === null) {
           removeWineRegNamedValue(
             userRegPath,
-            `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
+            'Software\\Wine\\Mac Driver',
             'RetinaMode',
             regUpsertOpts
           );
         }
-        if (typeof effectiveHighResolutionMode === 'boolean') {
-          removeWineRegNamedValue(
-            userRegPath,
-            'Software\\Wine\\Mac Driver',
-            'OneLauncherManagedRetina',
-            regUpsertOpts
-          );
-          removeWineRegNamedValue(
-            userRegPath,
-            'Software\\Wine\\Mac Driver',
-            'OneLauncherPriorRetina',
-            regUpsertOpts
-          );
-        } else if (priorMacDriverManaged) {
-          if (savedPriorRetinaVal === null) {
-            removeWineRegNamedValue(
-              userRegPath,
-              'Software\\Wine\\Mac Driver',
-              'RetinaMode',
-              regUpsertOpts
-            );
-          }
-          removeWineRegNamedValue(
-            userRegPath,
-            'Software\\Wine\\Mac Driver',
-            'OneLauncherManagedRetina',
-            regUpsertOpts
-          );
-          removeWineRegNamedValue(
-            userRegPath,
-            'Software\\Wine\\Mac Driver',
-            'OneLauncherPriorRetina',
-            regUpsertOpts
-          );
-        }
+        removeWineRegNamedValue(
+          userRegPath,
+          'Software\\Wine\\Mac Driver',
+          'OneLauncherManagedRetina',
+          regUpsertOpts
+        );
+        removeWineRegNamedValue(
+          userRegPath,
+          'Software\\Wine\\Mac Driver',
+          'OneLauncherPriorRetina',
+          regUpsertOpts
+        );
       }
 
-      if (backendRoute.direct3dRenderer !== 'vulkan' && hasPeCaps) {
+      if (backendRoute.direct3dRenderer !== 'vulkan' && !usesLegacyDdrawOrD3d8 && hasPeCaps) {
         for (const tExe of targetExes) {
           removeWineRegNamedValue(
             userRegPath,
@@ -8151,12 +8233,7 @@ function applyCrossOverPerGameSettings(
         }
       }
 
-      if (
-        !wantEmulateModeset &&
-        (cfg.emulateModeset === false ||
-          effectiveOptions.emulateModeset === false ||
-          (hasPeCaps && (peCaps.is64Bit || !enableLegacyDisplay)))
-      ) {
+      if (!wantEmulateModeset) {
         for (const tExe of targetExes) {
           removeWineRegNamedValue(
             userRegPath,
@@ -8396,6 +8473,7 @@ function applyCrossOverPerGameSettings(
     try {
       sanitizeWinePrefixDisplayConfigs(resolvedBottlePath, {
         ...effectiveOptions,
+        displayScalingMode: effectiveScalingMode,
         ...(typeof effectiveHighResolutionMode === 'boolean'
           ? { highResolutionMode: effectiveHighResolutionMode }
           : {}),
@@ -8573,10 +8651,280 @@ const IDTECH_R_MODE_RESOLUTIONS = {
 
 /** @type {Array<[number, number, number]>} */
 const SAFE_IDTECH_MODE_CANDIDATES = [
+  [19, 2560, 1600],
+  [18, 1920, 1200],
+  [17, 1920, 1080],
+  [12, 1680, 1050],
+  [8, 1600, 1200],
+  [13, 1600, 900],
+  [7, 1280, 1024],
+  [9, 1280, 720],
+  [6, 1152, 864],
   [5, 1024, 768],
   [4, 800, 600],
   [3, 640, 480],
 ];
+
+/**
+ * Schema-aware normalizer for bundled `dosbox*.conf` files inside a game's installation folder.
+ * Ensures `[sdl]` fullscreen/desktop OpenGL presentation (or windowed when `'windowed'`) and
+ * `[render]` aspect-ratio preservation while leaving comments, line endings, and `[autoexec]` untouched.
+ *
+ * @param {string} installDir
+ * @param {Record<string, any>} [options]
+ */
+function normalizeDosboxDisplayConfigs(installDir, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const rawScaling =
+    typeof opts.scalingMode === 'string' && opts.scalingMode !== 'default'
+      ? opts.scalingMode
+      : typeof opts.displayScalingMode === 'string' && opts.displayScalingMode !== 'default'
+        ? opts.displayScalingMode
+        : 'auto_fullscreen';
+  const rawAspect =
+    typeof opts.aspectRatio === 'string' && opts.aspectRatio !== 'default'
+      ? opts.aspectRatio
+      : typeof opts.displayAspectRatio === 'string' && opts.displayAspectRatio !== 'default'
+        ? opts.displayAspectRatio
+        : 'preserve_aspect';
+
+  /** @type {Array<{ filePath: string }>} */
+  const updatedFiles = [];
+  if (
+    rawScaling !== 'auto_fullscreen' &&
+    rawScaling !== 'force_fullscreen' &&
+    rawScaling !== 'windowed'
+  ) {
+    return { updatedFiles };
+  }
+  if (!installDir || typeof installDir !== 'string' || !installDir.trim()) {
+    return { updatedFiles };
+  }
+  const resolvedRoot = path.resolve(installDir.trim());
+  try {
+    if (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) {
+      return { updatedFiles };
+    }
+  } catch {
+    return { updatedFiles };
+  }
+
+  const isInsideRoot = (/** @type {string} */ candidatePath) => {
+    try {
+      const lstat = fs.lstatSync(candidatePath);
+      if (lstat.isSymbolicLink()) {
+        const target = path.resolve(path.dirname(candidatePath), fs.readlinkSync(candidatePath));
+        return target === resolvedRoot || target.startsWith(resolvedRoot + path.sep);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const wantFullscreen = rawScaling === 'auto_fullscreen' || rawScaling === 'force_fullscreen';
+  const wantAspectTrue = rawAspect !== 'stretch';
+
+  const processDosboxConf = (/** @type {string} */ confPath) => {
+    try {
+      const st = fs.statSync(confPath);
+      if (!st.isFile() || st.size <= 0 || st.size > 524288) return;
+      const original = fs.readFileSync(confPath, 'utf8');
+      const eol = original.includes('\r\n') ? '\r\n' : '\n';
+      const lines = original.split(/\r?\n/);
+
+      let currentSection = '';
+      let sawSdlSection = false;
+      let sawSdlFullscreen = false;
+      let sawSdlFullresolution = false;
+      let sawSdlOutput = false;
+      let lastSdlContentIdx = -1;
+      let sawRenderSection = false;
+      let sawRenderAspect = false;
+      let lastRenderContentIdx = -1;
+
+      /** @type {string[]} */
+      const outLines = [];
+
+      const flushSdlMissingKeys = () => {
+        if (!sawSdlSection || lastSdlContentIdx < 0) return;
+        /** @type {string[]} */
+        const inserts = [];
+        if (!sawSdlFullscreen) {
+          inserts.push(`fullscreen=${wantFullscreen ? 'true' : 'false'}`);
+          sawSdlFullscreen = true;
+        }
+        if (wantFullscreen && !sawSdlFullresolution) {
+          inserts.push('fullresolution=desktop');
+          sawSdlFullresolution = true;
+        }
+        if (wantFullscreen && !sawSdlOutput) {
+          inserts.push('output=opengl');
+          sawSdlOutput = true;
+        }
+        if (inserts.length > 0) {
+          outLines.splice(lastSdlContentIdx + 1, 0, ...inserts);
+          if (lastRenderContentIdx > lastSdlContentIdx) {
+            lastRenderContentIdx += inserts.length;
+          }
+          lastSdlContentIdx += inserts.length;
+        }
+      };
+
+      const flushRenderMissingKeys = () => {
+        if (!sawRenderSection || lastRenderContentIdx < 0 || sawRenderAspect) return;
+        outLines.splice(lastRenderContentIdx + 1, 0, `aspect=${wantAspectTrue ? 'true' : 'false'}`);
+        sawRenderAspect = true;
+        if (lastSdlContentIdx > lastRenderContentIdx) {
+          lastSdlContentIdx += 1;
+        }
+        lastRenderContentIdx += 1;
+      };
+
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        const secMatch = /^\s*\[\s*([^\]]+?)\s*\]\s*$/.exec(line);
+        if (secMatch) {
+          if (currentSection === 'sdl') flushSdlMissingKeys();
+          if (currentSection === 'render') flushRenderMissingKeys();
+          currentSection = secMatch[1].trim().toLowerCase();
+          outLines.push(line);
+          if (currentSection === 'sdl') {
+            sawSdlSection = true;
+            lastSdlContentIdx = outLines.length - 1;
+          } else if (currentSection === 'render') {
+            sawRenderSection = true;
+            lastRenderContentIdx = outLines.length - 1;
+          }
+          continue;
+        }
+
+        if (currentSection === 'autoexec' || /^\s*[#;]/.test(line) || !line.trim()) {
+          outLines.push(line);
+          continue;
+        }
+
+        const kvMatch = /^([ \t]*([A-Za-z0-9_]+)[ \t]*=[ \t]*)(.*?)\s*$/.exec(line);
+        if (!kvMatch) {
+          outLines.push(line);
+          continue;
+        }
+
+        const prefix = kvMatch[1];
+        const keyLower = kvMatch[2].toLowerCase();
+        const rawVal = kvMatch[3];
+        const valLower = rawVal.trim().toLowerCase();
+
+        if (currentSection === 'sdl') {
+          if (keyLower === 'fullscreen') {
+            sawSdlFullscreen = true;
+            outLines.push(`${prefix}${wantFullscreen ? 'true' : 'false'}`);
+            lastSdlContentIdx = outLines.length - 1;
+            continue;
+          }
+          if (keyLower === 'fullresolution') {
+            sawSdlFullresolution = true;
+            if (wantFullscreen) {
+              const resMatch = /^(\d+)x(\d+)$/i.exec(valLower);
+              const isLowHardcodedRes =
+                Boolean(resMatch) &&
+                (Number(resMatch?.[1] || 0) < 1920 || Number(resMatch?.[2] || 0) < 1080);
+              if (
+                valLower === 'original' ||
+                valLower === '0x0' ||
+                valLower === '' ||
+                isLowHardcodedRes
+              ) {
+                outLines.push(`${prefix}desktop`);
+                lastSdlContentIdx = outLines.length - 1;
+                continue;
+              }
+            }
+            outLines.push(line);
+            lastSdlContentIdx = outLines.length - 1;
+            continue;
+          }
+          if (keyLower === 'output') {
+            sawSdlOutput = true;
+            if (
+              wantFullscreen &&
+              (valLower === 'surface' || valLower === 'overlay' || valLower === 'ddraw')
+            ) {
+              outLines.push(`${prefix}opengl`);
+              lastSdlContentIdx = outLines.length - 1;
+              continue;
+            }
+            outLines.push(line);
+            lastSdlContentIdx = outLines.length - 1;
+            continue;
+          }
+          outLines.push(line);
+          lastSdlContentIdx = outLines.length - 1;
+          continue;
+        }
+
+        if (currentSection === 'render') {
+          if (keyLower === 'aspect') {
+            sawRenderAspect = true;
+            outLines.push(`${prefix}${wantAspectTrue ? 'true' : 'false'}`);
+            lastRenderContentIdx = outLines.length - 1;
+            continue;
+          }
+          outLines.push(line);
+          lastRenderContentIdx = outLines.length - 1;
+          continue;
+        }
+
+        outLines.push(line);
+      }
+
+      if (currentSection === 'sdl') flushSdlMissingKeys();
+      if (currentSection === 'render') flushRenderMissingKeys();
+
+      const updated = outLines.join(eol);
+      if (updated !== original) {
+        atomicWriteFileSync(confPath, updated);
+        updatedFiles.push({ filePath: confPath });
+      }
+    } catch {}
+  };
+
+  const skippedDirs = new Set([
+    '__support',
+    '__gog_support',
+    '__installer',
+    '_commonredist',
+    'redist',
+    'directx',
+    'vcredist',
+    'node_modules',
+  ]);
+
+  const walkDosboxDirs = (/** @type {string} */ dirPath, depth = 0) => {
+    if (depth > 3 || !dirPath || !isInsideRoot(dirPath)) return;
+    /** @type {fs.Dirent[]} */
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dirPath, entry.name);
+      if (!isInsideRoot(fullPath)) continue;
+      if (entry.isDirectory()) {
+        if (skippedDirs.has(entry.name.toLowerCase())) continue;
+        walkDosboxDirs(fullPath, depth + 1);
+      } else if (entry.isFile() && /^dosbox.*\.conf$/i.test(entry.name)) {
+        processDosboxConf(fullPath);
+      }
+    }
+  };
+
+  walkDosboxDirs(resolvedRoot, 0);
+  return { updatedFiles };
+}
 
 function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options = {}) {
   const hasValidPrefix = Boolean(
@@ -8614,11 +8962,28 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     } catch {}
   }
 
+  const effectiveScalingMode =
+    options && typeof options.displayScalingMode === 'string' && options.displayScalingMode !== 'default'
+      ? options.displayScalingMode
+      : options && typeof options.scalingMode === 'string' && options.scalingMode !== 'default'
+        ? options.scalingMode
+        : 'auto_fullscreen';
+  const effectiveAspectRatio =
+    options && typeof options.displayAspectRatio === 'string' && options.displayAspectRatio !== 'default'
+      ? options.displayAspectRatio
+      : options && typeof options.aspectRatio === 'string' && options.aspectRatio !== 'default'
+        ? options.aspectRatio
+        : 'preserve_aspect';
+
   const displayRes = getHostMaxDisplayResolution(highResolutionMode, options);
   const maxWidth =
     Number(options.maxWidth) > 0 ? Math.round(Number(options.maxWidth)) : displayRes.width;
   const maxHeight =
     Number(options.maxHeight) > 0 ? Math.round(Number(options.maxHeight)) : displayRes.height;
+  const physicalMaxWidth = Math.max(maxWidth, Number(displayRes.nativeWidth) || maxWidth);
+  const physicalMaxHeight = Math.max(maxHeight, Number(displayRes.nativeHeight) || maxHeight);
+  const isUpscalerFullscreenMode =
+    effectiveScalingMode === 'auto_fullscreen' || effectiveScalingMode === 'force_fullscreen';
 
   /** @type {any[]} */
   const sanitizedFiles = [];
@@ -8676,7 +9041,22 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     }
   };
 
+  const explicitScalingMode =
+    options && typeof options.displayScalingMode === 'string' && options.displayScalingMode !== 'default'
+      ? options.displayScalingMode
+      : options && typeof options.scalingMode === 'string' && options.scalingMode !== 'default'
+        ? options.scalingMode
+        : options && typeof options.effectiveDisplayScalingMode === 'string' && options.effectiveDisplayScalingMode !== 'default'
+          ? options.effectiveDisplayScalingMode
+          : null;
+
+  const isUniversalFullscreenActive =
+    explicitScalingMode !== null
+      ? explicitScalingMode !== 'windowed'
+      : false;
+
   const sanitizeConfigFile = (/** @type {string} */ filePath) => {
+    if (isUniversalFullscreenActive) return;
     const ext = path.extname(filePath).toLowerCase();
     if (ext !== '.cfg' && ext !== '.ini') return;
     try {
@@ -8706,28 +9086,31 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
           }
         }
 
-        // Clamp discrete id Tech 3 / id Tech 4 `seta r_mode "<N>"` when `r_fullscreen` is enabled
-        const isFullscreenEnabled = /^[ \t]*(?:seta?\s+)?r_fullscreen\s+"?([1-9]\d*)"?/im.test(
-          updated
-        );
-        if (isFullscreenEnabled) {
-          const rModeRe = /^([ \t]*(?:seta?\s+)?r_mode\s+")(\d+)(".*)$/im;
-          const rModeMatch = rModeRe.exec(updated);
-          if (rModeMatch) {
-            const modeIdx = Number(rModeMatch[2]);
-            const modeRes = IDTECH_R_MODE_RESOLUTIONS[modeIdx];
-            if (modeRes && (modeRes[0] > maxWidth || modeRes[1] > maxHeight)) {
-              const safePick =
-                SAFE_IDTECH_MODE_CANDIDATES.find(
-                  ([, cw, ch]) => cw <= maxWidth && ch <= maxHeight
-                ) || [3, 640, 480];
-              if (!prevW && !prevH) {
-                prevW = modeRes[0];
-                prevH = modeRes[1];
-                clampedW = safePick[1];
-                clampedH = safePick[2];
+        // Only clamp id Tech `seta r_mode "<N>"` when scaling is NOT `auto_fullscreen` / `force_fullscreen`
+        // AND the mode genuinely exceeds physical display pixel bounds (e.g. unplugged 4K external monitor).
+        if (!isUpscalerFullscreenMode) {
+          const isFullscreenEnabled = /^[ \t]*(?:seta?\s+)?r_fullscreen\s+"?([1-9]\d*)"?/im.test(
+            updated
+          );
+          if (isFullscreenEnabled) {
+            const rModeRe = /^([ \t]*(?:seta?\s+)?r_mode\s+")(\d+)(".*)$/im;
+            const rModeMatch = rModeRe.exec(updated);
+            if (rModeMatch) {
+              const modeIdx = Number(rModeMatch[2]);
+              const modeRes = IDTECH_R_MODE_RESOLUTIONS[modeIdx];
+              if (modeRes && (modeRes[0] > physicalMaxWidth || modeRes[1] > physicalMaxHeight)) {
+                const safePick =
+                  SAFE_IDTECH_MODE_CANDIDATES.find(
+                    ([, cw, ch]) => cw <= physicalMaxWidth && ch <= physicalMaxHeight
+                  ) || [3, 640, 480];
+                if (!prevW && !prevH) {
+                  prevW = modeRes[0];
+                  prevH = modeRes[1];
+                  clampedW = safePick[1];
+                  clampedH = safePick[2];
+                }
+                updated = updated.replace(rModeRe, `$1${safePick[0]}$3`);
               }
-              updated = updated.replace(rModeRe, `$1${safePick[0]}$3`);
             }
           }
         }
@@ -8824,6 +9207,10 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     try {
       if (fs.statSync(resolvedInstallDir).isDirectory()) {
         walkConfigDir(resolvedInstallDir, resolvedInstallDir, 0, 3);
+        normalizeDosboxDisplayConfigs(resolvedInstallDir, {
+          scalingMode: effectiveScalingMode,
+          aspectRatio: effectiveAspectRatio,
+        });
       }
     } catch {}
   }
@@ -9127,6 +9514,7 @@ module.exports = {
   cleanNonApfsAppleDoubleTwins,
   applyCrossOverPerGameSettings,
   getHostMaxDisplayResolution,
+  normalizeDosboxDisplayConfigs,
   sanitizeWinePrefixDisplayConfigs,
   ensureCompatibilityLayerReady,
 };

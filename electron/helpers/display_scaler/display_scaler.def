@@ -1,0 +1,4 @@
+LIBRARY one_display_scaler.dll
+EXPORTS
+    OneLauncherDisplayScalerGetVersion
+    OneLauncherDisplayScalerTriggerScan

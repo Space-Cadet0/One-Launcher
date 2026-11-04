@@ -925,9 +925,27 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           if (Array.isArray(raw.playTasks)) {
             const isFileTask = (/** @type {any} */ t) =>
               Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
+            const hasLegacyGogLauncherExe =
+              platform === 'darwin' &&
+              (fs.existsSync(path.join(installPath, 'GOGLauncher.exe')) ||
+                fs.existsSync(path.join(path.dirname(infoFilePath), 'GOGLauncher.exe')));
+            const rawPrimaryTask = raw.playTasks.find(
+              (/** @type {any} */ t) => isFileTask(t) && t.isPrimary
+            );
+            const rawGameTask = raw.playTasks.find(
+              (/** @type {any} */ t) =>
+                isFileTask(t) && String(t.category || '').trim().toLowerCase() === 'game'
+            );
+            const preferGameOverLegacyLauncher = Boolean(
+              hasLegacyGogLauncherExe &&
+                rawPrimaryTask &&
+                String(rawPrimaryTask.category || '').trim().toLowerCase() === 'launcher' &&
+                !rawPrimaryTask.arguments &&
+                rawGameTask
+            );
             const primaryTask =
-              raw.playTasks.find((/** @type {any} */ t) => isFileTask(t) && t.isPrimary) ||
-              raw.playTasks.find((/** @type {any} */ t) => isFileTask(t) && t.category === 'game') ||
+              (preferGameOverLegacyLauncher ? rawGameTask : rawPrimaryTask) ||
+              rawGameTask ||
               raw.playTasks.find((/** @type {any} */ t) => isFileTask(t));
             if (primaryTask && primaryTask.path) {
               if (

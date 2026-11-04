@@ -1,7 +1,7 @@
 {
   "name": "one-launcher",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "license": "MIT",
   "description": "Universal game library and launcher for Steam, GOG.com, Epic Games Store, and Xbox / PC Game Pass on macOS and Windows.",
   "author": "One Launcher Contributors",
@@ -17,17 +17,18 @@
     "preview": "vite preview",
     "test": "vitest run --config vitest.config.ts --fileParallelism=false",
     "test:unit": "vitest run --config vitest.config.ts --fileParallelism=false",
-    "test:native-asan": "node scripts/test-xbox-bridge-asan.cjs",
+    "test:native-asan": "node scripts/test-xbox-bridge-asan.cjs && node scripts/test-display-scaler-asan.cjs",
     "test:live-smoke": "vitest run --config vitest.live.config.ts",
     "typecheck": "tsc -b && tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "build:macos-helpers": "node scripts/build-macos-helpers.cjs",
     "build:xbox-bridge": "node scripts/build-xbox-bridge.cjs",
+    "build:display-scaler": "node scripts/build-display-scaler.cjs",
     "electron": "electron electron/main.cjs",
     "desktop": "electron electron/main.cjs",
-    "build:mac": "npm run build:xbox-bridge && npm run build:macos-helpers && npm run build && electron-builder --mac dir --publish never",
-    "dist:mac": "npm run build:xbox-bridge && npm run build:macos-helpers && npm run build && electron-builder --mac --publish never",
+    "build:mac": "npm run build:xbox-bridge && npm run build:display-scaler && npm run build:macos-helpers && npm run build && electron-builder --mac dir --publish never",
+    "dist:mac": "npm run build:xbox-bridge && npm run build:display-scaler && npm run build:macos-helpers && npm run build && electron-builder --mac --publish never",
     "build:win-uninstaller": "node scripts/windows-uninstaller/verify-uninstaller.cjs && MAKENSIS=$(find \"$HOME/Library/Caches/electron-builder\" -path \"*/mac/makensis\" 2>/dev/null | head -n 1) && NSISDIR=$(dirname $(dirname \"$MAKENSIS\")) \"$MAKENSIS\" build/standalone-uninstaller.nsi",
-    "build:win": "npm run build:xbox-bridge && npm run build && electron-builder --win --x64 --publish never && npm run build:win-uninstaller && cp \"build/Uninstall-OneLauncher.ps1\" \"release/Uninstall-OneLauncher.ps1\" && cp \"build/Uninstall One Launcher (Full Clean).bat\" \"release/Uninstall One Launcher (Full Clean).bat\""
+    "build:win": "npm run build:xbox-bridge && npm run build:display-scaler && npm run build && electron-builder --win --x64 --publish never && npm run build:win-uninstaller && cp \"build/Uninstall-OneLauncher.ps1\" \"release/Uninstall-OneLauncher.ps1\" && cp \"build/Uninstall One Launcher (Full Clean).bat\" \"release/Uninstall One Launcher (Full Clean).bat\""
   },
   "build": {
     "appId": "com.onelauncher.app",

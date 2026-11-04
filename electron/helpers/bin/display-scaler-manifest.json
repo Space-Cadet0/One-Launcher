@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "toolchain": {
+    "compiler": "zig cc",
+    "zigVersion": "0.13.0",
+    "targets": [
+      "x86-windows-gnu",
+      "x86_64-windows-gnu"
+    ],
+    "flags": [
+      "-std=c11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-fno-ident",
+      "-Wl,--strip-all"
+    ]
+  },
+  "sources": {
+    "electron/helpers/display_scaler/display_scaler.h": "3606faf71b04f8e5fdfd953977a84e48bb796672c96a0bddd6f3f7c7404d9e55",
+    "electron/helpers/display_scaler/display_scaler_internal.h": "294b22715b7cba70ba0cec410a8c100d3f893f89e39e274908c0d2bde8f78254",
+    "electron/helpers/display_scaler/display_scaler_math.c": "6cd41e0d1cec6ac252f6062d62f4356bc95afafb58b25fed6f706e33a4ee7413",
+    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "6e136158ca7c0329f1492b0919fc7fcb57181ef6e7e2b81884887b70a98cbae2",
+    "electron/helpers/display_scaler/display_scaler_window.c": "6bfe3f60f3d8814086a1183d00049bc57c5d6542ba0032dfc9ff9b43f87529d5",
+    "electron/helpers/display_scaler/display_scaler_dll.c": "598321320541d44f44432e39be252fc3e62b8af956e9cd0611e7ef960a8aa909",
+    "electron/helpers/display_scaler/display_launcher.c": "a816d450c77ccef03afaa36bbb3bcefb5bc107177b534272c4b88b17c2da6274",
+    "electron/helpers/display_scaler/display_scaler.def": "a975f9534e4087f11271db76527cbdea06c7f30954041ac3e73f57e29a47aad1",
+    "scripts/build-display-scaler.cjs": "99860f1ea235d140b8e6ab74676bfe69284e60f863f701ef694cbc8d2f913acd"
+  },
+  "outputs": {
+    "one_display_scaler_x86.dll": {
+      "sha256": "839f4b8ee1eeff41b219e859d213e532e248e1c58019103dd765e5fd41c9793e",
+      "sizeBytes": 109568,
+      "machine": "0x14c",
+      "peCheckSum": "0x00026777",
+      "exportedCount": 2
+    },
+    "one_display_scaler_x64.dll": {
+      "sha256": "0845a11fe271ab06017926742ba9e00a9dd0409473704c4b65d6ceb4956d2775",
+      "sizeBytes": 86016,
+      "machine": "0x8664",
+      "peCheckSum": "0x0001a853",
+      "exportedCount": 2
+    },
+    "one_display_launcher_x86.exe": {
+      "sha256": "96dd1688e964ea32d378dc6b8be0d61646370fe6a38ee69b912b397a0b379d81",
+      "sizeBytes": 59904,
+      "machine": "0x14c",
+      "subsystem": 2,
+      "peCheckSum": "0x000100c9"
+    },
+    "one_display_launcher_x64.exe": {
+      "sha256": "079103e42dea3d7d640f4ea24f4ec056b9fe177df0ff090bd72ca4c160b1f5d5",
+      "sizeBytes": 43520,
+      "machine": "0x8664",
+      "subsystem": 2,
+      "peCheckSum": "0x00014202"
+    }
+  }
+}

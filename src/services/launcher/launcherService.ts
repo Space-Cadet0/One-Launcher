@@ -18,6 +18,7 @@ import {
   type GameInstallInfo,
   type GameLaunchConfig,
   type GameLaunchConfigResetRequest,
+  type GlobalDisplayAspectRatioMode,
   type HibernateStatePayload,
   type InstallCompatibilityLayerRequest,
   type InstallCompatibilityLayerResult,
@@ -31,6 +32,7 @@ import {
   type SessionUpdatedPayload,
   type StorefrontLaunchPolicyView,
   type StorefrontLaunchProfile,
+  type ToggleSessionFullscreenResult,
   type UpdateCompatibilityLayerPayload,
   type UpdateCompatibilityLayerResult,
 } from '../../contracts/launcher';
@@ -58,10 +60,15 @@ import {
   persistSelectedStorefrontToStorage,
   reconcileLaunchConfigsWithDisk,
   resolveLaunchConfigFromMap,
+  sanitizeBottleDisplayScalingMode,
+  sanitizeDisplayAspectRatio,
   sanitizeGameLaunchConfig,
+  sanitizeGlobalBottleDisplayScalingMode,
+  sanitizeGlobalDisplayAspectRatio,
   sanitizeLegacyCompatLayer,
   sanitizePerformanceSettings as sanitizePerformanceSettingsEntry,
   sanitizeStorefrontLifecycleOverride,
+  sanitizeVirtualDesktopResolution,
   sanitizeWineDebugMode,
 } from './launchConfigStore';
 import {
@@ -119,11 +126,16 @@ export {
   getCrossOverGraphicsBackendPolicy,
   resolveEffectiveLaunchPolicy,
   resolveEffectiveLifecyclePolicy,
+  sanitizeBottleDisplayScalingMode,
+  sanitizeDisplayAspectRatio,
   sanitizeGameLaunchConfig,
+  sanitizeGlobalBottleDisplayScalingMode,
+  sanitizeGlobalDisplayAspectRatio,
   sanitizeLaunchMethod,
   sanitizeLegacyCompatLayer,
   sanitizeStorefrontLifecycleOverride,
   sanitizeStorefrontLifecyclePolicy,
+  sanitizeVirtualDesktopResolution,
   sanitizeWineDebugMode,
   type BuildEffectiveLaunchModePreviewParams,
   type BuildLaunchModePreviewParams,
@@ -940,7 +952,44 @@ export class LauncherService {
       data?.event === 'started' ||
       data?.event === 'stopping' ||
       data?.event === 'stopped' ||
+      data?.event === 'fullscreen_updated' ||
       data?.event === 'playtime_synced';
+
+    if (data?.event === 'fullscreen_updated') {
+      const rawRecord = data as unknown as Record<string, unknown>;
+      const targetGameId =
+        session?.gameId ||
+        (typeof rawRecord.gameId === 'string' ? rawRecord.gameId : undefined);
+      if (targetGameId) {
+        const existingSession = this.activeSessions.get(targetGameId);
+        if (existingSession || session) {
+          const mergedSession: ActiveGameSession = {
+            ...(existingSession || session!),
+            ...(session || {}),
+            ...(typeof rawRecord.fullscreenActive === 'boolean'
+              ? { fullscreenActive: rawRecord.fullscreenActive }
+              : {}),
+            ...(typeof rawRecord.displayAspectRatio === 'string'
+              ? {
+                  displayAspectRatio: sanitizeGlobalDisplayAspectRatio(
+                    rawRecord.displayAspectRatio
+                  ),
+                }
+              : {}),
+            ...(typeof rawRecord.displayScalingMode === 'string'
+              ? {
+                  displayScalingMode: sanitizeGlobalBottleDisplayScalingMode(
+                    rawRecord.displayScalingMode
+                  ),
+                }
+              : {}),
+          };
+          this.activeSessions.set(targetGameId, mergedSession);
+        }
+      }
+      this.notifyStateChanged();
+      return;
+    }
 
     const isCloudSyncEvent =
       data?.event === 'cloud_sync_warning' ||
@@ -2668,6 +2717,89 @@ export class LauncherService {
       success: true,
       message: `Stopped ${existing.title}`,
       sessionMinutesPlayed: 1,
+    };
+  }
+
+  public async toggleSessionFullscreen(
+    gameId: string,
+    options?: { fullscreen?: boolean; aspectRatio?: GlobalDisplayAspectRatioMode }
+  ): Promise<ToggleSessionFullscreenResult> {
+    const active = this.activeSessions.get(gameId);
+
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.electronAPI?.toggleSessionFullscreen === 'function'
+    ) {
+      try {
+        const res = await window.electronAPI.toggleSessionFullscreen({
+          gameId,
+          sessionId: active?.sessionId,
+          ...options,
+        });
+        const latestSession = this.activeSessions.get(gameId);
+        if (latestSession && res && res.success !== false) {
+          const nextFullscreen =
+            typeof res.fullscreenActive === 'boolean'
+              ? res.fullscreenActive
+              : typeof options?.fullscreen === 'boolean'
+                ? options.fullscreen
+                : !latestSession.fullscreenActive;
+          const nextAspect: GlobalDisplayAspectRatioMode | undefined = res.displayAspectRatio
+            ? sanitizeGlobalDisplayAspectRatio(res.displayAspectRatio)
+            : options?.aspectRatio
+              ? sanitizeGlobalDisplayAspectRatio(options.aspectRatio)
+              : latestSession.displayAspectRatio;
+          this.activeSessions.set(gameId, {
+            ...latestSession,
+            fullscreenActive: nextFullscreen,
+            ...(nextAspect ? { displayAspectRatio: nextAspect } : {}),
+          });
+          this.notifyStateChanged();
+        }
+        return res;
+      } catch (err: unknown) {
+        return {
+          success: false,
+          gameId,
+          sessionId: active?.sessionId,
+          error: this.getErrorMessage(err, 'Failed to toggle session fullscreen.'),
+        };
+      }
+    }
+
+    if (!active) {
+      return {
+        success: false,
+        gameId,
+        error: 'Game is not currently running.',
+      };
+    }
+
+    const nextFullscreen =
+      typeof options?.fullscreen === 'boolean' ? options.fullscreen : !active.fullscreenActive;
+    const nextAspect: GlobalDisplayAspectRatioMode = options?.aspectRatio
+      ? sanitizeGlobalDisplayAspectRatio(options.aspectRatio)
+      : active.displayAspectRatio ??
+        sanitizeGlobalDisplayAspectRatio(
+          this.performanceSettings.defaultDisplayAspectRatio
+        );
+
+    this.activeSessions.set(gameId, {
+      ...active,
+      fullscreenActive: nextFullscreen,
+      displayAspectRatio: nextAspect,
+    });
+    this.notifyStateChanged();
+
+    return {
+      success: true,
+      gameId,
+      sessionId: active.sessionId,
+      fullscreenActive: nextFullscreen,
+      displayAspectRatio: nextAspect,
+      message: nextFullscreen
+        ? 'Switched bottled game to fullscreen.'
+        : 'Switched bottled game to windowed mode.',
     };
   }
 

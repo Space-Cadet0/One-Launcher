@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   launchGame: (payload) => ipcRenderer.invoke('launcher:launch-game', payload),
   stopGame: (payload) => ipcRenderer.invoke('launcher:stop-game', payload),
   getRunningGames: () => ipcRenderer.invoke('launcher:get-running-games'),
+  toggleSessionFullscreen: (payload) =>
+    ipcRenderer.invoke('launcher:toggle-session-fullscreen', payload),
   installGame: (payload) => ipcRenderer.invoke('launcher:install-game', payload),
   pauseDownload: (taskId) => ipcRenderer.invoke('launcher:pause-download', taskId),
   resumeDownload: (taskId) => ipcRenderer.invoke('launcher:resume-download', taskId),

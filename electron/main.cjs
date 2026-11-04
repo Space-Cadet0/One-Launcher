@@ -189,10 +189,17 @@ function restoreOrCreateMainWindow() {
     clearTimeout(zeroRendererTeardownTimer);
     zeroRendererTeardownTimer = null;
   }
-  if (process.platform === 'darwin' && app.dock && typeof app.dock.show === 'function') {
-    try {
-      app.dock.show();
-    } catch {}
+  if (process.platform === 'darwin') {
+    if (app.dock && typeof app.dock.show === 'function') {
+      try {
+        app.dock.show();
+      } catch {}
+    }
+    if (typeof app.show === 'function') {
+      try {
+        app.show();
+      } catch {}
+    }
   }
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
@@ -210,6 +217,11 @@ function restoreOrCreateMainWindow() {
   }
   if (!mainWindow.isVisible()) {
     mainWindow.show();
+  }
+  if (process.platform === 'darwin' && typeof app.focus === 'function') {
+    try {
+      app.focus({ steal: true });
+    } catch {}
   }
   mainWindow.focus();
 }
@@ -294,6 +306,131 @@ function ensureAppTray() {
   }
 }
 
+/** @type {ReturnType<typeof setInterval> | null} */
+let macBottleFocusTimer = null;
+/** @type {{ pollAndActivateBottledGame?: () => number } | null | false} */
+let macCoopActivateAddon = null;
+
+function loadMacCoopActivateHelper() {
+  if (macCoopActivateAddon !== null) {
+    return macCoopActivateAddon || null;
+  }
+  if (process.platform !== 'darwin') {
+    macCoopActivateAddon = false;
+    return null;
+  }
+  const candidates = [
+    path.join(
+      process.resourcesPath || '',
+      'app.asar.unpacked',
+      'electron',
+      'helpers',
+      'libone_coop_activate.dylib'
+    ),
+    path.join(__dirname, 'helpers', 'libone_coop_activate.dylib'),
+  ];
+  for (const dylibPath of candidates) {
+    try {
+      if (!dylibPath || !fs.existsSync(dylibPath)) continue;
+      const mod = { exports: {} };
+      process.dlopen(mod, dylibPath);
+      if (typeof (/** @type {any} */ (mod.exports).pollAndActivateBottledGame) === 'function') {
+        macCoopActivateAddon = /** @type {{ pollAndActivateBottledGame: () => number }} */ (
+          mod.exports
+        );
+        return macCoopActivateAddon;
+      }
+    } catch {}
+  }
+  macCoopActivateAddon = false;
+  return null;
+}
+
+function stopMacBottleFocusHelper() {
+  if (macBottleFocusTimer) {
+    clearInterval(macBottleFocusTimer);
+    macBottleFocusTimer = null;
+  }
+}
+
+/**
+ * Cooperatively yields and transfers macOS AppKit frontmost status & Menu Bar
+ * ownership directly from One Launcher (`NSApp`) to a newly mapped CrossOver/Wine
+ * game window (including multi-stage wrapper -> game chains) via native AppKit
+ * `yieldActivationToApplication:` + `activateFromApplication:options:` (zero
+ * AppleEvents, zero TCC prompts).
+ * @param {any} eventPayload
+ * @param {any} [_effectivePolicy]
+ */
+function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
+  if (process.platform !== 'darwin' || process.env.VITEST || process.env.NODE_ENV === 'test') {
+    return;
+  }
+  const sessionInfo = eventPayload && eventPayload.session ? eventPayload.session : eventPayload;
+  const launchMethod = String((sessionInfo && sessionInfo.launchMethod) || '');
+  const exePath = String((sessionInfo && sessionInfo.executablePath) || '');
+  const isBottledWindowsLaunch =
+    launchMethod === 'compat_layer' || /\.(exe|bat|cmd|msi)$/i.test(exePath);
+  if (!isBottledWindowsLaunch) {
+    return;
+  }
+
+  stopMacBottleFocusHelper();
+  const helper = loadMacCoopActivateHelper();
+  if (!helper || typeof helper.pollAndActivateBottledGame !== 'function') {
+    return;
+  }
+
+  let ticks = 0;
+  let activeLayerTicks = 0;
+  let activeTicks = 0;
+  let lastPidTag = -1;
+
+  const timer = setInterval(() => {
+    ticks += 1;
+    if (ticks > 75) {
+      stopMacBottleFocusHelper();
+      return;
+    }
+    try {
+      const encoded = Number(helper.pollAndActivateBottledGame() || 0);
+      if ((encoded & 1) === 0) {
+        return;
+      }
+      const isActive = (encoded & 2) !== 0;
+      const layer = (encoded >> 2) & 0x3fff;
+      const pidTag = (encoded >> 16) & 0x7fff;
+      if (pidTag !== lastPidTag) {
+        lastPidTag = pidTag;
+        activeLayerTicks = 0;
+        activeTicks = 0;
+      }
+      if (isActive && layer >= 25) {
+        activeLayerTicks += 1;
+        if (activeLayerTicks >= 4) {
+          stopMacBottleFocusHelper();
+          return;
+        }
+      } else {
+        activeLayerTicks = 0;
+      }
+      if (isActive) {
+        activeTicks += 1;
+        if (activeTicks >= 20) {
+          stopMacBottleFocusHelper();
+        }
+      }
+    } catch {
+      stopMacBottleFocusHelper();
+    }
+  }, 200);
+
+  macBottleFocusTimer = timer;
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
 launcherEngine.setSessionLifecycleHook((/** @type {string} */ gameId, /** @type {any} */ eventPayload) => {
   try {
     updateAppTrayMenu();
@@ -326,6 +463,8 @@ launcherEngine.setSessionLifecycleHook((/** @type {string} */ gameId, /** @type 
       if (typeof memTrimTimer.unref === 'function') {
         memTrimTimer.unref();
       }
+
+      activateMacBottleGameWindowOnLaunch(eventPayload, effectivePolicy);
 
       const mode = effectivePolicy.inGameLauncherBehavior;
       if (mode === 'keep_open') {
@@ -391,6 +530,7 @@ launcherEngine.setSessionLifecycleHook((/** @type {string} */ gameId, /** @type 
         }
       }
     } else if (eventType === 'stopped') {
+      stopMacBottleFocusHelper();
       const remainingGames = launcherEngine.getRunningGames() || [];
       if (remainingGames.length > 0) return;
 
@@ -947,6 +1087,24 @@ const { trimStoreSyncIpcMemory } = registerStoreSyncIpcHandlers({
 
 registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainWindow: () => mainWindow });
 
+ipcMain.handle(
+  'launcher:toggle-session-fullscreen',
+  async (/** @type {any} */ _event, /** @type {any} */ payload) => {
+    if (typeof payload === 'string') {
+      return launcherEngine.toggleSessionFullscreen({ gameId: payload, sessionId: payload });
+    }
+    const raw = payload && typeof payload === 'object' ? payload : {};
+    return launcherEngine.toggleSessionFullscreen({
+      ...(typeof raw.sessionId === 'string' && raw.sessionId ? { sessionId: raw.sessionId } : {}),
+      ...(typeof raw.gameId === 'string' && raw.gameId ? { gameId: raw.gameId } : {}),
+      ...(typeof raw.fullscreen === 'boolean' ? { fullscreen: raw.fullscreen } : {}),
+      ...(typeof raw.aspectRatio === 'string' && raw.aspectRatio
+        ? { aspectRatio: raw.aspectRatio }
+        : {}),
+    });
+  }
+);
+
 registerWindowAndSystemIpcHandlers({
   ipcMain,
   app,
@@ -1017,12 +1175,12 @@ ipcMain.handle('app:get-version', () => {
   try {
     return app.getVersion();
   } catch {
-    return '0.2.1';
+    return '0.2.2';
   }
 });
 
 ipcMain.handle('app:get-info', () => {
-  let version = '0.2.1';
+  let version = '0.2.2';
   try {
     version = app.getVersion();
   } catch {}
@@ -1042,7 +1200,7 @@ ipcMain.handle('app:check-for-updates', async () => {
     ? rawRepoSlug
     : 'Space-Cadet0/One-Launcher';
   const defaultReleaseUrl = `https://github.com/${repoSlug}/releases`;
-  let currentVersion = '0.2.1';
+  let currentVersion = '0.2.2';
   try {
     currentVersion = app.getVersion();
   } catch {}
