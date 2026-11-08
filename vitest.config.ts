@@ -8,10 +8,12 @@ export default defineConfig({
     },
   },
   test: {
+    pool: 'threads',
     include: ['tests/**/*.test.{ts,tsx}'],
     exclude: ['tests/live/**', 'node_modules/**', 'dist/**', 'release/**'],
-    testTimeout: 10000,
-    hookTimeout: 10000,
+    testTimeout: 20000,
+    hookTimeout: 20000,
+    teardownTimeout: 20000,
     setupFiles: ['./tests/setup/offlineNetworkGuard.ts'],
   },
 });

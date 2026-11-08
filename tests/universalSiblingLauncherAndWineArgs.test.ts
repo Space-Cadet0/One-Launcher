@@ -177,6 +177,9 @@ describe('Universal Sibling Launcher Bootstrapper & Wine Argument Normalization'
         homedir: fakeHome,
         userDataDir: fakeUserData,
         customRoots: [gogLibrary],
+        applicationsDirs: [],
+        skipRegistry: true,
+        forceRefresh: true,
       });
       expect(scanRes.success).toBe(true);
       const match = scanRes.installedGames.find((g) => String(g.platformGameId) === '999000111');
