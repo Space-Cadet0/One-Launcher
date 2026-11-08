@@ -199,6 +199,7 @@ const { parseSteamEaInstallerDataXml } = require('../storefronts/steamLocalScann
 const {
   doChainedPublisherTitlesMatch,
   isGdkStubExecutablePath,
+  resolveSiblingLauncherStub,
 } = require('./installedGameScanner.cjs');
 
 /**
@@ -210,6 +211,113 @@ const {
  */
 function resolveAnyChainedHandoffId(raw) {
   return normalizeChainedHandoffId(raw) || normalizeVaultChainedHandoffId(raw) || '';
+}
+
+const WINE_KNOWN_PATH_EXT_RE =
+  /\.(exe|bat|cmd|com|msi|ini|cfg|conf|json|xml|txt|log|sav|dat|pak|pk3|pk4|wad|bsp|map|bik|smk|mpq|vpk|u|unr|dem|mod|dll|asi|bin|iso)$/i;
+
+/**
+ * Universally normalizes an argument or target executable path for Wine execution
+ * by converting verified POSIX / relative file paths to canonical Windows backslash paths
+ * (`Z:\...` or `C:\...`), while preserving URLs, storefront protocol URIs, Win32 CLI flags,
+ * and opaque auth/Base64 tokens untouched.
+ *
+ * @param {string} rawArg
+ * @param {string} [winePrefix]
+ * @returns {string}
+ */
+function normalizeWineArgumentBackslashes(rawArg, winePrefix = '') {
+  if (!rawArg || typeof rawArg !== 'string') return rawArg;
+  const trimmed = rawArg.trim();
+  if (!trimmed) return rawArg;
+
+  // 1. Never modify URLs or storefront/custom protocol URIs (`https://...`, `steam://...`, `com.epicgames.launcher://...`, `ms-xbl-...:`)
+  if (
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed) ||
+    /^(steam|epic|com\.epicgames\.launcher|uplay|origin|ea|link2ea|battlenet|goggalaxy|xbox|ms-xbl-[a-z0-9-]+|mailto):/i.test(
+      trimmed
+    )
+  ) {
+    return rawArg;
+  }
+
+  // 2. Windows drive path (`C:\Games/SubDir\game.exe` or `D:/Games/bin/app.exe`)
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed)) {
+    if (winePrefix && typeof winePrefix === 'string' && /^[a-zA-Z]:[\\/]/.test(winePrefix.trim())) {
+      const normTrimmed = trimmed.replace(/\\/g, '/');
+      const normDriveC = `${winePrefix.trim().replace(/\\/g, '/').replace(/\/+$/, '')}/drive_c`;
+      if (
+        normTrimmed.toLowerCase() === normDriveC.toLowerCase() ||
+        normTrimmed.toLowerCase().startsWith(`${normDriveC.toLowerCase()}/`)
+      ) {
+        const converted = toWineWindowsPath(trimmed, winePrefix);
+        return converted ? converted.replace(/\//g, '\\') : trimmed.replace(/\//g, '\\');
+      }
+    }
+    return trimmed.replace(/\//g, '\\');
+  }
+
+  // 3. Win32 UNC path (`\\server\share\game.exe`)
+  if (trimmed.startsWith('\\\\')) {
+    return trimmed;
+  }
+
+  // 4. CLI switch with attached value (`-cfg=configs/game.ini`, `/log:logs/game.log`, `-AUTH_PASSWORD=eyJ...`)
+  const switchParamMatch = trimmed.match(/^([/-]{1,2}[a-zA-Z0-9_.-]+[:=])(.+)$/);
+  if (switchParamMatch) {
+    const prefix = switchParamMatch[1];
+    const paramVal = switchParamMatch[2];
+    const normalizedVal = normalizeWineArgumentBackslashes(paramVal, winePrefix);
+    return normalizedVal === paramVal ? rawArg : `${prefix}${normalizedVal}`;
+  }
+
+  // 5. Single-segment Win32/POSIX CLI switches (`/nosplash`, `/w`, `-windowed`, `+connect`)
+  if (/^[/-][a-zA-Z0-9_?.-]+$/.test(trimmed) || trimmed.startsWith('+')) {
+    return rawArg;
+  }
+
+  // 6. Absolute POSIX path: convert ONLY when inside `winePrefix`, existing on disk (or parent dir exists),
+  // or ending in a known game/config file extension (prevents mangling `/api/v1` or Base64 strings starting with `/`).
+  if (trimmed.startsWith('/') && trimmed.includes('/', 1)) {
+    const firstSeg = trimmed.slice(1, trimmed.indexOf('/', 1));
+    if (!firstSeg.includes(':')) {
+      const normalizedPrefix = winePrefix ? path.resolve(winePrefix) : '';
+      const resolvedCandidate = path.resolve(trimmed);
+      const insidePrefix = Boolean(
+        normalizedPrefix &&
+          (resolvedCandidate === normalizedPrefix ||
+            resolvedCandidate.startsWith(normalizedPrefix + path.sep))
+      );
+      let existsOrParentExists = false;
+      try {
+        existsOrParentExists =
+          fs.existsSync(trimmed) || fs.existsSync(path.dirname(trimmed));
+      } catch {}
+      if (insidePrefix || existsOrParentExists || WINE_KNOWN_PATH_EXT_RE.test(trimmed)) {
+        const converted = toWineWindowsPath(trimmed, winePrefix);
+        return converted ? converted.replace(/\//g, '\\') : trimmed.replace(/\//g, '\\');
+      }
+    }
+    return rawArg;
+  }
+
+  // 7. Relative path with forward slashes (`./bin/game.exe`, `../data/level.map`, `System/game.exe`):
+  // Require explicit `./` or `../` prefix, a known file extension, or existence on disk so Base64/JWT tokens (`abc/def+ghi=`) are untouched.
+  if (!trimmed.startsWith('-') && !trimmed.startsWith('/') && trimmed.includes('/')) {
+    const looksLikeExplicitRelPath =
+      trimmed.startsWith('./') ||
+      trimmed.startsWith('../') ||
+      WINE_KNOWN_PATH_EXT_RE.test(trimmed);
+    const looksLikeBase64OrToken =
+      !trimmed.includes(' ') &&
+      (/[+=]$/.test(trimmed) || /[A-Za-z0-9+/]{24,}/.test(trimmed)) &&
+      !WINE_KNOWN_PATH_EXT_RE.test(trimmed);
+    if (!looksLikeBase64OrToken && looksLikeExplicitRelPath) {
+      return trimmed.replace(/\//g, '\\');
+    }
+  }
+
+  return rawArg;
 }
 
 /** @type {Map<string, string>} */
@@ -5303,6 +5411,21 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       }
     }
 
+    const hasExplicitLaunchArgs = Boolean(
+      (typeof launchConfig.launchArguments === 'string' && launchConfig.launchArguments.trim()) ||
+        (Array.isArray(payload.launchArgs) && payload.launchArgs.length > 0) ||
+        (typeof payload.launchArguments === 'string' && payload.launchArguments.trim())
+    );
+    if (resolvedExePath && !launchConfig.customExecutablePath && !hasExplicitLaunchArgs) {
+      const siblingCandidate = resolveSiblingLauncherStub(
+        resolvedExePath,
+        localInstallDir || payload.installPath || ''
+      );
+      if (siblingCandidate && fs.existsSync(siblingCandidate)) {
+        resolvedExePath = siblingCandidate;
+      }
+    }
+
     if (
       resolvedExePath &&
       resolvedExePath !== 'explorer.exe' &&
@@ -7113,13 +7236,20 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 realCrossOverPerlWrapper)
                 ? ['--dll', trimmedDllOverrides]
                 : [];
+            const effectiveWinePrefix =
+              targetWinePrefix ||
+              (resolvedExePath ? extractBottleRootFromPath(resolvedExePath) : '') ||
+              '';
+            const winTargetExePath = resolvedExePath
+              ? toWineWindowsPath(resolvedExePath, effectiveWinePrefix)
+              : '';
+            const normalizedWineArgs = args.map((a) =>
+              normalizeWineArgumentBackslashes(a, effectiveWinePrefix)
+            );
             if (wantDisplayLauncherWrap && bottleDisplayStagedInfo && resolvedExePath) {
               const chosenDisplayLauncherPosix = effectiveCaps?.is32Bit
                 ? bottleDisplayStagedInfo.launcherX86Posix
                 : bottleDisplayStagedInfo.launcherX64Posix;
-              const winTargetExePath = targetWinePrefix
-                ? toWineWindowsPath(resolvedExePath, targetWinePrefix)
-                : resolvedExePath;
               spawnArgs = [
                 ...waitChildrenArgs,
                 ...dllOverrideArgs,
@@ -7129,12 +7259,17 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 '--dll-x64',
                 bottleDisplayStagedInfo.winDllX64,
                 '--',
-                winTargetExePath,
-                ...args,
+                winTargetExePath || resolvedExePath,
+                ...normalizedWineArgs,
               ];
               bottleDisplayScalerWrapped = true;
             } else {
-              spawnArgs = [...waitChildrenArgs, ...dllOverrideArgs, resolvedExePath, ...args];
+              spawnArgs = [
+                ...waitChildrenArgs,
+                ...dllOverrideArgs,
+                resolvedExePath,
+                ...args,
+              ];
             }
             actualLaunchMethod = `compatibility_layer:${chosenCompatLayer.type}`;
           }
@@ -12609,4 +12744,5 @@ module.exports = {
   verifyGameFiles,
   uninstallGame,
   shutdownLauncherEngine,
+  normalizeWineArgumentBackslashes,
 };

@@ -42,7 +42,7 @@ ds_scaling_mode_t ds_parse_scaling_mode(const char *value)
     const char *p = value;
     size_t n = strlen(value);
     ds_trim_span(&p, &n);
-    if (ds_ascii_ieq_span(p, n, "auto_fullscreen")) {
+    if (ds_ascii_ieq_span(p, n, "auto_fullscreen") || ds_ascii_ieq_span(p, n, "auto")) {
         return DS_MODE_AUTO_FULLSCREEN;
     }
     if (ds_ascii_ieq_span(p, n, "force_fullscreen")) {

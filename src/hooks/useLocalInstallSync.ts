@@ -845,7 +845,7 @@ export function useLocalInstallSync({
         .then((info) => {
           if (cancelled) return;
           const previousVersion = localStorage.getItem('one_launcher_last_run_version');
-          const currentVersion = info?.version || '0.2.2';
+          const currentVersion = info?.version || '0.2.3';
           localStorage.setItem('one_launcher_last_run_version', currentVersion);
           if (
             (previousVersion && previousVersion !== currentVersion) ||

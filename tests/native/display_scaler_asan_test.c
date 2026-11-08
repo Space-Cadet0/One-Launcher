@@ -229,6 +229,7 @@ static void test_subrect_and_control_ini_parser(void)
     free(raw_no_nul);
 
     /* Mode & aspect string helpers */
+    ASSERT_TRUE(ds_parse_scaling_mode("auto") == DS_MODE_AUTO_FULLSCREEN);
     ASSERT_TRUE(ds_parse_scaling_mode("auto_fullscreen") == DS_MODE_AUTO_FULLSCREEN);
     ASSERT_TRUE(ds_parse_scaling_mode(" FORCE_FULLSCREEN ") == DS_MODE_FORCE_FULLSCREEN);
     ASSERT_TRUE(ds_parse_scaling_mode("windowed") == DS_MODE_PASSTHROUGH);

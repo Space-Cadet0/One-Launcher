@@ -924,6 +924,113 @@ function flattenGogNestedInstallDir(finalInstallPath, cleanId) {
 }
 
 /**
+ * Extracts a candidate launcher stem from an engine executable filename, requiring an
+ * explicit delimiter (`_main`, `-main`, `.main`), a digit-to-`main` boundary (`<Stem><N>Main.exe`),
+ * or a mixed-case `Main` boundary (`<Stem>Main.exe`).
+ * Safely rejects ordinary words ending in `main` (e.g. `Domain.exe`, `DOMAIN.EXE`, `Remain.exe`).
+ *
+ * @param {string | undefined | null} fileName
+ * @returns {string | null}
+ */
+function extractSiblingLauncherStem(fileName) {
+  if (!fileName || typeof fileName !== 'string') return null;
+  const cleanName = path.basename(fileName.replace(/\\/g, '/'));
+
+  // 1. Explicit delimiter before main: stem_main.exe, stem-main.exe, stem.main.exe
+  const delimMatch = cleanName.match(/^(.+?)[_\-.](?:main)\.exe$/i);
+  if (delimMatch && delimMatch[1].trim()) return delimMatch[1].trim();
+
+  // 2. Numeric transition before main: game2main.exe, engine3MAIN.exe
+  const digitMatch = cleanName.match(/^(.+?[0-9])(?:main)\.exe$/i);
+  if (digitMatch && digitMatch[1].trim()) return digitMatch[1].trim();
+
+  // 3. Mixed-case Main boundary: GameMain.exe, EngineMain.EXE (rejects Domain.exe / DOMAIN.EXE)
+  const camelMatch = cleanName.match(/^([A-Za-z0-9_.\-]+)Main\.[eE][xX][eE]$/);
+  if (camelMatch && camelMatch[1].trim()) return camelMatch[1].trim();
+
+  return null;
+}
+
+/**
+ * Resolves whether a candidate executable has a valid sibling bootstrapper launcher `<Stem>.exe`.
+ * Classic Windows titles frequently pair an outer launcher stub `<Stem>.exe` with an inner
+ * engine binary `<Stem>Main.exe`, `<Stem>_main.exe`, or `<Stem>-main.exe`.
+ * Preserves `candidatePath` unchanged when no valid PE bootstrapper sibling exists.
+ *
+ * @param {string | undefined | null} candidatePath
+ * @param {string | undefined | null} [rootDir]
+ * @returns {string | undefined}
+ */
+function resolveSiblingLauncherStub(candidatePath, rootDir = undefined) {
+  if (!candidatePath || typeof candidatePath !== 'string') return candidatePath || undefined;
+  const originalPath = candidatePath;
+  const normalizedCandidate = String(candidatePath).replace(/\\/g, path.sep);
+  const fileName = path.basename(normalizedCandidate);
+
+  const stem = extractSiblingLauncherStem(fileName);
+  if (!stem) return originalPath;
+  const targetName = `${stem.toLowerCase()}.exe`;
+
+  const candidateDir = path.dirname(normalizedCandidate);
+  const dirsToCheck = [candidateDir];
+
+  const parentDir = path.dirname(candidateDir);
+  if (parentDir && parentDir !== candidateDir && parentDir !== '.' && parentDir !== path.parse(parentDir).root) {
+    let allowParent = false;
+    if (rootDir && typeof rootDir === 'string') {
+      const resolvedRoot = path.resolve(String(rootDir).replace(/\\/g, path.sep));
+      const resolvedParent = path.resolve(parentDir);
+      const rel = path.relative(resolvedRoot, resolvedParent);
+      allowParent = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    } else {
+      const parentBase = path.basename(parentDir).toLowerCase();
+      const genericContainers = new Set([
+        'games',
+        'gog',
+        'gog games',
+        'steamapps',
+        'common',
+        'program files',
+        'program files (x86)',
+        'users',
+        'applications',
+        'onelauncher',
+      ]);
+      allowParent = Boolean(parentBase && !genericContainers.has(parentBase));
+    }
+    if (allowParent) {
+      dirsToCheck.push(parentDir);
+    }
+  }
+
+  for (const dir of dirsToCheck) {
+    if (!dir || !fs.existsSync(dir)) continue;
+    try {
+      const files = fs.readdirSync(dir);
+      const matchFile = files.find((f) => f.toLowerCase() === targetName);
+      if (!matchFile) continue;
+      const fullPath = path.join(dir, matchFile);
+      if (isExcludedExecutable(fullPath) || /^gdkstubgame\.exe$/i.test(matchFile)) {
+        continue;
+      }
+      try {
+        const stat = fs.statSync(fullPath);
+        if (!stat.isFile() || stat.size <= 0) {
+          continue;
+        }
+        const peHeader = inspectWindowsExecutableHeader(fullPath);
+        if (peHeader.is16BitDos) {
+          continue;
+        }
+        return fullPath;
+      } catch {}
+    } catch {}
+  }
+
+  return originalPath;
+}
+
+/**
  * Auto-discover the primary game executable inside an installation directory
  */
 function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
@@ -993,17 +1100,27 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
   }
 
   const cacheAndReturn = (/** @type {any} */ result) => {
+    let finalResult = result;
+    if (finalResult && finalResult.executablePath && !options.exactCandidate) {
+      const sibling = resolveSiblingLauncherStub(finalResult.executablePath, localInstallPath);
+      if (sibling && sibling !== finalResult.executablePath) {
+        finalResult = {
+          ...finalResult,
+          executablePath: sibling,
+        };
+      }
+    }
     setBoundedMapEntry(
       executableDiscoveryCache,
       cacheKey,
       {
-        result,
+        result: finalResult,
         mtimeMs: rootMtimeMs,
         timestamp: Date.now(),
       },
       MAX_DISCOVERY_CACHE_ENTRIES
     );
-    return { ...result };
+    return { ...finalResult };
   };
 
   /** @type {string[]} */
@@ -9517,4 +9634,6 @@ module.exports = {
   normalizeDosboxDisplayConfigs,
   sanitizeWinePrefixDisplayConfigs,
   ensureCompatibilityLayerReady,
+  extractSiblingLauncherStem,
+  resolveSiblingLauncherStub,
 };

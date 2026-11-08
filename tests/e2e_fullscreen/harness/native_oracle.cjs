@@ -10,6 +10,59 @@ const SCALER_DIR = path.join(ROOT_DIR, 'electron', 'helpers', 'display_scaler');
 const MATH_SRC = path.join(SCALER_DIR, 'display_scaler_math.c');
 
 let cachedProbeBinary = null;
+let cachedProbeTmpDir = null;
+
+process.on('exit', () => {
+  if (cachedProbeTmpDir) {
+    try {
+      fs.rmSync(cachedProbeTmpDir, { recursive: true, force: true });
+    } catch {}
+    cachedProbeTmpDir = null;
+  }
+});
+
+function compileProbeBinary(probeCPath, binPath) {
+  const commonArgs = [
+    '-std=c11',
+    '-O1',
+    `-I${SCALER_DIR}`,
+    MATH_SRC,
+    probeCPath,
+    '-o',
+    binPath,
+  ];
+  const compilers = [
+    ['clang', commonArgs],
+    ['gcc', commonArgs],
+    ['cc', commonArgs],
+  ];
+  const zigCacheRoot = path.join(ROOT_DIR, '.cache', 'zig');
+  if (fs.existsSync(zigCacheRoot)) {
+    try {
+      for (const entry of fs.readdirSync(zigCacheRoot)) {
+        const zigBin = path.join(
+          zigCacheRoot,
+          entry,
+          process.platform === 'win32' ? 'zig.exe' : 'zig'
+        );
+        if (fs.existsSync(zigBin)) {
+          compilers.push([zigBin, ['cc', ...commonArgs]]);
+        }
+      }
+    } catch {}
+  }
+
+  let lastErr = null;
+  for (const [cmd, args] of compilers) {
+    try {
+      execFileSync(cmd, args, { cwd: ROOT_DIR, stdio: 'pipe' });
+      return;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Failed to compile native display_scaler probe');
+}
 
 function ensureNativeProbe() {
   if (cachedProbeBinary && fs.existsSync(cachedProbeBinary)) {
@@ -17,7 +70,11 @@ function ensureNativeProbe() {
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-ds-probe-'));
-  const binPath = path.join(tmpDir, 'ds_probe');
+  cachedProbeTmpDir = tmpDir;
+  const binPath = path.join(
+    tmpDir,
+    process.platform === 'win32' ? 'ds_probe.exe' : 'ds_probe'
+  );
 
   const probeCSource = `
 #include <stdio.h>
@@ -113,15 +170,7 @@ int main(int argc, char **argv) {
   const probeCPath = path.join(tmpDir, 'ds_probe.c');
   fs.writeFileSync(probeCPath, probeCSource, 'utf8');
 
-  execFileSync('clang', [
-    '-std=c11',
-    '-O1',
-    `-I${SCALER_DIR}`,
-    MATH_SRC,
-    probeCPath,
-    '-o',
-    binPath,
-  ], { cwd: ROOT_DIR });
+  compileProbeBinary(probeCPath, binPath);
 
   cachedProbeBinary = binPath;
   return binPath;

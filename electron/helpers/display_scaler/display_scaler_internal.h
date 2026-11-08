@@ -81,9 +81,13 @@ typedef BOOL (WINAPI *pfn_ShowWindowAsync_t)(HWND, int);
 typedef BOOL (WINAPI *pfn_SetWindowPlacement_t)(HWND, const WINDOWPLACEMENT *);
 typedef BOOL (WINAPI *pfn_SetWindowPos_t)(HWND, HWND, int, int, int, int, UINT);
 typedef BOOL (WINAPI *pfn_MoveWindow_t)(HWND, int, int, int, int, BOOL);
+typedef LONG (WINAPI *pfn_GetWindowLongA_t)(HWND, int);
+typedef LONG (WINAPI *pfn_GetWindowLongW_t)(HWND, int);
 typedef LONG (WINAPI *pfn_SetWindowLongA_t)(HWND, int, LONG);
 typedef LONG (WINAPI *pfn_SetWindowLongW_t)(HWND, int, LONG);
 #if defined(_WIN64)
+typedef LONG_PTR (WINAPI *pfn_GetWindowLongPtrA_t)(HWND, int);
+typedef LONG_PTR (WINAPI *pfn_GetWindowLongPtrW_t)(HWND, int);
 typedef LONG_PTR (WINAPI *pfn_SetWindowLongPtrA_t)(HWND, int, LONG_PTR);
 typedef LONG_PTR (WINAPI *pfn_SetWindowLongPtrW_t)(HWND, int, LONG_PTR);
 #endif
@@ -100,6 +104,8 @@ typedef BOOL (WINAPI *pfn_ClipCursor_t)(const RECT *);
 typedef BOOL (WINAPI *pfn_GetClipCursor_t)(LPRECT);
 typedef BOOL (WINAPI *pfn_ScreenToClient_t)(HWND, LPPOINT);
 typedef BOOL (WINAPI *pfn_ClientToScreen_t)(HWND, LPPOINT);
+typedef int  (WINAPI *pfn_MapWindowPoints_t)(HWND, HWND, LPPOINT, UINT);
+typedef HWND (WINAPI *pfn_WindowFromPoint_t)(POINT);
 typedef int  (WINAPI *pfn_ReleaseDC_t)(HWND, HDC);
 
 typedef int  (WINAPI *pfn_GetDeviceCaps_t)(HDC, int);
@@ -129,6 +135,28 @@ typedef void  (APIENTRY *pfn_glBindFramebuffer_t)(GLenum, GLuint);
 typedef void  (APIENTRY *pfn_glDrawBuffer_t)(GLenum);
 typedef void  (APIENTRY *pfn_glReadBuffer_t)(GLenum);
 
+/*
+ * Wine `win32u` / `wined3d` private `D3DKMTEscape` command (`0x80000001`):
+ * `wined3d_swapchain_state_set_fullscreen` / `resize_target` passes a 16-byte `RECT`
+ * (`pPrivateDriverData`, `PrivateDriverDataSize == sizeof(RECT)`) and `(UINT)(uintptr_t)hwnd`
+ * (`hContext`) to `gdi32!D3DKMTEscape` -> `win32u!NtGdiDdDDIEscape`. When non-empty, `win32u`
+ * clamps `rects->visible` (and `wineserver` mouse hit-testing) to that virtual swapchain rect
+ * even when `hwnd` covers the full HiDPI physical monitor. Passing `{0,0,0,0}` clears the clamp.
+ */
+#define DS_WINE_D3DKMT_ESCAPE_SET_PRESENT_RECT 0x80000001u
+
+typedef struct ds_d3dkmt_escape_s {
+    UINT  hAdapter;
+    UINT  hDevice;
+    UINT  Type;
+    UINT  Flags;
+    void *pPrivateDriverData;
+    UINT  PrivateDriverDataSize;
+    UINT  hContext;
+} ds_d3dkmt_escape_t;
+
+typedef LONG (WINAPI *pfn_D3DKMTEscape_t)(const ds_d3dkmt_escape_t *);
+
 typedef struct ds_runtime_s {
     CRITICAL_SECTION    lock;
     bool                lock_initialized;
@@ -154,6 +182,8 @@ typedef struct ds_runtime_s {
 
     int32_t             real_screen_w;
     int32_t             real_screen_h;
+    int32_t             phys_screen_w;
+    int32_t             phys_screen_h;
     int32_t             real_bpp;
     int32_t             real_hz;
 
@@ -163,8 +193,11 @@ typedef struct ds_runtime_s {
     bool                mode_virtualized;
     bool                fullscreen_active;
     bool                user_forced_windowed;
+    bool                is_wine;
     bool                wined3d_uses_gl;
     bool                legacy_d3d_loaded;
+    bool                ddraw_loaded;
+    bool                d3d8_or_9_loaded;
     int32_t             virt_w;
     int32_t             virt_h;
     int32_t             virt_bpp;
@@ -189,6 +222,8 @@ typedef struct ds_runtime_s {
     bool                gl_host_want_visible;
     bool                cocoa_fs_synced;
     bool                app_inactive;
+    bool                visible_resync_needed;
+    bool                visible_resync_done;
     volatile LONG       gl_drawable_rebind_pending;
     DWORD               first_visible_tick;
     UINT                msg_apply_presentation;
@@ -226,9 +261,13 @@ typedef struct ds_runtime_s {
     pfn_SetWindowPlacement_t      real_SetWindowPlacement;
     pfn_SetWindowPos_t            real_SetWindowPos;
     pfn_MoveWindow_t              real_MoveWindow;
+    pfn_GetWindowLongA_t          real_GetWindowLongA;
+    pfn_GetWindowLongW_t          real_GetWindowLongW;
     pfn_SetWindowLongA_t          real_SetWindowLongA;
     pfn_SetWindowLongW_t          real_SetWindowLongW;
 #if defined(_WIN64)
+    pfn_GetWindowLongPtrA_t       real_GetWindowLongPtrA;
+    pfn_GetWindowLongPtrW_t       real_GetWindowLongPtrW;
     pfn_SetWindowLongPtrA_t       real_SetWindowLongPtrA;
     pfn_SetWindowLongPtrW_t       real_SetWindowLongPtrW;
 #endif
@@ -245,6 +284,8 @@ typedef struct ds_runtime_s {
     pfn_GetClipCursor_t           real_GetClipCursor;
     pfn_ScreenToClient_t          real_ScreenToClient;
     pfn_ClientToScreen_t          real_ClientToScreen;
+    pfn_MapWindowPoints_t         real_MapWindowPoints;
+    pfn_WindowFromPoint_t         real_WindowFromPoint;
     pfn_ReleaseDC_t               real_ReleaseDC;
 
     pfn_GetDeviceCaps_t           real_GetDeviceCaps;
@@ -258,6 +299,8 @@ typedef struct ds_runtime_s {
     pfn_SetDIBitsToDevice_t       real_SetDIBitsToDevice;
     pfn_StretchDIBits_t           real_StretchDIBits;
     pfn_SwapBuffers_t             real_SwapBuffers;
+    pfn_D3DKMTEscape_t            real_D3DKMTEscape;
+    pfn_D3DKMTEscape_t            real_NtGdiDdDDIEscape;
 
     pfn_wglCreateContext_t        real_wglCreateContext;
     pfn_wglCreateLayerContext_t   real_wglCreateLayerContext;
@@ -276,19 +319,35 @@ typedef struct ds_runtime_s {
 
 extern ds_runtime_t g_ds;
 
+/*
+ * 16bpp DirectDraw HAL compatibility preference applies exclusively when `ddraw.dll`
+ * is loaded without D3D8/D3D9 (`d3d8.dll` / `d3d9.dll`), preserving 1990s DirectDraw/D3D5-7
+ * hardware acceleration while keeping 32bpp untouched for D3D8+ titles.
+ */
+static inline bool ds_prefer_16bpp_ddraw(void)
+{
+    return g_ds.ddraw_loaded && !g_ds.d3d8_or_9_loaded;
+}
+
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
 bool ds_is_internal_call(void);
 void ds_enter_internal(void);
 void ds_leave_internal(void);
+uintptr_t ds_suspend_internal_depth(void);
+void ds_restore_internal_depth(uintptr_t saved_depth);
 bool ds_is_system_renderer_caller(const void *ret_addr);
 bool ds_is_wined3d_caller(const void *ret_addr);
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr);
 void ds_patch_loaded_modules(void);
 void ds_refresh_viewport_locked(void);
 int32_t ds_get_windowed_scale_locked(void);
+void ds_clear_wine_present_rect_on_hwnd(HWND hwnd);
 void ds_tracef(const char *fmt, ...);
 
 /* Window, GL host child, WndProc, hotkeys & control-file watcher (`display_scaler_window.c`) */
+LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LONG_PTR ds_get_wnd_long_ptr(HWND hwnd, int idx);
+LONG_PTR ds_set_wnd_long_ptr_raw(HWND hwnd, int idx, LONG_PTR val, bool unicode);
 bool ds_is_candidate_game_window(HWND hwnd, int32_t *out_cw, int32_t *out_ch);
 void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hint_virt_h);
 void ds_ensure_game_window_bounds(HWND candidate_hwnd);

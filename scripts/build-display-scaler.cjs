@@ -690,6 +690,8 @@ function compileSingleTarget({
     ...(isDll ? ['-shared'] : []),
     '-std=c11',
     '-Os',
+    '-fno-asynchronous-unwind-tables',
+    '-fno-unwind-tables',
     '-ffunction-sections',
     '-fdata-sections',
     '-Wall',

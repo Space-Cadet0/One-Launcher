@@ -32,6 +32,7 @@ const {
   isPathOrGameUnderIncompleteDownload,
 } = require('./engineStateRegistry.cjs');
 const { isExternalVolumeUnmounted } = require('./diskAndVolumeInspector.cjs');
+const macNativeInstallerAndCodesign = require('./macNativeInstallerAndCodesign.cjs');
 const {
   isExcludedExecutable,
   resolveMacAppBundleBinary,
@@ -43,7 +44,9 @@ const {
   extractBottleRootFromPath,
   listAllInitializedBottlePaths,
   detectCompatibilityLayers,
-} = require('./macNativeInstallerAndCodesign.cjs');
+  extractSiblingLauncherStem,
+  resolveSiblingLauncherStub,
+} = macNativeInstallerAndCodesign;
 const {
   primeXboxDiscoveryCachesAsync,
   collectXboxScanDirectories,
@@ -89,6 +92,7 @@ function isGdkStubExecutablePath(exePath) {
   const base = path.posix.basename(exePath.replace(/\\/g, '/'));
   return /^gdkstubgame\.exe$/i.test(base);
 }
+
 
 /**
  * Generates deterministic comparable title keys (full + edition-stripped) with Roman numeral
@@ -719,7 +723,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           const exeDiscovery =
             appInfoSpec && appInfoSpec.executablePath
               ? {
-                  executablePath: appInfoSpec.executablePath,
+                  executablePath: appInfoSpec.launchArguments
+                    ? appInfoSpec.executablePath
+                    : resolveSiblingLauncherStub(appInfoSpec.executablePath, installPath),
                   isWindowsBinaryOnMac: appInfoSpec.isWindowsBinaryOnMac,
                 }
               : findPrimaryExecutable(installPath, {
@@ -943,10 +949,25 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                 !rawPrimaryTask.arguments &&
                 rawGameTask
             );
-            const primaryTask =
+            let primaryTask =
               (preferGameOverLegacyLauncher ? rawGameTask : rawPrimaryTask) ||
               rawGameTask ||
               raw.playTasks.find((/** @type {any} */ t) => isFileTask(t));
+            if (primaryTask && primaryTask.path) {
+              const baseName = path.basename(String(primaryTask.path).replace(/\\/g, '/'));
+              const stem = extractSiblingLauncherStem(baseName);
+              if (stem) {
+                const siblingName = `${stem.toLowerCase()}.exe`;
+                const siblingTask = raw.playTasks.find((/** @type {any} */ t) => {
+                  if (!isFileTask(t)) return false;
+                  const tBase = path.basename(String(t.path).replace(/\\/g, '/')).toLowerCase();
+                  return tBase === siblingName;
+                });
+                if (siblingTask) {
+                  primaryTask = siblingTask;
+                }
+              }
+            }
             if (primaryTask && primaryTask.path) {
               if (
                 primaryTask.arguments &&
@@ -979,6 +1000,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                   break;
                 }
               }
+              if (executablePath && !launchArguments) {
+                executablePath = resolveSiblingLauncherStub(executablePath, installPath);
+              }
             }
           }
 
@@ -988,7 +1012,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               hintName: title,
               readOnly: true,
             });
-            executablePath = discovered.executablePath;
+            executablePath = resolveSiblingLauncherStub(discovered.executablePath, installPath);
             isWindowsBinaryOnMac = discovered.isWindowsBinaryOnMac;
           } else if (platform === 'darwin' && executablePath.toLowerCase().endsWith('.exe')) {
             isWindowsBinaryOnMac = true;
@@ -1117,10 +1141,13 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             const itemExeCandidate = item.executable
               ? toLocalFsPath(item.executable, customRoots)
               : '';
-            const resolvedHeroicExe =
+            const rawHeroicExe =
               itemExeCandidate && fs.existsSync(itemExeCandidate)
                 ? itemExeCandidate
                 : discovered.executablePath || itemExeCandidate || undefined;
+            const resolvedHeroicExe = rawHeroicExe
+              ? resolveSiblingLauncherStub(rawHeroicExe, installPath)
+              : undefined;
             const isWinOnMac =
               discovered.isWindowsBinaryOnMac ||
               isWindowsGogItem ||
@@ -1263,6 +1290,14 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               isWindowsBinaryOnMac = isWindowsBinaryOnMac || discovered.isWindowsBinaryOnMac;
             }
 
+            const launchArguments =
+              item.LaunchCommand && typeof item.LaunchCommand === 'string'
+                ? item.LaunchCommand.trim()
+                : '';
+
+            if (executablePath && !launchArguments) {
+              executablePath = resolveSiblingLauncherStub(executablePath, installPath);
+            }
             if (!executablePath || !fs.existsSync(executablePath)) continue;
 
             if (
@@ -1272,11 +1307,6 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             ) {
               isWindowsBinaryOnMac = true;
             }
-
-            const launchArguments =
-              item.LaunchCommand && typeof item.LaunchCommand === 'string'
-                ? item.LaunchCommand.trim()
-                : '';
 
             if (Boolean(options.userDataDir) || !isIsolatedTest) {
               recordImportedEpicInstall(
@@ -1362,7 +1392,8 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               hintName: appName,
               readOnly: true,
             });
-            if (!discovered.executablePath || !fs.existsSync(discovered.executablePath)) continue;
+            const effectiveEpicExe = resolveSiblingLauncherStub(discovered.executablePath, installPath);
+            if (!effectiveEpicExe || !fs.existsSync(effectiveEpicExe)) continue;
 
             if (Boolean(options.userDataDir) || !isIsolatedTest) {
               recordImportedEpicInstall(
@@ -1376,7 +1407,7 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
               platformGameId: appName,
               title: entry.DisplayName || path.basename(installPath) || appName,
               installPath,
-              executablePath: discovered.executablePath,
+              executablePath: effectiveEpicExe,
               version: entry.AppVersion ? String(entry.AppVersion) : undefined,
               manifestPath: datFile,
               runner: 'epic',
@@ -1470,6 +1501,9 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
             });
             if (!executablePath || !fs.existsSync(executablePath)) {
               executablePath = discovered.executablePath;
+            }
+            if (executablePath) {
+              executablePath = resolveSiblingLauncherStub(executablePath, installPath);
             }
             if (!executablePath || !fs.existsSync(executablePath)) {
               continue;
@@ -1842,10 +1876,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
                   hintName: rec.title,
                   readOnly: true,
                 });
-          const effectiveExe =
+          const rawEffectiveExe =
             matchedDiscovered?.executablePath ||
             (isRecExeValid ? recExeLocal : undefined) ||
             discovered.executablePath;
+          const effectiveExe = resolveSiblingLauncherStub(rawEffectiveExe, localInstall);
           if (
             !effectiveExe ||
             !fs.existsSync(effectiveExe) ||
@@ -2147,4 +2182,6 @@ module.exports = {
   isGdkStubExecutablePath,
   detectKernelAntiCheatMarkersInDir,
   resolveParadoxLauncherSettings,
+  extractSiblingLauncherStem,
+  resolveSiblingLauncherStub,
 };
