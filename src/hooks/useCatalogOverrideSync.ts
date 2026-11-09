@@ -18,6 +18,7 @@ import {
   unhideStorefrontEntry,
 } from '../services/storage/userOverrideStorage';
 import {
+  ensureSuppressedEntryRawGame,
   sanitizeGameCatalog,
   SuppressedCatalogEntry,
 } from '../services/integrations/catalogSanitizer';
@@ -566,6 +567,7 @@ export function useCatalogOverrideSync({
 
   const handleUnhideEntry = useCallback(
     (entry: SuppressedCatalogEntry) => {
+      if (!entry) return;
       let restoredSnapshot: CanonicalGame | undefined;
       internalMutationDepthRef.current += 1;
       try {
@@ -577,8 +579,9 @@ export function useCatalogOverrideSync({
       } finally {
         internalMutationDepthRef.current = Math.max(0, internalMutationDepthRef.current - 1);
       }
+      const baseStub = restoredSnapshot || ensureSuppressedEntryRawGame(entry).rawGame;
       const candidateGame: CanonicalGame = {
-        ...(restoredSnapshot || entry.rawGame),
+        ...baseStub,
         isVerifiedEntitlement: true,
       };
 
@@ -589,7 +592,8 @@ export function useCatalogOverrideSync({
       );
 
       setGameRefreshKey((prev) => prev + 1);
-      showSyncNotice(`Restored "${entry.rawTitle || entry.rawGame.title}" back to your library!`, 5000);
+      const displayTitle = entry.rawTitle || baseStub.title || entry.id;
+      showSyncNotice(`Restored "${displayTitle}" back to your library!`, 5000);
     },
     [setGames, setGameRefreshKey, showSyncNotice]
   );

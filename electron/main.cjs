@@ -1175,12 +1175,12 @@ ipcMain.handle('app:get-version', () => {
   try {
     return app.getVersion();
   } catch {
-    return '0.2.4';
+    return '0.2.5';
   }
 });
 
 ipcMain.handle('app:get-info', () => {
-  let version = '0.2.4';
+  let version = '0.2.5';
   try {
     version = app.getVersion();
   } catch {}
@@ -1200,7 +1200,7 @@ ipcMain.handle('app:check-for-updates', async () => {
     ? rawRepoSlug
     : 'Space-Cadet0/One-Launcher';
   const defaultReleaseUrl = `https://github.com/${repoSlug}/releases`;
-  let currentVersion = '0.2.4';
+  let currentVersion = '0.2.5';
   try {
     currentVersion = app.getVersion();
   } catch {}

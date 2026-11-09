@@ -110,7 +110,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const topMenuBarRef = useRef<HTMLDivElement | null>(null);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
-  const [appVersion, setAppVersion] = useState<string>('0.2.4');
+  const [appVersion, setAppVersion] = useState<string>('0.2.5');
   const [updateStatus, setUpdateStatus] = useState<
     'idle' | 'checking' | 'up-to-date' | 'update-available'
   >('idle');

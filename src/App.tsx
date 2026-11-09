@@ -31,6 +31,7 @@ import {
   loadPersistedGridSort,
 } from './components/Library/LibraryGridView';
 import { CollectionIcon } from './components/Common/CollectionIcon';
+import { ModalErrorBoundary } from './components/Common/ModalErrorBoundary';
 import { InGameHibernationView } from './components/Launcher/InGameHibernationView';
 import { markScrollActivity } from './utils/scrollActivityTracker';
 import { matchesLooseSearchQuery } from './services/common/titleUtils';
@@ -73,12 +74,66 @@ import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
 
 export { InGameHibernationView };
 
-const ManageCollectionsModal = lazy(() =>
+type LazyLoader = Parameters<typeof lazy>[0];
+
+export function lazyWithRetry<L extends LazyLoader>(
+  factory: L,
+  retries = 2,
+  intervalMs = 500
+) {
+  let activeLazyComponent: ReturnType<typeof lazy> | null = null;
+
+  const createCtor = (): Parameters<typeof lazy>[0] => {
+    return () =>
+      new Promise((resolve, reject) => {
+        function attempt(remaining: number): void {
+          Promise.resolve()
+            .then(() => factory())
+            .then(resolve)
+            .catch((err: unknown) => {
+              if (remaining <= 0) {
+                // When retries are exhausted, schedule un-poisoning of the React.lazy payload
+                // so subsequent remounts or modal reopenings make a fresh attempt rather than
+                // permanently failing with the cached rejection.
+                if (
+                  activeLazyComponent &&
+                  typeof activeLazyComponent === 'object' &&
+                  '_payload' in activeLazyComponent
+                ) {
+                  const payload = (
+                    activeLazyComponent as unknown as {
+                      _payload: { _status?: number; _result?: unknown };
+                    }
+                  )._payload;
+                  if (payload) {
+                    setTimeout(() => {
+                      if (payload._status === 2) {
+                        payload._status = -1;
+                        payload._result = createCtor();
+                      }
+                    }, 0);
+                  }
+                }
+                reject(err);
+                return;
+              }
+              setTimeout(() => attempt(remaining - 1), intervalMs);
+            });
+        }
+        attempt(retries);
+      }) as ReturnType<L>;
+  };
+
+  activeLazyComponent = lazy(createCtor());
+  return activeLazyComponent;
+}
+
+const ManageCollectionsModal = lazyWithRetry(() =>
   import('./components/Library/ManageCollectionsModal').then((m) => ({
     default: m.ManageCollectionsModal,
   }))
 );
-const IntegrationsModal = lazy(() =>
+const IntegrationsModal = lazyWithRetry(() =>
   import('./components/Navigation/IntegrationsModal').then((m) => ({
     default: m.IntegrationsModal,
   }))
@@ -91,14 +146,14 @@ const loadLibraryMatchManagerModal = () =>
   import('./components/Library/LibraryMatchManagerModal').then((m) => ({
     default: m.LibraryMatchManagerModal,
   }));
-const FixMatchWizardModal = lazy(loadFixMatchWizardModal);
-const LibraryMatchManagerModal = lazy(loadLibraryMatchManagerModal);
-const GameAchievementsModal = lazy(() =>
+const FixMatchWizardModal = lazyWithRetry(loadFixMatchWizardModal);
+const LibraryMatchManagerModal = lazyWithRetry(loadLibraryMatchManagerModal);
+const GameAchievementsModal = lazyWithRetry(() =>
   import('./components/Achievements/GameAchievementsModal').then((m) => ({
     default: m.GameAchievementsModal,
   }))
 );
-const DownloadManagerDrawer = lazy(() =>
+const DownloadManagerDrawer = lazyWithRetry(() =>
   import('./components/Launcher/DownloadManagerDrawer').then((m) => ({
     default: m.DownloadManagerDrawer,
   }))
@@ -107,7 +162,7 @@ const loadSystemSetupWizardModal = () =>
   import('./components/Launcher/SystemSetupWizard/SystemSetupWizardModal').then((m) => ({
     default: m.SystemSetupWizardModal,
   }));
-const SystemSetupWizardModal = lazy(loadSystemSetupWizardModal);
+const SystemSetupWizardModal = lazyWithRetry(loadSystemSetupWizardModal);
 
 function areShallowValuesEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -1334,104 +1389,146 @@ export function App() {
 
       {/* Modal: Manage Collections */}
       {isManageCollectionsOpen && (
-        <Suspense fallback={null}>
-          <ManageCollectionsModal
-            isOpen={isManageCollectionsOpen}
-            onClose={handleCloseManageCollections}
-            collections={collections}
-            game={collectionModalGame}
-            onCreateCollection={handleCreateCollection}
-            onRenameCollection={handleRenameCollection}
-            onDeleteCollection={handleDeleteCollection}
-            onToggleGameInCollection={handleToggleGameInCollection}
-            onReorderCollections={handleReorderCollections}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Manage Collections"
+          isOpen={isManageCollectionsOpen}
+          onClose={handleCloseManageCollections}
+        >
+          <Suspense fallback={null}>
+            <ManageCollectionsModal
+              isOpen={isManageCollectionsOpen}
+              onClose={handleCloseManageCollections}
+              collections={collections}
+              game={collectionModalGame}
+              onCreateCollection={handleCreateCollection}
+              onRenameCollection={handleRenameCollection}
+              onDeleteCollection={handleDeleteCollection}
+              onToggleGameInCollection={handleToggleGameInCollection}
+              onReorderCollections={handleReorderCollections}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Modal: Storefront Integrations & Cloud Sync */}
       {isIntegrationsModalOpen && (
-        <Suspense fallback={null}>
-          <IntegrationsModal
-            isOpen={isIntegrationsModalOpen}
-            onClose={handleCloseIntegrationsModal}
-            onLibraryUpdated={handleIntegrationsLibraryUpdated}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Storefront Integrations & Cloud Sync"
+          isOpen={isIntegrationsModalOpen}
+          onClose={handleCloseIntegrationsModal}
+        >
+          <Suspense fallback={null}>
+            <IntegrationsModal
+              isOpen={isIntegrationsModalOpen}
+              onClose={handleCloseIntegrationsModal}
+              onLibraryUpdated={handleIntegrationsLibraryUpdated}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Modal: Library Match & Overrides Studio */}
       {isMatchManagerOpen && (
-        <Suspense fallback={null}>
-          <LibraryMatchManagerModal
-            isOpen={isMatchManagerOpen}
-            isSuspended={isFixMatchModalOpen}
-            games={games}
-            onClose={handleCloseMatchManager}
-            onFixMatchForGame={handleOpenFixMatch}
-            onResetOverride={handleResetOverride}
-            onResetOverrideForGame={handleResetOverride}
-            onInspectGame={navigateSelectGame}
-            onSelectGame={navigateSelectGame}
-            onHideGame={handleHideGame}
-            onUnhideEntry={handleUnhideEntry}
-            onGameUpdated={handleGameUpdated}
-            onGamesBatchUpdated={handleGamesBatchUpdated}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Library Match & Overrides Studio"
+          isOpen={isMatchManagerOpen}
+          onClose={handleCloseMatchManager}
+        >
+          <Suspense fallback={null}>
+            <LibraryMatchManagerModal
+              isOpen={isMatchManagerOpen}
+              isSuspended={isFixMatchModalOpen}
+              games={games}
+              onClose={handleCloseMatchManager}
+              onFixMatchForGame={handleOpenFixMatch}
+              onResetOverride={handleResetOverride}
+              onResetOverrideForGame={handleResetOverride}
+              onInspectGame={navigateSelectGame}
+              onSelectGame={navigateSelectGame}
+              onHideGame={handleHideGame}
+              onUnhideEntry={handleUnhideEntry}
+              onGameUpdated={handleGameUpdated}
+              onGamesBatchUpdated={handleGamesBatchUpdated}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Modal: Fix Match & Metadata Override Wizard */}
       {isFixMatchModalOpen && (
-        <Suspense fallback={null}>
-          <FixMatchWizardModal
-            isOpen={isFixMatchModalOpen}
-            game={fixMatchGame}
-            onClose={handleCloseFixMatchModal}
-            onApplyOverride={handleApplyOverride}
-            onResetOverride={handleResetOverride}
-            onHideGame={handleHideGame}
-            existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Fix Match & Metadata Override Wizard"
+          isOpen={isFixMatchModalOpen}
+          onClose={handleCloseFixMatchModal}
+        >
+          <Suspense fallback={null}>
+            <FixMatchWizardModal
+              isOpen={isFixMatchModalOpen}
+              game={fixMatchGame}
+              onClose={handleCloseFixMatchModal}
+              onApplyOverride={handleApplyOverride}
+              onResetOverride={handleResetOverride}
+              onHideGame={handleHideGame}
+              existingOverride={fixMatchGame ? getUserOverrideForGame(fixMatchGame) : undefined}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Modal: Multi-Storefront Individual Achievements Browser */}
       {isAchievementsModalOpen && (
-        <Suspense fallback={null}>
-          <GameAchievementsModal
-            isOpen={isAchievementsModalOpen}
-            game={achievementsModalGame}
-            initialStorefrontId={achievementsInitialStorefrontId}
-            onClose={handleCloseAchievementsModal}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Game Achievements"
+          isOpen={isAchievementsModalOpen}
+          onClose={handleCloseAchievementsModal}
+        >
+          <Suspense fallback={null}>
+            <GameAchievementsModal
+              isOpen={isAchievementsModalOpen}
+              game={achievementsModalGame}
+              initialStorefrontId={achievementsInitialStorefrontId}
+              onClose={handleCloseAchievementsModal}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Slide-over Drawer: Universal Download & Installation Manager */}
       {isDownloadDrawerOpen && (
-        <Suspense fallback={null}>
-          <DownloadManagerDrawer
-            isOpen={isDownloadDrawerOpen}
-            onClose={handleCloseDownloadDrawer}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Download Manager"
+          isOpen={isDownloadDrawerOpen}
+          onClose={handleCloseDownloadDrawer}
+        >
+          <Suspense fallback={null}>
+            <DownloadManagerDrawer
+              isOpen={isDownloadDrawerOpen}
+              onClose={handleCloseDownloadDrawer}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Modal: Unified System Setup Wizard & Environment Health / Repair */}
       {isSystemSetupOpen && (
-        <Suspense fallback={null}>
-          <SystemSetupWizardModal
-            isOpen={isSystemSetupOpen}
-            mode={systemSetupMode}
-            initialStep={systemSetupInitialStep}
-            focusComponentId={systemSetupFocusComponent}
-            connectedStorefronts={connectedStorefronts}
-            onClose={handleCloseSystemSetup}
-            onOpenIntegrationsModal={handleOpenIntegrationsModal}
-            onLibraryUpdated={handleIntegrationsLibraryUpdated}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="System Setup Wizard"
+          isOpen={isSystemSetupOpen}
+          onClose={handleCloseSystemSetup}
+        >
+          <Suspense fallback={null}>
+            <SystemSetupWizardModal
+              isOpen={isSystemSetupOpen}
+              mode={systemSetupMode}
+              initialStep={systemSetupInitialStep}
+              focusComponentId={systemSetupFocusComponent}
+              connectedStorefronts={connectedStorefronts}
+              onClose={handleCloseSystemSetup}
+              onOpenIntegrationsModal={handleOpenIntegrationsModal}
+              onLibraryUpdated={handleIntegrationsLibraryUpdated}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Global Sync Progress Bar Dock */}

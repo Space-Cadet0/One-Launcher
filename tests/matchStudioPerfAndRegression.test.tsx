@@ -34,11 +34,13 @@ import {
   classifyAutoFilteredSubCategory,
 } from '../src/components/Library/MatchManager/matchManagerDiagnostics';
 import { FixMatchWizardModal } from '../src/components/Library/FixMatchWizardModal';
+import { ModalErrorBoundary } from '../src/components/Common/ModalErrorBoundary';
 import {
   STORAGE_KEY_SUPPRESSED_ENTRIES,
   clearSuppressedCatalogEntries,
   getSuppressedCatalogEntries,
   registerSuppressedCatalogEntries,
+  buildMinimalSuppressedGameStub,
   type SuppressedCatalogEntry,
 } from '../src/services/integrations/catalogSanitizer';
 import * as catalogSanitizerModule from '../src/services/integrations/catalogSanitizer';
@@ -2208,6 +2210,169 @@ describe('Wave 3B — Match Studio Performance & Behavioral Regression Suite (da
       } finally {
         wizardRoot.unmount();
       }
+    });
+
+    // ========================================================================
+    // 7. Suppressed Entry Ingestion Resilience, rawGame Normalization & Modal Fault Isolation
+    // ========================================================================
+    describe('7. Suppressed Entry Ingestion Resilience, rawGame Normalization & Modal Fault Isolation', () => {
+      it('normalizes incoming suppressed catalog entries lacking rawGame (e.g. Xbox sync) and guarantees valid CanonicalGame stubs', () => {
+        clearSuppressedCatalogEntries();
+
+        // Simulate Xbox catalog sync emitting non-game suppressed item without rawGame
+        const malformedEntry = {
+          id: 'xbox-9NSYNTH00001',
+          rawTitle: 'Synthetic Suppressed Xbox DLC Pack',
+          platformId: 'xbox' as StorefrontId,
+          platformGameId: '9NSYNTH00001',
+          reason: 'Filtered as non-game entry',
+          reasonCategory: 'non_game_filter' as const,
+          // rawGame intentionally omitted
+        } as unknown as SuppressedCatalogEntry;
+
+        registerSuppressedCatalogEntries([malformedEntry]);
+
+        const entries = getSuppressedCatalogEntries();
+        const found = entries.find((e) => e.id === 'xbox-9NSYNTH00001');
+        expect(found).toBeDefined();
+        expect(found?.rawGame).toBeDefined();
+        expect(found?.rawGame.id).toBe('xbox-9NSYNTH00001');
+        expect(found?.rawGame.title).toBe('Synthetic Suppressed Xbox DLC Pack');
+        expect(found?.rawGame.originalStoreTitle).toBe('Synthetic Suppressed Xbox DLC Pack');
+        expect(Array.isArray(found?.rawGame.platforms)).toBe(true);
+        expect(found?.rawGame.platforms.length).toBe(1);
+        expect(found?.rawGame.platforms[0].platformId).toBe('xbox');
+        expect(found?.rawGame.platforms[0].platformGameId).toBe('9NSYNTH00001');
+      });
+
+      it('safely opens and renders LibraryMatchManagerModal without throwing TypeError when suppressed entries lack rawGame', () => {
+        clearSuppressedCatalogEntries();
+
+        // Ingest malformed suppressed entry lacking rawGame directly
+        const malformedXboxEntry = {
+          id: 'xbox-9NSYNTH00001',
+          rawTitle: 'Synthetic Malformed Xbox Item',
+          platformId: 'xbox' as StorefrontId,
+          platformGameId: '9NSYNTH00001',
+          reason: 'Auto filtered non-game',
+          reasonCategory: 'non_game_filter' as const,
+        } as unknown as SuppressedCatalogEntry;
+
+        registerSuppressedCatalogEntries([malformedXboxEntry]);
+
+        // Render LibraryMatchManagerModal on suppressed tab
+        const studioRoot = createClientComponentRoot(LibraryMatchManagerModal, {
+          isOpen: true,
+          games: [],
+          initialTab: 'suppressed',
+          onClose: () => {},
+          onFixMatchForGame: () => {},
+        });
+
+        try {
+          studioRoot.rerender();
+          const doc = parseHtmlDocument(studioRoot.getHtml());
+          // Must render successfully without crashing or blank screen
+          const dialog = doc.querySelector('dialog[aria-labelledby]');
+          expect(dialog).not.toBeNull();
+
+          // Suppressed item raw title should be present in the studio output
+          const html = studioRoot.getHtml();
+          expect(html).toContain('Synthetic Malformed Xbox Item');
+        } finally {
+          studioRoot.unmount();
+        }
+      });
+
+      it('isolates modal-level render errors inside ModalErrorBoundary without crashing the application tree', () => {
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        // Test static error derivation
+        const testError = new Error('Simulated modal render TypeError');
+        const derivedState = ModalErrorBoundary.getDerivedStateFromError(testError);
+        expect(derivedState.hasError).toBe(true);
+        expect(derivedState.error).toBe(testError);
+
+        // Test component rendering with error boundary
+        let closedModal = false;
+        const boundaryInstance = new ModalErrorBoundary({
+          modalName: 'Library Match & Overrides Studio',
+          isOpen: true,
+          onClose: () => {
+            closedModal = true;
+          },
+          children: React.createElement('div', { 'data-testid': 'safe-content' }, 'Normal Modal Content'),
+        });
+
+        // Mock setState for isolated unit testing outside React tree
+        boundaryInstance.setState = (update: unknown) => {
+          const resolved =
+            typeof update === 'function'
+              ? (update as (s: unknown, p: unknown) => unknown)(boundaryInstance.state, boundaryInstance.props)
+              : update;
+          if (resolved && typeof resolved === 'object') {
+            boundaryInstance.state = {
+              ...boundaryInstance.state,
+              ...(resolved as Record<string, unknown>),
+            };
+          }
+        };
+
+        // Safe render
+        const normalNode = boundaryInstance.render();
+        expect(React.isValidElement(normalNode)).toBe(true);
+
+        // Simulated error state
+        boundaryInstance.state = {
+          hasError: true,
+          error: testError,
+          resetKey: 0,
+        };
+
+        const errorNode = boundaryInstance.render();
+        expect(React.isValidElement(errorNode)).toBe(true);
+
+        // Reset and close actions
+        (boundaryInstance as unknown as { handleReset: () => void }).handleReset();
+        expect(boundaryInstance.state.hasError).toBe(false);
+
+        boundaryInstance.state = {
+          hasError: true,
+          error: testError,
+          resetKey: 0,
+        };
+        (boundaryInstance as unknown as { handleClose: () => void }).handleClose();
+        expect(boundaryInstance.state.hasError).toBe(false);
+        expect(closedModal).toBe(true);
+
+        consoleSpy.mockRestore();
+      });
+
+      it('buildMinimalSuppressedGameStub generates valid CanonicalGame objects with full platform metadata', () => {
+        const stub = buildMinimalSuppressedGameStub({
+          id: 'xbox-test-123',
+          rawTitle: 'The Test Xbox Bundle',
+          platformId: 'xbox',
+          platformGameId: 'test-123',
+        });
+
+        expect(stub.id).toBe('xbox-test-123');
+        expect(stub.title).toBe('The Test Xbox Bundle');
+        expect(stub.sortTitle).toBe('Test Xbox Bundle');
+        expect(stub.originalStoreTitle).toBe('The Test Xbox Bundle');
+        expect(stub.platforms).toHaveLength(1);
+        expect(stub.platforms[0].platformId).toBe('xbox');
+        expect(stub.platforms[0].platformGameId).toBe('test-123');
+        expect(stub.platforms[0].installed).toBe(false);
+
+        // Edge case: empty parameters fallback gracefully
+        const minimalFallback = buildMinimalSuppressedGameStub({
+          id: 'generic-item',
+        });
+        expect(minimalFallback.id).toBe('generic-item');
+        expect(minimalFallback.title).toBe('generic-item');
+        expect(minimalFallback.platforms[0].platformId).toBe('steam');
+      });
     });
   });
 });

@@ -153,8 +153,9 @@ jobs:
 
             ---
 
-            ### ✨ Highlights in v0.2.4
+            ### ✨ Highlights in v0.2.5
 
+            * **Library Match & Overrides Studio Post-Sync Stability & Modal Fault Isolation**: Fixes an uncaught blank-screen crash (`#0e141b`) when opening **Library Match & Overrides Studio** after storefront or background syncing by normalizing suppressed non-game catalog records (`rawGame` invariant across IPC, storage hydration, and live sync), live-subscribing the Studio to mid-session suppressed-entry updates, hardening sparse platform arrays, and isolating all lazy modal/drawer portals behind a Top-Layer `<ModalErrorBoundary>` with retryable chunk loading.
             * **Universal Xbox / PC Game Pass Sign-In Fix on Windows & Fresh Installs (Passkey & Password)**: Eliminates the post-login `HTTP 400` authentication error by switching primary Xbox sign-in to official `LiveSDK` Desktop OAuth 2.0 (`oauth20_authorize.srf` -> `oauth20_desktop.srf`) with native Chromium WebAuthn / Windows Hello passkey support, 90-day refresh token persistence, and CSPRNG CSRF validation, while normalizing 5-segment Compact JWE `RST2.srf` `TOKEN_BROKER` tickets (`d=<jwe>` -> `t=<jwe>`) and preserving on-demand `.msixvc` CIK license acquisition.
             * **Multi-Hop Chained Launcher Injection & Companion Stub Discovery (macOS)**: Automatic structural `<Stem>.exe` bootstrapper promotion alongside `<Stem>Main.exe` / `<Stem>Game.exe` / `<Stem>Client.exe` binaries (zero manual *"Locate Installed Game"* overrides) and full `CreateProcess*` + `ShellExecute*` (`ShellExecuteExW/A`, `ShellExecuteW/A`) child-process chaining across arbitrary multi-hop launcher and map-reload handoffs.
             * **Full-Screen Retina Mouse Hit-Testing & OpenGL State Preservation**: Intercepts Wine's internal `D3DKMTEscape` / `NtGdiDdDDIEscape` (`0x80000001`) `present_rect` clamp so full-screen Retina windows retain `1:1` click hit-testing across the entire physical display, makes `OneLauncherGLHostChild` click-transparent (`HTTRANSPARENT`), chains `GWLP_WNDPROC` cleanly, and preserves `GL_VIEWPORT` / `GL_SCISSOR_BOX` across Direct3D/OpenGL mode switches.

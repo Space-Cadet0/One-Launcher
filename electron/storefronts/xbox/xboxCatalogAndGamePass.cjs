@@ -5671,13 +5671,36 @@ async function syncXboxCatalog(options = {}) {
       });
       if (!evalResult.eligible) {
         if (evalResult.isSuppressedNonGame && evalResult.title) {
+          const cleanTitle = (evalResult.title || '').trim();
           suppressedItems.push({
             id: `xbox-${productId}`,
-            rawTitle: evalResult.title,
+            rawTitle: cleanTitle,
             platformId: 'xbox',
             platformGameId: productId,
             reason: evalResult.reason,
             reasonCategory: 'non_game_filter',
+            rawGame: {
+              id: `xbox-${productId}`,
+              title: cleanTitle,
+              originalStoreTitle: cleanTitle,
+              sortTitle:
+                cleanTitle.replace(/^(The|A|An)\s+/i, '').trim() || cleanTitle,
+              isVerifiedEntitlement: true,
+              platforms: [
+                {
+                  platformId: 'xbox',
+                  platformGameId: productId,
+                  installed: preIsInstalledLocally,
+                  originalTitle: cleanTitle,
+                },
+              ],
+              headerImage: '',
+              capsuleImage: '',
+              developers: [],
+              publishers: [],
+              genres: [],
+              tags: ['Xbox'],
+            },
           });
         }
         continue;

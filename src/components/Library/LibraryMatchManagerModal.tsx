@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
-import { CanonicalGame } from '../../contracts/game';
+import { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
 import { UserGameOverride } from '../../contracts/override';
 import { StorefrontId } from '../../contracts/platform';
 import {
@@ -148,8 +148,21 @@ interface CachedLowConfDiagEntry {
   item: IndexedGameItem | null;
 }
 
+const MAX_MODULE_PROBED_RESULTS = 4_096;
 const moduleProbedResultsMap = new Map<string, string | null>();
 const moduleProbingSet = new Set<string>();
+
+function setModuleProbedResult(id: string, value: string | null): void {
+  moduleProbedResultsMap.delete(id);
+  if (moduleProbedResultsMap.size >= MAX_MODULE_PROBED_RESULTS) {
+    const oldestKey = moduleProbedResultsMap.keys().next().value;
+    if (oldestKey !== undefined) {
+      moduleProbedResultsMap.delete(oldestKey);
+    }
+  }
+  moduleProbedResultsMap.set(id, value);
+}
+
 let moduleStudioEventRevision = 0;
 let lastSeenOverridesMapRef: Record<string, UserGameOverride> | null = null;
 let syntheticOverridesMapRev = 0;
@@ -201,16 +214,19 @@ function yieldBetweenProbeBatches(): Promise<void> {
 
 function collectGameSearchFields(game: CanonicalGame): string[] {
   const fields: string[] = [];
+  if (!game) return fields;
   if (game.title) fields.push(game.title);
   if (game.originalStoreTitle) fields.push(game.originalStoreTitle);
   if (game.id) fields.push(game.id);
-  if (game.platforms) {
-    for (let i = 0; i < game.platforms.length; i += 1) {
-      const p = game.platforms[i];
-      if (p.platformId) fields.push(p.platformId);
-      if (p.platformGameId) fields.push(p.platformGameId);
-      if (p.originalTitle) fields.push(p.originalTitle);
+  const platforms = Array.isArray(game.platforms) ? game.platforms : [];
+  for (let i = 0; i < platforms.length; i += 1) {
+    const p = platforms[i];
+    if (!p) continue;
+    if (p.platformId) fields.push(p.platformId);
+    if (p.platformGameId !== undefined && p.platformGameId !== null) {
+      fields.push(String(p.platformGameId));
     }
+    if (p.originalTitle) fields.push(p.originalTitle);
   }
   return fields;
 }
@@ -437,9 +453,11 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
     };
     window.addEventListener('antigravity:user-override-updated', handleUpdate);
     window.addEventListener('antigravity:user-override-removed', handleRemoved);
+    window.addEventListener('antigravity:suppressed-entries-updated', handleUpdate);
     return () => {
       window.removeEventListener('antigravity:user-override-updated', handleUpdate);
       window.removeEventListener('antigravity:user-override-removed', handleRemoved);
+      window.removeEventListener('antigravity:suppressed-entries-updated', handleUpdate);
     };
   }, [isOpen]);
 
@@ -541,7 +559,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
                 res?.shortDescription || res?.aboutTheGame || res?.detailedDescription
               );
               if (res && clean.length >= 25 && !isGenericPlaceholderSynopsis(clean, game.title)) {
-                moduleProbedResultsMap.set(game.id, clean);
+                setModuleProbedResult(game.id, clean);
                 clearDurableEmptySynopsisProbe(game.id);
                 const validDevs =
                   res.developers?.filter((d) => d && d !== 'Unknown Developer') || [];
@@ -567,7 +585,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
                   scheduleThrottledProbeFlush();
                 }
               } else {
-                moduleProbedResultsMap.set(game.id, null);
+                setModuleProbedResult(game.id, null);
                 recordDurableEmptySynopsisProbe(game.id);
                 if (!stopped && !abortController.signal.aborted) {
                   pendingMapDeltaRef.current[game.id] = null;
@@ -583,7 +601,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
                 }
                 return;
               }
-              moduleProbedResultsMap.set(game.id, null);
+              setModuleProbedResult(game.id, null);
               recordDurableEmptySynopsisProbe(game.id);
               if (!stopped && !abortController.signal.aborted) {
                 pendingMapDeltaRef.current[game.id] = null;
@@ -682,11 +700,16 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
 
     for (let i = 0; i < games.length; i += 1) {
       const g = games[i];
+      if (!g || !g.id) continue;
       byId.set(g.id, g);
       byIdLower.set(g.id.toLowerCase(), g);
-      const isSinglePlat = g.platforms.length === 1;
-      for (let j = 0; j < g.platforms.length; j += 1) {
-        const p = g.platforms[j];
+      const platforms = Array.isArray(g.platforms)
+        ? g.platforms.filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId))
+        : [];
+      const isSinglePlat = platforms.length === 1;
+      for (let j = 0; j < platforms.length; j += 1) {
+        const p = platforms[j];
+        if (!p || !p.platformId || p.platformGameId === undefined || p.platformGameId === null) continue;
         const compKey = `${p.platformId}:${String(p.platformGameId)}`;
         const compLower = compKey.toLowerCase();
         const dashLower = `${p.platformId}-${String(p.platformGameId)}`.toLowerCase();
@@ -736,6 +759,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
     const items: IndexedUnmatchedItem[] = [];
     for (let i = 0; i < games.length; i += 1) {
       const game = games[i];
+      if (!game || !game.id) continue;
       const hasProbedEntryForGame =
         hasProbedMapEntries && Object.prototype.hasOwnProperty.call(probedSynopsisMap, game.id);
       const probedVal = hasProbedEntryForGame ? probedSynopsisMap[game.id] : undefined;
@@ -823,7 +847,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
       items.push(builtItem);
     }
 
-    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game.title, b.game.title));
+    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game?.title || '', b.game?.title || ''));
     const idSet = new Set<string>();
     for (let i = 0; i < items.length; i += 1) {
       idSet.add(items[i].game.id);
@@ -847,6 +871,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
     const items: IndexedGameItem[] = [];
     for (let i = 0; i < games.length; i += 1) {
       const game = games[i];
+      if (!game || !game.id) continue;
       const isUnmatched = unmatchedSet.has(game.id);
       const cachedLowConf = moduleLowConfDiagWeakMap.get(game);
       if (
@@ -910,7 +935,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
       items.push(builtItem);
     }
 
-    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game.title, b.game.title));
+    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game?.title || '', b.game?.title || ''));
     cachedBaseLowConfRef.current = items;
     hasHydratedLowConfRef.current = true;
     return items;
@@ -932,11 +957,25 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
 
     for (let i = 0; i < rawSuppressed.length; i += 1) {
       const entry = rawSuppressed[i];
-      const compKey = `${entry.platformId}:${String(entry.platformGameId)}`;
+      if (!entry) continue;
+      const suppressedGameId = entry.rawGame?.id || entry.id;
+      const suppressedGameIdLower = suppressedGameId ? suppressedGameId.toLowerCase() : '';
+      const platId = entry.platformId || entry.rawGame?.platforms?.[0]?.platformId;
+      const platGameId =
+        entry.platformGameId !== undefined && entry.platformGameId !== null && String(entry.platformGameId).trim() !== ''
+          ? String(entry.platformGameId).trim()
+          : entry.rawGame?.platforms?.[0]?.platformGameId !== undefined
+            ? String(entry.rawGame.platforms[0].platformGameId).trim()
+            : entry.id;
+      const compKey = platId && platGameId ? `${platId}:${platGameId}` : '';
+      const compKeyLower = compKey.toLowerCase();
       if (
-        catalogLookupIndex.byId.has(entry.rawGame.id) ||
-        catalogLookupIndex.byPlatComposite.has(compKey) ||
-        catalogLookupIndex.byPlatCompositeLower.has(compKey.toLowerCase())
+        (suppressedGameId &&
+          (catalogLookupIndex.byId.has(suppressedGameId) ||
+            (suppressedGameIdLower && catalogLookupIndex.byIdLower.has(suppressedGameIdLower)))) ||
+        (compKey &&
+          (catalogLookupIndex.byPlatComposite.has(compKey) ||
+            catalogLookupIndex.byPlatCompositeLower.has(compKeyLower)))
       ) {
         continue;
       }
@@ -944,7 +983,7 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
       const searchFields: string[] = [];
       if (entry.rawTitle) searchFields.push(entry.rawTitle);
       if (entry.platformId) searchFields.push(entry.platformId);
-      if (entry.platformGameId) searchFields.push(entry.platformGameId);
+      if (entry.platformGameId) searchFields.push(String(entry.platformGameId));
       if (entry.reason) searchFields.push(entry.reason);
 
       if (entry.reasonCategory === 'user_hidden') {
@@ -963,10 +1002,10 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
     }
 
     userSuppressed.sort((a, b) =>
-      STUDIO_TITLE_COLLATOR.compare(a.entry.rawTitle, b.entry.rawTitle)
+      STUDIO_TITLE_COLLATOR.compare(a.entry?.rawTitle || '', b.entry?.rawTitle || '')
     );
     autoFiltered.sort((a, b) =>
-      STUDIO_TITLE_COLLATOR.compare(a.entry.rawTitle, b.entry.rawTitle)
+      STUDIO_TITLE_COLLATOR.compare(a.entry?.rawTitle || '', b.entry?.rawTitle || '')
     );
 
     const next = { userSuppressed, autoFiltered };
@@ -1025,7 +1064,11 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
       }
       if (matchedGame) {
         const splitSuffix =
-          ov.splitFromMerged && ov.platformId && ov.platformGameId && matchedGame.platforms.length > 1
+          ov.splitFromMerged &&
+          ov.platformId &&
+          ov.platformGameId &&
+          Array.isArray(matchedGame.platforms) &&
+          matchedGame.platforms.length > 1
             ? `:split:${ov.platformId.toLowerCase()}:${String(ov.platformGameId).toLowerCase()}`
             : '';
         candidateKeys.push(`matched:${matchedGame.id.toLowerCase()}${splitSuffix}`);
@@ -1039,7 +1082,9 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
         searchFields.push(String(ov.matchedId));
       }
       if (ov.platformId) searchFields.push(ov.platformId);
-      if (ov.platformGameId) searchFields.push(ov.platformGameId);
+      if (ov.platformGameId !== undefined && ov.platformGameId !== null) {
+        searchFields.push(String(ov.platformGameId));
+      }
       if (matchedGame?.title) searchFields.push(matchedGame.title);
       if (matchedGame?.originalStoreTitle) searchFields.push(matchedGame.originalStoreTitle);
       if (matchedGame?.id) searchFields.push(matchedGame.id);
@@ -1089,14 +1134,18 @@ export const LibraryMatchManagerModal: React.FC<ExtendedLibraryMatchManagerModal
     const items: IndexedGameItem[] = [];
     for (let i = 0; i < games.length; i += 1) {
       const game = games[i];
-      if (!game.platforms || game.platforms.length <= 1) continue;
+      if (!game || !game.platforms || !Array.isArray(game.platforms)) continue;
+      const validPlatforms = game.platforms.filter(
+        (p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId)
+      );
+      if (validPlatforms.length <= 1) continue;
       items.push({
         game,
         searchFields: collectGameSearchFields(game),
       });
     }
 
-    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game.title, b.game.title));
+    items.sort((a, b) => STUDIO_TITLE_COLLATOR.compare(a.game?.title || '', b.game?.title || ''));
     cachedBaseMergedRef.current = items;
     hasHydratedMergedRef.current = true;
     return items;

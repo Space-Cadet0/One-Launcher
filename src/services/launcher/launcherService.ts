@@ -1849,6 +1849,9 @@ export class LauncherService {
     preferredPlatformId?: StorefrontId
   ): InstalledGameRecord | undefined {
     if (!game) return undefined;
+    const platforms = Array.isArray(game.platforms)
+      ? game.platforms.filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId))
+      : [];
 
     const idx = this.ensureInstalledLookupIndex();
     const cfg = this.getLaunchConfig(game.id);
@@ -1955,7 +1958,7 @@ export class LauncherService {
 
     // When preferredPlatformId is explicitly provided, strictly scope to that storefront
     if (preferredPlatformId) {
-      const targetPlat = game.platforms.find((p) => p.platformId === preferredPlatformId);
+      const targetPlat = platforms.find((p) => p.platformId === preferredPlatformId);
       if (targetPlat) {
         const matched = matchPlatformRecord(targetPlat);
         if (matched) return matched;
@@ -1973,7 +1976,7 @@ export class LauncherService {
           platformGameId: String(
             targetPlat?.platformGameId ||
               targetPlat?.storefrontAppId ||
-              game.platforms[0]?.platformGameId ||
+              platforms[0]?.platformGameId ||
               game.id
           ),
           packageFamilyName: targetPlat?.packageFamilyName,
@@ -1994,14 +1997,14 @@ export class LauncherService {
 
     const targetPlatformId = cfg?.preferredPlatformId;
     if (targetPlatformId) {
-      const targetPlat = game.platforms.find((p) => p.platformId === targetPlatformId);
+      const targetPlat = platforms.find((p) => p.platformId === targetPlatformId);
       if (targetPlat) {
         const matched = matchPlatformRecord(targetPlat);
         if (matched) return matched;
       }
     }
 
-    for (const p of game.platforms) {
+    for (const p of platforms) {
       const matched = matchPlatformRecord(p);
       if (matched) return matched;
     }
@@ -2014,11 +2017,11 @@ export class LauncherService {
 
     // 3. Fallback check by customExecutablePath in LaunchConfig or platformConfigs
     if (cfg?.customExecutablePath) {
-      const resolvedPlatId = targetPlatformId || game.platforms[0]?.platformId || 'custom';
-      const targetPlat = game.platforms.find((p) => p.platformId === resolvedPlatId);
+      const resolvedPlatId = targetPlatformId || platforms[0]?.platformId || 'custom';
+      const targetPlat = platforms.find((p) => p.platformId === resolvedPlatId);
       return {
         platformId: resolvedPlatId,
-        platformGameId: targetPlat?.platformGameId || game.platforms[0]?.platformGameId || game.id,
+        platformGameId: targetPlat?.platformGameId || platforms[0]?.platformGameId || game.id,
         packageFamilyName: targetPlat?.packageFamilyName,
         appUserModelId: targetPlat?.appUserModelId,
         xboxTitleId: targetPlat?.xboxTitleId,
@@ -2036,10 +2039,10 @@ export class LauncherService {
       for (const [platId, platProfile] of Object.entries(cfg.platformConfigs)) {
         if (platProfile?.customExecutablePath) {
           const resolvedPlatId = platId as StorefrontId;
-          const targetPlat = game.platforms.find((p) => p.platformId === resolvedPlatId);
+          const targetPlat = platforms.find((p) => p.platformId === resolvedPlatId);
           return {
             platformId: resolvedPlatId,
-            platformGameId: targetPlat?.platformGameId || game.platforms[0]?.platformGameId || game.id,
+            platformGameId: targetPlat?.platformGameId || platforms[0]?.platformGameId || game.id,
             packageFamilyName: targetPlat?.packageFamilyName,
             appUserModelId: targetPlat?.appUserModelId,
             xboxTitleId: targetPlat?.xboxTitleId,
@@ -2220,6 +2223,9 @@ export class LauncherService {
 
   public isGameInstalled(game: CanonicalGame, platformId?: StorefrontId): boolean {
     if (!game) return false;
+    const platforms = Array.isArray(game.platforms)
+      ? game.platforms.filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId))
+      : [];
 
     if (platformId) {
       const platCfg = this.getLaunchConfig(game.id, platformId);
@@ -2227,7 +2233,7 @@ export class LauncherService {
         return true;
       }
       if (this.getInstalledRecordForGame(game, platformId)) return true;
-      const plat = game.platforms.find((p) => p.platformId === platformId);
+      const plat = platforms.find((p) => p.platformId === platformId);
       return Boolean(plat?.installed);
     }
 
@@ -2239,7 +2245,7 @@ export class LauncherService {
     ) {
       return true;
     }
-    if (game.platforms.some((p) => p.installed)) return true;
+    if (platforms.some((p) => p.installed)) return true;
     return Boolean(this.getInstalledRecordForGame(game));
   }
 

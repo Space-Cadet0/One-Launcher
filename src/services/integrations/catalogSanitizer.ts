@@ -116,23 +116,30 @@ interface SteamEnrichedCacheItem {
   };
 }
 
-function buildMinimalSuppressedGameStub(params: {
+export function buildMinimalSuppressedGameStub(params: {
   id: string;
-  rawTitle: string;
-  platformId: StorefrontId;
-  platformGameId: string;
+  rawTitle?: string;
+  platformId?: StorefrontId;
+  platformGameId?: string | number;
 }): CanonicalGame {
-  const title = (params.rawTitle || params.id).trim();
+  const platId = params.platformId || 'steam';
+  const platGameId =
+    params.platformGameId !== undefined &&
+    params.platformGameId !== null &&
+    String(params.platformGameId).trim() !== ''
+      ? String(params.platformGameId).trim()
+      : String(params.id || '').trim();
+  const title = (params.rawTitle || params.id || platGameId || 'Unknown Title').trim() || 'Unknown Title';
   const sortTitle = title.replace(/^(The|A|An)\s+/i, '').trim() || title;
   return {
-    id: params.id,
+    id: params.id || `${platId}-${platGameId}`,
     title,
     sortTitle,
     originalStoreTitle: title,
     platforms: [
       {
-        platformId: params.platformId,
-        platformGameId: String(params.platformGameId),
+        platformId: platId,
+        platformGameId: platGameId,
         installed: false,
         originalTitle: title,
       },
@@ -142,6 +149,88 @@ function buildMinimalSuppressedGameStub(params: {
     publishers: [],
     genres: [],
     tags: [],
+  };
+}
+
+export function ensureSuppressedEntryRawGame(
+  entry?: Partial<SuppressedCatalogEntry> & { id?: string }
+): SuppressedCatalogEntry {
+  const platformId = (entry?.platformId || 'steam') as StorefrontId;
+  const platformGameId =
+    entry?.platformGameId !== undefined &&
+    entry?.platformGameId !== null &&
+    String(entry.platformGameId).trim() !== ''
+      ? String(entry.platformGameId).trim()
+      : String(entry?.id || '').trim();
+  const id =
+    String(entry?.id || (platformId && platformGameId ? `${platformId}-${platformGameId}` : '')).trim() ||
+    `suppressed-${Date.now()}`;
+  const rawTitle =
+    (entry?.rawTitle || entry?.rawGame?.title || id || 'Unknown Title').trim() ||
+    'Unknown Title';
+
+  let rawGame: CanonicalGame;
+  if (entry?.rawGame && typeof entry.rawGame === 'object' && entry.rawGame.id) {
+    const rawPlats = Array.isArray(entry.rawGame.platforms) ? entry.rawGame.platforms : [];
+    const validPlatforms = rawPlats
+      .filter((p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object'))
+      .map((p) => ({
+        ...p,
+        platformId: (p.platformId || platformId) as StorefrontId,
+        platformGameId:
+          p.platformGameId !== undefined && p.platformGameId !== null && String(p.platformGameId).trim() !== ''
+            ? String(p.platformGameId).trim()
+            : platformGameId,
+        installed: Boolean(p.installed),
+        originalTitle: (p.originalTitle || rawTitle).trim() || rawTitle,
+      }));
+
+    const platforms =
+      validPlatforms.length > 0
+        ? validPlatforms
+        : [
+            {
+              platformId,
+              platformGameId,
+              installed: false,
+              originalTitle: rawTitle,
+            },
+          ];
+
+    rawGame = {
+      ...entry.rawGame,
+      id: entry.rawGame.id || id,
+      title: (entry.rawGame.title || rawTitle).trim() || 'Unknown Title',
+      sortTitle:
+        (entry.rawGame.sortTitle || entry.rawGame.title || rawTitle)
+          .replace(/^(The|A|An)\s+/i, '')
+          .trim() || rawTitle,
+      originalStoreTitle: entry.rawGame.originalStoreTitle || rawTitle,
+      platforms,
+      headerImage: typeof entry.rawGame.headerImage === 'string' ? entry.rawGame.headerImage : '',
+      developers: Array.isArray(entry.rawGame.developers) ? entry.rawGame.developers : [],
+      publishers: Array.isArray(entry.rawGame.publishers) ? entry.rawGame.publishers : [],
+      genres: Array.isArray(entry.rawGame.genres) ? entry.rawGame.genres : [],
+      tags: Array.isArray(entry.rawGame.tags) ? entry.rawGame.tags : [],
+    };
+  } else {
+    rawGame = buildMinimalSuppressedGameStub({
+      id,
+      rawTitle,
+      platformId,
+      platformGameId,
+    });
+  }
+
+  return {
+    id,
+    rawTitle,
+    platformId,
+    platformGameId,
+    reason: entry?.reason || 'Filtered as non-game entry',
+    reasonCategory: entry?.reasonCategory || 'non_game_filter',
+    suppressedAt: typeof entry?.suppressedAt === 'number' ? entry.suppressedAt : Date.now(),
+    rawGame,
   };
 }
 
@@ -269,22 +358,19 @@ function syncSuppressedEntriesWithStorage(): void {
             platformId && platformGameId ? `${platformId}:${platformGameId}` : entry.id;
           if (!lastSuppressedEntries.has(mapKey) && !lastSuppressedEntries.has(entry.id)) {
             const rawTitle = entry.rawTitle || entry.rawGame?.title || entry.id;
-            lastSuppressedEntries.set(mapKey, {
-              id: entry.id,
-              rawTitle,
-              platformId,
-              platformGameId,
-              reason: entry.reason || 'Filtered as non-game entry',
-              reasonCategory: entry.reasonCategory,
-              suppressedAt:
-                typeof entry.suppressedAt === 'number' ? entry.suppressedAt : Date.now(),
-              rawGame: buildMinimalSuppressedGameStub({
+            lastSuppressedEntries.set(
+              mapKey,
+              ensureSuppressedEntryRawGame({
                 id: entry.id,
                 rawTitle,
                 platformId,
                 platformGameId,
-              }),
-            });
+                reason: entry.reason,
+                reasonCategory: entry.reasonCategory,
+                suppressedAt: entry.suppressedAt,
+                rawGame: entry.rawGame,
+              })
+            );
             mutatedMap = true;
           }
         }
@@ -321,7 +407,12 @@ function persistSuppressedEntriesToStorage(): void {
         id: e.id,
         store: e.platformId,
         platformId: e.platformId,
-        platformGameId: String(e.platformGameId),
+        platformGameId:
+          e.platformGameId !== undefined &&
+          e.platformGameId !== null &&
+          String(e.platformGameId) !== ''
+            ? String(e.platformGameId)
+            : String(e.id || ''),
         rawTitle: e.rawTitle,
         reason: e.reason,
         reasonCategory: e.reasonCategory,
@@ -388,10 +479,15 @@ export function getSuppressedCatalogEntries(): SuppressedCatalogEntry[] {
     ) {
       continue;
     }
-    combined.set(k, entry);
-    addSecondaryIndexKey(byId, entry.id, k);
-    if (entry.platformId && entry.platformGameId !== undefined) {
-      addSecondaryIndexKey(byPlatKey, `${entry.platformId}:${String(entry.platformGameId)}`, k);
+    const sanitizedEntry = ensureSuppressedEntryRawGame(entry);
+    combined.set(k, sanitizedEntry);
+    addSecondaryIndexKey(byId, sanitizedEntry.id, k);
+    if (sanitizedEntry.platformId && sanitizedEntry.platformGameId !== undefined) {
+      addSecondaryIndexKey(
+        byPlatKey,
+        `${sanitizedEntry.platformId}:${String(sanitizedEntry.platformGameId)}`,
+        k
+      );
     }
   }
 
@@ -419,7 +515,7 @@ export function getSuppressedCatalogEntries(): SuppressedCatalogEntry[] {
     }
 
     const rawTitle = h.rawTitle || h.rawGameSnapshot?.title || entryId;
-    const hiddenSuppressedEntry: SuppressedCatalogEntry = {
+    const hiddenSuppressedEntry = ensureSuppressedEntryRawGame({
       id: entryId,
       rawTitle,
       platformId: h.platformId,
@@ -427,15 +523,8 @@ export function getSuppressedCatalogEntries(): SuppressedCatalogEntry[] {
       reason: h.reason || 'Hidden / Suppressed by User',
       reasonCategory: 'user_hidden',
       suppressedAt: h.hiddenAt,
-      rawGame:
-        h.rawGameSnapshot ??
-        buildMinimalSuppressedGameStub({
-          id: entryId,
-          rawTitle,
-          platformId: h.platformId,
-          platformGameId: String(h.platformGameId),
-        }),
-    };
+      rawGame: h.rawGameSnapshot,
+    });
     combined.set(mapKey, hiddenSuppressedEntry);
     addSecondaryIndexKey(byId, entryId, mapKey);
     addSecondaryIndexKey(byPlatKey, platLookupKey, mapKey);
@@ -455,18 +544,49 @@ export function registerSuppressedCatalogEntries(entries: SuppressedCatalogEntry
   let mutated = false;
   for (const entry of entries) {
     if (entry && entry.id) {
+      const normalizedEntry = ensureSuppressedEntryRawGame(entry);
+      if (
+        normalizedEntry.reasonCategory !== 'user_hidden' &&
+        isNonGameStorefrontEntryRestored(
+          normalizedEntry.platformId,
+          normalizedEntry.platformGameId,
+          normalizedEntry.id
+        )
+      ) {
+        continue;
+      }
       const mapKey =
-        entry.platformId && entry.platformGameId
-          ? `${entry.platformId}:${entry.platformGameId}`
-          : entry.id;
-      lastSuppressedEntries.set(mapKey, entry);
-      mutated = true;
+        normalizedEntry.platformId && normalizedEntry.platformGameId
+          ? `${normalizedEntry.platformId}:${normalizedEntry.platformGameId}`
+          : normalizedEntry.id;
+      const existing = lastSuppressedEntries.get(mapKey);
+      const upgradesStubWithArtwork =
+        Boolean(normalizedEntry.rawGame.capsuleImage || normalizedEntry.rawGame.headerImage) &&
+        !existing?.rawGame?.capsuleImage &&
+        !existing?.rawGame?.headerImage;
+      if (
+        !existing ||
+        !existing.rawGame ||
+        upgradesStubWithArtwork ||
+        existing.id !== normalizedEntry.id ||
+        existing.rawTitle !== normalizedEntry.rawTitle ||
+        existing.reason !== normalizedEntry.reason ||
+        existing.reasonCategory !== normalizedEntry.reasonCategory
+      ) {
+        lastSuppressedEntries.set(mapKey, normalizedEntry);
+        mutated = true;
+      }
     }
   }
   if (mutated) {
     suppressedMapVersion++;
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(new CustomEvent('antigravity:suppressed-entries-updated'));
+      } catch {}
+    }
+    persistSuppressedEntriesToStorage();
   }
-  persistSuppressedEntriesToStorage();
 }
 
 /**

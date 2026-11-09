@@ -14,11 +14,14 @@ import {
   ShieldAlert,
   Wand,
 } from 'lucide-react';
-import { CanonicalGame } from '../../../contracts/game';
+import { CanonicalGame, GamePlatformOwnership } from '../../../contracts/game';
 import { toOlMediaUrl } from '../../../contracts/network';
 import { UserGameOverride } from '../../../contracts/override';
 import { StorefrontId } from '../../../contracts/platform';
-import { SuppressedCatalogEntry } from '../../../services/integrations/catalogSanitizer';
+import {
+  SuppressedCatalogEntry,
+  ensureSuppressedEntryRawGame,
+} from '../../../services/integrations/catalogSanitizer';
 import { launcherService } from '../../../services/launcher/launcherService';
 import {
   confirmMultipleNonGameStorefrontEntries,
@@ -375,7 +378,15 @@ export interface MatchManagerRowRenderContext {
   handleOpenExternalUrl: (url?: string) => void;
 }
 
+function getValidPlatforms(game?: Partial<CanonicalGame> | null): GamePlatformOwnership[] {
+  if (!game || !Array.isArray(game.platforms)) return [];
+  return game.platforms.filter(
+    (p): p is GamePlatformOwnership => Boolean(p && typeof p === 'object' && p.platformId)
+  );
+}
+
 function resolveStudioRowThumbnailSrc(game: CanonicalGame): string | undefined {
+  if (!game) return undefined;
   const override = getUserOverrideForGame(game);
   const rawSrc =
     override?.capsuleImage ||
@@ -384,9 +395,10 @@ function resolveStudioRowThumbnailSrc(game: CanonicalGame): string | undefined {
     game.headerImage;
   if (!rawSrc) return undefined;
   const hasCustomOverrideArt = Boolean(override?.capsuleImage || override?.headerImage);
-  const gogPlat = game.platforms.find((p) => p.platformId === 'gog');
-  const epicPlat = game.platforms.find((p) => p.platformId === 'epic');
-  const xboxPlat = game.platforms.find((p) => p.platformId === 'xbox');
+  const platforms = getValidPlatforms(game);
+  const gogPlat = platforms.find((p) => p.platformId === 'gog');
+  const epicPlat = platforms.find((p) => p.platformId === 'epic');
+  const xboxPlat = platforms.find((p) => p.platformId === 'xbox');
   return toOlMediaUrl({
     url: rawSrc,
     gameId: game.id,
@@ -921,7 +933,7 @@ export function renderMatchManagerFlatRow(
               </div>
 
               <div className="flex items-center gap-2 flex-wrap mt-1">
-                {game.platforms.map((p) => (
+                {getValidPlatforms(game).map((p) => (
                   <span
                     key={`${p.platformId}-${p.platformGameId}`}
                     className="inline-flex items-center gap-1 text-[11px] text-slate-300 bg-[#16202d] border border-[#2a475e] px-2 py-0.5 rounded"
@@ -990,8 +1002,9 @@ export function renderMatchManagerFlatRow(
               game.matchConfidence <= 1 ? game.matchConfidence * 100 : game.matchConfidence
             )
           : undefined;
+      const platforms = getValidPlatforms(game);
       const sourceTitle =
-        game.originalStoreTitle || game.platforms[0]?.originalTitle || game.title;
+        game.originalStoreTitle || platforms[0]?.originalTitle || game.title;
 
       return (
         <div
@@ -1038,7 +1051,7 @@ export function renderMatchManagerFlatRow(
               </div>
 
               <div className="flex items-center gap-2 flex-wrap mt-1">
-                {game.platforms.map((p) => (
+                {platforms.map((p) => (
                   <span
                     key={`${p.platformId}-${p.platformGameId}`}
                     className="inline-flex items-center gap-1 text-[11px] text-slate-300 bg-[#16202d] border border-[#2a475e] px-2 py-0.5 rounded"
@@ -1147,7 +1160,7 @@ export function renderMatchManagerFlatRow(
             )}
             <button
               type="button"
-              onClick={() => ctx.onFixMatchForGame(entry.rawGame)}
+              onClick={() => ctx.onFixMatchForGame(ensureSuppressedEntryRawGame(entry).rawGame)}
               className="min-h-6 px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow"
               title="Manually match this suppressed storefront entitlement to a real game and restore it to your library"
             >
@@ -1249,7 +1262,7 @@ export function renderMatchManagerFlatRow(
             )}
             <button
               type="button"
-              onClick={() => ctx.onFixMatchForGame(entry.rawGame)}
+              onClick={() => ctx.onFixMatchForGame(ensureSuppressedEntryRawGame(entry).rawGame)}
               className="min-h-6 px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow"
               title="Manually match this suppressed storefront entitlement to a real game and restore it to your library"
             >
@@ -1329,7 +1342,7 @@ export function renderMatchManagerFlatRow(
             )}
             <button
               type="button"
-              onClick={() => ctx.onFixMatchForGame(entry.rawGame)}
+              onClick={() => ctx.onFixMatchForGame(ensureSuppressedEntryRawGame(entry).rawGame)}
               className="min-h-6 px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow"
               title="Manually match this suppressed storefront entitlement to a real game and restore it to your library"
             >
@@ -1343,10 +1356,11 @@ export function renderMatchManagerFlatRow(
 
     case 'override-row': {
       const { override, matchedGame, isLastInSection } = row;
+      const platforms = getValidPlatforms(matchedGame);
       const sourcePlat =
-        matchedGame?.platforms.find(
+        platforms.find(
           (p) => p.platformId === (override.originalSourcePlatformId || override.platformId)
-        ) || matchedGame?.platforms[0];
+        ) || platforms[0];
 
       const sourcePlatformId =
         override.originalSourcePlatformId ||
@@ -1483,6 +1497,7 @@ export function renderMatchManagerFlatRow(
     case 'merged-row': {
       const { game, isFirstItem, isLastInSection } = row;
       const thumbSrc = resolveStudioRowThumbnailSrc(game);
+      const platforms = getValidPlatforms(game);
       return (
         <div
           key={row.key}
@@ -1514,12 +1529,12 @@ export function renderMatchManagerFlatRow(
               <div className="flex items-center gap-2 min-w-0 flex-wrap flex-1">
                 <span className="text-sm font-semibold text-white truncate">{game.title}</span>
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-950/70 border border-emerald-500/40 text-emerald-300 shrink-0">
-                  {game.platforms.length} Storefronts
+                  {platforms.length} Storefronts
                 </span>
 
                 {/* Inline Compact Storefront Entitlement Chips */}
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  {game.platforms.map((p) => {
+                  {platforms.map((p) => {
                     const installedRec = launcherService.getInstalledRecordForGame(
                       game,
                       p.platformId
