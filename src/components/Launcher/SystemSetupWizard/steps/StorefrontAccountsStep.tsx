@@ -401,6 +401,7 @@ export const StorefrontAccountsStep: React.FC<StorefrontAccountsStepProps> = ({
         const alreadyExchangedInMain =
           Boolean(authRes.authoritativeComplete) ||
           Boolean(authRes.tokenData) ||
+          spec.id === 'xbox' ||
           authRes.code === 'xbox_token_broker';
         if (!alreadyExchangedInMain && authRes.code && typeof api?.exchangeCode === 'function') {
           const exchanged = await api.exchangeCode(spec.id, authRes.code);

@@ -893,6 +893,8 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
         .then(async (res: StorefrontAuthResult) => {
           if (res.success) {
             if (
+              storefrontId === 'xbox' ||
+              res.code === 'xbox_token_broker' ||
               (res.games && res.games.length > 0) ||
               (Array.isArray(res.games) &&
                 (Boolean(res.authoritativeComplete) || Boolean(res.tokenData)))
@@ -902,7 +904,7 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
                 achievements: res.achievements as Record<string, AchievementSummaryEntry> | undefined,
               });
               return;
-            } else if (res.code) {
+            } else if (res.code && res.code !== 'xbox_token_broker') {
               await completeStoreAuthentication(storefrontId, res.code);
             } else {
               await completeStoreAuthentication(storefrontId);
@@ -981,24 +983,28 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
 
     // In Electron Desktop App: route secrets exclusively via IPC to main-process safeStorage vault
     if (typeof window !== 'undefined' && window.electronAPI?.isElectron) {
-      if (tokenOrCode) {
-        try {
-          const res = await window.electronAPI.exchangeCode(storefrontId, tokenOrCode);
-          if (res?.success) {
-            handleNativeSyncSuccess(storefrontId, {
-              ...res,
-              achievements: res.achievements as Record<string, AchievementSummaryEntry> | undefined,
-            });
-            return;
-          } else if (res?.error) {
-            setErrorMsg(res.error);
+      if (tokenOrCode && tokenOrCode !== 'xbox_token_broker') {
+        if (storefrontId === 'xbox' && !explicitCode) {
+          // Skip exchanging stale authRedirectInput when no explicit code was provided
+        } else {
+          try {
+            const res = await window.electronAPI.exchangeCode(storefrontId, tokenOrCode);
+            if (res?.success) {
+              handleNativeSyncSuccess(storefrontId, {
+                ...res,
+                achievements: res.achievements as Record<string, AchievementSummaryEntry> | undefined,
+              });
+              return;
+            } else if (res?.error) {
+              setErrorMsg(res.error);
+              setIsSubmitting(false);
+              return;
+            }
+          } catch (err: unknown) {
+            setErrorMsg(getErrorMessage(err, 'Failed to exchange authorization code.'));
             setIsSubmitting(false);
             return;
           }
-        } catch (err: unknown) {
-          setErrorMsg(getErrorMessage(err, 'Failed to exchange authorization code.'));
-          setIsSubmitting(false);
-          return;
         }
       }
 

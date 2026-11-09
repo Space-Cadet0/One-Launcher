@@ -25,6 +25,10 @@ const {
   STEAM_SSR_BG_EXTRACTOR_SCRIPT,
   createEpicAuthRecovery,
 } = require('../storefronts/epicAuthRecovery.cjs');
+const {
+  generateXboxOAuthState,
+  verifyXboxOAuthState,
+} = require('../storefronts/xbox/xboxAuthManager.cjs');
 
 const XBOX_TRUSTED_AUTH_HOSTS = Object.freeze([
   'login.live.com',
@@ -919,7 +923,19 @@ function registerStoreSyncIpcHandlers({
                 !authWindow.isDestroyed()
               ) {
                 xboxIsSecondLeg = true;
-                authWindow.loadURL(exResult.inlineAuthUrl);
+                const leg2Req =
+                  typeof storeSync?.xboxStorefront?.buildInlineLoginRequest === 'function'
+                    ? storeSync.xboxStorefront.buildInlineLoginRequest({
+                        urlOverride: exResult.inlineAuthUrl,
+                      })
+                    : null;
+                if (leg2Req?.extraHeadersString) {
+                  authWindow.loadURL(exResult.inlineAuthUrl, {
+                    extraHeaders: leg2Req.extraHeadersString,
+                  });
+                } else {
+                  authWindow.loadURL(exResult.inlineAuthUrl);
+                }
                 return;
               }
               if (!resolved) {
@@ -1034,7 +1050,14 @@ function registerStoreSyncIpcHandlers({
     let games = [];
     let tokenData = null;
     let authoritativeComplete = false;
-    const codeLabel = typeof codeOrPayload === 'string' ? codeOrPayload : 'xbox_token_broker';
+    const codeLabel =
+      storefrontId === 'xbox'
+        ? 'xbox_token_broker'
+        : typeof codeOrPayload === 'string'
+          ? codeOrPayload
+          : typeof codeOrPayload?.code === 'string'
+            ? codeOrPayload.code
+            : 'xbox_token_broker';
 
     try {
       launcherEngine?.clearStoreDisconnectedTombstone?.(storefrontId);
@@ -1136,72 +1159,56 @@ function registerStoreSyncIpcHandlers({
       return { success: false, error: `Unsupported storefront: ${storefrontId}` };
     }
 
-    /** @type {{ url: string, userAgent: string, extraHeadersString: string } | null} */
-    let xboxInlineReq = null;
-    if (
-      storefrontId === 'xbox' &&
-      typeof storeSync?.xboxStorefront?.buildInlineLoginRequest === 'function'
-    ) {
-      try {
-        const provider = storeSync.getXboxAuthProvider?.();
-        if (provider && typeof provider.ensureDeviceContext === 'function') {
-          await provider.ensureDeviceContext({ requireLegacyToken: true });
-          xboxInlineReq = storeSync.xboxStorefront.buildInlineLoginRequest();
-        }
-      } catch (err) {
-        // Fallback seamlessly to standard LiveSDK Desktop OAuth2 (`oauth20_desktop.srf`) if SOAP device init is unavailable
-        diagLog.warn(
-          'storeSyncIpc.authStorefront.xboxEnsureDeviceContext',
-          scrubAuthDiagnosticError(err)
-        );
-        xboxInlineReq = null;
-      }
-    }
-
     return new Promise((resolve) => {
       let resolved = false;
       let extractingSteam = false;
-      let xboxIsSecondLeg = false;
-      let xboxProcessingToken = false;
 
       const cleanBrowserUA = resolveCleanBrowserUserAgent(session);
       const currentMain = getMainWindow?.();
-      const xboxCsrfState =
-        storefrontId === 'xbox' ? crypto.randomBytes(16).toString('hex') : '';
-      let targetAuthUrl = xboxInlineReq ? xboxInlineReq.url : config.url;
-      if (!xboxInlineReq && storefrontId === 'xbox') {
+      let targetAuthUrl = config.url;
+      let xboxCsrfState = '';
+      /** @type {any} */
+      let xboxProvider = null;
+
+      if (storefrontId === 'xbox') {
         try {
-          const parsedCfgUrl = new URL(config.url);
-          if (!parsedCfgUrl.searchParams.has('state')) {
+          xboxProvider = storeSync?.getXboxAuthProvider?.() || null;
+          if (xboxProvider && typeof xboxProvider.beginOAuthAuthorization === 'function') {
+            const authReq = xboxProvider.beginOAuthAuthorization();
+            targetAuthUrl = authReq.url;
+            xboxCsrfState = authReq.state;
+          } else {
+            xboxCsrfState = generateXboxOAuthState();
+            const parsedCfgUrl = new URL(config.url);
             parsedCfgUrl.searchParams.set('state', xboxCsrfState);
+            targetAuthUrl = parsedCfgUrl.toString();
           }
-          targetAuthUrl = parsedCfgUrl.toString();
-        } catch {}
+        } catch (err) {
+          diagLog.warn(
+            'storeSyncIpc.authStorefront.xboxBeginOAuth',
+            scrubAuthDiagnosticError(err)
+          );
+          xboxCsrfState = generateXboxOAuthState();
+          try {
+            const parsedCfgUrl = new URL(config.url);
+            parsedCfgUrl.searchParams.set('state', xboxCsrfState);
+            targetAuthUrl = parsedCfgUrl.toString();
+          } catch {
+            targetAuthUrl = config.url;
+          }
+        }
       }
 
       const oauthPartition = resolveStorefrontOAuthPartition(storefrontId);
-      const isolatedXboxSession =
-        xboxInlineReq && typeof session?.fromPartition === 'function'
-          ? session.fromPartition(`xbox-cxh-${crypto.randomUUID()}`, { cache: false })
-          : null;
 
       /** @type {Record<string, any>} */
       const webPreferences = {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
-        userAgent: xboxInlineReq ? xboxInlineReq.userAgent : cleanBrowserUA,
+        userAgent: cleanBrowserUA,
+        partition: oauthPartition,
       };
-      if (xboxInlineReq) {
-        webPreferences.preload = path.join(__dirname, '../xboxAuthPreload.cjs');
-        if (isolatedXboxSession) {
-          webPreferences.session = isolatedXboxSession;
-        } else {
-          webPreferences.partition = oauthPartition;
-        }
-      } else {
-        webPreferences.partition = oauthPartition;
-      }
 
       const authWindow = new BrowserWindow({
         width: config.width,
@@ -1217,135 +1224,17 @@ function registerStoreSyncIpcHandlers({
         webPreferences,
       });
 
+      if (typeof authWindow.webContents?.setUserAgent === 'function' && cleanBrowserUA) {
+        authWindow.webContents.setUserAgent(cleanBrowserUA);
+      }
+
       const popupSession =
-        isolatedXboxSession ||
         authWindow.webContents?.session ||
         (typeof session?.fromPartition === 'function'
           ? session.fromPartition(oauthPartition)
           : null);
 
-      if (xboxInlineReq && typeof authWindow.webContents?.setUserAgent === 'function') {
-        authWindow.webContents.setUserAgent(xboxInlineReq.userAgent);
-      }
-
-      const isTrustedXboxUrl = (/** @type {string} */ candidate) => {
-        if (!isAllowedHttpsHost(candidate, XBOX_TRUSTED_AUTH_HOSTS)) {
-          return false;
-        }
-        if (typeof storeSync?.xboxStorefront?.isTrustedXboxAuthUrl === 'function') {
-          return Boolean(storeSync.xboxStorefront.isTrustedXboxAuthUrl(candidate));
-        }
-        return true;
-      };
-
-      /** @param {string} rawPayload */
-      const handleXboxCxhPayload = async (rawPayload) => {
-        if (resolved || authWindow.isDestroyed() || typeof rawPayload !== 'string' || !rawPayload) {
-          return;
-        }
-        if (Buffer.byteLength(rawPayload) > 65536) return;
-        /** @type {any} */
-        let parsed = null;
-        try {
-          parsed = JSON.parse(rawPayload);
-        } catch {
-          return;
-        }
-        if (!parsed || typeof parsed !== 'object') return;
-
-        // 1. CloudExperienceHost.getContext bridge handshake
-        if (
-          parsed.type === 'invoke' &&
-          parsed.value &&
-          parsed.value.name === 'CloudExperienceHost.getContext' &&
-          typeof parsed.value.context === 'string' &&
-          parsed.value.context.length <= 4096
-        ) {
-          if (!isTrustedXboxUrl(authWindow.webContents.getURL())) return;
-          const callbackMsg = JSON.stringify({
-            type: 'callback',
-            value: {
-              name: 'CloudExperienceHost.getContext',
-              args: [
-                'CloudExperienceHost',
-                'TokenBroker',
-                'TokenBroker',
-                '{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}',
-              ],
-              context: parsed.value.context,
-            },
-          });
-          try {
-            await authWindow.webContents.executeJavaScript(
-              `globalThis["CloudExperienceHost.Bridge.dispatchMessage"]?.(${JSON.stringify(callbackMsg)})`
-            );
-          } catch {}
-          return;
-        }
-
-        // 2. DAProperty user token exchange (1-leg SSO or 2-leg consent)
-        if (typeof parsed.sDAToken === 'string' && parsed.sDAToken && !xboxProcessingToken) {
-          xboxProcessingToken = true;
-          try {
-            const syncResult = await processStoreAuth('xbox', {
-              daProperty: parsed,
-              isSecondLeg: xboxIsSecondLeg,
-            });
-            if (
-              syncResult &&
-              syncResult.requiresInlineConsent &&
-              syncResult.inlineAuthUrl &&
-              !xboxIsSecondLeg &&
-              !resolved &&
-              !authWindow.isDestroyed()
-            ) {
-              xboxIsSecondLeg = true;
-              authWindow.loadURL(syncResult.inlineAuthUrl);
-              return;
-            }
-            if (!resolved) {
-              resolved = true;
-              safelyCloseAuthWindow();
-              resolve(syncResult);
-            }
-          } finally {
-            xboxProcessingToken = false;
-          }
-        }
-      };
-
-      const onXboxCxhNotify = (/** @type {any} */ event, /** @type {unknown} */ payload) => {
-        if (
-          resolved ||
-          authWindow.isDestroyed() ||
-          event?.sender !== authWindow.webContents ||
-          (event?.senderFrame &&
-            authWindow.webContents.mainFrame &&
-            event.senderFrame !== authWindow.webContents.mainFrame) ||
-          typeof payload !== 'string'
-        ) {
-          return;
-        }
-        const senderUrl = event?.senderFrame?.url || authWindow.webContents.getURL();
-        if (!isTrustedXboxUrl(senderUrl)) return;
-        void handleXboxCxhPayload(payload);
-      };
-
-      if (xboxInlineReq && typeof ipcMain.on === 'function') {
-        ipcMain.on('one-launcher:xbox-cxh-notify', onXboxCxhNotify);
-      }
-
       const safelyCloseAuthWindow = () => {
-        if (xboxInlineReq && typeof ipcMain.removeListener === 'function') {
-          try {
-            ipcMain.removeListener('one-launcher:xbox-cxh-notify', onXboxCxhNotify);
-          } catch {}
-        }
-        if (isolatedXboxSession && typeof isolatedXboxSession.clearStorageData === 'function') {
-          try {
-            void isolatedXboxSession.clearStorageData();
-          } catch {}
-        }
         clearOAuthPopupSessionCaches(popupSession);
         try {
           if (!authWindow.isDestroyed()) {
@@ -1361,12 +1250,12 @@ function registerStoreSyncIpcHandlers({
         event.preventDefault();
       });
 
-      /** @param {string} code */
-      const handleAuthCodeFound = async (code) => {
-        if (!code || resolved) return;
+      /** @param {string | { code: string, state?: string, expectedState?: string, url?: string }} codeOrPayload */
+      const handleAuthCodeFound = async (codeOrPayload) => {
+        if (!codeOrPayload || resolved) return;
         resolved = true;
         safelyCloseAuthWindow();
-        const syncResult = await processStoreAuth(storefrontId, code);
+        const syncResult = await processStoreAuth(storefrontId, codeOrPayload);
         resolve(syncResult);
       };
 
@@ -1406,26 +1295,41 @@ function registerStoreSyncIpcHandlers({
 
         if (
           storefrontId === 'xbox' &&
-          isAllowedHttpsHost(url, ['login.live.com', 'login.microsoftonline.com'])
+          isAllowedHttpsHost(url, XBOX_TRUSTED_AUTH_HOSTS)
         ) {
           try {
             const parsed = new URL(url);
-            if (parsed.pathname.toLowerCase().endsWith('/oauth20_desktop.srf')) {
-              if (parsed.searchParams.has('error')) {
-                const errCode = parsed.searchParams.get('error') || 'access_denied';
-                const errDesc = parsed.searchParams.get('error_description') || errCode;
+            const normalizedPath = parsed.pathname.replace(/\/+$/, '').toLowerCase();
+            if (normalizedPath.endsWith('/oauth20_desktop.srf')) {
+              const hashParams = new URLSearchParams(parsed.hash.replace(/^#\/?/, ''));
+              const getParam = (name) => {
+                const qVal = parsed.searchParams.get(name);
+                if (qVal !== null && qVal !== undefined && qVal !== '') return qVal;
+                return hashParams.get(name);
+              };
+
+              const errCode = getParam('error');
+              if (errCode) {
+                const safeErr = String(errCode).replace(/[^\w.-]/g, '').slice(0, 64) || 'access_denied';
+                const rawErrDesc =
+                  getParam('error_description') ||
+                  getParam('error_subcode') ||
+                  safeErr;
+                const safeErrDesc = scrubAuthDiagnosticError(rawErrDesc) || safeErr;
                 resolved = true;
+                xboxProvider?.clearPendingOAuthState?.();
                 safelyCloseAuthWindow();
                 resolve({
                   success: false,
                   storefrontId: 'xbox',
-                  error: `Microsoft sign-in cancelled (${errDesc})`,
+                  error: `Microsoft sign-in cancelled (${safeErrDesc})`,
                 });
                 return;
               }
-              const returnedState = parsed.searchParams.get('state');
-              if (xboxCsrfState && returnedState && returnedState !== xboxCsrfState) {
+              const returnedState = getParam('state');
+              if (xboxCsrfState && !verifyXboxOAuthState(returnedState, xboxCsrfState)) {
                 resolved = true;
+                xboxProvider?.clearPendingOAuthState?.();
                 safelyCloseAuthWindow();
                 resolve({
                   success: false,
@@ -1434,9 +1338,14 @@ function registerStoreSyncIpcHandlers({
                 });
                 return;
               }
-              const code = parsed.searchParams.get('code');
+              const code = getParam('code');
               if (code) {
-                handleAuthCodeFound(code);
+                handleAuthCodeFound({
+                  code: code.trim(),
+                  state: returnedState || xboxCsrfState,
+                  expectedState: xboxCsrfState,
+                  url,
+                });
                 return;
               }
             }
@@ -1542,18 +1451,6 @@ function registerStoreSyncIpcHandlers({
         const currentUrl = authWindow.webContents.getURL();
         checkUrlForCode(currentUrl);
 
-        if (xboxInlineReq && storefrontId === 'xbox' && isLivePostSrfUrl(currentUrl)) {
-          try {
-            const serverDataStr = await authWindow.webContents.executeJavaScript(
-              'JSON.stringify(globalThis.ServerData ?? null)'
-            );
-            if (typeof serverDataStr === 'string' && serverDataStr !== 'null') {
-              await handleXboxCxhPayload(serverDataStr);
-              return;
-            }
-          } catch {}
-        }
-
         if (storefrontId === 'epic' && isEpicAuthRedirectUrl(currentUrl)) {
           try {
             const pageSource = await authWindow.webContents.executeJavaScript(
@@ -1577,23 +1474,15 @@ function registerStoreSyncIpcHandlers({
       });
 
       authWindow.on('closed', () => {
-        if (xboxInlineReq && typeof ipcMain.removeListener === 'function') {
-          try {
-            ipcMain.removeListener('one-launcher:xbox-cxh-notify', onXboxCxhNotify);
-          } catch {}
-        }
         clearOAuthPopupSessionCaches(popupSession);
         if (!resolved) {
           resolved = true;
+          xboxProvider?.clearPendingOAuthState?.();
           resolve({ success: false, error: 'Sign-in window closed by user.' });
         }
       });
 
-      if (xboxInlineReq && xboxInlineReq.extraHeadersString) {
-        authWindow.loadURL(targetAuthUrl, { extraHeaders: xboxInlineReq.extraHeadersString });
-      } else {
-        authWindow.loadURL(targetAuthUrl);
-      }
+      authWindow.loadURL(targetAuthUrl);
     });
   });
 

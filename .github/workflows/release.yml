@@ -153,12 +153,12 @@ jobs:
 
             ---
 
-            ### ✨ Highlights in v0.2.3
+            ### ✨ Highlights in v0.2.4
 
+            * **Universal Xbox / PC Game Pass Sign-In Fix on Windows & Fresh Installs (Passkey & Password)**: Eliminates the post-login `HTTP 400` authentication error by switching primary Xbox sign-in to official `LiveSDK` Desktop OAuth 2.0 (`oauth20_authorize.srf` -> `oauth20_desktop.srf`) with native Chromium WebAuthn / Windows Hello passkey support, 90-day refresh token persistence, and CSPRNG CSRF validation, while normalizing 5-segment Compact JWE `RST2.srf` `TOKEN_BROKER` tickets (`d=<jwe>` -> `t=<jwe>`) and preserving on-demand `.msixvc` CIK license acquisition.
             * **Multi-Hop Chained Launcher Injection & Companion Stub Discovery (macOS)**: Automatic structural `<Stem>.exe` bootstrapper promotion alongside `<Stem>Main.exe` / `<Stem>Game.exe` / `<Stem>Client.exe` binaries (zero manual *"Locate Installed Game"* overrides) and full `CreateProcess*` + `ShellExecute*` (`ShellExecuteExW/A`, `ShellExecuteW/A`) child-process chaining across arbitrary multi-hop launcher and map-reload handoffs.
             * **Full-Screen Retina Mouse Hit-Testing & OpenGL State Preservation**: Intercepts Wine's internal `D3DKMTEscape` / `NtGdiDdDDIEscape` (`0x80000001`) `present_rect` clamp so full-screen Retina windows retain `1:1` click hit-testing across the entire physical display, makes `OneLauncherGLHostChild` click-transparent (`HTTRANSPARENT`), chains `GWLP_WNDPROC` cleanly, and preserves `GL_VIEWPORT` / `GL_SCISSOR_BOX` across Direct3D/OpenGL mode switches.
             * **Universal Bottled Fullscreen & Retina HiDPI Virtualization**: Clean-room dual-architecture (`PE32` `x86` + `PE32+` `x86_64`) Win32 display virtualizer (`one_display_scaler_{x86,x64}.dll` + `one_display_launcher_{x86,x64}.exe`) with centered aspect-preserved (`4:3`, `16:10`, `16:9`, integer, stretch) presentation, legacy DirectDraw `16bpp` menu compatibility alongside crisp `32bpp` D3D8/D3D9 rendering, live `Ctrl+Option+F` `2x` Retina Windowed toggling, and cooperative `Cmd+Tab` focus handoff (`libone_coop_activate.dylib`).
-            * **Unified Multi-Storefront & Xbox / PC Game Pass Authority**: Live SIGL v3 + DisplayCatalog entitlement reconciliation, one-click compatibility runner updates, and multi-pass **HowLongToBeat** typography normalization with offline SQLite vault persistence.
 
             ---
 

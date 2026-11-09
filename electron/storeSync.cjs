@@ -4218,6 +4218,9 @@ async function getEpicGameAchievementSchema(payload = {}, options = {}) {
 const xboxProviderCache = new Map();
 
 function getXboxAuthProvider(options = {}) {
+  if (options.authProviderOverride) {
+    return options.authProviderOverride;
+  }
   if (options.fetchFn) {
     return xboxStorefront.createXboxAuthProvider({
       userDataDir: options.userDataDir,
@@ -4475,6 +4478,11 @@ async function loginXbox(codeOrPayload, options = {}) {
     if (ex && ex.requiresInlineConsent) {
       return ex;
     }
+    return syncXboxLibrary(options);
+  }
+  const codeVal = typeof codeOrPayload === 'string' ? codeOrPayload : codeOrPayload?.code;
+  const cleanCode = typeof codeVal === 'string' ? codeVal.trim() : '';
+  if (cleanCode === 'xbox_token_broker' || cleanCode === 'token_broker') {
     return syncXboxLibrary(options);
   }
   await provider.exchangeAuthCode(codeOrPayload);

@@ -254,9 +254,13 @@ function normalizeStoreMsaTicket(rawTicket, options = {}) {
 }
 
 /**
- * Normalizes an Xbox Live RPS ticket for `POST https://user.auth.xboxlive.com/user/authenticate`.
- * Preserves existing `t=` or `d=` prefix verbatim (never produces `d=t=...`), defaulting bare MBI_SSL
- * compact tickets to `t=<ticket>`.
+ * Normalizes an Xbox Live RPS ticket for `POST https://user.auth.xboxlive.com/user/authenticate`:
+ * - 5-segment Compact JWEs (`eyJ...`, including `d=eyJ...` returned by `RST2.srf` `TOKEN_BROKER`
+ *   `<wst:TokenType>urn:passport:delegationcompact</wst:TokenType>`) MUST use `t=<jwe>` — live
+ *   `user.auth.xboxlive.com/user/authenticate` rejects `d=<jwe>` TokenBroker tickets with `HTTP 400`
+ *   while accepting `t=<jwe>` with `HTTP 200`.
+ * - Non-JWE opaque tickets preserve an explicit `t=` or `d=` prefix verbatim (never producing `d=t=...`),
+ *   defaulting bare MBI_SSL compact tickets to `t=<ticket>`.
  *
  * @param {string} rawTicket
  * @param {{ defaultPrefix?: 't=' | 'd=' }} [options]
@@ -265,11 +269,16 @@ function normalizeStoreMsaTicket(rawTicket, options = {}) {
 function normalizeXblRpsTicket(rawTicket, options = {}) {
   const trimmed = String(rawTicket || '').trim();
   if (!trimmed) return '';
+  const bare = trimmed.replace(/^[td]=/i, '').trim();
+  if (!bare) return '';
+  if (isCompactJwe(bare)) {
+    return `t=${bare}`;
+  }
   if (/^[td]=/i.test(trimmed)) {
-    return trimmed[0].toLowerCase() + '=' + trimmed.slice(2);
+    return `${trimmed[0].toLowerCase()}=${bare}`;
   }
   const prefix = options.defaultPrefix || 't=';
-  return `${prefix}${trimmed}`;
+  return `${prefix}${bare}`;
 }
 
 function formatStoreAuthTickets(rawTicket) {
@@ -825,16 +834,20 @@ function parseTrustedXboxOAuthCallbackUrl(rawInput, expectedRedirectUri = XBOX_O
   }
 
   const looksLikeUrlOrQuery =
-    /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || trimmed.startsWith('?');
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ||
+    trimmed.startsWith('?') ||
+    trimmed.startsWith('#') ||
+    trimmed.startsWith('/');
   if (!looksLikeUrlOrQuery) {
     return null;
   }
 
   let parsed;
   try {
-    parsed = trimmed.startsWith('?')
-      ? new URL(trimmed, expectedParsed.toString())
-      : new URL(trimmed);
+    parsed =
+      trimmed.startsWith('?') || trimmed.startsWith('#') || trimmed.startsWith('/')
+        ? new URL(trimmed, expectedParsed.toString())
+        : new URL(trimmed);
   } catch {
     throw new Error('Malformed Microsoft OAuth callback URL');
   }
@@ -853,11 +866,32 @@ function parseTrustedXboxOAuthCallbackUrl(rawInput, expectedRedirectUri = XBOX_O
 }
 
 /**
+ * Extracts a parameter value from a parsed OAuth URL, searching both query searchParams and URL hash fragment.
+ * @param {URL | null | undefined} parsedUrl
+ * @param {string} name
+ * @returns {string | null}
+ */
+function getXboxOAuthUrlParam(parsedUrl, name) {
+  if (!parsedUrl) return null;
+  const qVal = parsedUrl.searchParams?.get(name);
+  if (qVal !== null && qVal !== undefined && qVal !== '') return qVal;
+  try {
+    const hashStr = (parsedUrl.hash || '').replace(/^#\/?/, '');
+    if (hashStr) {
+      const hashParams = new URLSearchParams(hashStr);
+      const hVal = hashParams.get(name);
+      if (hVal !== null && hVal !== undefined && hVal !== '') return hVal;
+    }
+  } catch {}
+  return null;
+}
+
+/**
  * Extracts and validates an OAuth2 authorization code from a callback URL or structured payload,
  * enforcing `crypto.timingSafeEqual` CSRF `state` verification whenever `expectedState` is provided
  * (or when `requireState: true` is set).
  *
- * @param {string | { url?: string, callbackUrl?: string, code?: string, state?: string, expectedState?: string }} codeOrUrl
+ * @param {string | { url?: string, callbackUrl?: string, code?: string, state?: string, expectedState?: string, error?: string, error_code?: string }} codeOrUrl
  * @param {string | { expectedState?: string, redirectUri?: string, requireState?: boolean }} [options]
  * @returns {string}
  */
@@ -872,23 +906,46 @@ function extractAuthCodeFromInput(codeOrUrl, options = {}) {
   if (codeOrUrl && typeof codeOrUrl === 'object') {
     const effectiveExpected =
       opts.expectedState !== undefined ? opts.expectedState : codeOrUrl.expectedState;
+
+    // Check for explicit OAuth error in payload
+    const oauthError = codeOrUrl.error || codeOrUrl.error_code;
+    if (oauthError) {
+      const safeErr = String(oauthError).replace(/[^\w.-]/g, '').slice(0, 64) || 'access_denied';
+      throw new Error(`Microsoft sign-in cancelled or denied (${safeErr})`);
+    }
+
     const rawTarget = codeOrUrl.url || codeOrUrl.callbackUrl || '';
+    let parsedUrlFromTarget = null;
+    if (rawTarget) {
+      try {
+        parsedUrlFromTarget = parseTrustedXboxOAuthCallbackUrl(rawTarget, opts.redirectUri);
+      } catch {}
+    }
+
+    // Resolve state: explicit state on object -> state from embedded URL
+    let resolvedState = codeOrUrl.state;
+    if ((resolvedState === undefined || resolvedState === null || resolvedState === '') && parsedUrlFromTarget) {
+      resolvedState = getXboxOAuthUrlParam(parsedUrlFromTarget, 'state');
+    }
+
+    const directCode = String(codeOrUrl.code || '').trim();
+    if (directCode) {
+      if (effectiveExpected !== undefined || opts.requireState) {
+        if (!verifyXboxOAuthState(resolvedState, effectiveExpected)) {
+          throw new Error('Microsoft OAuth callback rejected: missing or mismatched CSRF state');
+        }
+      }
+      return directCode;
+    }
+
     if (rawTarget) {
       return extractAuthCodeFromInput(rawTarget, {
         ...opts,
         expectedState: effectiveExpected,
       });
     }
-    if (effectiveExpected !== undefined || opts.requireState) {
-      if (!verifyXboxOAuthState(codeOrUrl.state, effectiveExpected)) {
-        throw new Error('Microsoft OAuth callback rejected: missing or mismatched CSRF state');
-      }
-    }
-    const directCode = String(codeOrUrl.code || '').trim();
-    if (!directCode) {
-      throw new Error('Missing Microsoft OAuth authorization code');
-    }
-    return directCode;
+
+    throw new Error('Missing Microsoft OAuth authorization code');
   }
 
   const raw = String(codeOrUrl || '').trim();
@@ -898,20 +955,20 @@ function extractAuthCodeFromInput(codeOrUrl, options = {}) {
 
   const parsedUrl = parseTrustedXboxOAuthCallbackUrl(raw, opts.redirectUri);
   if (parsedUrl) {
-    const oauthError = parsedUrl.searchParams.get('error');
+    const oauthError = getXboxOAuthUrlParam(parsedUrl, 'error');
     if (oauthError) {
       const safeErr = String(oauthError).replace(/[^\w.-]/g, '').slice(0, 64) || 'access_denied';
       throw new Error(`Microsoft sign-in cancelled or denied (${safeErr})`);
     }
 
-    const callbackState = parsedUrl.searchParams.get('state');
+    const callbackState = getXboxOAuthUrlParam(parsedUrl, 'state');
     if (opts.expectedState !== undefined || opts.requireState) {
       if (!verifyXboxOAuthState(callbackState, opts.expectedState)) {
         throw new Error('Microsoft OAuth callback rejected: missing or mismatched CSRF state');
       }
     }
 
-    const code = parsedUrl.searchParams.get('code');
+    const code = getXboxOAuthUrlParam(parsedUrl, 'code');
     if (!code || !code.trim()) {
       throw new Error('Missing Microsoft OAuth authorization code');
     }
@@ -1144,6 +1201,10 @@ function createXboxAuthProvider(config = {}) {
     return authReq;
   };
 
+  const clearPendingOAuthState = () => {
+    pendingOAuthState = null;
+  };
+
   const postOAuthForm = async (formParams, signal) => {
     const body = new URLSearchParams(formParams);
     const res = await fetchImpl(MSA_OAUTH_TOKEN_URL, {
@@ -1345,43 +1406,62 @@ function createXboxAuthProvider(config = {}) {
   };
 
   const authenticateXblUser = async (rawXblAccessToken, proof, signal) => {
-    const rpsTicket = normalizeXblRpsTicket(rawXblAccessToken, { defaultPrefix: 't=' });
-    const bodyObj = {
-      RelyingParty: 'http://auth.xboxlive.com',
-      TokenType: 'JWT',
-      Properties: {
-        AuthMethod: 'RPS',
-        SiteName: 'user.auth.xboxlive.com',
-        RpsTicket: rpsTicket,
-        ProofKey: proof.proofKeyJwk,
-      },
+    const postXasuAttempt = async (rpsTicketCandidate) => {
+      const bodyObj = {
+        RelyingParty: 'http://auth.xboxlive.com',
+        TokenType: 'JWT',
+        Properties: {
+          AuthMethod: 'RPS',
+          SiteName: 'user.auth.xboxlive.com',
+          RpsTicket: rpsTicketCandidate,
+          ProofKey: proof.proofKeyJwk,
+        },
+      };
+      const bodyStr = JSON.stringify(bodyObj);
+      const sig = signXboxRequest({
+        method: 'POST',
+        url: XBL_USER_AUTH_URL,
+        authorizationHeader: '',
+        bodyBuffer: Buffer.from(bodyStr, 'utf8'),
+        ecPrivateKey: proof.privateKeyPem,
+      });
+
+      const res = await fetchImpl(XBL_USER_AUTH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'x-xbl-contract-version': '1',
+          Signature: sig,
+        },
+        body: bodyStr,
+        signal: buildXboxFetchSignal(signal),
+      });
+
+      const text = await res.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      return { res, json };
     };
-    const bodyStr = JSON.stringify(bodyObj);
-    const sig = signXboxRequest({
-      method: 'POST',
-      url: XBL_USER_AUTH_URL,
-      authorizationHeader: '',
-      bodyBuffer: Buffer.from(bodyStr, 'utf8'),
-      ecPrivateKey: proof.privateKeyPem,
-    });
 
-    const res = await fetchImpl(XBL_USER_AUTH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'x-xbl-contract-version': '1',
-        Signature: sig,
-      },
-      body: bodyStr,
-      signal: buildXboxFetchSignal(signal),
-    });
+    const primaryTicket = normalizeXblRpsTicket(rawXblAccessToken, { defaultPrefix: 't=' });
+    let { res, json } = await postXasuAttempt(primaryTicket);
 
-    const text = await res.text();
-    let json = null;
-    try {
-      json = text ? JSON.parse(text) : null;
-    } catch {}
+    // Deterministic single-retry prefix fallback (`t=` <-> `d=`) if XASU rejects an opaque RPS ticket with HTTP 400
+    if (res.status === 400 && (!res.ok || !json?.Token)) {
+      const bare = String(rawXblAccessToken || '').trim().replace(/^[td]=/i, '').trim();
+      if (bare) {
+        const altPrefix = primaryTicket.startsWith('t=') ? 'd=' : 't=';
+        const retryOutcome = await postXasuAttempt(`${altPrefix}${bare}`);
+        if (retryOutcome.res.ok && retryOutcome.json?.Token) {
+          res = retryOutcome.res;
+          json = retryOutcome.json;
+        }
+      }
+    }
+
     if (!res.ok || !json?.Token) {
       const msCv = extractSafeCorrelationId(res);
       const err = Object.assign(
@@ -3066,6 +3146,7 @@ function createXboxAuthProvider(config = {}) {
 
   return {
     beginOAuthAuthorization,
+    clearPendingOAuthState,
     buildRpXstsCacheKey,
     invalidateRpXstsCache,
     exchangeAuthCode,
