@@ -356,8 +356,28 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   const [launcherTick, setLauncherTick] = useState(0);
   const [sidebarClientHeight, setSidebarClientHeight] = useState(0);
   const storesDropdownRef = useRef<HTMLDivElement>(null);
+  const storesTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const storesMenuRef = useRef<HTMLDivElement | null>(null);
   const sidebarScrollRef = useRef<HTMLDivElement | null>(null);
   const lastLauncherSigRef = useRef<string>('');
+
+  const focusStoreMenuItem = (target: 'first' | 'last') => {
+    const run = () => {
+      const menuEl = storesMenuRef.current;
+      if (!menuEl) return;
+      const items = Array.from(
+        menuEl.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]:not(:disabled)')
+      );
+      if (items.length === 0) return;
+      const item = target === 'first' ? items[0] : items[items.length - 1];
+      item?.focus({ preventScroll: true });
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 0);
+    }
+  };
 
   useEffect(() => {
     const scrollEl = sidebarScrollRef.current;
@@ -601,7 +621,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       map.set(session.gameId, session);
     }
     return map;
-  }, [launcherTick, games]);
+  }, [launcherTick]);
 
   const renderHeaderRow = (row: Extract<SidebarFlatRow, { kind: 'header' }>) => {
     const isActiveGroup = isGridView && activeGroupId === row.groupId;
@@ -892,7 +912,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       {/* Sidebar Header & Search */}
       <div className="p-3 border-b border-steam-border/60 space-y-2.5 bg-[#161a22]">
         {/* Search Input */}
-        <div className="relative">
+        <search aria-label="Filter library" className="relative block">
           <label htmlFor={sidebarSearchInputId} className="sr-only">
             Search library by title
           </label>
@@ -908,15 +928,31 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             placeholder="Search by title..."
             className="w-full bg-[#10141b] border border-steam-border rounded pl-8 pr-3 py-1.5 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent transition-colors"
           />
-        </div>
+        </search>
 
         {/* Filter Controls Row */}
         <div className="flex items-center justify-between text-xs">
           {/* Storefront Filter Dropdown */}
           <div className="relative" ref={storesDropdownRef}>
             <button
+              ref={storesTriggerRef}
               type="button"
               onClick={() => setIsStoresDropdownOpen((prev) => !prev)}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowDown' || e.key === 'Home') {
+                  e.preventDefault();
+                  setIsStoresDropdownOpen(true);
+                  focusStoreMenuItem('first');
+                } else if (e.key === 'ArrowUp' || e.key === 'End') {
+                  e.preventDefault();
+                  setIsStoresDropdownOpen(true);
+                  focusStoreMenuItem('last');
+                } else if (e.key === 'Escape' && isStoresDropdownOpen) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setIsStoresDropdownOpen(false);
+                }
+              }}
               className={`min-h-6 flex items-center gap-1.5 text-[11px] px-2 py-1 rounded transition-colors cursor-pointer border select-none ${
                 isStoresDropdownOpen
                   ? 'bg-[#1b222d] text-white border-steam-accent/70 shadow-sm'
@@ -941,8 +977,46 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
 
             {isStoresDropdownOpen && (
               <div
+                ref={storesMenuRef}
                 role="menu"
                 aria-label="Filter Storefront"
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setIsStoresDropdownOpen(false);
+                    storesTriggerRef.current?.focus({ preventScroll: true });
+                    return;
+                  }
+                  if (e.key === 'Tab') {
+                    setIsStoresDropdownOpen(false);
+                    return;
+                  }
+                  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+                  if (typeof HTMLElement !== 'undefined' && 'focusGroup' in HTMLElement.prototype) {
+                    return;
+                  }
+                  const items = Array.from(
+                    e.currentTarget.querySelectorAll<HTMLButtonElement>(
+                      'button[role^="menuitem"]:not(:disabled)'
+                    )
+                  );
+                  if (items.length === 0) return;
+                  const currentIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+                  const nextIdx =
+                    e.key === 'Home'
+                      ? 0
+                      : e.key === 'End'
+                        ? items.length - 1
+                        : currentIdx < 0
+                          ? e.key === 'ArrowUp'
+                            ? items.length - 1
+                            : 0
+                          : (currentIdx + (e.key === 'ArrowUp' ? -1 : 1) + items.length) %
+                            items.length;
+                  e.preventDefault();
+                  items[nextIdx]?.focus({ preventScroll: true });
+                }}
                 className="absolute left-0 top-full mt-1 w-48 bg-[#1b222d] border border-steam-border rounded shadow-2xl py-1 z-50 animate-in fade-in-50 duration-100"
               >
                 <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-300 border-b border-steam-border/40 mb-1">

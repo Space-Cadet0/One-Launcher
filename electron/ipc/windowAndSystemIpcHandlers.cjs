@@ -2,7 +2,10 @@
 'use strict';
 
 const { compareSemver } = require('../utils/semverUtils.cjs');
-const { isAllowedHttpsHost } = require('../launcher/securityAndPathUtils.cjs');
+const {
+  isAllowedHttpsHost,
+  wrapIpcMainWithSenderCheck,
+} = require('../launcher/securityAndPathUtils.cjs');
 
 const ALLOWED_GITHUB_RELEASE_HOSTS = Object.freeze([
   'github.com',
@@ -95,10 +98,21 @@ function selectPlatformReleaseAsset(assets, platform = process.platform, arch = 
  * Window Chrome, Fullscreen & Menu Action IPC Handlers
  * Extracted from electron/main.cjs for clean modular boundary separation.
  *
- * @param {{ ipcMain: any, app: any, getMainWindow: () => any }} deps
+ * @param {{ ipcMain: any, app: any, getMainWindow: () => any, options?: Record<string, any> }} deps
  */
-function registerWindowAndSystemIpcHandlers({ ipcMain, app, getMainWindow }) {
-  if (!ipcMain) return;
+function registerWindowAndSystemIpcHandlers({
+  ipcMain: rawIpcMain,
+  app,
+  getMainWindow,
+  options: handlerOptions = {},
+}) {
+  if (!rawIpcMain) return;
+  const ipcMain = wrapIpcMainWithSenderCheck(rawIpcMain, {
+    getMainWindow,
+    isPackaged: Boolean(handlerOptions.isPackaged ?? app?.isPackaged),
+    allowedDevOrigin: handlerOptions.allowedDevOrigin || null,
+    expectedFileHref: handlerOptions.expectedFileHref || null,
+  });
 
   ipcMain.handle('window:toggle-fullscreen', () => {
     const mainWindow = getMainWindow?.();

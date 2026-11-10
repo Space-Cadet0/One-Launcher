@@ -53,7 +53,7 @@ type NativeSyncPayload = Partial<StorefrontAuthResult> & {
   hasDeviceContext?: boolean;
   authoritativeComplete?: boolean;
   transientOffline?: boolean;
-  tokenData?: (StorefrontTokenSummary & { expires_at?: string }) | null;
+  tokenData?: StorefrontTokenSummary | null;
   achievements?: Record<string, AchievementSummaryEntry>;
 };
 

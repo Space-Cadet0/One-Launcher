@@ -22,7 +22,12 @@ const {
   toHostFilesystemPath,
   atomicWriteFileSync,
   isStoreDisconnectedTombstoned,
+  refreshHostWindowsKnownFoldersAsync,
+  discoverWindowsLocalDrivesAsync,
 } = require('./securityAndPathUtils.cjs');
+const {
+  refreshWindowsStorefrontRegistryCacheAsync,
+} = require('../utils/windowsRegistryDiscovery.cjs');
 const {
   resolveDriveCPathCaseInsensitive,
   resolveBottleSteamExe,
@@ -2433,6 +2438,18 @@ async function probeEnvironmentHealth(options = {}) {
         : execFile;
   const hasInjectedExec =
     typeof options.execFileImpl === 'function' || typeof options.execFileFn === 'function';
+
+  if (
+    hostPlatform === 'win32' &&
+    (!isTestEnvironment(options) || options.prewarmWindowsCaches === true)
+  ) {
+    const prewarmOpts = options.prewarmWindowsCaches === true ? options : { platform: hostPlatform };
+    await Promise.all([
+      refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {}),
+      refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {}),
+      discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {}),
+    ]);
+  }
 
   // Run async OS & write-access probes concurrently
   const [

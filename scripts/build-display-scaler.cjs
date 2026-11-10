@@ -576,7 +576,22 @@ function buildManifestObject({ compilerVersion, scalerX86, scalerX64, launcherX8
       compiler: 'zig cc',
       zigVersion: compilerVersion || 'unknown',
       targets: ['x86-windows-gnu', 'x86_64-windows-gnu'],
-      flags: ['-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-fno-ident', '-Wl,--strip-all'],
+      flags: [
+        '-std=c11',
+        '-Oz',
+        '-fno-inline',
+        '-mstackrealign',
+        '-fno-unwind-tables',
+        '-fno-asynchronous-unwind-tables',
+        '-ffunction-sections',
+        '-fdata-sections',
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+        '-fno-ident',
+        '-Wl,--gc-sections',
+        '-Wl,--strip-all',
+      ],
     },
     sources: computeSourceManifestDigests(),
     outputs: {
@@ -683,13 +698,16 @@ function compileSingleTarget({
   const stagedPath = path.join(stageDir, stagedName);
   const srcPaths = sources.map((f) => path.join(SRC_DIR, f));
 
+  const isX86Target = targetTriple.startsWith('x86-') || targetTriple.startsWith('i686-');
   const args = [
     'cc',
     '-target',
     targetTriple,
     ...(isDll ? ['-shared'] : []),
     '-std=c11',
-    '-Os',
+    '-Oz',
+    '-fno-inline',
+    ...(isX86Target ? ['-mstackrealign'] : []),
     '-fno-asynchronous-unwind-tables',
     '-fno-unwind-tables',
     '-ffunction-sections',

@@ -282,7 +282,7 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       // Expand to all 6 rows
       const toggleLinks = findElements(
         tree,
-        (el) => el.type === 'a' && getTextContent(el).includes('See all 6 supported languages')
+        (el) => el.type === 'button' && getTextContent(el).includes('See all 6 supported languages')
       );
       expect(toggleLinks).toHaveLength(1);
       toggleLinks[0].props.onClick();
@@ -563,7 +563,7 @@ describe('Storefront Language Parsing & SteamLanguagesTable Accuracy (Steam, GOG
       // Expand to all 14 languages
       const toggleLinks = findElements(
         tree,
-        (el) => el.type === 'a' && getTextContent(el).includes('See all 14 supported languages')
+        (el) => el.type === 'button' && getTextContent(el).includes('See all 14 supported languages')
       );
       expect(toggleLinks).toHaveLength(1);
       toggleLinks[0].props.onClick();

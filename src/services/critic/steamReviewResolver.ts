@@ -28,7 +28,7 @@ interface EnrichedSteamReviewRecord {
   };
 }
 
-const STEAM_ENRICHED_REVIEWS_MAP = steamEnrichedCache as unknown as Record<string, EnrichedSteamReviewRecord>;
+const STEAM_ENRICHED_REVIEWS_MAP: Record<string, EnrichedSteamReviewRecord> = steamEnrichedCache;
 
 function extractSteamReviewsFromHtml(html: string): { positivePercent: number; totalReviews: number } | null {
   if (typeof DOMParser !== 'undefined') {

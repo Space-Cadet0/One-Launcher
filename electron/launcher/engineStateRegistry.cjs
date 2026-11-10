@@ -17,7 +17,80 @@ const {
   toHostFilesystemPath,
   setSecurityUserDataDirResolver,
   atomicWriteFileSync,
+  readJsonFileWithBackupSync,
+  approveLaunchCommands,
+  computeLaunchEnvApprovalFingerprint,
 } = require('./securityAndPathUtils.cjs');
+
+/** @type {Map<string, { mtimeMs: number, size: number, rawJson: string }>} */
+const stateJsonMemoryCache = new Map();
+
+/**
+ * Read a JSON state file with `(hostFilePath, mtimeMs, size)` read-through caching
+ * and automatic `.bak` fallback recovery on primary JSON corruption.
+ *
+ * @param {string} filePath
+ * @returns {any}
+ */
+function readCachedStateJsonSync(filePath) {
+  const hostPath = toHostFilesystemPath(filePath);
+  if (!hostPath) return null;
+  try {
+    const st = fs.statSync(hostPath);
+    const cached = stateJsonMemoryCache.get(hostPath);
+    if (
+      cached &&
+      cached.mtimeMs === st.mtimeMs &&
+      cached.size === st.size
+    ) {
+      return JSON.parse(cached.rawJson);
+    }
+    const parsed = readJsonFileWithBackupSync(hostPath, null);
+    if (parsed !== null && parsed !== undefined) {
+      const rawJson = JSON.stringify(parsed);
+      let latestMtime = st.mtimeMs;
+      let latestSize = st.size;
+      try {
+        const afterStat = fs.statSync(hostPath);
+        latestMtime = afterStat.mtimeMs;
+        latestSize = afterStat.size;
+      } catch {}
+      stateJsonMemoryCache.set(hostPath, {
+        mtimeMs: latestMtime,
+        size: latestSize,
+        rawJson,
+      });
+      return JSON.parse(rawJson);
+    }
+    stateJsonMemoryCache.delete(hostPath);
+    return null;
+  } catch {
+    stateJsonMemoryCache.delete(hostPath);
+    return null;
+  }
+}
+
+/**
+ * Atomically write a JSON state file and refresh the in-memory `(mtimeMs, size)` cache.
+ *
+ * @param {string} filePath
+ * @param {any} value
+ */
+function writeCachedStateJsonSync(filePath, value) {
+  const hostPath = toHostFilesystemPath(filePath);
+  const serialized = JSON.stringify(value, null, 2);
+  atomicWriteFileSync(hostPath, serialized);
+  try {
+    const st = fs.statSync(hostPath);
+    stateJsonMemoryCache.set(hostPath, {
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+      rawJson: JSON.stringify(value),
+    });
+  } catch {
+    stateJsonMemoryCache.delete(hostPath);
+  }
+}
 const uninstallSafety = require('./uninstallSafety.cjs');
 const {
   invalidateWindowsRegistryDiscoveryCache,
@@ -254,6 +327,7 @@ function trimLauncherEngineMemory() {
   macCodesignValidCache.clear();
   gogFirstPartySyncSignatureCache.clear();
   recentDisplaySanitizeCache.clear();
+  stateJsonMemoryCache.clear();
   invalidateWindowsRegistryDiscoveryCache();
   for (const inv of externalCacheInvalidators) {
     try {
@@ -296,6 +370,7 @@ function invalidateScanCaches() {
   macCodesignValidCache.clear();
   gogFirstPartySyncSignatureCache.clear();
   recentDisplaySanitizeCache.clear();
+  stateJsonMemoryCache.clear();
   invalidateWindowsRegistryDiscoveryCache();
   for (const inv of externalCacheInvalidators) {
     try {
@@ -1176,8 +1251,8 @@ function getManagedInstalledFilePath(userDataDir) {
 function loadManagedInstalledGames(userDataDir) {
   const filePath = getManagedInstalledFilePath(userDataDir);
   try {
-    if (!fs.existsSync(filePath)) return [];
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const parsed = readCachedStateJsonSync(filePath);
+    if (!parsed) return [];
     /** @type {any[]} */
     let records = [];
     if (Array.isArray(parsed)) {
@@ -1215,8 +1290,8 @@ function loadManagedInstalledGames(userDataDir) {
 function saveManagedInstalledGames(records, userDataDir) {
   const filePath = getManagedInstalledFilePath(userDataDir);
   try {
-    atomicWriteFileSync(filePath, JSON.stringify(records, null, 2));
     invalidateScanCaches();
+    writeCachedStateJsonSync(filePath, records);
     return true;
   } catch {
     return false;
@@ -1342,10 +1417,11 @@ function getLaunchConfigsFilePath(userDataDir) {
 function getGameLaunchConfigs(/** @type {any} */ options = {}) {
   const filePath = getLaunchConfigsFilePath(options.userDataDir);
   try {
-    if (!fs.existsSync(filePath)) return {};
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const parsed = readCachedStateJsonSync(filePath);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const shouldValidateFs = !options.userDataDir || options.pruneMissingExecutables === true;
+      // Only run filesystem existence pruning when explicitly requested (`pruneMissingExecutables: true`)
+      // so temporarily offline external drives / network shares never strip user-configured executables.
+      const shouldPruneMissingOnDisk = options.pruneMissingExecutables === true;
       let modified = false;
       const archiveAssetRe =
         /\.(kpf|pak|wad|pk3|pk4|vpk|bsa|ba2|upk|uasset|umap|pck|bundle|assets|ress|resource|zip|7z|rar)$/i;
@@ -1359,15 +1435,20 @@ function getGameLaunchConfigs(/** @type {any} */ options = {}) {
           cfg.launchMethod = 'auto';
           modified = true;
         }
-        if (shouldValidateFs && cfg.customExecutablePath) {
-          const localExe = toLocalFsPath(cfg.customExecutablePath, options.customRoots);
-          const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
-          if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
+        if (cfg.customExecutablePath) {
+          const isArchiveAsset = archiveAssetRe.test(String(cfg.customExecutablePath));
+          if (isArchiveAsset) {
             delete cfg.customExecutablePath;
             modified = true;
+          } else if (shouldPruneMissingOnDisk) {
+            const localExe = toLocalFsPath(cfg.customExecutablePath, options.customRoots);
+            if (!localExe || !fs.existsSync(localExe)) {
+              delete cfg.customExecutablePath;
+              modified = true;
+            }
           }
         }
-        if (shouldValidateFs && cfg.workingDirectory) {
+        if (shouldPruneMissingOnDisk && cfg.workingDirectory) {
           const localDir = toLocalFsPath(cfg.workingDirectory, options.customRoots);
           if (!localDir || !fs.existsSync(localDir)) {
             delete cfg.workingDirectory;
@@ -1385,15 +1466,20 @@ function getGameLaunchConfigs(/** @type {any} */ options = {}) {
               prof.launchMethod = 'auto';
               modified = true;
             }
-            if (shouldValidateFs && prof.customExecutablePath) {
-              const localExe = toLocalFsPath(prof.customExecutablePath, options.customRoots);
-              const isArchiveAsset = archiveAssetRe.test(String(localExe || ''));
-              if (!localExe || isArchiveAsset || !fs.existsSync(localExe)) {
+            if (prof.customExecutablePath) {
+              const isArchiveAsset = archiveAssetRe.test(String(prof.customExecutablePath));
+              if (isArchiveAsset) {
                 delete prof.customExecutablePath;
                 modified = true;
+              } else if (shouldPruneMissingOnDisk) {
+                const localExe = toLocalFsPath(prof.customExecutablePath, options.customRoots);
+                if (!localExe || !fs.existsSync(localExe)) {
+                  delete prof.customExecutablePath;
+                  modified = true;
+                }
               }
             }
-            if (shouldValidateFs && prof.workingDirectory) {
+            if (shouldPruneMissingOnDisk && prof.workingDirectory) {
               const localDir = toLocalFsPath(prof.workingDirectory, options.customRoots);
               if (!localDir || !fs.existsSync(localDir)) {
                 delete prof.workingDirectory;
@@ -1408,7 +1494,7 @@ function getGameLaunchConfigs(/** @type {any} */ options = {}) {
         (options.pruneMissingExecutables === true || options.persistPrunedConfigs === true)
       ) {
         try {
-          atomicWriteFileSync(filePath, JSON.stringify(parsed, null, 2));
+          writeCachedStateJsonSync(filePath, parsed);
         } catch {}
       }
       return parsed;
@@ -1432,8 +1518,8 @@ function saveGameLaunchConfig(/** @type {any} */ config, /** @type {any} */ opti
   if (config.reset === true) {
     delete existing[config.gameId];
     try {
-      atomicWriteFileSync(filePath, JSON.stringify(existing, null, 2));
       invalidateScanCaches();
+      writeCachedStateJsonSync(filePath, existing);
       return { success: true, config: { gameId: config.gameId } };
     } catch (/** @type {any} */ err) {
       return { success: false, error: err.message };
@@ -1519,8 +1605,36 @@ function saveGameLaunchConfig(/** @type {any} */ config, /** @type {any} */ opti
 
   existing[config.gameId] = updated;
   try {
-    atomicWriteFileSync(filePath, JSON.stringify(existing, null, 2));
     invalidateScanCaches();
+    writeCachedStateJsonSync(filePath, existing);
+    const envVars =
+      config.environmentVariables && typeof config.environmentVariables === 'object'
+        ? config.environmentVariables
+        : null;
+    if (envVars) {
+      for (const [envKey, envVal] of Object.entries(envVars)) {
+        if (
+          String(envKey || '').trim().toUpperCase() === 'DYLD_INSERT_LIBRARIES' &&
+          typeof envVal === 'string' &&
+          envVal.trim()
+        ) {
+          approveLaunchCommands(
+            config.gameId,
+            [
+              {
+                fingerprint: computeLaunchEnvApprovalFingerprint(
+                  'DYLD_INSERT_LIBRARIES',
+                  envVal.replace(/\0/g, '')
+                ),
+                field: 'environmentVariables.DYLD_INSERT_LIBRARIES',
+                scopePath: 'environmentVariables.DYLD_INSERT_LIBRARIES',
+              },
+            ],
+            options
+          );
+        }
+      }
+    }
     return { success: true, config: updated };
   } catch (/** @type {any} */ err) {
     return { success: false, error: err.message };
@@ -1639,8 +1753,8 @@ function sanitizeLauncherPerformanceSettings(/** @type {any} */ raw = {}) {
 function getLauncherPerformanceSettings(/** @type {any} */ options = {}) {
   const filePath = getPerformanceSettingsFilePath(options);
   try {
-    if (fs.existsSync(filePath)) {
-      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const parsed = readCachedStateJsonSync(filePath);
+    if (parsed && typeof parsed === 'object') {
       return sanitizeLauncherPerformanceSettings(parsed);
     }
   } catch {}
@@ -1655,7 +1769,7 @@ function saveLauncherPerformanceSettings(/** @type {any} */ settings = {}, /** @
       ? { ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS }
       : sanitizeLauncherPerformanceSettings({ ...current, ...(settings || {}) });
   try {
-    atomicWriteFileSync(filePath, JSON.stringify(merged, null, 2));
+    writeCachedStateJsonSync(filePath, merged);
   } catch {}
   const result = { ...merged };
   Object.defineProperties(result, {
@@ -1753,6 +1867,16 @@ function isSafeToDeleteInstallPath(targetPath, /** @type {any} */ options = {}) 
     ? toLocalFsPath(targetPath, options.customRoots)
     : targetPath;
   return uninstallSafety.isSafeToDeleteInstallPath(mappedPath, options);
+}
+
+async function safeRemoveInstallDirectoryAsync(targetPath, /** @type {any} */ options = {}) {
+  if (!targetPath || typeof targetPath !== 'string') {
+    return false;
+  }
+  const mappedPath = options.customRoots
+    ? toLocalFsPath(targetPath, options.customRoots)
+    : targetPath;
+  return uninstallSafety.safeRemoveGameDirectoryAsync(mappedPath, options);
 }
 
 function safeIsBottleSlug(slug) {
@@ -2044,6 +2168,7 @@ module.exports = {
 
   // Uninstall safety & dialogs
   isSafeToDeleteInstallPath,
+  safeRemoveInstallDirectoryAsync,
   safeIsBottleSlug,
   safeIsNumericAppId,
   browseLocalFiles,

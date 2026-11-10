@@ -17,6 +17,36 @@ export interface ModalShellProps {
 }
 
 /**
+ * Tests whether a pointer/click event on a `<dialog>` landed outside its rendered box
+ * (on `::backdrop`), with a clean fallback to `event.target === dialog` when JSDOM or
+ * synthetic tests report a `0x0` bounding rect or omit pointer coordinates.
+ */
+export function isBackdropPoint(
+  dialog: HTMLDialogElement,
+  event: { clientX?: number; clientY?: number; target: EventTarget | null }
+): boolean {
+  if (event.target !== dialog) return false;
+  if (typeof event.clientX !== 'number' || typeof event.clientY !== 'number') {
+    return true;
+  }
+  if (typeof dialog.getBoundingClientRect !== 'function') {
+    return true;
+  }
+  const rect = dialog.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) {
+    return true;
+  }
+  const right = typeof rect.right === 'number' ? rect.right : rect.left + rect.width;
+  const bottom = typeof rect.bottom === 'number' ? rect.bottom : rect.top + rect.height;
+  return (
+    event.clientX < rect.left ||
+    event.clientX > right ||
+    event.clientY < rect.top ||
+    event.clientY > bottom
+  );
+}
+
+/**
  * Native HTML `<dialog>` Top-Layer modal container following modern-web-guidance:
  * - Calls `dialog.showModal()` so the browser places the modal in the Top Layer,
  *   traps Tab focus natively, makes background content inert without mutating
@@ -74,6 +104,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
 
     const handleClose = (event?: Event) => {
       if (event && event.target && event.target !== dialog) return;
+      dialog.returnValue = '';
       onCloseRef.current();
     };
     const handleCancel = (event: Event) => {
@@ -108,7 +139,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   const handleDialogPointerDown = (event: React.PointerEvent<HTMLDialogElement>) => {
     const dialog = dialogRef.current;
     if (!dialog) return;
-    pointerStartedOnBackdropRef.current = event.target === dialog;
+    pointerStartedOnBackdropRef.current = isBackdropPoint(dialog, event);
   };
 
   const handleDialogClick = (event: React.MouseEvent<HTMLDialogElement>) => {
@@ -126,16 +157,11 @@ export const ModalShell: React.FC<ModalShellProps> = ({
     ) {
       return;
     }
-    const rect = dialog.getBoundingClientRect();
-    const isInDialog =
-      rect.top <= event.clientY &&
-      event.clientY <= rect.top + rect.height &&
-      rect.left <= event.clientX &&
-      event.clientX <= rect.left + rect.width;
-    if (!isInDialog) {
+    if (isBackdropPoint(dialog, event)) {
       if (typeof dialog.close === 'function' && dialog.open) {
         dialog.close();
       } else {
+        dialog.returnValue = '';
         onCloseRef.current();
       }
     }

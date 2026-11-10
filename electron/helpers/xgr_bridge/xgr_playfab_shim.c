@@ -84,8 +84,24 @@ void xgr_playfab_set_symbol_resolver_for_test(xgr_playfab_proc_resolver_fn resol
     ReleaseSRWLockExclusive(&g_pf_lock);
 }
 
+static void pf_set_active_user(XUserHandle new_user)
+{
+    XUserHandle dup_user = NULL;
+    if (new_user) {
+        (void)xgr_user_duplicate(new_user, &dup_user);
+    }
+    AcquireSRWLockExclusive(&g_pf_lock);
+    XUserHandle old_user = g_pf_active_user;
+    g_pf_active_user = dup_user;
+    ReleaseSRWLockExclusive(&g_pf_lock);
+    if (old_user) {
+        xgr_user_close(old_user);
+    }
+}
+
 void xgr_playfab_shim_reset(void)
 {
+    XUserHandle old_user = NULL;
     AcquireSRWLockExclusive(&g_pf_lock);
     g_real_Initialize = NULL;
     g_real_SetUiCallbacks = NULL;
@@ -98,8 +114,13 @@ void xgr_playfab_shim_reset(void)
     g_real_SetUiConflictResponse = NULL;
     g_real_SetUiOutOfStorageResponse = NULL;
     memset(g_pf_resolved_save_folder, 0, sizeof(g_pf_resolved_save_folder));
+    old_user = g_pf_active_user;
     g_pf_active_user = NULL;
     ReleaseSRWLockExclusive(&g_pf_lock);
+
+    if (old_user) {
+        xgr_user_close(old_user);
+    }
 
     InterlockedExchange(&g_pf_game_set_ui_callbacks, 0);
     InterlockedExchange(&g_pf_default_ui_installed, 0);
@@ -582,9 +603,7 @@ HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(
     /* Ensure session metadata (XUID/locale/offline state) is loaded when RPC is active */
     xgr_ensure_session_metadata_loaded();
 
-    AcquireSRWLockExclusive(&g_pf_lock);
-    g_pf_active_user = localUser;
-    ReleaseSRWLockExclusive(&g_pf_lock);
+    pf_set_active_user(localUser);
 
     InterlockedExchange(&g_pf_uploaded_release_active, 0);
     InterlockedExchange(&g_pf_sync_retry_count, 0);
@@ -623,9 +642,7 @@ HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUploadWithUiAsync(
     InterlockedExchange(&g_pf_sync_retry_count, 0);
 
     if (localUser) {
-        AcquireSRWLockExclusive(&g_pf_lock);
-        g_pf_active_user = localUser;
-        ReleaseSRWLockExclusive(&g_pf_lock);
+        pf_set_active_user(localUser);
     }
     if (option == XGR_PF_UPLOAD_RELEASE_DEVICE_AS_ACTIVE) {
         InterlockedExchange(&g_pf_uploaded_release_active, 1);
@@ -635,11 +652,36 @@ HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUploadWithUiAsync(
     return xgr_return_hr(hr);
 }
 
+typedef struct PfPreUninitCtx {
+    XAsyncBlock upload_ab;
+    XAsyncBlock *game_uninit_async;
+    PFN_PFGameSaveFilesUninitializeAsync real_uninit;
+    XUserHandle user;
+    volatile LONG refs;
+    volatile LONG done;
+    volatile LONG uninit_hr;
+} PfPreUninitCtx;
+
+static void pf_pre_uninit_ctx_release(PfPreUninitCtx *ctx)
+{
+    if (!ctx) return;
+    if (InterlockedDecrement(&ctx->refs) == 0) {
+        if (ctx->user) {
+            xgr_user_close(ctx->user);
+        }
+        free(ctx);
+    }
+}
+
 static void CALLBACK pf_pre_uninit_upload_done_cb(XAsyncBlock *ab)
 {
-    if (ab && ab->context) {
-        SetEvent((HANDLE)ab->context);
-    }
+    if (!ab || !ab->context) return;
+    PfPreUninitCtx *ctx = (PfPreUninitCtx *)ab->context;
+    InterlockedExchange(&g_pf_default_ui_installed, 0);
+    HRESULT hr = ctx->real_uninit(ctx->game_uninit_async);
+    InterlockedExchange(&ctx->uninit_hr, (LONG)hr);
+    InterlockedExchange(&ctx->done, 1);
+    pf_pre_uninit_ctx_release(ctx);
 }
 
 HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUninitializeAsync(XAsyncBlock *async)
@@ -680,21 +722,42 @@ HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUninitializeAsync(XAsyncBlock *async)
             }
         }
         if (real_upload) {
-            InterlockedExchange(&g_pf_sync_retry_count, 0);
-            HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
-            XAsyncBlock upload_ab;
-            memset(&upload_ab, 0, sizeof(upload_ab));
-            upload_ab.context = (void *)ev;
-            upload_ab.callback = pf_pre_uninit_upload_done_cb;
+            PfPreUninitCtx *ctx = (PfPreUninitCtx *)calloc(1, sizeof(*ctx));
+            if (ctx) {
+                InterlockedExchange(&g_pf_sync_retry_count, 0);
+                ctx->game_uninit_async = async;
+                ctx->real_uninit = real_uninit;
+                ctx->user = active_user;
+                active_user = NULL;
+                ctx->refs = 2; /* 1 caller ref + 1 completion callback ref */
+                ctx->done = 0;
+                ctx->uninit_hr = (LONG)S_OK;
+                ctx->upload_ab.queue = async ? async->queue : NULL;
+                ctx->upload_ab.context = ctx;
+                ctx->upload_ab.callback = pf_pre_uninit_upload_done_cb;
 
-            HRESULT uhr = real_upload(active_user, XGR_PF_UPLOAD_RELEASE_DEVICE_AS_ACTIVE, &upload_ab);
-            if (SUCCEEDED(uhr) && ev != NULL) {
-                (void)WaitForSingleObject(ev, XGR_PF_PRE_UNINIT_UPLOAD_TIMEOUT_MS);
-            }
-            if (ev != NULL) {
-                CloseHandle(ev);
+                HRESULT uhr = real_upload(ctx->user, XGR_PF_UPLOAD_RELEASE_DEVICE_AS_ACTIVE, &ctx->upload_ab);
+                if (SUCCEEDED(uhr)) {
+                    HRESULT hr = (InterlockedCompareExchange(&ctx->done, 0, 0) != 0)
+                        ? (HRESULT)InterlockedCompareExchange(&ctx->uninit_hr, 0, 0)
+                        : S_OK;
+                    pf_pre_uninit_ctx_release(ctx);
+                    return xgr_return_hr(hr);
+                }
+                if (InterlockedCompareExchange(&ctx->done, 0, 0) != 0) {
+                    HRESULT hr = (HRESULT)InterlockedCompareExchange(&ctx->uninit_hr, 0, 0);
+                    pf_pre_uninit_ctx_release(ctx);
+                    return xgr_return_hr(hr);
+                }
+                active_user = ctx->user;
+                ctx->user = NULL;
+                free(ctx);
             }
         }
+    }
+
+    if (active_user) {
+        xgr_user_close(active_user);
     }
 
     InterlockedExchange(&g_pf_default_ui_installed, 0);

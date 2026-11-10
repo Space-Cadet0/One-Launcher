@@ -84,7 +84,7 @@ describe('Static Architecture, Privacy Hygiene & Offline Guard Invariants', () =
       'vitest.config.ts',
       'vitest.live.config.ts',
     ];
-    const extRegex = /\.(?:cjs|mjs|js|ts|tsx|json|html|css|md|nsh|nsi|ps1|bat|py)$/i;
+    const extRegex = /\.(?:cjs|mjs|js|ts|tsx|json|html|css|md|nsh|nsi|ps1|bat|py|c|h)$/i;
     const violations = scanRepoForPiiViolations(REPO_ROOT, scanTargets, extRegex);
     expect(violations).toEqual([]);
 
@@ -462,15 +462,8 @@ describe('Static Architecture, Privacy Hygiene & Offline Guard Invariants', () =
     expect(importViolations).toEqual([]);
   });
 
-  it('10. Strict Renderer Type-Safety Gate: confirms zero explicit : any / as any across src/contracts, src/services, src/components, src/hooks, src/utils, and src/App.tsx', () => {
-    const strictTargets = [
-      'src/contracts',
-      'src/services',
-      'src/components',
-      'src/hooks',
-      'src/utils',
-      'src/App.tsx',
-    ];
+  it('10. Strict Renderer & Build-Config Type-Safety Gate: confirms zero explicit : any / as any across all of src/** (including src/types) and vite.config.ts', () => {
+    const strictTargets = ['src', 'vite.config.ts'];
     const tsExt = /\.(?:ts|tsx)$/i;
     const anyViolations: string[] = [];
 
@@ -498,5 +491,74 @@ describe('Static Architecture, Privacy Hygiene & Offline Guard Invariants', () =
     }
 
     expect(anyViolations).toEqual([]);
+  });
+
+  it('11. Preload Origin Guard & Parameter Forwarding Gate: verifies isTrustedMainRendererOrigin guard and 1:1 parameter forwarding for ipcRenderer.invoke wrappers', () => {
+    const preloadPath = path.resolve(REPO_ROOT, 'electron/preload.cjs');
+    const preloadRaw = fs.readFileSync(preloadPath, 'utf8');
+    expect(preloadRaw).toContain('if (isTrustedMainRendererOrigin())');
+
+    const preloadSf =
+      sharedCjsProgram.getSourceFile(preloadPath) ??
+      ts.createSourceFile(preloadPath, preloadRaw, ts.ScriptTarget.Latest, true);
+
+    const droppedParamViolations: string[] = [];
+
+    const checkWrapperFn = (propName: string, fn: ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration) => {
+      if (fn.parameters.length === 0) return;
+      const invokeCalls: ts.CallExpression[] = [];
+      const findInvoke = (n: ts.Node) => {
+        if (
+          ts.isCallExpression(n) &&
+          n.expression.getText(preloadSf) === 'ipcRenderer.invoke'
+        ) {
+          invokeCalls.push(n);
+        }
+        ts.forEachChild(n, findInvoke);
+      };
+      findInvoke(fn.body ?? fn);
+      if (invokeCalls.length !== 1) return;
+      const invokeText = invokeCalls[0].getText(preloadSf);
+      for (const param of fn.parameters) {
+        if (ts.isIdentifier(param.name)) {
+          const pName = param.name.text;
+          if (!new RegExp(`\\b${pName}\\b`).test(invokeText)) {
+            droppedParamViolations.push(`${propName} declares parameter "${pName}" not forwarded to ipcRenderer.invoke`);
+          }
+        }
+      }
+    };
+
+    const visitPreload = (node: ts.Node) => {
+      if (
+        ts.isCallExpression(node) &&
+        node.expression.getText(preloadSf) === 'contextBridge.exposeInMainWorld' &&
+        node.arguments.length >= 2 &&
+        ts.isObjectLiteralExpression(node.arguments[1])
+      ) {
+        for (const prop of node.arguments[1].properties) {
+          if (
+            ts.isPropertyAssignment(prop) &&
+            (ts.isArrowFunction(prop.initializer) || ts.isFunctionExpression(prop.initializer))
+          ) {
+            checkWrapperFn(prop.name.getText(preloadSf), prop.initializer);
+          } else if (ts.isMethodDeclaration(prop)) {
+            checkWrapperFn(prop.name.getText(preloadSf), prop);
+          }
+        }
+      }
+      ts.forEachChild(node, visitPreload);
+    };
+    visitPreload(preloadSf);
+
+    expect(droppedParamViolations).toEqual([]);
+  });
+
+  it('12. Rollup Service Layer DAG Gate: verifies vite.config.ts preserves acyclic 3-layer service chunking without monolithic services-core catch-all', () => {
+    const viteConfigRaw = fs.readFileSync(path.join(REPO_ROOT, 'vite.config.ts'), 'utf8');
+    expect(viteConfigRaw).toContain("'services-foundation'");
+    expect(viteConfigRaw).toContain("'services-catalog'");
+    expect(viteConfigRaw).toContain("'services-launcher'");
+    expect(viteConfigRaw).not.toContain("'services-core'");
   });
 });

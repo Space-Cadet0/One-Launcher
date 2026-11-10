@@ -87,21 +87,14 @@ export const SteamLanguagesTable: React.FC<SteamLanguagesTableProps> = ({
 
   const renderExpandToggle = () =>
     languages.length > 5 ? (
-      <a
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
         aria-expanded={isExpanded}
         onClick={() => setIsExpanded(!isExpanded)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setIsExpanded(!isExpanded);
-          }
-        }}
-        className="min-h-6 text-[11px] text-[#67c1f5] hover:text-white hover:underline cursor-pointer inline-flex items-center mt-1 font-normal select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#67c1f5] rounded"
+        className="min-h-6 text-[11px] text-[#67c1f5] hover:text-white hover:underline cursor-pointer inline-flex items-center mt-1 font-normal select-none bg-transparent border-0 p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#67c1f5] rounded"
       >
         {isExpanded ? 'Show fewer languages' : `See all ${languages.length} supported languages`}
-      </a>
+      </button>
     ) : null;
 
   if (effectiveSchema === 'audio_text') {

@@ -458,8 +458,20 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
 }
 
 /**
- * Scan a directory tree (bounded, without following symlinks) to verify that no nested symlink
- * or NTFS junction/reparse-point resolves outside `realInstallRoot`.
+ * Check whether an fs error represents a benign missing path (`ENOENT`).
+ * Any other error (`ELOOP`, `EACCES`, `EPERM`, `EIO`, `EBUSY`, `ENAMETOOLONG`) MUST fail closed!
+ *
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isMissingPathError(err) {
+  return String(err?.code || '').toUpperCase() === 'ENOENT';
+}
+
+/**
+ * Walk `realInstallRoot` iteratively across the ENTIRE directory tree (zero artificial entry caps)
+ * and verify that NO symbolic link or NTFS junction resolves outside `realInstallRoot`, failing
+ * closed on any non-`ENOENT` stat/readdir/realpath error (`ELOOP`, `EACCES`, `EPERM`, `EIO`).
  *
  * @param {string} realInstallRoot
  * @param {any} fsImpl
@@ -467,25 +479,23 @@ function evaluateLexicalPathSafety(candidatePath, options, protectedTrees, hasMa
  * @returns {boolean} true if safe (no escaping symlinks/junctions), false if unsafe
  */
 function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
-  const MAX_SCANNED_ENTRIES = 2000;
-  let scanned = 0;
   /** @type {string[]} */
   const stack = [realInstallRoot];
 
-  while (stack.length > 0 && scanned < MAX_SCANNED_ENTRIES) {
+  while (stack.length > 0) {
     const currentDir = /** @type {string} */ (stack.pop());
     /** @type {any[]} */
     let entries = [];
     try {
       entries = fsImpl.readdirSync(currentDir, { withFileTypes: true });
-    } catch {
-      continue;
+    } catch (readErr) {
+      if (isMissingPathError(readErr)) {
+        continue;
+      }
+      return false;
     }
 
     for (const entry of entries) {
-      scanned += 1;
-      if (scanned > MAX_SCANNED_ENTRIES) break;
-
       const entryName = typeof entry === 'string' ? entry : entry?.name;
       if (!entryName || entryName === '.' || entryName === '..') continue;
       const entryPath = isWinStyle
@@ -502,8 +512,11 @@ function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
           const st = fsImpl.lstatSync(entryPath);
           isSymlink = Boolean(st?.isSymbolicLink?.());
           isDirectory = !isSymlink && Boolean(st?.isDirectory?.());
-        } catch {
-          continue;
+        } catch (statErr) {
+          if (isMissingPathError(statErr)) {
+            continue;
+          }
+          return false;
         }
       }
 
@@ -513,8 +526,11 @@ function verifyNoEscapingSymlinksInTree(realInstallRoot, fsImpl, isWinStyle) {
           if (typeof fsImpl.realpathSync === 'function') {
             linkTargetResolved = fsImpl.realpathSync(entryPath);
           }
-        } catch {
-          // Dangling link: fall back to lexical resolution of readlinkSync target
+        } catch (realErr) {
+          if (!isMissingPathError(realErr)) {
+            return false;
+          }
+          // Dangling link (`ENOENT`): fall back to lexical resolution of `readlinkSync` target
         }
         if (!linkTargetResolved) {
           try {
@@ -621,20 +637,23 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
           const sentinelPath = prelimIsWin
             ? path.win32.join(prelimResolved, '.one_launcher_managed')
             : path.posix.join(prelimResolved, '.one_launcher_managed');
-          if (typeof fsImpl.lstatSync === 'function') {
-            try {
-              const sentStat = fsImpl.lstatSync(sentinelPath);
-              if (sentStat && !sentStat.isSymbolicLink?.() && sentStat.isFile?.()) {
-                hasManagedSentinel = true;
-              }
-            } catch {
-              // No sentinel file present
+          try {
+            const sentStat = fsImpl.lstatSync(sentinelPath);
+            if (sentStat && !sentStat.isSymbolicLink?.() && sentStat.isFile?.()) {
+              hasManagedSentinel = true;
+            }
+          } catch (sentErr) {
+            if (!isMissingPathError(sentErr)) {
+              return false;
             }
           }
         }
       }
-    } catch {
-      // Target does not exist on host filesystem (e.g. cross-OS lexical test); continue lexical validation
+    } catch (prelimErr) {
+      if (!isMissingPathError(prelimErr)) {
+        return false;
+      }
+      // Target does not exist on host filesystem (`ENOENT`); continue lexical validation
     }
   }
 
@@ -674,16 +693,21 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
 
       // If `resolved` exists on disk, verify `lstatSync`, `realpathSync` parent/library containment, and nested symlinks
       let targetExists = false;
-      try {
-        const targetStat = fsImpl.lstatSync?.(resolved);
-        if (targetStat) {
-          if (targetStat.isSymbolicLink?.()) {
+      if (typeof fsImpl.lstatSync === 'function') {
+        try {
+          const targetStat = fsImpl.lstatSync(resolved);
+          if (targetStat) {
+            if (targetStat.isSymbolicLink?.()) {
+              return false;
+            }
+            targetExists = true;
+          }
+        } catch (targetStatErr) {
+          if (!isMissingPathError(targetStatErr)) {
             return false;
           }
-          targetExists = true;
+          targetExists = false;
         }
-      } catch {
-        targetExists = false;
       }
 
       if (targetExists && typeof fsImpl.realpathSync === 'function') {
@@ -758,8 +782,164 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
           }
         }
       }
-    } catch {
-      // Ignore fs probe errors on virtual paths
+    } catch (probeErr) {
+      if (!isMissingPathError(probeErr)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Fail-closed assertion wrapper over `isSafeToDeleteInstallPath` that throws a structured
+ * `UNSAFE_UNINSTALL_PATH` / `UNSAFE_UNINSTALL_STAT_ERROR` error on any containment or stat failure.
+ *
+ * @param {unknown} targetPath
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function assertSafeGameUninstallDirectory(targetPath, options = {}) {
+  if (!isSafeToDeleteInstallPath(targetPath, options)) {
+    const err = /** @type {Error & { code?: string }} */ (
+      new Error(`Refusing unsafe game uninstall path: ${String(targetPath || '<empty>')}`)
+    );
+    err.code = 'UNSAFE_UNINSTALL_PATH';
+    throw err;
+  }
+  const clean = normalizeWin32DevicePrefix(String(targetPath));
+  const isWinStyle =
+    /^[a-zA-Z]:(?:[\\/]|$)/.test(clean) ||
+    /^\\\\[^\\]+\\[^\\]+/.test(clean) ||
+    (options.platform === 'win32' && !clean.startsWith('/'));
+  return isWinStyle
+    ? path.win32.resolve(clean.replace(/\//g, '\\'))
+    : path.posix.resolve(clean.replace(/\\/g, '/'));
+}
+
+/**
+ * Unlink a single file, symlink, or Windows NTFS directory junction without recursing into
+ * any external link target.
+ *
+ * @param {string} entryPath
+ * @param {boolean} isLink
+ */
+async function unlinkFileOrReparsePointAsync(entryPath, isLink) {
+  try {
+    await fs.promises.unlink(entryPath);
+    return;
+  } catch (err) {
+    const code = String(/** @type {any} */ (err)?.code || '').toUpperCase();
+    if (code === 'ENOENT') return;
+    // On Windows NTFS, directory junctions (`IO_REPARSE_TAG_MOUNT_POINT`) require `rmdir`
+    if (isLink && (code === 'EPERM' || code === 'EISDIR' || code === 'EACCES')) {
+      try {
+        await fs.promises.rmdir(entryPath);
+        return;
+      } catch (rmDirErr) {
+        if (String(/** @type {any} */ (rmDirErr)?.code || '').toUpperCase() === 'ENOENT') return;
+      }
+    }
+    if (!isLink && (code === 'EPERM' || code === 'EACCES')) {
+      try {
+        await fs.promises.chmod(entryPath, 0o666);
+        await fs.promises.unlink(entryPath);
+        return;
+      } catch {}
+    }
+    throw err;
+  }
+}
+
+/**
+ * Symlink- and NTFS-junction-safe bottom-up asynchronous directory remover for game uninstalls.
+ * Validates `rootDir` via `assertSafeGameUninstallDirectory` (unless `options.skipSafetyAssertion`
+ * is explicitly set after an already-verified parent check) and unlinks symlinks/reparse points
+ * themselves WITHOUT ever recursing into external targets.
+ *
+ * @param {string} rootDir
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+async function safeRemoveGameDirectoryAsync(rootDir, options = {}) {
+  const resolvedRoot = options.skipSafetyAssertion
+    ? path.resolve(normalizeWin32DevicePrefix(String(rootDir || '')))
+    : assertSafeGameUninstallDirectory(rootDir, options);
+
+  let rootStat;
+  try {
+    rootStat = await fs.promises.lstat(resolvedRoot);
+  } catch (err) {
+    if (isMissingPathError(err)) return false;
+    throw err;
+  }
+
+  if (rootStat.isSymbolicLink()) {
+    const err = /** @type {Error & { code?: string }} */ (
+      new Error(`Refusing to delete symlinked install root: ${resolvedRoot}`)
+    );
+    err.code = 'UNSAFE_UNINSTALL_SYMLINK_ROOT';
+    throw err;
+  }
+
+  if (!rootStat.isDirectory()) {
+    await unlinkFileOrReparsePointAsync(resolvedRoot, false);
+    return true;
+  }
+
+  /** @type {Array<{ dirPath: string, visitedChildren: boolean }>} */
+  const stack = [{ dirPath: resolvedRoot, visitedChildren: false }];
+
+  while (stack.length > 0) {
+    const current = /** @type {{ dirPath: string, visitedChildren: boolean }} */ (stack[stack.length - 1]);
+    if (!current.visitedChildren) {
+      current.visitedChildren = true;
+      let dirHandle;
+      try {
+        dirHandle = await fs.promises.opendir(current.dirPath);
+      } catch (openErr) {
+        if (isMissingPathError(openErr)) {
+          stack.pop();
+          continue;
+        }
+        throw openErr;
+      }
+      for await (const entry of dirHandle) {
+        const name = entry.name;
+        if (!name || name === '.' || name === '..') continue;
+        const fullPath = path.join(current.dirPath, name);
+        const entryStat = await fs.promises.lstat(fullPath).catch((e) => {
+          if (isMissingPathError(e)) return null;
+          throw e;
+        });
+        if (!entryStat) continue;
+
+        if (entryStat.isSymbolicLink()) {
+          await unlinkFileOrReparsePointAsync(fullPath, true);
+        } else if (entryStat.isDirectory()) {
+          stack.push({ dirPath: fullPath, visitedChildren: false });
+        } else {
+          await unlinkFileOrReparsePointAsync(fullPath, false);
+        }
+      }
+    } else {
+      stack.pop();
+      try {
+        await fs.promises.rmdir(current.dirPath);
+      } catch (rmErr) {
+        const code = String(/** @type {any} */ (rmErr)?.code || '').toUpperCase();
+        if (code !== 'ENOENT') {
+          try {
+            await fs.promises.chmod(current.dirPath, 0o777);
+            await fs.promises.rmdir(current.dirPath);
+          } catch (retryErr) {
+            if (String(/** @type {any} */ (retryErr)?.code || '').toUpperCase() !== 'ENOENT') {
+              throw retryErr;
+            }
+          }
+        }
+      }
     }
   }
 
@@ -768,6 +948,8 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
 
 module.exports = {
   isSafeToDeleteInstallPath,
+  assertSafeGameUninstallDirectory,
+  safeRemoveGameDirectoryAsync,
   normalizeWin32DevicePrefix,
   isSafeBottleSlug,
   isSafeNumericAppId,

@@ -27,7 +27,6 @@ import {
 import {
   sanitizeGameCatalog,
   registerSuppressedCatalogEntries,
-  SuppressedCatalogEntry,
 } from '../services/integrations/catalogSanitizer';
 import { steamMatcher } from '../services/steam/steamMatcher';
 import { steamApi } from '../services/steam/steamApi';
@@ -114,358 +113,419 @@ export function useManualLibrarySyncActions({
           import('../services/achievements/achievementDetailService'),
         ]);
 
-      const integrations = loadIntegrations();
-      let currentCatalog = gamesRef.current;
-      const initialCount = currentCatalog.length;
-
-      let installedSteamAppIds: Set<number> | null = null;
-      let steamAchs: Record<number, CachedAchievementEntry> = {};
-      let gogAchs: Record<string, CachedAchievementEntry> = {};
-      let epicAchs: Record<string, CachedAchievementEntry> = {};
-      let xboxAchs: Record<string, CachedAchievementEntry> = {};
-
+      const priorityScopeId = syncJobManager.beginPriorityScope('Syncing Storefront Libraries');
       try {
-        const [scannedAchs, scanResult] = await Promise.allSettled([
-          scanLocalSteamAchievements(),
-          scanLocalInstalledGames(),
-        ]);
-        if (
-          scannedAchs.status === 'fulfilled' &&
-          scannedAchs.value &&
-          Object.keys(scannedAchs.value).length > 0
-        ) {
-          steamAchs = scannedAchs.value;
-          cacheUserSteamAchievements(steamAchs);
-        }
-        if (scanResult.status === 'fulfilled' && scanResult.value?.success) {
-          installedSteamAppIds = new Set(scanResult.value.installedSteamAppIds);
-        }
-      } catch {}
+        const integrations = loadIntegrations();
+        const initialGameIds = new Set(gamesRef.current.map((g) => g.id));
 
-      const steamInteg = integrations.find((i) => i.storefrontId === 'steam' && i.isConnected);
-      if (steamInteg) {
-        await syncJobManager.trackTask('storefront_libraries', 'Steam', async () => {
-          try {
-            if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-              const steamRes = await window.electronAPI.syncStore('steam');
-              if (Array.isArray(steamRes?.suppressedItems) && steamRes.suppressedItems.length > 0) {
-                registerSuppressedCatalogEntries(
-                  steamRes.suppressedItems as SuppressedCatalogEntry[]
-                );
-              }
-              if (steamRes?.achievements && Object.keys(steamRes.achievements).length > 0) {
-                steamAchs = {
-                  ...steamAchs,
-                  ...(steamRes.achievements as Record<number, CachedAchievementEntry>),
-                };
-                cacheUserSteamAchievements(steamAchs);
-              }
-              if (steamRes?.success && steamRes.games && steamRes.games.length > 0) {
-                const verifiedSteamGames = steamRes.games.map((g) => ({
-                  ...g,
-                  isVerifiedEntitlement: true,
-                }));
-                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedSteamGames, 'steam');
-                try {
-                  const liveAchs =
-                    await steamAchievementsService.syncUserLibraryAchievements(verifiedSteamGames);
-                  if (liveAchs && Object.keys(liveAchs).length > 0) {
-                    steamAchs = { ...steamAchs, ...liveAchs };
-                    cacheUserSteamAchievements(steamAchs);
-                  }
-                } catch {}
+        type StorefrontMergeStep = {
+          storefrontId: 'steam' | 'gog' | 'epic' | 'xbox';
+          games: CanonicalGame[];
+          options?: { authoritativeComplete?: boolean };
+        };
+        const pendingStoreMerges: StorefrontMergeStep[] = [];
+
+        let installedSteamAppIds: Set<number> | null = null;
+        let steamAchs: Record<number, CachedAchievementEntry> = {};
+        let gogAchs: Record<string, CachedAchievementEntry> = {};
+        let epicAchs: Record<string, CachedAchievementEntry> = {};
+        let xboxAchs: Record<string, CachedAchievementEntry> = {};
+
+        try {
+          const [scannedAchs, scanResult] = await Promise.allSettled([
+            scanLocalSteamAchievements(),
+            scanLocalInstalledGames(),
+          ]);
+          if (
+            scannedAchs.status === 'fulfilled' &&
+            scannedAchs.value &&
+            Object.keys(scannedAchs.value).length > 0
+          ) {
+            steamAchs = scannedAchs.value;
+            cacheUserSteamAchievements(steamAchs);
+          }
+          if (scanResult.status === 'fulfilled' && scanResult.value?.success) {
+            installedSteamAppIds = new Set(scanResult.value.installedSteamAppIds);
+          }
+        } catch {}
+
+        const steamInteg = integrations.find((i) => i.storefrontId === 'steam' && i.isConnected);
+        if (steamInteg) {
+          await syncJobManager.trackTask('storefront_libraries', 'Steam', async () => {
+            try {
+              if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+                const steamRes = await window.electronAPI.syncStore('steam');
+                if (Array.isArray(steamRes?.suppressedItems) && steamRes.suppressedItems.length > 0) {
+                  registerSuppressedCatalogEntries(steamRes.suppressedItems);
+                }
+                if (steamRes?.achievements && Object.keys(steamRes.achievements).length > 0) {
+                  steamAchs = {
+                    ...steamAchs,
+                    ...(steamRes.achievements as Record<number, CachedAchievementEntry>),
+                  };
+                  cacheUserSteamAchievements(steamAchs);
+                }
+                if (steamRes?.success && steamRes.games && steamRes.games.length > 0) {
+                  const verifiedSteamGames = steamRes.games.map((g) => ({
+                    ...g,
+                    isVerifiedEntitlement: true,
+                  }));
+                  pendingStoreMerges.push({
+                    storefrontId: 'steam',
+                    games: verifiedSteamGames,
+                  });
+                  try {
+                    const liveAchs =
+                      await steamAchievementsService.syncUserLibraryAchievements(
+                        verifiedSteamGames,
+                        undefined,
+                        { priority: RequestPriority.P1_VIEWPORT }
+                      );
+                    if (liveAchs && Object.keys(liveAchs).length > 0) {
+                      steamAchs = { ...steamAchs, ...liveAchs };
+                      cacheUserSteamAchievements(steamAchs);
+                    }
+                  } catch {}
+                } else if (steamInteg.credentials?.steamId) {
+                  const res = await steamIntegration.fetchOwnedGames(steamInteg.credentials);
+                  pendingStoreMerges.push({
+                    storefrontId: 'steam',
+                    games: res.games,
+                  });
+                }
               } else if (steamInteg.credentials?.steamId) {
                 const res = await steamIntegration.fetchOwnedGames(steamInteg.credentials);
-                currentCatalog = mergeStorefrontGames(currentCatalog, res.games, 'steam');
+                pendingStoreMerges.push({
+                  storefrontId: 'steam',
+                  games: res.games,
+                });
               }
-            } else if (steamInteg.credentials?.steamId) {
-              const res = await steamIntegration.fetchOwnedGames(steamInteg.credentials);
-              currentCatalog = mergeStorefrontGames(currentCatalog, res.games, 'steam');
+            } catch (e) {
+              console.warn('Steam sync warning:', e);
             }
-          } catch (e) {
-            console.warn('Steam sync warning:', e);
-          }
-        });
-      }
+          });
+        }
 
-      const gogInteg = integrations.find((i) => i.storefrontId === 'gog' && i.isConnected);
-      if (gogInteg) {
-        await syncJobManager.trackTask('storefront_libraries', 'GOG.com', async () => {
-          try {
-            let syncedGog = false;
-            if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-              const gogRes = await window.electronAPI.syncStore('gog', gogInteg.credentials);
-              if (Array.isArray(gogRes?.suppressedItems) && gogRes.suppressedItems.length > 0) {
-                registerSuppressedCatalogEntries(
-                  gogRes.suppressedItems as SuppressedCatalogEntry[]
-                );
+        const gogInteg = integrations.find((i) => i.storefrontId === 'gog' && i.isConnected);
+        if (gogInteg) {
+          await syncJobManager.trackTask('storefront_libraries', 'GOG.com', async () => {
+            try {
+              let syncedGog = false;
+              if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+                const gogRes = await window.electronAPI.syncStore('gog', gogInteg.credentials);
+                if (Array.isArray(gogRes?.suppressedItems) && gogRes.suppressedItems.length > 0) {
+                  registerSuppressedCatalogEntries(gogRes.suppressedItems);
+                }
+                if (gogRes?.achievements && Object.keys(gogRes.achievements).length > 0) {
+                  gogAchs = {
+                    ...gogAchs,
+                    ...(gogRes.achievements as Record<string, CachedAchievementEntry>),
+                  };
+                  cacheUserGogAchievements(gogAchs);
+                }
+                if (gogRes?.success && Array.isArray(gogRes.games)) {
+                  if (gogRes.games.length > 0 || gogRes.authoritativeComplete === true) {
+                    const verifiedGogGames = gogRes.games.map((g) => ({
+                      ...g,
+                      isVerifiedEntitlement: true,
+                    }));
+                    pendingStoreMerges.push({
+                      storefrontId: 'gog',
+                      games: verifiedGogGames,
+                      options: {
+                        authoritativeComplete: Boolean(gogRes.authoritativeComplete),
+                      },
+                    });
+                  }
+                }
+                if (gogRes?.success || gogRes?.transientOffline) {
+                  syncedGog = true;
+                }
               }
-              if (gogRes?.achievements && Object.keys(gogRes.achievements).length > 0) {
-                gogAchs = {
-                  ...gogAchs,
-                  ...(gogRes.achievements as Record<string, CachedAchievementEntry>),
-                };
-                cacheUserGogAchievements(gogAchs);
-              }
-              if (gogRes?.success && Array.isArray(gogRes.games)) {
-                if (gogRes.games.length > 0 || gogRes.authoritativeComplete === true) {
-                  const verifiedGogGames = gogRes.games.map((g) => ({
-                    ...g,
-                    isVerifiedEntitlement: true,
-                  }));
-                  currentCatalog = mergeStorefrontGames(currentCatalog, verifiedGogGames, 'gog', {
-                    authoritativeComplete: Boolean(gogRes.authoritativeComplete),
+              if (!syncedGog) {
+                const { games: gogGames, authoritativeComplete: gogAuthComplete } =
+                  await connectGogIntegration(gogInteg.credentials || {});
+                const onlyGogGames = Array.isArray(gogGames)
+                  ? gogGames.filter((g) => g.platforms?.some((p) => p.platformId === 'gog'))
+                  : [];
+                if (onlyGogGames.length > 0 || gogAuthComplete === true) {
+                  pendingStoreMerges.push({
+                    storefrontId: 'gog',
+                    games: onlyGogGames,
+                    options: {
+                      authoritativeComplete: Boolean(gogAuthComplete),
+                    },
                   });
                 }
               }
-              if (gogRes?.success || gogRes?.transientOffline) {
-                syncedGog = true;
-              }
+            } catch (e) {
+              console.warn('GOG sync warning:', e);
             }
-            if (!syncedGog) {
-              const { games: gogGames, authoritativeComplete: gogAuthComplete } =
-                await connectGogIntegration(gogInteg.credentials || {});
-              const onlyGogGames = Array.isArray(gogGames)
-                ? gogGames.filter((g) => g.platforms?.some((p) => p.platformId === 'gog'))
-                : [];
-              if (onlyGogGames.length > 0 || gogAuthComplete === true) {
-                currentCatalog = mergeStorefrontGames(currentCatalog, onlyGogGames, 'gog', {
-                  authoritativeComplete: Boolean(gogAuthComplete),
-                });
-              }
-            }
-          } catch (e) {
-            console.warn('GOG sync warning:', e);
-          }
-        });
-      }
+          });
+        }
 
-      const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
-      if (epicInteg) {
-        await syncJobManager.trackTask('storefront_libraries', 'Epic Games Store', async () => {
-          try {
-            let syncedEpic = false;
-            if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-              const epicRes = await window.electronAPI.syncStore('epic', epicInteg.credentials);
-              if (Array.isArray(epicRes?.suppressedItems) && epicRes.suppressedItems.length > 0) {
-                registerSuppressedCatalogEntries(
-                  epicRes.suppressedItems as SuppressedCatalogEntry[]
-                );
+        const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
+        if (epicInteg) {
+          await syncJobManager.trackTask('storefront_libraries', 'Epic Games Store', async () => {
+            try {
+              let syncedEpic = false;
+              if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+                const epicRes = await window.electronAPI.syncStore('epic', epicInteg.credentials);
+                if (Array.isArray(epicRes?.suppressedItems) && epicRes.suppressedItems.length > 0) {
+                  registerSuppressedCatalogEntries(epicRes.suppressedItems);
+                }
+                if (epicRes?.achievements && Object.keys(epicRes.achievements).length > 0) {
+                  epicAchs = {
+                    ...epicAchs,
+                    ...(epicRes.achievements as Record<string, CachedAchievementEntry>),
+                  };
+                  cacheUserEpicAchievements(epicAchs);
+                }
+                if (epicRes?.success && Array.isArray(epicRes.games)) {
+                  if (epicRes.games.length > 0 || epicRes.authoritativeComplete === true) {
+                    const verifiedEpicGames = epicRes.games.map((g) => ({
+                      ...g,
+                      isVerifiedEntitlement: true,
+                    }));
+                    pendingStoreMerges.push({
+                      storefrontId: 'epic',
+                      games: verifiedEpicGames,
+                      options: {
+                        authoritativeComplete: Boolean(epicRes.authoritativeComplete),
+                      },
+                    });
+                  }
+                }
+                if (epicRes?.success || epicRes?.transientOffline) {
+                  syncedEpic = true;
+                }
               }
-              if (epicRes?.achievements && Object.keys(epicRes.achievements).length > 0) {
-                epicAchs = {
-                  ...epicAchs,
-                  ...(epicRes.achievements as Record<string, CachedAchievementEntry>),
-                };
-                cacheUserEpicAchievements(epicAchs);
-              }
-              if (epicRes?.success && Array.isArray(epicRes.games)) {
-                if (epicRes.games.length > 0 || epicRes.authoritativeComplete === true) {
-                  const verifiedEpicGames = epicRes.games.map((g) => ({
-                    ...g,
-                    isVerifiedEntitlement: true,
-                  }));
-                  currentCatalog = mergeStorefrontGames(currentCatalog, verifiedEpicGames, 'epic', {
-                    authoritativeComplete: Boolean(epicRes.authoritativeComplete),
+              if (!syncedEpic) {
+                const { games: epicGames, authoritativeComplete: epicAuthComplete } =
+                  await connectEpicIntegration(epicInteg.credentials || {});
+                const onlyEpicGames = Array.isArray(epicGames)
+                  ? epicGames.filter((g) => g.platforms?.some((p) => p.platformId === 'epic'))
+                  : [];
+                if (onlyEpicGames.length > 0 || epicAuthComplete === true) {
+                  pendingStoreMerges.push({
+                    storefrontId: 'epic',
+                    games: onlyEpicGames,
+                    options: {
+                      authoritativeComplete: Boolean(epicAuthComplete),
+                    },
                   });
                 }
               }
-              if (epicRes?.success || epicRes?.transientOffline) {
-                syncedEpic = true;
-              }
+            } catch (e) {
+              console.warn('Epic sync warning:', e);
             }
-            if (!syncedEpic) {
-              const { games: epicGames, authoritativeComplete: epicAuthComplete } =
-                await connectEpicIntegration(epicInteg.credentials || {});
-              const onlyEpicGames = Array.isArray(epicGames)
-                ? epicGames.filter((g) => g.platforms?.some((p) => p.platformId === 'epic'))
-                : [];
-              if (onlyEpicGames.length > 0 || epicAuthComplete === true) {
-                currentCatalog = mergeStorefrontGames(currentCatalog, onlyEpicGames, 'epic', {
-                  authoritativeComplete: Boolean(epicAuthComplete),
-                });
-              }
-            }
-          } catch (e) {
-            console.warn('Epic sync warning:', e);
-          }
-        });
-      }
+          });
+        }
 
-      const xboxInteg = integrations.find((i) => i.storefrontId === 'xbox' && i.isConnected);
-      if (xboxInteg) {
-        await syncJobManager.trackTask('storefront_libraries', 'Xbox', async () => {
-          try {
-            let syncedXbox = false;
-            const cachedXboxProfile = loadXboxProfileState();
-            const syncMode: XboxGamePassSyncMode =
-              cachedXboxProfile?.syncMode || 'owned_and_played';
-            if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-              const xboxRes = await window.electronAPI.syncStore('xbox', {
-                ...(xboxInteg.credentials || {}),
-                syncMode,
-                forceRefresh: true,
-              });
-              if (Array.isArray(xboxRes?.suppressedItems) && xboxRes.suppressedItems.length > 0) {
-                registerSuppressedCatalogEntries(
-                  xboxRes.suppressedItems as SuppressedCatalogEntry[]
-                );
-              }
-              if (xboxRes?.achievements && Object.keys(xboxRes.achievements).length > 0) {
-                xboxAchs = {
-                  ...xboxAchs,
-                  ...(xboxRes.achievements as Record<string, CachedAchievementEntry>),
-                };
-                cacheUserXboxAchievements(xboxAchs);
-              }
-              if (
-                xboxRes?.gamertag ||
-                xboxRes?.modernGamertag ||
-                xboxRes?.xuid ||
-                xboxRes?.avatarUrl ||
-                typeof xboxRes?.gamerscore === 'number' ||
-                xboxRes?.subscription
-              ) {
-                saveXboxProfileState({
-                  connected: true,
-                  gamertag: xboxRes.gamertag || xboxInteg.accountName,
-                  modernGamertag:
-                    xboxRes.modernGamertag || xboxRes.gamertag || xboxInteg.accountName,
-                  xuid: xboxRes.xuid || xboxInteg.accountId,
-                  avatarUrl: xboxRes.avatarUrl || xboxInteg.avatarUrl,
-                  gamerscore: xboxRes.gamerscore ?? cachedXboxProfile?.gamerscore,
-                  subscription: xboxRes.subscription ?? cachedXboxProfile?.subscription ?? null,
-                  syncMode: xboxRes.syncMode || syncMode,
-                  lastSyncedAt: new Date().toISOString(),
-                });
-              }
-              if (xboxRes?.success && Array.isArray(xboxRes.games)) {
-                const verifiedXboxGames = xboxRes.games.map((g) => ({
-                  ...g,
-                  isVerifiedEntitlement: true,
-                }));
-                const xboxAuthoritativeComplete =
-                  xboxRes.authoritativeComplete !== undefined
-                    ? Boolean(xboxRes.authoritativeComplete)
-                    : true;
-                currentCatalog = mergeStorefrontGames(currentCatalog, verifiedXboxGames, 'xbox', {
-                  authoritativeComplete: xboxAuthoritativeComplete,
-                });
-                syncedXbox = true;
-              } else if (xboxRes?.transientOffline) {
-                syncedXbox = true;
-              }
-            }
-            if (!syncedXbox) {
-              const { games: xboxGames, authoritativeComplete: xboxAuthComplete } =
-                await connectXboxIntegration({
+        const xboxInteg = integrations.find((i) => i.storefrontId === 'xbox' && i.isConnected);
+        if (xboxInteg) {
+          await syncJobManager.trackTask('storefront_libraries', 'Xbox', async () => {
+            try {
+              let syncedXbox = false;
+              const cachedXboxProfile = loadXboxProfileState();
+              const syncMode: XboxGamePassSyncMode =
+                cachedXboxProfile?.syncMode || 'owned_and_played';
+              if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+                const xboxRes = await window.electronAPI.syncStore('xbox', {
                   ...(xboxInteg.credentials || {}),
                   syncMode,
                   forceRefresh: true,
                 });
-              currentCatalog = mergeStorefrontGames(currentCatalog, xboxGames, 'xbox', {
-                authoritativeComplete:
-                  xboxAuthComplete !== undefined ? Boolean(xboxAuthComplete) : true,
-              });
+                if (Array.isArray(xboxRes?.suppressedItems) && xboxRes.suppressedItems.length > 0) {
+                  registerSuppressedCatalogEntries(xboxRes.suppressedItems);
+                }
+                if (xboxRes?.achievements && Object.keys(xboxRes.achievements).length > 0) {
+                  xboxAchs = {
+                    ...xboxAchs,
+                    ...(xboxRes.achievements as Record<string, CachedAchievementEntry>),
+                  };
+                  cacheUserXboxAchievements(xboxAchs);
+                }
+                if (
+                  xboxRes?.gamertag ||
+                  xboxRes?.modernGamertag ||
+                  xboxRes?.xuid ||
+                  xboxRes?.avatarUrl ||
+                  typeof xboxRes?.gamerscore === 'number' ||
+                  xboxRes?.subscription
+                ) {
+                  saveXboxProfileState({
+                    connected: true,
+                    gamertag: xboxRes.gamertag || xboxInteg.accountName,
+                    modernGamertag:
+                      xboxRes.modernGamertag || xboxRes.gamertag || xboxInteg.accountName,
+                    xuid: xboxRes.xuid || xboxInteg.accountId,
+                    avatarUrl: xboxRes.avatarUrl || xboxInteg.avatarUrl,
+                    gamerscore: xboxRes.gamerscore ?? cachedXboxProfile?.gamerscore,
+                    subscription: xboxRes.subscription ?? cachedXboxProfile?.subscription ?? null,
+                    syncMode: xboxRes.syncMode || syncMode,
+                    lastSyncedAt: new Date().toISOString(),
+                  });
+                }
+                if (xboxRes?.success && Array.isArray(xboxRes.games)) {
+                  const verifiedXboxGames = xboxRes.games.map((g) => ({
+                    ...g,
+                    isVerifiedEntitlement: true,
+                  }));
+                  const xboxAuthoritativeComplete =
+                    xboxRes.authoritativeComplete !== undefined
+                      ? Boolean(xboxRes.authoritativeComplete)
+                      : true;
+                  pendingStoreMerges.push({
+                    storefrontId: 'xbox',
+                    games: verifiedXboxGames,
+                    options: {
+                      authoritativeComplete: xboxAuthoritativeComplete,
+                    },
+                  });
+                  syncedXbox = true;
+                } else if (xboxRes?.transientOffline) {
+                  syncedXbox = true;
+                }
+              }
+              if (!syncedXbox) {
+                const { games: xboxGames, authoritativeComplete: xboxAuthComplete } =
+                  await connectXboxIntegration({
+                    ...(xboxInteg.credentials || {}),
+                    syncMode,
+                    forceRefresh: true,
+                  });
+                pendingStoreMerges.push({
+                  storefrontId: 'xbox',
+                  games: xboxGames,
+                  options: {
+                    authoritativeComplete:
+                      xboxAuthComplete !== undefined ? Boolean(xboxAuthComplete) : true,
+                  },
+                });
+              }
+            } catch (e) {
+              console.warn('Xbox sync warning:', e);
             }
-          } catch (e) {
-            console.warn('Xbox sync warning:', e);
+          });
+        }
+
+        if (onlineLifecycleManager.isOnline()) {
+          achievementDetailService.clearCache();
+        }
+
+        const applyFetchedSyncToCatalog = (baseCatalog: CanonicalGame[]): CanonicalGame[] => {
+          let merged = baseCatalog;
+          for (const step of pendingStoreMerges) {
+            merged = mergeStorefrontGames(merged, step.games, step.storefrontId, step.options);
           }
+          merged = runIntelligentNonSteamMatchPass(merged);
+          merged = reconcileCatalogTrophiesRecords(
+            merged,
+            steamAchs,
+            gogAchs,
+            epicAchs,
+            installedSteamAppIds,
+            xboxAchs
+          );
+          return overlayLauncherInstalledState(sanitizeGameCatalog(merged));
+        };
+
+        const liveBaseAtCommit = gamesRef.current;
+        const committedCatalog = applyFetchedSyncToCatalog(liveBaseAtCommit);
+        gamesRef.current = committedCatalog;
+        setGames((latest) => {
+          const next =
+            latest === liveBaseAtCommit ? committedCatalog : applyFetchedSyncToCatalog(latest);
+          gamesRef.current = next;
+          return next;
         });
-      }
 
-      currentCatalog = runIntelligentNonSteamMatchPass(currentCatalog);
-      currentCatalog = reconcileCatalogTrophiesRecords(
-        currentCatalog,
-        steamAchs,
-        gogAchs,
-        epicAchs,
-        installedSteamAppIds,
-        xboxAchs
-      );
-      if (onlineLifecycleManager.isOnline()) {
-        achievementDetailService.clearCache();
-      }
+        const finalCatalog = gamesRef.current;
+        const steamCount = finalCatalog.filter((g) =>
+          g.platforms?.some((p) => p.platformId === 'steam')
+        ).length;
+        const gogCount = finalCatalog.filter((g) =>
+          g.platforms?.some((p) => p.platformId === 'gog')
+        ).length;
+        const epicCount = finalCatalog.filter((g) =>
+          g.platforms?.some((p) => p.platformId === 'epic')
+        ).length;
+        const xboxCount = finalCatalog.filter((g) =>
+          g.platforms?.some((p) => p.platformId === 'xbox')
+        ).length;
 
-      currentCatalog = overlayLauncherInstalledState(sanitizeGameCatalog(currentCatalog));
-
-      const steamCount = currentCatalog.filter((g) =>
-        g.platforms?.some((p) => p.platformId === 'steam')
-      ).length;
-      const gogCount = currentCatalog.filter((g) =>
-        g.platforms?.some((p) => p.platformId === 'gog')
-      ).length;
-      const epicCount = currentCatalog.filter((g) =>
-        g.platforms?.some((p) => p.platformId === 'epic')
-      ).length;
-      const xboxCount = currentCatalog.filter((g) =>
-        g.platforms?.some((p) => p.platformId === 'xbox')
-      ).length;
-
-      const refreshedXboxProfile = loadXboxProfileState();
-      const nowIso = new Date().toISOString();
-      const updatedIntegrations = integrations.map((item) => {
-        if (!item.isConnected) return item;
-        if (item.storefrontId === 'xbox') {
-          const resolvedXboxName =
-            refreshedXboxProfile?.modernGamertag ||
-            refreshedXboxProfile?.gamertag ||
-            item.accountName ||
-            'Xbox Live User';
+        const refreshedXboxProfile = loadXboxProfileState();
+        const nowIso = new Date().toISOString();
+        const latestIntegrations = loadIntegrations();
+        const updatedIntegrations = latestIntegrations.map((item) => {
+          if (!item.isConnected) return item;
+          if (item.storefrontId === 'xbox') {
+            const resolvedXboxName =
+              refreshedXboxProfile?.modernGamertag ||
+              refreshedXboxProfile?.gamertag ||
+              item.accountName ||
+              'Xbox Live User';
+            return {
+              ...item,
+              accountName: resolvedXboxName,
+              avatarUrl: refreshedXboxProfile?.avatarUrl || item.avatarUrl,
+              gamesCount: xboxCount,
+              lastSyncedAt: nowIso,
+              statusMessage: formatXboxIntegrationStatusMessage(
+                resolvedXboxName,
+                xboxCount,
+                refreshedXboxProfile?.subscription
+              ),
+            };
+          }
+          let count = item.gamesCount;
+          if (item.storefrontId === 'steam') count = steamCount;
+          else if (item.storefrontId === 'gog') count = gogCount;
+          else if (item.storefrontId === 'epic') count = epicCount;
           return {
             ...item,
-            accountName: resolvedXboxName,
-            avatarUrl: refreshedXboxProfile?.avatarUrl || item.avatarUrl,
-            gamesCount: xboxCount,
+            gamesCount: count,
             lastSyncedAt: nowIso,
-            statusMessage: formatXboxIntegrationStatusMessage(
-              resolvedXboxName,
-              xboxCount,
-              refreshedXboxProfile?.subscription
-            ),
+            statusMessage: `Connected as ${item.accountName || 'User'} (${count} ${item.name} titles synced)`,
           };
-        }
-        let count = item.gamesCount;
-        if (item.storefrontId === 'steam') count = steamCount;
-        else if (item.storefrontId === 'gog') count = gogCount;
-        else if (item.storefrontId === 'epic') count = epicCount;
-        return {
-          ...item,
-          gamesCount: count,
-          lastSyncedAt: nowIso,
-          statusMessage: `Connected as ${item.accountName || 'User'} (${count} ${item.name} titles synced)`,
-        };
-      });
-      saveIntegrations(updatedIntegrations);
-
-      const newGamesDetected = Math.max(0, currentCatalog.length - initialCount);
-      gamesRef.current = currentCatalog;
-      setGames(currentCatalog);
-      saveCurrentCatalog(currentCatalog);
-      setGameRefreshKey((k) => k + 1);
-
-      if (newGamesDetected > 0) {
-        showSyncNotice(
-          `Sync complete! Detected ${newGamesDetected} newly added title${
-            newGamesDetected === 1 ? '' : 's'
-          } across your storefronts! (${currentCatalog.length} total titles)`,
-          5000
-        );
-      } else {
-        const connectedStores = updatedIntegrations.filter((i) => i.isConnected);
-        const storeParts = connectedStores.map((i) => {
-          if (i.storefrontId === 'steam') return `${steamCount} Steam`;
-          if (i.storefrontId === 'gog') return `${gogCount} GOG`;
-          if (i.storefrontId === 'epic') return `${epicCount} Epic`;
-          if (i.storefrontId === 'xbox') return `${xboxCount} Xbox`;
-          return `${i.gamesCount} ${i.name}`;
         });
-        showSyncNotice(
-          `All connected storefronts up to date: ${storeParts.join(
-            ', '
-          )} titles (trophies & playtime refreshed)`,
-          5000
-        );
+        saveIntegrations(updatedIntegrations);
+
+        let newGamesDetected = 0;
+        for (const g of finalCatalog) {
+          if (!initialGameIds.has(g.id)) {
+            newGamesDetected++;
+          }
+        }
+        saveCurrentCatalog(finalCatalog);
+        setGameRefreshKey((k) => k + 1);
+
+        if (newGamesDetected > 0) {
+          showSyncNotice(
+            `Sync complete! Detected ${newGamesDetected} newly added title${
+              newGamesDetected === 1 ? '' : 's'
+            } across your storefronts! (${finalCatalog.length} total titles)`,
+            5000
+          );
+        } else {
+          const connectedStores = updatedIntegrations.filter((i) => i.isConnected);
+          const storeParts = connectedStores.map((i) => {
+            if (i.storefrontId === 'steam') return `${steamCount} Steam`;
+            if (i.storefrontId === 'gog') return `${gogCount} GOG`;
+            if (i.storefrontId === 'epic') return `${epicCount} Epic`;
+            if (i.storefrontId === 'xbox') return `${xboxCount} Xbox`;
+            return `${i.gamesCount} ${i.name}`;
+          });
+          showSyncNotice(
+            `All connected storefronts up to date: ${storeParts.join(
+              ', '
+            )} titles (trophies & playtime refreshed)`,
+            5000
+          );
+        }
+      } finally {
+        syncJobManager.endPriorityScope(priorityScopeId);
       }
     } catch (err: unknown) {
       showSyncNotice(
@@ -474,7 +534,9 @@ export function useManualLibrarySyncActions({
       );
     } finally {
       setIsSyncing(false);
-      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      if (typeof window !== 'undefined') {
+        window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      }
     }
   }, [gamesRef, overlayLauncherInstalledState, setGameRefreshKey, setGames, showSyncNotice]);
 
@@ -502,178 +564,215 @@ export function useManualLibrarySyncActions({
         import('../services/achievements/achievementDetailService'),
       ]);
 
-      const integrations = loadIntegrations();
-      const steamAchs: Record<number, CachedAchievementEntry> = {};
-      const gogAchs: Record<string, CachedAchievementEntry> = {};
-      const epicAchs: Record<string, CachedAchievementEntry> = {};
-      const xboxAchs: Record<string, CachedAchievementEntry> = {};
+      const priorityScopeId = syncJobManager.beginPriorityScope('Syncing Storefront Trophies');
+      try {
+        const integrations = loadIntegrations();
+        const steamAchs: Record<number, CachedAchievementEntry> = {};
+        const gogAchs: Record<string, CachedAchievementEntry> = {};
+        const epicAchs: Record<string, CachedAchievementEntry> = {};
+        const xboxAchs: Record<string, CachedAchievementEntry> = {};
 
-      await syncJobManager.startTrophySync(5, async (updateProgress, checkCancelled) => {
-        updateProgress(0, 5, 'Scanning Local Steam Trophy Cache');
-        try {
-          const localScanned = await scanLocalSteamAchievements();
-          if (localScanned && Object.keys(localScanned).length > 0) {
-            Object.assign(steamAchs, localScanned);
-            cacheUserSteamAchievements(steamAchs);
-          }
-        } catch {}
-        if (checkCancelled()) return;
+        await syncJobManager.startTrophySync(5, async (updateProgress, checkCancelled) => {
+          updateProgress(0, 5, 'Scanning Local Steam Trophy Cache');
+          try {
+            const localScanned = await scanLocalSteamAchievements();
+            if (localScanned && Object.keys(localScanned).length > 0) {
+              Object.assign(steamAchs, localScanned);
+              cacheUserSteamAchievements(steamAchs);
+            }
+          } catch {}
+          if (checkCancelled()) return;
 
-        updateProgress(1, 5, 'Syncing Steam Cloud Achievements');
-        try {
-          const liveSteam = await steamAchievementsService.syncUserLibraryAchievements(
-            gamesRef.current,
-            (_done, _total, currentTitle) => {
-              if (!checkCancelled()) {
-                updateProgress(
-                  1,
-                  5,
-                  currentTitle ? `Steam: ${currentTitle}` : 'Syncing Steam Cloud Achievements'
-                );
+          updateProgress(1, 5, 'Syncing Steam Cloud Achievements');
+          try {
+            const liveSteam = await steamAchievementsService.syncUserLibraryAchievements(
+              gamesRef.current,
+              (_done, _total, currentTitle) => {
+                if (!checkCancelled()) {
+                  updateProgress(
+                    1,
+                    5,
+                    currentTitle ? `Steam: ${currentTitle}` : 'Syncing Steam Cloud Achievements'
+                  );
+                }
+              },
+              {
+                forceRefresh: true,
+                priority: RequestPriority.P1_VIEWPORT,
+                onBatchUpdated: (partialSteam) => {
+                  Object.assign(steamAchs, partialSteam);
+                  cacheUserSteamAchievements(steamAchs);
+                  const basePartial = gamesRef.current;
+                  const reconciledPartial = reconcileCatalogTrophiesRecords(
+                    basePartial,
+                    steamAchs,
+                    gogAchs,
+                    epicAchs,
+                    null,
+                    xboxAchs
+                  );
+                  gamesRef.current = reconciledPartial;
+                  setGames((latest) => {
+                    const next =
+                      latest === basePartial
+                        ? reconciledPartial
+                        : reconcileCatalogTrophiesRecords(
+                            latest,
+                            steamAchs,
+                            gogAchs,
+                            epicAchs,
+                            null,
+                            xboxAchs
+                          );
+                    gamesRef.current = next;
+                    return next;
+                  });
+                },
               }
-            },
-            {
-              forceRefresh: true,
-              onBatchUpdated: (partialSteam) => {
-                Object.assign(steamAchs, partialSteam);
-                cacheUserSteamAchievements(steamAchs);
-                const reconciledPartial = reconcileCatalogTrophiesRecords(
-                  gamesRef.current,
+            );
+            if (liveSteam && Object.keys(liveSteam).length > 0) {
+              Object.assign(steamAchs, liveSteam);
+              cacheUserSteamAchievements(steamAchs);
+            }
+          } catch (err) {
+            console.warn('Steam trophy sync warning:', err);
+          }
+          if (checkCancelled()) return;
+
+          updateProgress(2, 5, 'Syncing GOG Galaxy Achievements');
+          try {
+            const gogInteg = integrations.find((i) => i.storefrontId === 'gog' && i.isConnected);
+            const gogUsername = gogInteg?.credentials?.gogUsername || gogInteg?.accountName;
+            const gogToken = gogInteg?.credentials?.gogToken;
+            const gogUserId = gogInteg?.accountId;
+            const { achievements: fetchedGog } = await gogIntegration.fetchUserAchievementsAndStats(
+              gogUsername || '',
+              gogToken,
+              gogUserId
+            );
+            if (fetchedGog && Object.keys(fetchedGog).length > 0) {
+              Object.assign(gogAchs, fetchedGog);
+              cacheUserGogAchievements(gogAchs);
+            } else if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+              const gogRes = await window.electronAPI.syncStore('gog', gogInteg?.credentials);
+              if (gogRes?.achievements && Object.keys(gogRes.achievements).length > 0) {
+                Object.assign(gogAchs, gogRes.achievements);
+                cacheUserGogAchievements(gogAchs);
+              }
+            }
+          } catch (err) {
+            console.warn('GOG trophy sync warning:', err);
+          }
+          if (checkCancelled()) return;
+
+          updateProgress(3, 5, 'Syncing Epic Games Store Trophies');
+          try {
+            const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
+            const epicAccountId =
+              epicInteg?.credentials?.epicAccountId || epicInteg?.accountId || '';
+            const epicToken = epicInteg?.credentials?.epicToken;
+            const fetchedEpic = await epicIntegration.fetchUserAchievements(
+              epicAccountId,
+              epicToken
+            );
+            if (fetchedEpic && Object.keys(fetchedEpic).length > 0) {
+              Object.assign(epicAchs, fetchedEpic);
+              cacheUserEpicAchievements(epicAchs);
+            } else if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+              const epicRes = await window.electronAPI.syncStore('epic', epicInteg?.credentials);
+              if (epicRes?.achievements && Object.keys(epicRes.achievements).length > 0) {
+                Object.assign(epicAchs, epicRes.achievements);
+                cacheUserEpicAchievements(epicAchs);
+              }
+            }
+          } catch (err) {
+            console.warn('Epic trophy sync warning:', err);
+          }
+          if (checkCancelled()) return;
+
+          updateProgress(4, 5, 'Syncing Xbox Live Achievements & Gamerscore');
+          try {
+            const xboxInteg = integrations.find((i) => i.storefrontId === 'xbox' && i.isConnected);
+            const xboxPfns = Array.from(
+              new Set(
+                gamesRef.current
+                  .flatMap((g) => g.platforms)
+                  .filter((p) => p.platformId === 'xbox' && Boolean(p.packageFamilyName))
+                  .map((p) => p.packageFamilyName!)
+              )
+            );
+            const fetchedXbox = await xboxIntegration.fetchUserAchievements(
+              xboxPfns.length > 0 ? xboxPfns : undefined
+            );
+            if (fetchedXbox && Object.keys(fetchedXbox).length > 0) {
+              Object.assign(xboxAchs, fetchedXbox);
+              cacheUserXboxAchievements(xboxAchs);
+            } else if (xboxInteg && typeof window !== 'undefined' && window.electronAPI?.syncStore) {
+              const cachedProfile = loadXboxProfileState();
+              const xboxRes = await window.electronAPI.syncStore('xbox', {
+                ...(xboxInteg.credentials || {}),
+                syncMode: cachedProfile?.syncMode || 'owned_and_played',
+              });
+              if (xboxRes?.achievements && Object.keys(xboxRes.achievements).length > 0) {
+                Object.assign(xboxAchs, xboxRes.achievements);
+                cacheUserXboxAchievements(xboxAchs);
+              }
+            }
+          } catch (err) {
+            console.warn('Xbox trophy sync warning:', err);
+          }
+
+          updateProgress(5, 5, 'Reconciling Storefront Trophies');
+        });
+
+        if (onlineLifecycleManager.isOnline()) {
+          achievementDetailService.clearCache();
+        }
+
+        const baseAtCommit = gamesRef.current;
+        const reconciled = reconcileCatalogTrophiesRecords(
+          baseAtCommit,
+          steamAchs,
+          gogAchs,
+          epicAchs,
+          null,
+          xboxAchs
+        );
+        gamesRef.current = reconciled;
+        setGames((latest) => {
+          const next =
+            latest === baseAtCommit
+              ? reconciled
+              : reconcileCatalogTrophiesRecords(
+                  latest,
                   steamAchs,
                   gogAchs,
                   epicAchs,
                   null,
                   xboxAchs
                 );
-                gamesRef.current = reconciledPartial;
-                setGames(reconciledPartial);
-              },
-            }
-          );
-          if (liveSteam && Object.keys(liveSteam).length > 0) {
-            Object.assign(steamAchs, liveSteam);
-            cacheUserSteamAchievements(steamAchs);
-          }
-        } catch (err) {
-          console.warn('Steam trophy sync warning:', err);
-        }
-        if (checkCancelled()) return;
+          gamesRef.current = next;
+          return next;
+        });
 
-        updateProgress(2, 5, 'Syncing GOG Galaxy Achievements');
-        try {
-          const gogInteg = integrations.find((i) => i.storefrontId === 'gog' && i.isConnected);
-          const gogUsername = gogInteg?.credentials?.gogUsername || gogInteg?.accountName;
-          const gogToken = gogInteg?.credentials?.gogToken;
-          const gogUserId = gogInteg?.accountId;
-          const { achievements: fetchedGog } = await gogIntegration.fetchUserAchievementsAndStats(
-            gogUsername || '',
-            gogToken,
-            gogUserId
-          );
-          if (fetchedGog && Object.keys(fetchedGog).length > 0) {
-            Object.assign(gogAchs, fetchedGog);
-            cacheUserGogAchievements(gogAchs);
-          } else if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-            const gogRes = await window.electronAPI.syncStore('gog', gogInteg?.credentials);
-            if (gogRes?.achievements && Object.keys(gogRes.achievements).length > 0) {
-              Object.assign(gogAchs, gogRes.achievements);
-              cacheUserGogAchievements(gogAchs);
-            }
-          }
-        } catch (err) {
-          console.warn('GOG trophy sync warning:', err);
-        }
-        if (checkCancelled()) return;
+        const gamesWithTrophies = gamesRef.current.filter((g) =>
+          g.platforms.some(
+            (p) =>
+              p.achievements &&
+              (p.achievements.unlocked > 0 ||
+                p.achievements.total > 0 ||
+                (p.achievements.gamerscore?.earned ?? 0) > 0)
+          )
+        ).length;
 
-        updateProgress(3, 5, 'Syncing Epic Games Store Trophies');
-        try {
-          const epicInteg = integrations.find((i) => i.storefrontId === 'epic' && i.isConnected);
-          const epicAccountId =
-            epicInteg?.credentials?.epicAccountId || epicInteg?.accountId || '';
-          const epicToken = epicInteg?.credentials?.epicToken;
-          const fetchedEpic = await epicIntegration.fetchUserAchievements(
-            epicAccountId,
-            epicToken
-          );
-          if (fetchedEpic && Object.keys(fetchedEpic).length > 0) {
-            Object.assign(epicAchs, fetchedEpic);
-            cacheUserEpicAchievements(epicAchs);
-          } else if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-            const epicRes = await window.electronAPI.syncStore('epic', epicInteg?.credentials);
-            if (epicRes?.achievements && Object.keys(epicRes.achievements).length > 0) {
-              Object.assign(epicAchs, epicRes.achievements);
-              cacheUserEpicAchievements(epicAchs);
-            }
-          }
-        } catch (err) {
-          console.warn('Epic trophy sync warning:', err);
-        }
-        if (checkCancelled()) return;
-
-        updateProgress(4, 5, 'Syncing Xbox Live Achievements & Gamerscore');
-        try {
-          const xboxInteg = integrations.find((i) => i.storefrontId === 'xbox' && i.isConnected);
-          const xboxPfns = Array.from(
-            new Set(
-              gamesRef.current
-                .flatMap((g) => g.platforms)
-                .filter((p) => p.platformId === 'xbox' && Boolean(p.packageFamilyName))
-                .map((p) => p.packageFamilyName!)
-            )
-          );
-          const fetchedXbox = await xboxIntegration.fetchUserAchievements(
-            xboxPfns.length > 0 ? xboxPfns : undefined
-          );
-          if (fetchedXbox && Object.keys(fetchedXbox).length > 0) {
-            Object.assign(xboxAchs, fetchedXbox);
-            cacheUserXboxAchievements(xboxAchs);
-          } else if (xboxInteg && typeof window !== 'undefined' && window.electronAPI?.syncStore) {
-            const cachedProfile = loadXboxProfileState();
-            const xboxRes = await window.electronAPI.syncStore('xbox', {
-              ...(xboxInteg.credentials || {}),
-              syncMode: cachedProfile?.syncMode || 'owned_and_played',
-            });
-            if (xboxRes?.achievements && Object.keys(xboxRes.achievements).length > 0) {
-              Object.assign(xboxAchs, xboxRes.achievements);
-              cacheUserXboxAchievements(xboxAchs);
-            }
-          }
-        } catch (err) {
-          console.warn('Xbox trophy sync warning:', err);
-        }
-
-        updateProgress(5, 5, 'Reconciling Storefront Trophies');
-      });
-
-      if (onlineLifecycleManager.isOnline()) {
-        achievementDetailService.clearCache();
+        setGameRefreshKey((k) => k + 1);
+        showSyncNotice(
+          `Trophies synced across Steam, GOG, Epic & Xbox! (${gamesWithTrophies} titles with achievement data updated)`,
+          5000
+        );
+      } finally {
+        syncJobManager.endPriorityScope(priorityScopeId);
       }
-
-      const reconciled = reconcileCatalogTrophiesRecords(
-        gamesRef.current,
-        steamAchs,
-        gogAchs,
-        epicAchs,
-        null,
-        xboxAchs
-      );
-      const gamesWithTrophies = reconciled.filter((g) =>
-        g.platforms.some(
-          (p) =>
-            p.achievements &&
-            (p.achievements.unlocked > 0 ||
-              p.achievements.total > 0 ||
-              (p.achievements.gamerscore?.earned ?? 0) > 0)
-        )
-      ).length;
-      gamesRef.current = reconciled;
-      setGames(reconciled);
-
-      setGameRefreshKey((k) => k + 1);
-      showSyncNotice(
-        `Trophies synced across Steam, GOG, Epic & Xbox! (${gamesWithTrophies} titles with achievement data updated)`,
-        5000
-      );
     } catch (err: unknown) {
       showSyncNotice(
         `Trophy sync notice: ${getErrorMessage(err, 'Finished syncing trophies')}`,
@@ -681,7 +780,9 @@ export function useManualLibrarySyncActions({
       );
     } finally {
       setIsSyncingTrophies(false);
-      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      if (typeof window !== 'undefined') {
+        window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      }
     }
   }, [gamesRef, isSyncingTrophies, setGameRefreshKey, setGames, showSyncNotice]);
 
@@ -814,7 +915,12 @@ export function useManualLibrarySyncActions({
           const [refreshed, browseAssets, liveAchs] = await Promise.all([
             steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE),
             steamApi.fetchStoreBrowseAssets(targetAppId),
-            steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
+            steamAchievementsService.fetchPlayerGameAchievements(
+              targetAppId,
+              undefined,
+              undefined,
+              RequestPriority.P0_INTERACTIVE
+            ),
           ]);
 
           let resolvedVerticalCover =
@@ -967,7 +1073,9 @@ export function useManualLibrarySyncActions({
         mediaFlushTimer = null;
       }
       setIsSyncingAllMedia(false);
-      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      if (typeof window !== 'undefined') {
+        window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      }
     }
   }, [games, gamesRef, isSyncingAllMedia, setGames, setIsSyncingAllMedia, showSyncNotice]);
 
@@ -997,7 +1105,9 @@ export function useManualLibrarySyncActions({
       showSyncNotice('Finished refreshing available critic scores.', 5000);
     } finally {
       setIsSyncingScores(false);
-      window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      if (typeof window !== 'undefined') {
+        window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+      }
     }
   }, [games, isSyncingScores, showSyncNotice]);
 

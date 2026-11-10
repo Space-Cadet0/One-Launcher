@@ -96,7 +96,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
     volatile const char *marker_ref = g_onelauncher_appnotify_marker;
-    (void)marker_ref;
+    if (!marker_ref || !marker_ref[0]) return FALSE;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
     }

@@ -201,12 +201,6 @@ export function extractStaticHydrationAssets(
   return assets;
 }
 
-interface GlobalSchedulerHost {
-  scheduler?: {
-    yield?: () => Promise<void>;
-  };
-}
-
 type FavoritableGame = CanonicalGame & {
   isFavorite?: boolean;
   favorited?: boolean;
@@ -233,9 +227,10 @@ const MEDIA_SYNC_DOMAINS = [
 const MAX_RATE_LIMIT_RETRIES = 3;
 
 async function yieldToMainThread(): Promise<void> {
-  const host = globalThis as unknown as GlobalSchedulerHost;
-  if (typeof globalThis !== 'undefined' && typeof host.scheduler?.yield === 'function') {
-    await host.scheduler.yield();
+  const sched: unknown =
+    typeof globalThis !== 'undefined' ? Reflect.get(globalThis, 'scheduler') : undefined;
+  if (sched && typeof sched === 'object' && 'yield' in sched && typeof sched.yield === 'function') {
+    await sched.yield();
   } else {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }

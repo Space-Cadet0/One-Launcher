@@ -1,7 +1,40 @@
 'use strict';
 
+const net = require('node:net');
 const { isRejectedVideoUrl } = require('./offlineVaultService.cjs');
+const { isPrivateOrLoopbackIp } = require('./securityAndPathUtils.cjs');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
+
+function isSafeHydrationHttpsUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+    return false;
+  }
+  const host = String(parsed.hostname || '')
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase()
+    .replace(/\.$/, '');
+  if (
+    !host ||
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    (net.isIP(host) === 0 && !host.includes('.'))
+  ) {
+    return false;
+  }
+  if (net.isIP(host) !== 0 && isPrivateOrLoopbackIp(host)) {
+    return false;
+  }
+  return true;
+}
 
 const MAX_P1_HYDRATION_LRU_GAMES = 40;
 const RECENTLY_PLAYED_P0_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
@@ -101,20 +134,20 @@ function extractInlineStaticImagesAndPosters(html) {
   const inlineImagesSet = new Set();
   const inlinePostersSet = new Set();
 
-  const imgRegex = /<img\b[^>]*?\bsrc=["'](https?:\/\/[^"'\s>]+)["'][^>]*>/gi;
+  const imgRegex = /<img\b[^>]*?\bsrc=["'](https:\/\/[^"'\s>]+)["'][^>]*>/gi;
   let match;
   while ((match = imgRegex.exec(html)) !== null) {
     const url = match[1].trim();
-    if (url && !isRejectedVideoUrl(url)) {
+    if (url && isSafeHydrationHttpsUrl(url) && !isRejectedVideoUrl(url)) {
       inlineImagesSet.add(url);
       if (inlineImagesSet.size >= 8) break;
     }
   }
 
-  const videoPosterRegex = /<video\b[^>]*?\bposter=["'](https?:\/\/[^"'\s>]+)["'][^>]*>/gi;
+  const videoPosterRegex = /<video\b[^>]*?\bposter=["'](https:\/\/[^"'\s>]+)["'][^>]*>/gi;
   while ((match = videoPosterRegex.exec(html)) !== null) {
     const posterUrl = match[1].trim();
-    if (posterUrl && !isRejectedVideoUrl(posterUrl)) {
+    if (posterUrl && isSafeHydrationHttpsUrl(posterUrl) && !isRejectedVideoUrl(posterUrl)) {
       inlinePostersSet.add(posterUrl);
       if (inlinePostersSet.size >= 4) break;
     }

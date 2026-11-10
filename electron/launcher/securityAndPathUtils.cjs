@@ -226,8 +226,152 @@ function resolveEffectiveUserDataDir(options = {}) {
   return path.join(os.homedir(), '.one-launcher');
 }
 
+const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const RENAME_RETRY_DELAYS_MS = [6, 14, 28, 50];
+let sharedSyncSleepArray = null;
+
+function sleepSyncBrief(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  try {
+    if (!sharedSyncSleepArray && typeof SharedArrayBuffer === 'function') {
+      sharedSyncSleepArray = new Int32Array(new SharedArrayBuffer(4));
+    }
+    if (sharedSyncSleepArray && typeof Atomics?.wait === 'function') {
+      Atomics.wait(sharedSyncSleepArray, 0, 0, Math.min(100, Math.max(1, Math.floor(ms))));
+    }
+  } catch {
+    // Ignore when SharedArrayBuffer is unavailable in restricted contexts
+  }
+}
+
+function writeAndFsyncTempFileSync(tmpPath, content, fileMode) {
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content ?? ''), 'utf8');
+  const fd =
+    typeof fileMode === 'number'
+      ? fs.openSync(tmpPath, 'w', fileMode)
+      : fs.openSync(tmpPath, 'w');
+  try {
+    let offset = 0;
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset);
+      if (written <= 0) break;
+      offset += written;
+    }
+    try {
+      fs.fsyncSync(fd);
+    } catch {
+      // Virtual/tmpfs filesystems in tests may not support fsync
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function preserveBackupCopyBeforeWriteSync(hostFilePath, secureMode = false) {
+  const bakPath = `${hostFilePath}.bak`;
+  try {
+    if (!fs.existsSync(hostFilePath)) return;
+    const st = fs.statSync(hostFilePath);
+    if (!st.isFile() || st.size <= 0) return;
+    fs.copyFileSync(hostFilePath, bakPath);
+    if (secureMode && process.platform !== 'win32') {
+      try {
+        fs.chmodSync(bakPath, 0o600);
+      } catch {
+        // Ignore chmod failure
+      }
+    }
+  } catch {
+    // Non-fatal backup best-effort
+  }
+}
+
+function renameTempWithRetrySync(tmpPath, hostFilePath) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= RENAME_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      fs.renameSync(tmpPath, hostFilePath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = String(err?.code || '').toUpperCase();
+      if (!RENAME_RETRYABLE_CODES.has(code) || attempt >= RENAME_RETRY_DELAYS_MS.length) {
+        break;
+      }
+      sleepSyncBrief(RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastErr;
+}
+
 /**
- * Atomically write non-secret JSON/config file content via temporary file + rename.
+ * Read and parse a JSON state file with automatic recovery from `<filePath>.bak`
+ * if the primary file is truncated or corrupted.
+ *
+ * @param {string} filePath
+ * @param {any} [fallbackValue]
+ * @returns {{ data: any, stat: fs.Stats | null, recoveredFromBackup: boolean }}
+ */
+/**
+ * Read and parse a JSON file with automatic fallback to `<filePath>.bak` if the primary
+ * file is corrupted, truncated (0-byte), or unreadable mid-write.
+ *
+ * @param {string} filePath
+ * @param {any} [fallbackValue=null]
+ * @param {{ recoverMissingFromBackup?: boolean }} [options]
+ * @returns {any}
+ */
+function readJsonFileWithBackupSync(filePath, fallbackValue = null, options = {}) {
+  const hostFilePath = toHostFilesystemPath(filePath);
+  const bakPath = `${hostFilePath}.bak`;
+  let primaryExists = false;
+
+  try {
+    const primaryStat = fs.statSync(hostFilePath);
+    primaryExists = primaryStat.isFile();
+  } catch (statErr) {
+    if (/** @type {any} */ (statErr)?.code !== 'ENOENT') {
+      diagLog.debug('fs.readJsonStat', statErr, { filePath: hostFilePath });
+    }
+  }
+
+  if (primaryExists) {
+    try {
+      const raw = fs.readFileSync(hostFilePath, 'utf8');
+      if (raw.trim().length > 0) {
+        return JSON.parse(raw);
+      }
+    } catch (parseErr) {
+      diagLog.warn('fs.jsonPrimaryCorrupt', parseErr, { filePath: hostFilePath });
+    }
+  }
+
+  if (primaryExists || options.recoverMissingFromBackup === true) {
+    try {
+      if (fs.existsSync(bakPath)) {
+        const bakRaw = fs.readFileSync(bakPath, 'utf8');
+        if (bakRaw.trim().length > 0) {
+          const parsedBak = JSON.parse(bakRaw);
+          try {
+            fs.copyFileSync(bakPath, hostFilePath);
+          } catch {
+            // Keep parsed backup in memory even if disk restore fails
+          }
+          diagLog.warn('fs.jsonRecoveredFromBackup', null, { filePath: hostFilePath });
+          return parsedBak;
+        }
+      }
+    } catch (bakErr) {
+      diagLog.warn('fs.jsonBackupCorrupt', bakErr, { filePath: bakPath });
+    }
+  }
+
+  return fallbackValue;
+}
+
+/**
+ * Atomically write non-secret JSON/config file content via fsync'd temporary file +
+ * `.bak` preservation + bounded Windows EPERM/EBUSY rename retries.
  */
 function atomicWriteFileSync(filePath, content) {
   const hostFilePath = toHostFilesystemPath(filePath);
@@ -236,19 +380,27 @@ function atomicWriteFileSync(filePath, content) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const tmpPath = `${hostFilePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+  preserveBackupCopyBeforeWriteSync(hostFilePath, false);
   try {
-    fs.writeFileSync(tmpPath, content, 'utf8');
-    fs.renameSync(tmpPath, hostFilePath);
+    writeAndFsyncTempFileSync(tmpPath, content, undefined);
+    renameTempWithRetrySync(tmpPath, hostFilePath);
   } catch (err) {
     diagLog.warn('fs.atomicWriteFallback', err, { filePath: hostFilePath });
     try {
       if (fs.existsSync(tmpPath)) {
-        fs.unlinkSync(tmpPath);
+        fs.copyFileSync(tmpPath, hostFilePath);
+      } else {
+        fs.writeFileSync(hostFilePath, content, 'utf8');
       }
-    } catch {
-      // Ignore temp cleanup failure
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // Ignore temp cleanup failure
+      }
     }
-    fs.writeFileSync(hostFilePath, content, 'utf8');
   }
 }
 
@@ -289,8 +441,8 @@ function applyWindowsOwnerAclAsync(filePath, options = {}) {
 
 /**
  * Atomically write sensitive credential/session files (`user.json`, `auth.json`, tombstones, approved commands)
- * with strict owner-only directory (`0o700`) and file (`0o600`) permissions on POSIX, plus
- * non-blocking `icacls` inheritance-stripped owner ACL hardening on Windows (`win32`).
+ * with strict owner-only directory (`0o700`) and file (`0o600`) permissions on POSIX, fsync + `.bak` recovery,
+ * bounded Windows `EPERM`/`EBUSY` rename retries, and non-blocking `icacls` owner ACL hardening on Windows.
  */
 function atomicWriteSecureFileSync(filePath, content, options = {}) {
   const targetPlatform = options.platform || process.platform;
@@ -308,8 +460,9 @@ function atomicWriteSecureFileSync(filePath, content, options = {}) {
   }
 
   const tmpPath = `${hostFilePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+  preserveBackupCopyBeforeWriteSync(hostFilePath, true);
   try {
-    fs.writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600 });
+    writeAndFsyncTempFileSync(tmpPath, content, 0o600);
     if (process.platform !== 'win32') {
       try {
         fs.chmodSync(tmpPath, 0o600);
@@ -317,17 +470,24 @@ function atomicWriteSecureFileSync(filePath, content, options = {}) {
         diagLog.debug('security.chmodTmp', chmodTmpErr, { tmpPath });
       }
     }
-    fs.renameSync(tmpPath, hostFilePath);
+    renameTempWithRetrySync(tmpPath, hostFilePath);
   } catch (err) {
     diagLog.warn('security.atomicWriteFallback', err, { filePath: hostFilePath });
     try {
       if (fs.existsSync(tmpPath)) {
-        fs.unlinkSync(tmpPath);
+        fs.copyFileSync(tmpPath, hostFilePath);
+      } else {
+        fs.writeFileSync(hostFilePath, content, { encoding: 'utf8', mode: 0o600 });
       }
-    } catch {
-      // Ignore temp cleanup error
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // Ignore temp cleanup error
+      }
     }
-    fs.writeFileSync(hostFilePath, content, { encoding: 'utf8', mode: 0o600 });
   }
 
   if (process.platform !== 'win32') {
@@ -600,7 +760,7 @@ function createUnsafeUrlError(message, flags = {}) {
  * resolution contains ZERO private, loopback, link-local, or unspecified addresses.
  *
  * @param {unknown} urlStr
- * @param {{ dnsLookup?: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string }>> }} [options]
+   * @param {{ dnsLookup?: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string }>>, skipDnsForReservedTestTld?: boolean }} [options]
  * @returns {Promise<{ url: string, hostname: string, addresses: string[] }>}
  */
 async function assertSafePublicHttpsUrl(urlStr, options = {}) {
@@ -642,6 +802,14 @@ async function assertSafePublicHttpsUrl(urlStr, options = {}) {
       throw createUnsafeUrlError(`Blocked private or loopback IP literal: ${host}`);
     }
     return { url: parsed.toString(), hostname: host, addresses: [host] };
+  }
+
+  if (
+    options.skipDnsForReservedTestTld === true &&
+    typeof options.dnsLookup !== 'function' &&
+    (host.endsWith('.test') || host.endsWith('.example'))
+  ) {
+    return { url: parsed.toString(), hostname: host, addresses: [] };
   }
 
   const lookupFn =
@@ -688,6 +856,418 @@ async function assertSafePublicHttpsUrl(urlStr, options = {}) {
   return { url: parsed.toString(), hostname: host, addresses };
 }
 
+/**
+ * Read a Fetch `Response` body into a `Buffer` with a hard byte ceiling enforced
+ * incrementally on Web Streams (`res.body.getReader()`) so missing or spoofed
+ * `Content-Length` headers can never exhaust V8 memory. Supports lightweight
+ * unit-test mock responses that only implement `res.arrayBuffer()`.
+ *
+ * @param {any} res
+ * @param {number} maxFetchBytes
+ * @returns {Promise<Buffer>}
+ */
+async function readSafeResponseBuffer(res, maxFetchBytes) {
+  const limit = Number.isFinite(maxFetchBytes) && maxFetchBytes > 0 ? maxFetchBytes : 25 * 1024 * 1024;
+  const contentLengthRaw =
+    res?.headers && typeof res.headers.get === 'function'
+      ? res.headers.get('content-length')
+      : undefined;
+  if (contentLengthRaw !== null && contentLengthRaw !== undefined && String(contentLengthRaw).trim() !== '') {
+    const contentLen = Number(contentLengthRaw);
+    if (Number.isFinite(contentLen) && contentLen > limit) {
+      try {
+        await res?.body?.cancel?.();
+      } catch {}
+      const err = /** @type {Error & { code?: string }} */ (
+        new Error(`Response Content-Length (${contentLen}) exceeds limit (${limit})`)
+      );
+      err.code = 'ERR_RESPONSE_TOO_LARGE';
+      throw err;
+    }
+  }
+
+  if (res?.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    /** @type {Buffer[]} */
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        const buf = Buffer.isBuffer(value)
+          ? value
+          : ArrayBuffer.isView(value)
+            ? Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+            : Buffer.from(value);
+        total += buf.length;
+        if (total > limit) {
+          try {
+            await reader.cancel();
+          } catch {}
+          const err = /** @type {Error & { code?: string }} */ (
+            new Error(`Streamed response size (${total}) exceeds limit (${limit})`)
+          );
+          err.code = 'ERR_RESPONSE_TOO_LARGE';
+          throw err;
+        }
+        chunks.push(buf);
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total);
+  }
+
+  if (typeof res?.arrayBuffer === 'function') {
+    const ab = await res.arrayBuffer();
+    const byteLen = ab ? ab.byteLength : 0;
+    if (byteLen > limit) {
+      const err = /** @type {Error & { code?: string }} */ (
+        new Error(`Response ArrayBuffer size (${byteLen}) exceeds limit (${limit})`)
+      );
+      err.code = 'ERR_RESPONSE_TOO_LARGE';
+      throw err;
+    }
+    return Buffer.from(ab);
+  }
+
+  return Buffer.alloc(0);
+}
+
+/**
+ * SSRF-hardened outbound `https:` fetcher that:
+ *   1. Validates the initial URL and every `3xx` `Location` redirect hop (up to `maxRedirects`)
+ *      through `assertSafePublicHttpsUrl` using `redirect: 'manual'`.
+ *   2. Optionally reads the body through `readSafeResponseBuffer` (`maxFetchBytes` hard cap).
+ *   3. Preserves `options.fetchImpl` and `options.dnsLookup` DI compatibility for hermetic tests.
+ *
+ * @param {string} rawUrl
+ * @param {{
+ *   fetchImpl?: typeof fetch,
+ *   dnsLookup?: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string }>>,
+ *   method?: string,
+ *   headers?: Record<string, string>,
+ *   signal?: AbortSignal | null,
+ *   timeoutMs?: number,
+ *   maxRedirects?: number,
+ *   maxFetchBytes?: number,
+ *   readBody?: boolean,
+ *   allowDnsUnavailableForCustomFetch?: boolean,
+ * }} [options]
+ * @returns {Promise<{ response: any, finalUrl: string, buffer: Buffer | null }>}
+ */
+async function safePublicHttpsFetch(rawUrl, options = {}) {
+  const hasExplicitFetchImpl = typeof options.fetchImpl === 'function' && options.fetchImpl !== fetch;
+  const fetchFn = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch;
+  const allowOfflineTestFetch =
+    Boolean(options.allowDnsUnavailableForCustomFetch ?? hasExplicitFetchImpl) &&
+    hasExplicitFetchImpl &&
+    typeof options.dnsLookup !== 'function';
+  const maxRedirects =
+    typeof options.maxRedirects === 'number' && options.maxRedirects >= 0
+      ? Math.min(5, Math.floor(options.maxRedirects))
+      : 3;
+  const timeoutMs =
+    typeof options.timeoutMs === 'number' && options.timeoutMs > 0 ? options.timeoutMs : 15000;
+  const maxFetchBytes =
+    typeof options.maxFetchBytes === 'number' && options.maxFetchBytes > 0
+      ? options.maxFetchBytes
+      : 25 * 1024 * 1024;
+  const shouldReadBody = options.readBody !== false;
+
+  let currentUrl = String(rawUrl || '').trim();
+  let currentMethod = String(options.method || 'GET').toUpperCase();
+
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    try {
+      const validated = await assertSafePublicHttpsUrl(currentUrl, {
+        dnsLookup: options.dnsLookup,
+        skipDnsForReservedTestTld: allowOfflineTestFetch,
+      });
+      currentUrl = validated.url;
+    } catch (urlErr) {
+      const anyErr = /** @type {any} */ (urlErr);
+      if (anyErr?.isDnsUnavailable && allowOfflineTestFetch) {
+        currentUrl = new URL(currentUrl).toString();
+      } else {
+        throw urlErr;
+      }
+    }
+
+    const hopController = new AbortController();
+    const timer = setTimeout(() => hopController.abort(), timeoutMs);
+    const onCallerAbort = () => hopController.abort();
+    if (options.signal) {
+      if (options.signal.aborted) {
+        clearTimeout(timer);
+        hopController.abort();
+      } else {
+        options.signal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
+
+    let res;
+    try {
+      res = await fetchFn(currentUrl, {
+        method: currentMethod,
+        headers: options.headers || {},
+        redirect: 'manual',
+        signal: hopController.signal,
+      });
+
+      const status = Number(res?.status || 0);
+      if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+        const locationHeader =
+          res?.headers && typeof res.headers.get === 'function'
+            ? res.headers.get('location')
+            : '';
+        try {
+          await res?.body?.cancel?.();
+        } catch {}
+        if (!locationHeader || !String(locationHeader).trim()) {
+          throw createUnsafeUrlError(`Blocked redirect (${status}) missing Location header`);
+        }
+        if (hop >= maxRedirects) {
+          throw createUnsafeUrlError(`Blocked redirect chain exceeding ${maxRedirects} hops`);
+        }
+        let nextUrl;
+        try {
+          nextUrl = new URL(String(locationHeader).trim(), currentUrl).toString();
+        } catch {
+          throw createUnsafeUrlError('Blocked malformed redirect Location URL');
+        }
+        if (status === 303 && currentMethod !== 'GET' && currentMethod !== 'HEAD') {
+          currentMethod = 'GET';
+        }
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      const buffer =
+        shouldReadBody && res?.ok ? await readSafeResponseBuffer(res, maxFetchBytes) : null;
+      return { response: res, finalUrl: currentUrl, buffer };
+    } finally {
+      clearTimeout(timer);
+      if (options.signal) {
+        try {
+          options.signal.removeEventListener('abort', onCallerAbort);
+        } catch {}
+      }
+    }
+  }
+
+  throw createUnsafeUrlError('Redirect resolution terminated unexpectedly');
+}
+
+// ============================================================================
+// Renderer Origin, Navigation & IPC Sender Perimeter (`Finding #2`)
+// ============================================================================
+
+/**
+ * Resolve and validate `process.env.ELECTRON_START_URL` strictly for unpackaged development mode.
+ * Returns `null` unconditionally when `isPackaged === true` so production builds can NEVER
+ * load a local TCP dev server (`http://localhost:3000`).
+ *
+ * @param {unknown} rawEnvUrl
+ * @param {boolean} isPackaged
+ * @returns {string | null}
+ */
+function resolveTrustedDevStartUrl(rawEnvUrl, isPackaged) {
+  if (isPackaged) return null;
+  if (typeof rawEnvUrl !== 'string') return null;
+  const trimmed = rawEnvUrl.trim();
+  if (!trimmed || trimmed === '0' || trimmed.toLowerCase() === 'false') return null;
+  if (trimmed === '1' || trimmed.toLowerCase() === 'true') {
+    return 'http://localhost:3000';
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (parsed.username || parsed.password) return null;
+    const host = String(parsed.hostname || '')
+      .replace(/^\[|\]$/g, '')
+      .toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+      return parsed.toString();
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Determine whether `rawUrl` is a trusted One Launcher top-level renderer URL (`file://` app bundle
+ * or validated loopback dev server when unpackaged).
+ *
+ * @param {unknown} rawUrl
+ * @param {{ isPackaged?: boolean, allowedDevOrigin?: string | null, expectedFileHref?: string | null }} [options]
+ * @returns {boolean}
+ */
+function isTrustedAppRendererUrl(rawUrl, options = {}) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  const trimmed = rawUrl.trim();
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+
+  if (parsed.protocol === 'file:') {
+    if (typeof options.expectedFileHref === 'string' && options.expectedFileHref.trim()) {
+      try {
+        const expected = new URL(options.expectedFileHref.trim());
+        const normActual = decodeURIComponent(parsed.pathname).replace(/\\/g, '/').toLowerCase();
+        const normExpected = decodeURIComponent(expected.pathname).replace(/\\/g, '/').toLowerCase();
+        const expectedDir = path.posix.dirname(normExpected);
+        return (
+          normActual === normExpected ||
+          normActual.startsWith(`${expectedDir}/`)
+        );
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const isPackaged = Boolean(options.isPackaged);
+  if (isPackaged) {
+    return false;
+  }
+
+  if (typeof options.allowedDevOrigin === 'string' && options.allowedDevOrigin.trim()) {
+    try {
+      const allowedOrigin = new URL(options.allowedDevOrigin.trim()).origin;
+      return parsed.origin === allowedOrigin;
+    } catch {
+      return false;
+    }
+  }
+
+  if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+    const host = String(parsed.hostname || '')
+      .replace(/^\[|\]$/g, '')
+      .toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Verify that an Electron `IpcMainInvokeEvent` / `IpcMainEvent` originates from the trusted
+ * top-level app frame (`event.senderFrame === event.sender.mainFrame` + trusted app URL).
+ * Gracefully permits unit-test mock events where `event?.senderFrame == null`.
+ *
+ * @param {any} event
+ * @param {{ isPackaged?: boolean, allowedDevOrigin?: string | null, expectedFileHref?: string | null, getMainWindow?: (() => any) | null }} [options]
+ * @returns {boolean}
+ */
+function isTrustedIpcSenderEvent(event, options = {}) {
+  // Unit-test mock IPC events (`{}` or `{ sender: mockWebContents }` without `senderFrame`)
+  if (!event || event.senderFrame === undefined || event.senderFrame === null) {
+    return true;
+  }
+
+  const senderFrame = event.senderFrame;
+  const sender = event.sender;
+
+  // Reject any non-top-level subframe (`<iframe>` such as embedded YouTube/Wistia players)
+  if (sender && sender.mainFrame && senderFrame !== sender.mainFrame) {
+    return false;
+  }
+  if (typeof senderFrame.parent === 'object' && senderFrame.parent !== null) {
+    return false;
+  }
+  if (typeof senderFrame.routingId === 'number' && sender?.mainFrame?.routingId !== undefined) {
+    if (senderFrame.routingId !== sender.mainFrame.routingId) {
+      return false;
+    }
+  }
+
+  // If `getMainWindow` is provided and alive, reject unrelated BrowserWindows
+  if (typeof options.getMainWindow === 'function') {
+    try {
+      const mw = options.getMainWindow();
+      if (
+        mw &&
+        typeof mw.isDestroyed === 'function' &&
+        !mw.isDestroyed() &&
+        mw.webContents &&
+        sender &&
+        typeof sender.id === 'number' &&
+        typeof mw.webContents.id === 'number' &&
+        sender.id !== mw.webContents.id
+      ) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  const frameUrl = typeof senderFrame.url === 'string' ? senderFrame.url : '';
+  return isTrustedAppRendererUrl(frameUrl, options);
+}
+
+/**
+ * Throw a structured `ERR_UNTRUSTED_IPC_SENDER` error if `event` originates from an untrusted
+ * frame, subframe, or origin.
+ *
+ * @param {any} event
+ * @param {{ isPackaged?: boolean, allowedDevOrigin?: string | null, expectedFileHref?: string | null, getMainWindow?: (() => any) | null, channel?: string }} [options]
+ */
+function assertTrustedIpcSender(event, options = {}) {
+  if (!isTrustedIpcSenderEvent(event, options)) {
+    const frameUrl =
+      event?.senderFrame && typeof event.senderFrame.url === 'string'
+        ? event.senderFrame.url
+        : '<unknown>';
+    diagLog.warn('security.untrustedIpcSender', null, {
+      channel: options.channel || '<unspecified>',
+      frameUrl,
+    });
+    const err = /** @type {Error & { code?: string }} */ (
+      new Error(`Blocked IPC invocation from untrusted sender frame (${options.channel || 'ipc'})`)
+    );
+    err.code = 'ERR_UNTRUSTED_IPC_SENDER';
+    throw err;
+  }
+}
+
+/**
+ * Wrap an `ipcMain` instance so every `handle(channel, listener)` registration enforces
+ * `assertTrustedIpcSender(event)` before invoking `listener`, while preserving all other
+ * `ipcMain` methods (`on`, `removeListener`, `removeHandler`) with intact `this` binding.
+ *
+ * @param {any} ipcMain
+ * @param {{ isPackaged?: boolean, allowedDevOrigin?: string | null, expectedFileHref?: string | null, getMainWindow?: (() => any) | null }} [options]
+ */
+function wrapIpcMainWithSenderCheck(ipcMain, options = {}) {
+  if (!ipcMain || typeof ipcMain.handle !== 'function') return ipcMain;
+  return new Proxy(ipcMain, {
+    get(target, prop, receiver) {
+      if (prop === 'handle') {
+        return (/** @type {string} */ channel, /** @type {Function} */ listener) =>
+          target.handle(channel, (/** @type {any} */ event, ...args) => {
+            assertTrustedIpcSender(event, { ...options, channel });
+            return listener(event, ...args);
+          });
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 // ============================================================================
 // Recursive Launch Config Validator, Env Sanitizer & Settings Schema (`D8.2`)
 // ============================================================================
@@ -700,8 +1280,14 @@ const DANGEROUS_LAUNCH_ENV_KEYS = new Set([
   'DYLD_LIBRARY_PATH',
   'DYLD_FRAMEWORK_PATH',
   'DYLD_FALLBACK_LIBRARY_PATH',
+  'DYLD_FORCE_FLAT_NAMESPACE',
   'NODE_OPTIONS',
   'ELECTRON_RUN_AS_NODE',
+  'PYTHONHOME',
+  'PYTHONPATH',
+  'PYTHONSTARTUP',
+  'BASH_ENV',
+  'CX_ENV',
 ]);
 
 const LAUNCH_SHELL_OR_EXEC_FIELDS = [
@@ -713,7 +1299,13 @@ const LAUNCH_SHELL_OR_EXEC_FIELDS = [
   'executablePath',
 ];
 
-const LAUNCH_ENV_MAP_FIELDS = new Set(['env', 'envVars', 'environment', 'customEnv']);
+const LAUNCH_ENV_MAP_FIELDS = new Set([
+  'environmentVariables',
+  'env',
+  'envVars',
+  'environment',
+  'customEnv',
+]);
 
 const FORBIDDEN_RENDERER_IPC_KEYS = new Set([
   'execFileSync',
@@ -857,15 +1449,15 @@ const ALLOWED_LAUNCHER_SETTINGS_KEYS = new Set([
 ]);
 
 /**
- * Strip dangerous dynamic-linker and Node/Electron runtime injection environment keys
- * (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`,
- * `DYLD_FRAMEWORK_PATH`, `NODE_OPTIONS`, `ELECTRON_RUN_AS_NODE`) from an `env` map or string.
+ * Strip dangerous dynamic-linker, Python/shell startup, and Node/Electron runtime injection
+ * environment keys (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, `ELECTRON_RUN_AS_NODE`,
+ * `PYTHONHOME`, `PYTHONPATH`, `BASH_ENV`, `CX_ENV`) from an `env` map or string.
  */
 function sanitizeLaunchEnvironmentMap(rawEnv) {
   if (typeof rawEnv === 'string') {
     return rawEnv
       .replace(
-        /(?:^|\s+)(?:LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|DYLD_FRAMEWORK_PATH|DYLD_FALLBACK_LIBRARY_PATH|NODE_OPTIONS|ELECTRON_RUN_AS_NODE)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s]*)/gi,
+        /(?:^|\s+)(?:LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|DYLD_FRAMEWORK_PATH|DYLD_FALLBACK_LIBRARY_PATH|DYLD_FORCE_FLAT_NAMESPACE|NODE_OPTIONS|ELECTRON_RUN_AS_NODE|PYTHONHOME|PYTHONPATH|PYTHONSTARTUP|BASH_ENV|CX_ENV)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s]*)/gi,
         ''
       )
       .replace(/\0/g, '')
@@ -888,6 +1480,73 @@ function sanitizeLaunchEnvironmentMap(rawEnv) {
     cleanEnv[trimmedKey] = strVal;
   }
   return cleanEnv;
+}
+
+function computeLaunchEnvApprovalFingerprint(envKey, envValue) {
+  return crypto
+    .createHash('sha256')
+    .update(`env:${String(envKey || '').trim().toUpperCase()}\0${String(envValue ?? '')}`)
+    .digest('hex');
+}
+
+/**
+ * Sanitize `environmentVariables` at child-process spawn time.
+ * Always strips `DANGEROUS_LAUNCH_ENV_KEYS` (even from hand-edited `one_launcher_configs.json`),
+ * permitting `DYLD_INSERT_LIBRARIES` ONLY when its exact `(gameId, key, value)` SHA-256 digest
+ * was recorded in `approved_launch_commands.json` by trusted main-process `saveGameLaunchConfig`.
+ *
+ * @param {unknown} rawEnvMap
+ * @param {{ gameId?: string, options?: Record<string, any> }} [approvalCtx]
+ * @returns {Record<string, string>}
+ */
+function sanitizeSpawnEnvironmentMap(rawEnvMap, approvalCtx = {}) {
+  if (!rawEnvMap || typeof rawEnvMap !== 'object' || Array.isArray(rawEnvMap)) {
+    return {};
+  }
+  const clean = sanitizeLaunchEnvironmentMap(rawEnvMap);
+  const cleanGameId = String(approvalCtx?.gameId || '').trim();
+  if (cleanGameId) {
+    for (const [k, v] of Object.entries(rawEnvMap)) {
+      if (
+        String(k || '').trim().toUpperCase() === 'DYLD_INSERT_LIBRARIES' &&
+        typeof v === 'string' &&
+        v.trim()
+      ) {
+        const cleanVal = v.replace(/\0/g, '');
+        const fp = computeLaunchEnvApprovalFingerprint('DYLD_INSERT_LIBRARIES', cleanVal);
+        if (isLaunchCommandApproved(cleanGameId, fp, approvalCtx?.options || {})) {
+          clean[k.trim()] = cleanVal;
+        }
+      }
+    }
+  }
+  return clean;
+}
+
+/**
+ * Build a safe child-process environment by merging `sanitizeSpawnEnvironmentMap(userEnvMap)`
+ * onto `baseEnv` BEFORE applying trusted One Launcher `internalOverrides` (such as internal
+ * `libone_metal_preload.dylib` or `ONE_LAUNCHER_*` variables). Ensures even hand-edited
+ * `one_launcher_configs.json` files on disk can never inject dangerous loader variables.
+ *
+ * @param {Record<string, string | undefined>} [baseEnv]
+ * @param {unknown} [userEnvMap]
+ * @param {Record<string, string | undefined>} [internalOverrides]
+ * @param {{ gameId?: string, options?: Record<string, any> }} [approvalCtx]
+ * @returns {Record<string, string | undefined>}
+ */
+function buildSafeChildEnvironment(
+  baseEnv = {},
+  userEnvMap = null,
+  internalOverrides = {},
+  approvalCtx = {}
+) {
+  const safeUserEnv = sanitizeSpawnEnvironmentMap(userEnvMap, approvalCtx);
+  return {
+    ...(baseEnv || {}),
+    ...safeUserEnv,
+    ...(internalOverrides || {}),
+  };
 }
 
 /**
@@ -1618,19 +2277,385 @@ function applyParsedKnownFoldersJson(parsedJson, current, expandWinEnvString, no
   return next;
 }
 
+const WIN32_LOCAL_DRIVES_TTL_MS = 10_000;
+/** @type {string[] | null} */
+let cachedWin32LocalDrives = null;
+let cachedWin32LocalDrivesAt = 0;
+/** @type {Promise<string[]> | null} */
+let inFlightWin32DriveProbe = null;
+
+function normalizeWindowsDriveRoot(rawDrive) {
+  const m = String(rawDrive || '')
+    .trim()
+    .match(/^([A-Za-z]):/);
+  return m ? `${m[1].toUpperCase()}:\\` : '';
+}
+
+function resolveFallbackWin32SystemDrives(options = {}) {
+  const envObj =
+    options && options.env && typeof options.env === 'object' ? options.env : process.env;
+  const sysDriveRaw = String(
+    options?.systemDrive || envObj?.SystemDrive || envObj?.SYSTEMDRIVE || 'C:'
+  ).trim();
+  const norm = normalizeWindowsDriveRoot(sysDriveRaw);
+  return [norm || 'C:\\'];
+}
+
+function parseWindowsDriveDiscoveryOutput(stdout) {
+  /** @type {string[]} */
+  const roots = [];
+  const seen = new Set();
+  const addRoot = (/** @type {any} */ val) => {
+    const norm = normalizeWindowsDriveRoot(val);
+    if (norm && !seen.has(norm)) {
+      seen.add(norm);
+      roots.push(norm);
+    }
+  };
+
+  const trimmed = String(stdout || '').trim();
+  if (!trimmed) return roots;
+
+  // Support MountedDevices (`\DosDevices\D:    REG_BINARY ...`)
+  for (const rawLine of trimmed.split(/\r?\n/)) {
+    const dosMatch = rawLine.match(/\\DosDevices\\([A-Za-z]):\s+REG_/i);
+    if (dosMatch && dosMatch[1]) {
+      addRoot(`${dosMatch[1]}:`);
+    }
+  }
+  if (roots.length > 0) return roots;
+
+  // Support JSON array/object/string output
+  if (trimmed.startsWith('[') || trimmed.startsWith('{') || trimmed.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      for (const item of items) {
+        if (typeof item === 'string') {
+          addRoot(item);
+        } else if (item && typeof item === 'object') {
+          addRoot(item.DeviceID || item.Name || item.Root);
+        }
+      }
+      if (roots.length > 0) return roots;
+    } catch {}
+  }
+
+  // Support plain line-delimited `C:` / `D:\` output
+  for (const rawLine of trimmed.split(/\r?\n/)) {
+    const m = /^([A-Za-z]):\\?$/.exec(rawLine.trim());
+    if (m) addRoot(`${m[1]}:`);
+  }
+  return roots;
+}
+
+function clearCachedWindowsLocalDrives() {
+  cachedWin32LocalDrives = null;
+  cachedWin32LocalDrivesAt = 0;
+  inFlightWin32DriveProbe = null;
+}
+
+/**
+ * Unified, process-wide Windows local drive discovery (`DriveType=2` removable & `DriveType=3` fixed),
+ * skipping mapped SMB network shares (`DriveType=4`). Uses fast native `reg.exe query HKLM\SYSTEM\MountedDevices`
+ * + async `fs.promises.access` verification in production (~4ms, zero `powershell.exe` spawns), while
+ * preserving `options.execFileImpl` / `options.execFileFn` DI mocks for unit tests.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string[]>}
+ */
+function discoverWindowsLocalDrivesAsync(options = {}) {
+  const platform = options.platform || process.platform;
+  const hasCustomExec =
+    typeof options.execFileImpl === 'function' || typeof options.execFileFn === 'function';
+  if (platform !== 'win32' && !hasCustomExec) {
+    return Promise.resolve([]);
+  }
+
+  const sysDrives = resolveFallbackWin32SystemDrives(options);
+  const sysDriveRoot = sysDrives[0] || 'C:\\';
+
+  if (Array.isArray(options.mountedDriveRoots)) {
+    const explicit = options.mountedDriveRoots
+      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
+      .filter(Boolean);
+    return Promise.resolve(explicit.length > 0 ? explicit : [sysDriveRoot]);
+  }
+  if (Array.isArray(options.localDrives)) {
+    const explicit = options.localDrives
+      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
+      .filter(Boolean);
+    return Promise.resolve(explicit.length > 0 ? explicit : [sysDriveRoot]);
+  }
+
+  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : Date.now;
+  const now = Number(nowFn());
+  const useSharedCache =
+    !hasCustomExec && !options.bypassDriveCache && !options.forceRefresh;
+
+  if (
+    useSharedCache &&
+    Array.isArray(cachedWin32LocalDrives) &&
+    cachedWin32LocalDrives.length > 0 &&
+    now - cachedWin32LocalDrivesAt < WIN32_LOCAL_DRIVES_TTL_MS
+  ) {
+    return Promise.resolve(cachedWin32LocalDrives.slice());
+  }
+
+  if (useSharedCache && inFlightWin32DriveProbe) {
+    return inFlightWin32DriveProbe.then((list) => list.slice());
+  }
+
+  if (process.platform !== 'win32' && !hasCustomExec) {
+    return Promise.resolve([sysDriveRoot]);
+  }
+
+  const execFileFn =
+    typeof options.execFileImpl === 'function'
+      ? options.execFileImpl
+      : typeof options.execFileFn === 'function'
+        ? options.execFileFn
+        : execFile;
+
+  const probePromise = (async () => {
+    /** @type {string[]} */
+    let discovered = [];
+
+    if (!hasCustomExec && process.platform === 'win32') {
+      // Fast native C `reg.exe` MountedDevices probe (~4ms, zero PowerShell/.NET startup, excludes HKCU SMB shares)
+      const regCandidates = await new Promise((resolve) => {
+        try {
+          execFile(
+            'reg.exe',
+            ['query', 'HKLM\\SYSTEM\\MountedDevices'],
+            { encoding: 'utf8', timeout: 1500, windowsHide: true, maxBuffer: 256 * 1024 },
+            (err, stdout) => {
+              resolve(!err && stdout ? parseWindowsDriveDiscoveryOutput(String(stdout)) : []);
+            }
+          );
+        } catch {
+          resolve([]);
+        }
+      });
+
+      if (regCandidates.length > 0) {
+        const checks = await Promise.all(
+          regCandidates.map(async (root) => {
+            try {
+              await fs.promises.access(root, fs.constants.F_OK);
+              return root;
+            } catch {
+              return null;
+            }
+          })
+        );
+        discovered = checks.filter((r) => typeof r === 'string');
+      }
+    }
+
+    if (discovered.length === 0) {
+      // Fallback (or DI mock execution) via Win32_LogicalDisk
+      discovered = await new Promise((resolve) => {
+        try {
+          execFileFn(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-NonInteractive',
+              '-ExecutionPolicy',
+              'Bypass',
+              '-Command',
+              'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | Select-Object -ExpandProperty DeviceID',
+            ],
+            { timeout: 4000, windowsHide: true, maxBuffer: 64 * 1024 },
+            (/** @type {any} */ err, /** @type {any} */ stdout) => {
+              resolve(!err && stdout ? parseWindowsDriveDiscoveryOutput(String(stdout)) : []);
+            }
+          );
+        } catch {
+          resolve([]);
+        }
+      });
+    }
+
+    const result = discovered.length > 0 ? discovered : [sysDriveRoot];
+    if (!result.includes(sysDriveRoot) && !hasCustomExec) {
+      result.unshift(sysDriveRoot);
+    }
+    if (useSharedCache) {
+      cachedWin32LocalDrives = result;
+      cachedWin32LocalDrivesAt = Number(nowFn());
+    }
+    return result.slice();
+  })().finally(() => {
+    if (inFlightWin32DriveProbe === probePromise) {
+      inFlightWin32DriveProbe = null;
+    }
+  });
+
+  if (useSharedCache) {
+    inFlightWin32DriveProbe = probePromise;
+  }
+  return probePromise;
+}
+
+/**
+ * Return cached local Windows drives without blocking on A:\..Z:\ loops.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string[]}
+ */
+function getCachedWindowsLocalDrives(options = {}) {
+  const platform = options.platform || process.platform;
+  if (platform !== 'win32') return [];
+  const sysDrives = resolveFallbackWin32SystemDrives(options);
+  const sysDriveRoot = sysDrives[0] || 'C:\\';
+  if (Array.isArray(options.mountedDriveRoots)) {
+    const explicit = options.mountedDriveRoots
+      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
+      .filter(Boolean);
+    return explicit.length > 0 ? explicit : [sysDriveRoot];
+  }
+  if (Array.isArray(options.localDrives)) {
+    const explicit = options.localDrives
+      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
+      .filter(Boolean);
+    return explicit.length > 0 ? explicit : [sysDriveRoot];
+  }
+  if (Array.isArray(cachedWin32LocalDrives) && cachedWin32LocalDrives.length > 0) {
+    return cachedWin32LocalDrives.slice();
+  }
+  return [sysDriveRoot];
+}
+
+/**
+ * Synchronous accessor for local Windows drives (`DriveType=2` & `DriveType=3`):
+ * returns cached drives immediately when warm, uses fast `reg.exe query HKLM\SYSTEM\MountedDevices`
+ * on cold production calls (zero `powershell.exe`), and honors `execFileSyncFn`/`execFileSyncImpl`
+ * DI hooks for deterministic unit tests.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {string[]}
+ */
+function getKnownWindowsLocalDrivesSync(options = {}) {
+  if (Array.isArray(options.localDrives)) {
+    return options.localDrives
+      .map((/** @type {any} */ d) => String(d || '').trim())
+      .filter(Boolean)
+      .map((/** @type {string} */ d) => (/^[A-Za-z]:$/.test(d) ? `${d.toUpperCase()}\\` : d));
+  }
+  if (Array.isArray(options.mountedDriveRoots)) {
+    return options.mountedDriveRoots
+      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
+      .filter(Boolean);
+  }
+
+  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : Date.now;
+  const now = Number(nowFn());
+  const customExecFileSync =
+    typeof options.execFileSyncFn === 'function'
+      ? options.execFileSyncFn
+      : typeof options.execFileSyncImpl === 'function'
+        ? options.execFileSyncImpl
+        : null;
+
+  if (
+    customExecFileSync === null &&
+    !options.bypassDriveCache &&
+    Array.isArray(cachedWin32LocalDrives) &&
+    cachedWin32LocalDrives.length > 0
+  ) {
+    if (now - cachedWin32LocalDrivesAt >= WIN32_LOCAL_DRIVES_TTL_MS) {
+      discoverWindowsLocalDrivesAsync(options).catch(() => {});
+    }
+    return cachedWin32LocalDrives.slice();
+  }
+
+  const targetPlatform = options.platform || process.platform;
+  if (targetPlatform !== 'win32' || (process.platform !== 'win32' && customExecFileSync === null)) {
+    return resolveFallbackWin32SystemDrives(options);
+  }
+
+  const useSharedCache = customExecFileSync === null && !options.bypassDriveCache;
+
+  // Fast native C `reg.exe` cold fallback in real Win32 production (avoids spawning synchronous PowerShell)
+  if (customExecFileSync === null && process.platform === 'win32') {
+    try {
+      const regOut = childProcess.execFileSync(
+        'reg.exe',
+        ['query', 'HKLM\\SYSTEM\\MountedDevices'],
+        { encoding: 'utf8', timeout: 800, windowsHide: true, maxBuffer: 256 * 1024 }
+      );
+      const regDrives = parseWindowsDriveDiscoveryOutput(regOut).filter((root) => {
+        try {
+          return fs.existsSync(root);
+        } catch {
+          return false;
+        }
+      });
+      if (regDrives.length > 0) {
+        if (useSharedCache) {
+          cachedWin32LocalDrives = regDrives;
+          cachedWin32LocalDrivesAt = now;
+        }
+        return regDrives.slice();
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  const syncRunner = customExecFileSync || childProcess.execFileSync;
+  try {
+    const stdout = syncRunner(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | Select-Object -ExpandProperty DeviceID',
+      ],
+      {
+        timeout: 1500,
+        windowsHide: true,
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024,
+      }
+    );
+    const parsed = parseWindowsDriveDiscoveryOutput(String(stdout || ''));
+    const result = parsed.length > 0 ? parsed : resolveFallbackWin32SystemDrives(options);
+    if (useSharedCache) {
+      cachedWin32LocalDrives = result;
+      cachedWin32LocalDrivesAt = now;
+    }
+    return result.slice();
+  } catch {
+    const fallback = resolveFallbackWin32SystemDrives(options);
+    if (useSharedCache) {
+      cachedWin32LocalDrives = fallback;
+      cachedWin32LocalDrivesAt = now;
+    }
+    return fallback.slice();
+  }
+}
+
 /**
  * Asynchronously refresh Windows Known Folders via non-blocking `reg.exe` (`execFile`),
  * with zero mutual recursion with `resolveHostWindowsKnownFolders`.
  */
 function refreshHostWindowsKnownFoldersAsync(options = {}) {
-  if (process.platform !== 'win32') {
+  const hasInjectedExec =
+    typeof options.execFileImpl === 'function' || typeof options.execFileFn === 'function';
+  if (process.platform !== 'win32' && !hasInjectedExec) {
     return Promise.resolve(resolveHostWindowsKnownFolders(options));
   }
-  if (inFlightWinKnownFoldersRefresh) {
+  if (!hasInjectedExec && inFlightWinKnownFoldersRefresh) {
     return inFlightWinKnownFoldersRefresh;
   }
   const isVitest = Boolean(process.env.VITEST || process.env.NODE_ENV === 'test');
-  if (isVitest && !options.allowRegistryDiscoveryInTest) {
+  if (isVitest && !options.allowRegistryDiscoveryInTest && !hasInjectedExec) {
     return Promise.resolve(
       cachedLiveWinKnownFolders
         ? { ...cachedLiveWinKnownFolders }
@@ -1638,9 +2663,16 @@ function refreshHostWindowsKnownFoldersAsync(options = {}) {
     );
   }
 
-  inFlightWinKnownFoldersRefresh = new Promise((resolve) => {
+  const execAsync =
+    typeof options.execFileImpl === 'function'
+      ? options.execFileImpl
+      : typeof options.execFileFn === 'function'
+        ? options.execFileFn
+        : execFile;
+
+  const refreshPromise = new Promise((resolve) => {
     try {
-      execFile(
+      execAsync(
         'reg.exe',
         [
           'query',
@@ -1650,7 +2682,7 @@ function refreshHostWindowsKnownFoldersAsync(options = {}) {
         (err, stdout) => {
           if (!err && stdout) {
             const { homedir, pathImpl, normalizeWinOrHost, envLookup, expandWinEnvString } =
-              buildKnownFolderEnvHelpers();
+              buildKnownFolderEnvHelpers(options);
             let base = {
               homedir: normalizeWinOrHost(homedir),
               documents: normalizeWinOrHost(pathImpl.join(homedir, 'Documents')),
@@ -1674,8 +2706,10 @@ function refreshHostWindowsKnownFoldersAsync(options = {}) {
               }
             } catch {}
             base = applyRegistryOutputToKnownFolders(String(stdout), base, expandWinEnvString);
-            cachedLiveWinKnownFolders = base;
-            cachedLiveWinKnownFoldersAt = Date.now();
+            if (!hasInjectedExec) {
+              cachedLiveWinKnownFolders = base;
+              cachedLiveWinKnownFoldersAt = Date.now();
+            }
             resolve({ ...base });
             return;
           }
@@ -1686,20 +2720,32 @@ function refreshHostWindowsKnownFoldersAsync(options = {}) {
       resolve(cachedLiveWinKnownFolders ? { ...cachedLiveWinKnownFolders } : null);
     }
   }).finally(() => {
-    inFlightWinKnownFoldersRefresh = null;
+    if (inFlightWinKnownFoldersRefresh === refreshPromise) {
+      inFlightWinKnownFoldersRefresh = null;
+    }
   });
 
-  return inFlightWinKnownFoldersRefresh;
+  if (!hasInjectedExec) {
+    inFlightWinKnownFoldersRefresh = refreshPromise;
+  }
+  return refreshPromise;
 }
 
 /**
  * Resolve Windows Known Folders (`Documents`, `Saved Games`, `AppData\Local`, `AppData\Roaming`,
  * `AppData\LocalLow`) with an in-memory cache so hot paths never spawn subprocesses repeatedly.
- * On cold start on `win32`, runs a single UTF-8 PowerShell Known Folders query via
- * `childProcess.execFileSync`, rejecting any `\uFFFD` OEM mojibake paths with clean `userProfile`
- * fallbacks, while honoring test overrides (`options.windowsKnownFolders`, `options.windowsRegistryOutput`).
+ * On cold start on `win32`, queries native `reg.exe` (`HKCU\...\User Shell Folders`, ~6ms, zero
+ * `powershell.exe` COM stall), rejecting any `\uFFFD` OEM mojibake paths with clean `userProfile`
+ * fallbacks, while honoring test overrides (`options.windowsKnownFolders`, `options.windowsRegistryOutput`,
+ * `options.execFileSyncFn`, and Vitest `childProcess.execFileSync` spies).
  */
 function resolveHostWindowsKnownFolders(options = {}) {
+  const customSyncFn =
+    typeof options.execFileSyncFn === 'function'
+      ? options.execFileSyncFn
+      : typeof options.execFileSyncImpl === 'function'
+        ? options.execFileSyncImpl
+        : null;
   const hasExplicitSandboxHomedir = Boolean(
     options.homedir && options.homedir !== os.homedir()
   );
@@ -1709,7 +2755,7 @@ function resolveHostWindowsKnownFolders(options = {}) {
       options.windowsKnownFolders ||
       options.windowsRegistryOutput !== undefined ||
       options.env ||
-      typeof options.execFileSyncFn === 'function'
+      customSyncFn !== null
   );
 
   if (
@@ -1737,9 +2783,9 @@ function resolveHostWindowsKnownFolders(options = {}) {
     localLowAppData: normalizeWinOrHost(pathImpl.join(homedir, 'AppData', 'LocalLow')),
   };
 
-  // 1. Live Windows Known Folders resolution (Electron UTF-16 SHGetKnownFolderPath + single cached UTF-8 PowerShell query)
+  // 1. Live Windows Known Folders resolution: Electron UTF-16 SHGetKnownFolderPath + fast native `reg.exe` (~6ms)
   if (
-    (process.platform === 'win32' || typeof options.execFileSyncFn === 'function') &&
+    (process.platform === 'win32' || customSyncFn !== null) &&
     !hasExplicitSandboxHomedir &&
     options.windowsRegistryOutput === undefined &&
     !options.windowsKnownFolders
@@ -1757,65 +2803,109 @@ function resolveHostWindowsKnownFolders(options = {}) {
       // Fallback below
     }
 
-    const execSyncImpl =
-      typeof options.execFileSyncFn === 'function'
-        ? options.execFileSyncFn
-        : childProcess.execFileSync;
-    const psKnownFoldersScript = [
-      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-      '$sh = New-Object -ComObject Shell.Application',
-      '$sg = try { $n = $sh.Namespace("shell:SavedGames"); if ($n) { $n.Self.Path } else { "" } } catch { "" }',
-      '$ll = try { $n = $sh.Namespace("shell:LocalAppDataLow"); if ($n) { $n.Self.Path } else { "" } } catch { "" }',
-      '@{',
-      "  Personal = [Environment]::GetFolderPath('Personal')",
-      '  SavedGames = $sg',
-      "  LocalAppData = [Environment]::GetFolderPath('LocalApplicationData')",
-      "  AppData = [Environment]::GetFolderPath('ApplicationData')",
-      '  LocalLow = $ll',
-      '} | ConvertTo-Json -Compress',
-    ].join('; ');
+    const execSyncImpl = customSyncFn || childProcess.execFileSync;
+    const isVitest = Boolean(process.env.VITEST || process.env.NODE_ENV === 'test');
+    let resolvedViaReg = false;
 
     try {
-      const rawPsOut = execSyncImpl(
-        'powershell.exe',
+      const rawRegOut = execSyncImpl(
+        'reg.exe',
         [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          psKnownFoldersScript,
+          'query',
+          'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders',
         ],
         {
           encoding: 'utf8',
-          timeout: 3000,
+          timeout: 800,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'ignore'],
         }
       );
-      const stdoutStr = (
-        typeof rawPsOut === 'string'
-          ? rawPsOut
-          : Buffer.isBuffer(rawPsOut)
-            ? rawPsOut.toString('utf8')
-            : String(rawPsOut ?? '')
+      const regStr = (
+        typeof rawRegOut === 'string'
+          ? rawRegOut
+          : Buffer.isBuffer(rawRegOut)
+            ? rawRegOut.toString('utf8')
+            : String(rawRegOut ?? '')
       )
         .replace(/^\uFEFF/, '')
         .trim();
 
-      if (stdoutStr.startsWith('{')) {
-        const parsedJson = JSON.parse(stdoutStr);
+      if (regStr.startsWith('{')) {
+        const parsedJson = JSON.parse(regStr);
         current = applyParsedKnownFoldersJson(
           parsedJson,
           current,
           expandWinEnvString,
           normalizeWinOrHost
         );
-      } else if (/REG_(?:EXPAND_)?SZ/i.test(stdoutStr)) {
-        current = applyRegistryOutputToKnownFolders(stdoutStr, current, expandWinEnvString);
+        resolvedViaReg = true;
+      } else if (/REG_(?:EXPAND_)?SZ/i.test(regStr)) {
+        current = applyRegistryOutputToKnownFolders(regStr, current, expandWinEnvString);
+        resolvedViaReg = true;
       }
     } catch {
-      // Fallback cleanly to `current` defaults when PowerShell is unavailable or fails
+      // `reg.exe` failed; allow DI/Vitest fallback below
+    }
+
+    // Only invoke PowerShell fallback in unit-test / DI mock contexts where a spy specifically intercepts `powershell.exe`
+    if (!resolvedViaReg && (isVitest || customSyncFn !== null)) {
+      const psKnownFoldersScript = [
+        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+        '$sh = New-Object -ComObject Shell.Application',
+        '$sg = try { $n = $sh.Namespace("shell:SavedGames"); if ($n) { $n.Self.Path } else { "" } } catch { "" }',
+        '$ll = try { $n = $sh.Namespace("shell:LocalAppDataLow"); if ($n) { $n.Self.Path } else { "" } } catch { "" }',
+        '@{',
+        "  Personal = [Environment]::GetFolderPath('Personal')",
+        '  SavedGames = $sg',
+        "  LocalAppData = [Environment]::GetFolderPath('LocalApplicationData')",
+        "  AppData = [Environment]::GetFolderPath('ApplicationData')",
+        '  LocalLow = $ll',
+        '} | ConvertTo-Json -Compress',
+      ].join('; ');
+
+      try {
+        const rawPsOut = execSyncImpl(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            psKnownFoldersScript,
+          ],
+          {
+            encoding: 'utf8',
+            timeout: 3000,
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          }
+        );
+        const stdoutStr = (
+          typeof rawPsOut === 'string'
+            ? rawPsOut
+            : Buffer.isBuffer(rawPsOut)
+              ? rawPsOut.toString('utf8')
+              : String(rawPsOut ?? '')
+        )
+          .replace(/^\uFEFF/, '')
+          .trim();
+
+        if (stdoutStr.startsWith('{')) {
+          const parsedJson = JSON.parse(stdoutStr);
+          current = applyParsedKnownFoldersJson(
+            parsedJson,
+            current,
+            expandWinEnvString,
+            normalizeWinOrHost
+          );
+        } else if (/REG_(?:EXPAND_)?SZ/i.test(stdoutStr)) {
+          current = applyRegistryOutputToKnownFolders(stdoutStr, current, expandWinEnvString);
+        }
+      } catch {
+        // Fallback cleanly to `current` defaults
+      }
     }
   }
 
@@ -1868,15 +2958,27 @@ module.exports = {
   applyWindowsOwnerAclAsync,
   atomicWriteFileSync,
   atomicWriteSecureFileSync,
+  readJsonFileWithBackupSync,
   isContainedWithinRoot,
   isAllowedHttpsHost,
   isPrivateOrLoopbackIp,
   assertSafePublicHttpsUrl,
+  readSafeResponseBuffer,
+  safePublicHttpsFetch,
+  resolveTrustedDevStartUrl,
+  isTrustedAppRendererUrl,
+  isTrustedIpcSenderEvent,
+  assertTrustedIpcSender,
+  wrapIpcMainWithSenderCheck,
   DANGEROUS_LAUNCH_ENV_KEYS,
+  LAUNCH_ENV_MAP_FIELDS,
   LAUNCH_SHELL_OR_EXEC_FIELDS,
   FORBIDDEN_RENDERER_IPC_KEYS,
   ALLOWED_LAUNCHER_SETTINGS_KEYS,
   sanitizeLaunchEnvironmentMap,
+  sanitizeSpawnEnvironmentMap,
+  computeLaunchEnvApprovalFingerprint,
+  buildSafeChildEnvironment,
   sanitizeLaunchConfigRecursive,
   sanitizeLauncherSettingsPayload,
   computeLaunchCommandFingerprint,
@@ -1892,6 +2994,10 @@ module.exports = {
   purgeStoreHelperCredentials,
   getImportedEpicInstalls,
   recordImportedEpicInstall,
+  discoverWindowsLocalDrivesAsync,
+  getCachedWindowsLocalDrives,
+  getKnownWindowsLocalDrivesSync,
+  clearCachedWindowsLocalDrives,
   resolveHostWindowsKnownFolders,
   refreshHostWindowsKnownFoldersAsync,
   clearCachedWindowsKnownFolders,

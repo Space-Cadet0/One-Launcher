@@ -1,7 +1,12 @@
-import { createStore, entries as idbEntries, type UseStore } from 'idb-keyval';
 import type { CanonicalGame } from '../../contracts/game';
 import type { MediaSyncOutcome } from '../../contracts/steam';
-import { isIndexedDbAvailable, vaultDelete, vaultGet, vaultSet } from './indexedDbVault';
+import {
+  isIndexedDbAvailable,
+  vaultDelete,
+  vaultEntries,
+  vaultGet,
+  vaultSet,
+} from './indexedDbVault';
 
 /**
  * Phase 4 Option B: Tiered Data Mutability & Staged TTL Caching
@@ -103,22 +108,22 @@ const MAX_STUB_STRING_CHARS = 240;
 const memoryFallback = new Map<string, StagedCacheEntry<unknown>>();
 const localStorageMirroredKeys = new Set<string>();
 const vaultHydratedKeys = new Set<string>();
+const trackedCacheKeys = new Set<string>();
 
-let bulkVaultStore: UseStore | null = null;
 let inFlightBulkVaultHydration: Promise<number> | null = null;
 let bootHydrationPromise: Promise<number> | null = null;
 let stagedVaultHydrationComplete = false;
 
-function getBulkVaultStore(): UseStore | null {
-  if (!isIndexedDbAvailable()) return null;
-  if (!bulkVaultStore) {
-    try {
-      bulkVaultStore = createStore('one-launcher-db', 'kv');
-    } catch {
-      bulkVaultStore = null;
-    }
+function addBoundedKey(set: Set<string>, key: string): void {
+  if (set.has(key)) {
+    set.delete(key);
   }
-  return bulkVaultStore;
+  set.add(key);
+  while (set.size > MAX_MEMORY_FALLBACK_ENTRIES) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
 }
 
 function setMemoryFallbackBounded<T>(key: string, entry: StagedCacheEntry<T>): void {
@@ -139,6 +144,7 @@ export function clearStagedMemoryFallback(): void {
   parsedStagedMemo.clear();
   localStorageMirroredKeys.clear();
   vaultHydratedKeys.clear();
+  trackedCacheKeys.clear();
 }
 
 function compactDataPayloadForStub(data: unknown): unknown {
@@ -440,7 +446,7 @@ function setParsedStagedMemo(key: string, raw: string, parsed: Record<string, un
 
 /**
  * Saves an entry into persistent staged cache with tier-specific TTL and automatic quota handling.
- * Full payloads are stored as parsed objects in bounded LRU `memoryFallback` (4,096 entries) and
+ * Full payloads are stored as parsed objects in bounded LRU `memoryFallback` (16,384 entries) and
  * persisted asynchronously to IndexedDB vault, while oversized payloads (> 2KB) mirror a compact
  * `< 512 B` header/score stub to `localStorage` so cold reloads achieve 100% synchronous hit rate
  * without multi-MB `localStorage` bloat.
@@ -461,7 +467,7 @@ export function saveStagedCache<T>(
 ): StagedCacheEntry<T> {
   const entry = createStagedCacheEntry<T>(data, tier, options);
   const storage = getStorage();
-  trackedCacheKeys.add(key);
+  addBoundedKey(trackedCacheKeys, key);
 
   setMemoryFallbackBounded(key, entry);
   void vaultSet(`staged:${key}`, entry);
@@ -478,14 +484,14 @@ export function saveStagedCache<T>(
 
     try {
       storage.setItem(key, toStoreRaw);
-      localStorageMirroredKeys.add(key);
+      addBoundedKey(localStorageMirroredKeys, key);
       vaultHydratedKeys.delete(key);
       setParsedStagedMemo(key, toStoreRaw, toStoreObj);
     } catch {
       try {
         clearExpiredStagedCache();
         storage.setItem(key, toStoreRaw);
-        localStorageMirroredKeys.add(key);
+        addBoundedKey(localStorageMirroredKeys, key);
         vaultHydratedKeys.delete(key);
         setParsedStagedMemo(key, toStoreRaw, toStoreObj);
       } catch {
@@ -494,12 +500,12 @@ export function saveStagedCache<T>(
           storage.removeItem(key);
         } catch {}
         localStorageMirroredKeys.delete(key);
-        vaultHydratedKeys.add(key);
+        addBoundedKey(vaultHydratedKeys, key);
         parsedStagedMemo.delete(key);
       }
     }
   } else {
-    vaultHydratedKeys.add(key);
+    addBoundedKey(vaultHydratedKeys, key);
   }
 
   return entry;
@@ -518,13 +524,13 @@ export async function hydrateStagedCacheKeyFromVault<T>(
     fromVault.ttlMs = Infinity;
   }
   setMemoryFallbackBounded(key, fromVault);
-  vaultHydratedKeys.add(key);
+  addBoundedKey(vaultHydratedKeys, key);
   return fromVault;
 }
 
 export function isStagedVaultHydrationComplete(): boolean {
   if (stagedVaultHydrationComplete) return true;
-  if (!isIndexedDbAvailable() || !getBulkVaultStore()) {
+  if (!isIndexedDbAvailable()) {
     stagedVaultHydrationComplete = true;
     return true;
   }
@@ -572,15 +578,14 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
   if (inFlightBulkVaultHydration) {
     return inFlightBulkVaultHydration;
   }
-  const store = getBulkVaultStore();
-  if (!store) {
+  if (!isIndexedDbAvailable()) {
     stagedVaultHydrationComplete = true;
     return 0;
   }
 
   inFlightBulkVaultHydration = (async (): Promise<number> => {
     try {
-      const allEntries = await idbEntries(store);
+      const allEntries = await vaultEntries<IDBValidKey, unknown>();
       if (!Array.isArray(allEntries) || allEntries.length === 0) return 0;
       const now = Date.now();
       let hydratedCount = 0;
@@ -603,9 +608,9 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
         ) {
           continue;
         }
-        trackedCacheKeys.add(cacheKey);
+        addBoundedKey(trackedCacheKeys, cacheKey);
         setMemoryFallbackBounded(cacheKey, entry);
-        vaultHydratedKeys.add(cacheKey);
+        addBoundedKey(vaultHydratedKeys, cacheKey);
         hydratedCount++;
       }
       return hydratedCount;
@@ -628,6 +633,10 @@ export async function hydrateAllStagedCacheFromVault(): Promise<number> {
   return inFlightBulkVaultHydration;
 }
 
+function coerceDeserializedPayload<T>(raw: unknown): T {
+  return raw as T;
+}
+
 function evaluateHydratedStagedEntry<T>(
   entry: StagedCacheEntry<T>,
   bypassTTL: boolean
@@ -636,7 +645,7 @@ function evaluateHydratedStagedEntry<T>(
     entry.ttlMs = Infinity;
   }
   const valid = isCacheEntryValid(entry, bypassTTL);
-  const data = entry.data !== undefined ? entry.data : (entry as unknown as T);
+  const data = entry.data !== undefined ? entry.data : coerceDeserializedPayload<T>(entry);
   const stale =
     !valid &&
     data !== null &&
@@ -739,7 +748,7 @@ export function loadStagedCache<T>(
       }
     } else {
       // Legacy unversioned entry adapter
-      const legacyData = parsed as unknown as T;
+      const legacyData = coerceDeserializedPayload<T>(parsed);
       entry = {
         data: legacyData,
         cachedAt: Date.now(),
@@ -763,7 +772,6 @@ export function isCompactStubInLocalStorage(key: string): boolean {
 }
 
 export const STAGED_CACHE_PREFIX = 'antigravity_staged_';
-const trackedCacheKeys = new Set<string>();
 
 /**
  * Removes a staged cache entry from persistent storage and in-memory fallback.

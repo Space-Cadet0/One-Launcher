@@ -111,14 +111,17 @@ static uint32_t ds_compute_mod_flags_by_base(const WCHAR *base)
         L"d3d8.dll",
         L"d3d9.dll",
         L"d3d10.dll",
+        L"d3d10_1.dll",
         L"d3d10core.dll",
         L"d3d11.dll",
         L"d3d12.dll",
+        L"d3d12core.dll",
         L"dxgi.dll",
         L"opengl32.dll",
         L"vulkan-1.dll",
         L"winevulkan.dll",
         L"d3dmetal.dll",
+        L"winemetal.dll",
         L"winemac.drv",
         L"win32u.dll",
         L"user32.dll",
@@ -131,15 +134,18 @@ static uint32_t ds_compute_mod_flags_by_base(const WCHAR *base)
         }
     }
     static const WCHAR *const k_phys_surface_mods[] = {
+        L"dxgi.dll",
         L"d3d10.dll",
+        L"d3d10_1.dll",
         L"d3d10core.dll",
         L"d3d11.dll",
         L"d3d12.dll",
-        L"dxgi.dll",
+        L"d3d12core.dll",
         L"opengl32.dll",
         L"vulkan-1.dll",
         L"winevulkan.dll",
         L"d3dmetal.dll",
+        L"winemetal.dll",
         L"winemac.drv",
         L"win32u.dll",
         L"user32.dll",
@@ -217,6 +223,9 @@ bool ds_is_system_renderer_caller(const void *ret_addr)
 
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
 {
+    if (ds_is_passthrough_locked()) {
+        return false;
+    }
     uint32_t flags = 0;
     if (!ds_classify_caller_module(ret_addr, &flags)) {
         return true;
@@ -259,11 +268,40 @@ static bool ds_should_skip_iat_patch_module(const WCHAR *base)
         L"winemac.drv",
         L"winevulkan.dll",
         L"vulkan-1.dll",
+        L"d3dmetal.dll",
+        L"winemetal.dll",
         L"one_display_scaler_x86.dll",
         L"one_display_scaler_x64.dll"
     };
     for (size_t i = 0; i < sizeof(k_skip_mods) / sizeof(k_skip_mods[0]); i++) {
         if (_wcsicmp(base, k_skip_mods[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ds_is_passthrough_chaining_process(void)
+{
+    WCHAR exe_path[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(NULL, exe_path, MAX_PATH - 1) == 0) {
+        return false;
+    }
+    const WCHAR *base = ds_basename_w(exe_path);
+    static const WCHAR *const k_chain_only_procs[] = {
+        L"cmd.exe",
+        L"powershell.exe",
+        L"rundll32.exe",
+        L"steam.exe",
+        L"galaxyclient.exe",
+        L"galaxyclienthelper.exe",
+        L"galaxycommunication.exe",
+        L"epicgameslauncher.exe",
+        L"eadesktop.exe",
+        L"upc.exe"
+    };
+    for (size_t i = 0; i < sizeof(k_chain_only_procs) / sizeof(k_chain_only_procs[0]); i++) {
+        if (_wcsicmp(base, k_chain_only_procs[i]) == 0) {
             return true;
         }
     }
@@ -286,24 +324,16 @@ static bool ds_should_ignore_current_process(void)
         L"wineboot.exe",
         L"conhost.exe",
         L"svchost.exe",
-        L"rundll32.exe",
         L"reg.exe",
         L"regedit.exe",
         L"regsvr32.exe",
         L"msiexec.exe",
-        L"cmd.exe",
-        L"powershell.exe",
         L"one_display_launcher_x86.exe",
         L"one_display_launcher_x64.exe",
         L"one_xgr_win_launcher.exe",
         L"one_xgr_win_launcher_x86.exe",
-        L"steam.exe",
         L"steamwebhelper.exe",
         L"steamservice.exe",
-        L"galaxyclient.exe",
-        L"galaxyclienthelper.exe",
-        L"galaxycommunication.exe",
-        L"epicgameslauncher.exe",
         L"epicwebhelper.exe"
     };
     for (size_t i = 0; i < sizeof(k_ignored_procs) / sizeof(k_ignored_procs[0]); i++) {
@@ -312,6 +342,37 @@ static bool ds_should_ignore_current_process(void)
         }
     }
     return false;
+}
+
+static bool ds_recompute_modern_passthrough_locked(void)
+{
+    bool want = (
+        g_ds.modern_gfx_loaded &&
+        !g_ds.wined3d_uses_gl &&
+        !g_ds.game_gl_active &&
+        !g_ds.legacy_d3d_loaded
+    );
+    bool prev = g_ds.modern_swapchain_passthrough;
+    g_ds.modern_swapchain_passthrough = want;
+    if (!prev && want &&
+        g_ds.scaling_mode == DS_MODE_AUTO_FULLSCREEN &&
+        !g_ds.user_forced_fullscreen) {
+        bool had_virt = (g_ds.fullscreen_active || g_ds.mode_virtualized);
+        g_ds.fullscreen_active = false;
+        g_ds.mode_virtualized = false;
+        g_ds.virt_w = g_ds.real_screen_w;
+        g_ds.virt_h = g_ds.real_screen_h;
+        g_ds.virt_bpp = g_ds.real_bpp;
+        g_ds.virt_hz = g_ds.real_hz;
+        ds_refresh_viewport_locked();
+        return had_virt;
+    }
+    return false;
+}
+
+void ds_notify_gl_context_active_locked(void)
+{
+    (void)ds_recompute_modern_passthrough_locked();
 }
 
 void ds_refresh_viewport_locked(void)
@@ -411,7 +472,10 @@ static void ds_fill_devmode_a(DEVMODEA *dm, int32_t w, int32_t h, int32_t bpp, i
 static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW *lpDevMode, DWORD dwFlags)
 {
     if (!lpDevMode) return FALSE;
-    if (ds_is_internal_call() || g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
+    if (ds_is_internal_call() || ds_is_passthrough_locked()) {
         return g_ds.real_EnumDisplaySettingsExW ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
@@ -467,7 +531,10 @@ static BOOL WINAPI hook_EnumDisplaySettingsW(LPCWSTR lpszDeviceName, DWORD iMode
 static BOOL WINAPI hook_EnumDisplaySettingsExA(LPCSTR lpszDeviceName, DWORD iModeNum, DEVMODEA *lpDevMode, DWORD dwFlags)
 {
     if (!lpDevMode) return FALSE;
-    if (ds_is_internal_call() || g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
+    if (ds_is_internal_call() || ds_is_passthrough_locked()) {
         return g_ds.real_EnumDisplaySettingsExA ? g_ds.real_EnumDisplaySettingsExA(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
@@ -527,7 +594,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
             g_ds.hwnd_game != NULL &&
             IsWindow(g_ds.hwnd_game) &&
             !g_ds.user_forced_windowed &&
-            g_ds.scaling_mode != DS_MODE_PASSTHROUGH
+            !ds_is_passthrough_locked()
         );
         g_ds.virt_w = g_ds.real_screen_w;
         g_ds.virt_h = g_ds.real_screen_h;
@@ -599,7 +666,10 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
 
 static LONG ds_change_display_settings_w_impl(LPCWSTR lpszDeviceName, DEVMODEW *lpDevMode, HWND hwnd, DWORD dwFlags, LPVOID lParam, const void *caller_ret)
 {
-    if (ds_is_internal_call() || g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
+    if (ds_is_internal_call() || ds_is_passthrough_locked()) {
         return g_ds.real_ChangeDisplaySettingsExW
             ? g_ds.real_ChangeDisplaySettingsExW(lpszDeviceName, lpDevMode, hwnd, dwFlags, lParam)
             : DISP_CHANGE_SUCCESSFUL;
@@ -631,7 +701,10 @@ static LONG WINAPI hook_ChangeDisplaySettingsW(DEVMODEW *lpDevMode, DWORD dwFlag
 
 static LONG ds_change_display_settings_a_impl(LPCSTR lpszDeviceName, DEVMODEA *lpDevMode, HWND hwnd, DWORD dwFlags, LPVOID lParam, const void *caller_ret)
 {
-    if (ds_is_internal_call() || g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
+    if (ds_is_internal_call() || ds_is_passthrough_locked()) {
         return g_ds.real_ChangeDisplaySettingsExA
             ? g_ds.real_ChangeDisplaySettingsExA(lpszDeviceName, lpDevMode, hwnd, dwFlags, lParam)
             : DISP_CHANGE_SUCCESSFUL;
@@ -663,6 +736,9 @@ static LONG WINAPI hook_ChangeDisplaySettingsA(DEVMODEA *lpDevMode, DWORD dwFlag
 
 static int WINAPI hook_GetSystemMetrics(int nIndex)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
         EnterCriticalSection(&g_ds.lock);
         bool virt = g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
@@ -677,6 +753,9 @@ static int WINAPI hook_GetSystemMetrics(int nIndex)
             if (nIndex == SM_CYSCREEN || nIndex == SM_CYFULLSCREEN || nIndex == SM_CYVIRTUALSCREEN) {
                 return vh;
             }
+            if (nIndex == SM_XVIRTUALSCREEN || nIndex == SM_YVIRTUALSCREEN) {
+                return 0;
+            }
         }
     }
     return g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(nIndex) : 0;
@@ -688,10 +767,13 @@ static int WINAPI hook_GetSystemMetrics(int nIndex)
 
 static HWND WINAPI hook_CreateWindowExW(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     HWND hwnd = g_ds.real_CreateWindowExW
         ? g_ds.real_CreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam)
         : NULL;
-    if (hwnd && !ds_is_internal_call() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
+    if (hwnd && !ds_is_internal_call() && !ds_is_passthrough_locked() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
         ds_attach_and_apply_game_window(hwnd, nWidth > 0 ? nWidth : 0, nHeight > 0 ? nHeight : 0);
     }
     return hwnd;
@@ -699,10 +781,13 @@ static HWND WINAPI hook_CreateWindowExW(DWORD dwExStyle, LPCWSTR lpClassName, LP
 
 static HWND WINAPI hook_CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     HWND hwnd = g_ds.real_CreateWindowExA
         ? g_ds.real_CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam)
         : NULL;
-    if (hwnd && !ds_is_internal_call() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
+    if (hwnd && !ds_is_internal_call() && !ds_is_passthrough_locked() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
         ds_attach_and_apply_game_window(hwnd, nWidth > 0 ? nWidth : 0, nHeight > 0 ? nHeight : 0);
     }
     return hwnd;
@@ -710,9 +795,12 @@ static HWND WINAPI hook_CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPC
 
 static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     pfn_ShowWindow_t fn = is_async ? (pfn_ShowWindow_t)g_ds.real_ShowWindowAsync : g_ds.real_ShowWindow;
     if (!fn) return FALSE;
-    if (ds_is_internal_call() || !hWnd) {
+    if (ds_is_internal_call() || !hWnd || ds_is_passthrough_locked()) {
         return fn(hWnd, nCmdShow);
     }
 
@@ -766,7 +854,7 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
         }
 
         /*
-         * Classic Win32/DirectDraw titles (e.g. JK.EXE) call ShowWindow(hWnd, SW_MAXIMIZE)
+         * Classic Win32/DirectDraw titles call ShowWindow(hWnd, SW_MAXIMIZE)
          * when entering fullscreen 3D. In Wine/winemac.drv, NtUserShowWindow(SW_MAXIMIZE)
          * bypasses user32!SetWindowPos and maximizes the Cocoa NSWindow to full monitor bounds.
          * Clamp to SW_SHOW / SW_RESTORE / SW_SHOWNA and enforce our fullscreen viewport immediately.
@@ -784,6 +872,35 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
             InterlockedExchange(&g_ds.gl_drawable_rebind_pending, 1);
         }
         return res;
+    }
+
+    if (!is_hide && !is_minimize && hWnd) {
+        EnterCriticalSection(&g_ds.lock);
+        bool fs_dialog_raise = (
+            hWnd != g_ds.hwnd_game &&
+            g_ds.fullscreen_active &&
+            !g_ds.app_inactive &&
+            g_ds.real_SetWindowPos != NULL
+        );
+        LeaveCriticalSection(&g_ds.lock);
+
+        if (fs_dialog_raise) {
+            DWORD wnd_pid = 0;
+            GetWindowThreadProcessId(hWnd, &wnd_pid);
+            if (wnd_pid == GetCurrentProcessId()) {
+                WCHAR cls[16] = { 0 };
+                if (GetClassNameW(hWnd, cls, 15) > 0 && wcscmp(cls, L"#32770") == 0) {
+                    BOOL dlg_res = fn(hWnd, nCmdShow);
+                    if (g_ds.real_ClipCursor) {
+                        g_ds.real_ClipCursor(NULL);
+                    }
+                    ds_enter_internal();
+                    g_ds.real_SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    ds_leave_internal();
+                    return dlg_res;
+                }
+            }
+        }
     }
 
     return fn(hWnd, nCmdShow);
@@ -866,7 +983,7 @@ static bool ds_try_promote_fullscreen_resize_locked(
     bool sys_caller)
 {
     if (hWnd != g_ds.hwnd_game || g_ds.fullscreen_active || g_ds.user_forced_windowed ||
-        g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+        ds_is_passthrough_locked()) {
         return false;
     }
     if ((uFlags & (SWP_NOSIZE | SWP_HIDEWINDOW)) != 0 || cx < 240 || cy < 180 ||
@@ -955,7 +1072,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     if (!real_fn) {
         return (LONG)0xC0000002L;
     }
-    if (!g_ds.is_wine || ds_is_internal_call() || !desc ||
+    if (!g_ds.is_wine || ds_is_internal_call() || ds_is_passthrough_locked() || !desc ||
         desc->Type != DS_WINE_D3DKMT_ESCAPE_SET_PRESENT_RECT ||
         desc->PrivateDriverDataSize != (UINT)sizeof(RECT) ||
         desc->pPrivateDriverData == NULL) {
@@ -975,7 +1092,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
         int32_t win_scale = ds_get_windowed_scale_locked();
         bool suppress_clamp = (
             target_hwnd == g_ds.hwnd_game &&
-            g_ds.scaling_mode != DS_MODE_PASSTHROUGH &&
+            !ds_is_passthrough_locked() &&
             (g_ds.fullscreen_active ||
              win_scale > 1 ||
              (!g_ds.user_forced_windowed &&
@@ -1004,10 +1121,41 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
     return real_fn(desc);
 }
 
+static void ds_compute_centered_windowed_bounds(HWND hWnd, int32_t client_w, int32_t client_h, int *out_x, int *out_y, int *out_w, int *out_h)
+{
+    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
+    DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_EXSTYLE);
+    RECT wrc = { 0, 0, client_w, client_h };
+    if (g_ds.real_AdjustWindowRectEx) {
+        g_ds.real_AdjustWindowRectEx(&wrc, cur_style, FALSE, cur_exstyle);
+    }
+    int ww = wrc.right - wrc.left;
+    int wh = wrc.bottom - wrc.top;
+    int wx = (g_ds.real_screen_w - ww) / 2;
+    int wy = (g_ds.real_screen_h - wh) / 2;
+    *out_x = wx < 0 ? 0 : wx;
+    *out_y = wy < 0 ? 0 : wy;
+    *out_w = ww;
+    *out_h = wh;
+}
+
+static bool ds_is_hwnd_already_full_panel_internal(HWND hWnd)
+{
+    RECT cur_rc = { 0, 0, 0, 0 };
+    return IsWindowVisible(hWnd) &&
+           g_ds.real_GetWindowRect && g_ds.real_GetWindowRect(hWnd, &cur_rc) &&
+           cur_rc.left == 0 && cur_rc.top == 0 &&
+           (cur_rc.right - cur_rc.left) == g_ds.real_screen_w &&
+           (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h;
+}
+
 static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     if (!g_ds.real_SetWindowPos) return FALSE;
-    if (ds_is_internal_call() || !hWnd) {
+    if (ds_is_internal_call() || !hWnd || ds_is_passthrough_locked()) {
         return g_ds.real_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
     }
 
@@ -1050,13 +1198,8 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             eff_flags |= SWP_FRAMECHANGED;
         }
         ds_enter_internal();
-        RECT cur_rc = { 0, 0, 0, 0 };
         bool already_full = !staging_birth && !promoted_fs && !app_inactive &&
-                            IsWindowVisible(hWnd) &&
-                            g_ds.real_GetWindowRect && g_ds.real_GetWindowRect(hWnd, &cur_rc) &&
-                            cur_rc.left == 0 && cur_rc.top == 0 &&
-                            (cur_rc.right - cur_rc.left) == g_ds.real_screen_w &&
-                            (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h &&
+                            ds_is_hwnd_already_full_panel_internal(hWnd) &&
                             (eff_flags & (SWP_HIDEWINDOW | SWP_FRAMECHANGED)) == 0;
         if (already_full) {
             eff_flags = (eff_flags & ~(UINT)SWP_SHOWWINDOW) | SWP_NOMOVE | SWP_NOSIZE;
@@ -1080,18 +1223,8 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
     }
 
     if (win_scale > 1 && vw > 0 && vh > 0) {
-        DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
-        DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_EXSTYLE);
-        RECT wrc = { 0, 0, vw * win_scale, vh * win_scale };
-        if (g_ds.real_AdjustWindowRectEx) {
-            g_ds.real_AdjustWindowRectEx(&wrc, cur_style, FALSE, cur_exstyle);
-        }
-        int ww = wrc.right - wrc.left;
-        int wh = wrc.bottom - wrc.top;
-        int wx = (g_ds.real_screen_w - ww) / 2;
-        int wy = (g_ds.real_screen_h - wh) / 2;
-        if (wx < 0) wx = 0;
-        if (wy < 0) wy = 0;
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        ds_compute_centered_windowed_bounds(hWnd, vw * win_scale, vh * win_scale, &wx, &wy, &ww, &wh);
         int nx = (uFlags & SWP_NOMOVE) ? X : wx;
         int ny = (uFlags & SWP_NOMOVE) ? Y : wy;
         int ncx = (uFlags & SWP_NOSIZE) ? cx : ww;
@@ -1115,8 +1248,11 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
 
 static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint)
 {
+    if (!ds_is_internal_call()) {
+        ds_ensure_runtime_started();
+    }
     if (!g_ds.real_MoveWindow) return FALSE;
-    if (ds_is_internal_call() || !hWnd) {
+    if (ds_is_internal_call() || !hWnd || ds_is_passthrough_locked()) {
         return g_ds.real_MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
     }
 
@@ -1134,12 +1270,7 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
             ds_ensure_fullscreen_styles_on_owner_thread(hWnd);
         }
         ds_enter_internal();
-        RECT cur_rc = { 0, 0, 0, 0 };
-        bool already_full = !promoted_fs && IsWindowVisible(hWnd) &&
-                            g_ds.real_GetWindowRect && g_ds.real_GetWindowRect(hWnd, &cur_rc) &&
-                            cur_rc.left == 0 && cur_rc.top == 0 &&
-                            (cur_rc.right - cur_rc.left) == g_ds.real_screen_w &&
-                            (cur_rc.bottom - cur_rc.top) == g_ds.real_screen_h;
+        bool already_full = !promoted_fs && ds_is_hwnd_already_full_panel_internal(hWnd);
         if (!already_full) {
             ds_clear_wine_present_rect_on_hwnd(hWnd);
         }
@@ -1164,18 +1295,8 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
         return res;
     }
     if (win_scale > 1 && vw > 0 && vh > 0) {
-        DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
-        DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_EXSTYLE);
-        RECT wrc = { 0, 0, vw * win_scale, vh * win_scale };
-        if (g_ds.real_AdjustWindowRectEx) {
-            g_ds.real_AdjustWindowRectEx(&wrc, cur_style, FALSE, cur_exstyle);
-        }
-        int ww = wrc.right - wrc.left;
-        int wh = wrc.bottom - wrc.top;
-        int wx = (g_ds.real_screen_w - ww) / 2;
-        int wy = (g_ds.real_screen_h - wh) / 2;
-        if (wx < 0) wx = 0;
-        if (wy < 0) wy = 0;
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        ds_compute_centered_windowed_bounds(hWnd, vw * win_scale, vh * win_scale, &wx, &wy, &ww, &wh);
         ds_enter_internal();
         ds_clear_wine_present_rect_on_hwnd(hWnd);
         BOOL res = g_ds.real_MoveWindow(hWnd, wx, wy, ww, wh, bRepaint);
@@ -1217,34 +1338,22 @@ static LONG_PTR ds_handle_get_window_long(HWND hWnd, int nIndex, bool unicode)
 
 static LONG WINAPI hook_GetWindowLongA(HWND hWnd, int nIndex)
 {
-    if (nIndex != GWLP_WNDPROC) {
-        return g_ds.real_GetWindowLongA ? g_ds.real_GetWindowLongA(hWnd, nIndex) : 0;
-    }
     return (LONG)ds_handle_get_window_long(hWnd, nIndex, false);
 }
 
 static LONG WINAPI hook_GetWindowLongW(HWND hWnd, int nIndex)
 {
-    if (nIndex != GWLP_WNDPROC) {
-        return g_ds.real_GetWindowLongW ? g_ds.real_GetWindowLongW(hWnd, nIndex) : 0;
-    }
     return (LONG)ds_handle_get_window_long(hWnd, nIndex, true);
 }
 
 #if defined(_WIN64)
 static LONG_PTR WINAPI hook_GetWindowLongPtrA(HWND hWnd, int nIndex)
 {
-    if (nIndex != GWLP_WNDPROC) {
-        return g_ds.real_GetWindowLongPtrA ? g_ds.real_GetWindowLongPtrA(hWnd, nIndex) : 0;
-    }
     return ds_handle_get_window_long(hWnd, nIndex, false);
 }
 
 static LONG_PTR WINAPI hook_GetWindowLongPtrW(HWND hWnd, int nIndex)
 {
-    if (nIndex != GWLP_WNDPROC) {
-        return g_ds.real_GetWindowLongPtrW ? g_ds.real_GetWindowLongPtrW(hWnd, nIndex) : 0;
-    }
     return ds_handle_get_window_long(hWnd, nIndex, true);
 }
 #endif
@@ -1321,34 +1430,22 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
 
 static LONG WINAPI hook_SetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-    if (nIndex != GWL_STYLE && nIndex != GWL_EXSTYLE && nIndex != GWLP_WNDPROC) {
-        return g_ds.real_SetWindowLongA ? g_ds.real_SetWindowLongA(hWnd, nIndex, dwNewLong) : 0;
-    }
     return (LONG)ds_handle_set_window_long(hWnd, nIndex, (LONG_PTR)dwNewLong, false, __builtin_return_address(0));
 }
 
 static LONG WINAPI hook_SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-    if (nIndex != GWL_STYLE && nIndex != GWL_EXSTYLE && nIndex != GWLP_WNDPROC) {
-        return g_ds.real_SetWindowLongW ? g_ds.real_SetWindowLongW(hWnd, nIndex, dwNewLong) : 0;
-    }
     return (LONG)ds_handle_set_window_long(hWnd, nIndex, (LONG_PTR)dwNewLong, true, __builtin_return_address(0));
 }
 
 #if defined(_WIN64)
 static LONG_PTR WINAPI hook_SetWindowLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLong)
 {
-    if (nIndex != GWL_STYLE && nIndex != GWL_EXSTYLE && nIndex != GWLP_WNDPROC) {
-        return g_ds.real_SetWindowLongPtrA ? g_ds.real_SetWindowLongPtrA(hWnd, nIndex, dwNewLong) : 0;
-    }
     return ds_handle_set_window_long(hWnd, nIndex, dwNewLong, false, __builtin_return_address(0));
 }
 
 static LONG_PTR WINAPI hook_SetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong)
 {
-    if (nIndex != GWL_STYLE && nIndex != GWL_EXSTYLE && nIndex != GWLP_WNDPROC) {
-        return g_ds.real_SetWindowLongPtrW ? g_ds.real_SetWindowLongPtrW(hWnd, nIndex, dwNewLong) : 0;
-    }
     return ds_handle_set_window_long(hWnd, nIndex, dwNewLong, true, __builtin_return_address(0));
 }
 #endif
@@ -1357,9 +1454,11 @@ static BOOL WINAPI hook_GetClientRect(HWND hWnd, LPRECT lpRect)
 {
     if (!lpRect) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+        HWND desk = GetDesktopWindow();
         EnterCriticalSection(&g_ds.lock);
-        bool is_game_virt = (hWnd != NULL && hWnd == g_ds.hwnd_game &&
-                             (g_ds.fullscreen_active || ds_get_windowed_scale_locked() > 1) &&
+        bool is_game_virt = (hWnd != NULL &&
+                             ((hWnd == g_ds.hwnd_game && (g_ds.fullscreen_active || ds_get_windowed_scale_locked() > 1)) ||
+                              (hWnd == desk && g_ds.fullscreen_active)) &&
                              g_ds.virt_w > 0 && g_ds.virt_h > 0);
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
@@ -1623,6 +1722,194 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
     return g_ds.real_ClipCursor(lpRect);
 }
 
+static BOOL WINAPI hook_GetClipCursor(LPRECT lpRect)
+{
+    if (!lpRect || !g_ds.real_GetClipCursor) return FALSE;
+    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_ds.lock);
+        if (g_ds.has_virtual_clip) {
+            *lpRect = g_ds.virtual_clip_rect;
+            LeaveCriticalSection(&g_ds.lock);
+            return TRUE;
+        }
+        if (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0) {
+            lpRect->left = 0;
+            lpRect->top = 0;
+            lpRect->right = g_ds.virt_w;
+            lpRect->bottom = g_ds.virt_h;
+            LeaveCriticalSection(&g_ds.lock);
+            return TRUE;
+        }
+        LeaveCriticalSection(&g_ds.lock);
+    }
+    return g_ds.real_GetClipCursor(lpRect);
+}
+
+static DWORD WINAPI hook_GetMessagePos(void)
+{
+    DWORD raw = g_ds.real_GetMessagePos ? g_ds.real_GetMessagePos() : 0;
+    if (ds_is_internal_call() || !ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+        return raw;
+    }
+
+    int32_t px = (int32_t)(short)LOWORD(raw);
+    int32_t py = (int32_t)(short)HIWORD(raw);
+    int32_t vx = px;
+    int32_t vy = py;
+    bool mapped = false;
+
+    EnterCriticalSection(&g_ds.lock);
+    int32_t win_scale = ds_get_windowed_scale_locked();
+    HWND hwnd_game = g_ds.hwnd_game;
+    int32_t vw = g_ds.virt_w;
+    int32_t vh = g_ds.virt_h;
+    if (g_ds.fullscreen_active && vw > 0 && vh > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
+        ds_map_cursor_phys_to_virt(
+            px,
+            py,
+            g_ds.vp.dst_x,
+            g_ds.vp.dst_y,
+            g_ds.vp.dst_w,
+            g_ds.vp.dst_h,
+            vw,
+            vh,
+            &vx,
+            &vy
+        );
+        mapped = true;
+    } else if (win_scale > 1 && vw > 0 && vh > 0 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
+        POINT orig = { 0, 0 };
+        ds_enter_internal();
+        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
+        ds_leave_internal();
+        if (has_orig) {
+            int32_t rel_vx = 0, rel_vy = 0;
+            ds_map_cursor_phys_to_virt(
+                px,
+                py,
+                orig.x,
+                orig.y,
+                vw * win_scale,
+                vh * win_scale,
+                vw,
+                vh,
+                &rel_vx,
+                &rel_vy
+            );
+            vx = orig.x + rel_vx;
+            vy = orig.y + rel_vy;
+            mapped = true;
+        }
+    }
+    LeaveCriticalSection(&g_ds.lock);
+
+    if (!mapped) {
+        return raw;
+    }
+    return (DWORD)MAKELONG((WORD)(short)vx, (WORD)(short)vy);
+}
+
+static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
+{
+    if (!raw || raw->header.dwType != RIM_TYPEMOUSE) {
+        return;
+    }
+    /* Preserve relative 3D camera mickeys 1:1; only remap normalized absolute coords */
+    if ((raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+        return;
+    }
+
+    EnterCriticalSection(&g_ds.lock);
+    bool fs_active = (
+        g_ds.fullscreen_active &&
+        g_ds.real_screen_w > 0 &&
+        g_ds.real_screen_h > 0 &&
+        g_ds.vp.dst_w > 0 &&
+        g_ds.vp.dst_h > 0
+    );
+    int32_t rsw = g_ds.real_screen_w;
+    int32_t rsh = g_ds.real_screen_h;
+    ds_viewport_t vp = g_ds.vp;
+    LeaveCriticalSection(&g_ds.lock);
+
+    if (!fs_active) {
+        return;
+    }
+
+    double phys_x = ((double)raw->data.mouse.lLastX * (double)rsw) / 65535.0;
+    double phys_y = ((double)raw->data.mouse.lLastY * (double)rsh) / 65535.0;
+    double norm_x = ((phys_x - (double)vp.dst_x) * 65535.0) / (double)vp.dst_w;
+    double norm_y = ((phys_y - (double)vp.dst_y) * 65535.0) / (double)vp.dst_h;
+    if (norm_x < 0.0) norm_x = 0.0;
+    if (norm_x > 65535.0) norm_x = 65535.0;
+    if (norm_y < 0.0) norm_y = 0.0;
+    if (norm_y > 65535.0) norm_y = 65535.0;
+    raw->data.mouse.lLastX = (LONG)(norm_x + 0.5);
+    raw->data.mouse.lLastY = (LONG)(norm_y + 0.5);
+}
+
+static UINT WINAPI hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader)
+{
+    if (!g_ds.real_GetRawInputData) return (UINT)-1;
+    UINT res = g_ds.real_GetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+    if (res != (UINT)-1 &&
+        pData != NULL &&
+        uiCommand == RID_INPUT &&
+        res >= (UINT)sizeof(RAWINPUTHEADER) &&
+        !ds_is_internal_call() &&
+        ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+        ds_remap_rawinput_mouse_packet((RAWINPUT *)pData);
+    }
+    return res;
+}
+
+static UINT WINAPI hook_GetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UINT cbSizeHeader)
+{
+    if (!g_ds.real_GetRawInputBuffer) return (UINT)-1;
+    UINT res = g_ds.real_GetRawInputBuffer(pData, pcbSize, cbSizeHeader);
+    if (res != (UINT)-1 &&
+        res > 0 &&
+        pData != NULL &&
+        !ds_is_internal_call() &&
+        ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+        uint8_t *cur = (uint8_t *)pData;
+        for (UINT i = 0; i < res; i++) {
+            RAWINPUT *pkt = (RAWINPUT *)(void *)cur;
+            if (pkt->header.dwSize < sizeof(RAWINPUTHEADER)) {
+                break;
+            }
+            ds_remap_rawinput_mouse_packet(pkt);
+            size_t step = ((size_t)pkt->header.dwSize + sizeof(ULONG_PTR) - 1u) & ~(sizeof(ULONG_PTR) - 1u);
+            if (step == 0) break;
+            cur += step;
+        }
+    }
+    return res;
+}
+
+static BOOL WINAPI hook_RegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevices, UINT cbSize)
+{
+    if (!g_ds.real_RegisterRawInputDevices) return FALSE;
+    BOOL ok = g_ds.real_RegisterRawInputDevices(pRawInputDevices, uiNumDevices, cbSize);
+    if (ok && !ds_is_internal_call() && pRawInputDevices && cbSize >= sizeof(RAWINPUTDEVICE)) {
+        const uint8_t *base = (const uint8_t *)pRawInputDevices;
+        for (UINT i = 0; i < uiNumDevices; i++) {
+            const RAWINPUTDEVICE *dev = (const RAWINPUTDEVICE *)(const void *)(base + (size_t)i * (size_t)cbSize);
+            if (dev->usUsagePage == 0x01 && dev->usUsage == 0x02) {
+                bool remove_dev = (dev->dwFlags & 0x00000001u) != 0;
+                bool want_confine = !remove_dev && (dev->dwFlags & (RIDEV_NOLEGACY | RIDEV_CAPTUREMOUSE)) != 0;
+                EnterCriticalSection(&g_ds.lock);
+                g_ds.raw_mouse_nolegacy = want_confine;
+                if (want_confine && g_ds.fullscreen_active && !g_ds.app_inactive) {
+                    ds_reapply_cursor_clip_locked();
+                }
+                LeaveCriticalSection(&g_ds.lock);
+            }
+        }
+    }
+    return ok;
+}
+
 static BOOL WINAPI hook_ScreenToClient(HWND hWnd, LPPOINT lpPoint)
 {
     if (!lpPoint) return FALSE;
@@ -1796,33 +2083,94 @@ static HWND WINAPI hook_WindowFromPoint(POINT Point)
  * Child Process Propagation (32/64-bit Launcher Stubs -> Child Game Executables)
  * ------------------------------------------------------------------------- */
 
+static bool ds_probe_child_pe_is_x86(HANDLE hProcess, bool *out_is_x86)
+{
+    if (!hProcess || !out_is_x86) return false;
+    typedef BOOL (WINAPI *pfn_QueryFullProcessImageNameW_t)(HANDLE, DWORD, LPWSTR, PDWORD);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    pfn_QueryFullProcessImageNameW_t p_query_img = (k32 && g_ds.real_GetProcAddress)
+        ? (pfn_QueryFullProcessImageNameW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "QueryFullProcessImageNameW")
+        : NULL;
+    if (!p_query_img) return false;
+
+    WCHAR img_path[MAX_PATH] = { 0 };
+    DWORD cch = MAX_PATH;
+    if (!p_query_img(hProcess, 0, img_path, &cch) || cch == 0 || !img_path[0]) {
+        return false;
+    }
+
+    bool known = false;
+    ds_enter_internal();
+    HANDLE hf = CreateFileW(
+        img_path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hf != INVALID_HANDLE_VALUE) {
+        IMAGE_DOS_HEADER dos;
+        DWORD rd = 0;
+        if (ReadFile(hf, &dos, (DWORD)sizeof(dos), &rd, NULL) &&
+            rd == (DWORD)sizeof(dos) &&
+            dos.e_magic == IMAGE_DOS_SIGNATURE &&
+            dos.e_lfanew > 0 &&
+            dos.e_lfanew < 0x100000) {
+            if (SetFilePointer(hf, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+                struct {
+                    DWORD Signature;
+                    IMAGE_FILE_HEADER FileHeader;
+                } pe_hdr;
+                DWORD prd = 0;
+                if (ReadFile(hf, &pe_hdr, (DWORD)sizeof(pe_hdr), &prd, NULL) &&
+                    prd == (DWORD)sizeof(pe_hdr) &&
+                    pe_hdr.Signature == IMAGE_NT_SIGNATURE) {
+                    if (pe_hdr.FileHeader.Machine == IMAGE_FILE_MACHINE_I386) {
+                        *out_is_x86 = true;
+                        known = true;
+                    } else if (pe_hdr.FileHeader.Machine == 0x8664u || pe_hdr.FileHeader.Machine == 0xAA64u) {
+                        *out_is_x86 = false;
+                        known = true;
+                    }
+                }
+            }
+        }
+        CloseHandle(hf);
+    }
+    ds_leave_internal();
+    return known;
+}
+
 static void ds_inject_into_suspended_child(const PROCESS_INFORMATION *pi)
 {
     if (!pi || !pi->hProcess || !pi->hThread) return;
 
-    BOOL is_wow64 = FALSE;
-    typedef BOOL (WINAPI *pfn_IsWow64Process_t)(HANDLE, PBOOL);
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    pfn_IsWow64Process_t p_is_wow64 = k32 && g_ds.real_GetProcAddress
-        ? (pfn_IsWow64Process_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "IsWow64Process")
-        : NULL;
-
     bool child_is_x86 = false;
-    if (p_is_wow64 && p_is_wow64(pi->hProcess, &is_wow64)) {
-        if (is_wow64) {
-            child_is_x86 = true;
+    if (!ds_probe_child_pe_is_x86(pi->hProcess, &child_is_x86)) {
+        BOOL is_wow64 = FALSE;
+        typedef BOOL (WINAPI *pfn_IsWow64Process_t)(HANDLE, PBOOL);
+        pfn_IsWow64Process_t p_is_wow64 = k32 && g_ds.real_GetProcAddress
+            ? (pfn_IsWow64Process_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "IsWow64Process")
+            : NULL;
+        if (p_is_wow64 && p_is_wow64(pi->hProcess, &is_wow64)) {
+            if (is_wow64) {
+                child_is_x86 = true;
+            } else {
+#if !defined(_WIN64)
+                BOOL self_wow64 = FALSE;
+                if (p_is_wow64(GetCurrentProcess(), &self_wow64) && !self_wow64) {
+                    child_is_x86 = true;
+                }
+#endif
+            }
         } else {
 #if !defined(_WIN64)
-            BOOL self_wow64 = FALSE;
-            if (p_is_wow64(GetCurrentProcess(), &self_wow64) && !self_wow64) {
-                child_is_x86 = true;
-            }
+            child_is_x86 = true;
 #endif
         }
-    } else {
-#if !defined(_WIN64)
-        child_is_x86 = true;
-#endif
     }
 
 #if defined(_WIN64)
@@ -1872,6 +2220,138 @@ static void ds_inject_into_suspended_child(const PROCESS_INFORMATION *pi)
     }
 }
 
+static bool ds_env_block_has_key_w(const WCHAR *block, size_t block_chars, const WCHAR *key, size_t key_len)
+{
+    if (!block || block_chars == 0 || !key || key_len == 0) return false;
+    size_t pos = 0;
+    while (pos < block_chars && block[pos] != L'\0') {
+        const WCHAR *entry = block + pos;
+        size_t len = wcslen(entry);
+        if (len > key_len && entry[key_len] == L'=' && _wcsnicmp(entry, key, key_len) == 0) {
+            return true;
+        }
+        pos += len + 1;
+    }
+    return false;
+}
+
+static bool ds_append_env_entry_w(WCHAR **buf, size_t *len, size_t *cap, const WCHAR *entry, size_t entry_len)
+{
+    if (!buf || !len || !cap || !entry || entry_len == 0) return false;
+    size_t need = *len + entry_len + 2;
+    if (need > *cap) {
+        size_t new_cap = (*cap > 0) ? (*cap * 2) : 1024;
+        while (new_cap < need) new_cap *= 2;
+        WCHAR *nb = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, new_cap * sizeof(WCHAR));
+        if (!nb) return false;
+        if (*buf && *len > 0) {
+            memcpy(nb, *buf, (*len) * sizeof(WCHAR));
+        }
+        if (*buf) HeapFree(GetProcessHeap(), 0, *buf);
+        *buf = nb;
+        *cap = new_cap;
+    }
+    memcpy((*buf) + (*len), entry, entry_len * sizeof(WCHAR));
+    (*buf)[*len + entry_len] = L'\0';
+    *len += entry_len + 1;
+    (*buf)[*len] = L'\0';
+    return true;
+}
+
+static void ds_append_kv_if_missing_w(WCHAR **buf, size_t *len, size_t *cap, const WCHAR *key, const WCHAR *val)
+{
+    if (!key || !key[0] || !val || !val[0]) return;
+    size_t klen = wcslen(key);
+    if (ds_env_block_has_key_w(*buf, *len, key, klen)) return;
+    WCHAR line[MAX_PATH + 96];
+    int n = _snwprintf(line, (sizeof(line) / sizeof(line[0])) - 1, L"%ls=%ls", key, val);
+    if (n > 0) {
+        line[(sizeof(line) / sizeof(line[0])) - 1] = L'\0';
+        (void)ds_append_env_entry_w(buf, len, cap, line, wcslen(line));
+    }
+}
+
+static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
+{
+    if (!caller_env) {
+        /* When inheriting parent's env block, ensure auto-discovered paths/session files are exported */
+        if (g_ds.dll_x86[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_SCALER_DLL_X86", g_ds.dll_x86);
+        if (g_ds.dll_x64[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_SCALER_DLL_X64", g_ds.dll_x64);
+        if (g_ds.launcher_x86[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_LAUNCHER_EXE_X86", g_ds.launcher_x86);
+        if (g_ds.launcher_x64[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_LAUNCHER_EXE_X64", g_ds.launcher_x64);
+        if (g_ds.control_file[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_DISPLAY_CONTROL_FILE", g_ds.control_file);
+        if (g_ds.status_file[0]) SetEnvironmentVariableW(L"ONE_LAUNCHER_DISPLAY_STATUS_FILE", g_ds.status_file);
+        return NULL;
+    }
+
+    WCHAR *out_buf = NULL;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+
+    if ((caller_flags & CREATE_UNICODE_ENVIRONMENT) != 0) {
+        const WCHAR *p = (const WCHAR *)caller_env;
+        while (*p != L'\0') {
+            size_t elen = wcslen(p);
+            if (!ds_append_env_entry_w(&out_buf, &out_len, &out_cap, p, elen)) {
+                if (out_buf) HeapFree(GetProcessHeap(), 0, out_buf);
+                return NULL;
+            }
+            p += elen + 1;
+        }
+    } else {
+        const char *p = (const char *)caller_env;
+        while (*p != '\0') {
+            size_t alen = strlen(p);
+            int wneed = MultiByteToWideChar(CP_ACP, 0, p, (int)alen, NULL, 0);
+            if (wneed > 0) {
+                WCHAR *tmp = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)wneed + 1) * sizeof(WCHAR));
+                if (tmp) {
+                    MultiByteToWideChar(CP_ACP, 0, p, (int)alen, tmp, wneed);
+                    tmp[wneed] = L'\0';
+                    (void)ds_append_env_entry_w(&out_buf, &out_len, &out_cap, tmp, (size_t)wneed);
+                    HeapFree(GetProcessHeap(), 0, tmp);
+                }
+            }
+            p += alen + 1;
+        }
+    }
+
+    /* Merge parent ONE_LAUNCHER_* variables that were stripped by the caller's custom lpEnvironment */
+    LPWCH parent_env = GetEnvironmentStringsW();
+    if (parent_env) {
+        const WCHAR *pe = parent_env;
+        while (*pe != L'\0') {
+            size_t elen = wcslen(pe);
+            if (_wcsnicmp(pe, L"ONE_LAUNCHER_", 13) == 0) {
+                const WCHAR *eq = wcschr(pe, L'=');
+                if (eq && eq > pe) {
+                    size_t klen = (size_t)(eq - pe);
+                    if (!ds_env_block_has_key_w(out_buf, out_len, pe, klen)) {
+                        (void)ds_append_env_entry_w(&out_buf, &out_len, &out_cap, pe, elen);
+                    }
+                }
+            }
+            pe += elen + 1;
+        }
+        FreeEnvironmentStringsW(parent_env);
+    }
+
+    EnterCriticalSection(&g_ds.lock);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_SCALER_DLL_X86", g_ds.dll_x86);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_SCALER_DLL_X64", g_ds.dll_x64);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_LAUNCHER_EXE_X86", g_ds.launcher_x86);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_LAUNCHER_EXE_X64", g_ds.launcher_x64);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_DISPLAY_CONTROL_FILE", g_ds.control_file);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_DISPLAY_STATUS_FILE", g_ds.status_file);
+    ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, L"ONE_LAUNCHER_DISPLAY_TRACE_FILE", g_ds.trace_file);
+    LeaveCriticalSection(&g_ds.lock);
+
+    if (!out_buf) {
+        out_buf = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 2 * sizeof(WCHAR));
+    }
+    return out_buf;
+}
+
 static BOOL WINAPI hook_CreateProcessW(LPCWSTR lpApp, LPWSTR lpCmd, LPSECURITY_ATTRIBUTES lpPA, LPSECURITY_ATTRIBUTES lpTA, BOOL bInherit, DWORD dwFlags, LPVOID lpEnv, LPCWSTR lpDir, LPSTARTUPINFOW lpSI, LPPROCESS_INFORMATION lpPI)
 {
     if (!g_ds.real_CreateProcessW) return FALSE;
@@ -1884,7 +2364,16 @@ static BOOL WINAPI hook_CreateProcessW(LPCWSTR lpApp, LPWSTR lpCmd, LPSECURITY_A
     LPPROCESS_INFORMATION out_pi = lpPI ? lpPI : &local_pi;
     bool caller_suspended = (dwFlags & CREATE_SUSPENDED) != 0;
 
-    BOOL ok = g_ds.real_CreateProcessW(lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags | CREATE_SUSPENDED, lpEnv, lpDir, lpSI, out_pi);
+    WCHAR *merged_env = ds_build_merged_child_env_w(lpEnv, dwFlags);
+    LPVOID eff_env = merged_env ? (LPVOID)merged_env : lpEnv;
+    DWORD eff_flags = merged_env ? (dwFlags | CREATE_UNICODE_ENVIRONMENT) : dwFlags;
+
+    BOOL ok = g_ds.real_CreateProcessW(lpApp, lpCmd, lpPA, lpTA, bInherit, eff_flags | CREATE_SUSPENDED, eff_env, lpDir, lpSI, out_pi);
+    DWORD last_err = GetLastError();
+    if (merged_env) {
+        HeapFree(GetProcessHeap(), 0, merged_env);
+        SetLastError(last_err);
+    }
     if (!ok) return FALSE;
 
     ds_inject_into_suspended_child(out_pi);
@@ -1910,7 +2399,16 @@ static BOOL WINAPI hook_CreateProcessA(LPCSTR lpApp, LPSTR lpCmd, LPSECURITY_ATT
     LPPROCESS_INFORMATION out_pi = lpPI ? lpPI : &local_pi;
     bool caller_suspended = (dwFlags & CREATE_SUSPENDED) != 0;
 
-    BOOL ok = g_ds.real_CreateProcessA(lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags | CREATE_SUSPENDED, lpEnv, lpDir, lpSI, out_pi);
+    WCHAR *merged_env = ds_build_merged_child_env_w(lpEnv, dwFlags);
+    LPVOID eff_env = merged_env ? (LPVOID)merged_env : lpEnv;
+    DWORD eff_flags = merged_env ? (dwFlags | CREATE_UNICODE_ENVIRONMENT) : dwFlags;
+
+    BOOL ok = g_ds.real_CreateProcessA(lpApp, lpCmd, lpPA, lpTA, bInherit, eff_flags | CREATE_SUSPENDED, eff_env, lpDir, lpSI, out_pi);
+    DWORD last_err = GetLastError();
+    if (merged_env) {
+        HeapFree(GetProcessHeap(), 0, merged_env);
+        SetLastError(last_err);
+    }
     if (!ok) return FALSE;
 
     ds_inject_into_suspended_child(out_pi);
@@ -1963,17 +2461,30 @@ static pfn_ShellExecuteW_t   s_real_ShellExecuteW   = NULL;
 static pfn_ShellExecuteExA_t s_real_ShellExecuteExA = NULL;
 static pfn_ShellExecuteExW_t s_real_ShellExecuteExW = NULL;
 
-static void ds_ensure_shell32_loaded(void)
+static void ds_ensure_shell32_loaded(bool allow_load_library)
 {
     if (s_real_ShellExecuteExW) return;
     HMODULE sh32 = GetModuleHandleW(L"shell32.dll");
-    if (!sh32) sh32 = LoadLibraryW(L"shell32.dll");
+    if (!sh32 && allow_load_library) {
+        ds_enter_internal();
+        sh32 = g_ds.real_LoadLibraryW ? g_ds.real_LoadLibraryW(L"shell32.dll") : LoadLibraryW(L"shell32.dll");
+        ds_leave_internal();
+    }
     if (sh32 && g_ds.real_GetProcAddress) {
         s_real_ShellExecuteA   = (pfn_ShellExecuteA_t)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteA");
         s_real_ShellExecuteW   = (pfn_ShellExecuteW_t)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteW");
         s_real_ShellExecuteExA = (pfn_ShellExecuteExA_t)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteExA");
         s_real_ShellExecuteExW = (pfn_ShellExecuteExW_t)(uintptr_t)g_ds.real_GetProcAddress(sh32, "ShellExecuteExW");
     }
+}
+
+static bool ds_is_batch_extension_w(const WCHAR *path)
+{
+    if (!path) return false;
+    size_t len = wcslen(path);
+    if (len < 4) return false;
+    const WCHAR *ext = path + len - 4;
+    return (_wcsicmp(ext, L".bat") == 0 || _wcsicmp(ext, L".cmd") == 0);
 }
 
 static bool ds_is_exe_extension_w(const WCHAR *path)
@@ -2088,7 +2599,7 @@ static WCHAR *ds_resolve_shell_exec_target_w(const WCHAR *unquoted, const WCHAR 
 
 static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
 {
-    ds_ensure_shell32_loaded();
+    ds_ensure_shell32_loaded(!ds_is_internal_call());
     if (!pExecInfo || pExecInfo->cbSize < sizeof(SHELLEXECUTEINFOW)) {
         return s_real_ShellExecuteExW ? s_real_ShellExecuteExW(pExecInfo) : FALSE;
     }
@@ -2120,15 +2631,37 @@ static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
 
         if (resolved_exe) {
             const WCHAR *params = pExecInfo->lpParameters ? pExecInfo->lpParameters : L"";
+            bool is_batch = ds_is_batch_extension_w(resolved_exe);
+            WCHAR comspec[MAX_PATH] = { 0 };
+            if (is_batch) {
+                DWORD cn = GetEnvironmentVariableW(L"ComSpec", comspec, MAX_PATH);
+                if (cn == 0 || cn >= MAX_PATH) {
+                    UINT sn = GetSystemDirectoryW(comspec, MAX_PATH - 16);
+                    if (sn > 0 && sn < MAX_PATH - 16) {
+                        wcscat(comspec, L"\\cmd.exe");
+                    } else {
+                        wcscpy(comspec, L"C:\\windows\\system32\\cmd.exe");
+                    }
+                }
+            }
             size_t exe_len = wcslen(resolved_exe);
             size_t param_len = wcslen(params);
-            size_t max_cmd = exe_len + param_len + 16;
+            size_t com_len = is_batch ? wcslen(comspec) : 0;
+            size_t max_cmd = com_len + exe_len + param_len + 32;
             WCHAR *cmdline = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, max_cmd * sizeof(WCHAR));
             if (cmdline) {
-                if (param_len > 0) {
-                    _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" %ls", resolved_exe, params);
+                if (is_batch) {
+                    if (param_len > 0) {
+                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" /s /c \"\"%ls\" %ls\"", comspec, resolved_exe, params);
+                    } else {
+                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" /s /c \"\"%ls\"\"", comspec, resolved_exe);
+                    }
                 } else {
-                    _snwprintf(cmdline, max_cmd - 1, L"\"%ls\"", resolved_exe);
+                    if (param_len > 0) {
+                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\" %ls", resolved_exe, params);
+                    } else {
+                        _snwprintf(cmdline, max_cmd - 1, L"\"%ls\"", resolved_exe);
+                    }
                 }
                 cmdline[max_cmd - 1] = L'\0';
 
@@ -2148,7 +2681,7 @@ static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
                 }
 
                 BOOL ok = hook_CreateProcessW(
-                    resolved_exe,
+                    is_batch ? comspec : resolved_exe,
                     cmdline,
                     NULL,
                     NULL,
@@ -2216,7 +2749,7 @@ static WCHAR *ds_alloc_wide_from_acp(const char *src)
 
 static BOOL WINAPI hook_ShellExecuteExA(SHELLEXECUTEINFOA *pExecInfo)
 {
-    ds_ensure_shell32_loaded();
+    ds_ensure_shell32_loaded(!ds_is_internal_call());
     if (!pExecInfo || pExecInfo->cbSize < sizeof(SHELLEXECUTEINFOA)) {
         return s_real_ShellExecuteExA ? s_real_ShellExecuteExA(pExecInfo) : FALSE;
     }
@@ -2365,6 +2898,11 @@ static void *ds_lookup_hook_by_name(const char *func_name, bool allow_loader_hoo
     if (strcmp(func_name, "GetCursorPos") == 0) return (void *)(uintptr_t)hook_GetCursorPos;
     if (strcmp(func_name, "SetCursorPos") == 0) return (void *)(uintptr_t)hook_SetCursorPos;
     if (strcmp(func_name, "ClipCursor") == 0) return (void *)(uintptr_t)hook_ClipCursor;
+    if (strcmp(func_name, "GetClipCursor") == 0) return (void *)(uintptr_t)hook_GetClipCursor;
+    if (strcmp(func_name, "GetMessagePos") == 0) return (void *)(uintptr_t)hook_GetMessagePos;
+    if (strcmp(func_name, "GetRawInputData") == 0) return (void *)(uintptr_t)hook_GetRawInputData;
+    if (strcmp(func_name, "GetRawInputBuffer") == 0) return (void *)(uintptr_t)hook_GetRawInputBuffer;
+    if (strcmp(func_name, "RegisterRawInputDevices") == 0) return (void *)(uintptr_t)hook_RegisterRawInputDevices;
     if (strcmp(func_name, "ScreenToClient") == 0) return (void *)(uintptr_t)hook_ScreenToClient;
     if (strcmp(func_name, "ClientToScreen") == 0) return (void *)(uintptr_t)hook_ClientToScreen;
     if (strcmp(func_name, "MapWindowPoints") == 0) return (void *)(uintptr_t)hook_MapWindowPoints;
@@ -2400,6 +2938,7 @@ static void *ds_lookup_hook_by_name(const char *func_name, bool allow_loader_hoo
     if (strcmp(func_name, "wglGetProcAddress") == 0) return (void *)(uintptr_t)hook_wglGetProcAddress;
     if (strcmp(func_name, "glDrawBuffer") == 0) return (void *)(uintptr_t)hook_glDrawBuffer;
     if (strcmp(func_name, "glReadBuffer") == 0) return (void *)(uintptr_t)hook_glReadBuffer;
+    if (strcmp(func_name, "glGetIntegerv") == 0) return (void *)(uintptr_t)hook_glGetIntegerv;
 
     return NULL;
 }
@@ -2457,6 +2996,11 @@ static void *ds_lookup_hook_by_real_ptr(const void *fn_ptr, bool allow_loader_ho
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_GetCursorPos) return (void *)(uintptr_t)hook_GetCursorPos;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_SetCursorPos) return (void *)(uintptr_t)hook_SetCursorPos;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_ClipCursor) return (void *)(uintptr_t)hook_ClipCursor;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_GetClipCursor) return (void *)(uintptr_t)hook_GetClipCursor;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_GetMessagePos) return (void *)(uintptr_t)hook_GetMessagePos;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_GetRawInputData) return (void *)(uintptr_t)hook_GetRawInputData;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_GetRawInputBuffer) return (void *)(uintptr_t)hook_GetRawInputBuffer;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_RegisterRawInputDevices) return (void *)(uintptr_t)hook_RegisterRawInputDevices;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_ScreenToClient) return (void *)(uintptr_t)hook_ScreenToClient;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_ClientToScreen) return (void *)(uintptr_t)hook_ClientToScreen;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_MapWindowPoints) return (void *)(uintptr_t)hook_MapWindowPoints;
@@ -2492,6 +3036,7 @@ static void *ds_lookup_hook_by_real_ptr(const void *fn_ptr, bool allow_loader_ho
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_wglGetProcAddress) return (void *)(uintptr_t)hook_wglGetProcAddress;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_glDrawBuffer) return (void *)(uintptr_t)hook_glDrawBuffer;
     if (fn_ptr == (const void *)(uintptr_t)g_ds.real_glReadBuffer) return (void *)(uintptr_t)hook_glReadBuffer;
+    if (fn_ptr == (const void *)(uintptr_t)g_ds.real_glGetIntegerv) return (void *)(uintptr_t)hook_glGetIntegerv;
 
     return NULL;
 }
@@ -2505,6 +3050,8 @@ static bool ds_is_nul_terminated_within(const char *s, size_t max_bytes)
     return false;
 }
 
+static void ds_resolve_loaded_system_apis(void);
+
 static void ds_patch_single_module_iat(HMODULE hmod)
 {
     if (!hmod || hmod == g_ds.self_hmod) return;
@@ -2512,6 +3059,46 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     WCHAR mod_path[MAX_PATH] = { 0 };
     if (GetModuleFileNameW(hmod, mod_path, MAX_PATH - 1) == 0) return;
     const WCHAR *base = ds_basename_w(mod_path);
+
+    bool mod_state_changed = false;
+    if (_wcsicmp(base, L"ddraw.dll") == 0) {
+        if (!g_ds.ddraw_loaded || !g_ds.legacy_d3d_loaded) {
+            g_ds.ddraw_loaded = true;
+            g_ds.legacy_d3d_loaded = true;
+            mod_state_changed = true;
+        }
+    } else if (_wcsicmp(base, L"d3d8.dll") == 0 || _wcsicmp(base, L"d3d9.dll") == 0) {
+        if (!g_ds.d3d8_or_9_loaded || !g_ds.legacy_d3d_loaded) {
+            g_ds.d3d8_or_9_loaded = true;
+            g_ds.legacy_d3d_loaded = true;
+            mod_state_changed = true;
+        }
+    } else if (_wcsicmp(base, L"d3d10.dll") == 0 ||
+               _wcsicmp(base, L"d3d10_1.dll") == 0 ||
+               _wcsicmp(base, L"d3d10core.dll") == 0 ||
+               _wcsicmp(base, L"d3d11.dll") == 0 ||
+               _wcsicmp(base, L"d3d12.dll") == 0 ||
+               _wcsicmp(base, L"d3d12core.dll") == 0 ||
+               _wcsicmp(base, L"vulkan-1.dll") == 0 ||
+               _wcsicmp(base, L"winevulkan.dll") == 0 ||
+               _wcsicmp(base, L"d3dmetal.dll") == 0 ||
+               _wcsicmp(base, L"winemetal.dll") == 0) {
+        if (!g_ds.modern_gfx_loaded) {
+            g_ds.modern_gfx_loaded = true;
+            mod_state_changed = true;
+        }
+    }
+
+    if (mod_state_changed && g_ds.lock_initialized) {
+        EnterCriticalSection(&g_ds.lock);
+        bool need_restore = ds_recompute_modern_passthrough_locked();
+        LeaveCriticalSection(&g_ds.lock);
+        if (need_restore) {
+            ds_request_apply_presentation();
+            ds_write_status_file();
+        }
+    }
+
     if (ds_should_skip_iat_patch_module(base)) return;
 
     bool is_com_loader_only_mod = (
@@ -2541,14 +3128,6 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     if ((size_t)imp_dir.VirtualAddress >= size_of_image ||
         (size_t)imp_dir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) > size_of_image) {
         return;
-    }
-
-    if (_wcsicmp(base, L"ddraw.dll") == 0) {
-        g_ds.ddraw_loaded = true;
-        g_ds.legacy_d3d_loaded = true;
-    } else if (_wcsicmp(base, L"d3d8.dll") == 0 || _wcsicmp(base, L"d3d9.dll") == 0) {
-        g_ds.d3d8_or_9_loaded = true;
-        g_ds.legacy_d3d_loaded = true;
     }
 
     size_t desc_off = (size_t)imp_dir.VirtualAddress;
@@ -2699,6 +3278,7 @@ static HMODULE WINAPI hook_LoadLibraryA(LPCSTR lpLibFileName)
 {
     HMODULE h = g_ds.real_LoadLibraryA ? g_ds.real_LoadLibraryA(lpLibFileName) : NULL;
     if (h && !ds_is_internal_call()) {
+        ds_resolve_loaded_system_apis();
         ds_patch_loaded_modules();
     }
     return h;
@@ -2708,6 +3288,7 @@ static HMODULE WINAPI hook_LoadLibraryW(LPCWSTR lpLibFileName)
 {
     HMODULE h = g_ds.real_LoadLibraryW ? g_ds.real_LoadLibraryW(lpLibFileName) : NULL;
     if (h && !ds_is_internal_call()) {
+        ds_resolve_loaded_system_apis();
         ds_patch_loaded_modules();
     }
     return h;
@@ -2717,6 +3298,7 @@ static HMODULE WINAPI hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DW
 {
     HMODULE h = g_ds.real_LoadLibraryExA ? g_ds.real_LoadLibraryExA(lpLibFileName, hFile, dwFlags) : NULL;
     if (h && !ds_is_internal_call() && (dwFlags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) == 0) {
+        ds_resolve_loaded_system_apis();
         ds_patch_loaded_modules();
     }
     return h;
@@ -2726,13 +3308,14 @@ static HMODULE WINAPI hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
 {
     HMODULE h = g_ds.real_LoadLibraryExW ? g_ds.real_LoadLibraryExW(lpLibFileName, hFile, dwFlags) : NULL;
     if (h && !ds_is_internal_call() && (dwFlags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) == 0) {
+        ds_resolve_loaded_system_apis();
         ds_patch_loaded_modules();
     }
     return h;
 }
 
 /* -------------------------------------------------------------------------
- * Initialization & `DllMain`
+ * Initialization, Lazy Runtime Start & `DllMain`
  * ------------------------------------------------------------------------- */
 
 static void ds_read_env_w(const WCHAR *name, WCHAR *out_buf, size_t max_chars)
@@ -2753,58 +3336,112 @@ static void ds_read_env_utf8(const WCHAR *name, char *out_buf, size_t max_bytes)
     WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out_buf, (int)max_bytes, NULL, NULL);
 }
 
-static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
+static bool ds_read_ini_file_raw(const WCHAR *path, ds_control_state_t *out_ctl)
 {
-    g_ds.self_hmod = hinstDLL;
-    g_ds.tls_depth_idx = TlsAlloc();
-    InitializeCriticalSection(&g_ds.lock);
-    g_ds.lock_initialized = true;
+    if (!path || !path[0] || !out_ctl) return false;
+    HANDLE hf = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    char buf[1024];
+    DWORD bytes_read = 0;
+    BOOL ok = ReadFile(hf, buf, (DWORD)(sizeof(buf) - 1), &bytes_read, NULL);
+    CloseHandle(hf);
+    if (!ok || bytes_read == 0) return false;
+    buf[bytes_read] = '\0';
+    return ds_parse_control_ini(buf, (size_t)bytes_read, out_ctl);
+}
 
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    HMODULE u32 = LoadLibraryW(L"user32.dll");
-    HMODULE g32 = LoadLibraryW(L"gdi32.dll");
-    HMODULE gl32 = LoadLibraryW(L"opengl32.dll");
+static void ds_fill_sibling_path_if_empty(WCHAR *dst, size_t dst_cch, const WCHAR *dir, const WCHAR *filename)
+{
+    if (!dst || dst[0] != L'\0' || !dir || !dir[0] || !filename) return;
+    WCHAR candidate[MAX_PATH] = { 0 };
+    int n = _snwprintf(candidate, MAX_PATH - 1, L"%ls\\%ls", dir, filename);
+    if (n <= 0 || n >= MAX_PATH - 1) return;
+    candidate[MAX_PATH - 1] = L'\0';
+    DWORD attrs = GetFileAttributesW(candidate);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        wcsncpy(dst, candidate, dst_cch - 1);
+        dst[dst_cch - 1] = L'\0';
+    }
+}
 
-    g_ds.real_GetProcAddress = k32 ? (pfn_GetProcAddress_t)(uintptr_t)GetProcAddress(k32, "GetProcAddress") : NULL;
-    if (!g_ds.real_GetProcAddress) return;
+void ds_refresh_host_display_metrics(void)
+{
+    ds_enter_internal();
+    int32_t sm_w = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CXSCREEN) : 0;
+    int32_t sm_h = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CYSCREEN) : 0;
 
-    g_ds.real_LoadLibraryA   = (pfn_LoadLibraryA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryA");
-    g_ds.real_LoadLibraryW   = (pfn_LoadLibraryW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryW");
-    g_ds.real_LoadLibraryExA = (pfn_LoadLibraryExA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryExA");
-    g_ds.real_LoadLibraryExW = (pfn_LoadLibraryExW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryExW");
-    g_ds.real_CreateProcessA = (pfn_CreateProcessA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "CreateProcessA");
-    g_ds.real_CreateProcessW = (pfn_CreateProcessW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "CreateProcessW");
+    DEVMODEW cur_dm;
+    memset(&cur_dm, 0, sizeof(cur_dm));
+    cur_dm.dmSize = sizeof(cur_dm);
+    BOOL has_dm = g_ds.real_EnumDisplaySettingsExW &&
+                  g_ds.real_EnumDisplaySettingsExW(NULL, ENUM_CURRENT_SETTINGS, &cur_dm, 0);
+    ds_leave_internal();
 
-    {
-        char aff_env[16] = { 0 };
-        ds_read_env_utf8(L"ONE_LAUNCHER_SINGLE_CORE_AFFINITY", aff_env, sizeof(aff_env));
-        bool want_up = (aff_env[0] == '1');
-#if !defined(_WIN64)
-        if (!want_up && aff_env[0] != '0') {
-            HMODULE exe_mod = GetModuleHandleW(NULL);
-            if (exe_mod) {
-                const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)(const void *)exe_mod;
-                if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
-                    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const uint8_t *)exe_mod + dos->e_lfanew);
-                    if (nt->Signature == IMAGE_NT_SIGNATURE &&
-                        (nt->FileHeader.Characteristics & IMAGE_FILE_UP_SYSTEM_ONLY) != 0) {
-                        want_up = true;
-                    }
-                }
-            }
+    char inset_str[32] = { 0 };
+    ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
+
+    EnterCriticalSection(&g_ds.lock);
+    /*
+     * Always prefer GetSystemMetrics(SM_CXSCREEN / SM_CYSCREEN) for real_screen_w / real_screen_h
+     * because Win32 window placement and cursor coordinates operate in the calling process's
+     * DPI coordinate space (logical points for non-DPI-aware processes vs physical Retina pixels
+     * after SetProcessDPIAware()).
+     */
+    g_ds.real_screen_w = (sm_w > 0) ? sm_w : (has_dm && cur_dm.dmPelsWidth > 0 ? (int32_t)cur_dm.dmPelsWidth : 1024);
+    g_ds.real_screen_h = (sm_h > 0) ? sm_h : (has_dm && cur_dm.dmPelsHeight > 0 ? (int32_t)cur_dm.dmPelsHeight : 768);
+    g_ds.real_bpp      = (has_dm && cur_dm.dmBitsPerPel >= 8) ? (int32_t)cur_dm.dmBitsPerPel : 32;
+    g_ds.real_hz       = (has_dm && cur_dm.dmDisplayFrequency > 0) ? (int32_t)cur_dm.dmDisplayFrequency : 60;
+
+    g_ds.phys_screen_w = (has_dm && cur_dm.dmPelsWidth > 0)
+        ? (int32_t)cur_dm.dmPelsWidth
+        : g_ds.real_screen_w;
+    g_ds.phys_screen_h = (has_dm && cur_dm.dmPelsHeight > 0)
+        ? (int32_t)cur_dm.dmPelsHeight
+        : g_ds.real_screen_h;
+
+    if (inset_str[0] && g_ds.safe_inset_top == 0) {
+        int32_t raw_inset = (int32_t)atoi(inset_str);
+        if (raw_inset > 48 && has_dm && g_ds.real_screen_h > 0 &&
+            (int32_t)cur_dm.dmPelsHeight >= g_ds.real_screen_h * 2 - 4) {
+            raw_inset = (raw_inset + 1) / 2;
         }
-#endif
-        if (want_up) {
-            typedef BOOL (WINAPI *pfn_SetProcessAffinityMask_t)(HANDLE, DWORD_PTR);
-            pfn_SetProcessAffinityMask_t pfnSetAffinity = k32 ? (pfn_SetProcessAffinityMask_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "SetProcessAffinityMask") : NULL;
-            if (pfnSetAffinity) {
-                pfnSetAffinity(GetCurrentProcess(), 1);
-            }
-        }
+        g_ds.safe_inset_top = ds_clamp_safe_inset_top(raw_inset, g_ds.real_screen_h);
+    } else {
+        g_ds.safe_inset_top = ds_clamp_safe_inset_top(g_ds.safe_inset_top, g_ds.real_screen_h);
     }
 
-    if (u32) {
-        SetProcessDPIAware();
+    g_ds.mode_count = ds_build_mode_table(
+        g_ds.real_screen_w,
+        g_ds.real_screen_h,
+        g_ds.real_hz,
+        g_ds.modes,
+        DS_MAX_SYNTH_MODES
+    );
+    if (!g_ds.mode_virtualized && (g_ds.virt_w <= 0 || g_ds.virt_h <= 0)) {
+        g_ds.virt_w = g_ds.real_screen_w;
+        g_ds.virt_h = g_ds.real_screen_h;
+        g_ds.virt_bpp = g_ds.real_bpp;
+        g_ds.virt_hz = g_ds.real_hz;
+    }
+    ds_refresh_viewport_locked();
+    InterlockedIncrement(&g_ds.gdi_margin_gen);
+    LeaveCriticalSection(&g_ds.lock);
+}
+
+static void ds_resolve_loaded_system_apis(void)
+{
+    if (!g_ds.real_GetProcAddress) return;
+
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (u32 && !g_ds.real_EnumDisplaySettingsExW) {
         g_ds.real_EnumDisplaySettingsA    = (pfn_EnumDisplaySettingsA_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "EnumDisplaySettingsA");
         g_ds.real_EnumDisplaySettingsW    = (pfn_EnumDisplaySettingsW_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "EnumDisplaySettingsW");
         g_ds.real_EnumDisplaySettingsExA  = (pfn_EnumDisplaySettingsExA_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "EnumDisplaySettingsExA");
@@ -2841,6 +3478,10 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         g_ds.real_SetCursorPos            = (pfn_SetCursorPos_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "SetCursorPos");
         g_ds.real_ClipCursor              = (pfn_ClipCursor_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "ClipCursor");
         g_ds.real_GetClipCursor           = (pfn_GetClipCursor_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "GetClipCursor");
+        g_ds.real_GetMessagePos           = (pfn_GetMessagePos_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "GetMessagePos");
+        g_ds.real_GetRawInputData         = (pfn_GetRawInputData_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "GetRawInputData");
+        g_ds.real_GetRawInputBuffer       = (pfn_GetRawInputBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "GetRawInputBuffer");
+        g_ds.real_RegisterRawInputDevices = (pfn_RegisterRawInputDevices_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "RegisterRawInputDevices");
         g_ds.real_ScreenToClient          = (pfn_ScreenToClient_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "ScreenToClient");
         g_ds.real_ClientToScreen          = (pfn_ClientToScreen_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "ClientToScreen");
         g_ds.real_MapWindowPoints         = (pfn_MapWindowPoints_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "MapWindowPoints");
@@ -2848,7 +3489,8 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         g_ds.real_ReleaseDC               = (pfn_ReleaseDC_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "ReleaseDC");
     }
 
-    if (g32) {
+    HMODULE g32 = GetModuleHandleW(L"gdi32.dll");
+    if (g32 && !g_ds.real_GetDeviceCaps) {
         g_ds.real_GetDeviceCaps       = (pfn_GetDeviceCaps_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "GetDeviceCaps");
         g_ds.real_DeleteDC            = (pfn_DeleteDC_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "DeleteDC");
         g_ds.real_ChoosePixelFormat   = (pfn_ChoosePixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "ChoosePixelFormat");
@@ -2862,27 +3504,21 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         g_ds.real_SwapBuffers         = (pfn_SwapBuffers_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "SwapBuffers");
     }
 
-    {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        g_ds.is_wine = (ntdll != NULL && g_ds.real_GetProcAddress(ntdll, "wine_get_version") != NULL);
-        if (g_ds.is_wine) {
-            HMODULE w32u = GetModuleHandleW(L"win32u.dll");
-            if (!w32u) {
-                w32u = g_ds.real_LoadLibraryW ? g_ds.real_LoadLibraryW(L"win32u.dll") : LoadLibraryW(L"win32u.dll");
-            }
-            if (w32u) {
-                g_ds.real_NtGdiDdDDIEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(w32u, "NtGdiDdDDIEscape");
-            }
-            if (g32) {
-                g_ds.real_D3DKMTEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "D3DKMTEscape");
-            }
-            if (!g_ds.real_D3DKMTEscape) {
-                g_ds.real_D3DKMTEscape = g_ds.real_NtGdiDdDDIEscape;
-            }
+    if (g_ds.is_wine && !g_ds.real_D3DKMTEscape) {
+        HMODULE w32u = GetModuleHandleW(L"win32u.dll");
+        if (w32u && !g_ds.real_NtGdiDdDDIEscape) {
+            g_ds.real_NtGdiDdDDIEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(w32u, "NtGdiDdDDIEscape");
+        }
+        if (g32 && !g_ds.real_D3DKMTEscape) {
+            g_ds.real_D3DKMTEscape = (pfn_D3DKMTEscape_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "D3DKMTEscape");
+        }
+        if (!g_ds.real_D3DKMTEscape) {
+            g_ds.real_D3DKMTEscape = g_ds.real_NtGdiDdDDIEscape;
         }
     }
 
-    if (gl32) {
+    HMODULE gl32 = GetModuleHandleW(L"opengl32.dll");
+    if (gl32 && !g_ds.real_wglCreateContext) {
         g_ds.real_wglCreateContext       = (pfn_wglCreateContext_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "wglCreateContext");
         g_ds.real_wglCreateLayerContext  = (pfn_wglCreateLayerContext_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "wglCreateLayerContext");
         g_ds.real_wglGetCurrentDC        = (pfn_wglGetCurrentDC_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "wglGetCurrentDC");
@@ -2896,6 +3532,7 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         g_ds.real_wglGetProcAddress      = (pfn_wglGetProcAddress_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "wglGetProcAddress");
         g_ds.real_glDrawBuffer           = (pfn_glDrawBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "glDrawBuffer");
         g_ds.real_glReadBuffer           = (pfn_glReadBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "glReadBuffer");
+        g_ds.real_glGetIntegerv          = (pfn_glGetIntegerv_t)(uintptr_t)g_ds.real_GetProcAddress(gl32, "glGetIntegerv");
     }
     if (g32) {
         if (!g_ds.real_wglChoosePixelFormat)   g_ds.real_wglChoosePixelFormat   = (pfn_wglChoosePixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "wglChoosePixelFormat");
@@ -2904,61 +3541,80 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         if (!g_ds.real_wglSetPixelFormat)      g_ds.real_wglSetPixelFormat      = (pfn_wglSetPixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(g32, "wglSetPixelFormat");
     }
 
-    ds_ensure_shell32_loaded();
+    ds_ensure_shell32_loaded(false);
+}
+
+void ds_ensure_runtime_started(void)
+{
+    static volatile LONG s_runtime_started = 0;
+    if (!g_ds.active || g_ds.shutting_down) return;
+    if (InterlockedCompareExchange(&s_runtime_started, 1, 0) != 0) {
+        return;
+    }
+
+    ds_resolve_loaded_system_apis();
+
+    if (!ds_is_passthrough_locked() && !g_ds.dpi_aware_applied) {
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        if (u32 && g_ds.real_GetProcAddress) {
+            typedef BOOL (WINAPI *pfn_SetProcessDPIAware_t)(void);
+            pfn_SetProcessDPIAware_t pfn_dpi = (pfn_SetProcessDPIAware_t)(uintptr_t)g_ds.real_GetProcAddress(u32, "SetProcessDPIAware");
+            if (pfn_dpi) {
+                ds_enter_internal();
+                pfn_dpi();
+                ds_leave_internal();
+                g_ds.dpi_aware_applied = true;
+            }
+        }
+    }
+
+    if (g_ds.msg_apply_presentation == 0) {
+        g_ds.msg_apply_presentation = RegisterWindowMessageW(L"OneLauncher_ApplyDisplayPresentation");
+        g_ds.msg_gl_host_ctl = RegisterWindowMessageW(L"OneLauncher_GLHostControl");
+    }
+
+    if (g_ds.scaling_mode != DS_MODE_PASSTHROUGH) {
+        ds_refresh_host_display_metrics();
+        ds_start_control_watcher();
+    }
+}
+
+static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
+{
+    bool is_chaining_wrapper = ds_is_passthrough_chaining_process();
+
+    /* Discover <self_dir> and <self_dir>\active_session.ini before touching any Win32 state */
+    WCHAR self_path[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(hinstDLL, self_path, MAX_PATH - 1) > 0) {
+        WCHAR *last_sep = NULL;
+        for (WCHAR *p = self_path; *p; p++) {
+            if (*p == L'\\' || *p == L'/') last_sep = p;
+        }
+        if (last_sep) {
+            *last_sep = L'\0';
+            wcsncpy(g_ds.self_dir, self_path, MAX_PATH - 1);
+            g_ds.self_dir[MAX_PATH - 1] = L'\0';
+            _snwprintf(g_ds.active_session_file, MAX_PATH - 1, L"%ls\\active_session.ini", g_ds.self_dir);
+            g_ds.active_session_file[MAX_PATH - 1] = L'\0';
+        }
+    }
 
     char mode_str[64] = { 0 };
     char aspect_str[64] = { 0 };
+    char filter_str[32] = { 0 };
     char inset_str[32] = { 0 };
     char hotkey_str[16] = { 0 };
     ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_SCALING_MODE", mode_str, sizeof(mode_str));
     ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_ASPECT", aspect_str, sizeof(aspect_str));
+    ds_read_env_utf8(L"ONE_LAUNCHER_SCALING_FILTER", filter_str, sizeof(filter_str));
     ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
     ds_read_env_utf8(L"ONE_LAUNCHER_FULLSCREEN_HOTKEY", hotkey_str, sizeof(hotkey_str));
 
-    g_ds.scaling_mode = mode_str[0] ? ds_parse_scaling_mode(mode_str) : DS_MODE_AUTO_FULLSCREEN;
-    g_ds.aspect_mode  = aspect_str[0] ? ds_parse_aspect_mode(aspect_str) : DS_ASPECT_PRESERVE;
+    g_ds.scaling_mode   = mode_str[0] ? ds_parse_scaling_mode(mode_str) : DS_MODE_AUTO_FULLSCREEN;
+    g_ds.aspect_mode    = aspect_str[0] ? ds_parse_aspect_mode(aspect_str) : DS_ASPECT_PRESERVE;
+    g_ds.scale_filter   = filter_str[0] ? ds_parse_scale_filter(filter_str) : DS_FILTER_AUTO;
     g_ds.hotkey_enabled = (hotkey_str[0] != '0');
-
-    int32_t sm_w = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CXSCREEN) : 0;
-    int32_t sm_h = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CYSCREEN) : 0;
-
-    DEVMODEW cur_dm;
-    memset(&cur_dm, 0, sizeof(cur_dm));
-    cur_dm.dmSize = sizeof(cur_dm);
-    BOOL has_dm = g_ds.real_EnumDisplaySettingsExW &&
-                  g_ds.real_EnumDisplaySettingsExW(NULL, ENUM_CURRENT_SETTINGS, &cur_dm, 0);
-
-    /*
-     * Always prefer GetSystemMetrics(SM_CXSCREEN / SM_CYSCREEN) for real_screen_w / real_screen_h
-     * because Win32 window placement (CreateWindowEx / SetWindowPos / GetClientRect) and cursor
-     * coordinates (GetCursorPos / SetCursorPos / ClipCursor) operate in the calling process's
-     * DPI coordinate space (e.g. 1512x982 logical points for non-DPI-aware processes even when
-     * a warm wineserver reports 3024x1964 physical Retina pixels in EnumDisplaySettingsExW).
-     */
-    g_ds.real_screen_w = (sm_w > 0) ? sm_w : (has_dm && cur_dm.dmPelsWidth > 0 ? (int32_t)cur_dm.dmPelsWidth : 1024);
-    g_ds.real_screen_h = (sm_h > 0) ? sm_h : (has_dm && cur_dm.dmPelsHeight > 0 ? (int32_t)cur_dm.dmPelsHeight : 768);
-    g_ds.real_bpp      = (has_dm && cur_dm.dmBitsPerPel >= 8) ? (int32_t)cur_dm.dmBitsPerPel : 32;
-    g_ds.real_hz       = (has_dm && cur_dm.dmDisplayFrequency > 0) ? (int32_t)cur_dm.dmDisplayFrequency : 60;
-
-    /*
-     * Physical backing dimensions for OpenGL / WineD3D presentation to FBO 0:
-     * Prefer EnumDisplaySettingsExW pixel width/height; otherwise match logical screen bounds
-     * so standard 1x displays are never over-scaled.
-     */
-    g_ds.phys_screen_w = (has_dm && cur_dm.dmPelsWidth > 0)
-        ? (int32_t)cur_dm.dmPelsWidth
-        : g_ds.real_screen_w;
-    g_ds.phys_screen_h = (has_dm && cur_dm.dmPelsHeight > 0)
-        ? (int32_t)cur_dm.dmPelsHeight
-        : g_ds.real_screen_h;
-
-    int32_t raw_inset = inset_str[0] ? (int32_t)atoi(inset_str) : 0;
-    if (raw_inset > 48 && has_dm && g_ds.real_screen_h > 0 &&
-        (int32_t)cur_dm.dmPelsHeight >= g_ds.real_screen_h * 2 - 4) {
-        raw_inset = (raw_inset + 1) / 2;
-    }
-    g_ds.safe_inset_top = ds_clamp_safe_inset_top(raw_inset, g_ds.real_screen_h);
-    g_ds.mode_count = ds_build_mode_table(g_ds.real_screen_w, g_ds.real_screen_h, g_ds.real_hz, g_ds.modes, DS_MAX_SYNTH_MODES);
+    g_ds.safe_inset_top = inset_str[0] ? (int32_t)atoi(inset_str) : 0;
 
     ds_read_env_w(L"ONE_LAUNCHER_SCALER_DLL_X86", g_ds.dll_x86, MAX_PATH);
     ds_read_env_w(L"ONE_LAUNCHER_SCALER_DLL_X64", g_ds.dll_x64, MAX_PATH);
@@ -2968,13 +3624,126 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     ds_read_env_w(L"ONE_LAUNCHER_DISPLAY_STATUS_FILE", g_ds.status_file, MAX_PATH);
     ds_read_env_w(L"ONE_LAUNCHER_DISPLAY_TRACE_FILE", g_ds.trace_file, MAX_PATH);
 
-    g_ds.msg_apply_presentation = RegisterWindowMessageW(L"OneLauncher_ApplyDisplayPresentation");
-    g_ds.msg_gl_host_ctl = RegisterWindowMessageW(L"OneLauncher_GLHostControl");
-    g_ds.last_control_seq = 1;
+    if (g_ds.self_dir[0]) {
+        ds_fill_sibling_path_if_empty(g_ds.dll_x86, MAX_PATH, g_ds.self_dir, L"one_display_scaler_x86.dll");
+        ds_fill_sibling_path_if_empty(g_ds.dll_x64, MAX_PATH, g_ds.self_dir, L"one_display_scaler_x64.dll");
+        ds_fill_sibling_path_if_empty(g_ds.launcher_x86, MAX_PATH, g_ds.self_dir, L"one_display_launcher_x86.exe");
+        ds_fill_sibling_path_if_empty(g_ds.launcher_x64, MAX_PATH, g_ds.self_dir, L"one_display_launcher_x64.exe");
+    }
+
+    /*
+     * Cross-track warm daemon & runtime --watch-dir recovery:
+     * When ONE_LAUNCHER_DISPLAY_CONTROL_FILE is missing or points to a stale/deleted session INI,
+     * adopt <self_dir>\active_session.ini.
+     */
+    bool control_missing_or_stale = (
+        !g_ds.control_file[0] ||
+        GetFileAttributesW(g_ds.control_file) == INVALID_FILE_ATTRIBUTES
+    );
+    if (control_missing_or_stale && g_ds.active_session_file[0]) {
+        ds_control_state_t act_ctl;
+        if (ds_read_ini_file_raw(g_ds.active_session_file, &act_ctl)) {
+            g_ds.last_active_session_seq = ds_effective_active_session_seq(&act_ctl);
+            if (act_ctl.has_control_file) {
+                MultiByteToWideChar(CP_UTF8, 0, act_ctl.control_file, -1, g_ds.control_file, MAX_PATH);
+                g_ds.control_file[MAX_PATH - 1] = L'\0';
+            }
+            if (act_ctl.has_status_file) {
+                MultiByteToWideChar(CP_UTF8, 0, act_ctl.status_file, -1, g_ds.status_file, MAX_PATH);
+                g_ds.status_file[MAX_PATH - 1] = L'\0';
+            }
+            if (act_ctl.has_scaling_mode)   g_ds.scaling_mode   = act_ctl.scaling_mode;
+            if (act_ctl.has_aspect)         g_ds.aspect_mode    = act_ctl.aspect;
+            if (act_ctl.has_filter)         g_ds.scale_filter   = act_ctl.filter;
+            if (act_ctl.has_safe_inset_top) g_ds.safe_inset_top = act_ctl.safe_inset_top;
+            if (act_ctl.has_hotkey)         g_ds.hotkey_enabled = act_ctl.hotkey;
+        }
+    }
+
+    if (g_ds.control_file[0]) {
+        ds_control_state_t init_ctl;
+        if (ds_read_ini_file_raw(g_ds.control_file, &init_ctl)) {
+            if (init_ctl.has_scaling_mode)   g_ds.scaling_mode   = init_ctl.scaling_mode;
+            if (init_ctl.has_aspect)         g_ds.aspect_mode    = init_ctl.aspect;
+            if (init_ctl.has_filter)         g_ds.scale_filter   = init_ctl.filter;
+            if (init_ctl.has_safe_inset_top) g_ds.safe_inset_top = init_ctl.safe_inset_top;
+            if (init_ctl.has_hotkey)         g_ds.hotkey_enabled = init_ctl.hotkey;
+        }
+    }
+
+    /* Check "off"/passthrough mode BEFORE SetProcessDPIAware(), TLS/lock init, or IAT patching */
+    if (!is_chaining_wrapper && g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+        return;
+    }
+    if (is_chaining_wrapper) {
+        g_ds.scaling_mode = DS_MODE_PASSTHROUGH;
+    }
+
+    g_ds.self_hmod = hinstDLL;
+    g_ds.tls_depth_idx = TlsAlloc();
+    InitializeCriticalSection(&g_ds.lock);
+    g_ds.lock_initialized = true;
+    InitOnceInitialize(&g_ds.watcher_once);
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    g_ds.real_GetProcAddress = k32 ? (pfn_GetProcAddress_t)(uintptr_t)GetProcAddress(k32, "GetProcAddress") : NULL;
+    if (!g_ds.real_GetProcAddress) return;
+
+    g_ds.real_LoadLibraryA   = (pfn_LoadLibraryA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryA");
+    g_ds.real_LoadLibraryW   = (pfn_LoadLibraryW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryW");
+    g_ds.real_LoadLibraryExA = (pfn_LoadLibraryExA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryExA");
+    g_ds.real_LoadLibraryExW = (pfn_LoadLibraryExW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "LoadLibraryExW");
+    g_ds.real_CreateProcessA = (pfn_CreateProcessA_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "CreateProcessA");
+    g_ds.real_CreateProcessW = (pfn_CreateProcessW_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "CreateProcessW");
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    g_ds.is_wine = (ntdll != NULL && g_ds.real_GetProcAddress(ntdll, "wine_get_version") != NULL);
+
+    if (!is_chaining_wrapper) {
+        char aff_env[16] = { 0 };
+        ds_read_env_utf8(L"ONE_LAUNCHER_SINGLE_CORE_AFFINITY", aff_env, sizeof(aff_env));
+        bool want_up = (aff_env[0] == '1');
+#if !defined(_WIN64)
+        if (!want_up && aff_env[0] != '0') {
+            HMODULE exe_mod = GetModuleHandleW(NULL);
+            if (exe_mod) {
+                const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)(const void *)exe_mod;
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
+                    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const uint8_t *)exe_mod + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                        (nt->FileHeader.Characteristics & IMAGE_FILE_UP_SYSTEM_ONLY) != 0) {
+                        want_up = true;
+                    }
+                }
+            }
+        }
+#endif
+        if (want_up) {
+            typedef BOOL (WINAPI *pfn_SetProcessAffinityMask_t)(HANDLE, DWORD_PTR);
+            pfn_SetProcessAffinityMask_t pfnSetAffinity = (pfn_SetProcessAffinityMask_t)(uintptr_t)g_ds.real_GetProcAddress(k32, "SetProcessAffinityMask");
+            if (pfnSetAffinity) {
+                pfnSetAffinity(GetCurrentProcess(), 1);
+            }
+        }
+    }
+
+    /* Resolve ONLY already-mapped system DLLs under loader lock; never call LoadLibraryW here */
+    ds_resolve_loaded_system_apis();
+    if (!is_chaining_wrapper && g_ds.real_GetSystemMetrics) {
+        ds_refresh_host_display_metrics();
+    } else {
+        g_ds.real_screen_w = 1024;
+        g_ds.real_screen_h = 768;
+        g_ds.phys_screen_w = 1024;
+        g_ds.phys_screen_h = 768;
+        g_ds.real_bpp = 32;
+        g_ds.real_hz = 60;
+    }
+
+    g_ds.last_control_seq = 0;
     g_ds.active = true;
 
     ds_patch_loaded_modules();
-    ds_start_control_watcher();
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -2986,16 +3755,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         }
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         g_ds.shutting_down = true;
-        if (lpvReserved == NULL && g_ds.active) {
-            ds_stop_control_watcher();
-            ds_gl_shutdown();
-            if (g_ds.tls_depth_idx != TLS_OUT_OF_INDEXES) {
-                TlsFree(g_ds.tls_depth_idx);
-                g_ds.tls_depth_idx = TLS_OUT_OF_INDEXES;
-            }
-            if (g_ds.lock_initialized) {
-                DeleteCriticalSection(&g_ds.lock);
-                g_ds.lock_initialized = false;
+        if (g_ds.active) {
+            /* Never block with WaitForSingleObject under LdrpLoaderLock during detach */
+            ds_stop_control_watcher(true);
+            if (lpvReserved == NULL) {
+                ds_gl_shutdown();
+                if (g_ds.tls_depth_idx != TLS_OUT_OF_INDEXES) {
+                    TlsFree(g_ds.tls_depth_idx);
+                    g_ds.tls_depth_idx = TLS_OUT_OF_INDEXES;
+                }
+                if (g_ds.lock_initialized) {
+                    DeleteCriticalSection(&g_ds.lock);
+                    g_ds.lock_initialized = false;
+                }
             }
         }
     }

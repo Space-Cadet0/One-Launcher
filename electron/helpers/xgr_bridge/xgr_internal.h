@@ -710,6 +710,7 @@ HRESULT WINAPI xgr_pf_shim_PFGameSaveFilesUninitializeAsync(XAsyncBlock *async);
 /* xthreading.c */
 HRESULT xgr_query_threading(REFIID iid, void **ppv);
 void xgr_threading_shutdown(void);
+void xgr_threading_process_detach_cleanup(void);
 void *xgr_async_try_acquire_state(XAsyncBlock *async, void **out_context);
 void xgr_async_release_state(void *state_ref);
 HRESULT xgr_async_begin(XAsyncBlock *async, void *context, const void *identity, const char *identityName, XAsyncProvider *provider);
@@ -743,6 +744,8 @@ void xgr_gamesave_shutdown(void);
 /* xpackage.c */
 HRESULT xgr_query_package(REFIID iid, void **ppv);
 HRESULT xgr_package_mount_internal(const char *pkg_id, XPackageMountHandle *out);
+bool xgr_package_find_identifier_by_store_id(const char *store_id, char *out_id, size_t out_cap);
+bool xgr_package_find_store_id_by_identifier(const char *pkg_id, char *out_store_id, size_t out_cap);
 
 /* xsystem_misc.c */
 HRESULT xgr_query_error(REFIID iid, void **ppv);

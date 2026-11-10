@@ -103,6 +103,47 @@ static void clamp_default_output_audio_buffer_to_5ms(void) {
         return;
     }
 
+    /*
+     * Skip 5 ms CoreAudio buffer clamping on wireless / network audio transports
+     * (Bluetooth, Bluetooth LE, AirPlay, AVB) where aggressive 240-frame pull cycles
+     * starve packetized wireless codecs.
+     */
+    {
+        UInt32 transport_type = 0;
+        UInt32 trans_size = (UInt32)sizeof(transport_type);
+        AudioObjectPropertyAddress trans_addr = {
+            kAudioDevicePropertyTransportType,
+            kAudioObjectPropertyScopeGlobal,
+            0
+        };
+        OSStatus trans_st = get_prop(output_device, &trans_addr, 0, NULL, &trans_size, &transport_type);
+        if (trans_st != noErr) {
+            trans_addr.mScope = kAudioObjectPropertyScopeOutput;
+            trans_size = (UInt32)sizeof(transport_type);
+            trans_st = get_prop(output_device, &trans_addr, 0, NULL, &trans_size, &transport_type);
+        }
+        if (trans_st == noErr) {
+#ifndef kAudioDeviceTransportTypeBluetooth
+#define kAudioDeviceTransportTypeBluetooth   0x626c7574u /* 'blut' */
+#endif
+#ifndef kAudioDeviceTransportTypeBluetoothLE
+#define kAudioDeviceTransportTypeBluetoothLE 0x626c6561u /* 'blea' */
+#endif
+#ifndef kAudioDeviceTransportTypeAirPlay
+#define kAudioDeviceTransportTypeAirPlay     0x61697270u /* 'airp' */
+#endif
+#ifndef kAudioDeviceTransportTypeAVB
+#define kAudioDeviceTransportTypeAVB         0x65617662u /* 'eavb' */
+#endif
+            if (transport_type == kAudioDeviceTransportTypeBluetooth ||
+                transport_type == kAudioDeviceTransportTypeBluetoothLE ||
+                transport_type == kAudioDeviceTransportTypeAirPlay ||
+                transport_type == kAudioDeviceTransportTypeAVB) {
+                return;
+            }
+        }
+    }
+
     Float64 sample_rate = 0.0;
     prop_size = (UInt32)sizeof(sample_rate);
     AudioObjectPropertyAddress rate_addr = {
@@ -280,9 +321,24 @@ static int is_non_gui_wine_helper_process(void) {
         return 0;
     }
 
+    static const char *const k_loader_wrappers[] = {
+        "wine",
+        "wine64",
+        "wine32on64",
+        "wine-preloader",
+        "wine64-preloader",
+        "wine32on64-preloader",
+        "crossover",
+        "start.exe",
+        "start",
+    };
+
     static const char *const k_helper_exes[] = {
+        "wineserver",
         "reg.exe",
         "reg",
+        "regedit.exe",
+        "regsvr32.exe",
         "wineboot.exe",
         "wineboot",
         "conhost.exe",
@@ -292,21 +348,49 @@ static int is_non_gui_wine_helper_process(void) {
         "svchost.exe",
         "winedevice.exe",
         "winecfg.exe",
+        "explorer.exe",
+        "rundll32.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "one_display_launcher_x86.exe",
+        "one_display_launcher_x64.exe",
+        "one_xgr_win_launcher.exe",
+        "one_xgr_win_launcher_x86.exe",
     };
 
     const int argc = *argc_ptr < 32 ? *argc_ptr : 32;
     char **argv = *argv_ptr;
+    if (argv[0] && arg_basename_matches_ci(argv[0], "wineserver")) {
+        return 1;
+    }
+
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg || arg[0] == '\0' || arg[0] == '-') {
             continue;
         }
+        /* Skip start.exe switch flags such as /unix, /exec, /b, /wait, /min */
+        if (arg[0] == '/' && strlen(arg) <= 6 && strchr(arg + 1, '/') == NULL) {
+            continue;
+        }
+
+        int is_wrapper = 0;
+        for (size_t w = 0; w < sizeof(k_loader_wrappers) / sizeof(k_loader_wrappers[0]); ++w) {
+            if (arg_basename_matches_ci(arg, k_loader_wrappers[w])) {
+                is_wrapper = 1;
+                break;
+            }
+        }
+        if (is_wrapper) {
+            continue;
+        }
+
         for (size_t h = 0; h < sizeof(k_helper_exes) / sizeof(k_helper_exes[0]); ++h) {
             if (arg_basename_matches_ci(arg, k_helper_exes[h])) {
                 return 1;
             }
         }
-        /* First positional executable token inspected: if it is not a helper daemon, allow preload */
+        /* First real target executable token inspected: if it is not a helper daemon, allow preload */
         break;
     }
     return 0;

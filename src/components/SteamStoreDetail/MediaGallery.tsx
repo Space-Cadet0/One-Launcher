@@ -88,7 +88,7 @@ function addBoundedSetEntry(
   set.add(key);
 }
 
-function prefersReducedMotion(): boolean {
+export function prefersReducedMotion(): boolean {
   return (
     typeof window !== 'undefined' &&
     typeof window.matchMedia === 'function' &&
@@ -147,6 +147,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
   );
   const [isPlaying, setIsPlaying] = useState(false);
   const [isError, setIsError] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
   const [posterFailed, setPosterFailed] = useState(false);
   const [isSuspendedInGame, setIsSuspendedInGame] = useState<boolean>(() =>
     shouldSuspendMediaPlayback()
@@ -275,84 +276,81 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
     };
 
     if (hlsUrl) {
-      void (async () => {
-        try {
-          const HlsModule = await loadHlsModule();
-          if (cancelled) return;
-          if (HlsModule.isSupported()) {
-            hlsInstance = new HlsModule({
-              enableWorker: true,
-              lowLatencyMode: false,
-              maxBufferLength: 15,
-              maxMaxBufferLength: 30,
-              backBufferLength: 10,
-            });
-            hlsRef.current = hlsInstance;
-            hlsInstance.loadSource(hlsUrl);
-            hlsInstance.attachMedia(video);
-            hlsInstance.on(HlsModule.Events.MANIFEST_PARSED, () => {
-              startPlaybackIfAllowed();
-            });
-            if (shouldSuspendMediaPlayback()) {
-              hlsInstance.stopLoad();
-              video.pause();
-            }
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native Safari / WebKit HLS — skip downloading 372 kB hls.js bundle
+        video.src = hlsUrl;
+        startPlaybackIfAllowed();
+      } else {
+        void (async () => {
+          try {
+            const HlsModule = await loadHlsModule();
+            if (cancelled) return;
+            if (HlsModule.isSupported()) {
+              hlsInstance = new HlsModule({
+                enableWorker: true,
+                lowLatencyMode: false,
+                maxBufferLength: 15,
+                maxMaxBufferLength: 30,
+                backBufferLength: 10,
+              });
+              hlsRef.current = hlsInstance;
+              hlsInstance.loadSource(hlsUrl);
+              hlsInstance.attachMedia(video);
+              hlsInstance.on(HlsModule.Events.MANIFEST_PARSED, () => {
+                startPlaybackIfAllowed();
+              });
+              if (shouldSuspendMediaPlayback()) {
+                hlsInstance.stopLoad();
+                video.pause();
+              }
 
-            hlsInstance.on(HlsModule.Events.ERROR, (_event, data) => {
-              if (data.fatal) {
-                switch (data.type) {
-                  case HlsModule.ErrorTypes.NETWORK_ERROR:
-                    if (
-                      networkRetryCount < 1 &&
-                      onlineLifecycleManager.isOnline() &&
-                      !shouldSuspendMediaPlayback()
-                    ) {
-                      networkRetryCount += 1;
-                      console.warn('HLS network error, attempting single recovery...', data);
-                      hlsInstance?.startLoad();
-                    } else {
-                      console.warn('HLS fatal network error, stopping stream...', data);
+              hlsInstance.on(HlsModule.Events.ERROR, (_event, data) => {
+                if (data.fatal) {
+                  switch (data.type) {
+                    case HlsModule.ErrorTypes.NETWORK_ERROR:
+                      if (
+                        networkRetryCount < 1 &&
+                        onlineLifecycleManager.isOnline() &&
+                        !shouldSuspendMediaPlayback()
+                      ) {
+                        networkRetryCount += 1;
+                        console.warn('HLS network error, attempting single recovery...', data);
+                        hlsInstance?.startLoad();
+                      } else {
+                        console.warn('HLS fatal network error, stopping stream...', data);
+                        hlsInstance?.stopLoad();
+                        hlsInstance?.detachMedia();
+                        hlsInstance?.destroy();
+                        hlsInstance = null;
+                        hlsRef.current = null;
+                        fallbackToDirectMp4OrError();
+                      }
+                      break;
+                    case HlsModule.ErrorTypes.MEDIA_ERROR:
+                      console.warn('HLS media error, attempting recovery...', data);
+                      hlsInstance?.recoverMediaError();
+                      break;
+                    default:
+                      console.warn('HLS unrecoverable fatal error:', data);
                       hlsInstance?.stopLoad();
                       hlsInstance?.detachMedia();
                       hlsInstance?.destroy();
                       hlsInstance = null;
                       hlsRef.current = null;
                       fallbackToDirectMp4OrError();
-                    }
-                    break;
-                  case HlsModule.ErrorTypes.MEDIA_ERROR:
-                    console.warn('HLS media error, attempting recovery...', data);
-                    hlsInstance?.recoverMediaError();
-                    break;
-                  default:
-                    console.warn('HLS unrecoverable fatal error:', data);
-                    hlsInstance?.stopLoad();
-                    hlsInstance?.detachMedia();
-                    hlsInstance?.destroy();
-                    hlsInstance = null;
-                    hlsRef.current = null;
-                    fallbackToDirectMp4OrError();
-                    break;
+                      break;
+                  }
                 }
-              }
-            });
-          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Native Safari / WebKit HLS
-            video.src = hlsUrl;
-            startPlaybackIfAllowed();
-          } else {
+              });
+            } else {
+              fallbackToDirectMp4OrError();
+            }
+          } catch {
+            if (cancelled) return;
             fallbackToDirectMp4OrError();
           }
-        } catch {
-          if (cancelled) return;
-          if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = hlsUrl;
-            startPlaybackIfAllowed();
-          } else {
-            fallbackToDirectMp4OrError();
-          }
-        }
-      })();
+        })();
+      }
     } else if (mp4MaxUrl) {
       video.src = mp4MaxUrl;
       startPlaybackIfAllowed();
@@ -383,7 +381,7 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
         video.load?.();
       }
     };
-  }, [isEmbed, hasRequestedPlay, movie, hlsUrl, mp4MaxUrl, mp4LowUrl]);
+  }, [isEmbed, hasRequestedPlay, movie, hlsUrl, mp4MaxUrl, mp4LowUrl, retryNonce]);
 
   if (isEmbed) {
     const watchUrl = ytId ? `https://www.youtube.com/watch?v=${ytId}` : candidateUrl;
@@ -425,7 +423,6 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
                 alt={movie.name}
                 onError={() => setPosterFailed(true)}
                 className="w-full h-full object-contain select-none opacity-80"
-                fetchPriority="high"
                 decoding="async"
               />
             )}
@@ -595,7 +592,8 @@ const VideoPlayer: React.FC<{ movie: SteamMovie; autoplay?: boolean }> = ({
               onClick={(e) => {
                 e.stopPropagation();
                 setIsError(false);
-                if (videoRef.current) {
+                setRetryNonce((n) => n + 1);
+                if (!hlsUrl && videoRef.current) {
                   videoRef.current.load();
                 }
               }}
@@ -890,7 +888,6 @@ export const MediaGallery: React.FC<MediaGalleryProps> = ({
                       setFailedThumbUrls((prev) => setBoundedFlag(prev, thumbSrc))
                     }
                     className="w-full h-full object-cover select-none transition-transform duration-300 group-hover:scale-[1.01]"
-                    fetchPriority="high"
                     decoding="async"
                   />
                 )}

@@ -505,6 +505,88 @@ function purgeOsMetadataAndCountRealFilesSync(dirPath) {
   return summary;
 }
 
+/**
+ * Asynchronous counterpart to `purgeOsMetadataAndCountRealFilesSync` using `fs.promises.opendir`
+ * and `fs.promises.lstat` so save-folder scanning never blocks the Electron main thread.
+ *
+ * @param {string} dirPath
+ * @returns {Promise<{ exists: boolean, purgedCount: number, realFileCount: number }>}
+ */
+async function purgeOsMetadataAndCountRealFilesAsync(dirPath) {
+  const summary = { exists: false, purgedCount: 0, realFileCount: 0 };
+  if (!dirPath || typeof dirPath !== 'string') return summary;
+  try {
+    let rootStat = null;
+    try {
+      rootStat = await fs.promises.lstat(dirPath);
+    } catch {
+      return summary;
+    }
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      return summary;
+    }
+    summary.exists = true;
+
+    const isBroadOneDriveRoot = isBroadOneDriveKnownFolderRoot(dirPath);
+    const stack = [dirPath];
+    while (stack.length > 0) {
+      const currentDir = stack.pop();
+      if (!currentDir) continue;
+      const preserveRootDesktopIni = isWindowsKnownFolderRootPath(currentDir);
+      let dirHandle = null;
+      try {
+        dirHandle = await fs.promises.opendir(currentDir);
+      } catch {
+        continue;
+      }
+      try {
+        for await (const dirent of dirHandle) {
+          const name = dirent.name;
+          const fullPath = path.join(currentDir, name);
+          let entryStat;
+          try {
+            entryStat = await fs.promises.lstat(fullPath);
+          } catch {
+            continue;
+          }
+          if (entryStat.isSymbolicLink()) {
+            continue;
+          }
+          if (entryStat.isDirectory()) {
+            if (isBroadOneDriveRoot && process.platform === 'win32') {
+              continue;
+            }
+            stack.push(fullPath);
+            continue;
+          }
+          if (!entryStat.isFile()) {
+            continue;
+          }
+          if (isSparseOrOfflineStat(entryStat, isOneDrivePath(fullPath))) {
+            continue;
+          }
+          if (OS_METADATA_JUNK_REGEX.test(name)) {
+            if (preserveRootDesktopIni && name.toLowerCase() === 'desktop.ini') {
+              continue;
+            }
+            try {
+              await fs.promises.unlink(fullPath);
+              summary.purgedCount += 1;
+            } catch {
+              // Ignore locked OS metadata files without counting them as real game saves
+            }
+          } else {
+            summary.realFileCount += 1;
+          }
+        }
+      } catch {}
+    }
+  } catch (err) {
+    diagLog.warn('cloudSave.purgeOsMetadataAsyncFailed', err, { dirPath });
+  }
+  return summary;
+}
+
 function resolveCloudSaveBackupsRootDir(backupBaseOrUserDataDir, quotaOptions = {}) {
   if (typeof quotaOptions?.backupsRootDir === 'string' && quotaOptions.backupsRootDir.trim()) {
     return path.resolve(quotaOptions.backupsRootDir.trim());
@@ -693,8 +775,175 @@ function enforceCloudSaveBackupQuotaSync(backupsRootOrUserDataDir, options = {})
   return { evictedCount, freedBytes, totalBytes };
 }
 
+async function computeRealDirStatsAsync(dirPath) {
+  let bytes = 0;
+  let maxMtimeMs = 0;
+  try {
+    const rootSt = await fs.promises.lstat(dirPath);
+    if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
+      return { bytes: 0, mtimeMs: 0 };
+    }
+    maxMtimeMs = Number(rootSt.mtimeMs || 0);
+    const stack = [dirPath];
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (!cur) continue;
+      let dirHandle = null;
+      try {
+        dirHandle = await fs.promises.opendir(cur);
+      } catch {
+        continue;
+      }
+      try {
+        for await (const ent of dirHandle) {
+          const full = path.join(cur, ent.name);
+          let st;
+          try {
+            st = await fs.promises.lstat(full);
+          } catch {
+            continue;
+          }
+          if (st.isSymbolicLink()) continue;
+          if (st.mtimeMs > maxMtimeMs) maxMtimeMs = st.mtimeMs;
+          if (st.isDirectory()) {
+            stack.push(full);
+          } else if (st.isFile()) {
+            bytes += Number(st.size || 0);
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return { bytes, mtimeMs: maxMtimeMs };
+}
+
+async function collectCloudSaveSnapshotEntriesAsync(backupsRootDir) {
+  /** @type {Array<{ snapshotPath: string, snapshotName: string, seriesKey: string, bytes: number, mtimeMs: number }>} */
+  const allSnapshots = [];
+  if (!backupsRootDir) return allSnapshots;
+  try {
+    await fs.promises.access(backupsRootDir);
+  } catch {
+    return allSnapshots;
+  }
+
+  const walk = async (dir, relSegments, depth) => {
+    if (depth > 4) return;
+    let dirHandle = null;
+    try {
+      dirHandle = await fs.promises.opendir(dir);
+    } catch {
+      return;
+    }
+    try {
+      for await (const ent of dirHandle) {
+        if (!ent.isDirectory()) continue;
+        const fullPath = path.join(dir, ent.name);
+        try {
+          const st = await fs.promises.lstat(fullPath);
+          if (st.isSymbolicLink()) continue;
+          if (ent.name.startsWith('snapshot_')) {
+            const stats = await computeRealDirStatsAsync(fullPath);
+            const gameScopeSegs =
+              relSegments.length >= 2 ? relSegments.slice(0, 2) : relSegments.slice();
+            const seriesKey = gameScopeSegs.join('/') || dir;
+            allSnapshots.push({
+              snapshotPath: fullPath,
+              snapshotName: ent.name,
+              seriesKey,
+              bytes: stats.bytes,
+              mtimeMs: stats.mtimeMs || Number(st.mtimeMs || 0),
+            });
+          } else {
+            await walk(fullPath, [...relSegments, ent.name], depth + 1);
+          }
+        } catch {}
+      }
+    } catch {}
+  };
+
+  await walk(backupsRootDir, [], 0);
+  return allSnapshots;
+}
+
 async function enforceCloudSaveBackupQuotaAsync(backupsRootOrUserDataDir, options = {}) {
-  return enforceCloudSaveBackupQuotaSync(backupsRootOrUserDataDir, options);
+  let backupsRoot = resolveCloudSaveBackupsRootDir(backupsRootOrUserDataDir, options);
+  if (!backupsRoot && typeof backupsRootOrUserDataDir === 'string' && backupsRootOrUserDataDir) {
+    backupsRoot = path.resolve(backupsRootOrUserDataDir);
+  }
+  if (!backupsRoot) {
+    return { evictedCount: 0, freedBytes: 0, totalBytes: 0 };
+  }
+  try {
+    await fs.promises.access(backupsRoot);
+  } catch {
+    return { evictedCount: 0, freedBytes: 0, totalBytes: 0 };
+  }
+
+  const maxTotalBackupBytes =
+    typeof options.maxTotalBackupBytes === 'number' && options.maxTotalBackupBytes > 0
+      ? options.maxTotalBackupBytes
+      : typeof options.maxQuotaBytes === 'number' && options.maxQuotaBytes > 0
+        ? options.maxQuotaBytes
+        : DEFAULT_GLOBAL_CLOUD_SAVE_BACKUP_QUOTA_BYTES;
+  const minRetainedPerGame =
+    typeof options.minRetainedPerGame === 'number' && options.minRetainedPerGame >= 0
+      ? Math.floor(options.minRetainedPerGame)
+      : MIN_RETAINED_BACKUPS_PER_GAME;
+
+  const snapshots = await collectCloudSaveSnapshotEntriesAsync(backupsRoot);
+  let totalBytes = snapshots.reduce((acc, s) => acc + s.bytes, 0);
+  if (totalBytes <= maxTotalBackupBytes) {
+    return { evictedCount: 0, freedBytes: 0, totalBytes };
+  }
+
+  /** @type {Map<string, typeof snapshots>} */
+  const byGame = new Map();
+  for (const s of snapshots) {
+    let list = byGame.get(s.seriesKey);
+    if (!list) {
+      list = [];
+      byGame.set(s.seriesKey, list);
+    }
+    list.push(s);
+  }
+
+  const protectedPaths = new Set();
+  for (const list of byGame.values()) {
+    list.sort((a, b) => {
+      const diff = b.mtimeMs - a.mtimeMs;
+      if (Math.abs(diff) > 0.5) return diff;
+      return b.snapshotName.localeCompare(a.snapshotName);
+    });
+    for (let i = 0; i < Math.min(minRetainedPerGame, list.length); i++) {
+      protectedPaths.add(list[i].snapshotPath);
+    }
+  }
+
+  const evictable = snapshots
+    .filter((s) => !protectedPaths.has(s.snapshotPath))
+    .sort((a, b) => {
+      const diff = a.mtimeMs - b.mtimeMs;
+      if (Math.abs(diff) > 0.5) return diff;
+      return a.snapshotName.localeCompare(b.snapshotName);
+    });
+
+  let evictedCount = 0;
+  let freedBytes = 0;
+  for (const cand of evictable) {
+    if (totalBytes <= maxTotalBackupBytes) break;
+    if (!isContainedWithinRoot(backupsRoot, cand.snapshotPath)) continue;
+    try {
+      await fs.promises.rm(cand.snapshotPath, { recursive: true, force: true });
+      totalBytes = Math.max(0, totalBytes - cand.bytes);
+      freedBytes += cand.bytes;
+      evictedCount++;
+    } catch (rmErr) {
+      diagLog.warn('cloudSave.evictGlobalQuotaAsync', rmErr, { snapshotPath: cand.snapshotPath });
+    }
+  }
+
+  return { evictedCount, freedBytes, totalBytes };
 }
 
 /**
@@ -2079,7 +2328,7 @@ function createCloudSaveRunner(deps) {
         const locKey = `${gameId}:${useWindowsLocations ? 'windows' : 'osx'}:${loc.name}`;
         const lastTs = Number(timestampsData.gog[locKey] || 0) || 0;
         const hostLocPath = toHostFilesystemPath(loc.resolvedPath);
-        const hygiene = purgeOsMetadataAndCountRealFilesSync(hostLocPath);
+        const hygiene = await purgeOsMetadataAndCountRealFilesAsync(hostLocPath);
 
         if (mode === 'pre_launch' || mode === 'both') {
           const safeLocName = String(loc.name || '__default').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -2146,19 +2395,24 @@ function createCloudSaveRunner(deps) {
         const combinedOutput = `${execRes.stdout}\n${execRes.stderr}`.trim();
         if (!execRes.err) {
           let updatedTs = Math.floor(Date.now() / 1000);
-          const tsMatches = Array.from(combinedOutput.matchAll(/\b(1[6-9]\d{8}|2\d{9})\b/g));
-          if (tsMatches.length > 0) {
-            const parsedCandidate = Number(tsMatches[tsMatches.length - 1][1]);
+          const stdoutOnly = String(execRes.stdout || '');
+          const standaloneTsMatches = Array.from(
+            stdoutOnly.matchAll(/^\s*(1[6-9]\d{8}|2\d{9})(?:\.\d+)?\s*$/gm)
+          );
+          if (standaloneTsMatches.length > 0) {
+            const parsedCandidate = Math.floor(
+              Number(standaloneTsMatches[standaloneTsMatches.length - 1][1])
+            );
             if (Number.isFinite(parsedCandidate) && parsedCandidate > 0) {
               updatedTs = parsedCandidate;
             }
           } else {
-            const trimmedLines = combinedOutput
+            const trimmedLines = stdoutOnly
               .split(/\r?\n/)
               .map((l) => l.trim())
               .filter(Boolean);
             const lastLine = trimmedLines[trimmedLines.length - 1] || '';
-            if (/^\d+(\.\d+)?$/.test(lastLine)) {
+            if (/^\d{9,11}(?:\.\d+)?$/.test(lastLine)) {
               const numericLine = Math.floor(Number(lastLine));
               if (numericLine > 0) updatedTs = numericLine;
             }
@@ -2529,7 +2783,7 @@ function createCloudSaveRunner(deps) {
 
       let realFileCount = 0;
       if (saveDirExistsBefore) {
-        const hygiene = purgeOsMetadataAndCountRealFilesSync(hostResolvedSavePath);
+        const hygiene = await purgeOsMetadataAndCountRealFilesAsync(hostResolvedSavePath);
         realFileCount = hygiene.realFileCount;
       }
 
@@ -4053,6 +4307,7 @@ module.exports = {
   withCloudManifestFileLock,
   normalizePosixUtf8Locale,
   purgeOsMetadataAndCountRealFilesSync,
+  purgeOsMetadataAndCountRealFilesAsync,
   createCloudSaveRollingBackup,
   createCloudSaveRollingBackupAsync,
   enforceCloudSaveBackupQuotaSync,

@@ -557,9 +557,103 @@ function parseAppxManifestXml(xmlInput) {
   };
 }
 
+const XBOX_HTTP_TIMEOUT_MS = 20_000;
+
+/**
+ * Composes `AbortSignal.timeout(timeoutMs)` with an optional caller `AbortSignal`.
+ *
+ * @param {AbortSignal} [callerSignal]
+ * @param {number} [timeoutMs]
+ * @returns {AbortSignal | undefined}
+ */
+function buildXboxFetchSignal(callerSignal, timeoutMs = XBOX_HTTP_TIMEOUT_MS) {
+  const timeoutSignal =
+    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+  if (callerSignal && timeoutSignal && typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([callerSignal, timeoutSignal]);
+  }
+  return callerSignal || timeoutSignal;
+}
+
+/**
+ * Resolves a default BCP-47 Xbox/Microsoft Store locale tag (`en-US` fallback).
+ *
+ * @param {string} [explicitLocale]
+ * @returns {string}
+ */
+function resolveDefaultXboxLocale(explicitLocale) {
+  if (typeof explicitLocale === 'string' && explicitLocale.trim()) {
+    return explicitLocale.trim();
+  }
+  try {
+    const reqElectron = require('electron');
+    const loc = reqElectron?.app?.getLocale?.();
+    if (typeof loc === 'string' && loc.trim()) {
+      const trimmed = loc.trim();
+      if (trimmed.includes('-')) return trimmed;
+      const country = String(reqElectron?.app?.getLocaleCountryCode?.() || '').trim().toUpperCase();
+      if (/^[a-z]{2}$/i.test(trimmed) && /^[A-Z]{2}$/.test(country)) {
+        return `${trimmed.toLowerCase()}-${country}`;
+      }
+    }
+  } catch {}
+  return 'en-US';
+}
+
+/**
+ * Normalizes Microsoft Store / Xbox CDN image URLs (`//store-images...` -> `https://...`, `http://` -> `https://`).
+ *
+ * @param {string} [rawUrl]
+ * @returns {string}
+ */
+function normalizeStoreImageUrl(rawUrl) {
+  const s = String(rawUrl || '').trim();
+  if (!s) return '';
+  if (s.startsWith('//')) return `https:${s}`;
+  if (s.startsWith('http://')) return `https://${s.slice(7)}`;
+  return s;
+}
+
+/**
+ * Generates an `MS-CV` correlation vector (`<22-char base64>.0`).
+ *
+ * @returns {string}
+ */
+function makeCorrelationVector() {
+  return `${crypto.randomBytes(16).toString('base64').replace(/[+/=]/g, 'A').slice(0, 22)}.0`;
+}
+
+/**
+ * Extracts only the safe `MS-CV` / `x-correlation-id` header from an HTTP response.
+ *
+ * @param {any} res
+ * @returns {string}
+ */
+function extractSafeCorrelationId(res) {
+  if (!res || !res.headers) return 'none';
+  if (typeof res.headers.get === 'function') {
+    const val =
+      res.headers.get('ms-cv') ||
+      res.headers.get('MS-CV') ||
+      res.headers.get('x-correlation-id') ||
+      '';
+    return val ? String(val).slice(0, 96) : 'none';
+  }
+  const objVal = res.headers['ms-cv'] || res.headers['MS-CV'] || '';
+  return objVal ? String(objVal).slice(0, 96) : 'none';
+}
+
 module.exports = {
   APPX_BASE32_ALPHABET,
   HELPER_EXE_BASENAMES,
+  XBOX_HTTP_TIMEOUT_MS,
+  buildXboxFetchSignal,
+  resolveDefaultXboxLocale,
+  normalizeStoreImageUrl,
+  makeCorrelationVector,
+  extractSafeCorrelationId,
   normalizeContainerRelPath,
   stripXmlComments,
   decodeXmlEntities,

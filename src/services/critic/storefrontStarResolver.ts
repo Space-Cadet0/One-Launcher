@@ -101,7 +101,8 @@ export class StorefrontStarResolver {
             .replace(/\s+/g, ' ')
             .trim();
 
-          const queryUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(cleanTitle)}&limit=5`;
+          const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
+          const queryUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=5`;
           const res = await requestScheduler.schedule(
             queryUrl,
             () =>
@@ -126,8 +127,15 @@ export class StorefrontStarResolver {
             }
           } else {
             const data: unknown = await res.json();
+            const hasZeroMatches =
+              Boolean(data && typeof data === 'object') &&
+              typeof (data as { productCount?: unknown }).productCount === 'number' &&
+              ((data as { productCount: number }).productCount <= 0);
             const products =
-              data && typeof data === 'object' && Array.isArray((data as { products?: unknown }).products)
+              !hasZeroMatches &&
+              data &&
+              typeof data === 'object' &&
+              Array.isArray((data as { products?: unknown }).products)
                 ? ((data as { products: Array<Record<string, unknown>> }).products)
                 : [];
             if (products.length > 0) {

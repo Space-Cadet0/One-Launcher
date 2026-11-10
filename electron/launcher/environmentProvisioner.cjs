@@ -47,6 +47,7 @@ const {
   alignWineMsyncWithLiveBottle,
   resolveSipSafeWineBinaryAndPreloadEnv,
   prepareCrossOverWineSpawnEnv,
+  prepareAlignedAuxBottleWineCommand,
   parsePlistStringValues,
   compareRunnerVersions,
   recordRunnerInstallReceipt,
@@ -190,80 +191,6 @@ const {
  * @property {string} message
  * @property {string} [error]
  */
-
-/**
- * Prepare an auxiliary Wine / CrossOver command so `WINEMSYNC`, `CX_ENV`, `CX_ROOT`, SIP wrapper
- * resolution, and optional headless GUI dialog suppression stay aligned with any live `wineserver`.
- *
- * @param {{
- *   wineBinary: string,
- *   bottlePath?: string | null,
- *   env?: Record<string, any>,
- *   suppressGuiDialogs?: boolean,
- *   layerType?: string | null,
- * }} params
- * @returns {{ binaryPath: string, env: Record<string, any> }}
- */
-function prepareAlignedAuxBottleWineCommand(params) {
-  const {
-    wineBinary = '',
-    bottlePath = '',
-    env: inputEnv = {},
-    suppressGuiDialogs = false,
-    layerType,
-  } = params || {};
-  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
-  if (typeof macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand === 'function') {
-    const res = macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand({
-      wineBinary,
-      bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
-      env: workingEnv,
-      suppressGuiDialogs,
-      layerType,
-    });
-    const resolvedFromHelper =
-      res && typeof res.wineBinary === 'string' && res.wineBinary
-        ? res.wineBinary
-        : res && typeof res.binaryPath === 'string' && res.binaryPath
-          ? res.binaryPath
-          : '';
-    if (resolvedFromHelper) {
-      return {
-        binaryPath: resolvedFromHelper,
-        env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
-      };
-    }
-  }
-  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
-  if (effectivePrefix) {
-    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
-    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
-  }
-  if (suppressGuiDialogs) {
-    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
-    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
-    if (!curDll) {
-      workingEnv.WINEDLLOVERRIDES = disableSpec;
-    } else if (!curDll.includes('winemenubuilder.exe=d')) {
-      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
-    }
-    if (!workingEnv.WINEDEBUG) {
-      workingEnv.WINEDEBUG = '-all';
-    }
-  }
-  const resolvedBin =
-    typeof prepareCrossOverWineSpawnEnv === 'function'
-      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        })
-      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        });
-  return {
-    binaryPath: resolvedBin || wineBinary,
-    env: workingEnv,
-  };
-}
 
 /**
  * Pinned HTTPS vendor hosts allowed for automated installer discovery and downloads.

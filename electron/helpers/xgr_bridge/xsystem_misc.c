@@ -270,15 +270,20 @@ static HRESULT WINAPI xsys_GetConsoleId(void *iface, SIZE_T sz, char *out, SIZE_
     return xgr_return_hr(S_OK);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((used))
+#endif
+static const char g_xgr_default_sandbox_id[] = "RETAIL";
+
 static HRESULT WINAPI xsys_GetXboxLiveSandboxId(void *iface, SIZE_T sz, char *out, SIZE_T *used)
 {
     (void)iface;
-    const char *sbid = "RETAIL";
+    volatile const char *sbid = g_xgr_default_sandbox_id;
     const SIZE_T need = 7; /* strlen("RETAIL") + 1; XSystemXboxLiveSandboxIdMaxBytes == 16 */
     if (used) *used = need;
     if (!out) return xgr_return_hr(E_POINTER);
     if (sz < need) return xgr_return_hr(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
-    memcpy(out, sbid, need);
+    for (SIZE_T i = 0; i < need; i++) out[i] = sbid[i];
     return xgr_return_hr(S_OK);
 }
 

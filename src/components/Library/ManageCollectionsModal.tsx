@@ -19,6 +19,7 @@ import {
 } from '../Common/CollectionIcon';
 import { ModalShell } from '../Common/ModalShell';
 import { useSafeId } from '../../utils/useSafeId';
+import { isImeComposing } from '../../utils/keyboardUtils';
 
 interface ManageCollectionsModalProps {
   isOpen: boolean;
@@ -330,6 +331,7 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
                                 e.preventDefault();
+                                if (isImeComposing(e)) return;
                                 handleRenameSubmit(col.id);
                               } else if (e.key === 'Escape') {
                                 e.stopPropagation();
@@ -548,6 +550,11 @@ export const ManageCollectionsModal: React.FC<ManageCollectionsModalProps> = ({
                   placeholder="e.g. RPGs, Co-Op Favorites, Indie Gems..."
                   value={newColName}
                   onChange={(e) => setNewColName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && isImeComposing(e)) {
+                      e.preventDefault();
+                    }
+                  }}
                   className="bg-[#0e141b] border border-[#2a475e] text-white placeholder-slate-400 text-xs rounded px-3 py-1.5 flex-1 focus:border-steam-accent outline-none"
                   autoFocus
                 />

@@ -27,8 +27,9 @@ typedef void      (APIENTRY *pfn_glTexParameteri_t)(GLenum, GLenum, GLint);
 typedef GLboolean (APIENTRY *pfn_glIsEnabled_t)(GLenum);
 typedef void      (APIENTRY *pfn_glEnable_t)(GLenum);
 typedef void      (APIENTRY *pfn_glDisable_t)(GLenum);
-typedef void      (APIENTRY *pfn_glGetIntegerv_t)(GLenum, GLint *);
+typedef void      (APIENTRY *pfn_glGetBooleanv_t)(GLenum, GLboolean *);
 typedef void      (APIENTRY *pfn_glGetFloatv_t)(GLenum, GLfloat *);
+typedef void      (APIENTRY *pfn_glColorMask_t)(GLboolean, GLboolean, GLboolean, GLboolean);
 typedef void      (APIENTRY *pfn_glClearColor_t)(GLclampf, GLclampf, GLclampf, GLclampf);
 typedef void      (APIENTRY *pfn_glClear_t)(GLbitfield);
 typedef void      (APIENTRY *pfn_glScissor_t)(GLint, GLint, GLsizei, GLsizei);
@@ -88,6 +89,13 @@ typedef struct ds_gl_state_s {
     GLint                         last_w3d_vp[4];
     GLint                         last_w3d_sc[4];
 
+    /* Two-pass zero-shader FBO Sharp-Bilinear intermediate surface */
+    HGLRC                         sharp_ctx;
+    GLuint                        sharp_fbo;
+    GLuint                        sharp_tex;
+    int32_t                       sharp_w;
+    int32_t                       sharp_h;
+
     /* Bijective game_hdc <-> host_hdc map for OneLauncherGLHostChild */
     ds_gl_dc_entry_t              dc_map[DS_MAX_GL_DC_MAP];
     int                           last_host_pf;
@@ -128,8 +136,10 @@ typedef struct ds_gl_state_s {
     pfn_glIsEnabled_t             p_glIsEnabled;
     pfn_glEnable_t                p_glEnable;
     pfn_glDisable_t               p_glDisable;
+    pfn_glGetBooleanv_t           p_glGetBooleanv;
     pfn_glGetIntegerv_t           p_glGetIntegerv;
     pfn_glGetFloatv_t             p_glGetFloatv;
+    pfn_glColorMask_t             p_glColorMask;
     pfn_glClearColor_t            p_glClearColor;
     pfn_glClear_t                 p_glClear;
     pfn_glScissor_t               p_glScissor;
@@ -187,9 +197,14 @@ static bool ds_gl_init_procs_once(void)
     g_gl.p_glIsEnabled          = (pfn_glIsEnabled_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glIsEnabled");
     g_gl.p_glEnable             = (pfn_glEnable_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glEnable");
     g_gl.p_glDisable            = (pfn_glDisable_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glDisable");
+    g_gl.p_glGetBooleanv        = (pfn_glGetBooleanv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetBooleanv");
     g_gl.p_glGetIntegerv        = (pfn_glGetIntegerv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetIntegerv");
     g_gl.p_glGetFloatv          = (pfn_glGetFloatv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetFloatv");
+    g_gl.p_glColorMask          = (pfn_glColorMask_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glColorMask");
     g_gl.p_glViewport           = (pfn_glViewport_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glViewport");
+    if (!g_ds.real_glGetIntegerv) {
+        g_ds.real_glGetIntegerv = g_gl.p_glGetIntegerv;
+    }
     if (!g_ds.real_glDrawBuffer) {
         g_ds.real_glDrawBuffer  = (pfn_glDrawBuffer_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glDrawBuffer");
     }
@@ -257,6 +272,18 @@ static void ds_gl_destroy_fbo_current_ctx(void)
         g_gl.p_glDeleteFramebuffers(1, &g_gl.fbo_id);
         g_gl.fbo_id = 0;
     }
+    if (g_gl.sharp_ctx == g_gl.fbo_ctx) {
+        if (g_gl.sharp_tex) {
+            g_gl.p_glDeleteTextures(1, &g_gl.sharp_tex);
+            g_gl.sharp_tex = 0;
+        }
+        if (g_gl.sharp_fbo) {
+            g_gl.p_glDeleteFramebuffers(1, &g_gl.sharp_fbo);
+            g_gl.sharp_fbo = 0;
+        }
+        g_gl.sharp_w = 0;
+        g_gl.sharp_h = 0;
+    }
     g_gl.fbo_w = 0;
     g_gl.fbo_h = 0;
     g_gl.fbo_redirect_active = false;
@@ -295,9 +322,11 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
 
     if (g_gl.fbo_id == 0 || g_gl.fbo_w != virt_w || g_gl.fbo_h != virt_h) {
         GLint prev_tex = 0;
+        GLint prev_rb = 0;
         GLint prev_unpack_pbo = 0;
         if (g_gl.p_glGetIntegerv) {
             g_gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+            g_gl.p_glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
             if (g_gl.p_glBindBuffer) {
                 g_gl.p_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack_pbo);
                 if (prev_unpack_pbo != 0) {
@@ -324,11 +353,17 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
 
         g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, g_gl.depth_rb);
         g_gl.p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, virt_w, virt_h);
-        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        g_gl.p_glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prev_rb);
 
         g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, g_gl.fbo_id);
         g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.color_tex, 0);
         g_gl.p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_gl.depth_rb);
+        if (g_ds.real_glDrawBuffer) {
+            g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        }
+        if (g_ds.real_glReadBuffer) {
+            g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
+        }
 
         GLenum status = g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE) {
@@ -345,12 +380,6 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
     GLuint target_read = g_gl.game_read_fbo ? g_gl.game_read_fbo : g_gl.fbo_id;
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_draw);
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, target_read);
-    if (target_draw == g_gl.fbo_id && g_ds.real_glDrawBuffer) {
-        g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    }
-    if (target_read == g_gl.fbo_id && g_ds.real_glReadBuffer) {
-        g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
-    }
     static int32_t s_last_vw = 0, s_last_vh = 0, s_last_dw = 0, s_last_dh = 0;
     static GLuint s_last_fbo = 0;
     if (s_last_vw != virt_w || s_last_vh != virt_h || s_last_dw != dst_w || s_last_dh != dst_h || s_last_fbo != g_gl.fbo_id) {
@@ -370,24 +399,80 @@ static void APIENTRY hook_glBindFramebuffer(GLenum target, GLuint framebuffer)
     }
     if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 &&
         g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
+        GLuint virt_fb = (framebuffer == g_gl.fbo_id) ? 0u : framebuffer;
         if (target == GL_FRAMEBUFFER) {
-            g_gl.game_draw_fbo = framebuffer;
-            g_gl.game_read_fbo = framebuffer;
-            g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, framebuffer == 0 ? g_gl.fbo_id : framebuffer);
+            g_gl.game_draw_fbo = virt_fb;
+            g_gl.game_read_fbo = virt_fb;
+            g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
             return;
         }
         if (target == GL_DRAW_FRAMEBUFFER) {
-            g_gl.game_draw_fbo = framebuffer;
-            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer == 0 ? g_gl.fbo_id : framebuffer);
+            g_gl.game_draw_fbo = virt_fb;
+            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
             return;
         }
         if (target == GL_READ_FRAMEBUFFER) {
-            g_gl.game_read_fbo = framebuffer;
-            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer == 0 ? g_gl.fbo_id : framebuffer);
+            g_gl.game_read_fbo = virt_fb;
+            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, virt_fb == 0 ? g_gl.fbo_id : virt_fb);
             return;
         }
     }
     g_gl.p_glBindFramebuffer(target, framebuffer);
+}
+
+static void APIENTRY hook_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)
+{
+    if (!g_gl.p_glDeleteFramebuffers) return;
+    if (!ds_is_internal_call() && n > 0 && framebuffers &&
+        g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
+        bool has_protected = false;
+        bool rebound = false;
+        for (GLsizei i = 0; i < n; i++) {
+            GLuint fb = framebuffers[i];
+            if (fb != 0 && (fb == g_gl.fbo_id || fb == g_gl.sharp_fbo)) {
+                has_protected = true;
+                break;
+            }
+        }
+        if (has_protected) {
+            for (GLsizei i = 0; i < n; i++) {
+                GLuint fb = framebuffers[i];
+                if (fb == 0 || fb == g_gl.fbo_id || fb == g_gl.sharp_fbo) continue;
+                if (fb == g_gl.game_draw_fbo) { g_gl.game_draw_fbo = 0; rebound = true; }
+                if (fb == g_gl.game_read_fbo) { g_gl.game_read_fbo = 0; rebound = true; }
+                g_gl.p_glDeleteFramebuffers(1, &fb);
+            }
+        } else {
+            for (GLsizei i = 0; i < n; i++) {
+                GLuint fb = framebuffers[i];
+                if (fb == 0) continue;
+                if (fb == g_gl.game_draw_fbo) { g_gl.game_draw_fbo = 0; rebound = true; }
+                if (fb == g_gl.game_read_fbo) { g_gl.game_read_fbo = 0; rebound = true; }
+            }
+            g_gl.p_glDeleteFramebuffers(n, framebuffers);
+        }
+        if (rebound && g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && g_gl.p_glBindFramebuffer) {
+            g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.game_draw_fbo ? g_gl.game_draw_fbo : g_gl.fbo_id);
+            g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.game_read_fbo ? g_gl.game_read_fbo : g_gl.fbo_id);
+        }
+        return;
+    }
+    g_gl.p_glDeleteFramebuffers(n, framebuffers);
+}
+
+void APIENTRY hook_glGetIntegerv(GLenum pname, GLint *data)
+{
+    pfn_glGetIntegerv_t fn = g_ds.real_glGetIntegerv ? g_ds.real_glGetIntegerv : g_gl.p_glGetIntegerv;
+    if (!fn) return;
+    fn(pname, data);
+    if (!data || ds_is_internal_call()) return;
+    if ((pname == GL_FRAMEBUFFER_BINDING || pname == GL_READ_FRAMEBUFFER_BINDING) &&
+        g_gl.fbo_redirect_active && g_gl.fbo_id != 0 &&
+        g_gl.p_wglGetCurrentContext && g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
+        if ((GLuint)(*data) == g_gl.fbo_id) {
+            *data = 0;
+        }
+    }
 }
 
 void APIENTRY hook_glDrawBuffer(GLenum mode)
@@ -420,10 +505,10 @@ void APIENTRY hook_glReadBuffer(GLenum mode)
 
 static void ds_gl_ensure_state_procs(void)
 {
-    if (g_gl.p_glGetIntegerv && g_gl.p_glGetFloatv && g_gl.p_glIsEnabled &&
-        g_gl.p_glDisable && g_gl.p_glEnable && g_gl.p_glClearColor &&
-        g_gl.p_glClear && g_gl.p_glScissor && g_gl.p_glViewport &&
-        g_gl.p_wglGetCurrentDC) {
+    if (g_gl.p_glGetIntegerv && g_gl.p_glGetBooleanv && g_gl.p_glGetFloatv &&
+        g_gl.p_glIsEnabled && g_gl.p_glDisable && g_gl.p_glEnable &&
+        g_gl.p_glColorMask && g_gl.p_glClearColor && g_gl.p_glClear &&
+        g_gl.p_glScissor && g_gl.p_glViewport && g_gl.p_wglGetCurrentDC) {
         return;
     }
     if (!g_ds.real_GetProcAddress) {
@@ -433,11 +518,14 @@ static void ds_gl_ensure_state_procs(void)
     if (!h_gl) {
         return;
     }
+    if (!g_gl.p_glGetBooleanv)   g_gl.p_glGetBooleanv   = (pfn_glGetBooleanv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetBooleanv");
     if (!g_gl.p_glGetIntegerv)   g_gl.p_glGetIntegerv   = (pfn_glGetIntegerv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetIntegerv");
+    if (!g_ds.real_glGetIntegerv) g_ds.real_glGetIntegerv = g_gl.p_glGetIntegerv;
     if (!g_gl.p_glGetFloatv)     g_gl.p_glGetFloatv     = (pfn_glGetFloatv_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glGetFloatv");
     if (!g_gl.p_glIsEnabled)     g_gl.p_glIsEnabled     = (pfn_glIsEnabled_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glIsEnabled");
     if (!g_gl.p_glDisable)       g_gl.p_glDisable       = (pfn_glDisable_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glDisable");
     if (!g_gl.p_glEnable)        g_gl.p_glEnable        = (pfn_glEnable_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glEnable");
+    if (!g_gl.p_glColorMask)     g_gl.p_glColorMask     = (pfn_glColorMask_t)(uintptr_t)g_ds.real_GetProcAddress(h_gl, "glColorMask");
     if (!g_gl.p_glClearColor)    g_gl.p_glClearColor    = (pfn_glClearColor_t)ds_gl_proc_or_ext(h_gl, "glClearColor", NULL);
     if (!g_gl.p_glClear)         g_gl.p_glClear         = (pfn_glClear_t)ds_gl_proc_or_ext(h_gl, "glClear", NULL);
     if (!g_gl.p_glScissor)       g_gl.p_glScissor       = (pfn_glScissor_t)ds_gl_proc_or_ext(h_gl, "glScissor", NULL);
@@ -484,10 +572,20 @@ static void ds_gl_clear_pillarbox_margins(
     }
 
     GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
+    GLboolean was_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
+    GLboolean prev_cmask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    bool has_cmask = (g_gl.p_glGetBooleanv != NULL && g_gl.p_glColorMask != NULL);
     GLint prev_scissor[4] = { 0, 0, 0, 0 };
     GLfloat prev_clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     bool has_prev_scissor = (g_gl.p_glGetIntegerv != NULL);
     bool has_prev_clear = (g_gl.p_glGetFloatv != NULL);
+    if (has_cmask) {
+        g_gl.p_glGetBooleanv(GL_COLOR_WRITEMASK, prev_cmask);
+        g_gl.p_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    if (was_srgb) {
+        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+    }
     if (has_prev_scissor) {
         g_gl.p_glGetIntegerv(GL_SCISSOR_BOX, prev_scissor);
     }
@@ -517,11 +615,173 @@ static void ds_gl_clear_pillarbox_margins(
     if (has_prev_clear) {
         g_gl.p_glClearColor(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
     }
+    if (has_cmask) {
+        g_gl.p_glColorMask(prev_cmask[0], prev_cmask[1], prev_cmask[2], prev_cmask[3]);
+    }
+    if (was_srgb) {
+        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+    }
     if (has_prev_scissor && prev_scissor[2] >= 0 && prev_scissor[3] >= 0) {
         g_gl.p_glScissor(prev_scissor[0], prev_scissor[1], prev_scissor[2], prev_scissor[3]);
     }
     if (!was_scissor) {
         g_gl.p_glDisable(GL_SCISSOR_TEST);
+    }
+}
+
+static bool ds_gl_ensure_sharp_fbo(HGLRC cur_ctx, int32_t inter_w, int32_t inter_h)
+{
+    if (!cur_ctx || inter_w <= 0 || inter_h <= 0 || !ds_gl_init_procs_once()) {
+        return false;
+    }
+    if (g_gl.sharp_ctx != cur_ctx) {
+        g_gl.sharp_ctx = cur_ctx;
+        g_gl.sharp_fbo = 0;
+        g_gl.sharp_tex = 0;
+        g_gl.sharp_w = 0;
+        g_gl.sharp_h = 0;
+    }
+    if (g_gl.sharp_fbo != 0 && g_gl.sharp_w == inter_w && g_gl.sharp_h == inter_h) {
+        return true;
+    }
+
+    GLint prev_draw = 0;
+    GLint prev_read = 0;
+    GLint prev_tex = 0;
+    GLint prev_unpack = 0;
+    if (g_gl.p_glGetIntegerv) {
+        g_gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+        g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+        g_gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+        if (g_gl.p_glBindBuffer) {
+            g_gl.p_glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack);
+            if (prev_unpack != 0) {
+                g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            }
+        }
+    }
+
+    if (g_gl.sharp_fbo == 0) {
+        g_gl.p_glGenFramebuffers(1, &g_gl.sharp_fbo);
+        g_gl.p_glGenTextures(1, &g_gl.sharp_tex);
+    }
+    g_gl.p_glBindTexture(GL_TEXTURE_2D, g_gl.sharp_tex);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, inter_w, inter_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    g_gl.p_glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    if (prev_unpack != 0 && g_gl.p_glBindBuffer) {
+        g_gl.p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack);
+    }
+
+    g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, g_gl.sharp_fbo);
+    g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.sharp_tex, 0);
+    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
+    bool complete = (g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+
+    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
+    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+
+    if (!complete) {
+        if (g_gl.sharp_tex) {
+            g_gl.p_glDeleteTextures(1, &g_gl.sharp_tex);
+            g_gl.sharp_tex = 0;
+        }
+        if (g_gl.sharp_fbo) {
+            g_gl.p_glDeleteFramebuffers(1, &g_gl.sharp_fbo);
+            g_gl.sharp_fbo = 0;
+        }
+        g_gl.sharp_w = 0;
+        g_gl.sharp_h = 0;
+        return false;
+    }
+    g_gl.sharp_w = inter_w;
+    g_gl.sharp_h = inter_h;
+    return true;
+}
+
+static void ds_gl_present_blit_to_backbuffer(
+    HGLRC             cur_ctx,
+    GLuint            src_read_fbo,
+    GLint             sx0,
+    GLint             sy0,
+    GLint             sx1,
+    GLint             sy1,
+    GLint             dx0,
+    GLint             dy0,
+    GLint             dx1,
+    GLint             dy1,
+    GLbitfield        mask,
+    GLenum            fallback_filter,
+    ds_aspect_mode_t  aspect,
+    ds_scale_filter_t scale_filter
+)
+{
+    GLboolean was_srgb = (g_gl.p_glIsEnabled && (mask & GL_COLOR_BUFFER_BIT))
+        ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB)
+        : GL_FALSE;
+    if (was_srgb && g_gl.p_glDisable) {
+        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+    }
+
+    if (mask == GL_COLOR_BUFFER_BIT) {
+        GLenum filter = (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR;
+        int32_t src_w = (sx1 >= sx0) ? (sx1 - sx0) : (sx0 - sx1);
+        int32_t src_h = (sy1 >= sy0) ? (sy1 - sy0) : (sy0 - sy1);
+        int32_t dst_w = (dx1 >= dx0) ? (dx1 - dx0) : (dx0 - dx1);
+        int32_t dst_h = (dy1 >= dy0) ? (dy1 - dy0) : (dy0 - dy1);
+
+        if (aspect == DS_ASPECT_INTEGER || scale_filter == DS_FILTER_NEAREST) {
+            filter = GL_NEAREST;
+        } else if (scale_filter != DS_FILTER_LINEAR && src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0) {
+            bool want_sharp = (scale_filter == DS_FILTER_SHARP)
+                ? (dst_w > src_w || dst_h > src_h)
+                : (((int64_t)dst_w * 2LL >= (int64_t)src_w * 3LL) ||
+                   ((int64_t)dst_h * 2LL >= (int64_t)src_h * 3LL));
+            if (want_sharp) {
+                int32_t max_kx = 4096 / src_w;
+                if (max_kx < 1) max_kx = 1;
+                int32_t ceil_kx = (dst_w + src_w - 1) / src_w;
+                if (ceil_kx < 1) ceil_kx = 1;
+                int32_t kx = (ceil_kx < max_kx) ? ceil_kx : max_kx;
+
+                int32_t max_ky = 4096 / src_h;
+                if (max_ky < 1) max_ky = 1;
+                int32_t ceil_ky = (dst_h + src_h - 1) / src_h;
+                if (ceil_ky < 1) ceil_ky = 1;
+                int32_t ky = (ceil_ky < max_ky) ? ceil_ky : max_ky;
+
+                int32_t inter_w = src_w * kx;
+                int32_t inter_h = src_h * ky;
+                if (inter_w == dst_w && inter_h == dst_h) {
+                    filter = GL_NEAREST;
+                } else if ((kx > 1 || ky > 1) && ds_gl_ensure_sharp_fbo(cur_ctx, inter_w, inter_h)) {
+                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, src_read_fbo);
+                    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.sharp_fbo);
+                    g_gl.p_glBlitFramebuffer(sx0, sy0, sx1, sy1, 0, 0, inter_w, inter_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.sharp_fbo);
+                    g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+                    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
+                    g_gl.p_glBlitFramebuffer(0, 0, inter_w, inter_h, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, src_read_fbo);
+                    if (was_srgb && g_gl.p_glEnable) {
+                        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+                    }
+                    return;
+                }
+            }
+        }
+        fallback_filter = filter;
+    }
+
+    g_gl.p_glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, fallback_filter);
+    if (was_srgb && g_gl.p_glEnable) {
+        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
     }
 }
 
@@ -547,13 +807,16 @@ static void APIENTRY hook_glBlitFramebuffer(
 
     if (!ds_is_internal_call() && g_gl.p_glGetIntegerv && ds_is_wined3d_caller(__builtin_return_address(0))) {
         GLint draw_fbo = -1;
+        GLint read_fbo = 0;
         g_gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+        g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
         if (draw_fbo == 0) {
             HDC cur_hdc = g_gl.p_wglGetCurrentDC ? g_gl.p_wglGetCurrentDC() : NULL;
             HWND cur_win = cur_hdc ? WindowFromDC(cur_hdc) : NULL;
 
             EnterCriticalSection(&g_ds.lock);
             g_ds.wined3d_uses_gl = true;
+            ds_notify_gl_context_active_locked();
             bool is_target_win = (cur_win == NULL ||
                                   cur_win == g_ds.hwnd_game ||
                                   cur_win == g_ds.hwnd_gl_host ||
@@ -566,6 +829,7 @@ static void APIENTRY hook_glBlitFramebuffer(
             int32_t dst_x = g_ds.fullscreen_active ? g_ds.vp.dst_x : 0;
             int32_t dst_y = g_ds.fullscreen_active ? g_ds.vp.dst_y : 0;
             bool should_scale = (
+                !ds_is_passthrough_locked() &&
                 is_target_win &&
                 (g_ds.fullscreen_active || win_scale > 1) &&
                 vw > 0 &&
@@ -575,6 +839,7 @@ static void APIENTRY hook_glBlitFramebuffer(
                 (vw != dw || vh != dh)
             );
             ds_aspect_mode_t aspect = g_ds.fullscreen_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
+            ds_scale_filter_t sfilter = g_ds.scale_filter;
             LeaveCriticalSection(&g_ds.lock);
 
             if (should_scale) {
@@ -626,19 +891,37 @@ static void APIENTRY hook_glBlitFramebuffer(
                             }
                         }
                     }
-                    filter = (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR;
                     ds_gl_clear_pillarbox_margins(dst_x, gl_dst_y, dst_x + dw, gl_dst_y + dh, backing_w, backing_h);
                 }
                 GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
                 if (was_scissor && g_gl.p_glDisable) {
                     g_gl.p_glDisable(GL_SCISSOR_TEST);
                 }
-                g_gl.p_glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, nx0, ny0, nx1, ny1, mask, filter);
+                HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
+                ds_enter_internal();
+                ds_gl_present_blit_to_backbuffer(
+                    cur_ctx,
+                    (GLuint)read_fbo,
+                    srcX0,
+                    srcY0,
+                    srcX1,
+                    srcY1,
+                    nx0,
+                    ny0,
+                    nx1,
+                    ny1,
+                    mask,
+                    filter,
+                    aspect,
+                    sfilter
+                );
+                ds_leave_internal();
                 if (was_scissor && g_gl.p_glEnable) {
                     g_gl.p_glEnable(GL_SCISSOR_TEST);
                 }
                 g_gl.w3d_scaled_in_blit = true;
                 g_gl.last_present_was_gl = true;
+                InterlockedIncrement(&g_ds.gdi_margin_gen);
                 return;
             }
         }
@@ -648,14 +931,15 @@ static void APIENTRY hook_glBlitFramebuffer(
 }
 
 static void ds_gl_upscale_wined3d_backbuffer(
-    HGLRC            cur_ctx,
-    int32_t          vw,
-    int32_t          vh,
-    int32_t          dst_x,
-    int32_t          gl_dst_y,
-    int32_t          dw,
-    int32_t          dh,
-    ds_aspect_mode_t aspect
+    HGLRC             cur_ctx,
+    int32_t           vw,
+    int32_t           vh,
+    int32_t           dst_x,
+    int32_t           gl_dst_y,
+    int32_t           dw,
+    int32_t           dh,
+    ds_aspect_mode_t  aspect,
+    ds_scale_filter_t scale_filter
 )
 {
     if (vw <= 0 || vh <= 0 || dw <= 0 || dh <= 0) {
@@ -708,6 +992,8 @@ static void ds_gl_upscale_wined3d_backbuffer(
 
         g_gl.p_glBindFramebuffer(GL_FRAMEBUFFER, g_gl.w3d_fbo_id);
         g_gl.p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.w3d_color_tex, 0);
+        if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
         if (g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
             g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
             g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
@@ -719,19 +1005,21 @@ static void ds_gl_upscale_wined3d_backbuffer(
     }
 
     GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
+    GLboolean was_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
     if (was_scissor && g_gl.p_glDisable) {
         g_gl.p_glDisable(GL_SCISSOR_TEST);
+    }
+    if (was_srgb && g_gl.p_glDisable) {
+        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
     }
 
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.w3d_fbo_id);
     if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
-    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_COLOR_ATTACHMENT0);
     g_gl.p_glBlitFramebuffer(0, 0, vw, vh, 0, 0, vw, vh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.w3d_fbo_id);
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
     if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
 
     int32_t backing_w = g_ds.fullscreen_active ? g_ds.phys_screen_w : dw;
@@ -751,14 +1039,31 @@ static void ds_gl_upscale_wined3d_backbuffer(
 
     ds_gl_clear_pillarbox_margins(dst_x, gl_dst_y, dst_x + dst_w, gl_dst_y + dst_h, backing_w, backing_h);
 
-    GLenum filter = (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR;
-    g_gl.p_glBlitFramebuffer(0, 0, vw, vh, dst_x, gl_dst_y, dst_x + dst_w, gl_dst_y + dst_h, GL_COLOR_BUFFER_BIT, filter);
+    ds_gl_present_blit_to_backbuffer(
+        cur_ctx,
+        g_gl.w3d_fbo_id,
+        0,
+        0,
+        vw,
+        vh,
+        dst_x,
+        gl_dst_y,
+        dst_x + dst_w,
+        gl_dst_y + dst_h,
+        GL_COLOR_BUFFER_BIT,
+        (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
+        aspect,
+        scale_filter
+    );
 
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
     if (prev_draw_fbo == 0 && g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
     if (prev_read_fbo == 0 && g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
 
+    if (was_srgb && g_gl.p_glEnable) {
+        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+    }
     if (was_scissor && g_gl.p_glEnable) {
         g_gl.p_glEnable(GL_SCISSOR_TEST);
     }
@@ -773,8 +1078,8 @@ static void ds_gl_upscale_wined3d_backbuffer(
  * directly to `g_ds.hwnd_game`, `-[WineOpenGLContext clearDrawableLeavingSurfaceOnScreen]`
  * intentionally leaves the opaque `CGLSurface` / `CAOpenGLLayer` pinned above
  * `hwnd_game`'s GDI `CALayer` even after `wglMakeCurrent(NULL, NULL)` and
- * `wglDeleteContext`, occluding subsequent 2D GDI screens (such as Jedi Knight's
- * in-game `ESC` menu).
+ * `wglDeleteContext`, occluding subsequent 2D GDI screens (such as classic hybrid
+ * 2D/3D engines returning to an in-game `ESC` menu).
  *
  * By redirecting all WGL / pixel-format operations targeting `hwnd_game` onto
  * a dedicated full-client child window (`g_ds.hwnd_gl_host`):
@@ -1247,6 +1552,18 @@ void *ds_resolve_gl_hook_proc(const char *name, void *real_fn)
         }
         return (void *)(uintptr_t)hook_glBindFramebuffer;
     }
+    if (strcmp(name, "glDeleteFramebuffers") == 0 || strcmp(name, "glDeleteFramebuffersEXT") == 0) {
+        if (!g_gl.p_glDeleteFramebuffers) {
+            g_gl.p_glDeleteFramebuffers = (pfn_glDeleteFramebuffers_t)(uintptr_t)real_fn;
+        }
+        return (void *)(uintptr_t)hook_glDeleteFramebuffers;
+    }
+    if (strcmp(name, "glGetIntegerv") == 0) {
+        if (!g_ds.real_glGetIntegerv) {
+            g_ds.real_glGetIntegerv = (pfn_glGetIntegerv_t)(uintptr_t)real_fn;
+        }
+        return (void *)(uintptr_t)hook_glGetIntegerv;
+    }
     if (strcmp(name, "glDrawBuffer") == 0) {
         if (!g_ds.real_glDrawBuffer) {
             g_ds.real_glDrawBuffer = (pfn_glDrawBuffer_t)(uintptr_t)real_fn;
@@ -1313,11 +1630,23 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
     if (ds_is_internal_call()) {
         return g_ds.real_wglMakeCurrent(hdc, hglrc);
     }
+    ds_ensure_runtime_started();
 
     const void *caller_ret = __builtin_return_address(0);
     bool is_wined3d = ds_is_wined3d_caller(caller_ret);
     bool is_sys = ds_is_system_renderer_caller(caller_ret);
     HWND win = hdc ? WindowFromDC(hdc) : NULL;
+
+    if (win && hglrc != NULL && !is_sys) {
+        EnterCriticalSection(&g_ds.lock);
+        if (is_wined3d) {
+            g_ds.wined3d_uses_gl = true;
+        } else {
+            g_ds.game_gl_active = true;
+        }
+        ds_notify_gl_context_active_locked();
+        LeaveCriticalSection(&g_ds.lock);
+    }
 
     if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
         ds_attach_and_apply_game_window(win, 0, 0);
@@ -1364,13 +1693,7 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
         ds_gl_ensure_wgl_query_procs();
     }
 
-    if (is_wined3d) {
-        EnterCriticalSection(&g_ds.lock);
-        g_ds.wined3d_uses_gl = true;
-        LeaveCriticalSection(&g_ds.lock);
-        return ok;
-    }
-    if (is_sys) {
+    if (is_wined3d || is_sys) {
         return ok;
     }
 
@@ -1389,7 +1712,7 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
     int32_t vh = g_ds.virt_h;
     int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
     int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-    bool want_fbo = fs_active || (win_scale > 1);
+    bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
     LeaveCriticalSection(&g_ds.lock);
 
     if (is_game_win) {
@@ -1430,6 +1753,13 @@ BOOL WINAPI hook_wglDeleteContext(HGLRC hglrc)
         g_gl.w3d_color_tex = 0;
         g_gl.w3d_w = 0;
         g_gl.w3d_h = 0;
+    }
+    if (hglrc && hglrc == g_gl.sharp_ctx) {
+        g_gl.sharp_ctx = NULL;
+        g_gl.sharp_fbo = 0;
+        g_gl.sharp_tex = 0;
+        g_gl.sharp_w = 0;
+        g_gl.sharp_h = 0;
     }
     memset(g_gl.last_w3d_vp, 0, sizeof(g_gl.last_w3d_vp));
     memset(g_gl.last_w3d_sc, 0, sizeof(g_gl.last_w3d_sc));
@@ -1523,9 +1853,15 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
             ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(hdc) : FALSE)
             : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(hdc) : FALSE);
     }
+    ds_ensure_runtime_started();
 
     if (ds_is_wined3d_caller(caller_ret)) {
         HWND win = WindowFromDC(hdc);
+        EnterCriticalSection(&g_ds.lock);
+        g_ds.wined3d_uses_gl = true;
+        ds_notify_gl_context_active_locked();
+        LeaveCriticalSection(&g_ds.lock);
+
         if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
             ds_attach_and_apply_game_window(win, 0, 0);
         } else if (win && win == g_ds.hwnd_game) {
@@ -1535,7 +1871,6 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
         EnterCriticalSection(&g_ds.lock);
-        g_ds.wined3d_uses_gl = true;
         bool is_game_win = (
             win != NULL &&
             (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
@@ -1546,6 +1881,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         bool fs_active = g_ds.fullscreen_active;
         int32_t win_scale = ds_get_windowed_scale_locked();
         ds_aspect_mode_t aspect = fs_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
+        ds_scale_filter_t w3d_filter = g_ds.scale_filter;
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
         int32_t dst_x = fs_active ? g_ds.vp.dst_x : 0;
@@ -1553,10 +1889,11 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
         int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
         int32_t real_h = fs_active ? g_ds.real_screen_h : dh;
-        bool want_scale = fs_active || (win_scale > 1);
+        bool want_scale = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
         LeaveCriticalSection(&g_ds.lock);
 
         if (is_game_win) {
+            InterlockedIncrement(&g_ds.gdi_margin_gen);
             ds_set_gl_host_visible(true);
             ds_gl_ensure_wgl_query_procs();
             if (!g_gl.w3d_scaled_in_blit && want_scale && vw > 0 && vh > 0 && dw > 0 && dh > 0 &&
@@ -1564,7 +1901,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
                 if (cur_ctx != NULL) {
                     int32_t gl_dst_y = real_h - (dst_y + dh);
-                    ds_gl_upscale_wined3d_backbuffer(cur_ctx, vw, vh, dst_x, gl_dst_y, dw, dh, aspect);
+                    ds_gl_upscale_wined3d_backbuffer(cur_ctx, vw, vh, dst_x, gl_dst_y, dw, dh, aspect, w3d_filter);
                 }
             }
         }
@@ -1589,6 +1926,12 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
     }
 
     HWND win = WindowFromDC(hdc);
+    if (win) {
+        EnterCriticalSection(&g_ds.lock);
+        g_ds.game_gl_active = true;
+        ds_notify_gl_context_active_locked();
+        LeaveCriticalSection(&g_ds.lock);
+    }
     if (win && win != g_ds.hwnd_gl_host && (g_ds.hwnd_game == NULL || g_ds.hwnd_game != win) && ds_is_candidate_game_window(win, NULL, NULL)) {
         ds_attach_and_apply_game_window(win, 0, 0);
     } else if (win && win == g_ds.hwnd_game) {
@@ -1605,6 +1948,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
     bool fs_active = g_ds.fullscreen_active;
     int32_t win_scale = ds_get_windowed_scale_locked();
     ds_aspect_mode_t aspect = fs_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
+    ds_scale_filter_t filter_mode = g_ds.scale_filter;
     int32_t vw = g_ds.virt_w;
     int32_t vh = g_ds.virt_h;
     int32_t dst_x = fs_active ? g_ds.vp.dst_x : 0;
@@ -1615,7 +1959,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
     int32_t dh = dst_h;
     int32_t backing_w = fs_active ? g_ds.phys_screen_w : (vw * win_scale);
     int32_t backing_h = fs_active ? g_ds.phys_screen_h : (vh * win_scale);
-    bool want_fbo = fs_active || (win_scale > 1);
+    bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
     if (fs_active) {
         ds_viewport_t phys_vp;
         if (ds_gl_compute_phys_viewport(backing_w, backing_h, vw, vh, aspect, &phys_vp)) {
@@ -1638,6 +1982,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 EnterCriticalSection(&g_ds.lock);
                 g_gl.last_present_was_gl = true;
                 LeaveCriticalSection(&g_ds.lock);
+                InterlockedIncrement(&g_ds.gdi_margin_gen);
                 ds_set_gl_host_visible(true);
                 if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && want_fbo && dw > 0 && dh > 0) {
                     GLint dx0 = dst_x;
@@ -1645,20 +1990,46 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                     GLint dx1 = dst_x + dst_w;
                     GLint dy1 = dy0 + dst_h;
                     GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
+                    GLboolean was_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
                     if (was_scissor && g_gl.p_glDisable) {
                         g_gl.p_glDisable(GL_SCISSOR_TEST);
                     }
+                    if (was_srgb && g_gl.p_glDisable) {
+                        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+                    }
 
-                    g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.fbo_id);
                     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-                    if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_COLOR_ATTACHMENT0);
-                    if (g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
+                    if (g_ds.real_glDrawBuffer) {
+                        GLint fbo0_draw = GL_BACK;
+                        if (g_gl.p_glGetIntegerv) {
+                            g_gl.p_glGetIntegerv(GL_DRAW_BUFFER, &fbo0_draw);
+                        }
+                        if (fbo0_draw != GL_BACK) {
+                            g_ds.real_glDrawBuffer(GL_BACK);
+                        }
+                    }
 
                     ds_gl_clear_pillarbox_margins(dx0, dy0, dx1, dy1, backing_w, backing_h);
+                    ds_gl_present_blit_to_backbuffer(
+                        cur_ctx,
+                        g_gl.fbo_id,
+                        0,
+                        0,
+                        g_gl.fbo_w,
+                        g_gl.fbo_h,
+                        dx0,
+                        dy0,
+                        dx1,
+                        dy1,
+                        GL_COLOR_BUFFER_BIT,
+                        (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR,
+                        aspect,
+                        filter_mode
+                    );
 
-                    GLenum filter = (aspect == DS_ASPECT_INTEGER) ? GL_NEAREST : GL_LINEAR;
-                    g_gl.p_glBlitFramebuffer(0, 0, g_gl.fbo_w, g_gl.fbo_h, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT, filter);
-
+                    if (was_srgb && g_gl.p_glEnable) {
+                        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+                    }
                     if (was_scissor && g_gl.p_glEnable) {
                         g_gl.p_glEnable(GL_SCISSOR_TEST);
                     }
@@ -1680,7 +2051,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 vh = g_ds.virt_h;
                 dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
                 dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-                want_fbo = fs_active || (win_scale > 1);
+                want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
                 LeaveCriticalSection(&g_ds.lock);
                 ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
                 return swapped;
@@ -1705,6 +2076,7 @@ BOOL WINAPI hook_wglSwapBuffers(HDC hdc)
 
 void ds_gl_notify_mode_changed(void)
 {
+    InterlockedIncrement(&g_ds.gdi_margin_gen);
     if (!g_gl.fbo_supported || !g_gl.p_wglGetCurrentContext || g_gl.game_hglrc == NULL) {
         return;
     }
@@ -1716,7 +2088,7 @@ void ds_gl_notify_mode_changed(void)
         int32_t vh = g_ds.virt_h;
         int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
         int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-        bool want_fbo = fs_active || (win_scale > 1);
+        bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
         LeaveCriticalSection(&g_ds.lock);
         ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
     }
@@ -1726,6 +2098,7 @@ void ds_gl_notify_display_mode_switch(void)
 {
     memset(g_gl.last_w3d_vp, 0, sizeof(g_gl.last_w3d_vp));
     memset(g_gl.last_w3d_sc, 0, sizeof(g_gl.last_w3d_sc));
+    InterlockedIncrement(&g_ds.gdi_margin_gen);
     InterlockedExchange(&g_gl.mode_trace_budget, 16);
 }
 
@@ -1733,6 +2106,7 @@ void ds_gl_shutdown(void)
 {
     g_gl.game_hglrc = NULL;
     g_gl.w3d_hglrc = NULL;
+    g_gl.sharp_ctx = NULL;
     g_gl.fbo_redirect_active = false;
     g_gl.last_present_was_gl = false;
     ds_gl_release_all_host_dcs_for_hwnd(NULL);
@@ -1745,6 +2119,7 @@ void ds_gl_shutdown(void)
 static void ds_clear_gdi_margins(HDC hdcDst, int32_t dx, int32_t dy, int32_t dw, int32_t dh, bool force_clear)
 {
     static HWND    s_last_win = NULL;
+    static LONG    s_last_gen = -1;
     static int32_t s_last_dx = -1, s_last_dy = -1, s_last_dw = -1, s_last_dh = -1;
 
     if (!g_ds.fullscreen_active) {
@@ -1752,11 +2127,13 @@ static void ds_clear_gdi_margins(HDC hdcDst, int32_t dx, int32_t dy, int32_t dw,
     }
 
     HWND win = WindowFromDC(hdcDst);
-    if (!force_clear && win == s_last_win &&
+    LONG cur_gen = g_ds.gdi_margin_gen;
+    if (!force_clear && win == s_last_win && cur_gen == s_last_gen &&
         dx == s_last_dx && dy == s_last_dy && dw == s_last_dw && dh == s_last_dh) {
         return;
     }
     s_last_win = win;
+    s_last_gen = cur_gen;
     s_last_dx = dx;
     s_last_dy = dy;
     s_last_dw = dw;
@@ -1767,17 +2144,33 @@ static void ds_clear_gdi_margins(HDC hdcDst, int32_t dx, int32_t dy, int32_t dw,
     if (sw <= 0 || sh <= 0) return;
 
     ds_enter_internal();
+    /*
+     * Clear pillarbox/letterbox margins via an unclipped window cache DC so any game-installed
+     * clip region (`SelectClipRgn` / `BeginPaint` `rcPaint`) on `hdcDst` cannot leave stale
+     * pixels in the outer bars.
+     */
+    HDC clear_dc = (win && win != GetDesktopWindow())
+        ? GetDCEx(win, NULL, DCX_CACHE | DCX_CLIPSIBLINGS)
+        : NULL;
+    HDC target_dc = clear_dc ? clear_dc : hdcDst;
     if (dx > 0) {
-        PatBlt(hdcDst, 0, 0, dx, sh, BLACKNESS);
+        PatBlt(target_dc, 0, 0, dx, sh, BLACKNESS);
     }
     if (dx + dw < sw) {
-        PatBlt(hdcDst, dx + dw, 0, sw - (dx + dw), sh, BLACKNESS);
+        PatBlt(target_dc, dx + dw, 0, sw - (dx + dw), sh, BLACKNESS);
     }
     if (dy > 0) {
-        PatBlt(hdcDst, dx, 0, dw, dy, BLACKNESS);
+        PatBlt(target_dc, dx, 0, dw, dy, BLACKNESS);
     }
     if (dy + dh < sh) {
-        PatBlt(hdcDst, dx, dy + dh, dw, sh - (dy + dh), BLACKNESS);
+        PatBlt(target_dc, dx, dy + dh, dw, sh - (dy + dh), BLACKNESS);
+    }
+    if (clear_dc) {
+        if (g_ds.real_ReleaseDC) {
+            g_ds.real_ReleaseDC(win, clear_dc);
+        } else {
+            ReleaseDC(win, clear_dc);
+        }
     }
     ds_leave_internal();
 }
@@ -1795,9 +2188,14 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
     if (!win || win == g_ds.hwnd_gl_host) {
         return false;
     }
+    ds_ensure_runtime_started();
 
     bool need_reset_gl_host = false;
     EnterCriticalSection(&g_ds.lock);
+    if (ds_is_passthrough_locked()) {
+        LeaveCriticalSection(&g_ds.lock);
+        return false;
+    }
     int32_t win_scale = ds_get_windowed_scale_locked();
     bool is_game_gdi_target = (
         win == g_ds.hwnd_game ||
@@ -1851,32 +2249,36 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
 int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
 {
     if (!ds_is_internal_call() && !ds_is_system_renderer_caller(__builtin_return_address(0))) {
+        ds_ensure_runtime_started();
         if (hdc == NULL || GetObjectType(hdc) == OBJ_DC) {
             EnterCriticalSection(&g_ds.lock);
-            bool active = g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
+            bool passthrough = ds_is_passthrough_locked();
+            bool active = !passthrough && g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
             int32_t vw = g_ds.virt_w;
             int32_t vh = g_ds.virt_h;
             int32_t vbpp = g_ds.virt_bpp > 0 ? g_ds.virt_bpp : g_ds.real_bpp;
             int32_t vhz = g_ds.virt_hz > 0 ? g_ds.virt_hz : g_ds.real_hz;
             LeaveCriticalSection(&g_ds.lock);
 
-            if (active) {
-                if (index == HORZRES || index == DESKTOPHORZRES) return vw;
-                if (index == VERTRES || index == DESKTOPVERTRES) return vh;
-                if (index == BITSPIXEL) {
-                    if (ds_prefer_16bpp_ddraw() && vbpp > 16) return 16;
-                    if (vbpp >= 8) return vbpp;
+            if (!passthrough) {
+                if (active) {
+                    if (index == HORZRES || index == DESKTOPHORZRES) return vw;
+                    if (index == VERTRES || index == DESKTOPVERTRES) return vh;
+                    if (index == BITSPIXEL) {
+                        if (ds_prefer_16bpp_ddraw() && vbpp > 16) return 16;
+                        if (vbpp >= 8) return vbpp;
+                    }
+                    if (index == PLANES) return 1;
+                    if (index == VREFRESH && vhz > 0) return vhz;
                 }
-                if (index == PLANES) return 1;
-                if (index == VREFRESH && vhz > 0) return vhz;
+                int real_val = g_ds.real_GetDeviceCaps ? g_ds.real_GetDeviceCaps(hdc, index) : 0;
+                if (index == BITSPIXEL) {
+                    if (ds_prefer_16bpp_ddraw()) return 16;
+                    if (real_val < 8) return (vbpp >= 8) ? vbpp : 32;
+                }
+                if (index == PLANES && real_val < 1) return 1;
+                return real_val;
             }
-            int real_val = g_ds.real_GetDeviceCaps ? g_ds.real_GetDeviceCaps(hdc, index) : 0;
-            if (index == BITSPIXEL) {
-                if (ds_prefer_16bpp_ddraw()) return 16;
-                if (real_val < 8) return (vbpp >= 8) ? vbpp : 32;
-            }
-            if (index == PLANES && real_val < 1) return 1;
-            return real_val;
         }
     }
     return g_ds.real_GetDeviceCaps ? g_ds.real_GetDeviceCaps(hdc, index) : 0;
@@ -1890,8 +2292,15 @@ BOOL WINAPI hook_BitBlt(HDC hdcDst, int x, int y, int cx, int cy, HDC hdcSrc, in
         int32_t px = 0, py = 0, pw = 0, ph = 0;
         if (ds_map_subrect_virt_to_phys(x, y, cx, cy, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
             ds_clear_gdi_margins(hdcDst, dx, dy, dw, dh, (x <= 0 && y <= 0 && cx >= vw && cy >= vh));
-            SetStretchBltMode(hdcDst, COLORONCOLOR);
-            return g_ds.real_StretchBlt(hdcDst, px, py, pw, ph, hdcSrc, x1, y1, cx, cy, rop);
+            int prev_mode = GetStretchBltMode(hdcDst);
+            if (prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdcDst, COLORONCOLOR);
+            }
+            BOOL ok = g_ds.real_StretchBlt(hdcDst, px, py, pw, ph, hdcSrc, x1, y1, cx, cy, rop);
+            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdcDst, prev_mode);
+            }
+            return ok;
         }
     }
     return g_ds.real_BitBlt ? g_ds.real_BitBlt(hdcDst, x, y, cx, cy, hdcSrc, x1, y1, rop) : FALSE;
@@ -1905,8 +2314,15 @@ BOOL WINAPI hook_StretchBlt(HDC hdcDst, int xDst, int yDst, int wDst, int hDst, 
         int32_t px = 0, py = 0, pw = 0, ph = 0;
         if (ds_map_subrect_virt_to_phys(xDst, yDst, wDst, hDst, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
             ds_clear_gdi_margins(hdcDst, dx, dy, dw, dh, (xDst <= 0 && yDst <= 0 && wDst >= vw && hDst >= vh));
-            SetStretchBltMode(hdcDst, COLORONCOLOR);
-            return g_ds.real_StretchBlt(hdcDst, px, py, pw, ph, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
+            int prev_mode = GetStretchBltMode(hdcDst);
+            if (prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdcDst, COLORONCOLOR);
+            }
+            BOOL ok = g_ds.real_StretchBlt(hdcDst, px, py, pw, ph, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
+            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdcDst, prev_mode);
+            }
+            return ok;
         }
     }
     return g_ds.real_StretchBlt ? g_ds.real_StretchBlt(hdcDst, xDst, yDst, wDst, hDst, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop) : FALSE;
@@ -1915,13 +2331,66 @@ BOOL WINAPI hook_StretchBlt(HDC hdcDst, int xDst, int yDst, int wDst, int hDst, 
 int WINAPI hook_SetDIBitsToDevice(HDC hdc, int xDest, int yDest, DWORD w, DWORD h, int xSrc, int ySrc, UINT StartScan, UINT cLines, const VOID *lpvBits, const BITMAPINFO *lpbmi, UINT ColorUse)
 {
     int32_t vw = 0, vh = 0, dx = 0, dy = 0, dw = 0, dh = 0;
-    if (w > 0 && h > 0 && StartScan == 0 && cLines >= h && g_ds.real_StretchDIBits &&
+    if (w > 0 && h > 0 && cLines > 0 && lpvBits != NULL && lpbmi != NULL && g_ds.real_StretchDIBits &&
         ds_should_scale_gdi_dc(hdc, __builtin_return_address(0), &vw, &vh, &dx, &dy, &dw, &dh)) {
-        int32_t px = 0, py = 0, pw = 0, ph = 0;
-        if (ds_map_subrect_virt_to_phys(xDest, yDest, (int32_t)w, (int32_t)h, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
-            ds_clear_gdi_margins(hdc, dx, dy, dw, dh, (xDest <= 0 && yDest <= 0 && (int32_t)w >= vw && (int32_t)h >= vh));
-            SetStretchBltMode(hdc, COLORONCOLOR);
-            return g_ds.real_StretchDIBits(hdc, px, py, pw, ph, xSrc, ySrc, (int)w, (int)h, lpvBits, lpbmi, ColorUse, SRCCOPY);
+        DWORD hdr_sz = lpbmi->bmiHeader.biSize;
+        if (hdr_sz >= sizeof(BITMAPINFOHEADER) && hdr_sz <= 256) {
+            LONG dib_h = lpbmi->bmiHeader.biHeight;
+            int64_t abs_dib_h = (dib_h < 0) ? -(int64_t)dib_h : (int64_t)dib_h;
+            if (abs_dib_h > 0) {
+                int64_t s0 = (int64_t)ySrc > (int64_t)StartScan ? (int64_t)ySrc : (int64_t)StartScan;
+                int64_t req_end = (int64_t)ySrc + (int64_t)h;
+                int64_t buf_end = (int64_t)StartScan + (int64_t)cLines;
+                int64_t s1 = req_end < buf_end ? req_end : buf_end;
+                if (s1 > s0) {
+                    int32_t vis_h = (int32_t)(s1 - s0);
+                    int32_t band_y_dest = (dib_h > 0)
+                        ? (int32_t)((int64_t)yDest + (req_end - s1))
+                        : (int32_t)((int64_t)yDest + (s0 - (int64_t)ySrc));
+                    int32_t adj_y_src = (int32_t)(s0 - (int64_t)StartScan);
+                    int32_t px = 0, py = 0, pw = 0, ph = 0;
+                    if (ds_map_subrect_virt_to_phys(xDest, band_y_dest, (int32_t)w, vis_h, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
+                        const BITMAPINFO *use_bmi = lpbmi;
+                        uint8_t bmi_storage[256 + 1024];
+                        if (StartScan != 0 || (int64_t)cLines < abs_dib_h) {
+                            size_t pal_bytes = 0;
+                            const BITMAPINFOHEADER *bh = &lpbmi->bmiHeader;
+                            if (bh->biCompression == BI_BITFIELDS && hdr_sz < 108) {
+                                pal_bytes = 3 * sizeof(DWORD);
+                            } else if (bh->biBitCount > 0 && bh->biBitCount <= 8) {
+                                uint32_t max_c = 1u << bh->biBitCount;
+                                uint32_t n_cols = (bh->biClrUsed > 0 && bh->biClrUsed <= max_c) ? bh->biClrUsed : max_c;
+                                pal_bytes = (size_t)n_cols * ((ColorUse == DIB_PAL_COLORS) ? sizeof(WORD) : sizeof(RGBQUAD));
+                            } else if (bh->biClrUsed > 0 && bh->biClrUsed <= 256) {
+                                pal_bytes = (size_t)bh->biClrUsed * ((ColorUse == DIB_PAL_COLORS) ? sizeof(WORD) : sizeof(RGBQUAD));
+                            }
+                            if ((size_t)hdr_sz + pal_bytes <= sizeof(bmi_storage)) {
+                                memcpy(bmi_storage, lpbmi, (size_t)hdr_sz + pal_bytes);
+                                BITMAPINFO *patched = (BITMAPINFO *)(void *)bmi_storage;
+                                patched->bmiHeader.biHeight = (dib_h < 0) ? -(LONG)cLines : (LONG)cLines;
+                                patched->bmiHeader.biSizeImage = 0;
+                                use_bmi = patched;
+                            } else {
+                                use_bmi = NULL;
+                            }
+                        }
+                        if (use_bmi != NULL) {
+                            ds_clear_gdi_margins(hdc, dx, dy, dw, dh, (xDest <= 0 && band_y_dest <= 0 && (int32_t)w >= vw && vis_h >= vh));
+                            int prev_mode = GetStretchBltMode(hdc);
+                            if (prev_mode != COLORONCOLOR) {
+                                SetStretchBltMode(hdc, COLORONCOLOR);
+                            }
+                            int drawn = g_ds.real_StretchDIBits(
+                                hdc, px, py, pw, ph, xSrc, adj_y_src, (int)w, vis_h, lpvBits, use_bmi, ColorUse, SRCCOPY
+                            );
+                            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
+                                SetStretchBltMode(hdc, prev_mode);
+                            }
+                            return (drawn == (int)GDI_ERROR) ? 0 : vis_h;
+                        }
+                    }
+                }
+            }
         }
     }
     return g_ds.real_SetDIBitsToDevice
@@ -1937,8 +2406,15 @@ int WINAPI hook_StretchDIBits(HDC hdc, int xDest, int yDest, int DestWidth, int 
         int32_t px = 0, py = 0, pw = 0, ph = 0;
         if (ds_map_subrect_virt_to_phys(xDest, yDest, DestWidth, DestHeight, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
             ds_clear_gdi_margins(hdc, dx, dy, dw, dh, (xDest <= 0 && yDest <= 0 && DestWidth >= vw && DestHeight >= vh));
-            SetStretchBltMode(hdc, COLORONCOLOR);
-            return g_ds.real_StretchDIBits(hdc, px, py, pw, ph, xSrc, ySrc, SrcWidth, SrcHeight, lpBits, lpbmi, iUsage, rop);
+            int prev_mode = GetStretchBltMode(hdc);
+            if (prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdc, COLORONCOLOR);
+            }
+            int res = g_ds.real_StretchDIBits(hdc, px, py, pw, ph, xSrc, ySrc, SrcWidth, SrcHeight, lpBits, lpbmi, iUsage, rop);
+            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
+                SetStretchBltMode(hdc, prev_mode);
+            }
+            return res;
         }
     }
     return g_ds.real_StretchDIBits

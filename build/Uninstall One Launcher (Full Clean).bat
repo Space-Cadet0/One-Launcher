@@ -26,13 +26,26 @@ if /I not "%~1"=="/Y" if /I not "%~1"=="-y" if /I not "%~1"=="/S" (
 )
 
 echo.
+if not defined OL_ORIG_USERPROFILE set "OL_ORIG_USERPROFILE=%USERPROFILE%"
+set "OL_BAT_SELF=%~f0"
+set "OL_ADJACENT_PS1=%~dp0Uninstall-OneLauncher.ps1"
+if /I not "%~1"=="/NOELEVATE" if /I not "%~2"=="/ELEVATED" (
+    net session >nul 2>&1
+    if errorlevel 1 (
+        echo Requesting Administrator privileges for machine-wide Program Files / HKLM cleanup...
+        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:OL_BAT_SELF -ArgumentList '/Y','/ELEVATED' -Verb RunAs -Wait"
+        if not errorlevel 1 (
+            endlocal
+            exit /b 0
+        )
+    )
+)
+
 echo Executing deep cleanup via PowerShell...
 echo.
 
-set "OL_BAT_SELF=%~f0"
-set "OL_ADJACENT_PS1=%~dp0Uninstall-OneLauncher.ps1"
 if exist "%OL_ADJACENT_PS1%" (
-    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%OL_ADJACENT_PS1%"
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%OL_ADJACENT_PS1%" -OriginalUserProfile "%OL_ORIG_USERPROFILE%"
 ) else (
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$raw = Get-Content -LiteralPath $env:OL_BAT_SELF -Raw -Encoding UTF8; $marker = '# === ' + 'ONE_LAUNCHER_PS1_PAYLOAD ==='; $idx = $raw.IndexOf($marker); if ($idx -ge 0) { & ([scriptblock]::Create($raw.Substring($idx))) }"
 )
@@ -46,6 +59,58 @@ exit /b 0
 
 # === ONE_LAUNCHER_PS1_PAYLOAD ===
 $ErrorActionPreference = 'SilentlyContinue'
+
+function Resolve-InteractiveUserTargets {
+    $profiles = New-Object System.Collections.Generic.List[string]
+    $regRoots = New-Object System.Collections.Generic.List[string]
+    $candidateProfiles = @($env:OL_ORIG_USERPROFILE, $env:USERPROFILE) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $candidateSids = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($env:OL_ORIG_USERSID)) { $candidateSids.Add($env:OL_ORIG_USERSID) }
+    try {
+        Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+            $ownerSidRes = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+            if ($ownerSidRes -and $ownerSidRes.Sid -and -not $candidateSids.Contains([string]$ownerSidRes.Sid)) {
+                $candidateSids.Add([string]$ownerSidRes.Sid)
+            }
+        }
+    } catch {}
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($cs -and -not [string]::IsNullOrWhiteSpace($cs.UserName)) {
+            $ntAcct = New-Object System.Security.Principal.NTAccount([string]$cs.UserName)
+            $translatedSid = $ntAcct.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            if ($translatedSid -and -not $candidateSids.Contains($translatedSid)) { $candidateSids.Add($translatedSid) }
+        }
+    } catch {}
+    foreach ($cp in $candidateProfiles) {
+        $normCp = $cp.TrimEnd('\', '/')
+        if ($normCp -and -not $profiles.Contains($normCp)) { $profiles.Add($normCp) }
+    }
+    $profileListRoot = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    if (Test-Path -LiteralPath $profileListRoot) {
+        Get-ChildItem -LiteralPath $profileListRoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $sidName = $_.PSChildName
+            if ($sidName -match '^S-1-5-21-') {
+                $pProps = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                $imgPath = if ($pProps -and $pProps.ProfileImagePath) { [Environment]::ExpandEnvironmentVariables([string]$pProps.ProfileImagePath).TrimEnd('\', '/') } else { '' }
+                if ($candidateSids.Contains($sidName) -or ($imgPath -and ($profiles -contains $imgPath))) {
+                    if ($imgPath -and -not $profiles.Contains($imgPath)) { $profiles.Add($imgPath) }
+                    $hkuRoot = "Registry::HKEY_USERS\$sidName"
+                    if ((Test-Path -LiteralPath $hkuRoot) -and -not $regRoots.Contains($hkuRoot)) { $regRoots.Add($hkuRoot) }
+                }
+            }
+        }
+    }
+    foreach ($sid in $candidateSids) {
+        $hkuRoot = "Registry::HKEY_USERS\$sid"
+        if ((Test-Path -LiteralPath $hkuRoot) -and -not $regRoots.Contains($hkuRoot)) { $regRoots.Add($hkuRoot) }
+    }
+    return @{ Profiles = @($profiles); UserRegRoots = @($regRoots) }
+}
+
+$interactiveTargets = Resolve-InteractiveUserTargets
+$targetUserProfiles = @($interactiveTargets.Profiles)
+$targetUserRegRoots = @($interactiveTargets.UserRegRoots)
 
 function Remove-Safe {
     param([string]$p, [string]$lbl = "Path")
@@ -114,12 +179,16 @@ $removedIds = @()
 $importedPaths = @()
 $importedIds = @()
 
-@(
+$epicImpPaths = @(
     "$env:APPDATA\one-launcher\one_launcher_epic_imports.json",
     "$env:APPDATA\One Launcher\one_launcher_epic_imports.json",
     "$env:APPDATA\com.onelauncher.app\one_launcher_epic_imports.json",
     "$env:USERPROFILE\.one-launcher\one_launcher_epic_imports.json"
-) | ForEach-Object {
+)
+foreach ($uProf in $targetUserProfiles) {
+    $epicImpPaths += @("$uProf\AppData\Roaming\one-launcher\one_launcher_epic_imports.json", "$uProf\AppData\Roaming\One Launcher\one_launcher_epic_imports.json", "$uProf\AppData\Roaming\com.onelauncher.app\one_launcher_epic_imports.json", "$uProf\.one-launcher\one_launcher_epic_imports.json")
+}
+($epicImpPaths | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         try {
             $impData = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json
@@ -142,12 +211,16 @@ $importedIds = @()
     }
 }
 
-@(
+$olManifestPaths = @(
     "$env:APPDATA\one-launcher\one_launcher_installed.json",
     "$env:APPDATA\One Launcher\one_launcher_installed.json",
     "$env:APPDATA\com.onelauncher.app\one_launcher_installed.json",
     "$env:USERPROFILE\.one-launcher\one_launcher_installed.json"
-) | ForEach-Object {
+)
+foreach ($uProf in $targetUserProfiles) {
+    $olManifestPaths += @("$uProf\AppData\Roaming\one-launcher\one_launcher_installed.json", "$uProf\AppData\Roaming\One Launcher\one_launcher_installed.json", "$uProf\AppData\Roaming\com.onelauncher.app\one_launcher_installed.json", "$uProf\.one-launcher\one_launcher_installed.json")
+}
+($olManifestPaths | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         try {
             $data = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json
@@ -179,13 +252,17 @@ $importedIds = @()
     }
 }
 
-@(
+$legManifestPaths = @(
     "$env:APPDATA\one-launcher\legendaryConfig\legendary\installed.json",
     "$env:APPDATA\One Launcher\legendaryConfig\legendary\installed.json",
     "$env:APPDATA\com.onelauncher.app\legendaryConfig\legendary\installed.json",
     "$env:USERPROFILE\.config\legendary\installed.json",
     "$env:APPDATA\legendary\installed.json"
-) | ForEach-Object {
+)
+foreach ($uProf in $targetUserProfiles) {
+    $legManifestPaths += @("$uProf\AppData\Roaming\one-launcher\legendaryConfig\legendary\installed.json", "$uProf\AppData\Roaming\One Launcher\legendaryConfig\legendary\installed.json", "$uProf\AppData\Roaming\com.onelauncher.app\legendaryConfig\legendary\installed.json", "$uProf\.config\legendary\installed.json", "$uProf\AppData\Roaming\legendary\installed.json")
+}
+($legManifestPaths | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         try {
             $ldata = Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json
@@ -256,28 +333,34 @@ if (Test-Path -LiteralPath $gogCfg) {
 $gogDb = @('C:\ProgramData\GOG.com\Galaxy\storage\galaxy-2.0.db', 'C:\ProgramData\GOG.com\Galaxy\Storage\galaxy-2.0.db') | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if ($gogDb) {
     try {
+        Copy-Item -LiteralPath $gogDb -Destination "$gogDb.one-launcher-bak" -Force -ErrorAction SilentlyContinue
         $sql = "CREATE TEMP TABLE IF NOT EXISTS _ol_pids (productId INTEGER PRIMARY KEY); INSERT OR IGNORE INTO _ol_pids SELECT productId FROM InstalledBaseProducts WHERE installationPath LIKE '%OneLauncher%'; "
         foreach ($rid in $removedIds) { if ($rid -match '^\d+$') { $sql += "INSERT OR IGNORE INTO _ol_pids VALUES ($rid); " } }
         $sql += "DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); DELETE FROM PlayTaskLaunchParameters WHERE playTaskId IN (SELECT id FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids)); DELETE FROM PlayTasks WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM PlayTasks WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM ProductSettings WHERE gameReleaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM ProductSettings WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM GameFiles WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM GameFiles WHERE releaseKey IN (SELECT 'gog_' || productId FROM _ol_pids); DELETE FROM BaseModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM ModificationTargets WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM ImportedLatestBuildIds WHERE productId IN (SELECT productId FROM _ol_pids); DELETE FROM InstalledBaseProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR installationPath LIKE '%OneLauncher%'; DELETE FROM InstalledProducts WHERE productId IN (SELECT productId FROM _ol_pids) OR productId NOT IN (SELECT productId FROM InstalledBaseProducts); DELETE FROM ProductStates WHERE productId IN (SELECT productId FROM _ol_pids); DROP TABLE IF EXISTS _ol_pids;"
-        $nodeExe = @("$env:ProgramFiles\One Launcher\One Launcher.exe", "${env:ProgramFiles(x86)}\One Launcher\One Launcher.exe", "$env:LOCALAPPDATA\Programs\One Launcher\One Launcher.exe", "$env:LOCALAPPDATA\Programs\one-launcher\One Launcher.exe") | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+        $nodeCands = @("$env:ProgramFiles\One Launcher\One Launcher.exe", "${env:ProgramFiles(x86)}\One Launcher\One Launcher.exe", "$env:LOCALAPPDATA\Programs\One Launcher\One Launcher.exe", "$env:LOCALAPPDATA\Programs\one-launcher\One Launcher.exe")
+        foreach ($uProf in $targetUserProfiles) { $nodeCands += @("$uProf\AppData\Local\Programs\One Launcher\One Launcher.exe", "$uProf\AppData\Local\Programs\one-launcher\One Launcher.exe") }
+        $nodeExe = $nodeCands | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
         if (-not $nodeExe -and (Get-Command node.exe -ErrorAction SilentlyContinue)) { $nodeExe = (Get-Command node.exe).Source }
         if ($nodeExe) {
             $env:ELECTRON_RUN_AS_NODE = '1'; $env:OL_GOG_DB = $gogDb; $env:OL_GOG_SQL = $sql
-            & $nodeExe -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.env.OL_GOG_DB);try{db.exec('PRAGMA busy_timeout = 5000;');}catch{}for(const s of process.env.OL_GOG_SQL.split(';').map(x=>x.trim()).filter(Boolean)){try{db.exec(s+';')}catch{}}db.close();" 2>$null | Out-Null
+            & $nodeExe -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.env.OL_GOG_DB);try{db.exec('PRAGMA busy_timeout = 3000;');db.exec('BEGIN IMMEDIATE;');for(const s of process.env.OL_GOG_SQL.split(';').map(x=>x.trim()).filter(Boolean)){db.exec(s+';');}db.exec('COMMIT;');}catch{try{db.exec('ROLLBACK;');}catch{}}finally{try{db.close();}catch{}}" 2>$null | Out-Null
             Remove-Item Env:\ELECTRON_RUN_AS_NODE, Env:\OL_GOG_DB, Env:\OL_GOG_SQL -ErrorAction SilentlyContinue
         } elseif (Get-Command sqlite3.exe -ErrorAction SilentlyContinue) {
-            & sqlite3.exe $gogDb $sql 2>$null | Out-Null
+            $txSql = "PRAGMA busy_timeout = 3000; BEGIN IMMEDIATE; " + $sql + " COMMIT;"
+            & sqlite3.exe -cmd ".timeout 3000" $gogDb $txSql 2>$null | Out-Null
         }
     } catch {}
 }
 
 Write-Host "[3/7] Removing One Launcher game library folders..." -ForegroundColor Yellow
 $libDirs = @('C:\Games\OneLauncher', 'D:\Games\OneLauncher', 'E:\Games\OneLauncher', "$env:USERPROFILE\Games\OneLauncher", "$env:USERPROFILE\OneLauncher Games")
+foreach ($uProf in $targetUserProfiles) { $libDirs += @("$uProf\Games\OneLauncher", "$uProf\OneLauncher Games") }
 Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Root) { $dl = Join-Path $_.Root 'Games\OneLauncher'; if ($libDirs -notcontains $dl) { $libDirs += $dl } } }
-$libDirs | ForEach-Object { Remove-Safe $_ 'Game Library' }
+($libDirs | Select-Object -Unique) | ForEach-Object { Remove-Safe $_ 'Game Library' }
 $parentDirs = @('C:\Games', 'D:\Games', 'E:\Games', "$env:USERPROFILE\Games")
+foreach ($uProf in $targetUserProfiles) { if ($parentDirs -notcontains "$uProf\Games") { $parentDirs += "$uProf\Games" } }
 Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Root) { $dp = Join-Path $_.Root 'Games'; if ($parentDirs -notcontains $dp) { $parentDirs += $dp } } }
-$parentDirs | ForEach-Object {
+($parentDirs | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         $items = Get-ChildItem -LiteralPath $_ -Force -ErrorAction SilentlyContinue
         if (-not $items -or $items.Count -eq 0) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
@@ -285,32 +368,57 @@ $parentDirs | ForEach-Object {
 }
 
 Write-Host "[4/7] Running existing NSIS uninstaller & removing binaries..." -ForegroundColor Yellow
-@("$env:ProgramFiles\One Launcher\Uninstall One Launcher.exe", "${env:ProgramFiles(x86)}\One Launcher\Uninstall One Launcher.exe", "$env:LOCALAPPDATA\Programs\One Launcher\Uninstall One Launcher.exe", "$env:LOCALAPPDATA\Programs\one-launcher\Uninstall One Launcher.exe") | ForEach-Object {
+$uninstCands = @("$env:ProgramFiles\One Launcher\Uninstall One Launcher.exe", "${env:ProgramFiles(x86)}\One Launcher\Uninstall One Launcher.exe", "$env:LOCALAPPDATA\Programs\One Launcher\Uninstall One Launcher.exe", "$env:LOCALAPPDATA\Programs\one-launcher\Uninstall One Launcher.exe")
+foreach ($uProf in $targetUserProfiles) { $uninstCands += @("$uProf\AppData\Local\Programs\One Launcher\Uninstall One Launcher.exe", "$uProf\AppData\Local\Programs\one-launcher\Uninstall One Launcher.exe") }
+($uninstCands | Select-Object -Unique) | ForEach-Object {
     if ($_ -and (Test-Path -LiteralPath $_)) { Start-Process -FilePath $_ -ArgumentList '/S /KEEP_APP_DATA' -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue }
 }
-@("$env:ProgramFiles\One Launcher", "${env:ProgramFiles(x86)}\One Launcher", "$env:LOCALAPPDATA\Programs\One Launcher", "$env:LOCALAPPDATA\Programs\one-launcher") | ForEach-Object { if ($_) { Remove-Safe $_ 'Application Folder' } }
+$appCands = @("$env:ProgramFiles\One Launcher", "${env:ProgramFiles(x86)}\One Launcher", "$env:LOCALAPPDATA\Programs\One Launcher", "$env:LOCALAPPDATA\Programs\one-launcher")
+foreach ($uProf in $targetUserProfiles) { $appCands += @("$uProf\AppData\Local\Programs\One Launcher", "$uProf\AppData\Local\Programs\one-launcher") }
+($appCands | Select-Object -Unique) | ForEach-Object { if ($_) { Remove-Safe $_ 'Application Folder' } }
 
 Write-Host "[5/7] Purging Electron AppData, LocalStorage, OAuth & SafeStorage..." -ForegroundColor Yellow
-@("$env:APPDATA\one-launcher", "$env:APPDATA\One Launcher", "$env:APPDATA\com.onelauncher.app", "$env:APPDATA\universal-game-library", "$env:LOCALAPPDATA\one-launcher", "$env:LOCALAPPDATA\One Launcher", "$env:LOCALAPPDATA\one-launcher-updater", "$env:LOCALAPPDATA\One Launcher-updater", "$env:LOCALAPPDATA\com.onelauncher.app", "$env:LOCALAPPDATA\universal-game-library", "$env:USERPROFILE\.one-launcher", "$env:USERPROFILE\.universal-game-library") | ForEach-Object { Remove-Safe $_ 'Electron Data' }
+$eDataDirs = @("$env:APPDATA\one-launcher", "$env:APPDATA\One Launcher", "$env:APPDATA\com.onelauncher.app", "$env:APPDATA\universal-game-library", "$env:LOCALAPPDATA\one-launcher", "$env:LOCALAPPDATA\One Launcher", "$env:LOCALAPPDATA\one-launcher-updater", "$env:LOCALAPPDATA\One Launcher-updater", "$env:LOCALAPPDATA\com.onelauncher.app", "$env:LOCALAPPDATA\universal-game-library", "$env:USERPROFILE\.one-launcher", "$env:USERPROFILE\.universal-game-library")
+foreach ($uProf in $targetUserProfiles) { $eDataDirs += @("$uProf\AppData\Roaming\one-launcher", "$uProf\AppData\Roaming\One Launcher", "$uProf\AppData\Roaming\com.onelauncher.app", "$uProf\AppData\Roaming\universal-game-library", "$uProf\AppData\Local\one-launcher", "$uProf\AppData\Local\One Launcher", "$uProf\AppData\Local\one-launcher-updater", "$uProf\AppData\Local\One Launcher-updater", "$uProf\AppData\Local\com.onelauncher.app", "$uProf\AppData\Local\universal-game-library", "$uProf\.one-launcher", "$uProf\.universal-game-library") }
+($eDataDirs | Select-Object -Unique) | ForEach-Object { Remove-Safe $_ 'Electron Data' }
 
 Write-Host "[6/7] Purging Legendary & GOGDL CLI configs and caches..." -ForegroundColor Yellow
-@("$env:USERPROFILE\.config\legendary", "$env:APPDATA\legendary", "$env:LOCALAPPDATA\legendary", "$env:USERPROFILE\.config\gogdl", "$env:APPDATA\gogdl", "$env:USERPROFILE\.config\heroic_gogdl", "$env:APPDATA\heroic_gogdl", "$env:LOCALAPPDATA\heroic_gogdl", "$env:APPDATA\one-launcher\gogdlConfig", "$env:APPDATA\One Launcher\gogdlConfig") | ForEach-Object { Remove-Safe $_ 'CLI Config' }
-if (Test-Path -LiteralPath "$env:USERPROFILE\.config") {
-    $rem = Get-ChildItem -LiteralPath "$env:USERPROFILE\.config" -Force -ErrorAction SilentlyContinue
-    if (-not $rem -or $rem.Count -eq 0) { Remove-Item -LiteralPath "$env:USERPROFILE\.config" -Force -ErrorAction SilentlyContinue }
+$cliDirs = @("$env:USERPROFILE\.config\legendary", "$env:APPDATA\legendary", "$env:LOCALAPPDATA\legendary", "$env:USERPROFILE\.config\gogdl", "$env:APPDATA\gogdl", "$env:USERPROFILE\.config\heroic_gogdl", "$env:APPDATA\heroic_gogdl", "$env:LOCALAPPDATA\heroic_gogdl", "$env:APPDATA\one-launcher\gogdlConfig", "$env:APPDATA\One Launcher\gogdlConfig")
+foreach ($uProf in $targetUserProfiles) { $cliDirs += @("$uProf\.config\legendary", "$uProf\AppData\Roaming\legendary", "$uProf\AppData\Local\legendary", "$uProf\.config\gogdl", "$uProf\AppData\Roaming\gogdl", "$uProf\.config\heroic_gogdl", "$uProf\AppData\Roaming\heroic_gogdl", "$uProf\AppData\Local\heroic_gogdl", "$uProf\AppData\Roaming\one-launcher\gogdlConfig", "$uProf\AppData\Roaming\One Launcher\gogdlConfig") }
+($cliDirs | Select-Object -Unique) | ForEach-Object { Remove-Safe $_ 'CLI Config' }
+$dotCfgDirs = @("$env:USERPROFILE\.config")
+foreach ($uProf in $targetUserProfiles) { $dotCfgDirs += "$uProf\.config" }
+($dotCfgDirs | Select-Object -Unique) | ForEach-Object {
+    if (Test-Path -LiteralPath $_) {
+        $rem = Get-ChildItem -LiteralPath $_ -Force -ErrorAction SilentlyContinue
+        if (-not $rem -or $rem.Count -eq 0) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 Write-Host "[7/7] Cleaning up temp files, shortcuts, and Windows Registry..." -ForegroundColor Yellow
-@('one-launcher*', 'OneLauncher*', 'One Launcher*', 'gogdl*', 'legendary*') | ForEach-Object {
-    Get-ChildItem -Path $env:TEMP -Filter $_ -Force -ErrorAction SilentlyContinue | ForEach-Object { Remove-Safe $_.FullName 'Temp Item' }
+$tmpDirs = @($env:TEMP)
+foreach ($uProf in $targetUserProfiles) { $tmpDirs += "$uProf\AppData\Local\Temp" }
+($tmpDirs | Where-Object { $_ } | Select-Object -Unique) | ForEach-Object {
+    $tDir = $_
+    if (Test-Path -LiteralPath $tDir) {
+        @('one-launcher*', 'OneLauncher*', 'One Launcher*', 'gogdl*', 'legendary*') | ForEach-Object {
+            Get-ChildItem -Path $tDir -Filter $_ -Force -ErrorAction SilentlyContinue | ForEach-Object { Remove-Safe $_.FullName 'Temp Item' }
+        }
+    }
 }
-@("$env:USERPROFILE\Desktop\One Launcher.lnk", "$env:PUBLIC\Desktop\One Launcher.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\One Launcher.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\One Launcher", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\One Launcher.lnk", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\One Launcher") | ForEach-Object {
+$scPaths = @("$env:USERPROFILE\Desktop\One Launcher.lnk", "$env:PUBLIC\Desktop\One Launcher.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\One Launcher.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\One Launcher", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\One Launcher.lnk", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\One Launcher")
+foreach ($uProf in $targetUserProfiles) { $scPaths += @("$uProf\Desktop\One Launcher.lnk", "$uProf\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\One Launcher.lnk", "$uProf\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\One Launcher") }
+($scPaths | Select-Object -Unique) | ForEach-Object {
     if ($_ -and (Test-Path -LiteralPath $_)) { Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue }
 }
-@('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.onelauncher.app', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{com.onelauncher.app}', 'HKCU:\Software\com.onelauncher.app', 'HKCU:\Software\One Launcher', 'HKCU:\Software\one-launcher', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.onelauncher.app', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{com.onelauncher.app}', 'HKLM:\Software\com.onelauncher.app', 'HKLM:\Software\One Launcher', 'HKLM:\Software\one-launcher') | ForEach-Object {
+$regKeys = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.onelauncher.app', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{com.onelauncher.app}', 'HKCU:\Software\com.onelauncher.app', 'HKCU:\Software\One Launcher', 'HKCU:\Software\one-launcher', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.onelauncher.app', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{com.onelauncher.app}', 'HKLM:\Software\com.onelauncher.app', 'HKLM:\Software\One Launcher', 'HKLM:\Software\one-launcher')
+foreach ($uRoot in $targetUserRegRoots) { $regKeys += @("$uRoot\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.onelauncher.app", "$uRoot\Software\Microsoft\Windows\CurrentVersion\Uninstall\{com.onelauncher.app}", "$uRoot\Software\com.onelauncher.app", "$uRoot\Software\One Launcher", "$uRoot\Software\one-launcher") }
+($regKeys | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) { Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue }
 }
-@('HKCU:\Software\GOG.com\Games', 'HKLM:\Software\WOW6432Node\GOG.com\Games', 'HKLM:\Software\GOG.com\Games') | ForEach-Object {
+$gogRoots = @('HKCU:\Software\GOG.com\Games', 'HKLM:\Software\WOW6432Node\GOG.com\Games', 'HKLM:\Software\GOG.com\Games')
+foreach ($uRoot in $targetUserRegRoots) { $gogRoots += "$uRoot\Software\GOG.com\Games" }
+($gogRoots | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         Get-ChildItem -LiteralPath $_ -ErrorAction SilentlyContinue | ForEach-Object {
             $gp = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
@@ -320,7 +428,9 @@ Write-Host "[7/7] Cleaning up temp files, shortcuts, and Windows Registry..." -F
         }
     }
 }
-@('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') | ForEach-Object {
+$uninstRoots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+foreach ($uRoot in $targetUserRegRoots) { $uninstRoots += "$uRoot\Software\Microsoft\Windows\CurrentVersion\Uninstall" }
+($uninstRoots | Select-Object -Unique) | ForEach-Object {
     if (Test-Path -LiteralPath $_) {
         Get-ChildItem -LiteralPath $_ -ErrorAction SilentlyContinue | ForEach-Object {
             $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue

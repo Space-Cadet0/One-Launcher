@@ -61,6 +61,8 @@ static const GUID GI_IID_IUnknown =
 
 static const GUID GI_IID_IGameInput_v0 =
     {0x11be2a7e, 0x4254, 0x445a, {0x9c, 0x09, 0xff, 0xc4, 0x0f, 0x00, 0x69, 0x18}};
+static const GUID GI_IID_IGameInput_v0_2303 =
+    {0x20efb1b7, 0x5d05, 0x4a75, {0xb2, 0x67, 0xde, 0xc8, 0xf7, 0x0b, 0x89, 0x39}};
 static const GUID GI_IID_IGameInput_v1 =
     {0x40ffb7e4, 0x6150, 0x407a, {0xb4, 0x39, 0x13, 0x2b, 0xad, 0xc0, 0x8d, 0x2d}};
 static const GUID GI_IID_IGameInput_v2 =
@@ -729,7 +731,7 @@ typedef struct GI_DispatcherImpl {
 } GI_DispatcherImpl;
 
 #define GI_HISTORY_CAPACITY              64
-#define GI_MAX_CALLBACKS                 64
+#define GI_MAX_CALLBACKS                 256
 #define GI_MAX_DISPATCHERS               16
 #define GI_CALLBACK_QUEUE_CAP            256
 #define GI_DISCONNECTED_PROBE_BACKOFF_MS 1500ull
@@ -792,6 +794,7 @@ typedef struct GI_PendingCallbackItem {
 
 typedef struct GI_ManagerImpl {
     GI_IfaceSlot           v0_iface;
+    GI_IfaceSlot           v0_sys_iface;
     GI_IfaceSlot           v1_iface;
     GI_IfaceSlot           v2_iface;
     volatile LONG          ref_count;
@@ -821,9 +824,29 @@ typedef struct GI_ManagerImpl {
 } GI_ManagerImpl;
 
 static INIT_ONCE      g_mgr_once = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE      g_pin_self_once = INIT_ONCE_STATIC_INIT;
 static volatile LONG  g_mgr_ready = 0;
 static volatile LONG  g_live_dispatchers = 0;
+static volatile LONG  g_worker_threads_spawned = 0;
 static GI_ManagerImpl g_mgr;
+
+static BOOL CALLBACK gi_pin_self_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+#ifdef _WIN32
+    HMODULE pinned = NULL;
+    (void)GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)gi_pin_self_once_cb,
+        &pinned);
+#endif
+    return TRUE;
+}
+
+static inline void gi_pin_self_module(void) {
+    InitOnceExecuteOnce(&g_pin_self_once, gi_pin_self_once_cb, NULL, NULL);
+}
 
 /* -------------------------------------------------------------------------
  * Raw Mouse WM_INPUT Sink Thread (Unclamped Relative Mickeys + Wheel Deltas)
@@ -928,6 +951,7 @@ static DWORD WINAPI gi_raw_mouse_thread_proc(LPVOID param) {
         SetEvent(ready_evt);
     }
     if (!hwnd) {
+        InterlockedDecrement(&g_worker_threads_spawned);
         return 0;
     }
 
@@ -936,6 +960,7 @@ static DWORD WINAPI gi_raw_mouse_thread_proc(LPVOID param) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    InterlockedDecrement(&g_worker_threads_spawned);
     return 0;
 }
 
@@ -944,6 +969,8 @@ static BOOL CALLBACK gi_init_raw_mouse_once(PINIT_ONCE once, PVOID param, PVOID 
     (void)param;
     (void)ctx;
 
+    gi_pin_self_module();
+    InterlockedIncrement(&g_worker_threads_spawned);
     HANDLE ready_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
     HANDLE th = CreateThread(NULL, 0, gi_raw_mouse_thread_proc, ready_evt, 0, NULL);
     if (th) {
@@ -951,6 +978,8 @@ static BOOL CALLBACK gi_init_raw_mouse_once(PINIT_ONCE once, PVOID param, PVOID 
             (void)WaitForSingleObject(ready_evt, 150);
         }
         CloseHandle(th);
+    } else {
+        InterlockedDecrement(&g_worker_threads_spawned);
     }
     if (ready_evt) {
         CloseHandle(ready_evt);
@@ -2676,10 +2705,14 @@ static BOOL CALLBACK gi_init_cb_worker_once(PINIT_ONCE once, PVOID param, PVOID 
     (void)param;
     (void)ctx;
 
+    gi_pin_self_module();
+    InterlockedIncrement(&g_worker_threads_spawned);
     g_cb_wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     HANDLE th = CreateThread(NULL, 0, gi_cb_worker_thread_proc, NULL, 0, NULL);
     if (th) {
         CloseHandle(th);
+    } else {
+        InterlockedDecrement(&g_worker_threads_spawned);
     }
     return TRUE;
 }
@@ -2692,9 +2725,10 @@ static inline void gi_ensure_cb_worker(void) {
 }
 
 /* -------------------------------------------------------------------------
- * IGameInput Implementation (v0, v1, v2)
+ * IGameInput Implementation (v0, v0_2303, v1, v2)
  * ------------------------------------------------------------------------- */
 static const void *const g_mgr_v0_vtbl[];
+static const void *const g_mgr_v0_sys_vtbl[];
 static const void *const g_mgr_v1_vtbl[];
 static const void *const g_mgr_v2_vtbl[];
 
@@ -2717,6 +2751,11 @@ static HRESULT WINAPI gi_mgr_QueryInterface(void *iface, REFIID riid, void **ppv
     if (gi_guid_eq(riid, &GI_IID_IGameInput_v0)) {
         InterlockedIncrement(&g_mgr.ref_count);
         *ppv = &g_mgr.v0_iface;
+        return S_OK;
+    }
+    if (gi_guid_eq(riid, &GI_IID_IGameInput_v0_2303)) {
+        InterlockedIncrement(&g_mgr.ref_count);
+        *ppv = &g_mgr.v0_sys_iface;
         return S_OK;
     }
     if (gi_guid_eq(riid, &GI_IID_IGameInput_v1)) {
@@ -2941,15 +2980,6 @@ static HRESULT gi_register_callback_common(
         }
     }
     if (chosen == GI_MAX_CALLBACKS) {
-        for (size_t i = 0; i < GI_MAX_CALLBACKS; i++) {
-            size_t idx = ((size_t)tok + i) % GI_MAX_CALLBACKS;
-            if (g_mgr.callbacks[idx].in_flight == 0) {
-                chosen = idx;
-                break;
-            }
-        }
-    }
-    if (chosen == GI_MAX_CALLBACKS) {
         ReleaseSRWLockExclusive(&g_mgr.lock);
         return E_OUTOFMEMORY;
     }
@@ -3076,50 +3106,41 @@ static HRESULT WINAPI gi_mgr_RegisterDeviceCallback(
     return S_OK;
 }
 
-static bool gi_is_executable_ptr(const void *ptr) {
-    if (!ptr || (uintptr_t)ptr < 0x10000u) return false;
-    MEMORY_BASIC_INFORMATION mbi;
-    memset(&mbi, 0, sizeof(mbi));
-    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    DWORD p = mbi.Protect & 0xFFu;
-    return (p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
-            p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY);
-}
-
 /*
- * Slot 10 on `v0_IGameInput`:
- * Early v0 headers had 4-arg `RegisterGuideButtonCallback(dev, ctx, cb, tok)`,
- * while updated GDK v0 headers replaced it in-place with 5-arg
- * `RegisterSystemButtonCallback(dev, buttonFilter, ctx, cb, tok)`.
- * On Win64 (caller cleans stack), we safely support BOTH signatures!
+ * Slot 10 on `v0_IGameInput` vs `v0_2303_IGameInput`:
+ * - GDK Oct 2022 (`GI_IID_IGameInput_v0` / `11be2a7e-...`) has 5-arg
+ *   `RegisterGuideButtonCallback(self, dev, ctx, cb, tok)` (`ret 0x14` on x86).
+ * - GDK 2303+ (`GI_IID_IGameInput_v0_2303` / `20efb1b7-...`) has 6-arg
+ *   `RegisterSystemButtonCallback(self, dev, buttonFilter, ctx, cb, tok)` (`ret 0x18` on x86).
+ * Separate vtables guarantee exact `__stdcall` stack cleanup on 32-bit x86!
  */
-static HRESULT WINAPI gi_mgr_v0_RegisterSystemOrGuideCallback(
+static HRESULT WINAPI gi_mgr_v0_RegisterGuideButtonCallback(
     void *iface,
     void *raw_device,
-    uintptr_t arg3,
-    void *arg4,
-    void *arg5,
-    GameInputCallbackToken *arg6)
+    void *context,
+    void *callback_fn,
+    GameInputCallbackToken *out_token)
 {
     (void)iface;
     gi_sync_teb_last_error();
-#if defined(_WIN64)
-    /* Check if 4-arg RegisterGuideButtonCallback(dev, ctx=arg3, cb=arg4, tok=arg5) */
-    if (gi_is_executable_ptr(arg4) && !gi_is_executable_ptr(arg5)) {
-        return gi_register_callback_common(
-            GI_VER_0, 3, raw_device, GI_KindUnknown, 0,
-            arg4, (void *)arg3, (GameInputCallbackToken *)arg5);
-    }
-#else
-    (void)gi_is_executable_ptr;
-#endif
-    /* Otherwise 5-arg RegisterSystemButtonCallback(dev, filter=arg3, ctx=arg4, cb=arg5, tok=arg6) */
-    if (arg3 == 0) {
-        if (arg6) *arg6 = 0;
+    return gi_register_callback_common(GI_VER_0, 3, raw_device, GI_KindUnknown, 0, callback_fn, context, out_token);
+}
+
+static HRESULT WINAPI gi_mgr_v0_RegisterSystemButtonCallback(
+    void *iface,
+    void *raw_device,
+    GameInputSystemButtons button_filter,
+    void *context,
+    void *callback_fn,
+    GameInputCallbackToken *out_token)
+{
+    (void)iface;
+    gi_sync_teb_last_error();
+    if (button_filter == 0) {
+        if (out_token) *out_token = 0;
         return E_INVALIDARG;
     }
-    return gi_register_callback_common(GI_VER_0, 3, raw_device, GI_KindUnknown, 0, arg5, arg4, arg6);
+    return gi_register_callback_common(GI_VER_0, 3, raw_device, GI_KindUnknown, 0, callback_fn, context, out_token);
 }
 
 static HRESULT WINAPI gi_mgr_v1_RegisterSystemButtonCallback(
@@ -3162,45 +3183,71 @@ static void WINAPI gi_mgr_StopCallback(void *iface, GameInputCallbackToken token
     ReleaseSRWLockExclusive(&g_mgr.lock);
 }
 
-static bool gi_unregister_token(GameInputCallbackToken token) {
+static bool gi_unregister_token(GameInputCallbackToken token, uint64_t timeout_us) {
     if (token == 0) return false;
-    bool found = false;
+    bool result = false;
     DWORD cur_tid = GetCurrentThreadId();
+    bool infinite_wait = (timeout_us == UINT64_MAX);
+    uint64_t wait_ms_total = infinite_wait ? 0ull : (timeout_us == 0ull ? 0ull : ((timeout_us + 999ull) / 1000ull));
+    uint64_t start_ms = (uint64_t)GetTickCount64();
 
     AcquireSRWLockExclusive(&g_mgr.lock);
     for (size_t i = 0; i < GI_MAX_CALLBACKS; i++) {
         GI_CallbackSlot *slot = &g_mgr.callbacks[i];
         if (slot->active && slot->token == token) {
-            found = true;
             slot->stopped = true;
-            slot->unregistering = true;
+            if (slot->in_flight > 0 && slot->running_tid == cur_tid) {
+                /* Self-unregister inside active callback: defer slot wipe until callback returns */
+                slot->unregistering = true;
+                result = true;
+                break;
+            }
             while (slot->active &&
                    slot->token == token &&
-                   slot->in_flight > 0 &&
-                   slot->running_tid != cur_tid) {
-                if (!SleepConditionVariableSRW(&g_mgr.cb_cv, &g_mgr.lock, 500, 0)) {
-                    break;
+                   slot->in_flight > 0) {
+                if (!infinite_wait) {
+                    uint64_t elapsed_ms = (uint64_t)GetTickCount64() - start_ms;
+                    if (elapsed_ms >= wait_ms_total) {
+                        break;
+                    }
+                    uint64_t rem_ms = wait_ms_total - elapsed_ms;
+                    DWORD sleep_ms = (rem_ms >= (uint64_t)INFINITE) ? (INFINITE - 1u) : (DWORD)rem_ms;
+                    if (!SleepConditionVariableSRW(&g_mgr.cb_cv, &g_mgr.lock, sleep_ms, 0)) {
+                        if (GetLastError() == ERROR_TIMEOUT) {
+                            break;
+                        }
+                    }
+                } else {
+                    (void)SleepConditionVariableSRW(&g_mgr.cb_cv, &g_mgr.lock, INFINITE, 0);
                 }
             }
-            if (slot->active && slot->token == token && slot->in_flight == 0) {
-                memset(slot, 0, sizeof(*slot));
+            if (slot->active && slot->token == token) {
+                if (slot->in_flight == 0) {
+                    memset(slot, 0, sizeof(*slot));
+                    result = true;
+                } else {
+                    /* Timed out while callback is still in-flight: caller MUST NOT free context yet */
+                    slot->unregistering = true;
+                    result = false;
+                }
+            } else {
+                result = true;
             }
             break;
         }
     }
     ReleaseSRWLockExclusive(&g_mgr.lock);
-    return found;
+    return result;
 }
 
 static bool WINAPI gi_mgr_v0_UnregisterCallback(void *iface, GameInputCallbackToken token, uint64_t timeout_us) {
     (void)iface;
-    (void)timeout_us;
-    return gi_unregister_token(token);
+    return gi_unregister_token(token, timeout_us);
 }
 
 static bool WINAPI gi_mgr_v1_UnregisterCallback(void *iface, GameInputCallbackToken token) {
     (void)iface;
-    return gi_unregister_token(token);
+    return gi_unregister_token(token, UINT64_MAX);
 }
 
 static HRESULT WINAPI gi_mgr_CreateDispatcher(void *iface, void **out_dispatcher) {
@@ -3220,17 +3267,25 @@ static HRESULT WINAPI gi_mgr_CreateDispatcher(void *iface, void **out_dispatcher
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
+    bool registered = false;
     AcquireSRWLockExclusive(&g_mgr.lock);
     for (size_t i = 0; i < GI_MAX_DISPATCHERS; i++) {
         if (!g_mgr.dispatchers[i]) {
             g_mgr.dispatchers[i] = disp;
+            registered = true;
             break;
         }
     }
-    if (g_mgr.cb_queue_count > 0) {
+    if (registered && g_mgr.cb_queue_count > 0) {
         SetEvent(disp->wait_event);
     }
     ReleaseSRWLockExclusive(&g_mgr.lock);
+
+    if (!registered) {
+        CloseHandle(disp->wait_event);
+        HeapFree(GetProcessHeap(), 0, disp);
+        return E_OUTOFMEMORY;
+    }
 
     InterlockedIncrement(&g_live_dispatchers);
     *out_dispatcher = &disp->iface;
@@ -3314,7 +3369,32 @@ static const void *const g_mgr_v0_vtbl[] = {
     (const void *)gi_mgr_v0_GetTemporalReading,
     (const void *)gi_mgr_v0_RegisterReadingCallback,
     (const void *)gi_mgr_RegisterDeviceCallback,
-    (const void *)gi_mgr_v0_RegisterSystemOrGuideCallback,
+    (const void *)gi_mgr_v0_RegisterGuideButtonCallback,
+    (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
+    (const void *)gi_mgr_StopCallback,
+    (const void *)gi_mgr_v0_UnregisterCallback,
+    (const void *)gi_mgr_CreateDispatcher,
+    (const void *)gi_mgr_v0_CreateAggregateDevice,
+    (const void *)gi_mgr_FindDeviceFromId,
+    (const void *)gi_mgr_v0_FindDeviceFromObject,
+    (const void *)gi_mgr_v0_FindDeviceFromPlatformHandle,
+    (const void *)gi_mgr_FindDeviceFromPlatformString,
+    (const void *)gi_mgr_v0_EnableOemDeviceSupport,
+    (const void *)gi_mgr_SetFocusPolicy
+};
+
+static const void *const g_mgr_v0_sys_vtbl[] = {
+    (const void *)gi_mgr_QueryInterface,
+    (const void *)gi_mgr_AddRef,
+    (const void *)gi_mgr_Release,
+    (const void *)gi_mgr_GetCurrentTimestamp,
+    (const void *)gi_mgr_GetCurrentReading,
+    (const void *)gi_mgr_GetNextReading,
+    (const void *)gi_mgr_GetPreviousReading,
+    (const void *)gi_mgr_v0_GetTemporalReading,
+    (const void *)gi_mgr_v0_RegisterReadingCallback,
+    (const void *)gi_mgr_RegisterDeviceCallback,
+    (const void *)gi_mgr_v0_RegisterSystemButtonCallback,
     (const void *)gi_mgr_RegisterKeyboardLayoutCallback,
     (const void *)gi_mgr_StopCallback,
     (const void *)gi_mgr_v0_UnregisterCallback,
@@ -3509,9 +3589,10 @@ static BOOL CALLBACK gi_init_mgr_once(PINIT_ONCE once, PVOID param, PVOID *ctx) 
     (void)ctx;
 
     memset(&g_mgr, 0, sizeof(g_mgr));
-    g_mgr.v0_iface.lpVtbl = g_mgr_v0_vtbl;
-    g_mgr.v1_iface.lpVtbl = g_mgr_v1_vtbl;
-    g_mgr.v2_iface.lpVtbl = g_mgr_v2_vtbl;
+    g_mgr.v0_iface.lpVtbl     = g_mgr_v0_vtbl;
+    g_mgr.v0_sys_iface.lpVtbl = g_mgr_v0_sys_vtbl;
+    g_mgr.v1_iface.lpVtbl     = g_mgr_v1_vtbl;
+    g_mgr.v2_iface.lpVtbl     = g_mgr_v2_vtbl;
     InitializeSRWLock(&g_mgr.lock);
     InitializeConditionVariable(&g_mgr.cb_cv);
 
@@ -3558,8 +3639,9 @@ static BOOL CALLBACK gi_init_mgr_once(PINIT_ONCE once, PVOID param, PVOID *ctx) 
 }
 
 HRESULT WINAPI GameInputCreate(void **out_game_input) {
-    /* Reference marker so linker always retains it even under --gc-sections */
-    if (!g_onelauncher_gameinput_marker[0]) return E_UNEXPECTED;
+    /* Reference marker via volatile pointer so --gc-sections always retains it */
+    volatile const char *marker_ref = g_onelauncher_gameinput_marker;
+    if (!marker_ref || !marker_ref[0]) return E_UNEXPECTED;
     if (!out_game_input) return E_POINTER;
     *out_game_input = NULL;
 
@@ -3570,6 +3652,9 @@ HRESULT WINAPI GameInputCreate(void **out_game_input) {
 }
 
 HRESULT WINAPI DllCanUnloadNow(void) {
+    if (InterlockedCompareExchange(&g_worker_threads_spawned, 0, 0) > 0) {
+        return S_FALSE;
+    }
     if (InterlockedCompareExchange(&g_mgr_ready, 0, 0) == 0) {
         return S_OK;
     }

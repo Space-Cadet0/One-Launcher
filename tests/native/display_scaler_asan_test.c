@@ -4,7 +4,7 @@
  *
  * Exercises under `-std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror`:
  *   1. Notch-safe `ds_compute_viewport` (`preserve_aspect`, `integer`, `stretch`, fallback & clamping)
- *   2. `ds_build_mode_table` (`<= 40` modes invariant, ascending sort, deduplication, mandatory modes)
+ *   2. `ds_build_mode_table` (`<= DS_MAX_SYNTH_MODES` modes invariant, ascending sort, deduplication, mandatory modes)
  *   3. `ds_map_cursor_phys_to_virt` & `ds_map_cursor_virt_to_phys` (pillarbox/notch clamping & boundaries)
  *   4. 10,000-frame zero-drift 3D mouse-look `SetCursorPos`/`GetCursorPos` warp torture test + sub-pixel deltas
  *   5. `ds_map_subrect_virt_to_phys` (GDI dirty-rect blits & `ClipCursor`)
@@ -228,7 +228,7 @@ static void test_subrect_and_control_ini_parser(void)
     ASSERT_TRUE(!st.has_seq);
     free(raw_no_nul);
 
-    /* Mode & aspect string helpers */
+    /*Mode & aspect string helpers */
     ASSERT_TRUE(ds_parse_scaling_mode("auto") == DS_MODE_AUTO_FULLSCREEN);
     ASSERT_TRUE(ds_parse_scaling_mode("auto_fullscreen") == DS_MODE_AUTO_FULLSCREEN);
     ASSERT_TRUE(ds_parse_scaling_mode(" FORCE_FULLSCREEN ") == DS_MODE_FORCE_FULLSCREEN);
@@ -238,12 +238,212 @@ static void test_subrect_and_control_ini_parser(void)
     ASSERT_TRUE(ds_cycle_aspect_mode(DS_ASPECT_STRETCH) == DS_ASPECT_PRESERVE);
 }
 
+static void test_wave2a_exact_cursor_roundtrip_and_even_viewports(void)
+{
+    static const struct {
+        int32_t sw;
+        int32_t sh;
+        int32_t inset;
+    } panels[] = {
+        { 3024, 1964, 0 },
+        { 3024, 1964, 37 },
+        { 3024, 1964, 74 },
+        { 2560, 1440, 0 },
+        { 1920, 1080, 0 },
+    };
+
+    static const struct {
+        int32_t vw;
+        int32_t vh;
+    } modes[] = {
+        { 320, 200 },
+        { 640, 480 },
+        { 800, 600 },
+        { 1024, 768 },
+        { 1280, 720 },
+        { 1600, 900 },
+        { 1920, 1080 },
+    };
+
+    static const ds_aspect_mode_t aspects[] = {
+        DS_ASPECT_PRESERVE,
+        DS_ASPECT_INTEGER,
+        DS_ASPECT_STRETCH,
+    };
+
+    for (size_t pi = 0; pi < sizeof(panels) / sizeof(panels[0]); pi++) {
+        for (size_t mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
+            for (size_t ai = 0; ai < sizeof(aspects) / sizeof(aspects[0]); ai++) {
+                ds_viewport_t vp;
+                ASSERT_TRUE(ds_compute_viewport(
+                    panels[pi].sw,
+                    panels[pi].sh,
+                    panels[pi].inset,
+                    modes[mi].vw,
+                    modes[mi].vh,
+                    aspects[ai],
+                    &vp
+                ));
+
+                if (aspects[ai] == DS_ASPECT_PRESERVE) {
+                    if (vp.dst_w < vp.usable_w && vp.usable_w >= 2) ASSERT_TRUE((vp.dst_w & 1) == 0);
+                    if (vp.dst_h < vp.usable_h && vp.usable_h >= 2) ASSERT_TRUE((vp.dst_h & 1) == 0);
+                }
+
+                /* Whenever physical footprint >= virtual dimensions (D >= V >= 1),
+                 * pixel-center mapping must satisfy phys_to_virt(virt_to_phys(v)) == v
+                 * for EVERY single coordinate without -1 px/frame ceiling drift. */
+                if (vp.dst_w >= modes[mi].vw && vp.dst_h >= modes[mi].vh) {
+                    for (int32_t vx = 0; vx < modes[mi].vw; vx++) {
+                        int32_t px = 0, py = 0, rvx = -1, rvy = -1;
+                        ASSERT_TRUE(ds_map_cursor_virt_to_phys(
+                            vx, 0,
+                            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+                            modes[mi].vw, modes[mi].vh,
+                            &px, &py
+                        ));
+                        ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+                            px, py,
+                            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+                            modes[mi].vw, modes[mi].vh,
+                            &rvx, &rvy
+                        ));
+                        ASSERT_TRUE(rvx == vx && rvy == 0);
+                    }
+                    for (int32_t vy = 0; vy < modes[mi].vh; vy++) {
+                        int32_t px = 0, py = 0, rvx = -1, rvy = -1;
+                        ASSERT_TRUE(ds_map_cursor_virt_to_phys(
+                            0, vy,
+                            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+                            modes[mi].vw, modes[mi].vh,
+                            &px, &py
+                        ));
+                        ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+                            px, py,
+                            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+                            modes[mi].vw, modes[mi].vh,
+                            &rvx, &rvy
+                        ));
+                        ASSERT_TRUE(rvx == 0 && rvy == vy);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Specifically verify 1600x900 on 3024x1964 has even dst_h (1700) and zero drift at center (800, 450) */
+    ds_viewport_t vp_900p;
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 1600, 900, DS_ASPECT_PRESERVE, &vp_900p));
+    ASSERT_TRUE(vp_900p.dst_w == 3024 && vp_900p.dst_h == 1700);
+    int32_t cpx = 0, cpy = 0, crvx = 0, crvy = 0;
+    ASSERT_TRUE(ds_map_cursor_virt_to_phys(800, 450, vp_900p.dst_x, vp_900p.dst_y, vp_900p.dst_w, vp_900p.dst_h, 1600, 900, &cpx, &cpy));
+    ASSERT_TRUE(ds_map_cursor_phys_to_virt(cpx, cpy, vp_900p.dst_x, vp_900p.dst_y, vp_900p.dst_w, vp_900p.dst_h, 1600, 900, &crvx, &crvy));
+    ASSERT_TRUE(crvx == 800 && crvy == 450);
+
+    /* Verify symmetric pixel-center placement at 640x480 on 3024x1964 (~4.09x footprint):
+     * +/- 1 physical pixel around the mapped center remains inside virtual pixel (320, 240)
+     * rather than sitting on the left boundary with a 5:1 asymmetric deadzone. */
+    ds_viewport_t vp_480p;
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 640, 480, DS_ASPECT_PRESERVE, &vp_480p));
+    ASSERT_TRUE(ds_map_cursor_virt_to_phys(320, 240, vp_480p.dst_x, vp_480p.dst_y, vp_480p.dst_w, vp_480p.dst_h, 640, 480, &cpx, &cpy));
+    int32_t lvx = -1, lvy = -1, rvx = -1, rvy = -1;
+    ASSERT_TRUE(ds_map_cursor_phys_to_virt(cpx - 1, cpy - 1, vp_480p.dst_x, vp_480p.dst_y, vp_480p.dst_w, vp_480p.dst_h, 640, 480, &lvx, &lvy));
+    ASSERT_TRUE(ds_map_cursor_phys_to_virt(cpx + 1, cpy + 1, vp_480p.dst_x, vp_480p.dst_y, vp_480p.dst_w, vp_480p.dst_h, 640, 480, &rvx, &rvy));
+    ASSERT_TRUE(lvx == 320 && lvy == 240);
+    ASSERT_TRUE(rvx == 320 && rvy == 240);
+}
+
+static void test_wave2a_watertight_strips_and_extended_ini(void)
+{
+    /* Watertight adjacent 1-pixel GDI strip blits across non-integer scale (640x480 -> 2618x1964) */
+    ds_viewport_t vp;
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 640, 480, DS_ASPECT_PRESERVE, &vp));
+
+    int32_t expected_x = vp.dst_x;
+    for (int32_t vx = 0; vx < 640; vx++) {
+        int32_t px = 0, py = 0, pw = 0, ph = 0;
+        ASSERT_TRUE(ds_map_subrect_virt_to_phys(
+            vx, 0, 1, 480,
+            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+            640, 480,
+            &px, &py, &pw, &ph
+        ));
+        ASSERT_TRUE(px == expected_x);
+        ASSERT_TRUE(pw >= 1);
+        ASSERT_TRUE(py == vp.dst_y && ph == vp.dst_h);
+        expected_x = px + pw;
+    }
+    ASSERT_TRUE(expected_x == vp.dst_x + vp.dst_w);
+
+    int32_t expected_y = vp.dst_y;
+    for (int32_t vy = 0; vy < 480; vy++) {
+        int32_t px = 0, py = 0, pw = 0, ph = 0;
+        ASSERT_TRUE(ds_map_subrect_virt_to_phys(
+            0, vy, 640, 1,
+            vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h,
+            640, 480,
+            &px, &py, &pw, &ph
+        ));
+        ASSERT_TRUE(py == expected_y);
+        ASSERT_TRUE(ph >= 1);
+        ASSERT_TRUE(px == vp.dst_x && pw == vp.dst_w);
+        expected_y = py + ph;
+    }
+    ASSERT_TRUE(expected_y == vp.dst_y + vp.dst_h);
+
+    /* Extended active_session.ini & runtime control INI keys */
+    const char *session_ini =
+        "seq=7\r\n"
+        "fullscreen=1\r\n"
+        "aspect=preserve\r\n"
+        "safe_inset_top=74\r\n"
+        "filter=sharp\r\n"
+        "mode=auto_fullscreen\r\n"
+        "hotkey=1\r\n"
+        "updated_unix_ms=1762796867123\r\n"
+        "control_file=C:\\users\\Public\\OneLauncher\\display_control.ini\r\n"
+        "status_file=C:\\users\\Public\\OneLauncher\\display_status.json\r\n";
+    ds_control_state_t st;
+    ASSERT_TRUE(ds_parse_control_ini(session_ini, strlen(session_ini), &st));
+    ASSERT_TRUE(st.has_seq && st.seq == 7ULL);
+    ASSERT_TRUE(st.has_fullscreen && st.fullscreen == true);
+    ASSERT_TRUE(st.has_aspect && st.aspect == DS_ASPECT_PRESERVE);
+    ASSERT_TRUE(st.has_safe_inset_top && st.safe_inset_top == 74);
+    ASSERT_TRUE(st.has_filter && st.filter == DS_FILTER_SHARP);
+    ASSERT_TRUE(st.has_scaling_mode && st.scaling_mode == DS_MODE_AUTO_FULLSCREEN);
+    ASSERT_TRUE(st.has_hotkey && st.hotkey == true);
+    ASSERT_TRUE(st.has_updated_unix_ms && st.updated_unix_ms == 1762796867123ULL);
+    ASSERT_TRUE(st.has_control_file && strcmp(st.control_file, "C:\\users\\Public\\OneLauncher\\display_control.ini") == 0);
+    ASSERT_TRUE(st.has_status_file && strcmp(st.status_file, "C:\\users\\Public\\OneLauncher\\display_status.json") == 0);
+
+    ASSERT_TRUE(ds_parse_scale_filter("auto") == DS_FILTER_AUTO);
+    ASSERT_TRUE(ds_parse_scale_filter("sharp") == DS_FILTER_SHARP);
+    ASSERT_TRUE(ds_parse_scale_filter("sharp_bilinear") == DS_FILTER_SHARP);
+    ASSERT_TRUE(ds_parse_scale_filter("linear") == DS_FILTER_LINEAR);
+    ASSERT_TRUE(ds_parse_scale_filter("nearest") == DS_FILTER_NEAREST);
+    ASSERT_TRUE(strcmp(ds_scale_filter_to_string(DS_FILTER_SHARP), "sharp") == 0);
+
+    /* Canonical `active_session.ini` version comparison shared by DllMain & ds_poll_active_session_if_needed */
+    const char *sess_v1 = "seq=1\nupdated_unix_ms=1762800000100\naspect=preserve_aspect\n";
+    const char *sess_v2 = "seq=2\nupdated_unix_ms=1762800000500\naspect=stretch\n";
+    const char *sess_next_game = "seq=1\nupdated_unix_ms=1762800010000\naspect=integer\n";
+    ds_control_state_t s1, s2, s3;
+    ASSERT_TRUE(ds_parse_control_ini(sess_v1, strlen(sess_v1), &s1));
+    ASSERT_TRUE(ds_parse_control_ini(sess_v2, strlen(sess_v2), &s2));
+    ASSERT_TRUE(ds_parse_control_ini(sess_next_game, strlen(sess_next_game), &s3));
+    ASSERT_TRUE(ds_effective_active_session_seq(&s1) == 1762800000100ULL);
+    ASSERT_TRUE(ds_effective_active_session_seq(&s2) > ds_effective_active_session_seq(&s1));
+    ASSERT_TRUE(ds_effective_active_session_seq(&s3) > ds_effective_active_session_seq(&s2));
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
     test_mode_table_invariants();
     test_cursor_mapping_and_zero_drift_mouselook();
     test_subrect_and_control_ini_parser();
+    test_wave2a_exact_cursor_roundtrip_and_even_viewports();
+    test_wave2a_watertight_strips_and_extended_ini();
     printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
     return 0;
 }

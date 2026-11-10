@@ -276,17 +276,15 @@ const STEAM_SSR_BG_EXTRACTOR_SCRIPT = `
  */
 function createEpicAuthRecovery({ BrowserWindow, getMainWindow, storeSync, launcherEngine }) {
   /** @type {Promise<any> | null} */
-  let inFlightEpicAuthRecovery = null;
+  let inFlightSilentEpicAuthRecovery = null;
+  /** @type {Promise<any> | null} */
+  let inFlightInteractiveEpicAuthRecovery = null;
 
-  return async function recoverEpicAuthSession({ allowInteractiveAuth = false } = {}) {
-    if (!allowInteractiveAuth && launcherEngine?.isStoreDisconnectedTombstoned?.('epic')) {
-      return null;
-    }
-    if (inFlightEpicAuthRecovery) {
-      return inFlightEpicAuthRecovery;
-    }
-
-    inFlightEpicAuthRecovery = (async () => {
+  /**
+   * @param {boolean} allowInteractiveAuth
+   * @returns {Promise<any>}
+   */
+  const executeEpicRecoveryAttempt = async (allowInteractiveAuth) => {
       const cleanUA = buildPlatformBrowserUserAgent();
       const silentRedirectUrl = `https://www.epicgames.com/id/api/redirect?clientId=${encodeURIComponent(EPIC_OAUTH_CLIENT_ID)}&responseType=code`;
 
@@ -483,11 +481,48 @@ function createEpicAuthRecovery({ BrowserWindow, getMainWindow, storeSync, launc
       }
 
       return null;
+  };
+
+  return async function recoverEpicAuthSession(rawOptions = {}) {
+    // Support both `allowInteractiveAuth` and `allowInteractive` option aliases (Finding #17)
+    const allowInteractiveAuth = Boolean(
+      rawOptions?.allowInteractiveAuth || rawOptions?.allowInteractive
+    );
+    if (!allowInteractiveAuth && launcherEngine?.isStoreDisconnectedTombstoned?.('epic')) {
+      return null;
+    }
+
+    // Never coalesce an explicit interactive sign-in onto a failing silent recovery flight!
+    if (!allowInteractiveAuth) {
+      if (inFlightInteractiveEpicAuthRecovery) {
+        return inFlightInteractiveEpicAuthRecovery;
+      }
+      if (inFlightSilentEpicAuthRecovery) {
+        return inFlightSilentEpicAuthRecovery;
+      }
+      inFlightSilentEpicAuthRecovery = executeEpicRecoveryAttempt(false).finally(() => {
+        inFlightSilentEpicAuthRecovery = null;
+      });
+      return inFlightSilentEpicAuthRecovery;
+    }
+
+    if (inFlightInteractiveEpicAuthRecovery) {
+      return inFlightInteractiveEpicAuthRecovery;
+    }
+
+    inFlightInteractiveEpicAuthRecovery = (async () => {
+      if (inFlightSilentEpicAuthRecovery) {
+        const silentResult = await inFlightSilentEpicAuthRecovery.catch(() => null);
+        if (silentResult && silentResult.access_token) {
+          return silentResult;
+        }
+      }
+      return executeEpicRecoveryAttempt(true);
     })().finally(() => {
-      inFlightEpicAuthRecovery = null;
+      inFlightInteractiveEpicAuthRecovery = null;
     });
 
-    return inFlightEpicAuthRecovery;
+    return inFlightInteractiveEpicAuthRecovery;
   };
 }
 

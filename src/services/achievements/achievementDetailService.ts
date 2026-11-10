@@ -915,14 +915,11 @@ export class AchievementDetailService {
 
     if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
       try {
-        const ipcFn = window.electronAPI.getStoreAchievements as unknown as (
-          first: unknown,
-          second?: unknown
-        ) => Promise<unknown>;
+        const ipcFn = window.electronAPI.getStoreAchievements;
         const rawLiveRes =
           ipcFn.length >= 2
             ? await ipcFn('gog', gogPlatform?.platformGameId || targetId)
-            : await window.electronAPI.getStoreAchievements({
+            : await ipcFn({
                 platformId: 'gog',
                 storefrontId: 'gog',
                 gameId: game.id,

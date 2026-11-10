@@ -6,8 +6,12 @@ import {
 } from '../contracts/game';
 import { StorefrontId } from '../contracts/platform';
 import { InstalledGameRecord } from '../contracts/launcher';
-import { SavedStoreTokensMap, StorefrontTokenSummary } from '../types/electron';
 import { launcherService } from '../services/launcher/launcherService';
+import { normalizeGogAvatarUrl } from '../services/integrations/gogIntegration';
+import {
+  reconcileNativeStorefrontAuthSessions,
+  type ExtendedSavedStoreTokensMap,
+} from '../services/integrations/storefrontAuthReconciler';
 import {
   scanLocalInstalledGames,
   scanLocalSteamAchievements,
@@ -90,41 +94,6 @@ interface InstalledRecordsLookupMaps {
 type InstalledRecordsWithEpicSupport = InstalledGameRecord[] & {
   epicPlatformSupport?: Record<string, { windows: boolean; mac: boolean }>;
 };
-
-type TokenSummaryWithExtendedFields = StorefrontTokenSummary & {
-  uhs?: string;
-  gamerpicUrl?: string;
-  gamerscore?: number;
-  expires_at?: number;
-};
-
-type SavedTokensPayload = SavedStoreTokensMap & {
-  steam?: TokenSummaryWithExtendedFields;
-  gog?: TokenSummaryWithExtendedFields;
-  epic?: TokenSummaryWithExtendedFields;
-  xbox?: TokenSummaryWithExtendedFields;
-  suppressedItems?: SuppressedCatalogEntry[];
-};
-
-function normalizeGogAvatarUrlSafe(
-  avatarUrl?: string,
-  avatars?: Record<string, string>
-): string | undefined {
-  const candidate =
-    avatarUrl ||
-    avatars?.medium_2x ||
-    avatars?.medium ||
-    avatars?.large_2x ||
-    avatars?.large ||
-    avatars?.small_2x ||
-    avatars?.small;
-  if (!candidate || typeof candidate !== 'string') return undefined;
-  const trimmed = candidate.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.startsWith('//')) return `https:${trimmed}`;
-  if (trimmed.startsWith('http://')) return `https://${trimmed.slice(7)}`;
-  return trimmed;
-}
 
 function trimTrailingSlash(raw?: string | null): string {
   return raw ? String(raw).trim().replace(/[\\/]+$/, '').toLowerCase() : '';
@@ -865,228 +834,12 @@ export function useLocalInstallSync({
         .getSavedTokens()
         .then((rawSavedTokens) => {
           if (cancelled || !rawSavedTokens) return;
-          const savedTokens = rawSavedTokens as SavedTokensPayload;
-          let updatedIntegrations = loadIntegrations();
-          let integrationsChanged = false;
-          const activeCatalog = loadCurrentCatalog();
-
-          // 1. Reconcile Steam saved token (strictly non-secret identity)
-          if (savedTokens.steam?.steamId || savedTokens.steam?.access_token) {
-            const steamInteg = updatedIntegrations.find((i) => i.storefrontId === 'steam');
-            const steamId =
-              savedTokens.steam.steamId ||
-              steamInteg?.credentials?.steamId ||
-              steamInteg?.accountId;
-            const accountName =
-              savedTokens.steam.accountName || steamInteg?.accountName || 'Steam User';
-            if (
-              !steamInteg ||
-              !steamInteg.isConnected ||
-              !steamInteg.credentials?.steamId ||
-              steamInteg.accountName !== accountName
-            ) {
-              const count =
-                (Array.isArray(savedTokens.steam.games) && savedTokens.steam.games.length) ||
-                steamInteg?.gamesCount ||
-                activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'steam'))
-                  .length;
-              updatedIntegrations = updatedIntegrations.map((i) =>
-                i.storefrontId === 'steam'
-                  ? {
-                      ...i,
-                      isConnected: true,
-                      accountName,
-                      accountId: steamId,
-                      avatarUrl: savedTokens.steam?.avatarUrl || i.avatarUrl,
-                      gamesCount: count,
-                      lastSyncedAt: savedTokens.steam?.updatedAt || new Date().toISOString(),
-                      authMethod: 'oauth' as const,
-                      credentials: {
-                        steamId,
-                      },
-                      statusMessage: `Connected as ${accountName} (${count} titles synced)`,
-                    }
-                  : i
-              );
-              integrationsChanged = true;
-            }
-          }
-
-          // 2. Reconcile GOG saved token (strictly non-secret identity)
-          if (savedTokens.gog?.access_token) {
-            const gogInteg = updatedIntegrations.find((i) => i.storefrontId === 'gog');
-            const gogUserId = savedTokens.gog.user_id || gogInteg?.accountId;
-            const gogAvatar = normalizeGogAvatarUrlSafe(
-              savedTokens.gog.avatarUrl || gogInteg?.avatarUrl,
-              savedTokens.gog.avatars
-            );
-            const accountName =
-              savedTokens.gog.username && savedTokens.gog.username !== 'GOG User'
-                ? savedTokens.gog.username
-                : gogInteg?.accountName || 'GOG User';
-            if (
-              !gogInteg ||
-              !gogInteg.isConnected ||
-              gogInteg.avatarUrl !== gogAvatar ||
-              gogInteg.accountName !== accountName
-            ) {
-              const count =
-                gogInteg?.gamesCount && gogInteg.gamesCount > 0
-                  ? gogInteg.gamesCount
-                  : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'gog'))
-                      .length;
-              updatedIntegrations = updatedIntegrations.map((i) =>
-                i.storefrontId === 'gog'
-                  ? {
-                      ...i,
-                      isConnected: true,
-                      accountName,
-                      accountId: gogUserId,
-                      avatarUrl: gogAvatar || i.avatarUrl,
-                      gamesCount: count,
-                      lastSyncedAt: savedTokens.gog?.updatedAt || new Date().toISOString(),
-                      authMethod: 'oauth' as const,
-                      credentials: {
-                        gogUsername:
-                          accountName !== 'GOG User'
-                            ? accountName
-                            : i.credentials?.gogUsername,
-                      },
-                      statusMessage: `Connected as ${accountName} (${count} titles synced)`,
-                    }
-                  : i
-              );
-              integrationsChanged = true;
-            }
-          }
-
-          // 3. Reconcile Epic saved token (strictly non-secret identity)
-          if (savedTokens.epic?.access_token) {
-            const epicInteg = updatedIntegrations.find((i) => i.storefrontId === 'epic');
-            const displayName = savedTokens.epic.displayName || 'Epic User';
-            if (
-              !epicInteg ||
-              !epicInteg.isConnected ||
-              epicInteg.accountName !== displayName ||
-              !epicInteg.credentials?.epicAccountId
-            ) {
-              const count =
-                epicInteg?.gamesCount && epicInteg.gamesCount > 0
-                  ? epicInteg.gamesCount
-                  : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'epic'))
-                      .length;
-              const rawExpires = savedTokens.epic.expires_at ?? savedTokens.epic.expiresAt;
-              updatedIntegrations = updatedIntegrations.map((i) =>
-                i.storefrontId === 'epic'
-                  ? {
-                      ...i,
-                      isConnected: true,
-                      accountName: displayName,
-                      accountId: savedTokens.epic?.account_id,
-                      gamesCount: count,
-                      lastSyncedAt: savedTokens.epic?.updatedAt || new Date().toISOString(),
-                      authMethod: 'oauth' as const,
-                      credentials: {
-                        epicAccountId: savedTokens.epic?.account_id,
-                        ...(typeof rawExpires === 'number'
-                          ? { epicTokenExpiresAt: rawExpires }
-                          : {}),
-                      },
-                      statusMessage: `Connected as ${displayName} (${count} titles synced)`,
-                    }
-                  : i
-              );
-              integrationsChanged = true;
-            }
-          }
-
-          // 4. Reconcile Xbox saved token (strictly non-secret identity & sync preferences)
-          if (
-            savedTokens.xbox?.gamertag ||
-            savedTokens.xbox?.xuid ||
-            savedTokens.xbox?.connected ||
-            savedTokens.xbox?.uhs
-          ) {
-            const xboxInteg = updatedIntegrations.find((i) => i.storefrontId === 'xbox');
-            const cachedXboxProfile = loadXboxProfileState();
-            const gamertag =
-              savedTokens.xbox.modernGamertag ||
-              savedTokens.xbox.gamertag ||
-              xboxInteg?.accountName ||
-              cachedXboxProfile?.gamertag ||
-              'Xbox Player';
-            const xuid =
-              savedTokens.xbox.xuid || xboxInteg?.accountId || cachedXboxProfile?.xuid;
-            const avatarUrl =
-              savedTokens.xbox.avatarUrl ||
-              savedTokens.xbox.gamerpicUrl ||
-              xboxInteg?.avatarUrl ||
-              cachedXboxProfile?.avatarUrl;
-            const syncMode: XboxGamePassSyncMode =
-              savedTokens.xbox.syncMode || cachedXboxProfile?.syncMode || 'owned_and_played';
-            const resolvedSub =
-              savedTokens.xbox.subscription ?? cachedXboxProfile?.subscription ?? null;
-            saveXboxProfileState({
-              connected: true,
-              gamertag: savedTokens.xbox.gamertag || gamertag,
-              modernGamertag: savedTokens.xbox.modernGamertag || gamertag,
-              xuid,
-              avatarUrl,
-              gamerscore: savedTokens.xbox.gamerscore ?? cachedXboxProfile?.gamerscore,
-              subscription: resolvedSub,
-              syncMode,
-              lastSyncedAt: savedTokens.xbox.updatedAt || new Date().toISOString(),
-            });
-            if (typeof window !== 'undefined') {
-              window.dispatchEvent(new CustomEvent('ol:xbox-profile-updated'));
-            }
-            if (
-              !xboxInteg ||
-              !xboxInteg.isConnected ||
-              xboxInteg.accountName !== gamertag ||
-              xboxInteg.accountId !== xuid ||
-              xboxInteg.avatarUrl !== avatarUrl
-            ) {
-              const count =
-                xboxInteg?.gamesCount && xboxInteg.gamesCount > 0
-                  ? xboxInteg.gamesCount
-                  : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'xbox'))
-                      .length;
-              updatedIntegrations = updatedIntegrations.map((i) =>
-                i.storefrontId === 'xbox'
-                  ? {
-                      ...i,
-                      isConnected: true,
-                      accountName: gamertag,
-                      accountId: xuid,
-                      avatarUrl: avatarUrl || i.avatarUrl,
-                      gamesCount: count,
-                      lastSyncedAt: savedTokens.xbox?.updatedAt || new Date().toISOString(),
-                      authMethod: 'oauth' as const,
-                      credentials: {},
-                      statusMessage: formatXboxIntegrationStatusMessage(
-                        gamertag,
-                        count,
-                        resolvedSub
-                      ),
-                    }
-                  : i
-              );
-              integrationsChanged = true;
-            }
-          }
-
-          if (
-            Array.isArray(savedTokens.suppressedItems) &&
-            savedTokens.suppressedItems.length > 0
-          ) {
-            registerSuppressedCatalogEntries(savedTokens.suppressedItems);
-            integrationsChanged = true;
-          }
-
-          if (integrationsChanged) {
-            saveIntegrations(updatedIntegrations);
-          }
+          const savedTokens = rawSavedTokens as ExtendedSavedStoreTokensMap;
+          reconcileNativeStorefrontAuthSessions({
+            savedTokens,
+            persistIfChanged: true,
+            dispatchXboxProfileEvent: true,
+          });
 
           // Staggered sequential startup storefront sync
           if (window.electronAPI?.syncStore && launcherService.getRunningGames().length === 0) {
@@ -1155,7 +908,7 @@ export function useLocalInstallSync({
                       : 'Xbox Live User');
                   const resolvedAvatar =
                     storefrontId === 'gog'
-                      ? normalizeGogAvatarUrlSafe(syncAvatarUrl) || integ.avatarUrl
+                      ? normalizeGogAvatarUrl(syncAvatarUrl) || integ.avatarUrl
                       : syncAvatarUrl || integ.avatarUrl;
                   const nextStatus =
                     storefrontId === 'xbox'
@@ -1297,7 +1050,7 @@ export function useLocalInstallSync({
               ) {
                 try {
                   await yieldToMainThread();
-                  const activeXboxInteg = updatedIntegrations.find(
+                  const activeXboxInteg = loadIntegrations().find(
                     (i) => i.storefrontId === 'xbox'
                   );
                   const cachedProfile = loadXboxProfileState();

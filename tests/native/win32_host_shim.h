@@ -764,8 +764,13 @@ static inline PVOID InterlockedExchangePointer(PVOID volatile *target, PVOID val
 /* Zero-alloc atomic SRWLOCK supporting SRWLOCK_INIT ({0}) */
 typedef struct _SRWLOCK {
     volatile int32_t state; /* 0 = unlocked, >0 = readers, -1 = exclusive writer */
-} SRWLOCK;
+} SRWLOCK, *PSRWLOCK;
 #define SRWLOCK_INIT { 0 }
+
+static inline void InitializeSRWLock(PSRWLOCK lock)
+{
+    if (lock) lock->state = 0;
+}
 
 static inline void AcquireSRWLockExclusive(SRWLOCK *lock)
 {
@@ -966,9 +971,13 @@ enum win32_handle_kind {
     WIN32_HANDLE_THREAD = 0x54485244u
 };
 
+extern _Atomic int32_t g_win32_active_bg_workers;
+extern _Atomic int32_t g_win32_detached_threads;
+
 struct win32_handle_obj {
     uint32_t kind;
     int fd;
+    volatile int32_t ref_count;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     bool manual_reset;
@@ -1015,6 +1024,12 @@ static inline void *win32_thread_trampoline(void *arg)
     h->signaled = true;
     pthread_cond_broadcast(&h->cv);
     pthread_mutex_unlock(&h->mu);
+    if (__atomic_sub_fetch(&h->ref_count, 1, __ATOMIC_ACQ_REL) == 0) {
+        pthread_cond_destroy(&h->cv);
+        pthread_mutex_destroy(&h->mu);
+        win32_tracked_free(h);
+        atomic_fetch_sub_explicit(&g_win32_detached_threads, 1, memory_order_seq_cst);
+    }
     return NULL;
 }
 
@@ -1037,18 +1052,24 @@ static inline HANDLE CreateThread(
     if (!h) return NULL;
     h->kind = WIN32_HANDLE_THREAD;
     h->fd = -1;
+    h->ref_count = 2; /* 1 for running thread trampoline + 1 for returned HANDLE */
     pthread_mutex_init(&h->mu, NULL);
     pthread_cond_init(&h->cv, NULL);
     h->manual_reset = true;
     h->signaled = false;
     h->thread_fn = startFn;
     h->thread_arg = param;
-    if (pthread_create(&h->thread, NULL, win32_thread_trampoline, h) != 0) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&h->thread, &attr, win32_thread_trampoline, h) != 0) {
+        pthread_attr_destroy(&attr);
         pthread_cond_destroy(&h->cv);
         pthread_mutex_destroy(&h->mu);
         win32_tracked_free(h);
         return NULL;
     }
+    pthread_attr_destroy(&attr);
     return (HANDLE)h;
 }
 
@@ -1124,13 +1145,13 @@ static inline BOOL CloseHandle(HANDLE handle)
         return TRUE;
     }
     if (h->kind == WIN32_HANDLE_THREAD) {
-        if (!h->thread_joined) {
-            pthread_join(h->thread, NULL);
-            h->thread_joined = true;
+        atomic_fetch_add_explicit(&g_win32_detached_threads, 1, memory_order_seq_cst);
+        if (__atomic_sub_fetch(&h->ref_count, 1, __ATOMIC_ACQ_REL) == 0) {
+            pthread_cond_destroy(&h->cv);
+            pthread_mutex_destroy(&h->mu);
+            win32_tracked_free(h);
+            atomic_fetch_sub_explicit(&g_win32_detached_threads, 1, memory_order_seq_cst);
         }
-        pthread_cond_destroy(&h->cv);
-        pthread_mutex_destroy(&h->mu);
-        win32_tracked_free(h);
         return TRUE;
     }
     if (h->kind == WIN32_HANDLE_EVENT) {
@@ -1259,7 +1280,8 @@ static inline BOOL QueueUserWorkItem(LPTHREAD_START_ROUTINE cb, PVOID ctx, DWORD
 
 static inline void win32_drain_background_workers(void)
 {
-    while (atomic_load_explicit(&g_win32_active_bg_workers, memory_order_seq_cst) > 0) {
+    while (atomic_load_explicit(&g_win32_active_bg_workers, memory_order_seq_cst) > 0 ||
+           atomic_load_explicit(&g_win32_detached_threads, memory_order_seq_cst) > 0) {
         Sleep(1);
     }
 }
@@ -1594,6 +1616,7 @@ SRWLOCK g_win32_tls_lock = SRWLOCK_INIT;
 bool g_win32_tls_used[WIN32_MAX_TLS_SLOTS] = { false };
 pthread_key_t g_win32_tls_keys[WIN32_MAX_TLS_SLOTS];
 _Atomic int32_t g_win32_active_bg_workers = 0;
+_Atomic int32_t g_win32_detached_threads = 0;
 char g_win32_virtual_c_root[2048] = "/tmp";
 char g_win32_mock_module_path_utf8[2048] = "C:\\Games\\TestGame\\Game.exe";
 #endif

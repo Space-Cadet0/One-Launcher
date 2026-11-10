@@ -14,12 +14,12 @@ const zlib = require('node:zlib');
 const { classifyNonGameStorefrontItem } = require('../nonGameClassifier.cjs');
 const { normalizeStoreMsaTicket, XSTS_RELYING_PARTIES } = require('./xboxAuthManager.cjs');
 
-let xboxConfigAndIds = null;
-try {
-  xboxConfigAndIds = require('./xboxConfigAndIds.cjs');
-} catch {
-  // Optional Wave 1B sibling module
-}
+const xboxConfigAndIds = require('./xboxConfigAndIds.cjs');
+const {
+  XBOX_HTTP_TIMEOUT_MS,
+  buildXboxFetchSignal,
+  makeCorrelationVector,
+} = xboxConfigAndIds;
 
 const PCGAFD_ENTITLEMENTS_URL = 'https://beige.xboxservices.com/PCGAFD/entitlements';
 const PCGAFD_SUBSCRIPTIONS_URL = 'https://beige.xboxservices.com/PCGAFD/entitlements/subscriptions';
@@ -32,20 +32,8 @@ const GAMEPASS_SIGL_V3_URL = 'https://catalog.gamepass.com/sigls/v3';
 const PACKAGES_PC_BASE_URL = 'https://packagespc.xboxlive.com/GetBasePackage';
 const FE3_DELIVERY_SOAP_URL = 'https://fe3cr.delivery.mp.microsoft.com/ClientWebService/client.asmx';
 
-const XBOX_HTTP_TIMEOUT_MS = 20_000;
 const CROSS_PLATFORM_ENTITLEMENT_CACHE_TTL_MS = 30 * 60_000; // 30 minutes
 const CATALOG_DB_COMPACTION_THRESHOLD_BYTES = 10 * 1024 * 1024; // 10 MB
-
-function buildXboxFetchSignal(callerSignal, timeoutMs = XBOX_HTTP_TIMEOUT_MS) {
-  const timeoutSignal =
-    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
-      ? AbortSignal.timeout(timeoutMs)
-      : undefined;
-  if (callerSignal && timeoutSignal && typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([callerSignal, timeoutSignal]);
-  }
-  return callerSignal || timeoutSignal;
-}
 
 function resolveFetchImpl(options = {}) {
   return options.customFetch || options.fetchImpl || globalThis.fetch;
@@ -1571,10 +1559,6 @@ function evaluateXboxActiveAccessGate(params = /** @type {any} */ ({})) {
 // ============================================================================
 // 3. Active Subscription Tier Detector (`PCGAFD` + `collections` v6 Fallback)
 // ============================================================================
-
-function makeCorrelationVector() {
-  return `${crypto.randomBytes(16).toString('base64').replace(/=+$/g, '')}.0`;
-}
 
 function formatMultiPassTierDisplayName(primary, activeMatched, expandedCapabilitySet) {
   if (!primary) return 'None';
@@ -3662,6 +3646,7 @@ async function hydrateDisplayCatalogProducts(bigIds, options = {}) {
     )
   );
 
+  const staleCachedFallback = new Map();
   const hydratedMap =
     cacheStore && !bypassCache
       ? cacheStore.getProducts(uniqueIds, market, evalNowMs)
@@ -3669,6 +3654,7 @@ async function hydrateDisplayCatalogProducts(bigIds, options = {}) {
   if (hydratedMap.size > 0) {
     for (const [id, prod] of Array.from(hydratedMap.entries())) {
       if (hasStaleCachedDesktopPassGrants(prod, evalNowMs)) {
+        staleCachedFallback.set(id, prod);
         hydratedMap.delete(id);
       } else if (cachedSourceIds instanceof Set) {
         cachedSourceIds.add(id);
@@ -3677,9 +3663,54 @@ async function hydrateDisplayCatalogProducts(bigIds, options = {}) {
   }
   const missingIds = uniqueIds.filter((id) => !hydratedMap.has(id));
 
+  let failedBatchCount = 0;
+  const failedProductIds = new Set();
+  const attachHydrationStats = (mapObj) => {
+    try {
+      Object.defineProperties(mapObj, {
+        failedBatchCount: { value: failedBatchCount, enumerable: false, configurable: true },
+        failedProductIds: { value: failedProductIds, enumerable: false, configurable: true },
+      });
+    } catch {}
+    if (options.hydrationStats && typeof options.hydrationStats === 'object') {
+      options.hydrationStats.failedBatchCount =
+        (Number(options.hydrationStats.failedBatchCount) || 0) + failedBatchCount;
+      if (options.hydrationStats.failedProductIds instanceof Set) {
+        for (const fid of failedProductIds) {
+          options.hydrationStats.failedProductIds.add(fid);
+        }
+      }
+    }
+    return mapObj;
+  };
+
   if (missingIds.length === 0 || typeof fetchImpl !== 'function') {
-    return hydratedMap;
+    return attachHydrationStats(hydratedMap);
   }
+
+  const maxRetries =
+    typeof options.maxBatchRetries === 'number' && options.maxBatchRetries >= 0
+      ? options.maxBatchRetries
+      : 2;
+  const retryBaseDelayMs =
+    typeof options.retryBaseDelayMs === 'number' && options.retryBaseDelayMs >= 0
+      ? options.retryBaseDelayMs
+      : 60;
+
+  const parseRetryAfterMs = (res) => {
+    try {
+      const hdr =
+        res && res.headers && typeof res.headers.get === 'function'
+          ? res.headers.get('retry-after') || res.headers.get('Retry-After')
+          : res?.headers?.['retry-after'] || res?.headers?.['Retry-After'];
+      if (!hdr) return 0;
+      const secs = Number(hdr);
+      if (Number.isFinite(secs) && secs >= 0) {
+        return Math.min(2000, Math.round(secs * 1000));
+      }
+    } catch {}
+    return 0;
+  };
 
   const newlyFetched = new Map();
   const batches = [];
@@ -3693,30 +3724,86 @@ async function hydrateDisplayCatalogProducts(bigIds, options = {}) {
     await Promise.all(
       slice.map(async (batch) => {
         const url = `${DISPLAY_CATALOG_PRODUCTS_URL}?bigIds=${batch.join(',')}&market=${encodeURIComponent(market)}&languages=${encodeURIComponent(languages)}`;
-        try {
-          const res = await fetchImpl(url, {
-            method: 'GET',
-            headers: {
-              Accept: 'application/json',
-              'MS-CV': makeCorrelationVector(),
-            },
-            signal: buildXboxFetchSignal(options.signal),
-          });
-          if (!res.ok) return;
-          const json = await res.json();
-          const products = Array.isArray(json?.Products) ? json.Products : [];
-          for (const prod of products) {
-            const pid = String(prod?.ProductId || '').trim().toUpperCase();
-            if (pid) {
-              const compact = projectCompactDisplayCatalogProduct(prod);
-              hydratedMap.set(pid, compact);
-              newlyFetched.set(pid, compact);
-              if (cachedSourceIds instanceof Set) {
-                cachedSourceIds.delete(pid);
+        let succeeded = false;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          if (options.signal?.aborted) break;
+          try {
+            const res = await fetchImpl(url, {
+              method: 'GET',
+              headers: {
+                Accept: 'application/json',
+                'MS-CV': makeCorrelationVector(),
+              },
+              signal: buildXboxFetchSignal(options.signal),
+            });
+            if (!res.ok) {
+              const retryableStatus =
+                res.status === 429 ||
+                res.status === 500 ||
+                res.status === 502 ||
+                res.status === 503 ||
+                res.status === 504;
+              if (retryableStatus && attempt < maxRetries && !options.signal?.aborted) {
+                const waitMs =
+                  parseRetryAfterMs(res) ||
+                  Math.min(1500, retryBaseDelayMs * Math.pow(2, attempt));
+                if (waitMs > 0) {
+                  await new Promise((r) => setTimeout(r, waitMs));
+                }
+                continue;
+              }
+              break;
+            }
+            const json = await res.json();
+            const products = Array.isArray(json?.Products) ? json.Products : [];
+            for (const prod of products) {
+              const pid = String(prod?.ProductId || '').trim().toUpperCase();
+              if (pid) {
+                const compact = projectCompactDisplayCatalogProduct(prod);
+                hydratedMap.set(pid, compact);
+                newlyFetched.set(pid, compact);
+                if (cachedSourceIds instanceof Set) {
+                  cachedSourceIds.delete(pid);
+                }
+              }
+            }
+            succeeded = true;
+            break;
+          } catch {
+            if (attempt < maxRetries && !options.signal?.aborted) {
+              const waitMs = Math.min(1500, retryBaseDelayMs * Math.pow(2, attempt));
+              if (waitMs > 0) {
+                await new Promise((r) => setTimeout(r, waitMs));
+              }
+              continue;
+            }
+            break;
+          }
+        }
+
+        if (!succeeded) {
+          failedBatchCount += 1;
+          let expiredCacheFallback = null;
+          if (cacheStore && typeof cacheStore.getProducts === 'function') {
+            try {
+              expiredCacheFallback = cacheStore.getProducts(batch, market, 0);
+            } catch {}
+          }
+          for (const bid of batch) {
+            failedProductIds.add(bid);
+            if (!hydratedMap.has(bid)) {
+              const preserved =
+                staleCachedFallback.get(bid) ||
+                (expiredCacheFallback instanceof Map ? expiredCacheFallback.get(bid) : null);
+              if (preserved) {
+                hydratedMap.set(bid, preserved);
+                if (cachedSourceIds instanceof Set) {
+                  cachedSourceIds.add(bid);
+                }
               }
             }
           }
-        } catch {}
+        }
       })
     );
   }
@@ -3725,7 +3812,7 @@ async function hydrateDisplayCatalogProducts(bigIds, options = {}) {
     cacheStore.setProducts(newlyFetched, market);
   }
 
-  return hydratedMap;
+  return attachHydrationStats(hydratedMap);
 }
 
 const lookupDisplayCatalogProducts = hydrateDisplayCatalogProducts;
@@ -4365,7 +4452,11 @@ function deriveDefaultScidFromTitleId(rawTitleId, options = undefined) {
     typeof xboxConfigAndIds.deriveDefaultScidFromTitleId === 'function'
   ) {
     try {
-      const delegated = xboxConfigAndIds.deriveDefaultScidFromTitleId(rawTitleId, options);
+      const normalizedOpts =
+        typeof options === 'string'
+          ? { format: /** @type {any} */ (options) }
+          : /** @type {any} */ (options);
+      const delegated = xboxConfigAndIds.deriveDefaultScidFromTitleId(rawTitleId, normalizedOpts);
       if (delegated) return delegated;
     } catch {}
   }
@@ -4993,6 +5084,7 @@ function evaluateDisplayCatalogProduct(product, evalOptions = {}) {
 // 7. Full Xbox Library & Game Pass Sync Orchestrator (`syncXboxCatalog`)
 // ============================================================================
 
+const CROSS_PLATFORM_ENTITLEMENT_HASH_CACHE_MAX = 4;
 const crossPlatformEntitlementByTokenHash = new Map();
 const crossPlatformEntitlementByProvider = new WeakMap();
 
@@ -5001,6 +5093,11 @@ async function getCachedCrossPlatformRuntimeEntitlement({ authProvider, storeTok
     return null;
   }
   const now = Date.now();
+  for (const [k, v] of crossPlatformEntitlementByTokenHash.entries()) {
+    if (!v || now >= v.expiresAtMs) {
+      crossPlatformEntitlementByTokenHash.delete(k);
+    }
+  }
   const tokenKey =
     typeof storeToken === 'string' && storeToken.trim()
       ? crypto.createHash('sha256').update(storeToken.trim()).digest('hex')
@@ -5021,6 +5118,15 @@ async function getCachedCrossPlatformRuntimeEntitlement({ authProvider, storeTok
   const result = await authProvider.checkMinecraftJavaEntitlement();
   const entry = { result, expiresAtMs: now + CROSS_PLATFORM_ENTITLEMENT_CACHE_TTL_MS };
   if (tokenKey) {
+    if (
+      !crossPlatformEntitlementByTokenHash.has(tokenKey) &&
+      crossPlatformEntitlementByTokenHash.size >= CROSS_PLATFORM_ENTITLEMENT_HASH_CACHE_MAX
+    ) {
+      const oldestKey = crossPlatformEntitlementByTokenHash.keys().next().value;
+      if (oldestKey !== undefined) {
+        crossPlatformEntitlementByTokenHash.delete(oldestKey);
+      }
+    }
     crossPlatformEntitlementByTokenHash.set(tokenKey, entry);
   } else {
     crossPlatformEntitlementByProvider.set(authProvider, entry);
@@ -5389,6 +5495,7 @@ async function syncXboxCatalog(options = {}) {
     // Maps childBigId -> { ownedFromParent: boolean, inSiglFromParent: boolean, parentKeys: string[] }
     const bundleLineage = new Map();
     const cachedSourceIds = new Set();
+    const hydrationStats = { failedBatchCount: 0, failedProductIds: new Set() };
     const hydratedProducts = await hydrateDisplayCatalogProducts(Array.from(candidateSeedIds), {
       market,
       languages: `${locale},neutral`,
@@ -5397,6 +5504,9 @@ async function syncXboxCatalog(options = {}) {
       signal: options.signal,
       nowMs,
       cachedSourceIds,
+      hydrationStats,
+      maxBatchRetries: options.maxBatchRetries,
+      retryBaseDelayMs: options.retryBaseDelayMs,
     });
 
     // In `owned_only` mode, keep zero-extra-HTTP behavior for unowned SIGL titles while populating
@@ -5502,6 +5612,9 @@ async function syncXboxCatalog(options = {}) {
           signal: options.signal,
           nowMs,
           cachedSourceIds,
+          hydrationStats,
+          maxBatchRetries: options.maxBatchRetries,
+          retryBaseDelayMs: options.retryBaseDelayMs,
         });
         for (const [cid, cprod] of childHydrated.entries()) {
           hydratedProducts.set(cid, cprod);
@@ -5558,6 +5671,9 @@ async function syncXboxCatalog(options = {}) {
             signal: options.signal,
             nowMs,
             bypassCache: true,
+            hydrationStats,
+            maxBatchRetries: options.maxBatchRetries,
+            retryBaseDelayMs: options.retryBaseDelayMs,
           }
         );
         for (const [rid, rprod] of refreshedLayer3Map.entries()) {
@@ -5645,7 +5761,55 @@ async function syncXboxCatalog(options = {}) {
     for (const productId of allEvaluatedIds) {
       if (seenProductIds.has(productId)) continue;
       const product = hydratedProducts.get(productId);
-      if (!product) continue;
+      if (!product) {
+        // Preserve owned / locally-installed stub record if DisplayCatalog hydration failed for its batch
+        // so transient DisplayCatalog 5xx/429 errors never drop permanently owned titles!
+        if (
+          hydrationStats.failedProductIds.has(productId) &&
+          (ownedSet.has(productId) || localInstalledProductIds.has(productId))
+        ) {
+          seenProductIds.add(productId);
+          const achDec = titleHubDecorations.byProductId?.[productId] || null;
+          const stubTitle = String(achDec?.name || `Xbox Owned Title (${productId})`).trim();
+          const isLocalInst = localInstalledProductIds.has(productId);
+          games.push({
+            id: `xbox-${productId}`,
+            title: stubTitle,
+            originalStoreTitle: stubTitle,
+            sortTitle: stubTitle.replace(/^(The|A|An)\s+/i, '') || stubTitle,
+            isVerifiedEntitlement: true,
+            hydrationIncompleteStub: true,
+            nativePlatforms: ['windows'],
+            worksOn: { windows: true, mac: false, linux: false },
+            platforms: [
+              {
+                platformId: 'xbox',
+                platformGameId: productId,
+                storefrontAppId: productId,
+                originalTitle: stubTitle,
+                installed: isLocalInst,
+                platforms: { windows: true, mac: false, linux: false },
+                xboxProductId: productId,
+                xboxTitleId: achDec?.titleId || undefined,
+                scid: achDec?.scid || undefined,
+                ownershipType: ownedSet.has(productId) ? 'owned' : 'subscription',
+                playtimeMinutes: Number(achDec?.minutesPlayed || 0) || 0,
+                lastPlayed: achDec?.lastTimePlayed || undefined,
+                achievements: achDec?.summary || undefined,
+              },
+            ],
+            headerImage: achDec?.displayImage || '',
+            capsuleImage: achDec?.displayImage || '',
+            shortDescription: '',
+            releaseDate: '',
+            developers: [],
+            publishers: [],
+            genres: [],
+            tags: ['Xbox', 'Microsoft Store'],
+          });
+        }
+        continue;
+      }
 
       const lineage = bundleLineage.get(productId);
       const fromDesktopSiblingBundle = Boolean(
@@ -5981,8 +6145,10 @@ async function syncXboxCatalog(options = {}) {
       });
     }
 
+    const displayCatalogHydrationFailedBatchCount = Number(hydrationStats.failedBatchCount) || 0;
     const authoritativeComplete = Boolean(
-      subscription.authoritativeDetection !== false &&
+      displayCatalogHydrationFailedBatchCount === 0 &&
+        subscription.authoritativeDetection !== false &&
         siglFetchAuthoritative !== false &&
         (String(rawSyncMode || '').trim().toLowerCase() === 'subscription_only' ||
           entitlementData.authoritative !== false)
@@ -6005,12 +6171,14 @@ async function syncXboxCatalog(options = {}) {
       subscription,
       syncMode,
       authoritativeComplete,
+      displayCatalogHydrationFailedBatchCount,
       subscriptionChanged,
       stats: {
         ownedCount: ownedSet.size,
         activeSiglCount: activePcSiglSet.size,
         admittedCount: games.length,
         suppressedCount: suppressedItems.length,
+        displayCatalogHydrationFailedBatchCount,
       },
     };
   } finally {
@@ -6368,10 +6536,23 @@ async function resolveFe3DeliveryUrls(wuCategoryId, fetchImpl, signal = undefine
   const syncXml = await syncRes.text();
 
   const updatePairs = [];
-  const infoRegex = /<UpdateInfo>[\s\S]*?<ID>(\d+)<\/ID>[\s\S]*?<UpdateIdentity UpdateID="([^"]+)" RevisionNumber="(\d+)"/gi;
-  let m;
-  while ((m = infoRegex.exec(syncXml)) !== null) {
-    updatePairs.push({ intId: m[1], updateId: m[2], revisionNumber: m[3] });
+  const updateBlockRegex = /<(?:[\w-]+:)?(?:UpdateInfo|Update)\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?(?:UpdateInfo|Update)>/gi;
+  let blockMatch;
+  while ((blockMatch = updateBlockRegex.exec(syncXml)) !== null) {
+    const blockXml = blockMatch[1] || '';
+    const idMatch = blockXml.match(/<(?:[\w-]+:)?ID\b[^>]*>\s*(\d+)\s*<\/(?:[\w-]+:)?ID>/i);
+    const identityMatch = blockXml.match(/<(?:[\w-]+:)?UpdateIdentity\b([^>]*)\/?>/i);
+    if (!identityMatch) continue;
+    const identityAttrs = identityMatch[1] || '';
+    const updateId = xboxConfigAndIds.extractXmlAttr(identityAttrs, 'UpdateID');
+    const revisionNumber = xboxConfigAndIds.extractXmlAttr(identityAttrs, 'RevisionNumber');
+    if (updateId && revisionNumber) {
+      updatePairs.push({
+        intId: idMatch ? idMatch[1] : '',
+        updateId,
+        revisionNumber,
+      });
+    }
   }
   if (updatePairs.length === 0) return [];
 
@@ -6408,13 +6589,20 @@ async function resolveFe3DeliveryUrls(wuCategoryId, fetchImpl, signal = undefine
   const extXml = await extRes.text();
 
   const files = [];
-  const locRegex = /<FileLocation>[\s\S]*?<Url>([^<]+)<\/Url>[\s\S]*?<\/FileLocation>/gi;
+  const locBlockRegex = /<(?:[\w-]+:)?FileLocation\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?FileLocation>/gi;
   let lm;
-  while ((lm = locRegex.exec(extXml)) !== null) {
-    const rawUrl = lm[1].replace(/&amp;/g, '&').trim();
+  while ((lm = locBlockRegex.exec(extXml)) !== null) {
+    const locInner = lm[1] || '';
+    const urlMatch = locInner.match(/<(?:[\w-]+:)?Url\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?Url>/i);
+    if (!urlMatch) continue;
+    const rawUrl = xboxConfigAndIds.decodeXmlEntities(urlMatch[1] || '').trim();
     if (/^https?:\/\//i.test(rawUrl)) {
+      let fileName = 'package.msixvc';
+      try {
+        fileName = path.posix.basename(new URL(rawUrl).pathname) || 'package.msixvc';
+      } catch {}
       files.push({
-        fileName: path.posix.basename(new URL(rawUrl).pathname) || 'package.msixvc',
+        fileName,
         downloadUrls: [rawUrl],
         source: 'fe3_soap',
       });

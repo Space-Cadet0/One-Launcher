@@ -7,6 +7,8 @@ import type {
   MetadataSourceRoute,
   NativeGameBaselineSnapshot,
 } from '../../contracts/override';
+import type { UserMetadataOverride } from '../../types/electron';
+import { stripHtmlToPlainSynopsis } from '../common/synopsisTextUtils';
 
 export const STORAGE_KEY_USER_OVERRIDES = 'universal_game_library_user_overrides';
 export const STORAGE_KEY_HIDDEN_ENTRIES = 'universal_game_library_hidden_entries';
@@ -107,69 +109,66 @@ function toCompactHiddenRecord(entry: HiddenStorefrontEntry): CompactHiddenStore
   return compact;
 }
 
-/**
- * Strips any raw HTML tags, comments, BBCode, or entities from a short synopsis string,
- * returning clean plain text suitable for hero synopsis display.
- */
-function sanitizePlainSynopsis(rawText?: string, maxLength = 360): string {
-  if (!rawText || typeof rawText !== 'string') return '';
-  if (!/[<&]|\[\/?(?:b|i|u|url|quote|img)/i.test(rawText) && rawText.length <= maxLength) {
-    return rawText.trim();
-  }
-  const clean = rawText
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/product_(?:description|feature)_\d+/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(?:p|div|li|h[1-6]|tr|blockquote|section|article)>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\[\/?(?:b|i|u|url|quote|img|h[1-6]|list|code|spoiler|\*)[^\]]*\]/gi, '')
-    .replace(/&quot;/gi, '"')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&mdash;/gi, '—')
-    .replace(/&ndash;/gi, '–')
-    .replace(/&rsquo;|&lsquo;/gi, "'")
-    .replace(/&rdquo;|&ldquo;/gi, '"')
-    .replace(/&trade;/gi, '™')
-    .replace(/&reg;/gi, '®')
-    .replace(/&copy;/gi, '©')
-    .trim();
+const VALID_STOREFRONT_IDS: ReadonlySet<StorefrontId> = new Set([
+  'steam',
+  'gog',
+  'epic',
+  'xbox',
+  'custom',
+]);
 
-  if (!clean) return '';
-  const paragraphs = clean
-    .split(/\r?\n+/)
-    .map((p) =>
-      p
-        .replace(/^#{1,6}\s+/, '')
-        .replace(/\*\*(.+?)\*\*/g, '$1')
-        .replace(/\s+/g, ' ')
-        .trim()
-    )
-    .filter((p) => p.length > 0);
-  if (paragraphs.length === 0) return '';
+const VALID_MATCHED_STORES: ReadonlySet<UserGameOverride['matchedStore']> = new Set([
+  'steam',
+  'gog',
+  'epic',
+  'igdb',
+  'custom',
+]);
 
-  while (
-    paragraphs.length > 1 &&
-    ((paragraphs[0].length < 40 &&
-      /^(about(?:\s+the\s+game|\s+this\s+game)?|overview|story|description|features|synopsis|summary|key\s+features)\b[:.\s-]*$/i.test(
-        paragraphs[0]
-      )) ||
-      /when you buy this game\b|will be added to your gog\.com account/i.test(paragraphs[0]))
-  ) {
-    paragraphs.shift();
-  }
+function normalizeVaultUserOverride(
+  key: string,
+  rawOv: UserMetadataOverride
+): UserGameOverride | null {
+  const canonicalId =
+    typeof rawOv.gameId === 'string' && rawOv.gameId.trim()
+      ? rawOv.gameId.trim()
+      : !key.includes(':')
+      ? key.trim()
+      : '';
+  if (!canonicalId) return null;
 
-  let firstPara = paragraphs[0];
-  if (maxLength > 0 && firstPara.length > maxLength) {
-    const truncated = firstPara.substring(0, maxLength);
-    const lastSpace = truncated.lastIndexOf(' ');
-    firstPara =
-      (lastSpace > maxLength * 0.7 ? truncated.substring(0, lastSpace) : truncated).trim() + '...';
-  }
-  return firstPara.trim();
+  const {
+    platformId: rawPlatformId,
+    steamAppId: rawSteamAppId,
+    matchedStore: rawMatchedStore,
+    matchedId: rawMatchedId,
+    updatedAt: rawUpdatedAt,
+    ...rest
+  } = rawOv;
+
+  const platformId =
+    typeof rawPlatformId === 'string' &&
+    VALID_STOREFRONT_IDS.has(rawPlatformId as StorefrontId)
+      ? (rawPlatformId as StorefrontId)
+      : undefined;
+
+  const matchedStore: UserGameOverride['matchedStore'] =
+    typeof rawMatchedStore === 'string' &&
+    VALID_MATCHED_STORES.has(rawMatchedStore as UserGameOverride['matchedStore'])
+      ? (rawMatchedStore as UserGameOverride['matchedStore'])
+      : 'custom';
+
+  return {
+    ...rest,
+    gameId: canonicalId,
+    matchedStore,
+    ...(platformId !== undefined ? { platformId } : {}),
+    ...(typeof rawSteamAppId === 'number' || rawSteamAppId === null
+      ? { steamAppId: rawSteamAppId }
+      : {}),
+    ...(rawMatchedId !== undefined ? { matchedId: String(rawMatchedId) } : {}),
+    updatedAt: rawUpdatedAt || new Date(0).toISOString(),
+  };
 }
 
 /**
@@ -1174,7 +1173,7 @@ export function saveUserOverride(override: UserGameOverride, oldGame?: Canonical
       if (/<[a-z][\s\S]*>/i.test(updatedOverride.shortDescription) && !updatedOverride.detailedDescription) {
         updatedOverride.detailedDescription = updatedOverride.shortDescription;
       }
-      updatedOverride.shortDescription = sanitizePlainSynopsis(updatedOverride.shortDescription);
+      updatedOverride.shortDescription = stripHtmlToPlainSynopsis(updatedOverride.shortDescription, 360);
     }
     if (override.reviewScoreOverride !== undefined) {
       updatedOverride.reviewScoreOverride = override.reviewScoreOverride;
@@ -1752,6 +1751,13 @@ export function getUserOverrideForGame(
   return bestCandidate;
 }
 
+const QA_SANDBOX_ORG_RE = /^test\s+(?:developer|publisher)$/i;
+
+function hasQaSandboxOrganization(values?: string[] | null): boolean {
+  if (!Array.isArray(values)) return false;
+  return values.some((v) => QA_SANDBOX_ORG_RE.test(String(v || '').trim()));
+}
+
 /**
  * Updates the cached metadata snapshot on a routed UserGameOverride without overwriting
  * user-pinned custom fields (such as customTitleEdited, customSynopsisEdited, capsuleImage, or existing headerImage).
@@ -1761,6 +1767,9 @@ export function updateRoutedMetadataSnapshot(
   refreshed: Partial<UserGameOverride>
 ): void {
   if (!gameId || !refreshed) return;
+  if (hasQaSandboxOrganization(refreshed.developers) || hasQaSandboxOrganization(refreshed.publishers)) {
+    return;
+  }
   try {
     const current: UserGameOverridesMap = { ...loadUserOverrides() };
     const existing =
@@ -1778,7 +1787,7 @@ export function updateRoutedMetadataSnapshot(
       next.sortTitle = refreshed.title.replace(/^(The|A|An)\s+/i, '').trim();
     }
     if (!route.customSynopsisEdited && refreshed.shortDescription && refreshed.shortDescription.trim()) {
-      next.shortDescription = sanitizePlainSynopsis(refreshed.shortDescription);
+      next.shortDescription = stripHtmlToPlainSynopsis(refreshed.shortDescription, 360);
     }
     if (refreshed.detailedDescription && refreshed.detailedDescription.trim()) {
       next.detailedDescription = refreshed.detailedDescription;
@@ -1829,7 +1838,7 @@ export function updateRoutedMetadataSnapshot(
     ) {
       try {
         void window.electronAPI.offlineVault
-          .saveUserOverride(canonicalId, next as unknown as object)
+          .saveUserOverride(canonicalId, next)
           ?.catch?.(() => {});
       } catch {
         // Ignore non-fatal IPC errors during snapshot update
@@ -1922,7 +1931,14 @@ export function applyUserOverrideToGame(
     updated.iconUrl = override.iconUrl.trim();
   }
 
-  if (override.shortDescription !== undefined) {
+  const isPoisonedRoutedQaSnapshot =
+    Boolean(route && route.mode !== 'custom') &&
+    (hasQaSandboxOrganization(override.developers) || hasQaSandboxOrganization(override.publishers));
+
+  if (
+    override.shortDescription !== undefined &&
+    (!isPoisonedRoutedQaSnapshot || Boolean(route?.customSynopsisEdited))
+  ) {
     if (
       /<[a-z][\s\S]*>/i.test(override.shortDescription) &&
       override.detailedDescription === undefined &&
@@ -1930,25 +1946,25 @@ export function applyUserOverrideToGame(
     ) {
       updated.detailedDescription = override.shortDescription;
     }
-    updated.shortDescription = sanitizePlainSynopsis(override.shortDescription);
+    updated.shortDescription = stripHtmlToPlainSynopsis(override.shortDescription, 360);
   }
-  if (override.detailedDescription !== undefined) {
+  if (override.detailedDescription !== undefined && !isPoisonedRoutedQaSnapshot) {
     updated.detailedDescription = override.detailedDescription;
   }
 
-  if (Array.isArray(override.developers)) {
+  if (Array.isArray(override.developers) && !isPoisonedRoutedQaSnapshot) {
     updated.developers = [...override.developers];
   }
-  if (Array.isArray(override.publishers)) {
+  if (Array.isArray(override.publishers) && !isPoisonedRoutedQaSnapshot) {
     updated.publishers = [...override.publishers];
   }
-  if (Array.isArray(override.genres)) {
+  if (Array.isArray(override.genres) && !isPoisonedRoutedQaSnapshot) {
     updated.genres = [...override.genres];
   }
-  if (Array.isArray(override.tags)) {
+  if (Array.isArray(override.tags) && !isPoisonedRoutedQaSnapshot) {
     updated.tags = [...override.tags];
   }
-  if (override.releaseDate !== undefined) {
+  if (override.releaseDate !== undefined && !isPoisonedRoutedQaSnapshot) {
     updated.releaseDate = override.releaseDate;
   }
   if (override.reviewScoreOverride !== undefined) {
@@ -2111,23 +2127,14 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
       if (vaultRaw && typeof vaultRaw === 'object' && !Array.isArray(vaultRaw)) {
         for (const [key, rawOv] of Object.entries(vaultRaw)) {
           if (!rawOv || typeof rawOv !== 'object' || Array.isArray(rawOv)) continue;
-          const typedOv = rawOv as unknown as Partial<UserGameOverride>;
-          const canonicalId =
-            typeof typedOv.gameId === 'string' && typedOv.gameId.trim()
-              ? typedOv.gameId.trim()
-              : !key.includes(':')
-              ? key.trim()
-              : '';
-          if (!canonicalId) continue;
+          const normalizedOv = normalizeVaultUserOverride(key, rawOv);
+          if (!normalizedOv) continue;
+          const canonicalId = normalizedOv.gameId;
           const prev = canonicalVault[canonicalId];
           const prevTs = prev ? Date.parse(prev.updatedAt || '') || 0 : -1;
-          const curTs = Date.parse(typedOv.updatedAt || '') || 0;
+          const curTs = Date.parse(normalizedOv.updatedAt || '') || 0;
           if (!prev || curTs >= prevTs) {
-            canonicalVault[canonicalId] = {
-              ...(typedOv as UserGameOverride),
-              gameId: canonicalId,
-              updatedAt: typedOv.updatedAt || new Date(0).toISOString(),
-            };
+            canonicalVault[canonicalId] = normalizedOv;
           }
         }
       }
@@ -2227,22 +2234,19 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
       ) {
         try {
           const batchRes = await window.electronAPI.offlineVault.saveUserOverride({
-            batchOverrides: missingOrNewerForVault as unknown as Record<
-              string,
-              import('../../types/electron').UserMetadataOverride
-            >,
+            batchOverrides: missingOrNewerForVault,
           });
           if (!batchRes || batchRes.success === false) {
             for (const [id, ov] of Object.entries(missingOrNewerForVault)) {
               await window.electronAPI.offlineVault
-                .saveUserOverride(id, ov as unknown as object)
+                .saveUserOverride(id, ov)
                 ?.catch?.(() => {});
             }
           }
         } catch {
           for (const [id, ov] of Object.entries(missingOrNewerForVault)) {
             await window.electronAPI.offlineVault
-              .saveUserOverride(id, ov as unknown as object)
+              .saveUserOverride(id, ov)
               ?.catch?.(() => {});
           }
         }

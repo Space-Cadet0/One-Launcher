@@ -1012,8 +1012,9 @@ export class MetadataScraperService {
           }
         }
 
-        // Live GOG Catalog API search with raw query
-        const gogCatalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(rawQuery)}&limit=20&productType=in:game,pack`;
+        // Live GOG Catalog API search with GOG v1 `like:` filter syntax + 0-match recommendation guard
+        const cleanGogLike = rawQuery.replace(/^like:/i, '').trim();
+        const gogCatalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanGogLike}`)}&limit=20&productType=in:game,pack`;
         const gogRes = await requestScheduler.schedule(
           gogCatalogUrl,
           () =>
@@ -1028,10 +1029,30 @@ export class MetadataScraperService {
           'catalog.gog.com'
         );
         if (gogRes && gogRes.ok) {
-          const gogJson = await gogRes.json();
-          const products = Array.isArray(gogJson?.products) ? gogJson.products : [];
+          const gogJson = (await gogRes.json()) as {
+            productCount?: number;
+            products?: Array<{
+              id?: string | number;
+              title?: string;
+              slug?: string;
+              releaseDate?: string;
+              developers?: string[];
+              publishers?: string[];
+              coverVertical?: string;
+              coverHorizontal?: string;
+              storeLink?: string;
+            }>;
+          };
+          const hasZeroMatches =
+            typeof gogJson?.productCount === 'number' && gogJson.productCount <= 0;
+          const products =
+            !hasZeroMatches && Array.isArray(gogJson?.products) ? gogJson.products : [];
           for (const prod of products) {
             if (!prod?.id || !prod?.title) continue;
+            const orgs = [...(prod.developers || []), ...(prod.publishers || [])];
+            if (orgs.some((n) => /^test\s+(?:developer|publisher)$/i.test(String(n || '').trim()))) {
+              continue;
+            }
             if (isNonGameAddonTitle(prod.title, rawQuery)) continue;
             const sim = computeTitleSimilarity(rawQuery, prod.title);
             const titleKey = normalizeTitleKey(prod.title) || canonicalizeTitleKey(prod.title);

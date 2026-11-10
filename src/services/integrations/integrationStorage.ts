@@ -454,20 +454,18 @@ export function saveIntegrations(integrations: StorefrontIntegration[]): void {
         sessionApiKeysByStore.delete(integ.storefrontId);
       }
 
-      const copy: Record<string, unknown> = { ...integ };
+      const copy: StorefrontIntegration = { ...integ };
       for (const secretField of SENSITIVE_CREDENTIAL_FIELDS) {
-        delete copy[secretField];
+        Reflect.deleteProperty(copy, secretField);
       }
       if (copy.credentials && typeof copy.credentials === 'object') {
-        const creds: Record<string, unknown> = {
-          ...(copy.credentials as Record<string, unknown>),
-        };
+        const creds: StorefrontCredentials = { ...copy.credentials };
         for (const secretField of SENSITIVE_CREDENTIAL_FIELDS) {
-          delete creds[secretField];
+          Reflect.deleteProperty(creds, secretField);
         }
-        copy.credentials = creds as StorefrontCredentials;
+        copy.credentials = creds;
       }
-      return copy as unknown as StorefrontIntegration;
+      return copy;
     });
     localStorage.setItem(STORAGE_KEY_INTEGRATIONS, JSON.stringify(sanitized));
   } catch (err) {
@@ -480,6 +478,7 @@ export interface SaveCatalogOptions {
   skipSanitize?: boolean;
   dirtyGameIds?: ReadonlySet<string> | readonly string[];
   dirtyGames?: readonly CanonicalGame[];
+  removedGameIds?: ReadonlySet<string> | readonly string[];
 }
 
 const MODAL_CLOSE_FLUSH_DEBOUNCE_MS = 250;
@@ -494,10 +493,16 @@ let pendingCatalogNeedsSanitize = false;
 let pendingCatalogNeedsOverrides = false;
 let pendingIsFullCatalogSync = false;
 const pendingDirtyGameIds = new Set<string>();
+const pendingRemovedGameIds = new Set<string>();
 let pendingModalDeferStartedAt: number | null = null;
 
 function collectDirtyGameIdsFromOptions(options?: SaveCatalogOptions): string[] | null {
-  if (!options || (options.dirtyGameIds === undefined && options.dirtyGames === undefined)) {
+  if (
+    !options ||
+    (options.dirtyGameIds === undefined &&
+      options.dirtyGames === undefined &&
+      options.removedGameIds === undefined)
+  ) {
     return null;
   }
   const ids: string[] = [];
@@ -510,6 +515,15 @@ function collectDirtyGameIdsFromOptions(options?: SaveCatalogOptions): string[] 
     for (const g of options.dirtyGames) {
       if (g?.id) ids.push(g.id);
     }
+  }
+  return ids;
+}
+
+function collectRemovedGameIdsFromOptions(options?: SaveCatalogOptions): string[] {
+  if (!options?.removedGameIds) return [];
+  const ids: string[] = [];
+  for (const id of options.removedGameIds) {
+    if (typeof id === 'string' && id) ids.push(id);
   }
   return ids;
 }
@@ -653,11 +667,11 @@ function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
   const topMoviesLen = Array.isArray(legacyMedia.movies)
     ? legacyMedia.movies.length
     : 0;
-  const slim: Record<string, unknown> = { ...game };
-  delete slim.detailedDescription;
-  delete slim.aboutTheGame;
-  delete slim.screenshots;
-  delete slim.movies;
+  const slim: CanonicalGame = { ...game };
+  Reflect.deleteProperty(slim, 'detailedDescription');
+  Reflect.deleteProperty(slim, 'aboutTheGame');
+  Reflect.deleteProperty(slim, 'screenshots');
+  Reflect.deleteProperty(slim, 'movies');
   if (game.enrichedMetadata && typeof game.enrichedMetadata === 'object') {
     const prevMeta = game.enrichedMetadata;
     const hasScreenshotsCount = Array.isArray(prevMeta.screenshots)
@@ -666,32 +680,33 @@ function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame {
     const hasMoviesCount = Array.isArray(prevMeta.movies)
       ? prevMeta.movies.length
       : (prevMeta.hasMoviesCount ?? topMoviesLen);
-    const slimMeta: Record<string, unknown> = {
+    const slimMeta: NonNullable<CanonicalGame['enrichedMetadata']> & {
+      __quotaSlimmed?: boolean;
+    } = {
       ...prevMeta,
       __quotaSlimmed: true,
       hasScreenshotsCount,
       hasMoviesCount,
+      systemRequirements: {},
     };
-    delete slimMeta.detailedDescription;
-    delete slimMeta.aboutTheGame;
-    delete slimMeta.screenshots;
-    delete slimMeta.movies;
-    slimMeta.systemRequirements = {};
-    delete slimMeta.languageOptions;
-    delete slimMeta.supportedLanguages;
+    Reflect.deleteProperty(slimMeta, 'detailedDescription');
+    Reflect.deleteProperty(slimMeta, 'aboutTheGame');
+    Reflect.deleteProperty(slimMeta, 'screenshots');
+    Reflect.deleteProperty(slimMeta, 'movies');
+    Reflect.deleteProperty(slimMeta, 'languageOptions');
+    Reflect.deleteProperty(slimMeta, 'supportedLanguages');
     if (prevMeta.achievements && typeof prevMeta.achievements === 'object') {
       slimMeta.achievements = { total: prevMeta.achievements.total };
     }
-    delete slimMeta.pcRequirements;
-    delete slimMeta.pcRequirementsHtml;
-    delete slimMeta.macRequirements;
-    delete slimMeta.linuxRequirements;
+    Reflect.deleteProperty(slimMeta, 'pcRequirements');
+    Reflect.deleteProperty(slimMeta, 'pcRequirementsHtml');
+    Reflect.deleteProperty(slimMeta, 'macRequirements');
+    Reflect.deleteProperty(slimMeta, 'linuxRequirements');
     slim.enrichedMetadata = slimMeta;
   }
-  const finalSlim = slim as unknown as CanonicalGame;
-  slimmedGameWeakMemo.set(game, finalSlim);
-  slimmedGameWeakMemo.set(finalSlim, finalSlim);
-  return finalSlim;
+  slimmedGameWeakMemo.set(game, slim);
+  slimmedGameWeakMemo.set(slim, slim);
+  return slim;
 }
 
 const compactedGameWeakMemo = new WeakMap<CanonicalGame, CanonicalGame>();
@@ -933,7 +948,8 @@ function collectDroppedAndSelfHealedCatalogDelta(
 
 function writeCatalogToLocalStorage(
   cleaned: CanonicalGame[],
-  dirtyIds?: ReadonlySet<string> | null
+  dirtyIds?: ReadonlySet<string> | null,
+  removedIds?: ReadonlySet<string> | null
 ): void {
   const previousInMemory = inMemoryCatalogCache;
   const compacted = cleaned.map(compactGameForStorage);
@@ -967,6 +983,21 @@ function writeCatalogToLocalStorage(
       deleteOrphanedGamesFromOfflineVault(Array.from(removedIdSet));
     }
     lastPersistedVaultCatalogIds = nextIdSet;
+  } else if (removedIds && removedIds.size > 0) {
+    const nextIdSet = new Set<string>();
+    for (const g of compacted) {
+      if (g?.id) nextIdSet.add(g.id);
+    }
+    const confirmedRemoved: string[] = [];
+    for (const remId of removedIds) {
+      if (remId && !nextIdSet.has(remId)) {
+        confirmedRemoved.push(remId);
+        lastPersistedVaultCatalogIds?.delete(remId);
+      }
+    }
+    if (confirmedRemoved.length > 0) {
+      deleteOrphanedGamesFromOfflineVault(confirmedRemoved);
+    }
   }
 
   // Mirror catalog snapshot to Electron SQLite offlineVault when available (non-blocking).
@@ -1114,15 +1145,51 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
           vaultSnapIds.add(g.id);
           if (existingIdbIds && !existingIdbIds.has(g.id)) continue;
           const detailEntry = details[g.id];
+          const rawCritic = detailEntry?.criticScore;
           if (
-            detailEntry?.criticScore &&
-            typeof detailEntry.criticScore === 'object' &&
-            typeof (detailEntry.criticScore as { score?: unknown }).score === 'number'
+            rawCritic &&
+            typeof rawCritic === 'object' &&
+            typeof Reflect.get(rawCritic, 'score') === 'number'
           ) {
+            const cScore = Number(Reflect.get(rawCritic, 'score'));
+            const cSourceRaw = Reflect.get(rawCritic, 'source');
+            const cTierRaw = Reflect.get(rawCritic, 'tier');
+            const cNumRaw = Reflect.get(rawCritic, 'numReviews');
+            const cPercentRaw = Reflect.get(rawCritic, 'percentRecommended');
+            const cUrlRaw = Reflect.get(rawCritic, 'url');
+            const cSummaryRaw = Reflect.get(rawCritic, 'summary');
+            const cVerifiedRaw = Reflect.get(rawCritic, 'isVerified');
+            const cSyntheticRaw = Reflect.get(rawCritic, 'isSynthetic');
+            const fallbackTier: CriticScoreData['tier'] =
+              cScore >= 84 ? 'Mighty' : cScore >= 75 ? 'Strong' : cScore >= 66 ? 'Fair' : 'Weak';
+            const validTiers: ReadonlySet<CriticScoreData['tier']> = new Set([
+              'Mighty',
+              'Strong',
+              'Fair',
+              'Weak',
+            ]);
+            const vaultCriticData: CriticScoreData = {
+              score: cScore,
+              source:
+                typeof cSourceRaw === 'string'
+                  ? (cSourceRaw as CriticScoreData['source'])
+                  : 'metacritic',
+              tier:
+                typeof cTierRaw === 'string' &&
+                validTiers.has(cTierRaw as CriticScoreData['tier'])
+                  ? (cTierRaw as CriticScoreData['tier'])
+                  : fallbackTier,
+              ...(typeof cNumRaw === 'number' ? { numReviews: cNumRaw } : {}),
+              ...(typeof cPercentRaw === 'number' ? { percentRecommended: cPercentRaw } : {}),
+              url: typeof cUrlRaw === 'string' ? cUrlRaw : '',
+              ...(typeof cSummaryRaw === 'string' ? { summary: cSummaryRaw } : {}),
+              isVerified: typeof cVerifiedRaw === 'boolean' ? cVerifiedRaw : true,
+              ...(typeof cSyntheticRaw === 'boolean' ? { isSynthetic: cSyntheticRaw } : {}),
+            };
             criticScoreService.seedFromVaultIfMissing(
               g.steamAppId,
               g.title,
-              detailEntry.criticScore as unknown as CriticScoreData,
+              vaultCriticData,
               g.releaseDate,
               g.genres
             );
@@ -1249,11 +1316,16 @@ export function flushPendingCatalogSave(): void {
     try {
       let toWrite = pendingCatalogGames;
       const dirtySnapshot: ReadonlySet<string> | null =
-        !pendingIsFullCatalogSync && pendingDirtyGameIds.size > 0
+        !pendingIsFullCatalogSync &&
+        (pendingDirtyGameIds.size > 0 ||
+          pendingRemovedGameIds.size > 0 ||
+          pendingModalDeferStartedAt !== null)
           ? new Set<string>(pendingDirtyGameIds)
-          : !pendingIsFullCatalogSync && pendingModalDeferStartedAt !== null
-            ? new Set<string>()
-            : null;
+          : null;
+      const removedSnapshot: ReadonlySet<string> | null =
+        !pendingIsFullCatalogSync && pendingRemovedGameIds.size > 0
+          ? new Set<string>(pendingRemovedGameIds)
+          : null;
       if (pendingCatalogNeedsOverrides) {
         const userOverrides = loadUserOverrides();
         toWrite = applyUserOverridesToCatalog(toWrite, userOverrides);
@@ -1269,8 +1341,9 @@ export function flushPendingCatalogSave(): void {
       pendingCatalogNeedsOverrides = false;
       pendingIsFullCatalogSync = false;
       pendingDirtyGameIds.clear();
+      pendingRemovedGameIds.clear();
       pendingModalDeferStartedAt = null;
-      writeCatalogToLocalStorage(toWrite, dirtySnapshot);
+      writeCatalogToLocalStorage(toWrite, dirtySnapshot, removedSnapshot);
     } catch (err) {
       console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
     }
@@ -1442,6 +1515,7 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
   if (typeof window === 'undefined') return;
   try {
     const incomingDirtyIds = collectDirtyGameIdsFromOptions(options);
+    const incomingRemovedIds = collectRemovedGameIdsFromOptions(options);
     const isIncrementalCall = incomingDirtyIds !== null;
 
     if (!options?.immediate && !isTestEnv()) {
@@ -1465,10 +1539,16 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
       if (!isIncrementalCall) {
         pendingIsFullCatalogSync = true;
         pendingDirtyGameIds.clear();
+        pendingRemovedGameIds.clear();
         pendingModalDeferStartedAt = null;
       } else if (!pendingIsFullCatalogSync) {
         for (const id of incomingDirtyIds) {
           pendingDirtyGameIds.add(id);
+          pendingRemovedGameIds.delete(id);
+        }
+        for (const id of incomingRemovedIds) {
+          pendingRemovedGameIds.add(id);
+          pendingDirtyGameIds.delete(id);
         }
       }
 
@@ -1525,12 +1605,20 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     }
 
     let immediateDirtySnapshot: ReadonlySet<string> | null = null;
+    let immediateRemovedSnapshot: ReadonlySet<string> | null = null;
     if (isIncrementalCall && !pendingIsFullCatalogSync) {
       const mergedDirty = new Set<string>(pendingDirtyGameIds);
+      const mergedRemoved = new Set<string>(pendingRemovedGameIds);
       for (const id of incomingDirtyIds) {
         mergedDirty.add(id);
+        mergedRemoved.delete(id);
+      }
+      for (const id of incomingRemovedIds) {
+        mergedRemoved.add(id);
+        mergedDirty.delete(id);
       }
       immediateDirtySnapshot = mergedDirty;
+      immediateRemovedSnapshot = mergedRemoved.size > 0 ? mergedRemoved : null;
     }
 
     pendingCatalogGames = null;
@@ -1538,12 +1626,13 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     pendingCatalogNeedsOverrides = false;
     pendingIsFullCatalogSync = false;
     pendingDirtyGameIds.clear();
+    pendingRemovedGameIds.clear();
     pendingModalDeferStartedAt = null;
 
     const userOverrides = loadUserOverrides();
     const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
     const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
-    writeCatalogToLocalStorage(cleaned, immediateDirtySnapshot);
+    writeCatalogToLocalStorage(cleaned, immediateDirtySnapshot, immediateRemovedSnapshot);
   } catch (err) {
     console.error('Failed to save universal catalog', err);
   }
@@ -1565,6 +1654,7 @@ export function clearIntegrationStorage(): void {
   pendingCatalogNeedsOverrides = false;
   pendingIsFullCatalogSync = false;
   pendingDirtyGameIds.clear();
+  pendingRemovedGameIds.clear();
   pendingModalDeferStartedAt = null;
   inMemoryCatalogCache = null;
   inMemoryCatalogRawRef = null;

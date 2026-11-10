@@ -15,6 +15,7 @@ const {
 } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const { pathToFileURL } = require('node:url');
 const storeSync = require('./storeSync.cjs');
 const launcherEngine = require('./launcherEngine.cjs');
 const { createStorefrontLocalCacheFederator } = require('./launcher/storefrontLocalCacheFederator.cjs');
@@ -34,7 +35,22 @@ const {
 } = require('./ipc/offlineVaultIpcHandlers.cjs');
 const { compareSemver } = require('./utils/semverUtils.cjs');
 const { diagLog, flushSync: flushDiagnosticLogSync } = require('./utils/diagnosticLogger.cjs');
-const { isAllowedHttpsHost } = require('./launcher/securityAndPathUtils.cjs');
+const {
+  isAllowedHttpsHost,
+  resolveTrustedDevStartUrl,
+  isTrustedAppRendererUrl,
+  wrapIpcMainWithSenderCheck,
+  refreshHostWindowsKnownFoldersAsync,
+  discoverWindowsLocalDrivesAsync,
+  warmWindowsUserSidAsync,
+} = require('./launcher/securityAndPathUtils.cjs');
+const { refreshWindowsStorefrontRegistryCacheAsync } = require('./utils/windowsRegistryDiscovery.cjs');
+
+const SAFE_EXTERNAL_URI_SCHEME_RE =
+  /^(?:https?:\/\/|steam:\/\/|goggalaxy:\/\/|com\.epicgames\.launcher:\/\/|heroic:\/\/|msxbox:(?:\/\/|\S)|ms-windows-store:(?:\/\/|\S)|xbox:(?:\/\/|\S)|ms-xbl-[a-z0-9-]+:(?:\/\/|\S))/i;
+
+const DIST_INDEX_HTML_PATH = path.join(__dirname, '../dist/index.html');
+const EXPECTED_PACKAGED_FILE_HREF = pathToFileURL(DIST_INDEX_HTML_PATH).toString();
 
 // Register custom streaming media protocol (`ol-media://`) before `app.whenReady()`
 if (protocol && typeof protocol.registerSchemesAsPrivileged === 'function') {
@@ -154,7 +170,12 @@ const mediaHydrationEngine = createMediaHydrationEngine({
 
 if (typeof launcherEngine.setOfflineVaultLifecycleHooks === 'function') {
   launcherEngine.setOfflineVaultLifecycleHooks({
-    trimMemory: () => offlineVaultService.trimMemory(),
+    trimMemory: () => {
+      try {
+        storefrontFederator.trimMemory?.();
+      } catch {}
+      offlineVaultService.trimMemory();
+    },
     shutdown: () => {
       mediaHydrationEngine.shutdown();
       offlineVaultService.shutdown();
@@ -370,7 +391,10 @@ function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
   const launchMethod = String((sessionInfo && sessionInfo.launchMethod) || '');
   const exePath = String((sessionInfo && sessionInfo.executablePath) || '');
   const isBottledWindowsLaunch =
-    launchMethod === 'compat_layer' || /\.(exe|bat|cmd|msi)$/i.test(exePath);
+    launchMethod.startsWith('compatibility_layer') ||
+    launchMethod === 'compat_layer' ||
+    Boolean(sessionInfo && sessionInfo.isBottledSession) ||
+    /\.(exe|bat|cmd|msi)$/i.test(exePath);
   if (!isBottledWindowsLaunch) {
     return;
   }
@@ -407,7 +431,7 @@ function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
       }
       if (isActive && layer >= 25) {
         activeLayerTicks += 1;
-        if (activeLayerTicks >= 4) {
+        if (activeLayerTicks >= 3) {
           stopMacBottleFocusHelper();
           return;
         }
@@ -416,7 +440,7 @@ function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
       }
       if (isActive) {
         activeTicks += 1;
-        if (activeTicks >= 20) {
+        if (activeTicks >= 3) {
           stopMacBottleFocusHelper();
         }
       }
@@ -672,40 +696,94 @@ function createMainWindow() {
     );
   }
 
-  const distHtml = path.join(__dirname, '../dist/index.html');
-  if (app.isPackaged || process.env.NODE_ENV === 'production' || !process.env.ELECTRON_START_URL) {
-    if (fs.existsSync(distHtml)) {
-      mainWindow.loadFile(distHtml);
-    } else {
-      mainWindow.loadURL('http://localhost:3000').catch(() => {
-        setTimeout(() => {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.loadURL('http://localhost:3000').catch(() => {});
-          }
-        }, 1000);
-      });
+  const distHtml = DIST_INDEX_HTML_PATH;
+  const isPackagedBuild = Boolean(app?.isPackaged);
+  const devStartUrl = resolveTrustedDevStartUrl(process.env.ELECTRON_START_URL, isPackagedBuild);
+
+  // Strictly lock top-frame navigation & redirects to the trusted app origin; route safe external URIs to OS shell
+  const guardMainWindowNavigation = (
+    /** @type {any} */ event,
+    /** @type {unknown} */ targetUrl,
+    /** @type {boolean | undefined} */ isMainFrame
+  ) => {
+    const isTopFrame =
+      isMainFrame !== undefined
+        ? Boolean(isMainFrame)
+        : !event?.frame || event.frame === mainWindow?.webContents?.mainFrame;
+    if (!isTopFrame) {
+      return;
     }
-  } else {
-    mainWindow.loadURL('http://localhost:3000').catch(() => {
-      if (fs.existsSync(distHtml) && mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.loadFile(distHtml);
-      }
-    });
-  }
+    if (
+      isTrustedAppRendererUrl(targetUrl, {
+        isPackaged: isPackagedBuild,
+        allowedDevOrigin: devStartUrl,
+        expectedFileHref: EXPECTED_PACKAGED_FILE_HREF,
+      })
+    ) {
+      return;
+    }
+    event?.preventDefault?.();
+    if (
+      typeof targetUrl === 'string' &&
+      !/[\x00-\x1f\x7f]/.test(targetUrl) &&
+      SAFE_EXTERNAL_URI_SCHEME_RE.test(targetUrl.trim())
+    ) {
+      shell?.openExternal?.(targetUrl.trim());
+    }
+  };
+
+  mainWindow.webContents.on(
+    'will-navigate',
+    (/** @type {any} */ event, /** @type {string} */ targetUrl, /** @type {boolean} */ _isInPlace, /** @type {boolean} */ isMainFrame) => {
+      guardMainWindowNavigation(event, targetUrl, isMainFrame);
+    }
+  );
+  mainWindow.webContents.on(
+    'will-redirect',
+    (/** @type {any} */ event, /** @type {string} */ targetUrl, /** @type {boolean} */ _isInPlace, /** @type {boolean} */ isMainFrame) => {
+      guardMainWindowNavigation(event, targetUrl, isMainFrame);
+    }
+  );
 
   // Strictly deny arbitrary child popup windows; open external http(s) and storefront protocol links via OS shell
   mainWindow.webContents.setWindowOpenHandler((/** @type {any} */ { url }) => {
     if (
       typeof url === 'string' &&
       !/[\x00-\x1f\x7f]/.test(url) &&
-      /^(?:https?:\/\/|msxbox:(?:\/\/|\S)|ms-windows-store:(?:\/\/|\S)|xbox:(?:\/\/|\S)|ms-xbl-[a-z0-9-]+:(?:\/\/|\S))/i.test(
-        url.trim()
-      )
+      SAFE_EXTERNAL_URI_SCHEME_RE.test(url.trim())
     ) {
       shell?.openExternal?.(url.trim());
     }
     return { action: 'deny' };
   });
+
+  if (isPackagedBuild) {
+    // Production packaged builds MUST ONLY load bundled file:// assets — never fall back to localhost TCP ports
+    mainWindow.loadFile(distHtml).catch((err) => {
+      diagLog.error('main', 'Failed to load packaged dist/index.html', {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  } else if (process.env.NODE_ENV === 'production' || !devStartUrl) {
+    if (fs.existsSync(distHtml)) {
+      mainWindow.loadFile(distHtml);
+    } else if (process.env.NODE_ENV !== 'production') {
+      const fallbackDevUrl = 'http://localhost:3000';
+      mainWindow.loadURL(fallbackDevUrl).catch(() => {
+        setTimeout(() => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.loadURL(fallbackDevUrl).catch(() => {});
+          }
+        }, 1000);
+      });
+    }
+  } else {
+    mainWindow.loadURL(devStartUrl).catch(() => {
+      if (fs.existsSync(distHtml) && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.loadFile(distHtml);
+      }
+    });
+  }
 
   mainWindow.webContents.on('did-finish-load', () => {
     flushBufferedRendererEvents();
@@ -756,6 +834,13 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(() => {
+    if (process.platform === 'win32') {
+      void refreshWindowsStorefrontRegistryCacheAsync().catch(() => {});
+      void refreshHostWindowsKnownFoldersAsync().catch(() => {});
+      void discoverWindowsLocalDrivesAsync().catch(() => {});
+      void warmWindowsUserSidAsync().catch(() => {});
+    }
+
     if (protocol && typeof protocol.handle === 'function') {
       try {
         protocol.handle('ol-media', createOlMediaProtocolHandler({ offlineVaultService }));
@@ -813,9 +898,38 @@ if (!gotTheLock) {
       f.replace(/^\*:\/\/(\*\.)?/, '').replace(/\/\*$/, '')
     );
 
-    const corsRewriteHostPatterns = [...embedFilters, ...storeApiFilters].map((f) =>
+    const storeApiHostAllowlist = storeApiFilters.map((f) =>
       f.replace(/^\*:\/\/(\*\.)?/, '').replace(/\/\*$/, '')
     );
+
+    const isMainAppFrameInitiator = (/** @type {any} */ details) => {
+      if (
+        details?.frame &&
+        mainWindow &&
+        !mainWindow.isDestroyed() &&
+        mainWindow.webContents?.mainFrame &&
+        details.frame !== mainWindow.webContents.mainFrame
+      ) {
+        return false;
+      }
+      const initiator =
+        typeof details?.initiator === 'string' ? details.initiator.trim().toLowerCase() : '';
+      if (
+        !initiator ||
+        initiator === 'null' ||
+        initiator.startsWith('file://') ||
+        initiator.startsWith('ol-media://')
+      ) {
+        return true;
+      }
+      if (
+        !app?.isPackaged &&
+        /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/.test(initiator)
+      ) {
+        return true;
+      }
+      return false;
+    };
 
     const STANDARD_CHROME_UA =
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -847,7 +961,7 @@ if (!gotTheLock) {
           details.requestHeaders['Referer'] = 'https://www.gog.com/';
         }
 
-        if (isAllowedHttpsHost(url, ['store.steampowered.com'])) {
+        if (isAllowedHttpsHost(url, ['store.steampowered.com']) && isMainAppFrameInitiator(details)) {
           const existingCookie =
             details.requestHeaders['Cookie'] || details.requestHeaders['cookie'] || '';
           delete details.requestHeaders['cookie'];
@@ -870,7 +984,7 @@ if (!gotTheLock) {
           }
         }
 
-        if (isAllowedHttpsHost(url, ['lutris.net'])) {
+        if (isAllowedHttpsHost(url, ['lutris.net']) && isMainAppFrameInitiator(details)) {
           details.requestHeaders['User-Agent'] = STANDARD_CHROME_UA;
         }
 
@@ -893,13 +1007,13 @@ if (!gotTheLock) {
     ].join('; ');
 
     const APP_CSP_DEV = [
-      "default-src 'self' http://localhost:* ws://localhost:*",
-      "script-src 'self' 'unsafe-inline' http://localhost:*",
+      "default-src 'self' http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*",
+      "script-src 'self' 'unsafe-inline' http://localhost:* http://127.0.0.1:*",
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' data: https://fonts.gstatic.com",
       "img-src 'self' data: blob: ol-media: https:",
       "media-src 'self' data: blob: ol-media: https:",
-      "connect-src 'self' ol-media: https: http://localhost:* ws://localhost:*",
+      "connect-src 'self' ol-media: https: http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*",
       "frame-src https://www.youtube-nocookie.com https://www.youtube.com https://youtube.com https://youtube-nocookie.com https://*.wistia.net https://*.fast.wistia.net",
       "object-src 'none'",
       "base-uri 'self'",
@@ -934,11 +1048,22 @@ if (!gotTheLock) {
           return;
         }
 
-        if (isAllowedHttpsHost(url, corsRewriteHostPatterns)) {
+        // Allow embedded trailer subframes to render inside iframes without granting wildcard CORS
+        if (details.resourceType === 'subFrame' && isAllowedHttpsHost(url, embedHostAllowlist)) {
+          for (const key of Object.keys(responseHeaders)) {
+            if (key.toLowerCase() === 'x-frame-options') {
+              delete responseHeaders[key];
+            }
+          }
+          callback({ responseHeaders });
+          return;
+        }
+
+        // Only inject CORS headers on storefront/metadata APIs when initiated by the top-level app frame
+        if (isAllowedHttpsHost(url, storeApiHostAllowlist) && isMainAppFrameInitiator(details)) {
           for (const key of Object.keys(responseHeaders)) {
             const lowerKey = key.toLowerCase();
             if (
-              lowerKey === 'x-frame-options' ||
               lowerKey === 'access-control-allow-origin' ||
               lowerKey === 'access-control-allow-methods' ||
               lowerKey === 'access-control-allow-headers' ||
@@ -1012,18 +1137,26 @@ app.on('before-quit', (/** @type {any} */ event) => {
     event?.preventDefault?.();
     return;
   }
-  if (
-    !isQuittingAfterSync &&
+  const hasPostWork =
     typeof launcherEngine.hasActivePostSessionWork === 'function' &&
-    launcherEngine.hasActivePostSessionWork()
-  ) {
+    launcherEngine.hasActivePostSessionWork();
+  const hasActiveDownloads =
+    typeof launcherEngine.gracefulShutdownDownloads === 'function' &&
+    Array.isArray(launcherEngine.getDownloadQueue?.()) &&
+    launcherEngine.getDownloadQueue().some((/** @type {any} */ t) => t && t.status === 'downloading');
+
+  if (!isQuittingAfterSync && (hasPostWork || hasActiveDownloads)) {
     event?.preventDefault?.();
     isQuittingAfterSync = true;
     const waitPromise =
-      typeof launcherEngine.waitForActivePostSessionWork === 'function'
+      hasPostWork && typeof launcherEngine.waitForActivePostSessionWork === 'function'
         ? launcherEngine.waitForActivePostSessionWork(10000)
         : Promise.resolve();
-    shutdownInProgressPromise = Promise.resolve(waitPromise)
+    const downloadPromise =
+      hasActiveDownloads && typeof launcherEngine.gracefulShutdownDownloads === 'function'
+        ? launcherEngine.gracefulShutdownDownloads(3000)
+        : Promise.resolve();
+    shutdownInProgressPromise = Promise.allSettled([waitPromise, downloadPromise])
       .catch(() => {})
       .finally(() => {
         runSubsystemShutdownOnce();
@@ -1076,18 +1209,39 @@ app.on('window-all-closed', () => {
 // ============================================================================
 // Modularized Storefront, Launcher & Window IPC Handlers
 // ============================================================================
+const ipcSenderSecurityOptions = {
+  isPackaged: Boolean(app?.isPackaged),
+  allowedDevOrigin: resolveTrustedDevStartUrl(
+    process.env.ELECTRON_START_URL,
+    Boolean(app?.isPackaged)
+  ),
+  expectedFileHref: EXPECTED_PACKAGED_FILE_HREF,
+};
+
+const trustedIpcMain = wrapIpcMainWithSenderCheck(ipcMain, {
+  ...ipcSenderSecurityOptions,
+  getMainWindow: () => mainWindow,
+});
+
 const { trimStoreSyncIpcMemory } = registerStoreSyncIpcHandlers({
-  ipcMain,
+  ipcMain: trustedIpcMain,
   BrowserWindow,
   session,
   getMainWindow: () => mainWindow,
   storeSync,
   launcherEngine,
+  options: ipcSenderSecurityOptions,
 });
 
-registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainWindow: () => mainWindow });
+registerLauncherIpcHandlers({
+  ipcMain: trustedIpcMain,
+  launcherEngine,
+  dialog,
+  getMainWindow: () => mainWindow,
+  options: ipcSenderSecurityOptions,
+});
 
-ipcMain.handle(
+trustedIpcMain.handle(
   'launcher:toggle-session-fullscreen',
   async (/** @type {any} */ _event, /** @type {any} */ payload) => {
     if (typeof payload === 'string') {
@@ -1106,24 +1260,23 @@ ipcMain.handle(
 );
 
 registerWindowAndSystemIpcHandlers({
-  ipcMain,
+  ipcMain: trustedIpcMain,
   app,
   getMainWindow: () => mainWindow,
+  options: ipcSenderSecurityOptions,
 });
 
 registerOfflineVaultIpcHandlers({
-  ipcMain,
+  ipcMain: trustedIpcMain,
   offlineVaultService,
   mediaHydrationEngine,
   federator: storefrontFederator,
   getMainWindow: () => mainWindow,
   sendRendererEvent: sendOrBufferRendererEvent,
+  options: ipcSenderSecurityOptions,
 });
 
-const SAFE_EXTERNAL_URI_SCHEME_RE =
-  /^(?:https?:\/\/|steam:\/\/|goggalaxy:\/\/|com\.epicgames\.launcher:\/\/|heroic:\/\/|msxbox:(?:\/\/|\S)|ms-windows-store:(?:\/\/|\S)|xbox:(?:\/\/|\S)|ms-xbl-[a-z0-9-]+:(?:\/\/|\S))/i;
-
-ipcMain.handle('shell:open-external', async (/** @type {any} */ _event, /** @type {unknown} */ url) => {
+trustedIpcMain.handle('shell:open-external', async (/** @type {any} */ _event, /** @type {unknown} */ url) => {
   if (typeof url === 'string') {
     const trimmed = url.trim();
     if (
@@ -1138,9 +1291,12 @@ ipcMain.handle('shell:open-external', async (/** @type {any} */ _event, /** @typ
   return false;
 });
 
-ipcMain.handle('perf:trim-memory', async (/** @type {any} */ _event, /** @type {any} */ options) => {
+trustedIpcMain.handle('perf:trim-memory', async (/** @type {any} */ _event, /** @type {any} */ options) => {
   try {
     launcherEngine.trimLauncherEngineMemory?.();
+  } catch {}
+  try {
+    storefrontFederator.trimMemory?.();
   } catch {}
   try {
     offlineVaultService.trimMemory?.();
@@ -1171,7 +1327,7 @@ ipcMain.handle('perf:trim-memory', async (/** @type {any} */ _event, /** @type {
   return { success: true };
 });
 
-ipcMain.handle('app:get-version', () => {
+trustedIpcMain.handle('app:get-version', () => {
   try {
     return app.getVersion();
   } catch {
@@ -1179,7 +1335,7 @@ ipcMain.handle('app:get-version', () => {
   }
 });
 
-ipcMain.handle('app:get-info', () => {
+trustedIpcMain.handle('app:get-info', () => {
   let version = '0.2.5';
   try {
     version = app.getVersion();
@@ -1192,7 +1348,7 @@ ipcMain.handle('app:get-info', () => {
   };
 });
 
-ipcMain.handle('app:check-for-updates', async () => {
+trustedIpcMain.handle('app:check-for-updates', async () => {
   const rawRepoSlug = String(
     process.env.ONE_LAUNCHER_GITHUB_REPO || 'Space-Cadet0/One-Launcher'
   ).trim();

@@ -8,17 +8,15 @@ const {
   resolveIsolatedHomedirAndUserData,
   registerExternalCacheInvalidator,
 } = require('./engineStateRegistry.cjs');
+const {
+  discoverWindowsLocalDrivesAsync,
+  getKnownWindowsLocalDrivesSync,
+  getCachedWindowsLocalDrives,
+  clearCachedWindowsLocalDrives,
+} = require('./securityAndPathUtils.cjs');
 const { parseGamingRootFile } = require('./binaryAndManifestInspectors.cjs');
 
-const WIN_DRIVE_CACHE_TTL_MS = 10_000;
 const GAMING_SERVICES_CACHE_TTL_MS = 30_000;
-
-/** @type {{ timestamp: number, drives: string[] | null, inFlight: Promise<string[]> | null }} */
-let winLocalDrivesCache = {
-  timestamp: 0,
-  drives: null,
-  inFlight: null,
-};
 
 /** @type {{ timestamp: number, installed: boolean | null }} */
 let winGamingServicesCache = {
@@ -31,7 +29,7 @@ const MAC_VOLUME_CASE_CACHE_TTL_MS = 60_000;
 const macVolumeCaseSensitivityCache = new Map();
 
 registerExternalCacheInvalidator(() => {
-  winLocalDrivesCache = { timestamp: 0, drives: null, inFlight: null };
+  clearCachedWindowsLocalDrives();
   winGamingServicesCache = { timestamp: 0, installed: null };
   macVolumeCaseSensitivityCache.clear();
 });
@@ -39,161 +37,6 @@ registerExternalCacheInvalidator(() => {
 function normalizeWindowsDriveRoot(rawDrive) {
   const m = String(rawDrive || '').trim().match(/^([A-Za-z]):/);
   return m ? `${m[1].toUpperCase()}:\\` : '';
-}
-
-function parseLogicalDiskJsonOutput(stdout) {
-  /** @type {string[]} */
-  const roots = [];
-  const seen = new Set();
-  const addRoot = (/** @type {any} */ val) => {
-    const norm = normalizeWindowsDriveRoot(val);
-    if (norm && !seen.has(norm)) {
-      seen.add(norm);
-      roots.push(norm);
-    }
-  };
-
-  const trimmed = String(stdout || '').trim();
-  if (!trimmed) return roots;
-
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (typeof item === 'string') {
-          addRoot(item);
-        } else if (item && typeof item === 'object') {
-          addRoot(item.DeviceID || item.Name || item.Root);
-        }
-      }
-      return roots;
-    }
-    if (typeof parsed === 'string') {
-      addRoot(parsed);
-      return roots;
-    }
-    if (parsed && typeof parsed === 'object') {
-      addRoot(parsed.DeviceID || parsed.Name || parsed.Root);
-      return roots;
-    }
-  } catch {}
-
-  for (const line of trimmed.split(/\r?\n/)) {
-    addRoot(line);
-  }
-  return roots;
-}
-
-/**
- * Discover local fixed/removable Windows drives asynchronously (`DriveType=2 OR DriveType=3`),
- * cached for 10 seconds. Skips `DriveType=4` SMB network shares to avoid 21s TCP timeouts.
- */
-async function discoverWindowsLocalDrivesAsync(/** @type {any} */ options = {}) {
-  const platform = options.platform || process.platform;
-  if (platform !== 'win32') return [];
-
-  const sysDriveRoot =
-    normalizeWindowsDriveRoot(options.systemDrive || process.env.SystemDrive || 'C:') || 'C:\\';
-
-  if (Array.isArray(options.mountedDriveRoots)) {
-    const explicit = options.mountedDriveRoots
-      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
-      .filter(Boolean);
-    return explicit.length > 0 ? explicit : [sysDriveRoot];
-  }
-
-  const hasCustomExec =
-    typeof options.execFileFn === 'function' || typeof options.execFileImpl === 'function';
-
-  const now = Date.now();
-  if (
-    !hasCustomExec &&
-    !options.forceRefresh &&
-    winLocalDrivesCache.drives &&
-    now - winLocalDrivesCache.timestamp < WIN_DRIVE_CACHE_TTL_MS
-  ) {
-    return [...winLocalDrivesCache.drives];
-  }
-
-  if (!hasCustomExec && !options.forceRefresh && winLocalDrivesCache.inFlight) {
-    return winLocalDrivesCache.inFlight;
-  }
-
-  const execFileFn =
-    typeof options.execFileImpl === 'function'
-      ? options.execFileImpl
-      : typeof options.execFileFn === 'function'
-        ? options.execFileFn
-        : execFile;
-
-  // On non-Windows hosts running cross-OS unit tests without an execFile mock, return sysDriveRoot immediately.
-  if (process.platform !== 'win32' && !hasCustomExec) {
-    return [sysDriveRoot];
-  }
-
-  const psScript =
-    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-    'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | ' +
-    'Select-Object -ExpandProperty DeviceID | ConvertTo-Json -Compress';
-
-  const promise = new Promise((resolve) => {
-    try {
-      execFileFn(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', psScript],
-        { timeout: 4000, windowsHide: true },
-        (/** @type {any} */ err, /** @type {any} */ stdout) => {
-          const parsed = !err ? parseLogicalDiskJsonOutput(stdout) : [];
-          const result = parsed.length > 0 ? parsed : [sysDriveRoot];
-          if (!result.includes(sysDriveRoot)) {
-            result.unshift(sysDriveRoot);
-          }
-          if (!hasCustomExec) {
-            winLocalDrivesCache = {
-              timestamp: Date.now(),
-              drives: result,
-              inFlight: null,
-            };
-          }
-          resolve([...result]);
-        }
-      );
-    } catch {
-      if (!hasCustomExec) {
-        winLocalDrivesCache = {
-          timestamp: Date.now(),
-          drives: [sysDriveRoot],
-          inFlight: null,
-        };
-      }
-      resolve([sysDriveRoot]);
-    }
-  });
-
-  if (!hasCustomExec) {
-    winLocalDrivesCache.inFlight = promise;
-  }
-  return promise;
-}
-
-/**
- * Return cached local Windows drives without ever looping A:\..Z:\ synchronously.
- */
-function getCachedWindowsLocalDrives(/** @type {any} */ options = {}) {
-  const platform = options.platform || process.platform;
-  if (platform !== 'win32') return [];
-  const sysDriveRoot =
-    normalizeWindowsDriveRoot(options.systemDrive || process.env.SystemDrive || 'C:') || 'C:\\';
-  if (Array.isArray(options.mountedDriveRoots)) {
-    const explicit = options.mountedDriveRoots
-      .map((/** @type {any} */ d) => normalizeWindowsDriveRoot(d))
-      .filter(Boolean);
-    return explicit.length > 0 ? explicit : [sysDriveRoot];
-  }
-  if (winLocalDrivesCache.drives && winLocalDrivesCache.drives.length > 0) {
-    return [...winLocalDrivesCache.drives];
-  }
-  return [sysDriveRoot];
 }
 
 /**
@@ -248,11 +91,9 @@ function isExternalVolumeUnmounted(rawPath, /** @type {any} */ options = {}) {
       );
       return !normalizedMounted.includes(driveRoot);
     }
-    if (
-      winLocalDrivesCache.drives &&
-      Date.now() - winLocalDrivesCache.timestamp < WIN_DRIVE_CACHE_TTL_MS
-    ) {
-      return !winLocalDrivesCache.drives.includes(driveRoot);
+    const knownDrives = getKnownWindowsLocalDrivesSync();
+    if (knownDrives && knownDrives.length > 0) {
+      return !knownDrives.includes(driveRoot);
     }
     if (process.platform === 'win32') {
       try {
@@ -411,8 +252,9 @@ function hasWindowsGamingServicesInstalled(/** @type {any} */ options = {}) {
           addDrive(root);
         }
       } else if (!options.homedir && (process.platform === 'win32' || hasCustomExists)) {
-        if (winLocalDrivesCache.drives && winLocalDrivesCache.drives.length > 0) {
-          for (const cachedRoot of winLocalDrivesCache.drives) {
+        const knownDrives = getKnownWindowsLocalDrivesSync();
+        if (knownDrives && knownDrives.length > 0) {
+          for (const cachedRoot of knownDrives) {
             addDrive(cachedRoot);
           }
         } else {
@@ -520,7 +362,7 @@ function getDefaultInstallDir(platformId = 'custom', /** @type {any} */ options 
       if (
         process.platform === 'win32' &&
         !Array.isArray(options.mountedDriveRoots) &&
-        !winLocalDrivesCache.drives
+        !getKnownWindowsLocalDrivesSync()
       ) {
         for (let code = 67; code <= 90; code++) {
           const driveRoot = `${String.fromCharCode(code)}:\\`;

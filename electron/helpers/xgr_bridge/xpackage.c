@@ -410,26 +410,65 @@ static void WINAPI xp_XPackageCloseMountHandle(void *iface, XPackageMountHandle 
     if (InterlockedDecrement(&mount->ref) == 0) free(mount);
 }
 
-static HRESULT WINAPI xp_XPackageGetIdentifierLegacy(void *iface, const char *storeId, SIZE_T size, char *identifier)
+bool xgr_package_find_identifier_by_store_id(const char *store_id, char *out_id, size_t cap)
 {
-    (void)iface;
-    if (!storeId || !identifier) return E_INVALIDARG;
-    if (size < XGR_PACKAGE_IDENTIFIER_MAX_LEN) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-
+    if (!store_id || !store_id[0] || !out_id || cap == 0) return false;
     xgr_ensure_session_metadata_loaded();
     struct xgr_dlc_package_entry dlcs[XGR_MAX_DLC_PACKAGES];
     uint32_t dlc_count = xgr_copy_dlc_packages(dlcs, XGR_MAX_DLC_PACKAGES);
     for (uint32_t i = 0; i < dlc_count; i++) {
-        if (dlcs[i].store_id[0] && _stricmp(storeId, dlcs[i].store_id) == 0 && dlcs[i].id[0]) {
-            snprintf(identifier, size, "%s", dlcs[i].id);
-            return S_OK;
+        if (dlcs[i].store_id[0] && _stricmp(store_id, dlcs[i].store_id) == 0 && dlcs[i].id[0]) {
+            snprintf(out_id, cap, "%s", dlcs[i].id);
+            return true;
         }
+    }
+    struct xgr_runtime_config_snapshot cfg;
+    xgr_copy_runtime_config_snapshot(&cfg);
+    if (cfg.storeId[0] && _stricmp(store_id, cfg.storeId) == 0 && cfg.packageIdentifier[0]) {
+        snprintf(out_id, cap, "%s", cfg.packageIdentifier);
+        return true;
+    }
+    return false;
+}
+
+bool xgr_package_find_store_id_by_identifier(const char *pkg_id, char *out_store_id, size_t cap)
+{
+    if (!pkg_id || !pkg_id[0] || !out_store_id || cap == 0) return false;
+    xgr_ensure_session_metadata_loaded();
+    struct xgr_dlc_package_entry dlcs[XGR_MAX_DLC_PACKAGES];
+    uint32_t dlc_count = xgr_copy_dlc_packages(dlcs, XGR_MAX_DLC_PACKAGES);
+    for (uint32_t i = 0; i < dlc_count; i++) {
+        if (dlcs[i].id[0] && _stricmp(pkg_id, dlcs[i].id) == 0 && dlcs[i].store_id[0]) {
+            snprintf(out_store_id, cap, "%s", dlcs[i].store_id);
+            return true;
+        }
+    }
+    struct xgr_runtime_config_snapshot cfg;
+    xgr_copy_runtime_config_snapshot(&cfg);
+    if (cfg.packageIdentifier[0] && _stricmp(pkg_id, cfg.packageIdentifier) == 0 && cfg.storeId[0]) {
+        snprintf(out_store_id, cap, "%s", cfg.storeId);
+        return true;
+    }
+    return false;
+}
+
+static HRESULT WINAPI xp_XPackageGetIdentifierLegacy(void *iface, const char *storeId, SIZE_T size, char *identifier)
+{
+    (void)iface;
+    if (!storeId || !storeId[0] || !identifier) return E_INVALIDARG;
+    if (size < XGR_PACKAGE_IDENTIFIER_MAX_LEN) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+
+    if (xgr_package_find_identifier_by_store_id(storeId, identifier, size)) {
+        return S_OK;
     }
 
     struct xgr_runtime_config_snapshot cfg;
     xgr_copy_runtime_config_snapshot(&cfg);
-    snprintf(identifier, size, "%s", cfg.packageIdentifier);
-    return S_OK;
+    if (!cfg.storeId[0] && cfg.packageIdentifier[0]) {
+        snprintf(identifier, size, "%s", cfg.packageIdentifier);
+        return S_OK;
+    }
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 }
 
 static HRESULT WINAPI xp_XPackageGetWriteStats(void *iface, XPackageWriteStats *stats)

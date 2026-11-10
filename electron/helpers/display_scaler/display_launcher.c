@@ -779,6 +779,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ExitProcess(DS_LAUNCH_ERR_INVALID_ARGS);
     }
 
+    /* Auto-discover sibling DLLs from own directory when omitted on CLI */
+    {
+        WCHAR self_exe[MAX_PATH] = { 0 };
+        if (GetModuleFileNameW(NULL, self_exe, MAX_PATH - 1) > 0) {
+            WCHAR *last_sep = NULL;
+            for (WCHAR *p = self_exe; *p; p++) {
+                if (*p == L'\\' || *p == L'/') last_sep = p;
+            }
+            if (last_sep) {
+                *last_sep = L'\0';
+                if (!dll_x86 || !dll_x86[0]) {
+                    WCHAR cand[MAX_PATH];
+                    _snwprintf(cand, MAX_PATH - 1, L"%ls\\one_display_scaler_x86.dll", self_exe);
+                    cand[MAX_PATH - 1] = L'\0';
+                    if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+                        if (dll_x86) HeapFree(heap, 0, dll_x86);
+                        dll_x86 = dup_wstr_heap(cand);
+                    }
+                }
+                if (!dll_x64 || !dll_x64[0]) {
+                    WCHAR cand[MAX_PATH];
+                    _snwprintf(cand, MAX_PATH - 1, L"%ls\\one_display_scaler_x64.dll", self_exe);
+                    cand[MAX_PATH - 1] = L'\0';
+                    if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+                        if (dll_x64) HeapFree(heap, 0, dll_x64);
+                        dll_x64 = dup_wstr_heap(cand);
+                    }
+                }
+            }
+        }
+    }
+
     export_propagation_env(dll_x86, dll_x64);
 
     /* Mode 2: --inject-pid <pid> [--tid <tid>] --dll <dllPath> */
@@ -786,15 +818,72 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DWORD pid = (DWORD)wcstoul(inject_pid_str, NULL, 10);
         DWORD tid = (inject_tid_str && inject_tid_str[0] != L'\0') ? (DWORD)wcstoul(inject_tid_str, NULL, 10) : 0;
         if (pid == 0) ExitProcess(DS_LAUNCH_ERR_INVALID_ARGS);
-        if (tid != 0 && dll_single && dll_single[0] && read_pe_machine_w(dll_single) == DS_SELF_MACHINE) {
+        if (tid != 0) {
+            /*
+             * Suspended child APC injection (`--tid != 0`):
+             * NEVER fall through to `CreateRemoteThread` (`inject_pid_dispatch`) on a
+             * `CREATE_SUSPENDED` process whose `LdrInitializeThunk` has not yet run.
+             */
+            WCHAR proc_img[MAX_PATH] = { 0 };
+            HANDLE hp_q = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (hp_q) {
+                DWORD sz = MAX_PATH;
+                QueryFullProcessImageNameW(hp_q, 0, proc_img, &sz);
+                CloseHandle(hp_q);
+            }
+            uint16_t child_mach = read_pe_machine_w(proc_img);
+            if (child_mach == 0 && dll_single && dll_single[0]) {
+                child_mach = read_pe_machine_w(dll_single);
+            }
+            if (child_mach == 0) {
+                child_mach = DS_SELF_MACHINE;
+            }
+            const WCHAR *chosen_dll = (dll_single && dll_single[0])
+                ? dll_single
+                : ((child_mach == 0x014cu) ? dll_x86 : dll_x64);
+            if (!chosen_dll || !chosen_dll[0]) {
+                ExitProcess(DS_LAUNCH_ERR_APC_INJECT);
+            }
+            if (child_mach != DS_SELF_MACHINE) {
+                WCHAR sib_exe[MAX_PATH];
+                if (!resolve_sibling_launcher_exe(child_mach, sib_exe, MAX_PATH)) {
+                    ExitProcess(DS_LAUNCH_ERR_APC_INJECT);
+                }
+                WCHAR cmd[MAX_PATH * 3];
+                _snwprintf(
+                    cmd,
+                    (sizeof(cmd) / sizeof(WCHAR)) - 1,
+                    L"\"%ls\" --inject-pid %lu --tid %lu --dll \"%ls\"",
+                    sib_exe,
+                    (unsigned long)pid,
+                    (unsigned long)tid,
+                    chosen_dll
+                );
+                cmd[(sizeof(cmd) / sizeof(WCHAR)) - 1] = L'\0';
+                STARTUPINFOW si_apc;
+                PROCESS_INFORMATION pi_apc;
+                memset(&si_apc, 0, sizeof(si_apc));
+                memset(&pi_apc, 0, sizeof(pi_apc));
+                si_apc.cb = sizeof(si_apc);
+                if (!CreateProcessW(sib_exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si_apc, &pi_apc)) {
+                    ExitProcess(DS_LAUNCH_ERR_APC_INJECT);
+                }
+                WaitForSingleObject(pi_apc.hProcess, 5000);
+                DWORD apc_exit = 1;
+                GetExitCodeProcess(pi_apc.hProcess, &apc_exit);
+                CloseHandle(pi_apc.hThread);
+                CloseHandle(pi_apc.hProcess);
+                ExitProcess(apc_exit == 0 ? 0u : DS_LAUNCH_ERR_APC_INJECT);
+            }
+
             HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
             HANDLE ht = OpenThread(THREAD_SET_CONTEXT, FALSE, tid);
             HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
             FARPROC pLLW = hK32 ? GetProcAddress(hK32, "LoadLibraryW") : NULL;
-            bool apc_ok = (hp && ht && pLLW) ? queue_apc_dll_load(hp, ht, pLLW, dll_single) : false;
+            bool apc_ok = (hp && ht && pLLW) ? queue_apc_dll_load(hp, ht, pLLW, chosen_dll) : false;
             if (ht) CloseHandle(ht);
             if (hp) CloseHandle(hp);
-            if (apc_ok) ExitProcess(0u);
+            ExitProcess(apc_ok ? 0u : DS_LAUNCH_ERR_APC_INJECT);
         }
         bool ok = inject_pid_dispatch(pid, dll_single, dll_x86, dll_x64);
         ExitProcess(ok ? 0u : DS_LAUNCH_ERR_REMOTE_INJECT);
@@ -825,7 +914,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     uint16_t target_machine = read_pe_machine_w(target_exe_path);
     if (target_machine == 0) target_machine = DS_SELF_MACHINE;
 
-    /* Opposite bitness: chain transparently to matching sibling launcher */
+    /* Opposite bitness: chain transparently to matching sibling launcher with Job supervision */
     if (target_machine != DS_SELF_MACHINE) {
         WCHAR sib_exe[MAX_PATH];
         if (!resolve_sibling_launcher_exe(target_machine, sib_exe, MAX_PATH)) {
@@ -844,18 +933,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         s_si.cb = sizeof(s_si);
 
         BOOL chained = CreateProcessW(
-            sib_exe, sib_cmd, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &s_si, &s_pi
+            sib_exe, sib_cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &s_si, &s_pi
         );
         HeapFree(heap, 0, sib_cmd);
         if (!chained) {
             DWORD err = GetLastError();
             ExitProcess(err != 0 ? (UINT)err : DS_LAUNCH_ERR_CREATE_PROCESS);
         }
+
+        HANDLE sib_job = CreateJobObjectW(NULL, NULL);
+        if (sib_job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli_s;
+            memset(&jeli_s, 0, sizeof(jeli_s));
+            jeli_s.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            if (!SetInformationJobObject(sib_job, JobObjectExtendedLimitInformation, &jeli_s, sizeof(jeli_s)) ||
+                !AssignProcessToJobObject(sib_job, s_pi.hProcess)) {
+                CloseHandle(sib_job);
+                sib_job = NULL;
+            }
+        }
+        if (ResumeThread(s_pi.hThread) == (DWORD)-1) {
+            TerminateProcess(s_pi.hProcess, DS_LAUNCH_ERR_RESUME_THREAD);
+            CloseHandle(s_pi.hThread);
+            CloseHandle(s_pi.hProcess);
+            if (sib_job) CloseHandle(sib_job);
+            ExitProcess(DS_LAUNCH_ERR_RESUME_THREAD);
+        }
+
         WaitForSingleObject(s_pi.hProcess, INFINITE);
         DWORD sib_exit = 0;
         if (!GetExitCodeProcess(s_pi.hProcess, &sib_exit)) sib_exit = 1;
         CloseHandle(s_pi.hThread);
         CloseHandle(s_pi.hProcess);
+        if (sib_job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli_clear;
+            memset(&jeli_clear, 0, sizeof(jeli_clear));
+            jeli_clear.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            SetInformationJobObject(sib_job, JobObjectExtendedLimitInformation, &jeli_clear, sizeof(jeli_clear));
+            CloseHandle(sib_job);
+        }
         ExitProcess((UINT)sib_exit);
     }
 

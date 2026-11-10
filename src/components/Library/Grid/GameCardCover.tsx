@@ -400,6 +400,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           src={currentSrc}
           alt={game.title}
           loading={isAboveFold ? 'eager' : 'lazy'}
+          fetchPriority={cardIndex === 0 ? 'high' : undefined}
           decoding="async"
           onLoad={(e) => {
             const { naturalWidth, naturalHeight } = e.currentTarget;
@@ -423,14 +424,11 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
                   (c) => !failedCoverUrls.has(c) && c.includes(`/apps/${m[1]}/library_600x900`)
                 );
                 if (!hasRemainingUnhashedSteam && onlineLifecycleManager.isOnline()) {
-                  const coverSvc = igdbCoverService as unknown as {
-                    verifyAndRecordDeadSteamCover?: (
-                      appId: number,
-                      failedUrl?: string
-                    ) => unknown;
-                  };
-                  if (typeof coverSvc.verifyAndRecordDeadSteamCover === 'function') {
-                    void coverSvc.verifyAndRecordDeadSteamCover(appIdNum, unwrappedCurrentSrc);
+                  if (typeof igdbCoverService.verifyAndRecordDeadSteamCover === 'function') {
+                    void igdbCoverService.verifyAndRecordDeadSteamCover(
+                      appIdNum,
+                      unwrappedCurrentSrc
+                    );
                   } else {
                     igdbCoverService.recordDeadSteamCover(appIdNum);
                   }

@@ -115,7 +115,7 @@ interface EnrichedSteamCriticCacheEntry {
   };
 }
 
-const STEAM_ENRICHED_CRITIC_MAP = steamEnrichedCache as unknown as Record<string, EnrichedSteamCriticCacheEntry>;
+const STEAM_ENRICHED_CRITIC_MAP: Record<string, EnrichedSteamCriticCacheEntry> = steamEnrichedCache;
 
 const OPENCRITIC_PUBLIC_HEADERS: Record<string, string> = {
   Accept: 'application/json',

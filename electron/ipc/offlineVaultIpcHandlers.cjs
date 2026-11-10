@@ -10,23 +10,94 @@ const {
   atomicWriteFileSync,
   resolveEffectiveUserDataDir,
   toHostFilesystemPath,
+  wrapIpcMainWithSenderCheck,
 } = require('../launcher/securityAndPathUtils.cjs');
 
 /**
- * Creates the `ol-media://` custom streaming protocol handler backed by `OfflineVaultService`.
- * Enforces `assertSafePublicHttpsUrl` SSRF/DNS-rebinding protection on remote fallback URLs
- * and omits `Access-Control-Allow-Origin: *` so cross-origin embedded frames cannot read vault media.
- *
- * @param {{ offlineVaultService: any, dnsLookup?: any }} deps
+ * Case-insensitively extract a header value from a Fetch `Request` or mock request object.
+ * @param {any} request
+ * @param {string} headerName
+ * @returns {string}
  */
-function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
+function getRequestHeaderValue(request, headerName) {
+  const hdrs = request?.headers;
+  if (!hdrs) return '';
+  if (typeof hdrs.get === 'function') {
+    const val = hdrs.get(headerName);
+    return typeof val === 'string' ? val.trim() : '';
+  }
+  if (typeof hdrs === 'object') {
+    const target = headerName.toLowerCase();
+    for (const [k, v] of Object.entries(hdrs)) {
+      if (k.toLowerCase() === target && typeof v === 'string') {
+        return v.trim();
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Determine whether an `ol-media://` request originates from a cross-site embedded frame.
+ * @param {any} request
+ * @returns {boolean}
+ */
+function isUntrustedCrossSiteMediaRequest(request) {
+  const secFetchSite = getRequestHeaderValue(request, 'sec-fetch-site').toLowerCase();
+  if (secFetchSite === 'cross-site') {
+    return true;
+  }
+  const originHeader = getRequestHeaderValue(request, 'origin');
+  if (originHeader && /^https?:\/\//i.test(originHeader)) {
+    try {
+      const parsedOrigin = new URL(originHeader);
+      const host = String(parsedOrigin.hostname || '')
+        .replace(/^\[|\]$/g, '')
+        .toLowerCase();
+      if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+        return true;
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+const OL_MEDIA_BASE_SECURITY_HEADERS = Object.freeze({
+  'Cross-Origin-Resource-Policy': 'same-origin',
+});
+
+/**
+ * Creates the `ol-media://` custom streaming protocol handler backed by `OfflineVaultService`.
+ * Enforces `assertSafePublicHttpsUrl` SSRF/DNS-rebinding protection on remote fallback URLs,
+ * sets `Cross-Origin-Resource-Policy: same-origin`, and rejects cross-site subframe requests.
+ *
+ * @param {{ offlineVaultService?: any, getOfflineVault?: () => any, dnsLookup?: any }} deps
+ */
+function createOlMediaProtocolHandler({ offlineVaultService, getOfflineVault, dnsLookup }) {
   return async function handleOlMediaRequest(/** @type {any} */ request) {
     try {
+      const activeVault =
+        typeof getOfflineVault === 'function' ? getOfflineVault() : offlineVaultService;
       const rawReqUrl = String(request?.url || '');
       if (!rawReqUrl.startsWith('ol-media://')) {
         return new Response(null, {
           status: 400,
-          headers: { 'Cache-Control': 'no-store' },
+          headers: {
+            ...OL_MEDIA_BASE_SECURITY_HEADERS,
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+
+      if (isUntrustedCrossSiteMediaRequest(request)) {
+        return new Response(null, {
+          status: 403,
+          headers: {
+            ...OL_MEDIA_BASE_SECURITY_HEADERS,
+            'Cache-Control': 'no-store',
+          },
         });
       }
 
@@ -47,6 +118,7 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
         xboxTitleId: sp.get('xboxTitleId') || sp.get('xtid') || '',
       };
 
+      let localCacheOnly = false;
       if (params.url) {
         try {
           await assertSafePublicHttpsUrl(
@@ -55,20 +127,35 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
           );
         } catch (urlErr) {
           const anyErr = /** @type {any} */ (urlErr);
-          if (!anyErr?.isDnsUnavailable || typeof dnsLookup === 'function') {
+          if (!anyErr?.isDnsUnavailable) {
             return new Response(null, {
               status: 403,
-              headers: { 'Cache-Control': 'no-store' },
+              headers: {
+                ...OL_MEDIA_BASE_SECURITY_HEADERS,
+                'Cache-Control': 'no-store',
+              },
             });
           }
           // OS DNS is offline or domain is unresolvable (and already verified as `https:` with a
-          // public multi-label hostname and zero private IP literals): delegate to `offlineVaultService`
-          // so local SQLite/disk blobs and injected offline/test fetch handlers work seamlessly.
+          // public multi-label hostname and zero private IP literals): serve strictly from local
+          // SQLite/disk/federator cache unless an explicit test `fetchImpl` was injected.
+          localCacheOnly = !activeVault?.hasCustomFetchImpl;
         }
       }
 
-      const resolved = await offlineVaultService.resolveMediaRequest(params, {
+      if (!activeVault || typeof activeVault.resolveMediaRequest !== 'function') {
+        return new Response(null, {
+          status: 503,
+          headers: {
+            ...OL_MEDIA_BASE_SECURITY_HEADERS,
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+
+      const resolved = await activeVault.resolveMediaRequest(params, {
         signal: request?.signal,
+        ...(localCacheOnly ? { localCacheOnly: true } : {}),
       });
 
       if (!resolved || resolved.kind === 'error') {
@@ -79,6 +166,7 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
         return new Response(null, {
           status,
           headers: {
+            ...OL_MEDIA_BASE_SECURITY_HEADERS,
             'Cache-Control': 'no-store',
           },
         });
@@ -88,6 +176,7 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
         return new Response(/** @type {any} */ (resolved.buffer), {
           status: 200,
           headers: {
+            ...OL_MEDIA_BASE_SECURITY_HEADERS,
             'Content-Type': resolved.mimeType || 'image/jpeg',
             'Content-Length': String(resolved.buffer.length),
             'Cache-Control': resolved.cacheControl || 'public, max-age=31536000, immutable',
@@ -105,7 +194,10 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
         if (request?.signal) {
           if (request.signal.aborted) {
             nodeStream.destroy();
-            return new Response(null, { status: 499 });
+            return new Response(null, {
+              status: 499,
+              headers: { ...OL_MEDIA_BASE_SECURITY_HEADERS },
+            });
           }
           request.signal.addEventListener(
             'abort',
@@ -121,6 +213,7 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
         const webStream = Readable.toWeb(nodeStream);
         /** @type {Record<string, string>} */
         const headers = {
+          ...OL_MEDIA_BASE_SECURITY_HEADERS,
           'Content-Type': resolved.mimeType || 'image/jpeg',
           'Cache-Control': resolved.cacheControl || 'public, max-age=31536000, immutable',
         };
@@ -135,12 +228,18 @@ function createOlMediaProtocolHandler({ offlineVaultService, dnsLookup }) {
 
       return new Response(null, {
         status: 404,
-        headers: { 'Cache-Control': 'no-store' },
+        headers: {
+          ...OL_MEDIA_BASE_SECURITY_HEADERS,
+          'Cache-Control': 'no-store',
+        },
       });
     } catch {
       return new Response(null, {
         status: 500,
-        headers: { 'Cache-Control': 'no-store' },
+        headers: {
+          ...OL_MEDIA_BASE_SECURITY_HEADERS,
+          'Cache-Control': 'no-store',
+        },
       });
     }
   };
@@ -519,10 +618,11 @@ function writeUserOverridesToDiskAsync(filePath, nextOverrides, updatedAt) {
  *   sendRendererEvent?: (channel: string, payload: any) => void,
  *   userDataDir?: string,
  *   dnsLookup?: any,
+ *   options?: Record<string, any>,
  * }} deps
  */
 function registerOfflineVaultIpcHandlers({
-  ipcMain,
+  ipcMain: rawIpcMain,
   offlineVaultService,
   mediaHydrationEngine,
   federator,
@@ -530,10 +630,17 @@ function registerOfflineVaultIpcHandlers({
   sendRendererEvent,
   userDataDir,
   dnsLookup,
+  options: handlerOptions = {},
 }) {
-  if (!ipcMain || !offlineVaultService) {
+  if (!rawIpcMain || !offlineVaultService) {
     return { dispose: () => {} };
   }
+  const ipcMain = wrapIpcMainWithSenderCheck(rawIpcMain, {
+    getMainWindow,
+    isPackaged: Boolean(handlerOptions.isPackaged),
+    allowedDevOrigin: handlerOptions.allowedDevOrigin || null,
+    expectedFileHref: handlerOptions.expectedFileHref || null,
+  });
 
   const sendToRenderer = (/** @type {string} */ channel, /** @type {any} */ payload) => {
     if (typeof sendRendererEvent === 'function') {
@@ -722,12 +829,20 @@ function registerOfflineVaultIpcHandlers({
           error: anyErr?.message || 'Blocked unsafe URL',
         };
       }
+      if (!offlineVaultService?.hasCustomFetchImpl) {
+        return {
+          online: false,
+          status: null,
+          isDefinitive404: false,
+          isWafOrRateLimited: false,
+          error: anyErr?.message || 'DNS unavailable',
+        };
+      }
     }
     return await offlineVaultService.checkUrlStatus(urlStr);
   };
 
   ipcMain.handle('offlineVault:check-url-status', handleCheckUrlStatus);
-  ipcMain.handle('vault:check-url-status', handleCheckUrlStatus);
 
   // Durable User Metadata & Artwork Overrides (`userData/user_overrides.json`)
   const handleGetUserOverrides = async () => {
@@ -1142,9 +1257,6 @@ function registerOfflineVaultIpcHandlers({
   ipcMain.handle('offlineVault:get-user-overrides', handleGetUserOverrides);
   ipcMain.handle('offlineVault:save-user-override', handleSaveUserOverride);
   ipcMain.handle('offlineVault:remove-user-override', handleRemoveUserOverride);
-  ipcMain.handle('vault:get-user-overrides', handleGetUserOverrides);
-  ipcMain.handle('vault:save-user-override', handleSaveUserOverride);
-  ipcMain.handle('vault:remove-user-override', handleRemoveUserOverride);
 
   return {
     dispose: () => {

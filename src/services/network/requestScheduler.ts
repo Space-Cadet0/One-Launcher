@@ -36,6 +36,8 @@ export interface QueueItem<T = unknown> {
   gameKey?: string;
   signal?: AbortSignal;
   cleanupAbort?: () => void;
+  removed?: boolean;
+  dispatched?: boolean;
   fn: () => Promise<T>;
   priority: number;
   domain: string;
@@ -43,6 +45,12 @@ export interface QueueItem<T = unknown> {
   retries: number;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
+}
+
+export interface PriorityLaneQueue {
+  items: Array<QueueItem<unknown> | undefined>;
+  head: number;
+  activeCount: number;
 }
 
 export interface TokenBucket {
@@ -56,9 +64,23 @@ export interface TokenBucket {
   wasCoolingDown: boolean;
   probeInFlight: boolean;
   activeInteractiveCount: number;
-  queue: Array<QueueItem<unknown>>;
+  lanes: [PriorityLaneQueue, PriorityLaneQueue, PriorityLaneQueue];
   timer: ReturnType<typeof setTimeout> | null;
   retryTimers: Map<ReturnType<typeof setTimeout>, QueueItem<unknown>>;
+}
+
+function createPriorityLanes(): [PriorityLaneQueue, PriorityLaneQueue, PriorityLaneQueue] {
+  return [
+    { items: [], head: 0, activeCount: 0 },
+    { items: [], head: 0, activeCount: 0 },
+    { items: [], head: 0, activeCount: 0 },
+  ];
+}
+
+function priorityToLaneIndex(priority: number): 0 | 1 | 2 {
+  if (priority <= RequestPriority.P0_INTERACTIVE) return 0;
+  if (priority <= RequestPriority.P1_VIEWPORT) return 1;
+  return 2;
 }
 
 interface RateLimitSchedulerError extends Error {
@@ -273,10 +295,82 @@ export class RequestScheduler {
     return false;
   }
 
-  private sortBucketQueue(bucket: TokenBucket): void {
-    if (bucket.queue.length > 1) {
-      bucket.queue.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt);
+  private enqueueBucketItem(bucket: TokenBucket, item: QueueItem<unknown>): void {
+    item.removed = false;
+    item.dispatched = false;
+    const lane = bucket.lanes[priorityToLaneIndex(item.priority)];
+    lane.items.push(item);
+    lane.activeCount += 1;
+  }
+
+  private compactLaneIfNeeded(lane: PriorityLaneQueue): void {
+    if (lane.head >= lane.items.length) {
+      lane.items.length = 0;
+      lane.head = 0;
+    } else if (lane.head >= 64 && lane.head * 2 >= lane.items.length) {
+      lane.items = lane.items.slice(lane.head);
+      lane.head = 0;
     }
+  }
+
+  private pruneLaneHead(lane: PriorityLaneQueue): void {
+    while (lane.head < lane.items.length) {
+      const front = lane.items[lane.head];
+      if (!front || front.removed) {
+        lane.items[lane.head] = undefined;
+        lane.head += 1;
+        continue;
+      }
+      if (front.signal?.aborted) {
+        lane.items[lane.head] = undefined;
+        lane.head += 1;
+        front.removed = true;
+        lane.activeCount = Math.max(0, lane.activeCount - 1);
+        front.cleanupAbort?.();
+        front.reject(createAbortError('Request aborted'));
+        continue;
+      }
+      break;
+    }
+    this.compactLaneIfNeeded(lane);
+  }
+
+  private peekNextCandidate(bucket: TokenBucket): QueueItem<unknown> | undefined {
+    for (let laneIdx = 0; laneIdx < 3; laneIdx++) {
+      const lane = bucket.lanes[laneIdx as 0 | 1 | 2];
+      this.pruneLaneHead(lane);
+      if (lane.head < lane.items.length) {
+        return lane.items[lane.head];
+      }
+    }
+    return undefined;
+  }
+
+  private dequeueNextCandidate(bucket: TokenBucket): QueueItem<unknown> | undefined {
+    for (let laneIdx = 0; laneIdx < 3; laneIdx++) {
+      const lane = bucket.lanes[laneIdx as 0 | 1 | 2];
+      this.pruneLaneHead(lane);
+      if (lane.head < lane.items.length) {
+        const item = lane.items[lane.head];
+        lane.items[lane.head] = undefined;
+        lane.head += 1;
+        if (item) {
+          item.dispatched = true;
+          lane.activeCount = Math.max(0, lane.activeCount - 1);
+        }
+        this.compactLaneIfNeeded(lane);
+        return item;
+      }
+    }
+    return undefined;
+  }
+
+  private getBucketQueueLength(bucket: TokenBucket): number {
+    return (
+      bucket.lanes[0].activeCount +
+      bucket.lanes[1].activeCount +
+      bucket.lanes[2].activeCount
+    );
   }
 
   private resumeAllQueues(): void {
@@ -316,7 +410,7 @@ export class RequestScheduler {
         wasCoolingDown: false,
         probeInFlight: false,
         activeInteractiveCount: 0,
-        queue: [],
+        lanes: createPriorityLanes(),
         timer: null,
         retryTimers: new Map(),
       });
@@ -387,7 +481,7 @@ export class RequestScheduler {
         wasCoolingDown: false,
         probeInFlight: false,
         activeInteractiveCount: 0,
-        queue: [],
+        lanes: createPriorityLanes(),
         timer: null,
         retryTimers: new Map(),
       };
@@ -535,33 +629,35 @@ export class RequestScheduler {
         return;
       }
 
-      const item: QueueItem<T> = {
+      const item: QueueItem<unknown> = {
         id: `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
         url,
         gameKey,
         signal,
-        fn,
+        fn: () => fn(),
         priority,
         domain,
         queuedAt: Date.now(),
         retries: 0,
-        resolve,
+        resolve: (val: unknown) => resolve(val as T),
         reject,
       };
 
       if (signal) {
         const onAbort = () => {
           item.cleanupAbort?.();
-          const qIdx = bucket.queue.indexOf(item as unknown as QueueItem<unknown>);
-          if (qIdx !== -1) {
-            bucket.queue.splice(qIdx, 1);
+          if (!item.dispatched && !item.removed) {
+            const lane = bucket.lanes[priorityToLaneIndex(item.priority)];
+            item.removed = true;
+            lane.activeCount = Math.max(0, lane.activeCount - 1);
             item.reject(createAbortError('Request aborted'));
             return;
           }
           for (const [retryTimer, retryItem] of bucket.retryTimers.entries()) {
-            if (retryItem === (item as unknown as QueueItem<unknown>)) {
+            if (retryItem === item) {
               clearTimeout(retryTimer);
               bucket.retryTimers.delete(retryTimer);
+              item.removed = true;
               item.reject(createAbortError('Request aborted'));
               return;
             }
@@ -574,8 +670,7 @@ export class RequestScheduler {
         };
       }
 
-      bucket.queue.push(item as unknown as QueueItem<unknown>);
-      this.sortBucketQueue(bucket);
+      this.enqueueBucketItem(bucket, item);
       this.processQueue(domain);
     });
   }
@@ -594,11 +689,9 @@ export class RequestScheduler {
   }
 
   private pruneAbortedHead(bucket: TokenBucket): void {
-    while (bucket.queue.length > 0 && bucket.queue[0]?.signal?.aborted) {
-      const abortedItem = bucket.queue.shift()!;
-      abortedItem.cleanupAbort?.();
-      abortedItem.reject(createAbortError('Request aborted'));
-    }
+    this.pruneLaneHead(bucket.lanes[0]);
+    this.pruneLaneHead(bucket.lanes[1]);
+    this.pruneLaneHead(bucket.lanes[2]);
   }
 
   private processQueue(domain: string): void {
@@ -628,7 +721,7 @@ export class RequestScheduler {
       if (bucket.probeInFlight) {
         return;
       }
-      const nextCandidate = bucket.queue[0];
+      const nextCandidate = this.peekNextCandidate(bucket);
       if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
         return;
       }
@@ -649,6 +742,10 @@ export class RequestScheduler {
         }
         bucket.tokens -= 1;
       }
+      const canaryItem = this.dequeueNextCandidate(bucket);
+      if (!canaryItem) {
+        return;
+      }
       bucket.probeInFlight = true;
       onlineLifecycleManager.recordEndpointHealth({
         host: domain,
@@ -656,19 +753,17 @@ export class RequestScheduler {
         consecutiveFailures: bucket.consecutiveServerErrors,
         openedUntil: 0,
       });
-      const canaryItem = bucket.queue.shift()!;
       void this.executeItem(domain, bucket, canaryItem);
       return;
     }
 
     if (!this.enforceDelays) {
-      while (bucket.queue.length > 0) {
-        this.pruneAbortedHead(bucket);
-        const nextCandidate = bucket.queue[0];
+      while (this.getBucketQueueLength(bucket) > 0) {
+        const nextCandidate = this.peekNextCandidate(bucket);
         if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
           break;
         }
-        const item = bucket.queue.shift();
+        const item = this.dequeueNextCandidate(bucket);
         if (!item) break;
         void this.executeItem(domain, bucket, item);
       }
@@ -677,9 +772,8 @@ export class RequestScheduler {
 
     this.refill(bucket);
 
-    while (bucket.queue.length > 0) {
-      this.pruneAbortedHead(bucket);
-      const nextCandidate = bucket.queue[0];
+    while (this.getBucketQueueLength(bucket) > 0) {
+      const nextCandidate = this.peekNextCandidate(bucket);
       if (!nextCandidate || this.isCandidateHeld(nextCandidate.priority)) {
         break;
       }
@@ -700,18 +794,46 @@ export class RequestScheduler {
       }
 
       bucket.tokens -= 1;
-      const item = bucket.queue.shift()!;
+      const item = this.dequeueNextCandidate(bucket);
+      if (!item) break;
       void this.executeItem(domain, bucket, item);
     }
 
-    if (bucket.queue.length > 0 && bucket.tokens < 1) {
-      const nextCandidate = bucket.queue[0];
+    if (this.getBucketQueueLength(bucket) > 0 && bucket.tokens < 1) {
+      const nextCandidate = this.peekNextCandidate(bucket);
       if (nextCandidate && !this.isCandidateHeld(nextCandidate.priority)) {
         const tokensNeeded = 1 - bucket.tokens;
         const waitMs = Math.ceil((tokensNeeded / bucket.fillRate) * 1000);
         bucket.timer = setTimeout(() => this.processDomainQueue(domain), Math.max(10, waitMs));
       }
     }
+  }
+
+  private promoteBucketItems(
+    bucket: TokenBucket,
+    predicate: (item: QueueItem<unknown>) => boolean,
+    maxItems: number = Number.POSITIVE_INFINITY
+  ): number {
+    let promotedCount = 0;
+    const p0Lane = bucket.lanes[0];
+    for (const laneIdx of [1, 2] as const) {
+      const lane = bucket.lanes[laneIdx];
+      for (let i = lane.head; i < lane.items.length; i++) {
+        if (promotedCount >= maxItems) break;
+        const item = lane.items[i];
+        if (!item || item.removed || item.signal?.aborted) continue;
+        if (predicate(item)) {
+          lane.items[i] = undefined;
+          lane.activeCount = Math.max(0, lane.activeCount - 1);
+          item.priority = RequestPriority.P0_INTERACTIVE;
+          p0Lane.items.push(item);
+          p0Lane.activeCount += 1;
+          promotedCount += 1;
+        }
+      }
+      this.pruneLaneHead(lane);
+    }
+    return promotedCount;
   }
 
   /**
@@ -733,17 +855,11 @@ export class RequestScheduler {
 
     // 1. Exact URL or gameKey match across all buckets
     for (const [domainKey, bucket] of this.buckets.entries()) {
-      let bucketPromoted = false;
-      for (const item of bucket.queue) {
-        if (
-          (item.url === target || (item.gameKey !== undefined && item.gameKey === target)) &&
-          item.priority > RequestPriority.P0_INTERACTIVE
-        ) {
-          item.priority = RequestPriority.P0_INTERACTIVE;
-          bucketPromoted = true;
-        }
-      }
-      if (bucketPromoted) {
+      const count = this.promoteBucketItems(
+        bucket,
+        (item) => item.url === target || (item.gameKey !== undefined && item.gameKey === target)
+      );
+      if (count > 0) {
         affectedDomains.add(domainKey);
       }
     }
@@ -760,22 +876,13 @@ export class RequestScheduler {
       const limit = options?.wholeDomain
         ? (options.maxItems ?? Number.POSITIVE_INFINITY)
         : (options?.maxItems ?? 8);
-      let count = 0;
-      for (const item of bucket.queue) {
-        if (count >= limit) break;
-        if (item.priority > RequestPriority.P0_INTERACTIVE) {
-          item.priority = RequestPriority.P0_INTERACTIVE;
-          count++;
-        }
-      }
+      const count = this.promoteBucketItems(bucket, () => true, limit);
       if (count > 0) {
         affectedDomains.add(resolvedDomain);
       }
     }
 
     for (const domainKey of affectedDomains) {
-      const bucket = this.getBucket(domainKey);
-      this.sortBucketQueue(bucket);
       this.processDomainQueue(domainKey);
     }
   }
@@ -787,20 +894,12 @@ export class RequestScheduler {
     if (!gameKey) return;
     const affectedDomains: string[] = [];
     for (const [domainKey, bucket] of this.buckets.entries()) {
-      let promoted = false;
-      for (const item of bucket.queue) {
-        if (item.gameKey === gameKey && item.priority > RequestPriority.P0_INTERACTIVE) {
-          item.priority = RequestPriority.P0_INTERACTIVE;
-          promoted = true;
-        }
-      }
-      if (promoted) {
+      const count = this.promoteBucketItems(bucket, (item) => item.gameKey === gameKey);
+      if (count > 0) {
         affectedDomains.push(domainKey);
       }
     }
     for (const domainKey of affectedDomains) {
-      const bucket = this.getBucket(domainKey);
-      this.sortBucketQueue(bucket);
       this.processDomainQueue(domainKey);
     }
   }
@@ -946,13 +1045,15 @@ export class RequestScheduler {
         const backoffMs = this.enforceDelays ? computedBackoff : 0;
         const retryTimer = setTimeout(() => {
           bucket.retryTimers.delete(retryTimer);
-          if (item.signal?.aborted) {
+          if (item.signal?.aborted || item.removed) {
             item.cleanupAbort?.();
-            item.reject(createAbortError('Request aborted'));
+            if (!item.removed) {
+              item.removed = true;
+              item.reject(createAbortError('Request aborted'));
+            }
             return;
           }
-          bucket.queue.push(item);
-          this.sortBucketQueue(bucket);
+          this.enqueueBucketItem(bucket, item);
           this.processDomainQueue(domain);
         }, backoffMs);
         bucket.retryTimers.set(retryTimer, item);
@@ -993,12 +1094,17 @@ export class RequestScheduler {
           retryItem.reject(abortErr);
         }
       }
-      if (bucket.queue.length > 0) {
-        const queued = bucket.queue.splice(0, bucket.queue.length);
-        for (const item of queued) {
+      for (const lane of bucket.lanes) {
+        for (let i = lane.head; i < lane.items.length; i++) {
+          const item = lane.items[i];
+          if (!item || item.removed) continue;
+          item.removed = true;
           item.cleanupAbort?.();
           item.reject(abortErr);
         }
+        lane.items.length = 0;
+        lane.head = 0;
+        lane.activeCount = 0;
       }
       bucket.cooldownUntil = 0;
       bucket.consecutiveServerErrors = 0;
@@ -1019,11 +1125,12 @@ export class RequestScheduler {
   public getQueueLength(domain?: string): number {
     if (domain) {
       const key = this.resolveDomain(domain);
-      return this.buckets.get(key)?.queue.length || 0;
+      const bucket = this.buckets.get(key);
+      return bucket ? this.getBucketQueueLength(bucket) : 0;
     }
     let total = 0;
     for (const b of this.buckets.values()) {
-      total += b.queue.length;
+      total += this.getBucketQueueLength(b);
     }
     return total;
   }
@@ -1034,16 +1141,17 @@ export class RequestScheduler {
    */
   public clearBackgroundQueues(): void {
     for (const [domain, bucket] of this.buckets.entries()) {
-      const remaining: Array<QueueItem<unknown>> = [];
-      for (const item of bucket.queue) {
-        if (item.priority >= RequestPriority.P2_BACKGROUND) {
-          item.cleanupAbort?.();
-          item.reject(new Error('Cancelled stale background request'));
-        } else {
-          remaining.push(item);
-        }
+      const bgLane = bucket.lanes[2];
+      for (let i = bgLane.head; i < bgLane.items.length; i++) {
+        const item = bgLane.items[i];
+        if (!item || item.removed) continue;
+        item.removed = true;
+        item.cleanupAbort?.();
+        item.reject(new Error('Cancelled stale background request'));
       }
-      bucket.queue = remaining;
+      bgLane.items.length = 0;
+      bgLane.head = 0;
+      bgLane.activeCount = 0;
       this.processQueue(domain);
     }
   }

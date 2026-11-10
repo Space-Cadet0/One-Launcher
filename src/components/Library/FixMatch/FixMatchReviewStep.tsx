@@ -13,6 +13,7 @@ import { CriticSource } from '../../../contracts/critic';
 import { ReviewCandidateOption } from '../../../services/scraper/reviewCandidateService';
 import { calculateTier, getTierColor } from '../../../services/critic/criticUtils';
 import { openExternalStoreUrl } from './fixMatchTypes';
+import { isImeComposing } from '../../../utils/keyboardUtils';
 
 export interface FixMatchReviewStepProps {
   idPrefix?: string;
@@ -363,7 +364,7 @@ export function renderFixMatchReviewStep({
                         value={customScoreValue}
                         onChange={(e) => onCustomScoreChange(e.target.value)}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') e.preventDefault();
+                          if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                         }}
                         placeholder="e.g. 88"
                         className="w-24 px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-sm text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4]"
@@ -419,7 +420,7 @@ export function renderFixMatchReviewStep({
                       value={customScoreNumReviews}
                       onChange={(e) => onCustomReviewsChange(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') e.preventDefault();
+                        if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                       }}
                       placeholder="e.g. 120"
                       className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 font-mono focus:outline-none focus:border-[#66c0f4]"
@@ -439,7 +440,7 @@ export function renderFixMatchReviewStep({
                       value={customScoreUrl}
                       onChange={(e) => onCustomUrlChange(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') e.preventDefault();
+                        if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                       }}
                       placeholder="https://..."
                       className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4]"
@@ -460,7 +461,7 @@ export function renderFixMatchReviewStep({
                     value={customScoreSummary}
                     onChange={(e) => onCustomSummaryChange(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') e.preventDefault();
+                      if (e.key === 'Enter' && !isImeComposing(e)) e.preventDefault();
                     }}
                     placeholder="e.g. Universal acclaim based on critic reviews."
                     className="w-full px-3 py-1.5 rounded bg-[#131c27] border border-[#2a475e] text-xs text-white placeholder-slate-400 focus:outline-none focus:border-[#66c0f4]"

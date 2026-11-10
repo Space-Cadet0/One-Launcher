@@ -38,7 +38,9 @@
       "en-US"
     ],
     "afterPack": "build/afterPack.cjs",
+    "afterSign": "build/afterSign.cjs",
     "mac": {
+      "sign": "build/macSign.cjs",
       "icon": "build/icon.icns",
       "category": "public.app-category.games",
       "target": [

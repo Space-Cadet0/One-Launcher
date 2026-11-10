@@ -1089,6 +1089,8 @@ void xgr_ensure_session_metadata_loaded(void)
     xgr_sb_init(&sb);
     xgr_sb_append_fmt(&sb, "{\"titleId\":%u,\"scid\":", cfg.titleId);
     xgr_sb_append_json_str(&sb, cfg.scid);
+    xgr_sb_append_cstr(&sb, ",\"packageFamilyName\":");
+    xgr_sb_append_json_str(&sb, cfg.packageFamilyName);
     xgr_sb_append_cstr(&sb, ",\"pfn\":");
     xgr_sb_append_json_str(&sb, cfg.packageFamilyName);
     xgr_sb_append_cstr(&sb, ",\"storeId\":");

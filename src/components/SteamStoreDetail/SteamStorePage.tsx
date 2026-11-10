@@ -16,7 +16,7 @@ import {
 import { loadIntegrations } from '../../services/integrations/integrationStorage';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
 import { sanitizeSafeDomFragment } from '../../utils/safeHtmlSanitizer';
-import { MediaGallery } from './MediaGallery';
+import { MediaGallery, prefersReducedMotion } from './MediaGallery';
 import { SteamHeroDetails } from './SteamHeroDetails';
 import { SteamLibraryActionBar } from './SteamLibraryActionBar';
 import { HowLongToBeatCard } from './HowLongToBeatCard';
@@ -124,14 +124,6 @@ function isMicrosoftStoreAssetUrl(url?: string | null): boolean {
   } catch {
     return false;
   }
-}
-
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    Boolean(window.matchMedia('(prefers-reduced-motion: reduce)').matches)
-  );
 }
 
 function mergePreservingXboxHints(
@@ -371,12 +363,12 @@ const AboutThisGameHtml: React.FC<AboutThisGameHtmlProps> = ({
       }
 
       const rawSources = Array.from(videoEl.querySelectorAll('source'));
-      const validSources: HTMLElement[] = [];
+      const validSources: HTMLSourceElement[] = [];
       rawSources.forEach((sourceEl) => {
         const normalizedSourceSrc = normalizeProtocolRelativeUrl(sourceEl.getAttribute('src'));
         if (normalizedSourceSrc) {
           sourceEl.setAttribute('src', normalizedSourceSrc);
-          validSources.push(sourceEl as unknown as HTMLElement);
+          validSources.push(sourceEl);
         } else {
           sourceEl.remove();
         }

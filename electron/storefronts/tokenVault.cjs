@@ -10,6 +10,7 @@ const { execFileSync } = require('node:child_process');
 const { app } = require('electron');
 const {
   toHostFilesystemPath,
+  applyWindowsOwnerAclAsync,
   atomicWriteSecureFileSync,
   clearStoreDisconnectedTombstone,
 } = require('../launcher/securityAndPathUtils.cjs');
@@ -17,6 +18,9 @@ const {
 const scryptAsync = util.promisify(crypto.scrypt);
 
 const DERIVED_KEY_CACHE_MAX = 256;
+const DPAPI_VAULT_KEY_PREFIX = 'dpapi:v1:';
+const LEGACY_PLAIN_VAULT_KEY_PREFIX = 'v1:';
+const LEGACY_AES256GCM_TOKEN_PREFIX = 'v1:aes256gcm:';
 
 /** @type {string | null} */
 let cachedMachineIdentity = null;
@@ -44,6 +48,145 @@ const vaultSaltByFileCache = new Map();
  * @type {Map<string, Promise<any>>}
  */
 const vaultMutexQueues = new Map();
+
+/**
+ * @typedef {{
+ *   doc: Record<string, any>,
+ *   hydrated: boolean,
+ *   keyContextDigest: string,
+ *   pendingAsyncOps: number,
+ *   generation: number,
+ *   flushedGeneration: number,
+ *   tokensExists: boolean,
+ *   tokensMtimeMs: number,
+ *   tokensSize: number,
+ *   vaultKeyExists: boolean,
+ *   vaultKeyMtimeMs: number,
+ * }} VaultCacheEntry
+ */
+
+/**
+ * Authoritative per-vault in-memory cache shared across sync (`loadSavedTokens`, `saveTokens`,
+ * `clearTokens`, `writeTokensFile`) and async (`loadSavedTokensAsync`, `saveTokensAsync`,
+ * `clearTokensAsync`, `writeTokensFileAsync`) callers so cross-storefront mutations never clobber
+ * each other during `scryptAsync` and hot-path reads avoid redundant decryption.
+ *
+ * @type {Map<string, VaultCacheEntry>}
+ */
+const vaultMemoryCache = new Map();
+
+/**
+ * Registered listeners notified whenever vault tokens are saved, overwritten, or cleared.
+ *
+ * @type {Set<(event: { action: 'save' | 'clear' | 'write', storefrontId?: string, filePath: string, options?: Record<string, any> }) => void>}
+ */
+const vaultChangeListeners = new Set();
+
+/**
+ * Register a callback invoked when credentials in the vault are modified or cleared.
+ *
+ * @param {(event: { action: 'save' | 'clear' | 'write', storefrontId?: string, filePath: string, options?: Record<string, any> }) => void} listener
+ * @returns {() => void}
+ */
+function onVaultChange(listener) {
+  if (typeof listener !== 'function') {
+    return () => {};
+  }
+  vaultChangeListeners.add(listener);
+  return () => {
+    vaultChangeListeners.delete(listener);
+  };
+}
+
+/**
+ * @param {{ action: 'save' | 'clear' | 'write', storefrontId?: string, filePath: string, options?: Record<string, any> }} event
+ */
+function emitVaultChange(event) {
+  for (const listener of vaultChangeListeners) {
+    try {
+      listener(event);
+    } catch {}
+  }
+}
+
+/**
+ * Explicitly invalidates the in-memory vault cache (all paths or a single `tokens.json` path).
+ *
+ * @param {string} [filePath]
+ */
+function invalidateVaultMemoryCache(filePath) {
+  if (typeof filePath === 'string' && filePath.trim()) {
+    vaultMemoryCache.delete(path.resolve(toHostFilesystemPath(filePath.trim())));
+    return;
+  }
+  vaultMemoryCache.clear();
+}
+
+/**
+ * Deep-clones a plain JSON vault object so callers cannot mutate cached internal state.
+ *
+ * @param {Record<string, any> | null | undefined} doc
+ * @returns {Record<string, any>}
+ */
+function cloneVaultDoc(doc) {
+  if (!doc || typeof doc !== 'object') return {};
+  try {
+    return JSON.parse(JSON.stringify(doc));
+  } catch {
+    return { ...doc };
+  }
+}
+
+/**
+ * Resolves `electron.safeStorage` ONLY on Windows (`win32`, where DPAPI `CryptProtectData` is
+ * 100% promptless) or when explicitly injected/enabled via `options.safeStorage` / `options.useSafeStorage`.
+ * Never touches macOS Keychain (`darwin`) or Linux Secret Service by default.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {{ isEncryptionAvailable: () => boolean, encryptString: (plainText: string) => Buffer, decryptString: (encrypted: Buffer) => string } | null}
+ */
+function resolveSafeStorageBackend(options = {}) {
+  if (options && options.safeStorage && typeof options.safeStorage === 'object') {
+    return options.safeStorage;
+  }
+  const effectivePlatform = (options && options.platform) || process.platform;
+  const explicitlyEnabled = Boolean(options && options.useSafeStorage === true);
+  if (effectivePlatform !== 'win32' && !explicitlyEnabled) {
+    return null;
+  }
+  try {
+    const reqElectron = require('electron');
+    const ss = reqElectron && reqElectron.safeStorage;
+    if (
+      ss &&
+      typeof ss.isEncryptionAvailable === 'function' &&
+      typeof ss.encryptString === 'function' &&
+      typeof ss.decryptString === 'function'
+    ) {
+      return ss;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * @param {any} safeStorage
+ * @returns {boolean}
+ */
+function isSafeStorageEncryptionActive(safeStorage) {
+  if (!safeStorage || typeof safeStorage.isEncryptionAvailable !== 'function') {
+    return false;
+  }
+  try {
+    return (
+      safeStorage.isEncryptionAvailable() === true &&
+      typeof safeStorage.encryptString === 'function' &&
+      typeof safeStorage.decryptString === 'function'
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Derives deterministic, hardware-bound key material for the local workstation
@@ -172,9 +315,63 @@ function getTokensFilePath(options = {}) {
 }
 
 /**
- * Resolve or generate a random 256-bit per-user vault secret stored in `vault.key` (`0o600` / user-SID ACL)
- * adjacent to `tokens.json`. Prevents any other local account on a shared workstation from deriving
- * the vault key using world-readable `IOPlatformUUID` / `MachineGuid` alone.
+ * @param {string} hexSecret
+ * @param {any} safeStorage
+ * @returns {string}
+ */
+function encodeVaultSecretForDisk(hexSecret, safeStorage) {
+  if (isSafeStorageEncryptionActive(safeStorage)) {
+    const encryptedBuf = safeStorage.encryptString(hexSecret);
+    const buf = Buffer.isBuffer(encryptedBuf) ? encryptedBuf : Buffer.from(encryptedBuf);
+    return `${DPAPI_VAULT_KEY_PREFIX}${buf.toString('base64')}`;
+  }
+  return hexSecret;
+}
+
+/**
+ * @param {string} rawContent
+ * @param {any} safeStorage
+ * @returns {{ secret: string | null, needsMigration: boolean }}
+ */
+function decodeVaultSecretFromDisk(rawContent, safeStorage) {
+  const trimmed = String(rawContent || '').trim();
+  if (!trimmed) {
+    return { secret: null, needsMigration: false };
+  }
+  if (trimmed.startsWith(DPAPI_VAULT_KEY_PREFIX)) {
+    if (!isSafeStorageEncryptionActive(safeStorage)) {
+      return { secret: null, needsMigration: false };
+    }
+    const b64 = trimmed.slice(DPAPI_VAULT_KEY_PREFIX.length).trim();
+    if (!b64) {
+      return { secret: null, needsMigration: false };
+    }
+    try {
+      const unwrapped = String(safeStorage.decryptString(Buffer.from(b64, 'base64')) || '').trim();
+      if (/^[0-9a-f]{64}$/i.test(unwrapped)) {
+        return { secret: unwrapped.toLowerCase(), needsMigration: false };
+      }
+    } catch {}
+    return { secret: null, needsMigration: false };
+  }
+
+  const candidate = trimmed.startsWith(LEGACY_PLAIN_VAULT_KEY_PREFIX)
+    ? trimmed.slice(LEGACY_PLAIN_VAULT_KEY_PREFIX.length).trim()
+    : trimmed;
+  if (/^[0-9a-f]{64}$/i.test(candidate)) {
+    return {
+      secret: candidate.toLowerCase(),
+      needsMigration: isSafeStorageEncryptionActive(safeStorage),
+    };
+  }
+  return { secret: null, needsMigration: false };
+}
+
+/**
+ * Resolve or generate a random 256-bit per-user vault secret stored in `vault.key` (`0o600` / user-SID ACL,
+ * plus Win32 DPAPI `electron.safeStorage` envelope wrapping on Windows) adjacent to `tokens.json`.
+ * Prevents any other local account on a shared workstation from deriving the vault key using
+ * world-readable `IOPlatformUUID` / `MachineGuid` alone.
  *
  * @param {Record<string, any>} [options]
  * @param {boolean} [createIfMissing]
@@ -187,12 +384,25 @@ function getOrCreateVaultSecret(options = {}, createIfMissing = true) {
   const tokensPath = getTokensFilePath(options);
   const vaultDir = path.dirname(tokensPath);
   const vaultKeyPath = path.join(vaultDir, 'vault.key');
+  const safeStorage = resolveSafeStorageBackend(options);
 
   try {
     if (fs.existsSync(vaultKeyPath)) {
-      const existing = fs.readFileSync(vaultKeyPath, 'utf8').trim();
-      if (/^[0-9a-f]{64}$/i.test(existing)) {
-        return existing.toLowerCase();
+      const existing = fs.readFileSync(vaultKeyPath, 'utf8');
+      const decoded = decodeVaultSecretFromDisk(existing, safeStorage);
+      if (decoded.secret) {
+        if (decoded.needsMigration) {
+          try {
+            atomicWriteSecureFileSync(
+              vaultKeyPath,
+              encodeVaultSecretForDisk(decoded.secret, safeStorage)
+            );
+          } catch {}
+        }
+        return decoded.secret;
+      }
+      if (existing.trim().startsWith(DPAPI_VAULT_KEY_PREFIX)) {
+        return null;
       }
     }
   } catch {}
@@ -202,7 +412,7 @@ function getOrCreateVaultSecret(options = {}, createIfMissing = true) {
   }
 
   const freshSecret = crypto.randomBytes(32).toString('hex');
-  atomicWriteSecureFileSync(vaultKeyPath, freshSecret);
+  atomicWriteSecureFileSync(vaultKeyPath, encodeVaultSecretForDisk(freshSecret, safeStorage));
   return freshSecret;
 }
 
@@ -220,11 +430,24 @@ async function getOrCreateVaultSecretAsync(options = {}, createIfMissing = true)
   const tokensPath = getTokensFilePath(options);
   const vaultDir = path.dirname(tokensPath);
   const vaultKeyPath = path.join(vaultDir, 'vault.key');
+  const safeStorage = resolveSafeStorageBackend(options);
 
   try {
-    const existing = (await fs.promises.readFile(vaultKeyPath, 'utf8')).trim();
-    if (/^[0-9a-f]{64}$/i.test(existing)) {
-      return existing.toLowerCase();
+    const existing = await fs.promises.readFile(vaultKeyPath, 'utf8');
+    const decoded = decodeVaultSecretFromDisk(existing, safeStorage);
+    if (decoded.secret) {
+      if (decoded.needsMigration) {
+        try {
+          await atomicWriteVaultFileAsync(
+            vaultKeyPath,
+            encodeVaultSecretForDisk(decoded.secret, safeStorage)
+          );
+        } catch {}
+      }
+      return decoded.secret;
+    }
+    if (existing.trim().startsWith(DPAPI_VAULT_KEY_PREFIX)) {
+      return null;
     }
   } catch {}
 
@@ -233,7 +456,7 @@ async function getOrCreateVaultSecretAsync(options = {}, createIfMissing = true)
   }
 
   const freshSecret = crypto.randomBytes(32).toString('hex');
-  atomicWriteSecureFileSync(vaultKeyPath, freshSecret);
+  await atomicWriteVaultFileAsync(vaultKeyPath, encodeVaultSecretForDisk(freshSecret, safeStorage));
   return freshSecret;
 }
 
@@ -588,30 +811,151 @@ async function getOrInitPerFileSaltAsync(resolvedFilePath) {
 }
 
 /**
- * Atomic async `.tmp` + `rename` write with `0o600` owner-only permissions.
+ * @param {string} str
+ * @returns {Buffer}
+ */
+function decodeHexOrBase64Part(str) {
+  const trimmed = String(str || '').trim();
+  if (/^[0-9a-f]+$/i.test(trimmed) && (trimmed.length === 24 || trimmed.length === 32)) {
+    return Buffer.from(trimmed, 'hex');
+  }
+  return Buffer.from(trimmed, 'base64');
+}
+
+/**
+ * Parses and decrypts legacy `v1:aes256gcm:<salt>:<iv>:<tag>:<ciphertext>` string token payloads.
+ *
+ * @param {string} legacyStr
+ * @param {Record<string, any>} [options]
+ * @returns {any}
+ */
+function decryptLegacyV1StringSync(legacyStr, options = {}) {
+  const body = legacyStr.slice(LEGACY_AES256GCM_TOKEN_PREFIX.length);
+  const segs = body.split(':');
+  if (segs.length !== 4) {
+    throw new Error('Malformed legacy v1:aes256gcm payload');
+  }
+  const salt = decodeHexOrBase64Part(segs[0]);
+  const iv = decodeHexOrBase64Part(segs[1]);
+  const tag = decodeHexOrBase64Part(segs[2]);
+  const data = Buffer.from(segs[3], 'base64');
+
+  const hwIdentity = getMachineIdentityKeyMaterial(options);
+  const vaultSecret = getOrCreateVaultSecret(options, false);
+  const candidates = vaultSecret ? [`${hwIdentity}:${vaultSecret}`, hwIdentity] : [hwIdentity];
+  let lastErr = null;
+  for (const km of candidates) {
+    try {
+      const key = deriveVaultKeySync(km, salt);
+      return openAesGcmVaultEnvelope(key, { iv, tag, data });
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Failed to decrypt legacy v1:aes256gcm payload');
+}
+
+/**
+ * Async counterpart to `decryptLegacyV1StringSync`.
+ *
+ * @param {string} legacyStr
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<any>}
+ */
+async function decryptLegacyV1StringAsync(legacyStr, options = {}) {
+  const body = legacyStr.slice(LEGACY_AES256GCM_TOKEN_PREFIX.length);
+  const segs = body.split(':');
+  if (segs.length !== 4) {
+    throw new Error('Malformed legacy v1:aes256gcm payload');
+  }
+  const salt = decodeHexOrBase64Part(segs[0]);
+  const iv = decodeHexOrBase64Part(segs[1]);
+  const tag = decodeHexOrBase64Part(segs[2]);
+  const data = Buffer.from(segs[3], 'base64');
+
+  const hwIdentity = getMachineIdentityKeyMaterial(options);
+  const vaultSecret = await getOrCreateVaultSecretAsync(options, false);
+  const candidates = vaultSecret ? [`${hwIdentity}:${vaultSecret}`, hwIdentity] : [hwIdentity];
+  let lastErr = null;
+  for (const km of candidates) {
+    try {
+      const key = await deriveVaultKeyAsync(km, salt);
+      return openAesGcmVaultEnvelope(key, { iv, tag, data });
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Failed to decrypt legacy v1:aes256gcm payload');
+}
+
+/**
+ * Bounded Windows `EPERM` / `EBUSY` / `EACCES` retry for atomic `fs.promises.rename`.
+ *
+ * @param {string} tmpPath
+ * @param {string} targetPath
+ */
+async function renameWithWindowsRetryAsync(tmpPath, targetPath) {
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await fs.promises.rename(tmpPath, targetPath);
+      return;
+    } catch (err) {
+      const code = err && typeof err === 'object' ? /** @type {any} */ (err).code : '';
+      const retryable = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
+      if (!retryable || attempt >= maxAttempts) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 12 * attempt));
+    }
+  }
+}
+
+/**
+ * Atomic async `.tmp` + `fh.datasync()` + `rename` write with `0o600` / Windows owner-SID ACLs.
  *
  * @param {string} filePath
  * @param {string} content
  */
 async function atomicWriteVaultFileAsync(filePath, content) {
   const hostFilePath = toHostFilesystemPath(filePath);
-  if (process.platform === 'win32') {
-    atomicWriteSecureFileSync(hostFilePath, content);
-    return;
-  }
   const dir = path.dirname(hostFilePath);
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
   const tmpPath = `${hostFilePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  /** @type {fs.promises.FileHandle | null} */
+  let fh = null;
   try {
-    await fs.promises.writeFile(tmpPath, content, { encoding: 'utf8', mode: 0o600 });
+    fh = await fs.promises.open(tmpPath, 'wx', 0o600);
+    await fh.writeFile(content, 'utf8');
     try {
-      await fs.promises.chmod(tmpPath, 0o600);
+      await fh.datasync();
     } catch {}
-    await fs.promises.rename(tmpPath, hostFilePath);
-    try {
-      await fs.promises.chmod(hostFilePath, 0o600);
-    } catch {}
-  } catch (err) {
+    await fh.close();
+    fh = null;
+
+    if (process.platform === 'win32') {
+      try {
+        await applyWindowsOwnerAclAsync(tmpPath);
+      } catch {}
+    } else {
+      try {
+        await fs.promises.chmod(tmpPath, 0o600);
+      } catch {}
+    }
+
+    await renameWithWindowsRetryAsync(tmpPath, hostFilePath);
+
+    if (process.platform !== 'win32') {
+      try {
+        await fs.promises.chmod(hostFilePath, 0o600);
+      } catch {}
+    }
+  } catch {
+    if (fh) {
+      try {
+        await fh.close();
+      } catch {}
+    }
     try {
       await fs.promises.unlink(tmpPath);
     } catch {}
@@ -628,7 +972,7 @@ async function atomicWriteVaultFileAsync(filePath, content) {
  * @returns {Promise<T>}
  */
 function runWithVaultMutex(filePath, task) {
-  const key = path.resolve(filePath);
+  const key = path.resolve(toHostFilesystemPath(filePath));
   const prev = vaultMutexQueues.get(key) || Promise.resolve();
   const next = prev.catch(() => {}).then(task);
   const tracked = next.finally(() => {
@@ -641,6 +985,218 @@ function runWithVaultMutex(filePath, task) {
 }
 
 /**
+ * @param {string} resolvedFilePath
+ * @param {string} vaultKeyPath
+ * @param {Record<string, any>} [options]
+ * @returns {string}
+ */
+function computeVaultKeyContextDigest(resolvedFilePath, vaultKeyPath, options = {}) {
+  const hw = getMachineIdentityKeyMaterial(options);
+  const secretOverride =
+    options && typeof options.vaultSecretOverride === 'string' ? options.vaultSecretOverride : '';
+  const ss = resolveSafeStorageBackend(options);
+  const ssTag = !ss ? 'none' : isSafeStorageEncryptionActive(ss) ? 'avail' : 'unavail';
+  return crypto
+    .createHash('sha256')
+    .update(`${resolvedFilePath}|${vaultKeyPath}|${hw}|${secretOverride}|${ssTag}`)
+    .digest('hex');
+}
+
+/**
+ * @param {string} targetPath
+ * @returns {{ exists: boolean, mtimeMs: number, size: number }}
+ */
+function statSnapshotSync(targetPath) {
+  try {
+    const st = fs.statSync(targetPath);
+    return { exists: true, mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return { exists: false, mtimeMs: 0, size: 0 };
+  }
+}
+
+/**
+ * @param {string} targetPath
+ * @returns {Promise<{ exists: boolean, mtimeMs: number, size: number }>}
+ */
+async function statSnapshotAsync(targetPath) {
+  try {
+    const st = await fs.promises.stat(targetPath);
+    return { exists: true, mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return { exists: false, mtimeMs: 0, size: 0 };
+  }
+}
+
+/**
+ * @param {VaultCacheEntry | undefined} entry
+ * @param {string} resolvedFilePath
+ * @param {string} vaultKeyPath
+ * @param {string} keyContextDigest
+ * @returns {boolean}
+ */
+function isVaultCacheEntryValidSync(entry, resolvedFilePath, vaultKeyPath, keyContextDigest) {
+  if (!entry || !entry.hydrated || entry.keyContextDigest !== keyContextDigest) {
+    return false;
+  }
+  if (entry.pendingAsyncOps > 0) {
+    return true;
+  }
+  const tokSnap = statSnapshotSync(resolvedFilePath);
+  const keySnap = statSnapshotSync(vaultKeyPath);
+  if (tokSnap.exists !== entry.tokensExists || keySnap.exists !== entry.vaultKeyExists) {
+    return false;
+  }
+  if (tokSnap.exists && (tokSnap.mtimeMs !== entry.tokensMtimeMs || tokSnap.size !== entry.tokensSize)) {
+    return false;
+  }
+  if (keySnap.exists && keySnap.mtimeMs !== entry.vaultKeyMtimeMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @param {VaultCacheEntry | undefined} entry
+ * @param {string} resolvedFilePath
+ * @param {string} vaultKeyPath
+ * @param {string} keyContextDigest
+ * @returns {Promise<boolean>}
+ */
+async function isVaultCacheEntryValidAsync(entry, resolvedFilePath, vaultKeyPath, keyContextDigest) {
+  if (!entry || !entry.hydrated || entry.keyContextDigest !== keyContextDigest) {
+    return false;
+  }
+  if (entry.pendingAsyncOps > 0) {
+    return true;
+  }
+  const [tokSnap, keySnap] = await Promise.all([
+    statSnapshotAsync(resolvedFilePath),
+    statSnapshotAsync(vaultKeyPath),
+  ]);
+  if (tokSnap.exists !== entry.tokensExists || keySnap.exists !== entry.vaultKeyExists) {
+    return false;
+  }
+  if (tokSnap.exists && (tokSnap.mtimeMs !== entry.tokensMtimeMs || tokSnap.size !== entry.tokensSize)) {
+    return false;
+  }
+  if (keySnap.exists && keySnap.mtimeMs !== entry.vaultKeyMtimeMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Updates disk stat metadata on a cache entry after a read or flush.
+ *
+ * @param {VaultCacheEntry} entry
+ * @param {string} resolvedFilePath
+ * @param {string} vaultKeyPath
+ */
+function refreshEntryDiskStatsSync(entry, resolvedFilePath, vaultKeyPath) {
+  const tokSnap = statSnapshotSync(resolvedFilePath);
+  const keySnap = statSnapshotSync(vaultKeyPath);
+  entry.tokensExists = tokSnap.exists;
+  entry.tokensMtimeMs = tokSnap.mtimeMs;
+  entry.tokensSize = tokSnap.size;
+  entry.vaultKeyExists = keySnap.exists;
+  entry.vaultKeyMtimeMs = keySnap.mtimeMs;
+}
+
+/**
+ * @param {VaultCacheEntry} entry
+ * @param {string} resolvedFilePath
+ * @param {string} vaultKeyPath
+ */
+async function refreshEntryDiskStatsAsync(entry, resolvedFilePath, vaultKeyPath) {
+  const [tokSnap, keySnap] = await Promise.all([
+    statSnapshotAsync(resolvedFilePath),
+    statSnapshotAsync(vaultKeyPath),
+  ]);
+  entry.tokensExists = tokSnap.exists;
+  entry.tokensMtimeMs = tokSnap.mtimeMs;
+  entry.tokensSize = tokSnap.size;
+  entry.vaultKeyExists = keySnap.exists;
+  entry.vaultKeyMtimeMs = keySnap.mtimeMs;
+}
+
+/**
+ * Low-level synchronous disk encrypt + write (updates `vaultMemoryCache` synchronously).
+ *
+ * @param {string} filePath
+ * @param {Record<string, any>} tokens
+ * @param {Record<string, any>} [options]
+ */
+function persistTokensToDiskSync(filePath, tokens, options = {}) {
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+  const salt = normalizeSaltBuffer(options?.salt) || getOrInitPerFileSaltSync(resolved);
+  const cloned = cloneVaultDoc(tokens);
+  const jsonStr = JSON.stringify(cloned, null, 2);
+  const encryptedPayload = encryptTokensPayload(jsonStr, { ...options, salt });
+  atomicWriteSecureFileSync(resolved, JSON.stringify(encryptedPayload, null, 2));
+
+  const existingEntry = vaultMemoryCache.get(resolved);
+  const nextGen = existingEntry ? existingEntry.generation + 1 : 1;
+  /** @type {VaultCacheEntry} */
+  const entry = existingEntry || {
+    doc: cloned,
+    hydrated: true,
+    keyContextDigest,
+    pendingAsyncOps: 0,
+    generation: nextGen,
+    flushedGeneration: nextGen,
+    tokensExists: false,
+    tokensMtimeMs: 0,
+    tokensSize: 0,
+    vaultKeyExists: false,
+    vaultKeyMtimeMs: 0,
+  };
+  entry.doc = cloned;
+  entry.hydrated = true;
+  entry.keyContextDigest = keyContextDigest;
+  entry.generation = nextGen;
+  entry.flushedGeneration = nextGen;
+  refreshEntryDiskStatsSync(entry, resolved, vaultKeyPath);
+  vaultMemoryCache.set(resolved, entry);
+}
+
+/**
+ * Flushes the latest authoritative `entry.doc` to disk inside `runWithVaultMutex`,
+ * never clobbering a newer sync or async generation that arrived during `scryptAsync`.
+ *
+ * @param {string} filePath
+ * @param {VaultCacheEntry} entry
+ * @param {Record<string, any>} [options]
+ */
+async function flushAuthoritativeVaultEntryAsync(filePath, entry, options = {}) {
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+
+  while (entry.flushedGeneration < entry.generation) {
+    const snapGen = entry.generation;
+    const snapDoc = cloneVaultDoc(entry.doc);
+    const salt = normalizeSaltBuffer(options?.salt) || (await getOrInitPerFileSaltAsync(resolved));
+    const encryptedPayload = await encryptTokensPayloadAsync(JSON.stringify(snapDoc, null, 2), {
+      ...options,
+      salt,
+    });
+    if (entry.flushedGeneration >= snapGen) {
+      // A synchronous write already flushed >= snapGen while `scryptAsync` was running!
+      continue;
+    }
+    if (entry.generation > snapGen) {
+      // Another mutation arrived during `scryptAsync`; loop to encrypt the latest `entry.doc`!
+      continue;
+    }
+    await atomicWriteVaultFileAsync(resolved, JSON.stringify(encryptedPayload, null, 2));
+    entry.flushedGeneration = Math.max(entry.flushedGeneration, snapGen);
+    await refreshEntryDiskStatsAsync(entry, resolved, vaultKeyPath);
+  }
+}
+
+/**
  * Encrypt and atomically write OAuth tokens to disk with strict owner-only ACLs.
  * Never falls back to writing unencrypted plaintext tokens on disk.
  *
@@ -649,15 +1205,14 @@ function runWithVaultMutex(filePath, task) {
  */
 function writeTokensFile(tokens, options = {}) {
   const filePath = getTokensFilePath(options);
-  const resolved = path.resolve(filePath);
-  const salt = normalizeSaltBuffer(options?.salt) || getOrInitPerFileSaltSync(resolved);
-  const jsonStr = JSON.stringify(tokens, null, 2);
-  const encryptedPayload = encryptTokensPayload(jsonStr, { ...options, salt });
-  atomicWriteSecureFileSync(filePath, JSON.stringify(encryptedPayload, null, 2));
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  persistTokensToDiskSync(resolved, tokens, options);
+  emitVaultChange({ action: 'write', filePath: resolved, options });
 }
 
 /**
- * Async non-blocking counterpart to `writeTokensFile` using `crypto.scrypt` + atomic `.tmp` + `rename`.
+ * Async non-blocking counterpart to `writeTokensFile` using `crypto.scrypt` + atomic `.tmp` + `datasync` + `rename`.
+ * Updates the authoritative in-memory vault cache immediately so concurrent sync/async callers see the write.
  *
  * @param {Record<string, any>} tokens
  * @param {Record<string, any>} [options]
@@ -665,17 +1220,191 @@ function writeTokensFile(tokens, options = {}) {
  */
 async function writeTokensFileAsync(tokens, options = {}) {
   const filePath = getTokensFilePath(options);
-  return runWithVaultMutex(filePath, async () => {
-    const resolved = path.resolve(filePath);
-    const salt = normalizeSaltBuffer(options?.salt) || (await getOrInitPerFileSaltAsync(resolved));
-    const jsonStr = JSON.stringify(tokens, null, 2);
-    const encryptedPayload = await encryptTokensPayloadAsync(jsonStr, { ...options, salt });
-    await atomicWriteVaultFileAsync(filePath, JSON.stringify(encryptedPayload, null, 2));
-  });
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+  const cloned = cloneVaultDoc(tokens);
+
+  const prev = vaultMemoryCache.get(resolved);
+  const nextGen = prev ? prev.generation + 1 : 1;
+  /** @type {VaultCacheEntry} */
+  const entry = prev || {
+    doc: cloned,
+    hydrated: true,
+    keyContextDigest,
+    pendingAsyncOps: 0,
+    generation: nextGen,
+    flushedGeneration: 0,
+    tokensExists: false,
+    tokensMtimeMs: 0,
+    tokensSize: 0,
+    vaultKeyExists: false,
+    vaultKeyMtimeMs: 0,
+  };
+  entry.doc = cloned;
+  entry.hydrated = true;
+  entry.keyContextDigest = keyContextDigest;
+  entry.generation = nextGen;
+  entry.pendingAsyncOps += 1;
+  vaultMemoryCache.set(resolved, entry);
+  emitVaultChange({ action: 'write', filePath: resolved, options });
+
+  try {
+    await runWithVaultMutex(resolved, async () => {
+      await flushAuthoritativeVaultEntryAsync(resolved, entry, options);
+    });
+  } finally {
+    entry.pendingAsyncOps = Math.max(0, entry.pendingAsyncOps - 1);
+  }
 }
 
 /**
- * Load and decrypt saved storefront tokens, transparently upgrading legacy v2 or plaintext payloads to v3.
+ * Low-level synchronous disk reader (populates `vaultMemoryCache`).
+ *
+ * @param {string} resolved
+ * @param {string} vaultKeyPath
+ * @param {string} keyContextDigest
+ * @param {Record<string, any>} [options]
+ * @returns {Record<string, any>}
+ */
+function readTokensFromDiskSync(resolved, vaultKeyPath, keyContextDigest, options = {}) {
+  /**
+   * @param {Record<string, any>} docObj
+   * @returns {Record<string, any>}
+   */
+  const storeCacheResult = (docObj) => {
+    const cloned = cloneVaultDoc(docObj);
+    const prev = vaultMemoryCache.get(resolved);
+    // Never clobber uncommitted in-memory async mutations
+    if (prev && prev.pendingAsyncOps > 0 && prev.keyContextDigest === keyContextDigest) {
+      return cloneVaultDoc(prev.doc);
+    }
+    const nextGen = prev ? prev.generation + 1 : 1;
+    /** @type {VaultCacheEntry} */
+    const entry = {
+      doc: cloned,
+      hydrated: true,
+      keyContextDigest,
+      pendingAsyncOps: 0,
+      generation: nextGen,
+      flushedGeneration: nextGen,
+      tokensExists: false,
+      tokensMtimeMs: 0,
+      tokensSize: 0,
+      vaultKeyExists: false,
+      vaultKeyMtimeMs: 0,
+    };
+    refreshEntryDiskStatsSync(entry, resolved, vaultKeyPath);
+    vaultMemoryCache.set(resolved, entry);
+    return cloneVaultDoc(cloned);
+  };
+
+  if (!fs.existsSync(resolved)) {
+    return storeCacheResult({});
+  }
+
+  const rawContent = fs.readFileSync(resolved);
+  if (!rawContent || rawContent.length === 0) {
+    return storeCacheResult({});
+  }
+
+  const rawStr = rawContent.toString('utf-8').trim();
+  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = decryptLegacyV1StringSync(rawStr, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      try {
+        persistTokensToDiskSync(resolved, cleaned, options);
+      } catch {}
+      return cloneVaultDoc(cleaned);
+    } catch (decErr) {
+      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
+      return storeCacheResult({});
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawStr);
+  } catch {
+    return storeCacheResult({});
+  }
+
+  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = decryptLegacyV1StringSync(parsed, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      try {
+        persistTokensToDiskSync(resolved, cleaned, options);
+      } catch {}
+      return cloneVaultDoc(cleaned);
+    } catch (decErr) {
+      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
+      return storeCacheResult({});
+    }
+  }
+
+  if (parsed && parsed._encrypted_v2 === true) {
+    try {
+      const diskSalt = normalizeSaltBuffer(parsed.salt);
+      if (diskSalt && parsed._encrypted_v3 === true) {
+        vaultSaltByFileCache.set(resolved, diskSalt);
+      }
+      const decrypted = decryptTokensPayload(parsed, options);
+      const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
+      if (modified || parsed._encrypted_v3 !== true) {
+        try {
+          persistTokensToDiskSync(resolved, cleaned, options);
+          return cloneVaultDoc(cleaned);
+        } catch {}
+      }
+      return storeCacheResult(cleaned);
+    } catch (decErr) {
+      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+      console.warn('Failed to decrypt tokens payload:', msg);
+      return storeCacheResult({});
+    }
+  }
+
+  if (parsed && parsed._encrypted === true) {
+    return storeCacheResult({});
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    /** @type {Record<string, any>} */
+    const cleanedTokens = {};
+    let hadLegacyStoreCipher = false;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value && typeof value === 'object' && value._encrypted === true) {
+        continue;
+      }
+      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+        try {
+          cleanedTokens[key] = decryptLegacyV1StringSync(value, options);
+          hadLegacyStoreCipher = true;
+        } catch {}
+        continue;
+      }
+      cleanedTokens[key] = value;
+    }
+    const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
+    if (Object.keys(cleaned).length > 0 || hadLegacyStoreCipher) {
+      try {
+        persistTokensToDiskSync(resolved, cleaned, options);
+        return cloneVaultDoc(cleaned);
+      } catch {}
+    }
+    return storeCacheResult(cleaned);
+  }
+
+  return storeCacheResult({});
+}
+
+/**
+ * Load and decrypt saved storefront tokens, returning immediately from the authoritative
+ * in-memory vault cache when disk stats and key context match (zero redundant `scryptSync`).
  *
  * @param {Record<string, any>} [options]
  * @returns {Record<string, any>}
@@ -683,66 +1412,14 @@ async function writeTokensFileAsync(tokens, options = {}) {
 function loadSavedTokens(options = {}) {
   try {
     const filePath = getTokensFilePath(options);
-    if (!fs.existsSync(filePath)) {
-      return {};
+    const resolved = path.resolve(toHostFilesystemPath(filePath));
+    const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+    const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+    const cachedEntry = vaultMemoryCache.get(resolved);
+    if (isVaultCacheEntryValidSync(cachedEntry, resolved, vaultKeyPath, keyContextDigest)) {
+      return cloneVaultDoc(/** @type {VaultCacheEntry} */ (cachedEntry).doc);
     }
-
-    const rawContent = fs.readFileSync(filePath);
-    if (!rawContent || rawContent.length === 0) {
-      return {};
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(rawContent.toString('utf-8'));
-    } catch {
-      return {};
-    }
-
-    if (parsed && parsed._encrypted_v2 === true) {
-      try {
-        const diskSalt = normalizeSaltBuffer(parsed.salt);
-        if (diskSalt && parsed._encrypted_v3 === true) {
-          vaultSaltByFileCache.set(path.resolve(filePath), diskSalt);
-        }
-        const decrypted = decryptTokensPayload(parsed, options);
-        const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
-        if (modified || parsed._encrypted_v3 !== true) {
-          try {
-            writeTokensFile(cleaned, options);
-          } catch {}
-        }
-        return cleaned;
-      } catch (decErr) {
-        const msg = decErr instanceof Error ? decErr.message : String(decErr);
-        console.warn('Failed to decrypt tokens payload:', msg);
-        return {};
-      }
-    }
-
-    if (parsed && parsed._encrypted === true) {
-      return {};
-    }
-
-    if (parsed && typeof parsed === 'object') {
-      /** @type {Record<string, any>} */
-      const cleanedTokens = {};
-      for (const [key, value] of Object.entries(parsed)) {
-        if (value && typeof value === 'object' && value._encrypted === true) {
-          continue;
-        }
-        cleanedTokens[key] = value;
-      }
-      const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
-      if (Object.keys(cleaned).length > 0) {
-        try {
-          writeTokensFile(cleaned, options);
-        } catch {}
-      }
-      return cleaned;
-    }
-
-    return {};
+    return readTokensFromDiskSync(resolved, vaultKeyPath, keyContextDigest, options);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn('Failed to load saved tokens:', msg);
@@ -752,30 +1429,105 @@ function loadSavedTokens(options = {}) {
 
 /**
  * Internal unlocked async reader invoked inside `runWithVaultMutex`.
+ * Populates `vaultMemoryCache` without clobbering concurrent sync/async mutations.
  *
  * @param {string} filePath
  * @param {Record<string, any>} [options]
  * @returns {Promise<Record<string, any>>}
  */
 async function readTokensUnlockedAsync(filePath, options = {}) {
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+
+  const existingEntry = vaultMemoryCache.get(resolved);
+  if (await isVaultCacheEntryValidAsync(existingEntry, resolved, vaultKeyPath, keyContextDigest)) {
+    return cloneVaultDoc(/** @type {VaultCacheEntry} */ (existingEntry).doc);
+  }
+
+  /**
+   * @param {Record<string, any>} docObj
+   * @param {boolean} [persistUpgrade]
+   * @returns {Promise<Record<string, any>>}
+   */
+  const finalizeReadResultAsync = async (docObj, persistUpgrade = false) => {
+    // Re-check whether a synchronous writer mutated `vaultMemoryCache` while async I/O / scrypt ran!
+    const liveEntry = vaultMemoryCache.get(resolved);
+    if (liveEntry && liveEntry !== existingEntry && liveEntry.hydrated && liveEntry.keyContextDigest === keyContextDigest) {
+      return cloneVaultDoc(liveEntry.doc);
+    }
+    const cloned = cloneVaultDoc(docObj);
+    const nextGen = liveEntry ? liveEntry.generation + 1 : 1;
+    /** @type {VaultCacheEntry} */
+    const entry = liveEntry || {
+      doc: cloned,
+      hydrated: true,
+      keyContextDigest,
+      pendingAsyncOps: 0,
+      generation: nextGen,
+      flushedGeneration: persistUpgrade ? 0 : nextGen,
+      tokensExists: false,
+      tokensMtimeMs: 0,
+      tokensSize: 0,
+      vaultKeyExists: false,
+      vaultKeyMtimeMs: 0,
+    };
+    entry.doc = cloned;
+    entry.hydrated = true;
+    entry.keyContextDigest = keyContextDigest;
+    entry.generation = nextGen;
+    if (persistUpgrade) {
+      vaultMemoryCache.set(resolved, entry);
+      await flushAuthoritativeVaultEntryAsync(resolved, entry, options);
+    } else {
+      entry.flushedGeneration = nextGen;
+      await refreshEntryDiskStatsAsync(entry, resolved, vaultKeyPath);
+      vaultMemoryCache.set(resolved, entry);
+    }
+    return cloneVaultDoc(entry.doc);
+  };
+
   let rawContent;
   try {
-    rawContent = await fs.promises.readFile(filePath);
+    rawContent = await fs.promises.readFile(resolved);
   } catch {
-    return {};
+    return finalizeReadResultAsync({}, false);
   }
   if (!rawContent || rawContent.length === 0) {
-    return {};
+    return finalizeReadResultAsync({}, false);
+  }
+
+  const rawStr = rawContent.toString('utf-8').trim();
+  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = await decryptLegacyV1StringAsync(rawStr, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return finalizeReadResultAsync(cleaned, true);
+    } catch (decErr) {
+      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
+      return finalizeReadResultAsync({}, false);
+    }
   }
 
   let parsed;
   try {
-    parsed = JSON.parse(rawContent.toString('utf-8'));
+    parsed = JSON.parse(rawStr);
   } catch {
-    return {};
+    return finalizeReadResultAsync({}, false);
   }
 
-  const resolved = path.resolve(filePath);
+  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = await decryptLegacyV1StringAsync(parsed, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return finalizeReadResultAsync(cleaned, true);
+    } catch (decErr) {
+      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
+      return finalizeReadResultAsync({}, false);
+    }
+  }
 
   if (parsed && parsed._encrypted_v2 === true) {
     try {
@@ -785,65 +1537,64 @@ async function readTokensUnlockedAsync(filePath, options = {}) {
       }
       const decrypted = await decryptTokensPayloadAsync(parsed, options);
       const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
-      if (modified || parsed._encrypted_v3 !== true) {
-        try {
-          const salt = await getOrInitPerFileSaltAsync(resolved);
-          const encryptedPayload = await encryptTokensPayloadAsync(
-            JSON.stringify(cleaned, null, 2),
-            { ...options, salt }
-          );
-          await atomicWriteVaultFileAsync(filePath, JSON.stringify(encryptedPayload, null, 2));
-        } catch {}
-      }
-      return cleaned;
+      return finalizeReadResultAsync(cleaned, Boolean(modified || parsed._encrypted_v3 !== true));
     } catch (decErr) {
       const msg = decErr instanceof Error ? decErr.message : String(decErr);
       console.warn('Failed to decrypt tokens payload:', msg);
-      return {};
+      return finalizeReadResultAsync({}, false);
     }
   }
 
   if (parsed && parsed._encrypted === true) {
-    return {};
+    return finalizeReadResultAsync({}, false);
   }
 
   if (parsed && typeof parsed === 'object') {
     /** @type {Record<string, any>} */
     const cleanedTokens = {};
+    let hadLegacyStoreCipher = false;
     for (const [key, value] of Object.entries(parsed)) {
       if (value && typeof value === 'object' && value._encrypted === true) {
+        continue;
+      }
+      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+        try {
+          cleanedTokens[key] = await decryptLegacyV1StringAsync(value, options);
+          hadLegacyStoreCipher = true;
+        } catch {}
         continue;
       }
       cleanedTokens[key] = value;
     }
     const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
-    if (Object.keys(cleaned).length > 0) {
-      try {
-        const salt = await getOrInitPerFileSaltAsync(resolved);
-        const encryptedPayload = await encryptTokensPayloadAsync(
-          JSON.stringify(cleaned, null, 2),
-          { ...options, salt }
-        );
-        await atomicWriteVaultFileAsync(filePath, JSON.stringify(encryptedPayload, null, 2));
-      } catch {}
-    }
-    return cleaned;
+    return finalizeReadResultAsync(
+      cleaned,
+      Boolean(Object.keys(cleaned).length > 0 || hadLegacyStoreCipher)
+    );
   }
 
-  return {};
+  return finalizeReadResultAsync({}, false);
 }
 
 /**
- * Async non-blocking counterpart to `loadSavedTokens`, serialized with active writes.
+ * Async non-blocking counterpart to `loadSavedTokens`, backed by the authoritative in-memory cache
+ * and serialized with active writes.
  *
  * @param {Record<string, any>} [options]
  * @returns {Promise<Record<string, any>>}
  */
 async function loadSavedTokensAsync(options = {}) {
   const filePath = getTokensFilePath(options);
-  return runWithVaultMutex(filePath, async () => {
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+  const cachedEntry = vaultMemoryCache.get(resolved);
+  if (await isVaultCacheEntryValidAsync(cachedEntry, resolved, vaultKeyPath, keyContextDigest)) {
+    return cloneVaultDoc(/** @type {VaultCacheEntry} */ (cachedEntry).doc);
+  }
+  return runWithVaultMutex(resolved, async () => {
     try {
-      return await readTokensUnlockedAsync(filePath, options);
+      return await readTokensUnlockedAsync(resolved, options);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn('Failed to load saved tokens:', msg);
@@ -890,15 +1641,18 @@ function mergeStorefrontTokenUpdate(existing, storefrontId, tokenData) {
  */
 function saveTokens(storefrontId, tokenData, options = {}) {
   try {
+    const filePath = getTokensFilePath(options);
+    const resolved = path.resolve(toHostFilesystemPath(filePath));
     const existing = loadSavedTokens(options);
     const nextAll = mergeStorefrontTokenUpdate(existing, storefrontId, tokenData);
     const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
-    writeTokensFile(cleaned, options);
+    persistTokensToDiskSync(resolved, cleaned, options);
     if (!options?.fromExternalFallback && storefrontId) {
       try {
         clearStoreDisconnectedTombstone(storefrontId, options);
       } catch {}
     }
+    emitVaultChange({ action: 'save', storefrontId, filePath: resolved, options });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn('Failed to save tokens:', msg);
@@ -907,8 +1661,9 @@ function saveTokens(storefrontId, tokenData, options = {}) {
 
 /**
  * Serialized, non-blocking async read-modify-write for storefront credentials.
- * Uses `util.promisify(crypto.scrypt)` + per-file mutex + atomic `.tmp` + `rename`
- * so concurrent token refreshes across Epic, GOG, Steam, and Xbox never clobber one another.
+ * Shares the authoritative `vaultMemoryCache` with synchronous callers (`saveTokens`, `clearTokens`,
+ * `loadSavedTokens`, `writeTokensFile`) so cross-storefront writes NEVER clobber one another
+ * during `scryptAsync` worker execution.
  *
  * @param {string} storefrontId
  * @param {Record<string, any>} tokenData
@@ -917,28 +1672,96 @@ function saveTokens(storefrontId, tokenData, options = {}) {
  */
 async function saveTokensAsync(storefrontId, tokenData, options = {}) {
   const filePath = getTokensFilePath(options);
-  return runWithVaultMutex(filePath, async () => {
-    try {
-      const resolved = path.resolve(filePath);
-      const existing = await readTokensUnlockedAsync(filePath, options);
-      const nextAll = mergeStorefrontTokenUpdate(existing, storefrontId, tokenData);
-      const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
-      const salt = normalizeSaltBuffer(options?.salt) || (await getOrInitPerFileSaltAsync(resolved));
-      const encryptedPayload = await encryptTokensPayloadAsync(
-        JSON.stringify(cleaned, null, 2),
-        { ...options, salt }
-      );
-      await atomicWriteVaultFileAsync(filePath, JSON.stringify(encryptedPayload, null, 2));
-      if (!options?.fromExternalFallback && storefrontId) {
-        try {
-          clearStoreDisconnectedTombstone(storefrontId, options);
-        } catch {}
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+
+  // Fast synchronous optimistic merge if the cache entry is already warm (or vault file does not exist yet)
+  let optimisticEntry = vaultMemoryCache.get(resolved);
+  let appliedOptimistically = false;
+  if (isVaultCacheEntryValidSync(optimisticEntry, resolved, vaultKeyPath, keyContextDigest)) {
+    const entry = /** @type {VaultCacheEntry} */ (optimisticEntry);
+    const nextAll = mergeStorefrontTokenUpdate(entry.doc, storefrontId, tokenData);
+    const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
+    entry.doc = cloneVaultDoc(cleaned);
+    entry.generation += 1;
+    entry.pendingAsyncOps += 1;
+    appliedOptimistically = true;
+    emitVaultChange({ action: 'save', storefrontId, filePath: resolved, options });
+  } else if (!fs.existsSync(resolved)) {
+    const nextAll = mergeStorefrontTokenUpdate({}, storefrontId, tokenData);
+    const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
+    /** @type {VaultCacheEntry} */
+    const createdEntry = {
+      doc: cloneVaultDoc(cleaned),
+      hydrated: true,
+      keyContextDigest,
+      pendingAsyncOps: 1,
+      generation: 1,
+      flushedGeneration: 0,
+      tokensExists: false,
+      tokensMtimeMs: 0,
+      tokensSize: 0,
+      vaultKeyExists: false,
+      vaultKeyMtimeMs: 0,
+    };
+    vaultMemoryCache.set(resolved, createdEntry);
+    optimisticEntry = createdEntry;
+    appliedOptimistically = true;
+    emitVaultChange({ action: 'save', storefrontId, filePath: resolved, options });
+  }
+
+  try {
+    await runWithVaultMutex(resolved, async () => {
+      try {
+        if (!appliedOptimistically) {
+          await readTokensUnlockedAsync(resolved, options);
+          let entry = vaultMemoryCache.get(resolved);
+          if (!entry || !entry.hydrated || entry.keyContextDigest !== keyContextDigest) {
+            entry = {
+              doc: {},
+              hydrated: true,
+              keyContextDigest,
+              pendingAsyncOps: 0,
+              generation: 0,
+              flushedGeneration: 0,
+              tokensExists: false,
+              tokensMtimeMs: 0,
+              tokensSize: 0,
+              vaultKeyExists: false,
+              vaultKeyMtimeMs: 0,
+            };
+            vaultMemoryCache.set(resolved, entry);
+          }
+          const nextAll = mergeStorefrontTokenUpdate(entry.doc, storefrontId, tokenData);
+          const { cleaned } = sanitizeStorefrontTokensObject(nextAll, options);
+          entry.doc = cloneVaultDoc(cleaned);
+          entry.generation += 1;
+          entry.pendingAsyncOps += 1;
+          optimisticEntry = entry;
+          appliedOptimistically = true;
+          emitVaultChange({ action: 'save', storefrontId, filePath: resolved, options });
+        }
+
+        const activeEntry = vaultMemoryCache.get(resolved);
+        if (activeEntry) {
+          await flushAuthoritativeVaultEntryAsync(resolved, activeEntry, options);
+        }
+        if (!options?.fromExternalFallback && storefrontId) {
+          try {
+            clearStoreDisconnectedTombstone(storefrontId, options);
+          } catch {}
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('Failed to save tokens:', msg);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn('Failed to save tokens:', msg);
+    });
+  } finally {
+    if (appliedOptimistically && optimisticEntry) {
+      optimisticEntry.pendingAsyncOps = Math.max(0, optimisticEntry.pendingAsyncOps - 1);
     }
-  });
+  }
 }
 
 /**
@@ -947,11 +1770,14 @@ async function saveTokensAsync(storefrontId, tokenData, options = {}) {
  */
 function clearTokens(storefrontId, options = {}) {
   try {
+    const filePath = getTokensFilePath(options);
+    const resolved = path.resolve(toHostFilesystemPath(filePath));
     const existing = loadSavedTokens(options);
     if (existing[storefrontId]) {
       delete existing[storefrontId];
-      writeTokensFile(existing, options);
+      persistTokensToDiskSync(resolved, existing, options);
     }
+    emitVaultChange({ action: 'clear', storefrontId, filePath: resolved, options });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn('Failed to clear tokens:', msg);
@@ -967,25 +1793,53 @@ function clearTokens(storefrontId, options = {}) {
  */
 async function clearTokensAsync(storefrontId, options = {}) {
   const filePath = getTokensFilePath(options);
-  return runWithVaultMutex(filePath, async () => {
-    try {
-      const resolved = path.resolve(filePath);
-      const existing = await readTokensUnlockedAsync(filePath, options);
-      if (existing[storefrontId]) {
-        delete existing[storefrontId];
-        const salt =
-          normalizeSaltBuffer(options?.salt) || (await getOrInitPerFileSaltAsync(resolved));
-        const encryptedPayload = await encryptTokensPayloadAsync(
-          JSON.stringify(existing, null, 2),
-          { ...options, salt }
-        );
-        await atomicWriteVaultFileAsync(filePath, JSON.stringify(encryptedPayload, null, 2));
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn('Failed to clear tokens:', msg);
+  const resolved = path.resolve(toHostFilesystemPath(filePath));
+  const vaultKeyPath = path.join(path.dirname(resolved), 'vault.key');
+  const keyContextDigest = computeVaultKeyContextDigest(resolved, vaultKeyPath, options);
+
+  let optimisticEntry = vaultMemoryCache.get(resolved);
+  let appliedOptimistically = false;
+  if (isVaultCacheEntryValidSync(optimisticEntry, resolved, vaultKeyPath, keyContextDigest)) {
+    const entry = /** @type {VaultCacheEntry} */ (optimisticEntry);
+    if (entry.doc[storefrontId]) {
+      delete entry.doc[storefrontId];
+      entry.generation += 1;
+      entry.pendingAsyncOps += 1;
+      appliedOptimistically = true;
     }
-  });
+    emitVaultChange({ action: 'clear', storefrontId, filePath: resolved, options });
+  }
+
+  try {
+    await runWithVaultMutex(resolved, async () => {
+      try {
+        if (!appliedOptimistically) {
+          await readTokensUnlockedAsync(resolved, options);
+          const entry = vaultMemoryCache.get(resolved);
+          if (entry && entry.doc[storefrontId]) {
+            delete entry.doc[storefrontId];
+            entry.generation += 1;
+            entry.pendingAsyncOps += 1;
+            optimisticEntry = entry;
+            appliedOptimistically = true;
+          }
+          emitVaultChange({ action: 'clear', storefrontId, filePath: resolved, options });
+        }
+
+        const activeEntry = vaultMemoryCache.get(resolved);
+        if (activeEntry && activeEntry.flushedGeneration < activeEntry.generation) {
+          await flushAuthoritativeVaultEntryAsync(resolved, activeEntry, options);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('Failed to clear tokens:', msg);
+      }
+    });
+  } finally {
+    if (appliedOptimistically && optimisticEntry) {
+      optimisticEntry.pendingAsyncOps = Math.max(0, optimisticEntry.pendingAsyncOps - 1);
+    }
+  }
 }
 
 /**
@@ -1041,6 +1895,8 @@ module.exports = {
   isMockOrCorruptedToken,
   sanitizeStorefrontTokensObject,
   projectRedactedXboxSummary,
+  onVaultChange,
+  invalidateVaultMemoryCache,
   runWithVaultMutex,
   writeTokensFile,
   writeTokensFileAsync,

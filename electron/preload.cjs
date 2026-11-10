@@ -1,6 +1,41 @@
 const { contextBridge, ipcRenderer, webFrame } = require('electron');
 
-contextBridge.exposeInMainWorld('electronAPI', {
+function isTrustedMainRendererOrigin() {
+  if (typeof globalThis.window === 'undefined' || !globalThis.window) {
+    return true;
+  }
+  try {
+    if (globalThis.window.top && globalThis.window !== globalThis.window.top) {
+      return false;
+    }
+    const isTestHarness = Boolean(process?.env?.VITEST || process?.env?.NODE_ENV === 'test');
+    const loc = globalThis.window.location;
+    if (!loc || typeof loc.protocol !== 'string') {
+      return isTestHarness;
+    }
+    if (loc.protocol === 'file:') {
+      return true;
+    }
+    if (loc.protocol === 'http:' || loc.protocol === 'https:') {
+      const host = String(loc.hostname || '')
+        .replace(/^\[|\]$/g, '')
+        .toLowerCase();
+      return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    }
+    if (
+      loc.protocol === 'about:' &&
+      Boolean(process?.env?.VITEST || process?.env?.NODE_ENV === 'test')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+if (isTrustedMainRendererOrigin()) {
+  contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
   platform: process.platform,
   loginStore: (storefrontId) => ipcRenderer.invoke('auth:storefront', storefrontId),
@@ -63,8 +98,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('launcher:compat-runner-progress', handler);
   },
   getDiskSpace: (targetPath) => ipcRenderer.invoke('launcher:get-disk-space', targetPath),
-  getGameInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
-  getInstallInfo: (payload) => ipcRenderer.invoke('launcher:get-install-info', payload),
+  getGameInstallInfo: (payload, opts) =>
+    ipcRenderer.invoke('launcher:get-install-info', payload, opts),
+  getInstallInfo: (payload, opts) =>
+    ipcRenderer.invoke('launcher:get-install-info', payload, opts),
   launchGame: (payload) => ipcRenderer.invoke('launcher:launch-game', payload),
   stopGame: (payload) => ipcRenderer.invoke('launcher:stop-game', payload),
   getRunningGames: () => ipcRenderer.invoke('launcher:get-running-games'),
@@ -81,15 +118,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectExecutableDialog: (defaultPath) =>
     ipcRenderer.invoke('launcher:select-executable', defaultPath),
   selectFolderDialog: (defaultPath) => ipcRenderer.invoke('launcher:select-folder', defaultPath),
-  saveGameLaunchConfig: (config) => ipcRenderer.invoke('launcher:save-launch-config', config),
-  saveLaunchConfig: (config) => ipcRenderer.invoke('launcher:save-launch-config', config),
-  getGameLaunchConfigs: () => ipcRenderer.invoke('launcher:get-launch-configs'),
-  getLaunchConfig: (gameId) => ipcRenderer.invoke('launcher:get-launch-config', gameId),
-  deleteLaunchConfig: (gameId) => ipcRenderer.invoke('launcher:delete-launch-config', gameId),
+  saveGameLaunchConfig: (config, opts) =>
+    ipcRenderer.invoke('launcher:save-launch-config', config, opts),
+  saveLaunchConfig: (config, opts) =>
+    ipcRenderer.invoke('launcher:save-launch-config', config, opts),
+  getGameLaunchConfigs: (opts) => ipcRenderer.invoke('launcher:get-launch-configs', opts),
+  getLaunchConfig: (gameId, opts) => ipcRenderer.invoke('launcher:get-launch-config', gameId, opts),
+  deleteLaunchConfig: (gameId, opts) =>
+    ipcRenderer.invoke('launcher:delete-launch-config', gameId, opts),
   getLauncherPerformanceSettings: (opts) =>
     ipcRenderer.invoke('launcher:get-performance-settings', opts),
-  saveLauncherPerformanceSettings: (settings) =>
-    ipcRenderer.invoke('launcher:save-performance-settings', settings),
+  saveLauncherPerformanceSettings: (settings, opts) =>
+    ipcRenderer.invoke('launcher:save-performance-settings', settings, opts),
   drainPendingSessions: (opts) => ipcRenderer.invoke('launcher:drain-pending-sessions', opts),
   probeEnvironmentHealth: (options) =>
     ipcRenderer.invoke('launcher:probe-environment-health', options),
@@ -221,3 +261,4 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
   },
 });
+}

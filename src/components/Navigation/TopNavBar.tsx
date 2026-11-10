@@ -27,6 +27,8 @@ import {
 
 type TopMenuId = 'file' | 'edit' | 'view' | 'window';
 
+const TOP_MENU_ORDER: readonly TopMenuId[] = ['file', 'edit', 'view', 'window'];
+
 interface TopNavBarProps {
   searchQuery?: string;
   onSearchChange?: (query: string) => void;
@@ -47,6 +49,7 @@ interface TopNavBarProps {
   onGoForward?: () => void;
   forwardTitle?: string | null;
   connectedStorefronts?: StorefrontId[];
+  presentStorefronts?: readonly StorefrontId[];
   games?: CanonicalGame[];
   currentGameTitle?: string;
   canSyncCurrentGame?: boolean;
@@ -84,6 +87,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   onGoForward,
   forwardTitle,
   connectedStorefronts,
+  presentStorefronts,
   games,
   currentGameTitle,
   canSyncCurrentGame = false,
@@ -107,8 +111,24 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const [openMenu, setOpenMenu] = useState<TopMenuId | null>(null);
+  const [activeMenuBarIndex, setActiveMenuBarIndex] = useState(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const burgerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const burgerMenuDropdownRef = useRef<HTMLDivElement | null>(null);
   const topMenuBarRef = useRef<HTMLDivElement | null>(null);
+  const topMenuTriggerRefs = useRef<Record<TopMenuId, HTMLButtonElement | null>>({
+    file: null,
+    edit: null,
+    view: null,
+    window: null,
+  });
+  const topMenuDropdownRefs = useRef<Record<TopMenuId, HTMLDivElement | null>>({
+    file: null,
+    edit: null,
+    view: null,
+    window: null,
+  });
+  const windowBlurredRef = useRef(false);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
   const [appVersion, setAppVersion] = useState<string>('0.2.5');
   const [updateStatus, setUpdateStatus] = useState<
@@ -255,6 +275,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     return Math.round(sum / activeDownloads.length);
   }, [activeDownloads]);
 
+  // Close menus on window blur so switching OS windows never leaves stale menus open or re-opens on return
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    let focusResetTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleWindowBlur = () => {
+      windowBlurredRef.current = true;
+      setOpenMenu(null);
+      setIsMenuOpen(false);
+    };
+    const handleWindowFocus = () => {
+      if (focusResetTimer) clearTimeout(focusResetTimer);
+      focusResetTimer = setTimeout(() => {
+        windowBlurredRef.current = false;
+      }, 0);
+    };
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      if (focusResetTimer) clearTimeout(focusResetTimer);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, []);
+
   // Close burger menu or top window menu on outside click or escape
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -270,8 +314,15 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
         if (typeof document !== 'undefined' && document.querySelector('dialog[open]')) {
           return;
         }
-        setIsMenuOpen(false);
-        setOpenMenu(null);
+        if (openMenu !== null) {
+          const triggerToFocus = topMenuTriggerRefs.current[openMenu];
+          setOpenMenu(null);
+          triggerToFocus?.focus?.({ preventScroll: true });
+        }
+        if (isMenuOpen) {
+          setIsMenuOpen(false);
+          burgerTriggerRef.current?.focus?.({ preventScroll: true });
+        }
       }
     }
     if (typeof document !== 'undefined' && (isMenuOpen || openMenu !== null)) {
@@ -285,6 +336,119 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       }
     };
   }, [isMenuOpen, openMenu]);
+
+  const scheduleFocusInMenuContainer = (
+    getContainer: () => HTMLElement | null,
+    target: 'first' | 'last'
+  ) => {
+    const run = () => {
+      const container = getContainer();
+      if (!container) return;
+      const items = Array.from(
+        container.querySelectorAll<HTMLButtonElement>(
+          'button[role^="menuitem"]:not(:disabled):not([aria-disabled="true"])'
+        )
+      );
+      if (items.length === 0) return;
+      const item = target === 'first' ? items[0] : items[items.length - 1];
+      item?.focus?.({ preventScroll: true });
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 0);
+    }
+  };
+
+  const moveToAdjacentTopMenu = (currentIndex: number, direction: 1 | -1, keepOpen: boolean) => {
+    const nextIdx = (currentIndex + direction + TOP_MENU_ORDER.length) % TOP_MENU_ORDER.length;
+    const nextMenuId = TOP_MENU_ORDER[nextIdx];
+    setActiveMenuBarIndex(nextIdx);
+    if (keepOpen) {
+      setOpenMenu(nextMenuId);
+    }
+    topMenuTriggerRefs.current[nextMenuId]?.focus?.({ preventScroll: true });
+  };
+
+  const handleTopMenuTriggerKeyDown = (
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    menuId: TopMenuId,
+    menuIdx: number
+  ) => {
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      moveToAdjacentTopMenu(menuIdx, 1, openMenu !== null);
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      moveToAdjacentTopMenu(menuIdx, -1, openMenu !== null);
+    } else if (event.key === 'ArrowDown' || event.key === 'Home') {
+      event.preventDefault();
+      setActiveMenuBarIndex(menuIdx);
+      setOpenMenu(menuId);
+      scheduleFocusInMenuContainer(() => topMenuDropdownRefs.current[menuId], 'first');
+    } else if (event.key === 'ArrowUp' || event.key === 'End') {
+      event.preventDefault();
+      setActiveMenuBarIndex(menuIdx);
+      setOpenMenu(menuId);
+      scheduleFocusInMenuContainer(() => topMenuDropdownRefs.current[menuId], 'last');
+    } else if (event.key === 'Escape' && openMenu !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpenMenu(null);
+      topMenuTriggerRefs.current[menuId]?.focus?.({ preventScroll: true });
+    } else if (event.key === 'Tab') {
+      setOpenMenu(null);
+    }
+  };
+
+  const handleMenuContainerArrowKeys = (
+    event: React.KeyboardEvent<HTMLDivElement>,
+    options?: {
+      onEscape?: () => void;
+      onArrowHorizontal?: (direction: 1 | -1) => void;
+      onTabOut?: () => void;
+    }
+  ) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      options?.onEscape?.();
+      return;
+    }
+    if (event.key === 'Tab') {
+      options?.onTabOut?.();
+      return;
+    }
+    if ((event.key === 'ArrowRight' || event.key === 'ArrowLeft') && options?.onArrowHorizontal) {
+      event.preventDefault();
+      options.onArrowHorizontal(event.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    if (typeof HTMLElement !== 'undefined' && 'focusGroup' in HTMLElement.prototype) {
+      return;
+    }
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        'button[role^="menuitem"]:not(:disabled):not([aria-disabled="true"])'
+      )
+    );
+    if (items.length === 0) return;
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    const currentIdx = items.indexOf(activeEl as HTMLButtonElement);
+    const nextIdx =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? items.length - 1
+          : currentIdx < 0
+            ? event.key === 'ArrowUp'
+              ? items.length - 1
+              : 0
+            : (currentIdx + (event.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+    event.preventDefault();
+    items[nextIdx]?.focus?.({ preventScroll: true });
+  };
 
   const runMenuAction = (action: WindowMenuAction) => {
     setOpenMenu(null);
@@ -329,6 +493,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
 
   // Set of storefronts with cataloged games in user's library
   const storesInLibrary = useMemo(() => {
+    if (presentStorefronts) {
+      return new Set<StorefrontId>(presentStorefronts);
+    }
     const set = new Set<StorefrontId>();
     if (games) {
       for (const g of games) {
@@ -338,7 +505,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       }
     }
     return set;
-  }, [games]);
+  }, [presentStorefronts, games]);
 
   // Display 'all' and storefronts that are either connected OR present in library
   const visiblePlatforms: (StorefrontId | 'all')[] = useMemo(() => {
@@ -363,7 +530,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
           {/* Left Side: Brand Icon + Title + Steam-Style Menu Bar */}
           <div
             ref={topMenuBarRef}
-            className="app-no-drag flex items-center h-full pl-2.5 gap-0.5"
+            className="app-no-drag flex items-center h-full pl-2.5"
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
           >
             <img
@@ -375,18 +542,36 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               One Launcher
             </span>
 
+            <div
+              role="menubar"
+              aria-label="Application commands"
+              className="flex items-center h-full"
+            >
             {/* File Menu */}
-            <div className="relative">
+            <div role="none" className="relative flex items-center h-full">
               <button
+                ref={(el) => {
+                  topMenuTriggerRefs.current.file = el;
+                }}
                 type="button"
+                role="menuitem"
+                tabIndex={activeMenuBarIndex === 0 ? 0 : -1}
                 data-testid="win-menu-file"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === 'file'}
-                onClick={() => setOpenMenu(openMenu === 'file' ? null : 'file')}
-                onMouseEnter={() => {
-                  if (openMenu !== null && openMenu !== 'file') setOpenMenu('file');
+                onClick={() => {
+                  setActiveMenuBarIndex(0);
+                  setOpenMenu(openMenu === 'file' ? null : 'file');
                 }}
-                className={`min-h-6 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'file') {
+                    setActiveMenuBarIndex(0);
+                    setOpenMenu('file');
+                    topMenuTriggerRefs.current.file?.focus?.({ preventScroll: true });
+                  }
+                }}
+                onKeyDown={(e) => handleTopMenuTriggerKeyDown(e, 'file', 0)}
+                className={`min-h-6 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
                   openMenu === 'file'
                     ? 'bg-[#253447] text-white'
                     : 'text-steam-subtext hover:text-white hover:bg-white/5'
@@ -396,9 +581,22 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               </button>
               {openMenu === 'file' && (
                 <div
+                  ref={(el) => {
+                    topMenuDropdownRefs.current.file = el;
+                  }}
                   role="menu"
                   aria-label="File"
                   data-testid="win-menu-dropdown-file"
+                  onKeyDown={(e) =>
+                    handleMenuContainerArrowKeys(e, {
+                      onEscape: () => {
+                        setOpenMenu(null);
+                        topMenuTriggerRefs.current.file?.focus?.({ preventScroll: true });
+                      },
+                      onArrowHorizontal: (dir) => moveToAdjacentTopMenu(0, dir, true),
+                      onTabOut: () => setOpenMenu(null),
+                    })
+                  }
                   className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
                 >
                   <button
@@ -486,17 +684,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             </div>
 
             {/* Edit Menu */}
-            <div className="relative">
+            <div role="none" className="relative flex items-center h-full">
               <button
+                ref={(el) => {
+                  topMenuTriggerRefs.current.edit = el;
+                }}
                 type="button"
+                role="menuitem"
+                tabIndex={activeMenuBarIndex === 1 ? 0 : -1}
                 data-testid="win-menu-edit"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === 'edit'}
-                onClick={() => setOpenMenu(openMenu === 'edit' ? null : 'edit')}
-                onMouseEnter={() => {
-                  if (openMenu !== null && openMenu !== 'edit') setOpenMenu('edit');
+                onClick={() => {
+                  setActiveMenuBarIndex(1);
+                  setOpenMenu(openMenu === 'edit' ? null : 'edit');
                 }}
-                className={`min-h-6 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'edit') {
+                    setActiveMenuBarIndex(1);
+                    setOpenMenu('edit');
+                    topMenuTriggerRefs.current.edit?.focus?.({ preventScroll: true });
+                  }
+                }}
+                onKeyDown={(e) => handleTopMenuTriggerKeyDown(e, 'edit', 1)}
+                className={`min-h-6 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
                   openMenu === 'edit'
                     ? 'bg-[#253447] text-white'
                     : 'text-steam-subtext hover:text-white hover:bg-white/5'
@@ -506,9 +717,22 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               </button>
               {openMenu === 'edit' && (
                 <div
+                  ref={(el) => {
+                    topMenuDropdownRefs.current.edit = el;
+                  }}
                   role="menu"
                   aria-label="Edit"
                   data-testid="win-menu-dropdown-edit"
+                  onKeyDown={(e) =>
+                    handleMenuContainerArrowKeys(e, {
+                      onEscape: () => {
+                        setOpenMenu(null);
+                        topMenuTriggerRefs.current.edit?.focus?.({ preventScroll: true });
+                      },
+                      onArrowHorizontal: (dir) => moveToAdjacentTopMenu(1, dir, true),
+                      onTabOut: () => setOpenMenu(null),
+                    })
+                  }
                   className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
                 >
                   <button
@@ -571,17 +795,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             </div>
 
             {/* View Menu */}
-            <div className="relative">
+            <div role="none" className="relative flex items-center h-full">
               <button
+                ref={(el) => {
+                  topMenuTriggerRefs.current.view = el;
+                }}
                 type="button"
+                role="menuitem"
+                tabIndex={activeMenuBarIndex === 2 ? 0 : -1}
                 data-testid="win-menu-view"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === 'view'}
-                onClick={() => setOpenMenu(openMenu === 'view' ? null : 'view')}
-                onMouseEnter={() => {
-                  if (openMenu !== null && openMenu !== 'view') setOpenMenu('view');
+                onClick={() => {
+                  setActiveMenuBarIndex(2);
+                  setOpenMenu(openMenu === 'view' ? null : 'view');
                 }}
-                className={`min-h-6 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'view') {
+                    setActiveMenuBarIndex(2);
+                    setOpenMenu('view');
+                    topMenuTriggerRefs.current.view?.focus?.({ preventScroll: true });
+                  }
+                }}
+                onKeyDown={(e) => handleTopMenuTriggerKeyDown(e, 'view', 2)}
+                className={`min-h-6 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
                   openMenu === 'view'
                     ? 'bg-[#253447] text-white'
                     : 'text-steam-subtext hover:text-white hover:bg-white/5'
@@ -591,9 +828,22 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               </button>
               {openMenu === 'view' && (
                 <div
+                  ref={(el) => {
+                    topMenuDropdownRefs.current.view = el;
+                  }}
                   role="menu"
                   aria-label="View"
                   data-testid="win-menu-dropdown-view"
+                  onKeyDown={(e) =>
+                    handleMenuContainerArrowKeys(e, {
+                      onEscape: () => {
+                        setOpenMenu(null);
+                        topMenuTriggerRefs.current.view?.focus?.({ preventScroll: true });
+                      },
+                      onArrowHorizontal: (dir) => moveToAdjacentTopMenu(2, dir, true),
+                      onTabOut: () => setOpenMenu(null),
+                    })
+                  }
                   className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
                 >
                   <button
@@ -670,17 +920,30 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             </div>
 
             {/* Window Menu */}
-            <div className="relative">
+            <div role="none" className="relative flex items-center h-full">
               <button
+                ref={(el) => {
+                  topMenuTriggerRefs.current.window = el;
+                }}
                 type="button"
+                role="menuitem"
+                tabIndex={activeMenuBarIndex === 3 ? 0 : -1}
                 data-testid="win-menu-window"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === 'window'}
-                onClick={() => setOpenMenu(openMenu === 'window' ? null : 'window')}
-                onMouseEnter={() => {
-                  if (openMenu !== null && openMenu !== 'window') setOpenMenu('window');
+                onClick={() => {
+                  setActiveMenuBarIndex(3);
+                  setOpenMenu(openMenu === 'window' ? null : 'window');
                 }}
-                className={`min-h-6 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                onMouseEnter={() => {
+                  if (openMenu !== null && openMenu !== 'window') {
+                    setActiveMenuBarIndex(3);
+                    setOpenMenu('window');
+                    topMenuTriggerRefs.current.window?.focus?.({ preventScroll: true });
+                  }
+                }}
+                onKeyDown={(e) => handleTopMenuTriggerKeyDown(e, 'window', 3)}
+                className={`min-h-6 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
                   openMenu === 'window'
                     ? 'bg-[#253447] text-white'
                     : 'text-steam-subtext hover:text-white hover:bg-white/5'
@@ -690,9 +953,22 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
               </button>
               {openMenu === 'window' && (
                 <div
+                  ref={(el) => {
+                    topMenuDropdownRefs.current.window = el;
+                  }}
                   role="menu"
                   aria-label="Window"
                   data-testid="win-menu-dropdown-window"
+                  onKeyDown={(e) =>
+                    handleMenuContainerArrowKeys(e, {
+                      onEscape: () => {
+                        setOpenMenu(null);
+                        topMenuTriggerRefs.current.window?.focus?.({ preventScroll: true });
+                      },
+                      onArrowHorizontal: (dir) => moveToAdjacentTopMenu(3, dir, true),
+                      onTabOut: () => setOpenMenu(null),
+                    })
+                  }
                   className="bg-[#16202d] border border-[#2a475e] shadow-2xl rounded-md py-1.5 min-w-[230px] absolute top-full left-0 mt-0.5 z-50"
                 >
                   <button
@@ -726,7 +1002,8 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   <div role="separator" className="border-t border-steam-border/50 my-1" />
                   <button
                     type="button"
-                    role="menuitem"
+                    role="menuitemcheckbox"
+                    aria-checked={installedOnly}
                     onClick={() => {
                       setOpenMenu(null);
                       onToggleInstalledOnly();
@@ -735,7 +1012,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   >
                     <span>Installed Games Only</span>
                     {installedOnly && (
-                      <span className="text-xs font-bold text-emerald-400 ml-4">✓</span>
+                      <span aria-hidden="true" className="text-xs font-bold text-emerald-400 ml-4">
+                        ✓
+                      </span>
                     )}
                   </button>
                   <div role="separator" className="border-t border-steam-border/50 my-1" />
@@ -753,6 +1032,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                   </button>
                 </div>
               )}
+            </div>
             </div>
           </div>
 
@@ -839,8 +1119,24 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
           {/* Burger Menu Button with Dropdown */}
           <div className="relative" ref={menuRef}>
             <button
+              ref={burgerTriggerRef}
               type="button"
               onClick={() => setIsMenuOpen((prev) => !prev)}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowDown' || e.key === 'Home') {
+                  e.preventDefault();
+                  setIsMenuOpen(true);
+                  scheduleFocusInMenuContainer(() => burgerMenuDropdownRef.current, 'first');
+                } else if (e.key === 'ArrowUp' || e.key === 'End') {
+                  e.preventDefault();
+                  setIsMenuOpen(true);
+                  scheduleFocusInMenuContainer(() => burgerMenuDropdownRef.current, 'last');
+                } else if (e.key === 'Escape' && isMenuOpen) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setIsMenuOpen(false);
+                }
+              }}
               className={`app-no-drag min-w-6 min-h-6 p-2 rounded transition-all flex items-center justify-center border shadow-sm cursor-pointer ${
                 isMenuOpen
                   ? 'bg-steam-accent text-black border-steam-accent shadow-[0_0_12px_rgba(102,192,244,0.4)]'
@@ -861,8 +1157,18 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             {/* Burger Dropdown Menu */}
             {isMenuOpen && (
               <div
+                ref={burgerMenuDropdownRef}
                 role="menu"
-                aria-label="Application menu"
+                aria-label="Launcher actions"
+                onKeyDown={(e) =>
+                  handleMenuContainerArrowKeys(e, {
+                    onEscape: () => {
+                      setIsMenuOpen(false);
+                      burgerTriggerRef.current?.focus?.({ preventScroll: true });
+                    },
+                    onTabOut: () => setIsMenuOpen(false),
+                  })
+                }
                 className="app-no-drag absolute left-0 top-full mt-2 w-64 rounded-md bg-[#16202d] border border-steam-border shadow-2xl z-50 py-1.5 animate-in fade-in zoom-in-95 duration-150"
                 style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
               >
@@ -1407,6 +1713,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
 
           <button
             type="button"
+            aria-pressed={installedOnly}
             onClick={onToggleInstalledOnly}
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
             className={`app-no-drag px-2.5 py-1 text-xs rounded border transition-colors flex items-center gap-1.5 cursor-pointer ${
@@ -1481,6 +1788,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       onGoForward,
       forwardTitle,
       connectedStorefronts,
+      presentStorefronts,
       games,
       currentGameTitle,
       canSyncCurrentGame,
@@ -1502,6 +1810,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
       isFullScreen,
       isMaximized,
       openMenu,
+      activeMenuBarIndex,
       activeDownloads,
       avgDownloadProgress,
       appVersion,

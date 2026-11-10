@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useRef, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
@@ -62,9 +62,18 @@ import {
   parseStorageRequirementTextClient,
   sanitizeGameInstallSizeBytes,
 } from '../../utils/formatBytes';
-
-import { GameInstallModal } from '../Launcher/GameInstallModal';
 import { GameLaunchConfigModal } from '../Launcher/GameLaunchConfigModal';
+import { useIsRealClientRenderer } from '../../utils/useSafeId';
+
+const loadGameInstallModalModule = () => import('../Launcher/GameInstallModal');
+
+const GameInstallModal = lazy(() =>
+  loadGameInstallModalModule().then((m) => ({ default: m.GameInstallModal }))
+);
+
+function prefetchGameInstallModal(): void {
+  void loadGameInstallModalModule().catch(() => {});
+}
 
 interface PlatformAchievementSummary {
   platformId: StorefrontId;
@@ -126,6 +135,7 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
   onViewAchievements,
   onSelectedPlatformChange,
 }) => {
+  const isRealClientRenderer = useIsRealClientRenderer();
   const [showAchievementPopover, setShowAchievementPopover] = useState(false);
   const [showPlaytimePopover, setShowPlaytimePopover] = useState(false);
   const [launcherTick, setLauncherTick] = useState(0);
@@ -964,6 +974,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
               <button
                 type="button"
                 onClick={handleInstallClick}
+                onPointerEnter={prefetchGameInstallModal}
+                onFocus={prefetchGameInstallModal}
                 className="inline-flex items-center justify-center gap-1.5 xl:gap-2 px-5 xl:px-6 py-2 xl:py-2.5 rounded font-bold text-xs xl:text-sm text-white tracking-wider uppercase transition-all shadow-md hover:brightness-110 active:scale-[0.99] shrink-0 cursor-pointer"
                 style={{
                   background: 'linear-gradient(to right, #214b6b 0%, #123049 100%)',
@@ -1097,6 +1109,8 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
                     /* 1. Install Game... (shown when not installed) */
                     <button
                       type="button"
+                      onPointerEnter={prefetchGameInstallModal}
+                      onFocus={prefetchGameInstallModal}
                       onClick={() => {
                         setIsManageMenuOpen(false);
                         setIsInstallModalOpen(true);
@@ -1976,36 +1990,42 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
         </div>
       )}
 
-      {/* Universal Game Install Modal */}
-      <GameInstallModal
-        isOpen={isInstallModalOpen}
-        game={game}
-        initialPlatformId={selectedPlatformId}
-        onClose={() => setIsInstallModalOpen(false)}
-        onInstallStarted={(task) => {
-          if (task?.platformId) {
-            userManuallySelectedPlatformRef.current = true;
-            setSelectedPlatformId(task.platformId);
-            launcherService.setSelectedStorefrontForGame(game.id, task.platformId);
-          }
-        }}
-      />
+      {/* Universal Game Install Modal (lazy-loaded on demand) */}
+      {isInstallModalOpen && (
+        <Suspense fallback={null}>
+          <GameInstallModal
+            isOpen={isInstallModalOpen}
+            game={game}
+            initialPlatformId={selectedPlatformId}
+            onClose={() => setIsInstallModalOpen(false)}
+            onInstallStarted={(task) => {
+              if (task?.platformId) {
+                userManuallySelectedPlatformRef.current = true;
+                setSelectedPlatformId(task.platformId);
+                launcherService.setSelectedStorefrontForGame(game.id, task.platformId);
+              }
+            }}
+          />
+        </Suspense>
+      )}
 
-      {/* Per-Game Launch & Compatibility Configuration Modal */}
-      <GameLaunchConfigModal
-        isOpen={isLaunchConfigModalOpen}
-        game={game}
-        initialPlatformId={selectedPlatformId}
-        onClose={() => setIsLaunchConfigModalOpen(false)}
-        onSaved={(cfg) => {
-          if (cfg.preferredPlatformId) {
-            userManuallySelectedPlatformRef.current = true;
-            setSelectedPlatformId(cfg.preferredPlatformId);
-            launcherService.setSelectedStorefrontForGame(game.id, cfg.preferredPlatformId);
-          }
-          showTempFeedback(`Saved launch configuration for ${game.title}.`);
-        }}
-      />
+      {/* Per-Game Launch & Compatibility Configuration Modal (conditionally mounted in client renderer) */}
+      {(isLaunchConfigModalOpen || !isRealClientRenderer) && (
+        <GameLaunchConfigModal
+          isOpen={isLaunchConfigModalOpen}
+          game={game}
+          initialPlatformId={selectedPlatformId}
+          onClose={() => setIsLaunchConfigModalOpen(false)}
+          onSaved={(cfg) => {
+            if (cfg.preferredPlatformId) {
+              userManuallySelectedPlatformRef.current = true;
+              setSelectedPlatformId(cfg.preferredPlatformId);
+              launcherService.setSelectedStorefrontForGame(game.id, cfg.preferredPlatformId);
+            }
+            showTempFeedback(`Saved launch configuration for ${game.title}.`);
+          }}
+        />
+      )}
     </div>
   );
 };

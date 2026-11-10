@@ -41,6 +41,30 @@ const XVD_HASH_ENTRY_SIZE = 24; // 20B hash + 4B u32LE data_unit
 const XVC_INFO_HEADER_SIZE = 0xda8; // 3496 bytes
 const XVC_REGION_HEADER_SIZE = 0x80; // 128 bytes
 const SEGMENT_METADATA_MAGIC = ' PFX';
+const MAX_XVD_METADATA_ALLOC_BYTES = 64 * 1024 * 1024; // 64 MiB structural metadata cap
+const MAX_NTFS_READ_ALL_BYTES = 16 * 1024 * 1024; // 16 MiB whole-file NTFS manifest cap
+
+/**
+ * Reads an unsigned 64-bit little-endian integer and throws `RangeError` if it exceeds
+ * `Number.MAX_SAFE_INTEGER` (`2^53 - 1`), preventing silent IEEE-754 mantissa rounding.
+ *
+ * @param {Buffer} buf
+ * @param {number} offset
+ * @param {string} [label]
+ * @returns {number}
+ */
+function readSafeU64LE(buf, offset, label = 'uint64') {
+  if (!Buffer.isBuffer(buf) || offset < 0 || offset + 8 > buf.length) {
+    throw new RangeError(`Out-of-bounds 64-bit read for ${label} at offset ${offset}`);
+  }
+  const raw = buf.readBigUInt64LE(offset);
+  if (raw > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(
+      `Unsafe 64-bit integer overflow in ${label}: ${raw.toString()} exceeds Number.MAX_SAFE_INTEGER`
+    );
+  }
+  return Number(raw);
+}
 
 const XVD_VOLUME_FLAGS = Object.freeze({
   READ_ONLY: 1 << 0,
@@ -599,7 +623,7 @@ function parseXvdHeader(buf) {
   const volumeFlags = buf.readUInt32LE(0x208);
   const formatVersion = buf.readUInt32LE(0x20c);
   const fileTimeCreated = buf.readBigUInt64LE(0x210);
-  const driveSize = Number(buf.readBigUInt64LE(0x218));
+  const driveSize = readSafeU64LE(buf, 0x218, 'XvdHeader.driveSize');
   const vduid = Buffer.from(buf.subarray(0x220, 0x230));
   const vduidLow8 = Buffer.from(buf.subarray(0x220, 0x228));
   const uduid = Buffer.from(buf.subarray(0x230, 0x240));
@@ -611,6 +635,21 @@ function parseXvdHeader(buf) {
   const userDataLength = buf.readUInt32LE(0x28c);
   const xvcDataLength = buf.readUInt32LE(0x290);
   const dynamicHeaderLength = buf.readUInt32LE(0x294);
+  if (userDataLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+    throw new RangeError(
+      `XvdHeader.userDataLength (${userDataLength}) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+    );
+  }
+  if (xvcDataLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+    throw new RangeError(
+      `XvdHeader.xvcDataLength (${xvcDataLength}) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+    );
+  }
+  if (dynamicHeaderLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+    throw new RangeError(
+      `XvdHeader.dynamicHeaderLength (${dynamicHeaderLength}) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+    );
+  }
   const blockSize = buf.readUInt32LE(0x298) || 0xaa000;
   const productId = formatGuidLE(buf, 0x39c);
   const pduid = formatGuidLE(buf, 0x3ac);
@@ -948,7 +987,7 @@ function parseXvcInfo(buf) {
   const flags = buf.readUInt32LE(0xd18);
   const keyCount = Math.min(192, buf.readUInt16LE(0xd1e));
   const initialPlayRegionId = buf.readUInt32LE(0xd24);
-  const initialPlayOffset = Number(buf.readBigUInt64LE(0xd28));
+  const initialPlayOffset = readSafeU64LE(buf, 0xd28, 'XvcInfo.initialPlayOffset');
   const updateSegmentCount = buf.readUInt32LE(0xd3c);
 
   const encryptionKeyIds = [];
@@ -974,8 +1013,8 @@ function parseXvcInfo(buf) {
     const regionFlags = buf.readUInt32LE(rOff + 0x08);
     const firstSegmentIndex = buf.readUInt32LE(rOff + 0x0c);
     const description = readNullTerminatedUtf16LE(buf, rOff + 0x10, 32);
-    const offset = Number(buf.readBigUInt64LE(rOff + 0x50));
-    const length = Number(buf.readBigUInt64LE(rOff + 0x58));
+    const offset = readSafeU64LE(buf, rOff + 0x50, 'XvcRegion.offset');
+    const length = readSafeU64LE(buf, rOff + 0x58, 'XvcRegion.length');
     const hash = buf.readBigUInt64LE(rOff + 0x60);
     const isEncrypted = keyId !== 0xffff && keyId < 0xc0;
 
@@ -1095,7 +1134,7 @@ function parseSegmentMetadata(buf) {
     const flags = buf.readUInt16LE(recOff + 0x00);
     const pathCodeUnits = buf.readUInt16LE(recOff + 0x02);
     const pathRelByteOffset = buf.readUInt32LE(recOff + 0x04);
-    const fileSize = Number(buf.readBigUInt64LE(recOff + 0x08));
+    const fileSize = readSafeU64LE(recOff + 0x08 >= 0 ? buf : buf, recOff + 0x08, 'SegmentMetadata.fileSize');
 
     const strStart = pathsTableOffset + pathRelByteOffset;
     const strEnd = Math.min(buf.length, strStart + pathCodeUnits * 2);
@@ -1324,6 +1363,11 @@ function decodeNtfsDataRuns(buf, startOffset, clusterSize, partitionByteOffset) 
 
 async function readFromNtfsRuns(driveReader, runs, logicalOffset, byteLength, signal) {
   if (byteLength <= 0) return Buffer.alloc(0);
+  if (byteLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+    throw new RangeError(
+      `NTFS run allocation (${byteLength} bytes) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+    );
+  }
   const out = Buffer.alloc(byteLength);
   let remaining = byteLength;
   let outPos = 0;
@@ -1364,7 +1408,7 @@ async function locateNtfsPartitionOffset(driveReader, signal) {
     if (head.length < sectorSize * 2) continue;
     const gptHdr = head.subarray(sectorSize, sectorSize + 92);
     if (gptHdr.subarray(0, 8).toString('ascii') === 'EFI PART') {
-      const partEntryLba = Number(gptHdr.readBigUInt64LE(72));
+      const partEntryLba = readSafeU64LE(gptHdr, 72, 'GPT.partEntryLba');
       const numEntries = Math.min(128, gptHdr.readUInt32LE(80));
       const entrySize = gptHdr.readUInt32LE(84) || 128;
       const entriesBuf = await driveReader.readRange(
@@ -1378,7 +1422,7 @@ async function locateNtfsPartitionOffset(driveReader, signal) {
         if (eOff + 64 > entriesBuf.length) break;
         const typeGuid = entriesBuf.subarray(eOff, eOff + 16);
         if (typeGuid.every((b) => b === 0)) continue;
-        const firstLba = Number(entriesBuf.readBigUInt64LE(eOff + 32));
+        const firstLba = readSafeU64LE(entriesBuf, eOff + 32, 'GPT.firstLba');
         const candidateOffset = firstLba * sectorSize;
         const vbr = await driveReader.readRange(candidateOffset, 512, signal);
         if (vbr.length >= 0x50 && vbr.subarray(0x03, 0x0b).toString('ascii') === 'NTFS    ') {
@@ -1459,7 +1503,7 @@ function parseNtfsFileRecordAttributes(recordBuf, clusterSize, partitionByteOffs
         };
       } else if (attrOff + 64 <= fixed.length) {
         const runOff = attrOff + fixed.readUInt16LE(attrOff + 32);
-        const realSize = Number(fixed.readBigUInt64LE(attrOff + 48));
+        const realSize = readSafeU64LE(fixed, attrOff + 48, 'NTFS.realSize');
         const runs = decodeNtfsDataRuns(
           fixed.subarray(0, attrOff + attrLen),
           runOff,
@@ -1499,6 +1543,11 @@ function parseNtfsFileRecordAttributes(recordBuf, clusterSize, partitionByteOffs
 async function createVirtualDriveRangeReader(containerReader, header, layout, signal) {
   let batTable = null;
   if (header.xvdType === 1 && layout.dynamicHeader.byteLength > 0) {
+    if (layout.dynamicHeader.byteLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+      throw new RangeError(
+        `Dynamic XVD BAT header (${layout.dynamicHeader.byteLength} bytes) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+      );
+    }
     batTable = await containerReader.readRange(
       layout.dynamicHeader.byteOffset,
       layout.dynamicHeader.byteLength,
@@ -1599,7 +1648,7 @@ async function walkUnencryptedNtfsFiles(options) {
   const bytesPerSector = vbr.readUInt16LE(0x0b) || 512;
   const sectorsPerCluster = vbr.readUInt8(0x0d) || 8;
   const clusterSize = bytesPerSector * sectorsPerCluster;
-  const mftCluster = Number(vbr.readBigUInt64LE(0x30));
+  const mftCluster = readSafeU64LE(vbr, 0x30, 'NTFS.mftCluster');
   const rawRecClusters = vbr.readInt8(0x40);
   const recordSize =
     rawRecClusters < 0 ? 1 << -rawRecClusters : Math.max(1024, rawRecClusters * clusterSize);
@@ -1714,7 +1763,12 @@ async function walkUnencryptedNtfsFiles(options) {
           reqSignal || signal
         );
       },
-      readAllBytes: async (reqSignal) => {
+      readAllBytes: async (reqSignal, maxBytes = MAX_NTFS_READ_ALL_BYTES) => {
+        if (node.dataAttr.fileSize > maxBytes) {
+          throw new RangeError(
+            `NTFS readAllBytes refused for "${relPath}": fileSize ${node.dataAttr.fileSize} exceeds ${maxBytes} byte cap`
+          );
+        }
         if (node.dataAttr.resident) {
           return Buffer.from(node.dataAttr.residentData || Buffer.alloc(0));
         }
@@ -2042,6 +2096,16 @@ async function inspectMsixvcContainer(options = {}) {
         );
       }
     } else {
+      if (layout.userData.byteLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+        throw new RangeError(
+          `XVD userData (${layout.userData.byteLength} bytes) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+        );
+      }
+      if (layout.xvcInfo.byteLength > MAX_XVD_METADATA_ALLOC_BYTES) {
+        throw new RangeError(
+          `XVD xvcInfo (${layout.xvcInfo.byteLength} bytes) exceeds ${MAX_XVD_METADATA_ALLOC_BYTES} byte cap`
+        );
+      }
       if (layout.userData.byteLength > 0) {
         userDataBuf = await sliceOrRead(layout.userData.byteOffset, layout.userData.byteLength);
       }
@@ -2436,6 +2500,9 @@ module.exports = {
   createFileRangeReader,
   createHttpRangeReader,
   createLruBlockRangeReader,
+  MAX_XVD_METADATA_ALLOC_BYTES,
+  MAX_NTFS_READ_ALL_BYTES,
+  readSafeU64LE,
   parseXvdHeader,
   computeHashTreeLayout,
   computeXvdLayout,

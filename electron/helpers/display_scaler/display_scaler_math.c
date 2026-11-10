@@ -92,6 +92,55 @@ ds_aspect_mode_t ds_cycle_aspect_mode(ds_aspect_mode_t current)
     }
 }
 
+static bool ds_parse_scale_filter_span(const char *p, size_t n, ds_scale_filter_t *out_filter)
+{
+    if (!p || !out_filter) return false;
+    ds_trim_span(&p, &n);
+    if (ds_ascii_ieq_span(p, n, "auto")) {
+        *out_filter = DS_FILTER_AUTO;
+        return true;
+    }
+    if (ds_ascii_ieq_span(p, n, "sharp") || ds_ascii_ieq_span(p, n, "sharp_bilinear") ||
+        ds_ascii_ieq_span(p, n, "pixel_aa")) {
+        *out_filter = DS_FILTER_SHARP;
+        return true;
+    }
+    if (ds_ascii_ieq_span(p, n, "linear") || ds_ascii_ieq_span(p, n, "bilinear")) {
+        *out_filter = DS_FILTER_LINEAR;
+        return true;
+    }
+    if (ds_ascii_ieq_span(p, n, "nearest") || ds_ascii_ieq_span(p, n, "point")) {
+        *out_filter = DS_FILTER_NEAREST;
+        return true;
+    }
+    return false;
+}
+
+ds_scale_filter_t ds_parse_scale_filter(const char *value)
+{
+    if (!value) return DS_FILTER_AUTO;
+    ds_scale_filter_t f = DS_FILTER_AUTO;
+    if (ds_parse_scale_filter_span(value, strlen(value), &f)) {
+        return f;
+    }
+    return DS_FILTER_AUTO;
+}
+
+const char *ds_scale_filter_to_string(ds_scale_filter_t filter)
+{
+    switch (filter) {
+        case DS_FILTER_SHARP:
+            return "sharp";
+        case DS_FILTER_LINEAR:
+            return "linear";
+        case DS_FILTER_NEAREST:
+            return "nearest";
+        case DS_FILTER_AUTO:
+        default:
+            return "auto";
+    }
+}
+
 int32_t ds_clamp_safe_inset_top(int32_t safe_inset_top, int32_t screen_h)
 {
     if (screen_h <= 4 || safe_inset_top <= 0) {
@@ -193,9 +242,13 @@ bool ds_compute_viewport(
         dst_h = usable_h;
         dst_w = ds_round_aspect_dim_even_or_exact(rhs, (int64_t)virt_h, usable_w);
     } else if (lhs < rhs) {
-        /* Usable area is taller than virtual aspect -> letterbox */
+        /* Usable area is taller than virtual aspect -> letterbox (always even height when >= 2) */
         dst_w = usable_w;
-        dst_h = ds_round_aspect_dim_even_or_exact(lhs, (int64_t)virt_w, usable_h);
+        int64_t fit_h = (lhs + ((int64_t)virt_w / 2)) / (int64_t)virt_w;
+        if (fit_h > (int64_t)usable_h) fit_h = (int64_t)usable_h;
+        if (fit_h >= 2) fit_h &= ~(int64_t)1;
+        if (fit_h < 1) fit_h = 1;
+        dst_h = (int32_t)fit_h;
     }
 
     out_vp->dst_w = dst_w;
@@ -461,11 +514,27 @@ bool ds_map_cursor_virt_to_phys(
     int64_t cvx = ds_clamp_i64((int64_t)vx, 0, (int64_t)virt_w - 1);
     int64_t cvy = ds_clamp_i64((int64_t)vy, 0, (int64_t)virt_h - 1);
 
-    int64_t px = (int64_t)dst_x + (cvx * (int64_t)dst_w) / (int64_t)virt_w;
-    int64_t py = (int64_t)dst_y + (cvy * (int64_t)dst_h) / (int64_t)virt_h;
+    /*
+     * Map to the center of virtual pixel `(cvx, cvy)`'s physical footprint:
+     * `floor(((2 * v + 1) * D) / (2 * V))`, clamped on upscaling (`D >= V`) to
+     * `>= ceil(v * D / V)` so `ds_map_cursor_phys_to_virt(ds_map_cursor_virt_to_phys(v)) == v`
+     * holds identically for all `D >= V >= 1` with symmetric left/right sub-pixel thresholds.
+     */
+    int64_t rx = (((cvx * 2LL) + 1LL) * (int64_t)dst_w) / (2LL * (int64_t)virt_w);
+    int64_t ry = (((cvy * 2LL) + 1LL) * (int64_t)dst_h) / (2LL * (int64_t)virt_h);
+    if (dst_w >= virt_w) {
+        int64_t min_rx = (cvx * (int64_t)dst_w + (int64_t)virt_w - 1LL) / (int64_t)virt_w;
+        if (rx < min_rx) rx = min_rx;
+    }
+    if (dst_h >= virt_h) {
+        int64_t min_ry = (cvy * (int64_t)dst_h + (int64_t)virt_h - 1LL) / (int64_t)virt_h;
+        if (ry < min_ry) ry = min_ry;
+    }
+    rx = ds_clamp_i64(rx, 0, (int64_t)dst_w - 1);
+    ry = ds_clamp_i64(ry, 0, (int64_t)dst_h - 1);
 
-    *out_px = (int32_t)ds_clamp_i64(px, (int64_t)dst_x, (int64_t)dst_x + (int64_t)dst_w - 1);
-    *out_py = (int32_t)ds_clamp_i64(py, (int64_t)dst_y, (int64_t)dst_y + (int64_t)dst_h - 1);
+    *out_px = (int32_t)((int64_t)dst_x + rx);
+    *out_py = (int32_t)((int64_t)dst_y + ry);
     return true;
 }
 
@@ -589,6 +658,15 @@ bool ds_cursor_resolve_get_pos(
     return true;
 }
 
+static int64_t ds_div_floor_i64(int64_t num, int64_t den)
+{
+    if (den <= 0) return 0;
+    if (num >= 0) {
+        return num / den;
+    }
+    return -(((-num) + den - 1) / den);
+}
+
 bool ds_map_subrect_virt_to_phys(
     int32_t  vx,
     int32_t  vy,
@@ -619,10 +697,10 @@ bool ds_map_subrect_virt_to_phys(
     int64_t x1 = x0 + (int64_t)vw;
     int64_t y1 = y0 + (int64_t)vh;
 
-    int64_t px0 = (int64_t)dst_origin_x + (x0 * (int64_t)dst_w) / (int64_t)virt_w;
-    int64_t py0 = (int64_t)dst_origin_y + (y0 * (int64_t)dst_h) / (int64_t)virt_h;
-    int64_t px1 = (int64_t)dst_origin_x + (x1 * (int64_t)dst_w) / (int64_t)virt_w;
-    int64_t py1 = (int64_t)dst_origin_y + (y1 * (int64_t)dst_h) / (int64_t)virt_h;
+    int64_t px0 = (int64_t)dst_origin_x + ds_div_floor_i64(x0 * (int64_t)dst_w, (int64_t)virt_w);
+    int64_t py0 = (int64_t)dst_origin_y + ds_div_floor_i64(y0 * (int64_t)dst_h, (int64_t)virt_h);
+    int64_t px1 = (int64_t)dst_origin_x + ds_div_floor_i64(x1 * (int64_t)dst_w, (int64_t)virt_w);
+    int64_t py1 = (int64_t)dst_origin_y + ds_div_floor_i64(y1 * (int64_t)dst_h, (int64_t)virt_h);
 
     if (vw > 0 && px1 <= px0) px1 = px0 + 1;
     if (vh > 0 && py1 <= py0) py1 = py0 + 1;
@@ -646,6 +724,46 @@ static bool ds_parse_u64_span(const char *s, size_t len, uint64_t *out_val)
         acc = acc * 10ULL + digit;
     }
     *out_val = acc;
+    return true;
+}
+
+static bool ds_parse_i32_span(const char *s, size_t len, int32_t *out_val)
+{
+    if (!s || len == 0 || !out_val) return false;
+    bool neg = false;
+    size_t idx = 0;
+    if (s[0] == '-' || s[0] == '+') {
+        neg = (s[0] == '-');
+        idx = 1;
+        if (idx >= len) return false;
+    }
+    uint64_t mag = 0;
+    if (!ds_parse_u64_span(s + idx, len - idx, &mag)) return false;
+    if (neg) {
+        if (mag > 2147483648ULL) return false;
+        *out_val = (mag == 2147483648ULL) ? (-2147483647 - 1) : -(int32_t)mag;
+    } else {
+        if (mag > 2147483647ULL) return false;
+        *out_val = (int32_t)mag;
+    }
+    return true;
+}
+
+static bool ds_copy_unquoted_span(const char *s, size_t len, char *out_buf, size_t out_cap)
+{
+    if (!s || !out_buf || out_cap < 2) return false;
+    ds_trim_span(&s, &len);
+    if (len >= 2 && ((s[0] == '"' && s[len - 1] == '"') || (s[0] == '\'' && s[len - 1] == '\''))) {
+        s++;
+        len -= 2;
+        ds_trim_span(&s, &len);
+    }
+    if (len == 0 || len >= out_cap) return false;
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)s[i] < 0x20u) return false;
+    }
+    memcpy(out_buf, s, len);
+    out_buf[len] = '\0';
     return true;
 }
 
@@ -707,7 +825,8 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
                 out_state->fullscreen = false;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "aspect")) {
-            if (ds_ascii_ieq_span(val, val_len, "preserve_aspect")) {
+            if (ds_ascii_ieq_span(val, val_len, "preserve_aspect") ||
+                ds_ascii_ieq_span(val, val_len, "preserve")) {
                 out_state->has_aspect = true;
                 out_state->aspect = DS_ASPECT_PRESERVE;
             } else if (ds_ascii_ieq_span(val, val_len, "integer")) {
@@ -717,8 +836,67 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
                 out_state->has_aspect = true;
                 out_state->aspect = DS_ASPECT_STRETCH;
             }
+        } else if (ds_ascii_ieq_span(key, key_len, "safe_inset_top")) {
+            int32_t inset = 0;
+            if (ds_parse_i32_span(val, val_len, &inset)) {
+                out_state->has_safe_inset_top = true;
+                out_state->safe_inset_top = (inset > 0) ? inset : 0;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "filter") ||
+                   ds_ascii_ieq_span(key, key_len, "scaling_filter")) {
+            ds_scale_filter_t parsed_filter = DS_FILTER_AUTO;
+            if (ds_parse_scale_filter_span(val, val_len, &parsed_filter)) {
+                out_state->has_filter = true;
+                out_state->filter = parsed_filter;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "mode") ||
+                   ds_ascii_ieq_span(key, key_len, "scaling_mode")) {
+            if (ds_ascii_ieq_span(val, val_len, "auto_fullscreen") ||
+                ds_ascii_ieq_span(val, val_len, "auto")) {
+                out_state->has_scaling_mode = true;
+                out_state->scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+            } else if (ds_ascii_ieq_span(val, val_len, "force_fullscreen")) {
+                out_state->has_scaling_mode = true;
+                out_state->scaling_mode = DS_MODE_FORCE_FULLSCREEN;
+            } else if (ds_ascii_ieq_span(val, val_len, "off") ||
+                       ds_ascii_ieq_span(val, val_len, "passthrough") ||
+                       ds_ascii_ieq_span(val, val_len, "windowed")) {
+                out_state->has_scaling_mode = true;
+                out_state->scaling_mode = DS_MODE_PASSTHROUGH;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "hotkey")) {
+            if (ds_ascii_ieq_span(val, val_len, "1") || ds_ascii_ieq_span(val, val_len, "true")) {
+                out_state->has_hotkey = true;
+                out_state->hotkey = true;
+            } else if (ds_ascii_ieq_span(val, val_len, "0") || ds_ascii_ieq_span(val, val_len, "false")) {
+                out_state->has_hotkey = true;
+                out_state->hotkey = false;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "updated_unix_ms")) {
+            uint64_t parsed_ts = 0;
+            if (ds_parse_u64_span(val, val_len, &parsed_ts)) {
+                out_state->has_updated_unix_ms = true;
+                out_state->updated_unix_ms = parsed_ts;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "control_file")) {
+            if (ds_copy_unquoted_span(val, val_len, out_state->control_file, sizeof(out_state->control_file))) {
+                out_state->has_control_file = true;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "status_file")) {
+            if (ds_copy_unquoted_span(val, val_len, out_state->status_file, sizeof(out_state->status_file))) {
+                out_state->has_status_file = true;
+            }
         }
     }
 
-    return out_state->has_seq || out_state->has_fullscreen || out_state->has_aspect;
+    return out_state->has_seq ||
+           out_state->has_fullscreen ||
+           out_state->has_aspect ||
+           out_state->has_safe_inset_top ||
+           out_state->has_filter ||
+           out_state->has_scaling_mode ||
+           out_state->has_hotkey ||
+           out_state->has_updated_unix_ms ||
+           out_state->has_control_file ||
+           out_state->has_status_file;
 }

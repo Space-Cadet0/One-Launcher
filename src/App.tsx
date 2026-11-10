@@ -198,13 +198,11 @@ function areShallowRecordsEqual(
 
 function isCanonicalGameMateriallyUnchanged(prev: CanonicalGame, next: CanonicalGame): boolean {
   if (prev === next) return true;
-  const prevRec = prev as unknown as Record<string, unknown>;
-  const nextRec = next as unknown as Record<string, unknown>;
-  const keys = new Set([...Object.keys(prevRec), ...Object.keys(nextRec)]);
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
 
   for (const key of keys) {
-    const valPrev = prevRec[key];
-    const valNext = nextRec[key];
+    const valPrev: unknown = Reflect.get(prev, key);
+    const valNext: unknown = Reflect.get(next, key);
     if (Object.is(valPrev, valNext)) continue;
 
     if (
@@ -489,6 +487,17 @@ export function App() {
 
   const { syncNotice, syncNoticeTone, showSyncNotice } = useSyncNotice();
   const { isHibernating, runningGames, resumeFullUi } = useLauncherHibernationState();
+  const wasHibernatingRef = useRef(isHibernating);
+
+  useEffect(() => {
+    if (wasHibernatingRef.current && !isHibernating) {
+      if (typeof document !== 'undefined') {
+        const mainEl = document.getElementById('main-content');
+        mainEl?.focus?.({ preventScroll: true });
+      }
+    }
+    wasHibernatingRef.current = isHibernating;
+  }, [isHibernating]);
 
   const {
     isFixMatchModalOpen,
@@ -567,6 +576,36 @@ export function App() {
           }
         }
       }
+
+      if (prev !== games && prev.length > 0 && Math.abs(prev.length - games.length) <= 20) {
+        const prevById = new Map<string, CanonicalGame>();
+        for (let i = 0; i < prev.length; i++) {
+          const pg = prev[i];
+          if (pg?.id) prevById.set(pg.id, pg);
+        }
+        const dirtyIds: string[] = [];
+        for (let i = 0; i < games.length; i++) {
+          const g = games[i];
+          if (!g?.id) continue;
+          const prevGame = prevById.get(g.id);
+          if (!prevGame || prevGame !== g) {
+            dirtyIds.push(g.id);
+          }
+          if (prevGame) {
+            prevById.delete(g.id);
+          }
+        }
+        const removedIds = Array.from(prevById.keys());
+        if (dirtyIds.length + removedIds.length <= 20 && dirtyIds.length < games.length) {
+          saveCurrentCatalog(games, {
+            skipSanitize: true,
+            dirtyGameIds: dirtyIds,
+            removedGameIds: removedIds,
+          });
+          return;
+        }
+      }
+
       saveCurrentCatalog(games, { skipSanitize: true });
     } catch {}
   }, [games]);
@@ -1228,12 +1267,38 @@ export function App() {
     return undefined;
   }, [activeCollectionIconId, activeFilter, activeGroupId]);
 
+  const presentStorefrontsRef = useRef<readonly StorefrontId[]>([]);
+  const presentStorefrontsSigRef = useRef<string>('');
+  const presentStorefronts = useMemo<readonly StorefrontId[]>(() => {
+    const set = new Set<StorefrontId>();
+    for (let i = 0; i < games.length; i++) {
+      const plats = games[i]?.platforms;
+      if (!plats) continue;
+      for (let j = 0; j < plats.length; j++) {
+        const pid = plats[j]?.platformId;
+        if (pid) set.add(pid);
+      }
+    }
+    const sorted = Array.from(set).sort();
+    const sig = sorted.join('|');
+    if (sig === presentStorefrontsSigRef.current) {
+      return presentStorefrontsRef.current;
+    }
+    presentStorefrontsSigRef.current = sig;
+    presentStorefrontsRef.current = sorted;
+    return sorted;
+  }, [games]);
+
   if (isHibernating) {
     return <InGameHibernationView runningGames={runningGames} onResumeFullUi={resumeFullUi} />;
   }
 
   return (
     <div className="h-screen w-screen bg-[#0e141b] text-steam-text flex flex-col font-steam overflow-hidden">
+      <a href="#main-content" className="ol-visually-hidden ol-skip-link">
+        Skip to main content
+      </a>
+
       {/* Top Navigation Bar */}
       <TopNavBar
         searchQuery={searchQuery}
@@ -1255,7 +1320,7 @@ export function App() {
         onGoForward={goForward}
         forwardTitle={forwardTitle}
         connectedStorefronts={connectedStorefronts}
-        games={games}
+        presentStorefronts={presentStorefronts}
         currentGameTitle={!isGridView && selectedGame ? selectedGame.title : undefined}
         canSyncCurrentGame={canSyncCurrentGame}
         isSyncingCurrentGame={isSyncingCurrentGame}
@@ -1322,10 +1387,12 @@ export function App() {
 
         {/* Right Main Pane: Storefront Detail Layout OR Group/Whole Library Grid View */}
         <main
+          id="main-content"
+          tabIndex={-1}
           ref={mainContentRef}
           onScroll={handleMainScroll}
           style={{ overflowAnchor: 'none' }}
-          className="flex-1 h-full overflow-y-auto bg-[#0b0f14] relative"
+          className="flex-1 h-full overflow-y-auto bg-[#0b0f14] relative focus:outline-none"
         >
           {isGridView || !selectedGame ? (
             <LibraryGridView

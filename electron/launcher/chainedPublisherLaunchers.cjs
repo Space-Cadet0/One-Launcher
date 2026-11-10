@@ -10,6 +10,7 @@ const { resolveDriveCPathCaseInsensitive } = require('./wineAndCrossOverManager.
 const {
   enumerateWindowsRegistrySubkeys,
   discoverWindowsPublisherLauncherPaths,
+  normalizePublisherLauncherId,
 } = require('../utils/windowsRegistryDiscovery.cjs');
 
 /**
@@ -670,110 +671,7 @@ function parseBattleNetProductDbBuffer(rawBuf) {
  */
 function normalizeChainedHandoffId(raw) {
   if (typeof raw !== 'string') return null;
-  const norm = raw.trim().toLowerCase();
-  if (!norm) return null;
-  const compact = norm.replace(/[^a-z0-9]/g, '');
-  if (!compact) return null;
-
-  if (
-    norm === 'ubisoft' ||
-    norm === 'uplay' ||
-    norm === 'ubisoft_connect' ||
-    norm === 'ubisoft-connect' ||
-    norm === 'ubisoft connect' ||
-    norm === 'host_ubisoft' ||
-    norm === 'bottle_ubisoft' ||
-    compact === 'ubisoft' ||
-    compact === 'uplay' ||
-    compact === 'ubisoftconnect' ||
-    compact === 'hostubisoft' ||
-    compact === 'bottleubisoft'
-  ) {
-    return 'ubisoft';
-  }
-  if (
-    norm === 'ea' ||
-    norm === 'origin' ||
-    norm === 'ea_app' ||
-    norm === 'ea-app' ||
-    norm === 'ea app' ||
-    norm === 'eadesktop' ||
-    norm === 'ea_desktop' ||
-    norm === 'ea desktop' ||
-    norm === 'host_ea' ||
-    norm === 'bottle_ea' ||
-    compact === 'ea' ||
-    compact === 'origin' ||
-    compact === 'eaapp' ||
-    compact === 'theeaapp' ||
-    compact === 'eaappclient' ||
-    compact === 'originclient' ||
-    compact === 'eadesktop' ||
-    compact === 'link2ea' ||
-    compact === 'xbox2ea' ||
-    compact === 'eaconnectmicrosoft' ||
-    compact === 'electronicarts' ||
-    compact === 'eaplay' ||
-    compact === 'hostea' ||
-    compact === 'bottleea'
-  ) {
-    return 'ea';
-  }
-  if (
-    norm === 'bnet' ||
-    norm === 'battlenet' ||
-    norm === 'battle.net' ||
-    norm === 'battle_net' ||
-    norm === 'battle-net' ||
-    norm === 'blizzard' ||
-    norm === 'host_bnet' ||
-    norm === 'bottle_bnet' ||
-    compact === 'bnet' ||
-    compact === 'battlenet' ||
-    compact === 'blizzard' ||
-    compact === 'hostbnet' ||
-    compact === 'bottlebnet'
-  ) {
-    return 'bnet';
-  }
-  if (
-    norm === 'rockstar' ||
-    norm === 'rockstar_games' ||
-    norm === 'rockstar-games' ||
-    norm === 'rockstar games' ||
-    norm === 'rgl' ||
-    norm === 'socialclub' ||
-    norm === 'social_club' ||
-    norm === 'host_rockstar' ||
-    norm === 'bottle_rockstar' ||
-    compact === 'rockstar' ||
-    compact === 'rockstargames' ||
-    compact === 'rockstargameslauncher' ||
-    compact === 'rgl' ||
-    compact === 'socialclub' ||
-    compact === 'hostrockstar' ||
-    compact === 'bottlerockstar'
-  ) {
-    return 'rockstar';
-  }
-  if (
-    norm === 'riot' ||
-    norm === 'riot_client' ||
-    norm === 'riot-client' ||
-    norm === 'riot client' ||
-    norm === 'riotgames' ||
-    norm === 'riot_games' ||
-    norm === 'vanguard' ||
-    norm === 'host_riot' ||
-    compact === 'riot' ||
-    compact === 'riotclient' ||
-    compact === 'riotgames' ||
-    compact === 'vanguard' ||
-    compact === 'hostriot'
-  ) {
-    return 'riot';
-  }
-  return null;
+  return normalizePublisherLauncherId(raw);
 }
 
 /**

@@ -10,42 +10,17 @@
  * into the library on its own!
  */
 
+const {
+  XBOX_HTTP_TIMEOUT_MS,
+  buildXboxFetchSignal,
+  resolveDefaultXboxLocale,
+} = require('./xboxConfigAndIds.cjs');
+
 const TITLEHUB_BASE_URL = 'https://titlehub.xboxlive.com';
 const ACHIEVEMENTS_BASE_URL = 'https://achievements.xboxlive.com';
 const USERSTATS_BATCH_URL = 'https://userstats.xboxlive.com/batch';
 const USERPRESENCE_BASE_URL = 'https://userpresence.xboxlive.com';
-const XBOX_HTTP_TIMEOUT_MS = 20_000;
 const XBOX_PRESENCE_TIMEOUT_MS = 5_000;
-
-function buildXboxFetchSignal(callerSignal, timeoutMs = XBOX_HTTP_TIMEOUT_MS) {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (callerSignal && typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([callerSignal, timeoutSignal]);
-  }
-  return callerSignal || timeoutSignal;
-}
-
-function resolveDefaultXboxLocale(explicitLocale) {
-  if (typeof explicitLocale === 'string' && explicitLocale.trim()) {
-    return explicitLocale.trim();
-  }
-  try {
-    const reqElectron = require('electron');
-    const appLocale = reqElectron?.app?.getLocale?.();
-    if (typeof appLocale === 'string' && appLocale.trim()) {
-      const trimmed = appLocale.trim();
-      if (trimmed.includes('-')) return trimmed;
-      const country = String(reqElectron?.app?.getLocaleCountryCode?.() || '').trim().toUpperCase();
-      if (/^[a-z]{2}$/i.test(trimmed) && /^[A-Z]{2}$/.test(country)) {
-        return `${trimmed.toLowerCase()}-${country}`;
-      }
-      if (/^[a-z]{2}$/i.test(trimmed) && trimmed.toLowerCase() === 'en') {
-        return 'en-US';
-      }
-    }
-  } catch {}
-  return 'en-US';
-}
 
 function isValidNonSentinelTimestamp(rawTs) {
   if (!rawTs || typeof rawTs !== 'string') return false;

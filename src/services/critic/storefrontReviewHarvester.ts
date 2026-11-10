@@ -236,8 +236,8 @@ function extractGogPageReviewAnchors(html: string): {
   return { ocScore, ocUrl, ocId, mcUrl, mcSlug };
 }
 
-const STEAM_ENRICHED_ANCHOR_MAP = steamEnrichedCache as unknown as Record<string, EnrichedSteamAnchorRecord>;
-const GOG_ENRICHED_ANCHOR_MAP = gogEnrichedCache as unknown as Record<string, EnrichedGogAnchorRecord>;
+const STEAM_ENRICHED_ANCHOR_MAP: Record<string, EnrichedSteamAnchorRecord> = steamEnrichedCache;
+const GOG_ENRICHED_ANCHOR_MAP: Record<string, EnrichedGogAnchorRecord> = gogEnrichedCache;
 
 export class StorefrontReviewHarvester {
   private anchorCache = new Map<string, StorefrontReviewAnchor | null>();
@@ -549,7 +549,8 @@ export class StorefrontReviewHarvester {
         .replace(/\s+/g, ' ')
         .trim();
       try {
-        const catalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(cleanTitle)}&limit=1`;
+        const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
+        const catalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=1`;
         const catalogRes = await requestScheduler.schedule(
           catalogUrl,
           () =>
@@ -560,7 +561,9 @@ export class StorefrontReviewHarvester {
           Priority.P1_VIEWPORT,
           'catalog.gog.com'
         );
-        if (Array.isArray(catalogRes.data?.products) && catalogRes.data.products.length > 0) {
+        const hasZeroMatches =
+          typeof catalogRes.data?.productCount === 'number' && catalogRes.data.productCount <= 0;
+        if (!hasZeroMatches && Array.isArray(catalogRes.data?.products) && catalogRes.data.products.length > 0) {
           const prod = catalogRes.data.products[0];
           const prodTitle = prod.title || prod.slug?.replace(/_/g, ' ') || '';
           if (isTitleCompatible(cleanTitle, prodTitle)) {

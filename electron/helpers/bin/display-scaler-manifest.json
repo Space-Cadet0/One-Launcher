@@ -9,53 +9,60 @@
     ],
     "flags": [
       "-std=c11",
-      "-O2",
+      "-Oz",
+      "-fno-inline",
+      "-mstackrealign",
+      "-fno-unwind-tables",
+      "-fno-asynchronous-unwind-tables",
+      "-ffunction-sections",
+      "-fdata-sections",
       "-Wall",
       "-Wextra",
       "-Werror",
       "-fno-ident",
+      "-Wl,--gc-sections",
       "-Wl,--strip-all"
     ]
   },
   "sources": {
-    "electron/helpers/display_scaler/display_scaler.h": "3606faf71b04f8e5fdfd953977a84e48bb796672c96a0bddd6f3f7c7404d9e55",
-    "electron/helpers/display_scaler/display_scaler_internal.h": "c0a3ab71af1c0154b20b1a764ecc00481bf35273f0de910a0a7c25dc974c296a",
-    "electron/helpers/display_scaler/display_scaler_math.c": "261c124390e2d15a71cc712176a2c68bb9d63123c9433f970ef1ff4c9643052d",
-    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "f52ba0b76b66c951488f53b5200f92eb589a7e3f64067aef0613f8a468a841a8",
-    "electron/helpers/display_scaler/display_scaler_window.c": "56c72fe5d9e661879b633ae71d2a5796434926703bdba71318c9d136c9dd2bf1",
-    "electron/helpers/display_scaler/display_scaler_dll.c": "6e3b33c774a157288ddd32e73f3a890014003e42879f6340567b4e47a50790b0",
-    "electron/helpers/display_scaler/display_launcher.c": "a816d450c77ccef03afaa36bbb3bcefb5bc107177b534272c4b88b17c2da6274",
+    "electron/helpers/display_scaler/display_scaler.h": "61213974002470db1a5d4fecd17104047fded98b5b23c25440b40cdfc0ce94c1",
+    "electron/helpers/display_scaler/display_scaler_internal.h": "0a7856aebcf41c7791459751836916234d87c9fbdd30215932f0f9aabe6484cd",
+    "electron/helpers/display_scaler/display_scaler_math.c": "e0d995f2dd151060ea209117bafadf374b97b661fda8cd7e3344d8b98b306cb3",
+    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "91af8fb23b420d4caee0eb3753334cee519ed0e3ea439991e4ed4a52c06ccba7",
+    "electron/helpers/display_scaler/display_scaler_window.c": "8177fe0ced7043cc63780c95e75359589e50570001c2e3a055595de12c0401cf",
+    "electron/helpers/display_scaler/display_scaler_dll.c": "769f1255c28f363ea101424eb4ee40d46e2bbeb61cb523f9bf3c30c346f56e9b",
+    "electron/helpers/display_scaler/display_launcher.c": "b008914d69ce3574070d026e58f4dd28408ae97a108009fa8cd073456337c33b",
     "electron/helpers/display_scaler/display_scaler.def": "a975f9534e4087f11271db76527cbdea06c7f30954041ac3e73f57e29a47aad1",
-    "scripts/build-display-scaler.cjs": "62534d55dfc0531b444f568713dec7d640a3d3818071b671e05278cbff2892d6"
+    "scripts/build-display-scaler.cjs": "508fdbfe7983333865a8640e02d22f8716da60dc7b21345d0f3596003bcc6c25"
   },
   "outputs": {
     "one_display_scaler_x86.dll": {
-      "sha256": "156a11ed8e55610fc136785c10310e1cc76573871765c2bb66bffc2277f69b85",
-      "sizeBytes": 104960,
+      "sha256": "1c23acfa696ec53dd5b020f26e9ac4346e6c192514be76cd6b4d7ae20fc2d79c",
+      "sizeBytes": 122368,
       "machine": "0x14c",
-      "peCheckSum": "0x0001ab1e",
+      "peCheckSum": "0x00027035",
       "exportedCount": 2
     },
     "one_display_scaler_x64.dll": {
-      "sha256": "5cf1b4d80dfab59f1f6478dbe5f419e4efcdd4df9859f43ff347301d0b9ba6eb",
-      "sizeBytes": 95744,
+      "sha256": "effb753019cc78241ded2298ac67064fd3ac86a0bc41b1a55c1f08a83d2a60a3",
+      "sizeBytes": 113152,
       "machine": "0x8664",
-      "peCheckSum": "0x00021069",
+      "peCheckSum": "0x00028f40",
       "exportedCount": 2
     },
     "one_display_launcher_x86.exe": {
-      "sha256": "dc67e93d7ff1dbc7bbeeafa55e78b3a4667597bcf68f9df827c14e441a153e61",
-      "sizeBytes": 57856,
+      "sha256": "d54640597c1be4ac831cf5bea87fc1008485ca92f04679d1001fff39fea64c7d",
+      "sizeBytes": 59392,
       "machine": "0x14c",
       "subsystem": 2,
-      "peCheckSum": "0x0001b4b2"
+      "peCheckSum": "0x0000eff4"
     },
     "one_display_launcher_x64.exe": {
-      "sha256": "a8bc40b800ff34617935ec6078fd64660786e43a1b4f08345a3f3fd8025daa2b",
-      "sizeBytes": 43520,
+      "sha256": "ecd0574265d4c71e6a83267f1e8141e2b688ade1574e7ae602b58ad7c7eaa768",
+      "sizeBytes": 44544,
       "machine": "0x8664",
       "subsystem": 2,
-      "peCheckSum": "0x0000b6f0"
+      "peCheckSum": "0x00016d40"
     }
   }
 }

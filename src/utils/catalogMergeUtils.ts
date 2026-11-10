@@ -424,10 +424,10 @@ export function recomputeOsFieldsFromPlatforms(
     if (p.isWindowsBinaryOnMac === true) {
       hasWindows = true;
     }
-    if (Array.isArray(p.platforms)) {
-      const legacyArr = p.platforms as unknown as string[];
-      if (legacyArr.includes('windows')) hasWindows = true;
-      if (legacyArr.includes('mac') && !p.isWindowsBinaryOnMac) hasMac = true;
+    const rawPlatforms: unknown = p.platforms;
+    if (Array.isArray(rawPlatforms)) {
+      if (rawPlatforms.includes('windows')) hasWindows = true;
+      if (rawPlatforms.includes('mac') && !p.isWindowsBinaryOnMac) hasMac = true;
     } else if (p.platforms && typeof p.platforms === 'object') {
       if (p.platforms.windows !== false) hasWindows = true;
       if (p.platforms.mac === true && !p.isWindowsBinaryOnMac) hasMac = true;

@@ -167,7 +167,8 @@ export function handleGogEndpoints(req: FixtureRequest): FixtureResponse | null 
   const host = req.url.hostname.toLowerCase();
 
   if (host === 'catalog.gog.com' && req.url.pathname === '/v1/catalog') {
-    const q = norm(req.url.searchParams.get('query') || '');
+    const rawQueryParam = (req.url.searchParams.get('query') || '').replace(/^like:/i, '');
+    const q = norm(rawQueryParam);
     const products = !q
       ? []
       : GOG_PRODUCTS.filter((p) => {

@@ -145,6 +145,7 @@ XGR_GUID(IID_IXGameEventImpl,       0xbbfbdcc7, 0xbfe7, 0x409b, 0xa5, 0xca, 0xed
  * DLL Lifecycle & 7 Retail Exports
  * ========================================================================= */
 
+static SRWLOCK g_runtime_lifecycle_lock = SRWLOCK_INIT;
 static volatile LONG g_init_ref_count = 0;
 
 HRESULT WINAPI xgr_not_impl_stub(void *iface)
@@ -161,6 +162,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
         DisableThreadLibraryCalls(hinst);
     } else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
         xgr_uninstall_xcurl_shim();
+        xgr_threading_process_detach_cleanup();
     }
     return TRUE;
 }
@@ -181,9 +183,13 @@ HRESULT WINAPI InitializeApiImplEx2(ULONG gdkVer, ULONG gsVer, char mode, const 
     (void)gdkVer;
     (void)gsVer;
     (void)mode;
+    volatile const char *marker_ref = g_one_launcher_xgr_bridge_marker;
+    if (!marker_ref || !marker_ref[0]) return E_UNEXPECTED;
+    AcquireSRWLockExclusive(&g_runtime_lifecycle_lock);
     xgr_ensure_xcurl_shim();
     InterlockedIncrement(&g_init_ref_count);
     xgr_load_runtime_config(options);
+    ReleaseSRWLockExclusive(&g_runtime_lifecycle_lock);
     return xgr_return_hr(S_OK);
 }
 
@@ -199,24 +205,22 @@ HRESULT WINAPI InitializeApiImpl(ULONG gdkVer, ULONG gsVer)
 
 HRESULT WINAPI UninitializeApiImpl(void)
 {
+    AcquireSRWLockExclusive(&g_runtime_lifecycle_lock);
     LONG prev = InterlockedCompareExchange(&g_init_ref_count, 0, 0);
-    while (prev > 0) {
-        LONG observed = InterlockedCompareExchange(&g_init_ref_count, prev - 1, prev);
-        if (observed == prev) {
-            if (prev - 1 == 0) {
-                xgr_uninstall_xcurl_shim();
-                xgr_playfab_shim_reset();
-                xgr_invite_callbacks_reset();
-                xgr_gamesave_shutdown();
-                xgr_user_shutdown();
-                xgr_threading_shutdown();
-                xgr_rpc_shutdown();
-                xgr_runtime_config_reset();
-            }
-            break;
+    if (prev > 0) {
+        LONG next = InterlockedDecrement(&g_init_ref_count);
+        if (next == 0) {
+            xgr_uninstall_xcurl_shim();
+            xgr_playfab_shim_reset();
+            xgr_invite_callbacks_reset();
+            xgr_gamesave_shutdown();
+            xgr_user_shutdown();
+            xgr_threading_shutdown();
+            xgr_rpc_shutdown();
+            xgr_runtime_config_reset();
         }
-        prev = observed;
     }
+    ReleaseSRWLockExclusive(&g_runtime_lifecycle_lock);
     return xgr_return_hr(S_OK);
 }
 

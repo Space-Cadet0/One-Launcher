@@ -5486,7 +5486,16 @@ function ensureWineMetalPreloadDylib(/** @type {any} */ options = {}) {
       if (!fs.existsSync(helpersOutDir)) {
         fs.mkdirSync(helpersOutDir, { recursive: true });
       }
-      if (!fs.existsSync(extractedDylib)) {
+      const bundledStat = fs.statSync(bundledDylib);
+      let needsExtract = !fs.existsSync(extractedDylib);
+      if (!needsExtract) {
+        try {
+          needsExtract = fs.statSync(extractedDylib).size !== bundledStat.size;
+        } catch {
+          needsExtract = true;
+        }
+      }
+      if (needsExtract) {
         fs.writeFileSync(extractedDylib, fs.readFileSync(bundledDylib));
         fs.chmodSync(extractedDylib, 0o755);
       }
@@ -6298,6 +6307,74 @@ function prepareAlignedBottleWineCommand(params) {
     wineBinary: resolvedBin,
     prefixArgs,
     env: targetEnv,
+  };
+}
+
+/**
+ * Shared helper for auxiliary Wine / CrossOver commands (`wineboot`, `wineserver`, registry
+ * queries, background client wakes, and display watcher spawns) returning `{ binaryPath, env }`.
+ *
+ * @param {{
+ *   wineBinary: string,
+ *   bottlePath?: string | null,
+ *   env?: Record<string, any>,
+ *   suppressGuiDialogs?: boolean,
+ *   layerType?: string | null,
+ * }} params
+ * @returns {{ binaryPath: string, env: Record<string, any> }}
+ */
+function prepareAlignedAuxBottleWineCommand(params) {
+  const {
+    wineBinary = '',
+    bottlePath = '',
+    env: inputEnv = {},
+    suppressGuiDialogs = false,
+    layerType,
+  } = params || {};
+  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
+  const res = prepareAlignedBottleWineCommand({
+    wineBinary,
+    bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
+    env: workingEnv,
+    suppressGuiDialogs,
+    layerType,
+  });
+  const resolvedFromHelper =
+    res && typeof res.wineBinary === 'string' && res.wineBinary ? res.wineBinary : '';
+  if (resolvedFromHelper) {
+    return {
+      binaryPath: resolvedFromHelper,
+      env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
+    };
+  }
+  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
+  if (effectivePrefix) {
+    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
+    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
+  }
+  if (suppressGuiDialogs) {
+    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
+    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
+    if (!curDll) {
+      workingEnv.WINEDLLOVERRIDES = disableSpec;
+    } else if (!curDll.includes('winemenubuilder.exe=d')) {
+      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
+    }
+    if (!workingEnv.WINEDEBUG) {
+      workingEnv.WINEDEBUG = '-all';
+    }
+  }
+  const resolvedBin =
+    typeof prepareCrossOverWineSpawnEnv === 'function'
+      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        })
+      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
+          ...(layerType ? { layerType } : {}),
+        });
+  return {
+    binaryPath: resolvedBin || wineBinary,
+    env: workingEnv,
   };
 }
 
@@ -9620,6 +9697,7 @@ module.exports = {
   resolveSipSafeWineBinaryAndPreloadEnv,
   prepareCrossOverWineSpawnEnv,
   prepareAlignedBottleWineCommand,
+  prepareAlignedAuxBottleWineCommand,
   resolveWineserverBinary,
   shutdownWinePrefix,
   resolveBottleGogGalaxyExe,

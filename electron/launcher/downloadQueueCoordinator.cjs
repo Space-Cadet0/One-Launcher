@@ -24,7 +24,11 @@ const {
   deriveDefaultScidFromTitleId,
   inspectMicrosoftGameConfig,
 } = require('./binaryAndManifestInspectors.cjs');
-const { isProcessAlive, signalSubprocessTree } = require('./processTreeUtils.cjs');
+const {
+  isProcessAlive,
+  waitForProcessExit,
+  signalSubprocessTree,
+} = require('./processTreeUtils.cjs');
 const {
   resolveBottleSteamExe,
   isCrossOverPerlWineWrapperOptions,
@@ -98,6 +102,7 @@ const {
   detectCompatibilityLayers,
   resolveSipSafeWineBinaryAndPreloadEnv,
   prepareCrossOverWineSpawnEnv,
+  prepareAlignedAuxBottleWineCommand,
   ensureCompatibilityLayerReady,
   alignWineMsyncWithLiveBottle,
 } = macNativeInstallerAndCodesign;
@@ -148,80 +153,6 @@ function extractEpicRegistryLeaf(/** @type {any} */ regPath) {
     .map((s) => s.trim())
     .filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : '';
-}
-
-/**
- * Prepare an auxiliary Wine / CrossOver command so `WINEMSYNC`, `CX_ENV`, `CX_ROOT`, SIP wrapper
- * resolution, and optional headless GUI dialog suppression stay aligned with any live `wineserver`.
- *
- * @param {{
- *   wineBinary: string,
- *   bottlePath?: string | null,
- *   env?: Record<string, any>,
- *   suppressGuiDialogs?: boolean,
- *   layerType?: string | null,
- * }} params
- * @returns {{ binaryPath: string, env: Record<string, any> }}
- */
-function prepareAlignedAuxBottleWineCommand(params) {
-  const {
-    wineBinary = '',
-    bottlePath = '',
-    env: inputEnv = {},
-    suppressGuiDialogs = false,
-    layerType,
-  } = params || {};
-  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
-  if (typeof macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand === 'function') {
-    const res = macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand({
-      wineBinary,
-      bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
-      env: workingEnv,
-      suppressGuiDialogs,
-      layerType,
-    });
-    const resolvedFromHelper =
-      res && typeof res.wineBinary === 'string' && res.wineBinary
-        ? res.wineBinary
-        : res && typeof res.binaryPath === 'string' && res.binaryPath
-          ? res.binaryPath
-          : '';
-    if (resolvedFromHelper) {
-      return {
-        binaryPath: resolvedFromHelper,
-        env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
-      };
-    }
-  }
-  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
-  if (effectivePrefix) {
-    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
-    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
-  }
-  if (suppressGuiDialogs) {
-    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
-    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
-    if (!curDll) {
-      workingEnv.WINEDLLOVERRIDES = disableSpec;
-    } else if (!curDll.includes('winemenubuilder.exe=d')) {
-      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
-    }
-    if (!workingEnv.WINEDEBUG) {
-      workingEnv.WINEDEBUG = '-all';
-    }
-  }
-  const resolvedBin =
-    typeof prepareCrossOverWineSpawnEnv === 'function'
-      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        })
-      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        });
-  return {
-    binaryPath: resolvedBin || wineBinary,
-    env: workingEnv,
-  };
 }
 
 /** @type {((params: any, options?: any) => Promise<{ installed: boolean, provisionedNow: boolean, binaryPath: string, installDir: string, bottlePath?: string }>) | null} */
@@ -8237,6 +8168,66 @@ async function installGame(
   }
 }
 
+/** @type {Map<string, Promise<any>>} */
+const taskTransitionLocks = new Map();
+
+/**
+ * Serialize per-`taskId` `pauseDownload` / `resumeDownload` / `cancelDownload` async subprocess
+ * transitions so `resumeDownload` never races a still-exiting paused CLI downloader and
+ * `cancelDownload` never leaves a resumed process orphaned.
+ *
+ * @param {string} taskId
+ * @param {() => Promise<any>} transitionFn
+ * @returns {Promise<any>}
+ */
+function enqueueDownloadTaskTransition(taskId, transitionFn) {
+  const prev = taskTransitionLocks.get(taskId) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(transitionFn)
+    .finally(() => {
+      if (taskTransitionLocks.get(taskId) === next) {
+        taskTransitionLocks.delete(taskId);
+      }
+    });
+  taskTransitionLocks.set(taskId, next);
+  return next;
+}
+
+/**
+ * Terminate a checkpoint-resumable CLI subprocess (`gogdl`, `legendary`) cleanly on pause and
+ * wait for real OS process exit so file locks and stale CDN sockets are closed before resume.
+ *
+ * @param {any} child
+ * @param {string} targetPlatform
+ * @param {any} options
+ * @returns {Promise<void>}
+ */
+async function terminatePausedCheckpointSubprocess(child, targetPlatform, options = {}) {
+  if (!child) return;
+  const pid = Number(child.pid || 0);
+  if (targetPlatform === 'win32') {
+    await Promise.resolve(signalSubprocessTree(child, 'SIGKILL', options)).catch(() => {});
+  } else {
+    await Promise.resolve(signalSubprocessTree(child, 'SIGTERM', options)).catch(() => {});
+  }
+  if (pid > 0 && isProcessAlive(pid)) {
+    const graceful = await waitForProcessExit(child, pid, targetPlatform === 'win32' ? 1200 : 800);
+    if (!graceful && isProcessAlive(pid)) {
+      await Promise.resolve(signalSubprocessTree(child, 'SIGKILL', options)).catch(() => {});
+      await waitForProcessExit(child, pid, 500);
+    }
+  } else if (
+    child.exitCode == null &&
+    child.signalCode == null &&
+    typeof child.kill === 'function'
+  ) {
+    try {
+      child.kill('SIGTERM');
+    } catch {}
+  }
+}
+
 function pauseDownload(/** @type {string} */ taskId, /** @type {any} */ options = {}) {
   ensureDownloadQueueRehydrated(options);
   const task = downloadQueueMap.get(taskId);
@@ -8256,16 +8247,25 @@ function pauseDownload(/** @type {string} */ taskId, /** @type {any} */ options 
   const ctrl = downloadControllers.get(taskId);
   if (ctrl) {
     ctrl.pausedByUser = true;
+    const transitionEpoch = (Number(ctrl.transitionEpoch) || 0) + 1;
+    ctrl.transitionEpoch = transitionEpoch;
     if (ctrl.type === 'abort' && ctrl.controller) {
       try {
         ctrl.controller.abort();
       } catch {}
     } else if (ctrl.type === 'process' && ctrl.child) {
-      if (targetPlatform === 'win32') {
+      const childRef = ctrl.child;
+      const usesCheckpointRestart =
+        targetPlatform === 'win32' || typeof ctrl.resumeInstallFn === 'function';
+      if (usesCheckpointRestart) {
         ctrl.exitedWhilePaused = true;
-        signalSubprocessTree(ctrl.child, 'SIGKILL', options);
+        enqueueDownloadTaskTransition(taskId, () =>
+          terminatePausedCheckpointSubprocess(childRef, targetPlatform, options)
+        ).catch(() => {});
       } else {
-        signalSubprocessTree(ctrl.child, 'SIGSTOP', options);
+        enqueueDownloadTaskTransition(taskId, () =>
+          Promise.resolve(signalSubprocessTree(childRef, 'SIGSTOP', options))
+        ).catch(() => {});
       }
     }
   }
@@ -8305,9 +8305,12 @@ function resumeDownload(/** @type {string} */ taskId, /** @type {any} */ options
   const ctrl = downloadControllers.get(taskId);
   let shouldInvokeResumeFn = false;
   let shouldReinvokeInstallRequest = false;
+  let resumeEpoch = 0;
 
   if (ctrl) {
     ctrl.pausedByUser = false;
+    resumeEpoch = (Number(ctrl.transitionEpoch) || 0) + 1;
+    ctrl.transitionEpoch = resumeEpoch;
     const pid = ctrl.type === 'process' && ctrl.child ? ctrl.child.pid : null;
     const canSigCont =
       Boolean(pid) &&
@@ -8315,17 +8318,26 @@ function resumeDownload(/** @type {string} */ taskId, /** @type {any} */ options
       targetPlatform !== 'win32' &&
       isProcessAlive(pid);
     if (canSigCont) {
-      Promise.resolve(signalSubprocessTree(ctrl.child, 'SIGCONT', options))
-        .then((signaled) => {
-          if (!signaled && ctrl && typeof ctrl.resumeInstallFn === 'function') {
-            ctrl.exitedWhilePaused = false;
-            return ctrl.resumeInstallFn();
-          }
-          return undefined;
-        })
-        .catch((err) => {
-          diagLog.warn('resumeDownload.sigContFallback', err, { taskId });
-        });
+      enqueueDownloadTaskTransition(taskId, async () => {
+        if (ctrl.cancelRequested || ctrl.pausedByUser || ctrl.transitionEpoch !== resumeEpoch) {
+          return;
+        }
+        const sigRes = await Promise.resolve(signalSubprocessTree(ctrl.child, 'SIGCONT', options));
+        const signaled =
+          typeof sigRes === 'object' && sigRes !== null ? Boolean(sigRes.signaled) : Boolean(sigRes);
+        if (
+          !signaled &&
+          !ctrl.cancelRequested &&
+          !ctrl.pausedByUser &&
+          ctrl.transitionEpoch === resumeEpoch &&
+          typeof ctrl.resumeInstallFn === 'function'
+        ) {
+          ctrl.exitedWhilePaused = false;
+          await ctrl.resumeInstallFn();
+        }
+      }).catch((err) => {
+        diagLog.warn('resumeDownload.sigContFallback', err, { taskId });
+      });
     } else if (typeof ctrl.resumeInstallFn === 'function') {
       shouldInvokeResumeFn = true;
     }
@@ -8350,27 +8362,34 @@ function resumeDownload(/** @type {string} */ taskId, /** @type {any} */ options
   );
 
   if (shouldInvokeResumeFn && ctrl && typeof ctrl.resumeInstallFn === 'function') {
-    ctrl.exitedWhilePaused = false;
-    Promise.resolve()
-      .then(() => ctrl.resumeInstallFn())
-      .catch((err) => {
-        diagLog.warn('resumeDownload.resumeInstallFn', err, { taskId });
-      });
+    enqueueDownloadTaskTransition(taskId, async () => {
+      if (ctrl.cancelRequested || ctrl.pausedByUser || ctrl.transitionEpoch !== resumeEpoch) {
+        return;
+      }
+      const latest = downloadQueueMap.get(taskId);
+      if (!latest || latest.status === 'cancelled' || latest.status === 'paused') {
+        return;
+      }
+      ctrl.exitedWhilePaused = false;
+      await ctrl.resumeInstallFn();
+    }).catch((err) => {
+      diagLog.warn('resumeDownload.resumeInstallFn', err, { taskId });
+    });
   } else if (shouldReinvokeInstallRequest && task.installRequest) {
-    Promise.resolve()
-      .then(() =>
-        installGame(
-          {
-            ...task.installRequest,
-            taskId,
-            _resumingPausedInstall: true,
-          },
-          options
-        )
-      )
-      .catch((err) => {
-        diagLog.warn('resumeDownload.reinvokeInstallGame', err, { taskId });
-      });
+    const reqSnapshot = {
+      ...task.installRequest,
+      taskId,
+      _resumingPausedInstall: true,
+    };
+    enqueueDownloadTaskTransition(taskId, async () => {
+      const latest = downloadQueueMap.get(taskId);
+      if (!latest || latest.status === 'cancelled' || latest.status === 'paused') {
+        return;
+      }
+      await installGame(reqSnapshot, options);
+    }).catch((err) => {
+      diagLog.warn('resumeDownload.reinvokeInstallGame', err, { taskId });
+    });
   }
 
   return updatedRes;
@@ -8596,22 +8615,21 @@ function cancelDownload(/** @type {string} */ taskId, /** @type {any} */ options
   }
 
   const ctrl = downloadControllers.get(taskId);
-  let termPromise = null;
   if (ctrl) {
-    termPromise = terminateDownloadController(ctrl, options);
+    ctrl.cancelRequested = true;
+    ctrl.transitionEpoch = (Number(ctrl.transitionEpoch) || 0) + 1;
     downloadControllers.delete(taskId);
   }
   cleanupCancelledGogTempBins(task, ctrl);
   cleanupCancelledGogV2PartialInstall(task, ctrl);
   cleanupCancelledXboxPartialInstall(task, ctrl);
-  if (termPromise) {
-    termPromise
-      .finally(() => {
-        cleanupCancelledGogV2PartialInstall(task, ctrl);
-        cleanupCancelledXboxPartialInstall(task, ctrl);
-        return cleanupCancelledGogTempBinsAsync(task, ctrl);
-      })
-      .catch(() => {});
+  if (ctrl) {
+    enqueueDownloadTaskTransition(taskId, async () => {
+      await terminateDownloadController(ctrl, options);
+      cleanupCancelledGogV2PartialInstall(task, ctrl);
+      cleanupCancelledXboxPartialInstall(task, ctrl);
+      await cleanupCancelledGogTempBinsAsync(task, ctrl);
+    }).catch(() => {});
   }
 
   return updateDownloadTask(
@@ -8650,6 +8668,67 @@ function shutdownDownloadEngine(/** @type {any} */ options = {}) {
   }
   downloadControllers.clear();
   downloadSpeedTrackers.clear();
+}
+
+/**
+ * Gracefully pause and drain active download subprocesses during app `before-quit` within a
+ * bounded timeout (`timeoutMs`), preserving checkpoint journals on disk and preventing orphaned
+ * `gogdl` / `legendary` child trees.
+ *
+ * @param {number} [timeoutMs=3000]
+ * @param {any} [options]
+ * @returns {Promise<void>}
+ */
+async function gracefulShutdownDownloads(timeoutMs = 3000, options = {}) {
+  const safeTimeoutMs = Math.max(250, Math.min(15000, Number(timeoutMs) || 3000));
+  /** @type {Promise<any>[]} */
+  const shutdownPromises = [];
+
+  for (const [taskId, task] of downloadQueueMap.entries()) {
+    if (task && task.status === 'downloading') {
+      try {
+        updateDownloadTask(
+          taskId,
+          {
+            status: 'paused',
+            speedBytesPerSec: 0,
+            etaSeconds: undefined,
+            statusMessage: 'Paused on exit',
+          },
+          options
+        );
+      } catch {}
+    }
+  }
+
+  for (const [taskId, ctrl] of downloadControllers.entries()) {
+    ctrl.pausedByUser = true;
+    ctrl.exitedWhilePaused = true;
+    ctrl.transitionEpoch = (Number(ctrl.transitionEpoch) || 0) + 1;
+    shutdownPromises.push(
+      enqueueDownloadTaskTransition(taskId, async () => {
+        await terminateDownloadController(ctrl, options);
+        const pid = ctrl.type === 'process' && ctrl.child ? Number(ctrl.child.pid || 0) : 0;
+        if (pid > 0 && isProcessAlive(pid)) {
+          await waitForProcessExit(ctrl.child, pid, Math.min(1200, safeTimeoutMs));
+        }
+      })
+    );
+  }
+
+  downloadControllers.clear();
+  downloadSpeedTrackers.clear();
+  persistDownloadQueueToDisk(options?.userDataDir);
+
+  if (shutdownPromises.length > 0) {
+    await Promise.race([
+      Promise.allSettled(shutdownPromises),
+      new Promise((resolve) => {
+        const t = setTimeout(resolve, safeTimeoutMs);
+        if (typeof t.unref === 'function') t.unref();
+      }),
+    ]);
+  }
 }
 
 function getPausedByInGameTaskIds() {
@@ -8716,6 +8795,7 @@ module.exports = {
   cancelDownload,
   clearDownloadQueue,
   shutdownDownloadEngine,
+  gracefulShutdownDownloads,
   getPausedByInGameTaskIds,
   pauseActiveDownloadsForInGame,
   resumeDownloadsPausedByInGame,

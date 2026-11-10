@@ -452,15 +452,149 @@ function parseRegistryBinaryHexPairs(rawData) {
 }
 
 /**
- * Patch `hex:...` (`REG_BINARY`) or default `@=...` entries directly into a Wine `.reg` file section.
+ * Safely parses a GOG script `qword` / `REG_QWORD` `valueData` into an unsigned 64-bit `BigInt`
+ * without throwing `SyntaxError` / `RangeError` on hex whitespace, floats, or malformed strings
+ * (`Finding #17`).
  *
- * @param {string} regFilePath
+ * @param {unknown} rawValueData
+ * @returns {bigint}
+ */
+function parseSafeRegistryQwordBigInt(rawValueData) {
+  if (typeof rawValueData === 'bigint') {
+    return BigInt.asUintN(64, rawValueData);
+  }
+  if (typeof rawValueData === 'number') {
+    if (!Number.isFinite(rawValueData)) return 0n;
+    return BigInt.asUintN(64, BigInt(Math.trunc(rawValueData)));
+  }
+  const str = String(rawValueData ?? '').trim();
+  if (!str) return 0n;
+  try {
+    if (/^[+-]?0[xX][0-9a-fA-F_]+$/.test(str)) {
+      const cleanedHex = str.replace(/_/g, '');
+      const sign = cleanedHex.startsWith('-') ? -1n : 1n;
+      const body = cleanedHex.replace(/^[+-]/, '');
+      return BigInt.asUintN(64, sign * BigInt(body));
+    }
+    if (/^[+-]?\d+$/.test(str)) {
+      return BigInt.asUintN(64, BigInt(str));
+    }
+    if (/^[+-]?\d+\.\d+$/.test(str)) {
+      const num = Number(str);
+      if (Number.isFinite(num)) {
+        return BigInt.asUintN(64, BigInt(Math.trunc(num)));
+      }
+    }
+  } catch (err) {
+    diagLog.debug('gogScript.invalidQwordValueData', { valueData: str.slice(0, 64), err });
+  }
+  return 0n;
+}
+
+/**
+ * Pure helper that applies raw section entries (`@=...` or `hex:...`) to an in-memory Wine `.reg` string.
+ *
+ * @param {string} content
  * @param {string} subKeyPath
  * @param {Array<{ valueName: string, rawRegRhs: string }>} rawEntries
+ * @param {number} unixSec
+ * @returns {{ content: string, normalizedSubKey: string, liveSyncPairs: Array<[string, any]> }}
+ */
+function applyRawSectionPatchToContent(content, subKeyPath, rawEntries, unixSec) {
+  const normalizedSubKey = subKeyPath.trim().replace(/^\\+|\\+$/g, '').replace(/\\+/g, '\\');
+  const escapedSectionPath = normalizedSubKey.replace(/\\/g, '\\\\');
+  const sectionHeaderRe = new RegExp(
+    `^\\[${escapeRegExp(escapedSectionPath)}\\](?:\\s+\\d+)?[^\\r\\n]*$`,
+    'im'
+  );
+  const match = sectionHeaderRe.exec(content);
+  const formatLine = (/** @type {{ valueName: string, rawRegRhs: string }} */ item) => {
+    if (!item.valueName || item.valueName === '@') {
+      return `@=${item.rawRegRhs}`;
+    }
+    return `"${escapeWineRegString(item.valueName)}"=${item.rawRegRhs}`;
+  };
+
+  /** @type {Array<[string, any]>} */
+  const liveSyncPairs = rawEntries.map((item) => [
+    !item.valueName || item.valueName === '@' ? '@' : String(item.valueName),
+    { rawRegRhs: item.rawRegRhs },
+  ]);
+
+  if (!match) {
+    const lines = rawEntries.map(formatLine).join('\n');
+    const sep = content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
+    return {
+      content: `${content}${sep}[${escapedSectionPath}] ${unixSec}\n${lines}\n`,
+      normalizedSubKey,
+      liveSyncPairs,
+    };
+  }
+
+  const headerEnd = match.index + match[0].length;
+  const afterHeader = content.slice(headerEnd);
+  const nextSectionMatch = /^\[[^\]]+\]/m.exec(afterHeader);
+  const body = nextSectionMatch ? afterHeader.slice(0, nextSectionMatch.index) : afterHeader;
+  const rest = nextSectionMatch ? afterHeader.slice(nextSectionMatch.index) : '';
+  const bodyLines = body.split(/\r?\n/);
+
+  for (const item of rawEntries) {
+    const formatted = formatLine(item);
+    const isDefault = !item.valueName || item.valueName === '@';
+    let replaced = false;
+    for (let i = 0; i < bodyLines.length; i += 1) {
+      const line = bodyLines[i];
+      if (isDefault && /^\s*@=/.test(line)) {
+        bodyLines[i] = formatted;
+        replaced = true;
+        break;
+      }
+      if (!isDefault) {
+        const kvMatch = line.match(/^\s*"((?:[^"\\]|\\.)+)"\s*=/);
+        if (kvMatch) {
+          const unescaped = kvMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+          if (unescaped.toLowerCase() === item.valueName.toLowerCase()) {
+            bodyLines[i] = formatted;
+            replaced = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!replaced) {
+      let insertIdx = bodyLines.length;
+      while (insertIdx > 0 && bodyLines[insertIdx - 1].trim() === '') {
+        insertIdx -= 1;
+      }
+      bodyLines.splice(insertIdx, 0, formatted);
+    }
+  }
+
+  let rebuiltBody = bodyLines.join('\n');
+  if (!rebuiltBody.startsWith('\n')) rebuiltBody = `\n${rebuiltBody}`;
+  if (rest && !rebuiltBody.endsWith('\n\n')) {
+    rebuiltBody = rebuiltBody.endsWith('\n') ? `${rebuiltBody}\n` : `${rebuiltBody}\n\n`;
+  } else if (!rest && !rebuiltBody.endsWith('\n')) {
+    rebuiltBody = `${rebuiltBody}\n`;
+  }
+
+  return {
+    content: content.slice(0, match.index) + `[${escapedSectionPath}] ${unixSec}` + rebuiltBody + rest,
+    normalizedSubKey,
+    liveSyncPairs,
+  };
+}
+
+/**
+ * Batches multiple raw Wine `.reg` section mutations into a single file read + single atomic write
+ * (`Finding #17`).
+ *
+ * @param {string} regFilePath
+ * @param {Array<{ subKeyPath: string, valueName: string, rawRegRhs: string }>} rawPatchItems
  * @param {Record<string, any>} [options]
  */
-function patchRawWineRegistrySectionLines(regFilePath, subKeyPath, rawEntries, options = {}) {
-  if (!regFilePath || !subKeyPath || !Array.isArray(rawEntries) || rawEntries.length === 0) {
+function patchRawWineRegistrySectionsBatch(regFilePath, rawPatchItems, options = {}) {
+  if (!regFilePath || !Array.isArray(rawPatchItems) || rawPatchItems.length === 0) {
     return;
   }
   /** @type {'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE'} */
@@ -486,104 +620,71 @@ function patchRawWineRegistrySectionLines(regFilePath, subKeyPath, rawEntries, o
     } catch {}
   }
 
-  const normalizedSubKey = subKeyPath.trim().replace(/^\\+|\\+$/g, '').replace(/\\+/g, '\\');
-  const escapedSectionPath = normalizedSubKey.replace(/\\/g, '\\\\');
-  const sectionHeaderRe = new RegExp(
-    `^\\[${escapeRegExp(escapedSectionPath)}\\](?:\\s+\\d+)?[^\\r\\n]*$`,
-    'im'
-  );
-  const match = sectionHeaderRe.exec(content);
+  /** @type {Map<string, Array<{ valueName: string, rawRegRhs: string }>>} */
+  const groupedBySubKey = new Map();
+  for (const patch of rawPatchItems) {
+    if (!patch || !patch.subKeyPath) continue;
+    const normKey = patch.subKeyPath.trim().replace(/^\\+|\\+$/g, '').replace(/\\+/g, '\\');
+    if (!normKey) continue;
+    let bucket = groupedBySubKey.get(normKey);
+    if (!bucket) {
+      bucket = [];
+      groupedBySubKey.set(normKey, bucket);
+    }
+    bucket.push({ valueName: patch.valueName, rawRegRhs: patch.rawRegRhs });
+  }
+  if (groupedBySubKey.size === 0) return;
+
   const unixSec = Math.floor(Date.now() / 1000);
-  const formatLine = (/** @type {{ valueName: string, rawRegRhs: string }} */ item) => {
-    if (!item.valueName || item.valueName === '@') {
-      return `@=${item.rawRegRhs}`;
-    }
-    return `"${escapeWineRegString(item.valueName)}"=${item.rawRegRhs}`;
-  };
+  /** @type {Array<{ hiveName: 'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE', normalizedSubKey: string, entryPairsOrNullForDelete: Array<[string, any]> }>} */
+  const liveBatch = [];
 
-  /** @type {Array<[string, any]>} */
-  const liveSyncPairs = rawEntries.map((item) => [
-    !item.valueName || item.valueName === '@' ? '@' : String(item.valueName),
-    { rawRegRhs: item.rawRegRhs },
-  ]);
-
-  if (!match) {
-    const lines = rawEntries.map(formatLine).join('\n');
-    const sep = content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
-    atomicWriteFileSync(regFilePath, `${content}${sep}[${escapedSectionPath}] ${unixSec}\n${lines}\n`);
-  } else {
-    const headerEnd = match.index + match[0].length;
-    const afterHeader = content.slice(headerEnd);
-    const nextSectionMatch = /^\[[^\]]+\]/m.exec(afterHeader);
-    const body = nextSectionMatch ? afterHeader.slice(0, nextSectionMatch.index) : afterHeader;
-    const rest = nextSectionMatch ? afterHeader.slice(nextSectionMatch.index) : '';
-    const bodyLines = body.split(/\r?\n/);
-
-    for (const item of rawEntries) {
-      const formatted = formatLine(item);
-      const isDefault = !item.valueName || item.valueName === '@';
-      let replaced = false;
-      for (let i = 0; i < bodyLines.length; i += 1) {
-        const line = bodyLines[i];
-        if (isDefault && /^\s*@=/.test(line)) {
-          bodyLines[i] = formatted;
-          replaced = true;
-          break;
-        }
-        if (!isDefault) {
-          const kvMatch = line.match(/^\s*"((?:[^"\\]|\\.)+)"\s*=/);
-          if (kvMatch) {
-            const unescaped = kvMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-            if (unescaped.toLowerCase() === item.valueName.toLowerCase()) {
-              bodyLines[i] = formatted;
-              replaced = true;
-              break;
-            }
-          }
-        }
-      }
-      if (!replaced) {
-        let insertIdx = bodyLines.length;
-        while (insertIdx > 0 && bodyLines[insertIdx - 1].trim() === '') {
-          insertIdx -= 1;
-        }
-        bodyLines.splice(insertIdx, 0, formatted);
-      }
-    }
-
-    let rebuiltBody = bodyLines.join('\n');
-    if (!rebuiltBody.startsWith('\n')) rebuiltBody = `\n${rebuiltBody}`;
-    if (rest && !rebuiltBody.endsWith('\n\n')) {
-      rebuiltBody = rebuiltBody.endsWith('\n') ? `${rebuiltBody}\n` : `${rebuiltBody}\n\n`;
-    } else if (!rest && !rebuiltBody.endsWith('\n')) {
-      rebuiltBody = `${rebuiltBody}\n`;
-    }
-    atomicWriteFileSync(
-      regFilePath,
-      content.slice(0, match.index) + `[${escapedSectionPath}] ${unixSec}` + rebuiltBody + rest
-    );
+  for (const [subKeyPath, entries] of groupedBySubKey.entries()) {
+    const applied = applyRawSectionPatchToContent(content, subKeyPath, entries, unixSec);
+    content = applied.content;
+    liveBatch.push({
+      hiveName,
+      normalizedSubKey: applied.normalizedSubKey,
+      entryPairsOrNullForDelete: applied.liveSyncPairs,
+    });
   }
 
+  atomicWriteFileSync(regFilePath, content);
+
   if (options && Array.isArray(options.liveSyncAccumulator)) {
-    options.liveSyncAccumulator.push({
-      hiveName,
-      normalizedSubKey,
-      entryPairsOrNullForDelete: liveSyncPairs,
-    });
+    options.liveSyncAccumulator.push(...liveBatch);
   } else {
     const bottlePath =
       typeof options?.bottlePath === 'string' && options.bottlePath
         ? options.bottlePath
         : path.dirname(regFilePath);
     if (bottlePath && options?.skipLiveWineRegSync !== true) {
-      syncLiveWineRegistryBatchAsync(
-        bottlePath,
-        hiveName,
-        [{ hiveName, normalizedSubKey, entryPairsOrNullForDelete: liveSyncPairs }],
-        options
-      ).catch(() => {});
+      syncLiveWineRegistryBatchAsync(bottlePath, hiveName, liveBatch, options).catch(() => {});
     }
   }
+}
+
+/**
+ * Patch `hex:...` (`REG_BINARY`) or default `@=...` entries directly into a Wine `.reg` file section.
+ *
+ * @param {string} regFilePath
+ * @param {string} subKeyPath
+ * @param {Array<{ valueName: string, rawRegRhs: string }>} rawEntries
+ * @param {Record<string, any>} [options]
+ */
+function patchRawWineRegistrySectionLines(regFilePath, subKeyPath, rawEntries, options = {}) {
+  if (!regFilePath || !subKeyPath || !Array.isArray(rawEntries) || rawEntries.length === 0) {
+    return;
+  }
+  patchRawWineRegistrySectionsBatch(
+    regFilePath,
+    rawEntries.map((item) => ({
+      subKeyPath,
+      valueName: item.valueName,
+      rawRegRhs: item.rawRegRhs,
+    })),
+    options
+  );
 }
 
 /**
@@ -991,7 +1092,7 @@ async function executeGogGameScript(installDir, options = {}) {
                 });
               }
             } else if (rawValueType === 'qword' || rawValueType === 'reg_qword') {
-              const qVal = BigInt(rawValueData ?? 0);
+              const qVal = parseSafeRegistryQwordBigInt(rawValueData);
               if (!valNameStr || valNameStr === '@') {
                 queueBottleMapEntry(targetMap, sk, null, null);
               } else {
@@ -1036,7 +1137,7 @@ async function executeGogGameScript(installDir, options = {}) {
               regDataStr = String(Number.isFinite(numVal) ? numVal >>> 0 : 0);
             } else if (rawValueType === 'qword' || rawValueType === 'reg_qword') {
               regTypeFlag = 'REG_QWORD';
-              regDataStr = String(rawValueData ?? '0');
+              regDataStr = parseSafeRegistryQwordBigInt(rawValueData).toString(10);
             } else if (rawValueType === 'binary' || rawValueType === 'reg_binary') {
               regTypeFlag = 'REG_BINARY';
               regDataStr = parseRegistryBinaryHexPairs(rawValueData).join('');
@@ -1171,9 +1272,7 @@ async function executeGogGameScript(installDir, options = {}) {
     }
     if (hklmRawPatches.length > 0) {
       const sysRegPath = path.join(hostBottleDir, 'system.reg');
-      for (const patch of hklmRawPatches) {
-        patchRawWineRegistrySectionLines(sysRegPath, patch.subKeyPath, [patch], batchOpts);
-      }
+      patchRawWineRegistrySectionsBatch(sysRegPath, hklmRawPatches, batchOpts);
     }
     if (hkcuBatchMap.size > 0) {
       const hkcuSpecs = Array.from(hkcuBatchMap.entries()).map(([subKeyPath, entryMap]) => ({
@@ -1184,9 +1283,7 @@ async function executeGogGameScript(installDir, options = {}) {
     }
     if (hkcuRawPatches.length > 0) {
       const userRegPath = path.join(hostBottleDir, 'user.reg');
-      for (const patch of hkcuRawPatches) {
-        patchRawWineRegistrySectionLines(userRegPath, patch.subKeyPath, [patch], batchOpts);
-      }
+      patchRawWineRegistrySectionsBatch(userRegPath, hkcuRawPatches, batchOpts);
     }
     if (liveSyncAccumulator.length > 0) {
       await flushLiveWineRegistryAccumulator(hostBottleDir, liveSyncAccumulator, opts);
@@ -1238,6 +1335,8 @@ async function executeGogGameScript(installDir, options = {}) {
 module.exports = {
   GOG_SCRIPT_STAMP_FILENAME,
   executeGogGameScript,
+  parseSafeRegistryQwordBigInt,
+  patchRawWineRegistrySectionsBatch,
   patchRawWineRegistrySectionLines,
   selectCompatibleWin10SiblingDll,
   healMalformedTopLevelProxyDlls,

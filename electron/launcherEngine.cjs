@@ -272,6 +272,7 @@ const {
 
 const {
   scanAllInstalledGames,
+  scanAllInstalledGamesAsync,
 } = require('./launcher/installedGameScanner.cjs');
 
 const {
@@ -290,6 +291,7 @@ const {
   getPausedByInGameTaskIds,
   pauseActiveDownloadsForInGame,
   resumeDownloadsPausedByInGame,
+  gracefulShutdownDownloads,
 } = require('./launcher/downloadQueueCoordinator.cjs');
 
 const {
@@ -382,6 +384,7 @@ module.exports = {
   // A) Scanner & Helpers
   toLocalFsPath,
   scanAllInstalledGames,
+  scanAllInstalledGamesAsync,
   findPrimaryExecutable,
   getIndexedSteamAppInfoVdf,
   parseSteamBinaryVdfSlice,
@@ -575,6 +578,7 @@ module.exports = {
   updateDownloadTask,
   clearDownloadQueue,
   shutdownLauncherEngine,
+  gracefulShutdownDownloads,
   trimLauncherEngineMemory,
   steamAppInfoCache,
 

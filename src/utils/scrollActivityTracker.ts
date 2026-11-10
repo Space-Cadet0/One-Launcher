@@ -71,17 +71,12 @@ export function waitUntilScrollIdle(maxWaitMs: number = 1500): Promise<void> {
  * continuations stay responsive without starving input/scroll frames, falling
  * back to `setTimeout(..., 0)` when unavailable.
  */
-interface GlobalWithScheduler {
-  scheduler?: {
-    yield?: () => Promise<void>;
-  };
-}
-
 export async function yieldToMainThread(): Promise<void> {
-  const g = globalThis as unknown as GlobalWithScheduler;
-  if (g.scheduler && typeof g.scheduler.yield === 'function') {
+  const sched: unknown =
+    typeof globalThis !== 'undefined' ? Reflect.get(globalThis, 'scheduler') : undefined;
+  if (sched && typeof sched === 'object' && 'yield' in sched && typeof sched.yield === 'function') {
     try {
-      await g.scheduler.yield();
+      await sched.yield();
       return;
     } catch {
       // Fall back to macrotask yield below

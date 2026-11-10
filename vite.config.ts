@@ -2,153 +2,163 @@ import { defineConfig, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { createRequire } from 'node:module';
+
+interface SteamLocalScannerModule {
+  resolveLocalSteamUserdataDirs: (options?: Record<string, unknown>) => Promise<string[]>;
+  scanLocalSteamAchievements: (
+    options?: Record<string, unknown>
+  ) => Promise<
+    Record<number, { unlocked: number; total: number; percentage: number; isMastered: boolean }>
+  >;
+}
+
+let cachedSteamScanner: SteamLocalScannerModule | null = null;
+
+function loadSteamLocalScanner(): SteamLocalScannerModule {
+  if (!cachedSteamScanner) {
+    const cjsRequire = createRequire(import.meta.url);
+    cachedSteamScanner = cjsRequire(
+      './electron/storefronts/steamLocalScanner.cjs'
+    ) as SteamLocalScannerModule;
+  }
+  return cachedSteamScanner;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err || 'unknown_error');
+}
+
+async function scanLocalInstalledSteamAppIds(): Promise<number[]> {
+  const scanner = loadSteamLocalScanner();
+  const userdataDirs = await scanner.resolveLocalSteamUserdataDirs();
+  const steamappsDirs = new Set<string>();
+  for (const ud of userdataDirs) {
+    if (ud) {
+      steamappsDirs.add(path.join(path.dirname(ud), 'steamapps'));
+    }
+  }
+
+  for (const base of Array.from(steamappsDirs)) {
+    try {
+      const content = await fs.promises.readFile(path.join(base, 'libraryfolders.vdf'), 'utf8');
+      const isBottleDir = /(?:^|[\\/])drive_c(?:[\\/]|$)/i.test(base);
+      const driveCMatch = isBottleDir ? base.match(/^(.*?[\\/]drive_c)(?:[\\/]|$)/i) : null;
+      for (const m of content.matchAll(/"path"\s+"([^"]+)"/gi)) {
+        const rawLibPath = (m[1] || '').replace(/\\\\/g, '\\').trim();
+        if (!rawLibPath) continue;
+        if (driveCMatch && /^[a-zA-Z]:[\\/]/.test(rawLibPath)) {
+          const driveLetter = rawLibPath[0].toLowerCase();
+          const relWin = rawLibPath.slice(2).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+          if (driveLetter === 'c') {
+            steamappsDirs.add(path.join(driveCMatch[1], relWin, 'steamapps'));
+          } else if (driveLetter === 'z') {
+            steamappsDirs.add(path.join('/', relWin, 'steamapps'));
+          }
+        } else {
+          steamappsDirs.add(path.join(rawLibPath, 'steamapps'));
+        }
+      }
+    } catch {
+      // Ignore missing or unreadable libraryfolders.vdf
+    }
+  }
+
+  const appIdSet = new Set<number>();
+  for (const dir of steamappsDirs) {
+    try {
+      const files = await fs.promises.readdir(dir);
+      for (const file of files) {
+        const match = file.match(/^appmanifest_(\d+)\.acf$/);
+        if (match) {
+          const appId = Number.parseInt(match[1], 10);
+          if (appId > 0) appIdSet.add(appId);
+        }
+      }
+    } catch {
+      // Ignore non-existent or unreadable steamapps directory
+    }
+  }
+  return Array.from(appIdSet);
+}
 
 function localSystemScannerPlugin(): Plugin {
   return {
     name: 'local-system-scanner',
     configureServer(server) {
       server.middlewares.use('/api/local-system/installed-games', (_req, res) => {
-        try {
-          const home = os.homedir();
-          const steamDirs = [
-            path.join(home, 'Library/Application Support/Steam/steamapps'),
-            path.join(home, '.local/share/Steam/steamapps'),
-            path.join(home, '.steam/steam/steamapps'),
-            'C:\\Program Files (x86)\\Steam\\steamapps',
-          ];
-
-          // Parse libraryfolders.vdf if present to discover extra drives/libraries
-          for (const base of [...steamDirs]) {
-            const vdfPath = path.join(base, 'libraryfolders.vdf');
-            if (fs.existsSync(vdfPath)) {
-              try {
-                const content = fs.readFileSync(vdfPath, 'utf8');
-                const pathMatches = content.matchAll(/"path"\s+"([^"]+)"/g);
-                for (const m of pathMatches) {
-                  const customSteamApps = path.join(m[1], 'steamapps');
-                  if (fs.existsSync(customSteamApps) && !steamDirs.includes(customSteamApps)) {
-                    steamDirs.push(customSteamApps);
-                  }
-                }
-              } catch {
-                // Ignore parse errors
-              }
-            }
+        void (async () => {
+          try {
+            const installedSteamAppIds = await scanLocalInstalledSteamAppIds();
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                success: true,
+                installedSteamAppIds,
+                scannedAt: new Date().toISOString(),
+              })
+            );
+          } catch (err: unknown) {
+            res.setHeader('Content-Type', 'application/json');
+            res.statusCode = 500;
+            res.end(
+              JSON.stringify({
+                success: false,
+                error: getErrorMessage(err),
+                installedSteamAppIds: [],
+              })
+            );
           }
-
-          const installedSteamAppIds: number[] = [];
-          for (const dir of steamDirs) {
-            if (fs.existsSync(dir)) {
-              try {
-                const files = fs.readdirSync(dir);
-                for (const file of files) {
-                  const match = file.match(/^appmanifest_(\d+)\.acf$/);
-                  if (match) {
-                    const appId = parseInt(match[1], 10);
-                    if (!installedSteamAppIds.includes(appId)) {
-                      installedSteamAppIds.push(appId);
-                    }
-                  }
-                }
-              } catch {
-                // Ignore read errors
-              }
-            }
-          }
-
-          res.setHeader('Content-Type', 'application/json');
-          res.end(
-            JSON.stringify({
-              success: true,
-              installedSteamAppIds,
-              scannedAt: new Date().toISOString(),
-            })
-          );
-        } catch (err: any) {
-          res.setHeader('Content-Type', 'application/json');
-          res.statusCode = 500;
-          res.end(JSON.stringify({ success: false, error: err.message, installedSteamAppIds: [] }));
-        }
+        })();
       });
 
       server.middlewares.use('/api/local-system/steam-achievements', (_req, res) => {
-        try {
-          const home = os.homedir();
-          const steamUserDirs = [
-            path.join(home, 'Library/Application Support/Steam/userdata'),
-            path.join(home, '.local/share/Steam/userdata'),
-            path.join(home, '.steam/steam/userdata'),
-            'C:\\Program Files (x86)\\Steam\\userdata',
-          ];
-
-          const achievements: Record<number, { unlocked: number; total: number; percentage: number; source: string; syncedAt: string }> = {};
-
-          for (const base of steamUserDirs) {
-            if (!fs.existsSync(base)) continue;
-            try {
-              const userFolders = fs.readdirSync(base);
-              for (const u of userFolders) {
-                const lcDir = path.join(base, u, 'config/librarycache');
-                if (!fs.existsSync(lcDir)) continue;
-
-                const progressFile = path.join(lcDir, 'achievement_progress.json');
-                if (fs.existsSync(progressFile)) {
-                  try {
-                    const raw = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
-                    if (Array.isArray(raw.mapCache)) {
-                      for (const [appId, data] of raw.mapCache) {
-                        if (data && typeof data.unlocked === 'number' && typeof data.total === 'number') {
-                          achievements[appId] = {
-                            unlocked: data.unlocked,
-                            total: data.total,
-                            percentage: data.total > 0 ? Math.round((data.unlocked / data.total) * 100) : 0,
-                            source: 'local_client_cache',
-                            syncedAt: new Date().toISOString(),
-                          };
-                        }
-                      }
-                    }
-                  } catch {}
-                }
-
-                const files = fs.readdirSync(lcDir);
-                for (const file of files) {
-                  const m = file.match(/^(\d+)\.json$/);
-                  if (!m) continue;
-                  const appId = parseInt(m[1], 10);
-                  try {
-                    const content = fs.readFileSync(path.join(lcDir, file), 'utf8');
-                    const mTotal = content.match(/"nTotal"\s*:\s*(\d+)/);
-                    const mAchieved = content.match(/"nAchieved"\s*:\s*(\d+)/);
-                    if (mTotal || mAchieved) {
-                      const total = mTotal ? parseInt(mTotal[1], 10) : 0;
-                      const unlocked = mAchieved ? parseInt(mAchieved[1], 10) : 0;
-                      if (total > 0 || unlocked > 0) {
-                        if (!achievements[appId] || unlocked >= achievements[appId].unlocked) {
-                          achievements[appId] = {
-                            unlocked,
-                            total: total > 0 ? total : (achievements[appId]?.total || unlocked),
-                            percentage: total > 0 ? Math.round((unlocked / total) * 100) : 0,
-                            source: 'local_client_cache',
-                            syncedAt: new Date().toISOString(),
-                          };
-                        }
-                      }
-                    }
-                  } catch {}
-                }
+        void (async () => {
+          try {
+            const scanner = loadSteamLocalScanner();
+            const rawAchievements = await scanner.scanLocalSteamAchievements();
+            const scannedAt = new Date().toISOString();
+            const achievements: Record<
+              number,
+              {
+                unlocked: number;
+                total: number;
+                percentage: number;
+                isMastered?: boolean;
+                source: 'local_client_cache';
+                syncedAt: string;
               }
-            } catch {}
-          }
+            > = {};
 
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ success: true, achievements, scannedAt: new Date().toISOString() }));
-        } catch (err: any) {
-          res.setHeader('Content-Type', 'application/json');
-          res.statusCode = 500;
-          res.end(JSON.stringify({ success: false, error: err.message, achievements: {} }));
-        }
+            for (const [appIdKey, record] of Object.entries(rawAchievements || {})) {
+              const appId = Number(appIdKey);
+              if (appId > 0 && record) {
+                achievements[appId] = {
+                  unlocked: record.unlocked,
+                  total: record.total,
+                  percentage: record.percentage,
+                  isMastered: record.isMastered,
+                  source: 'local_client_cache',
+                  syncedAt: scannedAt,
+                };
+              }
+            }
+
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ success: true, achievements, scannedAt }));
+          } catch (err: unknown) {
+            res.setHeader('Content-Type', 'application/json');
+            res.statusCode = 500;
+            res.end(
+              JSON.stringify({
+                success: false,
+                error: getErrorMessage(err),
+                achievements: {},
+              })
+            );
+          }
+        })();
       });
     },
   };
@@ -207,30 +217,46 @@ export default defineConfig({
             }
           }
 
+          // Layer 0 (Pure Foundation - zero imports from steam/integrations/critic/launcher):
+          if (
+            normalizedId.includes('/src/contracts/') ||
+            normalizedId.includes('/src/services/common/') ||
+            normalizedId.includes('/src/services/network/requestScheduler') ||
+            normalizedId.includes('/src/services/network/onlineLifecycleManager') ||
+            normalizedId.includes('/src/services/storage/indexedDbVault') ||
+            normalizedId.includes('/src/services/storage/stagedCacheService') ||
+            normalizedId.includes('/src/services/storage/userOverrideStorage') ||
+            normalizedId.includes('/src/services/storage/knownGameAchievements') ||
+            normalizedId.includes('/src/services/storage/achievementReconciliation')
+          ) {
+            return 'services-foundation';
+          }
+
+          // Layer 1 (Storefront Catalog, Metadata, Critic, Platform & Sync):
+          if (
+            normalizedId.includes('/src/services/steam/') ||
+            normalizedId.includes('/src/services/integrations/') ||
+            normalizedId.includes('/src/services/igdb/') ||
+            normalizedId.includes('/src/services/critic/') ||
+            normalizedId.includes('/src/services/opencritic/') ||
+            normalizedId.includes('/src/services/hltb/') ||
+            normalizedId.includes('/src/services/platform/') ||
+            normalizedId.includes('/src/services/storage/') ||
+            normalizedId.includes('/src/services/network/')
+          ) {
+            return 'services-catalog';
+          }
+
+          // Layer 2 (Launcher, Install & Wine/CrossOver Runtime):
+          if (normalizedId.includes('/src/services/launcher/')) {
+            return 'services-launcher';
+          }
+
           if (normalizedId.includes('/src/components/SteamStoreDetail/')) {
             return 'ui-store-detail';
           }
 
-          if (
-            normalizedId.includes('/src/services/critic/') ||
-            normalizedId.includes('/src/services/opencritic/') ||
-            normalizedId.includes('/src/services/igdb/') ||
-            normalizedId.includes('/src/services/hltb/') ||
-            normalizedId.includes('/src/services/integrations/') ||
-            normalizedId.includes('/src/services/steam/')
-          ) {
-            return 'services-core';
-          }
-
-          if (normalizedId.includes('steamEnrichedCache') || normalizedId.includes('fullUserSteamGames')) {
-            return 'store-steam-enriched';
-          }
-          if (normalizedId.includes('gogEnrichedCache') || normalizedId.includes('gogUserLibrary')) {
-            return 'store-gog-enriched';
-          }
-          if (normalizedId.includes('epicUserLibrary')) {
-            return 'store-epic-library';
-          }
+          return undefined;
         },
       },
     },

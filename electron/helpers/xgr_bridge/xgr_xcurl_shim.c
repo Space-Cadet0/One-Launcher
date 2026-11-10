@@ -244,6 +244,29 @@ static VOID WINAPI shim_UnregisterAppConstrainedChangeNotification(PVOID registr
     xgr_sync_teb_last_error();
 }
 
+static INIT_ONCE g_pin_bridge_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK pin_bridge_module_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+#ifdef _WIN32
+    HMODULE pinned = NULL;
+    (void)GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)pin_bridge_module_once_cb,
+        &pinned
+    );
+#endif
+    return TRUE;
+}
+
+static inline void ensure_bridge_module_pinned(void)
+{
+    InitOnceExecuteOnce(&g_pin_bridge_once, pin_bridge_module_once_cb, NULL, NULL);
+}
+
 static void replace_iat_slot(IMAGE_THUNK_DATA *thunk, void *new_fn, void **orig_slot)
 {
     if (orig_slot && *orig_slot == NULL && (void *)(uintptr_t)thunk->u1.Function != new_fn) {
@@ -252,6 +275,7 @@ static void replace_iat_slot(IMAGE_THUNK_DATA *thunk, void *new_fn, void **orig_
     if ((void *)(uintptr_t)thunk->u1.Function == new_fn) {
         return;
     }
+    ensure_bridge_module_pinned();
     DWORD old_prot = 0;
     if (VirtualProtect(&thunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old_prot)) {
         thunk->u1.Function = (ULONG_PTR)(uintptr_t)new_fn;
@@ -452,6 +476,7 @@ void xgr_install_xcurl_shim(void)
         g_ldr_unregister =
             (PFN_LdrUnregisterDllNotification)(void *)GetProcAddress(hNtdll, "LdrUnregisterDllNotification");
         if (pReg) {
+            ensure_bridge_module_pinned();
             pReg(0, ldr_dll_notification_cb, NULL, &g_ldr_cookie);
         }
     }

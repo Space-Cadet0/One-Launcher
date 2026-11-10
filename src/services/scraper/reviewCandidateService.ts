@@ -44,8 +44,8 @@ interface OpenCriticGameDetailResponse {
   };
 }
 
-const STEAM_ENRICHED_REVIEW_MAP =
-  (steamEnrichedCache as unknown as Record<string, SteamEnrichedReviewEntry>) || {};
+const STEAM_ENRICHED_REVIEW_MAP: Record<string, SteamEnrichedReviewEntry> =
+  steamEnrichedCache || {};
 
 const OPENCRITIC_PUBLIC_HEADERS: Record<string, string> = {
   Accept: 'application/json',

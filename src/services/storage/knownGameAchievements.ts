@@ -238,14 +238,15 @@ export function cacheUserSteamAchievements(
   if (typeof window === 'undefined') return;
   try {
     const existing = readAchMapFromSlot(steamAchSlot, STORAGE_KEY_STEAM_ACH) || {};
-    const merged: Record<number, StoreAchievementSummary> = {};
+    const merged: Record<string, StoreAchievementSummary> = {};
 
     for (const [k, v] of Object.entries(existing)) {
-      merged[Number(k)] = v;
+      merged[String(Number(k))] = v;
     }
 
     for (const [key, inc] of Object.entries(map)) {
       const appId = Number(key);
+      const appKey = String(appId);
       const incSummary: StoreAchievementSummary = {
         unlocked: inc.unlocked,
         total: inc.total,
@@ -256,15 +257,12 @@ export function cacheUserSteamAchievements(
         hasConflict: inc.hasConflict,
         conflictDetails: inc.conflictDetails,
       };
-      merged[appId] =
-        reconcileAchievementSummaries(merged[appId], incSummary, { appId, store: 'steam' }) || incSummary;
+      merged[appKey] =
+        reconcileAchievementSummaries(merged[appKey], incSummary, { appId, store: 'steam' }) ||
+        incSummary;
     }
 
-    writeAchMapToSlot(
-      steamAchSlot,
-      STORAGE_KEY_STEAM_ACH,
-      merged as unknown as Record<string, StoreAchievementSummary>
-    );
+    writeAchMapToSlot(steamAchSlot, STORAGE_KEY_STEAM_ACH, merged);
   } catch (err) {
     console.warn('Failed to cache Steam achievements to localStorage:', err);
   }

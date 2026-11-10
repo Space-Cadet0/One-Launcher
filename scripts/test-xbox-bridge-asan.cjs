@@ -160,9 +160,17 @@ static void remove_tree_posix(const char *dir_path)
  * ------------------------------------------------------------------------- */
 
 static char g_last_license_token_params[1024] = { 0 };
+static char g_last_query_products_params[1024] = { 0 };
+static int  g_xgamesave_init_rpc_calls = 0;
 
 static HRESULT w2a_mock_rpc_handler(const char *method, const char *params_json_obj, char **out_result_json)
 {
+    if (strcmp(method, "xgamesave.init") == 0) {
+        g_xgamesave_init_rpc_calls++;
+        *out_result_json = strdup("{\"quotaBytes\":268435456}");
+        return S_OK;
+    }
+
     if (strcmp(method, "session.init") == 0) {
         const char *resp =
             "{"
@@ -207,7 +215,13 @@ static HRESULT w2a_mock_rpc_handler(const char *method, const char *params_json_
         return S_OK;
     }
 
-    if (strcmp(method, "xstore.queryProducts") == 0) {
+    if (strcmp(method, "xstore.queryProducts") == 0 || strcmp(method, "xstore.queryAssociatedProducts") == 0) {
+        snprintf(
+            g_last_query_products_params,
+            sizeof(g_last_query_products_params),
+            "%s",
+            params_json_obj ? params_json_obj : ""
+        );
         const char *resp =
             "{\"products\":[{"
             "\"storeId\":\"9NDLCEXP0001\","
@@ -294,11 +308,53 @@ static HRESULT WINAPI mock_PFGameSaveFilesAddUserWithUiAsync(XUserHandle localUs
     return S_OK;
 }
 
+static uint32_t g_pf_async_upload_delay_ms = 0u;
+static uint64_t g_pf_upload_observed_xuid = 0ULL;
+static volatile LONG g_pf_upload_completed_flag = 0;
+static bool g_pf_uninit_observed_upload_done = false;
+
+struct async_pf_upload_worker_ctx {
+    XAsyncBlock *async;
+    uint32_t delay_ms;
+};
+
+static DWORD WINAPI async_pf_upload_worker(LPVOID param)
+{
+    struct async_pf_upload_worker_ctx *w = (struct async_pf_upload_worker_ctx *)param;
+    Sleep(w->delay_ms);
+    InterlockedExchange(&g_pf_upload_completed_flag, 1);
+    if (w->async) {
+        if (w->async->queue) {
+            /* keep stack-escape test realistic */
+        }
+        if (w->async->callback) {
+            w->async->callback(w->async);
+        }
+    }
+    free(w);
+    return 0;
+}
+
 static HRESULT WINAPI mock_PFGameSaveFilesUploadWithUiAsync(XUserHandle localUser, uint32_t option, XAsyncBlock *async)
 {
-    (void)localUser;
     g_pf_upload_calls++;
     g_pf_last_upload_option = option;
+    g_pf_upload_observed_xuid = xgr_user_get_xuid(localUser);
+    if (g_pf_async_upload_delay_ms > 0u && async) {
+        InterlockedExchange(&g_pf_upload_completed_flag, 0);
+        struct async_pf_upload_worker_ctx *w = (struct async_pf_upload_worker_ctx *)calloc(1, sizeof(*w));
+        if (!w) return E_OUTOFMEMORY;
+        w->async = async;
+        w->delay_ms = g_pf_async_upload_delay_ms;
+        HANDLE th = CreateThread(NULL, 0, async_pf_upload_worker, w, 0, NULL);
+        if (!th) {
+            free(w);
+            return E_FAIL;
+        }
+        CloseHandle(th);
+        return S_OK;
+    }
+    InterlockedExchange(&g_pf_upload_completed_flag, 1);
     if (async && async->callback) {
         async->callback(async);
     }
@@ -310,6 +366,7 @@ static HRESULT WINAPI mock_PFGameSaveFilesUninitializeAsync(XAsyncBlock *async)
     if (g_pf_upload_calls > 0 && g_pf_last_upload_option == 1u) {
         g_pf_upload_ran_before_uninit = true;
     }
+    g_pf_uninit_observed_upload_done = (InterlockedCompareExchange(&g_pf_upload_completed_flag, 0, 0) == 1);
     g_pf_uninit_calls++;
     if (async && async->callback) {
         async->callback(async);
@@ -806,6 +863,240 @@ static void test_game_invite_and_protocol_dispatch(void)
     pTqClose(th_iface, manual_q);
 }
 
+/* -------------------------------------------------------------------------
+ * Test 5: Wave 2A Remediation Invariants (JSON depth, Async PlayFab Uninit,
+ *         XStore DLC PackageIdentifier, Serialized Self-Close, XGameSave)
+ * ------------------------------------------------------------------------- */
+struct self_close_q_ctx {
+    void *th_iface;
+    void (WINAPI *pClose)(void *, XTaskQueueHandle);
+    XTaskQueueHandle q;
+    HANDLE done_ev;
+};
+
+static void CALLBACK self_close_serialized_cb(void *context, bool canceled)
+{
+    (void)canceled;
+    struct self_close_q_ctx *c = (struct self_close_q_ctx *)context;
+    c->pClose(c->th_iface, c->q);
+    SetEvent(c->done_ev);
+}
+
+static void CALLBACK uninit_done_signal_cb(XAsyncBlock *ab)
+{
+    if (ab && ab->context) {
+        SetEvent((HANDLE)ab->context);
+    }
+}
+
+static void test_wave2_remediation_invariants(void)
+{
+    /* 5a. Depth-aware JSON key parser skips nested objects/arrays and escaped quotes */
+    const char *tricky_json =
+        "{"
+        "\"items\":[{\"id\":\"wrong_array_nested\",\"count\":999,\"flag\":false}],"
+        "\"nested\":{\"id\":\"wrong_obj_nested\",\"count\":888},"
+        "\"escaped\":\"\\\"id\\\":\\\"wrong_in_string\\\"\","
+        "\"id\":\"top_level_correct\","
+        "\"count\":42,"
+        "\"flag\":true"
+        "}";
+    char id_out[64] = { 0 };
+    int64_t cnt_out = 0;
+    bool flag_out = false;
+    ASSERT_TRUE(xgr_json_get_string(tricky_json, "id", id_out, sizeof(id_out)));
+    ASSERT_TRUE(strcmp(id_out, "top_level_correct") == 0);
+    ASSERT_TRUE(xgr_json_get_int64(tricky_json, "count", &cnt_out) && cnt_out == 42);
+    ASSERT_TRUE(xgr_json_get_bool(tricky_json, "flag", &flag_out) && flag_out == true);
+
+    /* 5b. XStoreQueryPackageIdentifier DLC + base storeId lookup & XStore forwarding */
+    void *store_iface = NULL;
+    ASSERT_HR_EQ(QueryApiImpl(&CLSID_XStoreImpl, &IID_IXStoreImpl6, &store_iface), S_OK);
+    const void *const *svtbl = *(const void *const **)store_iface;
+
+    typedef HRESULT (WINAPI *fn_create_ctx_t)(void *, const XUserHandle, XStoreContextHandle *);
+    typedef void    (WINAPI *fn_close_ctx_t)(void *, XStoreContextHandle);
+    typedef HRESULT (WINAPI *fn_qpkg_id_t)(void *, const char *, size_t, char *);
+    typedef HRESULT (WINAPI *fn_qprod_pkg_async_t)(void *, const XStoreContextHandle, uint32_t, const char *, XAsyncBlock *);
+    typedef HRESULT (WINAPI *fn_qprod_pkg_res_t)(void *, XAsyncBlock *, XStoreProductQueryHandle *);
+    typedef HRESULT (WINAPI *fn_qassoc_sid_async_t)(void *, const XStoreContextHandle, const char *, uint32_t, uint32_t, XAsyncBlock *);
+    typedef HRESULT (WINAPI *fn_qassoc_sid_res_t)(void *, XAsyncBlock *, XStoreProductQueryHandle *);
+    typedef void    (WINAPI *fn_close_prods_t)(void *, XStoreProductQueryHandle);
+
+    fn_create_ctx_t pCreateCtx = (fn_create_ctx_t)svtbl[3];
+    fn_close_ctx_t pCloseCtx = (fn_close_ctx_t)svtbl[4];
+    fn_qprod_pkg_async_t pQProdPkgAsync = (fn_qprod_pkg_async_t)svtbl[13];
+    fn_qprod_pkg_res_t pQProdPkgRes = (fn_qprod_pkg_res_t)svtbl[14];
+    fn_close_prods_t pCloseProds = (fn_close_prods_t)svtbl[19];
+    fn_qpkg_id_t pQueryPkgId = (fn_qpkg_id_t)svtbl[65];
+    fn_qassoc_sid_async_t pQAssocSidAsync = (fn_qassoc_sid_async_t)svtbl[77];
+    fn_qassoc_sid_res_t pQAssocSidRes = (fn_qassoc_sid_res_t)svtbl[78];
+
+    char pkg_id[XGR_PACKAGE_IDENTIFIER_MAX_LEN] = { 0 };
+    ASSERT_HR_EQ(pQueryPkgId(store_iface, "9NDLCEXP0001", sizeof(pkg_id), pkg_id), S_OK);
+    ASSERT_TRUE(strcmp(pkg_id, "9NDLCEXP0001_dlc_a1b2c3d4e5f6") == 0);
+    ASSERT_HR_EQ(pQueryPkgId(store_iface, "9NBASEGAME01", sizeof(pkg_id), pkg_id), S_OK);
+    ASSERT_TRUE(strcmp(pkg_id, "9NBASEGAME01_onelauncher") == 0);
+    ASSERT_HR_EQ(pQueryPkgId(store_iface, "9NUNKNOWN999", sizeof(pkg_id), pkg_id), HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+
+    XStoreContextHandle sc = NULL;
+    ASSERT_HR_EQ(pCreateCtx(store_iface, NULL, &sc), S_OK);
+
+    XAsyncBlock qpp_ab;
+    memset(&qpp_ab, 0, sizeof(qpp_ab));
+    g_last_query_products_params[0] = '\0';
+    ASSERT_HR_EQ(pQProdPkgAsync(store_iface, sc, 0xFFu, "9NDLCEXP0001_dlc_a1b2c3d4e5f6", &qpp_ab), S_OK);
+    ASSERT_HR_EQ(xgr_async_get_status(&qpp_ab, true), S_OK);
+    ASSERT_TRUE(strstr(g_last_query_products_params, "9NDLCEXP0001") != NULL);
+    XStoreProductQueryHandle qh1 = NULL;
+    ASSERT_HR_EQ(pQProdPkgRes(store_iface, &qpp_ab, &qh1), S_OK);
+    pCloseProds(store_iface, qh1);
+
+    XAsyncBlock qas_ab;
+    memset(&qas_ab, 0, sizeof(qas_ab));
+    g_last_query_products_params[0] = '\0';
+    ASSERT_HR_EQ(pQAssocSidAsync(store_iface, sc, "9NDLCEXP0002", 0xFFu, 25u, &qas_ab), S_OK);
+    ASSERT_HR_EQ(xgr_async_get_status(&qas_ab, true), S_OK);
+    ASSERT_TRUE(strstr(g_last_query_products_params, "9NDLCEXP0002") != NULL);
+    XStoreProductQueryHandle qh2 = NULL;
+    ASSERT_HR_EQ(pQAssocSidRes(store_iface, &qas_ab, &qh2), S_OK);
+    pCloseProds(store_iface, qh2);
+    pCloseCtx(store_iface, sc);
+
+    /* 5c. True async background-thread PlayFab pre-uninitialize upload chaining + XUserHandle retention */
+    void *user_iface = NULL;
+    ASSERT_HR_EQ(QueryApiImpl(&CLSID_XUserImpl, &IID_IXUserImpl6, &user_iface), S_OK);
+    const void *const *uvtbl = *(const void *const **)user_iface;
+    typedef void    (WINAPI *fn_uclose_t)(void *, XUserHandle);
+    typedef HRESULT (WINAPI *fn_uadd_async_t)(void *, uint32_t, XAsyncBlock *);
+    typedef HRESULT (WINAPI *fn_uadd_res_t)(void *, XAsyncBlock *, XUserHandle *);
+    fn_uclose_t pUserClose = (fn_uclose_t)uvtbl[4];
+    fn_uadd_async_t pUserAddAsync = (fn_uadd_async_t)uvtbl[7];
+    fn_uadd_res_t pUserAddRes = (fn_uadd_res_t)uvtbl[8];
+
+    XAsyncBlock uab;
+    memset(&uab, 0, sizeof(uab));
+    ASSERT_HR_EQ(pUserAddAsync(user_iface, 1u, &uab), S_OK);
+    ASSERT_HR_EQ(xgr_async_get_status(&uab, true), S_OK);
+    XUserHandle real_user = NULL;
+    ASSERT_HR_EQ(pUserAddRes(user_iface, &uab, &real_user), S_OK);
+    ASSERT_TRUE(real_user != NULL);
+
+    xgr_playfab_shim_reset();
+    xgr_playfab_set_symbol_resolver_for_test(w2a_playfab_resolver);
+    XAsyncBlock add_pf_ab;
+    memset(&add_pf_ab, 0, sizeof(add_pf_ab));
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesAddUserWithUiAsync(real_user, 0u, &add_pf_ab), S_OK);
+    /* Caller immediately closes its XUserHandle before UninitializeAsync — shim's retained ref must keep it valid! */
+    pUserClose(user_iface, real_user);
+
+    g_pf_upload_calls = 0;
+    g_pf_uninit_calls = 0;
+    g_pf_upload_observed_xuid = 0ULL;
+    g_pf_uninit_observed_upload_done = false;
+    g_pf_async_upload_delay_ms = 40u;
+
+    HANDLE uninit_done_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ASSERT_TRUE(uninit_done_ev != NULL);
+    XAsyncBlock uninit_ab;
+    memset(&uninit_ab, 0, sizeof(uninit_ab));
+    uninit_ab.context = uninit_done_ev;
+    uninit_ab.callback = uninit_done_signal_cb;
+
+    /* Returns immediately while background upload thread is still sleeping (zero stack UAR!) */
+    ASSERT_HR_EQ(xgr_pf_shim_PFGameSaveFilesUninitializeAsync(&uninit_ab), S_OK);
+    ASSERT_TRUE(WaitForSingleObject(uninit_done_ev, 3000) == WAIT_OBJECT_0);
+    CloseHandle(uninit_done_ev);
+    g_pf_async_upload_delay_ms = 0u;
+
+    ASSERT_TRUE(g_pf_upload_calls == 1);
+    ASSERT_TRUE(g_pf_uninit_calls == 1);
+    ASSERT_TRUE(g_pf_uninit_observed_upload_done);
+    ASSERT_TRUE(g_pf_upload_observed_xuid == 2533274790395904ULL);
+
+    /* 5d. xthreading: XTaskQueueGetPort(NULL) default process queue + serialized worker self-close (< 250ms, no 2s self-join) */
+    void *th_iface = NULL;
+    ASSERT_HR_EQ(QueryApiImpl(&CLSID_XThreadingImpl, &IID_IXThreadingImpl, &th_iface), S_OK);
+    const void *const *tvtbl = *(const void *const **)th_iface;
+    typedef HRESULT (WINAPI *fn_tq_create_t)(void *, XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle *);
+    typedef HRESULT (WINAPI *fn_tq_get_port_t)(void *, XTaskQueueHandle, XTaskQueuePort, XTaskQueuePortHandle *);
+    typedef void    (WINAPI *fn_tq_close_t)(void *, XTaskQueueHandle);
+    typedef HRESULT (WINAPI *fn_tq_submit_t)(void *, XTaskQueueHandle, XTaskQueuePort, void *, XTaskQueueCallback *);
+
+    fn_tq_create_t pTqCreate = (fn_tq_create_t)tvtbl[12];
+    fn_tq_get_port_t pTqGetPort = (fn_tq_get_port_t)tvtbl[14];
+    fn_tq_close_t pTqClose = (fn_tq_close_t)tvtbl[17];
+    fn_tq_submit_t pTqSubmit = (fn_tq_submit_t)tvtbl[18];
+
+    XTaskQueuePortHandle default_work_port = NULL;
+    ASSERT_HR_EQ(pTqGetPort(th_iface, NULL, XTaskQueuePort_Work, &default_work_port), S_OK);
+    ASSERT_TRUE(default_work_port != NULL);
+
+    XTaskQueueHandle ser_q = NULL;
+    ASSERT_HR_EQ(pTqCreate(th_iface, XTaskQueueDispatchMode_SerializedThreadPool, XTaskQueueDispatchMode_Manual, &ser_q), S_OK);
+    HANDLE self_close_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    struct self_close_q_ctx sc_ctx = { th_iface, pTqClose, ser_q, self_close_ev };
+    ULONGLONG t0 = GetTickCount64();
+    ASSERT_HR_EQ(pTqSubmit(th_iface, ser_q, XTaskQueuePort_Work, &sc_ctx, self_close_serialized_cb), S_OK);
+    ASSERT_TRUE(WaitForSingleObject(self_close_ev, 500) == WAIT_OBJECT_0);
+    ULONGLONG elapsed = GetTickCount64() - t0;
+    ASSERT_TRUE(elapsed < 500ULL);
+    CloseHandle(self_close_ev);
+    win32_drain_background_workers();
+
+    /* 5e. XGameSaveFilesGetFolderWithUiAsync calls xgamesave.init RPC + XGameSaveUpdate double-submit returns E_GS_HANDLE_EXPIRED */
+    void *gs_iface = NULL;
+    ASSERT_HR_EQ(QueryApiImpl(&CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, &gs_iface), S_OK);
+    const void *const *gvtbl = *(const void *const **)gs_iface;
+    typedef HRESULT (WINAPI *fn_gs_init_t)(void *, XUserHandle, const char *, BOOLEAN, XGameSaveProviderHandle *);
+    typedef void    (WINAPI *fn_gs_close_prov_t)(void *, XGameSaveProviderHandle);
+    typedef HRESULT (WINAPI *fn_gs_create_cont_t)(void *, XGameSaveProviderHandle, const char *, XGameSaveContainerHandle *);
+    typedef void    (WINAPI *fn_gs_close_cont_t)(void *, XGameSaveContainerHandle);
+    typedef HRESULT (WINAPI *fn_gs_create_upd_t)(void *, XGameSaveContainerHandle, const char *, XGameSaveUpdateHandle *);
+    typedef void    (WINAPI *fn_gs_close_upd_t)(void *, XGameSaveUpdateHandle);
+    typedef HRESULT (WINAPI *fn_gs_blob_write_t)(void *, XGameSaveUpdateHandle, const char *, const uint8_t *, SIZE_T);
+    typedef HRESULT (WINAPI *fn_gs_submit_upd_t)(void *, XGameSaveUpdateHandle);
+    typedef HRESULT (WINAPI *fn_gs_folder_async_t)(void *, XUserHandle, const char *, XAsyncBlock *);
+    typedef HRESULT (WINAPI *fn_gs_folder_res_t)(void *, XAsyncBlock *, SIZE_T, char *);
+
+    fn_gs_init_t pGsInit = (fn_gs_init_t)gvtbl[3];
+    fn_gs_close_prov_t pGsCloseProv = (fn_gs_close_prov_t)gvtbl[6];
+    fn_gs_create_cont_t pGsCreateCont = (fn_gs_create_cont_t)gvtbl[16];
+    fn_gs_close_cont_t pGsCloseCont = (fn_gs_close_cont_t)gvtbl[17];
+    fn_gs_create_upd_t pGsCreateUpd = (fn_gs_create_upd_t)gvtbl[23];
+    fn_gs_close_upd_t pGsCloseUpd = (fn_gs_close_upd_t)gvtbl[24];
+    fn_gs_blob_write_t pGsBlobWrite = (fn_gs_blob_write_t)gvtbl[25];
+    fn_gs_submit_upd_t pGsSubmitUpd = (fn_gs_submit_upd_t)gvtbl[27];
+    fn_gs_folder_async_t pGsFolderAsync = (fn_gs_folder_async_t)gvtbl[30];
+    fn_gs_folder_res_t pGsFolderRes = (fn_gs_folder_res_t)gvtbl[31];
+
+    int prev_gs_rpc = g_xgamesave_init_rpc_calls;
+    XAsyncBlock fab;
+    memset(&fab, 0, sizeof(fab));
+    ASSERT_HR_EQ(pGsFolderAsync(gs_iface, NULL, "00000000-0000-0000-0000-00006743210a", &fab), S_OK);
+    ASSERT_HR_EQ(xgr_async_get_status(&fab, true), S_OK);
+    ASSERT_TRUE(g_xgamesave_init_rpc_calls > prev_gs_rpc);
+    char folder_out[1024] = { 0 };
+    ASSERT_HR_EQ(pGsFolderRes(gs_iface, &fab, sizeof(folder_out), folder_out), S_OK);
+    ASSERT_TRUE(folder_out[0] != '\0');
+
+    XGameSaveProviderHandle prov = NULL;
+    ASSERT_HR_EQ(pGsInit(gs_iface, NULL, "00000000-0000-0000-0000-00006743210a", FALSE, &prov), S_OK);
+    XGameSaveContainerHandle cont = NULL;
+    ASSERT_HR_EQ(pGsCreateCont(gs_iface, prov, "slot_wave2a", &cont), S_OK);
+    XGameSaveUpdateHandle upd = NULL;
+    ASSERT_HR_EQ(pGsCreateUpd(gs_iface, cont, "slot_wave2a", &upd), S_OK);
+    const uint8_t payload[4] = { 1, 2, 3, 4 };
+    ASSERT_HR_EQ(pGsBlobWrite(gs_iface, upd, "save.bin", payload, sizeof(payload)), S_OK);
+    ASSERT_HR_EQ(pGsSubmitUpd(gs_iface, upd), S_OK);
+    /* Second submission or mutation on already-submitted update must fail with E_GS_HANDLE_EXPIRED */
+    ASSERT_HR_EQ(pGsSubmitUpd(gs_iface, upd), E_GS_HANDLE_EXPIRED);
+    ASSERT_HR_EQ(pGsBlobWrite(gs_iface, upd, "save2.bin", payload, sizeof(payload)), E_GS_HANDLE_EXPIRED);
+    pGsCloseUpd(gs_iface, upd);
+    pGsCloseCont(gs_iface, cont);
+    pGsCloseProv(gs_iface, prov);
+}
+
 int main(void)
 {
     char sandbox_template[] = "/tmp/ol-xgr-wave2a-asan-XXXXXX";
@@ -820,6 +1111,7 @@ int main(void)
     test_xpackage_locale_and_dlc_mounting();
     test_xstore_license_token_and_prices();
     test_game_invite_and_protocol_dispatch();
+    test_wave2_remediation_invariants();
 
     xgr_playfab_set_symbol_resolver_for_test(NULL);
     xgr_playfab_shim_reset();

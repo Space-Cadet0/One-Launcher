@@ -279,7 +279,8 @@ export class SteamAchievementsService {
   async fetchPlayerGameAchievements(
     appId: number,
     explicitSteamId?: string,
-    explicitApiKey?: string
+    explicitApiKey?: string,
+    priority: number = Priority.LOW
   ): Promise<StoreAchievementSummary | null> {
     const creds = this.getActiveSteamCredentials();
     const steamId = explicitSteamId || creds.steamId;
@@ -302,7 +303,7 @@ export class SteamAchievementsService {
                 error?: string;
               };
             }>(url, { timeout: 5000 }),
-          Priority.LOW,
+          priority,
           'api.steampowered.com',
           gameKey
         );
@@ -387,7 +388,7 @@ export class SteamAchievementsService {
         const res = await requestScheduler.schedule(
           canonicalXmlUrl,
           () => axios.get<string>(url, { timeout: 6000, responseType: 'text' }),
-          Priority.LOW,
+          priority,
           'steamcommunity.com',
           gameKey
         );
@@ -431,7 +432,7 @@ export class SteamAchievementsService {
               const friendlyRes = await requestScheduler.schedule(
                 canonicalFriendlyUrl,
                 () => axios.get<string>(friendlyUrl, { timeout: 6000, responseType: 'text' }),
-                Priority.LOW,
+                priority,
                 'steamcommunity.com',
                 gameKey
               );
@@ -521,6 +522,7 @@ export class SteamAchievementsService {
     options?: {
       forceRefresh?: boolean;
       includeUnplayed?: boolean;
+      priority?: number;
       onBatchUpdated?: (partialResults: Record<number, StoreAchievementSummary>) => void;
     }
   ): Promise<Record<number, StoreAchievementSummary>> {
@@ -633,7 +635,8 @@ export class SteamAchievementsService {
             const ach = await this.fetchPlayerGameAchievements(
               game.steamAppId,
               activeSteamId,
-              creds.apiKey
+              creds.apiKey,
+              options?.priority ?? Priority.LOW
             );
             if (ach) {
               results[game.steamAppId] = ach;

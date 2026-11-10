@@ -182,25 +182,31 @@ function installPasskeyCancellationHelper() {
 }
 
 const gTop = /** @type {any} */ (globalThis);
-const winObj = gTop.window;
-const locObj = gTop.location;
-const candidateHref =
-  locObj && typeof locObj.href === 'string' && locObj.href
-    ? locObj.href
-    : locObj && locObj.protocol && locObj.hostname
-      ? `${locObj.protocol}//${locObj.host || locObj.hostname}${locObj.pathname || '/'}`
-      : '';
 
-if (
-  winObj &&
-  winObj === winObj.top &&
-  locObj &&
-  !locObj.port &&
-  isAllowedHttpsHost(candidateHref, TRUSTED_HOSTS)
-) {
+function resolveCurrentTopFrameTrustedHref() {
+  const curWin = gTop.window;
+  const curLoc = gTop.location;
+  if (!curWin || curWin !== curWin.top || !curLoc || curLoc.port) {
+    return '';
+  }
+  const href =
+    typeof curLoc.href === 'string' && curLoc.href
+      ? curLoc.href
+      : curLoc.protocol && curLoc.hostname
+        ? `${curLoc.protocol}//${curLoc.host || curLoc.hostname}${curLoc.pathname || '/'}`
+        : '';
+  return isAllowedHttpsHost(href, TRUSTED_HOSTS) ? href : '';
+}
+
+if (resolveCurrentTopFrameTrustedHref()) {
   contextBridge.exposeInMainWorld('__oneLauncherXboxAuth', {
     notify: (/** @type {unknown} */ payload) => {
-      if (typeof payload === 'string' && payload.length <= 65536) {
+      // Re-verify top-frame HTTPS trusted Microsoft host at call time (Finding #17)
+      if (
+        typeof payload === 'string' &&
+        payload.length <= 65536 &&
+        resolveCurrentTopFrameTrustedHref()
+      ) {
         ipcRenderer.send('one-launcher:xbox-cxh-notify', payload);
       }
     },
@@ -219,4 +225,12 @@ if (
     } catch {}
     (${installPasskeyCancellationHelper.toString()})();
   `);
+}
+
+if (typeof module === 'object' && module && module.exports) {
+  module.exports = {
+    TRUSTED_HOSTS,
+    isAllowedHttpsHost,
+    resolveCurrentTopFrameTrustedHref,
+  };
 }

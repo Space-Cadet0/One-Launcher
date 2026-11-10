@@ -10,14 +10,20 @@ const {
   loadWgsSyncSidecar,
   saveWgsSyncSidecar,
   syncXboxTitleStorage,
+  releaseXboxTitleStorageSessionLock,
 } = require('./xboxTitleStorageSync.cjs');
 const {
+  buildXboxFetchSignal,
   resolveDefaultXboxLocale,
+} = require('./xboxConfigAndIds.cjs');
+const {
   postXboxTitlePresenceHeartbeat,
 } = require('./xboxAchievementsAndStats.cjs');
 
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB (authenticated sockets)
 const MAX_UNAUTH_RPC_FRAME_BYTES = 4096; // 4 KiB strict limit until sessionToken/key verified (D8.7)
+const MAX_HTTP_HEADER_BYTES = 8192; // 8 KiB strict limit for HTTP header pre-auth gate
+const DEFAULT_UNAUTH_HANDSHAKE_TIMEOUT_MS = 5_000; // 5s strict pre-auth deadline
 const MAX_CONCURRENT_SOCKETS = 16;
 const DEFAULT_SOCKET_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_PRESENCE_HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000; // 4 minutes
@@ -668,6 +674,7 @@ function createXboxStoreRuntimeProvider(options = {}) {
                 serviceTicket: String(serviceTicket || ''),
                 publisherUserId: String(publisherUserId || ''),
               }),
+              signal: buildXboxFetchSignal(undefined, 15_000),
             });
             if (res.ok) {
               const json = await res.json();
@@ -706,6 +713,7 @@ function createXboxStoreRuntimeProvider(options = {}) {
                 serviceTicket: String(serviceTicket || ''),
                 publisherUserId: String(publisherUserId || ''),
               }),
+              signal: buildXboxFetchSignal(undefined, 15_000),
             });
             if (res.ok) {
               const json = await res.json();
@@ -806,6 +814,25 @@ function normalizeLoopbackDecimalTitleId(rawTitleId, { preferHex = false } = {})
   return '';
 }
 
+function validateSafePackageFamilyName(rawPfn) {
+  const clean = String(rawPfn ?? '').trim();
+  if (!clean) return '';
+  if (
+    clean === '.' ||
+    clean === '..' ||
+    clean.includes('..') ||
+    clean.includes('/') ||
+    clean.includes('\\') ||
+    !/^[A-Za-z0-9._-]{1,128}$/.test(clean)
+  ) {
+    throw Object.assign(
+      new Error(`Rejected unsafe or traversal packageFamilyName: ${clean.slice(0, 64)}`),
+      { hr: -2147024809 } // E_INVALIDARG (0x80070057)
+    );
+  }
+  return clean;
+}
+
 async function startXboxRuntimeLoopbackServer(options = {}) {
   const {
     authProvider = null,
@@ -834,10 +861,15 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     Number(options.socketIdleTimeoutMs) > 0
       ? Number(options.socketIdleTimeoutMs)
       : DEFAULT_SOCKET_IDLE_TIMEOUT_MS;
+  const unauthHandshakeTimeoutMs =
+    Number(options.unauthTimeoutMs) > 0
+      ? Number(options.unauthTimeoutMs)
+      : DEFAULT_UNAUTH_HANDSHAKE_TIMEOUT_MS;
 
   const sessionKey = crypto.randomBytes(32).toString('hex'); // 64 hex chars
   const expectedKeyBuf = Buffer.from(sessionKey, 'utf8');
   const activeSockets = new Set();
+  const unauthSockets = new Set();
   const inFlightSaveInits = new Map();
   const VALID_SCID_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   /** @type {Set<string>} */
@@ -866,7 +898,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
       .toLowerCase(),
     msaAppId: String(gameMetadata.msaAppId || options.msaAppId || ''),
     storeId: String(gameMetadata.storeId || options.storeId || '').trim().toUpperCase(),
-    packageFamilyName: String(
+    packageFamilyName: validateSafePackageFamilyName(
       gameMetadata.packageFamilyName || options.packageFamilyName || options.pfn || ''
     ),
     locale: resolvedLocale,
@@ -876,6 +908,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     fullTrust: gameMetadata.fullTrust !== false,
     initializedSaves: new Set(),
     saveQuotas: new Map(),
+    remainingSaveQuotas: new Map(),
+    heldCloudLocks: new Map(),
     /** @type {Promise<any>} */
     pendingSaveChain: Promise.resolve(),
   };
@@ -933,11 +967,22 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
   }
 
   function resolveSystemAppDataHostDir(pfnOverride) {
+    const safeOverride =
+      pfnOverride !== undefined && pfnOverride !== null && String(pfnOverride).trim() !== ''
+        ? validateSafePackageFamilyName(pfnOverride)
+        : '';
     const explicitSaveRoot = saveRootDir || wgsRootDir;
     if (explicitSaveRoot) return explicitSaveRoot;
-    const pfn = pfnOverride || state.packageFamilyName;
+    const pfn = safeOverride || validateSafePackageFamilyName(state.packageFamilyName);
     if (bottleUsersDir && pfn) {
-      return path.join(bottleUsersDir, 'Packages', pfn, 'SystemAppData');
+      const packagesRoot = path.resolve(bottleUsersDir, 'Packages');
+      const resolvedDir = path.resolve(packagesRoot, pfn, 'SystemAppData');
+      if (!resolvedDir.startsWith(packagesRoot + path.sep)) {
+        throw Object.assign(new Error('Rejected path traversal in packageFamilyName'), {
+          hr: -2147024809,
+        });
+      }
+      return resolvedDir;
     }
     return null;
   }
@@ -994,7 +1039,10 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
         if (params.scid) state.scid = String(params.scid).toLowerCase();
         if (params.msaAppId) state.msaAppId = String(params.msaAppId);
         if (params.storeId) state.storeId = String(params.storeId).toUpperCase();
-        if (params.packageFamilyName) state.packageFamilyName = String(params.packageFamilyName);
+        const incomingPfn = params.packageFamilyName ?? params.pfn;
+        if (incomingPfn !== undefined && incomingPfn !== null && String(incomingPfn).trim() !== '') {
+          state.packageFamilyName = validateSafePackageFamilyName(incomingPfn);
+        }
         if (typeof params.fullTrust === 'boolean') state.fullTrust = params.fullTrust;
 
         const profile = await resolveActiveUserProfile();
@@ -1203,11 +1251,14 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
         if (VALID_SCID_UUID_RE.test(scid)) {
           activeScids.add(scid);
         }
-        const pfn = String(params.packageFamilyName || state.packageFamilyName);
+        const pfn = validateSafePackageFamilyName(
+          params.packageFamilyName || params.pfn || state.packageFamilyName
+        );
         const hexXuidScid = formatWgsUserScidFolderName(xuid, scid);
         const sysAppDataDir = resolveSystemAppDataHostDir(pfn);
 
         let quotaBytes = 256 * 1024 * 1024;
+        let remainingQuotaBytes = quotaBytes;
         let synced = false;
 
         if (sysAppDataDir && scid && enableCloudSaveSync) {
@@ -1217,6 +1268,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
           if (state.initializedSaves.has(syncKey)) {
             synced = true;
             quotaBytes = state.saveQuotas.get(syncKey) || quotaBytes;
+            remainingQuotaBytes = state.remainingSaveQuotas.get(syncKey) ?? quotaBytes;
           } else {
             let initPromise = inFlightSaveInits.get(syncKey);
             if (!initPromise) {
@@ -1235,12 +1287,33 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                   authProvider,
                   titleStorageOrigin,
                   fetchImpl,
+                  keepLockHeld: true,
                 });
                 const resolvedQuota = res?.quotaBytes || 256 * 1024 * 1024;
+                const resolvedRemaining = Number.isFinite(res?.remainingQuotaBytes)
+                  ? res.remainingQuotaBytes
+                  : resolvedQuota;
                 const resolvedSynced = Boolean(res?.synced);
+                const resolvedScid = String(res?.resolvedScid || scid).trim().toLowerCase();
                 state.saveQuotas.set(syncKey, resolvedQuota);
+                state.remainingSaveQuotas.set(syncKey, resolvedRemaining);
                 state.initializedSaves.add(syncKey);
-                return { quotaBytes: resolvedQuota, synced: resolvedSynced };
+                if (res?.lockHeld) {
+                  state.heldCloudLocks.set(syncKey, {
+                    xuid,
+                    resolvedScid,
+                    pfn,
+                    lockHeld: true,
+                    hadWrites:
+                      (res?.uploadedContainers || 0) > 0 ||
+                      (res?.deletedRemoteContainers || 0) > 0,
+                  });
+                }
+                return {
+                  quotaBytes: resolvedQuota,
+                  remainingQuotaBytes: resolvedRemaining,
+                  synced: resolvedSynced,
+                };
               };
               const chained = state.pendingSaveChain.then(executeInit, executeInit);
               state.pendingSaveChain = chained.catch(() => {});
@@ -1251,6 +1324,7 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
             }
             const initRes = await initPromise;
             quotaBytes = initRes.quotaBytes;
+            remainingQuotaBytes = initRes.remainingQuotaBytes;
             synced = initRes.synced;
           }
         }
@@ -1258,12 +1332,30 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
         return {
           synced,
           quotaBytes,
+          remainingQuota: remainingQuotaBytes,
+          remainingQuotaBytes,
           hexXuidScid,
           scid,
           packageFamilyName: pfn,
         };
       }
 
+      case 'xgamesave.remaining_quota':
+      case 'xgamesave.getRemainingQuota': {
+        const profile = await resolveActiveUserProfile();
+        const xuid = String(params.xuid || profile.xuid);
+        const scid = String(params.scid || state.scid).trim().toLowerCase();
+        const syncKey = `${xuid}:${scid}`;
+        const quotaBytes = state.saveQuotas.get(syncKey) || 256 * 1024 * 1024;
+        const remainingQuotaBytes = state.remainingSaveQuotas.get(syncKey) ?? quotaBytes;
+        return {
+          quotaBytes,
+          remainingQuota: remainingQuotaBytes,
+          remainingQuotaBytes,
+        };
+      }
+
+      case 'xgamesave.submit_update':
       case 'xgamesave.commit': {
         try {
           const profile = await resolveActiveUserProfile();
@@ -1272,11 +1364,14 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
           if (VALID_SCID_UUID_RE.test(scid)) {
             activeScids.add(scid);
           }
-          const pfn = String(params.packageFamilyName || state.packageFamilyName);
+          const pfn = validateSafePackageFamilyName(
+            params.packageFamilyName || params.pfn || state.packageFamilyName
+          );
           const containerName = String(params.containerName || '');
           const deleted = Boolean(params.deleted);
           const hexXuidScid = formatWgsUserScidFolderName(xuid, scid);
           const sysAppDataDir = resolveSystemAppDataHostDir(pfn);
+          const syncKey = `${xuid}:${scid}`;
 
           if (sysAppDataDir && scid) {
             const { wgsUserDir, xgsUserDir } = resolveTitleSaveDirs(sysAppDataDir, hexXuidScid);
@@ -1291,12 +1386,14 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                   }
                 }
                 if (enableCloudSaveSync) {
-                  await syncXboxTitleStorage({
+                  const priorLock = state.heldCloudLocks.get(syncKey);
+                  const knownQuota = state.saveQuotas.get(syncKey) || 256 * 1024 * 1024;
+                  const syncRes = await syncXboxTitleStorage({
                     mode: 'in_session',
                     wgsUserDir,
                     xgsUserDir,
                     xuid,
-                    scid,
+                    scid: priorLock?.resolvedScid || scid,
                     fallbackScid: state.fallbackScid || state.scid,
                     preserveLocalWgsDirOnFallback: true,
                     packageFamilyName: pfn,
@@ -1305,6 +1402,28 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
                     authProvider,
                     titleStorageOrigin,
                     fetchImpl,
+                    alreadyLocked: Boolean(priorLock?.lockHeld),
+                    keepLockHeld: true,
+                    quotaBytes: knownQuota,
+                  });
+                  if (syncRes?.quotaBytes > 0) {
+                    state.saveQuotas.set(syncKey, syncRes.quotaBytes);
+                  }
+                  if (Number.isFinite(syncRes?.remainingQuotaBytes)) {
+                    state.remainingSaveQuotas.set(syncKey, syncRes.remainingQuotaBytes);
+                  }
+                  const wroteAny =
+                    Boolean(priorLock?.hadWrites) ||
+                    (syncRes?.uploadedContainers || 0) > 0 ||
+                    (syncRes?.deletedRemoteContainers || 0) > 0;
+                  state.heldCloudLocks.set(syncKey, {
+                    xuid,
+                    resolvedScid: String(syncRes?.resolvedScid || priorLock?.resolvedScid || scid)
+                      .trim()
+                      .toLowerCase(),
+                    pfn,
+                    lockHeld: Boolean(syncRes?.lockHeld),
+                    hadWrites: wroteAny,
                   });
                 }
               } catch (commitErr) {
@@ -1323,15 +1442,27 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
             };
 
             const commitPromise = state.pendingSaveChain.then(enqueueCommit, enqueueCommit);
-            state.pendingSaveChain = commitPromise.catch(() => {});
+            state.pendingSaveChain = commitPromise.catch((bgErr) => {
+              if (params.waitForCloud !== true) {
+                console.warn(
+                  '[XboxLoopbackServer] Background cloud save commit warning:',
+                  bgErr?.message || bgErr
+                );
+              }
+            });
             if (params.waitForCloud === true) {
               await commitPromise;
             }
           }
 
+          const remainingQuotaBytes =
+            state.remainingSaveQuotas.get(syncKey) ??
+            state.saveQuotas.get(syncKey) ??
+            256 * 1024 * 1024;
           return {
             committed: true,
-            remainingQuota: 256 * 1024 * 1024,
+            remainingQuota: remainingQuotaBytes,
+            remainingQuotaBytes,
           };
         } catch (err) {
           throw Object.assign(
@@ -1352,46 +1483,116 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
 
   const server = net.createServer((socket) => {
     if (activeSockets.size >= maxConcurrentSockets) {
-      socket.destroy();
-      return;
+      // Evict the oldest unauthenticated socket first so slow pre-auth connections
+      // can never starve legitimate RPC clients of socket slots (Finding #12).
+      const oldestUnauth = unauthSockets.values().next().value;
+      if (oldestUnauth) {
+        unauthSockets.delete(oldestUnauth);
+        activeSockets.delete(oldestUnauth);
+        oldestUnauth.destroy();
+      } else {
+        socket.destroy();
+        return;
+      }
     }
 
     activeSockets.add(socket);
+    unauthSockets.add(socket);
     socket.setNoDelay(true);
     socket.setTimeout(socketIdleTimeoutMs);
     socket.on('timeout', () => {
       socket.destroy();
     });
 
-    // Two-stage O(1) frame reader: 4-byte length header -> single Buffer.allocUnsafe(bodyLen) + cursor copy
+    let socketAuthenticated = false;
+    let unauthTimer = setTimeout(() => {
+      if (!socketAuthenticated && !socket.destroyed) {
+        socket.destroy();
+      }
+    }, unauthHandshakeTimeoutMs);
+    if (typeof unauthTimer.unref === 'function') {
+      unauthTimer.unref();
+    }
+
+    const markSocketAuthenticated = () => {
+      if (!socketAuthenticated) {
+        socketAuthenticated = true;
+        unauthSockets.delete(socket);
+        if (unauthTimer) {
+          clearTimeout(unauthTimer);
+          unauthTimer = null;
+        }
+      }
+    };
+
+    // Dual-mode framing:
+    //  - 'binary' (native xgr_rpc.c): [u32LE length][JSON]
+    //  - 'http'   (HTTP JSON-RPC):    validates X-One-Launcher-Token immediately upon
+    //                                 header arrival (\r\n\r\n) BEFORE buffering body!
+    let protocolMode = null; // null | 'binary' | 'http'
     const headerBuf = Buffer.allocUnsafe(4);
     let headerFilled = 0;
     let bodyLen = 0;
     let frameBuf = null;
     let frameFilled = 0;
-    let socketAuthenticated = false;
+
+    let httpHeaderBuf = Buffer.alloc(0);
+    let httpHeadersVerified = false;
+    let httpContentLength = 0;
+    let httpKeepAlive = false;
+    let httpBodyBuf = null;
+    let httpBodyFilled = 0;
+
     const parsedReqQueue = [];
+
+    const writeHttpJsonResponse = (statusCode, statusText, payloadObj, closeAfter = false) => {
+      if (socket.destroyed) return;
+      const bodyJson = payloadObj ? Buffer.from(JSON.stringify(payloadObj), 'utf8') : Buffer.alloc(0);
+      const connHeader = closeAfter || !httpKeepAlive ? 'close' : 'keep-alive';
+      const head =
+        `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+        `Content-Type: application/json; charset=utf-8\r\n` +
+        `Content-Length: ${bodyJson.length}\r\n` +
+        `Connection: ${connHeader}\r\n\r\n`;
+      socket.write(head);
+      if (bodyJson.length > 0) {
+        socket.write(bodyJson);
+      }
+      if (closeAfter || !httpKeepAlive) {
+        socket.end();
+      }
+    };
 
     const drainParsedReqQueue = async () => {
       while (parsedReqQueue.length > 0 && !socket.destroyed) {
-        const req = parsedReqQueue.shift();
+        const item = parsedReqQueue.shift();
+        const req = item.req;
+        const isHttp = item.isHttp === true;
         const reqId = req.id ?? 0;
         try {
           const result = await dispatchRpcMethod(String(req.method || ''), req.params || {});
           if (!socket.destroyed) {
-            socket.write(encodeRpcFrame({ id: reqId, ok: true, hr: 0, result }));
+            const respObj = { id: reqId, ok: true, hr: 0, result };
+            if (isHttp) {
+              writeHttpJsonResponse(200, 'OK', respObj, false);
+            } else {
+              socket.write(encodeRpcFrame(respObj));
+            }
           }
         } catch (err) {
           const hr = Number.isInteger(err?.hr) ? err.hr : -2147467259; // E_FAIL (0x80004005)
           if (!socket.destroyed) {
-            socket.write(
-              encodeRpcFrame({
-                id: reqId,
-                ok: false,
-                hr,
-                error: err?.message || String(err),
-              })
-            );
+            const respObj = {
+              id: reqId,
+              ok: false,
+              hr,
+              error: err?.message || String(err),
+            };
+            if (isHttp) {
+              writeHttpJsonResponse(200, 'OK', respObj, false);
+            } else {
+              socket.write(encodeRpcFrame(respObj));
+            }
           }
         }
       }
@@ -1399,8 +1600,192 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
 
     let processingChain = Promise.resolve();
 
+    const looksLikeAsciiHttpPrefix = (b0) =>
+      b0 === 0x50 /* P (POST/PUT) */ ||
+      b0 === 0x47 /* G (GET) */ ||
+      b0 === 0x44 /* D (DELETE) */ ||
+      b0 === 0x48 /* H (HEAD) */ ||
+      b0 === 0x4f /* O (OPTIONS) */;
+
     socket.on('data', (chunk) => {
+      if (chunk.length === 0 || socket.destroyed) return;
+
+      if (protocolMode === null) {
+        // Binary unauthenticated frames have length 1..4096 so bytes [2..3] are 0x00;
+        // HTTP methods start with uppercase ASCII ('POST ', 'GET ', etc.).
+        if (headerFilled === 0 && chunk.length >= 4) {
+          const isAsciiMethod =
+            looksLikeAsciiHttpPrefix(chunk[0]) &&
+            chunk[1] >= 0x20 &&
+            chunk[1] <= 0x7e &&
+            chunk[2] >= 0x20 &&
+            chunk[2] <= 0x7e &&
+            chunk[3] >= 0x20 &&
+            chunk[3] <= 0x7e;
+          protocolMode = isAsciiMethod ? 'http' : 'binary';
+        } else if (headerFilled === 0 && !looksLikeAsciiHttpPrefix(chunk[0])) {
+          protocolMode = 'binary';
+        } else {
+          // Wait for 4 bytes to disambiguate cleanly
+          const take = Math.min(4 - headerFilled, chunk.length);
+          chunk.copy(headerBuf, headerFilled, 0, take);
+          headerFilled += take;
+          if (headerFilled < 4) return;
+          const isAsciiMethod =
+            looksLikeAsciiHttpPrefix(headerBuf[0]) &&
+            headerBuf[1] >= 0x20 &&
+            headerBuf[1] <= 0x7e &&
+            headerBuf[2] >= 0x20 &&
+            headerBuf[2] <= 0x7e &&
+            headerBuf[3] >= 0x20 &&
+            headerBuf[3] <= 0x7e;
+          if (isAsciiMethod) {
+            protocolMode = 'http';
+            chunk = Buffer.concat([headerBuf.subarray(0, 4), chunk.subarray(take)]);
+            headerFilled = 0;
+          } else {
+            protocolMode = 'binary';
+            chunk = chunk.subarray(take);
+          }
+        }
+      }
+
+      if (protocolMode === 'http') {
+        let cursor = 0;
+        while (cursor < chunk.length && !socket.destroyed) {
+          if (!httpHeadersVerified) {
+            const rem = chunk.subarray(cursor);
+            if (httpHeaderBuf.length + rem.length > MAX_HTTP_HEADER_BYTES + MAX_RPC_FRAME_BYTES) {
+              // Check if header terminator exists within MAX_HTTP_HEADER_BYTES
+              const probeSlice = rem.subarray(
+                0,
+                Math.max(0, MAX_HTTP_HEADER_BYTES - httpHeaderBuf.length + 4)
+              );
+              const combinedProbe = Buffer.concat([httpHeaderBuf, probeSlice]);
+              if (combinedProbe.indexOf('\r\n\r\n') < 0) {
+                socket.destroy();
+                return;
+              }
+            }
+            const prevLen = httpHeaderBuf.length;
+            const searchLimit = Math.min(rem.length, MAX_HTTP_HEADER_BYTES - prevLen + 4);
+            const candidateHeader = Buffer.concat([httpHeaderBuf, rem.subarray(0, searchLimit)]);
+            const headerEndIdx = candidateHeader.indexOf('\r\n\r\n');
+            if (headerEndIdx < 0) {
+              if (candidateHeader.length > MAX_HTTP_HEADER_BYTES) {
+                socket.destroy();
+                return;
+              }
+              httpHeaderBuf = candidateHeader;
+              return;
+            }
+
+            const rawHeadersStr = candidateHeader.subarray(0, headerEndIdx).toString('latin1');
+            const consumedFromRem = headerEndIdx + 4 - prevLen;
+            cursor += consumedFromRem;
+            httpHeaderBuf = Buffer.alloc(0);
+
+            const lines = rawHeadersStr.split('\r\n');
+            const headersMap = new Map();
+            for (let i = 1; i < lines.length; i += 1) {
+              const colon = lines[i].indexOf(':');
+              if (colon > 0) {
+                const k = lines[i].slice(0, colon).trim().toLowerCase();
+                const v = lines[i].slice(colon + 1).trim();
+                headersMap.set(k, v);
+              }
+            }
+
+            // Reject browser DNS-rebinding / cross-origin requests immediately
+            if (headersMap.get('origin') || headersMap.get('sec-fetch-site')) {
+              socket.write(
+                'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+              );
+              socket.destroy();
+              return;
+            }
+
+            // Validate X-One-Launcher-Token via constant-time timingSafeEqual BEFORE reading body!
+            const headerToken = headersMap.get('x-one-launcher-token') || '';
+            if (!verifySessionKeyConstantTime(headerToken, expectedKeyBuf)) {
+              socket.write(
+                'HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+              );
+              socket.destroy();
+              return;
+            }
+
+            markSocketAuthenticated();
+
+            const clRaw = headersMap.get('content-length');
+            const parsedCl = clRaw !== undefined ? Number(clRaw) : 0;
+            if (!Number.isInteger(parsedCl) || parsedCl < 0 || parsedCl > MAX_RPC_FRAME_BYTES) {
+              socket.write(
+                'HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+              );
+              socket.destroy();
+              return;
+            }
+
+            httpContentLength = parsedCl;
+            httpKeepAlive =
+              String(headersMap.get('connection') || '').toLowerCase() === 'keep-alive';
+            httpHeadersVerified = true;
+            httpBodyBuf = Buffer.allocUnsafe(httpContentLength);
+            httpBodyFilled = 0;
+          }
+
+          if (httpHeadersVerified) {
+            const need = httpContentLength - httpBodyFilled;
+            const take = Math.min(need, chunk.length - cursor);
+            if (take > 0) {
+              chunk.copy(httpBodyBuf, httpBodyFilled, cursor, cursor + take);
+              httpBodyFilled += take;
+              cursor += take;
+            }
+            if (httpBodyFilled === httpContentLength) {
+              const completedHttpBody = httpBodyBuf;
+              httpBodyBuf = null;
+              httpBodyFilled = 0;
+              httpHeadersVerified = false;
+              httpContentLength = 0;
+
+              let req;
+              try {
+                req =
+                  completedHttpBody.length > 0
+                    ? JSON.parse(completedHttpBody.toString('utf8'))
+                    : {};
+              } catch {
+                writeHttpJsonResponse(400, 'Bad Request', { ok: false, error: 'Invalid JSON' }, true);
+                socket.destroy();
+                return;
+              }
+              parsedReqQueue.push({ req, isHttp: true });
+            }
+          }
+        }
+
+        if (parsedReqQueue.length > 0 && !socket.destroyed) {
+          processingChain = processingChain.then(drainParsedReqQueue, drainParsedReqQueue);
+        }
+        return;
+      }
+
       let offset = 0;
+      if (headerFilled === 4 && frameBuf === null) {
+        bodyLen = headerBuf.readUInt32LE(0);
+        const maxAllowed = socketAuthenticated
+          ? MAX_RPC_FRAME_BYTES
+          : MAX_UNAUTH_RPC_FRAME_BYTES;
+        if (bodyLen === 0 || bodyLen > maxAllowed) {
+          socket.destroy();
+          return;
+        }
+        frameBuf = Buffer.allocUnsafe(bodyLen);
+        frameFilled = 0;
+      }
+
       while (offset < chunk.length && !socket.destroyed) {
         if (headerFilled < 4) {
           const needHeader = 4 - headerFilled;
@@ -1451,8 +1836,8 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
             return;
           }
 
-          socketAuthenticated = true;
-          parsedReqQueue.push(req);
+          markSocketAuthenticated();
+          parsedReqQueue.push({ req, isHttp: false });
         }
       }
 
@@ -1466,6 +1851,11 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     });
 
     socket.on('close', () => {
+      if (unauthTimer) {
+        clearTimeout(unauthTimer);
+        unauthTimer = null;
+      }
+      unauthSockets.delete(socket);
       activeSockets.delete(socket);
     });
   });
@@ -1506,12 +1896,38 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
     }
     closePromise = (async () => {
       await state.pendingSaveChain.catch(() => {});
+      if (enableCloudSaveSync && state.heldCloudLocks.size > 0) {
+        for (const lockEntry of state.heldCloudLocks.values()) {
+          if (!lockEntry?.lockHeld) continue;
+          try {
+            await releaseXboxTitleStorageSessionLock({
+              xuid: lockEntry.xuid,
+              scid: lockEntry.resolvedScid,
+              packageFamilyName: lockEntry.pfn,
+              msaAppId: state.msaAppId,
+              titleId: state.titleId,
+              authProvider,
+              titleStorageOrigin,
+              fetchImpl,
+              hadWrites: Boolean(lockEntry.hadWrites),
+              signal: buildXboxFetchSignal(undefined, 5_000),
+            });
+          } catch (releaseErr) {
+            console.warn(
+              '[XboxLoopbackServer] Failed to release TitleStorage session lock on close:',
+              releaseErr?.message || releaseErr
+            );
+          }
+        }
+        state.heldCloudLocks.clear();
+      }
       if (presenceActivated) {
         await sendPresenceUpdate('inactive');
       }
       for (const sock of activeSockets) {
         sock.destroy();
       }
+      unauthSockets.clear();
       activeSockets.clear();
       await new Promise((resolve) => server.close(() => resolve()));
     })();
@@ -1557,10 +1973,13 @@ async function startXboxRuntimeLoopbackServer(options = {}) {
 module.exports = {
   MAX_RPC_FRAME_BYTES,
   MAX_UNAUTH_RPC_FRAME_BYTES,
+  MAX_HTTP_HEADER_BYTES,
+  DEFAULT_UNAUTH_HANDSHAKE_TIMEOUT_MS,
   MAX_CONCURRENT_SOCKETS,
   DEFAULT_SOCKET_IDLE_TIMEOUT_MS,
   DEFAULT_PRESENCE_HEARTBEAT_INTERVAL_MS,
   verifySessionKeyConstantTime,
+  validateSafePackageFamilyName,
   encodeRpcFrame,
   resolveTitleSaveDirs,
   resolveTitleSaveRootDir,

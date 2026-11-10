@@ -5,7 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {
   isAllowedHttpsHost,
-  sanitizeLaunchConfigRecursive,
+  wrapIpcMainWithSenderCheck,
 } = require('../launcher/securityAndPathUtils.cjs');
 const {
   diagLog,
@@ -693,18 +693,26 @@ function resolveCleanBrowserUserAgent(session) {
  *   session: any,
  *   getMainWindow: () => any,
  *   storeSync: any,
- *   launcherEngine: any
+ *   launcherEngine: any,
+ *   options?: Record<string, any>
  * }} deps
  */
 function registerStoreSyncIpcHandlers({
-  ipcMain,
+  ipcMain: rawIpcMain,
   BrowserWindow,
   session,
   getMainWindow,
   storeSync,
   launcherEngine,
+  options: handlerOptions = {},
 }) {
-  if (!ipcMain) return { trimStoreSyncIpcMemory: trimSteamLocalScannerMemory };
+  if (!rawIpcMain) return { trimStoreSyncIpcMemory: trimSteamLocalScannerMemory };
+  const ipcMain = wrapIpcMainWithSenderCheck(rawIpcMain, {
+    getMainWindow,
+    isPackaged: Boolean(handlerOptions.isPackaged),
+    allowedDevOrigin: handlerOptions.allowedDevOrigin || null,
+    expectedFileHref: handlerOptions.expectedFileHref || null,
+  });
   trimSteamLocalScannerMemory();
 
   const recoverEpicAuthSession = createEpicAuthRecovery({
@@ -725,8 +733,8 @@ function registerStoreSyncIpcHandlers({
    * On-demand single-flight Microsoft Store `TokenBroker` (`InlineLogin.srf`) recovery hook.
    * Invoked automatically during Xbox `.msixvc` installation when an account was previously
    * restored from an OAuth2-only refresh token lacking `storeTicket` / `userStsLegacyTokenXml`
-   * (or when a Store licensing session requires interactive consent), so `Quake` and all other
-   * encrypted `.msixvc` packages acquire their 32-byte `CIK` and stream seamlessly without failing.
+   * (or when a Store licensing session requires interactive consent), so all encrypted
+   * `.msixvc` packages acquire their 32-byte `CIK` and stream seamlessly without failing.
    *
    * @param {{ title?: string, userDataDir?: string }} [context]
    * @returns {Promise<{ recovered: boolean, error?: string }>}
@@ -2206,7 +2214,6 @@ function registerStoreSyncIpcHandlers({
     return projected;
   };
   ipcMain.handle('store:get-tokens', handleGetSavedStoreTokens);
-  ipcMain.handle('store:get-saved-tokens', handleGetSavedStoreTokens);
 
   /**
    * @param {any} _event
@@ -2240,51 +2247,7 @@ function registerStoreSyncIpcHandlers({
   };
 
   ipcMain.handle('store:clear-tokens', handleClearStoreTokens);
-  ipcMain.handle('store:clear-token', handleClearStoreTokens);
   ipcMain.handle('store:disconnect', handleClearStoreTokens);
-
-  /**
-   * @param {any} _event
-   * @param {any} arg1
-   * @param {any} arg2
-   */
-  const handleSaveStoreTokens = async (_event, arg1, arg2) => {
-    const rawStorefrontId =
-      arg1 && typeof arg1 === 'object' ? arg1.storefrontId || arg1.store : arg1;
-    const rawTokenData =
-      arg1 && typeof arg1 === 'object' ? arg1.tokenData || arg1.tokens || arg2 : arg2;
-    const storefrontId = typeof rawStorefrontId === 'string' ? rawStorefrontId.trim() : '';
-    if (
-      !storefrontId ||
-      storefrontId === '__proto__' ||
-      storefrontId === 'constructor' ||
-      storefrontId === 'prototype' ||
-      !rawTokenData ||
-      typeof rawTokenData !== 'object' ||
-      Array.isArray(rawTokenData)
-    ) {
-      return { success: false, error: 'Invalid storefront token payload' };
-    }
-    const cleanIncoming = sanitizeLaunchConfigRecursive(rawTokenData);
-    const existing = storeSync.loadSavedTokens()?.[storefrontId] || {};
-    /** @type {Record<string, any>} */
-    const merged = { ...existing };
-    for (const [k, v] of Object.entries(cleanIncoming)) {
-      if (SECRET_TOKEN_OBJECT_KEYS.has(k) && typeof v === 'string' && !isRealSecretToken(v)) {
-        // Ignore renderer sentinel strings (`saved_in_electron`, `[REDACTED]`, etc.) so vaulted secrets stay intact
-        continue;
-      }
-      merged[k] = v;
-    }
-    storeSync.saveTokens(storefrontId, merged);
-    try {
-      launcherEngine?.clearStoreDisconnectedTombstone?.(storefrontId);
-    } catch {}
-    return { success: true };
-  };
-
-  ipcMain.handle('store:save-tokens', handleSaveStoreTokens);
-  ipcMain.handle('store:save-token', handleSaveStoreTokens);
 
   ipcMain.handle(
     'epic:fetch-achievements',

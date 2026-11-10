@@ -275,11 +275,9 @@ export class LauncherService {
     if (typeof window !== 'undefined' && window.electronAPI?.saveLauncherPerformanceSettings) {
       try {
         const res = await window.electronAPI.saveLauncherPerformanceSettings(next);
-        const resRecord =
-          res && typeof res === 'object' ? (res as unknown as Record<string, unknown>) : null;
         const saved =
-          resRecord?.settings && typeof resRecord.settings === 'object'
-            ? (resRecord.settings as Partial<LauncherPerformanceSettings>)
+          res && typeof res === 'object' && res.settings && typeof res.settings === 'object'
+            ? res.settings
             : res;
         if (saved && typeof saved === 'object') {
           this.performanceSettings = this.sanitizePerformanceSettings({
@@ -498,9 +496,8 @@ export class LauncherService {
       } catch {}
     }, 3500);
 
-    const maybeNodeTimer = timer as unknown as { unref?: () => void };
-    if (maybeNodeTimer && typeof maybeNodeTimer.unref === 'function') {
-      maybeNodeTimer.unref();
+    if (timer && typeof timer === 'object' && 'unref' in timer && typeof timer.unref === 'function') {
+      timer.unref();
     }
     this.activeDownloadPollTimer = timer;
   }
@@ -611,11 +608,10 @@ export class LauncherService {
         }
 
         if (perfSettings && typeof perfSettings === 'object') {
-          const perfRecord = perfSettings as unknown as Record<string, unknown>;
-          const remotePerf =
-            perfRecord.settings && typeof perfRecord.settings === 'object'
-              ? (perfRecord.settings as Partial<LauncherPerformanceSettings>)
-              : (perfSettings as Partial<LauncherPerformanceSettings>);
+          const remotePerf: Partial<LauncherPerformanceSettings> =
+            perfSettings.settings && typeof perfSettings.settings === 'object'
+              ? perfSettings.settings
+              : perfSettings;
           if (remotePerf && typeof remotePerf === 'object') {
             this.performanceSettings = this.sanitizePerformanceSettings({
               ...this.performanceSettings,
@@ -956,31 +952,29 @@ export class LauncherService {
       data?.event === 'playtime_synced';
 
     if (data?.event === 'fullscreen_updated') {
-      const rawRecord = data as unknown as Record<string, unknown>;
+      const rawGameId: unknown = Reflect.get(data, 'gameId');
+      const rawFullscreenActive: unknown = Reflect.get(data, 'fullscreenActive');
+      const rawDisplayAspectRatio: unknown = Reflect.get(data, 'displayAspectRatio');
+      const rawDisplayScalingMode: unknown = Reflect.get(data, 'displayScalingMode');
       const targetGameId =
-        session?.gameId ||
-        (typeof rawRecord.gameId === 'string' ? rawRecord.gameId : undefined);
+        session?.gameId || (typeof rawGameId === 'string' ? rawGameId : undefined);
       if (targetGameId) {
         const existingSession = this.activeSessions.get(targetGameId);
         if (existingSession || session) {
           const mergedSession: ActiveGameSession = {
             ...(existingSession || session!),
             ...(session || {}),
-            ...(typeof rawRecord.fullscreenActive === 'boolean'
-              ? { fullscreenActive: rawRecord.fullscreenActive }
+            ...(typeof rawFullscreenActive === 'boolean'
+              ? { fullscreenActive: rawFullscreenActive }
               : {}),
-            ...(typeof rawRecord.displayAspectRatio === 'string'
+            ...(typeof rawDisplayAspectRatio === 'string'
               ? {
-                  displayAspectRatio: sanitizeGlobalDisplayAspectRatio(
-                    rawRecord.displayAspectRatio
-                  ),
+                  displayAspectRatio: sanitizeGlobalDisplayAspectRatio(rawDisplayAspectRatio),
                 }
               : {}),
-            ...(typeof rawRecord.displayScalingMode === 'string'
+            ...(typeof rawDisplayScalingMode === 'string'
               ? {
-                  displayScalingMode: sanitizeGlobalBottleDisplayScalingMode(
-                    rawRecord.displayScalingMode
-                  ),
+                  displayScalingMode: sanitizeGlobalBottleDisplayScalingMode(rawDisplayScalingMode),
                 }
               : {}),
           };
@@ -1112,11 +1106,11 @@ export class LauncherService {
   }
 
   public getHostArch(): 'arm64' | 'x64' {
-    const apiRecord =
+    const rawArchProp: unknown =
       typeof window !== 'undefined' && window.electronAPI
-        ? (window.electronAPI as unknown as Record<string, unknown>)
+        ? Reflect.get(window.electronAPI, 'arch')
         : undefined;
-    const rawApiArch = typeof apiRecord?.arch === 'string' ? apiRecord.arch.trim() : '';
+    const rawApiArch = typeof rawArchProp === 'string' ? rawArchProp.trim() : '';
     const candidateArch = rawApiArch || (this.detectedHostArch || '').trim();
     if (candidateArch) {
       return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(candidateArch) ? 'x64' : 'arm64';

@@ -151,22 +151,18 @@ async function primeXboxDiscoveryCachesAsync(/** @type {any} */ options = {}) {
     return;
   }
 
-  const psScript =
-    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-    "$p = 'Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\GamingServices\\PackageRepository\\Package'; " +
-    'if (Test-Path -LiteralPath $p) { ' +
-    '  Get-ChildItem -LiteralPath $p -ErrorAction SilentlyContinue | ForEach-Object { ' +
-    "    $prop = Get-ItemProperty -LiteralPath $_.PSPath -Name 'Root' -ErrorAction SilentlyContinue; " +
-    '    if ($null -ne $prop -and $prop.Root) { $prop.Root } ' +
-    '  } | ConvertTo-Json -Compress ' +
-    '}';
-
   const regPromise = new Promise((resolve) => {
     try {
       execFileFn(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', psScript],
-        { timeout: 3000, windowsHide: true },
+        'reg.exe',
+        [
+          'query',
+          'HKLM\\SOFTWARE\\Microsoft\\GamingServices\\PackageRepository\\Package',
+          '/s',
+          '/v',
+          'Root',
+        ],
+        { encoding: 'utf8', timeout: 2000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
         (/** @type {any} */ err, /** @type {any} */ stdout) => {
           const out = !err ? String(stdout || '') : '';
           gamingServicesRegCache = {

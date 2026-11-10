@@ -16,6 +16,7 @@ const {
   isLaunchCommandApproved,
   confirmAndApproveLaunchCommands,
   revokeApprovedLaunchCommands,
+  wrapIpcMainWithSenderCheck,
 } = require('../launcher/securityAndPathUtils.cjs');
 
 const ALLOWED_STOREFRONT_IDS = new Set([
@@ -815,15 +816,35 @@ function stripUnconfirmedInlineShellCommands(rawPayload, launcherEngine, options
  *
  * @param {{ ipcMain: any, launcherEngine: any, dialog?: any, getMainWindow?: () => any, options?: Record<string, any> }} deps
  */
-function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainWindow, options: handlerOptions = {} }) {
-  if (!ipcMain || !launcherEngine) return;
+function registerLauncherIpcHandlers({
+  ipcMain: rawIpcMain,
+  launcherEngine,
+  dialog,
+  getMainWindow,
+  options: handlerOptions = {},
+}) {
+  if (!rawIpcMain || !launcherEngine) return;
+  const ipcMain = wrapIpcMainWithSenderCheck(rawIpcMain, {
+    getMainWindow,
+    isPackaged: Boolean(handlerOptions.isPackaged),
+    allowedDevOrigin: handlerOptions.allowedDevOrigin || null,
+    expectedFileHref: handlerOptions.expectedFileHref || null,
+  });
 
   ipcMain.handle('scan:steam-installed', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
-    return launcherEngine.scanAllInstalledGames(sanitizeRendererIpcOptions(options));
+    const safeOpts = sanitizeRendererIpcOptions(options);
+    if (typeof launcherEngine.scanAllInstalledGamesAsync === 'function') {
+      return launcherEngine.scanAllInstalledGamesAsync(safeOpts);
+    }
+    return launcherEngine.scanAllInstalledGames(safeOpts);
   });
 
   ipcMain.handle('launcher:scan-installed', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
-    return launcherEngine.scanAllInstalledGames(sanitizeRendererIpcOptions(options));
+    const safeOpts = sanitizeRendererIpcOptions(options);
+    if (typeof launcherEngine.scanAllInstalledGamesAsync === 'function') {
+      return launcherEngine.scanAllInstalledGamesAsync(safeOpts);
+    }
+    return launcherEngine.scanAllInstalledGames(safeOpts);
   });
 
   ipcMain.handle('launcher:detect-storefront-clients', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
@@ -1070,9 +1091,19 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
     return launcherEngine.getDiskSpace(typeof targetPath === 'string' ? targetPath : '');
   });
 
-  ipcMain.handle('launcher:get-install-info', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
-    return await launcherEngine.getGameInstallInfo(sanitizeRendererIpcOptions(payload));
-  });
+  ipcMain.handle(
+    'launcher:get-install-info',
+    async (/** @type {any} */ _event, /** @type {unknown} */ payload, /** @type {unknown} */ rawOpts) => {
+      const cleanPayload = sanitizeRendererIpcOptions(payload);
+      if (rawOpts !== undefined) {
+        return await launcherEngine.getGameInstallInfo(
+          cleanPayload,
+          sanitizeRendererIpcOptions(rawOpts)
+        );
+      }
+      return await launcherEngine.getGameInstallInfo(cleanPayload);
+    }
+  );
 
   ipcMain.handle('launcher:launch-game', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
     const sanitizedPayload = stripUnconfirmedInlineShellCommands(
@@ -1137,75 +1168,111 @@ function registerLauncherIpcHandlers({ ipcMain, launcherEngine, dialog, getMainW
     );
   });
 
-  ipcMain.handle('launcher:save-launch-config', async (/** @type {any} */ _event, /** @type {unknown} */ config) => {
-    const cleanConfig = sanitizeRendererIpcOptions(config);
-    if (cleanConfig.reset && cleanConfig.gameId) {
-      revokeApprovedLaunchCommands(cleanConfig.gameId, handlerOptions);
-      return launcherEngine.saveGameLaunchConfig(cleanConfig);
-    }
-
-    const incomingEntries = collectLaunchCommandsRecursive(cleanConfig);
-    if (incomingEntries.length > 0) {
-      const parentWin = typeof getMainWindow === 'function' ? getMainWindow() : null;
-      const approval = await confirmAndApproveLaunchCommands({
-        gameId: cleanConfig.gameId,
-        configOrPayload: cleanConfig,
-        dialog,
-        parentWindow: parentWin,
-        options: handlerOptions,
-      });
-      if (!approval.approved) {
-        return {
-          success: false,
-          error: approval.error || 'Custom shell command cancelled by user.',
-        };
+  ipcMain.handle(
+    'launcher:save-launch-config',
+    async (/** @type {any} */ _event, /** @type {unknown} */ config, /** @type {unknown} */ rawOpts) => {
+      const cleanConfig = sanitizeRendererIpcOptions(config);
+      const cleanOpts = rawOpts !== undefined ? sanitizeRendererIpcOptions(rawOpts) : undefined;
+      if (cleanConfig.reset && cleanConfig.gameId) {
+        revokeApprovedLaunchCommands(cleanConfig.gameId, handlerOptions);
+        return cleanOpts !== undefined
+          ? launcherEngine.saveGameLaunchConfig(cleanConfig, cleanOpts)
+          : launcherEngine.saveGameLaunchConfig(cleanConfig);
       }
+
+      const incomingEntries = collectLaunchCommandsRecursive(cleanConfig);
+      if (incomingEntries.length > 0) {
+        const parentWin = typeof getMainWindow === 'function' ? getMainWindow() : null;
+        const approval = await confirmAndApproveLaunchCommands({
+          gameId: cleanConfig.gameId,
+          configOrPayload: cleanConfig,
+          dialog,
+          parentWindow: parentWin,
+          options: handlerOptions,
+        });
+        if (!approval.approved) {
+          return {
+            success: false,
+            error: approval.error || 'Custom shell command cancelled by user.',
+          };
+        }
+      }
+
+      return cleanOpts !== undefined
+        ? launcherEngine.saveGameLaunchConfig(cleanConfig, cleanOpts)
+        : launcherEngine.saveGameLaunchConfig(cleanConfig);
     }
+  );
 
-    return launcherEngine.saveGameLaunchConfig(cleanConfig);
-  });
-
-  ipcMain.handle('launcher:get-launch-configs', async () => {
-    return launcherEngine.getGameLaunchConfigs();
-  });
-
-  ipcMain.handle('launcher:get-launch-config', async (/** @type {any} */ _event, /** @type {unknown} */ gameId) => {
-    const allConfigs = launcherEngine.getGameLaunchConfigs() || {};
-    if (typeof gameId === 'string' && gameId.trim()) {
-      return allConfigs[gameId.trim()] || null;
+  ipcMain.handle(
+    'launcher:get-launch-configs',
+    async (/** @type {any} */ _event, /** @type {unknown} */ rawOpts) => {
+      return rawOpts !== undefined
+        ? launcherEngine.getGameLaunchConfigs(sanitizeRendererIpcOptions(rawOpts))
+        : launcherEngine.getGameLaunchConfigs();
     }
-    return allConfigs;
-  });
+  );
 
-  ipcMain.handle('launcher:delete-launch-config', async (/** @type {any} */ _event, /** @type {unknown} */ rawArg) => {
-    const gameId =
-      typeof rawArg === 'string'
-        ? rawArg.trim()
-        : rawArg && typeof rawArg === 'object' && typeof (/** @type {any} */ (rawArg).gameId) === 'string'
-          ? /** @type {any} */ (rawArg).gameId.trim()
-          : '';
-    if (!gameId) {
-      return { success: false, error: 'Missing gameId for launch config deletion.' };
+  ipcMain.handle(
+    'launcher:get-launch-config',
+    async (/** @type {any} */ _event, /** @type {unknown} */ gameId, /** @type {unknown} */ rawOpts) => {
+      const allConfigs =
+        (rawOpts !== undefined
+          ? launcherEngine.getGameLaunchConfigs(sanitizeRendererIpcOptions(rawOpts))
+          : launcherEngine.getGameLaunchConfigs()) || {};
+      if (typeof gameId === 'string' && gameId.trim()) {
+        return allConfigs[gameId.trim()] || null;
+      }
+      return allConfigs;
     }
-    revokeApprovedLaunchCommands(gameId, handlerOptions);
-    return launcherEngine.saveGameLaunchConfig({ gameId, reset: true });
-  });
+  );
 
-  ipcMain.handle('launcher:get-performance-settings', async () => {
-    return launcherEngine.getLauncherPerformanceSettings({});
-  });
+  ipcMain.handle(
+    'launcher:delete-launch-config',
+    async (/** @type {any} */ _event, /** @type {unknown} */ rawArg, /** @type {unknown} */ rawOpts) => {
+      const gameId =
+        typeof rawArg === 'string'
+          ? rawArg.trim()
+          : rawArg &&
+              typeof rawArg === 'object' &&
+              typeof (/** @type {any} */ (rawArg).gameId) === 'string'
+            ? /** @type {any} */ (rawArg).gameId.trim()
+            : '';
+      if (!gameId) {
+        return { success: false, error: 'Missing gameId for launch config deletion.' };
+      }
+      const cleanOpts = rawOpts !== undefined ? sanitizeRendererIpcOptions(rawOpts) : undefined;
+      revokeApprovedLaunchCommands(gameId, handlerOptions);
+      return cleanOpts !== undefined
+        ? launcherEngine.saveGameLaunchConfig({ gameId, reset: true }, cleanOpts)
+        : launcherEngine.saveGameLaunchConfig({ gameId, reset: true });
+    }
+  );
 
-  const handleSaveStrictSettings = async (/** @type {any} */ _event, /** @type {unknown} */ settings) => {
-    const cleanSettings = sanitizeLauncherSettingsPayload(settings);
-    return launcherEngine.saveLauncherPerformanceSettings(cleanSettings, {});
-  };
+  ipcMain.handle(
+    'launcher:get-performance-settings',
+    async (/** @type {any} */ _event, /** @type {unknown} */ rawOpts) => {
+      return launcherEngine.getLauncherPerformanceSettings(sanitizeRendererIpcOptions(rawOpts));
+    }
+  );
 
-  ipcMain.handle('launcher:save-performance-settings', handleSaveStrictSettings);
-  ipcMain.handle('launcher:save-settings', handleSaveStrictSettings);
+  ipcMain.handle(
+    'launcher:save-performance-settings',
+    async (/** @type {any} */ _event, /** @type {unknown} */ settings, /** @type {unknown} */ rawOpts) => {
+      const cleanSettings = sanitizeLauncherSettingsPayload(settings);
+      return launcherEngine.saveLauncherPerformanceSettings(
+        cleanSettings,
+        sanitizeRendererIpcOptions(rawOpts)
+      );
+    }
+  );
 
-  ipcMain.handle('launcher:drain-pending-sessions', async () => {
-    return launcherEngine.drainPendingCompletedSessions({});
-  });
+  ipcMain.handle(
+    'launcher:drain-pending-sessions',
+    async (/** @type {any} */ _event, /** @type {unknown} */ rawOpts) => {
+      return launcherEngine.drainPendingCompletedSessions(sanitizeRendererIpcOptions(rawOpts));
+    }
+  );
 
   /**
    * Build a contract-complete `EnvironmentHealthSnapshot` fallback when a partial test mock

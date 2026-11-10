@@ -19,7 +19,12 @@ import {
   Trophy,
 } from 'lucide-react';
 import { StorefrontId } from '../../contracts/platform';
-import { StorefrontCredentials, StorefrontIntegration } from '../../contracts/integration';
+import { StorefrontIntegration } from '../../contracts/integration';
+import {
+  reconcileNativeStorefrontAuthSessions,
+  sanitizePublicCredentials,
+  scrubPersistedIntegrationSecrets,
+} from '../../services/integrations/storefrontAuthReconciler';
 import {
   OFFLINE_VAULT_TIER_CAPS,
   type OfflineVaultStats,
@@ -133,7 +138,7 @@ type NativeSyncResultPayload = Partial<StorefrontAuthResult> & {
   hasDeviceContext?: boolean;
   authoritativeComplete?: boolean;
   transientOffline?: boolean;
-  tokenData?: (StorefrontTokenSummary & { expires_at?: string }) | null;
+  tokenData?: StorefrontTokenSummary | null;
   achievements?: Record<string, AchievementSummaryEntry>;
 };
 
@@ -144,51 +149,6 @@ function getErrorMessage(err: unknown, fallback: string): string {
     if (typeof msg === 'string' && msg.trim()) return msg;
   }
   return fallback;
-}
-
-/**
- * Strips all secret tokens/keys so renderer localStorage only persists non-secret public identifiers.
- */
-function sanitizePublicCredentials(
-  storefrontId: StorefrontId,
-  creds?: StorefrontCredentials
-): StorefrontCredentials {
-  if (!creds || storefrontId === 'xbox') return {};
-  const next: StorefrontCredentials = {};
-  if (creds.steamId) next.steamId = creds.steamId;
-  if (creds.profileUrl) next.profileUrl = creds.profileUrl;
-  if (creds.vanityUrl) next.vanityUrl = creds.vanityUrl;
-  if (creds.gogUsername) next.gogUsername = creds.gogUsername;
-  if (creds.epicAccountId) next.epicAccountId = creds.epicAccountId;
-  if (creds.epicTokenExpiresAt) next.epicTokenExpiresAt = creds.epicTokenExpiresAt;
-  return next;
-}
-
-function scrubPersistedIntegrationSecrets(): StorefrontIntegration[] {
-  const loaded = loadIntegrations();
-  let mutated = false;
-  const cleaned = loaded.map((integ) => {
-    const raw = integ.credentials;
-    if (
-      raw &&
-      (raw.apiKey ||
-        raw.webToken ||
-        raw.gogToken ||
-        raw.epicToken ||
-        raw.epicRefreshToken)
-    ) {
-      mutated = true;
-      return {
-        ...integ,
-        credentials: sanitizePublicCredentials(integ.storefrontId, raw),
-      };
-    }
-    return integ;
-  });
-  if (mutated) {
-    saveIntegrations(cleaned);
-  }
-  return cleaned;
 }
 
 function extractAuthCodeFromUrlCandidate(candidate: string): string | null {
@@ -379,279 +339,14 @@ export const IntegrationsModal: React.FC<IntegrationsModalProps> = ({
             : Promise.resolve(null),
         ])
           .then(([savedTokens, xboxStatus]: [SavedStoreTokensMap, XboxStatusSnapshot | null]) => {
-            let updatedIntegrations = scrubPersistedIntegrationSecrets();
-            let integrationsChanged = false;
-            const activeCatalog = loadCurrentCatalog();
-
-            // 1. Reconcile Steam saved token (non-secret profile state only)
-            const steamSaved = savedTokens?.steam;
-            if (
-              steamSaved?.steamId ||
-              steamSaved?.hasAccessToken ||
-              steamSaved?.access_token ||
-              steamSaved?.connected
-            ) {
-              const steamInteg = updatedIntegrations.find((i) => i.storefrontId === 'steam');
-              const steamId =
-                steamSaved.steamId || steamInteg?.credentials?.steamId || steamInteg?.accountId;
-              const accountName =
-                steamSaved.accountName || steamInteg?.accountName || 'Steam User';
-              if (
-                !steamInteg ||
-                !steamInteg.isConnected ||
-                (steamId && steamInteg.credentials?.steamId !== steamId) ||
-                steamInteg.accountName !== accountName
-              ) {
-                const count =
-                  (Array.isArray(steamSaved.games) && steamSaved.games.length) ||
-                  steamInteg?.gamesCount ||
-                  activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'steam')).length;
-                updatedIntegrations = updatedIntegrations.map((i) =>
-                  i.storefrontId === 'steam'
-                    ? {
-                        ...i,
-                        isConnected: true,
-                        accountName,
-                        accountId: steamId,
-                        avatarUrl: steamSaved.avatarUrl || i.avatarUrl,
-                        gamesCount: count,
-                        lastSyncedAt: steamSaved.updatedAt || new Date().toISOString(),
-                        authMethod: 'oauth' as const,
-                        credentials: sanitizePublicCredentials('steam', {
-                          ...i.credentials,
-                          steamId,
-                        }),
-                        statusMessage: `Connected as ${accountName} (${count} titles synced)`,
-                      }
-                    : i
-                );
-                integrationsChanged = true;
-              }
-            }
-
-            // 2. Reconcile GOG saved token (never persist access/refresh tokens in localStorage)
-            const gogSaved = savedTokens?.gog;
-            if (
-              gogSaved?.hasAccessToken ||
-              gogSaved?.access_token ||
-              gogSaved?.connected ||
-              gogSaved?.user_id
-            ) {
-              const gogInteg = updatedIntegrations.find((i) => i.storefrontId === 'gog');
-              const gogUserId = gogSaved.user_id || gogInteg?.accountId;
-              const resolvedGogAvatar =
-                normalizeGogAvatarUrl(gogSaved.avatarUrl) ||
-                normalizeGogAvatarUrl(gogInteg?.avatarUrl) ||
-                gogInteg?.avatarUrl;
-              const resolvedGogName =
-                gogSaved.username ||
-                (gogInteg?.accountName && gogInteg.accountName !== 'GOG User'
-                  ? gogInteg.accountName
-                  : undefined) ||
-                'GOG User';
-              if (
-                !gogInteg ||
-                !gogInteg.isConnected ||
-                (resolvedGogAvatar && gogInteg.avatarUrl !== resolvedGogAvatar) ||
-                (gogSaved.username && gogInteg.accountName !== gogSaved.username)
-              ) {
-                const count =
-                  gogInteg?.gamesCount && gogInteg.gamesCount > 0
-                    ? gogInteg.gamesCount
-                    : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'gog')).length;
-                const accountName = resolvedGogName;
-                updatedIntegrations = updatedIntegrations.map((i) =>
-                  i.storefrontId === 'gog'
-                    ? {
-                        ...i,
-                        isConnected: true,
-                        accountName,
-                        accountId: gogUserId,
-                        avatarUrl: resolvedGogAvatar || i.avatarUrl,
-                        gamesCount: count,
-                        lastSyncedAt: gogSaved.updatedAt || new Date().toISOString(),
-                        authMethod: 'oauth' as const,
-                        credentials: sanitizePublicCredentials('gog', {
-                          ...i.credentials,
-                          gogUsername: accountName,
-                        }),
-                        statusMessage: `Connected as ${accountName} (${count} titles synced)`,
-                      }
-                    : i
-                );
-                integrationsChanged = true;
-              }
-            }
-
-            // 3. Reconcile Epic saved token (never persist access/refresh tokens in localStorage)
-            const epicSaved = savedTokens?.epic;
-            if (
-              epicSaved?.hasAccessToken ||
-              epicSaved?.access_token ||
-              epicSaved?.connected ||
-              epicSaved?.account_id
-            ) {
-              const epicInteg = updatedIntegrations.find((i) => i.storefrontId === 'epic');
-              const displayName = epicSaved.displayName || epicInteg?.accountName || 'Epic User';
-              const expiresAtStr =
-                epicSaved.expiresAt !== undefined ? String(epicSaved.expiresAt) : undefined;
-              if (
-                !epicInteg ||
-                !epicInteg.isConnected ||
-                epicInteg.accountName !== displayName
-              ) {
-                const count =
-                  epicInteg?.gamesCount && epicInteg.gamesCount > 0
-                    ? epicInteg.gamesCount
-                    : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'epic')).length;
-                updatedIntegrations = updatedIntegrations.map((i) =>
-                  i.storefrontId === 'epic'
-                    ? {
-                        ...i,
-                        isConnected: true,
-                        accountName: displayName,
-                        accountId: epicSaved.account_id || i.accountId,
-                        gamesCount: count,
-                        lastSyncedAt: epicSaved.updatedAt || new Date().toISOString(),
-                        authMethod: 'oauth' as const,
-                        credentials: sanitizePublicCredentials('epic', {
-                          epicAccountId: epicSaved.account_id || i.credentials?.epicAccountId,
-                          epicTokenExpiresAt: expiresAtStr || i.credentials?.epicTokenExpiresAt,
-                        }),
-                        statusMessage: `Connected as ${displayName} (${count} titles synced)`,
-                      }
-                    : i
-                );
-                integrationsChanged = true;
-              }
-            }
-
-            // 4. Reconcile Xbox saved session & Game Pass status (strictly non-secret state)
-            const xboxSaved = savedTokens?.xbox as
-              | (StorefrontTokenSummary & {
-                  gamerpicUrl?: string;
-                  gamerscore?: number;
-                })
-              | undefined;
-            const hasSavedXbox = Boolean(
-              xboxStatus?.connected ||
-                xboxSaved?.connected ||
-                xboxSaved?.hasAccessToken ||
-                xboxSaved?.hasRefreshToken ||
-                xboxSaved?.xuid ||
-                xboxSaved?.gamertag ||
-                xboxSaved?.access_token
-            );
-            if (hasSavedXbox) {
-              const cachedProfile = loadXboxProfileState();
-              const xboxInteg = updatedIntegrations.find((i) => i.storefrontId === 'xbox');
-              const gamertag =
-                xboxStatus?.modernGamertag ||
-                xboxStatus?.gamertag ||
-                xboxStatus?.accountName ||
-                xboxSaved?.modernGamertag ||
-                xboxSaved?.gamertag ||
-                cachedProfile?.modernGamertag ||
-                cachedProfile?.gamertag ||
-                xboxInteg?.accountName ||
-                'Xbox Live User';
-              const xuid =
-                xboxStatus?.xuid ||
-                xboxSaved?.xuid ||
-                cachedProfile?.xuid ||
-                xboxInteg?.accountId;
-              const avatarUrl =
-                xboxStatus?.avatarUrl ||
-                xboxStatus?.gamerpicUrl ||
-                xboxSaved?.avatarUrl ||
-                xboxSaved?.gamerpicUrl ||
-                cachedProfile?.avatarUrl ||
-                xboxInteg?.avatarUrl;
-              const nextProfile: XboxCachedProfileState = {
-                connected: true,
-                gamertag:
-                  xboxStatus?.gamertag ||
-                  xboxSaved?.gamertag ||
-                  cachedProfile?.gamertag ||
-                  gamertag,
-                modernGamertag: gamertag,
-                xuid,
-                avatarUrl,
-                gamerscore:
-                  typeof xboxStatus?.gamerscore === 'number'
-                    ? xboxStatus.gamerscore
-                    : typeof xboxSaved?.gamerscore === 'number'
-                      ? xboxSaved.gamerscore
-                      : cachedProfile?.gamerscore,
-                subscription:
-                  xboxStatus?.subscription !== undefined
-                    ? xboxStatus.subscription
-                    : xboxSaved?.subscription !== undefined
-                      ? xboxSaved.subscription
-                      : cachedProfile?.subscription ?? null,
-                syncMode:
-                  xboxStatus?.syncMode ||
-                  xboxSaved?.syncMode ||
-                  cachedProfile?.syncMode ||
-                  'owned_and_played',
-                hasDeviceContext:
-                  typeof xboxStatus?.hasDeviceContext === 'boolean'
-                    ? xboxStatus.hasDeviceContext
-                    : cachedProfile?.hasDeviceContext,
-                lastSyncedAt:
-                  xboxSaved?.updatedAt ||
-                  cachedProfile?.lastSyncedAt ||
-                  xboxInteg?.lastSyncedAt ||
-                  new Date().toISOString(),
-              };
-              saveXboxProfileState(nextProfile);
-              setXboxProfile(nextProfile);
-
-              const count =
-                xboxInteg?.gamesCount && xboxInteg.gamesCount > 0
-                  ? xboxInteg.gamesCount
-                  : activeCatalog.filter((g) => g.platforms.some((p) => p.platformId === 'xbox')).length;
-              const nextXboxStatusMessage = formatXboxIntegrationStatusMessage(
-                gamertag,
-                count,
-                nextProfile.subscription
-              );
-              const subscriptionFingerprintChanged =
-                (cachedProfile?.subscription?.subscriptionFingerprint || '') !==
-                  (nextProfile.subscription?.subscriptionFingerprint || '') ||
-                (cachedProfile?.subscription?.tierDisplayName || '') !==
-                  (nextProfile.subscription?.tierDisplayName || '');
-
-              if (
-                !xboxInteg ||
-                !xboxInteg.isConnected ||
-                xboxInteg.accountName !== gamertag ||
-                (avatarUrl && xboxInteg.avatarUrl !== avatarUrl) ||
-                xboxInteg.statusMessage !== nextXboxStatusMessage ||
-                subscriptionFingerprintChanged
-              ) {
-                updatedIntegrations = updatedIntegrations.map((i) =>
-                  i.storefrontId === 'xbox'
-                    ? {
-                        ...i,
-                        isConnected: true,
-                        accountName: gamertag,
-                        accountId: xuid,
-                        avatarUrl: avatarUrl || i.avatarUrl,
-                        gamesCount: count,
-                        lastSyncedAt: nextProfile.lastSyncedAt,
-                        authMethod: 'oauth' as const,
-                        credentials: {},
-                        statusMessage: nextXboxStatusMessage,
-                      }
-                    : i
-                );
-                integrationsChanged = true;
-              }
-            }
-
-            if (integrationsChanged) {
-              saveIntegrations(updatedIntegrations);
+            const { integrations: updatedIntegrations, xboxProfile: nextXboxProfile } =
+              reconcileNativeStorefrontAuthSessions({
+                savedTokens,
+                xboxStatus,
+                persistIfChanged: true,
+              });
+            if (nextXboxProfile) {
+              setXboxProfile(nextXboxProfile);
             }
             setIntegrations(updatedIntegrations);
           })

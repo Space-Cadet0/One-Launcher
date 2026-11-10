@@ -1003,32 +1003,86 @@ async function extractMsixvcStream(options = {}) {
     const allWorkUnits = buildExtractionWorkUnits(pendingSegments, effectiveChunkBytes);
 
     // Track multi-slice large file state (`<target>.olpart` open file handles & remaining slice counts)
+    // Verify `<targetPath>.olpart` exists and covers the contiguous completed prefix before skipping slices!
     const largeFileStates = new Map();
-    const runnableUnits = [];
+    const largeSlicesByRelPath = new Map();
+    for (const unit of allWorkUnits) {
+      if (unit.type === 'large_file_slice') {
+        const list = largeSlicesByRelPath.get(unit.seg.relPath) || [];
+        list.push(unit);
+        largeSlicesByRelPath.set(unit.seg.relPath, list);
+      }
+    }
 
+    for (const [relPath, sliceUnits] of largeSlicesByRelPath.entries()) {
+      sliceUnits.sort((a, b) => a.sliceIndex - b.sliceIndex);
+      const sampleUnit = sliceUnits[0];
+      const seg = sampleUnit.seg;
+      const sliceCount = sampleUnit.sliceCount;
+      const doneArr = Array.isArray(journal.completedLargeSlices[relPath])
+        ? journal.completedLargeSlices[relPath]
+        : [];
+      const rawSet = new Set(doneArr);
+      let verifiedSet = new Set();
+
+      if (rawSet.size > 0) {
+        const targetPath = await ensureSafeTargetFilePath(installRootResolved, relPath);
+        const partPath = `${targetPath}.olpart`;
+        const partStat = await fs.promises.stat(partPath).catch(() => null);
+
+        let contiguousPrefixCount = 0;
+        while (contiguousPrefixCount < sliceCount && rawSet.has(contiguousPrefixCount)) {
+          contiguousPrefixCount += 1;
+        }
+
+        const lastContiguousUnit =
+          contiguousPrefixCount > 0
+            ? sliceUnits.find((u) => u.sliceIndex === contiguousPrefixCount - 1)
+            : null;
+        const requiredPartBytes = lastContiguousUnit
+          ? lastContiguousUnit.fileOffset + lastContiguousUnit.plainByteLength
+          : 0;
+
+        if (
+          !partStat ||
+          !partStat.isFile() ||
+          contiguousPrefixCount === 0 ||
+          partStat.size < requiredPartBytes
+        ) {
+          delete journal.completedLargeSlices[relPath];
+          checkpointer.scheduleFlush();
+        } else {
+          const verifiedArr = [];
+          for (let s = 0; s < contiguousPrefixCount; s += 1) {
+            verifiedSet.add(s);
+            verifiedArr.push(s);
+          }
+          if (verifiedArr.length !== rawSet.size) {
+            journal.completedLargeSlices[relPath] = verifiedArr;
+            checkpointer.scheduleFlush();
+          }
+        }
+      }
+
+      largeFileStates.set(relPath, {
+        seg,
+        sliceCount,
+        completedSet: verifiedSet,
+        handlePromise: null,
+        targetPath: null,
+        partPath: null,
+      });
+    }
+
+    const runnableUnits = [];
     for (const unit of allWorkUnits) {
       if (unit.type !== 'large_file_slice') {
         runnableUnits.push(unit);
         continue;
       }
-      const { seg, sliceIndex, sliceCount, plainByteLength } = unit;
-      let st = largeFileStates.get(seg.relPath);
-      if (!st) {
-        const doneArr = Array.isArray(journal.completedLargeSlices[seg.relPath])
-          ? journal.completedLargeSlices[seg.relPath]
-          : [];
-        st = {
-          seg,
-          sliceCount,
-          completedSet: new Set(doneArr),
-          handlePromise: null,
-          targetPath: null,
-          partPath: null,
-        };
-        largeFileStates.set(seg.relPath, st);
-      }
-
-      if (st.completedSet.has(sliceIndex)) {
+      const { seg, sliceIndex, plainByteLength } = unit;
+      const st = largeFileStates.get(seg.relPath);
+      if (st && st.completedSet.has(sliceIndex)) {
         bytesDownloaded += plainByteLength;
         resumedUnits += 1;
       } else {

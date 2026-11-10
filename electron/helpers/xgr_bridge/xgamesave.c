@@ -71,12 +71,13 @@ struct update_op {
 struct XGameSaveUpdate {
     volatile LONG ref;
     volatile LONG api_closed;
+    volatile LONG submitted;
+    SRWLOCK lock;
     XGameSaveContainerHandle container;
     char *display_name;
     uint32_t count;
     uint32_t cap;
     struct update_op *ops;
-    bool submitted;
 };
 
 struct gs_ptr_registry {
@@ -371,9 +372,17 @@ struct bin_writer {
 
 static bool bw_append(struct bin_writer *w, const void *src, size_t n)
 {
-    if (w->len + n > w->cap) {
-        size_t ncap = w->cap ? w->cap * 2 : 512;
-        while (ncap < w->len + n) ncap *= 2;
+    if (n > SIZE_MAX - w->len - 1) return false;
+    size_t needed = w->len + n;
+    if (needed > w->cap) {
+        size_t ncap = w->cap ? w->cap : 512;
+        while (ncap < needed) {
+            if (ncap > SIZE_MAX / 2) {
+                ncap = needed;
+                break;
+            }
+            ncap *= 2;
+        }
         uint8_t *nb = (uint8_t *)realloc(w->buf, ncap);
         if (!nb) return false;
         w->buf = nb;
@@ -728,6 +737,8 @@ static HRESULT create_provider_internal(XUserHandle user, const char *config_id,
     if (!out) return E_INVALIDARG;
     *out = NULL;
 
+    xgr_ensure_session_metadata_loaded();
+
     struct xgr_runtime_config_snapshot snap;
     xgr_copy_runtime_config_snapshot(&snap);
 
@@ -943,11 +954,20 @@ static HRESULT delete_container_sync(XGameSaveProviderHandle prov, const char *c
 static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
 {
     if (!upd || !upd->container || !upd->container->provider) return E_INVALIDARG;
-    if (upd->submitted) return E_GS_HANDLE_EXPIRED;
+
+    AcquireSRWLockExclusive(&upd->lock);
+    if (InterlockedCompareExchange(&upd->submitted, 1, 0) != 0) {
+        ReleaseSRWLockExclusive(&upd->lock);
+        return E_GS_HANDLE_EXPIRED;
+    }
 
     size_t total_op_bytes = 0;
     for (uint32_t i = 0; i < upd->count; i++) total_op_bytes += upd->ops[i].size;
-    if (total_op_bytes > 16 * 1024 * 1024) return E_GS_UPDATE_TOO_BIG;
+    if (total_op_bytes > 16 * 1024 * 1024) {
+        InterlockedExchange(&upd->submitted, 0);
+        ReleaseSRWLockExclusive(&upd->lock);
+        return E_GS_UPDATE_TOO_BIG;
+    }
 
     XGameSaveProviderHandle prov = upd->container->provider;
     const char *cname = upd->container->name;
@@ -974,6 +994,8 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
         if (!nitems) {
             free_wgs_index(&idx);
             LeaveCriticalSection(&prov->cs);
+            InterlockedExchange(&upd->submitted, 0);
+            ReleaseSRWLockExclusive(&upd->lock);
             return E_OUTOFMEMORY;
         }
         idx.items = nitems;
@@ -993,6 +1015,8 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
     if (!is_new_container && !load_container_blobs(prov->wgs_user_dir, ce, &blobs, &bcnt)) {
         free_wgs_index(&idx);
         LeaveCriticalSection(&prov->cs);
+        InterlockedExchange(&upd->submitted, 0);
+        ReleaseSRWLockExclusive(&upd->lock);
         return E_OUTOFMEMORY;
     }
 
@@ -1086,7 +1110,6 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
             for (size_t s = 0; s < superseded_cnt; s++) {
                 delete_blob_guid_file_w(fdir, &superseded_guids[s]);
             }
-            upd->submitted = true;
         } else {
             hr = E_GS_OUT_OF_LOCAL_STORAGE;
         }
@@ -1096,6 +1119,7 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
         for (size_t nw = 0; nw < newly_written_cnt; nw++) {
             delete_blob_guid_file_w(fdir, &newly_written_guids[nw]);
         }
+        InterlockedExchange(&upd->submitted, 0);
     }
 
     free(superseded_guids);
@@ -1103,6 +1127,7 @@ static HRESULT submit_update_sync(XGameSaveUpdateHandle upd)
     free(blobs);
     free_wgs_index(&idx);
     LeaveCriticalSection(&prov->cs);
+    ReleaseSRWLockExclusive(&upd->lock);
 
     if (SUCCEEDED(hr)) {
         notify_rpc_save_commit(prov, cname, false);
@@ -1855,6 +1880,8 @@ static HRESULT WINAPI xgs_XGameSaveCreateUpdate(void *iface, XGameSaveContainerH
     }
     u->ref = 1;
     u->api_closed = 0;
+    u->submitted = 0;
+    InitializeSRWLock(&u->lock);
     u->container = cont; /* Transfers acquired cont ref */
     if (displayName) {
         size_t n = strlen(displayName) + 1;
@@ -1884,14 +1911,25 @@ static HRESULT append_update_op(XGameSaveUpdateHandle upd, const char *bname, co
 {
     if (!upd || !bname || !bname[0]) return E_INVALIDARG;
     if (!remove && len > 0 && !data) return E_INVALIDARG;
-    if (upd->submitted) return E_GS_HANDLE_EXPIRED;
+
+    AcquireSRWLockExclusive(&upd->lock);
+    if (InterlockedCompareExchange(&upd->submitted, 0, 0) != 0) {
+        ReleaseSRWLockExclusive(&upd->lock);
+        return E_GS_HANDLE_EXPIRED;
+    }
     for (uint32_t i = 0; i < upd->count; i++) {
-        if (strcmp(upd->ops[i].name, bname) == 0) return E_INVALIDARG;
+        if (strcmp(upd->ops[i].name, bname) == 0) {
+            ReleaseSRWLockExclusive(&upd->lock);
+            return E_INVALIDARG;
+        }
     }
     if (upd->count == upd->cap) {
         uint32_t ncap = upd->cap ? upd->cap * 2 : 8;
         struct update_op *nops = (struct update_op *)realloc(upd->ops, ncap * sizeof(*nops));
-        if (!nops) return E_OUTOFMEMORY;
+        if (!nops) {
+            ReleaseSRWLockExclusive(&upd->lock);
+            return E_OUTOFMEMORY;
+        }
         upd->ops = nops;
         upd->cap = ncap;
     }
@@ -1899,19 +1937,25 @@ static HRESULT append_update_op(XGameSaveUpdateHandle upd, const char *bname, co
     memset(op, 0, sizeof(*op));
     size_t nlen = strlen(bname) + 1;
     op->name = (char *)malloc(nlen);
-    if (!op->name) return E_OUTOFMEMORY;
+    if (!op->name) {
+        ReleaseSRWLockExclusive(&upd->lock);
+        return E_OUTOFMEMORY;
+    }
     memcpy(op->name, bname, nlen);
     op->remove = remove;
     if (!remove) {
         op->data = (uint8_t *)malloc(len ? len : 1);
         if (!op->data) {
             free(op->name);
+            op->name = NULL;
+            ReleaseSRWLockExclusive(&upd->lock);
             return E_OUTOFMEMORY;
         }
         if (len > 0) memcpy(op->data, data, len);
         op->size = len;
     }
     upd->count++;
+    ReleaseSRWLockExclusive(&upd->lock);
     return S_OK;
 }
 

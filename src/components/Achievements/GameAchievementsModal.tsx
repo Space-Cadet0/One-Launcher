@@ -383,13 +383,13 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
           {/* Achievement Text Info */}
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <h4
+              <h3
                 className={`text-sm font-bold truncate ${
                   isUnlocked || isSummaryCountOnly ? 'text-white' : 'text-slate-300'
                 }`}
               >
                 {isSecretHidden ? 'Hidden Achievement' : ach.name}
-              </h4>
+              </h3>
 
               {/* XP Badge if Epic */}
               {ach.xp !== undefined && (

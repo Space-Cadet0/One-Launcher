@@ -127,7 +127,37 @@ static const char *next_json_object_in_array(const char *cursor, char **out_obj_
     return NULL;
 }
 
-static struct XStoreProductQuery *build_product_query_from_json(const char *res_json)
+static char *extract_json_subobject(const char *json, const char *key)
+{
+    if (!json || !key) return NULL;
+    char pat[128];
+    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return NULL;
+    const char *cursor = json;
+    const char *p = NULL;
+    while ((p = strstr(cursor, pat)) != NULL) {
+        cursor = p + (size_t)plen;
+        const char *v = cursor;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v != ':') continue;
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v == '{') {
+            char *sub = NULL;
+            if (next_json_object_in_array(v, &sub) != NULL) {
+                return sub;
+            }
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static struct XStoreProductQuery *build_product_query_from_json(
+    const char *res_json,
+    const char *fallback_store_id,
+    uint32_t fallback_kind
+)
 {
     struct XStoreProductQuery *q = (struct XStoreProductQuery *)calloc(1, sizeof(*q));
     if (!q) return NULL;
@@ -137,12 +167,13 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
     if (!arr) {
         struct xgr_runtime_config_snapshot cfg;
         xgr_copy_runtime_config_snapshot(&cfg);
-        if (cfg.storeId[0]) {
+        const char *sid = (fallback_store_id && fallback_store_id[0]) ? fallback_store_id : cfg.storeId;
+        if (sid && sid[0]) {
             q->items = (struct owned_product *)calloc(1, sizeof(*q->items));
             if (q->items) {
                 q->count = 1;
                 struct owned_product *op = &q->items[0];
-                snprintf(op->store_id, sizeof(op->store_id), "%s", cfg.storeId);
+                snprintf(op->store_id, sizeof(op->store_id), "%s", sid);
                 snprintf(op->title, sizeof(op->title), "%s", cfg.displayName[0] ? cfg.displayName : "Xbox Game");
                 strcpy(op->language, "en-US");
                 strcpy(op->sku_id, "0010");
@@ -160,7 +191,7 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
                 op->prod.language = op->language;
                 op->prod.inAppOfferToken = op->offer_token;
                 op->prod.linkUri = op->link_uri;
-                op->prod.productKind = 0x04;
+                op->prod.productKind = fallback_kind ? fallback_kind : 0x04;
                 op->prod.price.currencyCode = op->currency;
                 op->prod.hasDigitalDownload = true;
                 op->prod.isInUserCollection = true;
@@ -200,7 +231,10 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
         if (!xgr_json_get_string(obj, "skuId", op->sku_id, sizeof(op->sku_id))) {
             strcpy(op->sku_id, "0010");
         }
-        if (!xgr_json_get_string(obj, "currencyCode", op->currency, sizeof(op->currency))) {
+        char *price_obj = extract_json_subobject(obj, "price");
+        const char *price_src = price_obj ? price_obj : obj;
+        if (!xgr_json_get_string(price_src, "currencyCode", op->currency, sizeof(op->currency)) &&
+            (price_src == obj || !xgr_json_get_string(obj, "currencyCode", op->currency, sizeof(op->currency)))) {
             strcpy(op->currency, "USD");
         }
         int64_t kind = 0x04;
@@ -213,11 +247,14 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
         float list_price = 0.0f;
         float base_price = 0.0f;
         bool on_sale = false;
-        parse_json_float_field(obj, "price", &list_price);
-        if (!parse_json_float_field(obj, "basePrice", &base_price)) {
+        parse_json_float_field(price_src, "price", &list_price);
+        if (!parse_json_float_field(price_src, "basePrice", &base_price) &&
+            (price_src == obj || !parse_json_float_field(obj, "basePrice", &base_price))) {
             base_price = list_price;
         }
-        xgr_json_get_bool(obj, "isOnSale", &on_sale);
+        if (!xgr_json_get_bool(price_src, "isOnSale", &on_sale) && price_src != obj) {
+            xgr_json_get_bool(obj, "isOnSale", &on_sale);
+        }
 
         op->sku.skuId = op->sku_id;
         op->sku.title = op->title;
@@ -227,8 +264,16 @@ static struct XStoreProductQuery *build_product_query_from_json(const char *res_
         op->sku.price.basePrice = base_price;
         op->sku.price.isOnSale = on_sale;
         op->sku.price.currencyCode = op->currency;
-        xgr_json_get_string(obj, "formattedPrice", op->sku.price.formattedPrice, sizeof(op->sku.price.formattedPrice));
-        xgr_json_get_string(obj, "formattedBasePrice", op->sku.price.formattedBasePrice, sizeof(op->sku.price.formattedBasePrice));
+        if (!xgr_json_get_string(price_src, "formattedPrice", op->sku.price.formattedPrice, sizeof(op->sku.price.formattedPrice)) && price_src != obj) {
+            xgr_json_get_string(obj, "formattedPrice", op->sku.price.formattedPrice, sizeof(op->sku.price.formattedPrice));
+        }
+        if (!xgr_json_get_string(price_src, "formattedBasePrice", op->sku.price.formattedBasePrice, sizeof(op->sku.price.formattedBasePrice)) && price_src != obj) {
+            xgr_json_get_string(obj, "formattedBasePrice", op->sku.price.formattedBasePrice, sizeof(op->sku.price.formattedBasePrice));
+        }
+        if (!xgr_json_get_string(price_src, "formattedRecurrencePrice", op->sku.price.formattedRecurrencePrice, sizeof(op->sku.price.formattedRecurrencePrice)) && price_src != obj) {
+            xgr_json_get_string(obj, "formattedRecurrencePrice", op->sku.price.formattedRecurrencePrice, sizeof(op->sku.price.formattedRecurrencePrice));
+        }
+        free(price_obj);
         op->sku.isInUserCollection = in_coll;
         op->sku.collectionData.quantity = in_coll ? 1 : 0;
 
@@ -405,6 +450,8 @@ static HRESULT CALLBACK can_acquire_provider(XAsyncOp op, const XAsyncProviderDa
 struct prod_query_ctx {
     char method[64];
     char *params_json;
+    char fallback_store_id[64];
+    uint32_t fallback_kind;
     XStoreProductQueryHandle result_handle;
 };
 
@@ -428,7 +475,11 @@ static HRESULT CALLBACK prod_query_provider(XAsyncOp op, const XAsyncProviderDat
             if (xgr_rpc_is_configured()) {
                 xgr_rpc_call(ctx->method, ctx->params_json ? ctx->params_json : "{}", &res);
             }
-            ctx->result_handle = build_product_query_from_json(res);
+            ctx->result_handle = build_product_query_from_json(
+                res,
+                ctx->fallback_store_id,
+                ctx->fallback_kind
+            );
             free(res);
             if (!ctx->result_handle) {
                 xgr_async_complete(data->async, E_OUTOFMEMORY, 0);
@@ -632,7 +683,15 @@ static void WINAPI xs_XStoreCloseContextHandle(void *iface, XStoreContextHandle 
     }
 }
 
-static HRESULT start_product_query_async(const char *method, char *params_json, const void *id, const char *name, XAsyncBlock *async)
+static HRESULT start_product_query_async_ex(
+    const char *method,
+    char *params_json,
+    const char *fallback_store_id,
+    uint32_t fallback_kind,
+    const void *id,
+    const char *name,
+    XAsyncBlock *async
+)
 {
     struct prod_query_ctx *ctx = (struct prod_query_ctx *)calloc(1, sizeof(*ctx));
     if (!ctx) {
@@ -641,12 +700,21 @@ static HRESULT start_product_query_async(const char *method, char *params_json, 
     }
     snprintf(ctx->method, sizeof(ctx->method), "%s", method);
     ctx->params_json = params_json;
+    if (fallback_store_id && fallback_store_id[0]) {
+        snprintf(ctx->fallback_store_id, sizeof(ctx->fallback_store_id), "%s", fallback_store_id);
+    }
+    ctx->fallback_kind = fallback_kind;
     HRESULT hr = xgr_async_begin(async, ctx, id, name, prod_query_provider);
     if (FAILED(hr)) {
         free(ctx->params_json);
         free(ctx);
     }
     return xgr_return_hr(hr);
+}
+
+static HRESULT start_product_query_async(const char *method, char *params_json, const void *id, const char *name, XAsyncBlock *async)
+{
+    return start_product_query_async_ex(method, params_json, NULL, 0, id, name, async);
 }
 
 static HRESULT WINAPI xs_XStoreQueryAssociatedProductsAsync(void *iface, const XStoreContextHandle sc, uint32_t kinds, uint32_t maxItems, XAsyncBlock *async)
@@ -732,11 +800,44 @@ static HRESULT WINAPI xs_XStoreQueryProductForCurrentGameResult(void *iface, XAs
 
 static HRESULT WINAPI xs_XStoreQueryProductForPackageAsync(void *iface, const XStoreContextHandle sc, uint32_t kinds, const char *pkgId, XAsyncBlock *async)
 {
-    (void)iface; (void)sc; (void)pkgId;
-    char *p = (char *)malloc(64);
+    (void)iface; (void)sc;
+    if (!pkgId || !pkgId[0] || !async) return E_INVALIDARG;
+
+    char store_id[64] = { 0 };
+    bool have_sid = xgr_package_find_store_id_by_identifier(pkgId, store_id, sizeof(store_id));
+
+    XgrStrBuf sb;
+    xgr_sb_init(&sb);
+    xgr_sb_append_fmt(&sb, "{\"productKinds\":%u,\"packageIdentifier\":", kinds);
+    xgr_sb_append_json_str(&sb, pkgId);
+    if (have_sid && store_id[0]) {
+        xgr_sb_append_cstr(&sb, ",\"storeId\":");
+        xgr_sb_append_json_str(&sb, store_id);
+        xgr_sb_append_cstr(&sb, ",\"storeIds\":[");
+        xgr_sb_append_json_str(&sb, store_id);
+        xgr_sb_append_cstr(&sb, "],\"actionFilters\":[]}");
+        char *p = xgr_sb_detach(&sb);
+        if (!p) return E_OUTOFMEMORY;
+        return start_product_query_async_ex(
+            "xstore.queryProducts",
+            p,
+            store_id,
+            kinds ? kinds : 0x01u,
+            (const void *)xs_XStoreQueryProductForPackageAsync,
+            "XStoreQueryProductForPackageAsync",
+            async
+        );
+    }
+    xgr_sb_append_cstr(&sb, ",\"maxItems\":5}");
+    char *p = xgr_sb_detach(&sb);
     if (!p) return E_OUTOFMEMORY;
-    snprintf(p, 64, "{\"productKinds\":%u,\"maxItems\":5}", kinds);
-    return start_product_query_async("xstore.queryEntitledProducts", p, (const void *)xs_XStoreQueryProductForPackageAsync, "XStoreQueryProductForPackageAsync", async);
+    return start_product_query_async(
+        "xstore.queryEntitledProducts",
+        p,
+        (const void *)xs_XStoreQueryProductForPackageAsync,
+        "XStoreQueryProductForPackageAsync",
+        async
+    );
 }
 
 static HRESULT WINAPI xs_XStoreQueryProductForPackageResult(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out)
@@ -1130,12 +1231,18 @@ static HRESULT WINAPI xs_XStoreDownloadAndInstallPackagesResult(void *iface, XAs
 static HRESULT WINAPI xs_XStoreQueryPackageIdentifier(void *iface, const char *storeId, SIZE_T size, char *pkgId)
 {
     (void)iface;
-    if (!storeId || !pkgId) return E_INVALIDARG;
+    if (!storeId || !storeId[0] || !pkgId) return E_INVALIDARG;
     if (size < XGR_PACKAGE_IDENTIFIER_MAX_LEN) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (xgr_package_find_identifier_by_store_id(storeId, pkgId, size)) {
+        return S_OK;
+    }
     struct xgr_runtime_config_snapshot cfg;
     xgr_copy_runtime_config_snapshot(&cfg);
-    snprintf(pkgId, size, "%s", cfg.packageIdentifier);
-    return S_OK;
+    if (!cfg.storeId[0] && cfg.packageIdentifier[0]) {
+        snprintf(pkgId, size, "%s", cfg.packageIdentifier);
+        return S_OK;
+    }
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 }
 
 static HRESULT WINAPI xs_XStoreRegisterGameLicenseChanged(void *iface, XStoreContextHandle sc, XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *tok)
@@ -1214,10 +1321,15 @@ static HRESULT WINAPI xs_XStoreShowProductPageUIResult(void *iface, XAsyncBlock 
 /* IXStoreImpl5 */
 static HRESULT WINAPI xs_XStoreQueryAssociatedProductsForStoreIdAsync(void *iface, const XStoreContextHandle sc, const char *sid, uint32_t kinds, uint32_t maxItems, XAsyncBlock *async)
 {
-    (void)iface; (void)sc; (void)sid;
-    char *p = (char *)malloc(128);
+    (void)iface; (void)sc;
+    if (!sid || !sid[0] || !async) return E_INVALIDARG;
+    XgrStrBuf sb;
+    xgr_sb_init(&sb);
+    xgr_sb_append_cstr(&sb, "{\"storeId\":");
+    xgr_sb_append_json_str(&sb, sid);
+    xgr_sb_append_fmt(&sb, ",\"productKinds\":%u,\"maxItems\":%u}", kinds, maxItems);
+    char *p = xgr_sb_detach(&sb);
     if (!p) return E_OUTOFMEMORY;
-    snprintf(p, 128, "{\"productKinds\":%u,\"maxItems\":%u}", kinds, maxItems);
     return start_product_query_async("xstore.queryAssociatedProducts", p, (const void *)xs_XStoreQueryAssociatedProductsForStoreIdAsync, "XStoreQueryAssociatedProductsForStoreIdAsync", async);
 }
 static HRESULT WINAPI xs_XStoreQueryAssociatedProductsForStoreIdResult(void *iface, XAsyncBlock *async, XStoreProductQueryHandle *out)

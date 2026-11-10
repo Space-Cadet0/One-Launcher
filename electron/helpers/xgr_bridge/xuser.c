@@ -26,13 +26,59 @@ struct user_change_reg {
 
 static SRWLOCK g_user_lock = SRWLOCK_INIT;
 static XUserHandle g_active_user = NULL;
+static XUserHandle *g_live_users = NULL;
+static size_t g_live_users_count = 0;
+static size_t g_live_users_cap = 0;
 static struct user_change_reg *g_change_regs = NULL;
 static uint64_t g_next_change_token = 1;
 
+static bool user_registry_contains_locked(XUserHandle u)
+{
+    if (!u) return false;
+    for (size_t i = 0; i < g_live_users_count; i++) {
+        if (g_live_users[i] == u) return true;
+    }
+    return false;
+}
+
+static bool user_registry_insert_locked(XUserHandle u)
+{
+    if (!u) return false;
+    if (user_registry_contains_locked(u)) return true;
+    if (g_live_users_count == g_live_users_cap) {
+        size_t ncap = g_live_users_cap ? g_live_users_cap * 2 : 8;
+        XUserHandle *nitems = (XUserHandle *)realloc(g_live_users, ncap * sizeof(XUserHandle));
+        if (!nitems) return false;
+        g_live_users = nitems;
+        g_live_users_cap = ncap;
+    }
+    g_live_users[g_live_users_count++] = u;
+    return true;
+}
+
+static void user_registry_remove_locked(XUserHandle u)
+{
+    for (size_t i = 0; i < g_live_users_count; i++) {
+        if (g_live_users[i] == u) {
+            g_live_users[i] = g_live_users[--g_live_users_count];
+            break;
+        }
+    }
+    if (g_live_users_count == 0 && g_live_users != NULL) {
+        free(g_live_users);
+        g_live_users = NULL;
+        g_live_users_cap = 0;
+    }
+}
+
 uint64_t xgr_user_get_xuid(XUserHandle user)
 {
-    if (user && user->xuid) return user->xuid;
     AcquireSRWLockShared(&g_user_lock);
+    if (user && user_registry_contains_locked(user) && user->xuid) {
+        uint64_t uid = user->xuid;
+        ReleaseSRWLockShared(&g_user_lock);
+        return uid;
+    }
     uint64_t id = g_active_user ? g_active_user->xuid : 2533274790395904ULL;
     ReleaseSRWLockShared(&g_user_lock);
     return id;
@@ -64,7 +110,11 @@ uint64_t xgr_user_get_primary_xuid(void)
 HRESULT xgr_user_duplicate(XUserHandle user, XUserHandle *out_user)
 {
     if (!user || !out_user) return E_INVALIDARG;
-    InterlockedIncrement(&user->ref);
+    AcquireSRWLockShared(&g_user_lock);
+    if (user_registry_contains_locked(user)) {
+        InterlockedIncrement(&user->ref);
+    }
+    ReleaseSRWLockShared(&g_user_lock);
     *out_user = user;
     return S_OK;
 }
@@ -72,7 +122,16 @@ HRESULT xgr_user_duplicate(XUserHandle user, XUserHandle *out_user)
 void xgr_user_close(XUserHandle user)
 {
     if (!user) return;
-    if (InterlockedDecrement(&user->ref) == 0) {
+    bool do_free = false;
+    AcquireSRWLockExclusive(&g_user_lock);
+    if (user_registry_contains_locked(user)) {
+        if (InterlockedDecrement(&user->ref) == 0) {
+            user_registry_remove_locked(user);
+            do_free = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_user_lock);
+    if (do_free) {
         free(user);
     }
 }
@@ -175,17 +234,26 @@ static HRESULT ensure_signed_in_user_worker(XUserHandle *out_user)
         }
     }
 
+    XUserHandle discard_u = NULL;
     AcquireSRWLockExclusive(&g_user_lock);
     if (!g_active_user) {
+        if (!user_registry_insert_locked(u)) {
+            ReleaseSRWLockExclusive(&g_user_lock);
+            free(u);
+            return E_OUTOFMEMORY;
+        }
         InterlockedIncrement(&u->ref);
         g_active_user = u;
         *out_user = u;
     } else {
         InterlockedIncrement(&g_active_user->ref);
         *out_user = g_active_user;
-        xgr_user_close(u);
+        discard_u = u;
     }
     ReleaseSRWLockExclusive(&g_user_lock);
+    if (discard_u) {
+        free(discard_u);
+    }
     return S_OK;
 }
 

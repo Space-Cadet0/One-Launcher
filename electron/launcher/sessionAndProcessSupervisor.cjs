@@ -15,6 +15,8 @@ const {
   atomicWriteFileSync,
   isContainedWithinRoot,
   resolveHostWindowsKnownFolders,
+  sanitizeSpawnEnvironmentMap,
+  buildSafeChildEnvironment,
 } = require('./securityAndPathUtils.cjs');
 const {
   resolveBottleSteamExe,
@@ -100,6 +102,7 @@ const {
   getGameLaunchConfigs,
   resolveEffectivePerformancePolicy,
   isSafeToDeleteInstallPath,
+  safeRemoveInstallDirectoryAsync,
   safeIsNumericAppId,
 } = require('./engineStateRegistry.cjs');
 
@@ -151,6 +154,7 @@ const {
   cleanNonApfsAppleDoubleTwins,
   alignWineMsyncWithLiveBottle,
   prepareCrossOverWineSpawnEnv,
+  prepareAlignedAuxBottleWineCommand,
 } = macNativeInstallerAndCodesign;
 
 const {
@@ -404,80 +408,6 @@ function resetSupervisorStateForTests() {
 }
 
 /**
- * Prepare an auxiliary Wine / CrossOver command so `WINEMSYNC`, `CX_ENV`, `CX_ROOT`, SIP wrapper
- * resolution, and optional headless GUI dialog suppression stay aligned with any live `wineserver`.
- *
- * @param {{
- *   wineBinary: string,
- *   bottlePath?: string | null,
- *   env?: Record<string, any>,
- *   suppressGuiDialogs?: boolean,
- *   layerType?: string | null,
- * }} params
- * @returns {{ binaryPath: string, env: Record<string, any> }}
- */
-function prepareAlignedAuxBottleWineCommand(params) {
-  const {
-    wineBinary = '',
-    bottlePath = '',
-    env: inputEnv = {},
-    suppressGuiDialogs = false,
-    layerType,
-  } = params || {};
-  const workingEnv = inputEnv && typeof inputEnv === 'object' ? inputEnv : {};
-  if (typeof macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand === 'function') {
-    const res = macNativeInstallerAndCodesign.prepareAlignedBottleWineCommand({
-      wineBinary,
-      bottlePath: bottlePath || workingEnv.WINEPREFIX || '',
-      env: workingEnv,
-      suppressGuiDialogs,
-      layerType,
-    });
-    const resolvedFromHelper =
-      res && typeof res.wineBinary === 'string' && res.wineBinary
-        ? res.wineBinary
-        : res && typeof res.binaryPath === 'string' && res.binaryPath
-          ? res.binaryPath
-          : '';
-    if (resolvedFromHelper) {
-      return {
-        binaryPath: resolvedFromHelper,
-        env: res.env && typeof res.env === 'object' ? res.env : workingEnv,
-      };
-    }
-  }
-  const effectivePrefix = String(bottlePath || workingEnv.WINEPREFIX || '').trim();
-  if (effectivePrefix) {
-    workingEnv.WINEPREFIX = workingEnv.WINEPREFIX || effectivePrefix;
-    alignWineMsyncWithLiveBottle(effectivePrefix, workingEnv);
-  }
-  if (suppressGuiDialogs) {
-    const disableSpec = 'mscoree,mshtml=d;winemenubuilder.exe=d';
-    const curDll = String(workingEnv.WINEDLLOVERRIDES || '').trim();
-    if (!curDll) {
-      workingEnv.WINEDLLOVERRIDES = disableSpec;
-    } else if (!curDll.includes('winemenubuilder.exe=d')) {
-      workingEnv.WINEDLLOVERRIDES = `${curDll};${disableSpec}`;
-    }
-    if (!workingEnv.WINEDEBUG) {
-      workingEnv.WINEDEBUG = '-all';
-    }
-  }
-  const resolvedBin =
-    typeof prepareCrossOverWineSpawnEnv === 'function'
-      ? prepareCrossOverWineSpawnEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        })
-      : resolveSipSafeWineBinaryAndPreloadEnv(wineBinary, workingEnv, {
-          ...(layerType ? { layerType } : {}),
-        });
-  return {
-    binaryPath: resolvedBin || wineBinary,
-    env: workingEnv,
-  };
-}
-
-/**
  * Remove specific environment variable assignments from a CrossOver `CX_ENV` string while
  * preserving all remaining quoted or unquoted tokens cleanly.
  *
@@ -720,9 +650,14 @@ function computeMacPrimaryDisplaySafeInsetTop(highResMode = false, options = {})
  *
  * @param {Record<string, any> | null | undefined} effectiveCaps
  * @param {string} effectiveDisplayScalingMode
+ * @param {string} [launchArgsStr]
  * @returns {boolean}
  */
-function shouldWrapBottleSessionWithDisplayLauncher(effectiveCaps, effectiveDisplayScalingMode) {
+function shouldWrapBottleSessionWithDisplayLauncher(
+  effectiveCaps,
+  effectiveDisplayScalingMode,
+  launchArgsStr = ''
+) {
   if (
     effectiveDisplayScalingMode === 'windowed' ||
     effectiveDisplayScalingMode === 'virtual_desktop' ||
@@ -739,6 +674,17 @@ function shouldWrapBottleSessionWithDisplayLauncher(effectiveCaps, effectiveDisp
   ) {
     return false;
   }
+  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+    String(launchArgsStr || effectiveCaps?.launchArguments || '')
+  );
+  const isModernUnity64 = Boolean(
+    effectiveCaps &&
+      !effectiveCaps.is32Bit &&
+      effectiveCaps.is64Bit &&
+      effectiveCaps.importsUnityPlayer &&
+      !forceGlCore
+  );
+  const effectiveUsesOpenGl = Boolean(effectiveCaps?.usesOpenGl && !isModernUnity64);
   const isModernSelfScaling64Bit = Boolean(
     effectiveCaps &&
       !effectiveCaps.is32Bit &&
@@ -746,9 +692,10 @@ function shouldWrapBottleSessionWithDisplayLauncher(effectiveCaps, effectiveDisp
       (effectiveCaps.importsD3d12 ||
         effectiveCaps.importsD3d11Or10 ||
         effectiveCaps.importsVulkan ||
-        effectiveCaps.importsModernSdl) &&
+        effectiveCaps.importsModernSdl ||
+        isModernUnity64) &&
       !effectiveCaps.usesLegacyDirectDrawOrD3d &&
-      !effectiveCaps.usesOpenGl &&
+      !effectiveUsesOpenGl &&
       !effectiveCaps.importsSdl1 &&
       !effectiveCaps.isLauncherStubCandidate
   );
@@ -773,6 +720,119 @@ function formatDisplayScalerControlIni(seq, fullscreen, aspect, safeInsetTop = 0
     safe_inset_top = Math.max(0, Math.min(80, Math.round(safeInsetTop)));
   }
   return `seq=${safeSeq}\nfullscreen=${fullscreen ? 1 : 0}\naspect=${safeAspect}\nsafe_inset_top=${safe_inset_top}\n`;
+}
+
+let lastActiveSessionManifestMs = 0;
+
+/**
+ * Atomically write `active_session.ini` in `<drive_c>/ProgramData/OneLauncher/display_scaler/` so
+ * child processes whose parent stripped `ONE_LAUNCHER_*` environment variables can self-discover
+ * the active display scaler configuration alongside `one_display_scaler_{x86,x64}.dll`.
+ *
+ * @param {string} stageDirPosix
+ * @param {{
+ *   seq: number,
+ *   mode: string,
+ *   aspect: string,
+ *   filter?: string,
+ *   safeInsetTop?: number,
+ *   hotkey?: boolean | number,
+ *   controlFileWin: string,
+ *   statusFileWin: string,
+ * }} params
+ */
+function writeActiveDisplaySessionManifestIni(stageDirPosix, params) {
+  if (!stageDirPosix || !params) return;
+  const safeSeq = Math.max(1, Math.floor(Number(params.seq) || 1));
+  const safeMode = String(params.mode || 'auto_fullscreen').trim() || 'auto_fullscreen';
+  const safeAspect = VALID_DISPLAY_ASPECT_MODES.has(params.aspect)
+    ? params.aspect
+    : 'preserve_aspect';
+  const safeFilter = String(params.filter || 'sharp_bilinear').trim() || 'sharp_bilinear';
+  const safeInsetTop =
+    typeof params.safeInsetTop === 'number' && Number.isFinite(params.safeInsetTop)
+      ? Math.max(0, Math.min(80, Math.round(params.safeInsetTop)))
+      : 0;
+  const hotkeyVal =
+    params.hotkey === false || params.hotkey === 0 ? 0 : 1;
+  const updatedUnixMs = Math.max(Date.now(), lastActiveSessionManifestMs + 1);
+  lastActiveSessionManifestMs = updatedUnixMs;
+  const lines = [
+    `seq=${safeSeq}`,
+    `mode=${safeMode}`,
+    `aspect=${safeAspect}`,
+    `filter=${safeFilter}`,
+    `safe_inset_top=${safeInsetTop}`,
+    `hotkey=${hotkeyVal}`,
+    `control_file=${String(params.controlFileWin || '')}`,
+    `status_file=${String(params.statusFileWin || '')}`,
+    `updated_unix_ms=${updatedUnixMs}`,
+    '',
+  ];
+  atomicWriteFileSync(path.join(stageDirPosix, 'active_session.ini'), lines.join('\n'));
+}
+
+/**
+ * Attach bidirectional polling of `display_status_<sessionId>.json` so in-game `Ctrl+Option+F`
+ * hotkey toggles synchronize back to `entry.session.fullscreenActive` and UI listeners.
+ *
+ * @param {any} entry
+ * @param {Record<string, any>} [options]
+ */
+function attachBottleDisplayStatusPoller(entry, options = {}) {
+  if (
+    !entry ||
+    !entry.displayStatusFilePosix ||
+    (isTestEnvironment(options) && options.enableDisplayStatusSyncInTests !== true)
+  ) {
+    return;
+  }
+  const statusPollMs = Math.max(100, Number(options.displayStatusPollMs) || 600);
+  const statusTimer = setInterval(() => {
+    if (entry.finalized || !entry.displayStatusFilePosix) {
+      clearInterval(statusTimer);
+      return;
+    }
+    try {
+      if (!fs.existsSync(entry.displayStatusFilePosix)) return;
+      const st = fs.statSync(entry.displayStatusFilePosix);
+      if (!st.isFile() || st.mtimeMs <= (entry.lastObservedDisplayStatusMtimeMs || 0)) {
+        return;
+      }
+      entry.lastObservedDisplayStatusMtimeMs = st.mtimeMs;
+      const parsed = JSON.parse(fs.readFileSync(entry.displayStatusFilePosix, 'utf8'));
+      if (!parsed || typeof parsed !== 'object') return;
+      let updated = false;
+      if (
+        typeof parsed.fullscreen === 'boolean' &&
+        parsed.fullscreen !== entry.session.fullscreenActive
+      ) {
+        entry.session.fullscreenActive = parsed.fullscreen;
+        updated = true;
+      }
+      if (
+        typeof parsed.aspect === 'string' &&
+        VALID_DISPLAY_ASPECT_MODES.has(parsed.aspect) &&
+        parsed.aspect !== entry.session.displayAspectRatio
+      ) {
+        entry.session.displayAspectRatio = parsed.aspect;
+        updated = true;
+      }
+      if (updated) {
+        emitSessionUpdated(
+          {
+            session: { ...entry.session },
+            event: 'fullscreen_updated',
+          },
+          options
+        );
+      }
+    } catch {}
+  }, statusPollMs);
+  if (typeof statusTimer.unref === 'function') {
+    statusTimer.unref();
+  }
+  entry.displayStatusTimer = statusTimer;
 }
 
 /**
@@ -2050,58 +2110,138 @@ function trackPostSessionPromise(/** @type {any} */ promise) {
   return promise;
 }
 
+const PROTECTED_PUBLISHER_EXE_RE =
+  /^(?:steam|galaxyclient|epicgameslauncher|upc|ubisoftconnect|ubisoftgamelauncher|eadesktop|ealauncher|battle\.net|riotclientservices|gdkstubgame)\.exe$/i;
+
+/**
+ * Verify via `ps eww -p <pid>` whether a candidate Wine process belongs to `normScopePrefix`.
+ * Returns `false` if the process explicitly carries a `WINEPREFIX=` pointing to a DIFFERENT bottle.
+ *
+ * @param {number} pid
+ * @param {string} normScopePrefix
+ * @returns {Promise<boolean>}
+ */
+function doesPosixProcessMatchWinePrefix(pid, normScopePrefix) {
+  if (!normScopePrefix) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    try {
+      execFile('ps', ['eww', '-p', String(pid)], { timeout: 800 }, (err, stdout) => {
+        if (err || !stdout) return resolve(true);
+        const text = String(stdout).replace(/\\/g, '/');
+        const m = /(?:^|\s)WINEPREFIX=(?:"([^"]+)"|'([^']+)'|(\S+))/i.exec(text);
+        if (!m) {
+          return resolve(true);
+        }
+        const rawPrefix = (m[1] || m[2] || m[3] || '').trim().replace(/\/+$/, '').toLowerCase();
+        if (!rawPrefix) return resolve(true);
+        resolve(rawPrefix === normScopePrefix || rawPrefix.startsWith(`${normScopePrefix}/`));
+      });
+    } catch {
+      resolve(true);
+    }
+  });
+}
+
+/**
+ * Batched POSIX process matcher that captures a single `ps -axo pid=,pgid=,ppid=,command=`
+ * snapshot for an entire list of target Windows `.exe` names and verifies `WINEPREFIX` ownership
+ * before sending `signal`.
+ *
+ * @param {string[]} exePathsOrNames
+ * @param {NodeJS.Signals} [signal='SIGTERM']
+ * @param {string} [scopeHint='']
+ * @returns {Promise<void>}
+ */
+function killPosixProcessesMatchingWinExes(
+  exePathsOrNames,
+  signal = 'SIGTERM',
+  scopeHint = ''
+) {
+  return new Promise((resolve) => {
+    if (process.platform === 'win32' || !Array.isArray(exePathsOrNames)) {
+      return resolve(undefined);
+    }
+    /** @type {RegExp[]} */
+    const tokenRegexes = [];
+    const seenBases = new Set();
+    for (const rawExe of exePathsOrNames) {
+      if (!rawExe || typeof rawExe !== 'string') continue;
+      const exeBase = path.basename(rawExe).trim();
+      const baseLower = exeBase.toLowerCase();
+      if (
+        !exeBase ||
+        exeBase.length <= 3 ||
+        seenBases.has(baseLower) ||
+        PROTECTED_PUBLISHER_EXE_RE.test(exeBase)
+      ) {
+        continue;
+      }
+      seenBases.add(baseLower);
+      const escapedBase = exeBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      tokenRegexes.push(new RegExp(`(?:^|[\\\\/\\s"'])${escapedBase}(?:\\s|["']|$)`, 'i'));
+    }
+    if (tokenRegexes.length === 0) return resolve(undefined);
+
+    const normScope = scopeHint
+      ? path.resolve(String(scopeHint)).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+      : '';
+    try {
+      execFile(
+        'ps',
+        ['-axo', 'pid=,pgid=,ppid=,command='],
+        { timeout: 1500 },
+        async (err, stdout) => {
+          if (err || !stdout) return resolve(undefined);
+          /** @type {Array<{ pid: number, cmdMatchedScope: boolean }>} */
+          const candidates = [];
+          for (const rawLine of String(stdout).split(/\r?\n/)) {
+            const m = rawLine.trim().match(/^(\d+)\s+\d+\s+\d+\s+(.+)$/);
+            if (!m) continue;
+            const candidatePid = Number.parseInt(m[1], 10);
+            const cmd = m[2].trim();
+            if (!candidatePid || candidatePid <= 1 || candidatePid === process.pid) continue;
+            if (
+              /^(?:\/bin\/|\/usr\/bin\/)?(?:ps|pkill|pgrep|grep|rg|vim|nvim|nano|less|tail|cat)\b/i.test(
+                cmd
+              )
+            ) {
+              continue;
+            }
+            if (!tokenRegexes.some((re) => re.test(cmd))) continue;
+            const lowerCmd = cmd.replace(/\\/g, '/').toLowerCase();
+            const cmdMatchedScope = Boolean(normScope && lowerCmd.includes(normScope));
+            const hasWineOrPathContext =
+              cmdMatchedScope ||
+              /(?:wine|crossover|gameportingtoolkit|drive_c|[a-z]:\/)/i.test(lowerCmd);
+            if (!hasWineOrPathContext) continue;
+            candidates.push({ pid: candidatePid, cmdMatchedScope });
+          }
+
+          for (const cand of candidates) {
+            if (normScope && !cand.cmdMatchedScope) {
+              const matchesPrefix = await doesPosixProcessMatchWinePrefix(cand.pid, normScope);
+              if (!matchesPrefix) continue;
+            }
+            try {
+              process.kill(cand.pid, signal);
+            } catch {}
+          }
+          resolve(undefined);
+        }
+      );
+    } catch {
+      resolve(undefined);
+    }
+  });
+}
+
 function killPosixProcessesMatchingWinExe(
   /** @type {string} */ exePath,
   /** @type {NodeJS.Signals} */ signal = 'SIGTERM',
   scopeHint = ''
 ) {
-  return new Promise((resolve) => {
-    if (!exePath || process.platform === 'win32') return resolve(undefined);
-    const exeBase = path.basename(exePath);
-    if (
-      !exeBase ||
-      exeBase.length <= 3 ||
-      /^(?:steam|galaxyclient|epicgameslauncher|upc|ubisoftconnect|ubisoftgamelauncher|eadesktop|ealauncher|battle\.net|riotclientservices|gdkstubgame)\.exe$/i.test(
-        exeBase
-      )
-    ) {
-      return resolve(undefined);
-    }
-    const escapedBase = exeBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const exactTokenRe = new RegExp(`(?:^|[\\\\/\\s"'])${escapedBase}(?:\\s|["']|$)`, 'i');
-    const normScope = scopeHint ? String(scopeHint).replace(/\\/g, '/').toLowerCase() : '';
-    try {
-      execFile('ps', ['-axo', 'pid=,command='], { timeout: 1500 }, (err, stdout) => {
-        if (err || !stdout) return resolve(undefined);
-        for (const rawLine of String(stdout).split(/\r?\n/)) {
-          const m = rawLine.trim().match(/^(\d+)\s+(.+)$/);
-          if (!m) continue;
-          const candidatePid = Number.parseInt(m[1], 10);
-          const cmd = m[2].trim();
-          if (!candidatePid || candidatePid <= 1 || candidatePid === process.pid) continue;
-          if (
-            /^(?:\/bin\/|\/usr\/bin\/)?(?:ps|pkill|pgrep|grep|rg|vim|nvim|nano|less|tail|cat)\b/i.test(
-              cmd
-            )
-          ) {
-            continue;
-          }
-          if (!exactTokenRe.test(cmd)) continue;
-          const lowerCmd = cmd.replace(/\\/g, '/').toLowerCase();
-          const hasWineOrPathContext =
-            (normScope && lowerCmd.includes(normScope)) ||
-            /(?:wine|crossover|gameportingtoolkit|drive_c|[a-z]:\/)/i.test(lowerCmd);
-          if (!hasWineOrPathContext) continue;
-          try {
-            process.kill(candidatePid, signal);
-          } catch {}
-        }
-        resolve(undefined);
-      });
-    } catch {
-      resolve(undefined);
-    }
-  });
+  if (!exePath) return Promise.resolve(undefined);
+  return killPosixProcessesMatchingWinExes([exePath], signal, scopeHint);
 }
 
 function isMacSipProtectedExecutableOrScript(/** @type {string} */ binPath) {
@@ -2362,7 +2502,20 @@ function finalizeGameSession(/** @type {string} */ gameId, /** @type {any} */ op
 
   if (entry.postExitCommand) {
     try {
-      exec(entry.postExitCommand, { timeout: 5000, windowsHide: true }, () => {});
+      const safePostExitEnv = buildSafeChildEnvironment(
+        process.env,
+        entry.launchConfig?.environmentVariables,
+        {},
+        {
+          gameId: entry.gameId || entry.session?.gameId || '',
+          options: entry.launchOptions || options,
+        }
+      );
+      exec(
+        entry.postExitCommand,
+        { env: safePostExitEnv, timeout: 5000, windowsHide: true },
+        () => {}
+      );
     } catch {}
   }
 
@@ -3402,11 +3555,12 @@ async function launchChainedPublisherGame(ctx) {
             localInstallDir && fs.existsSync(localInstallDir)
               ? localInstallDir
               : path.dirname(nativeSpec.launcherExe),
-          env: {
-            ...process.env,
-            ...(launchConfig.environmentVariables || {}),
-            ...(nativeSpec.envOverrides || {}),
-          },
+          env: buildSafeChildEnvironment(
+            process.env,
+            launchConfig.environmentVariables,
+            nativeSpec.envOverrides,
+            { gameId, options }
+          ),
           stdio: ['ignore', 'ignore', 'pipe'],
           detached: false,
         });
@@ -3506,10 +3660,12 @@ async function launchChainedPublisherGame(ctx) {
     }
 
     /** @type {Record<string, any>} */
-    const bottleEnv = {
-      ...process.env,
-      ...(launchConfig.environmentVariables || {}),
-    };
+    const bottleEnv = buildSafeChildEnvironment(
+      process.env,
+      launchConfig.environmentVariables,
+      {},
+      { gameId, options }
+    );
 
     const candidateBottleInstall =
       localInstallDir && !hasGdkStubIndicator && isBottlePath(localInstallDir)
@@ -3784,7 +3940,11 @@ async function launchChainedPublisherGame(ctx) {
       realGameExe || realInstallPath
         ? resolveEffectiveGameExecutableCapabilities(
             realGameExe || undefined,
-            realInstallPath || undefined
+            realInstallPath || undefined,
+            {
+              ...options,
+              launchArguments: userLaunchArgs.join(' '),
+            }
           )
         : null;
     const chainedProxyCandidateDirs = [
@@ -3987,8 +4147,10 @@ async function launchChainedPublisherGame(ctx) {
     bottleEnv.ONE_LAUNCHER_DISPLAY_ASPECT = chainedDisplayAspectRatio;
     bottleEnv.ONE_LAUNCHER_SAFE_INSET_TOP = String(chainedSafeInsetTop);
     bottleEnv.ONE_LAUNCHER_FULLSCREEN_HOTKEY = chainedFullscreenHotkey ? '1' : '0';
+    /** @type {ReturnType<typeof stageBottleDisplayScalerBinaries> | null} */
+    let stagedChainedDisp = null;
     if (bottlePath && fs.existsSync(bottlePath)) {
-      const stagedChainedDisp = stageBottleDisplayScalerBinaries(bottlePath, options);
+      stagedChainedDisp = stageBottleDisplayScalerBinaries(bottlePath, options);
       if (stagedChainedDisp.stageDirPosix) {
         chainedDisplayControlFilePosix = path.join(
           stagedChainedDisp.stageDirPosix,
@@ -3998,6 +4160,8 @@ async function launchChainedPublisherGame(ctx) {
           stagedChainedDisp.stageDirPosix,
           `display_status_${chainedSessionId}.json`
         );
+        const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${chainedSessionId}.ini`;
+        const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${chainedSessionId}.json`;
         try {
           atomicWriteFileSync(
             chainedDisplayControlFilePosix,
@@ -4008,13 +4172,22 @@ async function launchChainedPublisherGame(ctx) {
               chainedSafeInsetTop
             )
           );
+          writeActiveDisplaySessionManifestIni(stagedChainedDisp.stageDirPosix, {
+            seq: 1,
+            mode: chainedDisplayScalingMode,
+            aspect: chainedDisplayAspectRatio,
+            safeInsetTop: chainedSafeInsetTop,
+            hotkey: chainedFullscreenHotkey,
+            controlFileWin: winCtlFile,
+            statusFileWin: winStatusFile,
+          });
         } catch {}
         bottleEnv.ONE_LAUNCHER_SCALER_DLL_X86 = stagedChainedDisp.winDllX86;
         bottleEnv.ONE_LAUNCHER_SCALER_DLL_X64 = stagedChainedDisp.winDllX64;
         bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X86 = stagedChainedDisp.winLauncherX86;
         bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X64 = stagedChainedDisp.winLauncherX64;
-        bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${chainedSessionId}.ini`;
-        bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${chainedSessionId}.json`;
+        bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
+        bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
       }
     }
 
@@ -4071,6 +4244,50 @@ async function launchChainedPublisherGame(ctx) {
       detached: false,
     });
 
+    const canWrapChainedDisplayScaler =
+      (!isTestEnvironment(options) || options.enableDisplayScalerInTests === true) &&
+      Boolean(stagedChainedDisp && stagedChainedDisp.allPresent) &&
+      shouldWrapBottleSessionWithDisplayLauncher(
+        chainedEffectiveCaps,
+        chainedDisplayScalingMode,
+        userLaunchArgs.join(' ')
+      );
+    /** @type {any} */
+    let chainedDisplayWatcherChild = null;
+    const chainedWatchTargetDir =
+      realInstallPath || localInstallDir || (realGameExe ? path.dirname(realGameExe) : '');
+    if (canWrapChainedDisplayScaler && stagedChainedDisp && bottlePath && chainedWatchTargetDir) {
+      try {
+        const winWatchDir = toWineWindowsPath(chainedWatchTargetDir, bottlePath);
+        if (winWatchDir) {
+          chainedDisplayWatcherChild = gameSpawnImpl(
+            wineSpawnCmd,
+            [
+              ...chainedDllArgs,
+              stagedChainedDisp.launcherX86Posix,
+              '--watch-dir',
+              winWatchDir,
+              '--dll-x86',
+              stagedChainedDisp.winDllX86,
+              '--dll-x64',
+              stagedChainedDisp.winDllX64,
+              '--timeout-ms',
+              '120000',
+            ],
+            {
+              cwd: effectiveCwd,
+              env: spawnEnv,
+              stdio: ['ignore', 'ignore', 'ignore'],
+              detached: false,
+            }
+          );
+          if (chainedDisplayWatcherChild && typeof chainedDisplayWatcherChild.unref === 'function') {
+            chainedDisplayWatcherChild.unref();
+          }
+        }
+      } catch {}
+    }
+
     const session = {
       sessionId: chainedSessionId,
       gameId,
@@ -4125,8 +4342,10 @@ async function launchChainedPublisherGame(ctx) {
       displayControlSeq: 1,
       displayControlFilePosix: chainedDisplayControlFilePosix || null,
       displayStatusFilePosix: chainedDisplayStatusFilePosix || null,
-      displayScalerWrapped: false,
-      displayWatcherChild: null,
+      displayScalerWrapped: Boolean(chainedDisplayWatcherChild),
+      displayWatcherChild: chainedDisplayWatcherChild || null,
+      displayStatusTimer: null,
+      lastObservedDisplayStatusMtimeMs: 0,
       chosenCompatLayerType: chosenLayer?.type || null,
       installPath: realInstallPath || localInstallDir || '',
       platformGameId: String(payload.platformGameId || gameId),
@@ -4134,6 +4353,8 @@ async function launchChainedPublisherGame(ctx) {
       launchConfig,
       effectiveStorefrontLifecycle: effectivePerfPolicy.storefrontClientLifecycle,
     };
+
+    attachBottleDisplayStatusPoller(entry, options);
 
     if (child?.stderr && typeof child.stderr.on === 'function') {
       child.stderr.on('data', (/** @type {any} */ chunk) => {
@@ -4549,11 +4770,12 @@ async function launchChainedPublisherGame(ctx) {
           : process.cwd();
     winChild = gameSpawnImpl(winSpec.launcherExe, winArgs, {
       cwd: winCwd,
-      env: {
-        ...process.env,
-        ...(launchConfig.environmentVariables || {}),
-        ...(winSpec.envOverrides || {}),
-      },
+      env: buildSafeChildEnvironment(
+        process.env,
+        launchConfig.environmentVariables,
+        winSpec.envOverrides,
+        { gameId, options }
+      ),
       stdio: ['ignore', 'ignore', 'pipe'],
       detached: false,
       windowsHide: false,
@@ -4868,12 +5090,30 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       payload.launchConfig,
       payload.platformId
     );
-    const launchConfig = {
+    const rawMergedLaunchConfig = {
       ...platformSavedConfig,
       ...(payload.storefrontClientLifecycle
         ? { storefrontClientLifecycle: payload.storefrontClientLifecycle }
         : {}),
       ...platformPayloadConfig,
+    };
+    const rawSavedEnv =
+      platformSavedConfig.environmentVariables &&
+      typeof platformSavedConfig.environmentVariables === 'object'
+        ? sanitizeSpawnEnvironmentMap(platformSavedConfig.environmentVariables, { gameId, options })
+        : undefined;
+    const rawInlineEnv =
+      platformPayloadConfig.environmentVariables &&
+      typeof platformPayloadConfig.environmentVariables === 'object'
+        ? sanitizeSpawnEnvironmentMap(platformPayloadConfig.environmentVariables, { gameId, options })
+        : undefined;
+    const mergedSafeEnv =
+      rawSavedEnv || rawInlineEnv
+        ? { ...(rawSavedEnv || {}), ...(rawInlineEnv || {}) }
+        : undefined;
+    const launchConfig = {
+      ...rawMergedLaunchConfig,
+      ...(mergedSafeEnv ? { environmentVariables: mergedSafeEnv } : {}),
     };
     const effectivePerfPolicy = payload.performanceSettings
       ? resolveEffectivePerformancePolicy(launchConfig, payload.performanceSettings, options)
@@ -5520,10 +5760,12 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       );
     const args = parseLaunchArguments(effectiveLaunchArgsStr);
     /** @type {Record<string, any>} */
-    const env = {
-      ...process.env,
-      ...(launchConfig.environmentVariables || {}),
-    };
+    const env = buildSafeChildEnvironment(
+      process.env,
+      launchConfig.environmentVariables,
+      {},
+      { gameId, options }
+    );
 
     // Execute optional pre-launch command asynchronously (never block Electron main thread)
     if (launchConfig.preLaunchCommand) {
@@ -5531,7 +5773,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         try {
           exec(
             launchConfig.preLaunchCommand,
-            { timeout: 5000, windowsHide: true },
+            { env, timeout: 5000, windowsHide: true },
             (cmdErr) => {
               if (cmdErr) {
                 diagLog.warn('launchGame.preLaunchCommand', cmdErr, { gameId });
@@ -5566,7 +5808,10 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         ? resolveEffectiveGameExecutableCapabilities(
             resolvedExePath,
             localInstallDir || '',
-            options
+            {
+              ...options,
+              launchArguments: effectiveLaunchArgsStr,
+            }
           )
         : null;
 
@@ -6882,6 +7127,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                   bottleDisplayStagedInfo.stageDirPosix,
                   `display_status_${preGeneratedSessionId}.json`
                 );
+                const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${preGeneratedSessionId}.ini`;
+                const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${preGeneratedSessionId}.json`;
                 try {
                   atomicWriteFileSync(
                     bottleDisplayControlFilePosix,
@@ -6892,13 +7139,22 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                       safeInsetTop
                     )
                   );
+                  writeActiveDisplaySessionManifestIni(bottleDisplayStagedInfo.stageDirPosix, {
+                    seq: 1,
+                    mode: effectiveDisplayScalingMode,
+                    aspect: effectiveDisplayAspectRatio,
+                    safeInsetTop,
+                    hotkey: enableFullscreenHotkey,
+                    controlFileWin: winCtlFile,
+                    statusFileWin: winStatusFile,
+                  });
                 } catch {}
                 env.ONE_LAUNCHER_SCALER_DLL_X86 = bottleDisplayStagedInfo.winDllX86;
                 env.ONE_LAUNCHER_SCALER_DLL_X64 = bottleDisplayStagedInfo.winDllX64;
                 env.ONE_LAUNCHER_LAUNCHER_EXE_X86 = bottleDisplayStagedInfo.winLauncherX86;
                 env.ONE_LAUNCHER_LAUNCHER_EXE_X64 = bottleDisplayStagedInfo.winLauncherX64;
-                env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${preGeneratedSessionId}.ini`;
-                env.ONE_LAUNCHER_DISPLAY_STATUS_FILE = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${preGeneratedSessionId}.json`;
+                env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
+                env.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
               }
             }
 
@@ -6909,7 +7165,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               canInjectDisplayScaler &&
               shouldWrapBottleSessionWithDisplayLauncher(
                 effectiveCaps,
-                effectiveDisplayScalingMode
+                effectiveDisplayScalingMode,
+                effectiveLaunchArgsStr
               );
           }
 
@@ -8016,57 +8273,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               lastObservedDisplayStatusMtimeMs: 0,
             };
 
-            if (
-              entry.displayStatusFilePosix &&
-              isBottledMacSession &&
-              (!isTestEnvironment(options) || options.enableDisplayStatusSyncInTests === true)
-            ) {
-              const statusPollMs = Math.max(100, Number(options.displayStatusPollMs) || 600);
-              const statusTimer = setInterval(() => {
-                if (entry.finalized || !entry.displayStatusFilePosix) {
-                  clearInterval(statusTimer);
-                  return;
-                }
-                try {
-                  if (!fs.existsSync(entry.displayStatusFilePosix)) return;
-                  const st = fs.statSync(entry.displayStatusFilePosix);
-                  if (!st.isFile() || st.mtimeMs <= (entry.lastObservedDisplayStatusMtimeMs || 0)) {
-                    return;
-                  }
-                  entry.lastObservedDisplayStatusMtimeMs = st.mtimeMs;
-                  const parsed = JSON.parse(fs.readFileSync(entry.displayStatusFilePosix, 'utf8'));
-                  if (!parsed || typeof parsed !== 'object') return;
-                  let updated = false;
-                  if (
-                    typeof parsed.fullscreen === 'boolean' &&
-                    parsed.fullscreen !== entry.session.fullscreenActive
-                  ) {
-                    entry.session.fullscreenActive = parsed.fullscreen;
-                    updated = true;
-                  }
-                  if (
-                    typeof parsed.aspect === 'string' &&
-                    VALID_DISPLAY_ASPECT_MODES.has(parsed.aspect) &&
-                    parsed.aspect !== entry.session.displayAspectRatio
-                  ) {
-                    entry.session.displayAspectRatio = parsed.aspect;
-                    updated = true;
-                  }
-                  if (updated) {
-                    emitSessionUpdated(
-                      {
-                        session: { ...entry.session },
-                        event: 'fullscreen_updated',
-                      },
-                      options
-                    );
-                  }
-                } catch {}
-              }, statusPollMs);
-              if (typeof statusTimer.unref === 'function') {
-                statusTimer.unref();
-              }
-              entry.displayStatusTimer = statusTimer;
+            if (isBottledMacSession) {
+              attachBottleDisplayStatusPoller(entry, options);
             }
 
             if (
@@ -9319,23 +9527,28 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
         ? path.basename(exePath)
         : '';
 
-    if (!isTestStopEnv && exeBase && exeBase.length > 3) {
-      await killPosixProcessesMatchingWinExe(exePath, 'SIGTERM', targetEntry.winePrefix || '');
+    /** @type {string[]} */
+    const stopWinExeTargets = [];
+    if (exeBase && exeBase.length > 3) {
+      stopWinExeTargets.push(exePath);
     }
-    if (!isTestStopEnv && Array.isArray(targetEntry.targetExeBasenamesLower)) {
+    if (Array.isArray(targetEntry.targetExeBasenamesLower)) {
       for (const childExeName of targetEntry.targetExeBasenamesLower) {
         if (
           typeof childExeName === 'string' &&
           childExeName.length > 4 &&
           childExeName.toLowerCase() !== exeBase.toLowerCase()
         ) {
-          await killPosixProcessesMatchingWinExe(
-            childExeName,
-            'SIGTERM',
-            targetEntry.winePrefix || ''
-          );
+          stopWinExeTargets.push(childExeName);
         }
       }
+    }
+    if (!isTestStopEnv && stopWinExeTargets.length > 0) {
+      await killPosixProcessesMatchingWinExes(
+        stopWinExeTargets,
+        'SIGTERM',
+        targetEntry.winePrefix || ''
+      );
     }
     if (Number(targetEntry.reLatchedBottleChildPid) > 0) {
       try {
@@ -9533,8 +9746,12 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
             process.kill(pid, 'SIGKILL');
           } catch {}
         }
-        if (!isTestStopEnv && exeBase && exeBase.length > 3) {
-          await killPosixProcessesMatchingWinExe(exePath, 'SIGKILL', targetEntry.winePrefix || '');
+        if (!isTestStopEnv && stopWinExeTargets.length > 0) {
+          await killPosixProcessesMatchingWinExes(
+            stopWinExeTargets,
+            'SIGKILL',
+            targetEntry.winePrefix || ''
+          );
         }
         if (macAppBundlePath && !isTestStopEnv) {
           await signalMacAppBundleProcesses('SIGKILL');
@@ -9680,6 +9897,21 @@ function toggleSessionFullscreen(payload = {}, options = {}) {
           controlFilePosix,
           formatDisplayScalerControlIni(nextSeq, nextFullscreen, nextAspect)
         );
+        const toggleStageDir = path.dirname(controlFilePosix);
+        const sessionIdForIni = String(targetEntry.session.sessionId || '');
+        writeActiveDisplaySessionManifestIni(toggleStageDir, {
+          seq: nextSeq,
+          mode: nextFullscreen
+            ? targetEntry.session.displayScalingMode === 'force_fullscreen'
+              ? 'force_fullscreen'
+              : 'auto_fullscreen'
+            : 'windowed',
+          aspect: nextAspect,
+          safeInsetTop: 0,
+          hotkey: true,
+          controlFileWin: `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${sessionIdForIni}.ini`,
+          statusFileWin: `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${sessionIdForIni}.json`,
+        });
       } catch (/** @type {any} */ writeErr) {
         return {
           success: false,
@@ -11998,7 +12230,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
               const acfCommonDir = path.join(steamappsDir, 'common', installdir);
               if (fs.existsSync(acfCommonDir) && isSafeToDeleteInstallPath(acfCommonDir, options)) {
                 try {
-                  fs.rmSync(acfCommonDir, { recursive: true, force: true });
+                  await safeRemoveInstallDirectoryAsync(acfCommonDir, {
+                    ...options,
+                    skipSafetyAssertion: true,
+                  });
                 } catch {}
               }
             }
@@ -12032,7 +12267,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
           isBottleInstall = true;
         }
         try {
-          fs.rmSync(localInstall, { recursive: true, force: true });
+          await safeRemoveInstallDirectoryAsync(localInstall, {
+            ...options,
+            skipSafetyAssertion: true,
+          });
           removedLocalSteamFiles = true;
         } catch {}
       }
@@ -12099,7 +12337,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
         isSafeToDeleteInstallPath(localInstall, options)
       ) {
         try {
-          fs.rmSync(localInstall, { recursive: true, force: true });
+          await safeRemoveInstallDirectoryAsync(localInstall, {
+            ...options,
+            skipSafetyAssertion: true,
+          });
         } catch (rmErr) {
           diagLog.warn('uninstallGame.xboxRemoveDir', rmErr, { localInstall });
         }
@@ -12136,7 +12377,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
             isSafeBottleChainedGameDirToDelete(chainedBottleRoot, localInstall)
           ) {
             try {
-              fs.rmSync(localInstall, { recursive: true, force: true });
+              await safeRemoveInstallDirectoryAsync(localInstall, {
+                ...options,
+                skipSafetyAssertion: true,
+              });
             } catch (rmBottleGameErr) {
               diagLog.warn('uninstallGame.chainedBottleRemoveDir', rmBottleGameErr, {
                 localInstall,
@@ -12151,7 +12395,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
             isSafeToDeleteInstallPath(localInstall, options)
           ) {
             try {
-              fs.rmSync(localInstall, { recursive: true, force: true });
+              await safeRemoveInstallDirectoryAsync(localInstall, {
+                ...options,
+                skipSafetyAssertion: true,
+              });
             } catch {}
           }
         }
@@ -12624,7 +12871,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
 
       if (canDeleteLocal && isSafeToDeleteInstallPath(localInstall, options)) {
         try {
-          fs.rmSync(localInstall, { recursive: true, force: true });
+          await safeRemoveInstallDirectoryAsync(localInstall, {
+            ...options,
+            skipSafetyAssertion: true,
+          });
         } catch {}
       }
     }
@@ -12639,7 +12889,10 @@ async function uninstallGame(/** @type {any} */ payload = {}, /** @type {any} */
 
       if (canDeleteSplitParent && isSafeToDeleteInstallPath(gogSplitParentDir, options)) {
         try {
-          fs.rmSync(gogSplitParentDir, { recursive: true, force: true });
+          await safeRemoveInstallDirectoryAsync(gogSplitParentDir, {
+            ...options,
+            skipSafetyAssertion: true,
+          });
         } catch {}
       }
     }
@@ -12690,6 +12943,12 @@ function shutdownLauncherEngine(/** @type {any} */ options = {}) {
       } catch {}
       entry.pollTimer = null;
     }
+    if (entry && entry.displayStatusTimer) {
+      try {
+        clearInterval(entry.displayStatusTimer);
+      } catch {}
+      entry.displayStatusTimer = null;
+    }
     if (entry && entry.displayWatcherChild && typeof entry.displayWatcherChild.kill === 'function') {
       try {
         entry.displayWatcherChild.kill('SIGTERM');
@@ -12719,6 +12978,8 @@ module.exports = {
   buildStorefrontLaunchUri,
   trackPostSessionPromise,
   killPosixProcessesMatchingWinExe,
+  killPosixProcessesMatchingWinExes,
+  writeActiveDisplaySessionManifestIni,
   isMacSipProtectedExecutableOrScript,
   isWindowsElevationRequiredError,
   spawnWindowsViaPowerShellStartProcess,

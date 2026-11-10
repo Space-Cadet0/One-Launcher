@@ -17,6 +17,37 @@ const {
   aesKeyWrapRfc3394,
   aesKeyUnwrapRfc3394,
 } = require('./xboxBoringSslCrypto.cjs');
+const {
+  XBOX_HTTP_TIMEOUT_MS,
+  buildXboxFetchSignal,
+  makeCorrelationVector,
+} = require('./xboxConfigAndIds.cjs');
+
+const MAX_PARSED_RSA_PRIVATE_KEYS = 32;
+const parsedRsaPrivateKeyCache = new Map();
+
+function getCachedRsaPrivateKeyObject(pemOrKey) {
+  if (!pemOrKey) {
+    throw new Error('Missing RSA private key');
+  }
+  if (typeof pemOrKey === 'object' && !Buffer.isBuffer(pemOrKey)) {
+    return pemOrKey;
+  }
+  const cacheKey = Buffer.isBuffer(pemOrKey) ? pemOrKey.toString('utf8') : String(pemOrKey);
+  const hit = parsedRsaPrivateKeyCache.get(cacheKey);
+  if (hit) {
+    parsedRsaPrivateKeyCache.delete(cacheKey);
+    parsedRsaPrivateKeyCache.set(cacheKey, hit);
+    return hit;
+  }
+  const parsed = crypto.createPrivateKey(cacheKey);
+  if (parsedRsaPrivateKeyCache.size >= MAX_PARSED_RSA_PRIVATE_KEYS) {
+    const oldest = parsedRsaPrivateKeyCache.keys().next().value;
+    if (oldest !== undefined) parsedRsaPrivateKeyCache.delete(oldest);
+  }
+  parsedRsaPrivateKeyCache.set(cacheKey, parsed);
+  return parsed;
+}
 
 const MSA_DEVICE_ADD_URL = 'https://login.live.com/ppsecure/deviceaddcredential.srf';
 const MSA_RST2_URL = 'https://login.live.com/RST2.srf';
@@ -1269,10 +1300,16 @@ function makeXmlDsigTamperedError() {
  * XML-DSig `<Signature>` is present, and throws `SPLICENSE_SIGNATURE_TAMPERED` if either
  * `<DigestValue>` or `<SignatureValue>` fails verification or is malformed.
  *
+ * Security note (Finding #16): Microsoft CLEP `<License>` responses embed an unchained inline
+ * `<RSAKeyValue>` inside `<KeyInfo>`. Unless `options.pinnedSpkiSha256Set` is supplied by the caller,
+ * this verifier enforces transport/envelope integrity (SHA-256 C14N digest + RSA-SHA256 signature
+ * consistency over TLS) rather than PKI root-CA identity authentication.
+ *
  * @param {string} xmlText
+ * @param {{ pinnedSpkiSha256Set?: Set<string> | string[] }} [options]
  * @returns {boolean}
  */
-function verifyLicenseXmlDsigIfPresent(xmlText) {
+function verifyLicenseXmlDsigIfPresent(xmlText, options = {}) {
   const decodedXml = decodeSpLicenseXmlIfPresent(xmlText);
   if (decodedXml === null) {
     return false;
@@ -1405,6 +1442,22 @@ function verifyLicenseXmlDsigIfPresent(xmlText) {
       },
       format: 'jwk',
     });
+    if (options?.pinnedSpkiSha256Set) {
+      const pinSet =
+        options.pinnedSpkiSha256Set instanceof Set
+          ? options.pinnedSpkiSha256Set
+          : new Set(Array.isArray(options.pinnedSpkiSha256Set) ? options.pinnedSpkiSha256Set : []);
+      if (pinSet.size > 0) {
+        const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+        const spkiSha256 = crypto.createHash('sha256').update(spkiDer).digest('hex').toLowerCase();
+        const matchedPin = Array.from(pinSet).some(
+          (p) => String(p || '').trim().toLowerCase() === spkiSha256
+        );
+        if (!matchedPin) {
+          throw makeXmlDsigTamperedError();
+        }
+      }
+    }
     rsaVerified = crypto.verify(
       'RSA-SHA256',
       Buffer.from(c14nSignedInfo, 'utf8'),
@@ -1956,8 +2009,9 @@ function buildSignedRst2SoapEnvelope({
   let keyInfoXml = '';
 
   if (signingMode === 'rsa') {
+    const rsaKeyObj = getCachedRsaPrivateKeyObject(rsaPrivateKeyPem);
     signatureValueB64 = crypto
-      .sign('RSA-SHA256', Buffer.from(canonicalSignedInfo, 'utf8'), rsaPrivateKeyPem)
+      .sign('RSA-SHA256', Buffer.from(canonicalSignedInfo, 'utf8'), rsaKeyObj)
       .toString('base64');
   } else {
     const nonce = crypto.randomBytes(32);
@@ -2298,14 +2352,41 @@ function normalizeLicensingMsaTicket(rawTicket) {
   return `t=${bare}`;
 }
 
-const DEFAULT_CLEP_HTTP_TIMEOUT_MS = 20_000;
+const DEFAULT_CLEP_HTTP_TIMEOUT_MS = XBOX_HTTP_TIMEOUT_MS;
 
 function createClepFetchSignal(outerSignal, timeoutMs = DEFAULT_CLEP_HTTP_TIMEOUT_MS) {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (outerSignal && typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([outerSignal, timeoutSignal]);
+  return buildXboxFetchSignal(outerSignal, timeoutMs);
+}
+
+function raceClepPromiseWithCallerSignal(sharedPromise, callerSignal) {
+  if (!callerSignal) return sharedPromise;
+  if (callerSignal.aborted) {
+    const err =
+      callerSignal.reason instanceof Error
+        ? callerSignal.reason
+        : Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    return Promise.reject(err);
   }
-  return outerSignal || timeoutSignal;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      const err =
+        callerSignal.reason instanceof Error
+          ? callerSignal.reason
+          : Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+      reject(err);
+    };
+    callerSignal.addEventListener('abort', onAbort, { once: true });
+    sharedPromise.then(
+      (val) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        reject(err);
+      }
+    );
+  });
 }
 
 function scrubPiiFromErrorText(rawMsg, maxLen = 140) {
@@ -2334,15 +2415,11 @@ function extractSafeSoapFaultSuffix(rawXml) {
   return safeCode ? `, code=${safeCode}` : '';
 }
 
-function makeCorrelationVector() {
-  return `${crypto.randomBytes(12).toString('base64').replace(/[+/=]/g, 'A').slice(0, 16)}.0`;
-}
-
 // ============================================================================
 // 4. Public Device Provisioning & Content CIK Acquisition API
 // ============================================================================
 
-let inFlightDeviceContextPromise = null;
+const inFlightDeviceContextByScope = new Map();
 
 /**
  * Provisions or refreshes a virtual Windows device (`deviceaddcredential.srf` -> `RST2.srf` ->
@@ -2437,8 +2514,19 @@ async function ensureDeviceLicenseContext(options = {}) {
     };
   }
 
-  if (inFlightDeviceContextPromise && !options.forceRefresh) {
-    return inFlightDeviceContextPromise;
+  const scopeKey = String(userDataDir || 'default');
+  if (inFlightDeviceContextByScope.has(scopeKey) && !options.forceRefresh) {
+    return raceClepPromiseWithCallerSignal(
+      inFlightDeviceContextByScope.get(scopeKey),
+      options.signal
+    );
+  }
+  if (options.signal?.aborted) {
+    const err =
+      options.signal.reason instanceof Error
+        ? options.signal.reason
+        : Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    throw err;
   }
 
   const run = (async () => {
@@ -2475,7 +2563,7 @@ async function ensureDeviceLicenseContext(options = {}) {
           'User-Agent': MSA_WINDOWS_USER_AGENT,
         },
         body: addXml,
-        signal: createClepFetchSignal(options.signal),
+        signal: createClepFetchSignal(undefined),
       });
 
       const addBody = await addRes.text();
@@ -2512,7 +2600,7 @@ async function ensureDeviceLicenseContext(options = {}) {
               mobileOperator: 'Public',
             },
           }),
-          signal: createClepFetchSignal(options.signal),
+          signal: createClepFetchSignal(undefined),
         });
         if (devLicRes.ok) {
           const devLicJson = await devLicRes.json();
@@ -2567,7 +2655,7 @@ async function ensureDeviceLicenseContext(options = {}) {
         'User-Agent': MSA_WINDOWS_USER_AGENT,
       },
       body: rstAuthXml,
-      signal: createClepFetchSignal(options.signal),
+      signal: createClepFetchSignal(undefined),
     });
 
     const rstAuthBody = await rstAuthRes.text();
@@ -2616,7 +2704,7 @@ async function ensureDeviceLicenseContext(options = {}) {
           'User-Agent': MSA_WINDOWS_USER_AGENT,
         },
         body: exXml,
-        signal: createClepFetchSignal(options.signal),
+        signal: createClepFetchSignal(undefined),
       });
 
       const exBody = await exRes.text();
@@ -2702,11 +2790,12 @@ async function ensureDeviceLicenseContext(options = {}) {
       clepRsaKeyPem,
     };
   })().finally(() => {
-    inFlightDeviceContextPromise = null;
+    inFlightDeviceContextByScope.delete(scopeKey);
   });
 
-  inFlightDeviceContextPromise = run;
-  return run;
+  inFlightDeviceContextByScope.set(scopeKey, run);
+  run.catch(() => {});
+  return raceClepPromiseWithCallerSignal(run, options.signal);
 }
 
 /**

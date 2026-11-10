@@ -371,9 +371,40 @@ function serializeWgsContainerBlobIndex(blobs = [], version = 4) {
 async function writeFileAtomic(targetPath, dataBuffer) {
   const hostTargetPath = toHostFilesystemPath(targetPath);
   await fs.promises.mkdir(path.dirname(hostTargetPath), { recursive: true });
-  const tmpPath = `${hostTargetPath}.tmp.${process.pid}.${Date.now()}`;
-  await fs.promises.writeFile(tmpPath, dataBuffer);
-  await fs.promises.rename(tmpPath, hostTargetPath);
+  const randHex = crypto.randomBytes(6).toString('hex');
+  const tmpPath = `${hostTargetPath}.tmp.${process.pid}.${Date.now()}.${randHex}`;
+  let fh = null;
+  try {
+    fh = await fs.promises.open(tmpPath, 'wx');
+    await fh.writeFile(dataBuffer);
+    await fh.datasync();
+    await fh.close();
+    fh = null;
+
+    const maxAttempts = process.platform === 'win32' ? 4 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await fs.promises.rename(tmpPath, hostTargetPath);
+        return;
+      } catch (renameErr) {
+        const code = renameErr?.code;
+        if (
+          attempt < maxAttempts &&
+          (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')
+        ) {
+          await new Promise((r) => setTimeout(r, 15 * attempt));
+          continue;
+        }
+        throw renameErr;
+      }
+    }
+  } catch (err) {
+    if (fh) {
+      await fh.close().catch(() => {});
+    }
+    await fs.promises.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,18 +1078,21 @@ function normalizeRemoteContainerItem(rawItem) {
   };
 }
 
-function parseRemoteAtomsMap(containerJson) {
+function parseRemoteAtomsMap(containerJson, options = {}) {
+  const validateOpts = options.allowedLoopbackOrigin
+    ? { allowedLoopbackOrigin: options.allowedLoopbackOrigin }
+    : undefined;
   const out = new Map();
   const atoms = containerJson?.atoms;
   if (Array.isArray(atoms)) {
     for (const item of atoms) {
       if (!item || !item.name) continue;
       if (item.blobUri) {
-        out.set(String(item.name), validateTitleStorageBlobUri(item.blobUri));
+        out.set(String(item.name), validateTitleStorageBlobUri(item.blobUri, validateOpts));
       } else if (item.atom) {
         const atomStr = String(item.atom);
         if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(atomStr)) {
-          out.set(String(item.name), validateTitleStorageBlobUri(atomStr));
+          out.set(String(item.name), validateTitleStorageBlobUri(atomStr, validateOpts));
         } else {
           out.set(String(item.name), /,binary$/i.test(atomStr) ? atomStr : `${atomStr},binary`);
         }
@@ -1068,11 +1102,11 @@ function parseRemoteAtomsMap(containerJson) {
     for (const [blobName, atomVal] of Object.entries(atoms)) {
       if (!atomVal) continue;
       if (typeof atomVal === 'object' && atomVal.blobUri) {
-        out.set(blobName, validateTitleStorageBlobUri(atomVal.blobUri));
+        out.set(blobName, validateTitleStorageBlobUri(atomVal.blobUri, validateOpts));
       } else {
         const atomStr = String(atomVal);
         if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(atomStr)) {
-          out.set(blobName, validateTitleStorageBlobUri(atomStr));
+          out.set(blobName, validateTitleStorageBlobUri(atomStr, validateOpts));
         } else {
           out.set(blobName, /,binary$/i.test(atomStr) ? atomStr : `${atomStr},binary`);
         }
@@ -1282,7 +1316,7 @@ function createTitleStorageClient(options = {}) {
           res
         );
       }
-      return parseRemoteAtomsMap(res.json());
+      return parseRemoteAtomsMap(res.json(), { allowedLoopbackOrigin });
     },
 
     async downloadAtom(atomId, signal) {
@@ -1587,11 +1621,50 @@ async function syncXboxTitleStorage(options = {}) {
   });
 
   let lockAcquired = Boolean(alreadyLocked);
+  let reacquiredExpiredSessionLock = false;
   let readOnlyFallback = false;
   let uploadedContainers = 0;
   let downloadedContainers = 0;
   let deletedRemoteContainers = 0;
-  let quotaBytes = 256 * 1024 * 1024;
+  let quotaBytes =
+    Number(options.quotaBytes) > 0 ? Number(options.quotaBytes) : 256 * 1024 * 1024;
+
+  const computeUsedBytes = (containersMap) => {
+    let total = 0;
+    for (const container of containersMap.values()) {
+      if (!container || !(container.blobs instanceof Map)) continue;
+      for (const blob of container.blobs.values()) {
+        const sz = Number(blob?.size);
+        if (Number.isFinite(sz) && sz > 0) {
+          total += sz;
+        } else if (Buffer.isBuffer(blob?.data)) {
+          total += blob.data.length;
+        }
+      }
+    }
+    return total;
+  };
+
+  const runWithSessionLockRecovery = async (writeFn) => {
+    try {
+      return await writeFn();
+    } catch (writeErr) {
+      if (
+        alreadyLocked &&
+        !reacquiredExpiredSessionLock &&
+        (writeErr?.status === 403 || writeErr?.status === 412)
+      ) {
+        reacquiredExpiredSessionLock = true;
+        const lockInfo = await client.acquireLock(signal);
+        lockAcquired = lockInfo.locked;
+        if (lockInfo.quotaBytes > 0) {
+          quotaBytes = lockInfo.quotaBytes;
+        }
+        return await writeFn();
+      }
+      throw writeErr;
+    }
+  };
 
   try {
     if (!lockAcquired) {
@@ -1648,7 +1721,7 @@ async function syncXboxTitleStorage(options = {}) {
           mergedContainers.delete(delName);
           continue;
         }
-        await client.deleteContainer(delName, signal);
+        await runWithSessionLockRecovery(() => client.deleteContainer(delName, signal));
         pendingDeletions.delete(delName);
         mergedContainers.delete(delName);
         deletedRemoteContainers += 1;
@@ -1762,30 +1835,32 @@ async function syncXboxTitleStorage(options = {}) {
         }
 
         try {
-          const atomsObject = {};
-          for (const [bName, blob] of container.blobs.entries()) {
-            let atomToken = blob.atom;
-            if (!atomToken) {
-              atomToken = await client.uploadAtom(blob.data, signal);
-              blob.atom = atomToken;
+          await runWithSessionLockRecovery(async () => {
+            const atomsObject = {};
+            for (const [bName, blob] of container.blobs.entries()) {
+              let atomToken = blob.atom;
+              if (!atomToken) {
+                atomToken = await client.uploadAtom(blob.data, signal);
+                blob.atom = atomToken;
+              }
+              atomsObject[bName] = atomToken;
             }
-            atomsObject[bName] = atomToken;
-          }
 
-          const isoNow = container.modifiedIso || new Date().toISOString();
-          await client.putContainerManifest(
-            cName,
-            {
-              displayName: container.displayName || cName,
-              clientFileTime: isoNow,
-              atomsObject,
-            },
-            signal
-          );
+            const isoNow = container.modifiedIso || new Date().toISOString();
+            await client.putContainerManifest(
+              cName,
+              {
+                displayName: container.displayName || cName,
+                clientFileTime: isoNow,
+                atomsObject,
+              },
+              signal
+            );
 
-          container.dirty = false;
-          container.stateFlags = 0;
-          container.remoteClientFileTime = isoNow;
+            container.dirty = false;
+            container.stateFlags = 0;
+            container.remoteClientFileTime = isoNow;
+          });
           uploadedContainers += 1;
         } catch (uploadErr) {
           if (!firstUploadError) firstUploadError = uploadErr;
@@ -1821,6 +1896,9 @@ async function syncXboxTitleStorage(options = {}) {
       lockAcquired = false;
     }
 
+    const usedBytes = computeUsedBytes(mergedContainers);
+    const remainingQuotaBytes = Math.max(0, quotaBytes - usedBytes);
+
     if (readOnlyFallback) {
       return {
         synced: true,
@@ -1829,6 +1907,8 @@ async function syncXboxTitleStorage(options = {}) {
         resolvedScid: normalizedScid,
         resolvedWgsUserDir: wgsUserDir,
         quotaBytes,
+        usedBytes,
+        remainingQuotaBytes,
         downloadedContainers,
         uploadedContainers: 0,
         deletedRemoteContainers: 0,
@@ -1843,6 +1923,8 @@ async function syncXboxTitleStorage(options = {}) {
       resolvedScid: normalizedScid,
       resolvedWgsUserDir: wgsUserDir,
       quotaBytes,
+      usedBytes,
+      remainingQuotaBytes,
       downloadedContainers,
       uploadedContainers,
       deletedRemoteContainers,
@@ -1855,6 +1937,14 @@ async function syncXboxTitleStorage(options = {}) {
     }
     throw err;
   }
+}
+
+async function releaseXboxTitleStorageSessionLock(options = {}) {
+  const { xuid, scid } = options;
+  if (!xuid || !scid) return false;
+  const client = createTitleStorageClient(options);
+  await client.releaseLock(Boolean(options.hadWrites), options.signal);
+  return true;
 }
 
 module.exports = {
@@ -1886,4 +1976,5 @@ module.exports = {
   importXgsFolderIntoWgs,
   createTitleStorageClient,
   syncXboxTitleStorage,
+  releaseXboxTitleStorageSessionLock,
 };

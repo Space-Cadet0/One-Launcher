@@ -36,6 +36,13 @@ typedef enum ds_aspect_mode_e {
     DS_ASPECT_STRETCH  = 2
 } ds_aspect_mode_t;
 
+typedef enum ds_scale_filter_e {
+    DS_FILTER_AUTO    = 0,
+    DS_FILTER_SHARP   = 1,
+    DS_FILTER_LINEAR  = 2,
+    DS_FILTER_NEAREST = 3
+} ds_scale_filter_t;
+
 typedef struct ds_viewport_s {
     int32_t usable_x;
     int32_t usable_y;
@@ -75,6 +82,20 @@ typedef struct ds_control_state_s {
     bool              fullscreen;
     bool              has_aspect;
     ds_aspect_mode_t  aspect;
+    bool              has_safe_inset_top;
+    int32_t           safe_inset_top;
+    bool              has_filter;
+    ds_scale_filter_t filter;
+    bool              has_scaling_mode;
+    ds_scaling_mode_t scaling_mode;
+    bool              has_hotkey;
+    bool              hotkey;
+    bool              has_updated_unix_ms;
+    uint64_t          updated_unix_ms;
+    bool              has_control_file;
+    char              control_file[520];
+    bool              has_status_file;
+    char              status_file[520];
 } ds_control_state_t;
 
 /* Environment & configuration string helpers */
@@ -82,6 +103,8 @@ ds_scaling_mode_t ds_parse_scaling_mode(const char *value);
 ds_aspect_mode_t  ds_parse_aspect_mode(const char *value);
 const char       *ds_aspect_mode_to_string(ds_aspect_mode_t mode);
 ds_aspect_mode_t  ds_cycle_aspect_mode(ds_aspect_mode_t current);
+ds_scale_filter_t ds_parse_scale_filter(const char *value);
+const char       *ds_scale_filter_to_string(ds_scale_filter_t filter);
 
 /* Clamps top safe-area notch inset so 0 <= safe_top < screen_h / 4 (0 when screen_h < 4) */
 int32_t ds_clamp_safe_inset_top(int32_t safe_inset_top, int32_t screen_h);
@@ -97,7 +120,7 @@ bool ds_compute_viewport(
     ds_viewport_t   *out_vp
 );
 
-/* Synthesizes deduplicated, sorted 16-bpp & 32-bpp display mode table (strictly <= 40 entries) */
+/* Synthesizes deduplicated, sorted 16-bpp & 32-bpp display mode table (strictly <= DS_MAX_SYNTH_MODES entries) */
 size_t ds_build_mode_table(
     int32_t            native_w,
     int32_t            native_h,
@@ -184,6 +207,21 @@ bool ds_map_subrect_virt_to_phys(
 
 /* Live control INI file parser (`seq=...`, `fullscreen=0|1`, `aspect=...`) */
 bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_state);
+
+/*
+ * Canonical monotonic version key for `active_session.ini` shared between `DllMain`
+ * initialization and `ds_poll_active_session_if_needed` hot-updates. Prefers
+ * `updated_unix_ms` (strictly monotonic across both intra-session toggles and
+ * consecutive game launches where `seq` resets to 1) with fallback to `seq`.
+ */
+static inline uint64_t ds_effective_active_session_seq(const ds_control_state_t *ctl)
+{
+    if (!ctl) return 0ULL;
+    if (ctl->has_updated_unix_ms && ctl->updated_unix_ms > 0ULL) {
+        return ctl->updated_unix_ms;
+    }
+    return ctl->has_seq ? ctl->seq : 1ULL;
+}
 
 #ifdef __cplusplus
 }

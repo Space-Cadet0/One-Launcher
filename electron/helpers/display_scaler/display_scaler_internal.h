@@ -55,6 +55,35 @@
 #define GL_PIXEL_UNPACK_BUFFER_BINDING     0x88EF
 #endif
 
+#ifndef GL_COLOR_WRITEMASK
+#define GL_COLOR_WRITEMASK                 0x0C23
+#endif
+#ifndef GL_FRAMEBUFFER_SRGB
+#define GL_FRAMEBUFFER_SRGB                0x8DB9
+#endif
+
+#ifndef WM_MOUSEHWHEEL
+#define WM_MOUSEHWHEEL                     0x020E
+#endif
+#ifndef RID_INPUT
+#define RID_INPUT                          0x10000003
+#endif
+#ifndef RIM_TYPEMOUSE
+#define RIM_TYPEMOUSE                      0
+#endif
+#ifndef MOUSE_MOVE_ABSOLUTE
+#define MOUSE_MOVE_ABSOLUTE                1
+#endif
+#ifndef MOUSE_VIRTUAL_DESKTOP
+#define MOUSE_VIRTUAL_DESKTOP              0x02
+#endif
+#ifndef RIDEV_NOLEGACY
+#define RIDEV_NOLEGACY                     0x00000030
+#endif
+#ifndef RIDEV_CAPTUREMOUSE
+#define RIDEV_CAPTUREMOUSE                 0x00000200
+#endif
+
 /* Win32 function pointer typedefs */
 typedef HMODULE (WINAPI *pfn_LoadLibraryA_t)(LPCSTR);
 typedef HMODULE (WINAPI *pfn_LoadLibraryW_t)(LPCWSTR);
@@ -102,6 +131,10 @@ typedef BOOL (WINAPI *pfn_GetCursorPos_t)(LPPOINT);
 typedef BOOL (WINAPI *pfn_SetCursorPos_t)(int, int);
 typedef BOOL (WINAPI *pfn_ClipCursor_t)(const RECT *);
 typedef BOOL (WINAPI *pfn_GetClipCursor_t)(LPRECT);
+typedef DWORD (WINAPI *pfn_GetMessagePos_t)(void);
+typedef UINT (WINAPI *pfn_GetRawInputData_t)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+typedef UINT (WINAPI *pfn_GetRawInputBuffer_t)(PRAWINPUT, PUINT, UINT);
+typedef BOOL (WINAPI *pfn_RegisterRawInputDevices_t)(PCRAWINPUTDEVICE, UINT, UINT);
 typedef BOOL (WINAPI *pfn_ScreenToClient_t)(HWND, LPPOINT);
 typedef BOOL (WINAPI *pfn_ClientToScreen_t)(HWND, LPPOINT);
 typedef int  (WINAPI *pfn_MapWindowPoints_t)(HWND, HWND, LPPOINT, UINT);
@@ -134,6 +167,7 @@ typedef PROC  (WINAPI *pfn_wglGetProcAddress_t)(LPCSTR);
 typedef void  (APIENTRY *pfn_glBindFramebuffer_t)(GLenum, GLuint);
 typedef void  (APIENTRY *pfn_glDrawBuffer_t)(GLenum);
 typedef void  (APIENTRY *pfn_glReadBuffer_t)(GLenum);
+typedef void  (APIENTRY *pfn_glGetIntegerv_t)(GLenum, GLint *);
 
 /*
  * Wine `win32u` / `wined3d` private `D3DKMTEscape` command (`0x80000001`):
@@ -167,9 +201,12 @@ typedef struct ds_runtime_s {
 
     ds_scaling_mode_t   scaling_mode;
     ds_aspect_mode_t    aspect_mode;
+    ds_scale_filter_t   scale_filter;
     int32_t             safe_inset_top;
     bool                hotkey_enabled;
 
+    WCHAR               self_dir[MAX_PATH];
+    WCHAR               active_session_file[MAX_PATH];
     WCHAR               dll_x86[MAX_PATH];
     WCHAR               dll_x64[MAX_PATH];
     WCHAR               launcher_x86[MAX_PATH];
@@ -178,6 +215,7 @@ typedef struct ds_runtime_s {
     WCHAR               status_file[MAX_PATH];
     WCHAR               trace_file[MAX_PATH];
     uint64_t            last_control_seq;
+    uint64_t            last_active_session_seq;
     uint64_t            status_seq;
 
     int32_t             real_screen_w;
@@ -193,11 +231,16 @@ typedef struct ds_runtime_s {
     bool                mode_virtualized;
     bool                fullscreen_active;
     bool                user_forced_windowed;
+    bool                user_forced_fullscreen;
     bool                is_wine;
     bool                wined3d_uses_gl;
+    bool                game_gl_active;
     bool                legacy_d3d_loaded;
     bool                ddraw_loaded;
     bool                d3d8_or_9_loaded;
+    bool                modern_gfx_loaded;
+    bool                modern_swapchain_passthrough;
+    bool                dpi_aware_applied;
     int32_t             virt_w;
     int32_t             virt_h;
     int32_t             virt_bpp;
@@ -210,6 +253,8 @@ typedef struct ds_runtime_s {
     bool                orig_wndproc_unicode;
     bool                has_saved_window_state;
     bool                has_saved_class_bg;
+    bool                has_saved_hmenu;
+    HMENU               saved_hmenu;
     LONG_PTR            saved_class_bg;
     LONG_PTR            saved_style;
     LONG_PTR            saved_exstyle;
@@ -220,6 +265,8 @@ typedef struct ds_runtime_s {
     HWND                hwnd_gl_host;
     bool                gl_host_visible;
     bool                gl_host_want_visible;
+    volatile LONG       gl_host_hide_queued;
+    volatile LONG       gdi_margin_gen;
     bool                cocoa_fs_synced;
     bool                app_inactive;
     bool                visible_resync_needed;
@@ -228,12 +275,14 @@ typedef struct ds_runtime_s {
     DWORD               first_visible_tick;
     UINT                msg_apply_presentation;
     UINT                msg_gl_host_ctl;
+    INIT_ONCE           watcher_once;
     HANDLE              watcher_thread;
     HANDLE              stop_event;
 
     ds_cursor_warp_state_t warp;
     bool                has_virtual_clip;
     RECT                virtual_clip_rect;
+    bool                raw_mouse_nolegacy;
 
     /* Real unhooked Win32 pointers */
     pfn_LoadLibraryA_t            real_LoadLibraryA;
@@ -282,6 +331,10 @@ typedef struct ds_runtime_s {
     pfn_SetCursorPos_t            real_SetCursorPos;
     pfn_ClipCursor_t              real_ClipCursor;
     pfn_GetClipCursor_t           real_GetClipCursor;
+    pfn_GetMessagePos_t           real_GetMessagePos;
+    pfn_GetRawInputData_t         real_GetRawInputData;
+    pfn_GetRawInputBuffer_t       real_GetRawInputBuffer;
+    pfn_RegisterRawInputDevices_t real_RegisterRawInputDevices;
     pfn_ScreenToClient_t          real_ScreenToClient;
     pfn_ClientToScreen_t          real_ClientToScreen;
     pfn_MapWindowPoints_t         real_MapWindowPoints;
@@ -315,6 +368,7 @@ typedef struct ds_runtime_s {
     pfn_wglGetProcAddress_t       real_wglGetProcAddress;
     pfn_glDrawBuffer_t            real_glDrawBuffer;
     pfn_glReadBuffer_t            real_glReadBuffer;
+    pfn_glGetIntegerv_t           real_glGetIntegerv;
 } ds_runtime_t;
 
 extern ds_runtime_t g_ds;
@@ -329,6 +383,19 @@ static inline bool ds_prefer_16bpp_ddraw(void)
     return g_ds.ddraw_loaded && !g_ds.d3d8_or_9_loaded;
 }
 
+static inline bool ds_is_passthrough_locked(void)
+{
+    if (g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
+        return true;
+    }
+    if (g_ds.scaling_mode == DS_MODE_AUTO_FULLSCREEN &&
+        g_ds.modern_swapchain_passthrough &&
+        !g_ds.user_forced_fullscreen) {
+        return true;
+    }
+    return false;
+}
+
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
 bool ds_is_internal_call(void);
 void ds_enter_internal(void);
@@ -340,6 +407,9 @@ bool ds_is_wined3d_caller(const void *ret_addr);
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr);
 void ds_patch_loaded_modules(void);
 void ds_refresh_viewport_locked(void);
+void ds_refresh_host_display_metrics(void);
+void ds_ensure_runtime_started(void);
+void ds_notify_gl_context_active_locked(void);
 int32_t ds_get_windowed_scale_locked(void);
 void ds_clear_wine_present_rect_on_hwnd(HWND hwnd);
 void ds_tracef(const char *fmt, ...);
@@ -363,7 +433,7 @@ void ds_ensure_fullscreen_styles_on_owner_thread(HWND hwnd);
 void ds_apply_window_presentation_on_owner_thread(HWND hwnd);
 void ds_write_status_file(void);
 void ds_start_control_watcher(void);
-void ds_stop_control_watcher(void);
+void ds_stop_control_watcher(bool process_terminating);
 void ds_reapply_cursor_clip_locked(void);
 
 /* OpenGL FBO, GDI 2D & WineD3D GL drawable upscaler hooks (`display_scaler_gl_gdi.c`) */
@@ -400,5 +470,6 @@ BOOL    WINAPI hook_wglSwapBuffers(HDC hdc);
 PROC    WINAPI hook_wglGetProcAddress(LPCSTR lpszProc);
 void    APIENTRY hook_glDrawBuffer(GLenum mode);
 void    APIENTRY hook_glReadBuffer(GLenum mode);
+void    APIENTRY hook_glGetIntegerv(GLenum pname, GLint *data);
 
 #endif /* ONE_LAUNCHER_DISPLAY_SCALER_INTERNAL_H */

@@ -268,9 +268,35 @@ export function hasUncheckedSteamBrowseAssets(appId: number): boolean {
   return !steamApi.getStoreBrowseAssetsInstant(appId)?.capsuleImage;
 }
 
-export const globalAttemptedCoverLookups = new Set<string>();
-const resolvedCandidateIndexCache = new Map<string, number>();
-export const failedCoverUrls = new Set<string>();
+export const MAX_COVER_SET_ENTRIES = 8192;
+
+class BoundedStringSet extends Set<string> {
+  private readonly maxEntries: number;
+
+  constructor(maxEntries: number) {
+    super();
+    this.maxEntries = maxEntries;
+  }
+
+  override add(value: string): this {
+    if (this.has(value)) {
+      return this;
+    }
+    if (this.maxEntries > 0) {
+      while (this.size >= this.maxEntries) {
+        const oldest = this.values().next().value;
+        if (oldest === undefined) break;
+        this.delete(oldest);
+      }
+    }
+    return super.add(value);
+  }
+}
+
+export const globalAttemptedCoverLookups: Set<string> = new BoundedStringSet(
+  MAX_COVER_SET_ENTRIES
+);
+export const failedCoverUrls: Set<string> = new BoundedStringSet(MAX_COVER_SET_ENTRIES);
 
 export function clearAttemptedCoverLookups(): void {
   globalAttemptedCoverLookups.clear();
@@ -278,7 +304,6 @@ export function clearAttemptedCoverLookups(): void {
 
 export function clearFailedCoverUrls(gameId?: string): void {
   failedCoverUrls.clear();
-  resolvedCandidateIndexCache.clear();
   if (gameId) {
     globalAttemptedCoverLookups.delete(gameId);
     for (const key of Array.from(globalAttemptedCoverLookups)) {

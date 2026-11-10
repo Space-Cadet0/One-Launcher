@@ -18,8 +18,19 @@ import {
   updateRoutedMetadataSnapshot,
 } from '../storage/userOverrideStorage';
 import { getSteamCategoryIconUrl } from './steamApi';
-import { sanitizeStoreReleaseDate } from '../common/titleUtils';
+import {
+  isSequelMismatch,
+  normalizeTitleKey,
+  sanitizeStoreReleaseDate,
+  stripEditionSuffix,
+} from '../common/titleUtils';
 import { escapeHtml, sanitizeStoreHtml } from '../common/htmlSanitizer';
+import {
+  extractFirstParagraph,
+  stripHtmlToPlainSynopsis,
+} from '../common/synopsisTextUtils';
+
+export { extractFirstParagraph, stripHtmlToPlainSynopsis };
 import { requestScheduler, Priority, RequestPriority } from '../network/requestScheduler';
 import gogEnrichedCache from '../storage/gogEnrichedCache.json';
 
@@ -205,6 +216,24 @@ interface RawMediaMovieItem {
   webm?: { '480'?: string; max?: string };
 }
 
+interface NormalizedEpicIpcPayload {
+  title?: string;
+  shortDescription?: string;
+  detailedDescription?: string;
+  aboutTheGame?: string;
+  headerImage?: string;
+  capsuleImage?: string;
+  releaseDate?: string;
+  developers?: string[];
+  publishers?: string[];
+  screenshots?: Array<string | RawMediaScreenshotItem>;
+  movies?: RawMediaMovieItem[];
+  supportedLanguages?: string | string[];
+  languages?: string | string[];
+  systemRequirements?: { minimum?: string; recommended?: string };
+  namespace?: string;
+}
+
 interface NormalizedXboxIpcPayload {
   title?: string;
   name?: string;
@@ -257,7 +286,6 @@ function ensureHttps(url?: string): string {
 
 const MAX_SYNOPSIS_MEMO_ENTRIES = 4096;
 const MAX_SYNOPSIS_MEMO_INPUT_LEN = 16_384;
-const plainSynopsisMemo = new Map<string, string>();
 const storeBoilerplateMemo = new Map<string, string>();
 const genericPlaceholderSynopsisMemo = new Map<string, boolean>();
 const cleanGogHtmlMemo = new Map<string, string>();
@@ -278,97 +306,6 @@ function lruSet<V>(cache: Map<string, V>, key: string, value: V): V {
   }
   cache.set(key, value);
   return value;
-}
-
-export function stripHtmlToPlainSynopsis(rawText?: string, maxLength = 320): string {
-  if (!rawText || typeof rawText !== 'string') return '';
-  const canMemo = rawText.length <= MAX_SYNOPSIS_MEMO_INPUT_LEN;
-  const memoKey = canMemo ? `${maxLength}\u0000${rawText}` : '';
-  if (canMemo) {
-    const hit = lruGet(plainSynopsisMemo, memoKey);
-    if (hit !== undefined) return hit;
-  }
-
-  const clean = rawText
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/product_(?:description|feature)_\d+/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(?:p|div|li|h[1-6]|tr|blockquote|section|article)>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\[\/?(?:b|i|u|url|quote|img|h[1-6]|list|code|spoiler|\*)[^\]]*\]/gi, '')
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/&quot;/gi, '"')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&mdash;/gi, '—')
-    .replace(/&ndash;/gi, '–')
-    .replace(/&rsquo;|&lsquo;/gi, "'")
-    .replace(/&rdquo;|&ldquo;/gi, '"')
-    .replace(/&trade;/gi, '™')
-    .replace(/&reg;/gi, '®')
-    .replace(/&copy;/gi, '©')
-    .replace(/&#(\d+);/g, (_, dec) => {
-      const code = parseInt(dec, 10);
-      return !isNaN(code) ? String.fromCharCode(code) : '';
-    })
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
-      const code = parseInt(hex, 16);
-      return !isNaN(code) ? String.fromCharCode(code) : '';
-    })
-    .trim();
-
-  if (!clean) {
-    return canMemo ? lruSet(plainSynopsisMemo, memoKey, '') : '';
-  }
-
-  const paragraphs = clean
-    .split(/\r?\n+/)
-    .map((p) =>
-      p
-        .replace(/^#{1,6}\s+/, '')
-        .replace(/\*\*(.+?)\*\*/g, '$1')
-        .replace(/__(.+?)__/g, '$1')
-        .replace(/\s+/g, ' ')
-        .trim()
-    )
-    .filter((p) => p.length > 0);
-  if (paragraphs.length === 0) {
-    return canMemo ? lruSet(plainSynopsisMemo, memoKey, '') : '';
-  }
-
-  while (
-    paragraphs.length > 1 &&
-    ((paragraphs[0].length < 40 &&
-      /^(about(?:\s+the\s+game|\s+this\s+game)?|overview|story|description|features|synopsis|summary|key\s+features)\b[:.\s-]*$/i.test(
-        paragraphs[0]
-      )) ||
-      /when you buy this game\b|will be added to your gog\.com account/i.test(paragraphs[0]))
-  ) {
-    paragraphs.shift();
-  }
-
-  let firstPara = paragraphs[0];
-
-  if (maxLength > 0 && firstPara.length > maxLength) {
-    const truncated = firstPara.substring(0, maxLength);
-    const lastSpace = truncated.lastIndexOf(' ');
-    if (lastSpace > maxLength * 0.7) {
-      firstPara = truncated.substring(0, lastSpace).trim() + '...';
-    } else {
-      firstPara = truncated.trim() + '...';
-    }
-  }
-  const result = firstPara.trim();
-  return canMemo ? lruSet(plainSynopsisMemo, memoKey, result) : result;
-}
-
-export function extractFirstParagraph(rawText?: string, maxLength = 260): string | null {
-  const result = stripHtmlToPlainSynopsis(rawText, maxLength);
-  return result || null;
 }
 
 export function stripStoreBoilerplate(plain: string): string {
@@ -944,28 +881,45 @@ export class FallbackMetadataProvider {
         let catProd: GogCatalogProduct | null = null;
         if (lookupTitle || purchaseSlug) {
           try {
-            const q = lookupTitle || purchaseSlug || '';
-            const catUrl = `${this.getGogCatalogBaseUrl()}/v1/catalog?query=${encodeURIComponent(q)}&limit=5&productType=in:game,pack`;
+            const q = (lookupTitle || purchaseSlug || '').replace(/^like:/i, '').trim();
+            const likeParam = encodeURIComponent(`like:${q}`);
+            const catUrl = `${this.getGogCatalogBaseUrl()}/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`;
             const catRes = await requestScheduler.schedule(
-              `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(q)}&limit=5&productType=in:game,pack`,
-              () => axios.get<{ products?: GogCatalogProduct[] }>(catUrl, { timeout: 6000 }),
+              `https://catalog.gog.com/v1/catalog?query=${likeParam}&limit=5&productType=in:game,pack`,
+              () =>
+                axios.get<{ productCount?: number; products?: GogCatalogProduct[] }>(catUrl, {
+                  timeout: 6000,
+                }),
               effectivePriority,
               'catalog.gog.com',
               gogGameKey
             );
-            const products = Array.isArray(catRes.data?.products) ? catRes.data.products : [];
-            const normLookup = lookupTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const hasZeroMatches =
+              typeof catRes.data?.productCount === 'number' && catRes.data.productCount <= 0;
+            const rawProducts =
+              !hasZeroMatches && Array.isArray(catRes.data?.products) ? catRes.data.products : [];
+            const isQaSandboxProduct = (p?: GogCatalogProduct | null): boolean => {
+              if (!p) return true;
+              const orgs = [...(p.developers || []), ...(p.publishers || [])];
+              return orgs.some((name) => /^test\s+(?:developer|publisher)$/i.test(String(name || '').trim()));
+            };
+            const products = rawProducts.filter((p) => !isQaSandboxProduct(p));
+            const normLookup = normalizeTitleKey(lookupTitle);
+            const normBaseLookup = normalizeTitleKey(stripEditionSuffix(lookupTitle));
+            const isCorroboratedCatalogCandidate = (p?: GogCatalogProduct | null): boolean => {
+              if (!p?.title || !normLookup) return false;
+              const candNorm = normalizeTitleKey(p.title);
+              if (!candNorm) return false;
+              if (candNorm === normLookup) return true;
+              const candBase = normalizeTitleKey(stripEditionSuffix(p.title));
+              if (normBaseLookup && candBase === normBaseLookup && !isSequelMismatch(lookupTitle, p.title)) {
+                return true;
+              }
+              return false;
+            };
             catProd =
               (purchaseSlug ? products.find((p) => p?.slug === purchaseSlug) || null : null) ||
-              (normLookup
-                ? products.find(
-                    (p) =>
-                      String(p?.title || '')
-                        .toLowerCase()
-                        .replace(/[^a-z0-9]/g, '') === normLookup
-                  ) || null
-                : null) ||
-              products[0] ||
+              products.find((p) => isCorroboratedCatalogCandidate(p)) ||
               null;
           } catch (catErr: unknown) {
             console.warn(
@@ -1214,13 +1168,14 @@ export class FallbackMetadataProvider {
     // Step 1: Official Epic Catalog Offers API via Electron IPC Bridge
     if (typeof window !== 'undefined' && window.electronAPI?.fetchEpicProductMetadata) {
       try {
-        const ipcData = await window.electronAPI.fetchEpicProductMetadata({
+        const rawEpicIpc = await window.electronAPI.fetchEpicProductMetadata({
           slug: slugOrTitle,
           appName: options?.appName || slugOrTitle,
           namespace: options?.namespace,
           catalogItemId: options?.catalogItemId,
           title: options?.title || slugOrTitle,
         });
+        const ipcData = rawEpicIpc as NormalizedEpicIpcPayload | null;
 
         if (
           ipcData &&

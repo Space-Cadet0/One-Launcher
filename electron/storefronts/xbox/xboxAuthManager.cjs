@@ -17,6 +17,80 @@
 
 const crypto = require('node:crypto');
 const xboxDeviceClep = require('./xboxDeviceClep.cjs');
+const {
+  XBOX_HTTP_TIMEOUT_MS,
+  buildXboxFetchSignal,
+  resolveDefaultXboxLocale,
+  extractSafeCorrelationId,
+} = require('./xboxConfigAndIds.cjs');
+
+const MAX_PARSED_EC_PRIVATE_KEYS = 32;
+const parsedEcPrivateKeyCache = new Map();
+
+function getCachedEcPrivateKeyObject(ecPrivateKey) {
+  if (!ecPrivateKey) {
+    throw new Error('signXboxRequest requires ecPrivateKey');
+  }
+  if (typeof ecPrivateKey === 'object' && !Buffer.isBuffer(ecPrivateKey)) {
+    return ecPrivateKey;
+  }
+  const cacheKey = Buffer.isBuffer(ecPrivateKey) ? ecPrivateKey.toString('utf8') : String(ecPrivateKey);
+  const hit = parsedEcPrivateKeyCache.get(cacheKey);
+  if (hit) {
+    parsedEcPrivateKeyCache.delete(cacheKey);
+    parsedEcPrivateKeyCache.set(cacheKey, hit);
+    return hit;
+  }
+  const parsed = crypto.createPrivateKey(cacheKey);
+  if (parsedEcPrivateKeyCache.size >= MAX_PARSED_EC_PRIVATE_KEYS) {
+    const oldest = parsedEcPrivateKeyCache.keys().next().value;
+    if (oldest !== undefined) parsedEcPrivateKeyCache.delete(oldest);
+  }
+  parsedEcPrivateKeyCache.set(cacheKey, parsed);
+  return parsed;
+}
+
+function createAbortError(reason) {
+  if (reason instanceof Error) return reason;
+  const err = new Error(
+    typeof reason === 'string' && reason ? reason : 'The operation was aborted'
+  );
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
+ * Isolates a shared single-flight network promise from an individual caller's `AbortSignal`
+ * so one impatient caller aborting its `AbortController` rejects only that caller without
+ * poisoning sibling callers awaiting the same in-flight refresh (Finding #13).
+ *
+ * @template T
+ * @param {Promise<T>} sharedPromise
+ * @param {AbortSignal} [callerSignal]
+ * @returns {Promise<T>}
+ */
+function racePromiseWithCallerSignal(sharedPromise, callerSignal) {
+  if (!callerSignal) return sharedPromise;
+  if (callerSignal.aborted) {
+    return Promise.reject(createAbortError(callerSignal.reason));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(createAbortError(callerSignal.reason));
+    };
+    callerSignal.addEventListener('abort', onAbort, { once: true });
+    sharedPromise.then(
+      (val) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        reject(err);
+      }
+    );
+  });
+}
 
 const XBOX_LIVESDK_CLIENT_ID = '00000000402b5328';
 const XBOX_TOKEN_BROKER_CLIENT_ID = '000000004424da1f';
@@ -65,7 +139,6 @@ const MC_LOGIN_WITH_XBOX_URL = 'https://api.minecraftservices.com/authentication
 const MC_ENTITLEMENTS_URL = 'https://api.minecraftservices.com/entitlements/mcstore';
 const MC_PROFILE_URL = 'https://api.minecraftservices.com/minecraft/profile';
 
-const XBOX_HTTP_TIMEOUT_MS = 20_000;
 const MINECRAFT_ENTITLEMENT_CACHE_TTL_MS = 30 * 60_000; // 30 minutes
 
 // Windows FILETIME epoch delta: milliseconds between 1601-01-01T00:00:00Z and 1970-01-01T00:00:00Z
@@ -82,59 +155,8 @@ const XSTS_RELYING_PARTIES = Object.freeze({
   PLAYFAB: 'https://playfabapi.com/',
 });
 
-/**
- * Composes `AbortSignal.timeout(20_000)` with an optional caller `AbortSignal`.
- *
- * @param {AbortSignal} [callerSignal]
- * @param {number} [timeoutMs]
- * @returns {AbortSignal}
- */
-function buildXboxFetchSignal(callerSignal, timeoutMs = XBOX_HTTP_TIMEOUT_MS) {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (callerSignal && typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([callerSignal, timeoutSignal]);
-  }
-  return callerSignal || timeoutSignal;
-}
-
-/**
- * Extracts only the `MS-CV` / correlation vector header from an HTTP response for safe diagnostics
- * without ever logging or rethrowing raw HTTP error bodies.
- *
- * @param {any} res
- * @returns {string}
- */
-function extractSafeCorrelationId(res) {
-  if (!res || !res.headers) return 'none';
-  if (typeof res.headers.get === 'function') {
-    const val =
-      res.headers.get('ms-cv') ||
-      res.headers.get('MS-CV') ||
-      res.headers.get('x-correlation-id') ||
-      '';
-    return val ? String(val).slice(0, 96) : 'none';
-  }
-  const objVal = res.headers['ms-cv'] || res.headers['MS-CV'] || '';
-  return objVal ? String(objVal).slice(0, 96) : 'none';
-}
-
 function resolveDefaultAuthLocale(explicitLocale) {
-  if (typeof explicitLocale === 'string' && explicitLocale.trim()) {
-    return explicitLocale.trim();
-  }
-  try {
-    const reqElectron = require('electron');
-    const loc = reqElectron?.app?.getLocale?.();
-    if (typeof loc === 'string' && loc.trim()) {
-      const trimmed = loc.trim();
-      if (trimmed.includes('-')) return trimmed;
-      const country = String(reqElectron?.app?.getLocaleCountryCode?.() || '').trim().toUpperCase();
-      if (/^[a-z]{2}$/i.test(trimmed) && /^[A-Z]{2}$/.test(country)) {
-        return `${trimmed.toLowerCase()}-${country}`;
-      }
-    }
-  } catch {}
-  return 'en-US';
+  return resolveDefaultXboxLocale(explicitLocale);
 }
 
 /**
@@ -471,10 +493,7 @@ function signXboxRequest(params = /** @type {any} */ ({})) {
     windowsTicks,
   });
 
-  const keyObj =
-    typeof ecPrivateKey === 'string' || Buffer.isBuffer(ecPrivateKey)
-      ? crypto.createPrivateKey(ecPrivateKey)
-      : ecPrivateKey;
+  const keyObj = getCachedEcPrivateKeyObject(ecPrivateKey);
 
   const rawRS64 = crypto.sign('sha256', toSign, {
     key: keyObj,
@@ -1090,6 +1109,7 @@ function isFutureIsoTimestamp(isoStr, bufferMs = 10 * 60_000) {
 
 // Shared per-vault single-flight locks so multiple provider instances never race refresh_token rotation
 const globalInFlightMsaRenewals = new Map();
+const globalInFlightXblUserTokens = new Map();
 const globalInFlightXblSessionRenewals = new Map();
 
 // Shared 30-minute Minecraft Java entitlement cache keyed by SHA-256(account/token)
@@ -1115,15 +1135,35 @@ function createXboxAuthProvider(config = {}) {
 
   // Ephemeral session cache for secondary Relying Party XSTS tokens, device tokens, SISU title tokens, and endpoints
   const rpXstsCache = new Map();
+  const inFlightRpXsts = new Map();
   const xblDeviceTokenCache = new Map();
+  const inFlightDeviceTokens = new Map();
   const sisuSessionCache = new Map();
+  const inFlightSisuSessions = new Map();
   const titleAuthSessionCache = new Map();
   const inFlightTitleAuthSessions = new Map();
   let cachedDefaultTitleEndpoints = null;
+  let inFlightDefaultTitleEndpoints = null;
   const cachedPerTitleEndpoints = new Map();
+  const inFlightPerTitleEndpoints = new Map();
+  let cachedProofRecord = null;
   let pendingOAuthState = null;
 
   const vaultOpts = userDataDir ? { userDataDir } : {};
+
+  if (typeof vault.onVaultChange === 'function') {
+    vault.onVaultChange(({ storefrontId }) => {
+      if (!storefrontId || storefrontId === 'xbox') {
+        rpXstsCache.clear();
+        xblDeviceTokenCache.clear();
+        sisuSessionCache.clear();
+        titleAuthSessionCache.clear();
+        cachedPerTitleEndpoints.clear();
+        cachedDefaultTitleEndpoints = null;
+        cachedProofRecord = null;
+      }
+    });
+  }
 
   const loadXboxVaultRecord = () => {
     const all = vault.loadSavedTokens(vaultOpts) || {};
@@ -1164,20 +1204,37 @@ function createXboxAuthProvider(config = {}) {
     rpXstsCache.delete(buildRpXstsCacheKey(relyingParty, sandboxId, subjectType));
   };
 
-  const ensureProofKeyRecord = () => {
-    const current = loadXboxVaultRecord();
+  const ensureProofKeyRecord = (optionalLoadedSaved) => {
+    const current =
+      optionalLoadedSaved && typeof optionalLoadedSaved === 'object'
+        ? optionalLoadedSaved
+        : cachedProofRecord
+          ? null
+          : loadXboxVaultRecord();
+
     if (
-      current.proofPrivateKeyPem &&
-      current.proofPublicKeyPem &&
-      current.proofKeyJwk &&
-      current.proofKeyJwk.x &&
-      current.proofKeyJwk.y
+      cachedProofRecord &&
+      (!current || !current.proofPrivateKeyPem || current.proofPrivateKeyPem === cachedProofRecord.privateKeyPem)
     ) {
-      return {
-        privateKeyPem: current.proofPrivateKeyPem,
-        publicKeyPem: current.proofPublicKeyPem,
-        proofKeyJwk: current.proofKeyJwk,
+      return cachedProofRecord;
+    }
+
+    const effectiveCurrent = current || loadXboxVaultRecord();
+    if (
+      effectiveCurrent.proofPrivateKeyPem &&
+      effectiveCurrent.proofPublicKeyPem &&
+      effectiveCurrent.proofKeyJwk &&
+      effectiveCurrent.proofKeyJwk.x &&
+      effectiveCurrent.proofKeyJwk.y
+    ) {
+      const privateKeyObj = getCachedEcPrivateKeyObject(effectiveCurrent.proofPrivateKeyPem);
+      cachedProofRecord = {
+        privateKeyPem: effectiveCurrent.proofPrivateKeyPem,
+        privateKeyObj,
+        publicKeyPem: effectiveCurrent.proofPublicKeyPem,
+        proofKeyJwk: effectiveCurrent.proofKeyJwk,
       };
+      return cachedProofRecord;
     }
     const generated = generateXboxProofKeyPair();
     saveXboxVaultRecord({
@@ -1185,11 +1242,14 @@ function createXboxAuthProvider(config = {}) {
       proofPublicKeyPem: generated.publicKeyPem,
       proofKeyJwk: generated.proofKeyJwk,
     });
-    return {
+    parsedEcPrivateKeyCache.set(generated.privateKeyPem, generated.privateKey);
+    cachedProofRecord = {
       privateKeyPem: generated.privateKeyPem,
+      privateKeyObj: generated.privateKey,
       publicKeyPem: generated.publicKeyPem,
       proofKeyJwk: generated.proofKeyJwk,
     };
+    return cachedProofRecord;
   };
 
   const beginOAuthAuthorization = (options = {}) => {
@@ -1251,7 +1311,10 @@ function createXboxAuthProvider(config = {}) {
   const refreshMsaPlane = async (plane, signal) => {
     const lockKey = `${lockScopeKey}:${plane}`;
     if (globalInFlightMsaRenewals.has(lockKey)) {
-      return globalInFlightMsaRenewals.get(lockKey);
+      return racePromiseWithCallerSignal(globalInFlightMsaRenewals.get(lockKey), signal);
+    }
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
     }
 
     const promise = (async () => {
@@ -1293,7 +1356,7 @@ function createXboxAuthProvider(config = {}) {
           } catch {
             // Fall through to `www.microsoft.com` (`store`) plane renewal below
           }
-          return refreshMsaPlane('store', signal);
+          return refreshMsaPlane('store', undefined);
         }
         return saved;
       }
@@ -1347,7 +1410,7 @@ function createXboxAuthProvider(config = {}) {
             refresh_token: refreshToken,
             scope: SCOPE_XBL_MBI_SSL,
           },
-          signal
+          undefined
         );
 
         const expiresInSec = Number(tokenData.expires_in || 86400) || 86400;
@@ -1402,7 +1465,8 @@ function createXboxAuthProvider(config = {}) {
     });
 
     globalInFlightMsaRenewals.set(lockKey, promise);
-    return promise;
+    promise.catch(() => {});
+    return racePromiseWithCallerSignal(promise, signal);
   };
 
   const authenticateXblUser = async (rawXblAccessToken, proof, signal) => {
@@ -1597,7 +1661,7 @@ function createXboxAuthProvider(config = {}) {
 
   const ensureValidXblUserToken = async (forceRefresh = false, signal) => {
     const saved = loadXboxVaultRecord();
-    const proof = ensureProofKeyRecord();
+    const proof = ensureProofKeyRecord(saved);
     if (!forceRefresh && saved.xblUserToken && isFutureIsoTimestamp(saved.xblUserNotAfter, 15 * 60_000)) {
       return {
         xblUserToken: saved.xblUserToken,
@@ -1607,36 +1671,74 @@ function createXboxAuthProvider(config = {}) {
       };
     }
 
-    let xblAccessToken = saved.xblAccessToken || saved.access_token;
-    if (forceRefresh || !xblAccessToken || !isFutureIsoTimestamp(saved.msaExpiresAt, 10 * 60_000)) {
-      const refreshed = await refreshMsaPlane('xbl', signal);
-      xblAccessToken = refreshed.xblAccessToken;
+    if (!forceRefresh && globalInFlightXblUserTokens.has(lockScopeKey)) {
+      return racePromiseWithCallerSignal(globalInFlightXblUserTokens.get(lockScopeKey), signal);
+    }
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
     }
 
-    let xasu;
-    try {
-      xasu = await authenticateXblUser(xblAccessToken, proof, signal);
-    } catch (err) {
-      if (!forceRefresh) {
-        const refreshed = await refreshMsaPlane('xbl', signal);
-        xasu = await authenticateXblUser(refreshed.xblAccessToken, proof, signal);
-      } else {
-        throw err;
+    const userTokenPromise = (async () => {
+      const latestSaved = loadXboxVaultRecord();
+      const activeProof = ensureProofKeyRecord(latestSaved);
+      if (
+        !forceRefresh &&
+        latestSaved.xblUserToken &&
+        isFutureIsoTimestamp(latestSaved.xblUserNotAfter, 15 * 60_000)
+      ) {
+        return {
+          xblUserToken: latestSaved.xblUserToken,
+          xblUserNotAfter: latestSaved.xblUserNotAfter,
+          uhs: latestSaved.uhs || '',
+          proof: activeProof,
+        };
       }
-    }
 
-    await saveXboxVaultRecordAsync({
-      xblUserToken: xasu.token,
-      xblUserNotAfter: xasu.notAfter,
-      uhs: xasu.uhs || saved.uhs,
+      let xblAccessToken = latestSaved.xblAccessToken || latestSaved.access_token;
+      if (
+        forceRefresh ||
+        !xblAccessToken ||
+        !isFutureIsoTimestamp(latestSaved.msaExpiresAt, 10 * 60_000)
+      ) {
+        const refreshed = await refreshMsaPlane('xbl', undefined);
+        xblAccessToken = refreshed.xblAccessToken;
+      }
+
+      let xasu;
+      try {
+        xasu = await authenticateXblUser(xblAccessToken, activeProof, undefined);
+      } catch (err) {
+        if (!forceRefresh) {
+          const refreshed = await refreshMsaPlane('xbl', undefined);
+          xasu = await authenticateXblUser(refreshed.xblAccessToken, activeProof, undefined);
+        } else {
+          throw err;
+        }
+      }
+
+      await saveXboxVaultRecordAsync({
+        xblUserToken: xasu.token,
+        xblUserNotAfter: xasu.notAfter,
+        uhs: xasu.uhs || latestSaved.uhs,
+      });
+
+      return {
+        xblUserToken: xasu.token,
+        xblUserNotAfter: xasu.notAfter,
+        uhs: xasu.uhs,
+        proof: activeProof,
+      };
+    })().finally(() => {
+      if (globalInFlightXblUserTokens.get(lockScopeKey) === userTokenPromise) {
+        globalInFlightXblUserTokens.delete(lockScopeKey);
+      }
     });
 
-    return {
-      xblUserToken: xasu.token,
-      xblUserNotAfter: xasu.notAfter,
-      uhs: xasu.uhs,
-      proof,
-    };
+    if (!forceRefresh) {
+      globalInFlightXblUserTokens.set(lockScopeKey, userTokenPromise);
+    }
+    userTokenPromise.catch(() => {});
+    return racePromiseWithCallerSignal(userTokenPromise, signal);
   };
 
   const finalizeXboxUserSession = async ({
@@ -1972,7 +2074,10 @@ function createXboxAuthProvider(config = {}) {
    */
   const getValidXboxSession = async (options = {}) => {
     const forceRefresh = Boolean(options.forceRefresh);
-    const saved = loadXboxVaultRecord();
+    const saved =
+      options._savedSnapshot && typeof options._savedSnapshot === 'object'
+        ? options._savedSnapshot
+        : loadXboxVaultRecord();
     const xblLiveCacheKey = buildRpXstsCacheKey(XSTS_RELYING_PARTIES.XBOX_LIVE, 'RETAIL', 'user');
 
     if (forceRefresh) {
@@ -1999,17 +2104,23 @@ function createXboxAuthProvider(config = {}) {
     }
 
     if (globalInFlightXblSessionRenewals.has(lockScopeKey) && !forceRefresh) {
-      return globalInFlightXblSessionRenewals.get(lockScopeKey);
+      return racePromiseWithCallerSignal(
+        globalInFlightXblSessionRenewals.get(lockScopeKey),
+        options.signal
+      );
+    }
+    if (options.signal?.aborted) {
+      throw createAbortError(options.signal.reason);
     }
 
     const renewalPromise = (async () => {
-      const { xblUserToken, proof } = await ensureValidXblUserToken(forceRefresh, options.signal);
+      const { xblUserToken, proof } = await ensureValidXblUserToken(forceRefresh, undefined);
       const xsts = await authorizeXstsInternal({
         relyingParty: XSTS_RELYING_PARTIES.XBOX_LIVE,
         xblUserToken,
         sandboxId: 'RETAIL',
         proof,
-        signal: options.signal,
+        signal: undefined,
       });
 
       const current = loadXboxVaultRecord();
@@ -2021,7 +2132,7 @@ function createXboxAuthProvider(config = {}) {
       let resolvedModernGt = xsts.modernGamertag || current.modernGamertag || resolvedGamertag;
 
       if (!gamerpicUrl || options.refreshProfile) {
-        const profile = await fetchProfileSettings(xsts.authorizationHeader, options.signal);
+        const profile = await fetchProfileSettings(xsts.authorizationHeader, undefined);
         if (profile) {
           gamerpicUrl = profile.gamerpicUrl || gamerpicUrl;
           gamerscore = profile.gamerscore || gamerscore;
@@ -2070,11 +2181,16 @@ function createXboxAuthProvider(config = {}) {
         authorizationHeader: xsts.authorizationHeader,
       };
     })().finally(() => {
-      globalInFlightXblSessionRenewals.delete(lockScopeKey);
+      if (globalInFlightXblSessionRenewals.get(lockScopeKey) === renewalPromise) {
+        globalInFlightXblSessionRenewals.delete(lockScopeKey);
+      }
     });
 
-    globalInFlightXblSessionRenewals.set(lockScopeKey, renewalPromise);
-    return renewalPromise;
+    if (!forceRefresh) {
+      globalInFlightXblSessionRenewals.set(lockScopeKey, renewalPromise);
+    }
+    renewalPromise.catch(() => {});
+    return racePromiseWithCallerSignal(renewalPromise, options.signal);
   };
 
   /**
@@ -2293,7 +2409,10 @@ function createXboxAuthProvider(config = {}) {
     }
 
     // Check persistent `xstsMpToken` shortcut for `http://mp.microsoft.com/`
-    const saved = loadXboxVaultRecord();
+    const saved =
+      options._savedSnapshot && typeof options._savedSnapshot === 'object'
+        ? options._savedSnapshot
+        : loadXboxVaultRecord();
     if (
       !forceRefresh &&
       isVaultPersistableMpXsts &&
@@ -2314,32 +2433,51 @@ function createXboxAuthProvider(config = {}) {
       return hit;
     }
 
-    const { xblUserToken, proof } = await ensureValidXblUserToken(forceRefresh, options.signal);
-    const minted = await authorizeXstsInternal({
-      relyingParty: rp,
-      xblUserToken: options.userTokenOverride || xblUserToken,
-      deviceToken: options.deviceToken,
-      titleToken: options.titleToken,
-      sandboxId,
-      proof,
-      signal: options.signal,
-    });
-
-    if (isVaultPersistableMpXsts && minted.token && minted.uhs) {
-      const mpPatch = {
-        xstsMpToken: minted.token,
-        xstsMpUhs: minted.uhs,
-        xstsMpNotAfter: minted.notAfter,
-      };
-      await saveXboxVaultRecordAsync(mpPatch).catch(() => {
-        try {
-          saveXboxVaultRecord(mpPatch);
-        } catch {}
-      });
+    if (!forceRefresh && inFlightRpXsts.has(cacheKey)) {
+      return racePromiseWithCallerSignal(inFlightRpXsts.get(cacheKey), options.signal);
+    }
+    if (options.signal?.aborted) {
+      throw createAbortError(options.signal.reason);
     }
 
-    rpXstsCache.set(cacheKey, minted);
-    return minted;
+    const xstsFlight = (async () => {
+      const { xblUserToken, proof } = await ensureValidXblUserToken(forceRefresh, undefined);
+      const minted = await authorizeXstsInternal({
+        relyingParty: rp,
+        xblUserToken: options.userTokenOverride || xblUserToken,
+        deviceToken: options.deviceToken,
+        titleToken: options.titleToken,
+        sandboxId,
+        proof,
+        signal: undefined,
+      });
+
+      if (isVaultPersistableMpXsts && minted.token && minted.uhs) {
+        const mpPatch = {
+          xstsMpToken: minted.token,
+          xstsMpUhs: minted.uhs,
+          xstsMpNotAfter: minted.notAfter,
+        };
+        await saveXboxVaultRecordAsync(mpPatch).catch(() => {
+          try {
+            saveXboxVaultRecord(mpPatch);
+          } catch {}
+        });
+      }
+
+      rpXstsCache.set(cacheKey, minted);
+      return minted;
+    })().finally(() => {
+      if (inFlightRpXsts.get(cacheKey) === xstsFlight) {
+        inFlightRpXsts.delete(cacheKey);
+      }
+    });
+
+    if (!forceRefresh) {
+      inFlightRpXsts.set(cacheKey, xstsFlight);
+    }
+    xstsFlight.catch(() => {});
+    return racePromiseWithCallerSignal(xstsFlight, options.signal);
   };
 
   /**
@@ -2357,59 +2495,116 @@ function createXboxAuthProvider(config = {}) {
       return cached.token;
     }
 
-    const proof = ensureProofKeyRecord();
-    const postDeviceAuthenticate = async (properties) => {
-      const devAuthBody = JSON.stringify({
-        RelyingParty: 'http://auth.xboxlive.com',
-        TokenType: 'JWT',
-        Properties: properties,
-      });
-      const devAuthSig = signXboxRequest({
-        method: 'POST',
-        url: XBL_DEVICE_AUTH_URL,
-        authorizationHeader: '',
-        bodyBuffer: Buffer.from(devAuthBody, 'utf8'),
-        ecPrivateKey: proof.privateKeyPem,
-      });
-      const devAuthRes = await fetchImpl(XBL_DEVICE_AUTH_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'x-xbl-contract-version': '1',
-          Signature: devAuthSig,
-        },
-        body: devAuthBody,
-        signal: buildXboxFetchSignal(signal),
-      });
-      const text = await devAuthRes.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {}
-      return {
-        ok: devAuthRes.ok,
-        status: devAuthRes.status,
-        msCv: extractSafeCorrelationId(devAuthRes),
-        json,
-      };
-    };
+    if (!forceRefresh && inFlightDeviceTokens.has(normMode)) {
+      return racePromiseWithCallerSignal(inFlightDeviceTokens.get(normMode), signal);
+    }
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
+    }
 
-    if (normMode === 'pop') {
-      const savedDevCtx = loadXboxVaultRecord()?.deviceContext || {};
+    const devTokenFlight = (async () => {
+      const proof = ensureProofKeyRecord();
+      const postDeviceAuthenticate = async (properties) => {
+        const devAuthBody = JSON.stringify({
+          RelyingParty: 'http://auth.xboxlive.com',
+          TokenType: 'JWT',
+          Properties: properties,
+        });
+        const devAuthSig = signXboxRequest({
+          method: 'POST',
+          url: XBL_DEVICE_AUTH_URL,
+          authorizationHeader: '',
+          bodyBuffer: Buffer.from(devAuthBody, 'utf8'),
+          ecPrivateKey: proof.privateKeyObj || proof.privateKeyPem,
+        });
+        const devAuthRes = await fetchImpl(XBL_DEVICE_AUTH_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'x-xbl-contract-version': '1',
+            Signature: devAuthSig,
+          },
+          body: devAuthBody,
+          signal: buildXboxFetchSignal(undefined),
+        });
+        const text = await devAuthRes.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch {}
+        return {
+          ok: devAuthRes.ok,
+          status: devAuthRes.status,
+          msCv: extractSafeCorrelationId(devAuthRes),
+          json,
+        };
+      };
+
+      if (normMode === 'pop') {
+        const savedDevCtx = loadXboxVaultRecord()?.deviceContext || {};
+        const seedBase =
+          savedDevCtx.hwDeviceId ||
+          savedDevCtx.deviceMembername ||
+          (typeof vault.getHardwareFingerprint === 'function' ? vault.getHardwareFingerprint() : '') ||
+          lockScopeKey;
+        const idUuid = deriveDashedUuidFromSeed(seedBase, 'xbl-pop-device-id');
+        const serialUuid = deriveDashedUuidFromSeed(
+          savedDevCtx.deviceMembername || seedBase,
+          'xbl-pop-device-serial'
+        );
+
+        const popRes = await postDeviceAuthenticate({
+          AuthMethod: 'ProofOfPossession',
+          Id: `{${idUuid}}`,
+          DeviceType: 'Win32',
+          SerialNumber: `{${serialUuid}}`,
+          Version: '10.0.22631',
+          ProofKey: proof.proofKeyJwk,
+        });
+
+        if (!popRes.ok || !popRes.json?.Token) {
+          const err = Object.assign(
+            new Error(
+              `Xbox device.auth.xboxlive.com (PoP) failed (HTTP ${popRes.status}, MS-CV=${popRes.msCv})`
+            ),
+            { status: popRes.status, msCv: popRes.msCv }
+          );
+          throw err;
+        }
+
+        const notAfter =
+          popRes.json.NotAfter || new Date(Date.now() + 4 * 3600_000).toISOString();
+        xblDeviceTokenCache.set('pop', { token: popRes.json.Token, notAfter });
+        return popRes.json.Token;
+      }
+
+      // `normMode === 'rps'`: Hardware-trusted Win32 RPS DeviceToken
+      const devCtx = await ensureDeviceContext({ forceRefresh });
+      const rawTicket = String(devCtx?.deviceToken || '')
+        .replace(/^WLID1\.0="/i, '')
+        .replace(/^"+|"+$/g, '')
+        .trim()
+        .replace(/^[td]=/i, '');
+      if (!rawTicket) {
+        throw new Error('Xbox RPS DeviceToken requires a provisioned device ticket');
+      }
+
       const seedBase =
-        savedDevCtx.hwDeviceId ||
-        savedDevCtx.deviceMembername ||
+        devCtx?.hwDeviceId ||
+        devCtx?.deviceMembername ||
         (typeof vault.getHardwareFingerprint === 'function' ? vault.getHardwareFingerprint() : '') ||
         lockScopeKey;
-      const idUuid = deriveDashedUuidFromSeed(seedBase, 'xbl-pop-device-id');
+      const idUuid = deriveDashedUuidFromSeed(seedBase, 'xbl-device-id');
       const serialUuid = deriveDashedUuidFromSeed(
-        savedDevCtx.deviceMembername || seedBase,
-        'xbl-pop-device-serial'
+        devCtx?.deviceMembername || seedBase,
+        'xbl-device-serial'
       );
 
-      const popRes = await postDeviceAuthenticate({
-        AuthMethod: 'ProofOfPossession',
+      const buildRpsProps = (prefix) => ({
+        AuthMethod: 'RPS',
+        SiteName: 'user.auth.xboxlive.com',
+        RpsTicket: `${prefix}${rawTicket}`,
         Id: `{${idUuid}}`,
         DeviceType: 'Win32',
         SerialNumber: `{${serialUuid}}`,
@@ -2417,77 +2612,39 @@ function createXboxAuthProvider(config = {}) {
         ProofKey: proof.proofKeyJwk,
       });
 
-      if (!popRes.ok || !popRes.json?.Token) {
+      let rpsRes = await postDeviceAuthenticate(buildRpsProps('t='));
+      if (!rpsRes.ok || !rpsRes.json?.Token) {
+        const dFallbackRes = await postDeviceAuthenticate(buildRpsProps('d='));
+        if (dFallbackRes.ok && dFallbackRes.json?.Token) {
+          rpsRes = dFallbackRes;
+        }
+      }
+
+      if (!rpsRes.ok || !rpsRes.json?.Token) {
         const err = Object.assign(
           new Error(
-            `Xbox device.auth.xboxlive.com (PoP) failed (HTTP ${popRes.status}, MS-CV=${popRes.msCv})`
+            `Xbox device.auth.xboxlive.com (RPS) failed (HTTP ${rpsRes.status}, MS-CV=${rpsRes.msCv})`
           ),
-          { status: popRes.status, msCv: popRes.msCv }
+          { status: rpsRes.status, msCv: rpsRes.msCv }
         );
         throw err;
       }
 
       const notAfter =
-        popRes.json.NotAfter || new Date(Date.now() + 4 * 3600_000).toISOString();
-      xblDeviceTokenCache.set('pop', { token: popRes.json.Token, notAfter });
-      return popRes.json.Token;
-    }
-
-    // `normMode === 'rps'`: Hardware-trusted Win32 RPS DeviceToken
-    const devCtx = await ensureDeviceContext({ forceRefresh });
-    const rawTicket = String(devCtx?.deviceToken || '')
-      .replace(/^WLID1\.0="/i, '')
-      .replace(/^"+|"+$/g, '')
-      .trim()
-      .replace(/^[td]=/i, '');
-    if (!rawTicket) {
-      throw new Error('Xbox RPS DeviceToken requires a provisioned device ticket');
-    }
-
-    const seedBase =
-      devCtx?.hwDeviceId ||
-      devCtx?.deviceMembername ||
-      (typeof vault.getHardwareFingerprint === 'function' ? vault.getHardwareFingerprint() : '') ||
-      lockScopeKey;
-    const idUuid = deriveDashedUuidFromSeed(seedBase, 'xbl-device-id');
-    const serialUuid = deriveDashedUuidFromSeed(
-      devCtx?.deviceMembername || seedBase,
-      'xbl-device-serial'
-    );
-
-    const buildRpsProps = (prefix) => ({
-      AuthMethod: 'RPS',
-      SiteName: 'user.auth.xboxlive.com',
-      RpsTicket: `${prefix}${rawTicket}`,
-      Id: `{${idUuid}}`,
-      DeviceType: 'Win32',
-      SerialNumber: `{${serialUuid}}`,
-      Version: '10.0.22631',
-      ProofKey: proof.proofKeyJwk,
+        rpsRes.json.NotAfter || new Date(Date.now() + 4 * 3600_000).toISOString();
+      xblDeviceTokenCache.set('rps', { token: rpsRes.json.Token, notAfter });
+      return rpsRes.json.Token;
+    })().finally(() => {
+      if (inFlightDeviceTokens.get(normMode) === devTokenFlight) {
+        inFlightDeviceTokens.delete(normMode);
+      }
     });
 
-    let rpsRes = await postDeviceAuthenticate(buildRpsProps('t='));
-    if (!rpsRes.ok || !rpsRes.json?.Token) {
-      const dFallbackRes = await postDeviceAuthenticate(buildRpsProps('d='));
-      if (dFallbackRes.ok && dFallbackRes.json?.Token) {
-        rpsRes = dFallbackRes;
-      }
+    if (!forceRefresh) {
+      inFlightDeviceTokens.set(normMode, devTokenFlight);
     }
-
-    if (!rpsRes.ok || !rpsRes.json?.Token) {
-      const err = Object.assign(
-        new Error(
-          `Xbox device.auth.xboxlive.com (RPS) failed (HTTP ${rpsRes.status}, MS-CV=${rpsRes.msCv})`
-        ),
-        { status: rpsRes.status, msCv: rpsRes.msCv }
-      );
-      throw err;
-    }
-
-    const notAfter =
-      rpsRes.json.NotAfter || new Date(Date.now() + 4 * 3600_000).toISOString();
-    xblDeviceTokenCache.set('rps', { token: rpsRes.json.Token, notAfter });
-    return rpsRes.json.Token;
+    devTokenFlight.catch(() => {});
+    return racePromiseWithCallerSignal(devTokenFlight, signal);
   };
 
   /**
@@ -2504,106 +2661,125 @@ function createXboxAuthProvider(config = {}) {
       return cached;
     }
 
-    const proof = ensureProofKeyRecord();
-    let saved = loadXboxVaultRecord();
-    if (!saved.xblAccessToken || !isFutureIsoTimestamp(saved.msaExpiresAt, 10 * 60_000)) {
-      saved = await refreshMsaPlane('xbl', signal);
+    if (!forceRefresh && inFlightSisuSessions.has(cleanAppId)) {
+      return racePromiseWithCallerSignal(inFlightSisuSessions.get(cleanAppId), signal);
     }
-    const userRpsTicket = normalizeXblRpsTicket(saved.xblAccessToken, { defaultPrefix: 't=' });
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
+    }
 
-    const attemptSisuAuthorize = async (xblDeviceToken) => {
-      const sisuBody = JSON.stringify({
-        AccessToken: userRpsTicket,
-        AppId: cleanAppId,
-        DeviceToken: xblDeviceToken,
-        Sandbox: 'RETAIL',
-        SiteName: 'user.auth.xboxlive.com',
-        RelyingParty: 'http://xboxlive.com',
-        UseModernGamertag: true,
-        ProofKey: proof.proofKeyJwk,
-      });
-
-      const sisuSig = signXboxRequest({
-        method: 'POST',
-        url: XBL_SISU_AUTHORIZE_URL,
-        authorizationHeader: '',
-        bodyBuffer: Buffer.from(sisuBody, 'utf8'),
-        ecPrivateKey: proof.privateKeyPem,
-      });
-
-      const sisuRes = await fetchImpl(XBL_SISU_AUTHORIZE_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'x-xbl-contract-version': '1',
-          Signature: sisuSig,
-        },
-        body: sisuBody,
-        signal: buildXboxFetchSignal(signal),
-      });
-
-      const text = await sisuRes.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {}
-      return {
-        ok: sisuRes.ok,
-        status: sisuRes.status,
-        msCv: extractSafeCorrelationId(sisuRes),
-        json,
-        deviceToken: xblDeviceToken,
-      };
-    };
-
-    // Prefer fast ProofOfPossession DeviceToken for SISU, falling back to RPS DeviceToken if needed
-    let sisuAttempt = null;
-    try {
-      const popDeviceToken = await getXblDeviceToken({ mode: 'pop', forceRefresh, signal });
-      sisuAttempt = await attemptSisuAuthorize(popDeviceToken);
-    } catch {}
-
-    if (!sisuAttempt || !sisuAttempt.ok) {
-      try {
-        const rpsDeviceToken = await getXblDeviceToken({ mode: 'rps', forceRefresh, signal });
-        const rpsAttempt = await attemptSisuAuthorize(rpsDeviceToken);
-        if (rpsAttempt.ok || !sisuAttempt) {
-          sisuAttempt = rpsAttempt;
-        }
-      } catch (rpsErr) {
-        if (!sisuAttempt) throw rpsErr;
+    const sisuFlight = (async () => {
+      const proof = ensureProofKeyRecord();
+      let saved = loadXboxVaultRecord();
+      if (!saved.xblAccessToken || !isFutureIsoTimestamp(saved.msaExpiresAt, 10 * 60_000)) {
+        saved = await refreshMsaPlane('xbl', undefined);
       }
-    }
+      const userRpsTicket = normalizeXblRpsTicket(saved.xblAccessToken, { defaultPrefix: 't=' });
 
-    if (!sisuAttempt || !sisuAttempt.ok) {
-      const err = Object.assign(
-        new Error(
-          `SISU authorize failed for AppId=${cleanAppId} (HTTP ${sisuAttempt?.status ?? 'ERR'}, MS-CV=${sisuAttempt?.msCv || 'none'})`
-        ),
-        { status: sisuAttempt?.status, msCv: sisuAttempt?.msCv || 'none' }
-      );
-      throw err;
-    }
+      const attemptSisuAuthorize = async (xblDeviceToken) => {
+        const sisuBody = JSON.stringify({
+          AccessToken: userRpsTicket,
+          AppId: cleanAppId,
+          DeviceToken: xblDeviceToken,
+          Sandbox: 'RETAIL',
+          SiteName: 'user.auth.xboxlive.com',
+          RelyingParty: 'http://xboxlive.com',
+          UseModernGamertag: true,
+          ProofKey: proof.proofKeyJwk,
+        });
 
-    const sisuJson = sisuAttempt.json || {};
-    const authTokenObj = sisuJson?.AuthorizationToken || {};
-    const xui = authTokenObj?.DisplayClaims?.xui?.[0] || {};
-    const sisuTitleId = String(sisuJson?.TitleToken?.DisplayClaims?.xti?.tid || '');
-    const entry = {
-      msaAppId: cleanAppId,
-      titleId: sisuTitleId,
-      deviceToken: sisuJson?.DeviceToken || sisuAttempt.deviceToken,
-      titleToken: sisuJson?.TitleToken?.Token || '',
-      userToken: sisuJson?.UserToken?.Token || '',
-      xstsToken: authTokenObj?.Token || '',
-      uhs: xui.uhs || '',
-      xuid: xui.xid || '',
-      gamertag: xui.gtg || xui.mgt || '',
-      notAfter: authTokenObj?.NotAfter || sisuJson?.TitleToken?.NotAfter || '',
-    };
-    sisuSessionCache.set(cleanAppId, entry);
-    return entry;
+        const sisuSig = signXboxRequest({
+          method: 'POST',
+          url: XBL_SISU_AUTHORIZE_URL,
+          authorizationHeader: '',
+          bodyBuffer: Buffer.from(sisuBody, 'utf8'),
+          ecPrivateKey: proof.privateKeyObj || proof.privateKeyPem,
+        });
+
+        const sisuRes = await fetchImpl(XBL_SISU_AUTHORIZE_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'x-xbl-contract-version': '1',
+            Signature: sisuSig,
+          },
+          body: sisuBody,
+          signal: buildXboxFetchSignal(undefined),
+        });
+
+        const text = await sisuRes.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch {}
+        return {
+          ok: sisuRes.ok,
+          status: sisuRes.status,
+          msCv: extractSafeCorrelationId(sisuRes),
+          json,
+          deviceToken: xblDeviceToken,
+        };
+      };
+
+      // Prefer fast ProofOfPossession DeviceToken for SISU, falling back to RPS DeviceToken if needed
+      let sisuAttempt = null;
+      try {
+        const popDeviceToken = await getXblDeviceToken({ mode: 'pop', forceRefresh, signal: undefined });
+        sisuAttempt = await attemptSisuAuthorize(popDeviceToken);
+      } catch {}
+
+      if (!sisuAttempt || !sisuAttempt.ok) {
+        try {
+          const rpsDeviceToken = await getXblDeviceToken({ mode: 'rps', forceRefresh, signal: undefined });
+          const rpsAttempt = await attemptSisuAuthorize(rpsDeviceToken);
+          if (rpsAttempt.ok || !sisuAttempt) {
+            sisuAttempt = rpsAttempt;
+          }
+        } catch (rpsErr) {
+          if (!sisuAttempt) throw rpsErr;
+        }
+      }
+
+      if (!sisuAttempt || !sisuAttempt.ok) {
+        const err = Object.assign(
+          new Error(
+            `SISU authorize failed for AppId=${cleanAppId} (HTTP ${sisuAttempt?.status ?? 'ERR'}, MS-CV=${sisuAttempt?.msCv || 'none'})`
+          ),
+          { status: sisuAttempt?.status, msCv: sisuAttempt?.msCv || 'none' }
+        );
+        throw err;
+      }
+
+      const sisuJson = sisuAttempt.json || {};
+      const authTokenObj = sisuJson?.AuthorizationToken || {};
+      const xui = authTokenObj?.DisplayClaims?.xui?.[0] || {};
+      const sisuTitleId = String(sisuJson?.TitleToken?.DisplayClaims?.xti?.tid || '');
+      const entry = {
+        msaAppId: cleanAppId,
+        titleId: sisuTitleId,
+        deviceToken: sisuJson?.DeviceToken || sisuAttempt.deviceToken,
+        titleToken: sisuJson?.TitleToken?.Token || '',
+        userToken: sisuJson?.UserToken?.Token || '',
+        xstsToken: authTokenObj?.Token || '',
+        uhs: xui.uhs || '',
+        xuid: xui.xid || '',
+        gamertag: xui.gtg || xui.mgt || '',
+        notAfter: authTokenObj?.NotAfter || sisuJson?.TitleToken?.NotAfter || '',
+      };
+      sisuSessionCache.set(cleanAppId, entry);
+      return entry;
+    })().finally(() => {
+      if (inFlightSisuSessions.get(cleanAppId) === sisuFlight) {
+        inFlightSisuSessions.delete(cleanAppId);
+      }
+    });
+
+    if (!forceRefresh) {
+      inFlightSisuSessions.set(cleanAppId, sisuFlight);
+    }
+    sisuFlight.catch(() => {});
+    return racePromiseWithCallerSignal(sisuFlight, signal);
   };
 
   /**
@@ -2624,7 +2800,10 @@ function createXboxAuthProvider(config = {}) {
     }
 
     if (!forceRefresh && inFlightTitleAuthSessions.has(cleanAppId)) {
-      return inFlightTitleAuthSessions.get(cleanAppId);
+      return racePromiseWithCallerSignal(inFlightTitleAuthSessions.get(cleanAppId), signal);
+    }
+    if (signal?.aborted) {
+      throw createAbortError(signal.reason);
     }
 
     const expectedDecimalTitleId = normalizeDecimalTitleId(titleId);
@@ -2635,7 +2814,7 @@ function createXboxAuthProvider(config = {}) {
 
       // Primary universal GDK path: Device TOKEN_BROKER -> title.auth.xboxlive.com/title/authenticate
       try {
-        const rpsDeviceToken = await getXblDeviceToken({ mode: 'rps', forceRefresh, signal });
+        const rpsDeviceToken = await getXblDeviceToken({ mode: 'rps', forceRefresh, signal: undefined });
         const broker = await xboxDeviceClep.acquireTitleBrokerTicket({
           msaAppId: cleanAppId,
           tokenVault: vault,
@@ -2662,7 +2841,7 @@ function createXboxAuthProvider(config = {}) {
             url: XBL_TITLE_AUTH_URL,
             authorizationHeader: '',
             bodyBuffer: Buffer.from(titleAuthBody, 'utf8'),
-            ecPrivateKey: proof.privateKeyPem,
+            ecPrivateKey: proof.privateKeyObj || proof.privateKeyPem,
           });
 
           const titleRes = await fetchImpl(XBL_TITLE_AUTH_URL, {
@@ -2674,7 +2853,7 @@ function createXboxAuthProvider(config = {}) {
               Signature: titleAuthSig,
             },
             body: titleAuthBody,
-            signal: buildXboxFetchSignal(signal),
+            signal: buildXboxFetchSignal(undefined),
           });
 
           const titleText = await titleRes.text();
@@ -2701,7 +2880,7 @@ function createXboxAuthProvider(config = {}) {
             forceRefresh,
             deviceToken: rpsDeviceToken,
             titleToken: titleJson.Token,
-            signal,
+            signal: undefined,
           });
 
           const sessionEntry = {
@@ -2723,7 +2902,7 @@ function createXboxAuthProvider(config = {}) {
       // Guarded SISU fallback: ONLY accept if its TitleToken matches the expected game TitleId
       // (prevents accepting LiveSDK's `1794566092` TitleToken when AccessToken belongs to LiveSDK).
       try {
-        const sisu = await getSisuTitleSession(cleanAppId, forceRefresh, signal);
+        const sisu = await getSisuTitleSession(cleanAppId, forceRefresh, undefined);
         if (
           sisu?.titleToken &&
           (!expectedDecimalTitleId || !sisu.titleId || sisu.titleId === expectedDecimalTitleId)
@@ -2743,7 +2922,7 @@ function createXboxAuthProvider(config = {}) {
                   userTokenOverride: sisu.userToken || undefined,
                   deviceToken: sisu.deviceToken || undefined,
                   titleToken: sisu.titleToken,
-                  signal,
+                  signal: undefined,
                 });
 
           const fallbackEntry = {
@@ -2763,11 +2942,16 @@ function createXboxAuthProvider(config = {}) {
       if (primaryErr) throw primaryErr;
       return null;
     })().finally(() => {
-      inFlightTitleAuthSessions.delete(cleanAppId);
+      if (inFlightTitleAuthSessions.get(cleanAppId) === run) {
+        inFlightTitleAuthSessions.delete(cleanAppId);
+      }
     });
 
-    inFlightTitleAuthSessions.set(cleanAppId, run);
-    return run;
+    if (!forceRefresh) {
+      inFlightTitleAuthSessions.set(cleanAppId, run);
+    }
+    run.catch(() => {});
+    return racePromiseWithCallerSignal(run, signal);
   };
 
   const resolveRelyingPartyForTargetUrl = async (
@@ -2799,7 +2983,7 @@ function createXboxAuthProvider(config = {}) {
         url: endpointUrl,
         authorizationHeader: authHeader,
         bodyBuffer: Buffer.alloc(0),
-        ecPrivateKey: activeProof.privateKeyPem,
+        ecPrivateKey: activeProof.privateKeyObj || activeProof.privateKeyPem,
       });
       const res = await fetchImpl(endpointUrl, {
         method: 'GET',
@@ -2809,7 +2993,7 @@ function createXboxAuthProvider(config = {}) {
           Accept: 'application/json',
           Signature: sig,
         },
-        signal: buildXboxFetchSignal(opts.signal),
+        signal: buildXboxFetchSignal(undefined),
       });
       if (!res.ok) return { ok: false, endPoints: [] };
       const json = await res.json();
@@ -2823,22 +3007,35 @@ function createXboxAuthProvider(config = {}) {
       // 1. Per-Title NSAL (`titles/current/endpoints` with title-bound XSTS, or `titles/{decimalTid}/endpoints`)
       if (cacheKeyId && (xblTitleAuthHeader || decimalTitleId)) {
         if (!cachedPerTitleEndpoints.has(cacheKeyId)) {
-          let fetched = { ok: false, endPoints: [] };
-          if (xblTitleAuthHeader) {
-            fetched = await fetchSignedEndpoints(
-              XBL_TITLE_ENDPOINTS_CURRENT_URL,
-              xblTitleAuthHeader
-            );
+          let flight = inFlightPerTitleEndpoints.get(cacheKeyId);
+          if (!flight) {
+            flight = (async () => {
+              let fetched = { ok: false, endPoints: [] };
+              if (xblTitleAuthHeader) {
+                fetched = await fetchSignedEndpoints(
+                  XBL_TITLE_ENDPOINTS_CURRENT_URL,
+                  xblTitleAuthHeader
+                );
+              }
+              if (!fetched.ok && decimalTitleId && (xblTitleAuthHeader || baseXblAuthHeader)) {
+                fetched = await fetchSignedEndpoints(
+                  `https://title.mgt.xboxlive.com/titles/${encodeURIComponent(decimalTitleId)}/endpoints`,
+                  xblTitleAuthHeader || baseXblAuthHeader
+                );
+              }
+              if (fetched.ok) {
+                cachedPerTitleEndpoints.set(cacheKeyId, fetched.endPoints);
+              }
+              return fetched;
+            })().finally(() => {
+              if (inFlightPerTitleEndpoints.get(cacheKeyId) === flight) {
+                inFlightPerTitleEndpoints.delete(cacheKeyId);
+              }
+            });
+            inFlightPerTitleEndpoints.set(cacheKeyId, flight);
+            flight.catch(() => {});
           }
-          if (!fetched.ok && decimalTitleId && (xblTitleAuthHeader || baseXblAuthHeader)) {
-            fetched = await fetchSignedEndpoints(
-              `https://title.mgt.xboxlive.com/titles/${encodeURIComponent(decimalTitleId)}/endpoints`,
-              xblTitleAuthHeader || baseXblAuthHeader
-            );
-          }
-          if (fetched.ok) {
-            cachedPerTitleEndpoints.set(cacheKeyId, fetched.endPoints);
-          }
+          await racePromiseWithCallerSignal(flight, opts.signal);
         }
         const perTitleEps = cachedPerTitleEndpoints.get(cacheKeyId);
         if (perTitleEps) {
@@ -2850,13 +3047,25 @@ function createXboxAuthProvider(config = {}) {
       // 2. System Default NSAL (`titles/default/endpoints?type=1`)
       const defaultAuth = xblTitleAuthHeader || baseXblAuthHeader;
       if (!cachedDefaultTitleEndpoints && defaultAuth) {
-        const defaultFetched = await fetchSignedEndpoints(
-          XBL_TITLE_ENDPOINTS_DEFAULT_URL,
-          defaultAuth
-        );
-        if (defaultFetched.ok) {
-          cachedDefaultTitleEndpoints = defaultFetched.endPoints;
+        if (!inFlightDefaultTitleEndpoints) {
+          const defFlight = (async () => {
+            const defaultFetched = await fetchSignedEndpoints(
+              XBL_TITLE_ENDPOINTS_DEFAULT_URL,
+              defaultAuth
+            );
+            if (defaultFetched.ok) {
+              cachedDefaultTitleEndpoints = defaultFetched.endPoints;
+            }
+            return defaultFetched;
+          })().finally(() => {
+            if (inFlightDefaultTitleEndpoints === defFlight) {
+              inFlightDefaultTitleEndpoints = null;
+            }
+          });
+          inFlightDefaultTitleEndpoints = defFlight;
+          defFlight.catch(() => {});
         }
+        await racePromiseWithCallerSignal(inFlightDefaultTitleEndpoints, opts.signal);
       }
       if (cachedDefaultTitleEndpoints) {
         const matchedDefaultRp = matchDynamicTitleEndpointRelyingParty(
@@ -2865,7 +3074,10 @@ function createXboxAuthProvider(config = {}) {
         );
         if (matchedDefaultRp) return matchedDefaultRp;
       }
-    } catch {
+    } catch (nsalErr) {
+      if (nsalErr?.name === 'AbortError' && opts.signal?.aborted) {
+        throw nsalErr;
+      }
       // Fall through cleanly to post-NSAL built-in SDK mappings
     }
 
@@ -2894,8 +3106,14 @@ function createXboxAuthProvider(config = {}) {
     }
 
     const effectiveBody = bodyBuffer !== undefined ? bodyBuffer : params.body;
-    const proof = ensureProofKeyRecord();
-    const baseSession = await getValidXboxSession({ forceRefresh, signal });
+    // Load vault snapshot AT MOST ONCE per outbound request (and served from in-memory vault cache)
+    const savedSnapshot = loadXboxVaultRecord();
+    const proof = ensureProofKeyRecord(savedSnapshot);
+    const baseSession = await getValidXboxSession({
+      forceRefresh,
+      signal,
+      _savedSnapshot: savedSnapshot,
+    });
 
     let isTitleStorageHost = false;
     try {
@@ -2919,6 +3137,7 @@ function createXboxAuthProvider(config = {}) {
         forceRefresh,
         deviceToken: rpsDeviceToken || undefined,
         signal,
+        _savedSnapshot: savedSnapshot,
       });
     } else {
       // Step 1: Acquire hardware-bound `TitleToken` FIRST so Per-Title NSAL (`titles/current/endpoints`)
@@ -2960,6 +3179,7 @@ function createXboxAuthProvider(config = {}) {
             deviceToken: titleSession.deviceToken || undefined,
             titleToken: titleSession.titleToken,
             signal,
+            _savedSnapshot: savedSnapshot,
           });
         } catch {
           // Graceful fallback if a specific 3rd-party Relying Party rejects TitleToken or DeviceToken
@@ -2968,20 +3188,24 @@ function createXboxAuthProvider(config = {}) {
               forceRefresh,
               deviceToken: titleSession.deviceToken || undefined,
               signal,
+              _savedSnapshot: savedSnapshot,
             });
           } catch {
-            xstsResult = await getXstsToken(targetRp, { forceRefresh, signal });
+            xstsResult = await getXstsToken(targetRp, {
+              forceRefresh,
+              signal,
+              _savedSnapshot: savedSnapshot,
+            });
           }
         }
       } else {
         let rpsDeviceToken = null;
         if (targetRp === XSTS_RELYING_PARTIES.XBOX_LIVE) {
-          const savedVault = loadXboxVaultRecord();
           if (
             xblDeviceTokenCache.has('rps') ||
-            savedVault?.deviceContext?.deviceToken ||
-            savedVault?.deviceContext?.deviceMembername ||
-            savedVault?.userStsLegacyTokenXml
+            savedSnapshot?.deviceContext?.deviceToken ||
+            savedSnapshot?.deviceContext?.deviceMembername ||
+            savedSnapshot?.userStsLegacyTokenXml
           ) {
             rpsDeviceToken = await getXblDeviceToken({ mode: 'rps', forceRefresh, signal }).catch(
               () => null
@@ -2992,6 +3216,7 @@ function createXboxAuthProvider(config = {}) {
           forceRefresh,
           deviceToken: rpsDeviceToken || undefined,
           signal,
+          _savedSnapshot: savedSnapshot,
         });
       }
     }
@@ -3002,7 +3227,7 @@ function createXboxAuthProvider(config = {}) {
       url,
       authorizationHeader,
       bodyBuffer: effectiveBody,
-      ecPrivateKey: proof.privateKeyPem,
+      ecPrivateKey: proof.privateKeyObj || proof.privateKeyPem,
     });
 
     return {
@@ -3178,6 +3403,8 @@ module.exports = {
   XSTS_RELYING_PARTIES,
   MINECRAFT_ENTITLEMENT_CACHE_TTL_MS,
   buildRpXstsCacheKey,
+  racePromiseWithCallerSignal,
+  getCachedEcPrivateKeyObject,
   generateXboxOAuthState,
   verifyXboxOAuthState,
   isCompactJwe,

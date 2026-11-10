@@ -4,10 +4,13 @@ import type {
   GamePlatformOwnership,
   PlatformEntry,
   PlatformOwnership,
+  StoreAchievementSummary,
   XboxGamePassSyncMode,
   XboxSubscriptionSummary,
   XboxSubscriptionTierId,
 } from '../contracts/game';
+import type { UserGameOverride } from '../contracts/override';
+import type { SuppressedCatalogEntry } from '../services/integrations/catalogSanitizer';
 import type { StorefrontId } from '../contracts/platform';
 import type {
   ClientLoginTargetId,
@@ -110,10 +113,7 @@ export interface AchievementSummaryEntry {
   isMastered?: boolean;
 }
 
-export interface StorefrontAchievementsResponse {
-  achievements?: Record<string, AchievementSummaryEntry>;
-  [gameKey: string]: any;
-}
+export type StorefrontAchievementsResponse = Record<string, StoreAchievementSummary>;
 
 export interface AchievementSchemaItem {
   id?: string;
@@ -149,12 +149,15 @@ export interface StorefrontTokenSummary {
   modernGamertag?: string;
   xuid?: string;
   avatarUrl?: string;
+  gamerpicUrl?: string;
+  gamerscore?: number;
   avatars?: Record<string, string>;
   subscription?: XboxSubscriptionSummary | null;
   syncMode?: XboxGamePassSyncMode;
   games?: CanonicalGame[];
   updatedAt?: string;
   expiresAt?: string | number;
+  expires_at?: string | number;
 }
 
 export interface SavedStoreTokensMap {
@@ -162,8 +165,8 @@ export interface SavedStoreTokensMap {
   gog?: StorefrontTokenSummary;
   epic?: StorefrontTokenSummary;
   xbox?: StorefrontTokenSummary;
-  suppressedItems?: never[];
-  [storefrontId: string]: any;
+  suppressedItems?: SuppressedCatalogEntry[];
+  [storefrontId: string]: StorefrontTokenSummary | SuppressedCatalogEntry[] | undefined;
 }
 
 export interface StorefrontAuthResult {
@@ -183,7 +186,7 @@ export interface StorefrontAuthResult {
   syncMode?: XboxGamePassSyncMode;
   games?: CanonicalGame[];
   achievements?: Record<string | number, AchievementSummaryEntry>;
-  suppressedItems?: any[];
+  suppressedItems?: SuppressedCatalogEntry[];
   tokenData?: StorefrontTokenSummary | null;
   authoritativeComplete?: boolean;
   subscriptionChanged?: boolean;
@@ -205,7 +208,13 @@ export interface HltbSearchEntry {
   comp_all?: number;
 }
 
-export interface UserMetadataOverride {
+export interface UserMetadataOverride
+  extends Partial<
+    Omit<
+      UserGameOverride,
+      'matchedStore' | 'matchedId' | 'updatedAt' | 'platformId' | 'steamAppId'
+    >
+  > {
   gameId: string;
   title?: string;
   coverUrl?: string;
@@ -221,7 +230,7 @@ export interface UserMetadataOverride {
   platformGameId?: string;
   steamAppId?: number | null;
   matchedStore?: string;
-  matchedId?: string;
+  matchedId?: string | number;
   purgeKeys?: string[];
   updatedAt?: string;
 }
@@ -350,7 +359,7 @@ export interface ElectronAPI {
     subscription?: XboxSubscriptionSummary;
     syncMode?: XboxGamePassSyncMode;
     games?: CanonicalGame[];
-    suppressedItems?: any[];
+    suppressedItems?: SuppressedCatalogEntry[];
     achievements?: Record<string | number, AchievementSummaryEntry>;
     authoritativeComplete?: boolean;
     subscriptionChanged?: boolean;
@@ -408,7 +417,7 @@ export interface ElectronAPI {
     catalogItemId?: string;
     title?: string;
     slug?: string;
-  }) => Promise<Record<string, any> | null>;
+  }) => Promise<Record<string, unknown> | null>;
   fetchEpicGameSchema?: (payload: {
     gameId?: string;
     platformGameId?: string;
@@ -425,7 +434,7 @@ export interface ElectronAPI {
     title?: string;
     query?: string;
     limit?: number;
-  }) => Promise<Record<string, any> | null>;
+  }) => Promise<Record<string, unknown> | null>;
   fetchXboxGameSchema?: (payload: {
     gameId?: string;
     platformGameId?: string;
@@ -435,19 +444,24 @@ export interface ElectronAPI {
     titleId?: string;
     packageFamilyName?: string;
   }) => Promise<AchievementSchemaItem[] | { achievements?: AchievementSchemaItem[]; [key: string]: unknown }>;
-  getStoreAchievements?: (payload: {
-    platformId: string;
-    storefrontId?: string;
-    gameId?: string;
-    platformGameId?: string;
-    xboxProductId?: string;
-    xboxTitleId?: string;
-    packageFamilyName?: string;
-    appName?: string;
-    namespace?: string;
-    catalogItemId?: string;
-    title?: string;
-  }) => Promise<Record<string, any> | null>;
+  getStoreAchievements?: (
+    payloadOrPlatformId:
+      | {
+          platformId: string;
+          storefrontId?: string;
+          gameId?: string;
+          platformGameId?: string;
+          xboxProductId?: string;
+          xboxTitleId?: string;
+          packageFamilyName?: string;
+          appName?: string;
+          namespace?: string;
+          catalogItemId?: string;
+          title?: string;
+        }
+      | string,
+    platformGameId?: string
+  ) => Promise<Record<string, unknown> | AchievementSchemaItem[] | null>;
   getXboxStatus?: (payload?: {
     refreshSubscription?: boolean;
     forceRefresh?: boolean;

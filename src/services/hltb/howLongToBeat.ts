@@ -112,9 +112,11 @@ function schedulePersistConsolidatedHltbCache(): void {
   }, 150);
   if (
     persistDebounceTimer &&
-    typeof (persistDebounceTimer as unknown as { unref?: () => void }).unref === 'function'
+    typeof persistDebounceTimer === 'object' &&
+    'unref' in persistDebounceTimer &&
+    typeof persistDebounceTimer.unref === 'function'
   ) {
-    (persistDebounceTimer as unknown as { unref: () => void }).unref();
+    persistDebounceTimer.unref();
   }
 }
 

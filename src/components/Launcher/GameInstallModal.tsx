@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { acquireModalOverlayLock } from '../../utils/modalOverlayLock';
 import { ModalShell } from '../Common/ModalShell';
@@ -240,9 +240,6 @@ function resolveTargetSteamDisplayPath(params: {
   );
 }
 
-let diskSpaceReqSeq = 0;
-let diskSpaceDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
 export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   isOpen,
   game,
@@ -250,6 +247,18 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   onClose,
   onInstallStarted,
 }) => {
+  const diskSpaceReqSeqRef = useRef<number>(0);
+  const diskSpaceDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      diskSpaceReqSeqRef.current += 1;
+      if (diskSpaceDebounceTimerRef.current) {
+        clearTimeout(diskSpaceDebounceTimerRef.current);
+        diskSpaceDebounceTimerRef.current = null;
+      }
+    };
+  }, []);
   const [selectedPlatformId, setSelectedPlatformId] = useState<StorefrontId>(() => {
     return (
       initialPlatformId ||
@@ -327,15 +336,15 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     if (!isOpen || selectedPlatformId !== 'steam' || !targetSteamPath) return;
     if (steamDiskQueryTracker.lastPath === targetSteamPath) return;
     steamDiskQueryTracker.lastPath = targetSteamPath;
-    if (diskSpaceDebounceTimer) {
-      clearTimeout(diskSpaceDebounceTimer);
-      diskSpaceDebounceTimer = null;
+    if (diskSpaceDebounceTimerRef.current) {
+      clearTimeout(diskSpaceDebounceTimerRef.current);
+      diskSpaceDebounceTimerRef.current = null;
     }
-    const reqId = ++diskSpaceReqSeq;
+    const reqId = ++diskSpaceReqSeqRef.current;
     launcherService
       .getDiskSpace(targetSteamPath)
       .then((ds) => {
-        if (reqId === diskSpaceReqSeq && ds) {
+        if (reqId === diskSpaceReqSeqRef.current && ds) {
           setDiskSpace(ds);
         }
       })
@@ -410,11 +419,11 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           setSelectedOs(chosenOs);
         }
 
-        if (diskSpaceDebounceTimer) {
-          clearTimeout(diskSpaceDebounceTimer);
-          diskSpaceDebounceTimer = null;
+        if (diskSpaceDebounceTimerRef.current) {
+          clearTimeout(diskSpaceDebounceTimerRef.current);
+          diskSpaceDebounceTimerRef.current = null;
         }
-        const reqId = ++diskSpaceReqSeq;
+        const reqId = ++diskSpaceReqSeqRef.current;
 
         if (selectedPlatformId === 'steam') {
           const currentLayers = launcherService
@@ -439,7 +448,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               launcherService
                 .getDiskSpace(initialSteamPath)
                 .then((ds) => {
-                  if (active && reqId === diskSpaceReqSeq && ds) setDiskSpace(ds);
+                  if (active && reqId === diskSpaceReqSeqRef.current && ds) setDiskSpace(ds);
                 })
                 .catch(() => {});
             }
@@ -447,7 +456,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
             launcherService
               .getDiskSpace(initialSteamPath)
               .then((ds) => {
-                if (active && reqId === diskSpaceReqSeq && ds) setDiskSpace(ds);
+                if (active && reqId === diskSpaceReqSeqRef.current && ds) setDiskSpace(ds);
               })
               .catch(() => {});
           }
@@ -457,7 +466,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           launcherService
             .getDiskSpace(info.defaultInstallDir)
             .then((ds) => {
-              if (active && reqId === diskSpaceReqSeq && ds) setDiskSpace(ds);
+              if (active && reqId === diskSpaceReqSeqRef.current && ds) setDiskSpace(ds);
             })
             .catch(() => {});
         }
@@ -472,9 +481,9 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
     return () => {
       active = false;
-      if (diskSpaceDebounceTimer) {
-        clearTimeout(diskSpaceDebounceTimer);
-        diskSpaceDebounceTimer = null;
+      if (diskSpaceDebounceTimerRef.current) {
+        clearTimeout(diskSpaceDebounceTimerRef.current);
+        diskSpaceDebounceTimerRef.current = null;
       }
     };
   }, [isOpen, game.id, selectedPlatformId]);
@@ -495,26 +504,26 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
 
   const handleDirectoryChange = async (newDir: string, debounce = false) => {
     setInstallDir(newDir);
-    if (diskSpaceDebounceTimer) {
-      clearTimeout(diskSpaceDebounceTimer);
-      diskSpaceDebounceTimer = null;
+    if (diskSpaceDebounceTimerRef.current) {
+      clearTimeout(diskSpaceDebounceTimerRef.current);
+      diskSpaceDebounceTimerRef.current = null;
     }
-    const reqId = ++diskSpaceReqSeq;
+    const reqId = ++diskSpaceReqSeqRef.current;
     const isTestEnv =
       (typeof process !== 'undefined' && process.env?.NODE_ENV === 'test') ||
-      (typeof import.meta !== 'undefined' &&
-        (import.meta as unknown as { env?: { MODE?: string } }).env?.MODE === 'test');
+      (typeof import.meta !== 'undefined' && import.meta.env?.MODE === 'test');
     if (debounce && !isTestEnv) {
-      diskSpaceDebounceTimer = setTimeout(async () => {
+      diskSpaceDebounceTimerRef.current = setTimeout(async () => {
+        diskSpaceDebounceTimerRef.current = null;
         const ds = await launcherService.getDiskSpace(newDir);
-        if (reqId === diskSpaceReqSeq && ds) {
+        if (reqId === diskSpaceReqSeqRef.current && ds) {
           setDiskSpace(ds);
         }
       }, 250);
       return;
     }
     const ds = await launcherService.getDiskSpace(newDir);
-    if (reqId === diskSpaceReqSeq && ds) {
+    if (reqId === diskSpaceReqSeqRef.current && ds) {
       setDiskSpace(ds);
     }
   };

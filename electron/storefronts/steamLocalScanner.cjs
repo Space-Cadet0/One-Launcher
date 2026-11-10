@@ -9,6 +9,33 @@ const { discoverWindowsSteamRegistryPaths } = require('../utils/windowsRegistryD
 const STEAM_LOCAL_SCAN_TTL_MS = 15000;
 const STEAM_ID64_BASE = 76561197960265728n;
 const STEAM_HTTP_TIMEOUT_MS = 20_000;
+const MAX_STEAM_SCANNER_CACHE_ENTRIES = 128;
+
+/**
+ * Inserts an entry into a bounded LRU-order `Map` (`maxEntries = 128` by default).
+ *
+ * @template K, V
+ * @param {Map<K, V>} map
+ * @param {K} key
+ * @param {V} value
+ * @param {number} [maxEntries]
+ */
+function setBoundedSteamCacheEntry(
+  map,
+  key,
+  value,
+  maxEntries = MAX_STEAM_SCANNER_CACHE_ENTRIES
+) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
 
 /**
  * Per-account/scope TTL caches so switching active Steam accounts never leaks stale playtimes
@@ -419,8 +446,210 @@ async function scanLocalSteamEaChainedGames(options = {}) {
     }
   } catch {}
 
-  cachedLocalSteamEaChainedByScope.set(scopeKey, { at: Date.now(), data: detected });
+  setBoundedSteamCacheEntry(cachedLocalSteamEaChainedByScope, scopeKey, {
+    at: Date.now(),
+    data: detected,
+  });
   return { ...detected };
+}
+
+/**
+ * Linear brace-depth VDF scanner for Steam `userdata/<id>/config/localconfig.vdf`.
+ * Navigates `"Software" -> "Valve" -> "Steam" -> "apps"` (case-insensitively, also supporting
+ * minimal `"apps" { "<appId>" { ... } }` or top-level `"<appId>" { ... }` VDF snippets) and
+ * extracts `"Playtime"`, `"PlaytimeDisconnected"`, `"Playtime2wks"`, and `"LastPlayed"` at the
+ * exact `<appId>` block depth—unaffected by nested `"cloud"`, `"autocloud"`, or `"BadgeData"`
+ * sub-blocks (`Finding #15`).
+ *
+ * @param {string} vdfContent
+ * @returns {Record<number, { playtimeMinutes: number, playtime2wks: number, lastPlayedEpoch: number, lastPlayed: number }>}
+ */
+function parseLocalConfigPlaytime(vdfContent) {
+  /** @type {Record<number, { playtimeMinutes: number, playtime2wks: number, lastPlayedEpoch: number, lastPlayed: number }>} */
+  const out = {};
+  if (!vdfContent || typeof vdfContent !== 'string') {
+    return out;
+  }
+
+  /** @type {Map<number, { playtime: number, playtimeDisconnected: number, playtime2wks: number, lastPlayed: number, touched: boolean }>} */
+  const accum = new Map();
+  /** @type {string[]} */
+  const sectionStack = [];
+  /** @type {string | null} */
+  let pendingKey = null;
+
+  const isTargetAppDepth = () => {
+    const depth = sectionStack.length;
+    if (depth === 0) return 0;
+    const leaf = sectionStack[depth - 1];
+    if (!/^[1-9]\d*$/.test(leaf)) return 0;
+    const appId = Number(leaf);
+    if (!Number.isSafeInteger(appId) || appId <= 0) return 0;
+
+    if (depth === 1) {
+      // Bare `"<appId>" { ... }` test snippet
+      return appId;
+    }
+    const parent = sectionStack[depth - 2].toLowerCase();
+    if (parent !== 'apps') {
+      return 0;
+    }
+    if (depth === 2) {
+      // `"apps" { "<appId>" { ... } }` snippet
+      return appId;
+    }
+    const grandParent = sectionStack[depth - 3].toLowerCase();
+    if (grandParent !== 'steam') {
+      return 0;
+    }
+    if (depth >= 5) {
+      const valveSeg = sectionStack[depth - 4].toLowerCase();
+      const softSeg = sectionStack[depth - 5].toLowerCase();
+      if (valveSeg !== 'valve' || softSeg !== 'software') {
+        return 0;
+      }
+    }
+    return appId;
+  };
+
+  const len = vdfContent.length;
+  let i = 0;
+  while (i < len) {
+    const ch = vdfContent.charCodeAt(i);
+
+    // Skip whitespace
+    if (ch <= 32) {
+      i += 1;
+      continue;
+    }
+
+    // Skip `//` line comments
+    if (ch === 47 /* '/' */ && i + 1 < len && vdfContent.charCodeAt(i + 1) === 47) {
+      i += 2;
+      while (i < len && vdfContent.charCodeAt(i) !== 10 && vdfContent.charCodeAt(i) !== 13) {
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === 123 /* '{' */) {
+      sectionStack.push(pendingKey !== null ? pendingKey : '');
+      pendingKey = null;
+      i += 1;
+      continue;
+    }
+
+    if (ch === 125 /* '}' */) {
+      pendingKey = null;
+      if (sectionStack.length > 0) {
+        sectionStack.pop();
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === 34 /* '"' */) {
+      i += 1;
+      let token = '';
+      let chunkStart = i;
+      while (i < len) {
+        const c = vdfContent.charCodeAt(i);
+        if (c === 92 /* '\\' */) {
+          if (i > chunkStart) {
+            token += vdfContent.slice(chunkStart, i);
+          }
+          i += 1;
+          if (i < len) {
+            const esc = vdfContent.charCodeAt(i);
+            if (esc === 110) token += '\n';
+            else if (esc === 116) token += '\t';
+            else if (esc === 114) token += '\r';
+            else token += vdfContent[i];
+            i += 1;
+          }
+          chunkStart = i;
+          continue;
+        }
+        if (c === 34 /* '"' */) {
+          if (i > chunkStart) {
+            token += vdfContent.slice(chunkStart, i);
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+
+      if (pendingKey === null) {
+        pendingKey = token;
+      } else {
+        const keyLower = pendingKey.toLowerCase();
+        pendingKey = null;
+        if (
+          keyLower === 'playtime' ||
+          keyLower === 'playtimedisconnected' ||
+          keyLower === 'playtime2wks' ||
+          keyLower === 'lastplayed'
+        ) {
+          const targetAppId = isTargetAppDepth();
+          if (targetAppId > 0 && /^\d+$/.test(token.trim())) {
+            const numVal = Number(token.trim());
+            if (Number.isFinite(numVal) && numVal >= 0) {
+              let rec = accum.get(targetAppId);
+              if (!rec) {
+                rec = {
+                  playtime: 0,
+                  playtimeDisconnected: 0,
+                  playtime2wks: 0,
+                  lastPlayed: 0,
+                  touched: false,
+                };
+                accum.set(targetAppId, rec);
+              }
+              rec.touched = true;
+              if (keyLower === 'playtime') {
+                rec.playtime = Math.max(rec.playtime, numVal);
+              } else if (keyLower === 'playtimedisconnected') {
+                rec.playtimeDisconnected = Math.max(rec.playtimeDisconnected, numVal);
+              } else if (keyLower === 'playtime2wks') {
+                rec.playtime2wks = Math.max(rec.playtime2wks, numVal);
+              } else if (keyLower === 'lastplayed') {
+                rec.lastPlayed = Math.max(rec.lastPlayed, numVal);
+              }
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // Unquoted VDF token fallback
+    let uStart = i;
+    while (i < len) {
+      const uc = vdfContent.charCodeAt(i);
+      if (uc <= 32 || uc === 123 || uc === 125 || uc === 34) break;
+      i += 1;
+    }
+    const unquoted = vdfContent.slice(uStart, i);
+    if (pendingKey === null) {
+      pendingKey = unquoted;
+    } else {
+      pendingKey = null;
+    }
+  }
+
+  for (const [appId, rec] of accum.entries()) {
+    if (!rec.touched) continue;
+    const totalMin = rec.playtime + rec.playtimeDisconnected;
+    out[appId] = {
+      playtimeMinutes: totalMin,
+      playtime2wks: rec.playtime2wks,
+      lastPlayedEpoch: rec.lastPlayed,
+      lastPlayed: rec.lastPlayed,
+    };
+  }
+
+  return out;
 }
 
 /**
@@ -457,27 +686,17 @@ async function readLocalSteamPlaytimes(options = {}) {
           if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
             filePlaytimes = prev.playtimes;
           } else {
-            filePlaytimes = {};
             const vdf = await fs.promises.readFile(vdfPath, 'utf8');
-            const regex = /"(\d+)"\s*\{([^{}]+)\}/g;
-            let m;
-            while ((m = regex.exec(vdf)) !== null) {
-              const appId = Number(m[1]);
-              const body = m[2];
-              if (!appId || (!body.includes('"Playtime"') && !body.includes('"LastPlayed"'))) {
-                continue;
-              }
-              const ptMatch = body.match(/"Playtime"\s+"(\d+)"/i);
-              const ptDiscMatch = body.match(/"PlaytimeDisconnected"\s+"(\d+)"/i);
-              const lpMatch = body.match(/"LastPlayed"\s+"(\d+)"/i);
-              const totalMin =
-                (ptMatch ? Number(ptMatch[1]) : 0) + (ptDiscMatch ? Number(ptDiscMatch[1]) : 0);
-              const lpEpoch = lpMatch ? Number(lpMatch[1]) : 0;
-              if (!filePlaytimes[appId] || totalMin >= filePlaytimes[appId].playtimeMinutes) {
-                filePlaytimes[appId] = { playtimeMinutes: totalMin, lastPlayedEpoch: lpEpoch };
-              }
+            const parsedVdf = parseLocalConfigPlaytime(vdf);
+            filePlaytimes = {};
+            for (const [appIdKey, ptEntry] of Object.entries(parsedVdf)) {
+              const appIdNum = Number(appIdKey);
+              filePlaytimes[appIdNum] = {
+                playtimeMinutes: ptEntry.playtimeMinutes,
+                lastPlayedEpoch: ptEntry.lastPlayedEpoch,
+              };
             }
-            steamLocalVdfMtimeCache.set(vdfPath, {
+            setBoundedSteamCacheEntry(steamLocalVdfMtimeCache, vdfPath, {
               mtimeMs: st.mtimeMs,
               size: st.size,
               playtimes: filePlaytimes,
@@ -485,19 +704,21 @@ async function readLocalSteamPlaytimes(options = {}) {
           }
           for (const [appIdKey, ptObj] of Object.entries(filePlaytimes)) {
             const appIdNum = Number(appIdKey);
-            if (
-              !playtimes[appIdNum] ||
-              ptObj.playtimeMinutes >= playtimes[appIdNum].playtimeMinutes
-            ) {
-              playtimes[appIdNum] = ptObj;
-            }
+            const existingPt = playtimes[appIdNum];
+            playtimes[appIdNum] = {
+              playtimeMinutes: Math.max(existingPt?.playtimeMinutes || 0, ptObj.playtimeMinutes || 0),
+              lastPlayedEpoch: Math.max(existingPt?.lastPlayedEpoch || 0, ptObj.lastPlayedEpoch || 0),
+            };
           }
         } catch {}
       }
     }
   } catch {}
 
-  cachedLocalSteamPlaytimesByScope.set(scopeKey, { at: Date.now(), data: playtimes });
+  setBoundedSteamCacheEntry(cachedLocalSteamPlaytimesByScope, scopeKey, {
+    at: Date.now(),
+    data: playtimes,
+  });
   return { ...playtimes };
 }
 
@@ -600,7 +821,7 @@ async function scanLocalSteamAchievements(options = {}) {
                   }
                 }
               }
-              steamLocalAchFileMtimeCache.set(progressFile, {
+              setBoundedSteamCacheEntry(steamLocalAchFileMtimeCache, progressFile, {
                 mtimeMs: st.mtimeMs,
                 size: st.size,
                 data: progMap,
@@ -631,11 +852,7 @@ async function scanLocalSteamAchievements(options = {}) {
                   unlocked: mAchieved ? parseInt(mAchieved[1], 10) : 0,
                 };
               }
-              if (steamLocalAchFileMtimeCache.size > 5000) {
-                const oldestKey = steamLocalAchFileMtimeCache.keys().next().value;
-                if (oldestKey !== undefined) steamLocalAchFileMtimeCache.delete(oldestKey);
-              }
-              steamLocalAchFileMtimeCache.set(fullAchPath, {
+              setBoundedSteamCacheEntry(steamLocalAchFileMtimeCache, fullAchPath, {
                 mtimeMs: st.mtimeMs,
                 size: st.size,
                 data: parsedCounts,
@@ -660,7 +877,10 @@ async function scanLocalSteamAchievements(options = {}) {
     }
   } catch {}
 
-  cachedLocalSteamAchievementsByScope.set(scopeKey, { at: Date.now(), data: achievements });
+  setBoundedSteamCacheEntry(cachedLocalSteamAchievementsByScope, scopeKey, {
+    at: Date.now(),
+    data: achievements,
+  });
   return { ...achievements };
 }
 
@@ -823,8 +1043,9 @@ async function parseSteamGamesListJson(
     const cloudPlaytime = Number(g.playtime_forever || 0) + Number(g.playtime_disconnected || 0);
     const localPt = localPlaytimes[appId];
     const playtimeMinutes = Math.max(cloudPlaytime, localPt ? localPt.playtimeMinutes : 0);
-    const lastPlayedEpoch = Number(
-      g.rtime_last_played || (localPt ? localPt.lastPlayedEpoch : 0) || 0
+    const lastPlayedEpoch = Math.max(
+      Number(g.rtime_last_played) || 0,
+      Number(localPt ? localPt.lastPlayedEpoch : 0) || 0
     );
     const lastPlayed =
       lastPlayedEpoch > 0 ? new Date(lastPlayedEpoch * 1000).toISOString() : undefined;
@@ -969,8 +1190,10 @@ async function parseSteamGamesListJson(
 }
 
 module.exports = {
+  MAX_STEAM_SCANNER_CACHE_ENTRIES,
   steamId64ToAccountId32,
   parseActiveAccountIdFromLoginUsersVdf,
+  parseLocalConfigPlaytime,
   resolveActiveSteamAccountDirs,
   resolveLocalSteamUserdataDirs,
   readLocalSteamPlaytimes,

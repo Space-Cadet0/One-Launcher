@@ -11,7 +11,12 @@ const {
   validateFederatedImageFile,
   resolveFederatorUserDataDir,
 } = require('./storefrontLocalCacheFederator.cjs');
-const { isContainedWithinRoot } = require('./securityAndPathUtils.cjs');
+const {
+  isContainedWithinRoot,
+  readSafeResponseBuffer,
+  safePublicHttpsFetch,
+} = require('./securityAndPathUtils.cjs');
+const { normalizePublisherLauncherId } = require('../utils/windowsRegistryDiscovery.cjs');
 const { classifyNonGameStorefrontItem } = require('../storefronts/nonGameClassifier.cjs');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 
@@ -586,58 +591,7 @@ const EPIC_EA_DRM_NOTICE_RE =
  */
 function normalizeVaultChainedHandoffId(raw) {
   if (typeof raw !== 'string') return null;
-  const clean = raw.trim().toLowerCase();
-  if (!clean) return null;
-  if (
-    clean === 'ea' ||
-    clean === 'theeaapp' ||
-    clean === 'the ea app' ||
-    clean === 'origin' ||
-    clean === 'origin client' ||
-    clean === 'ea app' ||
-    clean === 'eadesktop' ||
-    clean === 'ea desktop' ||
-    clean === 'eaplay' ||
-    clean === 'ea play' ||
-    clean === 'electronicarts' ||
-    clean === 'electronic arts' ||
-    clean === 'link2ea'
-  ) {
-    return 'ea';
-  }
-  if (
-    clean === 'ubisoft' ||
-    clean === 'uplay' ||
-    clean === 'ubisoft connect' ||
-    clean === 'ubisoftconnect'
-  ) {
-    return 'ubisoft';
-  }
-  if (
-    clean === 'bnet' ||
-    clean === 'battlenet' ||
-    clean === 'battle.net' ||
-    clean === 'blizzard'
-  ) {
-    return 'bnet';
-  }
-  if (
-    clean === 'rockstar' ||
-    clean === 'rockstargames' ||
-    clean === 'rockstar games' ||
-    clean === 'rgl'
-  ) {
-    return 'rockstar';
-  }
-  if (
-    clean === 'riot' ||
-    clean === 'riotclient' ||
-    clean === 'riot games' ||
-    clean === 'riotgames'
-  ) {
-    return 'riot';
-  }
-  return null;
+  return normalizePublisherLauncherId(raw);
 }
 
 const CANONICAL_XBOX_CHAINED_PUBLISHER_META = Object.freeze({
@@ -1219,6 +1173,7 @@ class OfflineVaultService {
    */
   constructor(options = {}) {
     this.options = { ...options };
+    this.hasCustomFetchImpl = typeof options.fetchImpl === 'function';
     this.federator =
       options.federator instanceof StorefrontLocalCacheFederator ||
       (options.federator &&
@@ -4630,7 +4585,7 @@ class OfflineVaultService {
    * 3. Reference-counted `AbortSignal`-coalesced upstream fetch + async normalization + persist-on-read
    *
    * @param {Record<string, any> | string | URL} paramsInput
-   * @param {{ signal?: AbortSignal, backgroundHydration?: boolean, hydrationTier?: number, throwOnAbort?: boolean }} [reqOpts]
+   * @param {{ signal?: AbortSignal, backgroundHydration?: boolean, hydrationTier?: number, throwOnAbort?: boolean, localCacheOnly?: boolean }} [reqOpts]
    */
   async resolveMediaRequest(paramsInput = {}, reqOpts = {}) {
     /** @type {Record<string, any>} */
@@ -4739,26 +4694,29 @@ class OfflineVaultService {
       }
     }
 
-    // Tier 1A: Existing content-addressed blob hit
+    // Tier 1A: Existing content-addressed blob hit (async stat — zero main-thread blocking)
     if (assetRow && assetRow.storage_kind === 'blob' && assetRow.blob_sha256) {
       const mb = db
         .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
         .get(assetRow.blob_sha256);
       if (mb) {
         const blobPath = this.getBlobFilePath(mb.sha256, mb.ext);
-        if (
-          isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform) &&
-          fs.existsSync(blobPath)
-        ) {
-          this.touchBlobAccess(mb.sha256);
-          return {
-            kind: 'file',
-            filePath: blobPath,
-            mimeType: mb.mime_type,
-            sizeBytes: Number(mb.size_bytes || 0),
-            cacheControl: 'public, max-age=31536000, immutable',
-            source: 'vault_blob',
-          };
+        if (isContainedWithinRoot(this.blobsDir, blobPath, this.options.platform)) {
+          let blobStat = null;
+          try {
+            blobStat = await fs.promises.stat(blobPath);
+          } catch {}
+          if (blobStat && blobStat.isFile() && blobStat.size > 0) {
+            this.touchBlobAccess(mb.sha256);
+            return {
+              kind: 'file',
+              filePath: blobPath,
+              mimeType: mb.mime_type,
+              sizeBytes: Number(mb.size_bytes || blobStat.size || 0),
+              cacheControl: 'public, max-age=31536000, immutable',
+              source: 'vault_blob',
+            };
+          }
         }
       }
       // Self-heal missing blob file
@@ -4767,7 +4725,7 @@ class OfflineVaultService {
       ).run(assetRow.url_key);
     }
 
-    // Tier 1B: Existing verified federated local file hit
+    // Tier 1B: Existing verified federated local file hit (async lstat + 16-byte header probe)
     if (assetRow && assetRow.storage_kind === 'federated' && assetRow.federated_path) {
       const federatedPath = String(assetRow.federated_path);
       if (
@@ -4779,17 +4737,18 @@ class OfflineVaultService {
         ).run(assetRow.url_key);
       } else {
         try {
-          const lst = fs.lstatSync(federatedPath);
+          const lst = await fs.promises.lstat(federatedPath);
           if (!lst.isSymbolicLink() && lst.isFile() && lst.size >= 33) {
             const header = Buffer.allocUnsafe(16);
             header.fill(0);
-            const fd = fs.openSync(federatedPath, 'r');
+            const fh = await fs.promises.open(federatedPath, 'r');
             let bytesRead = 0;
             try {
-              bytesRead = fs.readSync(fd, header, 0, 16, 0);
+              const readRes = await fh.read(header, 0, 16, 0);
+              bytesRead = Number(readRes?.bytesRead || 0);
             } finally {
               try {
-                fs.closeSync(fd);
+                await fh.close();
               } catch {}
             }
             const magic = detectImageMagicBytes(header.subarray(0, bytesRead));
@@ -4905,9 +4864,43 @@ class OfflineVaultService {
       }
     }
 
-    // Tier 3: Reference-Counted `AbortSignal`-Coalesced Upstream HTTP(S) Fetch + Persist-on-Read
-    if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+    // Tier 3: Reference-Counted `AbortSignal`-Coalesced Upstream HTTPS Fetch + Persist-on-Read
+    if (!rawUrl) {
       return { kind: 'error', status: 404, reason: 'no_upstream_url' };
+    }
+    if (!/^https:\/\//i.test(rawUrl)) {
+      return { kind: 'error', status: 403, reason: 'ssrf_blocked' };
+    }
+    if (reqOpts.localCacheOnly === true) {
+      if (offlineFallbackBlobSha) {
+        const fallbackMb = db
+          .prepare('SELECT sha256, ext, mime_type, size_bytes FROM media_blobs WHERE sha256 = ?')
+          .get(offlineFallbackBlobSha);
+        if (fallbackMb) {
+          const fallbackPath = this.getBlobFilePath(fallbackMb.sha256, fallbackMb.ext);
+          if (isContainedWithinRoot(this.blobsDir, fallbackPath, this.options.platform)) {
+            let fbStat = null;
+            try {
+              fbStat = await fs.promises.stat(fallbackPath);
+            } catch {}
+            if (fbStat && fbStat.isFile() && fbStat.size > 0) {
+              db.prepare(
+                "UPDATE game_media_assets SET source_url = ?, storage_kind = 'blob', blob_sha256 = ? WHERE url_key = ?"
+              ).run(offlineFallbackPrevSourceUrl || rawUrl, offlineFallbackBlobSha, urlKey);
+              this.touchBlobAccess(fallbackMb.sha256);
+              return {
+                kind: 'file',
+                filePath: fallbackPath,
+                mimeType: fallbackMb.mime_type,
+                sizeBytes: Number(fallbackMb.size_bytes || fbStat.size || 0),
+                cacheControl: 'public, max-age=3600',
+                source: 'vault_blob',
+              };
+            }
+          }
+        }
+      }
+      return { kind: 'error', status: 404, reason: 'offline_cache_miss' };
     }
 
     if (reqOpts.signal?.aborted) {
@@ -4973,7 +4966,10 @@ class OfflineVaultService {
         }
 
         try {
-          const res = await fetchFn(rawUrl, {
+          const { response: res } = await safePublicHttpsFetch(rawUrl, {
+            fetchImpl: fetchFn,
+            dnsLookup: this.options.dnsLookup,
+            allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
             method: 'GET',
             headers: {
               Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
@@ -4981,6 +4977,9 @@ class OfflineVaultService {
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             },
             signal: sharedAbortCtrl.signal,
+            timeoutMs: 10000,
+            maxRedirects: 3,
+            readBody: false,
           });
 
           const status = Number(res.status || 0);
@@ -5067,8 +5066,16 @@ class OfflineVaultService {
             };
           }
 
-          const arrayBuf = await res.arrayBuffer();
-          const rawBuf = Buffer.from(arrayBuf);
+          let rawBuf;
+          try {
+            rawBuf = await readSafeResponseBuffer(res, maxFetchBytes);
+          } catch (streamErr) {
+            if (/** @type {any} */ (streamErr)?.code === 'ERR_RESPONSE_TOO_LARGE') {
+              this.releaseCanaryIfHeld(host);
+              return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
+            }
+            throw streamErr;
+          }
           if (rawBuf.length > maxFetchBytes) {
             this.releaseCanaryIfHeld(host);
             return { response: { kind: 'error', status: 413, reason: 'image_too_large' } };
@@ -5133,6 +5140,10 @@ class OfflineVaultService {
           if (entry.abortedByAllSubscribers && !entry.timedOut) {
             this.releaseCanaryIfHeld(host);
             return { response: { kind: 'error', status: 499, reason: 'aborted' } };
+          }
+          if (/** @type {any} */ (err)?.isSsrfBlocked) {
+            this.releaseCanaryIfHeld(host);
+            return { response: { kind: 'error', status: 403, reason: 'ssrf_blocked' } };
           }
           const msg = err instanceof Error ? err.message : String(err);
           this.recordHostFailure(host, null, msg);
@@ -5261,12 +5272,13 @@ class OfflineVaultService {
    */
   async checkUrlStatus(url) {
     const cleanUrl = typeof url === 'string' ? url.trim() : '';
-    if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) {
+    if (!cleanUrl || !/^https:\/\//i.test(cleanUrl)) {
       return {
         online: false,
         status: null,
         isDefinitive404: false,
         isWafOrRateLimited: false,
+        ...(cleanUrl ? { blocked: true } : {}),
       };
     }
 
@@ -5311,17 +5323,26 @@ class OfflineVaultService {
     if (typeof timer.unref === 'function') timer.unref();
 
     try {
-      let res = await fetchFn(cleanUrl, {
+      let { response: res } = await safePublicHttpsFetch(cleanUrl, {
+        fetchImpl: fetchFn,
+        dnsLookup: this.options.dnsLookup,
+        allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
         method: 'HEAD',
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         },
         signal: ctrl.signal,
+        timeoutMs: 6000,
+        maxRedirects: 3,
+        readBody: false,
       });
 
       if (res.status === 405 || res.status === 403) {
-        res = await fetchFn(cleanUrl, {
+        const fallbackGet = await safePublicHttpsFetch(cleanUrl, {
+          fetchImpl: fetchFn,
+          dnsLookup: this.options.dnsLookup,
+          allowDnsUnavailableForCustomFetch: this.hasCustomFetchImpl,
           method: 'GET',
           headers: {
             Range: 'bytes=0-2047',
@@ -5329,7 +5350,11 @@ class OfflineVaultService {
               'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           },
           signal: ctrl.signal,
+          timeoutMs: 6000,
+          maxRedirects: 3,
+          readBody: false,
         });
+        res = fallbackGet.response;
       }
 
       const status = Number(res.status || 0);
@@ -5380,6 +5405,16 @@ class OfflineVaultService {
         isWafOrRateLimited: false,
       };
     } catch (err) {
+      if (/** @type {any} */ (err)?.isSsrfBlocked) {
+        this.releaseCanaryIfHeld(host);
+        return {
+          online: false,
+          status: null,
+          isDefinitive404: false,
+          isWafOrRateLimited: false,
+          blocked: true,
+        };
+      }
       const msg = err instanceof Error ? err.message : String(err);
       this.recordHostFailure(host, null, msg);
       return {

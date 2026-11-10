@@ -317,7 +317,7 @@ function readPeDelayImportedDllNamesFromFd(fd, layout, fileSize) {
  * Derive normalized graphics & legacy API capability flags from deduplicated lowercase DLL names.
  *
  * @param {string[]} importedDlls
- * @param {{ usesDynamicQgl?: boolean, dynamicallyLoadsDirectDraw?: boolean, hasUe5IoStoreContainer?: boolean }} [extra]
+ * @param {{ usesDynamicQgl?: boolean, dynamicallyLoadsDirectDraw?: boolean, hasUe5IoStoreContainer?: boolean, is64Bit?: boolean, forceGlCore?: boolean }} [extra]
  */
 function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const dllList = Array.isArray(importedDlls) ? importedDlls : [];
@@ -325,7 +325,11 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const usesDynamicQgl = Boolean(extra.usesDynamicQgl);
   const dynamicallyLoadsDirectDraw = Boolean(extra.dynamicallyLoadsDirectDraw);
   const hasUe5IoStoreContainer = Boolean(extra.hasUe5IoStoreContainer);
+  const is64Bit = Boolean(extra.is64Bit);
+  const forceGlCore = Boolean(extra.forceGlCore);
 
+  const importsUnityPlayer = dllSet.has('unityplayer.dll');
+  const isModernUnity64Host = Boolean(importsUnityPlayer && is64Bit && !forceGlCore);
   const importsDdraw2d = dllSet.has('ddraw.dll') || dynamicallyLoadsDirectDraw;
   const importsD3dImmediateMode = dllSet.has('d3dim.dll') || dllSet.has('d3dim700.dll');
   const usesLegacyDdraw = Boolean(importsDdraw2d || importsD3dImmediateMode);
@@ -341,7 +345,7 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const importsLegacyD3dOrGl =
     importsD3d8 ||
     usesLegacyDdraw ||
-    importsOpenGl;
+    (importsOpenGl && !isModernUnity64Host);
   const hasExplicitD3d11Or10 =
     dllSet.has('d3d11.dll') ||
     dllSet.has('d3d10.dll') ||
@@ -350,6 +354,7 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
     dllList.some((d) => /^d3dx1[01](?:_\d+)?\.dll$/i.test(d));
   const importsD3d11Or10 =
     hasExplicitD3d11Or10 ||
+    isModernUnity64Host ||
     (dllSet.has('dxgi.dll') && !importsD3d12 && !hasUe5IoStoreContainer);
   const isD3d12Only =
     (importsD3d12 || hasUe5IoStoreContainer) &&
@@ -360,6 +365,7 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
 
   return {
     usesDynamicQgl,
+    importsUnityPlayer,
     importsDdraw2d,
     importsD3dImmediateMode,
     usesLegacyDdraw,
@@ -785,10 +791,20 @@ function inspectPeCapabilities(exePath, options = {}) {
   const isDynamicBase = Boolean(pe.isDynamicBase);
   const dynamicallyLoadsOpenGl = Boolean(pe.dynamicallyLoadsOpenGl);
   const dynamicallyLoadsDirectDraw = Boolean(pe.dynamicallyLoadsDirectDraw);
-  const gfxCaps = derivePeGraphicsCapabilities(importedDlls, {
+  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+    String(options?.launchArguments || '')
+  );
+  const mergedForGfx = delayImportedDlls.some(
+    (d) => String(d || '').trim().toLowerCase() === 'unityplayer.dll'
+  )
+    ? Array.from(new Set([...importedDlls, 'unityplayer.dll']))
+    : importedDlls;
+  const gfxCaps = derivePeGraphicsCapabilities(mergedForGfx, {
     usesDynamicQgl: dynamicallyLoadsOpenGl,
     dynamicallyLoadsDirectDraw,
     hasUe5IoStoreContainer: Boolean(options?.hasUe5IoStoreContainer),
+    is64Bit,
+    forceGlCore,
   });
   const isDosboxExecutable =
     typeof exePath === 'string' && /^dosbox[^\\/]*\.exe$/i.test(path.win32.basename(exePath.trim()));
@@ -3237,9 +3253,12 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
             candidateDllNames.push(entry.name);
           }
         }
-        const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
+          const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
         for (let i = 0; i < orderedDllNames.length; i += 1) {
           const dllName = orderedDllNames[i];
+          if (/^unityplayer\.dll$/i.test(dllName)) {
+            dllSet.add('unityplayer.dll');
+          }
           const dllPath = path.join(targetExeDir, dllName);
           const isRedistDll = NON_ENGINE_REDIST_DLL_RE.test(dllName);
           const dllHeader = inspectWindowsExecutableHeader(dllPath, {
@@ -3267,6 +3286,17 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     }
   }
 
+  for (const inspectedPe of allInspectedPes) {
+    if (
+      Array.isArray(inspectedPe.delayImportedDlls) &&
+      inspectedPe.delayImportedDlls.some(
+        (d) => String(d || '').trim().toLowerCase() === 'unityplayer.dll'
+      )
+    ) {
+      dllSet.add('unityplayer.dll');
+    }
+  }
+
   const importedDlls = Array.from(dllSet);
 
   const effectiveMachine =
@@ -3287,6 +3317,13 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     Boolean(options?.hasUe5IoStoreContainer) ||
     detectUe5IoStoreContainer(normalizedInstallDir, effectiveExePath);
 
+  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+    String(options?.launchArguments || '')
+  );
+  const isModernUnity64Host = Boolean(
+    is64Bit && !is32Bit && dllSet.has('unityplayer.dll') && !forceGlCore
+  );
+
   const anyDynamicQgl =
     dllDynamicOpenGl || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsOpenGl));
   const anyDynamicDdraw =
@@ -3295,16 +3332,27 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     usesDynamicQgl: anyDynamicQgl,
     dynamicallyLoadsDirectDraw: anyDynamicDdraw,
     hasUe5IoStoreContainer,
+    is64Bit,
+    forceGlCore,
   });
 
-  const usesOpenGl = importedDlls.includes('opengl32.dll') || anyDynamicQgl;
+  const usesOpenGl = (importedDlls.includes('opengl32.dll') || anyDynamicQgl) && !isModernUnity64Host;
   const usesLegacyDirectDrawOrD3d =
     importedDlls.some(
       (d) => d === 'ddraw.dll' || d === 'd3dim.dll' || d === 'd3dim700.dll' || d === 'd3d8.dll'
     ) || anyDynamicDdraw;
-  const usesModernGraphicsApi = importedDlls.some(
-    (d) => d === 'd3d12.dll' || d === 'vulkan-1.dll' || d === 'dxgi.dll' || d === 'd3d11.dll'
-  );
+  const usesModernGraphicsApi =
+    isModernUnity64Host ||
+    importedDlls.some(
+      (d) => d === 'd3d12.dll' || d === 'vulkan-1.dll' || d === 'dxgi.dll' || d === 'd3d11.dll'
+    );
+  const effectiveIsLauncherStubCandidate = isModernUnity64Host
+    ? Boolean(
+        validChildren.length > 0 ||
+          launcherSettings.resolvedTargetExePath ||
+          paradoxSettings.paradoxDirectGameExe
+      )
+    : isLauncherStubCandidate;
   const isLegacy32BitOpenGl =
     effectiveMachine === 'x86' && usesOpenGl && !usesModernGraphicsApi;
   const needsLegacyDisplayModeSynthesis =
@@ -3361,7 +3409,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     isLegacy32BitOpenGl,
     needsLegacyDisplayModeSynthesis,
     isDosboxExecutable,
-    isLauncherStubCandidate,
+    isLauncherStubCandidate: effectiveIsLauncherStubCandidate,
     hasChildGameExecutable:
       validChildren.length > 0 ||
       Boolean(launcherSettings.resolvedTargetExePath) ||

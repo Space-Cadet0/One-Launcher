@@ -1,4 +1,4 @@
-import { createStore, del, get, set, type UseStore } from 'idb-keyval';
+import { createStore, del, entries, get, set, type UseStore } from 'idb-keyval';
 
 const DB_NAME = 'one-launcher-db';
 const STORE_NAME = 'kv';
@@ -54,5 +54,18 @@ export async function vaultDelete(key: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+export async function vaultEntries<
+  K extends IDBValidKey = IDBValidKey,
+  V = unknown,
+>(): Promise<Array<[K, V]>> {
+  const store = getVaultStore();
+  if (!store) return [];
+  try {
+    return await entries<K, V>(store);
+  } catch {
+    return [];
   }
 }

@@ -346,20 +346,112 @@ static bool append_utf8_codepoint(XgrStrBuf *sb, uint32_t cp)
 static const char *json_locate_key_value(const char *json, const char *key)
 {
     if (!json || !key) return NULL;
-    char pat[160];
-    int plen = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    if (plen <= 0 || (size_t)plen >= sizeof(pat)) return NULL;
+    size_t key_len = strlen(key);
 
     const char *p = json;
-    while ((p = strstr(p, pat)) != NULL) {
-        const char *after = p + plen;
-        while (*after && isspace((unsigned char)*after)) after++;
-        if (*after == ':') {
-            after++;
-            while (*after && isspace((unsigned char)*after)) after++;
-            return after;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '{') return NULL;
+
+    int depth = 0;
+    bool expect_key = false;
+
+    while (*p) {
+        char ch = *p;
+        if (ch == '"') {
+            const char *str_start = ++p;
+            bool has_escape = false;
+            while (*p && *p != '"') {
+                if (*p == '\\') {
+                    has_escape = true;
+                    p++;
+                    if (!*p) return NULL;
+                }
+                p++;
+            }
+            if (!*p) return NULL;
+            const char *str_end = p;
+            p++; /* consume closing '"' */
+
+            if (depth == 1 && expect_key) {
+                bool key_match = false;
+                if (!has_escape) {
+                    key_match = ((size_t)(str_end - str_start) == key_len) &&
+                                (key_len == 0 || memcmp(str_start, key, key_len) == 0);
+                } else {
+                    size_t ki = 0;
+                    const char *sp = str_start;
+                    key_match = true;
+                    while (sp < str_end) {
+                        char kc = *sp++;
+                        if (kc == '\\' && sp < str_end) {
+                            char esc = *sp++;
+                            switch (esc) {
+                                case '"':  kc = '"'; break;
+                                case '\\': kc = '\\'; break;
+                                case '/':  kc = '/'; break;
+                                case 'b':  kc = '\b'; break;
+                                case 'f':  kc = '\f'; break;
+                                case 'n':  kc = '\n'; break;
+                                case 'r':  kc = '\r'; break;
+                                case 't':  kc = '\t'; break;
+                                default:   key_match = false; break;
+                            }
+                        }
+                        if (!key_match || ki >= key_len || kc != key[ki]) {
+                            key_match = false;
+                            break;
+                        }
+                        ki++;
+                    }
+                    if (ki != key_len) key_match = false;
+                }
+
+                const char *after = p;
+                while (*after && isspace((unsigned char)*after)) after++;
+                if (*after == ':') {
+                    p = after + 1;
+                    expect_key = false;
+                    if (key_match) {
+                        while (*p && isspace((unsigned char)*p)) p++;
+                        return p;
+                    }
+                    continue;
+                }
+            }
+            continue;
         }
-        p += plen;
+
+        if (ch == '{') {
+            depth++;
+            if (depth == 1) expect_key = true;
+            p++;
+            continue;
+        }
+        if (ch == '}') {
+            depth--;
+            p++;
+            if (depth <= 0) break;
+            continue;
+        }
+        if (ch == '[') {
+            depth++;
+            p++;
+            continue;
+        }
+        if (ch == ']') {
+            depth--;
+            p++;
+            if (depth <= 0) break;
+            continue;
+        }
+        if (depth == 1) {
+            if (ch == ',') {
+                expect_key = true;
+            } else if (ch == ':') {
+                expect_key = false;
+            }
+        }
+        p++;
     }
     return NULL;
 }

@@ -253,23 +253,37 @@ function oracleComputeViewport(screenW, screenH, safeInsetTop, virtW, virtH, asp
       dstH = virtH * k;
     } else {
       integerScale = 0;
-      const fitByH = Math.floor((usableH * virtW + Math.floor(virtH / 2)) / virtH);
-      if (fitByH <= usableW) {
+      const lhs = usableW * virtH;
+      const rhs = usableH * virtW;
+      if (lhs > rhs) {
         dstH = usableH;
-        dstW = (fitByH + 1) & ~1;
+        const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
+        dstW = Math.min(usableW, (rhs % virtH === 0) ? Math.floor(rhs / virtH) : ((fitByH + 1) & ~1));
+      } else if (lhs < rhs) {
+        dstW = usableW;
+        let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
+        if (fitH >= 2) fitH &= ~1;
+        dstH = Math.max(1, fitH);
       } else {
-        dstW = (usableW + 1) & ~1;
-        dstH = Math.floor((usableW * virtH + Math.floor(virtH / 2)) / virtW);
+        dstW = usableW;
+        dstH = usableH;
       }
     }
   } else {
-    const fitByH = Math.floor((usableH * virtW + Math.floor(virtH / 2)) / virtH);
-    if (fitByH <= usableW) {
+    const lhs = usableW * virtH;
+    const rhs = usableH * virtW;
+    if (lhs > rhs) {
       dstH = usableH;
-      dstW = (fitByH + 1) & ~1;
+      const fitByH = Math.floor((rhs + Math.floor(virtH / 2)) / virtH);
+      dstW = Math.min(usableW, (rhs % virtH === 0) ? Math.floor(rhs / virtH) : ((fitByH + 1) & ~1));
+    } else if (lhs < rhs) {
+      dstW = usableW;
+      let fitH = Math.min(usableH, Math.floor((lhs + Math.floor(virtW / 2)) / virtW));
+      if (fitH >= 2) fitH &= ~1;
+      dstH = Math.max(1, fitH);
     } else {
-      dstW = (usableW + 1) & ~1;
-      dstH = Math.floor((usableW * virtH + Math.floor(virtH / 2)) / virtW);
+      dstW = usableW;
+      dstH = usableH;
     }
   }
 

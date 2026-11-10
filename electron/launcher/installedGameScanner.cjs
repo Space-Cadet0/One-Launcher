@@ -4,8 +4,15 @@ const os = require('node:os');
 const { DatabaseSync } = require('node:sqlite');
 
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
-const { recordImportedEpicInstall } = require('./securityAndPathUtils.cjs');
-const { discoverWindowsEpicRegistryPaths } = require('../utils/windowsRegistryDiscovery.cjs');
+const {
+  recordImportedEpicInstall,
+  discoverWindowsLocalDrivesAsync,
+  refreshHostWindowsKnownFoldersAsync,
+} = require('./securityAndPathUtils.cjs');
+const {
+  discoverWindowsEpicRegistryPaths,
+  refreshWindowsStorefrontRegistryCacheAsync,
+} = require('../utils/windowsRegistryDiscovery.cjs');
 const { fromWineWindowsPath } = require('./firstPartyRegistration.cjs');
 const {
   parseByteCountOrFormattedSize,
@@ -16,6 +23,7 @@ const {
 } = require('./binaryAndManifestInspectors.cjs');
 const {
   getUserDataDir,
+  isTestEnvironment,
   getXboxStorefrontModules,
   getLastProductionScanCache,
   setLastProductionScanCache,
@@ -64,13 +72,12 @@ const {
 } = require('./chainedPublisherLaunchers.cjs');
 const {
   parseVaultJson,
-  normalizeVaultChainedHandoffId,
   sanitizeVaultPlatformEntriesOsFlags,
 } = require('./offlineVaultService.cjs');
 const { parseSteamEaInstallerDataXml } = require('../storefronts/steamLocalScanner.cjs');
 
 function resolveAnyChainedHandoffId(/** @type {any} */ raw) {
-  return normalizeChainedHandoffId(raw) || normalizeVaultChainedHandoffId(raw);
+  return normalizeChainedHandoffId(raw);
 }
 
 function extractRegistryPathLeafKeys(/** @type {any} */ rawRegistryPath) {
@@ -355,16 +362,39 @@ function loadChainedCatalogIndex(userDataDir, /** @type {any} */ options = {}, /
     if (fs.existsSync(vaultDbPath)) {
       const vaultDb = new DatabaseSync(vaultDbPath, { readOnly: true });
       try {
+        // Project only lightweight columns in the full-table pass so thousands of uninstalled
+        // library rows never trigger synchronous `zlib.inflateRawSync` on multi-KB `enriched_json`.
         const rows = vaultDb
-          .prepare(
-            'SELECT game_id, canonical_title, platforms_json, summary_json, enriched_json FROM vault_games'
-          )
+          .prepare('SELECT game_id, canonical_title, platforms_json, summary_json FROM vault_games')
           .all();
+        const getEnrichedByIdStmt = vaultDb.prepare(
+          'SELECT enriched_json FROM vault_games WHERE game_id = ?'
+        );
         for (const row of rows) {
           if (!row) continue;
           const summary = parseVaultJson(row.summary_json) || {};
           const platforms = parseVaultJson(row.platforms_json) || summary.platforms || [];
-          const enrichedMetadata = row.enriched_json ? parseVaultJson(row.enriched_json) : null;
+          let enrichedMetadata = null;
+          const needsEnrichedDrmFallback =
+            !summary.drmNotice &&
+            !summary.chainedLauncherHandoff &&
+            !summary.externalStorefrontHandoff &&
+            Array.isArray(platforms) &&
+            platforms.some((p) => {
+              if (!p || typeof p !== 'object') return false;
+              const pid = String(p.platformId || '').toLowerCase();
+              return (
+                (pid === 'xbox' || pid === 'epic') &&
+                !p.chainedLauncherHandoff &&
+                !p.externalStorefrontHandoff
+              );
+            });
+          if (needsEnrichedDrmFallback && row.game_id) {
+            const enrichedRow = getEnrichedByIdStmt.get(row.game_id);
+            if (enrichedRow?.enriched_json) {
+              enrichedMetadata = parseVaultJson(enrichedRow.enriched_json);
+            }
+          }
           indexGameEntry({
             ...summary,
             id: summary.id || row.game_id,
@@ -482,6 +512,13 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
 
     if (platform === 'win32') {
       primeXboxDiscoveryCachesAsync(options).catch(() => {});
+      if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
+        const prewarmOpts =
+          options.prewarmWindowsCaches === true ? options : { platform };
+        refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {});
+        refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {});
+        discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {});
+      }
     }
 
     /** @type {Record<string, any>} */
@@ -2175,8 +2212,32 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
   }
 }
 
+/**
+ * Async wrapper around `scanAllInstalledGames` that pre-warms Windows registry,
+ * known-folder, and drive-root caches asynchronously before scanning so IPC calls
+ * on `win32` never block the Electron main thread on cold synchronous `reg.exe` spawns.
+ */
+async function scanAllInstalledGamesAsync(/** @type {any} */ options = {}) {
+  const platform = options.platform || process.platform;
+  if (platform === 'win32') {
+    const prewarmOpts = options.prewarmWindowsCaches === true ? options : { platform };
+    /** @type {Promise<any>[]} */
+    const tasks = [primeXboxDiscoveryCachesAsync(options).catch(() => {})];
+    if (!isTestEnvironment(options) || options.prewarmWindowsCaches === true) {
+      tasks.push(
+        refreshWindowsStorefrontRegistryCacheAsync(prewarmOpts).catch(() => {}),
+        refreshHostWindowsKnownFoldersAsync(prewarmOpts).catch(() => {}),
+        discoverWindowsLocalDrivesAsync(prewarmOpts).catch(() => {})
+      );
+    }
+    await Promise.all(tasks);
+  }
+  return scanAllInstalledGames(options);
+}
+
 module.exports = {
   scanAllInstalledGames,
+  scanAllInstalledGamesAsync,
   buildChainedTitleMatchKeys,
   doChainedPublisherTitlesMatch,
   isGdkStubExecutablePath,

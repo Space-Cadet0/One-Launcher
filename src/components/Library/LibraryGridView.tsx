@@ -955,9 +955,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
         {sortedGames.length === 0 && (
           <div className="py-20 text-center flex flex-col items-center justify-center gap-3 bg-[#16202d]/50 rounded-lg border border-steam-border/60 p-8">
             <Layers aria-hidden="true" className="w-12 h-12 text-steam-subtext/70" />
-            <h3 className="text-base font-bold text-white">
+            <h2 className="text-base font-bold text-white">
               {title ? `No games in "${title}"` : 'No games found'}
-            </h3>
+            </h2>
             <p className="text-xs text-steam-subtext max-w-sm">
               {title
                 ? `You have not assigned any titles to the "${title}" collection yet. You can add games from the sidebar or any game detail page.`

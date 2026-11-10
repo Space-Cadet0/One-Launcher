@@ -76,6 +76,11 @@ static bool starts_with_ascii(const char *str, const char *prefix) {
     return strncmp(str, prefix, plen) == 0;
 }
 
+static bool contains_ascii_sub(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !needle[0]) return false;
+    return strstr(haystack, needle) != NULL;
+}
+
 static bool is_ignored_helper_owner(const char *lower_owner) {
     static const char *const kIgnored[] = {
         "explorer.exe",
@@ -86,17 +91,31 @@ static bool is_ignored_helper_owner(const char *lower_owner) {
         "rpcss.exe",
         "conhost.exe",
         "tabtip.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "rundll32.exe",
         "one_display_launcher_x86.exe",
         "one_display_launcher_x64.exe",
+        "one_xgr_win_launcher.exe",
+        "one_xgr_win_launcher_x86.exe",
         "galaxyclient.exe",
         "galaxyclient helper.exe",
+        "galaxyclienthelper.exe",
+        "galaxycommunication.exe",
         "gog galaxy notifications renderer.exe",
         "qtwebengineprocess.exe",
         "python.exe",
         "steam.exe",
         "steamwebhelper.exe",
+        "steamservice.exe",
         "epicgameslauncher.exe",
         "epicwebhelper.exe",
+        "eadesktop.exe",
+        "eabackgroundservice.exe",
+        "upc.exe",
+        "ubisoftgamelauncher.exe",
+        "rockstarlauncher.exe",
+        "rockstarservice.exe",
     };
     for (size_t i = 0; i < sizeof(kIgnored) / sizeof(kIgnored[0]); i++) {
         if (strcmp(lower_owner, kIgnored[i]) == 0) {
@@ -118,7 +137,16 @@ static bool find_top_bottled_game_window(int32_t *out_pid, int32_t *out_layer) {
         return false;
     }
 
+    CGRect main_bounds = CGDisplayBounds(CGMainDisplayID());
+    double screen_area = (main_bounds.size.width > 0.0 && main_bounds.size.height > 0.0)
+        ? (main_bounds.size.width * main_bounds.size.height)
+        : 0.0;
+
     bool found = false;
+    double best_score = -1.0;
+    int32_t best_pid = 0;
+    int32_t best_layer = 0;
+
     CFIndex count = CFArrayGetCount(win_list);
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(win_list, i);
@@ -158,14 +186,122 @@ static bool find_top_bottled_game_window(int32_t *out_pid, int32_t *out_layer) {
             CFNumberGetValue(layer_ref, kCFNumberSInt32Type, &layer);
         }
 
-        *out_pid = pid;
-        *out_layer = layer;
-        found = true;
-        break;
+        double area = rect.size.width * rect.size.height;
+        bool is_near_fullscreen = (screen_area > 0.0 && area >= screen_area * 0.80);
+        double score = area;
+        if (is_near_fullscreen) {
+            score += 1.0e12;
+        }
+        if (layer > 0) {
+            score += 1.0e10;
+        }
+
+        /* Strict '>' preserves frontmost WindowServer Z-order on equal-sized windows */
+        if (!found || score > best_score) {
+            found = true;
+            best_score = score;
+            best_pid = pid;
+            best_layer = layer;
+        }
     }
 
     CFRelease(win_list);
+    if (found) {
+        *out_pid = best_pid;
+        *out_layer = best_layer;
+    }
     return found;
+}
+
+static const char *nsstring_to_utf8(id ns_str) {
+    if (!ns_str) return NULL;
+    SEL sel_utf8 = sel_registerName("UTF8String");
+    const char *(*msg_utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
+    return msg_utf8(ns_str, sel_utf8);
+}
+
+/*
+ * Guard against stealing focus when the user Cmd+Tab's to an unrelated macOS app
+ * (Safari, Finder, Terminal, etc.) during launch polling: only transfer activation
+ * when One Launcher itself or a Wine/CrossOver bottle helper is currently frontmost.
+ */
+static bool can_cooperatively_transfer_from_frontmost(id ns_app, id current_app, int32_t target_pid) {
+    SEL sel_is_active = sel_registerName("isActive");
+    BOOL (*msg_bool)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+    if (ns_app && msg_bool(ns_app, sel_is_active)) {
+        return true;
+    }
+
+    Class cls_ws = objc_getClass("NSWorkspace");
+    if (!cls_ws) {
+        return true;
+    }
+    SEL sel_shared_ws = sel_registerName("sharedWorkspace");
+    id (*msg_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    id shared_ws = msg_id((id)cls_ws, sel_shared_ws);
+    if (!shared_ws) {
+        return true;
+    }
+
+    SEL sel_front = sel_registerName("frontmostApplication");
+    id front_app = msg_id(shared_ws, sel_front);
+    if (!front_app) {
+        return true;
+    }
+
+    SEL sel_pid = sel_registerName("processIdentifier");
+    int32_t (*msg_pid)(id, SEL) = (int32_t (*)(id, SEL))objc_msgSend;
+    int32_t front_pid = msg_pid(front_app, sel_pid);
+    if (front_pid == target_pid) {
+        return true;
+    }
+    if (current_app && front_pid == msg_pid(current_app, sel_pid)) {
+        return true;
+    }
+
+    SEL sel_bundle_id = sel_registerName("bundleIdentifier");
+    const char *bundle_utf8 = nsstring_to_utf8(msg_id(front_app, sel_bundle_id));
+    if (bundle_utf8 && bundle_utf8[0]) {
+        char lower_bid[256];
+        str_to_lower_ascii(bundle_utf8, lower_bid, sizeof(lower_bid));
+        if (contains_ascii_sub(lower_bid, "crossover") ||
+            contains_ascii_sub(lower_bid, "wine") ||
+            contains_ascii_sub(lower_bid, "onelauncher") ||
+            contains_ascii_sub(lower_bid, "electron")) {
+            return true;
+        }
+    }
+
+    SEL sel_loc_name = sel_registerName("localizedName");
+    const char *name_utf8 = nsstring_to_utf8(msg_id(front_app, sel_loc_name));
+    if (name_utf8 && name_utf8[0]) {
+        char lower_name[256];
+        str_to_lower_ascii(name_utf8, lower_name, sizeof(lower_name));
+        if (starts_with_ascii(lower_name, "wine") ||
+            ends_with_ascii(lower_name, ".exe") ||
+            contains_ascii_sub(lower_name, "crossover") ||
+            contains_ascii_sub(lower_name, "one launcher") ||
+            contains_ascii_sub(lower_name, "onelauncher") ||
+            contains_ascii_sub(lower_name, "electron")) {
+            return true;
+        }
+    }
+
+    SEL sel_exe_url = sel_registerName("executableURL");
+    SEL sel_path = sel_registerName("path");
+    id exe_url = msg_id(front_app, sel_exe_url);
+    const char *exe_utf8 = exe_url ? nsstring_to_utf8(msg_id(exe_url, sel_path)) : NULL;
+    if (exe_utf8 && exe_utf8[0]) {
+        char lower_exe[512];
+        str_to_lower_ascii(exe_utf8, lower_exe, sizeof(lower_exe));
+        if (contains_ascii_sub(lower_exe, "/wine") ||
+            contains_ascii_sub(lower_exe, "crossover") ||
+            contains_ascii_sub(lower_exe, "gameportingtoolkit")) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static bool coop_activate_pid(int32_t pid) {
@@ -192,6 +328,13 @@ static bool coop_activate_pid(int32_t pid) {
     id (*msg_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
     id ns_app = msg_id((id)cls_ns_app, sel_shared_app);
 
+    SEL sel_current_app = sel_registerName("currentApplication");
+    id current_app = msg_id((id)cls_run_app, sel_current_app);
+
+    if (!can_cooperatively_transfer_from_frontmost(ns_app, current_app, pid)) {
+        return false;
+    }
+
     SEL sel_responds = sel_registerName("respondsToSelector:");
     BOOL (*msg_responds)(id, SEL, SEL) = (BOOL (*)(id, SEL, SEL))objc_msgSend;
 
@@ -201,16 +344,14 @@ static bool coop_activate_pid(int32_t pid) {
         msg_yield(ns_app, sel_yield, target_app);
     }
 
-    SEL sel_current_app = sel_registerName("currentApplication");
-    id current_app = msg_id((id)cls_run_app, sel_current_app);
-
     SEL sel_act_from = sel_registerName("activateFromApplication:options:");
     if (current_app && msg_responds(target_app, sel_responds, sel_act_from)) {
         /* NSApplicationActivateAllWindows = 1 << 0 */
         BOOL (*msg_act_from)(id, SEL, id, uintptr_t) =
             (BOOL (*)(id, SEL, id, uintptr_t))objc_msgSend;
         (void)msg_act_from(target_app, sel_act_from, current_app, (uintptr_t)1);
-    } else {
+    }
+    if (!msg_bool(target_app, sel_is_active)) {
         SEL sel_act_opts = sel_registerName("activateWithOptions:");
         if (msg_responds(target_app, sel_responds, sel_act_opts)) {
             BOOL (*msg_act_opts)(id, SEL, uintptr_t) =

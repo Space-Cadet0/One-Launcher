@@ -8,6 +8,9 @@ const { execFile, execFileSync } = require('node:child_process');
 const {
   isContainedWithinRoot,
   resolveHostWindowsKnownFolders,
+  discoverWindowsLocalDrivesAsync,
+  getKnownWindowsLocalDrivesSync,
+  clearCachedWindowsLocalDrives,
 } = require('./securityAndPathUtils.cjs');
 const {
   computePackageFamilyName,
@@ -79,195 +82,6 @@ const gogRootWebCacheDirLookup = new Map();
 const MAX_GOG_ROOT_WEBCACHE_DIR_ENTRIES = 16;
 const xboxManifestScanLookup = new Map();
 const MAX_XBOX_MANIFEST_LOOKUP_ENTRIES = 256;
-
-const WIN32_LOCAL_DRIVES_TTL_MS = 10_000;
-/** @type {string[] | null} */
-let cachedWin32LocalDrives = null;
-let cachedWin32LocalDrivesAt = 0;
-/** @type {Promise<string[]> | null} */
-let inFlightWin32DriveProbe = null;
-
-function resolveFallbackWin32SystemDrives(options = {}) {
-  const envObj = options && options.env && typeof options.env === 'object' ? options.env : process.env;
-  const sysDriveRaw = String(envObj?.SystemDrive || 'C:').trim();
-  const match = /^([A-Za-z]):/.exec(sysDriveRaw);
-  const letter = match ? match[1].toUpperCase() : 'C';
-  return [`${letter}:\\`];
-}
-
-/**
- * Asynchronously discovers local fixed (`DriveType=3`) and removable (`DriveType=2`) Windows
- * logical drives via CIM (`Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3"`),
- * cached with a `10s` TTL and skipping `DriveType=4` mapped SMB network shares so disconnected
- * NAS/VPN drives never stall the Electron main thread for 5-30 seconds.
- *
- * @param {Record<string, any>} [options]
- * @returns {Promise<string[]>}
- */
-function discoverWindowsLocalDrivesAsync(options = {}) {
-  const platform = options.platform || process.platform;
-  const execFileFn =
-    typeof options.execFileImpl === 'function' ? options.execFileImpl : execFile;
-  if (platform !== 'win32' && typeof options.execFileImpl !== 'function') {
-    return Promise.resolve([]);
-  }
-  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : Date.now;
-  const now = Number(nowFn());
-  const useSharedCache = typeof options.execFileImpl !== 'function' && !options.bypassDriveCache;
-
-  if (
-    useSharedCache &&
-    Array.isArray(cachedWin32LocalDrives) &&
-    cachedWin32LocalDrives.length > 0 &&
-    now - cachedWin32LocalDrivesAt < WIN32_LOCAL_DRIVES_TTL_MS
-  ) {
-    return Promise.resolve(cachedWin32LocalDrives.slice());
-  }
-
-  if (useSharedCache && inFlightWin32DriveProbe) {
-    return inFlightWin32DriveProbe;
-  }
-
-  const probePromise = new Promise((resolve) => {
-    const args = [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | Select-Object -ExpandProperty DeviceID',
-    ];
-    try {
-      execFileFn(
-        'powershell.exe',
-        args,
-        { timeout: 4000, windowsHide: true, maxBuffer: 64 * 1024 },
-        (err, stdout) => {
-          const drives = new Set();
-          if (!err && typeof stdout === 'string') {
-            for (const rawLine of stdout.split(/\r?\n/)) {
-              const trimmed = rawLine.trim();
-              const m = /^([A-Za-z]):\\?$/.exec(trimmed);
-              if (m) {
-                drives.add(`${m[1].toUpperCase()}:\\`);
-              }
-            }
-          }
-          if (drives.size === 0) {
-            for (const d of resolveFallbackWin32SystemDrives(options)) {
-              drives.add(d);
-            }
-          }
-          const result = Array.from(drives);
-          if (useSharedCache) {
-            cachedWin32LocalDrives = result;
-            cachedWin32LocalDrivesAt = Number(nowFn());
-          }
-          resolve(result.slice());
-        }
-      );
-    } catch {
-      const fallback = resolveFallbackWin32SystemDrives(options);
-      if (useSharedCache) {
-        cachedWin32LocalDrives = fallback;
-        cachedWin32LocalDrivesAt = Number(nowFn());
-      }
-      resolve(fallback.slice());
-    }
-  }).finally(() => {
-    if (inFlightWin32DriveProbe === probePromise) {
-      inFlightWin32DriveProbe = null;
-    }
-  });
-
-  if (useSharedCache) {
-    inFlightWin32DriveProbe = probePromise;
-  }
-  return probePromise;
-}
-
-function getKnownWindowsLocalDrivesSync(options = {}) {
-  if (Array.isArray(options.localDrives)) {
-    return options.localDrives
-      .map((d) => String(d || '').trim())
-      .filter(Boolean)
-      .map((d) => (/^[A-Za-z]:$/.test(d) ? `${d.toUpperCase()}\\` : d));
-  }
-  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : Date.now;
-  const now = Number(nowFn());
-  if (Array.isArray(cachedWin32LocalDrives) && cachedWin32LocalDrives.length > 0) {
-    if (now - cachedWin32LocalDrivesAt >= WIN32_LOCAL_DRIVES_TTL_MS) {
-      discoverWindowsLocalDrivesAsync(options).catch(() => {});
-    }
-    return cachedWin32LocalDrives.slice();
-  }
-
-  const targetPlatform = options.platform || process.platform;
-  const customExecFileSync =
-    typeof options.execFileSyncFn === 'function'
-      ? options.execFileSyncFn
-      : typeof options.execFileSyncImpl === 'function'
-        ? options.execFileSyncImpl
-        : null;
-
-  if (
-    targetPlatform === 'win32' &&
-    (process.platform === 'win32' || customExecFileSync !== null)
-  ) {
-    const syncRunner = customExecFileSync || execFileSync;
-    const useSharedCache = customExecFileSync === null && !options.bypassDriveCache;
-    try {
-      const stdout = syncRunner(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" | Select-Object -ExpandProperty DeviceID',
-        ],
-        {
-          timeout: 1500,
-          windowsHide: true,
-          encoding: 'utf8',
-          maxBuffer: 64 * 1024,
-        }
-      );
-      const drives = new Set();
-      if (typeof stdout === 'string') {
-        for (const rawLine of stdout.split(/\r?\n/)) {
-          const trimmed = rawLine.trim();
-          const m = /^([A-Za-z]):\\?$/.exec(trimmed);
-          if (m) {
-            drives.add(`${m[1].toUpperCase()}:\\`);
-          }
-        }
-      }
-      if (drives.size === 0) {
-        for (const d of resolveFallbackWin32SystemDrives(options)) {
-          drives.add(d);
-        }
-      }
-      const result = Array.from(drives);
-      if (useSharedCache) {
-        cachedWin32LocalDrives = result;
-        cachedWin32LocalDrivesAt = now;
-      }
-      return result.slice();
-    } catch {
-      const fallback = resolveFallbackWin32SystemDrives(options);
-      if (useSharedCache) {
-        cachedWin32LocalDrives = fallback;
-        cachedWin32LocalDrivesAt = now;
-      }
-      return fallback.slice();
-    }
-  }
-
-  discoverWindowsLocalDrivesAsync(options).catch(() => {});
-  return resolveFallbackWin32SystemDrives(options);
-}
 
 function getLazyLauncherEngine() {
   try {
@@ -3182,8 +2996,7 @@ function clearFederatorCaches() {
   gogGalaxyDbSnapshotLookup.clear();
   gogRootWebCacheDirLookup.clear();
   xboxManifestScanLookup.clear();
-  cachedWin32LocalDrives = null;
-  cachedWin32LocalDrivesAt = 0;
+  clearCachedWindowsLocalDrives();
 }
 
 class StorefrontLocalCacheFederator {

@@ -34,6 +34,7 @@ struct queued_task {
 struct XTaskQueuePortObject {
     const void *lpVtbl;
     volatile LONG ref;
+    volatile LONG owner_refs;
     XTaskQueueDispatchMode mode;
     XTaskQueuePort port_type;
     CRITICAL_SECTION cs;
@@ -44,6 +45,7 @@ struct XTaskQueuePortObject {
     bool terminating;
     HANDLE terminated_event;
     HANDLE worker_thread;
+    volatile LONG worker_tid;
 };
 
 struct XTaskQueueObject {
@@ -154,9 +156,18 @@ static void port_addref(XTaskQueuePortHandle port)
     if (port) InterlockedIncrement(&port->ref);
 }
 
+static void port_owner_addref(XTaskQueuePortHandle port)
+{
+    if (port) {
+        InterlockedIncrement(&port->ref);
+        InterlockedIncrement(&port->owner_refs);
+    }
+}
+
 static DWORD WINAPI serialized_port_worker(LPVOID arg)
 {
     XTaskQueuePortHandle port = (XTaskQueuePortHandle)arg;
+    InterlockedExchange(&port->worker_tid, (LONG)GetCurrentThreadId());
     for (;;) {
         struct queued_task *ready = NULL;
         bool is_canceled = false;
@@ -210,6 +221,8 @@ static DWORD WINAPI serialized_port_worker(LPVOID arg)
             free(ready);
         }
     }
+    /* Release dedicated worker-lifetime reference strictly after exiting the loop */
+    port_release(port);
     return 0;
 }
 
@@ -237,6 +250,7 @@ static HRESULT create_port_obj(XTaskQueueDispatchMode mode, XTaskQueuePort port_
     XTaskQueuePortHandle p = (XTaskQueuePortHandle)calloc(1, sizeof(*p));
     if (!p) return E_OUTOFMEMORY;
     p->ref = 1;
+    p->owner_refs = 1;
     p->mode = mode;
     p->port_type = port_type;
     InitializeCriticalSection(&p->cs);
@@ -248,7 +262,20 @@ static HRESULT create_port_obj(XTaskQueueDispatchMode mode, XTaskQueuePort port_
         return E_OUTOFMEMORY;
     }
     if (mode == XTaskQueueDispatchMode_SerializedThreadPool || mode == XTaskQueueDispatchMode_Immediate) {
-        p->worker_thread = CreateThread(NULL, 0, serialized_port_worker, p, 0, NULL);
+        /* Hold a dedicated worker-lifetime reference until serialized_port_worker exits its loop */
+        p->ref = 2;
+        DWORD tid = 0;
+        p->worker_thread = CreateThread(NULL, 0, serialized_port_worker, p, 0, &tid);
+        if (p->worker_thread) {
+            if (tid != 0) {
+                InterlockedCompareExchange(&p->worker_tid, (LONG)tid, 0);
+            }
+        } else {
+            CloseHandle(p->terminated_event);
+            DeleteCriticalSection(&p->cs);
+            free(p);
+            return E_OUTOFMEMORY;
+        }
     }
     *out = p;
     return S_OK;
@@ -258,18 +285,51 @@ static void port_release(XTaskQueuePortHandle port)
 {
     if (!port) return;
     if (InterlockedDecrement(&port->ref) == 0) {
-        EnterCriticalSection(&port->cs);
-        port->terminating = true;
-        WakeAllConditionVariable(&port->cv);
-        LeaveCriticalSection(&port->cs);
         if (port->worker_thread) {
-            WaitForSingleObject(port->worker_thread, 2000);
-            CloseHandle(port->worker_thread);
+            DWORD cur_tid = GetCurrentThreadId();
+            DWORD w_tid = (DWORD)InterlockedCompareExchange(&port->worker_tid, 0, 0);
+            if (w_tid != 0 && cur_tid == w_tid) {
+                /* Self-release at worker tail: detach handle without self-joining */
+                CloseHandle(port->worker_thread);
+                port->worker_thread = NULL;
+            } else {
+                DWORD wr = WaitForSingleObject(port->worker_thread, 2000);
+                if (wr != WAIT_OBJECT_0) {
+                    /* Worker still running in OS teardown: never free(port) after a timed-out join */
+                    return;
+                }
+                CloseHandle(port->worker_thread);
+                port->worker_thread = NULL;
+            }
         }
         if (port->terminated_event) CloseHandle(port->terminated_event);
         DeleteCriticalSection(&port->cs);
         free(port);
     }
+}
+
+static void port_owner_release(XTaskQueuePortHandle port)
+{
+    if (!port) return;
+    if (InterlockedDecrement(&port->owner_refs) == 0) {
+        EnterCriticalSection(&port->cs);
+        port->terminating = true;
+        if (port->queued_count == 0 && port->terminated_event) {
+            SetEvent(port->terminated_event);
+        }
+        WakeAllConditionVariable(&port->cv);
+        LeaveCriticalSection(&port->cs);
+
+        if (port->worker_thread) {
+            DWORD cur_tid = GetCurrentThreadId();
+            DWORD w_tid = (DWORD)InterlockedCompareExchange(&port->worker_tid, 0, 0);
+            if (w_tid == 0 || cur_tid != w_tid) {
+                /* External caller: wait boundedly while holding owner's port->ref */
+                (void)WaitForSingleObject(port->worker_thread, 2000);
+            }
+        }
+    }
+    port_release(port);
 }
 
 void xgr_task_queue_close(XTaskQueueHandle queue)
@@ -286,8 +346,8 @@ void xgr_task_queue_close(XTaskQueueHandle queue)
             free(w);
             w = next;
         }
-        port_release(queue->work);
-        port_release(queue->completion);
+        port_owner_release(queue->work);
+        port_owner_release(queue->completion);
         DeleteCriticalSection(&queue->mon_cs);
         free(queue->monitors);
         free(queue);
@@ -654,12 +714,15 @@ void xgr_threading_shutdown(void)
     if (pq) {
         xgr_task_queue_close(pq);
     }
+    /* Keep g_time_sensitive_tls process-scoped; never reset g_tls_once or TlsFree mid-process */
+}
 
+void xgr_threading_process_detach_cleanup(void)
+{
     if (g_time_sensitive_tls != TLS_OUT_OF_INDEXES) {
         TlsFree(g_time_sensitive_tls);
         g_time_sensitive_tls = TLS_OUT_OF_INDEXES;
     }
-    InitOnceInitialize(&g_tls_once);
 }
 
 static void CALLBACK async_work_runner(void *ctx, bool canceled)
@@ -1037,6 +1100,18 @@ static HRESULT WINAPI th_XTaskQueueCreate(void *iface, XTaskQueueDispatchMode wm
     return xgr_return_hr(create_queue_internal(wm, cm, q));
 }
 
+static inline XTaskQueueHandle resolve_queue(XTaskQueueHandle q, bool *out_temp_ref)
+{
+    if (out_temp_ref) *out_temp_ref = false;
+    if (q) return q;
+    XTaskQueueHandle proc_q = NULL;
+    if (xgr_task_queue_get_process(&proc_q) && proc_q) {
+        if (out_temp_ref) *out_temp_ref = true;
+        return proc_q;
+    }
+    return NULL;
+}
+
 static HRESULT WINAPI th_XTaskQueueCreateComposite(void *iface, XTaskQueuePortHandle wp, XTaskQueuePortHandle cp, XTaskQueueHandle *out)
 {
     (void)iface;
@@ -1047,8 +1122,8 @@ static HRESULT WINAPI th_XTaskQueueCreateComposite(void *iface, XTaskQueuePortHa
     q->composite = true;
     q->next_token = 1;
     InitializeCriticalSection(&q->mon_cs);
-    port_addref(wp);
-    port_addref(cp);
+    port_owner_addref(wp);
+    port_owner_addref(cp);
     q->work = wp;
     q->completion = cp;
     *out = q;
@@ -1058,10 +1133,21 @@ static HRESULT WINAPI th_XTaskQueueCreateComposite(void *iface, XTaskQueuePortHa
 static HRESULT WINAPI th_XTaskQueueGetPort(void *iface, XTaskQueueHandle q, XTaskQueuePort port, XTaskQueuePortHandle *out)
 {
     (void)iface;
-    if (!q || !out) return xgr_return_hr(E_INVALIDARG);
-    if (port == XTaskQueuePort_Work) { *out = q->work; return S_OK; }
-    if (port == XTaskQueuePort_Completion) { *out = q->completion; return S_OK; }
-    return E_INVALIDARG;
+    if (!out) return xgr_return_hr(E_INVALIDARG);
+    *out = NULL;
+    bool temp_ref = false;
+    q = resolve_queue(q, &temp_ref);
+    if (!q) return xgr_return_hr(HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+    HRESULT hr = E_INVALIDARG;
+    if (port == XTaskQueuePort_Work) {
+        *out = q->work;
+        hr = S_OK;
+    } else if (port == XTaskQueuePort_Completion) {
+        *out = q->completion;
+        hr = S_OK;
+    }
+    if (temp_ref) xgr_task_queue_close(q);
+    return xgr_return_hr(hr);
 }
 
 static HRESULT WINAPI th_XTaskQueueDuplicateHandle(void *iface, XTaskQueueHandle q, XTaskQueueHandle *dup)
