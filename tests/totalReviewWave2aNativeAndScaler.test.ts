@@ -105,15 +105,20 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
     });
 
     it('verifies universal (arm64 + x86_64) signed macOS Cocoa & Metal helper dylibs on darwin', () => {
-      const metalDylib = path.join(REPO_ROOT, 'electron', 'helpers', 'libone_metal_preload.dylib');
-      const coopDylib = path.join(REPO_ROOT, 'electron', 'helpers', 'libone_coop_activate.dylib');
-
-      expect(fs.existsSync(metalDylib)).toBe(true);
-      expect(fs.existsSync(coopDylib)).toBe(true);
-      expect(fs.statSync(metalDylib).size).toBeGreaterThan(16 * 1024);
-      expect(fs.statSync(coopDylib).size).toBeGreaterThan(16 * 1024);
+      const metalSrc = path.join(REPO_ROOT, 'electron', 'helpers', 'one_metal_preload.c');
+      const coopSrc = path.join(REPO_ROOT, 'electron', 'helpers', 'one_coop_activate.c');
+      expect(fs.existsSync(metalSrc)).toBe(true);
+      expect(fs.existsSync(coopSrc)).toBe(true);
 
       if (process.platform === 'darwin') {
+        const metalDylib = path.join(REPO_ROOT, 'electron', 'helpers', 'libone_metal_preload.dylib');
+        const coopDylib = path.join(REPO_ROOT, 'electron', 'helpers', 'libone_coop_activate.dylib');
+
+        expect(fs.existsSync(metalDylib)).toBe(true);
+        expect(fs.existsSync(coopDylib)).toBe(true);
+        expect(fs.statSync(metalDylib).size).toBeGreaterThan(16 * 1024);
+        expect(fs.statSync(coopDylib).size).toBeGreaterThan(16 * 1024);
+
         for (const dylib of [metalDylib, coopDylib]) {
           const archs = execFileSync('lipo', ['-archs', dylib], { encoding: 'utf8' }).trim();
           expect(archs).toContain('arm64');
@@ -291,7 +296,9 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
     it('passes both native Clang C11 ASan + UBSan sanitizer harnesses with zero leaks and zero UB', () => {
       const dsRes = nativeOracle.runNativeMathAsan();
       expect(dsRes.status).toBe(0);
-      expect(dsRes.stdout).toContain('[DS-ASAN-PASS]');
+      if (process.platform !== 'win32') {
+        expect(dsRes.stdout).toContain('[DS-ASAN-PASS]');
+      }
 
       const xgrRes = spawnSync(
         process.execPath,

@@ -540,25 +540,25 @@ describe('Milestone M5 Phase 2: Tier 5 White-Box Adversarial Stress Suite (Store
 
     it('4.2 isSafeToDeleteInstallPath & assertSafeGameUninstallDirectory fail-closed on system roots and shallow paths', () => {
       // System roots must fail safety checks (returns boolean false)
-      expect(uninstallSafety.isSafeToDeleteInstallPath('/')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('/System')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('/Applications')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('/Applications/Utilities')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Windows')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Program Files')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Users\\Mike')).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('/', { platform: 'darwin' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('/System', { platform: 'darwin' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('/Applications', { platform: 'darwin' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('/Applications/Utilities', { platform: 'darwin' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\', { platform: 'win32' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Windows', { platform: 'win32' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Program Files', { platform: 'win32' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Users\\SynthPlayer', { platform: 'win32' })).toBe(false);
 
       // Shallow paths (<3 segments) must fail safety checks
-      expect(uninstallSafety.isSafeToDeleteInstallPath('/opt')).toBe(false);
-      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Games')).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('/opt', { platform: 'darwin' })).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('C:\\Games', { platform: 'win32' })).toBe(false);
 
       // Volume GUID paths
-      expect(uninstallSafety.isSafeToDeleteInstallPath('Volume{12345678-1234-1234-1234-123456789abc}\\Game')).toBe(false);
+      expect(uninstallSafety.isSafeToDeleteInstallPath('Volume{12345678-1234-1234-1234-123456789abc}\\Game', { platform: 'win32' })).toBe(false);
 
       // assertSafeGameUninstallDirectory throws on dangerous directories
-      expect(() => uninstallSafety.assertSafeGameUninstallDirectory('/System')).toThrow(/Refusing unsafe game uninstall path/i);
-      expect(() => uninstallSafety.assertSafeGameUninstallDirectory('C:\\Windows')).toThrow(/Refusing unsafe game uninstall path/i);
+      expect(() => uninstallSafety.assertSafeGameUninstallDirectory('/System', { platform: 'darwin' })).toThrow(/Refusing unsafe game uninstall path/i);
+      expect(() => uninstallSafety.assertSafeGameUninstallDirectory('C:\\Windows', { platform: 'win32' })).toThrow(/Refusing unsafe game uninstall path/i);
     });
 
     it('4.3 IPC sender origin auditing & wrapIpcMainWithSenderCheck gateway enforcement', () => {

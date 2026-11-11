@@ -32,10 +32,20 @@ function compileProbeBinary(probeCPath, binPath) {
     binPath,
   ];
   const compilers = [
+    ['zig', ['cc', ...commonArgs]],
     ['clang', commonArgs],
     ['gcc', commonArgs],
     ['cc', commonArgs],
   ];
+  const homeCacheZig = path.join(
+    os.homedir(),
+    '.cache',
+    'onelauncher-zig',
+    process.platform === 'win32' ? 'zig.exe' : 'zig'
+  );
+  if (fs.existsSync(homeCacheZig)) {
+    compilers.unshift([homeCacheZig, ['cc', ...commonArgs]]);
+  }
   const zigCacheRoot = path.join(ROOT_DIR, '.cache', 'zig');
   if (fs.existsSync(zigCacheRoot)) {
     try {

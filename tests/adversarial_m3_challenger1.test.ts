@@ -365,12 +365,28 @@ describe('Milestone M3 Adversarial Challenge — Security & Path Sanitization St
       const libraryRoot = path.join(tempBase, 'Games');
       fs.mkdirSync(libraryRoot, { recursive: true });
 
+      const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+      const tryCreateNonJunctionSymlink = (target: string, linkPath: string): boolean => {
+        try {
+          fs.symlinkSync(target, linkPath);
+          return true;
+        } catch (err: unknown) {
+          if (
+            process.platform === 'win32' &&
+            (err as { code?: string })?.code === 'EPERM'
+          ) {
+            return false;
+          }
+          throw err;
+        }
+      };
+
       try {
-        // 1. Target path itself is a symbolic link
+        // 1. Target path itself is a symbolic link / junction
         const realGame = path.join(libraryRoot, 'RealGame');
         fs.mkdirSync(realGame, { recursive: true });
         const symlinkGame = path.join(libraryRoot, 'SymlinkGame');
-        fs.symlinkSync(realGame, symlinkGame, 'dir');
+        fs.symlinkSync(realGame, symlinkGame, dirLinkType);
         expect(
           uninstallSafety.isSafeToDeleteInstallPath(symlinkGame, {
             libraryRoot,
@@ -378,10 +394,14 @@ describe('Milestone M3 Adversarial Challenge — Security & Path Sanitization St
           })
         ).toBe(false);
 
-        // 2. Symlink inside game directory pointing to /
+        // 2. Symlink / junction inside game directory pointing to OS root
         const escapeRootGame = path.join(libraryRoot, 'EscapeRootGame');
         fs.mkdirSync(escapeRootGame, { recursive: true });
-        fs.symlinkSync('/', path.join(escapeRootGame, 'root_link'));
+        fs.symlinkSync(
+          process.platform === 'win32' ? path.parse(tempBase).root : '/',
+          path.join(escapeRootGame, 'root_link'),
+          dirLinkType
+        );
         expect(
           uninstallSafety.isSafeToDeleteInstallPath(escapeRootGame, {
             libraryRoot,
@@ -389,10 +409,10 @@ describe('Milestone M3 Adversarial Challenge — Security & Path Sanitization St
           })
         ).toBe(false);
 
-        // 3. Symlink inside game directory pointing to user homedir
+        // 3. Symlink / junction inside game directory pointing to user homedir
         const escapeHomeGame = path.join(libraryRoot, 'EscapeHomeGame');
         fs.mkdirSync(escapeHomeGame, { recursive: true });
-        fs.symlinkSync(os.homedir(), path.join(escapeHomeGame, 'home_link'));
+        fs.symlinkSync(os.homedir(), path.join(escapeHomeGame, 'home_link'), dirLinkType);
         expect(
           uninstallSafety.isSafeToDeleteInstallPath(escapeHomeGame, {
             libraryRoot,
@@ -403,37 +423,41 @@ describe('Milestone M3 Adversarial Challenge — Security & Path Sanitization St
         // 4. Dangling symlink pointing outside install root
         const danglingGame = path.join(libraryRoot, 'DanglingGame');
         fs.mkdirSync(danglingGame, { recursive: true });
-        fs.symlinkSync(
-          path.join(tempBase, 'nonexistent_outside_target'),
-          path.join(danglingGame, 'dangling_link')
-        );
-        expect(
-          uninstallSafety.isSafeToDeleteInstallPath(danglingGame, {
-            libraryRoot,
-            platform: process.platform,
-          })
-        ).toBe(false);
+        if (
+          tryCreateNonJunctionSymlink(
+            path.join(tempBase, 'nonexistent_outside_target'),
+            path.join(danglingGame, 'dangling_link')
+          )
+        ) {
+          expect(
+            uninstallSafety.isSafeToDeleteInstallPath(danglingGame, {
+              libraryRoot,
+              platform: process.platform,
+            })
+          ).toBe(false);
+        }
 
         // 5. Circular symlinks triggering ELOOP
         const circularGame = path.join(libraryRoot, 'CircularGame');
         fs.mkdirSync(circularGame, { recursive: true });
         const c1 = path.join(circularGame, 'link1');
         const c2 = path.join(circularGame, 'link2');
-        fs.symlinkSync(c2, c1);
-        fs.symlinkSync(c1, c2);
-        expect(
-          uninstallSafety.isSafeToDeleteInstallPath(circularGame, {
-            libraryRoot,
-            platform: process.platform,
-          })
-        ).toBe(false);
+        if (tryCreateNonJunctionSymlink(c2, c1) && tryCreateNonJunctionSymlink(c1, c2)) {
+          expect(
+            uninstallSafety.isSafeToDeleteInstallPath(circularGame, {
+              libraryRoot,
+              platform: process.platform,
+            })
+          ).toBe(false);
+        }
 
-        // 6. Legitimate INTERNAL symlink pointing inside install directory
+        // 6. Legitimate INTERNAL symlink / junction pointing inside install directory
         const legitGame = path.join(libraryRoot, 'LegitGame');
-        fs.mkdirSync(legitGame, { recursive: true });
-        const dataFile = path.join(legitGame, 'data.bin');
+        const legitInternalSubdir = path.join(legitGame, 'internal_assets');
+        fs.mkdirSync(legitInternalSubdir, { recursive: true });
+        const dataFile = path.join(legitInternalSubdir, 'data.bin');
         fs.writeFileSync(dataFile, 'content');
-        fs.symlinkSync(dataFile, path.join(legitGame, 'data_link.bin'));
+        fs.symlinkSync(legitInternalSubdir, path.join(legitGame, 'assets_link'), dirLinkType);
         expect(
           uninstallSafety.isSafeToDeleteInstallPath(legitGame, {
             libraryRoot,

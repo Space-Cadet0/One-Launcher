@@ -764,7 +764,7 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       // 1. Fail-closed on EACCES stat error
       expect(() =>
         uninstallSafety.assertSafeGameUninstallDirectory(gameDir, {
-          platform: 'darwin',
+          platform: process.platform,
           homedir: sandbox,
           fsImpl: {
             ...fs,
@@ -784,11 +784,15 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
         fs.writeFileSync(path.join(bulkSubdir, `f_${String(i).padStart(4, '0')}.bin`), 'x');
       }
       const escapingLink = path.join(gameDir, 'zzz_escape_link');
-      fs.symlinkSync(externalSecretDir, escapingLink);
+      fs.symlinkSync(
+        externalSecretDir,
+        escapingLink,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      );
 
       expect(
         uninstallSafety.isSafeToDeleteInstallPath(gameDir, {
-          platform: 'darwin',
+          platform: process.platform,
           homedir: sandbox,
         })
       ).toBe(false);
@@ -798,11 +802,15 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       fs.mkdirSync(gameDir2, { recursive: true });
       fs.writeFileSync(path.join(gameDir2, 'game.bin'), 'binary-data');
       const linkToExternal = path.join(gameDir2, 'linked_docs');
-      fs.symlinkSync(externalSecretDir, linkToExternal);
+      fs.symlinkSync(
+        externalSecretDir,
+        linkToExternal,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      );
 
       // Even if unlinker runs directly on a tree containing a symlink, external files MUST survive intact
       await uninstallSafety.safeRemoveGameDirectoryAsync(gameDir2, {
-        platform: 'darwin',
+        platform: process.platform,
         homedir: sandbox,
         skipSafetyAssertion: true,
       });
@@ -821,7 +829,7 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       // Attempting to delete libraryRoot itself MUST be rejected even if within allowedRoot
       expect(
         uninstallSafety.isSafeToDeleteInstallPath(libraryRoot, {
-          platform: 'darwin',
+          platform: process.platform,
           libraryRoot,
         })
       ).toBe(false);
@@ -837,7 +845,7 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       // Strictly nested child directory inside libraryRoot is accepted
       expect(
         uninstallSafety.isSafeToDeleteInstallPath(gameDir, {
-          platform: 'darwin',
+          platform: process.platform,
           libraryRoot,
         })
       ).toBe(true);

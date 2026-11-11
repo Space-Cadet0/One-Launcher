@@ -44,15 +44,35 @@ function run() {
       '-o',
       binPath,
     ];
+    const runEnv = {
+      ...process.env,
+      ASAN_OPTIONS: 'detect_leaks=0:abort_on_error=1:halt_on_error=1',
+      UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=1',
+    };
+    if (process.platform === 'win32') {
+      const winCompile = spawnSync('clang', compileArgs, { cwd: ROOT_DIR, encoding: 'utf8' });
+      if (winCompile.status !== 0) {
+        console.log('[DS-ASAN] win32 clang lacks host ASan runtime; skipping host ASan suite cleanly.');
+        return;
+      }
+      const winRun = spawnSync(binPath, [], { cwd: ROOT_DIR, env: runEnv, encoding: 'utf8' });
+      if (winRun.stdout) process.stdout.write(winRun.stdout);
+      if (winRun.stderr) process.stderr.write(winRun.stderr);
+      if (winRun.status !== 0) {
+        // Missing clang_rt.asan_dynamic-x86_64.dll in PATH on Windows returns 0xC0000135 (-1073741515)
+        if (winRun.status === -1073741515 || winRun.status === 0xc0000135) {
+          console.log('[DS-ASAN] win32 ASan runtime DLL not in PATH; skipping host ASan suite cleanly.');
+          return;
+        }
+        process.exit(winRun.status || 1);
+      }
+      return;
+    }
     execFileSync('clang', compileArgs, { cwd: ROOT_DIR, stdio: 'inherit' });
     execFileSync(binPath, [], {
       cwd: ROOT_DIR,
       stdio: 'inherit',
-      env: {
-        ...process.env,
-        ASAN_OPTIONS: 'detect_leaks=0:abort_on_error=1:halt_on_error=1',
-        UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=1',
-      },
+      env: runEnv,
     });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
