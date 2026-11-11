@@ -337,6 +337,96 @@ recordTest('ALIAS-08', 'Graceful fallback on malformed --expected-mode and --dis
   return 'Malformed values gracefully fell back to default geometries';
 });
 
+// 2.9 Space-separated CLI flags + Display P3 iCCP 1-LSB hardware dither & Control Center dot handling
+recordTest('ICCP-01', 'Display P3 iCCP screenshot handles ±1 LSB hardware dither & Control Center privacy dot while rejecting real Menu Bar bleed', () => {
+  const zlib = require('node:zlib');
+  const w = 3024;
+  const h = 1964;
+  const oracle = computeOracleViewport(w, h, 0, 800, 600, 'preserve');
+  const rgba = Buffer.alloc(w * h * 4);
+  for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
+
+  // Simulate Display P3 10-bit -> 8-bit ±1 LSB spatial dither in left/right pillarbox margins
+  for (let y = 0; y < h; y += 7) {
+    rgba[(y * w + 10) * 4 + 2] = 1; // RGB(0, 0, 1)
+    rgba[(y * w + (w - 10)) * 4] = 1; // RGB(1, 0, 0)
+  }
+  // Simulate macOS Control Center privacy indicator dot at (2989, 33)
+  for (let y = 30; y <= 36; y++) {
+    for (let x = 2986; x <= 2992; x++) {
+      const idx = (y * w + x) * 4;
+      rgba[idx] = 91;
+      rgba[idx + 1] = 89;
+      rgba[idx + 2] = 214;
+    }
+  }
+  // Fill active 4:3 viewport [202..2821, 0..1963]
+  for (let y = oracle.dstY; y < oracle.dstY + oracle.dstH; y++) {
+    const rowOffset = y * w * 4;
+    for (let x = oracle.dstX; x < oracle.dstX + oracle.dstW; x++) {
+      const idx = rowOffset + (x * 4);
+      rgba[idx] = 60;
+      rgba[idx + 1] = 80;
+      rgba[idx + 2] = 120;
+    }
+  }
+
+  // Embed valid ancillary iCCP chunk before IDAT
+  const basePng = encodePng(w, h, rgba);
+  const idatPos = basePng.indexOf(Buffer.from('IDAT')) - 4;
+  const iccpPayload = Buffer.concat([
+    Buffer.from('Display P3\0\0', 'ascii'),
+    zlib.deflateSync(Buffer.from('icc-profile-stub')),
+  ]);
+  const iccpLen = Buffer.alloc(4);
+  iccpLen.writeUInt32BE(iccpPayload.length, 0);
+  const iccpType = Buffer.from('iCCP', 'ascii');
+  const iccpCrc = Buffer.alloc(4);
+  iccpCrc.writeUInt32BE(zlib.crc32(Buffer.concat([iccpType, iccpPayload])) >>> 0, 0);
+  const iccpPng = Buffer.concat([
+    basePng.subarray(0, idatPos),
+    iccpLen,
+    iccpType,
+    iccpPayload,
+    iccpCrc,
+    basePng.subarray(idatPos),
+  ]);
+
+  const iccpPath = path.join(tempDir, 'display_p3_hardware.png');
+  fs.writeFileSync(iccpPath, iccpPng);
+
+  // Test space-separated CLI flags: --image <path> --resolution 800x600 --json
+  const cliOut = cp.execFileSync(
+    process.execPath,
+    [cliPath, '--image', iccpPath, '--resolution', '800x600', '--json'],
+    { encoding: 'utf8' }
+  );
+  const parsed = JSON.parse(cliOut);
+  assert.strictEqual(parsed.passed, true, 'Hardware Display P3 capture with ±1 LSB dither + privacy dot must pass');
+  assert.strictEqual(parsed.centeringErrorPx, 0);
+  assert.strictEqual(parsed.privacyIndicatorDotExcluded, true);
+  assert.strictEqual(parsed.menuBarBleed, false);
+
+  // Now inject real Menu Bar bleed at (x=50, y=20) on the same iCCP capture -> MUST FAIL
+  rgba[(20 * w + 50) * 4] = 200;
+  rgba[(20 * w + 50) * 4 + 1] = 200;
+  rgba[(20 * w + 50) * 4 + 2] = 200;
+  const bleedBase = encodePng(w, h, rgba);
+  const bleedIdatPos = bleedBase.indexOf(Buffer.from('IDAT')) - 4;
+  const bleedIccpPng = Buffer.concat([
+    bleedBase.subarray(0, bleedIdatPos),
+    iccpLen,
+    iccpType,
+    iccpPayload,
+    iccpCrc,
+    bleedBase.subarray(bleedIdatPos),
+  ]);
+  const bleedRes = verifyDisplayOutput({ imageBuffer: bleedIccpPng, gameRes: '800x600' });
+  assert.strictEqual(bleedRes.passed, false, 'Real Menu Bar bleed on iCCP capture must still fail');
+  assert.strictEqual(bleedRes.menuBarBleed, true, 'menuBarBleed must be flagged');
+  return 'Hardware iCCP dither + privacy dot accepted; real Menu Bar bleed strictly rejected';
+});
+
 // Clean up temp dir
 try {
   fs.rmSync(tempDir, { recursive: true, force: true });

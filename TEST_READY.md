@@ -66,9 +66,9 @@ All 24 features from `PROJECT.md § Feature Inventory` are 100% covered across a
 
 ## Supporting Automated Test Suites
 - **Native C11 AddressSanitizer & UBSan**: `npm run test:native-asan` (100% pass, 0 leaks, 0 errors across display_scaler and xgr_bridge).
-- **Vitest Unit & Integration Suites**: `npm test` (88 test files, 1,307 tests, 100% pass under offline network guard).
+- **Vitest Unit & Integration Suites**: `npm test` (96 test files, 1,460+ tests, 100% pass under offline network guard).
 - **Static Architecture & Privacy Gates**: `npx vitest run tests/staticArchitectureInvariants.test.ts` (13/13 pass, zero personal paths, zero undeclared identifiers).
 - **TypeScript Strict Compilation**: `npm run typecheck` (0 errors across renderer, test, and electron projects).
 - **Display Verifier Adversarial Stress Suites**:
   - `node tests/stress_verify_display_output.cjs` (17/17 pass)
-  - `node tests/challenger_verify_display_output.cjs` (13/13 pass)
+  - `node tests/challenger_verify_display_output.cjs` (14/14 pass)

@@ -95,6 +95,7 @@ function decodePng(buffer) {
   let compressionMethod = 0;
   let filterMethod = 0;
   let interlaceMethod = 0;
+  let hasColorProfile = false;
   const idatChunks = [];
 
   while (pos < buffer.length) {
@@ -126,6 +127,8 @@ function decodePng(buffer) {
       if (interlaceMethod !== 0) {
         throw new Error('Interlaced PNGs are not supported');
       }
+    } else if (type === 'iCCP' || type === 'cHRM' || type === 'sRGB' || type === 'gAMA') {
+      hasColorProfile = true;
     } else if (type === 'IDAT') {
       idatChunks.push(buffer.subarray(dataStart, dataEnd));
     } else if (type === 'IEND') {
@@ -220,6 +223,7 @@ function decodePng(buffer) {
   return {
     width,
     height,
+    hasColorProfile,
     data: rgba,
     getPixel(x, y) {
       if (x < 0 || x >= width || y < 0 || y >= height) {
@@ -687,16 +691,52 @@ function computeViewportLuminance(decodedImg, viewport, options = {}) {
  * @param {object} options
  * @returns {object} Verification report
  */
-function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
+function analyzeDisplayPixels(decodedImg, expectedViewport, optionsOrWidth = {}, maybeHeight) {
+  const options = typeof optionsOrWidth === 'number'
+    ? {
+        displayWidth: optionsOrWidth,
+        displayHeight: typeof maybeHeight === 'number' ? maybeHeight : decodedImg.height,
+      }
+    : (optionsOrWidth || {});
+
   const { width, height } = decodedImg;
-  const targetDisplayW = options.displayWidth || 3024;
-  const targetDisplayH = options.displayHeight || 1964;
-  const strictBlack = options.strictBlack !== false;
+  const targetDisplayW = options.displayWidth || width || 3024;
+  const targetDisplayH = options.displayHeight || height || 1964;
+  const isHardwareCapture = Boolean(
+    (options.hardwareCapture || decodedImg.hasColorProfile) &&
+    !options.synthetic &&
+    options.strictBlack !== true
+  );
+  // Display P3 10-bit -> 8-bit hardware compositor screenshots exhibit ±1..2 LSB
+  // spatial dithering in pitch-black margins; synthetic sRGB buffers enforce 0 tolerance.
+  const blackTolerance = typeof options.blackTolerance === 'number'
+    ? Math.max(0, options.blackTolerance)
+    : (isHardwareCapture ? 2 : 0);
+
+  const isNonBlackRgb = (r, g, b) => (r > blackTolerance || g > blackTolerance || b > blackTolerance);
+  // macOS Control Center composites a non-suppressible ~12x12px privacy indicator dot in
+  // the top-right corner ([width - 64 .. width - 16, 16 .. 48]) during active screen capture.
+  const isInControlCenterPrivacyDotBox = (x, y) =>
+    isHardwareCapture && width >= 1440 && x >= width - 64 && x <= width - 16 && y >= 16 && y <= 48;
 
   const violations = [];
-  let totalMarginViolations = 0;
-  let menuBarBleed = false;
+  const privacyDotCandidates = [];
+  let coreMarginViolations = 0;
+  let coreMenuBarBleed = false;
   let dockBleed = false;
+
+  const recordMarginViolation = (x, y, px, region) => {
+    if (isInControlCenterPrivacyDotBox(x, y)) {
+      privacyDotCandidates.push({ x, y, r: px.r, g: px.g, b: px.b, region });
+      return;
+    }
+    coreMarginViolations++;
+    if (violations.length < 100) {
+      violations.push({ x, y, r: px.r, g: px.g, b: px.b, region });
+    }
+    if (y <= 44) coreMenuBarBleed = true;
+    if (y >= height - 60) dockBleed = true;
+  };
 
   // 1. Physical Resolution Check
   const resolutionOk = (width === targetDisplayW && height === targetDisplayH);
@@ -712,13 +752,8 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < dstX; x++) {
         const px = decodedImg.getPixel(x, y);
-        if (px.r !== 0 || px.g !== 0 || px.b !== 0) {
-          totalMarginViolations++;
-          if (violations.length < 100) {
-            violations.push({ x, y, r: px.r, g: px.g, b: px.b, region: 'left_pillarbox' });
-          }
-          if (y <= 44) menuBarBleed = true;
-          if (y >= height - 60) dockBleed = true;
+        if (isNonBlackRgb(px.r, px.g, px.b)) {
+          recordMarginViolation(x, y, px, 'left_pillarbox');
         }
       }
     }
@@ -730,13 +765,8 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     for (let y = 0; y < height; y++) {
       for (let x = rightMarginStart; x < width; x++) {
         const px = decodedImg.getPixel(x, y);
-        if (px.r !== 0 || px.g !== 0 || px.b !== 0) {
-          totalMarginViolations++;
-          if (violations.length < 100) {
-            violations.push({ x, y, r: px.r, g: px.g, b: px.b, region: 'right_pillarbox' });
-          }
-          if (y <= 44) menuBarBleed = true;
-          if (y >= height - 60) dockBleed = true;
+        if (isNonBlackRgb(px.r, px.g, px.b)) {
+          recordMarginViolation(x, y, px, 'right_pillarbox');
         }
       }
     }
@@ -747,12 +777,8 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     for (let y = 0; y < dstY; y++) {
       for (let x = 0; x < width; x++) {
         const px = decodedImg.getPixel(x, y);
-        if (px.r !== 0 || px.g !== 0 || px.b !== 0) {
-          totalMarginViolations++;
-          if (violations.length < 100) {
-            violations.push({ x, y, r: px.r, g: px.g, b: px.b, region: 'top_letterbox' });
-          }
-          if (y <= 44) menuBarBleed = true;
+        if (isNonBlackRgb(px.r, px.g, px.b)) {
+          recordMarginViolation(x, y, px, 'top_letterbox');
         }
       }
     }
@@ -764,14 +790,30 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     for (let y = bottomMarginStart; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const px = decodedImg.getPixel(x, y);
-        if (px.r !== 0 || px.g !== 0 || px.b !== 0) {
-          totalMarginViolations++;
-          if (violations.length < 100) {
-            violations.push({ x, y, r: px.r, g: px.g, b: px.b, region: 'bottom_letterbox' });
-          }
-          if (y >= height - 60) dockBleed = true;
+        if (isNonBlackRgb(px.r, px.g, px.b)) {
+          recordMarginViolation(x, y, px, 'bottom_letterbox');
         }
       }
+    }
+  }
+
+  // Only treat isolated top-right pixels as macOS Control Center privacy dot when every
+  // other margin pixel across the entire panel (including 0..width-65 of Menu Bar) is clean.
+  const privacyIndicatorDotExcluded =
+    isHardwareCapture &&
+    coreMarginViolations === 0 &&
+    !dockBleed &&
+    privacyDotCandidates.length > 0 &&
+    privacyDotCandidates.length <= 300;
+
+  let totalMarginViolations = coreMarginViolations;
+  let menuBarBleed = coreMenuBarBleed;
+  if (!privacyIndicatorDotExcluded && privacyDotCandidates.length > 0) {
+    totalMarginViolations += privacyDotCandidates.length;
+    menuBarBleed = true;
+    for (const cand of privacyDotCandidates) {
+      if (violations.length >= 100) break;
+      violations.push(cand);
     }
   }
 
@@ -811,42 +853,36 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
   const imgData = decodedImg.data;
   const isBuf = Buffer.isBuffer(imgData);
 
+  const isActiveAt = (x, y, rowOffset) => {
+    if (isInControlCenterPrivacyDotBox(x, y) && privacyIndicatorDotExcluded) {
+      return false;
+    }
+    if (isBuf) {
+      const idx = rowOffset + (x * 4);
+      return isNonBlackRgb(imgData[idx], imgData[idx + 1], imgData[idx + 2]);
+    }
+    const px = decodedImg.getPixel(x, y);
+    return isNonBlackRgb(px.r, px.g, px.b);
+  };
+
   // 3a. Horizontal boundary measurement across sampled rows
   let measuredLeft = -1;
   let measuredRight = -1;
 
-  for (const y of sampleRows) {
+  const scanHorizontalRow = (y) => {
     const rowOffset = y * width * 4;
     let rowLeft = -1;
     let rowRight = -1;
 
-    // Scan inward from left
     for (let x = 0; x < width; x++) {
-      let active = false;
-      if (isBuf) {
-        const idx = rowOffset + (x * 4);
-        active = (imgData[idx] > 0 || imgData[idx + 1] > 0 || imgData[idx + 2] > 0);
-      } else {
-        const px = decodedImg.getPixel(x, y);
-        active = (px.r > 0 || px.g > 0 || px.b > 0);
-      }
-      if (active) {
+      if (isActiveAt(x, y, rowOffset)) {
         rowLeft = x;
         break;
       }
     }
 
-    // Scan inward from right
     for (let x = width - 1; x >= 0; x--) {
-      let active = false;
-      if (isBuf) {
-        const idx = rowOffset + (x * 4);
-        active = (imgData[idx] > 0 || imgData[idx + 1] > 0 || imgData[idx + 2] > 0);
-      } else {
-        const px = decodedImg.getPixel(x, y);
-        active = (px.r > 0 || px.g > 0 || px.b > 0);
-      }
-      if (active) {
+      if (isActiveAt(x, y, rowOffset)) {
         rowRight = x;
         break;
       }
@@ -857,6 +893,22 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     }
     if (rowRight !== -1 && (measuredRight === -1 || rowRight > measuredRight)) {
       measuredRight = rowRight;
+    }
+  };
+
+  for (const y of sampleRows) {
+    scanHorizontalRow(y);
+  }
+
+  // Secondary dense row scan for dark real-game hardware captures where sparse midline rows may fall in shadow
+  if (
+    isHardwareCapture &&
+    dstH > 16 &&
+    (measuredLeft !== dstX || measuredRight !== dstX + dstW - 1)
+  ) {
+    const denseRowStep = Math.max(1, Math.floor(dstH / 128));
+    for (let y = dstY; y < dstY + dstH; y += denseRowStep) {
+      scanHorizontalRow(y);
     }
   }
 
@@ -869,27 +921,36 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
   let measuredTop = -1;
   let measuredBottom = -1;
 
-  for (let y = 0; y < height; y++) {
-    const rowOffset = y * width * 4;
-    let rowActive = false;
-    for (const sx of sampleCols) {
-      let active = false;
-      if (isBuf) {
-        const idx = rowOffset + (sx * 4);
-        active = (imgData[idx] > 0 || imgData[idx + 1] > 0 || imgData[idx + 2] > 0);
-      } else {
-        const px = decodedImg.getPixel(sx, y);
-        active = (px.r > 0 || px.g > 0 || px.b > 0);
+  const scanVerticalWithCols = (colsToCheck) => {
+    for (let y = 0; y < height; y++) {
+      const rowOffset = y * width * 4;
+      let rowActive = false;
+      for (const sx of colsToCheck) {
+        if (isActiveAt(sx, y, rowOffset)) {
+          rowActive = true;
+          break;
+        }
       }
-      if (active) {
-        rowActive = true;
-        break;
+      if (rowActive) {
+        if (measuredTop === -1 || y < measuredTop) measuredTop = y;
+        if (measuredBottom === -1 || y > measuredBottom) measuredBottom = y;
       }
     }
-    if (rowActive) {
-      if (measuredTop === -1) measuredTop = y;
-      measuredBottom = y;
+  };
+
+  scanVerticalWithCols(sampleCols);
+
+  if (
+    isHardwareCapture &&
+    dstW > 16 &&
+    (measuredTop !== dstY || measuredBottom !== dstY + dstH - 1)
+  ) {
+    const denseCols = [];
+    const denseColStep = Math.max(1, Math.floor(dstW / 128));
+    for (let sx = dstX; sx < dstX + dstW; sx += denseColStep) {
+      denseCols.push(sx);
     }
+    scanVerticalWithCols(denseCols);
   }
 
   const measuredDstY = (measuredTop !== -1) ? measuredTop : expectedViewport.dstY;
@@ -909,20 +970,30 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
   let rightInnerActiveCount = 0;
 
   for (const y of sampleRows) {
+    const rowOffset = y * width * 4;
     if (dstX > 0) {
-      const outer = decodedImg.getPixel(dstX - 1, y);
-      if (outer.r !== 0 || outer.g !== 0 || outer.b !== 0) leftOuterMarginClean = false;
-
-      const innerL = decodedImg.getPixel(dstX, y);
-      if (innerL.r > 0 || innerL.g > 0 || innerL.b > 0) leftInnerActiveCount++;
+      if (isActiveAt(dstX - 1, y, rowOffset)) leftOuterMarginClean = false;
+      if (isActiveAt(dstX, y, rowOffset)) leftInnerActiveCount++;
     }
 
     if (dstX + dstW < width) {
-      const innerR = decodedImg.getPixel(dstX + dstW - 1, y);
-      if (innerR.r > 0 || innerR.g > 0 || innerR.b > 0) rightInnerActiveCount++;
+      if (isActiveAt(dstX + dstW - 1, y, rowOffset)) rightInnerActiveCount++;
+      if (isActiveAt(dstX + dstW, y, rowOffset)) rightOuterMarginClean = false;
+    }
+  }
 
-      const outer = decodedImg.getPixel(dstX + dstW, y);
-      if (outer.r !== 0 || outer.g !== 0 || outer.b !== 0) rightOuterMarginClean = false;
+  if (isHardwareCapture && dstH > 16 && ((dstX > 0 && leftInnerActiveCount === 0) || (dstX + dstW < width && rightInnerActiveCount === 0))) {
+    const denseRowStep = Math.max(1, Math.floor(dstH / 128));
+    for (let y = dstY; y < dstY + dstH; y += denseRowStep) {
+      const rowOffset = y * width * 4;
+      if (dstX > 0) {
+        if (isActiveAt(dstX - 1, y, rowOffset)) leftOuterMarginClean = false;
+        if (isActiveAt(dstX, y, rowOffset)) leftInnerActiveCount++;
+      }
+      if (dstX + dstW < width) {
+        if (isActiveAt(dstX + dstW - 1, y, rowOffset)) rightInnerActiveCount++;
+        if (isActiveAt(dstX + dstW, y, rowOffset)) rightOuterMarginClean = false;
+      }
     }
   }
 
@@ -937,19 +1008,27 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
 
   for (const x of sampleCols) {
     if (dstY > 0) {
-      const outer = decodedImg.getPixel(x, dstY - 1);
-      if (outer.r !== 0 || outer.g !== 0 || outer.b !== 0) topOuterMarginClean = false;
-
-      const innerT = decodedImg.getPixel(x, dstY);
-      if (innerT.r > 0 || innerT.g > 0 || innerT.b > 0) topInnerActiveCount++;
+      if (isActiveAt(x, dstY - 1, (dstY - 1) * width * 4)) topOuterMarginClean = false;
+      if (isActiveAt(x, dstY, dstY * width * 4)) topInnerActiveCount++;
     }
 
     if (dstY + dstH < height) {
-      const innerB = decodedImg.getPixel(x, dstY + dstH - 1);
-      if (innerB.r > 0 || innerB.g > 0 || innerB.b > 0) bottomInnerActiveCount++;
+      if (isActiveAt(x, dstY + dstH - 1, (dstY + dstH - 1) * width * 4)) bottomInnerActiveCount++;
+      if (isActiveAt(x, dstY + dstH, (dstY + dstH) * width * 4)) bottomOuterMarginClean = false;
+    }
+  }
 
-      const outer = decodedImg.getPixel(x, dstY + dstH);
-      if (outer.r !== 0 || outer.g !== 0 || outer.b !== 0) bottomOuterMarginClean = false;
+  if (isHardwareCapture && dstW > 16 && ((dstY > 0 && topInnerActiveCount === 0) || (dstY + dstH < height && bottomInnerActiveCount === 0))) {
+    const denseColStep = Math.max(1, Math.floor(dstW / 128));
+    for (let x = dstX; x < dstX + dstW; x += denseColStep) {
+      if (dstY > 0) {
+        if (isActiveAt(x, dstY - 1, (dstY - 1) * width * 4)) topOuterMarginClean = false;
+        if (isActiveAt(x, dstY, dstY * width * 4)) topInnerActiveCount++;
+      }
+      if (dstY + dstH < height) {
+        if (isActiveAt(x, dstY + dstH - 1, (dstY + dstH - 1) * width * 4)) bottomInnerActiveCount++;
+        if (isActiveAt(x, dstY + dstH, (dstY + dstH) * width * 4)) bottomOuterMarginClean = false;
+      }
     }
   }
 
@@ -1049,6 +1128,9 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
     isHorizontallyCentered,
     isZeroWhiteBorder,
     isPureBlackMargins,
+    blackTolerance,
+    privacyIndicatorDotExcluded,
+    privacyIndicatorExcludedPixels: privacyIndicatorDotExcluded ? privacyDotCandidates.length : 0,
     summary,
   };
 }
@@ -1075,8 +1157,8 @@ function analyzeDisplayPixels(decodedImg, expectedViewport, options = {}) {
 function verifyDisplayOutput(options = {}) {
   let virtW = options.virtualWidth || options.virtW;
   let virtH = options.virtualHeight || options.virtH;
-  if ((!virtW || !virtH) && (options.expectedMode || options.gameRes)) {
-    const raw = options.expectedMode || options.gameRes;
+  if ((!virtW || !virtH) && (options.expectedMode || options.gameRes || options.resolution)) {
+    const raw = options.expectedMode || options.gameRes || options.resolution;
     if (typeof raw === 'string') {
       const parts = raw.split('x');
       if (parts.length === 2) {
@@ -1091,29 +1173,59 @@ function verifyDisplayOutput(options = {}) {
   const aspectMode = options.aspectMode || 'preserve';
   const defect = options.defect || 'none';
 
-  let displayW = options.displayWidth || options.displayW || options.screenW;
-  let displayH = options.displayHeight || options.displayH || options.screenH;
-  if ((!displayW || !displayH) && (options.display || options.displayRes)) {
+  let explicitDisplayW = options.displayWidth || options.displayW || options.screenW;
+  let explicitDisplayH = options.displayHeight || options.displayH || options.screenH;
+  if ((!explicitDisplayW || !explicitDisplayH) && (options.display || options.displayRes)) {
     const raw = options.display || options.displayRes;
     if (typeof raw === 'string') {
       const parts = raw.split('x');
       if (parts.length === 2) {
-        displayW = displayW || parseInt(parts[0], 10);
-        displayH = displayH || parseInt(parts[1], 10);
+        explicitDisplayW = explicitDisplayW || parseInt(parts[0], 10);
+        explicitDisplayH = explicitDisplayH || parseInt(parts[1], 10);
       }
     }
   }
 
-  if (!displayW || !displayH) {
-    const detected = detectDisplayGeometry();
-    displayW = displayW || (detected && detected.width) || 3024;
-    displayH = displayH || (detected && detected.height) || 1964;
-  }
-
+  let displayW = explicitDisplayW;
+  let displayH = explicitDisplayH;
   let pngBuffer = null;
   let tempCapturePath = null;
+  let usedLiveCapture = false;
 
   try {
+    let preDecoded = null;
+    if (Buffer.isBuffer(options.imageBuffer)) {
+      pngBuffer = options.imageBuffer;
+      preDecoded = decodePng(pngBuffer);
+      if (!displayW || !displayH) {
+        displayW = displayW || preDecoded.width;
+        displayH = displayH || preDecoded.height;
+      }
+    } else if (options.image) {
+      if (!fs.existsSync(options.image)) {
+        return {
+          ok: false,
+          passed: false,
+          exitCode: 2,
+          error: `Image file does not exist: ${options.image}`,
+          errors: [`Image file does not exist: ${options.image}`],
+          summary: `ERROR: Image file not found: ${options.image}`,
+        };
+      }
+      pngBuffer = fs.readFileSync(options.image);
+      preDecoded = decodePng(pngBuffer);
+      if (!displayW || !displayH) {
+        displayW = displayW || preDecoded.width;
+        displayH = displayH || preDecoded.height;
+      }
+    }
+
+    if (!displayW || !displayH) {
+      const detected = detectDisplayGeometry();
+      displayW = displayW || (detected && detected.width) || 3024;
+      displayH = displayH || (detected && detected.height) || 1964;
+    }
+
     const expectedViewport = computeOracleViewport(displayW, displayH, 0, virtW, virtH, aspectMode);
     if (!expectedViewport) {
       return {
@@ -1138,65 +1250,9 @@ function verifyDisplayOutput(options = {}) {
         },
       };
     }
-    if (Buffer.isBuffer(options.imageBuffer)) {
-      pngBuffer = options.imageBuffer;
-    } else if (options.image) {
-      if (!fs.existsSync(options.image)) {
-        return {
-          ok: false,
-          passed: false,
-          exitCode: 2,
-          error: `Image file does not exist: ${options.image}`,
-          errors: [`Image file does not exist: ${options.image}`],
-          summary: `ERROR: Image file not found: ${options.image}`,
-        };
-      }
-      pngBuffer = fs.readFileSync(options.image);
-    } else if (options.synthetic) {
-      pngBuffer = generateSyntheticDisplayBuffer({
-        width: displayW,
-        height: displayH,
-        gameW: virtW,
-        gameH: virtH,
-        aspectMode,
-        defect,
-      });
-    } else if (options.live || options.capture) {
-      if (process.platform !== 'darwin') {
-        return {
-          ok: false,
-          passed: false,
-          exitCode: 2,
-          error: `Live capture is only supported on macOS (current: ${process.platform}). Use --synthetic in headless environments.`,
-          errors: [`Live capture is only supported on macOS (current: ${process.platform})`],
-          summary: `ERROR: Live capture requires macOS; use --synthetic.`,
-        };
-      }
 
-      const lockCheck = detectScreenLockState();
-      if (lockCheck.isLocked) {
-        return {
-          ok: true,
-          passed: true,
-          skipped: true,
-          exitCode: 0,
-          errors: [],
-          reason: 'macOS screen is currently locked (CGSSessionScreenIsLocked = 1). Live frame buffer verification skipped.',
-          summary: 'SKIP: Screen locked (CGSSessionScreenIsLocked = 1).',
-        };
-      }
-
-      tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
-      captureWholeDisplay(tempCapturePath);
-      pngBuffer = fs.readFileSync(tempCapturePath);
-    } else {
-      // Default fallback: If on macOS and screen is unlocked, run live; otherwise run synthetic
-      const lockCheck = detectScreenLockState();
-      if (process.platform === 'darwin' && !lockCheck.isLocked) {
-        tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
-        captureWholeDisplay(tempCapturePath);
-        pngBuffer = fs.readFileSync(tempCapturePath);
-      } else {
+    if (!pngBuffer) {
+      if (options.synthetic) {
         pngBuffer = generateSyntheticDisplayBuffer({
           width: displayW,
           height: displayH,
@@ -1205,14 +1261,64 @@ function verifyDisplayOutput(options = {}) {
           aspectMode,
           defect,
         });
+      } else if (options.live || options.capture) {
+        if (process.platform !== 'darwin') {
+          return {
+            ok: false,
+            passed: false,
+            exitCode: 2,
+            error: `Live capture is only supported on macOS (current: ${process.platform}). Use --synthetic in headless environments.`,
+            errors: [`Live capture is only supported on macOS (current: ${process.platform})`],
+            summary: `ERROR: Live capture requires macOS; use --synthetic.`,
+          };
+        }
+
+        const lockCheck = detectScreenLockState();
+        if (lockCheck.isLocked) {
+          return {
+            ok: true,
+            passed: true,
+            skipped: true,
+            exitCode: 0,
+            errors: [],
+            reason: 'macOS screen is currently locked (CGSSessionScreenIsLocked = 1). Live frame buffer verification skipped.',
+            summary: 'SKIP: Screen locked (CGSSessionScreenIsLocked = 1).',
+          };
+        }
+
+        tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
+        captureWholeDisplay(tempCapturePath);
+        pngBuffer = fs.readFileSync(tempCapturePath);
+        usedLiveCapture = true;
+      } else {
+        // Default fallback: If on macOS and screen is unlocked, run live; otherwise run synthetic
+        const lockCheck = detectScreenLockState();
+        if (process.platform === 'darwin' && !lockCheck.isLocked) {
+          tempCapturePath = path.join(os.tmpdir(), `onelauncher-verify-display-${Date.now()}.png`);
+          captureWholeDisplay(tempCapturePath);
+          pngBuffer = fs.readFileSync(tempCapturePath);
+          usedLiveCapture = true;
+        } else {
+          pngBuffer = generateSyntheticDisplayBuffer({
+            width: displayW,
+            height: displayH,
+            gameW: virtW,
+            gameH: virtH,
+            aspectMode,
+            defect,
+          });
+        }
       }
     }
 
-    const decoded = decodePng(pngBuffer);
+    const decoded = preDecoded || decodePng(pngBuffer);
     const analysis = analyzeDisplayPixels(decoded, expectedViewport, {
       displayWidth: displayW,
       displayHeight: displayH,
-      strictBlack: options.strictBlack !== false,
+      synthetic: Boolean(options.synthetic),
+      hardwareCapture: Boolean(usedLiveCapture || decoded.hasColorProfile),
+      strictBlack: options.strictBlack === true,
+      blackTolerance: options.blackTolerance,
     });
 
     const errors = [];
@@ -1349,11 +1455,33 @@ function parseCliArgs(args) {
     displayHeight: null,
     aspectMode: 'preserve',
     defect: 'none',
+    strictBlack: false,
     verbose: false,
     json: false,
   };
 
-  for (const arg of args) {
+  const applyDimPair = (val, target) => {
+    if (typeof val !== 'string') return;
+    const parts = val.split('x');
+    if (parts.length === 2) {
+      const w = parseInt(parts[0], 10);
+      const h = parseInt(parts[1], 10);
+      if (!Number.isNaN(w) && !Number.isNaN(h)) {
+        if (target === 'virtual') {
+          options.virtualWidth = w;
+          options.virtualHeight = h;
+        } else {
+          options.displayWidth = w;
+          options.displayHeight = h;
+        }
+      }
+    }
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const nextVal = () => (i + 1 < args.length && !args[i + 1].startsWith('--') ? args[++i] : '');
+
     if (arg === '--help' || arg === '-h') {
       printUsage();
       process.exit(0);
@@ -1361,26 +1489,42 @@ function parseCliArgs(args) {
       options.live = true;
     } else if (arg === '--synthetic') {
       options.synthetic = true;
+    } else if (arg === '--strict-black') {
+      options.strictBlack = true;
+    } else if (arg.startsWith('--black-tolerance=')) {
+      const tol = parseInt(arg.slice('--black-tolerance='.length), 10);
+      if (!Number.isNaN(tol)) options.blackTolerance = tol;
+    } else if (arg === '--black-tolerance') {
+      const tol = parseInt(nextVal(), 10);
+      if (!Number.isNaN(tol)) options.blackTolerance = tol;
     } else if (arg.startsWith('--image=')) {
       options.image = arg.slice('--image='.length);
-    } else if (arg.startsWith('--game-res=') || arg.startsWith('--expected-mode=')) {
-      const prefix = arg.startsWith('--game-res=') ? '--game-res=' : '--expected-mode=';
-      const parts = arg.slice(prefix.length).split('x');
-      if (parts.length === 2) {
-        options.virtualWidth = parseInt(parts[0], 10);
-        options.virtualHeight = parseInt(parts[1], 10);
-      }
+    } else if (arg === '--image') {
+      options.image = nextVal();
+    } else if (
+      arg.startsWith('--game-res=') ||
+      arg.startsWith('--expected-mode=') ||
+      arg.startsWith('--resolution=')
+    ) {
+      const eqIdx = arg.indexOf('=');
+      applyDimPair(arg.slice(eqIdx + 1), 'virtual');
+    } else if (arg === '--game-res' || arg === '--expected-mode' || arg === '--resolution') {
+      applyDimPair(nextVal(), 'virtual');
     } else if (arg.startsWith('--display-res=') || arg.startsWith('--display=')) {
-      const prefix = arg.startsWith('--display-res=') ? '--display-res=' : '--display=';
-      const parts = arg.slice(prefix.length).split('x');
-      if (parts.length === 2) {
-        options.displayWidth = parseInt(parts[0], 10);
-        options.displayHeight = parseInt(parts[1], 10);
-      }
+      const eqIdx = arg.indexOf('=');
+      applyDimPair(arg.slice(eqIdx + 1), 'display');
+    } else if (arg === '--display-res' || arg === '--display') {
+      applyDimPair(nextVal(), 'display');
     } else if (arg.startsWith('--aspect-mode=')) {
       options.aspectMode = arg.slice('--aspect-mode='.length);
+    } else if (arg === '--aspect-mode') {
+      const val = nextVal();
+      if (val) options.aspectMode = val;
     } else if (arg.startsWith('--defect=')) {
       options.defect = arg.slice('--defect='.length);
+    } else if (arg === '--defect') {
+      const val = nextVal();
+      if (val) options.defect = val;
     } else if (arg === '--verbose') {
       options.verbose = true;
     } else if (arg === '--json') {
