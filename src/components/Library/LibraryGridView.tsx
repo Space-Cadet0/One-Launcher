@@ -597,10 +597,18 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
     const handleScrollOrWheel = (e: Event) => {
       handleDismiss();
-      const target = e.target as HTMLElement | null;
-      if (target && typeof target.scrollTop === 'number') {
-        const key = target.tagName === 'MAIN' ? 'main' : 'sidebar';
-        recordScrollActivity(target.scrollTop, key);
+      const rawTarget = e.target as HTMLElement | null;
+      const scrollContainer =
+        (rawTarget?.tagName === 'MAIN' || rawTarget?.tagName === 'ASIDE'
+          ? rawTarget
+          : rawTarget?.closest?.('main') || rawTarget?.closest?.('aside')) ||
+        (typeof document !== 'undefined'
+          ? (document.getElementById('main-content') as HTMLElement | null)
+          : null);
+
+      if (scrollContainer && typeof scrollContainer.scrollTop === 'number') {
+        const key = scrollContainer.tagName === 'MAIN' ? 'main' : 'sidebar';
+        recordScrollActivity(scrollContainer.scrollTop, key);
       } else {
         scheduleScrollIdleMemoryTrim();
       }

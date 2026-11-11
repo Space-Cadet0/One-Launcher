@@ -110,15 +110,51 @@ function emitVaultChange(event) {
 }
 
 /**
- * Explicitly invalidates the in-memory vault cache (all paths or a single `tokens.json` path).
+ * Explicitly invalidates the in-memory vault cache (all paths or a single `tokens.json` path / options object),
+ * wiping sensitive key material from `derivedKeyCache` (`entry.key.fill(0)`).
  *
- * @param {string} [filePath]
+ * @param {string | Record<string, any>} [filePathOrOptions]
  */
-function invalidateVaultMemoryCache(filePath) {
-  if (typeof filePath === 'string' && filePath.trim()) {
-    vaultMemoryCache.delete(path.resolve(toHostFilesystemPath(filePath.trim())));
+function invalidateVaultMemoryCache(filePathOrOptions) {
+  let targetPath = null;
+  if (typeof filePathOrOptions === 'string' && filePathOrOptions.trim()) {
+    targetPath = path.resolve(toHostFilesystemPath(filePathOrOptions.trim()));
+  } else if (filePathOrOptions && typeof filePathOrOptions === 'object') {
+    try {
+      const resolvedFromOpts = getTokensFilePath(filePathOrOptions);
+      if (resolvedFromOpts) {
+        targetPath = path.resolve(toHostFilesystemPath(resolvedFromOpts));
+      }
+    } catch {}
+  }
+
+  if (targetPath) {
+    vaultMemoryCache.delete(targetPath);
+    const cachedSalt = vaultSaltByFileCache.get(targetPath);
+    if (cachedSalt) {
+      const saltHex = cachedSalt.toString('hex');
+      const entry = derivedKeyCache.get(saltHex);
+      if (entry && Buffer.isBuffer(entry.key)) {
+        try {
+          entry.key.fill(0);
+        } catch {}
+      }
+      derivedKeyCache.delete(saltHex);
+      vaultSaltByFileCache.delete(targetPath);
+    }
     return;
   }
+
+  // Global cache eviction: scrub all derived key buffers before clearing
+  for (const entry of derivedKeyCache.values()) {
+    try {
+      if (entry && Buffer.isBuffer(entry.key)) {
+        entry.key.fill(0);
+      }
+    } catch {}
+  }
+  derivedKeyCache.clear();
+  vaultSaltByFileCache.clear();
   vaultMemoryCache.clear();
 }
 
@@ -469,6 +505,12 @@ function storeDerivedKeyInCache(saltHex, kmDigest, key) {
   if (!derivedKeyCache.has(saltHex) && derivedKeyCache.size >= DERIVED_KEY_CACHE_MAX) {
     const oldestKey = derivedKeyCache.keys().next().value;
     if (oldestKey !== undefined) {
+      const oldestEntry = derivedKeyCache.get(oldestKey);
+      if (oldestEntry && Buffer.isBuffer(oldestEntry.key)) {
+        try {
+          oldestEntry.key.fill(0);
+        } catch {}
+      }
       derivedKeyCache.delete(oldestKey);
     }
   }
@@ -913,6 +955,7 @@ async function renameWithWindowsRetryAsync(tmpPath, targetPath) {
 
 /**
  * Atomic async `.tmp` + `fh.datasync()` + `rename` write with `0o600` / Windows owner-SID ACLs.
+ * Preserves `<filePath>.bak` backup before replacing valid existing file.
  *
  * @param {string} filePath
  * @param {string} content
@@ -943,6 +986,24 @@ async function atomicWriteVaultFileAsync(filePath, content) {
       } catch {}
     }
 
+    // Preserve .bak backup copy before replacing target if target exists and is non-empty
+    try {
+      const targetStat = await fs.promises.stat(hostFilePath).catch(() => null);
+      if (targetStat && targetStat.isFile() && targetStat.size > 0) {
+        const bakPath = `${hostFilePath}.bak`;
+        await fs.promises.copyFile(hostFilePath, bakPath);
+        if (process.platform === 'win32') {
+          try {
+            await applyWindowsOwnerAclAsync(bakPath);
+          } catch {}
+        } else {
+          try {
+            await fs.promises.chmod(bakPath, 0o600);
+          } catch {}
+        }
+      }
+    } catch {}
+
     await renameWithWindowsRetryAsync(tmpPath, hostFilePath);
 
     if (process.platform !== 'win32') {
@@ -963,25 +1024,59 @@ async function atomicWriteVaultFileAsync(filePath, content) {
   }
 }
 
+const VAULT_LOCK_TIMEOUT_MS = 5000;
+
 /**
- * Serializes concurrent async vault operations per resolved `tokens.json` path.
+ * Serializes concurrent async vault operations per resolved `tokens.json` path with a 5000ms timeout.
  *
  * @template T
  * @param {string} filePath
  * @param {() => Promise<T>} task
+ * @param {number} [lockTimeoutMs=VAULT_LOCK_TIMEOUT_MS]
  * @returns {Promise<T>}
  */
-function runWithVaultMutex(filePath, task) {
+function runWithVaultMutex(filePath, task, lockTimeoutMs = VAULT_LOCK_TIMEOUT_MS) {
   const key = path.resolve(toHostFilesystemPath(filePath));
   const prev = vaultMutexQueues.get(key) || Promise.resolve();
-  const next = prev.catch(() => {}).then(task);
-  const tracked = next.finally(() => {
-    if (vaultMutexQueues.get(key) === tracked) {
-      vaultMutexQueues.delete(key);
-    }
-  });
+
+  let timer = null;
+  /** @type {Promise<T>} */
+  const executedTask = prev
+    .catch(() => {})
+    .then(() => {
+      let taskPromise;
+      try {
+        taskPromise = Promise.resolve(task());
+        taskPromise.catch(() => {});
+      } catch (err) {
+        return Promise.reject(err);
+      }
+
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`Vault mutex lock timed out after ${lockTimeoutMs}ms`));
+        }, lockTimeoutMs);
+      });
+
+      return Promise.race([taskPromise, timeoutPromise]);
+    })
+    .finally(() => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    });
+
+  const tracked = executedTask
+    .catch(() => {})
+    .finally(() => {
+      if (vaultMutexQueues.get(key) === tracked) {
+        vaultMutexQueues.delete(key);
+      }
+    });
+
   vaultMutexQueues.set(key, tracked);
-  return next;
+  return executedTask;
 }
 
 /**
@@ -1259,7 +1354,189 @@ async function writeTokensFileAsync(tokens, options = {}) {
 }
 
 /**
- * Low-level synchronous disk reader (populates `vaultMemoryCache`).
+ * Attempts to parse and decrypt a vault buffer synchronously.
+ *
+ * @param {Buffer} rawContent
+ * @param {string} resolved
+ * @param {Record<string, any>} options
+ * @returns {{ success: boolean, tokens?: Record<string, any>, shouldPersist?: boolean, error?: any }}
+ */
+function tryDecryptVaultBufferSync(rawContent, resolved, options = {}) {
+  if (!rawContent || rawContent.length === 0) {
+    return { success: false };
+  }
+
+  const rawStr = rawContent.toString('utf-8').trim();
+  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = decryptLegacyV1StringSync(rawStr, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return { success: true, tokens: cleaned, shouldPersist: true };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawStr);
+  } catch (parseErr) {
+    return { success: false, error: parseErr };
+  }
+
+  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = decryptLegacyV1StringSync(parsed, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return { success: true, tokens: cleaned, shouldPersist: true };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  if (parsed && parsed._encrypted_v2 === true) {
+    try {
+      const diskSalt = normalizeSaltBuffer(parsed.salt);
+      if (diskSalt && parsed._encrypted_v3 === true) {
+        vaultSaltByFileCache.set(resolved, diskSalt);
+      }
+      const decrypted = decryptTokensPayload(parsed, options);
+      const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
+      return {
+        success: true,
+        tokens: cleaned,
+        shouldPersist: Boolean(modified || parsed._encrypted_v3 !== true),
+      };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  if (parsed && parsed._encrypted === true) {
+    return { success: false, error: new Error('Unsupported legacy _encrypted format') };
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    /** @type {Record<string, any>} */
+    const cleanedTokens = {};
+    let hadLegacyStoreCipher = false;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value && typeof value === 'object' && value._encrypted === true) {
+        continue;
+      }
+      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+        try {
+          cleanedTokens[key] = decryptLegacyV1StringSync(value, options);
+          hadLegacyStoreCipher = true;
+        } catch {}
+        continue;
+      }
+      cleanedTokens[key] = value;
+    }
+    const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
+    return {
+      success: true,
+      tokens: cleaned,
+      shouldPersist: Boolean(Object.keys(cleaned).length > 0 || hadLegacyStoreCipher),
+    };
+  }
+
+  return { success: false };
+}
+
+/**
+ * Attempts to parse and decrypt a vault buffer asynchronously.
+ *
+ * @param {Buffer} rawContent
+ * @param {string} resolved
+ * @param {Record<string, any>} options
+ * @returns {Promise<{ success: boolean, tokens?: Record<string, any>, shouldPersist?: boolean, error?: any }>}
+ */
+async function tryDecryptVaultBufferAsync(rawContent, resolved, options = {}) {
+  if (!rawContent || rawContent.length === 0) {
+    return { success: false };
+  }
+
+  const rawStr = rawContent.toString('utf-8').trim();
+  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = await decryptLegacyV1StringAsync(rawStr, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return { success: true, tokens: cleaned, shouldPersist: true };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawStr);
+  } catch (parseErr) {
+    return { success: false, error: parseErr };
+  }
+
+  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+    try {
+      const dec = await decryptLegacyV1StringAsync(parsed, options);
+      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
+      return { success: true, tokens: cleaned, shouldPersist: true };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  if (parsed && parsed._encrypted_v2 === true) {
+    try {
+      const diskSalt = normalizeSaltBuffer(parsed.salt);
+      if (diskSalt && parsed._encrypted_v3 === true) {
+        vaultSaltByFileCache.set(resolved, diskSalt);
+      }
+      const decrypted = await decryptTokensPayloadAsync(parsed, options);
+      const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
+      return {
+        success: true,
+        tokens: cleaned,
+        shouldPersist: Boolean(modified || parsed._encrypted_v3 !== true),
+      };
+    } catch (decErr) {
+      return { success: false, error: decErr };
+    }
+  }
+
+  if (parsed && parsed._encrypted === true) {
+    return { success: false, error: new Error('Unsupported legacy _encrypted format') };
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    /** @type {Record<string, any>} */
+    const cleanedTokens = {};
+    let hadLegacyStoreCipher = false;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value && typeof value === 'object' && value._encrypted === true) {
+        continue;
+      }
+      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+        try {
+          cleanedTokens[key] = await decryptLegacyV1StringAsync(value, options);
+          hadLegacyStoreCipher = true;
+        } catch {}
+        continue;
+      }
+      cleanedTokens[key] = value;
+    }
+    const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
+    return {
+      success: true,
+      tokens: cleaned,
+      shouldPersist: Boolean(Object.keys(cleaned).length > 0 || hadLegacyStoreCipher),
+    };
+  }
+
+  return { success: false };
+}
+
+/**
+ * Low-level synchronous disk reader (populates `vaultMemoryCache`) with .bak recovery fallback.
  *
  * @param {string} resolved
  * @param {string} vaultKeyPath
@@ -1299,104 +1576,61 @@ function readTokensFromDiskSync(resolved, vaultKeyPath, keyContextDigest, option
     return cloneVaultDoc(cloned);
   };
 
-  if (!fs.existsSync(resolved)) {
-    return storeCacheResult({});
-  }
+  const bakPath = `${resolved}.bak`;
 
-  const rawContent = fs.readFileSync(resolved);
-  if (!rawContent || rawContent.length === 0) {
-    return storeCacheResult({});
-  }
-
-  const rawStr = rawContent.toString('utf-8').trim();
-  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
+  let primaryBuffer = null;
+  if (fs.existsSync(resolved)) {
     try {
-      const dec = decryptLegacyV1StringSync(rawStr, options);
-      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
-      try {
-        persistTokensToDiskSync(resolved, cleaned, options);
-      } catch {}
-      return cloneVaultDoc(cleaned);
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
-      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
-      return storeCacheResult({});
-    }
+      primaryBuffer = fs.readFileSync(resolved);
+    } catch {}
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(rawStr);
-  } catch {
-    return storeCacheResult({});
-  }
+  let result = primaryBuffer ? tryDecryptVaultBufferSync(primaryBuffer, resolved, options) : { success: false };
 
-  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
-    try {
-      const dec = decryptLegacyV1StringSync(parsed, options);
-      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
-      try {
-        persistTokensToDiskSync(resolved, cleaned, options);
-      } catch {}
-      return cloneVaultDoc(cleaned);
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
-      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
-      return storeCacheResult({});
-    }
-  }
-
-  if (parsed && parsed._encrypted_v2 === true) {
-    try {
-      const diskSalt = normalizeSaltBuffer(parsed.salt);
-      if (diskSalt && parsed._encrypted_v3 === true) {
-        vaultSaltByFileCache.set(resolved, diskSalt);
-      }
-      const decrypted = decryptTokensPayload(parsed, options);
-      const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
-      if (modified || parsed._encrypted_v3 !== true) {
-        try {
-          persistTokensToDiskSync(resolved, cleaned, options);
-          return cloneVaultDoc(cleaned);
-        } catch {}
-      }
-      return storeCacheResult(cleaned);
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+  // Fallback recovery: if primary file is missing, empty (0 bytes), corrupted, or fails decryption
+  if (!result.success) {
+    if (result.error) {
+      const msg = result.error instanceof Error ? result.error.message : String(result.error);
       console.warn('Failed to decrypt tokens payload:', msg);
-      return storeCacheResult({});
     }
-  }
-
-  if (parsed && parsed._encrypted === true) {
-    return storeCacheResult({});
-  }
-
-  if (parsed && typeof parsed === 'object') {
-    /** @type {Record<string, any>} */
-    const cleanedTokens = {};
-    let hadLegacyStoreCipher = false;
-    for (const [key, value] of Object.entries(parsed)) {
-      if (value && typeof value === 'object' && value._encrypted === true) {
-        continue;
-      }
-      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
-        try {
-          cleanedTokens[key] = decryptLegacyV1StringSync(value, options);
-          hadLegacyStoreCipher = true;
-        } catch {}
-        continue;
-      }
-      cleanedTokens[key] = value;
-    }
-    const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
-    if (Object.keys(cleaned).length > 0 || hadLegacyStoreCipher) {
+    if (fs.existsSync(bakPath)) {
       try {
-        persistTokensToDiskSync(resolved, cleaned, options);
-        return cloneVaultDoc(cleaned);
+        const bakStat = fs.statSync(bakPath);
+        if (bakStat.isFile() && bakStat.size > 0) {
+          const bakBuffer = fs.readFileSync(bakPath);
+          const bakResult = tryDecryptVaultBufferSync(bakBuffer, resolved, options);
+          if (bakResult.success && bakResult.tokens) {
+            console.warn(`Recovered vault tokens from backup file: ${bakPath}`);
+            try {
+              fs.copyFileSync(bakPath, resolved);
+              if (process.platform !== 'win32') {
+                try {
+                  fs.chmodSync(resolved, 0o600);
+                } catch {}
+              }
+            } catch {
+              try {
+                persistTokensToDiskSync(resolved, bakResult.tokens, options);
+              } catch {}
+            }
+            result = bakResult;
+          }
+        }
+      } catch (bakErr) {
+        const msg = bakErr instanceof Error ? bakErr.message : String(bakErr);
+        console.warn('Failed to recover vault tokens from backup:', msg);
+      }
+    }
+  }
+
+  if (result.success && result.tokens) {
+    if (result.shouldPersist) {
+      try {
+        persistTokensToDiskSync(resolved, result.tokens, options);
+        return cloneVaultDoc(result.tokens);
       } catch {}
     }
-    return storeCacheResult(cleaned);
+    return storeCacheResult(result.tokens);
   }
 
   return storeCacheResult({});
@@ -1428,7 +1662,7 @@ function loadSavedTokens(options = {}) {
 }
 
 /**
- * Internal unlocked async reader invoked inside `runWithVaultMutex`.
+ * Internal unlocked async reader invoked inside `runWithVaultMutex` with .bak recovery fallback.
  * Populates `vaultMemoryCache` without clobbering concurrent sync/async mutations.
  *
  * @param {string} filePath
@@ -1487,90 +1721,47 @@ async function readTokensUnlockedAsync(filePath, options = {}) {
     return cloneVaultDoc(entry.doc);
   };
 
-  let rawContent;
+  const bakPath = `${resolved}.bak`;
+
+  let primaryBuffer = null;
   try {
-    rawContent = await fs.promises.readFile(resolved);
-  } catch {
-    return finalizeReadResultAsync({}, false);
-  }
-  if (!rawContent || rawContent.length === 0) {
-    return finalizeReadResultAsync({}, false);
-  }
+    primaryBuffer = await fs.promises.readFile(resolved);
+  } catch {}
 
-  const rawStr = rawContent.toString('utf-8').trim();
-  if (rawStr.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
-    try {
-      const dec = await decryptLegacyV1StringAsync(rawStr, options);
-      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
-      return finalizeReadResultAsync(cleaned, true);
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
-      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
-      return finalizeReadResultAsync({}, false);
-    }
-  }
+  let result = primaryBuffer ? await tryDecryptVaultBufferAsync(primaryBuffer, resolved, options) : { success: false };
 
-  let parsed;
-  try {
-    parsed = JSON.parse(rawStr);
-  } catch {
-    return finalizeReadResultAsync({}, false);
-  }
-
-  if (typeof parsed === 'string' && parsed.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
-    try {
-      const dec = await decryptLegacyV1StringAsync(parsed, options);
-      const { cleaned } = sanitizeStorefrontTokensObject(dec, options);
-      return finalizeReadResultAsync(cleaned, true);
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
-      console.warn('Failed to decrypt legacy v1 tokens payload:', msg);
-      return finalizeReadResultAsync({}, false);
-    }
-  }
-
-  if (parsed && parsed._encrypted_v2 === true) {
-    try {
-      const diskSalt = normalizeSaltBuffer(parsed.salt);
-      if (diskSalt && parsed._encrypted_v3 === true) {
-        vaultSaltByFileCache.set(resolved, diskSalt);
-      }
-      const decrypted = await decryptTokensPayloadAsync(parsed, options);
-      const { cleaned, modified } = sanitizeStorefrontTokensObject(decrypted, options);
-      return finalizeReadResultAsync(cleaned, Boolean(modified || parsed._encrypted_v3 !== true));
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr);
+  // Fallback recovery: if primary file is missing, empty (0 bytes), corrupted, or fails decryption
+  if (!result.success) {
+    if (result.error) {
+      const msg = result.error instanceof Error ? result.error.message : String(result.error);
       console.warn('Failed to decrypt tokens payload:', msg);
-      return finalizeReadResultAsync({}, false);
+    }
+    try {
+      const bakStat = await fs.promises.stat(bakPath).catch(() => null);
+      if (bakStat && bakStat.isFile() && bakStat.size > 0) {
+        const bakBuffer = await fs.promises.readFile(bakPath);
+        const bakResult = await tryDecryptVaultBufferAsync(bakBuffer, resolved, options);
+        if (bakResult.success && bakResult.tokens) {
+          console.warn(`Recovered vault tokens from backup file: ${bakPath}`);
+          try {
+            await fs.promises.copyFile(bakPath, resolved);
+            if (process.platform !== 'win32') {
+              try {
+                await fs.promises.chmod(resolved, 0o600);
+              } catch {}
+            }
+          } catch {}
+          result = bakResult;
+        }
+      }
+    } catch (bakErr) {
+      const msg = bakErr instanceof Error ? bakErr.message : String(bakErr);
+      console.warn('Failed to recover vault tokens from backup:', msg);
     }
   }
 
-  if (parsed && parsed._encrypted === true) {
-    return finalizeReadResultAsync({}, false);
-  }
-
-  if (parsed && typeof parsed === 'object') {
-    /** @type {Record<string, any>} */
-    const cleanedTokens = {};
-    let hadLegacyStoreCipher = false;
-    for (const [key, value] of Object.entries(parsed)) {
-      if (value && typeof value === 'object' && value._encrypted === true) {
-        continue;
-      }
-      if (typeof value === 'string' && value.startsWith(LEGACY_AES256GCM_TOKEN_PREFIX)) {
-        try {
-          cleanedTokens[key] = await decryptLegacyV1StringAsync(value, options);
-          hadLegacyStoreCipher = true;
-        } catch {}
-        continue;
-      }
-      cleanedTokens[key] = value;
-    }
-    const { cleaned } = sanitizeStorefrontTokensObject(cleanedTokens, options);
-    return finalizeReadResultAsync(
-      cleaned,
-      Boolean(Object.keys(cleaned).length > 0 || hadLegacyStoreCipher)
-    );
+  if (result.success && result.tokens) {
+    return finalizeReadResultAsync(result.tokens, Boolean(result.shouldPersist));
   }
 
   return finalizeReadResultAsync({}, false);
@@ -1882,6 +2073,202 @@ function projectRedactedXboxSummary(xboxEntry) {
   };
 }
 
+/**
+ * Canonical contract interface: persists tokens for a specific store and accountId.
+ *
+ * @param {string} store
+ * @param {string} [accountId]
+ * @param {Record<string, any>} [tokenData]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<void>}
+ */
+async function storeToken(store, accountId, tokenData, options = {}) {
+  let effectiveAccountId = accountId;
+  let effectiveTokenData = tokenData;
+  let effectiveOptions = options;
+  if (accountId && typeof accountId === 'object' && tokenData === undefined) {
+    effectiveTokenData = accountId;
+    effectiveAccountId = undefined;
+  }
+  if (!store || typeof store !== 'string') {
+    throw new TypeError('Store identifier must be a non-empty string');
+  }
+  const payload =
+    effectiveAccountId && typeof effectiveAccountId === 'string'
+      ? { ...(effectiveTokenData || {}), accountId: effectiveAccountId }
+      : { ...(effectiveTokenData || {}) };
+  await saveTokensAsync(store, payload, effectiveOptions);
+}
+
+/**
+ * Canonical contract interface: retrieves saved tokens for a specific store and optional accountId.
+ *
+ * @param {string} store
+ * @param {string} [accountId]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Record<string, any> | null>}
+ */
+async function retrieveToken(store, accountId, options = {}) {
+  let effectiveAccountId = accountId;
+  let effectiveOptions = options;
+  if (accountId && typeof accountId === 'object' && (!options || Object.keys(options).length === 0)) {
+    effectiveOptions = accountId;
+    effectiveAccountId = undefined;
+  }
+  if (!store || typeof store !== 'string') return null;
+  const allTokens = await loadSavedTokensAsync(effectiveOptions);
+  if (!allTokens || typeof allTokens !== 'object') return null;
+  const storeEntry = allTokens[store];
+  if (!storeEntry || typeof storeEntry !== 'object') return null;
+  if (effectiveAccountId && typeof effectiveAccountId === 'string') {
+    if (storeEntry.accountId !== effectiveAccountId) {
+      return null;
+    }
+  }
+  return cloneVaultDoc(storeEntry);
+}
+
+/**
+ * Canonical contract interface: deletes saved tokens for a specific store and optional accountId.
+ *
+ * @param {string} store
+ * @param {string} [accountId]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<boolean>}
+ */
+async function deleteToken(store, accountId, options = {}) {
+  let effectiveAccountId = accountId;
+  let effectiveOptions = options;
+  if (accountId && typeof accountId === 'object' && (!options || Object.keys(options).length === 0)) {
+    effectiveOptions = accountId;
+    effectiveAccountId = undefined;
+  }
+  if (!store || typeof store !== 'string') return false;
+  const allTokens = await loadSavedTokensAsync(effectiveOptions);
+  if (!allTokens || typeof allTokens !== 'object' || !allTokens[store]) {
+    return false;
+  }
+  if (effectiveAccountId && typeof effectiveAccountId === 'string') {
+    const entry = allTokens[store];
+    if (!entry || typeof entry !== 'object' || entry.accountId !== effectiveAccountId) {
+      return false;
+    }
+  }
+  await clearTokensAsync(store, effectiveOptions);
+  return true;
+}
+
+/**
+ * Canonical contract alias for `runWithVaultMutex`.
+ * If invoked with a task callback, executes task under mutex and returns its Promise.
+ * If invoked without a task callback, returns an acquire/release handle.
+ *
+ * @template T
+ * @param {string} filePath
+ * @param {(() => Promise<T>) | number | { timeoutMs?: number, lockTimeoutMs?: number }} [taskOrCallback]
+ * @param {number} [timeoutMs]
+ * @returns {Promise<T> | {
+ *   lockPromise: Promise<void>,
+ *   acquired: Promise<void>,
+ *   release: () => void,
+ *   readonly isAcquired: boolean,
+ *   readonly isReleased: boolean,
+ *   [Symbol.asyncDispose]: () => Promise<void>
+ * }}
+ */
+function acquireVaultLock(filePath, taskOrCallback, timeoutMs) {
+  if (typeof taskOrCallback === 'function') {
+    return runWithVaultMutex(filePath, taskOrCallback, timeoutMs);
+  }
+
+  let effectiveTimeout;
+  if (typeof taskOrCallback === 'number') {
+    effectiveTimeout = taskOrCallback;
+  } else if (typeof timeoutMs === 'number') {
+    effectiveTimeout = timeoutMs;
+  } else if (taskOrCallback && typeof taskOrCallback === 'object') {
+    effectiveTimeout =
+      typeof taskOrCallback.timeoutMs === 'number'
+        ? taskOrCallback.timeoutMs
+        : typeof taskOrCallback.lockTimeoutMs === 'number'
+          ? taskOrCallback.lockTimeoutMs
+          : undefined;
+  }
+
+  let isReleased = false;
+  let isAcquired = false;
+  let releaseInternal = null;
+  let acquiredResolve = null;
+  let acquiredReject = null;
+
+  const acquired = new Promise((resolve, reject) => {
+    acquiredResolve = resolve;
+    acquiredReject = reject;
+  });
+  // Prevent unhandled promise rejection warnings if consumer awaits only lockPromise
+  acquired.catch(() => {});
+
+  const release = () => {
+    if (isReleased) return;
+    isReleased = true;
+    if (typeof releaseInternal === 'function') {
+      releaseInternal();
+    }
+  };
+
+  const lockPromise = runWithVaultMutex(
+    filePath,
+    () => {
+      if (isReleased) {
+        isAcquired = true;
+        if (acquiredResolve) acquiredResolve();
+        return Promise.resolve();
+      }
+
+      return new Promise((resolve) => {
+        releaseInternal = resolve;
+        isAcquired = true;
+        if (acquiredResolve) acquiredResolve();
+      });
+    },
+    effectiveTimeout
+  );
+
+  lockPromise.catch((err) => {
+    if (!isAcquired && acquiredReject) {
+      acquiredReject(err);
+    }
+  });
+
+  return {
+    lockPromise,
+    acquired,
+    release,
+    get isAcquired() {
+      return isAcquired;
+    },
+    get isReleased() {
+      return isReleased;
+    },
+    async [Symbol.asyncDispose]() {
+      release();
+      await lockPromise.catch(() => {});
+    },
+  };
+}
+
+/**
+ * Canonical contract alias for `atomicWriteVaultFileAsync`.
+ *
+ * @param {string} filePath
+ * @param {string} content
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<void>}
+ */
+async function writeVaultAtomic(filePath, content, options = {}) {
+  return atomicWriteVaultFileAsync(filePath, content);
+}
+
 module.exports = {
   getMachineIdentityKeyMaterial,
   getHardwareFingerprint: getMachineIdentityKeyMaterial,
@@ -1898,6 +2285,11 @@ module.exports = {
   onVaultChange,
   invalidateVaultMemoryCache,
   runWithVaultMutex,
+  acquireVaultLock,
+  writeVaultAtomic,
+  storeToken,
+  retrieveToken,
+  deleteToken,
   writeTokensFile,
   writeTokensFileAsync,
   loadSavedTokens,

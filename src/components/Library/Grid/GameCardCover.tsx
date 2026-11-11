@@ -17,6 +17,8 @@ import {
 } from '../../../utils/scrollActivityTracker';
 import {
   isCurrentlyFastScrolling,
+  addPendingFastScrollMount,
+  removePendingFastScrollMount,
   notifyImageUnmounted,
 } from './gridScrollTracker';
 import {
@@ -97,17 +99,46 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         setIsCoverMounted(true);
         return undefined;
       }
+
+      let pendingMount: (() => void) | null = null;
+
+      const cancelPendingMount = () => {
+        if (pendingMount) {
+          removePendingFastScrollMount(pendingMount);
+          pendingMount = null;
+        }
+      };
+
       const observer = new IntersectionObserver(
         (entries) => {
-          if (entries.some((entry) => entry.isIntersecting)) {
-            setIsCoverMounted(true);
-            observer.disconnect();
+          const isIntersecting = entries.some((entry) => entry.isIntersecting);
+          if (isIntersecting) {
+            if (isCurrentlyFastScrolling()) {
+              if (!pendingMount) {
+                pendingMount = () => {
+                  pendingMount = null;
+                  setIsCoverMounted(true);
+                  observer.disconnect();
+                };
+                addPendingFastScrollMount(pendingMount);
+              }
+            } else {
+              cancelPendingMount();
+              setIsCoverMounted(true);
+              observer.disconnect();
+            }
+          } else {
+            cancelPendingMount();
           }
         },
         { rootMargin: '600px 0px' }
       );
       observer.observe(el);
-      return () => observer.disconnect();
+
+      return () => {
+        cancelPendingMount();
+        observer.disconnect();
+      };
     }, [isCoverMounted]);
 
     const candidates = useMemo(() => {

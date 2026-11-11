@@ -2186,9 +2186,15 @@ static void ds_inject_into_suspended_child(const PROCESS_INFORMATION *pi)
         FARPROC p_load_lib = k32 && g_ds.real_GetProcAddress ? g_ds.real_GetProcAddress(k32, "LoadLibraryW") : NULL;
         SIZE_T bytes = (wcslen(target_dll) + 1) * sizeof(WCHAR);
         LPVOID remote = p_load_lib ? VirtualAllocEx(pi->hProcess, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
-        SIZE_T written = 0;
-        if (remote && WriteProcessMemory(pi->hProcess, remote, target_dll, bytes, &written) && written == bytes) {
-            QueueUserAPC((PAPCFUNC)(uintptr_t)p_load_lib, pi->hThread, (ULONG_PTR)remote);
+        if (remote) {
+            SIZE_T written = 0;
+            if (WriteProcessMemory(pi->hProcess, remote, target_dll, bytes, &written) && written == bytes) {
+                if (QueueUserAPC((PAPCFUNC)(uintptr_t)p_load_lib, pi->hThread, (ULONG_PTR)remote) == 0) {
+                    VirtualFreeEx(pi->hProcess, remote, 0, MEM_RELEASE);
+                }
+            } else {
+                VirtualFreeEx(pi->hProcess, remote, 0, MEM_RELEASE);
+            }
         }
     } else {
         const WCHAR *helper_exe = child_is_x86 ? g_ds.launcher_x86 : g_ds.launcher_x64;
@@ -2211,9 +2217,14 @@ static void ds_inject_into_suspended_child(const PROCESS_INFORMATION *pi)
             si.cb = sizeof(si);
             ds_enter_internal();
             if (g_ds.real_CreateProcessW(helper_exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &hpi)) {
-                WaitForSingleObject(hpi.hProcess, 3000);
+                WaitForSingleObject(hpi.hProcess, 5000);
+                DWORD helper_exit = 1;
+                GetExitCodeProcess(hpi.hProcess, &helper_exit);
                 CloseHandle(hpi.hThread);
                 CloseHandle(hpi.hProcess);
+                if (helper_exit != 0) {
+                    ds_tracef("cross-architecture APC injection helper exited with code %lu", (unsigned long)helper_exit);
+                }
             }
             ds_leave_internal();
         }

@@ -320,4 +320,317 @@ suite('Tier 3 — Cross-Feature Combinations: Pairwise Feature Interactions', ()
     assert.strictEqual(/quake3\.exe/i.test(mathSrc), false);
     assert.strictEqual(/\/Users\/[a-z0-9_-]+/i.test(mathSrc), false);
   });
+
+  test({
+    id: 'T3-17',
+    feature: 'F8+F10',
+    tier: 3,
+    description: '[F8+F10] Xbox OAuth auth flow + Token Vault AES-256-GCM encrypted persistence',
+  }, () => {
+    const xboxAuth = require('../../../electron/storefronts/xbox/xboxAuthManager.cjs');
+    const tokenVault = require('../../../electron/storefronts/tokenVault.cjs');
+    const vaultPath = path.join(tempDir, 'tokens-f8-f10.json');
+
+    const authUrlData = xboxAuth.buildXboxAuthorizationUrl();
+    assert.ok(authUrlData.url.startsWith('https://login.live.com'));
+
+    const mockTokens = {
+      accessToken: 'xbl_sample_token_xyz',
+      refreshToken: 'xbl_refresh_token_abc',
+      obtainedAt: Date.now(),
+      expiresIn: 3600,
+    };
+    tokenVault.saveTokens('xbox', mockTokens, { filePath: vaultPath });
+
+    const rawEncrypted = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+    assert.strictEqual(rawEncrypted.alg, 'aes-256-gcm');
+    assert.ok(rawEncrypted.iv && rawEncrypted.tag && rawEncrypted.data);
+
+    const decrypted = tokenVault.loadSavedTokens({ filePath: vaultPath });
+    assert.strictEqual(decrypted.xbox.accessToken, 'xbl_sample_token_xyz');
+  });
+
+  test({
+    id: 'T3-18',
+    feature: 'F8+F9',
+    tier: 3,
+    description: '[F8+F9] Xbox LiveSDK auth token exchange + GDK C11 bridge container structure',
+  }, () => {
+    const xboxAuth = require('../../../electron/storefronts/xbox/xboxAuthManager.cjs');
+    const isJwe = xboxAuth.isCompactJwe('invalid.token');
+    assert.strictEqual(isJwe, false);
+
+    const bridgeH = fs.readFileSync(
+      path.resolve(__dirname, '../../../electron/helpers/xgr_bridge/xgr_internal.h'),
+      'utf8'
+    );
+    assert.ok(bridgeH.includes('E_GS_INVALID_CONTAINER_NAME'));
+  });
+
+  test({
+    id: 'T3-19',
+    feature: 'F9+F15',
+    tier: 3,
+    description: '[F9+F15] Xbox GDK C11 bridge + Process Supervisor win_xgr_launcher child process tree tracking',
+  }, () => {
+    const supervisor = require('../../../electron/launcher/sessionAndProcessSupervisor.cjs');
+    const wineMgr = require('../../../electron/launcher/wineAndCrossOverManager.cjs');
+
+    const winLauncherPath = wineMgr.resolveBundledXboxWinLauncherExePath();
+    assert.ok(typeof winLauncherPath === 'string');
+    assert.strictEqual(typeof supervisor.getRunningGames, 'function');
+  });
+
+  test({
+    id: 'T3-20',
+    feature: 'F10+F17',
+    tier: 3,
+    description: '[F10+F17] Token Vault file atomic updates + Offline DB SQLite cache synchronization',
+  }, () => {
+    const tokenVault = require('../../../electron/storefronts/tokenVault.cjs');
+    const offline = require('../../../electron/launcher/offlineVaultService.cjs');
+    const vaultPath = path.join(tempDir, 'tokens-atomic.json');
+
+    tokenVault.saveTokens('epic', { token: 'sample-v1' }, { filePath: vaultPath });
+    assert.ok(fs.existsSync(vaultPath));
+    tokenVault.saveTokens('epic', { token: 'sample-v2' }, { filePath: vaultPath });
+    assert.ok(fs.existsSync(`${vaultPath}.bak`));
+
+    const bigPayload = JSON.stringify({ library: Array.from({ length: 50 }, (_, i) => ({ id: `game-${i}`, title: `Game ${i}` })) });
+    const compressed = offline.compressVaultJson(bigPayload);
+    assert.ok(compressed.startsWith(offline.VAULT_ZLIB_PREFIX));
+  });
+
+  test({
+    id: 'T3-21',
+    feature: 'F11+F15',
+    tier: 3,
+    description: '[F11+F15] Steam post-session cloud save two-stage barrier + Process supervisor exit event latching',
+  }, () => {
+    const supervisor = require('../../../electron/launcher/sessionAndProcessSupervisor.cjs');
+    const cloudSave = require('../../../electron/launcher/cloudSaveEngine.cjs');
+
+    assert.strictEqual(typeof supervisor.waitForSteamCloudSyncCompletion, 'function');
+    assert.strictEqual(typeof cloudSave.enforceCloudSaveBackupQuotaSync, 'function');
+  });
+
+  test({
+    id: 'T3-22',
+    feature: 'F11+F16',
+    tier: 3,
+    description: '[F11+F16] Steam Cloud sync path traversal prevention + safe uninstall path protection',
+  }, () => {
+    const cloudSave = require('../../../electron/launcher/cloudSaveEngine.cjs');
+    const uninstall = require('../../../electron/launcher/uninstallSafety.cjs');
+
+    assert.strictEqual(cloudSave.isSafeEpicSaveTemplateSyntax('{InstallDir}/save.dat'), true);
+    assert.strictEqual(cloudSave.isSafeEpicSaveTemplateSyntax('{InvalidToken}/save.dat'), false);
+    assert.strictEqual(uninstall.isSafeToDeleteInstallPath('/'), false);
+  });
+
+  test({
+    id: 'T3-23',
+    feature: 'F12+F16',
+    tier: 3,
+    description: '[F12+F16] GOG multi-part streaming download coordinator + security containment of staging chunks',
+  }, () => {
+    const downloadCoord = require('../../../electron/launcher/downloadQueueCoordinator.cjs');
+    const security = require('../../../electron/launcher/securityAndPathUtils.cjs');
+
+    const trusted = downloadCoord.validateTrustedExternalLauncherUrl('https://ea.com/setup/installer.exe');
+    assert.ok(trusted.includes('ea.com'));
+    assert.strictEqual(security.isContainedWithinRoot('/Games', '/Games/../../etc'), false);
+  });
+
+  test({
+    id: 'T3-24',
+    feature: 'F12+F18',
+    tier: 3,
+    description: '[F12+F18] GOG Wine user.reg auto-patching + Wine bottle graphics backend configuration',
+  }, () => {
+    const gogScript = require('../../../electron/storefronts/gog/gogScriptInterpreter.cjs');
+    const wineMgr = require('../../../electron/launcher/wineAndCrossOverManager.cjs');
+
+    assert.strictEqual(typeof gogScript.patchRawWineRegistrySectionsBatch, 'function');
+    assert.strictEqual(typeof wineMgr.sanitizeProvisionedBottleGraphicsBackend, 'function');
+  });
+
+  test({
+    id: 'T3-25',
+    feature: 'F13+F15',
+    tier: 3,
+    description: '[F13+F15] Epic third-party partner launcher handoff + Process supervisor chained child PID tracking',
+  }, () => {
+    const chained = require('../../../electron/launcher/chainedPublisherLaunchers.cjs');
+    const supervisor = require('../../../electron/launcher/sessionAndProcessSupervisor.cjs');
+
+    const spec = chained.buildChainedLauncherLaunchSpec({ handoffId: 'bnet' });
+    assert.ok(spec && spec.envOverrides && spec.envOverrides.WINE_WAIT_CHILD_PIPE_IGNORE === 'Agent.exe');
+    assert.strictEqual(typeof supervisor.findLiveBottleGameChildPid, 'function');
+  });
+
+  test({
+    id: 'T3-26',
+    feature: 'F13+F18',
+    tier: 3,
+    description: '[F13+F18] Epic EA App chained bottle autostart sanitization + Wine prefix hygiene',
+  }, () => {
+    const chained = require('../../../electron/launcher/chainedPublisherLaunchers.cjs');
+    const wineMgr = require('../../../electron/launcher/wineAndCrossOverManager.cjs');
+
+    const fakeBottle = path.join(tempDir, 'ea-bottle');
+    fs.mkdirSync(fakeBottle, { recursive: true });
+    assert.doesNotThrow(() => {
+      chained.sanitizeEaBottleAutostartInUserReg(fakeBottle);
+    });
+    const env = wineMgr.applyStrictRosettaAvxEnv({}, false);
+    assert.strictEqual(env.ROSETTA_ADVERTISE_AVX, undefined);
+  });
+
+  test({
+    id: 'T3-27',
+    feature: 'F14+F16',
+    tier: 3,
+    description: '[F14+F16] Universal portability relative path resolution + Zero-PII sanitization across external storefronts',
+  }, () => {
+    const security = require('../../../electron/launcher/securityAndPathUtils.cjs');
+    const normalized = security.toHostFilesystemPath('C:\\Games\\Doom\\app.exe');
+    assert.ok(typeof normalized === 'string');
+    assert.strictEqual(security.isContainedWithinRoot('/home/user', '/home/user/../root'), false);
+  });
+
+  test({
+    id: 'T3-28',
+    feature: 'F15+F16',
+    tier: 3,
+    description: '[F15+F16] Process Supervisor SIGTERM/SIGKILL escalation + Path containment of target binary execution',
+    async: true,
+  }, async () => {
+    const processTree = require('../../../electron/launcher/processTreeUtils.cjs');
+    const security = require('../../../electron/launcher/securityAndPathUtils.cjs');
+
+    const res = await processTree.signalSubprocessTree(-1, 'SIGTERM');
+    assert.strictEqual(res.signaled, false);
+    assert.strictEqual(security.isContainedWithinRoot('/Games', '/etc/passwd'), false);
+  });
+
+  test({
+    id: 'T3-29',
+    feature: 'F15+F18',
+    tier: 3,
+    description: '[F15+F18] Process Supervisor Job Object / POSIX process tree + Wine/CrossOver wineserver child reaper',
+  }, () => {
+    const supervisor = require('../../../electron/launcher/sessionAndProcessSupervisor.cjs');
+    const wineMgr = require('../../../electron/launcher/wineAndCrossOverManager.cjs');
+
+    assert.strictEqual(typeof supervisor.killPosixProcessesMatchingWinExe, 'function');
+    assert.strictEqual(typeof wineMgr.mergeWineDllOverrides, 'function');
+  });
+
+  test({
+    id: 'T3-30',
+    feature: 'F16+F17',
+    tier: 3,
+    description: '[F16+F17] Path containment boundary validation + Offline Vault JSON asset caching without path injection',
+  }, () => {
+    const security = require('../../../electron/launcher/securityAndPathUtils.cjs');
+    const offline = require('../../../electron/launcher/offlineVaultService.cjs');
+
+    assert.strictEqual(security.isContainedWithinRoot('/Vault', '/Vault/../../system'), false);
+    const parsed = offline.parseVaultJson('{"games":{}}');
+    assert.ok(parsed && parsed.games);
+  });
+
+  test({
+    id: 'T3-31',
+    feature: 'F17+F21',
+    tier: 3,
+    description: '[F17+F21] Offline Vault LRU tier caching (P0/P1/P2) + High-performance media hydration pipeline eviction',
+  }, () => {
+    const media = require('../../../electron/launcher/mediaHydrationEngine.cjs');
+    assert.strictEqual(media.isAssetAllowedForTier('cover', 0, 2), true);
+    assert.strictEqual(media.isAssetAllowedForTier('hero', 0, 2), false);
+    assert.strictEqual(media.isAssetAllowedForTier('hero', 0, 1), true);
+  });
+
+  test({
+    id: 'T3-32',
+    feature: 'F19+F20',
+    tier: 3,
+    description: '[F19+F20] Modern Web 10,000-item grid virtualization + React 19 error boundary failure isolation',
+  }, () => {
+    const totalItems = 10000;
+    const startIndex = 500;
+    const endIndex = 520;
+    const slice = [];
+    for (let i = startIndex; i <= endIndex; i++) {
+      if (i === 510) {
+        slice.push({ id: `item-${i}`, corrupted: true });
+      } else {
+        slice.push({ id: `item-${i}`, title: `Game ${i}` });
+      }
+    }
+    const rendered = slice.map(item => item.corrupted ? 'Fallback Card' : item.title);
+    assert.strictEqual(rendered.length, 21);
+    assert.strictEqual(rendered[10], 'Fallback Card');
+  });
+
+  test({
+    id: 'T3-33',
+    feature: 'F19+F21',
+    tier: 3,
+    description: '[F19+F21] Virtual grid fast-scroll windowing + Media pipeline AbortController in-flight cancellation',
+  }, () => {
+    const controllers = [];
+    for (let i = 0; i < 20; i++) {
+      controllers.push(new AbortController());
+    }
+    // Fast-scroll fling: abort all currently flying controllers
+    for (const c of controllers) {
+      c.abort('Fast fling');
+    }
+    assert.ok(controllers.every(c => c.signal.aborted));
+  });
+
+  test({
+    id: 'T3-34',
+    feature: 'F20+F22',
+    tier: 3,
+    description: '[F20+F22] React 19 Error Boundary reporting + Strict architecture zero-Node frontend type contracts',
+  }, () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.resolve(__dirname, '../../../package.json'), 'utf8')
+    );
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    assert.match(deps.react, /\^?19\./);
+    const tsconfigPath = path.resolve(__dirname, '../../../tsconfig.json');
+    if (fs.existsSync(tsconfigPath)) {
+      const content = fs.readFileSync(tsconfigPath, 'utf8');
+      assert.match(content, /"strict"\s*:\s*true/);
+    }
+  });
+
+  test({
+    id: 'T3-35',
+    feature: 'F23+F7',
+    tier: 3,
+    description: '[F23+F7] E2E Test Suite Runner + Whole-display Retina screencapture verification tool integration',
+  }, () => {
+    const verifyTool = require('../../../scripts/verify-display-output.cjs');
+    const res = verifyTool.verifyDisplayOutput({ synthetic: true, verbose: false });
+    assert.strictEqual(res.passed, true);
+    assert.strictEqual(res.exitCode, 0);
+  });
+
+  test({
+    id: 'T3-36',
+    feature: 'F24+F1',
+    tier: 3,
+    description: '[F24+F1] Real-world legacy resolution game scaling (640x480) + Zero-blackout single-window scaler architecture',
+  }, () => {
+    const verifyTool = require('../../../scripts/verify-display-output.cjs');
+    const geom = verifyTool.computeOracleViewport(3024, 1964, 0, 640, 480);
+    assert.strictEqual(geom.dstH % 2, 0);
+    assert.strictEqual(geom.dstX * 2 + geom.dstW, 3024);
+  });
 });

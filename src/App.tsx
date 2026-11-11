@@ -6,7 +6,6 @@ import {
   useCallback,
   useDeferredValue,
   startTransition,
-  lazy,
   Suspense,
 } from 'react';
 import { CanonicalGame } from './contracts/game';
@@ -74,59 +73,8 @@ import { SteamStorePage } from './components/SteamStoreDetail/SteamStorePage';
 
 export { InGameHibernationView };
 
-type LazyLoader = Parameters<typeof lazy>[0];
-
-export function lazyWithRetry<L extends LazyLoader>(
-  factory: L,
-  retries = 2,
-  intervalMs = 500
-) {
-  let activeLazyComponent: ReturnType<typeof lazy> | null = null;
-
-  const createCtor = (): Parameters<typeof lazy>[0] => {
-    return () =>
-      new Promise((resolve, reject) => {
-        function attempt(remaining: number): void {
-          Promise.resolve()
-            .then(() => factory())
-            .then(resolve)
-            .catch((err: unknown) => {
-              if (remaining <= 0) {
-                // When retries are exhausted, schedule un-poisoning of the React.lazy payload
-                // so subsequent remounts or modal reopenings make a fresh attempt rather than
-                // permanently failing with the cached rejection.
-                if (
-                  activeLazyComponent &&
-                  typeof activeLazyComponent === 'object' &&
-                  '_payload' in activeLazyComponent
-                ) {
-                  const payload = (
-                    activeLazyComponent as unknown as {
-                      _payload: { _status?: number; _result?: unknown };
-                    }
-                  )._payload;
-                  if (payload) {
-                    setTimeout(() => {
-                      if (payload._status === 2) {
-                        payload._status = -1;
-                        payload._result = createCtor();
-                      }
-                    }, 0);
-                  }
-                }
-                reject(err);
-                return;
-              }
-              setTimeout(() => attempt(remaining - 1), intervalMs);
-            });
-        }
-        attempt(retries);
-      }) as ReturnType<L>;
-  };
-
-  activeLazyComponent = lazy(createCtor());
-  return activeLazyComponent;
-}
+import { lazyWithRetry } from './utils/lazyWithRetry';
+export { lazyWithRetry };
 
 const ManageCollectionsModal = lazyWithRetry(() =>
   import('./components/Library/ManageCollectionsModal').then((m) => ({
@@ -480,6 +428,7 @@ export function App() {
   }, [activeGroupId, collections, pushEntry, selectedGame?.id]);
 
   const [searchQuery, setSearchQuery] = useState('');
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const [selectedPlatform, setSelectedPlatform] = useState<StorefrontId | 'all'>('all');
   const [installedOnly, setInstalledOnly] = useState(false);
   const [isSyncingAllMedia, setIsSyncingAllMedia] = useState(false);
@@ -852,9 +801,9 @@ export function App() {
         if (!isInstalled) return false;
       }
 
-      if (searchQuery.trim()) {
-        const matchesTitle = matchesLooseSearchQuery(game.title, searchQuery);
-        const matchesOrigTitle = matchesLooseSearchQuery(game.originalStoreTitle, searchQuery);
+      if (deferredSearchQuery.trim()) {
+        const matchesTitle = matchesLooseSearchQuery(game.title, deferredSearchQuery);
+        const matchesOrigTitle = matchesLooseSearchQuery(game.originalStoreTitle, deferredSearchQuery);
         if (!matchesTitle && !matchesOrigTitle) return false;
       }
 
@@ -887,7 +836,7 @@ export function App() {
     games,
     selectedPlatform,
     installedOnly,
-    searchQuery,
+    deferredSearchQuery,
     activeFilter,
     libraryFilterIndex,
     deferredLibraryFilterState,

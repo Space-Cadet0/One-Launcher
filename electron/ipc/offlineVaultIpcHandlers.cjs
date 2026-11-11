@@ -185,7 +185,67 @@ function createOlMediaProtocolHandler({ offlineVaultService, getOfflineVault, dn
       }
 
       if (resolved.kind === 'file' && typeof resolved.filePath === 'string') {
-        const nodeStream = fs.createReadStream(resolved.filePath);
+        const rangeHeader = getRequestHeaderValue(request, 'range');
+        let totalSize =
+          typeof resolved.sizeBytes === 'number' && resolved.sizeBytes > 0
+            ? resolved.sizeBytes
+            : 0;
+
+        if (!totalSize) {
+          try {
+            const st = await fs.promises.stat(resolved.filePath);
+            totalSize = st.size;
+          } catch {
+            totalSize = 0;
+          }
+        }
+
+        let statusCode = 200;
+        let streamOpts = {};
+        /** @type {Record<string, string>} */
+        const headers = {
+          ...OL_MEDIA_BASE_SECURITY_HEADERS,
+          'Content-Type': resolved.mimeType || 'image/jpeg',
+          'Cache-Control': resolved.cacheControl || 'public, max-age=31536000, immutable',
+          'Accept-Ranges': 'bytes',
+        };
+
+        if (rangeHeader && /^bytes=\d*-\d*$/i.test(rangeHeader) && totalSize > 0) {
+          const match = rangeHeader.match(/^bytes=(\d*)-(\d*)$/i);
+          if (match) {
+            const rawStart = match[1];
+            const rawEnd = match[2];
+            let start = rawStart !== '' ? parseInt(rawStart, 10) : 0;
+            let end = rawEnd !== '' ? parseInt(rawEnd, 10) : totalSize - 1;
+
+            if (rawStart === '' && rawEnd !== '') {
+              const suffixLen = parseInt(rawEnd, 10);
+              start = Math.max(0, totalSize - suffixLen);
+              end = totalSize - 1;
+            }
+
+            if (start <= end && start < totalSize) {
+              end = Math.min(end, totalSize - 1);
+              statusCode = 206;
+              streamOpts = { start, end };
+              headers['Content-Range'] = `bytes ${start}-${end}/${totalSize}`;
+              headers['Content-Length'] = String(end - start + 1);
+            } else {
+              return new Response(null, {
+                status: 416,
+                headers: {
+                  ...OL_MEDIA_BASE_SECURITY_HEADERS,
+                  'Content-Range': `bytes */${totalSize}`,
+                  'Accept-Ranges': 'bytes',
+                },
+              });
+            }
+          }
+        } else if (totalSize > 0) {
+          headers['Content-Length'] = String(totalSize);
+        }
+
+        const nodeStream = fs.createReadStream(resolved.filePath, streamOpts);
         nodeStream.on('error', () => {
           try {
             nodeStream.destroy();
@@ -211,17 +271,8 @@ function createOlMediaProtocolHandler({ offlineVaultService, getOfflineVault, dn
         }
 
         const webStream = Readable.toWeb(nodeStream);
-        /** @type {Record<string, string>} */
-        const headers = {
-          ...OL_MEDIA_BASE_SECURITY_HEADERS,
-          'Content-Type': resolved.mimeType || 'image/jpeg',
-          'Cache-Control': resolved.cacheControl || 'public, max-age=31536000, immutable',
-        };
-        if (typeof resolved.sizeBytes === 'number' && resolved.sizeBytes > 0) {
-          headers['Content-Length'] = String(resolved.sizeBytes);
-        }
         return new Response(/** @type {any} */ (webStream), {
-          status: 200,
+          status: statusCode,
           headers,
         });
       }

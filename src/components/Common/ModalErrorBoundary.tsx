@@ -21,7 +21,7 @@ interface ModalErrorBoundaryState {
  * rendering an accessible top-layer ModalShell error fallback with recovery actions.
  * Automatically clears error state whenever isOpen transitions back to false or re-opens.
  */
-export class ModalErrorBoundary extends Component<
+class ModalErrorBoundaryClass extends Component<
   ModalErrorBoundaryProps,
   ModalErrorBoundaryState
 > {
@@ -33,11 +33,13 @@ export class ModalErrorBoundary extends Component<
     resetKey: 0,
   };
 
-  public static getDerivedStateFromError(error: Error): Partial<ModalErrorBoundaryState> {
-    return { hasError: true, error };
+  public static getDerivedStateFromError(error: unknown): Partial<ModalErrorBoundaryState> {
+    const normalizedError =
+      error instanceof Error ? error : new Error(String(error || 'Unknown error'));
+    return { hasError: true, error: normalizedError };
   }
 
-  public override componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
+  public override componentDidCatch(error: unknown, errorInfo: ErrorInfo): void {
     console.error(
       `[ModalErrorBoundary] Uncaught exception in ${this.props.modalName || 'Modal'}:`,
       error,
@@ -99,7 +101,11 @@ export class ModalErrorBoundary extends Component<
             </div>
 
             {this.state.error?.message && (
-              <div className="p-3 rounded-lg bg-[#0e141b]/80 border border-[#2a475e] text-xs font-mono text-amber-200/90 break-words max-h-32 overflow-y-auto">
+              <div
+                role="alert"
+                aria-live="assertive"
+                className="p-3 rounded-lg bg-[#0e141b]/80 border border-[#2a475e] text-xs font-mono text-amber-200/90 break-words max-h-32 overflow-y-auto"
+              >
                 {this.state.error.message}
               </div>
             )}
@@ -115,6 +121,7 @@ export class ModalErrorBoundary extends Component<
               </button>
               <button
                 type="button"
+                autoFocus
                 onClick={this.handleClose}
                 className="px-3.5 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-xs font-bold text-slate-950 flex items-center gap-1.5 transition-colors cursor-pointer"
               >
@@ -134,3 +141,19 @@ export class ModalErrorBoundary extends Component<
     );
   }
 }
+
+export const ModalErrorBoundary: typeof ModalErrorBoundaryClass = new Proxy(
+  ModalErrorBoundaryClass,
+  {
+    apply(target, _thisArg, argArray) {
+      const props = (argArray[0] || {}) as ModalErrorBoundaryProps;
+      return new target(props).render();
+    },
+    construct(target, argArray) {
+      const props = (argArray[0] || {}) as ModalErrorBoundaryProps;
+      return new target(props);
+    },
+  }
+);
+
+export { ModalErrorBoundaryClass };

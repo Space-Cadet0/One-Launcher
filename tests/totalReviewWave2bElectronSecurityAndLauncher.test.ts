@@ -234,6 +234,42 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
 
       await supervisor.stopGame({ gameId: 'gog-synth-handedit' }, { platform: 'win32' });
     });
+
+    it('sanitizes baseEnv as well as userEnvMap in buildSafeChildEnvironment while preserving internalOverrides', () => {
+      const baseEnvWithDangerous = {
+        PATH: '/usr/bin:/bin',
+        NODE_OPTIONS: '--inspect=0.0.0.0:9229',
+        LD_PRELOAD: '/tmp/evil_preload.so',
+        DYLD_INSERT_LIBRARIES: '/tmp/evil_dyld.dylib',
+        ELECTRON_RUN_AS_NODE: '1',
+        BASH_ENV: '/tmp/evil.sh',
+        PYTHONPATH: '/tmp/evil_py',
+      };
+      const userEnvMap = {
+        SAFE_USER_VAR: 'hello',
+        LD_PRELOAD: '/tmp/user_evil.so',
+      };
+      const internalOverrides = {
+        ONE_LAUNCHER_INTERNAL: '1',
+      };
+
+      const safeEnv = securityUtils.buildSafeChildEnvironment(
+        baseEnvWithDangerous,
+        userEnvMap,
+        internalOverrides
+      );
+
+      // Dangerous keys from both baseEnv and userEnvMap must be stripped
+      expect(safeEnv.PATH).toBe('/usr/bin:/bin');
+      expect(safeEnv.SAFE_USER_VAR).toBe('hello');
+      expect(safeEnv.ONE_LAUNCHER_INTERNAL).toBe('1');
+      expect(safeEnv.NODE_OPTIONS).toBeUndefined();
+      expect(safeEnv.LD_PRELOAD).toBeUndefined();
+      expect(safeEnv.DYLD_INSERT_LIBRARIES).toBeUndefined();
+      expect(safeEnv.ELECTRON_RUN_AS_NODE).toBeUndefined();
+      expect(safeEnv.BASH_ENV).toBeUndefined();
+      expect(safeEnv.PYTHONPATH).toBeUndefined();
+    });
   });
 
   describe('2. Findings #2 & #5: Sender Validation, Loopback Origin Lock, Preload Forwarding & IPC Pruning', () => {
@@ -371,6 +407,50 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       const passedOpts = (spyGetConfigs.mock.calls[0] as any[])[0];
       expect(passedOpts.forceRefresh).toBe(true);
       expect(passedOpts.userDataDir).toBeUndefined();
+    });
+
+    it('wraps handleOnce and avoids double-proxying wrapped ipcMain instances in wrapIpcMainWithSenderCheck', () => {
+      let handleOnceChannel = '';
+      let handleOnceWrappedListener: any = null;
+      const fakeIpcMain = {
+        handle: vi.fn(),
+        handleOnce: vi.fn((ch, fn) => {
+          handleOnceChannel = ch;
+          handleOnceWrappedListener = fn;
+        }),
+      };
+
+      const wrapped = securityUtils.wrapIpcMainWithSenderCheck(fakeIpcMain, {
+        isPackaged: true,
+        expectedFileHref: 'file:///app/dist/index.html',
+      });
+      expect(wrapped.__isIpcSenderCheckWrapped).toBe(true);
+
+      // Re-wrapping an already wrapped proxy must return the same proxy without nesting
+      const rewrapped = securityUtils.wrapIpcMainWithSenderCheck(wrapped);
+      expect(rewrapped).toBe(wrapped);
+
+      // Registering via handleOnce must wrap listener with assertTrustedIpcSender
+      const dummyListener = vi.fn((_evt, arg) => `res_${arg}`);
+      wrapped.handleOnce('test:once-channel', dummyListener);
+      expect(handleOnceChannel).toBe('test:once-channel');
+      expect(typeof handleOnceWrappedListener).toBe('function');
+
+      // Untrusted senderFrame invocation on handleOnce must throw ERR_UNTRUSTED_IPC_SENDER
+      const subFrame = { url: 'https://evil.example.com', routingId: 99 };
+      const mainWc = { id: 1, mainFrame: { url: 'file:///app/dist/index.html', routingId: 1 } };
+      expect(() =>
+        handleOnceWrappedListener({ sender: mainWc, senderFrame: subFrame }, 'data')
+      ).toThrow(/Blocked IPC invocation from untrusted/);
+      expect(dummyListener).not.toHaveBeenCalled();
+
+      // Trusted senderFrame invocation succeeds
+      const result = handleOnceWrappedListener(
+        { sender: mainWc, senderFrame: mainWc.mainFrame },
+        'success'
+      );
+      expect(result).toBe('res_success');
+      expect(dummyListener).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -535,6 +615,73 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       const bodyBuf = Buffer.from(await sameOriginRes.arrayBuffer());
       expect(bodyBuf.length).toBe(68);
     });
+
+    it('handles HTTP 206 byte-range requests with Content-Range, Accept-Ranges, and partial content streams on ol-media://', async () => {
+      const sandbox = trackSandbox('ol-w2b-range-');
+      const testFile = path.join(sandbox, 'stream_test.dat');
+      const fileContent = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      fs.writeFileSync(testFile, fileContent, 'utf8');
+
+      const mockVault = {
+        resolveMediaRequest: async () => ({
+          kind: 'file',
+          filePath: testFile,
+          mimeType: 'application/octet-stream',
+          sizeBytes: fileContent.length,
+          cacheControl: 'public, max-age=3600',
+        }),
+      };
+
+      const handler = offlineVaultIpc.createOlMediaProtocolHandler({
+        getOfflineVault: () => mockVault,
+        dnsLookup: async () => ({ address: '93.184.216.34', family: 4 }),
+      });
+
+      // 1. Full content request returns 200 with Accept-Ranges: bytes
+      const fullRes = await handler(
+        new Request('ol-media://asset?url=https%3A%2F%2Fcdn.example.test%2Ffile.dat', {
+          headers: { 'sec-fetch-site': 'same-origin' },
+        })
+      );
+      expect(fullRes.status).toBe(200);
+      expect(fullRes.headers.get('Accept-Ranges')).toBe('bytes');
+      expect(fullRes.headers.get('Content-Length')).toBe(String(fileContent.length));
+
+      // 2. Valid byte range bytes=4-13 returns HTTP 206 with Content-Range
+      const rangeRes = await handler(
+        new Request('ol-media://asset?url=https%3A%2F%2Fcdn.example.test%2Ffile.dat', {
+          headers: { 'sec-fetch-site': 'same-origin', range: 'bytes=4-13' },
+        })
+      );
+      expect(rangeRes.status).toBe(206);
+      expect(rangeRes.headers.get('Accept-Ranges')).toBe('bytes');
+      expect(rangeRes.headers.get('Content-Range')).toBe(`bytes 4-13/${fileContent.length}`);
+      expect(rangeRes.headers.get('Content-Length')).toBe('10');
+      const chunkBuf = Buffer.from(await rangeRes.arrayBuffer());
+      expect(chunkBuf.toString('utf8')).toBe(fileContent.slice(4, 14));
+
+      // 3. Suffix byte range bytes=-6 returns last 6 bytes
+      const suffixRes = await handler(
+        new Request('ol-media://asset?url=https%3A%2F%2Fcdn.example.test%2Ffile.dat', {
+          headers: { 'sec-fetch-site': 'same-origin', range: 'bytes=-6' },
+        })
+      );
+      expect(suffixRes.status).toBe(206);
+      expect(suffixRes.headers.get('Content-Range')).toBe(
+        `bytes ${fileContent.length - 6}-${fileContent.length - 1}/${fileContent.length}`
+      );
+      const suffixBuf = Buffer.from(await suffixRes.arrayBuffer());
+      expect(suffixBuf.toString('utf8')).toBe(fileContent.slice(-6));
+
+      // 4. Unsatisfiable range returns HTTP 416
+      const invalidRangeRes = await handler(
+        new Request('ol-media://asset?url=https%3A%2F%2Fcdn.example.test%2Ffile.dat', {
+          headers: { 'sec-fetch-site': 'same-origin', range: 'bytes=100-200' },
+        })
+      );
+      expect(invalidRangeRes.status).toBe(416);
+      expect(invalidRangeRes.headers.get('Content-Range')).toBe(`bytes */${fileContent.length}`);
+    });
   });
 
   describe('5. Findings #6 & #18: Download Engine !signaled Resume Fix, Per-Task Serialization & Graceful Shutdown', () => {
@@ -663,6 +810,37 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       expect(fs.existsSync(gameDir2)).toBe(false);
       expect(fs.existsSync(externalSecretFile)).toBe(true);
       expect(fs.readFileSync(externalSecretFile, 'utf8')).toBe('DO_NOT_DELETE_ME');
+    });
+
+    it('strictly rejects deleting the library root container itself when targetPath equals options.libraryRoot', () => {
+      const sandbox = trackSandbox('ol-w2b-libroot-');
+      const libraryRoot = path.join(sandbox, 'Games', 'OneLauncher');
+      const gameDir = path.join(libraryRoot, 'ValidGame');
+      fs.mkdirSync(gameDir, { recursive: true });
+
+      // Attempting to delete libraryRoot itself MUST be rejected even if within allowedRoot
+      expect(
+        uninstallSafety.isSafeToDeleteInstallPath(libraryRoot, {
+          platform: 'darwin',
+          libraryRoot,
+        })
+      ).toBe(false);
+
+      // Windows-style library root self-deletion must also be rejected
+      expect(
+        uninstallSafety.isSafeToDeleteInstallPath('C:\\Games\\OneLauncher', {
+          platform: 'win32',
+          libraryRoot: 'C:\\Games\\OneLauncher',
+        })
+      ).toBe(false);
+
+      // Strictly nested child directory inside libraryRoot is accepted
+      expect(
+        uninstallSafety.isSafeToDeleteInstallPath(gameDir, {
+          platform: 'darwin',
+          libraryRoot,
+        })
+      ).toBe(true);
     });
   });
 
@@ -866,6 +1044,56 @@ describe('Total Review Wave 2B: Electron Security Perimeter, Dual-OS Supervisor,
       expect(cloudSrc).toContain(
         'stdoutOnly.matchAll(/^\\s*(1[6-9]\\d{8}|2\\d{9})(?:\\.\\d+)?\\s*$/gm)'
       );
+    });
+
+    it('self-heals corrupted SQLite databases in ensureOpen() and batches utility deletions without phantom FTS queries', () => {
+      const sandbox = trackSandbox('ol-w2b-vault-heal-');
+      const vaultDir = path.join(sandbox, 'offline-vault');
+      fs.mkdirSync(vaultDir, { recursive: true });
+      const dbPath = path.join(vaultDir, 'catalog_metadata.sqlite');
+
+      // 1. Write corrupted header into SQLite file
+      fs.writeFileSync(dbPath, 'CORRUPTED_SQLITE_GARBAGE_HEADER_DATA_12345');
+
+      const vault = new offlineVaultMod.OfflineVaultService({
+        userDataDir: sandbox,
+      });
+
+      // ensureOpen() must detect corruption, back up corrupt file, and initialize clean SQLite schema
+      const db = vault.ensureOpen();
+      expect(db).toBeDefined();
+
+      const corruptBackups = fs.readdirSync(vaultDir).filter((f: string) => f.includes('.corrupt.'));
+      expect(corruptBackups.length).toBe(1);
+
+      // 2. Insert standalone launcher utility into vault_games and verify batch cleanup during getCatalogSnapshot()
+      db.prepare(
+        'INSERT INTO vault_games (game_id, canonical_title, is_installed, platforms_json, summary_json) VALUES (?, ?, 0, ?, ?)'
+      ).run(
+        'ea-app-util',
+        'EA App',
+        JSON.stringify([{ platformId: 'ea', installed: false }]),
+        JSON.stringify({ id: 'ea-app-util', title: 'EA App' })
+      );
+      vault.upsertGames([
+        {
+          id: 'real-game-1',
+          title: 'Synthetic Action Game',
+          isInstalled: true,
+          platforms: [{ platformId: 'win32', installed: true }],
+        },
+      ]);
+
+      const snapshot = vault.getCatalogSnapshot();
+      expect(snapshot.success).toBe(true);
+      expect(snapshot.games.some((g: any) => g.id === 'real-game-1')).toBe(true);
+      expect(snapshot.games.some((g: any) => g.id === 'ea-app-util')).toBe(false);
+
+      // Verify it was purged from the database
+      const row = db.prepare('SELECT game_id FROM vault_games WHERE game_id = ?').get('ea-app-util');
+      expect(row).toBeUndefined();
+
+      vault.shutdown();
     });
   });
 

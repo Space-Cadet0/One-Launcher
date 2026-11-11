@@ -1501,8 +1501,7 @@ class OfflineVaultService {
       }
     } catch {}
 
-    const db = new DatabaseSync(this.dbPath);
-    db.exec(`
+    const initSql = `
       PRAGMA auto_vacuum = INCREMENTAL;
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
@@ -1577,7 +1576,36 @@ class OfflineVaultService {
         last_error TEXT,
         updated_at INTEGER NOT NULL DEFAULT 0
       );
-    `);
+    `;
+
+    let db;
+    try {
+      db = new DatabaseSync(this.dbPath);
+      db.exec(initSql);
+    } catch (openErr) {
+      diagLog.warn('offlineVault.databaseCorrupt', openErr);
+      try {
+        const corruptBackup = `${this.dbPath}.corrupt.${Date.now()}`;
+        if (fs.existsSync(this.dbPath)) {
+          fs.renameSync(this.dbPath, corruptBackup);
+        }
+        if (fs.existsSync(`${this.dbPath}-wal`)) {
+          try {
+            fs.unlinkSync(`${this.dbPath}-wal`);
+          } catch {}
+        }
+        if (fs.existsSync(`${this.dbPath}-shm`)) {
+          try {
+            fs.unlinkSync(`${this.dbPath}-shm`);
+          } catch {}
+        }
+        db = new DatabaseSync(this.dbPath);
+        db.exec(initSql);
+      } catch (recoverErr) {
+        diagLog.error('offlineVault.databaseRecoveryFailed', recoverErr);
+        throw recoverErr;
+      }
+    }
 
     try {
       const cols = db.prepare('PRAGMA table_info(vault_games)').all();
@@ -1842,18 +1870,9 @@ class OfflineVaultService {
             if (orphanPruneIds.length > 0) {
               const delAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
               const delGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
-              let delFtsStmt = null;
-              try {
-                delFtsStmt = db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?');
-              } catch {}
               for (const gid of orphanPruneIds) {
                 delAssetsStmt.run(gid);
                 delGameStmt.run(gid);
-                if (delFtsStmt) {
-                  try {
-                    delFtsStmt.run(gid);
-                  } catch {}
-                }
               }
             }
             db.exec('COMMIT');
@@ -2327,7 +2346,6 @@ class OfflineVaultService {
             try {
               deleteOrphanAssetsStmt.run(gameId);
               deleteOrphanGameStmt.run(gameId);
-              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(gameId);
             } catch {}
           }
           continue;
@@ -2361,7 +2379,6 @@ class OfflineVaultService {
           if (existing) {
             try {
               db.prepare('DELETE FROM vault_games WHERE game_id = ?').run(gameId);
-              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(gameId);
             } catch {}
           }
           continue;
@@ -3259,6 +3276,8 @@ class OfflineVaultService {
     const pendingOsRepairs = [];
     /** @type {string[]} */
     const pendingOrphanPruneIds = [];
+    /** @type {string[]} */
+    const pendingLauncherUtilityPurgeIds = [];
 
     for (const row of rows) {
       const isArchivedRotation = Number(row.archived_by_subscription_rotation || 0) === 1;
@@ -3321,13 +3340,7 @@ class OfflineVaultService {
       const rowTitle = String(summary?.title || row.canonical_title || '');
       if (!isRowInstalled && isStandaloneStorefrontLauncherUtility(rowTitle, platforms)) {
         if (!this.options?.readOnly && !options?.readOnly && row.game_id) {
-          try {
-            const qOnly = db.prepare('PRAGMA query_only').get();
-            if (!Number(qOnly?.query_only)) {
-              db.prepare('DELETE FROM vault_games WHERE game_id = ?').run(String(row.game_id));
-              db.prepare('DELETE FROM vault_games_fts WHERE game_id = ?').run(String(row.game_id));
-            }
-          } catch {}
+          pendingLauncherUtilityPurgeIds.push(String(row.game_id));
         }
         continue;
       }
@@ -3511,6 +3524,30 @@ class OfflineVaultService {
         }
       } catch (err) {
         diagLog.debug('offlineVault.repairHydratedOsFlags', err);
+      }
+    }
+
+    if (pendingLauncherUtilityPurgeIds.length > 0 && !this.options?.readOnly && !options?.readOnly) {
+      try {
+        const qOnly = db.prepare('PRAGMA query_only').get();
+        if (!Number(qOnly?.query_only)) {
+          db.exec('BEGIN IMMEDIATE');
+          try {
+            const delAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
+            const delGameStmt = db.prepare('DELETE FROM vault_games WHERE game_id = ?');
+            for (const id of pendingLauncherUtilityPurgeIds) {
+              delAssetsStmt.run(id);
+              delGameStmt.run(id);
+            }
+            db.exec('COMMIT');
+          } catch (txErr) {
+            try {
+              db.exec('ROLLBACK');
+            } catch {}
+          }
+        }
+      } catch (err) {
+        diagLog.debug('offlineVault.purgeLauncherUtilities', err);
       }
     }
 

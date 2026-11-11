@@ -71,6 +71,15 @@ export function VirtualGridRows<T>({
   virtualizerRef.current = rowVirtualizer;
 
   useLayoutEffect(() => {
+    const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
+    setScrollMargin((prev) => (prev === next ? prev : next));
+  });
+
+  useLayoutEffect(() => {
+    virtualizerRef.current.measure();
+  }, [safeCols]);
+
+  useLayoutEffect(() => {
     const syncMargin = () => {
       const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
       setScrollMargin((prev) => (prev === next ? prev : next));
@@ -196,6 +205,11 @@ export function VirtualListRows<T>({
 
   const virtualizerRef = useRef(listVirtualizer);
   virtualizerRef.current = listVirtualizer;
+
+  useLayoutEffect(() => {
+    const next = computeOffsetRelativeToScrollParent(containerRef.current, scrollElement);
+    setScrollMargin((prev) => (prev === next ? prev : next));
+  });
 
   useLayoutEffect(() => {
     const syncMargin = () => {

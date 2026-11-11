@@ -79,3 +79,6 @@ scripts/pdf_*
 scripts/*_authentic_*.json
 tier4_titles.json
 
+# Agent Coordination Metadata
+.agents/
+

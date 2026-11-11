@@ -587,6 +587,212 @@ describe('Wave 2C Deliverable 2 — Unified In-Memory TokenVault & Win32 DPAPI S
     const afterDelete = await tokenVault.loadSavedTokensAsync(vaultOpts);
     expect(afterDelete).toEqual({});
   });
+
+  it('creates .bak backup copy during writes and recovers automatically when tokens.json is 0-byte or corrupted', async () => {
+    const userDataDir = makeTempDir('wave2c-vault-bak-');
+    const vaultOpts = { userDataDir, machineIdOverride: 'synthetic-bak-machine-001' };
+    const tokensPath = path.join(userDataDir, 'tokens.json');
+    const bakPath = `${tokensPath}.bak`;
+
+    // 1. Initial write creates tokens.json
+    await tokenVault.saveTokensAsync(
+      'epic',
+      { access_token: 'epic_bak_initial_token', refresh_token: 'epic_bak_initial_ref' },
+      vaultOpts
+    );
+    expect(fs.existsSync(tokensPath)).toBe(true);
+
+    // 2. Second write preserves previous tokens in .bak backup file
+    await tokenVault.saveTokensAsync(
+      'gog',
+      { access_token: 'gog_bak_second_token', refresh_token: 'gog_bak_second_ref' },
+      vaultOpts
+    );
+    expect(fs.existsSync(bakPath)).toBe(true);
+    const bakStat = fs.statSync(bakPath);
+    expect(bakStat.size).toBeGreaterThan(0);
+
+    // 3. Simulate sudden power failure / truncation leaving tokens.json 0 bytes
+    fs.writeFileSync(tokensPath, '');
+    expect(fs.statSync(tokensPath).size).toBe(0);
+
+    // Invalidate in-memory cache to force reading from disk
+    tokenVault.invalidateVaultMemoryCache(vaultOpts);
+
+    // Async loader must detect 0-byte primary, recover from .bak, and restore primary file on disk
+    const recoveredAsync = await tokenVault.loadSavedTokensAsync(vaultOpts);
+    expect(recoveredAsync.epic?.access_token).toBe('epic_bak_initial_token');
+    expect(fs.statSync(tokensPath).size).toBeGreaterThan(0);
+
+    // 4. Simulate corruption (gibberish non-JSON content)
+    fs.writeFileSync(tokensPath, 'CORRUPTED_NON_JSON_DATA_GARBAGE');
+    tokenVault.invalidateVaultMemoryCache(vaultOpts);
+
+    // Sync loader must detect corrupted primary, recover from .bak, and restore primary file on disk
+    const recoveredSync = tokenVault.loadSavedTokens(vaultOpts);
+    expect(recoveredSync.epic?.access_token).toBe('epic_bak_initial_token');
+    expect(fs.statSync(tokensPath).size).toBeGreaterThan(0);
+    const primaryJson = JSON.parse(fs.readFileSync(tokensPath, 'utf8'));
+    expect(primaryJson._encrypted_v3).toBe(true);
+  });
+
+  it('enforces 5000ms mutex lock timeout and unblocks queued tasks without deadlocks', async () => {
+    const userDataDir = makeTempDir('wave2c-vault-mutex-');
+    const tokensPath = path.join(userDataDir, 'tokens.json');
+
+    // 1. Short timeout verification using parameter
+    const shortTimeoutMs = 60;
+    const timedOutTask = tokenVault.runWithVaultMutex(
+      tokensPath,
+      () => new Promise((resolve) => setTimeout(resolve, 200)),
+      shortTimeoutMs
+    );
+    await expect(timedOutTask).rejects.toThrow(`Vault mutex lock timed out after ${shortTimeoutMs}ms`);
+
+    // 2. Deadlock prevention: subsequent task queued behind a timed-out task runs successfully
+    const hangTask = tokenVault.runWithVaultMutex(
+      tokensPath,
+      () => new Promise((resolve) => setTimeout(resolve, 300)),
+      shortTimeoutMs
+    );
+    const nextTask = tokenVault.runWithVaultMutex(
+      tokensPath,
+      async () => 'recovered_queue_task_result',
+      5000
+    );
+
+    await expect(hangTask).rejects.toThrow(`Vault mutex lock timed out after ${shortTimeoutMs}ms`);
+    const nextResult = await nextTask;
+    expect(nextResult).toBe('recovered_queue_task_result');
+
+    // 3. Default 5000ms timeout with vitest fake timers
+    vi.useFakeTimers();
+    try {
+      const defaultTimeoutPromise = tokenVault.runWithVaultMutex(
+        tokensPath,
+        () => new Promise(() => {}) // never resolves
+      );
+      // Advance by 5001ms to trigger the default 5000ms timeout
+      await vi.advanceTimersByTimeAsync(5005);
+      await expect(defaultTimeoutPromise).rejects.toThrow('Vault mutex lock timed out after 5000ms');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('conforms to canonical contract interface exports (storeToken, retrieveToken, deleteToken, acquireVaultLock, writeVaultAtomic)', async () => {
+    const userDataDir = makeTempDir('wave2c-vault-contract-');
+    const vaultOpts = { userDataDir, machineIdOverride: 'synthetic-contract-machine-001' };
+    const tokensPath = path.join(userDataDir, 'tokens.json');
+
+    expect(typeof tokenVault.storeToken).toBe('function');
+    expect(typeof tokenVault.retrieveToken).toBe('function');
+    expect(typeof tokenVault.deleteToken).toBe('function');
+    expect(typeof tokenVault.acquireVaultLock).toBe('function');
+    expect(typeof tokenVault.writeVaultAtomic).toBe('function');
+
+    // 1. storeToken persists credentials
+    await tokenVault.storeToken(
+      'epic',
+      'account_synthetic_01',
+      { access_token: 'epic_tok_c1', refresh_token: 'epic_ref_c1' },
+      vaultOpts
+    );
+
+    // 2. retrieveToken retrieves by store and checks accountId
+    const retrievedValid = await tokenVault.retrieveToken('epic', 'account_synthetic_01', vaultOpts);
+    expect(retrievedValid?.access_token).toBe('epic_tok_c1');
+    expect(retrievedValid?.accountId).toBe('account_synthetic_01');
+
+    // AccountId mismatch returns null
+    const retrievedMismatch = await tokenVault.retrieveToken('epic', 'different_account_id', vaultOpts);
+    expect(retrievedMismatch).toBeNull();
+
+    // Missing store returns null
+    const retrievedMissing = await tokenVault.retrieveToken('gog', undefined, vaultOpts);
+    expect(retrievedMissing).toBeNull();
+
+    // 2b. Unattributed token retrieval and deletion isolation
+    await tokenVault.storeToken('gog', undefined, { access_token: 'gog_unattributed' }, vaultOpts);
+    expect(await tokenVault.retrieveToken('gog', 'user_mismatch', vaultOpts)).toBeNull();
+    expect(await tokenVault.deleteToken('gog', 'user_mismatch', vaultOpts)).toBe(false);
+    expect(await tokenVault.retrieveToken('gog', undefined, vaultOpts)).toEqual(
+      expect.objectContaining({ access_token: 'gog_unattributed' })
+    );
+    expect(await tokenVault.deleteToken('gog', undefined, vaultOpts)).toBe(true);
+    expect(await tokenVault.retrieveToken('gog', undefined, vaultOpts)).toBeNull();
+
+    // 3. deleteToken removes token and returns boolean
+    const deletedFalse = await tokenVault.deleteToken('epic', 'mismatched_account_id', vaultOpts);
+    expect(deletedFalse).toBe(false);
+
+    const deletedTrue = await tokenVault.deleteToken('epic', 'account_synthetic_01', vaultOpts);
+    expect(deletedTrue).toBe(true);
+
+    const retrievedAfterDelete = await tokenVault.retrieveToken('epic', 'account_synthetic_01', vaultOpts);
+    expect(retrievedAfterDelete).toBeNull();
+
+    // 4. writeVaultAtomic writes atomically
+    const testFilePath = path.join(userDataDir, 'test-atomic.txt');
+    await tokenVault.writeVaultAtomic(testFilePath, 'atomic_content_123');
+    expect(fs.readFileSync(testFilePath, 'utf8')).toBe('atomic_content_123');
+
+    // 5. acquireVaultLock runs task under lock (callback pattern)
+    let lockExecuted = false;
+    const lockResult = await tokenVault.acquireVaultLock(tokensPath, async () => {
+      lockExecuted = true;
+      return 'lock_completed';
+    });
+    expect(lockExecuted).toBe(true);
+    expect(lockResult).toBe('lock_completed');
+
+    // 5b. acquireVaultLock handle release pattern
+    const lockHandle = tokenVault.acquireVaultLock(tokensPath, 3000);
+    expect(typeof lockHandle.release).toBe('function');
+    expect(lockHandle.acquired).toBeInstanceOf(Promise);
+    await lockHandle.acquired;
+
+    let subsequentTaskRan = false;
+    const subsequentTask = tokenVault.acquireVaultLock(tokensPath, async () => {
+      subsequentTaskRan = true;
+      return 'subsequent_ok';
+    });
+
+    lockHandle.release();
+    await lockHandle.lockPromise;
+    const subsequentResult = await subsequentTask;
+    expect(subsequentTaskRan).toBe(true);
+    expect(subsequentResult).toBe('subsequent_ok');
+  });
+
+  it('supports selective cache invalidation with { userDataDir } preserving other cached vaults and scrubbing derived keys', async () => {
+    const dirA = makeTempDir('wave2c-vault-selective-a-');
+    const dirB = makeTempDir('wave2c-vault-selective-b-');
+    const optsA = { userDataDir: dirA, machineIdOverride: 'synthetic-selective-machine-001' };
+    const optsB = { userDataDir: dirB, machineIdOverride: 'synthetic-selective-machine-001' };
+
+    // Seed both vaults
+    await tokenVault.saveTokensAsync('epic', { access_token: 'vault_a_token' }, optsA);
+    await tokenVault.saveTokensAsync('epic', { access_token: 'vault_b_token' }, optsB);
+
+    // Warm in-memory cache for both
+    const loadedA1 = tokenVault.loadSavedTokens(optsA);
+    const loadedB1 = tokenVault.loadSavedTokens(optsB);
+    expect(loadedA1.epic?.access_token).toBe('vault_a_token');
+    expect(loadedB1.epic?.access_token).toBe('vault_b_token');
+
+    // Selectively invalidate ONLY vault A
+    tokenVault.invalidateVaultMemoryCache(optsA);
+
+    // Vault B must STILL be served from cache without disk re-reading
+    const loadedB2 = tokenVault.loadSavedTokens(optsB);
+    expect(loadedB2.epic?.access_token).toBe('vault_b_token');
+
+    // Global invalidation evicts all vaults and scrubs keys
+    tokenVault.invalidateVaultMemoryCache();
+    const loadedB3 = await tokenVault.loadSavedTokensAsync(optsB);
+    expect(loadedB3.epic?.access_token).toBe('vault_b_token');
+  });
 });
 
 // ============================================================================

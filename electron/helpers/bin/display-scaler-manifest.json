@@ -30,24 +30,24 @@
     "electron/helpers/display_scaler/display_scaler_math.c": "e0d995f2dd151060ea209117bafadf374b97b661fda8cd7e3344d8b98b306cb3",
     "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "91af8fb23b420d4caee0eb3753334cee519ed0e3ea439991e4ed4a52c06ccba7",
     "electron/helpers/display_scaler/display_scaler_window.c": "8177fe0ced7043cc63780c95e75359589e50570001c2e3a055595de12c0401cf",
-    "electron/helpers/display_scaler/display_scaler_dll.c": "769f1255c28f363ea101424eb4ee40d46e2bbeb61cb523f9bf3c30c346f56e9b",
+    "electron/helpers/display_scaler/display_scaler_dll.c": "578be1327c0d1082577055257ac4491f080430458c575afb45351fabe22490fa",
     "electron/helpers/display_scaler/display_launcher.c": "b008914d69ce3574070d026e58f4dd28408ae97a108009fa8cd073456337c33b",
     "electron/helpers/display_scaler/display_scaler.def": "a975f9534e4087f11271db76527cbdea06c7f30954041ac3e73f57e29a47aad1",
     "scripts/build-display-scaler.cjs": "508fdbfe7983333865a8640e02d22f8716da60dc7b21345d0f3596003bcc6c25"
   },
   "outputs": {
     "one_display_scaler_x86.dll": {
-      "sha256": "1c23acfa696ec53dd5b020f26e9ac4346e6c192514be76cd6b4d7ae20fc2d79c",
+      "sha256": "e7d542ffed290f4ec382c4fcfbc3378ac28fed4469b1b83c9aab05f1857bef61",
       "sizeBytes": 122368,
       "machine": "0x14c",
-      "peCheckSum": "0x00027035",
+      "peCheckSum": "0x000217ce",
       "exportedCount": 2
     },
     "one_display_scaler_x64.dll": {
-      "sha256": "effb753019cc78241ded2298ac67064fd3ac86a0bc41b1a55c1f08a83d2a60a3",
+      "sha256": "885b597992f5d8ac9810b64ad0b27595ab0b4532da93f536739e46e4351a3484",
       "sizeBytes": 113152,
       "machine": "0x8664",
-      "peCheckSum": "0x00028f40",
+      "peCheckSum": "0x00022490",
       "exportedCount": 2
     },
     "one_display_launcher_x86.exe": {

@@ -221,20 +221,27 @@ function isSafeNumericAppId(id) {
  * @param {string} anchorRoot
  * @param {string} candidatePath
  * @param {boolean} isWinStyle
+ * @param {boolean} [strict]
  * @returns {boolean}
  */
-function isPathContainedInRoot(anchorRoot, candidatePath, isWinStyle) {
+function isPathContainedInRoot(anchorRoot, candidatePath, isWinStyle, strict = false) {
   if (!anchorRoot || !candidatePath) return false;
   if (anchorRoot.includes('\0') || candidatePath.includes('\0')) return false;
   if (isWinStyle || /^[a-zA-Z]:[\\/]/.test(anchorRoot) || anchorRoot.startsWith('\\\\')) {
     const normAnchor = path.win32.resolve(normalizeWin32DevicePrefix(anchorRoot)).toLowerCase();
     const normCand = path.win32.resolve(normalizeWin32DevicePrefix(candidatePath)).toLowerCase();
     const rel = path.win32.relative(normAnchor, normCand);
+    if (strict) {
+      return rel !== '' && !rel.startsWith('..') && !path.win32.isAbsolute(rel);
+    }
     return rel === '' || (!rel.startsWith('..') && !path.win32.isAbsolute(rel));
   }
   const normAnchor = path.posix.resolve(anchorRoot.replace(/\\/g, '/'));
   const normCand = path.posix.resolve(candidatePath.replace(/\\/g, '/'));
   const rel = path.posix.relative(normAnchor, normCand);
+  if (strict) {
+    return rel !== '' && !rel.startsWith('..') && !path.posix.isAbsolute(rel);
+  }
   return rel === '' || (!rel.startsWith('..') && !path.posix.isAbsolute(rel));
 }
 
@@ -670,7 +677,8 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
     options.libraryRoot || options.allowedRoot || options.bottleRoot || '';
 
   if (allowedRoot && typeof allowedRoot === 'string') {
-    if (!isPathContainedInRoot(allowedRoot, resolved, isWinStyle)) {
+    // Game install path must be strictly nested inside allowedRoot, never the root container itself!
+    if (!isPathContainedInRoot(allowedRoot, resolved, isWinStyle, true)) {
       return false;
     }
   }
@@ -741,7 +749,7 @@ function isSafeToDeleteInstallPath(targetPath, options = {}) {
           const realAllowedRoot = fsImpl.existsSync?.(allowedRoot)
             ? fsImpl.realpathSync(allowedRoot)
             : allowedRoot;
-          if (!isPathContainedInRoot(realAllowedRoot, realTarget, isWinStyle)) {
+          if (!isPathContainedInRoot(realAllowedRoot, realTarget, isWinStyle, true)) {
             return false;
           }
         }

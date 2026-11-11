@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useState, useEffect, useRef, useMemo } from 'react';
+import React, { Suspense, useState, useEffect, useRef, useMemo } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { StorefrontIcon, getStorefrontDisplayName } from '../Common/StorefrontIcon';
@@ -63,11 +63,13 @@ import {
   sanitizeGameInstallSizeBytes,
 } from '../../utils/formatBytes';
 import { GameLaunchConfigModal } from '../Launcher/GameLaunchConfigModal';
+import { ModalErrorBoundary } from '../Common/ModalErrorBoundary';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
 import { useIsRealClientRenderer } from '../../utils/useSafeId';
 
 const loadGameInstallModalModule = () => import('../Launcher/GameInstallModal');
 
-const GameInstallModal = lazy(() =>
+const GameInstallModal = lazyWithRetry(() =>
   loadGameInstallModalModule().then((m) => ({ default: m.GameInstallModal }))
 );
 
@@ -1992,39 +1994,51 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
 
       {/* Universal Game Install Modal (lazy-loaded on demand) */}
       {isInstallModalOpen && (
-        <Suspense fallback={null}>
-          <GameInstallModal
-            isOpen={isInstallModalOpen}
-            game={game}
-            initialPlatformId={selectedPlatformId}
-            onClose={() => setIsInstallModalOpen(false)}
-            onInstallStarted={(task) => {
-              if (task?.platformId) {
-                userManuallySelectedPlatformRef.current = true;
-                setSelectedPlatformId(task.platformId);
-                launcherService.setSelectedStorefrontForGame(game.id, task.platformId);
-              }
-            }}
-          />
-        </Suspense>
+        <ModalErrorBoundary
+          modalName="Game Installation"
+          isOpen={isInstallModalOpen}
+          onClose={() => setIsInstallModalOpen(false)}
+        >
+          <Suspense fallback={null}>
+            <GameInstallModal
+              isOpen={isInstallModalOpen}
+              game={game}
+              initialPlatformId={selectedPlatformId}
+              onClose={() => setIsInstallModalOpen(false)}
+              onInstallStarted={(task) => {
+                if (task?.platformId) {
+                  userManuallySelectedPlatformRef.current = true;
+                  setSelectedPlatformId(task.platformId);
+                  launcherService.setSelectedStorefrontForGame(game.id, task.platformId);
+                }
+              }}
+            />
+          </Suspense>
+        </ModalErrorBoundary>
       )}
 
       {/* Per-Game Launch & Compatibility Configuration Modal (conditionally mounted in client renderer) */}
       {(isLaunchConfigModalOpen || !isRealClientRenderer) && (
-        <GameLaunchConfigModal
+        <ModalErrorBoundary
+          modalName="Launch Configuration"
           isOpen={isLaunchConfigModalOpen}
-          game={game}
-          initialPlatformId={selectedPlatformId}
           onClose={() => setIsLaunchConfigModalOpen(false)}
-          onSaved={(cfg) => {
-            if (cfg.preferredPlatformId) {
-              userManuallySelectedPlatformRef.current = true;
-              setSelectedPlatformId(cfg.preferredPlatformId);
-              launcherService.setSelectedStorefrontForGame(game.id, cfg.preferredPlatformId);
-            }
-            showTempFeedback(`Saved launch configuration for ${game.title}.`);
-          }}
-        />
+        >
+          <GameLaunchConfigModal
+            isOpen={isLaunchConfigModalOpen}
+            game={game}
+            initialPlatformId={selectedPlatformId}
+            onClose={() => setIsLaunchConfigModalOpen(false)}
+            onSaved={(cfg) => {
+              if (cfg.preferredPlatformId) {
+                userManuallySelectedPlatformRef.current = true;
+                setSelectedPlatformId(cfg.preferredPlatformId);
+                launcherService.setSelectedStorefrontForGame(game.id, cfg.preferredPlatformId);
+              }
+              showTempFeedback(`Saved launch configuration for ${game.title}.`);
+            }}
+          />
+        </ModalErrorBoundary>
       )}
     </div>
   );

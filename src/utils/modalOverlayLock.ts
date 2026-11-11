@@ -10,8 +10,60 @@ export function canPortalModalToBody(): boolean {
   );
 }
 
-export function isModalOverlayOpen(): boolean {
+/**
+ * Checks whether any modal dialog or shell is actively open in the DOM.
+ * If activeModalOverlayCount leaked (e.g. from an uncaught error in a child dialog),
+ * triggers self-healing reset to restore DOM interactivity.
+ */
+export function checkModalOverlaySelfHealing(): boolean {
+  if (
+    activeModalOverlayCount > 0 &&
+    typeof document !== 'undefined' &&
+    typeof document.querySelectorAll === 'function'
+  ) {
+    const openModals = document.querySelectorAll(
+      'dialog[open], [data-modal-shell="true"], [data-modal-open="true"]'
+    );
+    if (openModals.length === 0) {
+      emergencyResetModalOverlayLock();
+      return false;
+    }
+  }
   return activeModalOverlayCount > 0;
+}
+
+export function isModalOverlayOpen(): boolean {
+  checkModalOverlaySelfHealing();
+  return activeModalOverlayCount > 0;
+}
+
+/**
+ * Emergency reset to clear `#root[inert]` and `data-modal-overlay-open` in case
+ * an unhandled component or modal crash aborted normal unmount cleanup.
+ */
+export function emergencyResetModalOverlayLock(): void {
+  activeModalOverlayCount = 0;
+  lockedRootWithInert = false;
+  if (typeof document !== 'undefined') {
+    if (document.documentElement?.removeAttribute) {
+      document.documentElement.removeAttribute('data-modal-overlay-open');
+    }
+    const rootEl = document.getElementById?.('root');
+    if (rootEl && typeof rootEl.removeAttribute === 'function') {
+      rootEl.removeAttribute('inert');
+    }
+  }
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('antigravity:modal-overlay-changed', {
+          detail: { isOpen: false },
+        })
+      );
+    } catch {
+      // Ignore CustomEvent dispatch errors in restricted test environments
+    }
+  }
 }
 
 /**

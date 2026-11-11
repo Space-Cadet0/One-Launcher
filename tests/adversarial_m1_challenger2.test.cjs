@@ -5,8 +5,17 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const assert = require('node:assert');
 const os = require('node:os');
+const { execFileSync } = require('node:child_process');
 
 const macNativeInstaller = require('../electron/launcher/macNativeInstallerAndCodesign.cjs');
+const {
+  verifyDisplayOutput,
+  encodePng,
+  decodePng,
+  computeOracleViewport,
+  generateSyntheticDisplayBuffer,
+  computeViewportLuminance,
+} = require('../scripts/verify-display-output.cjs');
 
 // Helpers for test fixture creation
 let testTempDir = null;
@@ -516,6 +525,614 @@ runTest('Track 2.6: Non-boolean crossoverHighResolutionMode values (null, "false
     } finally {
       cleanupTempDir();
     }
+  }
+});
+
+// ============================================================================
+// TRACK 3: Whole-Display Verifier Adversarial Defect Injection Torture
+// ============================================================================
+console.log('\n--- TRACK 3: Whole-Display Verifier Defect Injection Torture ---');
+
+runTest('Track 3.1: Horizontal offset defect (+1px shift) strictly detected and rejected', () => {
+  const buf = generateSyntheticDisplayBuffer({ defect: 'offset' });
+  const report = verifyDisplayOutput({ imageBuffer: buf });
+  assert.strictEqual(report.ok, false, 'Verifier must reject 1px horizontal offset shift');
+  assert.ok(
+    report.metrics.centeringDelta > 0 || report.metrics.marginViolations > 0,
+    'Must report centering delta or margin violations'
+  );
+  assert.strictEqual(report.exitCode, 1, 'Verification failure must set exitCode 1');
+});
+
+runTest('Track 3.2: Horizontal offset defect (-1px shift) strictly detected and rejected', () => {
+  const w = 3024;
+  const h = 1964;
+  const oracle = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const rgba = Buffer.alloc(w * h * 4);
+  for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
+  const shiftedX = oracle.dstX - 1; // shifted left by 1px
+  for (let y = oracle.dstY; y < oracle.dstY + oracle.dstH; y++) {
+    const rowOffset = y * w * 4;
+    for (let x = shiftedX; x < shiftedX + oracle.dstW; x++) {
+      const idx = rowOffset + (x * 4);
+      rgba[idx] = 100;
+      rgba[idx + 1] = 120;
+      rgba[idx + 2] = 140;
+    }
+  }
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, rgba) });
+  assert.strictEqual(report.ok, false, 'Verifier must reject negative 1px horizontal offset shift');
+  assert.ok(report.metrics.centeringDelta > 0 || report.metrics.marginViolations > 0);
+  assert.strictEqual(report.exitCode, 1);
+});
+
+runTest('Track 3.3: Vertical offset defect (+1px shift in letterbox mode) strictly detected and rejected', () => {
+  const vertOffsetFrame = generateSyntheticDisplayBuffer({
+    defect: 'vertical_offset',
+    screenW: 3024,
+    screenH: 1964,
+    virtW: 1920,
+    virtH: 1080,
+  });
+  const report = verifyDisplayOutput({
+    imageBuffer: vertOffsetFrame,
+    screenW: 3024,
+    screenH: 1964,
+    virtW: 1920,
+    virtH: 1080,
+  });
+  assert.strictEqual(report.ok, false, 'Verifier must reject 1px vertical offset shift');
+  assert.strictEqual(report.metrics.verticalCenteringDelta, 1, 'Must report 1px vertical centering delta');
+  assert.strictEqual(report.metrics.centeringDelta, 1, 'Chebyshev centering error must be 1px');
+  assert.strictEqual(report.exitCode, 1);
+});
+
+runTest('Track 3.4: Vertical offset defect (-1px shift in letterbox mode) strictly detected and rejected', () => {
+  const w = 3024;
+  const h = 1964;
+  const oracle = computeOracleViewport(w, h, 0, 1920, 1080, 'preserve');
+  const rgba = Buffer.alloc(w * h * 4);
+  for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
+  const shiftedY = oracle.dstY - 1; // shifted up by 1px
+  for (let y = shiftedY; y < shiftedY + oracle.dstH; y++) {
+    const rowOffset = y * w * 4;
+    for (let x = oracle.dstX; x < oracle.dstX + oracle.dstW; x++) {
+      const idx = rowOffset + (x * 4);
+      rgba[idx] = 100;
+      rgba[idx + 1] = 120;
+      rgba[idx + 2] = 140;
+    }
+  }
+  const report = verifyDisplayOutput({
+    imageBuffer: encodePng(w, h, rgba),
+    virtualWidth: 1920,
+    virtualHeight: 1080,
+  });
+  assert.strictEqual(report.ok, false, 'Verifier must reject negative 1px vertical offset shift');
+  assert.strictEqual(report.metrics.verticalCenteringDelta, 1);
+  assert.strictEqual(report.exitCode, 1);
+});
+
+runTest('Track 3.5: Margin white bleed in left and right pillarbox margins strictly rejected', () => {
+  const report = verifyDisplayOutput({
+    imageBuffer: generateSyntheticDisplayBuffer({ defect: 'margin_white' }),
+  });
+  assert.strictEqual(report.ok, false, 'Verifier must reject white pixels in margins');
+  assert.ok(report.metrics.marginViolations > 0, 'Must record positive margin violations');
+  assert.strictEqual(report.isPureBlackMargins, false, 'isPureBlackMargins must be false');
+  assert.strictEqual(report.exitCode, 1);
+});
+
+runTest('Track 3.6: macOS Menu Bar bleed across top 0..44px margin boundary strictly flagged and rejected', () => {
+  for (const testY of [0, 22, 44]) {
+    const w = 3024;
+    const h = 1964;
+    const buf = generateSyntheticDisplayBuffer({ width: w, height: h });
+    const decoded = decodePng(buf);
+    const midLeftMarginX = 50;
+    const idx = (testY * w + midLeftMarginX) * 4;
+    decoded.data[idx] = 200;
+    decoded.data[idx + 1] = 200;
+    decoded.data[idx + 2] = 200;
+
+    const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, decoded.data) });
+    assert.strictEqual(report.ok, false, `Must reject menu bar bleed at y=${testY}`);
+    assert.strictEqual(report.metrics.menuBarBleed, true, `menuBarBleed must be true at y=${testY}`);
+    assert.ok(report.errors.some(e => e.includes('Menu Bar')), `Error must mention Menu Bar at y=${testY}`);
+  }
+});
+
+runTest('Track 3.7: macOS Dock bleed across bottom 60px margin boundary strictly flagged and rejected', () => {
+  for (const offset of [0, 30, 59]) {
+    const w = 3024;
+    const h = 1964;
+    const testY = h - 60 + offset;
+    const buf = generateSyntheticDisplayBuffer({ width: w, height: h });
+    const decoded = decodePng(buf);
+    const midLeftMarginX = 50;
+    const idx = (testY * w + midLeftMarginX) * 4;
+    decoded.data[idx] = 180;
+    decoded.data[idx + 1] = 180;
+    decoded.data[idx + 2] = 180;
+
+    const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, decoded.data) });
+    assert.strictEqual(report.ok, false, `Must reject dock bleed at y=${testY}`);
+    assert.strictEqual(report.metrics.dockBleed, true, `dockBleed must be true at y=${testY}`);
+    assert.ok(report.errors.some(e => e.includes('Dock')), `Error must mention Dock at y=${testY}`);
+  }
+});
+
+runTest('Track 3.8: All-black unrendered frame in aspect-preserving pillarbox mode strictly evaluates to 0.0 luminance and fails', () => {
+  const blackBuf = encodePng(3024, 1964, Buffer.alloc(3024 * 1964 * 4, 0));
+  const report = verifyDisplayOutput({ imageBuffer: blackBuf });
+  assert.strictEqual(report.metrics.avgLuminance, 0, 'Perceived luminance must be strictly 0.0');
+  assert.strictEqual(report.ok, false, 'Verifier must reject unrendered all-black frame in pillarbox mode');
+  assert.strictEqual(report.exitCode, 1);
+});
+
+runTest('Track 3.9: All-black frame in stretch mode strictly rejected with zero luminance', () => {
+  const blackBuf = encodePng(3024, 1964, Buffer.alloc(3024 * 1964 * 4, 0));
+  const stretchReport = verifyDisplayOutput({ imageBuffer: blackBuf, aspectMode: 'stretch' });
+  assert.strictEqual(stretchReport.metrics.avgLuminance, 0, 'Luminance is strictly 0.0');
+  assert.strictEqual(stretchReport.ok, false, 'Verifier must reject all-black stretch frame');
+  assert.strictEqual(stretchReport.passed, false, 'passed must be false');
+  assert.strictEqual(stretchReport.exitCode, 1, 'Failed verification must yield exitCode 1');
+  assert.ok(
+    stretchReport.summary.includes('zero luminance') || stretchReport.errors.some(e => e.includes('zero luminance')),
+    'Summary or errors must indicate zero luminance'
+  );
+});
+
+// ============================================================================
+// TRACK 4: Whole-Display Verifier Edge Robustness & Texture Fuzzing
+// ============================================================================
+console.log('\n--- TRACK 4: Whole-Display Verifier Edge Robustness & Texture Fuzzing ---');
+
+runTest('Track 4.1: Dark border pixels resilience: single dark pixel at midline boundary passes without spurious false rejection', () => {
+  const w = 3024;
+  const h = 1964;
+  const vp = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const rgba = Buffer.alloc(w * h * 4);
+  for (let y = vp.dstY; y < vp.dstY + vp.dstH; y++) {
+    for (let x = vp.dstX; x < vp.dstX + vp.dstW; x++) {
+      const idx = (y * w + x) * 4;
+      rgba[idx] = 120;
+      rgba[idx + 1] = 120;
+      rgba[idx + 2] = 120;
+      rgba[idx + 3] = 255;
+    }
+  }
+  // Single dark pixel at midline
+  const darkIdx = (Math.floor(h / 2) * w + vp.dstX) * 4;
+  rgba[darkIdx] = 0;
+  rgba[darkIdx + 1] = 0;
+  rgba[darkIdx + 2] = 0;
+
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, rgba) });
+  assert.strictEqual(report.ok, true, 'Multi-row edge detection must not falsely reject dark midline pixel');
+  assert.strictEqual(report.metrics.centeringDelta, 0, 'Centering delta must remain 0px');
+  assert.strictEqual(report.leftEdgeClean, true);
+});
+
+runTest('Track 4.2: Distributed multi-row resilience: 1, 2, 4, and 8 of 9 sampled rows having dark edge pixels pass cleanly', () => {
+  const w = 3024;
+  const h = 1964;
+  const vp = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const rowSampleCount = Math.min(9, Math.max(1, vp.dstH - 2));
+  const sampleRows = [];
+  for (let i = 1; i <= rowSampleCount; i++) {
+    sampleRows.push(vp.dstY + Math.floor((vp.dstH * i) / (rowSampleCount + 1)));
+  }
+
+  for (const darkCount of [1, 2, 4, 8]) {
+    const rgba = Buffer.alloc(w * h * 4);
+    for (let y = vp.dstY; y < vp.dstY + vp.dstH; y++) {
+      for (let x = vp.dstX; x < vp.dstX + vp.dstW; x++) {
+        const idx = (y * w + x) * 4;
+        rgba[idx] = 130;
+        rgba[idx + 1] = 130;
+        rgba[idx + 2] = 130;
+        rgba[idx + 3] = 255;
+      }
+    }
+    for (let k = 0; k < darkCount; k++) {
+      const y = sampleRows[k];
+      const idx = (y * w + vp.dstX) * 4;
+      rgba[idx] = 0;
+      rgba[idx + 1] = 0;
+      rgba[idx + 2] = 0;
+    }
+    const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, rgba) });
+    assert.strictEqual(report.ok, true, `${darkCount} dark sampled rows must pass`);
+    assert.strictEqual(report.metrics.centeringDelta, 0);
+    assert.strictEqual(report.leftEdgeClean, true);
+  }
+});
+
+runTest('Track 4.3: Dark border threshold test: when ALL 9 sampled rows have dark edge pixels, verifier advances measured boundary', () => {
+  const w = 3024;
+  const h = 1964;
+  const vp = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const rowSampleCount = Math.min(9, Math.max(1, vp.dstH - 2));
+  const sampleRows = [];
+  for (let i = 1; i <= rowSampleCount; i++) {
+    sampleRows.push(vp.dstY + Math.floor((vp.dstH * i) / (rowSampleCount + 1)));
+  }
+
+  const rgba = Buffer.alloc(w * h * 4);
+  for (let y = vp.dstY; y < vp.dstY + vp.dstH; y++) {
+    for (let x = vp.dstX; x < vp.dstX + vp.dstW; x++) {
+      const idx = (y * w + x) * 4;
+      rgba[idx] = 130;
+      rgba[idx + 1] = 130;
+      rgba[idx + 2] = 130;
+      rgba[idx + 3] = 255;
+    }
+  }
+  // Set all 9 sampled rows to dark at dstX
+  for (let k = 0; k < 9; k++) {
+    const y = sampleRows[k];
+    const idx = (y * w + vp.dstX) * 4;
+    rgba[idx] = 0;
+    rgba[idx + 1] = 0;
+    rgba[idx + 2] = 0;
+  }
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, rgba) });
+  assert.strictEqual(report.ok, false, '9 dark sampled rows advances boundary and triggers failure');
+  assert.strictEqual(report.metrics.centeringDelta, 1);
+  assert.strictEqual(report.leftEdgeClean, false);
+});
+
+runTest('Track 4.4: Faint 1-bit outer margin bleed rejection: RGB(0, 0, 1) at (0, 0) strictly caught', () => {
+  const buf = generateSyntheticDisplayBuffer();
+  const decoded = decodePng(buf);
+  decoded.data[2] = 1; // B = 1 at (0, 0)
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(decoded.width, decoded.height, decoded.data) });
+  assert.strictEqual(report.ok, false, '1-bit faint bleed must be caught');
+  assert.ok(report.metrics.marginViolations >= 1);
+  assert.strictEqual(report.metrics.menuBarBleed, true);
+});
+
+runTest('Track 4.5: Faint 1-bit outer margin bleed adjacent to viewport (dstX - 1, midY) with RGB(1, 0, 0) strictly caught', () => {
+  const w = 3024;
+  const h = 1964;
+  const vp = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const buf = generateSyntheticDisplayBuffer({ width: w, height: h });
+  const decoded = decodePng(buf);
+  const midY = Math.floor(h / 2);
+  const idx = (midY * w + (vp.dstX - 1)) * 4;
+  decoded.data[idx] = 1; // R = 1
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, decoded.data) });
+  assert.strictEqual(report.ok, false, '1-bit faint bleed adjacent to viewport must be caught');
+  assert.ok(report.metrics.marginViolations >= 1);
+  assert.strictEqual(report.leftEdgeClean, false);
+});
+
+runTest('Track 4.6: Faint 1-bit outer margin bleed at (dstX + dstW, height - 10) with RGB(0, 1, 0) strictly caught', () => {
+  const w = 3024;
+  const h = 1964;
+  const vp = computeOracleViewport(w, h, 0, 640, 480, 'preserve');
+  const buf = generateSyntheticDisplayBuffer({ width: w, height: h });
+  const decoded = decodePng(buf);
+  const targetY = h - 10;
+  const idx = (targetY * w + (vp.dstX + vp.dstW)) * 4;
+  decoded.data[idx + 1] = 1; // G = 1
+  const report = verifyDisplayOutput({ imageBuffer: encodePng(w, h, decoded.data) });
+  assert.strictEqual(report.ok, false, '1-bit faint bleed in right bottom margin must be caught');
+  assert.ok(report.metrics.marginViolations >= 1);
+  assert.strictEqual(report.metrics.dockBleed, true);
+});
+
+runTest('Track 4.7: Faint 1-bit bleed in top and bottom letterbox margins strictly caught', () => {
+  const w = 3024;
+  const h = 1964;
+  const buf = generateSyntheticDisplayBuffer({ width: w, height: h, gameW: 1920, gameH: 1080 });
+  const decoded = decodePng(buf);
+  // Top letterbox margin at (100, 5)
+  const topIdx = (5 * w + 100) * 4;
+  decoded.data[topIdx + 2] = 1; // B = 1
+  // Bottom letterbox margin at (100, 1950)
+  const botIdx = (1950 * w + 100) * 4;
+  decoded.data[botIdx] = 1; // R = 1
+
+  const report = verifyDisplayOutput({
+    imageBuffer: encodePng(w, h, decoded.data),
+    virtualWidth: 1920,
+    virtualHeight: 1080,
+  });
+  assert.strictEqual(report.ok, false, 'Faint letterbox bleeds must be caught');
+  assert.ok(report.metrics.marginViolations >= 2);
+});
+
+// ============================================================================
+// TRACK 5: Whole-Display Verifier Corrupt & Hostile Inputs Resilience
+// ============================================================================
+console.log('\n--- TRACK 5: Whole-Display Verifier Corrupt & Hostile Inputs Resilience ---');
+
+runTest('Track 5.1: Zero-length buffer fails gracefully without crashing', () => {
+  const report = verifyDisplayOutput({ imageBuffer: Buffer.alloc(0) });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('PNG'));
+});
+
+runTest('Track 5.2: Truncated PNG header (< 8 bytes) fails gracefully', () => {
+  const report = verifyDisplayOutput({ imageBuffer: Buffer.from([0x89, 0x50, 0x4e]) });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.strictEqual(report.error, 'Invalid PNG signature');
+});
+
+runTest('Track 5.3: Truncated IHDR chunk header fails gracefully', () => {
+  const truncated = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from([0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]),
+  ]);
+  const report = verifyDisplayOutput({ imageBuffer: truncated });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('Truncated'));
+});
+
+runTest('Track 5.4: Missing IDAT chunks fails gracefully', () => {
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(100, 0);
+  ihdrData.writeUInt32BE(100, 4);
+  ihdrData.writeUInt8(8, 8);
+  ihdrData.writeUInt8(6, 9);
+  const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32BE(13, 0);
+  const typeBuf = Buffer.from('IHDR');
+  const crcBuf = Buffer.alloc(4);
+  const iendLen = Buffer.alloc(4);
+  const iendType = Buffer.from('IEND');
+  const iendCrc = Buffer.alloc(4);
+
+  const missingIdat = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    lenBuf, typeBuf, ihdrData, crcBuf,
+    iendLen, iendType, iendCrc,
+  ]);
+  const report = verifyDisplayOutput({ imageBuffer: missingIdat });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('No IDAT chunks found'));
+});
+
+runTest('Track 5.5: Corrupt IDAT zlib payload fails gracefully', () => {
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(100, 0);
+  ihdrData.writeUInt32BE(100, 4);
+  ihdrData.writeUInt8(8, 8);
+  ihdrData.writeUInt8(6, 9);
+  const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32BE(13, 0);
+  const typeBuf = Buffer.from('IHDR');
+  const crcBuf = Buffer.alloc(4);
+
+  const badIdatData = Buffer.from('this is totally corrupt non-zlib payload');
+  const idatLen = Buffer.alloc(4); idatLen.writeUInt32BE(badIdatData.length, 0);
+  const idatType = Buffer.from('IDAT');
+  const iendLen = Buffer.alloc(4);
+  const iendType = Buffer.from('IEND');
+  const iendCrc = Buffer.alloc(4);
+
+  const corruptPng = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    lenBuf, typeBuf, ihdrData, crcBuf,
+    idatLen, idatType, badIdatData, crcBuf,
+    iendLen, iendType, iendCrc,
+  ]);
+  const report = verifyDisplayOutput({ imageBuffer: corruptPng });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('header check') || report.error.includes('zlib'));
+});
+
+runTest('Track 5.6: Unsupported PNG formats (16-bit, paletted, interlaced) fail gracefully', () => {
+  function makePngHeader(depth, colorType, interlace) {
+    const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const len = Buffer.alloc(4); len.writeUInt32BE(13, 0);
+    const type = Buffer.from('IHDR');
+    const data = Buffer.alloc(13);
+    data.writeUInt32BE(100, 0);
+    data.writeUInt32BE(100, 4);
+    data.writeUInt8(depth, 8);
+    data.writeUInt8(colorType, 9);
+    data.writeUInt8(0, 10);
+    data.writeUInt8(0, 11);
+    data.writeUInt8(interlace, 12);
+    const crc = Buffer.alloc(4);
+    return Buffer.concat([sig, len, type, data, crc]);
+  }
+
+  // 16-bit depth
+  const r1 = verifyDisplayOutput({ imageBuffer: makePngHeader(16, 6, 0) });
+  assert.strictEqual(r1.ok, false);
+  assert.strictEqual(r1.exitCode, 2);
+  assert.ok(r1.error.includes('Unsupported bit depth'));
+
+  // Paletted colorType 3
+  const r2 = verifyDisplayOutput({ imageBuffer: makePngHeader(8, 3, 0) });
+  assert.strictEqual(r2.ok, false);
+  assert.strictEqual(r2.exitCode, 2);
+  assert.ok(r2.error.includes('Unsupported color type'));
+
+  // Interlaced
+  const r3 = verifyDisplayOutput({ imageBuffer: makePngHeader(8, 6, 1) });
+  assert.strictEqual(r3.ok, false);
+  assert.strictEqual(r3.exitCode, 2);
+  assert.ok(r3.error.includes('Interlaced'));
+});
+
+runTest('Track 5.7: Non-existent image file fails gracefully with clear error', () => {
+  const missingPath = path.join(os.tmpdir(), `nonexistent-img-${Date.now()}.png`);
+  const report = verifyDisplayOutput({ image: missingPath });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('does not exist'));
+});
+
+runTest('Track 5.8: Extreme resolution scaling: 8K (7680x4320) synthetic frame verified under 1000ms without OOM', () => {
+  const t0 = Date.now();
+  const report = verifyDisplayOutput({
+    synthetic: true,
+    displayWidth: 7680,
+    displayHeight: 4320,
+    virtualWidth: 1920,
+    virtualHeight: 1080,
+  });
+  const elapsed = Date.now() - t0;
+  assert.strictEqual(report.ok, true, '8K verification must pass');
+  assert.strictEqual(report.displayWidth, 7680);
+  assert.strictEqual(report.displayHeight, 4320);
+  assert.ok(elapsed < 1000, `8K verification must complete under 1000ms (took ${elapsed}ms)`);
+});
+
+runTest('Track 5.9: Extreme resolution scaling: Low-res 320x200 synthetic frame verified cleanly', () => {
+  const report = verifyDisplayOutput({
+    synthetic: true,
+    displayWidth: 320,
+    displayHeight: 200,
+    virtualWidth: 320,
+    virtualHeight: 200,
+  });
+  assert.strictEqual(report.ok, true);
+  assert.strictEqual(report.displayWidth, 320);
+  assert.strictEqual(report.displayHeight, 200);
+});
+
+runTest('Track 5.10: Extreme display aspect ratios: Ultra-wide 5120x1440 verified cleanly', () => {
+  const report = verifyDisplayOutput({
+    synthetic: true,
+    displayWidth: 5120,
+    displayHeight: 1440,
+    virtualWidth: 1920,
+    virtualHeight: 1080,
+  });
+  assert.strictEqual(report.ok, true);
+  assert.strictEqual(report.displayWidth, 5120);
+  assert.strictEqual(report.displayHeight, 1440);
+  assert.strictEqual(report.centeringErrorPx, 0);
+});
+
+runTest('Track 5.11: Hostile CLI invocation resilience (non-PNG file, missing file, defect flags, negative dimensions probe)', () => {
+  const scriptPath = path.resolve(__dirname, '../scripts/verify-display-output.cjs');
+
+  // Subprocess test: Missing file -> exitCode 2
+  try {
+    execFileSync(process.execPath, [scriptPath, '--image=/nonexistent_test_screenshot.png'], { stdio: 'pipe' });
+    assert.fail('Should have exited with non-zero');
+  } catch (err) {
+    assert.strictEqual(err.status, 2, 'Missing file CLI invocation must exit with code 2');
+  }
+
+  // Subprocess test: Non-PNG file -> exitCode 2
+  const fakeFile = path.join(os.tmpdir(), `fake-img-${Date.now()}.png`);
+  fs.writeFileSync(fakeFile, 'plain text content');
+  try {
+    try {
+      execFileSync(process.execPath, [scriptPath, `--image=${fakeFile}`], { stdio: 'pipe' });
+      assert.fail('Should have exited with non-zero');
+    } catch (err) {
+      assert.strictEqual(err.status, 2, 'Non-PNG file CLI invocation must exit with code 2');
+    }
+  } finally {
+    try { fs.unlinkSync(fakeFile); } catch {}
+  }
+
+  // Subprocess test: Defect offset -> exitCode 1
+  try {
+    execFileSync(process.execPath, [scriptPath, '--synthetic', '--defect=offset'], { stdio: 'pipe' });
+    assert.fail('Should have exited with non-zero');
+  } catch (err) {
+    assert.strictEqual(err.status, 1, 'Defect offset CLI invocation must exit with code 1');
+  }
+
+  // Subprocess test: Defect dock_bleed -> exitCode 1
+  try {
+    execFileSync(process.execPath, [scriptPath, '--synthetic', '--defect=dock_bleed'], { stdio: 'pipe' });
+    assert.fail('Should have exited with non-zero');
+  } catch (err) {
+    assert.strictEqual(err.status, 1, 'Defect dock_bleed CLI invocation must exit with code 1');
+  }
+
+  // Subprocess test: Negative dimensions exit gracefully with exitCode 2 without crashing
+  try {
+    execFileSync(process.execPath, [scriptPath, '--game-res=-10x-20'], { stdio: 'pipe' });
+    assert.fail('Should have failed');
+  } catch (err) {
+    assert.strictEqual(err.status, 2, 'Negative resolution must cause CLI exit code 2');
+    const stderr = err.stderr ? err.stderr.toString() : '';
+    assert.ok(
+      stderr.includes('Failed to compute expected viewport geometry') || stderr.includes('ERROR:'),
+      'Stderr captures graceful failure'
+    );
+    assert.ok(!stderr.includes('throw new Error'), 'Must not crash with uncaught throw');
+  }
+});
+
+runTest('Track 5.12: Programmatic invalid/negative resolution handling returns graceful error', () => {
+  const report = verifyDisplayOutput({ virtualWidth: -10, virtualHeight: -20 });
+  assert.strictEqual(report.ok, false);
+  assert.strictEqual(report.passed, false);
+  assert.strictEqual(report.exitCode, 2);
+  assert.ok(report.error.includes('Failed to compute expected viewport geometry'));
+});
+
+// ============================================================================
+// TRACK 6: Turnkey CLI & Live / Screenshot Verification
+// ============================================================================
+console.log('\n--- TRACK 6: Turnkey CLI & Live / Screenshot Verification ---');
+
+runTest('Track 6.1: Turnkey verification of reference screenshot verified_jk_3d_hidpi_pillarbox.png passes with 0 violations', () => {
+  const refPath = process.env.ONELAUNCHER_TEST_REF_SCREENSHOT || path.join(os.tmpdir(), 'verified_jk_3d_hidpi_pillarbox.png');
+  if (fs.existsSync(refPath)) {
+    const report = verifyDisplayOutput({
+      image: refPath,
+      virtualWidth: 640,
+      virtualHeight: 480,
+    });
+    assert.strictEqual(report.ok, true, 'Reference screenshot must pass verification');
+    assert.strictEqual(report.displayWidth, 3024);
+    assert.strictEqual(report.displayHeight, 1964);
+    assert.strictEqual(report.centeringErrorPx, 0, 'Centering error must be 0px');
+    assert.strictEqual(report.totalMarginViolations, 0, 'Margin violations must be 0');
+    assert.strictEqual(report.menuBarBleed, false, 'menuBarBleed must be false');
+    assert.strictEqual(report.dockBleed, false, 'dockBleed must be false');
+  } else {
+    console.log(' (skipped: reference screenshot not present on filesystem)');
+  }
+});
+
+runTest('Track 6.2: Turnkey --synthetic verification passes with exit code 0 and valid JSON output', () => {
+  const scriptPath = path.resolve(__dirname, '../scripts/verify-display-output.cjs');
+  const out = execFileSync(process.execPath, [scriptPath, '--synthetic', '--json'], { encoding: 'utf8' });
+  const parsed = JSON.parse(out);
+  assert.strictEqual(parsed.ok, true);
+  assert.strictEqual(parsed.passed, true);
+  assert.strictEqual(parsed.displayWidth, 3024);
+  assert.strictEqual(parsed.displayHeight, 1964);
+  assert.strictEqual(parsed.centeringErrorPx, 0);
+  assert.strictEqual(parsed.totalMarginViolations, 0);
+});
+
+runTest('Track 6.3: C11 Oracle concordance across diverse resolution pairs', () => {
+  const screenW = 3024;
+  const screenH = 1964;
+  const testPairs = [
+    { virtW: 640, virtH: 480, expDstW: 2620, expDstH: 1964, expDstX: 202, expDstY: 0 },
+    { virtW: 800, virtH: 600, expDstW: 2620, expDstH: 1964, expDstX: 202, expDstY: 0 },
+    { virtW: 1024, virtH: 768, expDstW: 2620, expDstH: 1964, expDstX: 202, expDstY: 0 },
+    { virtW: 1280, virtH: 720, expDstW: 3024, expDstH: 1700, expDstX: 0, expDstY: 132 },
+    { virtW: 1920, virtH: 1080, expDstW: 3024, expDstH: 1700, expDstX: 0, expDstY: 132 },
+  ];
+
+  for (const pair of testPairs) {
+    const vp = computeOracleViewport(screenW, screenH, 0, pair.virtW, pair.virtH, 'preserve');
+    assert.strictEqual(vp.dstW, pair.expDstW, `dstW mismatch for ${pair.virtW}x${pair.virtH}`);
+    assert.strictEqual(vp.dstH, pair.expDstH, `dstH mismatch for ${pair.virtW}x${pair.virtH}`);
+    assert.strictEqual(vp.dstX, pair.expDstX, `dstX mismatch for ${pair.virtW}x${pair.virtH}`);
+    assert.strictEqual(vp.dstY, pair.expDstY, `dstY mismatch for ${pair.virtW}x${pair.virtH}`);
+    assert.strictEqual((vp.dstH & 1), 0, `dstH must be even for ${pair.virtW}x${pair.virtH}`);
   }
 });
 

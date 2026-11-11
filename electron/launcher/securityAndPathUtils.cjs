@@ -1253,14 +1253,20 @@ function assertTrustedIpcSender(event, options = {}) {
  */
 function wrapIpcMainWithSenderCheck(ipcMain, options = {}) {
   if (!ipcMain || typeof ipcMain.handle !== 'function') return ipcMain;
+  if (ipcMain.__isIpcSenderCheckWrapped) return ipcMain;
   return new Proxy(ipcMain, {
     get(target, prop, receiver) {
-      if (prop === 'handle') {
-        return (/** @type {string} */ channel, /** @type {Function} */ listener) =>
-          target.handle(channel, (/** @type {any} */ event, ...args) => {
+      if (prop === '__isIpcSenderCheckWrapped') return true;
+      if (prop === 'handle' || prop === 'handleOnce') {
+        return (/** @type {string} */ channel, /** @type {Function} */ listener) => {
+          if (typeof target[prop] !== 'function') {
+            return undefined;
+          }
+          return target[prop](channel, (/** @type {any} */ event, ...args) => {
             assertTrustedIpcSender(event, { ...options, channel });
             return listener(event, ...args);
           });
+        };
       }
       const value = Reflect.get(target, prop, receiver);
       return typeof value === 'function' ? value.bind(target) : value;
@@ -1541,9 +1547,10 @@ function buildSafeChildEnvironment(
   internalOverrides = {},
   approvalCtx = {}
 ) {
+  const safeBaseEnv = sanitizeLaunchEnvironmentMap(baseEnv || {});
   const safeUserEnv = sanitizeSpawnEnvironmentMap(userEnvMap, approvalCtx);
   return {
-    ...(baseEnv || {}),
+    ...safeBaseEnv,
     ...safeUserEnv,
     ...(internalOverrides || {}),
   };
