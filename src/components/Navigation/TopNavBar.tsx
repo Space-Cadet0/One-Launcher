@@ -130,7 +130,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   });
   const windowBlurredRef = useRef(false);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
-  const [appVersion, setAppVersion] = useState<string>('0.2.5');
+  const [appVersion, setAppVersion] = useState<string>('0.2.6');
   const [updateStatus, setUpdateStatus] = useState<
     'idle' | 'checking' | 'up-to-date' | 'update-available'
   >('idle');
