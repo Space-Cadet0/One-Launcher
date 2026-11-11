@@ -287,7 +287,14 @@ describe('Milestone M3 Adversarial Challenge — Security & Path Sanitization St
     });
 
     it('strictly blocks Windows drive letter mismatches, UNC cross-host/cross-share attacks, and UNC roots', () => {
-      const winOpts = { platform: 'win32' };
+      const missingFsImpl = {
+        existsSync: () => false,
+        lstatSync: () => {
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        },
+        realpathSync: (p: string) => p,
+      };
+      const winOpts = { platform: 'win32', fsImpl: missingFsImpl };
 
       // Drive mismatches
       expect(

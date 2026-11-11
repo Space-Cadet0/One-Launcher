@@ -300,7 +300,7 @@ suite('Tier 1 — Feature F18: Storefronts Sync, Ingestion & Universal Portabili
     for (const f of files) {
       const content = fs.readFileSync(path.join(launcherDir, f), 'utf8');
       assert.strictEqual(
-        /\/Users\/(?!Shared)[a-zA-Z0-9_-]+\/(?!Documents\/Antigravity)/.test(content),
+        /\/Users\/(?!runner|Shared|testuser)[a-zA-Z0-9_-]+\//.test(content),
         false,
         `File ${f} must not leak personal macOS home directory`
       );

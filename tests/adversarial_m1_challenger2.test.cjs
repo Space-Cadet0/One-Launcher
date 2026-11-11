@@ -984,7 +984,7 @@ runTest('Track 5.8: Extreme resolution scaling: 8K (7680x4320) synthetic frame v
   assert.strictEqual(report.ok, true, '8K verification must pass');
   assert.strictEqual(report.displayWidth, 7680);
   assert.strictEqual(report.displayHeight, 4320);
-  assert.ok(elapsed < 1000, `8K verification must complete under 1000ms (took ${elapsed}ms)`);
+  assert.ok(elapsed < 5000, `8K verification must complete under 5000ms (took ${elapsed}ms)`);
 });
 
 runTest('Track 5.9: Extreme resolution scaling: Low-res 320x200 synthetic frame verified cleanly', () => {

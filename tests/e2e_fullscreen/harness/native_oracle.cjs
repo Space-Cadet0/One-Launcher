@@ -31,8 +31,12 @@ function compileProbeBinary(probeCPath, binPath) {
     '-o',
     binPath,
   ];
+  const zigCcArgs =
+    process.platform === 'win32'
+      ? ['cc', '-target', 'x86_64-windows-gnu', ...commonArgs]
+      : ['cc', ...commonArgs];
   const compilers = [
-    ['zig', ['cc', ...commonArgs]],
+    ['zig', zigCcArgs],
     ['clang', commonArgs],
     ['gcc', commonArgs],
     ['cc', commonArgs],
@@ -44,7 +48,7 @@ function compileProbeBinary(probeCPath, binPath) {
     process.platform === 'win32' ? 'zig.exe' : 'zig'
   );
   if (fs.existsSync(homeCacheZig)) {
-    compilers.unshift([homeCacheZig, ['cc', ...commonArgs]]);
+    compilers.unshift([homeCacheZig, zigCcArgs]);
   }
   const zigCacheRoot = path.join(ROOT_DIR, '.cache', 'zig');
   if (fs.existsSync(zigCacheRoot)) {
@@ -56,7 +60,7 @@ function compileProbeBinary(probeCPath, binPath) {
           process.platform === 'win32' ? 'zig.exe' : 'zig'
         );
         if (fs.existsSync(zigBin)) {
-          compilers.push([zigBin, ['cc', ...commonArgs]]);
+          compilers.push([zigBin, zigCcArgs]);
         }
       }
     } catch {}

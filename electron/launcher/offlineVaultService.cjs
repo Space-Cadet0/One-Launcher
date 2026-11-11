@@ -1584,6 +1584,12 @@ class OfflineVaultService {
       db.exec(initSql);
     } catch (openErr) {
       diagLog.warn('offlineVault.databaseCorrupt', openErr);
+      if (db) {
+        try {
+          db.close();
+        } catch {}
+        db = null;
+      }
       try {
         const corruptBackup = `${this.dbPath}.corrupt.${Date.now()}`;
         if (fs.existsSync(this.dbPath)) {

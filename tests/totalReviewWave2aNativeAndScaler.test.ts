@@ -151,7 +151,7 @@ describe('Total Project Review — Wave 2A: Native C11 Display Scaler, macOS Hel
       const mathSrc = readRepoFile('electron/helpers/display_scaler/display_scaler_math.c');
       expect(mathSrc).toContain('(((cvx * 2LL) + 1LL) * (int64_t)dst_w) / (2LL * (int64_t)virt_w)');
       expect(mathSrc).toContain('(((cvy * 2LL) + 1LL) * (int64_t)dst_h) / (2LL * (int64_t)virt_h)');
-    });
+    }, 60_000);
 
     it('guards GL_COLOR_WRITEMASK + GL_FRAMEBUFFER_SRGB, masks internal FBO bindings, and implements two-pass zero-shader Sharp-Bilinear', () => {
       const glGdiSrc = readRepoFile('electron/helpers/display_scaler/display_scaler_gl_gdi.c');

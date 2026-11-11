@@ -1086,10 +1086,11 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
       sqliteCacheStoreByDbPath.delete(dbPath);
     }
 
+    let db = null;
     try {
       registerCacheProcessExitCleanup();
       const preOpenBytes = getSqliteFileTotalBytes(dbPath);
-      const db = new DatabaseSync(dbPath);
+      db = new DatabaseSync(dbPath);
       db.exec(`
         PRAGMA busy_timeout = 5000;
         PRAGMA journal_mode = WAL;
@@ -1323,6 +1324,11 @@ function openXboxCatalogCacheStore(userDataDirOrOptions) {
       sqliteCacheStoreByDbPath.set(dbPath, { db, handle });
       return handle;
     } catch {
+      if (db) {
+        try {
+          db.close();
+        } catch {}
+      }
       // Fall through to JSON store if SQLite cannot open
     }
   }

@@ -1221,9 +1221,14 @@ function verifyDisplayOutput(options = {}) {
     }
 
     if (!displayW || !displayH) {
-      const detected = detectDisplayGeometry();
-      displayW = displayW || (detected && detected.width) || 3024;
-      displayH = displayH || (detected && detected.height) || 1964;
+      if (options.synthetic) {
+        displayW = displayW || 3024;
+        displayH = displayH || 1964;
+      } else {
+        const detected = detectDisplayGeometry();
+        displayW = displayW || (detected && detected.width) || 3024;
+        displayH = displayH || (detected && detected.height) || 1964;
+      }
     }
 
     const expectedViewport = computeOracleViewport(displayW, displayH, 0, virtW, virtH, aspectMode);
