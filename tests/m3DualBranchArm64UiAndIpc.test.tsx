@@ -76,14 +76,15 @@ function findByTestId(node: unknown, testId: string): React.ReactElement<any> | 
 
 function makeLayer(
   type: CompatibilityLayerInfo['type'],
-  appsRoot: string,
+  _appsRoot: string,
   overrides: Partial<CompatibilityLayerInfo> = {}
 ): CompatibilityLayerInfo {
+  const posixRoot = '/tmp/ol-m3-mac';
   const isArm64 = type === 'crossover_preview_arm64';
   const isPreview = type === 'crossover_preview' || isArm64;
   const appName = isPreview ? 'CrossOver Preview.app' : 'CrossOver.app';
-  const bottlesDir = path.join(
-    appsRoot,
+  const bottlesDir = path.posix.join(
+    posixRoot,
     'Library',
     'Application Support',
     isPreview ? 'CrossOver' : 'CrossOver',
@@ -97,8 +98,13 @@ function makeLayer(
       : isPreview
         ? 'CrossOver Preview'
         : 'CrossOver',
-    appPath: path.join(appsRoot, 'Applications', appName),
-    binaryPath: path.join(appsRoot, 'Applications', appName, 'Contents/SharedSupport/CrossOver/bin/wine'),
+    appPath: path.posix.join(posixRoot, 'Applications', appName),
+    binaryPath: path.posix.join(
+      posixRoot,
+      'Applications',
+      appName,
+      'Contents/SharedSupport/CrossOver/bin/wine'
+    ),
     bottlesDir,
     availableBottles: [isArm64 ? 'OneLauncher-arm64' : 'OneLauncher'],
     version: isPreview ? '27.0.0' : '26.2.0',
@@ -247,10 +253,16 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
   let tmpRoot: string;
   const origPlatform = process.platform;
   const origArch = process.arch;
+  const prevElectronApi =
+    typeof window !== 'undefined' ? (window as unknown as { electronAPI?: unknown }).electronAPI : undefined;
 
   beforeEach(() => {
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
     Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
+    if (typeof window !== 'undefined') {
+      const win = window as unknown as { electronAPI?: Record<string, unknown> };
+      win.electronAPI = { ...(win.electronAPI || {}), platform: 'darwin', arch: 'arm64' };
+    }
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-m3-unit-'));
   });
 
@@ -258,6 +270,9 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
     vi.restoreAllMocks();
     Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
     Object.defineProperty(process, 'arch', { value: origArch, configurable: true });
+    if (typeof window !== 'undefined') {
+      (window as unknown as { electronAPI?: unknown }).electronAPI = prevElectronApi;
+    }
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -516,8 +531,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Game'),
-            executablePath: path.join(tmpRoot, 'Games/Game/Game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Game'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Game/Game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -672,8 +687,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/TestGame'),
-            executablePath: path.join(tmpRoot, 'Games/TestGame/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/TestGame'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/TestGame/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -699,8 +714,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Launch Config arm64 Test',
-        installPath: path.join(tmpRoot, 'Games/TestGame'),
-        executablePath: path.join(tmpRoot, 'Games/TestGame/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/TestGame'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/TestGame/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -738,7 +753,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       )[0];
       expect(winePrefixInput).toBeDefined();
       expect(winePrefixInput.props.placeholder).toBe(
-        formatUserFacingPath(path.join(arm64EmptyLayer.bottlesDir!, '...'))
+        `${formatUserFacingPath(arm64EmptyLayer.bottlesDir!).replace(/\/+$/, '')}/...`
       );
       emptyModal.unmount();
 
@@ -1030,7 +1045,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         availableBottles: [
           {
             name: 'OneLauncher',
-            path: path.join(tmpRoot, 'CrossOver/Bottles/OneLauncher'),
+            path: path.posix.join('/tmp/ol-m3-mac', 'CrossOver/Bottles/OneLauncher'),
             runnerType: 'crossover',
             wineArch: 'win64',
             bottleArch: 'win64',
@@ -1292,8 +1307,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Policy'),
-            executablePath: path.join(tmpRoot, 'Games/Policy/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Policy'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Policy/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -1521,7 +1536,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         ],
       });
       vi.spyOn(launcherService, 'getDiskSpace').mockResolvedValue({
-        targetPath: path.join(tmpRoot, 'Games/Sanitize'),
+        targetPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Sanitize'),
         freeBytes: 200 * 1024 ** 3,
         usedBytes: 300 * 1024 ** 3,
         totalBytes: 500 * 1024 ** 3,
@@ -1730,8 +1745,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/LaunchCfg4D'),
-            executablePath: path.join(tmpRoot, 'Games/LaunchCfg4D/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/LaunchCfg4D'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/LaunchCfg4D/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -1760,8 +1775,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Launch Config 4D Test',
-        installPath: path.join(tmpRoot, 'Games/LaunchCfg4D'),
-        executablePath: path.join(tmpRoot, 'Games/LaunchCfg4D/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/LaunchCfg4D'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/LaunchCfg4D/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -1888,7 +1903,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         ],
       });
       vi.spyOn(launcherService, 'getDiskSpace').mockResolvedValue({
-        targetPath: path.join(tmpRoot, 'Games/Probe2BEDGED'),
+        targetPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe2BEDGED'),
         freeBytes: 200 * 1024 ** 3,
         usedBytes: 300 * 1024 ** 3,
         totalBytes: 500 * 1024 ** 3,
@@ -2055,7 +2070,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         ],
       });
       vi.spyOn(launcherService, 'getDiskSpace').mockResolvedValue({
-        targetPath: path.join(tmpRoot, 'Games/Probe2BEDGEC'),
+        targetPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe2BEDGEC'),
         freeBytes: 200 * 1024 ** 3,
         usedBytes: 300 * 1024 ** 3,
         totalBytes: 500 * 1024 ** 3,
@@ -2165,8 +2180,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe4DD'),
-            executablePath: path.join(tmpRoot, 'Games/Probe4DD/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DD'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DD/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2192,8 +2207,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 4D-D Game',
-        installPath: path.join(tmpRoot, 'Games/Probe4DD'),
-        executablePath: path.join(tmpRoot, 'Games/Probe4DD/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DD'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DD/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -2291,8 +2306,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe4DC'),
-            executablePath: path.join(tmpRoot, 'Games/Probe4DC/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DC'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe4DC/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2431,8 +2446,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe6B'),
-            executablePath: path.join(tmpRoot, 'Games/Probe6B/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6B'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6B/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2440,8 +2455,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'epic',
             platformGameId: 'epic-probe-6b',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe6BEpic'),
-            executablePath: path.join(tmpRoot, 'Games/Probe6BEpic/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6BEpic'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6BEpic/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2456,8 +2471,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 6B Race Game',
-        installPath: path.join(tmpRoot, 'Games/Probe6B'),
-        executablePath: path.join(tmpRoot, 'Games/Probe6B/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6B'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6B/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
 
@@ -2639,8 +2654,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe6C'),
-            executablePath: path.join(tmpRoot, 'Games/Probe6C/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6C'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6C/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2656,8 +2671,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 6C Game',
-        installPath: path.join(tmpRoot, 'Games/Probe6C'),
-        executablePath: path.join(tmpRoot, 'Games/Probe6C/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6C'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe6C/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -2966,8 +2981,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/FindingB1'),
-            executablePath: path.join(tmpRoot, 'Games/FindingB1/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB1'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB1/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -2983,8 +2998,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Finding B Cold Race',
-        installPath: path.join(tmpRoot, 'Games/FindingB1'),
-        executablePath: path.join(tmpRoot, 'Games/FindingB1/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB1'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB1/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -3140,8 +3155,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/FindingB2Steam'),
-            executablePath: path.join(tmpRoot, 'Games/FindingB2Steam/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Steam'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Steam/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3149,8 +3164,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'epic',
             platformGameId: 'epic-b2',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/FindingB2Epic'),
-            executablePath: path.join(tmpRoot, 'Games/FindingB2Epic/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Epic'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Epic/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3166,8 +3181,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Finding B Switch & Reset',
-        installPath: path.join(tmpRoot, 'Games/FindingB2Steam'),
-        executablePath: path.join(tmpRoot, 'Games/FindingB2Steam/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Steam'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingB2Steam/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -3356,8 +3371,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/FindingC'),
-            executablePath: path.join(tmpRoot, 'Games/FindingC/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingC'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/FindingC/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3597,8 +3612,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Defect2'),
-            executablePath: path.join(tmpRoot, 'Games/Defect2/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect2'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect2/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3636,8 +3651,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Defect 2 Orphan Bottle',
-        installPath: path.join(tmpRoot, 'Games/Defect2'),
-        executablePath: path.join(tmpRoot, 'Games/Defect2/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect2'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect2/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -3831,8 +3846,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Defect3Steam'),
-            executablePath: path.join(tmpRoot, 'Games/Defect3Steam/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Steam'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Steam/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3840,8 +3855,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'epic',
             platformGameId: 'epic-d3',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Defect3Epic'),
-            executablePath: path.join(tmpRoot, 'Games/Defect3Epic/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Epic'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Epic/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -3867,8 +3882,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Defect 3 Tab Switch',
-        installPath: path.join(tmpRoot, 'Games/Defect3Steam'),
-        executablePath: path.join(tmpRoot, 'Games/Defect3Steam/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Steam'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Defect3Steam/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -4024,8 +4039,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe1Ci'),
-            executablePath: path.join(tmpRoot, 'Games/Probe1Ci/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Ci'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Ci/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -4066,8 +4081,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 1C-i Manual Runner Edit',
-        installPath: path.join(tmpRoot, 'Games/Probe1Ci'),
-        executablePath: path.join(tmpRoot, 'Games/Probe1Ci/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Ci'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Ci/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -4267,8 +4282,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe1Cii'),
-            executablePath: path.join(tmpRoot, 'Games/Probe1Cii/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Cii'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Cii/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -4309,8 +4324,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 1C-ii Modal Session Epoch',
-        installPath: path.join(tmpRoot, 'Games/Probe1Cii'),
-        executablePath: path.join(tmpRoot, 'Games/Probe1Cii/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Cii'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1Cii/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -4470,8 +4485,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'steam',
             platformGameId: '1091500',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe1CiiiSteam'),
-            executablePath: path.join(tmpRoot, 'Games/Probe1CiiiSteam/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiSteam'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiSteam/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -4479,8 +4494,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
             platformId: 'epic',
             platformGameId: 'epic-1c-iii',
             installed: true,
-            installPath: path.join(tmpRoot, 'Games/Probe1CiiiEpic'),
-            executablePath: path.join(tmpRoot, 'Games/Probe1CiiiEpic/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiEpic'),
+            executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiEpic/game.exe'),
             isWindowsBinaryOnMac: true,
             platforms: { windows: true, mac: false, linux: false },
           },
@@ -4521,8 +4536,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         platformId: 'steam',
         platformGameId: '1091500',
         title: 'Probe 1C-iii Dirty Inactive Tab',
-        installPath: path.join(tmpRoot, 'Games/Probe1CiiiSteam'),
-        executablePath: path.join(tmpRoot, 'Games/Probe1CiiiSteam/game.exe'),
+        installPath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiSteam'),
+        executablePath: path.posix.join('/tmp/ol-m3-mac', 'Games/Probe1CiiiSteam/game.exe'),
         isWindowsBinaryOnMac: true,
       } as InstalledGameRecord);
       vi.spyOn(environmentSetupService, 'getLastSnapshot').mockReturnValue(
@@ -4671,7 +4686,7 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
         availableBottles: [
           {
             name: 'OneLauncher',
-            path: path.join(tmpRoot, 'CrossOver/Bottles/OneLauncher'),
+            path: path.posix.join('/tmp/ol-m3-mac', 'CrossOver/Bottles/OneLauncher'),
             runnerType: 'crossover',
             wineArch: 'win64',
             bottleArch: 'win64',

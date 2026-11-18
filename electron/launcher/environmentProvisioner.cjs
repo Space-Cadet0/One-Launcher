@@ -2191,7 +2191,7 @@ async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, optio
       }
     } else {
       const canUseDitto =
-        process.platform === 'darwin' ||
+        (process.platform === 'darwin' && fs.existsSync('/usr/bin/ditto')) ||
         typeof options.execFileFn === 'function' ||
         typeof options.execFileImpl === 'function';
       if (canUseDitto) {
@@ -2218,7 +2218,7 @@ async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, optio
       options.skipStagingCodesignVerify !== true &&
       typeof options.verifySignatureFn !== 'function' &&
       fs.existsSync(siblingStagingPath) &&
-      (process.platform === 'darwin' ||
+      ((process.platform === 'darwin' && fs.existsSync('/usr/bin/codesign')) ||
         typeof options.execFileFn === 'function' ||
         typeof options.execFileImpl === 'function');
 

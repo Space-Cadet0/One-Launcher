@@ -836,8 +836,8 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
             platformId: 'steam',
             platformGameId: '991001',
             installed: true,
-            installPath: path.join(sandbox, 'games/MultiArch'),
-            executablePath: path.join(sandbox, 'games/MultiArch/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m4-mac', 'games/MultiArch'),
+            executablePath: path.posix.join('/tmp/ol-m4-mac', 'games/MultiArch/game.exe'),
           },
         ],
       });
@@ -1016,8 +1016,8 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
             platformId: 'steam',
             platformGameId: '992001',
             installed: true,
-            installPath: path.join(sandbox, 'games/IntelSan'),
-            executablePath: path.join(sandbox, 'games/IntelSan/game.exe'),
+            installPath: path.posix.join('/tmp/ol-m4-mac', 'games/IntelSan'),
+            executablePath: path.posix.join('/tmp/ol-m4-mac', 'games/IntelSan/game.exe'),
           },
         ],
       });
