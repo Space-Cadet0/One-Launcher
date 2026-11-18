@@ -33,11 +33,13 @@ Download the latest installers from the **[Releases page](https://github.com/Spa
 - **One Launcher Full Uninstaller.exe** is attached to the same release if you want to remove the app completely.
 
 ### Setup Wizard
+![One Launcher 5-step Setup Wizard](docs/screenshots/setup-wizard.png)
+
 On first launch, a 5-step **Setup Wizard** walks through initial setup for your operating system:
 - **macOS:** `1. Accounts` (connect Steam, GOG, Epic, and Xbox), `2. Windows Games` (choose a compatibility runner and bottle), `3. Launchers` (configure storefront clients), `4. Install` (automated setup), and `5. Sign In` (sign in to installed store clients).
 - **Windows:** `1. System` (check Visual C++ Redistributable and WebView2 runtimes), `2. Accounts`, `3. Launchers`, `4. Install`, and `5. Sign In`.
 
-A health check indicator remains in the top menu bar after setup. If a tool, runtime, or bottle configuration breaks later, click that indicator to reopen the wizard in repair mode.
+After initial setup, **Setup Wizard** stays available in the top-left menu (and under **File -> Setup Wizard...** on Windows). If a tool, runtime, or bottle configuration needs attention later, an amber alert dot appears next to that menu item so you can reopen the wizard to check health or repair things.
 
 ---
 
@@ -77,7 +79,7 @@ One Launcher connects directly to four storefronts, along with local game folder
 - **GOG.com:** Sign in directly to download DRM-free games and sync cloud saves without GOG Galaxy installed (optional GOG Galaxy support handles achievements and multiplayer).
 - **Epic Games Store:** Sign in directly to download games, sync cloud saves, and track achievements without running the Epic Games Launcher for most titles.
 - **Xbox / PC Game Pass:** Sign in with Microsoft / Xbox Live to import Microsoft Store purchases, Game Pass games, achievements, and cloud saves. Choose whether to sync the full Game Pass catalog, only games you have played or installed, or strictly owned purchases. **Chained launchers for Xbox Game Pass games (e.g., EA) are not yet implemented.**
-- **Local and Standalone Installs:** Scans your drives and CrossOver or Wine bottles for macOS `.app` bundles and Windows `.exe` games while filtering out stray uninstallers and crash reporters. You can also link a local install manually using **Manage Game -> Locate Installed Game...** or set a custom executable in **Launch Properties...**.
+- **Local and Standalone Installs:** Scans your drives and CrossOver or Wine bottles for macOS `.app` bundles and Windows `.exe` games while filtering out stray uninstallers and crash reporters. You can also link a local install manually using **Manage Game -> Locate Installed Game...** or set a custom executable in **Launch Settings...** (Windows) or **Launch & Compatibility Settings...** (macOS).
 
 Sign-ins go directly to each storefront's official login page with no One Launcher account or external server in between, and tokens are encrypted in your operating system's keychain. Store metadata and artwork are cached locally in the **Offline Library Vault** (configurable at `250 MB`, `1 GB`, or `2 GB`) so your library stays browsable offline.
 
@@ -123,7 +125,7 @@ One Launcher automatically matches your store accounts and local folders to game
 <details>
 <summary>Building from Source (For Developers)</summary>
 
-Requires **Node.js 22+**, **npm**, and **Zig 0.13.0** (for building the Xbox GDK bridge DLLs from C source).
+Requires **Node.js 22+**, **npm**, and **Zig 0.13.0** (for building both the Xbox GDK bridge DLLs and the Display Scaler binaries from C source).
 
 ```bash
 git clone https://github.com/Space-Cadet0/One-Launcher.git
