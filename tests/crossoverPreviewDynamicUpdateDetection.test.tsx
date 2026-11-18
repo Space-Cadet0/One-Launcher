@@ -158,6 +158,8 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
   let tmpRoot: string;
   let userDataDir: string;
   let appsDir: string;
+  const origPlatform = process.platform;
+  const origArch = process.arch;
 
   beforeEach(() => {
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-cx-preview-dynamic-test-'));
@@ -165,6 +167,8 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
     appsDir = path.join(tmpRoot, 'Applications');
     fs.mkdirSync(userDataDir, { recursive: true });
     fs.mkdirSync(appsDir, { recursive: true });
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
     launcherEngine.setUserDataDir(userDataDir);
     (environmentSetupService as any).lastPreviewSignInResult = null;
     (environmentSetupService as any).lastSnapshot = null;
@@ -172,6 +176,8 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
 
   afterEach(() => {
     vi.restoreAllMocks();
+    Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
+    Object.defineProperty(process, 'arch', { value: origArch, configurable: true });
     try {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     } catch {}
@@ -2788,6 +2794,9 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       // Direct installRunnerDirect with existingLayer on 20261111 and downloadUrl on 20261111
       const res = await environmentProvisioner.installRunnerDirect('crossover_preview', {
         _runnerOperation: 'update',
+        platform: 'darwin',
+        homedir: tmpRoot,
+        customApplicationsDir: appsDir,
         existingLayer: {
           id: 'crossover_preview',
           type: 'crossover_preview',
@@ -2795,7 +2804,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
           version: '27.0.0',
           previewDate: '20261111',
           displayVersion: '27.0.0 (Preview 20261111)',
-          appPath: '/Applications/CrossOver Preview.app',
+          appPath: path.join(appsDir, 'CrossOver Preview.app'),
         },
         downloadUrl: 'https://www.codeweavers.com/preview/download/crossover-preview-20261111.zip',
         skipNetwork: false,

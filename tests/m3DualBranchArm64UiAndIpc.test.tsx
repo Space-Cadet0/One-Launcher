@@ -245,13 +245,19 @@ function makeSnapshot(
 
 describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', () => {
   let tmpRoot: string;
+  const origPlatform = process.platform;
+  const origArch = process.arch;
 
   beforeEach(() => {
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-m3-unit-'));
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
+    Object.defineProperty(process, 'arch', { value: origArch, configurable: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -773,8 +779,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '1091500',
-        defaultInstallDir: path.join(tmpRoot, 'Games/Arm64Game'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/Arm64Game')],
+        defaultInstallDir: '~/Games/Arm64Game',
+        availableInstallDirs: ['~/Games/Arm64Game'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [
@@ -1168,8 +1174,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '1091500',
-        defaultInstallDir: path.join(tmpRoot, 'Games/Transition'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/Transition')],
+        defaultInstallDir: '~/Games/Transition',
+        availableInstallDirs: ['~/Games/Transition'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [
@@ -1506,8 +1512,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '1091500',
-        defaultInstallDir: path.join(tmpRoot, 'Games/Sanitize'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/Sanitize')],
+        defaultInstallDir: '~/Games/Sanitize',
+        availableInstallDirs: ['~/Games/Sanitize'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [
@@ -1654,8 +1660,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '101',
-        defaultInstallDir: path.join(tmpRoot, 'Games/SwitchTest'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/SwitchTest')],
+        defaultInstallDir: '~/Games/SwitchTest',
+        availableInstallDirs: ['~/Games/SwitchTest'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [
@@ -1873,8 +1879,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '1091500',
-        defaultInstallDir: path.join(tmpRoot, 'Games/Probe2BEDGED'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/Probe2BEDGED')],
+        defaultInstallDir: '~/Games/Probe2BEDGED',
+        availableInstallDirs: ['~/Games/Probe2BEDGED'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [
@@ -2040,8 +2046,8 @@ describe('M3 Dual-Branch arm64 UI, IPC, Services & Accessibility Integration', (
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'steam',
         platformGameId: '1091500',
-        defaultInstallDir: path.join(tmpRoot, 'Games/Probe2BEDGEC'),
-        availableInstallDirs: [path.join(tmpRoot, 'Games/Probe2BEDGEC')],
+        defaultInstallDir: '~/Games/Probe2BEDGEC',
+        availableInstallDirs: ['~/Games/Probe2BEDGEC'],
         canDirectDownload: true,
         isCrossPlatformBottleInstall: true,
         availableInstallers: [

@@ -1129,7 +1129,9 @@ describe('M2: Arm64 Bottle Architecture & Launch/Runtime Handling (F6–F8)', ()
     macNativeInstaller.resolveSipSafeWineBinaryAndPreloadEnv(armApp.wineBin, win64Env, {
       wineArch: 'win64',
     });
-    expect(win64Env.WINELOADER).toContain('x86_64-unix/wine.app/Contents/MacOS/wine');
+    expect(String(win64Env.WINELOADER).replace(/\\/g, '/')).toContain(
+      'x86_64-unix/wine.app/Contents/MacOS/wine'
+    );
 
     // Arbitrary parent folder containing 'arm64' does NOT force arm64 loader on standard CrossOver Preview
     const devArm64Parent = path.join(home, 'arm64dev');
@@ -1140,7 +1142,7 @@ describe('M2: Arm64 Bottle Architecture & Launch/Runtime Handling (F6–F8)', ()
     );
     const stdEnv: Record<string, any> = {};
     macNativeInstaller.resolveSipSafeWineBinaryAndPreloadEnv(stdUnderArm64Parent.wineBin, stdEnv, {});
-    expect(stdEnv.WINELOADER).toContain('x86_64-unix/wine');
+    expect(String(stdEnv.WINELOADER).replace(/\\/g, '/')).toContain('x86_64-unix/wine');
 
     // shutdownWinePrefix overrides stale process.env.CX_BOTTLE_PATH
     const customBottlesRoot = path.join(home, 'custom_bottles');

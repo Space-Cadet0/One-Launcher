@@ -327,6 +327,7 @@ describe('Tier 1 — F4 & F5: Dual-Branch URL Discovery, Branch Cache & Side-by-
       stagedBundle.appPath,
       destBundle,
       {
+        platform: 'darwin',
         skipStagingCodesignVerify: true,
         execFileFn: (cmd: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
           invokedCmds.push(`${cmd} ${args.join(' ')}`);

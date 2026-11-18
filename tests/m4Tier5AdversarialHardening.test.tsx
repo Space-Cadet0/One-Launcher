@@ -318,9 +318,13 @@ function makeWizardSnapshot(
 describe('M4 Tier 5 Adversarial Hardening Suite', () => {
   const prevElectronApi = (globalThis as unknown as { window?: { electronAPI?: unknown } }).window
     ?.electronAPI;
+  const origPlatform = process.platform;
+  const origArch = process.arch;
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
     if (typeof localStorage !== 'undefined' && typeof localStorage.clear === 'function') {
       localStorage.clear();
     }
@@ -332,6 +336,8 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
+    Object.defineProperty(process, 'arch', { value: origArch, configurable: true });
     const win = (globalThis as unknown as { window?: { electronAPI?: unknown } }).window;
     if (win) {
       win.electronAPI = prevElectronApi;
@@ -1067,8 +1073,8 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'gog',
         platformGameId: '993001',
-        defaultInstallDir: path.join(sandbox, 'Games/Mismatch'),
-        availableInstallDirs: [path.join(sandbox, 'Games/Mismatch')],
+        defaultInstallDir: '~/Games/Mismatch',
+        availableInstallDirs: ['~/Games/Mismatch'],
         canDirectDownload: true,
         estimatedSizeBytes: 1024,
         availableInstallers: [
@@ -1886,8 +1892,8 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
       vi.spyOn(launcherService, 'getGameInstallInfo').mockResolvedValue({
         platformId: 'gog',
         platformGameId: '996001',
-        defaultInstallDir: path.join(sandbox, 'Games/DualOS'),
-        availableInstallDirs: [path.join(sandbox, 'Games/DualOS')],
+        defaultInstallDir: '~/Games/DualOS',
+        availableInstallDirs: ['~/Games/DualOS'],
         canDirectDownload: true,
         estimatedSizeBytes: 1024,
         availableInstallers: [
