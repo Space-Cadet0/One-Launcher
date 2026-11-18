@@ -34,7 +34,7 @@ Grab the latest installers from the **[v0.2.7 Release page](https://github.com/S
 - Download and run **`One Launcher Setup 0.2.7.exe`** from the [v0.2.7 release](https://github.com/Space-Cadet0/One-Launcher/releases/tag/v0.2.7).
 - If you ever want a clean removal later, **`One Launcher Full Uninstaller.exe`** is attached to the same release so nothing is left behind.
 
-On first launch, a 5-step Setup Wizard helps you connect your store accounts and verify your Mac compatibility tools (CrossOver, Apple Game Porting Toolkit, or Wine) or Windows runtime prerequisites. You can re-open it anytime from the top-left menu.
+On first launch, a 5-step Setup Wizard helps you connect your store accounts and verify your Mac compatibility tools (CrossOver, Apple Game Porting Toolkit, or Wine) or Windows runtime prerequisites. An ongoing health check flags any missing tools or broken bottle settings in the menu bar so you can re-open the wizard and repair them anytime.
 
 ---
 
@@ -42,7 +42,7 @@ On first launch, a 5-step Setup Wizard helps you connect your store accounts and
 
 ### Your whole library on one screen
 ![One Launcher library grid showing Steam, GOG, Epic, and Xbox Game Pass games](docs/screenshots/library-overview.png)
-Browse every title in a cover grid or list, narrow down by 6 filter categories (storefront, install readiness, genre, critic score, platform, and release era), sort how you like, and organize games into custom sidebar collections with 24 folder icons.
+Browse every title in a cover grid, switch storefronts or installed-only views from the top bar, narrow down with 6 filter categories (OS compatibility, critic/player ratings, genres, game features like co-op or HDR, release era, and developers/publishers), sort how you like, and organize games into custom sidebar collections with 24 folder icons.
 
 ### Game pages built for actually deciding what to play
 ![Game detail header for Death Stranding 2 showing playtime, achievements, Metacritic consensus, and trailer](docs/screenshots/ds2-game-detail.png)
@@ -62,19 +62,19 @@ Sign in directly to Steam, GOG.com, Epic Games, and Xbox Live through their offi
 
 ### Playing Windows games on Mac
 ![Launch and Compatibility Settings modal showing graphics backends, MetalFX DLSS, frame rate limit, and display scaling](docs/screenshots/crossover-launch-settings.png)
-For Windows titles running on a Mac, each game keeps its own graphics and display settings: pick a translation backend (`D3DMetal`, `DXMT`, `DXVK`, or `WineD3D`), turn on MetalFX DLSS or Spatial upscaling, enable HUD overlays (Metal HUD, DXVK HUD, or FPS counter), cap frame rates to keep fans quiet, enable Retina resolution, and tune fullscreen or aspect-ratio scaling.
+For Windows titles running on a Mac, each game keeps its own graphics and display settings: pick a translation backend (`D3DMetal`, `DXMT`, `DXVK`, or `WineD3D`), turn on MetalFX DLSS or Spatial upscaling, enable HUD overlays (Apple Metal HUD or DXVK / DXMT HUD with live FPS telemetry), cap frame rates to keep fans quiet, switch on Retina 192 DPI mode for sharp menus and text, and tune fullscreen or aspect-ratio scaling.
 
 ### Achievements across stores
 ![Achievements modal showing unlocked progress, timestamps, and global rarity](docs/screenshots/game-achievements.png)
-Inspect unlocked and remaining achievements from Steam, Epic, GOG, and Xbox in one place with unlock dates and global rarity percentages. Secret achievement descriptions stay blurred until you click them so story moments don't get spoiled.
+Inspect unlocked and remaining achievements from Steam, Epic, GOG, and Xbox in one place with unlock dates and global rarity percentages. Secret achievement descriptions stay hidden behind a Reveal Spoiler toggle so story moments don't get spoiled.
 
 ### Fix Match wizard when local folders get weird
 ![Four-step Fix Match and Metadata wizard showing cross-store search results](docs/screenshots/fix-match-wizard.png)
-If an old DRM-free install, bottle `.exe`, or ambiguously named folder pulls the wrong cover, the 4-step **Fix Match & Metadata** wizard searches Steam, IGDB, GOG, Epic, and Xbox together, lets you swap poster or hero artwork, pick your preferred review source, and edit metadata before applying anything.
+If an old DRM-free install, bottle `.exe`, or ambiguously named folder pulls the wrong cover, the 4-step **Fix Match & Metadata** wizard searches Steam, IGDB, GOG, Epic, and Xbox together, lets you swap 2:3 cover poster artwork, pick your preferred review source, and edit metadata before applying anything.
 
 ### Library Match & Overrides Studio for auditing your catalog
 ![Library Match and Overrides Studio showing manual overrides across storefronts](docs/screenshots/library-match-studio.png)
-Open **Library Match & Overrides Studio** from the top-left menu to review auto-matched titles, track down unmatched installs, manage every manual override in one table, and export or import a JSON backup of your custom matches.
+Open **Library Match & Overrides Studio** from the top-left menu to review auto-matched titles, track down unmatched installs, and manage every manual override in one table.
 
 ---
 
@@ -86,7 +86,7 @@ One Launcher connects to **Steam**, **GOG.com**, **Epic Games Store**, **Xbox / 
 *Note on Xbox Game Pass:* Direct Xbox and PC Game Pass games are supported on both Windows and Mac, including achievements and cloud saves. However, **chained launchers for Xbox Game Pass games (such as EA games launched through the EA App) are not yet implemented.**
 
 ### Windows compatibility and the Display Scaler on Mac
-On Apple Silicon Macs, One Launcher automatically detects **CrossOver**, **CrossOver Preview** (Intel and ARM modes), **Apple Game Porting Toolkit**, and **Wine**. When an older or picky Windows game refuses to behave on modern Mac displays, One Launcher's built-in Display Scaler handles fullscreen presentation and integer or aspect-ratio scaling without distorting the image. While in-game, press `Ctrl+Option+F` to toggle fullscreen vs. windowed mode, or `Ctrl+Option+A` to cycle aspect ratios such as `4:3`. If launching a storefront client briefly opens its desktop wrapper on Mac or PC, **Client Auto-Close** cleans it up after your game exits.
+On Apple Silicon Macs, One Launcher automatically detects **CrossOver**, **CrossOver Preview** (Intel and ARM modes), **Apple Game Porting Toolkit**, and **Wine**. When an older or picky Windows game tries to run at low legacy resolutions like `640x480` or `800x600`, One Launcher's built-in Display Scaler upscales it cleanly into notch-safe macOS fullscreen with integer pixel-perfect, `4:3` pillarbox, or stretch aspect modes, while keeping `Cmd+Tab` app switching cooperative instead of trapping your cursor or display. While in-game, press `Ctrl+Option+F` to toggle fullscreen vs. windowed mode, or `Ctrl+Option+A` to cycle aspect ratios. If launching a storefront client briefly opens its desktop wrapper on Mac or PC, **Client Auto-Close** cleans it up after your game exits.
 
 ### Downloads, saves, memory hibernation, and offline mode
 Queue downloads inside the Universal Download Manager and let it automatically pause active downloads as soon as you start playing something else. Before and after every play session, One Launcher captures rolling local backups of your save folders alongside your store's cloud save sync. While a game is running, **In-Game Hibernation** suspends background artwork and video decoding so the launcher uses next to no memory or CPU, and the **Offline Library Vault** keeps your entire catalog, covers, and cached metadata browsable on flights or offline setups.
