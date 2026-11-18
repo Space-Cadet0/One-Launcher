@@ -89,7 +89,7 @@ describe('Tier 1 — F8 & F9: Arm64 FEX Runtime, IPC Allowlists & Cross-Service 
       homedir: sandbox.homedir,
     });
 
-    expect(derivedRoot).toBe(armBundle.cxRoot);
+    expect(String(derivedRoot).replace(/\\/g, '/')).toBe(armBundle.cxRoot.replace(/\\/g, '/'));
 
     const prepEnv: Record<string, string> = {};
     const prep = await wineAndCrossOverManager.prepareXboxBottleEnvironment({

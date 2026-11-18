@@ -7260,7 +7260,7 @@ function mergeCxEnvVariables(existingCxEnv, updates = {}) {
 function deriveCrossOverRootFromBinaryPath(wineBinaryPath) {
   if (!wineBinaryPath || typeof wineBinaryPath !== 'string') return '';
   const norm = path.resolve(wineBinaryPath);
-  const sharedMatch = norm.match(/^(.*\/Contents\/SharedSupport\/CrossOver)(?:\/|$)/i);
+  const sharedMatch = norm.match(/^(.*[\\/]Contents[\\/]SharedSupport[\\/]CrossOver)(?:[\\/]|$)/i);
   if (sharedMatch && sharedMatch[1]) {
     return sharedMatch[1];
   }
@@ -7269,7 +7269,7 @@ function deriveCrossOverRootFromBinaryPath(wineBinaryPath) {
     return path.dirname(binDir);
   }
   const unixMatch = norm.match(
-    /^(.*)\/lib(?:64)?\/wine\/[^/]+\/wine(?:\.app\/Contents\/MacOS\/wine)?$/i
+    /^(.*)[\\/]lib(?:64)?[\\/]wine[\\/][^\\/]+[\\/]wine(?:\.app[\\/]Contents[\\/]MacOS[\\/]wine)?$/i
   );
   if (unixMatch && unixMatch[1]) {
     return unixMatch[1];

@@ -555,6 +555,10 @@ describe('Tier 2 — F1–F5 Boundaries: Preview Portal, Feed Hijack, Cache & At
   });
 
   it('F5.B3: non-writable target applicationsDir fails fast with permission/access error', async () => {
+    if (path.sep === '\\' || (typeof process.getuid === 'function' && process.getuid() === 0)) {
+      // POSIX directory mode 0o555 does not revoke write ACLs on Windows NTFS or root UID 0
+      return;
+    }
     const readOnlyAppsDir = path.join(sandbox.tmpRoot, 'ReadOnlyApps');
     fs.mkdirSync(readOnlyAppsDir, { recursive: true });
     fs.chmodSync(readOnlyAppsDir, 0o555);

@@ -136,9 +136,10 @@ function seedCrossOverApp(
 
 function makeLayer(
   type: CompatibilityLayerInfo['type'],
-  sandboxRoot: string,
+  _sandboxRoot: string,
   overrides: Partial<CompatibilityLayerInfo> = {}
 ): CompatibilityLayerInfo {
+  const posixRoot = '/tmp/ol-m4-mac';
   const isArm64 = type === 'crossover_preview_arm64';
   const isPreview = type === 'crossover_preview' || isArm64;
   const appName = isArm64
@@ -146,7 +147,7 @@ function makeLayer(
     : isPreview
       ? 'CrossOver Preview.app'
       : 'CrossOver.app';
-  const bottlesDir = path.join(sandboxRoot, 'Library/Application Support/CrossOver/Bottles');
+  const bottlesDir = path.posix.join(posixRoot, 'Library/Application Support/CrossOver/Bottles');
   return {
     id: type,
     type,
@@ -155,8 +156,13 @@ function makeLayer(
       : isPreview
         ? 'CrossOver Preview'
         : 'CrossOver',
-    binaryPath: path.join(sandboxRoot, 'Applications', appName, 'Contents/SharedSupport/CrossOver/bin/wine'),
-    appPath: path.join(sandboxRoot, 'Applications', appName),
+    binaryPath: path.posix.join(
+      posixRoot,
+      'Applications',
+      appName,
+      'Contents/SharedSupport/CrossOver/bin/wine'
+    ),
+    appPath: path.posix.join(posixRoot, 'Applications', appName),
     bottlesDir,
     availableBottles: [isArm64 ? 'OneLauncher-arm64' : 'OneLauncher'],
     version: isPreview ? '27.0.0' : '26.4.0',
