@@ -14,7 +14,7 @@
 
 If your games are split across Steam, GOG, Epic, Xbox / PC Game Pass, and a handful of standalone folders, it gets annoying fast trying to remember where you own something or which launcher actually has it installed.
 
-One Launcher pulls your whole collection into a single desktop app for **macOS (Apple Silicon)** and **Windows 10/11**. It tracks what you own, merges duplicates across stores, downloads artwork, critic scores, and HowLongToBeat times, and lets you launch Mac-native games, Windows games on PC, or Windows games on Mac through CrossOver, Apple Game Porting Toolkit, or Wine.
+One Launcher pulls your whole collection into a single desktop app for **macOS (Apple Silicon)** and **Windows 10/11**. It tracks what you own, merges duplicates across stores, and pulls in artwork, critic scores, and HowLongToBeat times. You can launch Mac-native games, Windows games on PC, or Windows games on Mac via CrossOver, Apple Game Porting Toolkit, or Wine.
 
 ---
 
@@ -34,7 +34,7 @@ Grab the latest installers from the **[v0.2.7 Release page](https://github.com/S
 - Download and run **`One Launcher Setup 0.2.7.exe`** from the [v0.2.7 release](https://github.com/Space-Cadet0/One-Launcher/releases/tag/v0.2.7).
 - If you ever want a clean removal later, **`One Launcher Full Uninstaller.exe`** is also attached to the same release.
 
-When you open One Launcher for the first time, a 5-step Setup Wizard walks you through signing in to your store accounts and checking your compatibility runners (on Mac) or system prerequisites (on Windows). You can re-open it anytime from the top-left menu.
+When you open One Launcher for the first time, a 5-step Setup Wizard walks you through signing in to your store accounts and checking your Mac compatibility tools (like CrossOver or Wine) or Windows prerequisites. You can re-open it anytime from the top-left menu.
 
 ---
 
@@ -50,11 +50,11 @@ Each game gets its own page with trailers, screenshots, playtime, Metacritic/Ope
 
 ### Store accounts, Game Pass sync modes, and offline caching
 ![Storefront Integrations modal showing connected accounts and Game Pass options](docs/screenshots/storefront-integrations.png)
-Sign in directly to Steam, GOG.com, Epic Games, and Xbox Live using their official sign-in pages—no extra launchers need to stay open in the background. For Xbox / PC Game Pass, you can choose whether to show your full Game Pass catalog, only games you've played or installed, or just permanent purchases.
+Sign in directly to Steam, GOG.com, Epic Games, and Xbox Live through their official login pages, without leaving extra store apps running in the background. For Xbox / PC Game Pass, you can choose whether to show your full Game Pass catalog, only games you've played or installed, or just permanent purchases.
 
 ### Playing Windows games on Mac
 ![Launch and Compatibility Settings modal showing graphics backends, MetalFX DLSS, frame rate limit, and display scaling](docs/screenshots/crossover-launch-settings.png)
-Mac players can tweak CrossOver, CrossOver Preview (`arm64 / FEX`), Apple Game Porting Toolkit, or Wine settings per game: pick D3DMetal or DXMT, turn on MetalFX DLSS upscaling, cap frame rates to keep fans quiet, enable Retina sharpness, and toggle fullscreen or aspect-ratio scaling on the fly with `Ctrl+Option+F` and `Ctrl+Option+A`.
+If you play Windows games on a Mac, each title gets its own menu for graphics and display tweaks: turn on MetalFX upscaling, cap frame rates to keep fans quiet, enable Retina resolution, and adjust fullscreen or aspect-ratio scaling without leaving the game.
 
 ### Achievements across stores
 ![Achievements modal showing unlocked progress, timestamps, and global rarity](docs/screenshots/game-achievements.png)
@@ -65,25 +65,25 @@ Browse unlocked and locked achievements with global rarity percentages and unloc
 ## What It Does
 
 ### Connects your storefronts without getting in the way
-One Launcher brings together **Steam**, **GOG.com**, **Epic Games Store**, **Xbox / PC Game Pass**, and **custom local games** (both native `.app` bundles on Mac and Windows `.exe` folders). It automatically scans your drives and compatibility bottles for games you already have installed, filters out uninstallers and crash reporters, and merges duplicate entries when you own the same game on two stores.
+One Launcher brings together **Steam**, **GOG.com**, **Epic Games Store**, **Xbox / PC Game Pass**, and **local installs** (both Mac `.app` bundles and Windows `.exe` folders). It scans your drives and CrossOver or Wine bottles for games you already installed, skipping stray uninstallers and crash reporters. If you own the same game on two stores, it merges them into a single entry.
 
 *Note on Xbox Game Pass:* Direct Xbox and PC Game Pass games are supported on both Windows and Mac, including achievements and cloud saves. However, **chained launchers for Xbox Game Pass games (such as EA games launched through the EA App) are not yet implemented.**
 
 ### Makes Windows games behave better on Mac
-If you game on Apple Silicon, One Launcher works alongside **CrossOver**, **CrossOver Preview** (both `x86_64` and `arm64 / FEX`), **Apple Game Porting Toolkit**, and **Wine**. It detects your installed runners and bottles, lets you pick the graphics backend (`D3DMetal`, `DXMT`, `DXVK`, or `WineD3D`) per game, exposes MetalFX DLSS where supported, and fixes common fullscreen headaches on older and newer Windows games alike. Live shortcuts let you switch between fullscreen and windowed (`Ctrl+Option+F`) or cycle aspect ratios like 4:3 pillarbox and integer scaling (`Ctrl+Option+A`) while a game is running.
+On Apple Silicon Macs, One Launcher detects your installed **CrossOver**, **CrossOver Preview** (Intel and ARM modes), **Apple Game Porting Toolkit**, and **Wine** setups automatically. You can pick the graphics mode per game (`D3DMetal`, `DXMT`, `DXVK`, or `WineD3D`) and enable MetalFX DLSS upscaling where supported. Older Windows games that normally break or stretch on modern Mac screens get automatic fullscreen fixes too. While playing, press `Ctrl+Option+F` to flip between fullscreen and windowed, or `Ctrl+Option+A` to cycle aspect ratios like 4:3.
 
 ### Keeps downloads, saves, and offline browsing tidy
-You can queue game installs directly from One Launcher, track extraction and verification progress, and let downloads pause automatically the moment you start playing something else. Before and after a session, One Launcher keeps rolling local backups of your saves alongside storefront cloud sync. While you're in a game, In-Game Hibernation frees up artwork and video memory so the launcher stays out of your way, and the Offline Library Vault caches your catalog and covers locally so your library still loads cleanly on a plane or train.
+You can queue downloads right from the app and have them pause automatically the second you launch a game. Before and after each session, One Launcher saves rolling local backups of your save files alongside your store's cloud sync. When you're in-game, **In-Game Hibernation** drops artwork and video memory so the launcher stays lightweight, and the **Offline Library Vault** keeps your game list and covers cached for flights or spotty Wi-Fi.
 
 ### Fixes messy matches when local folders look weird
-Added a DRM-free game or an old installer whose folder name didn't match right away? Open the 4-step Fix Match wizard to search Steam, GOG, Epic, and IGDB at once, swap the cover art or hero banner, tweak the title or description, and preview the card before saving.
+If a DRM-free folder or old installer gets misidentified, **Fix Match** searches Steam, GOG, Epic, and IGDB at once to track it down. You can swap the cover or hero art, edit the title, and preview the card before saving.
 
 ---
 
 ## Good to Know (Current Limitations)
 
 - **Chained launchers for Xbox Game Pass games (e.g., EA) are not yet implemented.** Direct Game Pass titles work, while Game Pass games that hand off to a third-party publisher client like the EA App aren't supported yet.
-- Games that require Windows kernel-level anti-cheat (such as Riot Vanguard) cannot run inside macOS compatibility layers and require native Windows.
+- Games that require Windows kernel-level anti-cheat (such as Riot Vanguard) cannot run on a Mac through compatibility tools and require native Windows.
 
 ---
 
