@@ -949,7 +949,7 @@ describe('M4 Tier 5 Adversarial Hardening Suite', () => {
       await Promise.resolve();
       const tree = renderer.render();
       expect(latestForm!.resolvedBottleFolderPath).toBe(
-        path.join(armLayer.bottlesDir!, 'OneLauncher-arm64')
+        path.posix.join(armLayer.bottlesDir!, 'OneLauncher-arm64')
       );
       const bottleSel = findVNodes(
         tree,
