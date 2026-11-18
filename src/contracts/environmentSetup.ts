@@ -7,6 +7,7 @@ export type EnvironmentComponentId =
   | 'win_webview2'
   | 'runner_crossover'
   | 'runner_crossover_preview'
+  | 'runner_crossover_preview_arm64'
   | 'runner_wine'
   | 'runner_gptk'
   | 'bottle_default'
@@ -115,12 +116,17 @@ export interface EnvironmentComponentState {
   status: EnvironmentComponentStatus;
   version?: string;
   latestVersion?: string;
+  latestDisplayVersion?: string;
   binaryPath?: string;
   installLocation?: string;
   wasPreviouslyConfigured?: boolean;
   canAutoInstall: boolean;
   requiresExternalDownload?: boolean;
   externalDownloadUrl?: string;
+  downloadUrl?: string;
+  authRequired?: boolean;
+  previewDate?: string;
+  semver?: string;
   estimatedDownloadMB?: number;
   recommendationTier: RecommendationTier;
   recommendationBadge: string;
@@ -135,10 +141,15 @@ export interface BottleEnvironmentSummary {
   runnerType: Exclude<CompatibilityLayerType, 'native'> | null;
   runnerName?: string;
   runnerInstalled: boolean;
+  wineArch?: 'win64' | 'arm64';
+  bottleArch?: 'win64' | 'arm64';
   availableBottles: Array<{
     name: string;
     path: string;
     runnerType: Exclude<CompatibilityLayerType, 'native'>;
+    wineArch?: 'win64' | 'arm64';
+    bottleArch?: 'win64' | 'arm64';
+    previewEnabled?: boolean;
     hasSteam: boolean;
     hasGogGalaxy: boolean;
     hasEpicLauncher: boolean;

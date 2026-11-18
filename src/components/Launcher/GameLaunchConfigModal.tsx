@@ -299,6 +299,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             isRescanningRunners: form.isRescanningRunners,
             onRescanLayers: form.handleRescanLayers,
             isInstallingRunner: form.isInstallingRunner,
+            isAnotherRunnerOperationActive: form.isAnotherRunnerOperationActive,
             onInstallRunnerViaBrew: form.handleInstallRunnerViaBrew,
             onDownloadRunner: form.handleDownloadRunner,
             runnerUpdateFeedback: form.runnerUpdateFeedback,
@@ -422,6 +423,17 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             onChangePostExitCommand: form.setPostExitCommand,
           })}
         </div>
+
+        {form.saveError && (
+          <div
+            data-testid="launch-config-save-error"
+            role="alert"
+            className="mx-5 mb-2 rounded-lg bg-red-950/70 border border-red-500/50 px-3 py-2 text-xs text-red-200 flex items-center gap-2 shrink-0"
+          >
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" aria-hidden="true" />
+            <span>{form.saveError}</span>
+          </div>
+        )}
 
         {/* Footer */}
         <div className="px-5 py-3.5 bg-[#0e151f] border-t border-[#223447] flex items-center justify-between gap-3 shrink-0">

@@ -204,6 +204,7 @@ function sanitizeBottleNameSlug(raw) {
   if (
     trimmed === '.' ||
     trimmed === '..' ||
+    trimmed.startsWith('-') ||
     trimmed.includes('..') ||
     trimmed.includes('/') ||
     trimmed.includes('\\') ||
@@ -222,8 +223,9 @@ function sanitizeBottleNameSlug(raw) {
  *   explicitBottleName?: string | null,
  *   gameConfigBottleName?: string | null,
  *   wizardPreferredBottleName?: string | null,
- *   discoveredBottleNames?: Array<string | { name?: string, hasSteam?: boolean }> | null,
+ *   discoveredBottleNames?: Array<string | { name?: string, hasSteam?: boolean, wineArch?: string, bottleArch?: string }> | null,
  *   runnerType?: string | null,
+ *   layerType?: string | null,
  * }} [params]
  * @returns {string}
  */
@@ -234,10 +236,18 @@ function resolveDefaultChainedBottleName(params = {}) {
     wizardPreferredBottleName,
     discoveredBottleNames,
     runnerType,
+    layerType,
   } = params || {};
+
+  const normRunner = String(runnerType || layerType || '').trim().toLowerCase();
+  const isArm64Runner = normRunner === 'crossover_preview_arm64';
+  const isIntelCrossOverRunner =
+    normRunner === 'crossover' || normRunner === 'crossover_preview';
 
   /** @type {string[]} */
   const validDiscovered = [];
+  /** @type {Set<string>} */
+  const excludedByArchLower = new Set();
   let steamBottleCandidate = '';
   if (Array.isArray(discoveredBottleNames)) {
     for (const entry of discoveredBottleNames) {
@@ -250,6 +260,19 @@ function resolveDefaultChainedBottleName(params = {}) {
           }
         }
       } else if (entry && typeof entry === 'object' && typeof entry.name === 'string') {
+        const entryArch = String(entry.wineArch || entry.bottleArch || '')
+          .trim()
+          .toLowerCase();
+        if (isArm64Runner && entryArch && entryArch !== 'arm64') {
+          const skipSlug = sanitizeBottleNameSlug(entry.name);
+          if (skipSlug) excludedByArchLower.add(skipSlug.toLowerCase());
+          continue;
+        }
+        if (isIntelCrossOverRunner && entryArch === 'arm64') {
+          const skipSlug = sanitizeBottleNameSlug(entry.name);
+          if (skipSlug) excludedByArchLower.add(skipSlug.toLowerCase());
+          continue;
+        }
         const clean = sanitizeBottleNameSlug(entry.name);
         if (clean) {
           validDiscovered.push(clean);
@@ -274,18 +297,27 @@ function resolveDefaultChainedBottleName(params = {}) {
   if (cleanGameCfg) return alignWithDiscovered(cleanGameCfg);
 
   const cleanWizardPref = sanitizeBottleNameSlug(wizardPreferredBottleName);
-  if (cleanWizardPref) return alignWithDiscovered(cleanWizardPref);
+  if (cleanWizardPref && !excludedByArchLower.has(cleanWizardPref.toLowerCase())) {
+    return alignWithDiscovered(cleanWizardPref);
+  }
 
   if (validDiscovered.length > 0) {
+    if (isArm64Runner) {
+      const armMatch = validDiscovered.find((d) => d.toLowerCase() === 'onelauncher-arm64');
+      if (armMatch) return armMatch;
+      return validDiscovered[0];
+    }
     const oneLauncherMatch = validDiscovered.find((d) => d.toLowerCase() === 'onelauncher');
     if (oneLauncherMatch) return oneLauncherMatch;
     if (steamBottleCandidate) return steamBottleCandidate;
     return validDiscovered[0];
   }
 
-  const normRunner = String(runnerType || '').trim().toLowerCase();
   if (normRunner === 'wine' || normRunner === 'gptk') {
     return 'default';
+  }
+  if (isArm64Runner) {
+    return 'OneLauncher-arm64';
   }
   return 'OneLauncher';
 }

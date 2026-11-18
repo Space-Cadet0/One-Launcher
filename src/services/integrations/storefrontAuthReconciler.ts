@@ -403,12 +403,11 @@ export function reconcileNativeStorefrontAuthSessions(
     }
   }
 
-  if (
-    Array.isArray(savedTokens?.suppressedItems) &&
-    savedTokens.suppressedItems.length > 0
-  ) {
+  if (Array.isArray(savedTokens?.suppressedItems)) {
     registerSuppressedCatalogEntries(savedTokens.suppressedItems);
-    integrationsChanged = true;
+    if (savedTokens.suppressedItems.length > 0) {
+      integrationsChanged = true;
+    }
   }
 
   if (integrationsChanged && options.persistIfChanged !== false) {

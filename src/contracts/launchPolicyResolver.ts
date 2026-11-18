@@ -25,6 +25,7 @@ export interface ResolveEffectiveLaunchPolicyInput {
   storefrontClientLifecycle?: 'default' | StorefrontClientLifecyclePolicy | string;
   globalStorefrontLifecycle?: StorefrontClientLifecyclePolicy | string;
   usesGalaxySdk?: boolean;
+  isClientlessXboxInstall?: boolean;
 }
 
 export interface ResolvedEffectiveLaunchPolicy {
@@ -288,12 +289,14 @@ export function resolveEffectiveLaunchPolicy(
   const usesClientlessEos =
     isInstalled && !delegatesToStorefrontUri && platformId === 'epic';
 
+  const isClientlessXboxInstall = Boolean(input.isClientlessXboxInstall);
+
   const syncsCloudSavesStandalone =
     isInstalled &&
     !delegatesToStorefrontUri &&
     (platformId === 'gog' ||
       platformId === 'epic' ||
-      (platformId === 'xbox' && isBottleExecution));
+      (platformId === 'xbox' && (isBottleExecution || isClientlessXboxInstall)));
 
   let spawnsStorefrontClient = false;
   if (isInstalled) {
@@ -306,7 +309,8 @@ export function resolveEffectiveLaunchPolicy(
     } else if (platformId === 'epic') {
       spawnsStorefrontClient = isBottleExecution && !isFastDirectBypass;
     } else if (platformId === 'xbox') {
-      spawnsStorefrontClient = !isBottleExecution && effectiveLifecycle === 'default_client';
+      spawnsStorefrontClient =
+        !isBottleExecution && !isClientlessXboxInstall && effectiveLifecycle === 'default_client';
     } else {
       spawnsStorefrontClient = false;
     }

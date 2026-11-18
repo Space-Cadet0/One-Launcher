@@ -336,13 +336,26 @@ describe('Wave 2C Deliverable 1 — Epic Base-Game Category Segment Classificati
   it('admits Epic base games carrying { path: "applications" } and { path: "games" } without substring false positives', () => {
     const { classifyNonGameStorefrontItem } = nonGameClassifier;
 
-    // Base game carrying both "games" and "applications" (standard Epic base-game metadata)
+    // Base game carrying both "games" and "applications" (standard Epic base-game metadata with itemType: APPLICATION)
     expect(
       classifyNonGameStorefrontItem({
         store: 'epic',
         title: 'Synthetic Citadel Odyssey',
         platformId: 'epic',
         platformGameId: 'SyntheticCitadelApp',
+        itemType: 'APPLICATION',
+        categories: [{ path: 'games' }, { path: 'games/edition/base' }, { path: 'applications' }],
+      })
+    ).toBeNull();
+
+    // Base game with real-world Epic DURABLE permanent entitlement license
+    expect(
+      classifyNonGameStorefrontItem({
+        store: 'epic',
+        title: 'Synthetic Durable Odyssey',
+        platformId: 'epic',
+        platformGameId: 'SyntheticDurableApp',
+        itemType: 'DURABLE',
         categories: [{ path: 'games' }, { path: 'games/edition/base' }, { path: 'applications' }],
       })
     ).toBeNull();
@@ -354,6 +367,7 @@ describe('Wave 2C Deliverable 1 — Epic Base-Game Category Segment Classificati
         title: 'Synthetic Moddable Strategy',
         platformId: 'epic',
         platformGameId: 'SyntheticModdableApp',
+        itemType: 'DURABLE',
         categories: [
           { path: 'games' },
           { path: 'games_mods_support' },
@@ -370,8 +384,20 @@ describe('Wave 2C Deliverable 1 — Epic Base-Game Category Segment Classificati
         title: 'Synthetic Expansion Pack',
         platformId: 'epic',
         platformGameId: 'SyntheticExpansionDlc',
+        itemType: 'DURABLE',
         mainGameItem: { id: 'base-catalog-id-001' },
         categories: [{ path: 'addons' }, { path: 'applications' }],
+      })
+    ).toMatch(/DLC/i);
+
+    expect(
+      classifyNonGameStorefrontItem({
+        store: 'xbox',
+        title: 'Synthetic Xbox Expansion',
+        platformId: 'xbox',
+        platformGameId: 'SyntheticXboxDlc',
+        productType: 'Durable',
+        categories: [],
       })
     ).toMatch(/DLC/i);
 
@@ -421,7 +447,18 @@ describe('Wave 2C Deliverable 1 — Epic Base-Game Category Segment Classificati
               sandboxType: 'PUBLIC',
               metadata: {
                 title: 'Synthetic Base Alpha',
-                itemType: 'EXECUTABLE',
+                itemType: 'APPLICATION',
+                categories: [{ path: 'games' }, { path: 'applications' }, { path: 'games/edition/base' }],
+              },
+            },
+            {
+              appName: 'SyntheticBaseDurable',
+              namespace: 'ns_alpha_001',
+              catalogItemId: 'cat_durable_002',
+              sandboxType: 'PUBLIC',
+              metadata: {
+                title: 'Synthetic Base Durable',
+                itemType: 'DURABLE',
                 categories: [{ path: 'games' }, { path: 'applications' }, { path: 'games/edition/base' }],
               },
             },
@@ -462,7 +499,7 @@ describe('Wave 2C Deliverable 1 — Epic Base-Game Category Segment Classificati
     });
 
     expect(outMeta.authoritativeComplete).toBe(true);
-    expect(games.map((g: any) => g.title)).toEqual(['Synthetic Base Alpha']);
+    expect(games.map((g: any) => g.title)).toEqual(['Synthetic Base Alpha', 'Synthetic Base Durable']);
     expect(outMeta.suppressedItems.map((s: any) => s.platformGameId)).toEqual(['SyntheticAddonBeta']);
   });
 });

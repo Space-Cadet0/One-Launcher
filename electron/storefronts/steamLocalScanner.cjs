@@ -262,6 +262,7 @@ async function resolveLocalSteamUserdataDirs(options = {}) {
     const bottleParents = [
       path.join(home, 'Library/Application Support/CrossOver/Bottles'),
       path.join(home, 'Library/Application Support/CrossOver Preview/Bottles'),
+      path.join(home, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
       path.join(home, 'Games/OneLauncher/Bottles'),
     ];
     for (const parent of bottleParents) {

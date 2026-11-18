@@ -12,6 +12,7 @@ import {
   GlobalBottleDisplayScalingMode,
   GlobalDisplayAspectRatioMode,
   LaunchMethod,
+  resolveDefaultBottleForLayer,
   ResolvedLaunchModePreview,
   VirtualDesktopResolutionPreset,
 } from '../../../contracts/launcher';
@@ -33,6 +34,10 @@ import {
   X,
 } from 'lucide-react';
 import { environmentSetupService } from '../../../services/launcher/environmentSetupService';
+import {
+  COMPATIBILITY_RUNNER_DESCRIPTORS,
+  launcherService,
+} from '../../../services/launcher/launcherService';
 import { formatBytes } from '../../../utils/formatBytes';
 import {
   COMPAT_LAYER_OPTIONS,
@@ -164,6 +169,7 @@ export interface CompatibilityLayerSectionProps {
   isRescanningRunners: boolean;
   onRescanLayers: () => void;
   isInstallingRunner: boolean;
+  isAnotherRunnerOperationActive?: boolean;
   onInstallRunnerViaBrew: () => void;
   onDownloadRunner: () => void;
   runnerUpdateFeedback: string | null;
@@ -239,6 +245,8 @@ function CompatibilityLayerSectionImpl(
     isUpdatingRunner,
     onUpdateRunner,
     onCheckRunnerUpdates,
+    onInstallRunnerFromArchive,
+    onSwitchToStableCrossOver,
     resolvedBottleFolderPath,
     onOpenBottleFolder,
     isRescanningRunners,
@@ -278,10 +286,85 @@ function CompatibilityLayerSectionImpl(
     return null;
   }
 
-  const effectiveDlssUnavailableReason =
-    props.dlssUnavailableReason ||
-    resolveDlssEligibility({ crossoverGraphicsBackend, activeLayer, preview }).reason ||
-    'Not available with DXVK or WineD3D';
+  const hostArch = launcherService.getHostArch();
+  const visibleCompatLayerOptions = COMPAT_LAYER_OPTIONS.filter(
+    (opt) => opt.value !== 'crossover_preview_arm64' || hostArch === 'arm64'
+  );
+  const effectiveCompatSelectValue = visibleCompatLayerOptions.some(
+    (opt) => opt.value === compatibilityLayer
+  )
+    ? compatibilityLayer
+    : visibleCompatLayerOptions[0]?.value || 'crossover';
+  const wasLayerDowngradedForHost = effectiveCompatSelectValue !== compatibilityLayer;
+
+  const effectiveActiveLayer = wasLayerDowngradedForHost
+    ? detectedLayers.find((l) => l.type === effectiveCompatSelectValue)
+    : activeLayer;
+  const effectiveAvailableBottles = wasLayerDowngradedForHost
+    ? effectiveActiveLayer?.availableBottles || []
+    : availableBottles;
+  const effectiveRunnerDescriptor = wasLayerDowngradedForHost
+    ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === effectiveCompatSelectValue) ||
+      selectedRunnerDescriptor
+    : selectedRunnerDescriptor;
+  const effectiveUpdateInfo = wasLayerDowngradedForHost
+    ? runnerUpdates[effectiveCompatSelectValue]
+    : activeUpdateInfo;
+  const effectiveInstalledVer = wasLayerDowngradedForHost
+    ? effectiveActiveLayer?.version || effectiveUpdateInfo?.installedVersion
+    : activeInstalledVer;
+  const effectiveSecondaryBuildText = wasLayerDowngradedForHost
+    ? formatRunnerSecondaryBuildText({
+        installedVersion: effectiveInstalledVer,
+        displayVersion:
+          effectiveActiveLayer?.displayVersion || effectiveUpdateInfo?.installedDisplayVersion,
+        buildVersion:
+          effectiveActiveLayer?.buildVersion || effectiveUpdateInfo?.installedBuildVersion,
+      })
+    : activeSecondaryBuildText;
+  const effectiveRunnerProgress = wasLayerDowngradedForHost ? undefined : activeRunnerProgress;
+
+  const effectiveDlssEligibility = wasLayerDowngradedForHost
+    ? resolveDlssEligibility({
+        crossoverGraphicsBackend,
+        activeLayer: effectiveActiveLayer,
+        preview,
+      })
+    : null;
+  const effectiveIsDlssSupportedBackend = wasLayerDowngradedForHost
+    ? effectiveDlssEligibility!.supported
+    : isDlssSupportedBackend;
+  const effectiveDlssUnavailableReason = wasLayerDowngradedForHost
+    ? effectiveDlssEligibility!.reason || 'Not available with DXVK or WineD3D'
+    : props.dlssUnavailableReason ||
+      resolveDlssEligibility({ crossoverGraphicsBackend, activeLayer: effectiveActiveLayer, preview })
+        .reason ||
+      'Not available with DXVK or WineD3D';
+  const effectiveShowD3DMetalVersionSelector = wasLayerDowngradedForHost
+    ? Boolean(
+        effectiveActiveLayer?.availableD3DMetalVersions
+          ? effectiveActiveLayer.availableD3DMetalVersions.length > 1
+          : effectiveCompatSelectValue === 'crossover_preview' ||
+            effectiveCompatSelectValue === 'crossover_preview_arm64'
+      ) &&
+      (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'd3dmetal')
+    : showD3DMetalVersionSelector;
+  const effectivePrimaryD3DVer = wasLayerDowngradedForHost
+    ? effectiveActiveLayer?.availableD3DMetalVersions?.find((v) => v.isDefault || v.id === '4')
+        ?.version ||
+      effectiveActiveLayer?.d3dmetalVersion ||
+      '4.0b3'
+    : primaryD3DVer;
+  const effectiveFallbackD3DVer = wasLayerDowngradedForHost
+    ? effectiveActiveLayer?.availableD3DMetalVersions?.find((v) => v.id === '3')?.version || '3.0'
+    : fallbackD3DVer;
+  const effectiveIsDxvkHudSupported = wasLayerDowngradedForHost
+    ? effectiveCompatSelectValue === 'wine' ||
+      ((effectiveCompatSelectValue === 'crossover' ||
+        effectiveCompatSelectValue === 'crossover_preview' ||
+        effectiveCompatSelectValue === 'crossover_preview_arm64') &&
+        (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'dxvk'))
+    : isDxvkHudSupported;
 
   const effectiveMetalfxSpatialUpscaleFactor = props.metalfxSpatialUpscaleFactor;
   const handleMetalfxSpatialUpscaleChange = props.onChangeMetalfxSpatialUpscaleFactor ?? NOOP;
@@ -392,44 +475,94 @@ function CompatibilityLayerSectionImpl(
       normalizedExecArch === 'arm64');
   const isLaaNotNeededAndOff = isConfirmed64BitBinary && !effectiveForceLargeAddressAware;
 
-  const isCrossOverFamily =
-    compatibilityLayer === 'crossover' || compatibilityLayer === 'crossover_preview';
-  const showBottleControl = isCrossOverFamily || availableBottles.length > 0;
-  const winePrefixPlaceholder =
-    compatibilityLayer === 'crossover_preview'
+  const isPreviewBranch =
+    effectiveCompatSelectValue === 'crossover_preview' ||
+    effectiveCompatSelectValue === 'crossover_preview_arm64';
+  const isCrossOverFamily = effectiveCompatSelectValue === 'crossover' || isPreviewBranch;
+  const showBottleControl = isCrossOverFamily || effectiveAvailableBottles.length > 0;
+  const winePrefixPlaceholder = effectiveActiveLayer?.bottlesDir
+    ? `${formatUserFacingPath(effectiveActiveLayer.bottlesDir).replace(/\/+$/, '')}/...`
+    : isPreviewBranch
       ? '~/Library/Application Support/CrossOver Preview/Bottles/...'
-      : compatibilityLayer === 'crossover'
+      : isCrossOverFamily
         ? '~/Library/Application Support/CrossOver/Bottles/...'
         : '~/Games/OneLauncher/Prefixes/default';
+  const bottlePlaceholder =
+    effectiveCompatSelectValue === 'crossover_preview_arm64'
+      ? 'e.g. OneLauncher-arm64, Default'
+      : 'e.g. OneLauncher, Steam, Default';
 
   const sanitizedSecondaryBuild = formatRunnerSecondaryBuildText({
-    installedVersion: activeInstalledVer,
-    displayVersion: activeSecondaryBuildText,
+    installedVersion: effectiveInstalledVer,
+    displayVersion: effectiveSecondaryBuildText,
   });
 
   const canAutoInstallRunner =
-    selectedRunnerDescriptor.canAutoInstallDirect ??
-    selectedRunnerDescriptor.canAutoInstallViaBrew ??
+    effectiveRunnerDescriptor.canAutoInstallDirect ??
+    effectiveRunnerDescriptor.canAutoInstallViaBrew ??
     false;
 
-  const visibleCompatLayerOptions = COMPAT_LAYER_OPTIONS;
+  const trimmedWineBottleName = wineBottleName.trim();
+  const anyLayerBottleArch =
+    effectiveActiveLayer?.bottleDetails?.[trimmedWineBottleName]?.wineArch ||
+    activeLayer?.bottleDetails?.[trimmedWineBottleName]?.wineArch ||
+    detectedLayers.find((l) => l.bottleDetails?.[trimmedWineBottleName]?.wineArch)?.bottleDetails?.[
+      trimmedWineBottleName
+    ]?.wineArch;
+  const isBottleOrphanForDowngradedHost = Boolean(
+    wasLayerDowngradedForHost &&
+      trimmedWineBottleName &&
+      ((effectiveAvailableBottles.length > 0 &&
+        !effectiveAvailableBottles.includes(trimmedWineBottleName)) ||
+        anyLayerBottleArch === 'arm64' ||
+        /-arm64$/i.test(trimmedWineBottleName))
+  );
+  const effectiveBottleControlValue = isBottleOrphanForDowngradedHost ? '' : wineBottleName;
+
+  const defaultResolvedBottle = resolveDefaultBottleForLayer(
+    effectiveActiveLayer || {
+      type: effectiveCompatSelectValue,
+      availableBottles: effectiveAvailableBottles,
+    },
+    effectiveCompatSelectValue,
+    effectiveRunnerDescriptor.defaultBottleName
+  );
+  const effectiveSelectedBottleName =
+    effectiveBottleControlValue.trim() || defaultResolvedBottle || '';
+  const selectedBottleArch = effectiveSelectedBottleName
+    ? effectiveActiveLayer?.bottleDetails?.[effectiveSelectedBottleName]?.wineArch ||
+      activeLayer?.bottleDetails?.[effectiveSelectedBottleName]?.wineArch ||
+      detectedLayers.find((l) => l.bottleDetails?.[effectiveSelectedBottleName]?.wineArch)
+        ?.bottleDetails?.[effectiveSelectedBottleName]?.wineArch
+    : undefined;
+  const hasBottleArchMismatch = Boolean(
+    effectiveSelectedBottleName &&
+      ((effectiveCompatSelectValue === 'crossover_preview_arm64' &&
+        (selectedBottleArch === 'win64' ||
+          (!selectedBottleArch && /^OneLauncher$/i.test(effectiveSelectedBottleName)))) ||
+        ((effectiveCompatSelectValue === 'crossover' ||
+          effectiveCompatSelectValue === 'crossover_preview') &&
+          (selectedBottleArch === 'arm64' || /-arm64$/i.test(effectiveSelectedBottleName))))
+  );
 
   const isOperationActive = Boolean(
-    activeRunnerProgress || isInstallingRunner || isUpdatingRunner
+    effectiveRunnerProgress || isInstallingRunner || isUpdatingRunner
   );
+  const isRunnerActionDisabled =
+    isOperationActive || Boolean(props.isAnotherRunnerOperationActive);
   const effectiveOperation: 'install' | 'update' =
-    activeRunnerProgress?.operation || (isUpdatingRunner ? 'update' : 'install');
+    effectiveRunnerProgress?.operation || (isUpdatingRunner ? 'update' : 'install');
   const isDeterminateDownload =
-    activeRunnerProgress?.phase === 'downloading' &&
-    typeof activeRunnerProgress.progressPercent === 'number' &&
-    Number.isFinite(activeRunnerProgress.progressPercent);
+    effectiveRunnerProgress?.phase === 'downloading' &&
+    typeof effectiveRunnerProgress.progressPercent === 'number' &&
+    Number.isFinite(effectiveRunnerProgress.progressPercent);
   const determinatePercent = isDeterminateDownload
-    ? Math.max(0, Math.min(100, Math.round(activeRunnerProgress!.progressPercent!)))
+    ? Math.max(0, Math.min(100, Math.round(effectiveRunnerProgress!.progressPercent!)))
     : undefined;
 
   const hasByteTelemetry =
-    typeof activeRunnerProgress?.bytesDownloaded === 'number' &&
-    activeRunnerProgress.bytesDownloaded >= 0;
+    typeof effectiveRunnerProgress?.bytesDownloaded === 'number' &&
+    effectiveRunnerProgress.bytesDownloaded >= 0;
 
   return (
     <section
@@ -457,7 +590,8 @@ function CompatibilityLayerSectionImpl(
               : 'Auto-Detect Runner'}
           </span>
           <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-semibold">
-            {detectedLayers.filter((l) => l.type !== 'native').length} Detected on System
+            {detectedLayers.filter((l) => l.type !== 'native' && l.available !== false).length}{' '}
+            Detected on System
           </span>
         </div>
       </div>
@@ -475,7 +609,7 @@ function CompatibilityLayerSectionImpl(
             id="compat-runner-select"
             data-testid="compat-runner-select"
             aria-label="Compatibility Runner"
-            value={compatibilityLayer}
+            value={effectiveCompatSelectValue}
             onChange={(e) =>
               onSelectCompatibilityLayer(e.target.value as CompatibilityLayerType)
             }
@@ -501,34 +635,59 @@ function CompatibilityLayerSectionImpl(
             >
               {isCrossOverFamily ? 'Target CrossOver Bottle' : 'Target Bottle Name'}
             </label>
-            {availableBottles.length > 0 ? (
+            {effectiveAvailableBottles.length > 0 ? (
               <LaunchSelect
                 id="compat-target-bottle-control"
                 aria-label="Target Bottle Name"
-                value={wineBottleName}
+                value={effectiveBottleControlValue}
                 onChange={(e) => onChangeWineBottleName(e.target.value)}
               >
-                <option value="">Default Bottle ({availableBottles[0]})</option>
-                {availableBottles.map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                  </option>
-                ))}
+                <option value="">Default Bottle ({defaultResolvedBottle || effectiveAvailableBottles[0]})</option>
+                {effectiveAvailableBottles.map((b) => {
+                  const bottleArch = effectiveActiveLayer?.bottleDetails?.[b]?.wineArch;
+                  const archSuffix =
+                    bottleArch === 'arm64'
+                      ? ' (arm64 / FEX)'
+                      : bottleArch === 'win64'
+                        ? ' (Intel / win64)'
+                        : '';
+                  return (
+                    <option key={b} value={b}>
+                      {b}
+                      {archSuffix}
+                    </option>
+                  );
+                })}
               </LaunchSelect>
             ) : (
               <input
                 id="compat-target-bottle-control"
                 type="text"
                 aria-label="Target Bottle Name"
-                value={wineBottleName}
+                value={effectiveBottleControlValue}
                 onChange={(e) => onChangeWineBottleName(e.target.value)}
-                placeholder="e.g. OneLauncher, Steam, Default"
+                placeholder={bottlePlaceholder}
                 autoComplete="off"
                 spellCheck={false}
                 autoCorrect="off"
                 autoCapitalize="off"
                 className={`${LAUNCH_TEXT_INPUT_CLASSES} font-mono`}
               />
+            )}
+            {hasBottleArchMismatch && (
+              <div
+                data-testid="compat-bottle-arch-mismatch-warning"
+                role="alert"
+                className="flex items-start gap-1.5 rounded bg-amber-950/45 border border-amber-500/45 px-2 py-1 text-[10px] text-amber-200"
+              >
+                <AlertTriangle className="w-3 h-3 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  Bottle &ldquo;{effectiveSelectedBottleName}&rdquo; does not match{' '}
+                  {effectiveCompatSelectValue === 'crossover_preview_arm64'
+                    ? 'arm64 / FEX (use "OneLauncher-arm64").'
+                    : 'Intel / win64 (use "OneLauncher").'}
+                </span>
+              </div>
             )}
           </div>
         )}
@@ -547,26 +706,26 @@ function CompatibilityLayerSectionImpl(
             data-testid="runner-installed-version"
             className="flex flex-wrap items-center gap-2 text-xs"
           >
-            <span className="font-bold text-white">{selectedRunnerDescriptor.shortLabel}</span>
-            {selectedRunnerDescriptor.vendor && (
+            <span className="font-bold text-white">{effectiveRunnerDescriptor.shortLabel}</span>
+            {effectiveRunnerDescriptor.vendor && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-steam-subtext">
-                {selectedRunnerDescriptor.vendor}
+                {effectiveRunnerDescriptor.vendor}
               </span>
             )}
-            {activeLayer ? (
+            {effectiveActiveLayer ? (
               <>
                 <span className="font-mono text-[11px] font-semibold text-emerald-300">
-                  v{activeInstalledVer || 'Detected'}
+                  v{effectiveInstalledVer || 'Detected'}
                   {sanitizedSecondaryBuild ? ` · ${sanitizedSecondaryBuild}` : ''}
                 </span>
-                {activeLayer.d3dmetalVersion && (
+                {effectiveActiveLayer.d3dmetalVersion && (
                   <span
                     data-testid="runner-d3dmetal-version"
                     className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300"
                   >
-                    {(activeLayer.availableD3DMetalVersions?.length || 0) > 1
-                      ? `D3DMetal ${activeLayer.availableD3DMetalVersions![0].version} / ${activeLayer.availableD3DMetalVersions![1].version}`
-                      : `D3DMetal ${activeLayer.d3dmetalVersion}`}
+                    {(effectiveActiveLayer.availableD3DMetalVersions?.length || 0) > 1
+                      ? `D3DMetal ${effectiveActiveLayer.availableD3DMetalVersions![0].version} / ${effectiveActiveLayer.availableD3DMetalVersions![1].version}`
+                      : `D3DMetal ${effectiveActiveLayer.d3dmetalVersion}`}
                   </span>
                 )}
               </>
@@ -575,9 +734,9 @@ function CompatibilityLayerSectionImpl(
                 <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">
                   Not Installed
                 </span>
-                {activeUpdateInfo?.latestVersion && (
+                {effectiveUpdateInfo?.latestVersion && (
                   <span className="text-[11px] font-semibold text-steam-subtext">
-                    Latest: v{activeUpdateInfo.latestVersion}
+                    Latest: v{effectiveUpdateInfo.latestVersion}
                   </span>
                 )}
               </>
@@ -590,20 +749,51 @@ function CompatibilityLayerSectionImpl(
                 <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
                 <span>Checking for updates...</span>
               </span>
-            ) : activeLayer && activeUpdateInfo?.updateAvailable ? (
+            ) : isPreviewBranch &&
+              effectiveUpdateInfo?.authRequired &&
+              !effectiveUpdateInfo?.updateAvailable ? (
+              <>
+                <span
+                  data-testid="runner-auth-required-badge"
+                  className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300"
+                >
+                  Sign-In Required
+                </span>
+                <button
+                  type="button"
+                  data-testid="sign-in-runner-btn"
+                  aria-label={`Sign in to CodeWeavers for ${effectiveRunnerDescriptor.shortLabel}`}
+                  onClick={onUpdateRunner}
+                  disabled={isRunnerActionDisabled}
+                  className={`min-h-6 min-w-6 inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[10px] font-bold text-sky-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                >
+                  {isUpdatingRunner ? (
+                    <>
+                      <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+                      <span>Signing in...</span>
+                    </>
+                  ) : (
+                    <>
+                      <RefreshCw className="w-3 h-3" aria-hidden="true" />
+                      <span>Sign In &amp; Check</span>
+                    </>
+                  )}
+                </button>
+              </>
+            ) : effectiveActiveLayer && effectiveUpdateInfo?.updateAvailable ? (
               <>
                 <span
                   data-testid="runner-update-available-badge"
                   className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300"
                 >
-                  Update Available: v{activeUpdateInfo.latestVersion}
+                  Update Available: v{effectiveUpdateInfo.latestVersion}
                 </span>
                 <button
                   type="button"
                   data-testid="update-runner-btn"
-                  aria-label={`Update ${selectedRunnerDescriptor.shortLabel} to v${activeUpdateInfo.latestVersion}`}
+                  aria-label={`Update ${effectiveRunnerDescriptor.shortLabel} to v${effectiveUpdateInfo.latestVersion}`}
                   onClick={onUpdateRunner}
-                  disabled={isOperationActive}
+                  disabled={isRunnerActionDisabled}
                   className={`min-h-6 min-w-6 inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-[10px] font-bold text-emerald-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
                 >
                   {isUpdatingRunner ? (
@@ -619,7 +809,7 @@ function CompatibilityLayerSectionImpl(
                   )}
                 </button>
               </>
-            ) : activeLayer ? (
+            ) : effectiveActiveLayer ? (
               <>
                 <span
                   data-testid="runner-up-to-date-badge"
@@ -631,12 +821,31 @@ function CompatibilityLayerSectionImpl(
                   type="button"
                   data-testid="check-runner-updates-btn"
                   onClick={onCheckRunnerUpdates}
-                  disabled={isCheckingUpdates || isOperationActive}
+                  disabled={isCheckingUpdates || isRunnerActionDisabled}
                   className={`min-h-6 min-w-6 inline-flex items-center gap-1 px-2 py-1 rounded bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[10px] font-semibold text-steam-subtext hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
                 >
                   <RefreshCw className="w-2.5 h-2.5" aria-hidden="true" />
                   <span>Check for Updates</span>
                 </button>
+                {effectiveCompatSelectValue === 'crossover_preview' &&
+                  effectiveUpdateInfo?.stableSurpassesPreview &&
+                  !effectiveUpdateInfo?.canAutoUpdate &&
+                  onSwitchToStableCrossOver && (
+                    <button
+                      type="button"
+                      data-testid="switch-to-stable-crossover-btn"
+                      onClick={onSwitchToStableCrossOver}
+                      disabled={isRunnerActionDisabled}
+                      className={`min-h-6 min-w-6 inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-[10px] font-bold text-sky-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                    >
+                      <Download className="w-3 h-3" aria-hidden="true" />
+                      <span>
+                        {effectiveUpdateInfo.stableFallbackVersion
+                          ? `Switch to CrossOver v${effectiveUpdateInfo.stableFallbackVersion}`
+                          : 'Switch to Stable CrossOver'}
+                      </span>
+                    </button>
+                  )}
               </>
             ) : null}
           </div>
@@ -657,15 +866,15 @@ function CompatibilityLayerSectionImpl(
               <div className="flex items-center gap-1.5 min-w-0">
                 <Loader2 className="w-3.5 h-3.5 text-sky-400 animate-spin shrink-0" aria-hidden="true" />
                 <span className="font-semibold text-white">
-                  {activeRunnerProgress
-                    ? formatRunnerPhaseLabel(activeRunnerProgress.phase, effectiveOperation)
+                  {effectiveRunnerProgress
+                    ? formatRunnerPhaseLabel(effectiveRunnerProgress.phase, effectiveOperation)
                     : effectiveOperation === 'update'
                       ? 'Updating runner...'
                       : 'Installing runner...'}
                 </span>
-                {activeRunnerProgress?.message && (
+                {effectiveRunnerProgress?.message && (
                   <span className="text-steam-subtext truncate">
-                    — {activeRunnerProgress.message}
+                    — {effectiveRunnerProgress.message}
                   </span>
                 )}
               </div>
@@ -673,10 +882,10 @@ function CompatibilityLayerSectionImpl(
               <div className="flex items-center gap-2 shrink-0">
                 {hasByteTelemetry && (
                   <span className="font-mono text-[10px] text-sky-300">
-                    {formatBytes(activeRunnerProgress!.bytesDownloaded!)}
-                    {typeof activeRunnerProgress?.totalBytes === 'number' &&
-                    activeRunnerProgress.totalBytes > 0
-                      ? ` / ${formatBytes(activeRunnerProgress.totalBytes)}`
+                    {formatBytes(effectiveRunnerProgress!.bytesDownloaded!)}
+                    {typeof effectiveRunnerProgress?.totalBytes === 'number' &&
+                    effectiveRunnerProgress.totalBytes > 0
+                      ? ` / ${formatBytes(effectiveRunnerProgress.totalBytes)}`
                       : ''}
                     {determinatePercent !== undefined ? ` (${determinatePercent}%)` : ''}
                   </span>
@@ -703,7 +912,7 @@ function CompatibilityLayerSectionImpl(
               className="ol-setup-progress w-full h-2 block"
               max={100}
               value={determinatePercent}
-              aria-label={`${selectedRunnerDescriptor.shortLabel} ${
+              aria-label={`${effectiveRunnerDescriptor.shortLabel} ${
                 effectiveOperation === 'update' ? 'update' : 'installation'
               } progress`}
             />
@@ -711,18 +920,18 @@ function CompatibilityLayerSectionImpl(
         )}
 
         <p className="text-[11px] text-steam-text leading-relaxed">
-          {selectedRunnerDescriptor.description}
+          {effectiveRunnerDescriptor.description}
         </p>
         <p className="text-[10px] text-steam-subtext leading-relaxed">
           <span className="font-semibold text-sky-300">Best for: </span>
-          {selectedRunnerDescriptor.bestFor}
+          {effectiveRunnerDescriptor.bestFor}
         </p>
 
-        {activeLayer ? (
+        {effectiveActiveLayer ? (
           <div className="pt-0.5 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded bg-[#0e151f] border border-[#223447] px-2.5 py-1.5">
               <span className="text-[10px] font-mono text-sky-300/90 truncate">
-                {formatUserFacingPath(activeLayer.binaryPath)}
+                {formatUserFacingPath(effectiveActiveLayer.binaryPath)}
               </span>
               <div className="flex items-center gap-1.5 shrink-0">
                 {resolvedBottleFolderPath && (
@@ -766,23 +975,29 @@ function CompatibilityLayerSectionImpl(
                 <div className="font-bold text-amber-300">Runner Not Installed on This Mac</div>
                 <div className="text-[11px] text-amber-100/90 mt-0.5">
                   {canAutoInstallRunner ? (
-                    compatibilityLayer === 'crossover_preview' ? (
+                    isPreviewBranch && effectiveUpdateInfo?.authRequired ? (
                       <>
-                        CrossOver Preview is not currently installed in{' '}
+                        CodeWeavers sign-in is required before{' '}
+                        {effectiveRunnerDescriptor.shortLabel} can be checked or downloaded. Click{' '}
+                        <strong>Sign In &amp; Check</strong> above to authenticate in-app.
+                      </>
+                    ) : isPreviewBranch ? (
+                      <>
+                        {effectiveRunnerDescriptor.shortLabel} is not currently installed in{' '}
                         <code className="font-mono">/Applications</code>. Click below to sign in to
                         CodeWeavers Preview in-app — One Launcher will automatically capture,
                         verify, and install the build.
                       </>
                     ) : (
                       <>
-                        {selectedRunnerDescriptor.shortLabel} is not currently installed in{' '}
+                        {effectiveRunnerDescriptor.shortLabel} is not currently installed in{' '}
                         <code className="font-mono">/Applications</code>. Click Install below to
                         download, verify, and install it automatically.
                       </>
                     )
                   ) : (
                     <>
-                      {selectedRunnerDescriptor.shortLabel} is not currently installed in{' '}
+                      {effectiveRunnerDescriptor.shortLabel} is not currently installed in{' '}
                       <code className="font-mono">/Applications</code>. Select CrossOver above for
                       1-click automatic installation, or download Preview from CodeWeavers.
                     </>
@@ -792,11 +1007,11 @@ function CompatibilityLayerSectionImpl(
             </div>
 
             <div className="flex flex-wrap items-center gap-2 pt-0.5">
-              {canAutoInstallRunner ? (
+              {canAutoInstallRunner && !(isPreviewBranch && effectiveUpdateInfo?.authRequired) ? (
                 <button
                   type="button"
                   data-testid="install-runner-brew-btn"
-                  disabled={isOperationActive}
+                  disabled={isRunnerActionDisabled}
                   onClick={onInstallRunnerViaBrew}
                   className={`min-h-6 min-w-6 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-[11px] font-bold text-emerald-200 hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
                 >
@@ -809,37 +1024,51 @@ function CompatibilityLayerSectionImpl(
                     <>
                       <Download className="w-3.5 h-3.5" aria-hidden="true" />
                       <span>
-                        {compatibilityLayer === 'crossover_preview'
-                          ? `Sign In & Install CrossOver Preview (${
-                              selectedRunnerDescriptor.estimatedDownloadMB
-                                ? `~${selectedRunnerDescriptor.estimatedDownloadMB} MB`
+                        {isPreviewBranch && !effectiveUpdateInfo?.downloadUrl
+                          ? `Sign In & Install ${effectiveRunnerDescriptor.shortLabel} (${
+                              effectiveRunnerDescriptor.estimatedDownloadMB
+                                ? `~${effectiveRunnerDescriptor.estimatedDownloadMB} MB`
                                 : '~480 MB'
                             })`
-                          : `Install ${selectedRunnerDescriptor.shortLabel}${
-                              selectedRunnerDescriptor.estimatedDownloadMB
-                                ? ` (~${selectedRunnerDescriptor.estimatedDownloadMB} MB)`
+                          : `Install ${effectiveRunnerDescriptor.shortLabel}${
+                              effectiveRunnerDescriptor.estimatedDownloadMB
+                                ? ` (~${effectiveRunnerDescriptor.estimatedDownloadMB} MB)`
                                 : ''
                             }`}
                       </span>
                     </>
                   )}
                 </button>
-              ) : (
-                <button
-                  type="button"
-                  data-testid="download-runner-btn"
-                  onClick={onDownloadRunner}
-                  className={`min-h-6 min-w-6 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[11px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-                >
-                  <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>
-                    {compatibilityLayer === 'crossover_preview'
-                      ? 'Open Preview Portal'
-                      : selectedRunnerDescriptor.downloadLabel}{' '}
-                    ↗
-                  </span>
-                </button>
-              )}
+              ) : !canAutoInstallRunner ? (
+                <>
+                  <button
+                    type="button"
+                    data-testid="download-runner-btn"
+                    onClick={onDownloadRunner}
+                    className={`min-h-6 min-w-6 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[11px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>
+                      {isPreviewBranch
+                        ? 'Open Preview Portal'
+                        : effectiveRunnerDescriptor.downloadLabel}{' '}
+                      ↗
+                    </span>
+                  </button>
+                  {onInstallRunnerFromArchive && (
+                    <button
+                      type="button"
+                      data-testid="install-runner-archive-btn"
+                      onClick={onInstallRunnerFromArchive}
+                      disabled={isRunnerActionDisabled}
+                      className={`min-h-6 min-w-6 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-[11px] font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer disabled:opacity-50 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                    >
+                      <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>Install from Archive...</span>
+                    </button>
+                  )}
+                </>
+              ) : null}
 
               <button
                 type="button"
@@ -873,24 +1102,38 @@ function CompatibilityLayerSectionImpl(
           </div>
         )}
 
-        {runnerUpdateFeedback && (
-          <div
-            data-testid="runner-update-feedback"
-            className="text-[11px] px-2.5 py-1.5 rounded border bg-sky-500/15 text-sky-200 border-sky-500/30"
-          >
-            {runnerUpdateFeedback}
-          </div>
-        )}
+        {runnerUpdateFeedback && (() => {
+          const isUpdateError =
+            /\b(could not|failed|error|unavailable|busy|quit|unsupported|invalid)\b/i.test(
+              runnerUpdateFeedback
+            );
+          return (
+            <div
+              data-testid="runner-update-feedback"
+              role={isUpdateError ? 'alert' : 'status'}
+              aria-live={isUpdateError ? 'assertive' : 'polite'}
+              className="text-[11px] px-2.5 py-1.5 rounded border bg-sky-500/15 text-sky-200 border-sky-500/30"
+            >
+              {runnerUpdateFeedback}
+            </div>
+          );
+        })()}
 
-        {runnerActionFeedback && (
-          <div
-            className={`text-[11px] px-2.5 py-1.5 rounded border ${getBadgeToneClasses(
-              runnerActionFeedback.tone
-            )}`}
-          >
-            {runnerActionFeedback.text}
-          </div>
-        )}
+        {runnerActionFeedback && (() => {
+          const isActionError = runnerActionFeedback.tone === 'amber';
+          return (
+            <div
+              data-testid="runner-action-feedback"
+              role={isActionError ? 'alert' : 'status'}
+              aria-live={isActionError ? 'assertive' : 'polite'}
+              className={`text-[11px] px-2.5 py-1.5 rounded border ${getBadgeToneClasses(
+                runnerActionFeedback.tone
+              )}`}
+            >
+              {runnerActionFeedback.text}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Custom Wine Prefix Path */}
@@ -980,11 +1223,11 @@ function CompatibilityLayerSectionImpl(
             >
               {CROSSOVER_BACKEND_OPTIONS.map((opt) => {
                 const dynamicLabel =
-                  opt.value === 'd3dmetal' && activeLayer?.d3dmetalVersion
+                  opt.value === 'd3dmetal' && effectiveActiveLayer?.d3dmetalVersion
                     ? `D3DMetal (v${
-                        crossoverD3DMetalVersion === '3' && showD3DMetalVersionSelector
-                          ? fallbackD3DVer
-                          : activeLayer.d3dmetalVersion
+                        crossoverD3DMetalVersion === '3' && effectiveShowD3DMetalVersionSelector
+                          ? effectiveFallbackD3DVer
+                          : effectiveActiveLayer.d3dmetalVersion
                       } — Apple GPTK 64-bit DirectX 11 & 12)`
                     : opt.label;
                 return (
@@ -1005,7 +1248,7 @@ function CompatibilityLayerSectionImpl(
         )}
 
         {/* Per-Game D3DMetal Version Switcher (CrossOver Preview / Dual-D3DMetal Runners) */}
-        {preview.visibleSections.crossoverRendering && showD3DMetalVersionSelector && (
+        {preview.visibleSections.crossoverRendering && effectiveShowD3DMetalVersionSelector && (
           <div
             data-testid="crossover-d3dmetal-version-section"
             className="rounded-lg bg-[#0e151f] border border-[#223447] p-2.5 space-y-2"
@@ -1015,7 +1258,7 @@ function CompatibilityLayerSectionImpl(
                 D3DMetal Engine Version (Per-Game Override)
               </span>
               <span className="text-[10px] text-steam-subtext">
-                Dual D3DMetal Bundled: v{primaryD3DVer} &amp; v{fallbackD3DVer}
+                Dual D3DMetal Bundled: v{effectivePrimaryD3DVer} &amp; v{effectiveFallbackD3DVer}
               </span>
             </div>
 
@@ -1024,20 +1267,20 @@ function CompatibilityLayerSectionImpl(
                 {
                   value: 'auto' as CrossOverD3DMetalVersion,
                   testId: 'd3dmetal-version-auto',
-                  title: `Auto / Default (D3DMetal ${primaryD3DVer})`,
-                  desc: `Uses D3DMetal ${primaryD3DVer} by default while respecting CrossOver compatdb per-game profiles`,
+                  title: `Auto / Default (D3DMetal ${effectivePrimaryD3DVer})`,
+                  desc: `Uses D3DMetal ${effectivePrimaryD3DVer} by default while respecting CrossOver compatdb per-game profiles`,
                 },
                 {
                   value: '4' as CrossOverD3DMetalVersion,
                   testId: 'd3dmetal-version-4',
-                  title: `Force D3DMetal ${primaryD3DVer}`,
-                  desc: `Forces lib/apple_gptk (D3DMetal ${primaryD3DVer}), overriding any compatdb fallback`,
+                  title: `Force D3DMetal ${effectivePrimaryD3DVer}`,
+                  desc: `Forces lib/apple_gptk (D3DMetal ${effectivePrimaryD3DVer}), overriding any compatdb fallback`,
                 },
                 {
                   value: '3' as CrossOverD3DMetalVersion,
                   testId: 'd3dmetal-version-3',
-                  title: `Force D3DMetal ${fallbackD3DVer} (Fallback)`,
-                  desc: `Switches to lib/apple_gptk3 (D3DMetal ${fallbackD3DVer}) for games with regressions on ${primaryD3DVer}`,
+                  title: `Force D3DMetal ${effectiveFallbackD3DVer} (Fallback)`,
+                  desc: `Switches to lib/apple_gptk3 (D3DMetal ${effectiveFallbackD3DVer}) for games with regressions on ${effectivePrimaryD3DVer}`,
                 },
               ].map((item) => {
                 const isSelected = crossoverD3DMetalVersion === item.value;
@@ -1085,7 +1328,7 @@ function CompatibilityLayerSectionImpl(
                 <span id={dlssLabelId} className="text-xs font-semibold text-white">
                   DLSS (MetalFX Upscaling)
                 </span>
-                {!isDlssSupportedBackend && (
+                {!effectiveIsDlssSupportedBackend && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/15 text-steam-subtext font-medium">
                     Unavailable
                   </span>
@@ -1096,15 +1339,15 @@ function CompatibilityLayerSectionImpl(
                 data-testid="crossover-dlss-hint"
                 className="text-[10px] text-steam-subtext leading-snug"
               >
-                {isDlssSupportedBackend
+                {effectiveIsDlssSupportedBackend
                   ? 'Exposes NVIDIA DLSS to the game (powered by Apple MetalFX) for D3DMetal & DXMT — select Quality / Balanced / Performance inside the game’s graphics settings.'
                   : effectiveDlssUnavailableReason}
               </p>
             </div>
             <SwitchControl
               dataTestId="toggle-crossover-dlss"
-              checked={isDlssSupportedBackend && crossoverDlss}
-              disabled={!isDlssSupportedBackend}
+              checked={effectiveIsDlssSupportedBackend && crossoverDlss}
+              disabled={!effectiveIsDlssSupportedBackend}
               ariaLabelledBy={dlssLabelId}
               ariaDescribedBy={dlssHintId}
               onChange={onToggleCrossoverDlss}
@@ -1606,24 +1849,24 @@ function CompatibilityLayerSectionImpl(
                   <span id={dxvkHudLabelId} className="text-xs font-semibold text-white">
                     DXVK / DXMT HUD
                   </span>
-                  {!isDxvkHudSupported && (
+                  {!effectiveIsDxvkHudSupported && (
                     <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/5 border border-white/15 text-steam-subtext font-medium">
                       Unavailable
                     </span>
                   )}
                 </div>
                 <p id={dxvkHudHintId} className="text-[10px] text-steam-subtext leading-snug">
-                  {isDxvkHudSupported
+                  {effectiveIsDxvkHudSupported
                     ? 'Displays Vulkan/DXVK pipeline statistics and shader compile status.'
                     : 'Requires DXVK or Auto backend (use Apple Metal HUD for D3DMetal & GPTK).'}
                 </p>
               </div>
               <SwitchControl
                 dataTestId="toggle-dxvk-hud"
-                checked={isDxvkHudSupported && dxvkHud}
-                disabled={!isDxvkHudSupported}
+                checked={effectiveIsDxvkHudSupported && dxvkHud}
+                disabled={!effectiveIsDxvkHudSupported}
                 title={
-                  !isDxvkHudSupported
+                  !effectiveIsDxvkHudSupported
                     ? 'DXVK HUD requires DXVK or Auto backend (not used by D3DMetal, DXMT, WineD3D, or Apple GPTK — use Metal HUD instead)'
                     : undefined
                 }

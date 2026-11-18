@@ -39,7 +39,12 @@ const {
   ensureMacExecutablePermissions,
   resolveTargetMacAppBundlePath,
   isValidBottleDirectory,
+  inspectBottleConfMetadata,
+  inspectCrossOverBundleMarkers,
+  assertRunnerBottleArchCompatible,
   detectCompatibilityLayers,
+  provisionCrossOverBottleViaCxbottle,
+  resolveWineserverBinary,
   shutdownWinePrefix,
   resolveBottleGogGalaxyExe,
   resolveBottleEpicLauncherExe,
@@ -50,7 +55,14 @@ const {
   prepareAlignedAuxBottleWineCommand,
   parsePlistStringValues,
   compareRunnerVersions,
+  extractRunnerPreviewDate,
+  extractCandidateLinksFromText,
   recordRunnerInstallReceipt,
+  isPreviewSparkleFeedUrl,
+  isPreviewSparkleEnclosureValid,
+  setCachedAuthenticatedPreviewUrl,
+  getCachedAuthenticatedPreviewUrl,
+  clearCachedAuthenticatedPreviewUrl,
 } = macNativeInstallerAndCodesign;
 const {
   inspectWindowsExecutableHeader,
@@ -74,6 +86,7 @@ const {
   saveSetupWizardState,
   probeClientLoginStates,
   probeEnvironmentHealth,
+  invalidateProberRunnerUpdatesCache,
 } = require('./environmentHealthProber.cjs');
 const {
   CHAINED_PUBLISHER_ECOSYSTEMS,
@@ -89,6 +102,8 @@ const {
  * @typedef {import('./environmentHealthProber.cjs').EnvironmentComponentId} EnvironmentComponentId
  * @typedef {import('./environmentHealthProber.cjs').ClientLoginTargetId} ClientLoginTargetId
  * @typedef {import('./environmentHealthProber.cjs').NonNativeRunnerType} NonNativeRunnerType
+ * @typedef {EnvironmentComponentId | 'runner_crossover_preview_arm64'} ProvisionerComponentId
+ * @typedef {NonNativeRunnerType | 'crossover_preview_arm64'} ProvisionerRunnerType
  * @typedef {import('./environmentHealthProber.cjs').StorefrontId} StorefrontId
  * @typedef {import('./environmentHealthProber.cjs').ClientAuthProbeState} ClientAuthProbeState
  * @typedef {import('./environmentHealthProber.cjs').EnvironmentHealthSnapshot} EnvironmentHealthSnapshot
@@ -99,13 +114,14 @@ const {
 /**
  * @typedef {object} EnvironmentSetupTaskRequest
  * @property {EnvironmentSetupAction} action
- * @property {EnvironmentComponentId} componentId
- * @property {NonNativeRunnerType} [runnerType]
+ * @property {ProvisionerComponentId} componentId
+ * @property {ProvisionerRunnerType} [runnerType]
  * @property {'reuse_existing' | 'create_dedicated'} [bottleMode]
  * @property {string} [bottleName]
  * @property {string} [dmgPath]
  * @property {string} [archivePath]
  * @property {boolean} [forceUpdate]
+ * @property {string} [downloadUrl]
  */
 
 /**
@@ -114,7 +130,7 @@ const {
 
 /**
  * @typedef {object} CompatibilityRunnerProgressEvent
- * @property {NonNativeRunnerType} runnerType
+ * @property {ProvisionerRunnerType} runnerType
  * @property {'install' | 'update'} operation
  * @property {CompatibilityRunnerOperationPhase} phase
  * @property {number | null} progressPercent
@@ -135,7 +151,7 @@ const {
 /**
  * @typedef {object} EnvironmentSetupProgressEvent
  * @property {string} runId
- * @property {EnvironmentComponentId | ClientLoginTargetId} componentId
+ * @property {ProvisionerComponentId | ClientLoginTargetId} componentId
  * @property {EnvironmentSetupAction} [action]
  * @property {number} stepIndex
  * @property {number} totalSteps
@@ -150,7 +166,7 @@ const {
 
 /**
  * @typedef {object} EnvironmentSetupTaskOutcome
- * @property {EnvironmentComponentId} componentId
+ * @property {ProvisionerComponentId} componentId
  * @property {EnvironmentSetupAction} action
  * @property {'completed' | 'skipped' | 'failed' | 'cancelled' | 'opened_external'} status
  * @property {string} message
@@ -319,17 +335,87 @@ function onEnvironmentSetupProgress(listener) {
 }
 
 /**
- * Map an `EnvironmentComponentId` to a `NonNativeRunnerType` when applicable.
+ * Normalize a requested runner type / compatibility layer string (`'runner_*'` IDs -> canonical
+ * runner type; `''`, `'auto'`, `'native'` -> `''` auto-select).
+ *
+ * @param {unknown} rawRunnerType
+ * @returns {string}
+ */
+function normalizeRequestedRunnerType(rawRunnerType) {
+  const s = String(rawRunnerType || '')
+    .trim()
+    .toLowerCase();
+  if (!s || s === 'auto' || s === 'native') return '';
+  if (s === 'runner_crossover_preview_arm64' || s === 'crossover_preview_arm64') {
+    return 'crossover_preview_arm64';
+  }
+  if (s === 'runner_crossover_preview' || s === 'crossover_preview') {
+    return 'crossover_preview';
+  }
+  if (s === 'runner_crossover' || s === 'crossover') {
+    return 'crossover';
+  }
+  if (s === 'runner_wine' || s === 'wine') {
+    return 'wine';
+  }
+  if (s === 'runner_gptk' || s === 'gptk') {
+    return 'gptk';
+  }
+  return s.startsWith('runner_') ? s.slice('runner_'.length) : s;
+}
+
+/**
+ * Resolve canonical CodeWeavers runner bundle metadata (target `.app` name, display label,
+ * component ID, and preview branch) so Standard and Arm64 Preview never overwrite each other.
+ *
+ * @param {string} rawRunnerType
+ * @returns {{ runnerType: 'crossover' | 'crossover_preview' | 'crossover_preview_arm64', canonicalAppName: string, displayLabel: string, componentId: ProvisionerComponentId, previewBranch: 'standard' | 'arm64' | null } | null}
+ */
+function resolveCodeWeaversRunnerSpec(rawRunnerType) {
+  switch (normalizeRequestedRunnerType(rawRunnerType)) {
+    case 'crossover':
+      return {
+        runnerType: 'crossover',
+        canonicalAppName: 'CrossOver.app',
+        displayLabel: 'CrossOver',
+        componentId: 'runner_crossover',
+        previewBranch: null,
+      };
+    case 'crossover_preview':
+      return {
+        runnerType: 'crossover_preview',
+        canonicalAppName: 'CrossOver Preview.app',
+        displayLabel: 'CrossOver Preview',
+        componentId: 'runner_crossover_preview',
+        previewBranch: 'standard',
+      };
+    case 'crossover_preview_arm64':
+      return {
+        runnerType: 'crossover_preview_arm64',
+        canonicalAppName: 'CrossOver Preview arm64.app',
+        displayLabel: 'CrossOver Preview (Arm64)',
+        componentId: 'runner_crossover_preview_arm64',
+        previewBranch: 'arm64',
+      };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Map a `ProvisionerComponentId` to a `ProvisionerRunnerType` when applicable.
  *
  * @param {string} componentId
- * @returns {NonNativeRunnerType | null}
+ * @returns {ProvisionerRunnerType | null}
  */
 function componentIdToRunnerType(componentId) {
-  switch (componentId) {
+  switch (String(componentId || '').trim().toLowerCase()) {
     case 'runner_crossover':
       return 'crossover';
     case 'runner_crossover_preview':
       return 'crossover_preview';
+    case 'runner_crossover_preview_arm64':
+      return 'crossover_preview_arm64';
     case 'runner_wine':
       return 'wine';
     case 'runner_gptk':
@@ -380,8 +466,9 @@ function emitEnvironmentSetupProgress(event, options = {}) {
 
   if (typeof options.onRunnerProgress === 'function') {
     const runnerType =
-      (options._runnerProgressMeta && options._runnerProgressMeta.runnerType) ||
-      componentIdToRunnerType(String(event.componentId || ''));
+      normalizeRequestedRunnerType(
+        options._runnerProgressMeta && options._runnerProgressMeta.runnerType
+      ) || componentIdToRunnerType(String(event.componentId || ''));
     const validRunnerPhases = new Set([
       'probing',
       'downloading',
@@ -396,7 +483,7 @@ function emitEnvironmentSetupProgress(event, options = {}) {
     if (runnerType && validRunnerPhases.has(mappedPhase)) {
       /** @type {CompatibilityRunnerProgressEvent} */
       const runnerEvent = {
-        runnerType,
+        runnerType: /** @type {ProvisionerRunnerType} */ (runnerType),
         operation:
           options._runnerProgressMeta && options._runnerProgressMeta.operation === 'update'
             ? 'update'
@@ -574,12 +661,18 @@ async function fetchValidatedResponse(initialUrl, options = {}, signal = undefin
       throw abortErr;
     }
 
+    const callerHeaders =
+      options.headers && typeof options.headers === 'object' ? { ...options.headers } : {};
+    const callerExplicitUa = callerHeaders['User-Agent'] || callerHeaders['user-agent'];
+    const requestHeaders = { ...callerHeaders };
+    if (!callerExplicitUa && options.preserveSessionUserAgent !== true) {
+      requestHeaders['User-Agent'] = 'OneGameLauncher/1.0';
+    }
+
     const res = await fetchImpl(currentUrl, {
       redirect: 'manual',
       signal,
-      headers: {
-        'User-Agent': 'OneGameLauncher/1.0',
-      },
+      ...(Object.keys(requestHeaders).length > 0 ? { headers: requestHeaders } : {}),
     });
 
     if (!res) {
@@ -706,7 +799,7 @@ async function fetchValidatedText(url, options = {}, signal = undefined) {
  *
  * @param {string} url
  * @param {string} destFilePath
- * @param {{ runId: string, componentId: EnvironmentComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number, label: string, minFreeBytes?: number }} ctx
+ * @param {{ runId: string, componentId: ProvisionerComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number, label: string, minFreeBytes?: number }} ctx
  * @param {Record<string, any>} [options]
  * @param {AbortSignal} [signal]
  * @returns {Promise<{ filePath: string, bytesDownloaded: number }>}
@@ -724,7 +817,8 @@ async function streamVerifiedDownloadToFile(
   const diskInfo = await getDiskSpace(path.dirname(destFilePath), options);
   if (
     typeof diskInfo.availableBytes === 'number' &&
-    diskInfo.availableBytes > 0 &&
+    Number.isFinite(diskInfo.availableBytes) &&
+    diskInfo.availableBytes >= 0 &&
     diskInfo.availableBytes < minFreeBytes
   ) {
     throw new Error(
@@ -748,6 +842,23 @@ async function streamVerifiedDownloadToFile(
   );
 
   const res = await fetchValidatedResponse(url, options, signal);
+  if (options.rejectHtmlPayload === true) {
+    const contentType = String(
+      (typeof res.headers?.get === 'function'
+        ? res.headers.get('content-type')
+        : res.headers?.['content-type'] || res.headers?.['Content-Type']) || ''
+    ).toLowerCase();
+    if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+      try {
+        await res.body?.cancel?.();
+      } catch {}
+      const htmlErr = /** @type {Error & { code?: string }} */ (
+        new Error('Received HTML response instead of installer archive.')
+      );
+      htmlErr.code = 'HTML_PAYLOAD_DETECTED';
+      throw htmlErr;
+    }
+  }
   const rawLen =
     typeof res.headers?.get === 'function'
       ? res.headers.get('content-length')
@@ -772,6 +883,18 @@ async function streamVerifiedDownloadToFile(
         throw abortErr;
       }
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (
+        options.rejectHtmlPayload === true &&
+        bytesDownloaded === 0 &&
+        buf.length > 0 &&
+        /^\s*(?:<!doctype\s+html|<html\b|<head\b)/i.test(buf.subarray(0, 512).toString('utf8'))
+      ) {
+        const htmlErr = /** @type {Error & { code?: string }} */ (
+          new Error('Received HTML login/challenge payload instead of installer archive.')
+        );
+        htmlErr.code = 'HTML_PAYLOAD_DETECTED';
+        throw htmlErr;
+      }
       bytesDownloaded += buf.length;
       if (bytesDownloaded > MAX_INSTALLER_DOWNLOAD_BYTES) {
         throw new Error('Downloaded payload exceeded maximum allowed size.');
@@ -800,8 +923,27 @@ async function streamVerifiedDownloadToFile(
 
     if (res.body && typeof res.body.getReader === 'function') {
       const reader = res.body.getReader();
+      const onStreamAbort = () => {
+        try {
+          if (typeof reader.cancel === 'function') {
+            Promise.resolve(reader.cancel()).catch(() => {});
+          }
+        } catch {}
+      };
+      if (signal && typeof signal.addEventListener === 'function') {
+        if (signal.aborted) {
+          onStreamAbort();
+        } else {
+          signal.addEventListener('abort', onStreamAbort, { once: true });
+        }
+      }
       try {
         while (true) {
+          if (signal?.aborted) {
+            const abortErr = new Error('Download cancelled.');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
           const { done, value } = await reader.read();
           if (done) break;
           if (value && value.byteLength > 0) {
@@ -809,12 +951,22 @@ async function streamVerifiedDownloadToFile(
           }
         }
       } finally {
+        if (signal && typeof signal.removeEventListener === 'function') {
+          try {
+            signal.removeEventListener('abort', onStreamAbort);
+          } catch {}
+        }
         try {
           reader.releaseLock();
         } catch {}
       }
     } else if (res.body && Symbol.asyncIterator in Object(res.body)) {
       for await (const chunk of res.body) {
+        if (signal?.aborted) {
+          const abortErr = new Error('Download cancelled.');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
         if (chunk) {
           await writeChunk(chunk);
         }
@@ -1278,6 +1430,16 @@ function getExecFileFn(options = {}) {
  */
 function runExecFileAsync(execFileFn, cmd, args, execOpts = {}) {
   return new Promise((resolve, reject) => {
+    /** @type {(() => void) | null} */
+    let onAbort = null;
+    const detachAbortListener = () => {
+      if (execOpts.signal && onAbort && typeof execOpts.signal.removeEventListener === 'function') {
+        try {
+          execOpts.signal.removeEventListener('abort', onAbort);
+        } catch {}
+      }
+      onAbort = null;
+    };
     try {
       const child = execFileFn(
         cmd,
@@ -1289,6 +1451,7 @@ function runExecFileAsync(execFileFn, cmd, args, execOpts = {}) {
           ...(execOpts.signal ? { signal: execOpts.signal } : {}),
         },
         (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+          detachAbortListener();
           if (err) {
             err.stdout = String(stdout || '');
             err.stderr = String(stderr || '');
@@ -1302,7 +1465,7 @@ function runExecFileAsync(execFileFn, cmd, args, execOpts = {}) {
         }
       );
       if (execOpts.signal && child && typeof child.kill === 'function') {
-        const onAbort = () => {
+        onAbort = () => {
           try {
             child.kill('SIGTERM');
           } catch {}
@@ -1311,6 +1474,7 @@ function runExecFileAsync(execFileFn, cmd, args, execOpts = {}) {
         else execOpts.signal.addEventListener('abort', onAbort, { once: true });
       }
     } catch (err) {
+      detachAbortListener();
       reject(err);
     }
   });
@@ -1375,13 +1539,13 @@ async function verifyMacAppDeveloperSignature(
       execFileFn,
       '/usr/bin/codesign',
       ['--verify', '--deep', '--strict', appPath],
-      { timeout: 60000 }
+      { timeout: 60000, ...(options.signal ? { signal: options.signal } : {}) }
     );
     const dvRes = await runExecFileAsync(
       execFileFn,
       '/usr/bin/codesign',
       ['-dv', '--verbose=4', appPath],
-      { timeout: 30000 }
+      { timeout: 30000, ...(options.signal ? { signal: options.signal } : {}) }
     );
     const combined = `${dvRes.stdout}\n${dvRes.stderr}`;
 
@@ -1673,11 +1837,13 @@ function formatRunnerDisplayLabel(runnerType, existingLayer = null) {
   if (existingLayer && typeof existingLayer.name === 'string' && existingLayer.name.trim()) {
     return existingLayer.name.trim();
   }
-  switch (String(runnerType || '').trim().toLowerCase()) {
+  switch (normalizeRequestedRunnerType(runnerType)) {
     case 'crossover':
       return 'CrossOver';
     case 'crossover_preview':
       return 'CrossOver Preview';
+    case 'crossover_preview_arm64':
+      return 'CrossOver Preview (Arm64)';
     case 'gptk':
       return 'Apple Game Porting Toolkit';
     case 'wine':
@@ -1710,9 +1876,7 @@ async function assertRunnerSafeToReplace(
   existingLayer = null,
   options = {}
 ) {
-  const cleanRunnerType = String(runnerType || 'crossover')
-    .trim()
-    .toLowerCase();
+  const cleanRunnerType = normalizeRequestedRunnerType(runnerType) || 'crossover';
   const runnerLabel = formatRunnerDisplayLabel(cleanRunnerType, existingLayer);
   const hostPlatform = String(options.platform || process.platform);
   const externalExistingMgr =
@@ -1728,18 +1892,19 @@ async function assertRunnerSafeToReplace(
   // 1. Check active One Launcher bottled sessions
   for (const [gameId, entry] of activeSessions.entries()) {
     if (!entry || entry.finalized === true) continue;
-    const sessLayer = String(
+    const rawSessLayer = String(
       entry.session?.compatibilityLayer || entry.compatibilityLayer || ''
     )
       .trim()
       .toLowerCase();
+    const sessLayer = normalizeRequestedRunnerType(rawSessLayer);
     const wineBin = String(entry.wineBinary || '').trim();
     const winePrefix = String(entry.winePrefix || '').trim();
     const isBottledSession = Boolean(
       wineBin ||
         winePrefix ||
         entry.launchedViaBottleSteam ||
-        (sessLayer && sessLayer !== 'native')
+        (rawSessLayer && rawSessLayer !== 'native')
     );
     const matchesTargetRunner =
       (hostPlatform === 'darwin' && isBottledSession) ||
@@ -1819,14 +1984,14 @@ async function assertRunnerSafeToReplace(
     let hasGuiOrExternalApp = false;
     let hasIdleWineserverOrDaemon = false;
     const idleDaemonRe =
-      /(?:^|[\\/ ])(?:wineserver|services\.exe|plugplay\.exe|svchost\.exe|rpcss\.exe|winedevice\.exe|explorer\.exe|conhost\.exe|tabtip\.exe)(?:\s|$|")/i;
+      /(?:^|[\\/ ])(?:wineserver(?:-arm64|-x86|64)?|services\.exe|plugplay\.exe|svchost\.exe|rpcss\.exe|winedevice\.exe|explorer\.exe|conhost\.exe|tabtip\.exe)(?:\s|$|")/i;
 
     for (const proc of matched) {
       const cmdAfterApp = proc.command.slice(proc.command.indexOf(appPrefix) + appPrefix.length);
       const macOsBinMatch = cmdAfterApp.match(/^Contents\/MacOS\/([^\s"]+)/i);
       if (macOsBinMatch) {
         const macBinName = macOsBinMatch[1];
-        if (!/^wine(?:64)?(?:-preloader|server)?$/i.test(macBinName)) {
+        if (!/^wine(?:64)?(?:-preloader|server(?:64|-arm64|-x86)?)?$/i.test(macBinName)) {
           hasGuiOrExternalApp = true;
           continue;
         }
@@ -1858,35 +2023,71 @@ async function assertRunnerSafeToReplace(
   // cleanly shut down known Wine prefixes and wineserver, then re-verify.
   if (initialPs.hasIdleWineserverOrDaemon) {
     const { homedir } = resolveIsolatedHomedirAndUserData(options);
-    /** @type {string[]} */
-    const candidatePrefixes = [];
+    /** @type {Set<string>} */
+    const candidatePrefixes = new Set();
     if (existingLayer?.bottlesDir && Array.isArray(existingLayer?.availableBottles)) {
       for (const bName of existingLayer.availableBottles) {
-        candidatePrefixes.push(path.join(existingLayer.bottlesDir, bName));
+        candidatePrefixes.add(path.join(existingLayer.bottlesDir, bName));
       }
     }
-    const olPrefixesRoot = path.join(homedir, 'Games/OneLauncher/Prefixes');
-    if (fs.existsSync(olPrefixesRoot)) {
+    const customCxBottleRoots = [options.cxBottlePath, process.env.CX_BOTTLE_PATH]
+      .filter((v) => typeof v === 'string' && v.trim())
+      .flatMap((v) =>
+        String(v)
+          .split(path.delimiter)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+    for (const bottlesParent of Array.from(
+      new Set([
+        path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
+        path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+        path.join(homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
+        path.join(homedir, 'Games/OneLauncher/Prefixes'),
+        ...customCxBottleRoots,
+      ])
+    )) {
+      if (!fs.existsSync(bottlesParent)) continue;
       try {
-        for (const ent of fs.readdirSync(olPrefixesRoot, { withFileTypes: true })) {
-          if (ent.isDirectory()) {
-            candidatePrefixes.push(path.join(olPrefixesRoot, ent.name));
+        for (const ent of fs.readdirSync(bottlesParent, { withFileTypes: true })) {
+          if (ent.isDirectory() && !ent.name.startsWith('.')) {
+            candidatePrefixes.add(path.join(bottlesParent, ent.name));
           }
         }
       } catch {}
     }
 
+    const execFileFn = getExecFileFn(options);
+    const shutdownWineBin =
+      existingLayer?.wineserverBinary ||
+      existingLayer?.binaryPath ||
+      path.join(effectiveAppPath, 'Contents/SharedSupport/CrossOver/bin/wine');
     for (const prefixDir of candidatePrefixes) {
       try {
-        shutdownWinePrefix(prefixDir, existingLayer?.wineserverBinary || null, {
-          waitSeconds: 2,
+        await shutdownWinePrefix(shutdownWineBin, prefixDir, 3000, {
+          bottleName: path.basename(prefixDir),
+          cxBottlePath: path.dirname(prefixDir),
+          layerType: cleanRunnerType,
+          execFileFn,
         });
       } catch {}
     }
-    if (existingLayer?.wineserverBinary && fs.existsSync(existingLayer.wineserverBinary)) {
+    const cxBinDir = path.join(effectiveAppPath, 'Contents/SharedSupport/CrossOver/bin');
+    const wineserverBinsToKill = Array.from(
+      new Set(
+        [
+          existingLayer?.wineserverBinary,
+          resolveWineserverBinary(existingLayer?.binaryPath, { layerType: cleanRunnerType }),
+          path.join(cxBinDir, 'wineserver'),
+          path.join(cxBinDir, 'wineserver64'),
+          path.join(cxBinDir, 'wineserver-arm64'),
+          path.join(cxBinDir, 'wineserver-x86'),
+        ].filter((p) => typeof p === 'string' && p.trim() && fs.existsSync(p))
+      )
+    );
+    for (const wsBin of wineserverBinsToKill) {
       try {
-        const execFileFn = getExecFileFn(options);
-        await runExecFileAsync(execFileFn, existingLayer.wineserverBinary, ['-k'], {
+        await runExecFileAsync(execFileFn, wsBin, ['-k'], {
           timeout: 4000,
         });
       } catch {}
@@ -1940,13 +2141,42 @@ function evictMacAppCachesForPath(targetAppPath) {
 async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, options = {}) {
   const parentDir = path.dirname(targetDestAppPath);
   const appName = path.basename(targetDestAppPath);
+  const signal = /** @type {AbortSignal | undefined} */ (options.signal);
+  if (signal?.aborted) {
+    const abortErr = new Error(`Installation of ${appName} cancelled.`);
+    abortErr.name = 'AbortError';
+    throw abortErr;
+  }
+
   await fs.promises.mkdir(parentDir, { recursive: true });
+
+  let destinationExists = false;
+  try {
+    await fs.promises.lstat(targetDestAppPath);
+    destinationExists = true;
+  } catch {}
+
+  try {
+    await fs.promises.access(parentDir, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (accessErr) {
+    throw new Error(
+      `Cannot install ${appName}: write permission denied on "${parentDir}" (${accessErr instanceof Error ? accessErr.message : String(accessErr)}).`
+    );
+  }
+  if (destinationExists) {
+    try {
+      await fs.promises.access(targetDestAppPath, fs.constants.W_OK);
+    } catch (targetAccessErr) {
+      throw new Error(
+        `Cannot replace existing "${targetDestAppPath}": write/rename permission denied (${targetAccessErr instanceof Error ? targetAccessErr.message : String(targetAccessErr)}).`
+      );
+    }
+  }
 
   const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const siblingStagingPath = path.join(parentDir, `.${appName}.ol-staging-${suffix}`);
   const backupPath = path.join(parentDir, `.${appName}.ol-backup-${suffix}`);
   const execFileFn = getExecFileFn(options);
-  const signal = /** @type {AbortSignal | undefined} */ (options.signal);
   let movedExistingToBackup = false;
 
   try {
@@ -2023,7 +2253,13 @@ async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, optio
       );
     }
 
-    let destinationExists = false;
+    if (signal?.aborted) {
+      const abortErr = new Error(`Installation of ${appName} cancelled.`);
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+
+    destinationExists = false;
     try {
       await fs.promises.lstat(targetDestAppPath);
       destinationExists = true;
@@ -2053,6 +2289,7 @@ async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, optio
     if (movedExistingToBackup) {
       try {
         await fs.promises.rm(backupPath, { recursive: true, force: true });
+        movedExistingToBackup = false;
       } catch {}
     }
 
@@ -2063,6 +2300,23 @@ async function atomicReplaceMacAppBundle(stagedAppPath, targetDestAppPath, optio
         await fs.promises.rm(siblingStagingPath, { recursive: true, force: true });
       }
     } catch {}
+    if (fs.existsSync(targetDestAppPath)) {
+      if (movedExistingToBackup && fs.existsSync(backupPath)) {
+        try {
+          await fs.promises.rm(backupPath, { recursive: true, force: true });
+        } catch {}
+      }
+      try {
+        const stagingPrefix = `.${appName}.ol-staging-`;
+        const backupPrefix = `.${appName}.ol-backup-`;
+        const entries = await fs.promises.readdir(parentDir);
+        for (const ent of entries) {
+          if (ent.startsWith(stagingPrefix) || ent.startsWith(backupPrefix)) {
+            await fs.promises.rm(path.join(parentDir, ent), { recursive: true, force: true }).catch(() => {});
+          }
+        }
+      } catch {}
+    }
   }
 }
 
@@ -2120,7 +2374,10 @@ async function mountVerifyAndInstallDmgApp(
     typeof options.onExecHdiutil === 'function'
       ? options.onExecHdiutil
       : (/** @type {string[]} */ args) =>
-          runExecFileAsync(execFileFn, 'hdiutil', args, { timeout: 120000 });
+          runExecFileAsync(execFileFn, 'hdiutil', args, {
+            timeout: 120000,
+            ...(options.signal ? { signal: options.signal } : {}),
+          });
 
   let attached = false;
   try {
@@ -2206,25 +2463,39 @@ async function mountVerifyAndInstallDmgApp(
 }
 
 /**
- * Recursively find a `.app` bundle inside an archive extraction staging directory (up to depth 3).
+ * Recursively find a `.app` bundle inside an archive extraction staging directory (up to depth 3),
+ * optionally prioritizing preferred `.app` bundle basenames.
  *
  * @param {string} rootDir
  * @param {number} [depth]
+ * @param {string[]} [preferredAppNames]
  * @returns {Promise<string | null>}
  */
-async function findStagedAppBundle(rootDir, depth = 0) {
+async function findStagedAppBundle(rootDir, depth = 0, preferredAppNames = []) {
   if (depth > 3 || !fs.existsSync(rootDir)) return null;
   const entries = await fs.promises.readdir(rootDir, { withFileTypes: true });
-  for (const ent of entries) {
-    if (ent.name.startsWith('.') || ent.name === '__MACOSX') continue;
-    if (ent.isDirectory() && ent.name.toLowerCase().endsWith('.app')) {
-      return path.join(rootDir, ent.name);
+  const appEntries = entries.filter(
+    (ent) => !ent.name.startsWith('.') && ent.name !== '__MACOSX' && ent.isDirectory() && ent.name.toLowerCase().endsWith('.app')
+  );
+  if (Array.isArray(preferredAppNames) && preferredAppNames.length > 0 && appEntries.length > 0) {
+    for (const pref of preferredAppNames) {
+      const lowerPref = String(pref || '').trim().toLowerCase();
+      if (!lowerPref) continue;
+      const hit = appEntries.find((ent) => ent.name.toLowerCase() === lowerPref);
+      if (hit) return path.join(rootDir, hit.name);
     }
+  }
+  if (appEntries.length > 0) {
+    return path.join(rootDir, appEntries[0].name);
   }
   for (const ent of entries) {
     if (ent.name.startsWith('.') || ent.name === '__MACOSX') continue;
     if (ent.isDirectory()) {
-      const nested = await findStagedAppBundle(path.join(rootDir, ent.name), depth + 1);
+      const nested = await findStagedAppBundle(
+        path.join(rootDir, ent.name),
+        depth + 1,
+        preferredAppNames
+      );
       if (nested) return nested;
     }
   }
@@ -2420,7 +2691,7 @@ async function resolveGogGalaxyInstallerUrl(targetOs, options = {}, signal = und
  *
  * @param {'osx' | 'windows'} targetOs
  * @param {string} destFilePath
- * @param {{ runId: string, componentId: EnvironmentComponentId, stepIndex?: number, totalSteps?: number, label: string, minFreeBytes?: number }} progressCtx
+ * @param {{ runId: string, componentId: ProvisionerComponentId, stepIndex?: number, totalSteps?: number, label: string, minFreeBytes?: number }} progressCtx
  * @param {Record<string, any>} [options]
  * @param {AbortSignal} [signal]
  * @returns {Promise<{ url: string, isStubWebInstaller: boolean }>}
@@ -2515,6 +2786,7 @@ async function downloadGogGalaxyInstallerToFile(
 function isAllowedCodeWeaversAuthNavigationUrl(rawUrl, options = {}) {
   try {
     const parsed = new URL(String(rawUrl || '').trim());
+    if (parsed.username || parsed.password) return false;
     const host = parsed.hostname.toLowerCase();
     if (
       options.allowLoopbackInstallerUrls === true &&
@@ -2528,8 +2800,20 @@ function isAllowedCodeWeaversAuthNavigationUrl(rawUrl, options = {}) {
       host.endsWith('.codeweavers.com') ||
       host === 'google.com' ||
       host.endsWith('.google.com') ||
-      host === 'appleid.apple.com' ||
-      host === 'challenges.cloudflare.com'
+      host === 'apple.com' ||
+      host.endsWith('.apple.com') ||
+      host === 'github.com' ||
+      host.endsWith('.github.com') ||
+      host === 'microsoft.com' ||
+      host.endsWith('.microsoft.com') ||
+      host === 'live.com' ||
+      host.endsWith('.live.com') ||
+      host === 'microsoftonline.com' ||
+      host.endsWith('.microsoftonline.com') ||
+      host === 'cloudflare.com' ||
+      host.endsWith('.cloudflare.com') ||
+      host === 'cf-challenges.com' ||
+      host.endsWith('.cf-challenges.com')
     );
   } catch {
     return false;
@@ -2547,6 +2831,7 @@ function isAllowedCodeWeaversAuthNavigationUrl(rawUrl, options = {}) {
 function isAllowedCodeWeaversDownloadUrl(rawUrl, options = {}) {
   try {
     const parsed = new URL(String(rawUrl || '').trim());
+    if (parsed.username || parsed.password) return false;
     const host = parsed.hostname.toLowerCase();
     if (
       options.allowLoopbackInstallerUrls === true &&
@@ -2562,52 +2847,122 @@ function isAllowedCodeWeaversDownloadUrl(rawUrl, options = {}) {
 }
 
 /**
- * Extract an optional version or preview build date hint from a CodeWeavers Preview filename.
+ * Parse a strict 8-digit preview build date (`YYYYMMDD`) into a finite number,
+ * returning `null` for semver or malformed strings so `NaN` never leaks into comparisons.
+ *
+ * @param {unknown} val
+ * @returns {number | null}
+ */
+function parseNumericPreviewDate(val) {
+  if (typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!/^\d{8}$/.test(trimmed)) return null;
+  const num = Number(trimmed);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Extract an optional version or preview build date hint from a CodeWeavers Preview filename
+ * (stripping `?query` / `#hash` and preferring 8-digit preview build dates over dotted ISO dates).
  *
  * @param {string} filename
  * @returns {string | null}
  */
 function extractPreviewFilenameVersionHint(filename) {
-  const base = path.basename(String(filename || '').trim()).replace(/\.(?:zip|dmg)$/i, '');
+  const stripped = String(filename || '').trim().split(/[?#]/)[0];
+  const base = path.basename(stripped).replace(/\.(?:zip|dmg)$/i, '');
   if (!base) return null;
+  const extractDateFn =
+    typeof macNativeInstallerAndCodesign?.extractRunnerPreviewDate === 'function'
+      ? macNativeInstallerAndCodesign.extractRunnerPreviewDate
+      : null;
+  const dateMatch = extractDateFn
+    ? extractDateFn(base)
+    : base.match(/(?:preview\s*|[-_.]|^)(20\d{6})(?=[^0-9]|$)/i)?.[1];
+  if (dateMatch) return dateMatch;
   const semverMatch = base.match(/(\d+\.\d+(?:\.\d+)?)/);
   if (semverMatch) return semverMatch[1];
-  const dateMatch = base.match(/(?:^|[-_.])(20\d{6})(?:$|[-_.])/);
-  if (dateMatch) return dateMatch[1];
   return null;
 }
 
 /**
- * Detect experimental ARM64-only CrossOver Preview builds (`crossover-preview-arm64-YYYYMMDD.zip`,
- * `*-aarch64*`, etc.), which must be excluded in favor of the standard macOS CrossOver Preview
- * build (`crossover-preview-YYYYMMDD.zip`).
+ * Classify a CodeWeavers CrossOver Preview download target into `'arm64'`, `'standard'`, or `null`.
  *
  * @param {string} rawTarget
- * @returns {boolean}
+ * @returns {'arm64' | 'standard' | null}
  */
-function isExperimentalArm64CrossOverPreviewTarget(rawTarget) {
+function classifyCrossOverPreviewArchiveBranch(rawTarget) {
   const raw = String(rawTarget || '').trim();
-  if (!raw) return false;
-  let candidate = raw;
+  if (!raw) return null;
+  let candidate = raw.split(/[?#]/)[0];
   try {
     const parsed = new URL(raw, 'https://www.codeweavers.com/preview/download');
     candidate = decodeURIComponent(parsed.pathname || raw);
   } catch {
     try {
-      candidate = decodeURIComponent(raw);
+      candidate = decodeURIComponent(candidate);
     } catch {}
   }
+  const lowerPath = candidate.toLowerCase();
   const base = path.basename(candidate).toLowerCase();
-  return /(?:^|[-_.])(arm64|aarch64|apple[-_.]?silicon)(?:[-_.]|\.(?:zip|dmg)$|$)/i.test(base);
+  if (
+    !base ||
+    /\.(?:deb|rpm|bin|tar\.gz|tar\.bz2|tgz)$/i.test(base) ||
+    /(?:^|[-_.])(source|src|linux|debian|ubuntu|rpm)(?:[-_.]|\.(?:zip|dmg)$)/i.test(base)
+  ) {
+    return null;
+  }
+  const hasExplicitPreviewToken = /preview/i.test(base);
+  const isNonPreviewStableFilename =
+    !hasExplicitPreviewToken &&
+    (/crossover/i.test(base) || /\/preview\/download\//i.test(lowerPath)) &&
+    (/\d+\.\d+/.test(base) ||
+      /(?:^|[-_.])(stable|demo|trial|release)(?:[-_.]|\.(?:zip|dmg)$)/i.test(base) ||
+      !/20\d{6}/.test(base));
+  if (isNonPreviewStableFilename) {
+    return null;
+  }
+  if (
+    /(?:^|[\s/_.-])(arm64|aarch64|apple[-_.]?silicon)(?:[\s/_.-]|\.(?:zip|dmg)$|$)/i.test(
+      lowerPath
+    )
+  ) {
+    return 'arm64';
+  }
+  if (
+    /crossover[-_.]?preview/i.test(base) ||
+    /\/preview\/download\/(?:.+\/)?[^/?#]+\.(?:zip|dmg)$/i.test(candidate)
+  ) {
+    return 'standard';
+  }
+  return null;
 }
 
 /**
- * Deterministically select the newest standard (non-ARM64) macOS CrossOver Preview `.zip` / `.dmg`
- * download URL from links discovered on the CodeWeavers Preview portal page.
+ * Resolve `'standard' | 'arm64'` preview branch from options (`previewBranch`, `runnerType`, `componentId`).
  *
- * Explicitly excludes experimental `arm64` / `aarch64` builds (e.g.
- * `crossover-preview-arm64-20261015.zip`), Linux installers (`.deb`, `.rpm`, `.bin`), source
- * tarballs, and generic non-Preview trial links.
+ * @param {Record<string, any>} [options]
+ * @param {string} [fallbackRunnerType]
+ * @returns {'standard' | 'arm64'}
+ */
+function resolvePreviewBranch(options = {}, fallbackRunnerType = undefined) {
+  const explicitBranch = String(options?.previewBranch || options?.branch || '')
+    .trim()
+    .toLowerCase();
+  if (explicitBranch === 'arm64') return 'arm64';
+  if (explicitBranch === 'standard') return 'standard';
+  const normalizedRunner = normalizeRequestedRunnerType(
+    options?.runnerType || options?.componentId || fallbackRunnerType || ''
+  );
+  if (normalizedRunner === 'crossover_preview_arm64') {
+    return 'arm64';
+  }
+  return 'standard';
+}
+
+/**
+ * Deterministically select the newest macOS CrossOver Preview `.zip` / `.dmg` download URL for the
+ * requested branch (`'standard'` by default, or `'arm64'` when `options.previewBranch === 'arm64'`).
  *
  * @param {unknown[]} candidateUrls
  * @param {string} [baseUrl]
@@ -2622,6 +2977,8 @@ function selectPreferredCrossOverPreviewDownloadUrl(
   if (!Array.isArray(candidateUrls) || candidateUrls.length === 0) {
     return null;
   }
+
+  const requestedBranch = resolvePreviewBranch(options);
 
   /**
    * @type {Array<{
@@ -2682,23 +3039,25 @@ function selectPreferredCrossOverPreviewDownloadUrl(
     }
 
     const hasExplicitPreviewName = /crossover[-_.]?preview/i.test(filename);
-    const isUnderPreviewDownloadPath = /\/preview\/download\/[^/?#]+\.(?:zip|dmg)$/i.test(
-      decodedPath
-    );
+    const isUnderPreviewDownloadPath =
+      /\/preview\/download\/(?:.+\/)?[^/?#]+\.(?:zip|dmg)$/i.test(decodedPath);
     if (!hasExplicitPreviewName && !isUnderPreviewDownloadPath) {
       continue;
     }
 
-    if (
-      options.allowExperimentalArm64Preview !== true &&
-      (isExperimentalArm64CrossOverPreviewTarget(filename) ||
-        isExperimentalArm64CrossOverPreviewTarget(resolvedUrl))
-    ) {
+    const classifiedBranch = classifyCrossOverPreviewArchiveBranch(resolvedUrl);
+    if (classifiedBranch !== requestedBranch) {
       continue;
     }
 
-    const dateMatch = filename.match(/(?:^|[-_.])(20\d{6})(?:[-_.]|\.(?:zip|dmg)$)/i);
-    const buildDateNum = dateMatch ? Number(dateMatch[1]) : 0;
+    const extractDateFn =
+      typeof macNativeInstallerAndCodesign?.extractRunnerPreviewDate === 'function'
+        ? macNativeInstallerAndCodesign.extractRunnerPreviewDate
+        : null;
+    const previewDateStr = extractDateFn
+      ? extractDateFn(filename) || extractDateFn(resolvedUrl)
+      : (filename.match(/(?:preview\s*|[-_.]|^)(20\d{6})(?=[^0-9]|$)/i)?.[1] || null);
+    const buildDateNum = parseNumericPreviewDate(previewDateStr) ?? 0;
     const versionHint = extractPreviewFilenameVersionHint(filename);
     const isZip = /\.zip$/i.test(filename);
 
@@ -2743,6 +3102,32 @@ function selectPreferredCrossOverPreviewDownloadUrl(
 }
 
 /**
+ * Discover both `'standard'` and `'arm64'` CrossOver Preview download URLs from a single portal
+ * candidate list.
+ *
+ * @param {unknown[]} candidateUrls
+ * @param {string} [baseUrl]
+ * @param {Record<string, any>} [options]
+ * @returns {{ standard: string | null, arm64: string | null }}
+ */
+function discoverCrossOverPreviewBranchUrls(
+  candidateUrls,
+  baseUrl = 'https://www.codeweavers.com/preview/download',
+  options = {}
+) {
+  return {
+    standard: selectPreferredCrossOverPreviewDownloadUrl(candidateUrls, baseUrl, {
+      ...options,
+      previewBranch: 'standard',
+    }),
+    arm64: selectPreferredCrossOverPreviewDownloadUrl(candidateUrls, baseUrl, {
+      ...options,
+      previewBranch: 'arm64',
+    }),
+  };
+}
+
+/**
  * Resolve canonical semver from a CrossOver Preview `.app` bundle `Info.plist` when the filename
  * hint was absent or only carried an 8-digit preview date (`YYYYMMDD`).
  *
@@ -2757,11 +3142,20 @@ function resolvePreviewBundleVersion(appBundlePath, hintVersion) {
       const plistDict = parsePlistStringValues(plistPath);
       const bundleVer = String(plistDict.CFBundleVersion || '').trim();
       const shortVer = String(plistDict.CFBundleShortVersionString || '').trim();
-      const semverMatch = bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.\d+)?$/);
+      const semverMatch =
+        bundleVer.match(/^(\d+\.\d+\.\d+)(?:\.\d+)?$/) ||
+        shortVer.match(/^(\d+\.\d+\.\d+)(?:\.\d+)?$/);
       if (semverMatch) {
         return semverMatch[1];
       }
-      if (!hintVersion && (shortVer || bundleVer)) {
+      const dateHint =
+        extractPreviewFilenameVersionHint(bundleVer) ||
+        extractPreviewFilenameVersionHint(shortVer) ||
+        hintVersion;
+      if (dateHint) {
+        return dateHint;
+      }
+      if (shortVer || bundleVer) {
         return shortVer || bundleVer;
       }
     }
@@ -2776,10 +3170,10 @@ function resolvePreviewBundleVersion(appBundlePath, hintVersion) {
  * the sign-in window once capture starts, and stream live byte progress to One Launcher.
  *
  * @param {string} destDir
- * @param {{ runId: string, componentId: EnvironmentComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number }} progressCtx
+ * @param {{ runId: string, componentId: ProvisionerComponentId, action?: EnvironmentSetupAction, stepIndex: number, totalSteps: number }} progressCtx
  * @param {Record<string, any>} [options]
  * @param {AbortSignal} [signal]
- * @returns {Promise<{ archivePath: string, resolvedVersion: string | null }>}
+ * @returns {Promise<{ archivePath: string, resolvedVersion: string | null, alreadyUpToDate?: boolean, authenticated?: boolean, downloadUrl?: string | null, discoveredBranchUrls?: { standard: string | null, arm64: string | null } }>}
  */
 async function captureCodeWeaversPreviewDownload(
   destDir,
@@ -2793,18 +3187,26 @@ async function captureCodeWeaversPreviewDownload(
     throw abortErr;
   }
 
-  await fs.promises.mkdir(destDir, { recursive: true });
+  const requestedBranch = resolvePreviewBranch({
+    ...options,
+    ...(progressCtx?.componentId ? { componentId: progressCtx.componentId } : {}),
+  });
 
-  const minFreeBytes = Number(options.minFreeBytes || 1200 * 1024 * 1024);
-  const diskInfo = await getDiskSpace(destDir, options);
-  if (
-    typeof diskInfo.availableBytes === 'number' &&
-    diskInfo.availableBytes > 0 &&
-    diskInfo.availableBytes < minFreeBytes
-  ) {
-    throw new Error(
-      `Insufficient disk space (${Math.round(diskInfo.availableBytes / (1024 * 1024))} MB free, need at least ${Math.round(minFreeBytes / (1024 * 1024))} MB).`
-    );
+  if (options.authenticateOnly !== true) {
+    await fs.promises.mkdir(destDir, { recursive: true });
+
+    const minFreeBytes = Number(options.minFreeBytes || 1200 * 1024 * 1024);
+    const diskInfo = await getDiskSpace(destDir, options);
+    if (
+      typeof diskInfo.availableBytes === 'number' &&
+      Number.isFinite(diskInfo.availableBytes) &&
+      diskInfo.availableBytes >= 0 &&
+      diskInfo.availableBytes < minFreeBytes
+    ) {
+      throw new Error(
+        `Insufficient disk space (${Math.round(diskInfo.availableBytes / (1024 * 1024))} MB free, need at least ${Math.round(minFreeBytes / (1024 * 1024))} MB).`
+      );
+    }
   }
 
   if (typeof options.capturePreviewDownloadFn === 'function') {
@@ -2826,6 +3228,38 @@ async function captureCodeWeaversPreviewDownload(
       const abortErr = new Error('CodeWeavers Preview sign-in cancelled.');
       abortErr.name = 'AbortError';
       throw abortErr;
+    }
+    if (hookRes && typeof hookRes === 'object' && hookRes.alreadyUpToDate === true) {
+      return {
+        alreadyUpToDate: true,
+        archivePath: '',
+        resolvedVersion: hookRes.resolvedVersion || hookRes.version || null,
+      };
+    }
+    if (
+      options.authenticateOnly === true ||
+      (hookRes && typeof hookRes === 'object' && hookRes.authenticated === true)
+    ) {
+      const hookDownloadUrl =
+        hookRes && typeof hookRes === 'object' && typeof hookRes.downloadUrl === 'string'
+          ? hookRes.downloadUrl.trim()
+          : typeof hookRes === 'string' && /^https?:\/\//i.test(hookRes.trim())
+            ? hookRes.trim()
+            : null;
+      const hookVer =
+        hookRes && typeof hookRes === 'object' && typeof hookRes.resolvedVersion === 'string'
+          ? hookRes.resolvedVersion.trim()
+          : hookRes && typeof hookRes === 'object' && typeof hookRes.version === 'string'
+            ? hookRes.version.trim()
+            : hookDownloadUrl
+              ? extractPreviewFilenameVersionHint(hookDownloadUrl) || extractRunnerPreviewDate(hookDownloadUrl)
+              : null;
+      return {
+        authenticated: true,
+        archivePath: '',
+        downloadUrl: hookDownloadUrl,
+        resolvedVersion: hookVer || null,
+      };
     }
     const hookArchivePath =
       typeof hookRes === 'string'
@@ -2870,12 +3304,8 @@ async function captureCodeWeaversPreviewDownload(
   const previewDownloadUrl = String(
     options.previewPortalUrl || 'https://www.codeweavers.com/preview/download'
   ).trim();
-  if (!isAllowedCodeWeaversAuthNavigationUrl(previewDownloadUrl, options)) {
-    const urlErr = /** @type {Error & { code?: string }} */ (
-      new Error(`Untrusted CodeWeavers Preview portal URL: ${previewDownloadUrl}`)
-    );
-    urlErr.code = 'INSTALLER_URL_BLOCKED';
-    throw urlErr;
+  if (!isAllowedCodeWeaversDownloadUrl(previewDownloadUrl, options)) {
+    throwBlockedUrlError(`Untrusted CodeWeavers Preview portal URL: ${previewDownloadUrl}`);
   }
 
   const previewSession = sessionMod.fromPartition('persist:codeweavers-preview');
@@ -2897,8 +3327,11 @@ async function captureCodeWeaversPreviewDownload(
     let sawLoginPage = false;
     let autoTriggeredDownloadAfterLogin = false;
     let autoTriggeredArchiveDownload = false;
-    /** @type {string | null} */
-    let lastDiscoveredStandardArchiveUrl = null;
+    const shouldShowImmediately =
+      options.showAuthWindowImmediately === true || options.authenticateOnly === true;
+    let authWindowShown = shouldShowImmediately;
+    /** @type {{ standard: string | null, arm64: string | null }} */
+    let lastDiscoveredBranchUrls = { standard: null, arm64: null };
     /** @type {any} */
     let activeDownloadItem = null;
     /** @type {any} */
@@ -2937,11 +3370,17 @@ async function captureCodeWeaversPreviewDownload(
       if (settled || downloadCaptured || closingForCapture) return;
       try {
         if (authWindow && !authWindow.isDestroyed()) {
-          if (typeof authWindow.show === 'function') {
-            authWindow.show();
+          if (!authWindowShown) {
+            authWindowShown = true;
+            if (typeof authWindow.show === 'function') {
+              authWindow.show();
+            }
           }
           if (typeof authWindow.focus === 'function') {
             authWindow.focus();
+          }
+          if (typeof authWindow.moveTop === 'function') {
+            authWindow.moveTop();
           }
         }
       } catch {}
@@ -2985,7 +3424,7 @@ async function captureCodeWeaversPreviewDownload(
         return false;
       }
       autoTriggeredArchiveDownload = true;
-      lastDiscoveredStandardArchiveUrl = targetUrl;
+      lastDiscoveredBranchUrls[requestedBranch] = targetUrl;
       emitEnvironmentSetupProgress(
         {
           ...progressCtx,
@@ -3038,9 +3477,21 @@ async function captureCodeWeaversPreviewDownload(
           signal.removeEventListener('abort', onAbort);
         }
       } catch {}
+      try {
+        const wcRef = authWindow && !authWindow.isDestroyed() ? authWindow.webContents : null;
+        if (wcRef && typeof wcRef.removeAllListeners === 'function') {
+          wcRef.removeAllListeners();
+        }
+      } catch {}
+      try {
+        if (authWindow && typeof authWindow.removeAllListeners === 'function') {
+          authWindow.removeAllListeners();
+        }
+      } catch {}
+      forceCloseAuthWindow();
     };
 
-    const settleResolve = (/** @type {{ archivePath: string, resolvedVersion: string | null }} */ val) => {
+    const settleResolve = (/** @type {{ archivePath: string, resolvedVersion: string | null, alreadyUpToDate?: boolean, authenticated?: boolean, downloadUrl?: string | null, discoveredBranchUrls?: { standard: string | null, arm64: string | null } }} */ val) => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -3054,7 +3505,7 @@ async function captureCodeWeaversPreviewDownload(
       reject(err);
     };
 
-    onWillDownload = (_event, item) => {
+    onWillDownload = async (_event, item) => {
       if (settled || downloadCaptured) {
         try {
           if (item && typeof item.cancel === 'function') item.cancel();
@@ -3084,14 +3535,14 @@ async function captureCodeWeaversPreviewDownload(
       const hasValidArchiveExt =
         /\.(?:zip|dmg)$/i.test(filename) || /\.(?:zip|dmg)(?:\?|$)/i.test(itemUrl);
 
-      if (!allUrlsTrusted || !hasValidArchiveExt) {
+      if (!allUrlsTrusted) {
         try {
           if (item && typeof item.cancel === 'function') item.cancel();
         } catch {}
         forceCloseAuthWindow();
         const secErr = /** @type {Error & { code?: string }} */ (
           new Error(
-            `Blocked CrossOver Preview download from untrusted host or unsupported file type (${filename || itemUrl || 'unknown'}).`
+            `Blocked CrossOver Preview download from untrusted host or unsupported URL (${filename || itemUrl || 'unknown'}).`
           )
         );
         secErr.code = 'INSTALLER_URL_BLOCKED';
@@ -3099,16 +3550,59 @@ async function captureCodeWeaversPreviewDownload(
         return;
       }
 
-      if (
-        options.allowExperimentalArm64Preview !== true &&
-        (isExperimentalArm64CrossOverPreviewTarget(filename) ||
-          urlsToCheck.some((u) => isExperimentalArm64CrossOverPreviewTarget(u)))
-      ) {
+      if (!hasValidArchiveExt) {
         try {
           if (item && typeof item.cancel === 'function') item.cancel();
         } catch {}
-        if (lastDiscoveredStandardArchiveUrl && !autoTriggeredArchiveDownload) {
-          triggerArchiveDownloadUrl(lastDiscoveredStandardArchiveUrl);
+        return;
+      }
+
+      if (options.authenticateOnly === true) {
+        try {
+          if (item && typeof item.cancel === 'function') item.cancel();
+        } catch {}
+        try {
+          if (previewSession?.cookies && typeof previewSession.cookies.flushStore === 'function') {
+            await previewSession.cookies.flushStore();
+          }
+        } catch {}
+        forceCloseAuthWindow();
+        const candidateVer =
+          extractPreviewFilenameVersionHint(filename) ||
+          extractRunnerPreviewDate(filename) ||
+          extractPreviewFilenameVersionHint(itemUrl) ||
+          extractRunnerPreviewDate(itemUrl) ||
+          null;
+        if (itemUrl && typeof setCachedAuthenticatedPreviewUrl === 'function') {
+          const detectedBranch =
+            classifyCrossOverPreviewArchiveBranch(itemUrl) ||
+            classifyCrossOverPreviewArchiveBranch(filename) ||
+            requestedBranch;
+          setCachedAuthenticatedPreviewUrl(itemUrl, {
+            ...options,
+            previewBranch: detectedBranch,
+          });
+        }
+        settleResolve({
+          authenticated: true,
+          archivePath: '',
+          downloadUrl: itemUrl || null,
+          resolvedVersion: candidateVer,
+        });
+        return;
+      }
+
+      const itemBranch =
+        urlsToCheck.map((u) => classifyCrossOverPreviewArchiveBranch(u)).find(Boolean) ||
+        classifyCrossOverPreviewArchiveBranch(filename) ||
+        null;
+      if (itemBranch && itemBranch !== requestedBranch) {
+        try {
+          if (item && typeof item.cancel === 'function') item.cancel();
+        } catch {}
+        const preferredBranchUrl = lastDiscoveredBranchUrls[requestedBranch];
+        if (preferredBranchUrl && !autoTriggeredArchiveDownload) {
+          triggerArchiveDownloadUrl(preferredBranchUrl);
           return;
         }
         if (!autoTriggeredArchiveDownload) {
@@ -3116,13 +3610,11 @@ async function captureCodeWeaversPreviewDownload(
           return;
         }
         forceCloseAuthWindow();
-        const armErr = /** @type {Error & { code?: string }} */ (
+        settleReject(
           new Error(
-            `Skipped experimental ARM64 CrossOver Preview build (${filename || itemUrl}); standard macOS CrossOver Preview build is required.`
+            `CrossOver Preview download (${filename || itemUrl}) belongs to the ${itemBranch} branch, but ${requestedBranch} was requested.`
           )
         );
-        armErr.code = 'EXPERIMENTAL_ARM64_PREVIEW_EXCLUDED';
-        settleReject(armErr);
         return;
       }
 
@@ -3140,24 +3632,11 @@ async function captureCodeWeaversPreviewDownload(
         isDmgDownload ? 'CrossOverPreview.dmg' : 'CrossOverPreview.zip'
       );
 
+      // Attach path and download progress/completion listeners synchronously BEFORE awaiting flushStore()
+      // so fast/mocked downloads that emit 'done' immediately after will-download never drop events.
       if (typeof item.setSavePath === 'function') {
         item.setSavePath(destArchivePath);
       }
-
-      forceCloseAuthWindow();
-
-      const initialTotal =
-        typeof item.getTotalBytes === 'function' ? Number(item.getTotalBytes() || 0) : 0;
-      emitEnvironmentSetupProgress(
-        {
-          ...progressCtx,
-          phase: 'downloading',
-          bytesDownloaded: 0,
-          ...(initialTotal > 0 ? { totalBytes: initialTotal, progressPercent: 0 } : {}),
-          message: 'Downloading CrossOver Preview...',
-        },
-        options
-      );
 
       if (typeof item.on === 'function') {
         item.on('updated', (/** @type {any} */ _uEvt, /** @type {string} */ state) => {
@@ -3202,6 +3681,7 @@ async function captureCodeWeaversPreviewDownload(
           settleResolve({
             archivePath: destArchivePath,
             resolvedVersion,
+            discoveredBranchUrls: lastDiscoveredBranchUrls,
           });
           return;
         }
@@ -3221,6 +3701,27 @@ async function captureCodeWeaversPreviewDownload(
       } else if (typeof item.on === 'function') {
         item.on('done', onDownloadDone);
       }
+
+      try {
+        if (previewSession?.cookies && typeof previewSession.cookies.flushStore === 'function') {
+          await previewSession.cookies.flushStore();
+        }
+      } catch {}
+      if (settled) return;
+      forceCloseAuthWindow();
+
+      const initialTotal =
+        typeof item.getTotalBytes === 'function' ? Number(item.getTotalBytes() || 0) : 0;
+      emitEnvironmentSetupProgress(
+        {
+          ...progressCtx,
+          phase: 'downloading',
+          bytesDownloaded: 0,
+          ...(initialTotal > 0 ? { totalBytes: initialTotal, progressPercent: 0 } : {}),
+          message: 'Downloading CrossOver Preview...',
+        },
+        options
+      );
     };
 
     onAbort = () => {
@@ -3250,7 +3751,7 @@ async function captureCodeWeaversPreviewDownload(
           ? { parent: mainWin }
           : {}),
         modal: false,
-        show: options.showAuthWindowImmediately === true,
+        show: shouldShowImmediately,
         closable: true,
         resizable: true,
         autoHideMenuBar: true,
@@ -3263,6 +3764,40 @@ async function captureCodeWeaversPreviewDownload(
         },
       });
 
+      if (shouldShowImmediately) {
+        revealAuthWindow();
+      }
+
+      const timeoutMs = Number(options.timeoutMs || options.timeout || 0);
+      if (timeoutMs > 0) {
+        scheduleBoundedTimer(() => {
+          if (settled || downloadCaptured) return;
+          try {
+            if (activeDownloadItem && typeof activeDownloadItem.cancel === 'function') {
+              activeDownloadItem.cancel();
+            }
+          } catch {}
+          forceCloseAuthWindow();
+          const timeoutErr = /** @type {Error & { code?: string }} */ (
+            new Error(`CodeWeavers Preview sign-in timed out after ${timeoutMs}ms.`)
+          );
+          timeoutErr.name = 'TimeoutError';
+          timeoutErr.code = 'ETIMEDOUT';
+          settleReject(timeoutErr);
+        }, timeoutMs);
+      }
+
+      const cleanBrowserUa =
+        process.platform === 'win32'
+          ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+          : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
+
+      try {
+        if (typeof previewSession.setUserAgent === 'function') {
+          previewSession.setUserAgent(cleanBrowserUa);
+        }
+      } catch {}
+
       scheduleBoundedTimer(() => {
         if (!settled && !downloadCaptured && !closingForCapture && !autoTriggeredArchiveDownload) {
           revealAuthWindow();
@@ -3270,6 +3805,11 @@ async function captureCodeWeaversPreviewDownload(
       }, 1500);
 
       const wc = authWindow.webContents;
+      try {
+        if (typeof wc?.setUserAgent === 'function') {
+          wc.setUserAgent(cleanBrowserUa);
+        }
+      } catch {}
 
       inspectPortalAndTriggerDownload = async (currentUrlHint = '', retryAttempt = 0) => {
         if (
@@ -3313,9 +3853,14 @@ async function captureCodeWeaversPreviewDownload(
         }
 
         const isLoginRoute =
-          pathname.startsWith('/login') ||
-          pathname.startsWith('/signin') ||
-          pathname.includes('/login/') ||
+          pathname.includes('/login') ||
+          pathname.includes('/signin') ||
+          pathname.includes('/sign-in') ||
+          pathname.includes('/sign_in') ||
+          pathname.startsWith('/account/login') ||
+          pathname.startsWith('/account/signin') ||
+          pathname.startsWith('/account/auth') ||
+          (pathname.startsWith('/account') && (parsed.search.includes('gourl') || parsed.search.includes('login') || parsed.search.includes('signin'))) ||
           pathname.endsWith('/login');
         if (isLoginRoute) {
           sawLoginPage = true;
@@ -3327,17 +3872,27 @@ async function captureCodeWeaversPreviewDownload(
         /** @type {string[]} */
         let scrapedHrefs = [];
         let hasPasswordInput = false;
+        let hasChallengeDom = false;
         if (wc && typeof wc.executeJavaScript === 'function') {
           try {
             const pageProbe = await wc.executeJavaScript(
               `(() => {
                 const hrefs = [];
-                for (const el of document.querySelectorAll('a[href], area[href], [data-download-url]')) {
-                  const val = el.getAttribute('href') || el.getAttribute('data-download-url') || el.href || '';
+                for (const el of document.querySelectorAll('a[href], area[href], [data-download-url], [data-url], [data-href], [data-link]')) {
+                  const val = el.getAttribute('href') || el.getAttribute('data-download-url') || el.getAttribute('data-url') || el.getAttribute('data-href') || el.getAttribute('data-link') || el.href || '';
                   if (val) hrefs.push(String(val));
                 }
-                const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
-                return { hrefs, hasPasswordInput };
+                const hasPasswordInput = Boolean(
+                  document.querySelector('input[type="password"], form[action*="login"], form[action*="signin"]')
+                );
+                const hasChallengeDom = Boolean(
+                  document.querySelector(
+                    '#challenge-form, #cf-challenge-running, #cf-browser-verification, .cf-browser-verification, #challenge-platform, .challenge-platform, iframe[src*="challenges.cloudflare.com"], [name="cf-turnstile-response"]'
+                  ) || /Just a moment/i.test(String(document.title || ''))
+                );
+                const rawHtml = document.body ? document.body.innerHTML.slice(0, 100000) : '';
+                const pageTitle = String(document.title || '');
+                return { hrefs, hasPasswordInput, hasChallengeDom, rawHtml, pageTitle };
               })()`,
               true
             );
@@ -3348,6 +3903,28 @@ async function captureCodeWeaversPreviewDownload(
                 scrapedHrefs = pageProbe.hrefs.map((/** @type {any} */ u) => String(u || ''));
               }
               hasPasswordInput = Boolean(pageProbe.hasPasswordInput);
+              hasChallengeDom = Boolean(pageProbe.hasChallengeDom);
+              if (!hasChallengeDom && typeof pageProbe.pageTitle === 'string') {
+                if (/Just a moment/i.test(pageProbe.pageTitle)) {
+                  hasChallengeDom = true;
+                }
+              }
+              if (
+                typeof pageProbe.rawHtml === 'string' &&
+                pageProbe.rawHtml
+              ) {
+                if (
+                  !hasChallengeDom &&
+                  /id=["']challenge-form["']|id=["']cf-challenge-running["']|cf-browser-verification|challenge-platform|challenges\.cloudflare\.com|cf-turnstile-response|<title>\s*Just a moment\b|\bJust a moment\b/i.test(
+                    pageProbe.rawHtml
+                  )
+                ) {
+                  hasChallengeDom = true;
+                }
+                if (typeof extractCandidateLinksFromText === 'function') {
+                  extractCandidateLinksFromText(pageProbe.rawHtml, scrapedHrefs);
+                }
+              }
             }
           } catch {}
         }
@@ -3363,21 +3940,132 @@ async function captureCodeWeaversPreviewDownload(
           return;
         }
 
-        const bestArchiveUrl = selectPreferredCrossOverPreviewDownloadUrl(
-          scrapedHrefs,
-          currentUrl,
-          options
-        );
-        if (bestArchiveUrl) {
-          lastDiscoveredStandardArchiveUrl = bestArchiveUrl;
-          triggerArchiveDownloadUrl(bestArchiveUrl);
-          return;
-        }
-
-        if (hasPasswordInput) {
+        if (hasPasswordInput || hasChallengeDom) {
           sawLoginPage = true;
           autoTriggeredDownloadAfterLogin = false;
           revealAuthWindow();
+          return;
+        }
+
+        const candidateHrefs = [...scrapedHrefs];
+        if (options.downloadUrl && typeof options.downloadUrl === 'string') {
+          candidateHrefs.push(options.downloadUrl.trim());
+        }
+        if (Array.isArray(options.previewCandidateUrls)) {
+          for (const u of options.previewCandidateUrls) {
+            if (typeof u === 'string' && u.trim()) candidateHrefs.push(u.trim());
+          }
+        }
+
+        const discoveredBranches = discoverCrossOverPreviewBranchUrls(
+          candidateHrefs,
+          currentUrl,
+          options
+        );
+        lastDiscoveredBranchUrls = {
+          standard: discoveredBranches.standard || lastDiscoveredBranchUrls.standard,
+          arm64: discoveredBranches.arm64 || lastDiscoveredBranchUrls.arm64,
+        };
+        if (typeof setCachedAuthenticatedPreviewUrl === 'function') {
+          if (discoveredBranches.standard) {
+            setCachedAuthenticatedPreviewUrl(discoveredBranches.standard, {
+              ...options,
+              previewBranch: 'standard',
+            });
+          }
+          if (discoveredBranches.arm64) {
+            setCachedAuthenticatedPreviewUrl(discoveredBranches.arm64, {
+              ...options,
+              previewBranch: 'arm64',
+            });
+          }
+        }
+        const bestArchiveUrl = discoveredBranches[requestedBranch];
+
+        if (options.authenticateOnly === true) {
+          if (bestArchiveUrl) {
+            try {
+              if (previewSession?.cookies && typeof previewSession.cookies.flushStore === 'function') {
+                await previewSession.cookies.flushStore();
+              }
+            } catch {}
+            forceCloseAuthWindow();
+            settleResolve({
+              authenticated: true,
+              archivePath: '',
+              downloadUrl: bestArchiveUrl,
+              resolvedVersion:
+                extractPreviewFilenameVersionHint(bestArchiveUrl) ||
+                extractRunnerPreviewDate(bestArchiveUrl) ||
+                null,
+              discoveredBranchUrls: lastDiscoveredBranchUrls,
+            });
+            return;
+          }
+        }
+
+        if (bestArchiveUrl) {
+          lastDiscoveredBranchUrls[requestedBranch] = bestArchiveUrl;
+
+          // Defense-in-depth: If this is an update operation and existingLayer is already at or newer
+          // than bestArchiveUrl, do NOT download the 480 MB archive and overwrite identical bundle.
+          if (
+            options._runnerOperation === 'update' &&
+            !options.forceReinstall &&
+            options.existingLayer
+          ) {
+            const candidatePreviewDate =
+              extractRunnerPreviewDate(bestArchiveUrl) ||
+              extractRunnerPreviewDate(path.basename(bestArchiveUrl));
+            const existingLayer = options.existingLayer;
+            const existingPreviewDate =
+              extractRunnerPreviewDate(existingLayer.previewDate) ||
+              extractRunnerPreviewDate(existingLayer.displayVersion) ||
+              extractRunnerPreviewDate(existingLayer.buildVersion) ||
+              extractRunnerPreviewDate(existingLayer.version);
+
+            const candidateDateNum = parseNumericPreviewDate(candidatePreviewDate);
+            const existingDateNum = parseNumericPreviewDate(existingPreviewDate);
+
+            let isAlreadyCurrentOrNewer = false;
+            if (candidateDateNum !== null && existingDateNum !== null) {
+              if (candidateDateNum === existingDateNum) {
+                const candidateSemverMatch = path.basename(bestArchiveUrl).match(/(\d+\.\d+(?:\.\d+)?)/);
+                const existingSemver =
+                  existingLayer.version && /^\d+\.\d+(?:\.\d+)?$/.test(existingLayer.version)
+                    ? existingLayer.version
+                    : null;
+                if (candidateSemverMatch && existingSemver && typeof compareRunnerVersions === 'function') {
+                  isAlreadyCurrentOrNewer = compareRunnerVersions(existingSemver, candidateSemverMatch[1]) >= 0;
+                } else {
+                  isAlreadyCurrentOrNewer = true;
+                }
+              } else if (existingDateNum > candidateDateNum) {
+                isAlreadyCurrentOrNewer = true;
+              }
+            } else if (existingDateNum !== null && candidateDateNum === null) {
+              isAlreadyCurrentOrNewer = true;
+            }
+
+            if (isAlreadyCurrentOrNewer) {
+              try {
+                if (previewSession?.cookies && typeof previewSession.cookies.flushStore === 'function') {
+                  await previewSession.cookies.flushStore();
+                }
+              } catch {}
+              forceCloseAuthWindow();
+              settleResolve({
+                alreadyUpToDate: true,
+                archivePath: '',
+                downloadUrl: bestArchiveUrl,
+                resolvedVersion: candidatePreviewDate || existingPreviewDate || existingLayer.version || null,
+                discoveredBranchUrls: lastDiscoveredBranchUrls,
+              });
+              return;
+            }
+          }
+
+          triggerArchiveDownloadUrl(bestArchiveUrl);
           return;
         }
 
@@ -3440,14 +4128,23 @@ async function captureCodeWeaversPreviewDownload(
               const parsed = new URL(String(navUrl || '').trim());
               const pathname = parsed.pathname.toLowerCase();
               const host = parsed.hostname.toLowerCase();
-              if (
-                pathname.startsWith('/login') ||
-                pathname.startsWith('/signin') ||
-                host === 'challenges.cloudflare.com' ||
-                host === 'google.com' ||
-                host.endsWith('.google.com') ||
-                host === 'appleid.apple.com'
-              ) {
+              const isCodeWeaversOrigin =
+                host === 'codeweavers.com' ||
+                host.endsWith('.codeweavers.com') ||
+                (options.allowLoopbackInstallerUrls === true &&
+                  (host === '127.0.0.1' || host === 'localhost'));
+              const isAuthOrChallengeHost = !isCodeWeaversOrigin;
+              const isLoginPath =
+                pathname.includes('/login') ||
+                pathname.includes('/signin') ||
+                pathname.includes('/sign-in') ||
+                pathname.includes('/sign_in') ||
+                pathname.startsWith('/account/login') ||
+                pathname.startsWith('/account/signin') ||
+                pathname.startsWith('/account/auth') ||
+                (pathname.startsWith('/account') && (parsed.search.includes('gourl') || parsed.search.includes('login') || parsed.search.includes('signin'))) ||
+                isAuthOrChallengeHost;
+              if (isLoginPath) {
                 sawLoginPage = true;
                 autoTriggeredDownloadAfterLogin = false;
                 revealAuthWindow();
@@ -3471,12 +4168,16 @@ async function captureCodeWeaversPreviewDownload(
                 return;
               }
               const pathname = parsed.pathname.toLowerCase();
-              if (
-                pathname.startsWith('/login') ||
-                pathname.startsWith('/signin') ||
-                pathname.includes('/login/') ||
-                pathname.endsWith('/login')
-              ) {
+              const isLoginPath =
+                pathname.includes('/login') ||
+                pathname.includes('/signin') ||
+                pathname.includes('/sign-in') ||
+                pathname.includes('/sign_in') ||
+                pathname.startsWith('/account/login') ||
+                pathname.startsWith('/account/signin') ||
+                pathname.startsWith('/account/auth') ||
+                (pathname.startsWith('/account') && (parsed.search.includes('gourl') || parsed.search.includes('login') || parsed.search.includes('signin')));
+              if (isLoginPath) {
                 sawLoginPage = true;
                 autoTriggeredDownloadAfterLogin = false;
                 revealAuthWindow();
@@ -3592,30 +4293,53 @@ function detectExternalRunnerManagerName(appPath) {
  *
  * @param {string} rawRunnerType
  * @param {Record<string, any>} [options]
- * @returns {Promise<{ success: boolean, installed?: boolean, openedExternal?: boolean, openedExternalUrl?: string, switchedToStableCrossOver?: boolean, installedPath?: string, version?: string | null, message: string }>}
+ * @returns {Promise<{ success: boolean, installed?: boolean, alreadyUpToDate?: boolean, authenticated?: boolean, downloadUrl?: string | null, openedExternal?: boolean, openedExternalUrl?: string, switchedToStableCrossOver?: boolean, installedPath?: string, version?: string | null, message: string, error?: string }>}
  */
 async function installRunnerDirect(rawRunnerType, options = {}) {
-  const requestedRunnerType = String(rawRunnerType || 'crossover')
-    .trim()
-    .toLowerCase();
+  const requestedRunnerType = normalizeRequestedRunnerType(rawRunnerType);
+  if (
+    requestedRunnerType !== 'crossover' &&
+    requestedRunnerType !== 'crossover_preview' &&
+    requestedRunnerType !== 'crossover_preview_arm64' &&
+    requestedRunnerType !== 'wine' &&
+    requestedRunnerType !== 'gptk'
+  ) {
+    const rawDisplay = String(rawRunnerType ?? '').trim();
+    throw new Error(
+      `Unsupported compatibility runner type: ${rawDisplay || requestedRunnerType || '(empty)'}`
+    );
+  }
   const effectiveRunnerType =
     requestedRunnerType === 'crossover_preview' && options.switchToStableCrossOver === true
       ? 'crossover'
       : requestedRunnerType;
+  const runnerSpec = resolveCodeWeaversRunnerSpec(effectiveRunnerType);
+  const isPreviewRunner =
+    effectiveRunnerType === 'crossover_preview' ||
+    effectiveRunnerType === 'crossover_preview_arm64';
+  const previewBranch =
+    effectiveRunnerType === 'crossover_preview_arm64'
+      ? 'arm64'
+      : resolvePreviewBranch(options, effectiveRunnerType);
+  const cwPreviewLabel = runnerSpec?.displayLabel || 'CrossOver Preview';
 
   const { homedir } = resolveIsolatedHomedirAndUserData(options);
   let targetAppsDir = await resolveTargetMacApplicationsDir(homedir, options);
   const signal = /** @type {AbortSignal | undefined} */ (options.signal);
+  if (signal?.aborted) {
+    const abortErr = new Error(`Installation of ${cwPreviewLabel || effectiveRunnerType} cancelled.`);
+    abortErr.name = 'AbortError';
+    throw abortErr;
+  }
 
-  /** @type {EnvironmentComponentId} */
-  const componentId =
-    effectiveRunnerType === 'crossover_preview'
-      ? 'runner_crossover_preview'
-      : effectiveRunnerType === 'wine'
-        ? 'runner_wine'
-        : effectiveRunnerType === 'gptk'
-          ? 'runner_gptk'
-          : 'runner_crossover';
+  /** @type {ProvisionerComponentId} */
+  const componentId = runnerSpec
+    ? runnerSpec.componentId
+    : effectiveRunnerType === 'wine'
+      ? 'runner_wine'
+      : effectiveRunnerType === 'gptk'
+        ? 'runner_gptk'
+        : 'runner_crossover';
 
   const progressCtx = options._progressCtx || {
     runId: String(options.runId || `runner-install-${Date.now()}`),
@@ -3624,12 +4348,44 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
     totalSteps: 1,
   };
 
+  const hostPlatform = String(options.platform || process.platform).toLowerCase();
+  const hostArch = String(options.arch || process.arch || 'arm64').toLowerCase();
+  if (
+    effectiveRunnerType === 'crossover_preview_arm64' &&
+    (hostPlatform !== 'darwin' || hostArch !== 'arm64')
+  ) {
+    const archErrMsg =
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.';
+    emitEnvironmentSetupProgress(
+      {
+        ...progressCtx,
+        phase: 'failed',
+        message: archErrMsg,
+        error: archErrMsg,
+      },
+      options
+    );
+    return {
+      success: false,
+      installed: false,
+      message: archErrMsg,
+      error: archErrMsg,
+    };
+  }
+
   const detectedBefore = detectCompatibilityLayers({
     ...options,
     ...explicitHomedirOpt(options),
   });
+  const isSwitchingPreviewToStable =
+    requestedRunnerType === 'crossover_preview' && options.switchToStableCrossOver === true;
+  const providedExistingLayer =
+    options.existingLayer &&
+    (!isSwitchingPreviewToStable || options.existingLayer.type === effectiveRunnerType)
+      ? options.existingLayer
+      : null;
   const existingLayer =
-    options.existingLayer ||
+    providedExistingLayer ||
     detectedBefore.find((/** @type {any} */ l) => l.type === effectiveRunnerType) ||
     null;
 
@@ -3659,32 +4415,59 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
     !externalMgr &&
     typeof options.customApplicationsDir !== 'string'
   ) {
-    const existingParent = path.dirname(existingLayer.appPath);
-    try {
-      if (options.homedir) {
+    const matchesCanonicalBundle =
+      !runnerSpec ||
+      path.basename(existingLayer.appPath).toLowerCase() ===
+        runnerSpec.canonicalAppName.toLowerCase();
+    if (matchesCanonicalBundle) {
+      const existingParent = path.dirname(existingLayer.appPath);
+      const existsOnDisk = fs.existsSync(existingLayer.appPath);
+      if (options.homedir && !existsOnDisk) {
         targetAppsDir = existingParent;
         existingTargetAppPath = existingLayer.appPath;
       } else {
-        await fs.promises.access(existingParent, fs.constants.W_OK);
-        targetAppsDir = existingParent;
-        existingTargetAppPath = existingLayer.appPath;
+        try {
+          await fs.promises.access(existingParent, fs.constants.W_OK | fs.constants.X_OK);
+          if (existsOnDisk) {
+            await fs.promises.access(existingLayer.appPath, fs.constants.W_OK);
+          }
+          targetAppsDir = existingParent;
+          existingTargetAppPath = existingLayer.appPath;
+        } catch (permErr) {
+          if (
+            options._runnerOperation === 'update' &&
+            options.authenticateOnly !== true
+          ) {
+            throw new Error(
+              `Cannot update ${formatRunnerDisplayLabel(effectiveRunnerType, existingLayer)}: write/rename permission denied on "${existingLayer.appPath}" or "${existingParent}" (${permErr instanceof Error ? permErr.message : String(permErr)}).`
+            );
+          }
+        }
       }
-    } catch {}
+    }
   }
 
   // Pre-flight active-session & external OS process safety check before downloading or extracting
-  const preflightSafe = await assertRunnerSafeToReplace(
-    effectiveRunnerType,
-    existingTargetAppPath,
-    existingLayer,
-    options
-  );
-  throwIfRunnerBusy(preflightSafe);
+  if (options.authenticateOnly !== true) {
+    const preflightTargetAppPath =
+      existingTargetAppPath ||
+      (!externalMgr && !existingLayer?.appPath && runnerSpec
+        ? path.join(targetAppsDir, runnerSpec.canonicalAppName)
+        : null);
+    const preflightSafe = await assertRunnerSafeToReplace(
+      effectiveRunnerType,
+      preflightTargetAppPath,
+      existingLayer,
+      options
+    );
+    throwIfRunnerBusy(preflightSafe);
+  }
 
   if (typeof options.mockDirectDownload === 'function') {
     return await options.mockDirectDownload(effectiveRunnerType, {
       ...options,
       requestedRunnerType,
+      componentId,
       targetAppsDir,
       existingLayer,
       existingTargetAppPath,
@@ -3827,6 +4610,76 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
   };
 
   /**
+   * Strip quarantine, verify CodeWeavers Developer ID, rename `CrossOver Preview.app` ->
+   * `CrossOver Preview arm64.app` for `crossover_preview_arm64`, and re-verify
+   * `codesign --verify --deep --strict` post-rename before atomic swap.
+   *
+   * @param {string} initialStagedApp
+   * @param {string | null} [initialVersion]
+   * @returns {Promise<{ preparedApp: string, resolvedVersion: string | null }>}
+   */
+  const verifyAndPrepareCodeWeaversStagedApp = async (initialStagedApp, initialVersion = null) => {
+    let preparedApp = initialStagedApp;
+    await clearMacQuarantineAsync(preparedApp, { ...options, force: true });
+    await verifyMacAppDeveloperSignature(preparedApp, ['2C75U774H4'], {
+      ...options,
+      _componentId: componentId,
+      expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
+    });
+
+    const stagedCxRoot = path.join(preparedApp, 'Contents', 'SharedSupport', 'CrossOver');
+    if (fs.existsSync(stagedCxRoot) && typeof inspectCrossOverBundleMarkers === 'function') {
+      const stagedMarkers = inspectCrossOverBundleMarkers(preparedApp);
+      if (effectiveRunnerType === 'crossover_preview_arm64' && !stagedMarkers.isArm64Bundle) {
+        await fs.promises.rm(preparedApp, { recursive: true, force: true }).catch(() => {});
+        throw new Error(
+          'Selected archive contains an Intel/standard CrossOver bundle without arm64 FEX runtime markers (expected lib/wine/aarch64-unix/ntdll.so or bin/wineserver-arm64).'
+        );
+      }
+      if (
+        (effectiveRunnerType === 'crossover_preview' || effectiveRunnerType === 'crossover') &&
+        stagedMarkers.isArm64Bundle
+      ) {
+        await fs.promises.rm(preparedApp, { recursive: true, force: true }).catch(() => {});
+        throw new Error(
+          `Selected archive contains an arm64 CrossOver Preview bundle, which cannot be installed as ${cwPreviewLabel}.`
+        );
+      }
+    }
+
+    if (effectiveRunnerType === 'crossover_preview_arm64') {
+      const targetArm64Name = 'CrossOver Preview arm64.app';
+      if (path.basename(preparedApp) !== targetArm64Name) {
+        const renamedPath = path.join(path.dirname(preparedApp), targetArm64Name);
+        if (fs.existsSync(renamedPath)) {
+          await fs.promises.rm(renamedPath, { recursive: true, force: true });
+        }
+        await fs.promises.rename(preparedApp, renamedPath);
+        preparedApp = renamedPath;
+      }
+
+      const canExecCodesign =
+        options.skipStagingCodesignVerify !== true &&
+        (process.platform === 'darwin' ||
+          typeof options.execFileFn === 'function' ||
+          typeof options.execFileImpl === 'function');
+      if (canExecCodesign) {
+        await runExecFileAsync(
+          getExecFileFn(options),
+          '/usr/bin/codesign',
+          ['--verify', '--deep', '--strict', preparedApp],
+          { timeout: 60000, ...(signal ? { signal } : {}) }
+        );
+      }
+    }
+
+    const resolvedVersion = isPreviewRunner
+      ? resolvePreviewBundleVersion(preparedApp, initialVersion)
+      : initialVersion;
+    return { preparedApp, resolvedVersion };
+  };
+
+  /**
    * Perform pre-swap safety guard and atomic `.app` installation.
    *
    * @param {string} stagedApp
@@ -3834,12 +4687,12 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
    * @param {string | null} [resolvedVersion]
    */
   const atomicSwapVerifiedApp = async (stagedApp, displayLabel, resolvedVersion = null) => {
+    const canonicalName = runnerSpec ? runnerSpec.canonicalAppName : path.basename(stagedApp);
     const destAppPath =
       existingTargetAppPath &&
-      path.basename(existingTargetAppPath).toLowerCase() ===
-        path.basename(stagedApp).toLowerCase()
+      path.basename(existingTargetAppPath).toLowerCase() === canonicalName.toLowerCase()
         ? existingTargetAppPath
-        : path.join(targetAppsDir, path.basename(stagedApp));
+        : path.join(targetAppsDir, canonicalName);
 
     const preSwapSafe = await assertRunnerSafeToReplace(
       effectiveRunnerType,
@@ -3868,7 +4721,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         homedir,
       });
     }
-    invalidateScanCaches();
+    invalidateScanCaches({ skipPreviewUrlCacheClear: true });
     return {
       success: true,
       installed: true,
@@ -3899,8 +4752,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
       }
     } else {
       const lowerLocal = explicitLocalInstallerPath.toLowerCase();
-      const isCodeWeaversRunner =
-        effectiveRunnerType === 'crossover' || effectiveRunnerType === 'crossover_preview';
+      const isCodeWeaversRunner = Boolean(runnerSpec);
 
       if (lowerLocal.endsWith('.dmg')) {
         emitEnvironmentSetupProgress(
@@ -3911,9 +4763,12 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           },
           options
         );
+        const dmgTargetAppPath =
+          existingTargetAppPath ||
+          (runnerSpec ? path.join(targetAppsDir, runnerSpec.canonicalAppName) : null);
         const preSwapSafe = await assertRunnerSafeToReplace(
           effectiveRunnerType,
-          existingTargetAppPath,
+          dmgTargetAppPath,
           existingLayer,
           options
         );
@@ -3927,18 +4782,31 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           {
             ...options,
             _componentId: componentId,
-            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+            ...(dmgTargetAppPath ? { targetAppBundlePath: dmgTargetAppPath } : {}),
             ...(effectiveRunnerType === 'gptk' ? { requireGptkBundle: true } : {}),
             ...(effectiveRunnerType === 'wine'
               ? { allowAdhocSignature: true, prepareUnsignedWineBundle: true }
               : {}),
           }
         );
-        invalidateScanCaches();
+        const localDmgVersion = isPreviewRunner
+          ? resolvePreviewBundleVersion(
+              installedPath,
+              extractPreviewFilenameVersionHint(explicitLocalInstallerPath)
+            )
+          : null;
+        if (localDmgVersion && typeof recordRunnerInstallReceipt === 'function') {
+          recordRunnerInstallReceipt(installedPath, effectiveRunnerType, localDmgVersion, {
+            ...options,
+            homedir,
+          });
+        }
+        invalidateScanCaches({ skipPreviewUrlCacheClear: true });
         return {
           success: true,
           installed: true,
           installedPath,
+          ...(localDmgVersion ? { version: localDmgVersion } : {}),
           message: `Installed ${path.basename(installedPath)} to ${path.dirname(installedPath)}.`,
         };
       }
@@ -3974,8 +4842,18 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
               { timeout: 300000, signal }
             );
           }
+          if (signal?.aborted) {
+            const abortErr = new Error(
+              `Installation of ${cwPreviewLabel || effectiveRunnerType} cancelled.`
+            );
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
 
-          const stagedApp = await findStagedAppBundle(stagingDir);
+          const preferredBundleNames = runnerSpec
+            ? [runnerSpec.canonicalAppName, 'CrossOver Preview.app']
+            : [];
+          const stagedApp = await findStagedAppBundle(stagingDir, 0, preferredBundleNames);
           if (!stagedApp) {
             throw new Error(
               `No macOS .app bundle found inside ${path.basename(explicitLocalInstallerPath)}.`
@@ -3991,14 +4869,19 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
             options
           );
 
+          let finalStagedApp = stagedApp;
+          let localArchiveVersion = isPreviewRunner
+            ? extractPreviewFilenameVersionHint(explicitLocalInstallerPath)
+            : null;
           if (effectiveRunnerType === 'gptk') {
             await verifyAndPrepareStagedGptkApp(stagedApp);
           } else if (isCodeWeaversRunner) {
-            await verifyMacAppDeveloperSignature(stagedApp, ['2C75U774H4'], {
-              ...options,
-              _componentId: componentId,
-              expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
-            });
+            const prepared = await verifyAndPrepareCodeWeaversStagedApp(
+              stagedApp,
+              localArchiveVersion
+            );
+            finalStagedApp = prepared.preparedApp;
+            localArchiveVersion = prepared.resolvedVersion;
           } else if (effectiveRunnerType === 'wine') {
             await verifyAndPrepareStagedWineApp(stagedApp);
           } else {
@@ -4010,8 +4893,9 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           }
 
           return await atomicSwapVerifiedApp(
-            stagedApp,
-            formatRunnerDisplayLabel(effectiveRunnerType, existingLayer)
+            finalStagedApp,
+            formatRunnerDisplayLabel(effectiveRunnerType, existingLayer),
+            localArchiveVersion
           );
         } finally {
           try {
@@ -4027,18 +4911,86 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
   }
 
   // -------------------------------------------------------------------------
-  // CrossOver Preview:
+  // CrossOver Preview (`crossover_preview` & `crossover_preview_arm64`):
   // 1) Explicit local `dmgPath` / `archivePath` (handled above).
-  // 2) Installed `CrossOver Preview.app` Sparkle `SUFeedURL` on an allowed CodeWeavers host.
-  // 3) Installed `existingLayer` where public `cxmac.xml` Stable has strictly surpassed Preview.
-  // 4) Sandboxed in-app CodeWeavers sign-in (`persist:codeweavers-preview`) + auto-captured install.
-  // 5) Headless / `skipNetwork` fallback to official CodeWeavers Preview portal.
+  // 2) Installed Sparkle `SUFeedURL` ONLY when it is a genuine Preview feed (never `cxmac.xml`).
+  // 3) For standard `crossover_preview` only: switch to Stable if surpassed/requested.
+  // 4) Cookie-backed authenticated `previewSession.fetch` streaming download (when verified archive URL available).
+  // 5) Sandboxed in-app CodeWeavers sign-in (`persist:codeweavers-preview`) + auto-captured install.
+  // 6) Headless / `skipNetwork` fallback to official CodeWeavers Preview portal.
   // -------------------------------------------------------------------------
   /** @type {{ xml: string, feedUrl: string, sparklePublicEdKey: string } | null} */
   let resolvedPreviewSparkleFeed = null;
-  if (effectiveRunnerType === 'crossover_preview') {
-    const portalUrl = 'https://www.codeweavers.com/preview/download';
+  if (isPreviewRunner) {
+    const rawDownloadUrl =
+      typeof options.downloadUrl === 'string' ? options.downloadUrl.trim() : '';
+    if (rawDownloadUrl && !isAllowedCodeWeaversDownloadUrl(rawDownloadUrl, options)) {
+      throwBlockedUrlError(`Untrusted CodeWeavers Preview download URL blocked: ${rawDownloadUrl}`);
+    }
+    const rawPreviewPortalUrl =
+      typeof options.previewPortalUrl === 'string' ? options.previewPortalUrl.trim() : '';
+    if (rawPreviewPortalUrl && !isAllowedCodeWeaversDownloadUrl(rawPreviewPortalUrl, options)) {
+      throwBlockedUrlError(
+        `Untrusted CodeWeavers Preview portal URL blocked: ${rawPreviewPortalUrl}`
+      );
+    }
+
+    const portalUrl = String(
+      rawDownloadUrl || rawPreviewPortalUrl || 'https://www.codeweavers.com/preview/download'
+    ).trim();
+    const previewPortalPageUrl = String(
+      rawPreviewPortalUrl || 'https://www.codeweavers.com/preview/download'
+    ).trim();
+
+    if (
+      !options.authenticateOnly &&
+      options._runnerOperation === 'update' &&
+      !options.forceReinstall &&
+      existingLayer &&
+      options.downloadUrl
+    ) {
+      const candidatePreviewDate = extractRunnerPreviewDate(options.downloadUrl);
+      const existingPreviewDate =
+        extractRunnerPreviewDate(existingLayer.previewDate) ||
+        extractRunnerPreviewDate(existingLayer.displayVersion) ||
+        extractRunnerPreviewDate(existingLayer.buildVersion) ||
+        extractRunnerPreviewDate(existingLayer.version);
+      const candidateDateNum = parseNumericPreviewDate(candidatePreviewDate);
+      const existingDateNum = parseNumericPreviewDate(existingPreviewDate);
+
+      let isAlreadyCurrent = false;
+      if (candidateDateNum !== null && existingDateNum !== null) {
+        isAlreadyCurrent = existingDateNum >= candidateDateNum;
+      } else {
+        const candidateHint = extractPreviewFilenameVersionHint(options.downloadUrl);
+        const existingSemver =
+          existingLayer.version && /^\d+\.\d+(?:\.\d+)?$/.test(String(existingLayer.version))
+            ? String(existingLayer.version)
+            : null;
+        if (
+          candidateHint &&
+          !/^\d{8}$/.test(candidateHint) &&
+          existingSemver &&
+          typeof compareRunnerVersions === 'function'
+        ) {
+          isAlreadyCurrent = compareRunnerVersions(existingSemver, candidateHint) >= 0;
+        }
+      }
+      if (isAlreadyCurrent) {
+        return {
+          success: true,
+          installed: false,
+          alreadyUpToDate: true,
+          version: existingLayer.version,
+          message: `${cwPreviewLabel} is already up to date (${existingLayer.displayVersion || existingLayer.version || 'latest version'}).`,
+        };
+      }
+    }
+
     if (options.skipNetwork === true) {
+      if (!isAllowedCodeWeaversDownloadUrl(portalUrl, options)) {
+        throwBlockedUrlError(`Untrusted CodeWeavers Preview portal URL blocked: ${portalUrl}`);
+      }
       await openExternalUri(portalUrl, options);
       return {
         success: true,
@@ -4049,46 +5001,58 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
       };
     }
 
-    if (existingLayer?.appPath && typeof parsePlistStringValues === 'function') {
-      const plistDict = parsePlistStringValues(
-        path.join(existingLayer.appPath, 'Contents/Info.plist')
-      );
-      const rawSuFeedUrl = String(options.previewFeedUrl || plistDict.SUFeedURL || '').trim();
+    const explicitFeedUrl =
+      typeof options.previewFeedUrl === 'string' ? options.previewFeedUrl.trim() : '';
+    if (
+      (explicitFeedUrl || (!options.downloadUrl && existingLayer?.appPath)) &&
+      typeof parsePlistStringValues === 'function'
+    ) {
+      const plistDict =
+        existingLayer?.appPath && !explicitFeedUrl
+          ? parsePlistStringValues(path.join(existingLayer.appPath, 'Contents/Info.plist'))
+          : {};
+      const rawSuFeedUrl = String(explicitFeedUrl || plistDict.SUFeedURL || '').trim();
       const rawSuPubKey = String(
         options.sparklePublicEdKey ||
           plistDict.SUPublicEDKey ||
           CODEWEAVERS_SPARKLE_PUBLIC_ED_KEY
       ).trim();
-      if (rawSuFeedUrl) {
+      const validPreviewFeed =
+        rawSuFeedUrl &&
+        (typeof isPreviewSparkleFeedUrl === 'function'
+          ? isPreviewSparkleFeedUrl(rawSuFeedUrl, options)
+          : !/\/cxmac\.xml$/i.test(new URL(rawSuFeedUrl).pathname) &&
+            /preview/i.test(new URL(rawSuFeedUrl).pathname));
+      if (validPreviewFeed) {
         try {
-          const parsedFeedHost = new URL(rawSuFeedUrl).hostname.toLowerCase();
-          const isAllowedPreviewFeedHost =
-            parsedFeedHost === 'codeweavers.com' ||
-            parsedFeedHost === 'www.codeweavers.com' ||
-            parsedFeedHost === 'media.codeweavers.com' ||
-            (options.allowLoopbackInstallerUrls === true &&
-              (parsedFeedHost === '127.0.0.1' || parsedFeedHost === 'localhost'));
-          if (isAllowedPreviewFeedHost) {
-            const safeFeedUrl = validateInstallerUrl(rawSuFeedUrl, options);
-            emitEnvironmentSetupProgress(
-              {
-                ...progressCtx,
-                phase: 'probing',
-                message: 'Resolving latest CrossOver Preview release from CodeWeavers Sparkle feed...',
-              },
-              options
-            );
-            const previewXml = await fetchValidatedText(safeFeedUrl, options, signal);
-            const encCheck = previewXml.match(/<enclosure\b([^>]*)>/i);
-            const urlAttrCheck = encCheck ? encCheck[1].match(/\burl=["']([^"']+)["']/i) : null;
-            if (urlAttrCheck && urlAttrCheck[1].trim()) {
-              validateInstallerUrl(urlAttrCheck[1].trim(), options);
-              resolvedPreviewSparkleFeed = {
-                xml: previewXml,
-                feedUrl: safeFeedUrl,
-                sparklePublicEdKey: rawSuPubKey,
-              };
-            }
+          const safeFeedUrl = validateInstallerUrl(rawSuFeedUrl, options);
+          emitEnvironmentSetupProgress(
+            {
+              ...progressCtx,
+              phase: 'probing',
+              message: `Resolving latest ${cwPreviewLabel} release from CodeWeavers Sparkle feed...`,
+            },
+            options
+          );
+          const previewXml = await fetchValidatedText(safeFeedUrl, options, signal);
+          const encCheck = previewXml.match(/<enclosure\b([^>]*)>/i);
+          const urlAttrCheck = encCheck ? encCheck[1].match(/\burl=["']([^"']+)["']/i) : null;
+          const enclosureUrl = urlAttrCheck ? urlAttrCheck[1].trim() : '';
+          const enclosureValid =
+            enclosureUrl &&
+            (typeof isPreviewSparkleEnclosureValid === 'function'
+              ? isPreviewSparkleEnclosureValid(enclosureUrl, {
+                  ...options,
+                  previewBranch,
+                })
+              : classifyCrossOverPreviewArchiveBranch(enclosureUrl) === previewBranch);
+          if (enclosureUrl && enclosureValid) {
+            validateInstallerUrl(enclosureUrl, options);
+            resolvedPreviewSparkleFeed = {
+              xml: previewXml,
+              feedUrl: safeFeedUrl,
+              sparklePublicEdKey: rawSuPubKey,
+            };
           }
         } catch (err) {
           if (isFatalSecurityOrAbortError(err, signal)) {
@@ -4099,7 +5063,14 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
     }
 
     if (!resolvedPreviewSparkleFeed) {
-      if (existingLayer?.version) {
+      if (
+        effectiveRunnerType === 'crossover_preview' &&
+        existingLayer?.version &&
+        (options.switchToStableCrossOver === true ||
+          (!options.downloadUrl &&
+            !options.previewCandidateUrls?.length &&
+            options.autoSwitchToStableIfSurpassed === true))
+      ) {
         try {
           const stableXml = await fetchValidatedText(
             'https://www.codeweavers.com/xml/versions/cxmac.xml',
@@ -4140,123 +5111,39 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
       }
 
       const electronModForCapture = (options && options.electronMod) || getElectron();
-      const canCapturePreviewInApp =
-        typeof options.capturePreviewDownloadFn === 'function' ||
-        (Boolean(electronModForCapture?.BrowserWindow) &&
-          Boolean(electronModForCapture?.session) &&
-          (!isTestEnvironment(options) || options.allowInteractivePreviewCapture === true));
 
-      if (canCapturePreviewInApp) {
-        const previewTempDir = await fs.promises.mkdtemp(
-          path.join(os.tmpdir(), 'ol-cx-preview-')
-        );
-        const execFn = getExecFileFn(options);
-        try {
-          const captured = await captureCodeWeaversPreviewDownload(
-            previewTempDir,
-            progressCtx,
-            options,
-            signal
-          );
-          const capturedArchivePath = captured.archivePath;
-          let resolvedVersion = captured.resolvedVersion || null;
-
-          if (
-            typeof options.expectedSha256 === 'string' &&
-            /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
-          ) {
-            emitEnvironmentSetupProgress(
-              {
-                ...progressCtx,
-                phase: 'verifying_signature',
-                message: 'Verifying CrossOver Preview archive SHA-256 checksum...',
-              },
-              options
-            );
-            await verifyFileSha256Async(
-              capturedArchivePath,
-              options.expectedSha256.trim().toLowerCase()
-            );
-          }
-
-          if (/\.dmg$/i.test(capturedArchivePath)) {
-            emitEnvironmentSetupProgress(
-              {
-                ...progressCtx,
-                phase: 'verifying_signature',
-                message: 'Verifying CodeWeavers Developer ID signature...',
-              },
-              options
-            );
-            const preSwapSafe = await assertRunnerSafeToReplace(
-              effectiveRunnerType,
-              existingTargetAppPath,
-              existingLayer,
-              options
-            );
-            throwIfRunnerBusy(preSwapSafe);
-
-            const installedPath = await mountVerifyAndInstallDmgApp(
-              capturedArchivePath,
-              targetAppsDir,
-              ['2C75U774H4'],
-              /Developer ID Application:\s*CodeWeavers/i,
-              {
-                ...options,
-                _componentId: componentId,
-                ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
-              }
-            );
-            resolvedVersion = resolvePreviewBundleVersion(installedPath, resolvedVersion);
-            if (
-              resolvedVersion &&
-              !/^\d{8}$/.test(resolvedVersion) &&
-              typeof recordRunnerInstallReceipt === 'function'
-            ) {
-              recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
-                ...options,
-                homedir,
-              });
-            }
-            invalidateScanCaches();
-            return {
-              success: true,
-              installed: true,
-              installedPath,
-              ...(resolvedVersion ? { version: resolvedVersion } : {}),
-              message: `Installed CrossOver Preview to ${installedPath}.`,
-            };
-          }
-
-          const stagingDir = path.join(previewTempDir, 'staging');
-          await fs.promises.mkdir(stagingDir, { recursive: true });
+      /**
+       * Helper to install an already-downloaded Preview archive (`.zip` or `.dmg`).
+       *
+       * @param {string} capturedArchivePath
+       * @param {string | null} initialVersion
+       * @param {string} workTempDir
+       */
+      const finalizeCapturedPreviewArchive = async (
+        capturedArchivePath,
+        initialVersion,
+        workTempDir
+      ) => {
+        let resolvedVersion = initialVersion || null;
+        if (
+          typeof options.expectedSha256 === 'string' &&
+          /^[a-f0-9]{64}$/i.test(options.expectedSha256.trim())
+        ) {
           emitEnvironmentSetupProgress(
             {
               ...progressCtx,
-              phase: 'extracting',
-              message: 'Extracting CrossOver Preview archive...',
+              phase: 'verifying_signature',
+              message: `Verifying ${cwPreviewLabel} archive SHA-256 checksum...`,
             },
             options
           );
+          await verifyFileSha256Async(
+            capturedArchivePath,
+            options.expectedSha256.trim().toLowerCase()
+          );
+        }
 
-          if (typeof options.onExtractArchive === 'function') {
-            await options.onExtractArchive(capturedArchivePath, stagingDir);
-          } else {
-            await runExecFileAsync(
-              execFn,
-              '/usr/bin/ditto',
-              ['-x', '-k', capturedArchivePath, stagingDir],
-              { timeout: 300000, signal }
-            );
-          }
-
-          const stagedApp = await findStagedAppBundle(stagingDir);
-          if (!stagedApp) {
-            throw new Error(
-              'CrossOver Preview.app was not found inside the downloaded archive.'
-            );
-          }
-
+        if (/\.dmg$/i.test(capturedArchivePath)) {
           emitEnvironmentSetupProgress(
             {
               ...progressCtx,
@@ -4265,25 +5152,452 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
             },
             options
           );
-          await verifyMacAppDeveloperSignature(stagedApp, ['2C75U774H4'], {
-            ...options,
-            _componentId: componentId,
-            expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
-          });
-
-          resolvedVersion = resolvePreviewBundleVersion(stagedApp, resolvedVersion);
-          return await atomicSwapVerifiedApp(
-            stagedApp,
-            'CrossOver Preview',
-            resolvedVersion && !/^\d{8}$/.test(resolvedVersion) ? resolvedVersion : null
+          const dmgTargetAppPath =
+            existingTargetAppPath ||
+            (runnerSpec ? path.join(targetAppsDir, runnerSpec.canonicalAppName) : null);
+          const preSwapSafe = await assertRunnerSafeToReplace(
+            effectiveRunnerType,
+            dmgTargetAppPath,
+            existingLayer,
+            options
           );
-        } finally {
-          try {
-            await fs.promises.rm(previewTempDir, { recursive: true, force: true });
-          } catch {}
+          throwIfRunnerBusy(preSwapSafe);
+
+          const installedPath = await mountVerifyAndInstallDmgApp(
+            capturedArchivePath,
+            targetAppsDir,
+            ['2C75U774H4'],
+            /Developer ID Application:\s*CodeWeavers/i,
+            {
+              ...options,
+              _componentId: componentId,
+              ...(dmgTargetAppPath ? { targetAppBundlePath: dmgTargetAppPath } : {}),
+            }
+          );
+          resolvedVersion = resolvePreviewBundleVersion(installedPath, resolvedVersion);
+          if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
+            recordRunnerInstallReceipt(installedPath, effectiveRunnerType, resolvedVersion, {
+              ...options,
+              homedir,
+            });
+          }
+          invalidateScanCaches({ skipPreviewUrlCacheClear: true });
+          return {
+            success: true,
+            installed: true,
+            installedPath,
+            ...(resolvedVersion ? { version: resolvedVersion } : {}),
+            message: `Installed ${cwPreviewLabel} to ${installedPath}.`,
+          };
+        }
+
+        const execFn = getExecFileFn(options);
+        const stagingDir = path.join(workTempDir, 'staging');
+        await fs.promises.mkdir(stagingDir, { recursive: true });
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'extracting',
+            message: `Extracting ${cwPreviewLabel} archive...`,
+          },
+          options
+        );
+
+        if (typeof options.onExtractArchive === 'function') {
+          await options.onExtractArchive(capturedArchivePath, stagingDir);
+        } else {
+          await runExecFileAsync(
+            execFn,
+            '/usr/bin/ditto',
+            ['-x', '-k', capturedArchivePath, stagingDir],
+            { timeout: 300000, signal }
+          );
+        }
+
+        if (signal?.aborted) {
+          const abortErr = new Error(
+            `Extraction of ${cwPreviewLabel || effectiveRunnerType} cancelled.`
+          );
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+
+        const preferredNames = runnerSpec
+          ? [runnerSpec.canonicalAppName, 'CrossOver Preview.app']
+          : ['CrossOver Preview.app'];
+        const stagedApp = await findStagedAppBundle(stagingDir, 0, preferredNames);
+        if (!stagedApp) {
+          throw new Error('CrossOver Preview.app was not found inside the downloaded archive.');
+        }
+
+        emitEnvironmentSetupProgress(
+          {
+            ...progressCtx,
+            phase: 'verifying_signature',
+            message: 'Verifying CodeWeavers Developer ID signature...',
+          },
+          options
+        );
+        const prepared = await verifyAndPrepareCodeWeaversStagedApp(stagedApp, resolvedVersion);
+        return await atomicSwapVerifiedApp(
+          prepared.preparedApp,
+          cwPreviewLabel,
+          prepared.resolvedVersion || null
+        );
+      };
+
+      // Attempt cookie-backed authenticated `previewSession.fetch` / `options.previewSessionFetch`
+      // streaming download before opening a BrowserWindow when not authenticating-only and no
+      // explicit `capturePreviewDownloadFn` test hook is injected.
+      if (
+        !options.authenticateOnly &&
+        typeof options.capturePreviewDownloadFn !== 'function'
+      ) {
+        const stripDefaultLauncherUa = (/** @type {any} */ fetchOpts) => {
+          const {
+            redirect: _stripRedirect,
+            headers: rawHeaders,
+            ...safeOpts
+          } = fetchOpts || {};
+          const callerHasExplicitUa = Boolean(
+            options?.headers?.['User-Agent'] || options?.headers?.['user-agent']
+          );
+          if (!rawHeaders || typeof rawHeaders !== 'object') {
+            return { safeOpts, headers: undefined };
+          }
+          const cleanedHeaders = { ...rawHeaders };
+          if (!callerHasExplicitUa) {
+            if (cleanedHeaders['User-Agent'] === 'OneGameLauncher/1.0') {
+              delete cleanedHeaders['User-Agent'];
+            }
+            if (cleanedHeaders['user-agent'] === 'OneGameLauncher/1.0') {
+              delete cleanedHeaders['user-agent'];
+            }
+          }
+          const hasHeaders = Object.keys(cleanedHeaders).length > 0;
+          return {
+            safeOpts,
+            headers: hasHeaders ? cleanedHeaders : undefined,
+          };
+        };
+
+        let usesElectronSessionFetch = false;
+        const resolveStreamPreviewFetch = () => {
+          if (typeof options.previewSessionFetch === 'function') {
+            return options.previewSessionFetch;
+          }
+          if (typeof options.sessionFetch === 'function') {
+            return options.sessionFetch;
+          }
+          const sessionMod = electronModForCapture?.session;
+          if (sessionMod && typeof sessionMod.fromPartition === 'function') {
+            try {
+              const previewSession = sessionMod.fromPartition('persist:codeweavers-preview');
+              const cleanBrowserUa =
+                process.platform === 'win32'
+                  ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+                  : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
+              try {
+                if (typeof previewSession?.setUserAgent === 'function') {
+                  previewSession.setUserAgent(cleanBrowserUa);
+                }
+              } catch {}
+              if (typeof previewSession?.fetch === 'function') {
+                usesElectronSessionFetch = true;
+                return (/** @type {string} */ u, /** @type {any} */ fetchOpts) => {
+                  const { safeOpts, headers } = stripDefaultLauncherUa(fetchOpts);
+                  return previewSession.fetch(u, {
+                    ...safeOpts,
+                    ...(headers ? { headers } : {}),
+                    credentials: 'include',
+                  });
+                };
+              }
+              if (previewSession?.net && typeof previewSession.net.fetch === 'function') {
+                usesElectronSessionFetch = true;
+                return (/** @type {string} */ u, /** @type {any} */ fetchOpts) => {
+                  const { safeOpts, headers } = stripDefaultLauncherUa(fetchOpts);
+                  return previewSession.net.fetch(u, {
+                    ...safeOpts,
+                    ...(headers ? { headers } : {}),
+                    credentials: 'include',
+                  });
+                };
+              }
+            } catch {}
+          }
+          return null;
+        };
+
+        const streamPreviewFetch = resolveStreamPreviewFetch();
+        if (typeof streamPreviewFetch === 'function') {
+          let verifiedArchiveUrl = options.downloadUrl
+            ? selectPreferredCrossOverPreviewDownloadUrl([options.downloadUrl], previewPortalPageUrl, {
+                ...options,
+                previewBranch,
+              })
+            : null;
+          if (!verifiedArchiveUrl && typeof getCachedAuthenticatedPreviewUrl === 'function') {
+            const cachedBranchUrl = getCachedAuthenticatedPreviewUrl({
+              ...options,
+              previewBranch,
+            });
+            if (cachedBranchUrl) {
+              verifiedArchiveUrl = selectPreferredCrossOverPreviewDownloadUrl(
+                [cachedBranchUrl],
+                previewPortalPageUrl,
+                { ...options, previewBranch }
+              );
+            }
+          }
+
+          if (
+            !verifiedArchiveUrl &&
+            !options.skipNetwork &&
+            isAllowedCodeWeaversDownloadUrl(previewPortalPageUrl, options)
+          ) {
+            try {
+              const explicitUa =
+                options?.headers?.['User-Agent'] || options?.headers?.['user-agent'];
+              const portalProbeHeaders = explicitUa
+                ? { 'User-Agent': explicitUa }
+                : usesElectronSessionFetch
+                  ? undefined
+                  : {
+                      'User-Agent':
+                        process.platform === 'win32'
+                          ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+                          : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+                    };
+              const portalRes = await streamPreviewFetch(previewPortalPageUrl, {
+                signal,
+                ...(portalProbeHeaders ? { headers: portalProbeHeaders } : {}),
+              });
+              const rawPortalResUrl = String(portalRes?.url || '').trim();
+              if (
+                rawPortalResUrl &&
+                !isAllowedCodeWeaversAuthNavigationUrl(rawPortalResUrl, options)
+              ) {
+                try {
+                  await portalRes?.body?.cancel?.();
+                } catch {}
+                throwBlockedUrlError(
+                  `Untrusted CodeWeavers Preview portal redirect URL blocked: ${rawPortalResUrl}`
+                );
+              }
+              if (portalRes && portalRes.ok) {
+                const portalResUrl = rawPortalResUrl.toLowerCase();
+                const portalText =
+                  typeof portalRes.text === 'function' ? await portalRes.text() : '';
+                const looksLikeAuthOrChallenge =
+                  portalResUrl.includes('/login') ||
+                  portalResUrl.includes('/signin') ||
+                  portalResUrl.includes('/account/login') ||
+                  /<input[^>]+type=["']password["']/i.test(portalText) ||
+                  /<form[^>]+action=["'][^"']*(?:login|signin)/i.test(portalText) ||
+                  /<title>[^<]*Sign\s*In[^<]*\|[^<]*CodeWeavers/i.test(portalText) ||
+                  /<title>\s*Just a moment\b/i.test(portalText) ||
+                  /cf-challenge-running|challenge-platform|challenges\.cloudflare\.com|cf-turnstile-response/i.test(
+                    portalText
+                  );
+                if (!looksLikeAuthOrChallenge && portalText) {
+                  const links = extractCandidateLinksFromText(portalText, []);
+                  const discovered = discoverCrossOverPreviewBranchUrls(
+                    links,
+                    previewPortalPageUrl,
+                    options
+                  );
+                  if (typeof setCachedAuthenticatedPreviewUrl === 'function') {
+                    if (discovered.standard) {
+                      setCachedAuthenticatedPreviewUrl(discovered.standard, {
+                        ...options,
+                        previewBranch: 'standard',
+                      });
+                    }
+                    if (discovered.arm64) {
+                      setCachedAuthenticatedPreviewUrl(discovered.arm64, {
+                        ...options,
+                        previewBranch: 'arm64',
+                      });
+                    }
+                  }
+                  verifiedArchiveUrl = discovered[previewBranch];
+                }
+              }
+            } catch (probeErr) {
+              if (isFatalSecurityOrAbortError(probeErr, signal)) {
+                throw probeErr;
+              }
+            }
+          }
+
+          if (verifiedArchiveUrl) {
+            const streamTempDir = await fs.promises.mkdtemp(
+              path.join(os.tmpdir(), 'ol-cx-preview-')
+            );
+            let downloadStepComplete = false;
+            try {
+              const isDmgStream = /\.dmg(?:\?|$)/i.test(verifiedArchiveUrl);
+              const streamArchivePath = path.join(
+                streamTempDir,
+                isDmgStream ? 'CrossOverPreview.dmg' : 'CrossOverPreview.zip'
+              );
+              const wrappedStreamFetch = async (/** @type {string} */ u, /** @type {any} */ fetchOpts) => {
+                const { safeOpts, headers } = stripDefaultLauncherUa(fetchOpts);
+                const resp = await streamPreviewFetch(u, {
+                  ...safeOpts,
+                  ...(headers ? { headers } : {}),
+                });
+                if (!resp) {
+                  throw new Error('Empty response from CodeWeavers Preview download.');
+                }
+                const respUrl = String(resp.url || '').trim();
+                const lowerRespUrl = respUrl.toLowerCase();
+                if (respUrl && !isAllowedCodeWeaversAuthNavigationUrl(respUrl, options)) {
+                  try {
+                    await resp.body?.cancel?.();
+                  } catch {}
+                  throwBlockedUrlError(
+                    `Untrusted CodeWeavers Preview redirect URL blocked: ${respUrl}`
+                  );
+                }
+                if (
+                  resp.status === 401 ||
+                  resp.status === 403 ||
+                  !resp.ok ||
+                  lowerRespUrl.includes('/login') ||
+                  lowerRespUrl.includes('/signin') ||
+                  lowerRespUrl.includes('/account/login') ||
+                  (respUrl && !isAllowedCodeWeaversDownloadUrl(respUrl, options))
+                ) {
+                  const authErr = /** @type {Error & { code?: string }} */ (
+                    new Error(`Preview download requires authentication (HTTP ${resp.status || 0}).`)
+                  );
+                  authErr.code = 'PREVIEW_AUTH_REQUIRED';
+                  throw authErr;
+                }
+                return resp;
+              };
+
+              await streamVerifiedDownloadToFile(
+                verifiedArchiveUrl,
+                streamArchivePath,
+                {
+                  ...progressCtx,
+                  label: cwPreviewLabel,
+                  minFreeBytes: Number(options.minFreeBytes || 1200 * 1024 * 1024),
+                },
+                {
+                  ...options,
+                  fetchFn: wrappedStreamFetch,
+                  rejectHtmlPayload: true,
+                  preserveSessionUserAgent: true,
+                },
+                signal
+              );
+              downloadStepComplete = true;
+              const streamHintVersion =
+                extractPreviewFilenameVersionHint(verifiedArchiveUrl) ||
+                extractRunnerPreviewDate(verifiedArchiveUrl);
+              return await finalizeCapturedPreviewArchive(
+                streamArchivePath,
+                streamHintVersion,
+                streamTempDir
+              );
+            } catch (streamErr) {
+              if (
+                downloadStepComplete ||
+                isFatalSecurityOrAbortError(streamErr, signal) ||
+                Boolean(/** @type {any} */ (streamErr)?.busyCode)
+              ) {
+                throw streamErr;
+              }
+              if (typeof clearCachedAuthenticatedPreviewUrl === 'function') {
+                clearCachedAuthenticatedPreviewUrl(previewBranch);
+              }
+            } finally {
+              try {
+                await fs.promises.rm(streamTempDir, { recursive: true, force: true });
+              } catch {}
+            }
+          }
         }
       }
 
+      const canCapturePreviewInApp =
+        typeof options.capturePreviewDownloadFn === 'function' ||
+        (Boolean(electronModForCapture?.BrowserWindow) &&
+          Boolean(electronModForCapture?.session) &&
+          (!isTestEnvironment(options) || options.allowInteractivePreviewCapture === true));
+
+      if (canCapturePreviewInApp) {
+        const previewTempDir =
+          options.authenticateOnly === true
+            ? os.tmpdir()
+            : await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ol-cx-preview-'));
+        try {
+          const captured = await captureCodeWeaversPreviewDownload(
+            previewTempDir,
+            progressCtx,
+            { ...options, previewBranch },
+            signal
+          );
+          if (captured && captured.alreadyUpToDate) {
+            emitEnvironmentSetupProgress(
+              {
+                ...progressCtx,
+                phase: 'completed',
+                progressPercent: 100,
+                message: `${cwPreviewLabel} is already up to date (${existingLayer?.displayVersion || existingLayer?.version || 'latest version'}).`,
+              },
+              options
+            );
+            return {
+              success: true,
+              installed: false,
+              alreadyUpToDate: true,
+              version: existingLayer?.version || captured.resolvedVersion,
+              message: `${cwPreviewLabel} is already up to date (${existingLayer?.displayVersion || existingLayer?.version || 'latest version'}).`,
+            };
+          }
+
+          if (captured && (captured.authenticated || options.authenticateOnly)) {
+            emitEnvironmentSetupProgress(
+              {
+                ...progressCtx,
+                phase: 'completed',
+                progressPercent: 100,
+                message: 'CodeWeavers Preview authentication completed.',
+              },
+              options
+            );
+            return {
+              success: true,
+              installed: false,
+              authenticated: true,
+              downloadUrl: captured.downloadUrl || null,
+              version: captured.resolvedVersion || existingLayer?.version,
+              message: 'CodeWeavers Preview authentication completed.',
+            };
+          }
+
+          return await finalizeCapturedPreviewArchive(
+            captured.archivePath,
+            captured.resolvedVersion || null,
+            previewTempDir
+          );
+        } finally {
+          if (options.authenticateOnly !== true) {
+            try {
+              await fs.promises.rm(previewTempDir, { recursive: true, force: true });
+            } catch {}
+          }
+        }
+      }
+
+      if (!isAllowedCodeWeaversDownloadUrl(portalUrl, options)) {
+        throwBlockedUrlError(`Untrusted CodeWeavers Preview portal URL blocked: ${portalUrl}`);
+      }
       await openExternalUri(portalUrl, options);
       return {
         success: true,
@@ -4320,12 +5634,11 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
 
   try {
     // -----------------------------------------------------------------------
-    // 1. CrossOver Stable (`crossover`) & Sparkle-Enabled CrossOver Preview (`crossover_preview`)
+    // 1. CrossOver Stable (`crossover`) & Sparkle-Enabled CrossOver Preview
     // -----------------------------------------------------------------------
-    if (effectiveRunnerType === 'crossover' || effectiveRunnerType === 'crossover_preview') {
-      const isPreviewSparkle =
-        effectiveRunnerType === 'crossover_preview' && Boolean(resolvedPreviewSparkleFeed);
-      const cwLabel = isPreviewSparkle ? 'CrossOver Preview' : 'CrossOver';
+    if (effectiveRunnerType === 'crossover' || isPreviewRunner) {
+      const isPreviewSparkle = isPreviewRunner && Boolean(resolvedPreviewSparkleFeed);
+      const cwLabel = isPreviewSparkle ? cwPreviewLabel : 'CrossOver';
       if (!isPreviewSparkle && !options._prefetchedCxMacXml) {
         emitEnvironmentSetupProgress(
           {
@@ -4483,9 +5796,12 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           },
           options
         );
+        const dmgTargetAppPath =
+          existingTargetAppPath ||
+          (runnerSpec ? path.join(targetAppsDir, runnerSpec.canonicalAppName) : null);
         const preSwapSafe = await assertRunnerSafeToReplace(
           effectiveRunnerType,
-          existingTargetAppPath,
+          dmgTargetAppPath,
           existingLayer,
           options
         );
@@ -4499,7 +5815,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
           {
             ...options,
             _componentId: componentId,
-            ...(existingTargetAppPath ? { targetAppBundlePath: existingTargetAppPath } : {}),
+            ...(dmgTargetAppPath ? { targetAppBundlePath: dmgTargetAppPath } : {}),
           }
         );
         if (resolvedVersion && typeof recordRunnerInstallReceipt === 'function') {
@@ -4508,7 +5824,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
             homedir,
           });
         }
-        invalidateScanCaches();
+        invalidateScanCaches({ skipPreviewUrlCacheClear: true });
         return {
           success: true,
           installed: true,
@@ -4540,7 +5856,10 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         );
       }
 
-      const stagedApp = await findStagedAppBundle(stagingDir);
+      const preferredNames = runnerSpec
+        ? [runnerSpec.canonicalAppName, 'CrossOver Preview.app']
+        : [];
+      const stagedApp = await findStagedAppBundle(stagingDir, 0, preferredNames);
       if (!stagedApp) {
         throw new Error(`${cwLabel}.app was not found inside the downloaded archive.`);
       }
@@ -4553,13 +5872,12 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
         },
         options
       );
-      await verifyMacAppDeveloperSignature(stagedApp, ['2C75U774H4'], {
-        ...options,
-        _componentId: componentId,
-        expectedVendorAuthorityPattern: /Developer ID Application:\s*CodeWeavers/i,
-      });
-
-      return await atomicSwapVerifiedApp(stagedApp, cwLabel, resolvedVersion);
+      const prepared = await verifyAndPrepareCodeWeaversStagedApp(stagedApp, resolvedVersion);
+      return await atomicSwapVerifiedApp(
+        prepared.preparedApp,
+        cwLabel,
+        prepared.resolvedVersion
+      );
     }
 
     // -----------------------------------------------------------------------
@@ -4830,7 +6148,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
             homedir,
           });
         }
-        invalidateScanCaches();
+        invalidateScanCaches({ skipPreviewUrlCacheClear: true });
         return {
           success: true,
           installed: true,
@@ -5044,7 +6362,7 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
             homedir,
           });
         }
-        invalidateScanCaches();
+        invalidateScanCaches({ skipPreviewUrlCacheClear: true });
         return {
           success: true,
           installed: true,
@@ -5109,6 +6427,95 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
 }
 
 /**
+ * Maps CrossOver bottle slugs to descriptor objects carrying `wineArch` metadata and filters
+ * stale `wizardState.preferredBottleName` when an existing bottle of that name is incompatible
+ * with `layer.type`.
+ *
+ * @param {string} homedir
+ * @param {any} layer
+ * @param {string} bottlesDir
+ * @param {string[]} bottleNames
+ * @param {any} wizardState
+ * @returns {{ mappedBottles: Array<{ name: string, wineArch?: 'win64' | 'arm64', previewEnabled?: boolean, timestamp?: string }>, compatibleWizardBottleName: string | undefined }}
+ */
+function buildCompatibleCrossOverBottleResolutionInputs(
+  homedir,
+  layer,
+  bottlesDir,
+  bottleNames,
+  wizardState
+) {
+  const runnerType = normalizeRequestedRunnerType(layer?.type);
+  const isArm64Runner = runnerType === 'crossover_preview_arm64';
+  const mappedBottles = (Array.isArray(bottleNames) ? bottleNames : []).map((bName) => {
+    const bPath = path.join(bottlesDir, bName);
+    const detailMeta = layer?.bottleDetails?.[bName];
+    const confMeta = detailMeta || inspectBottleConfMetadata(bPath);
+    const resolvedWineArch =
+      confMeta?.wineArch ||
+      (isValidBottleDirectory(bPath, false) ? 'win64' : undefined);
+    return {
+      name: bName,
+      ...(confMeta || {}),
+      ...(resolvedWineArch ? { wineArch: resolvedWineArch } : {}),
+    };
+  });
+
+  const rawWizardBottle = String(wizardState?.preferredBottleName || '').trim();
+  let compatibleWizardBottleName = rawWizardBottle || undefined;
+  if (rawWizardBottle) {
+    const candidateBottleDirs = Array.from(
+      new Set(
+        [
+          bottlesDir,
+          path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
+          path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+          path.join(homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
+        ].filter(Boolean)
+      )
+    );
+    const wizardDetailArch = layer?.bottleDetails?.[rawWizardBottle]?.wineArch;
+    if (
+      wizardDetailArch &&
+      (isArm64Runner ? wizardDetailArch !== 'arm64' : wizardDetailArch === 'arm64')
+    ) {
+      compatibleWizardBottleName = undefined;
+    } else {
+      for (const dir of candidateBottleDirs) {
+        const candidatePath = path.join(dir, rawWizardBottle);
+        if (!fs.existsSync(candidatePath)) continue;
+        const meta = inspectBottleConfMetadata(candidatePath);
+        const isInit =
+          Boolean(meta.wineArch) ||
+          fs.existsSync(path.join(candidatePath, 'cxbottle.conf')) ||
+          isValidBottleDirectory(candidatePath, false);
+        if (!isInit) continue;
+        const arch = meta.wineArch || 'win64';
+        if (isArm64Runner ? arch !== 'arm64' : arch === 'arm64') {
+          compatibleWizardBottleName = undefined;
+          break;
+        }
+      }
+    }
+    if (compatibleWizardBottleName && wizardState?.preferredRunnerType) {
+      const rawSavedPref = String(wizardState.preferredRunnerType).trim().toLowerCase();
+      const savedPrefRunner =
+        rawSavedPref === 'skip' ? '' : normalizeRequestedRunnerType(rawSavedPref);
+      if (
+        savedPrefRunner &&
+        (savedPrefRunner === 'crossover_preview_arm64') !== isArm64Runner &&
+        rawWizardBottle.toLowerCase() ===
+          (savedPrefRunner === 'crossover_preview_arm64' ? 'onelauncher-arm64' : 'onelauncher')
+      ) {
+        compatibleWizardBottleName = undefined;
+      }
+    }
+  }
+
+  return { mappedBottles, compatibleWizardBottleName };
+}
+
+/**
  * Resolve active runner and bottle path/name for bottle operations on macOS.
  *
  * @param {string} homedir
@@ -5118,29 +6525,92 @@ async function installRunnerDirect(rawRunnerType, options = {}) {
  */
 function resolveRunnerAndBottleTarget(homedir, prefs = {}, options = {}) {
   const wizardState = getSetupWizardState(options);
+  const hostArch = String(options.arch || process.arch || 'arm64').toLowerCase();
+  const rawPrefRunner = typeof prefs.runnerType === 'string' ? prefs.runnerType.trim() : '';
+  const normalizedPrefRunner = normalizeRequestedRunnerType(rawPrefRunner);
+  const hasExplicitAutoPref = Boolean(rawPrefRunner) && normalizedPrefRunner === '';
+  const rawWizardRunner =
+    wizardState.preferredRunnerType &&
+    String(wizardState.preferredRunnerType).trim().toLowerCase() !== 'skip'
+      ? wizardState.preferredRunnerType
+      : '';
+  const normalizedWizardRunner = normalizeRequestedRunnerType(rawWizardRunner);
+  const desiredRunner = hasExplicitAutoPref
+    ? ''
+    : normalizedPrefRunner || normalizedWizardRunner;
+
+  if (desiredRunner === 'crossover_preview_arm64' && hostArch !== 'arm64') {
+    throw new Error(
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+    );
+  }
+
+  if (
+    prefs.bottleName !== undefined &&
+    prefs.bottleName !== null &&
+    String(prefs.bottleName).trim() !== '' &&
+    !safeIsBottleSlug(String(prefs.bottleName).trim())
+  ) {
+    throw new Error(
+      `Invalid bottle name "${prefs.bottleName}": must be a safe directory slug without path traversal or leading hyphens.`
+    );
+  }
+
   const runners = detectCompatibilityLayers({ ...options, ...explicitHomedirOpt(options) });
   if (runners.length === 0) {
+    if (normalizedPrefRunner) {
+      throw new Error(`Compatibility runner "${normalizedPrefRunner}" is not installed.`);
+    }
     throw new Error(
       'No macOS compatibility runner (CrossOver or Wine) is installed yet. Install a runner first.'
     );
   }
 
-  const desiredRunner =
-    prefs.runnerType ||
-    (wizardState.preferredRunnerType !== 'skip' ? wizardState.preferredRunnerType : '');
-  const layer =
-    (desiredRunner && runners.find((r) => r.type === desiredRunner)) || runners[0];
+  const matchedDesired = desiredRunner
+    ? runners.find((r) => r && (r.type === desiredRunner || r.id === desiredRunner))
+    : null;
+  if (normalizedPrefRunner && !matchedDesired) {
+    throw new Error(`Compatibility runner "${normalizedPrefRunner}" is not installed.`);
+  }
+  if (normalizedPrefRunner && matchedDesired && matchedDesired.available === false) {
+    throw new Error(
+      matchedDesired.type === 'crossover_preview_arm64'
+        ? 'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+        : `Compatibility runner "${normalizedPrefRunner}" is unavailable on this host.`
+    );
+  }
+  const layer = matchedDesired || runners.find((r) => r.available !== false) || runners[0];
+  if (
+    layer.type === 'crossover_preview_arm64' &&
+    (hostArch !== 'arm64' || layer.available === false)
+  ) {
+    throw new Error(
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+    );
+  }
 
-  if (layer.type === 'crossover' || layer.type === 'crossover_preview') {
+  if (
+    layer.type === 'crossover' ||
+    layer.type === 'crossover_preview' ||
+    layer.type === 'crossover_preview_arm64'
+  ) {
     const bottlesDir =
       layer.bottlesDir ||
       path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
     const available = Array.isArray(layer.availableBottles) ? layer.availableBottles : [];
+    const { mappedBottles, compatibleWizardBottleName } =
+      buildCompatibleCrossOverBottleResolutionInputs(
+        homedir,
+        layer,
+        bottlesDir,
+        available,
+        wizardState
+      );
     const requestedName = resolveDefaultChainedBottleName({
       explicitBottleName: prefs.bottleName,
       gameConfigBottleName: prefs.gameConfigBottleName,
-      wizardPreferredBottleName: wizardState.preferredBottleName,
-      discoveredBottleNames: available,
+      wizardPreferredBottleName: compatibleWizardBottleName,
+      discoveredBottleNames: mappedBottles,
       runnerType: layer.type,
     });
     return {
@@ -5153,7 +6623,7 @@ function resolveRunnerAndBottleTarget(homedir, prefs = {}, options = {}) {
   const prefixSlug =
     prefs.bottleName && safeIsBottleSlug(prefs.bottleName)
       ? prefs.bottleName.trim()
-      : wizardState.preferredRunnerType === layer.type &&
+      : normalizedWizardRunner === layer.type &&
           wizardState.preferredBottleName &&
           safeIsBottleSlug(wizardState.preferredBottleName)
         ? wizardState.preferredBottleName
@@ -5256,14 +6726,27 @@ async function runBottleInstallerAndWait(
     ? `${installerDefaultDisablePrefix};${customEnvOverrides.WINEDLLOVERRIDES}`
     : `${installerDefaultDisablePrefix};winemenubuilder.exe=d`;
 
+  const isCrossOverLayer =
+    layer.type === 'crossover' ||
+    layer.type === 'crossover_preview' ||
+    layer.type === 'crossover_preview_arm64';
+  const sharedCxBottlesDir = path.join(
+    options.homedir || os.homedir(),
+    'Library/Application Support/CrossOver/Bottles'
+  );
   /** @type {Record<string, any>} */
   const env = {
     ...process.env,
     WINEPREFIX: bottlePath,
     ...customEnvOverrides,
     WINEDLLOVERRIDES: mergedWineDllOverrides,
-    ...(layer.type === 'crossover' || layer.type === 'crossover_preview'
-      ? { CX_BOTTLE: bottleName }
+    ...(isCrossOverLayer
+      ? {
+          CX_BOTTLE: bottleName,
+          ...(path.resolve(path.dirname(bottlePath)) !== path.resolve(sharedCxBottlesDir)
+            ? { CX_BOTTLE_PATH: path.dirname(bottlePath) }
+            : {}),
+        }
       : {}),
   };
   alignWineMsyncWithLiveBottle(bottlePath, env);
@@ -5523,38 +7006,22 @@ async function ensureBottleInitializedInternal(
   const execFileFn = getExecFileFn(options);
   const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
 
-  if (layer.type === 'crossover' || layer.type === 'crossover_preview') {
+  if (
+    layer.type === 'crossover' ||
+    layer.type === 'crossover_preview' ||
+    layer.type === 'crossover_preview_arm64'
+  ) {
+    assertRunnerBottleArchCompatible(layer.type, bottleName, bottlePath);
     if (!isValidBottleDirectory(bottlePath, isMockHomedir)) {
-      const cxbottleCandidates = [
-        layer.binaryPath ? path.join(path.dirname(layer.binaryPath), 'cxbottle') : '',
-        '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
-        '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
-      ].filter(Boolean);
-      const cxbottleBin =
-        cxbottleCandidates.find((p) => fs.existsSync(p)) ||
-        (typeof options.execFileFn === 'function' ? cxbottleCandidates[0] : '');
-
-      await fs.promises.mkdir(path.dirname(bottlePath), { recursive: true });
-      if (cxbottleBin) {
-        const cxbottleEnv = applyCrossOverEnvironmentHygiene(
-          { ...process.env },
-          {
-            wineBinaryPath: layer.binaryPath || cxbottleBin,
-            compatLayer: layer,
-            layerType: layer.type,
-            homedir: options.homedir,
-            platform: 'darwin',
-          }
-        );
-        try {
-          await runExecFileAsync(
-            execFileFn,
-            cxbottleBin,
-            ['--bottle', bottleName, '--create', '--template', 'win10_64'],
-            { timeout: 60000, env: cxbottleEnv, signal }
-          );
-        } catch {}
-      }
+      await provisionCrossOverBottleViaCxbottle(
+        layer,
+        bottleName,
+        bottlePath,
+        {},
+        { ...options, execFileFn },
+        signal
+      );
+      assertRunnerBottleArchCompatible(layer.type, bottleName, bottlePath);
     }
     await ensureCompatibilityLayerReady(
       layer,
@@ -5613,8 +7080,8 @@ async function ensureBottleInitializedInternal(
  * @param {{
  *   handoffId: 'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot',
  *   scope: 'host' | 'bottle',
- *   componentId: EnvironmentComponentId,
- *   progressBase: { runId: string, componentId: EnvironmentComponentId, stepIndex: number, totalSteps: number },
+ *   componentId: ProvisionerComponentId,
+ *   progressBase: { runId: string, componentId: ProvisionerComponentId, stepIndex: number, totalSteps: number },
  *   tempDir: string,
  *   layer?: any,
  *   bottleName?: string,
@@ -5844,6 +7311,57 @@ function cancelEnvironmentSetup(runId, _options = {}) {
 }
 
 /**
+ * Resolve runner + bottle target for `install_client` bottle tasks and fail fast on invalid
+ * bottle slugs, unsupported `crossover_preview_arm64` on non-arm64 hosts, or existing
+ * incompatible CrossOver `WineArch` bottles before probing/installing clients.
+ *
+ * @param {string} homedir
+ * @param {{ runnerType?: string, bottleName?: string }} task
+ * @param {Record<string, any>} options
+ * @returns {{ layer: any, bottleName: string, bottlePath: string }}
+ */
+function resolveAndValidateBottleClientTarget(homedir, task, options) {
+  const hostArch = String(options.arch || process.arch || 'arm64').toLowerCase();
+  const normalizedTaskRunner = normalizeRequestedRunnerType(task?.runnerType);
+  if (normalizedTaskRunner === 'crossover_preview_arm64' && hostArch !== 'arm64') {
+    throw new Error(
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+    );
+  }
+  if (
+    task?.bottleName !== undefined &&
+    task?.bottleName !== null &&
+    String(task.bottleName).trim() !== '' &&
+    !safeIsBottleSlug(String(task.bottleName).trim())
+  ) {
+    throw new Error(
+      `Invalid bottle name "${task.bottleName}": must be a safe directory slug without path traversal or leading hyphens.`
+    );
+  }
+  const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+    homedir,
+    { runnerType: task?.runnerType, bottleName: task?.bottleName },
+    options
+  );
+  if (
+    layer.type === 'crossover_preview_arm64' &&
+    (hostArch !== 'arm64' || layer.available === false)
+  ) {
+    throw new Error(
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+    );
+  }
+  if (
+    layer.type === 'crossover' ||
+    layer.type === 'crossover_preview' ||
+    layer.type === 'crossover_preview_arm64'
+  ) {
+    assertRunnerBottleArchCompatible(layer.type, bottleName, bottlePath);
+  }
+  return { layer, bottleName, bottlePath };
+}
+
+/**
  * Execute requested environment setup tasks sequentially in dependency order:
  * `os_prerequisite` -> `install_runner` -> `ensure_bottle` -> `install_client` -> `sync_first_party_manifests`.
  *
@@ -5880,7 +7398,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
 
   /** @type {EnvironmentSetupTaskOutcome[]} */
   const outcomes = [];
-  /** @type {EnvironmentComponentId[]} */
+  /** @type {ProvisionerComponentId[]} */
   const succeededComponents = [];
   let wasCancelled = false;
 
@@ -6154,14 +7672,32 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
           }
 
           const runnerType =
-            task.runnerType ||
-            (componentId === 'runner_crossover_preview'
-              ? 'crossover_preview'
-              : componentId === 'runner_wine'
-                ? 'wine'
-                : componentId === 'runner_gptk'
-                  ? 'gptk'
-                  : 'crossover');
+            normalizeRequestedRunnerType(task.runnerType) ||
+            componentIdToRunnerType(componentId) ||
+            'crossover';
+
+          const hostArchForRunner = String(options.arch || process.arch || 'arm64').toLowerCase();
+          if (runnerType === 'crossover_preview_arm64' && hostArchForRunner !== 'arm64') {
+            const unsupportedMsg =
+              'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.';
+            emitEnvironmentSetupProgress(
+              {
+                ...progressBase,
+                phase: 'failed',
+                message: unsupportedMsg,
+                error: unsupportedMsg,
+              },
+              options
+            );
+            outcomes.push({
+              componentId,
+              action: task.action,
+              status: 'failed',
+              message: unsupportedMsg,
+              error: unsupportedMsg,
+            });
+            continue;
+          }
 
           const existingLayers = detectCompatibilityLayers({
             ...options,
@@ -6172,11 +7708,20 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
             alreadyLayer &&
             !options.forceReinstall &&
             !task.forceUpdate &&
+            !task.downloadUrl &&
             !task.dmgPath &&
             !task.archivePath
           ) {
-            saveSetupWizardState({ preferredRunnerType: runnerType }, options);
+            saveSetupWizardState(
+              { preferredRunnerType: /** @type {any} */ (runnerType) },
+              options
+            );
             succeededComponents.push(componentId);
+            try {
+              if (typeof invalidateProberRunnerUpdatesCache === 'function') {
+                invalidateProberRunnerUpdatesCache({ skipPreviewUrlCacheClear: true });
+              }
+            } catch {}
             emitEnvironmentSetupProgress(
               {
                 ...progressBase,
@@ -6199,13 +7744,55 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
             ...options,
             dmgPath: task.dmgPath || options.dmgPath,
             archivePath: task.archivePath || options.archivePath,
+            ...(task.downloadUrl || options.downloadUrl
+              ? { downloadUrl: task.downloadUrl || options.downloadUrl }
+              : {}),
             existingLayer: alreadyLayer || null,
             _runnerOperation: alreadyLayer ? 'update' : 'install',
             signal: controller.signal,
             _progressCtx: progressBase,
           });
 
-          if (res.openedExternal) {
+          if (!res || res.success === false) {
+            if (/** @type {any} */ (res)?.cancelled || controller.signal.aborted) {
+              wasCancelled = true;
+              emitEnvironmentSetupProgress(
+                {
+                  ...progressBase,
+                  phase: 'cancelled',
+                  message: res?.message || 'Cancelled.',
+                },
+                options
+              );
+              outcomes.push({
+                componentId,
+                action: task.action,
+                status: 'cancelled',
+                message: res?.message || 'Cancelled by user.',
+              });
+            } else {
+              const failMsg =
+                /** @type {any} */ (res)?.error ||
+                res?.message ||
+                `Failed to install ${runnerType}.`;
+              emitEnvironmentSetupProgress(
+                {
+                  ...progressBase,
+                  phase: 'failed',
+                  message: failMsg,
+                  error: failMsg,
+                },
+                options
+              );
+              outcomes.push({
+                componentId,
+                action: task.action,
+                status: 'failed',
+                message: failMsg,
+                error: failMsg,
+              });
+            }
+          } else if (res.openedExternal) {
             emitEnvironmentSetupProgress(
               {
                 ...progressBase,
@@ -6222,6 +7809,76 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               openedExternalUrl: res.openedExternalUrl,
               message: res.message,
             });
+          } else if (res.alreadyUpToDate) {
+            const currentWizardState = getSetupWizardState(options);
+            if (!task.forceUpdate || !currentWizardState?.preferredRunnerType) {
+              saveSetupWizardState(
+                { preferredRunnerType: /** @type {any} */ (runnerType) },
+                options
+              );
+            }
+            succeededComponents.push(componentId);
+            try {
+              if (typeof invalidateProberRunnerUpdatesCache === 'function') {
+                invalidateProberRunnerUpdatesCache({ skipPreviewUrlCacheClear: true });
+              }
+            } catch {}
+            emitEnvironmentSetupProgress(
+              {
+                ...progressBase,
+                phase: 'skipped',
+                message: res.message,
+              },
+              options
+            );
+            outcomes.push({
+              componentId,
+              action: task.action,
+              status: 'skipped',
+              ...(alreadyLayer?.appPath || alreadyLayer?.binaryPath
+                ? { installedPath: alreadyLayer.appPath || alreadyLayer.binaryPath }
+                : {}),
+              message: res.message,
+            });
+          } else if (res.installed !== true) {
+            if (res.authenticated && options.authenticateOnly === true) {
+              emitEnvironmentSetupProgress(
+                {
+                  ...progressBase,
+                  phase: 'skipped',
+                  message: res.message,
+                },
+                options
+              );
+              outcomes.push({
+                componentId,
+                action: task.action,
+                status: 'skipped',
+                message: res.message,
+              });
+            } else {
+              const notInstalledMsg =
+                res.message ||
+                (res.authenticated
+                  ? 'Authenticated with CodeWeavers Preview without installing runner.'
+                  : `Runner ${runnerType} was not installed.`);
+              emitEnvironmentSetupProgress(
+                {
+                  ...progressBase,
+                  phase: 'failed',
+                  message: notInstalledMsg,
+                  error: notInstalledMsg,
+                },
+                options
+              );
+              outcomes.push({
+                componentId,
+                action: task.action,
+                status: 'failed',
+                message: notInstalledMsg,
+                error: notInstalledMsg,
+              });
+            }
           } else {
             const currentWizardState = getSetupWizardState(options);
             const nextPreferredRunnerType = res.switchedToStableCrossOver
@@ -6231,16 +7888,22 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
               !task.forceUpdate ||
               !currentWizardState?.preferredRunnerType ||
               (res.switchedToStableCrossOver &&
-                currentWizardState.preferredRunnerType === 'crossover_preview');
+                normalizeRequestedRunnerType(currentWizardState.preferredRunnerType) ===
+                  'crossover_preview');
             if (shouldSavePreferredRunner) {
               saveSetupWizardState(
                 {
-                  preferredRunnerType: nextPreferredRunnerType,
+                  preferredRunnerType: /** @type {any} */ (nextPreferredRunnerType),
                 },
                 options
               );
             }
             succeededComponents.push(componentId);
+            try {
+              if (typeof invalidateProberRunnerUpdatesCache === 'function') {
+                invalidateProberRunnerUpdatesCache({ skipPreviewUrlCacheClear: true });
+              }
+            } catch {}
             emitEnvironmentSetupProgress(
               {
                 ...progressBase,
@@ -6275,11 +7938,42 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
             continue;
           }
 
+          const hostArchForBottle = String(options.arch || process.arch || 'arm64').toLowerCase();
+          const normalizedTaskRunnerForBottle = normalizeRequestedRunnerType(task.runnerType);
+          if (
+            normalizedTaskRunnerForBottle === 'crossover_preview_arm64' &&
+            hostArchForBottle !== 'arm64'
+          ) {
+            throw new Error(
+              'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+            );
+          }
+
+          if (
+            task.bottleName !== undefined &&
+            task.bottleName !== null &&
+            String(task.bottleName).trim() !== '' &&
+            !safeIsBottleSlug(String(task.bottleName).trim())
+          ) {
+            throw new Error(
+              `Invalid bottle name "${task.bottleName}": must be a safe directory slug without path traversal or leading hyphens.`
+            );
+          }
+
           const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
             homedir,
             { runnerType: task.runnerType, bottleName: task.bottleName },
             options
           );
+
+          if (
+            layer.type === 'crossover_preview_arm64' &&
+            (hostArchForBottle !== 'arm64' || layer.available === false)
+          ) {
+            throw new Error(
+              'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+            );
+          }
 
           emitEnvironmentSetupProgress(
             {
@@ -6291,38 +7985,22 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
           );
 
           const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
-          if (layer.type === 'crossover' || layer.type === 'crossover_preview') {
+          if (
+            layer.type === 'crossover' ||
+            layer.type === 'crossover_preview' ||
+            layer.type === 'crossover_preview_arm64'
+          ) {
+            assertRunnerBottleArchCompatible(layer.type, bottleName, bottlePath);
             if (!isValidBottleDirectory(bottlePath, isMockHomedir)) {
-              const cxbottleCandidates = [
-                layer.binaryPath ? path.join(path.dirname(layer.binaryPath), 'cxbottle') : '',
-                '/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
-                '/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/cxbottle',
-              ].filter(Boolean);
-              const cxbottleBin =
-                cxbottleCandidates.find((p) => fs.existsSync(p)) ||
-                (typeof options.execFileFn === 'function' ? cxbottleCandidates[0] : '');
-
-              await fs.promises.mkdir(path.dirname(bottlePath), { recursive: true });
-              if (cxbottleBin) {
-                const cxbottleEnv = applyCrossOverEnvironmentHygiene(
-                  { ...process.env },
-                  {
-                    wineBinaryPath: layer.binaryPath || cxbottleBin,
-                    compatLayer: layer,
-                    layerType: layer.type,
-                    homedir: options.homedir,
-                    platform: 'darwin',
-                  }
-                );
-                try {
-                  await runExecFileAsync(
-                    execFileFn,
-                    cxbottleBin,
-                    ['--bottle', bottleName, '--create', '--template', 'win10_64'],
-                    { timeout: 60000, env: cxbottleEnv, signal: controller.signal }
-                  );
-                } catch {}
-              }
+              await provisionCrossOverBottleViaCxbottle(
+                layer,
+                bottleName,
+                bottlePath,
+                {},
+                { ...options, execFileFn },
+                controller.signal
+              );
+              assertRunnerBottleArchCompatible(layer.type, bottleName, bottlePath);
             }
             await ensureCompatibilityLayerReady(
               layer,
@@ -6380,7 +8058,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
             options
           );
           succeededComponents.push('bottle_default');
-          invalidateScanCaches();
+          invalidateScanCaches({ skipPreviewUrlCacheClear: true });
 
           emitEnvironmentSetupProgress(
             {
@@ -6542,9 +8220,9 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
 
             // B) Bottled Windows Steam (macOS)
             if (componentId === 'bottle_steam') {
-              const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+              const { layer, bottleName, bottlePath } = resolveAndValidateBottleClientTarget(
                 homedir,
-                { runnerType: task.runnerType, bottleName: task.bottleName },
+                task,
                 options
               );
               const existingSteam = resolveBottleSteamExe(bottlePath);
@@ -6817,9 +8495,9 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
 
             // D) Bottled GOG Galaxy (macOS)
             if (componentId === 'bottle_gog') {
-              const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+              const { layer, bottleName, bottlePath } = resolveAndValidateBottleClientTarget(
                 homedir,
-                { runnerType: task.runnerType, bottleName: task.bottleName },
+                task,
                 options
               );
               const existingGog = resolveBottleGogGalaxyExe(bottlePath);
@@ -7088,9 +8766,9 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
 
             // F) Bottled Epic Games Launcher (macOS)
             if (componentId === 'bottle_epic') {
-              const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+              const { layer, bottleName, bottlePath } = resolveAndValidateBottleClientTarget(
                 homedir,
-                { runnerType: task.runnerType, bottleName: task.bottleName },
+                task,
                 options
               );
               const existingEpic = resolveBottleEpicLauncherExe(bottlePath);
@@ -7236,9 +8914,9 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
                   continue;
                 }
 
-                const { layer, bottleName, bottlePath } = resolveRunnerAndBottleTarget(
+                const { layer, bottleName, bottlePath } = resolveAndValidateBottleClientTarget(
                   homedir,
-                  { runnerType: task.runnerType, bottleName: task.bottleName },
+                  task,
                   options
                 );
                 await ensureBottleInitializedInternal(
@@ -7429,7 +9107,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
           try {
             syncEpicFirstPartyLauncher(options);
           } catch {}
-          invalidateScanCaches();
+          invalidateScanCaches({ skipPreviewUrlCacheClear: true });
 
           emitEnvironmentSetupProgress(
             {
@@ -7504,7 +9182,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
     try {
       saveSetupWizardState(
         {
-          addConfiguredComponents: succeededComponents,
+          addConfiguredComponents: /** @type {any} */ (succeededComponents),
           lastHealthCheckAt: new Date().toISOString(),
         },
         options
@@ -7512,7 +9190,7 @@ async function runEnvironmentSetupTasks(payload, options = {}) {
     } catch {}
   }
 
-  invalidateScanCaches();
+  invalidateScanCaches({ skipPreviewUrlCacheClear: true });
   const snapshot = await probeEnvironmentHealth({
     ...options,
     forceRefreshRunnerUpdates: true,
@@ -7810,12 +9488,19 @@ async function startGuidedClientLogin(payload, options = {}) {
   const hostPlatform =
     rawPlatform === 'win32' ? 'win32' : rawPlatform === 'linux' ? 'linux' : 'darwin';
   const { homedir } = resolveIsolatedHomedirAndUserData(options);
+  const rawRequestedRunner = typeof payload?.runnerType === 'string' ? payload.runnerType.trim() : '';
+  const normalizedRequestedRunner = normalizeRequestedRunnerType(rawRequestedRunner);
+  const hasExplicitAutoRunner = Boolean(rawRequestedRunner) && normalizedRequestedRunner === '';
 
   const probeOpts = {
     ...options,
     ...explicitHomedirOpt(options),
     platform: hostPlatform,
-    ...(payload?.runnerType ? { preferredRunnerType: payload.runnerType } : {}),
+    ...(normalizedRequestedRunner
+      ? { preferredRunnerType: normalizedRequestedRunner }
+      : hasExplicitAutoRunner
+        ? { preferredRunnerType: 'skip' }
+        : {}),
     ...(payload?.bottleName ? { preferredBottleName: payload.bottleName } : {}),
   };
 
@@ -7860,23 +9545,88 @@ async function startGuidedClientLogin(payload, options = {}) {
   /** @type {any} */
   let bottleLayer = null;
   if (initialState.scope === 'bottle') {
-    const runners = detectCompatibilityLayers({
-      ...options,
-      ...explicitHomedirOpt(options),
-    });
-    bottleLayer =
-      (payload?.runnerType && runners.find((r) => r.type === payload.runnerType)) ||
-      runners[0] ||
-      null;
-    if (!bottleLayer?.binaryPath) {
+    const hostArch = String(options.arch || process.arch || 'arm64').toLowerCase();
+    if (
+      normalizedRequestedRunner === 'crossover_preview_arm64' &&
+      hostPlatform === 'darwin' &&
+      hostArch !== 'arm64'
+    ) {
       activeGuidedLogins.delete(targetId);
+      const archErrMsg =
+        'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.';
       return {
         success: false,
         targetId,
         authenticated: false,
         probeState: initialState,
-        message: 'No compatibility runner available to launch bottled client.',
-        error: 'Compatibility runner missing.',
+        message: archErrMsg,
+        error: archErrMsg,
+      };
+    }
+    const runners = detectCompatibilityLayers({
+      ...options,
+      ...explicitHomedirOpt(options),
+    });
+    const matchedLayer = normalizedRequestedRunner
+      ? runners.find(
+          (r) => r && (r.type === normalizedRequestedRunner || r.id === normalizedRequestedRunner)
+        )
+      : null;
+    if (normalizedRequestedRunner) {
+      if (!matchedLayer) {
+        activeGuidedLogins.delete(targetId);
+        const missingMsg = `Compatibility runner "${normalizedRequestedRunner}" is not installed.`;
+        return {
+          success: false,
+          targetId,
+          authenticated: false,
+          probeState: initialState,
+          message: missingMsg,
+          error: missingMsg,
+        };
+      }
+      if (
+        matchedLayer.available === false ||
+        (matchedLayer.type === 'crossover_preview_arm64' && hostArch !== 'arm64')
+      ) {
+        activeGuidedLogins.delete(targetId);
+        const unavailMsg =
+          matchedLayer.type === 'crossover_preview_arm64'
+            ? 'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+            : `Compatibility runner "${normalizedRequestedRunner}" is unavailable on this host.`;
+        return {
+          success: false,
+          targetId,
+          authenticated: false,
+          probeState: initialState,
+          message: unavailMsg,
+          error: unavailMsg,
+        };
+      }
+    }
+    bottleLayer =
+      matchedLayer ||
+      runners.find(
+        (r) =>
+          r &&
+          r.available !== false &&
+          !(r.type === 'crossover_preview_arm64' && hostArch !== 'arm64')
+      ) ||
+      null;
+    if (!bottleLayer?.binaryPath) {
+      activeGuidedLogins.delete(targetId);
+      const onlyUnsupportedArm64 =
+        hostArch !== 'arm64' && runners.some((r) => r && r.type === 'crossover_preview_arm64');
+      const errMsg = onlyUnsupportedArm64
+        ? 'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+        : 'No compatibility runner available to launch bottled client.';
+      return {
+        success: false,
+        targetId,
+        authenticated: false,
+        probeState: initialState,
+        message: errMsg,
+        error: onlyUnsupportedArm64 ? errMsg : 'Compatibility runner missing.',
       };
     }
   }
@@ -8045,7 +9795,7 @@ async function startGuidedClientLogin(payload, options = {}) {
             syncEpicFirstPartyLauncher(options);
           }
         } catch {}
-        invalidateScanCaches();
+        invalidateScanCaches({ skipPreviewUrlCacheClear: true });
 
         let autoClosedClient = false;
         if (payload?.autoCloseOnSuccess !== false) {
@@ -8242,7 +9992,7 @@ async function ensureRosetta2InBackground(options = {}) {
           }
         );
       } catch {}
-      invalidateScanCaches();
+      invalidateScanCaches({ skipPreviewUrlCacheClear: true });
       diagLog.info(
         'environmentProvisioner',
         'Apple Rosetta 2 background installation succeeded',
@@ -8327,25 +10077,93 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
   const provisionableId = /** @type {'ubisoft' | 'ea' | 'bnet' | 'rockstar' | 'riot'} */ (canonical);
   const ecosystem = CHAINED_PUBLISHER_ECOSYSTEMS[provisionableId];
   const { homedir } = resolveIsolatedHomedirAndUserData(options);
+  const hostArch = String(options.arch || options.hostArch || process.arch || 'arm64').toLowerCase();
+
+  const normalizedParamRunnerType = normalizeRequestedRunnerType(runnerLayer?.type);
+  const effectiveRunnerLayer =
+    runnerLayer && normalizedParamRunnerType && normalizedParamRunnerType !== runnerLayer.type
+      ? { ...runnerLayer, type: normalizedParamRunnerType }
+      : runnerLayer;
+
+  if (
+    targetPlatform === 'darwin' &&
+    normalizedParamRunnerType === 'crossover_preview_arm64' &&
+    (hostArch !== 'arm64' || effectiveRunnerLayer?.available === false)
+  ) {
+    throw new Error(
+      'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+    );
+  }
+
+  if (
+    targetPlatform === 'darwin' &&
+    typeof bottleName === 'string' &&
+    bottleName.trim() !== '' &&
+    !safeIsBottleSlug(bottleName.trim())
+  ) {
+    throw new Error(
+      `Invalid bottle name "${bottleName.trim()}": must be a safe directory slug without path traversal or leading hyphens.`
+    );
+  }
 
   const resolveExplicitOrWizardBottlePath = () => {
+    if (
+      targetPlatform === 'darwin' &&
+      typeof bottleName === 'string' &&
+      bottleName.trim() !== '' &&
+      !safeIsBottleSlug(bottleName.trim())
+    ) {
+      throw new Error(
+        `Invalid bottle name "${bottleName.trim()}": must be a safe directory slug without path traversal or leading hyphens.`
+      );
+    }
     if (typeof bottlePath === 'string' && bottlePath.trim()) {
       const cleanPath = bottlePath.trim();
       const cleanName =
         typeof bottleName === 'string' && bottleName.trim()
           ? bottleName.trim()
           : path.basename(cleanPath);
-      return { bottleName: cleanName, bottlePath: cleanPath };
+      let inferredLayerType = normalizedParamRunnerType;
+      if (!inferredLayerType && targetPlatform === 'darwin') {
+        try {
+          inferredLayerType = resolveRunnerAndBottleTarget(
+            homedir,
+            { runnerType: undefined, bottleName: cleanName },
+            options
+          )?.layer?.type;
+        } catch (/** @type {any} */ inferErr) {
+          const inferMsg = String(inferErr?.message || inferErr || '');
+          if (/Apple Silicon|unsupported on Intel|Invalid bottle name/i.test(inferMsg)) {
+            throw inferErr;
+          }
+        }
+      }
+      return { bottleName: cleanName, bottlePath: cleanPath, layerType: inferredLayerType };
     }
-    const explicitRunnerBin = String(runnerLayer?.binaryPath || runnerLayer?.path || '').trim();
-    if (runnerLayer && explicitRunnerBin) {
+    const explicitRunnerBin = String(
+      effectiveRunnerLayer?.binaryPath || effectiveRunnerLayer?.path || ''
+    ).trim();
+    if (effectiveRunnerLayer && explicitRunnerBin) {
       const wizardState = getSetupWizardState(options);
-      if (runnerLayer.type === 'crossover' || runnerLayer.type === 'crossover_preview') {
+      if (
+        normalizedParamRunnerType === 'crossover' ||
+        normalizedParamRunnerType === 'crossover_preview' ||
+        normalizedParamRunnerType === 'crossover_preview_arm64'
+      ) {
+        if (
+          typeof bottleName === 'string' &&
+          bottleName.trim() !== '' &&
+          !safeIsBottleSlug(bottleName.trim())
+        ) {
+          throw new Error(
+            `Invalid bottle name "${bottleName.trim()}": must be a safe directory slug without path traversal or leading hyphens.`
+          );
+        }
         const bottlesDir =
-          runnerLayer.bottlesDir ||
+          effectiveRunnerLayer.bottlesDir ||
           path.join(homedir, 'Library/Application Support/CrossOver/Bottles');
-        let discoveredBottles = Array.isArray(runnerLayer.availableBottles)
-          ? runnerLayer.availableBottles
+        let discoveredBottles = Array.isArray(effectiveRunnerLayer.availableBottles)
+          ? effectiveRunnerLayer.availableBottles
           : [];
         if (discoveredBottles.length === 0 && fs.existsSync(bottlesDir)) {
           try {
@@ -8355,21 +10173,33 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
               .map((d) => d.name);
           } catch {}
         }
+        const { mappedBottles, compatibleWizardBottleName } =
+          buildCompatibleCrossOverBottleResolutionInputs(
+            homedir,
+            effectiveRunnerLayer,
+            bottlesDir,
+            discoveredBottles,
+            wizardState
+          );
         const resolvedName = resolveDefaultChainedBottleName({
           explicitBottleName: bottleName,
-          wizardPreferredBottleName: wizardState.preferredBottleName,
-          discoveredBottleNames: discoveredBottles,
-          runnerType: runnerLayer.type,
+          wizardPreferredBottleName: compatibleWizardBottleName,
+          discoveredBottleNames: mappedBottles,
+          runnerType: normalizedParamRunnerType,
         });
         return {
           bottleName: resolvedName,
           bottlePath: path.join(bottlesDir, resolvedName),
+          layerType: normalizedParamRunnerType,
         };
       }
+      const normalizedWizardPrefRunner = normalizeRequestedRunnerType(
+        wizardState.preferredRunnerType === 'skip' ? '' : wizardState.preferredRunnerType
+      );
       const prefixSlug =
         bottleName && safeIsBottleSlug(bottleName)
           ? bottleName.trim()
-          : wizardState.preferredRunnerType === runnerLayer.type &&
+          : normalizedWizardPrefRunner === normalizedParamRunnerType &&
               wizardState.preferredBottleName &&
               safeIsBottleSlug(wizardState.preferredBottleName)
             ? wizardState.preferredBottleName
@@ -8377,26 +10207,63 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
       return {
         bottleName: prefixSlug,
         bottlePath: path.join(homedir, 'Games/OneLauncher/Prefixes', prefixSlug),
+        layerType: normalizedParamRunnerType,
       };
     }
     const resolvedTarget = resolveRunnerAndBottleTarget(
       homedir,
-      { runnerType: runnerLayer?.type, bottleName },
+      { runnerType: effectiveRunnerLayer?.type, bottleName },
       options
     );
     return {
       bottleName: resolvedTarget.bottleName,
       bottlePath: resolvedTarget.bottlePath,
+      layerType: resolvedTarget.layer?.type,
     };
+  };
+
+  const validateDarwinRunnerAndBottlePrecheck = () => {
+    let checkBottleName = '';
+    let checkBottlePath = '';
+    let effectiveLayerType = normalizedParamRunnerType;
+    try {
+      const resolvedCheck = resolveExplicitOrWizardBottlePath();
+      checkBottleName = resolvedCheck.bottleName;
+      checkBottlePath = resolvedCheck.bottlePath;
+      if (!effectiveLayerType && resolvedCheck.layerType) {
+        effectiveLayerType = resolvedCheck.layerType;
+      }
+    } catch (/** @type {any} */ resolveErr) {
+      const msg = String(resolveErr?.message || resolveErr || '');
+      if (
+        /Apple Silicon|unsupported on Intel|Invalid bottle name|Compatibility runner .* is (?:not installed|unavailable)/i.test(
+          msg
+        ) ||
+        (normalizedParamRunnerType && /not installed/i.test(msg))
+      ) {
+        throw resolveErr;
+      }
+    }
+    if (effectiveLayerType === 'crossover_preview_arm64' && hostArch !== 'arm64') {
+      throw new Error(
+        'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+      );
+    }
+    if (
+      (effectiveLayerType === 'crossover' ||
+        effectiveLayerType === 'crossover_preview' ||
+        effectiveLayerType === 'crossover_preview_arm64') &&
+      checkBottlePath
+    ) {
+      assertRunnerBottleArchCompatible(effectiveLayerType, checkBottleName, checkBottlePath);
+    }
+    return { checkBottleName, checkBottlePath, effectiveLayerType };
   };
 
   // Fast read-only precheck (0 network calls if already installed)
   if (!options.forceReinstall) {
     if (targetPlatform === 'darwin') {
-      let checkBottlePath = '';
-      try {
-        checkBottlePath = resolveExplicitOrWizardBottlePath().bottlePath;
-      } catch {}
+      const { checkBottlePath } = validateDarwinRunnerAndBottlePrecheck();
       if (checkBottlePath) {
         const existingBottle = discoverBottlePublisherLauncher(checkBottlePath, provisionableId);
         if (existingBottle.installed && existingBottle.binaryPath) {
@@ -8453,6 +10320,10 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
       binaryPath: bin,
       installDir: dir,
     };
+  }
+
+  if (options.forceReinstall && targetPlatform === 'darwin') {
+    validateDarwinRunnerAndBottlePrecheck();
   }
 
   if (options.skipNetwork === true && typeof options.fetchFn !== 'function') {
@@ -8541,10 +10412,12 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
         await ensureRosetta2InBackground({ ...options, signal });
       }
 
-      const explicitRunnerBin = String(runnerLayer?.binaryPath || runnerLayer?.path || '').trim();
-      if (runnerLayer && explicitRunnerBin) {
+      const explicitRunnerBin = String(
+        effectiveRunnerLayer?.binaryPath || effectiveRunnerLayer?.path || ''
+      ).trim();
+      if (effectiveRunnerLayer && explicitRunnerBin) {
         effectiveLayer = {
-          ...runnerLayer,
+          ...effectiveRunnerLayer,
           binaryPath: explicitRunnerBin,
         };
         const resolvedBottle = resolveExplicitOrWizardBottlePath();
@@ -8553,7 +10426,7 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
       } else {
         const resolved = resolveRunnerAndBottleTarget(
           homedir,
-          { runnerType: runnerLayer?.type, bottleName },
+          { runnerType: effectiveRunnerLayer?.type, bottleName },
           options
         );
         effectiveLayer = resolved.layer;
@@ -8627,7 +10500,7 @@ async function ensureChainedPublisherLauncherInstalled(params, options = {}) {
         options
       );
     } catch {}
-    invalidateScanCaches();
+    invalidateScanCaches({ skipPreviewUrlCacheClear: true });
 
     emitProgressCallback({
       percent: 100,
@@ -8671,7 +10544,14 @@ module.exports = {
   onEnvironmentSetupProgress,
   emitEnvironmentSetupProgress,
   ensureRosetta2InBackground,
-  isExperimentalArm64CrossOverPreviewTarget,
+  resolveCodeWeaversRunnerSpec,
+  parseNumericPreviewDate,
+  classifyCrossOverPreviewArchiveBranch,
+  discoverCrossOverPreviewBranchUrls,
+  isAllowedCodeWeaversAuthNavigationUrl,
+  isAllowedCodeWeaversDownloadUrl,
+  extractPreviewFilenameVersionHint,
+  resolvePreviewBundleVersion,
   selectPreferredCrossOverPreviewDownloadUrl,
   captureCodeWeaversPreviewDownload,
   installRunnerDirect,

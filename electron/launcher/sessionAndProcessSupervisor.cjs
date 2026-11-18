@@ -138,6 +138,8 @@ const {
   removeSteamAppFromLibraryFoldersVdf,
   cleanupCrossOverSteamShortcuts,
   isValidBottleDirectory,
+  inspectBottleConfMetadata,
+  assertRunnerBottleArchCompatible,
   listBottleSubdirectories,
   detectCompatibilityLayers,
   resolveWineLayerMoltenVkPath,
@@ -215,6 +217,36 @@ const {
  */
 function resolveAnyChainedHandoffId(raw) {
   return normalizeChainedHandoffId(raw) || normalizeVaultChainedHandoffId(raw) || '';
+}
+
+/**
+ * Normalize a requested compatibility runner string (`'runner_crossover_preview_arm64'`, `'auto'`,
+ * `'native'`, etc.) into a canonical runner type (`''` when auto/omitted/native).
+ *
+ * @param {unknown} rawLayer
+ * @returns {string}
+ */
+function normalizeRequestedCompatibilityLayerType(rawLayer) {
+  const s = String(rawLayer || '')
+    .trim()
+    .toLowerCase();
+  if (!s || s === 'auto' || s === 'native') return '';
+  if (s === 'runner_crossover_preview_arm64' || s === 'crossover_preview_arm64') {
+    return 'crossover_preview_arm64';
+  }
+  if (s === 'runner_crossover_preview' || s === 'crossover_preview') {
+    return 'crossover_preview';
+  }
+  if (s === 'runner_crossover' || s === 'crossover') {
+    return 'crossover';
+  }
+  if (s === 'runner_wine' || s === 'wine') {
+    return 'wine';
+  }
+  if (s === 'runner_gptk' || s === 'gptk') {
+    return 'gptk';
+  }
+  return s.startsWith('runner_') ? s.slice('runner_'.length) : s;
 }
 
 const WINE_KNOWN_PATH_EXT_RE =
@@ -386,6 +418,7 @@ function computeBottleGraphicsEnvContract(envObj) {
     dxvkCfg: String(src.DXVK_CONFIG || '').trim(),
     avx: src.ROSETTA_ADVERTISE_AVX ?? 'unset',
     msync: String(src.WINEMSYNC || '1').trim(),
+    fexX87: String(src.FEX_X87REDUCEDPRECISION || 'unset').trim(),
   });
 }
 
@@ -3641,21 +3674,73 @@ async function launchChainedPublisherGame(ctx) {
       };
     }
 
+    const effectiveHostArch = String(options.arch || process.arch || 'arm64')
+      .trim()
+      .toLowerCase();
     const layers = detectCompatibilityLayers(options);
-    const preferredType =
+    const rawPreferredType =
       launchConfig.compatibilityLayer ||
       payload.compatibilityLayer ||
       installedRecord?.compatibilityLayer;
-    const chosenLayer =
-      (preferredType && preferredType !== 'native'
-        ? layers.find((l) => l.type === preferredType || l.id === preferredType)
-        : layers.find((l) => l.type === 'crossover' || l.type === 'crossover_preview')) ||
-      layers[0];
+    const preferredType = normalizeRequestedCompatibilityLayerType(rawPreferredType);
+    if (preferredType === 'crossover_preview_arm64' && effectiveHostArch !== 'arm64') {
+      return {
+        success: false,
+        error:
+          'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.',
+      };
+    }
+    const explicitMatchedLayer = preferredType
+      ? layers.find((l) => l && (l.type === preferredType || l.id === preferredType))
+      : null;
+    if (preferredType) {
+      if (!explicitMatchedLayer) {
+        return {
+          success: false,
+          error: `Launch failed: Requested compatibility runner "${preferredType}" is not installed.`,
+        };
+      }
+      if (
+        explicitMatchedLayer.available === false ||
+        (explicitMatchedLayer.type === 'crossover_preview_arm64' &&
+          effectiveHostArch !== 'arm64')
+      ) {
+        return {
+          success: false,
+          error:
+            explicitMatchedLayer.type === 'crossover_preview_arm64'
+              ? 'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.'
+              : `Launch failed: Requested compatibility runner "${preferredType}" is unavailable on this host.`,
+        };
+      }
+    }
+    const chosenLayer = preferredType
+      ? explicitMatchedLayer
+      : layers.find(
+          (l) =>
+            l &&
+            l.available !== false &&
+            (l.type === 'crossover' ||
+              l.type === 'crossover_preview' ||
+              l.type === 'crossover_preview_arm64')
+        ) ||
+        layers.find((l) => l && l.available !== false) ||
+        layers[0];
 
     if (!chosenLayer || !chosenLayer.binaryPath) {
       return {
         success: false,
         error: `No Windows compatibility layer (CrossOver, Game Porting Toolkit, or Wine) detected on macOS to run ${ecosystem.displayName}.`,
+      };
+    }
+    if (
+      chosenLayer.type === 'crossover_preview_arm64' &&
+      (effectiveHostArch !== 'arm64' || chosenLayer.available === false)
+    ) {
+      return {
+        success: false,
+        error:
+          'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.',
       };
     }
 
@@ -3686,18 +3771,94 @@ async function launchChainedPublisherGame(ctx) {
         (explicitBottleFromInstall ? path.basename(explicitBottleFromInstall) : '')
     ).trim();
     const gameConfigBottleName = String(launchConfig.wineBottleName || '').trim();
+    const isMockHomedirForChained = Boolean(
+      options.homedir || options.customApplicationsDir || isTestEnvironment(options)
+    );
     const wizardState = getSupervisorSetupWizardState(options);
-    const wizardPreferredBottleName = String(wizardState?.preferredBottleName || '').trim();
+    const rawWizardPreferredBottleName = String(wizardState?.preferredBottleName || '').trim();
+    const { homedir: supervisorHomedir } = resolveIsolatedHomedirAndUserData(options);
+    const chainedBottlesDir =
+      chosenLayer.bottlesDir ||
+      path.join(supervisorHomedir, 'Library/Application Support/CrossOver/Bottles');
+    const isArm64ChosenLayer = chosenLayer.type === 'crossover_preview_arm64';
+    const isIntelCrossOverChosenLayer =
+      chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview';
+    const mappedDiscoveredBottles = Array.isArray(chosenLayer.availableBottles)
+      ? chosenLayer.availableBottles.map((/** @type {string} */ bName) => {
+          const bPath = path.join(chainedBottlesDir, bName);
+          const detailMeta = chosenLayer.bottleDetails?.[bName];
+          const confMeta = detailMeta || inspectBottleConfMetadata(bPath);
+          const resolvedWineArch =
+            confMeta?.wineArch ||
+            (isValidBottleDirectory(bPath, false) ? 'win64' : undefined);
+          return {
+            name: bName,
+            ...(confMeta || {}),
+            ...(resolvedWineArch ? { wineArch: resolvedWineArch } : {}),
+          };
+        })
+      : [];
+
+    let effectiveWizardPreferredBottleName = rawWizardPreferredBottleName;
+    if (
+      rawWizardPreferredBottleName &&
+      (isArm64ChosenLayer || isIntelCrossOverChosenLayer)
+    ) {
+      const candidateWizardBottleDirs = Array.from(
+        new Set(
+          [
+            chainedBottlesDir,
+            path.join(supervisorHomedir, 'Library/Application Support/CrossOver/Bottles'),
+            path.join(supervisorHomedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+            path.join(
+              supervisorHomedir,
+              'Library/Application Support/CrossOver Preview arm64/Bottles'
+            ),
+          ].filter(Boolean)
+        )
+      );
+      const detailArch = chosenLayer.bottleDetails?.[rawWizardPreferredBottleName]?.wineArch;
+      if (detailArch && (isArm64ChosenLayer ? detailArch !== 'arm64' : detailArch === 'arm64')) {
+        effectiveWizardPreferredBottleName = '';
+      } else {
+        for (const dir of candidateWizardBottleDirs) {
+          const candPath = path.join(dir, rawWizardPreferredBottleName);
+          if (!fs.existsSync(candPath)) continue;
+          const meta = inspectBottleConfMetadata(candPath);
+          const isInit =
+            Boolean(meta.wineArch) ||
+            fs.existsSync(path.join(candPath, 'cxbottle.conf')) ||
+            isValidBottleDirectory(candPath, false);
+          if (!isInit) continue;
+          const arch = meta.wineArch || 'win64';
+          if (isArm64ChosenLayer ? arch !== 'arm64' : arch === 'arm64') {
+            effectiveWizardPreferredBottleName = '';
+            break;
+          }
+        }
+      }
+      if (effectiveWizardPreferredBottleName && wizardState?.preferredRunnerType) {
+        const savedPrefRunner = String(wizardState.preferredRunnerType).trim();
+        if (
+          savedPrefRunner !== 'skip' &&
+          (savedPrefRunner === 'crossover_preview_arm64') !== isArm64ChosenLayer &&
+          rawWizardPreferredBottleName.toLowerCase() ===
+            (savedPrefRunner === 'crossover_preview_arm64' ? 'onelauncher-arm64' : 'onelauncher')
+        ) {
+          effectiveWizardPreferredBottleName = '';
+        }
+      }
+    }
+
     const helperBottleName =
       typeof chainedPublisherLaunchers.resolveDefaultChainedBottleName === 'function'
         ? String(
             chainedPublisherLaunchers.resolveDefaultChainedBottleName({
               explicitBottleName,
               gameConfigBottleName,
-              wizardPreferredBottleName,
-              discoveredBottleNames: Array.isArray(chosenLayer.availableBottles)
-                ? chosenLayer.availableBottles
-                : [],
+              wizardPreferredBottleName: effectiveWizardPreferredBottleName || undefined,
+              discoveredBottleNames: mappedDiscoveredBottles,
+              runnerType: chosenLayer.type,
             }) || ''
           ).trim()
         : '';
@@ -3705,12 +3866,9 @@ async function launchChainedPublisherGame(ctx) {
       gameConfigBottleName ||
       explicitBottleName ||
       helperBottleName ||
-      wizardPreferredBottleName ||
+      effectiveWizardPreferredBottleName ||
       '';
 
-    const isMockHomedirForChained = Boolean(
-      options.homedir || options.customApplicationsDir || isTestEnvironment(options)
-    );
     let preResolvedBottlePath = '';
     if (
       explicitBottleFromInstall &&
@@ -3719,7 +3877,9 @@ async function launchChainedPublisherGame(ctx) {
     ) {
       preResolvedBottlePath = explicitBottleFromInstall;
     } else if (
-      (chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview') &&
+      (chosenLayer.type === 'crossover' ||
+        chosenLayer.type === 'crossover_preview' ||
+        chosenLayer.type === 'crossover_preview_arm64') &&
       chosenLayer.bottlesDir &&
       requestedBottleName
     ) {
@@ -3729,6 +3889,21 @@ async function launchChainedPublisherGame(ctx) {
         isValidBottleDirectory(candidateNamedBottle, isMockHomedirForChained)
       ) {
         preResolvedBottlePath = candidateNamedBottle;
+      }
+    }
+
+    if (preResolvedBottlePath) {
+      try {
+        assertRunnerBottleArchCompatible(
+          chosenLayer.type,
+          requestedBottleName || path.basename(preResolvedBottlePath),
+          preResolvedBottlePath
+        );
+      } catch (/** @type {any} */ archErr) {
+        return {
+          success: false,
+          error: archErr?.message || String(archErr),
+        };
       }
     }
 
@@ -3974,6 +4149,13 @@ async function launchChainedPublisherGame(ctx) {
     const earlyChainedPerfPolicy = resolveEffectivePerformancePolicy(launchConfig || {}, options);
     const chainedCompatCapOptions = {
       ...options,
+      runnerType: chosenLayer.type,
+      isPreviewRunner:
+        chosenLayer.type === 'crossover_preview' ||
+        chosenLayer.type === 'crossover_preview_arm64',
+      isPreviewArm64Runner: chosenLayer.type === 'crossover_preview_arm64',
+      ...(chosenLayer.binaryPath ? { wineBinary: chosenLayer.binaryPath } : {}),
+      ...(chosenLayer.version ? { runnerVersion: chosenLayer.version } : {}),
       skipBottleProvisioning: true,
       ...(options.enableAudioBufferClamp === true || launchConfig?.audioBufferClamp === true
         ? { enableAudioBufferClamp: true }
@@ -4007,7 +4189,9 @@ async function launchChainedPublisherGame(ctx) {
 
     bottleEnv.WINEPREFIX = bottlePath;
     if (
-      (chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview') &&
+      (chosenLayer.type === 'crossover' ||
+        chosenLayer.type === 'crossover_preview' ||
+        chosenLayer.type === 'crossover_preview_arm64') &&
       bottleName
     ) {
       bottleEnv.CX_BOTTLE = bottleName;
@@ -5125,6 +5309,22 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
 
     const rawLaunchMethod = launchConfig.launchMethod || payload.launchMethod || 'auto';
     const launchMethod = rawLaunchMethod === 'custom' ? 'auto' : rawLaunchMethod;
+    const effectiveHostArch = String(options.arch || process.arch || 'arm64')
+      .trim()
+      .toLowerCase();
+    if (
+      platform === 'darwin' &&
+      normalizeRequestedCompatibilityLayerType(
+        launchConfig.compatibilityLayer || payload.compatibilityLayer
+      ) === 'crossover_preview_arm64' &&
+      effectiveHostArch !== 'arm64'
+    ) {
+      return {
+        success: false,
+        error:
+          'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.',
+      };
+    }
     const preferWindowsExe =
       platform === 'darwin' &&
       launchMethod === 'compatibility_layer' &&
@@ -5666,6 +5866,8 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       }
     }
 
+    /** @type {any} */
+    let resolvedExePeInfo = null;
     if (
       resolvedExePath &&
       resolvedExePath !== 'explorer.exe' &&
@@ -5698,6 +5900,28 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               })
             : null;
       }
+      const requestedCompatLayer = normalizeRequestedCompatibilityLayerType(
+        launchConfig.compatibilityLayer || payload.compatibilityLayer
+      );
+      let allowArm64PeForLaunch = false;
+      if (platform === 'darwin' && effectiveHostArch === 'arm64') {
+        if (requestedCompatLayer) {
+          allowArm64PeForLaunch = requestedCompatLayer === 'crossover_preview_arm64';
+        } else {
+          const previewLayers = detectCompatibilityLayers(options);
+          const autoLayer =
+            previewLayers.find(
+              (l) =>
+                l.available !== false &&
+                (l.type === 'crossover' ||
+                  l.type === 'crossover_preview' ||
+                  l.type === 'crossover_preview_arm64')
+            ) ||
+            previewLayers.find((l) => l.available !== false) ||
+            previewLayers[0];
+          allowArm64PeForLaunch = autoLayer?.type === 'crossover_preview_arm64';
+        }
+      }
       if (
         peInfo &&
         peInfo.exists &&
@@ -5705,15 +5929,17 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         !isCompatibleX86OrX64PeHeader(peInfo, {
           hostPlatform: platform,
           hostArch: options.arch || process.arch,
-        }) &&
-        !launchConfig.customExecutablePath
+          allowArm64Pe: allowArm64PeForLaunch,
+        })
       ) {
         const searchRoot = localInstallDir || payload.installPath || path.dirname(resolvedExePath);
-        const compatibleAltExe = findBestX86OrX64WindowsExe(searchRoot, {
-          strictPe: Boolean(options.strictPe),
-          platform,
-          arch: options.arch || process.arch,
-        });
+        const compatibleAltExe = !launchConfig.customExecutablePath
+          ? findBestX86OrX64WindowsExe(searchRoot, {
+              strictPe: Boolean(options.strictPe),
+              platform,
+              arch: options.arch || process.arch,
+            })
+          : null;
         if (compatibleAltExe && fs.existsSync(compatibleAltExe)) {
           diagLog.info('launchGame.peArchFallbackSelected', {
             gameId,
@@ -5738,6 +5964,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           error: `Launch failed: Game executable "${path.basename(resolvedExePath)}" is incomplete or corrupted (invalid Windows PE header). Please repair or reinstall the game.`,
         };
       }
+      resolvedExePeInfo = peInfo;
     }
 
     if (
@@ -5798,8 +6025,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
         Boolean(resolvedExePath && /\.(exe|bat|msi)$/i.test(resolvedExePath)) ||
         (launchMethod === 'compatibility_layer' && !isMacNativeExecutable) ||
         (!isMacNativeExecutable &&
-          launchConfig.compatibilityLayer &&
-          launchConfig.compatibilityLayer !== 'native'));
+          Boolean(normalizeRequestedCompatibilityLayerType(launchConfig.compatibilityLayer))));
 
     const effectiveCaps =
       resolvedExePath &&
@@ -6071,12 +6297,56 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           ...options,
           ...(effectiveCaps?.isLegacy32BitOpenGl ? { preferLegacy32BitOpenGlWine: true } : {}),
         });
-        const preferredType = launchConfig.compatibilityLayer;
-        let chosenLayer =
-          (preferredType && preferredType !== 'native'
-            ? layers.find((l) => l.type === preferredType || l.id === preferredType)
-            : layers.find((l) => l.type === 'crossover' || l.type === 'crossover_preview')) ||
-          layers[0];
+        const rawPreferredType = launchConfig.compatibilityLayer || payload.compatibilityLayer;
+        const preferredType = normalizeRequestedCompatibilityLayerType(rawPreferredType);
+        if (
+          preferredType === 'crossover_preview_arm64' &&
+          platform === 'darwin' &&
+          effectiveHostArch !== 'arm64'
+        ) {
+          return {
+            success: false,
+            error:
+              'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.',
+          };
+        }
+        const explicitMatchedLayer = preferredType
+          ? layers.find((l) => l && (l.type === preferredType || l.id === preferredType))
+          : null;
+        if (preferredType) {
+          if (!explicitMatchedLayer) {
+            return {
+              success: false,
+              error: `Launch failed: Requested compatibility runner "${preferredType}" is not installed.`,
+            };
+          }
+          if (
+            explicitMatchedLayer.available === false ||
+            (explicitMatchedLayer.type === 'crossover_preview_arm64' &&
+              platform === 'darwin' &&
+              effectiveHostArch !== 'arm64')
+          ) {
+            return {
+              success: false,
+              error:
+                explicitMatchedLayer.type === 'crossover_preview_arm64'
+                  ? 'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.'
+                  : `Launch failed: Requested compatibility runner "${preferredType}" is unavailable on this host.`,
+            };
+          }
+        }
+        let chosenLayer = preferredType
+          ? explicitMatchedLayer
+          : layers.find(
+              (l) =>
+                l &&
+                l.available !== false &&
+                (l.type === 'crossover' ||
+                  l.type === 'crossover_preview' ||
+                  l.type === 'crossover_preview_arm64')
+            ) ||
+            layers.find((l) => l && l.available !== false) ||
+            layers[0];
 
         if (!chosenLayer) {
           if (isAutoLikeMethod && options.allowStorefrontFallbackOnMissingCompat) {
@@ -6089,6 +6359,17 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             };
           }
         } else {
+          if (
+            chosenLayer.type === 'crossover_preview_arm64' &&
+            platform === 'darwin' &&
+            effectiveHostArch !== 'arm64'
+          ) {
+            return {
+              success: false,
+              error:
+                'Launch failed: CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64.',
+            };
+          }
           let effectiveCompatLaunchConfig = launchConfig;
           if (
             (effectiveCaps?.isLegacy32BitOpenGl ||
@@ -6098,7 +6379,10 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
           ) {
             const readyCrossOverLayer = layers.find(
               (l) =>
-                (l.type === 'crossover' || l.type === 'crossover_preview') &&
+                l.available !== false &&
+                (l.type === 'crossover' ||
+                  l.type === 'crossover_preview' ||
+                  l.type === 'crossover_preview_arm64') &&
                 l.binaryPath &&
                 ((Array.isArray(l.availableBottles) && l.availableBottles.length > 0) ||
                   isTestEnvironment(options) ||
@@ -6113,7 +6397,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               chosenLayer = readyCrossOverLayer;
               if (
                 effectiveCompatLaunchConfig?.winePrefixPath &&
-                !/\/CrossOver(?: Preview)?\/Bottles\//i.test(
+                !/\/CrossOver(?: Preview(?: arm64)?)?\/Bottles\//i.test(
                   String(effectiveCompatLaunchConfig.winePrefixPath).replace(/\\/g, '/')
                 )
               ) {
@@ -6170,6 +6454,13 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
 
           const compatLayerCapOptions = {
             ...options,
+            runnerType: chosenLayer.type,
+            isPreviewRunner:
+              chosenLayer.type === 'crossover_preview' ||
+              chosenLayer.type === 'crossover_preview_arm64',
+            isPreviewArm64Runner: chosenLayer.type === 'crossover_preview_arm64',
+            ...(chosenLayer.binaryPath ? { wineBinary: chosenLayer.binaryPath } : {}),
+            ...(chosenLayer.version ? { runnerVersion: chosenLayer.version } : {}),
             ...(effectiveCaps ? { peCapabilities: effectiveCaps } : {}),
             ...(options.enableAudioBufferClamp === true ||
             (options.enableAudioBufferClamp !== false &&
@@ -6200,34 +6491,55 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             compatLayerCapOptions
           );
 
-          if (chosenLayer.type === 'crossover' || chosenLayer.type === 'crossover_preview') {
+          if (
+            chosenLayer.type === 'crossover' ||
+            chosenLayer.type === 'crossover_preview' ||
+            chosenLayer.type === 'crossover_preview_arm64'
+          ) {
             const resolvedBottleDir =
               env.WINEPREFIX ||
               (chosenLayer.bottlesDir && env.CX_BOTTLE
                 ? path.join(chosenLayer.bottlesDir, env.CX_BOTTLE)
                 : '');
-            if (!resolvedBottleDir || !fs.existsSync(resolvedBottleDir)) {
-              const fallbackLayer = layers.find(
-                (l) =>
-                  l.id !== chosenLayer.id &&
-                  l.type !== 'crossover' &&
-                  l.type !== 'crossover_preview'
-              );
-              if (fallbackLayer) {
-                chosenLayer = fallbackLayer;
-                delete env.CX_BOTTLE;
-                compatResult = await ensureCompatibilityLayerReady(
-                  chosenLayer,
-                  launchConfig,
-                  env,
-                  compatLayerCapOptions
-                );
-              }
+            const isMissingOrUninitializedBottle =
+              !resolvedBottleDir ||
+              (options.skipBottleProvisioning === true
+                ? !isValidBottleDirectory(resolvedBottleDir, false)
+                : !fs.existsSync(resolvedBottleDir));
+            if (isMissingOrUninitializedBottle) {
+              const missingBottleLabel =
+                env.CX_BOTTLE ||
+                launchConfig.wineBottleName ||
+                (chosenLayer.type === 'crossover_preview_arm64'
+                  ? 'OneLauncher-arm64'
+                  : 'OneLauncher');
+              return {
+                success: false,
+                error: `CrossOver bottle "${missingBottleLabel}" is missing or does not exist at "${resolvedBottleDir || '(unresolved)'}". Provision or select a valid bottle first.`,
+              };
             }
           }
 
           chosenCompatLayer = chosenLayer;
           targetWinePrefix = compatResult?.winePrefix || env.WINEPREFIX || null;
+          if (
+            resolvedExePeInfo &&
+            resolvedExePeInfo.isValidPe &&
+            (resolvedExePeInfo.isArm64 ||
+              resolvedExePeInfo.isArm64Ec ||
+              resolvedExePeInfo.machine === 0xaa64 ||
+              resolvedExePeInfo.machine === 0xa641) &&
+            (chosenLayer.type !== 'crossover_preview_arm64' ||
+              (compatResult?.wineArch && compatResult.wineArch !== 'arm64') ||
+              (targetWinePrefix &&
+                fs.existsSync(path.join(targetWinePrefix, 'cxbottle.conf')) &&
+                inspectBottleConfMetadata(targetWinePrefix).wineArch === 'win64'))
+          ) {
+            return {
+              success: false,
+              error: `Launch failed: Executable "${path.basename(resolvedExePath || 'game.exe')}" targets unsupported architecture (${resolvedExePeInfo.machineHex || '0xaa64'}) for ${chosenLayer.type}.`,
+            };
+          }
 
           if (targetWinePrefix) {
             const resolvedTargetPrefix = path.resolve(targetWinePrefix);
@@ -7463,6 +7775,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             const isCrossOverWineWrapper =
               chosenCompatLayer.type === 'crossover' ||
               chosenCompatLayer.type === 'crossover_preview' ||
+              chosenCompatLayer.type === 'crossover_preview_arm64' ||
               /CrossOver[^/\\]*\.app\/Contents\/SharedSupport\/CrossOver\/bin\/wine$/i.test(
                 String(chosenCompatLayer.binaryPath || '')
               );
@@ -7691,7 +8004,11 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               );
 
               const stage1Env = { ...env };
+              const isArm64Stage1 =
+                chosenCompatLayer.type === 'crossover_preview_arm64' ||
+                compatResult?.wineArch === 'arm64';
               if (
+                !isArm64Stage1 &&
                 effectivePerfPolicy.storefrontClientLifecycle === 'default_client' &&
                 (launchConfig?.crossoverGraphicsBackend === undefined ||
                   launchConfig?.crossoverGraphicsBackend === 'auto') &&

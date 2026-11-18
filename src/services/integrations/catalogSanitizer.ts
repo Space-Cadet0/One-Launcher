@@ -336,8 +336,36 @@ function syncSuppressedEntriesWithStorage(): void {
 
     const parsed: unknown = JSON.parse(raw);
     let sawLegacyRawGameBloat = false;
+    let selfHealedStaleEntry = false;
     let mutatedMap = false;
     if (Array.isArray(parsed)) {
+      const verifiedEntitlements = loadVerifiedEntitlementsFromStorage();
+      const isEntryVerifiedEntitlement = (
+        platId: StorefrontId,
+        platGameId: string,
+        entryId: string,
+        titleStr: string
+      ): boolean => {
+        const cleanPlatGameId = String(platGameId || '').trim().toLowerCase();
+        const cleanEntryId = String(entryId || '').trim().toLowerCase();
+        const strippedEntryId = cleanEntryId.replace(new RegExp(`^${platId}[-:]`, 'i'), '').trim();
+        const normTitle = titleStr ? normalizeCanonicalTitle(titleStr) : '';
+        if (platId === 'steam') {
+          const numId = Number(platGameId);
+          return Number.isFinite(numId) && numId > 0 && verifiedEntitlements.steam.has(numId);
+        }
+        if (platId === 'gog' || platId === 'epic' || platId === 'xbox') {
+          const bucket = verifiedEntitlements[platId];
+          return Boolean(
+            (cleanPlatGameId && bucket.has(cleanPlatGameId)) ||
+              (cleanEntryId && bucket.has(cleanEntryId)) ||
+              (strippedEntryId && bucket.has(strippedEntryId)) ||
+              (normTitle && bucket.has(normTitle))
+          );
+        }
+        return false;
+      };
+
       for (const rawItem of parsed) {
         if (!rawItem || typeof rawItem !== 'object') continue;
         const entry = rawItem as Partial<SuppressedCatalogEntry> & {
@@ -348,21 +376,33 @@ function syncSuppressedEntriesWithStorage(): void {
         }
         const platformId = (entry.platformId || entry.store || 'steam') as StorefrontId;
         const platformGameId = String(entry.platformGameId || entry.id || '');
+        const rawTitle = entry.rawTitle || entry.rawGame?.title || entry.id || '';
         if (
           entry.id &&
           entry.reasonCategory &&
           entry.reasonCategory !== 'user_hidden' &&
           !isNonGameStorefrontEntryRestored(platformId, platformGameId, entry.id)
         ) {
+          if (
+            entry.reasonCategory === 'non_game_filter' &&
+            isEntryVerifiedEntitlement(platformId, platformGameId, entry.id, rawTitle)
+          ) {
+            const staleKey =
+              platformId && platformGameId ? `${platformId}:${platformGameId}` : entry.id;
+            if (lastSuppressedEntries.delete(staleKey) || lastSuppressedEntries.delete(entry.id)) {
+              mutatedMap = true;
+            }
+            selfHealedStaleEntry = true;
+            continue;
+          }
           const mapKey =
             platformId && platformGameId ? `${platformId}:${platformGameId}` : entry.id;
           if (!lastSuppressedEntries.has(mapKey) && !lastSuppressedEntries.has(entry.id)) {
-            const rawTitle = entry.rawTitle || entry.rawGame?.title || entry.id;
             lastSuppressedEntries.set(
               mapKey,
               ensureSuppressedEntryRawGame({
                 id: entry.id,
-                rawTitle,
+                rawTitle: rawTitle || entry.id,
                 platformId,
                 platformGameId,
                 reason: entry.reason,
@@ -382,7 +422,7 @@ function syncSuppressedEntriesWithStorage(): void {
       cachedSuppressedRaw = raw;
       cachedSuppressedRestoredRef = restoredRef;
       inMemorySuppressedHydrated = true;
-      if (sawLegacyRawGameBloat) {
+      if (sawLegacyRawGameBloat || selfHealedStaleEntry) {
         persistSuppressedEntriesToStorage();
       }
     }
@@ -538,10 +578,114 @@ export function getSuppressedCatalogEntries(): SuppressedCatalogEntry[] {
   return snapshot;
 }
 
-export function registerSuppressedCatalogEntries(entries: SuppressedCatalogEntry[]): void {
+export interface RegisterSuppressedOptions {
+  storefrontId?: StorefrontId;
+  authoritativeComplete?: boolean;
+  authoritativeGames?: CanonicalGame[];
+}
+
+export function registerSuppressedCatalogEntries(
+  entries: SuppressedCatalogEntry[],
+  options?: RegisterSuppressedOptions
+): void {
   if (!Array.isArray(entries)) return;
   syncSuppressedEntriesWithStorage();
   let mutated = false;
+
+  const targetStorefront = options?.storefrontId;
+  const isAuthoritative = Boolean(targetStorefront && options?.authoritativeComplete === true);
+  const authGames = Array.isArray(options?.authoritativeGames) ? options.authoritativeGames : [];
+
+  const positiveIds = new Set<string>();
+  const positiveTitlesByStore = new Map<StorefrontId, Set<string>>();
+  const positiveTitlesAll = new Set<string>();
+
+  const addPositiveTitle = (sf: StorefrontId | undefined, raw: string | undefined) => {
+    if (!raw) return;
+    const norm = normalizeCanonicalTitle(raw);
+    if (!norm) return;
+    positiveTitlesAll.add(norm);
+    if (sf) {
+      let set = positiveTitlesByStore.get(sf);
+      if (!set) {
+        set = new Set<string>();
+        positiveTitlesByStore.set(sf, set);
+      }
+      set.add(norm);
+    }
+  };
+
+  for (const g of authGames) {
+    if (!g || typeof g !== 'object') continue;
+    if (g.id) positiveIds.add(String(g.id).trim().toLowerCase());
+    if (typeof g.steamAppId === 'number' && g.steamAppId > 0) {
+      positiveIds.add(`steam:${g.steamAppId}`);
+      positiveIds.add(`steam-${g.steamAppId}`);
+      positiveIds.add(String(g.steamAppId));
+    }
+    addPositiveTitle(targetStorefront, g.title);
+    addPositiveTitle(targetStorefront, g.originalStoreTitle);
+    for (const p of g.platforms || []) {
+      if (!p || typeof p !== 'object') continue;
+      const pid = p.platformId;
+      const pgid = p.platformGameId !== undefined && p.platformGameId !== null ? String(p.platformGameId).trim() : '';
+      if (pid && pgid) {
+        const pgLower = pgid.toLowerCase();
+        positiveIds.add(`${pid}:${pgLower}`);
+        positiveIds.add(`${pid}-${pgLower}`);
+        positiveIds.add(pgLower);
+      }
+      if (p.catalogItemId) {
+        const catLower = String(p.catalogItemId).trim().toLowerCase();
+        if (catLower) {
+          positiveIds.add(catLower);
+          if (pid) {
+            positiveIds.add(`${pid}:${catLower}`);
+            positiveIds.add(`${pid}-${catLower}`);
+          }
+        }
+      }
+      addPositiveTitle(pid || targetStorefront, g.title);
+      addPositiveTitle(pid || targetStorefront, g.originalStoreTitle);
+      addPositiveTitle(pid || targetStorefront, p.originalTitle);
+    }
+  }
+
+  const matchesPositiveGame = (entry: SuppressedCatalogEntry): boolean => {
+    if (entry.reasonCategory === 'user_hidden') return false;
+    if (positiveIds.size === 0 && positiveTitlesAll.size === 0) return false;
+    if (targetStorefront && entry.platformId !== targetStorefront) return false;
+
+    const idLower = String(entry.id || '').trim().toLowerCase();
+    const pgLower = String(entry.platformGameId || '').trim().toLowerCase();
+    const compositeColon = entry.platformId && pgLower ? `${entry.platformId}:${pgLower}` : '';
+    const compositeDash = entry.platformId && pgLower ? `${entry.platformId}-${pgLower}` : '';
+
+    if (
+      (idLower && positiveIds.has(idLower)) ||
+      (pgLower && positiveIds.has(pgLower)) ||
+      (compositeColon && positiveIds.has(compositeColon)) ||
+      (compositeDash && positiveIds.has(compositeDash))
+    ) {
+      return true;
+    }
+
+    const normTitle = normalizeCanonicalTitle(entry.rawTitle || entry.rawGame?.title || '');
+    if (normTitle) {
+      const storeTitles = positiveTitlesByStore.get(entry.platformId);
+      if (storeTitles?.has(normTitle) || (!targetStorefront && positiveTitlesAll.has(normTitle))) {
+        return true;
+      }
+      if (targetStorefront === entry.platformId && positiveTitlesAll.has(normTitle)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const incomingMapKeys = new Set<string>();
+  const normalizedIncoming: Array<{ mapKey: string; normalizedEntry: SuppressedCatalogEntry }> = [];
+
   for (const entry of entries) {
     if (entry && entry.id) {
       const normalizedEntry = ensureSuppressedEntryRawGame(entry);
@@ -555,29 +699,61 @@ export function registerSuppressedCatalogEntries(entries: SuppressedCatalogEntry
       ) {
         continue;
       }
+      if (matchesPositiveGame(normalizedEntry)) {
+        continue;
+      }
       const mapKey =
         normalizedEntry.platformId && normalizedEntry.platformGameId
           ? `${normalizedEntry.platformId}:${normalizedEntry.platformGameId}`
           : normalizedEntry.id;
-      const existing = lastSuppressedEntries.get(mapKey);
-      const upgradesStubWithArtwork =
-        Boolean(normalizedEntry.rawGame.capsuleImage || normalizedEntry.rawGame.headerImage) &&
-        !existing?.rawGame?.capsuleImage &&
-        !existing?.rawGame?.headerImage;
+      incomingMapKeys.add(mapKey);
+      normalizedIncoming.push({ mapKey, normalizedEntry });
+    }
+  }
+
+  if (isAuthoritative && targetStorefront) {
+    for (const [k, existing] of lastSuppressedEntries.entries()) {
       if (
-        !existing ||
-        !existing.rawGame ||
-        upgradesStubWithArtwork ||
-        existing.id !== normalizedEntry.id ||
-        existing.rawTitle !== normalizedEntry.rawTitle ||
-        existing.reason !== normalizedEntry.reason ||
-        existing.reasonCategory !== normalizedEntry.reasonCategory
+        existing &&
+        existing.platformId === targetStorefront &&
+        existing.reasonCategory !== 'user_hidden' &&
+        !incomingMapKeys.has(k)
       ) {
-        lastSuppressedEntries.set(mapKey, normalizedEntry);
+        lastSuppressedEntries.delete(k);
         mutated = true;
       }
     }
   }
+
+  if (positiveIds.size > 0 || positiveTitlesAll.size > 0) {
+    for (const [k, existing] of lastSuppressedEntries.entries()) {
+      if (existing && existing.reasonCategory !== 'user_hidden' && matchesPositiveGame(existing)) {
+        lastSuppressedEntries.delete(k);
+        mutated = true;
+      }
+    }
+  }
+
+  for (const { mapKey, normalizedEntry } of normalizedIncoming) {
+    const existing = lastSuppressedEntries.get(mapKey);
+    const upgradesStubWithArtwork =
+      Boolean(normalizedEntry.rawGame.capsuleImage || normalizedEntry.rawGame.headerImage) &&
+      !existing?.rawGame?.capsuleImage &&
+      !existing?.rawGame?.headerImage;
+    if (
+      !existing ||
+      !existing.rawGame ||
+      upgradesStubWithArtwork ||
+      existing.id !== normalizedEntry.id ||
+      existing.rawTitle !== normalizedEntry.rawTitle ||
+      existing.reason !== normalizedEntry.reason ||
+      existing.reasonCategory !== normalizedEntry.reasonCategory
+    ) {
+      lastSuppressedEntries.set(mapKey, normalizedEntry);
+      mutated = true;
+    }
+  }
+
   if (mutated) {
     suppressedMapVersion++;
     if (typeof window !== 'undefined') {
@@ -587,6 +763,17 @@ export function registerSuppressedCatalogEntries(entries: SuppressedCatalogEntry
     }
     persistSuppressedEntriesToStorage();
   }
+}
+
+export function reconcileStorefrontSuppressedEntries(
+  storefrontId: StorefrontId,
+  entries: SuppressedCatalogEntry[],
+  options?: Omit<RegisterSuppressedOptions, 'storefrontId'>
+): void {
+  registerSuppressedCatalogEntries(entries, {
+    ...options,
+    storefrontId,
+  });
 }
 
 /**
@@ -3734,23 +3921,45 @@ export function sanitizeGameCatalog(
   // Remove any previously suppressed entries that are now present in finalCatalog (because they were restored or overridden)
   if (lastSuppressedEntries.size > 0) {
     const activePlatformKeys = new Set<string>();
+    const activeVerifiedTitles = new Set<string>();
     for (const g of finalCatalog) {
-      if (g.id) activePlatformKeys.add(g.id);
+      if (g.id) activePlatformKeys.add(g.id.toLowerCase());
+      if (typeof g.steamAppId === 'number' && g.steamAppId > 0) {
+        activePlatformKeys.add(`steam:${g.steamAppId}`);
+        activePlatformKeys.add(`steam-${g.steamAppId}`);
+      }
+      if (g.isVerifiedEntitlement && g.title) {
+        const nt = normalizeCanonicalTitle(g.title);
+        if (nt) activeVerifiedTitles.add(nt);
+      }
       for (const p of g.platforms || []) {
         if (p.platformId && p.platformGameId) {
-          activePlatformKeys.add(`${p.platformId}:${p.platformGameId}`);
-          activePlatformKeys.add(`${p.platformId}-${p.platformGameId}`);
+          const pgLower = String(p.platformGameId).toLowerCase();
+          activePlatformKeys.add(`${p.platformId}:${pgLower}`);
+          activePlatformKeys.add(`${p.platformId}-${pgLower}`);
+        }
+        if (p.platformId && p.catalogItemId) {
+          const catLower = String(p.catalogItemId).toLowerCase();
+          activePlatformKeys.add(`${p.platformId}:${catLower}`);
+          activePlatformKeys.add(`${p.platformId}-${catLower}`);
+          activePlatformKeys.add(catLower);
         }
       }
     }
     let removedActive = false;
     for (const [k, entry] of lastSuppressedEntries.entries()) {
+      const kLower = String(k || '').toLowerCase();
+      const idLower = String(entry.id || '').toLowerCase();
+      const pgLower = String(entry.platformGameId || '').toLowerCase();
+      const entryNormTitle = normalizeCanonicalTitle(entry.rawTitle || entry.rawGame?.title || '');
       if (
         entry.reasonCategory !== 'user_hidden' &&
-        (activePlatformKeys.has(k) ||
-          activePlatformKeys.has(entry.id) ||
-          activePlatformKeys.has(`${entry.platformId}:${entry.platformGameId}`) ||
-          activePlatformKeys.has(`${entry.platformId}-${entry.platformGameId}`))
+        (activePlatformKeys.has(kLower) ||
+          activePlatformKeys.has(idLower) ||
+          activePlatformKeys.has(`${entry.platformId}:${pgLower}`) ||
+          activePlatformKeys.has(`${entry.platformId}-${pgLower}`) ||
+          (pgLower && activePlatformKeys.has(pgLower)) ||
+          (entryNormTitle && activeVerifiedTitles.has(entryNormTitle)))
       ) {
         lastSuppressedEntries.delete(k);
         removedActive = true;

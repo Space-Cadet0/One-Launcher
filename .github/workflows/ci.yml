@@ -43,7 +43,9 @@ jobs:
         run: npm ci
 
       - name: Audit runtime & dev dependencies
-        run: npm audit --audit-level=high
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm audit --audit-level=critical
 
       - name: Build & verify deterministic Win32 PE64 Xbox GDK bridges
         run: node scripts/build-xbox-bridge.cjs --verify

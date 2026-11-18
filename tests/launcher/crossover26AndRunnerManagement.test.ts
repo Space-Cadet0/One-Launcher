@@ -2293,7 +2293,11 @@ setTimeout(() => process.exit(0), 1000);
         expect(runnerSelect).toBeDefined();
         const optionNodes = findElements(runnerSelect, (el) => el.type === 'option');
         const optionValues = optionNodes.map((o) => o.props.value);
-        expect(optionValues).toEqual(['crossover', 'crossover_preview', 'gptk', 'wine']);
+        const expectedRunnerOptions =
+          launcherService.getHostArch() === 'arm64'
+            ? ['crossover', 'crossover_preview', 'crossover_preview_arm64', 'gptk', 'wine']
+            : ['crossover', 'crossover_preview', 'gptk', 'wine'];
+        expect(optionValues).toEqual(expectedRunnerOptions);
         expect(optionValues).not.toContain('native');
         expect(optionValues).not.toContain('whisky');
 
@@ -2411,7 +2415,7 @@ setTimeout(() => process.exit(0), 1000);
 
       // 2. Verify detectCompatibilityLayers resolves crossover_preview's bottlesDir to ~/Library/Application Support/CrossOver/Bottles
       // when ~/Library/Application Support/CrossOver Preview/Bottles only contains an empty uninitialized OneLauncher directory,
-      // and cleans up the empty uninitialized OneLauncher folder
+      // without mutating or deleting user bottle directories during read-only detection
       const crossoverPreviewWine = path.join(
         testHome,
         'Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine'
@@ -2442,7 +2446,7 @@ setTimeout(() => process.exit(0), 1000);
       expect(previewLayer).toBeDefined();
       expect(previewLayer.bottlesDir).toBe(sharedBottlesDir);
       expect(previewLayer.availableBottles).toContain('OneLauncher');
-      expect(fs.existsSync(brokenPreviewOneLauncher)).toBe(false);
+      expect(fs.existsSync(brokenPreviewOneLauncher)).toBe(true);
 
       // 3. Verify applyCrossOverPerGameSettings(bottlePath, config, { isPreviewRunner: true }) writes "Preview" = "1"
       // into [Bottle] section of <bottlePath>/cxbottle.conf (both when creating [Bottle] and when [Bottle] already exists),

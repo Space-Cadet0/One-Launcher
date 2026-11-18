@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type SetStateAction } from 'react';
 import { CanonicalGame } from '../../../contracts/game';
 import { StorefrontId } from '../../../contracts/platform';
 import {
@@ -17,6 +17,7 @@ import {
   LauncherPerformanceSettings,
   LaunchMethod,
   PostGameLauncherBehavior,
+  resolveDefaultBottleForLayer,
   StorefrontClientLifecyclePolicy,
   StorefrontLaunchProfile,
   VirtualDesktopResolutionPreset,
@@ -45,6 +46,27 @@ interface LauncherServiceHostAware {
 function checkLauncherWindowsHost(): boolean {
   const svc = launcherService as typeof launcherService & LauncherServiceHostAware;
   return typeof svc.isWindowsHost === 'function' ? Boolean(svc.isWindowsHost()) : false;
+}
+
+function isFormBottleCompatibleWithRunner(
+  bottleName: string,
+  runnerType: CompatibilityLayerType,
+  allLayers: CompatibilityLayerInfo[]
+): boolean {
+  if (!bottleName) return true;
+  const targetLayer = allLayers.find((l) => l.type === runnerType);
+  const bottleArch =
+    targetLayer?.bottleDetails?.[bottleName]?.wineArch ||
+    allLayers.find((l) => l.bottleDetails?.[bottleName]?.wineArch)?.bottleDetails?.[
+      bottleName
+    ]?.wineArch;
+  if (runnerType === 'crossover_preview_arm64') {
+    return bottleArch ? bottleArch === 'arm64' : !/^OneLauncher$/i.test(bottleName);
+  }
+  if (runnerType === 'crossover' || runnerType === 'crossover_preview') {
+    return bottleArch ? bottleArch === 'win64' : !/-arm64$/i.test(bottleName);
+  }
+  return true;
 }
 
 export interface UseGameLaunchConfigFormParams {
@@ -127,6 +149,7 @@ export function useGameLaunchConfigForm({
   const [hasEditedGlobalPerfSettings, setHasEditedGlobalPerfSettings] = useState<boolean>(false);
   const [detectedLayers, setDetectedLayers] = useState<CompatibilityLayerInfo[]>([]);
   const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [isInstallingRunner, setIsInstallingRunner] = useState<boolean>(false);
   const [isRescanningRunners, setIsRescanningRunners] = useState<boolean>(false);
   const [runnerActionFeedback, setRunnerActionFeedback] = useState<{
@@ -138,11 +161,22 @@ export function useGameLaunchConfigForm({
   );
   const [isCheckingUpdates, setIsCheckingUpdates] = useState<boolean>(false);
   const [isUpdatingRunner, setIsUpdatingRunner] = useState<boolean>(false);
+  const [activeRunnerOpType, setActiveRunnerOpType] = useState<Exclude<
+    CompatibilityLayerType,
+    'native'
+  > | null>(null);
   const [runnerUpdateFeedback, setRunnerUpdateFeedback] = useState<string | null>(null);
   const [runnerProgressByType, setRunnerProgressByType] = useState<
     Partial<Record<Exclude<CompatibilityLayerType, 'native'>, CompatibilityRunnerProgressEvent>>
   >(() => launcherService.getActiveRunnerOperations());
   const [, setInstallInfoTick] = useState(0);
+  const userEditedCompatPlatformsRef = useRef<Set<StorefrontId>>(new Set());
+  const userResetPendingDetectPlatformsRef = useRef<Set<StorefrontId>>(new Set());
+  const hasDetectedLayersResolvedRef = useRef<boolean>(false);
+  const latestDetectedLayersRef = useRef<CompatibilityLayerInfo[]>([]);
+  const formSessionIdRef = useRef<number>(0);
+  const compatEditEpochByPlatformRef = useRef<Partial<Record<StorefrontId, number>>>({});
+  const activeRunnerOpTypeRef = useRef<Exclude<CompatibilityLayerType, 'native'> | null>(null);
 
   const loadFormFieldsForPlatform = useCallback(
     (
@@ -152,8 +186,17 @@ export function useGameLaunchConfigForm({
     ) => {
       const source =
         drafts?.[targetPlatId] ?? launcherService.getLaunchConfig(game.id, targetPlatId);
-      const activeLayers = (layersOverride || detectedLayers).filter((l) =>
-        COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+      const hostArch =
+        typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+      const isHostSupportedRunner = (layerType: CompatibilityLayerType | undefined): boolean =>
+        Boolean(
+          layerType &&
+            COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === layerType) &&
+            (layerType !== 'crossover_preview_arm64' || hostArch === 'arm64')
+        );
+      const allRawLayers = layersOverride || detectedLayers;
+      const activeLayers = allRawLayers.filter(
+        (l) => l.available !== false && isHostSupportedRunner(l.type)
       );
       const initialPreview = launcherService.resolveEffectiveLaunchModePreview(
         game,
@@ -192,15 +235,34 @@ export function useGameLaunchConfigForm({
       setCustomExecutablePath(source?.customExecutablePath || '');
       setWorkingDirectory(source?.workingDirectory || '');
       setLaunchArguments(source?.launchArguments || '');
-      const defaultLayer: CompatibilityLayerType =
+      const defaultLayer: CompatibilityLayerType = isHostSupportedRunner(source?.compatibilityLayer)
+        ? source!.compatibilityLayer!
+        : activeLayers[0]?.type && activeLayers[0].type !== 'native'
+          ? activeLayers[0].type
+          : 'crossover';
+      const rawSavedBottle = source?.wineBottleName || '';
+      const wasSavedLayerRejected = Boolean(
         source?.compatibilityLayer &&
-        COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === source.compatibilityLayer)
-          ? source.compatibilityLayer
-          : activeLayers[0]?.type && activeLayers[0].type !== 'native'
-            ? activeLayers[0].type
-            : 'crossover';
+          source.compatibilityLayer !== 'native' &&
+          source.compatibilityLayer !== defaultLayer
+      );
+      const fallbackLayerInfo = activeLayers.find((l) => l.type === defaultLayer);
+      const fallbackAvailableBottles = fallbackLayerInfo?.availableBottles || [];
+      const isSavedBottleInFallbackOptions =
+        fallbackAvailableBottles.length === 0 || fallbackAvailableBottles.includes(rawSavedBottle);
+      const isSavedBottleCompatible = isFormBottleCompatibleWithRunner(
+        rawSavedBottle,
+        defaultLayer,
+        allRawLayers
+      );
+      const resolvedWineBottleName =
+        rawSavedBottle &&
+        (!isSavedBottleInFallbackOptions ||
+          ((wasSavedLayerRejected || hostArch !== 'arm64') && !isSavedBottleCompatible))
+          ? ''
+          : rawSavedBottle;
       setCompatibilityLayer(defaultLayer);
-      setWineBottleName(source?.wineBottleName || '');
+      setWineBottleName(resolvedWineBottleName);
       setWinePrefixPath(source?.winePrefixPath || '');
       setCrossoverGraphicsBackend(source?.crossoverGraphicsBackend || 'auto');
       setCrossoverD3DMetalVersion(
@@ -351,7 +413,7 @@ export function useGameLaunchConfigForm({
         workingDirectory: source?.workingDirectory || '',
         launchArguments: source?.launchArguments || '',
         compatibilityLayer: defaultLayer,
-        wineBottleName: source?.wineBottleName || '',
+        wineBottleName: resolvedWineBottleName,
         winePrefixPath: source?.winePrefixPath || '',
         crossoverGraphicsBackend: source?.crossoverGraphicsBackend || 'auto',
         crossoverD3DMetalVersion: loadedCrossoverD3DVer,
@@ -384,8 +446,34 @@ export function useGameLaunchConfigForm({
   );
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      formSessionIdRef.current += 1;
+      compatEditEpochByPlatformRef.current = {};
+      userEditedCompatPlatformsRef.current.clear();
+      userResetPendingDetectPlatformsRef.current.clear();
+      hasDetectedLayersResolvedRef.current = false;
+      latestDetectedLayersRef.current = [];
+      setIsUpdatingRunner(false);
+      setIsInstallingRunner(false);
+      activeRunnerOpTypeRef.current = null;
+      setActiveRunnerOpType(null);
+      setIsRescanningRunners(false);
+      setIsCheckingUpdates(false);
+      return;
+    }
     let active = true;
+    formSessionIdRef.current += 1;
+    const effectSessionId = formSessionIdRef.current;
+    compatEditEpochByPlatformRef.current = {};
+    userEditedCompatPlatformsRef.current.clear();
+    userResetPendingDetectPlatformsRef.current.clear();
+    hasDetectedLayersResolvedRef.current = false;
+    setIsUpdatingRunner(false);
+    setIsInstallingRunner(false);
+    activeRunnerOpTypeRef.current = null;
+    setActiveRunnerOpType(null);
+    setIsRescanningRunners(false);
+    setIsCheckingUpdates(false);
 
     const existingBase = launcherService.getLaunchConfig(game.id);
     const effPlat = launcherService.getEffectivePlatformForGame(game);
@@ -412,6 +500,7 @@ export function useGameLaunchConfigForm({
 
     const initialLayers = launcherService.getCompatibilityLayers();
     const initialRunnerUpdates = launcherService.getRunnerUpdates();
+    latestDetectedLayersRef.current = initialLayers;
     setDetectedLayers(initialLayers);
     setRunnerUpdates(initialRunnerUpdates);
     loadFormFieldsForPlatform(startPlatId, initialDrafts, initialLayers);
@@ -419,7 +508,7 @@ export function useGameLaunchConfigForm({
     launcherService
       .detectInstalledStorefrontClients()
       .then(() => {
-        if (!active) return;
+        if (!active || formSessionIdRef.current !== effectSessionId) return;
         setInstallInfoTick((t) => t + 1);
       })
       .catch(() => {});
@@ -428,38 +517,265 @@ export function useGameLaunchConfigForm({
       launcherService
         .getGameInstallInfo(game, startPlatId)
         .then(() => {
-          if (!active) return;
+          if (!active || formSessionIdRef.current !== effectSessionId) return;
           setInstallInfoTick((t) => t + 1);
         })
         .catch(() => {});
     }
 
     launcherService.detectCompatibilityLayers().then((layers) => {
-      if (!active) return;
+      if (!active || formSessionIdRef.current !== effectSessionId) return;
+      hasDetectedLayersResolvedRef.current = true;
+      latestDetectedLayersRef.current = layers;
       if (JSON.stringify(layers) !== JSON.stringify(initialLayers)) {
         setDetectedLayers(layers);
       }
-      const validLayers = layers.filter((l) =>
-        COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+      const currentHostArch =
+        typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+      const isLayerHostSupported = (layerType: CompatibilityLayerType | undefined): boolean =>
+        Boolean(
+          layerType &&
+            layerType !== 'native' &&
+            COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === layerType) &&
+            (layerType !== 'crossover_preview_arm64' || currentHostArch === 'arm64')
+        );
+      const validLayers = layers.filter(
+        (l) => l.available !== false && isLayerHostSupported(l.type)
       );
+      const currentPlatId = latestRef.current.preferredPlatformId;
+
+      const currentDrafts = latestRef.current.draftsByPlatform;
+      const draftUpdates: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {};
+      const baselineDraftPatches: Partial<
+        Record<
+          StorefrontId,
+          { compatibilityLayer?: CompatibilityLayerType; wineBottleName?: string }
+        >
+      > = {};
+
+      for (const [rawPlatId, draftProfile] of Object.entries(currentDrafts)) {
+        const platId = rawPlatId as StorefrontId;
+        if (platId === currentPlatId || !draftProfile) continue;
+
+        if (userResetPendingDetectPlatformsRef.current.has(platId) && validLayers.length > 0) {
+          userResetPendingDetectPlatformsRef.current.delete(platId);
+          const autoLayer = validLayers[0].type;
+          if (draftProfile.compatibilityLayer !== autoLayer || draftProfile.wineBottleName) {
+            draftUpdates[platId] = {
+              ...draftProfile,
+              compatibilityLayer: autoLayer,
+              wineBottleName: undefined,
+            };
+            baselineDraftPatches[platId] = {
+              compatibilityLayer: autoLayer,
+              wineBottleName: '',
+            };
+          }
+          continue;
+        }
+
+        if (!userEditedCompatPlatformsRef.current.has(platId)) {
+          const isDraftLayerSupported = isLayerHostSupported(draftProfile.compatibilityLayer);
+          if (
+            (!draftProfile.compatibilityLayer || !isDraftLayerSupported) &&
+            validLayers.length > 0
+          ) {
+            const autoLayer = validLayers[0].type;
+            const rawBottle = draftProfile.wineBottleName || '';
+            const autoBottles = validLayers[0].availableBottles || [];
+            const isBottleValidForAuto =
+              !rawBottle ||
+              (isFormBottleCompatibleWithRunner(rawBottle, autoLayer, layers) &&
+                (autoBottles.length === 0 || autoBottles.includes(rawBottle)));
+            draftUpdates[platId] = {
+              ...draftProfile,
+              compatibilityLayer: autoLayer,
+              wineBottleName: isBottleValidForAuto ? draftProfile.wineBottleName : undefined,
+            };
+            baselineDraftPatches[platId] = {
+              compatibilityLayer: autoLayer,
+              ...(isBottleValidForAuto ? {} : { wineBottleName: '' }),
+            };
+          } else if (draftProfile.compatibilityLayer && isDraftLayerSupported && layers.length > 0) {
+            const rawBottle = draftProfile.wineBottleName || '';
+            if (rawBottle) {
+              const targetLayer = validLayers.find((l) => l.type === draftProfile.compatibilityLayer);
+              const targetBottles = targetLayer?.availableBottles || [];
+              const isInTargetOptions =
+                targetBottles.length === 0 || targetBottles.includes(rawBottle);
+              const isCompatibleWithTarget = isFormBottleCompatibleWithRunner(
+                rawBottle,
+                draftProfile.compatibilityLayer,
+                layers
+              );
+              if (!isInTargetOptions || (currentHostArch !== 'arm64' && !isCompatibleWithTarget)) {
+                draftUpdates[platId] = {
+                  ...draftProfile,
+                  wineBottleName: undefined,
+                };
+                baselineDraftPatches[platId] = {
+                  wineBottleName: '',
+                };
+              }
+            }
+          }
+        } else if (draftProfile.compatibilityLayer && draftProfile.wineBottleName) {
+          const targetLayer = layers.find(
+            (l) => l.type === draftProfile.compatibilityLayer && l.available !== false
+          );
+          const targetAvailableBottles = targetLayer?.availableBottles || [];
+          if (
+            targetAvailableBottles.length > 0 &&
+            !targetAvailableBottles.includes(draftProfile.wineBottleName)
+          ) {
+            draftUpdates[platId] = {
+              ...draftProfile,
+              wineBottleName: undefined,
+            };
+          }
+        }
+      }
+
+      if (Object.keys(draftUpdates).length > 0) {
+        setDraftsByPlatform((prev) => ({ ...prev, ...draftUpdates }));
+      }
+      if (Object.keys(baselineDraftPatches).length > 0) {
+        setBaselineFieldsByPlatform((prev) => {
+          const next = { ...prev };
+          let changed = false;
+          for (const [platId, patch] of Object.entries(baselineDraftPatches)) {
+            const rawSig = next[platId as StorefrontId];
+            if (!rawSig || !patch) continue;
+            try {
+              const parsed = JSON.parse(rawSig) as Record<string, unknown>;
+              next[platId as StorefrontId] = JSON.stringify({ ...parsed, ...patch });
+              changed = true;
+            } catch {
+              // ignore malformed baseline
+            }
+          }
+          return changed ? next : prev;
+        });
+      }
+
+      if (userResetPendingDetectPlatformsRef.current.has(currentPlatId)) {
+        userResetPendingDetectPlatformsRef.current.delete(currentPlatId);
+        if (validLayers.length > 0) {
+          const autoLayer = validLayers[0].type;
+          setCompatibilityLayer((prev) => (prev === autoLayer ? prev : autoLayer));
+          setWineBottleName('');
+          setBaselineFieldsByPlatform((prev) => {
+            const rawSig = prev[currentPlatId];
+            if (!rawSig) return prev;
+            try {
+              const parsed = JSON.parse(rawSig) as Record<string, unknown>;
+              return {
+                ...prev,
+                [currentPlatId]: JSON.stringify({
+                  ...parsed,
+                  compatibilityLayer: autoLayer,
+                  wineBottleName: '',
+                }),
+              };
+            } catch {
+              return prev;
+            }
+          });
+        }
+        return;
+      }
+
+      if (userEditedCompatPlatformsRef.current.has(currentPlatId)) {
+        const currentLayer = latestRef.current.compatibilityLayer;
+        const currentBottle = latestRef.current.wineBottleName.trim();
+        if (currentBottle) {
+          const targetLayer = layers.find(
+            (l) => l.type === currentLayer && l.available !== false
+          );
+          const targetAvailableBottles = targetLayer?.availableBottles || [];
+          if (
+            targetAvailableBottles.length > 0 &&
+            !targetAvailableBottles.includes(currentBottle)
+          ) {
+            setWineBottleName('');
+          }
+        }
+        return;
+      }
+
       const activeSource =
-        initialDrafts[startPlatId] ?? launcherService.getLaunchConfig(game.id, startPlatId);
-      if (!activeSource?.compatibilityLayer && validLayers.length > 0) {
+        latestRef.current.draftsByPlatform[currentPlatId] ??
+        launcherService.getLaunchConfig(game.id, currentPlatId);
+      const isSourceLayerHostSupported = isLayerHostSupported(activeSource?.compatibilityLayer);
+      if ((!activeSource?.compatibilityLayer || !isSourceLayerHostSupported) && validLayers.length > 0) {
         const autoLayer = validLayers[0].type;
         setCompatibilityLayer((prev) => (prev === autoLayer ? prev : autoLayer));
+        const rawSavedBottle = activeSource?.wineBottleName || '';
+        const autoLayerBottles = validLayers[0].availableBottles || [];
+        const isBottleValidForAuto =
+          !rawSavedBottle ||
+          (isFormBottleCompatibleWithRunner(rawSavedBottle, autoLayer, layers) &&
+            (autoLayerBottles.length === 0 || autoLayerBottles.includes(rawSavedBottle)));
+        const sanitizedBottle = isBottleValidForAuto ? rawSavedBottle : '';
+        if (!isBottleValidForAuto) {
+          setWineBottleName('');
+        }
         setBaselineFieldsByPlatform((prev) => {
-          const rawSig = prev[startPlatId];
+          const rawSig = prev[currentPlatId];
           if (!rawSig) return prev;
           try {
             const parsed = JSON.parse(rawSig) as Record<string, unknown>;
             return {
               ...prev,
-              [startPlatId]: JSON.stringify({ ...parsed, compatibilityLayer: autoLayer }),
+              [currentPlatId]: JSON.stringify({
+                ...parsed,
+                compatibilityLayer: autoLayer,
+                ...(isBottleValidForAuto ? {} : { wineBottleName: sanitizedBottle }),
+              }),
             };
           } catch {
             return prev;
           }
         });
+      } else if (
+        activeSource?.compatibilityLayer &&
+        isSourceLayerHostSupported &&
+        layers.length > 0
+      ) {
+        const targetRunner = activeSource.compatibilityLayer;
+        const rawSavedBottle = activeSource.wineBottleName || '';
+        const targetLayer = validLayers.find((l) => l.type === targetRunner);
+        const targetBottles = targetLayer?.availableBottles || [];
+        const isInTargetOptions =
+          targetBottles.length === 0 || targetBottles.includes(rawSavedBottle);
+        const isCompatibleWithTarget = isFormBottleCompatibleWithRunner(
+          rawSavedBottle,
+          targetRunner,
+          layers
+        );
+        const shouldSanitizeOnColdLoad = Boolean(
+          rawSavedBottle &&
+            (!isInTargetOptions || (currentHostArch !== 'arm64' && !isCompatibleWithTarget))
+        );
+        if (shouldSanitizeOnColdLoad) {
+          setWineBottleName((prev) => (prev === rawSavedBottle ? '' : prev));
+          setBaselineFieldsByPlatform((prev) => {
+            const rawSig = prev[currentPlatId];
+            if (!rawSig) return prev;
+            try {
+              const parsed = JSON.parse(rawSig) as Record<string, unknown>;
+              return {
+                ...prev,
+                [currentPlatId]: JSON.stringify({
+                  ...parsed,
+                  wineBottleName: '',
+                }),
+              };
+            } catch {
+              return prev;
+            }
+          });
+        }
       }
     });
 
@@ -475,7 +791,7 @@ export function useGameLaunchConfigForm({
       launcherService
         .checkCompatibilityLayerUpdates()
         .then((updates) => {
-          if (!active) return;
+          if (!active || formSessionIdRef.current !== effectSessionId) return;
           if (
             updates &&
             typeof updates === 'object' &&
@@ -486,12 +802,19 @@ export function useGameLaunchConfigForm({
         })
         .catch(() => {})
         .finally(() => {
-          if (active && !hasCachedUpdates) setIsCheckingUpdates(false);
+          if (active && formSessionIdRef.current === effectSessionId && !hasCachedUpdates) {
+            setIsCheckingUpdates(false);
+          }
         });
     }
 
     return () => {
       active = false;
+      formSessionIdRef.current += 1;
+      compatEditEpochByPlatformRef.current = {};
+      userEditedCompatPlatformsRef.current.clear();
+      userResetPendingDetectPlatformsRef.current.clear();
+      hasDetectedLayersResolvedRef.current = false;
     };
   }, [isOpen, game.id, initialPlatformId]);
 
@@ -502,8 +825,11 @@ export function useGameLaunchConfigForm({
 
   useEffect(() => {
     if (!isOpen) return;
+    let active = true;
+    const sessionId = formSessionIdRef.current;
     setRunnerProgressByType(launcherService.getActiveRunnerOperations());
     const unsubscribe = launcherService.onRunnerProgress((event) => {
+      if (!active || formSessionIdRef.current !== sessionId) return;
       const isTerminal =
         event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';
       if (isTerminal) {
@@ -515,11 +841,15 @@ export function useGameLaunchConfigForm({
         });
         if (event.phase === 'completed') {
           void launcherService.detectCompatibilityLayers().then((layers) => {
+            if (!active || formSessionIdRef.current !== sessionId) return;
             if (Array.isArray(layers)) {
+              hasDetectedLayersResolvedRef.current = true;
+              latestDetectedLayersRef.current = layers;
               setDetectedLayers(layers);
             }
           });
           void launcherService.checkCompatibilityLayerUpdates().then((updates) => {
+            if (!active || formSessionIdRef.current !== sessionId) return;
             if (updates && typeof updates === 'object') {
               setRunnerUpdates(updates);
             }
@@ -532,8 +862,11 @@ export function useGameLaunchConfigForm({
         }));
       }
     });
-    return unsubscribe;
-  }, [isOpen]);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [isOpen, game.id, initialPlatformId]);
 
   const selectedRunnerDescriptor =
     COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === compatibilityLayer) ||
@@ -543,10 +876,19 @@ export function useGameLaunchConfigForm({
   const availableBottles = activeLayer?.availableBottles || [];
   const activeRunnerProgress =
     compatibilityLayer !== 'native' ? runnerProgressByType[compatibilityLayer] : undefined;
+  const isActiveOpOnSelectedRunner =
+    !activeRunnerOpType || activeRunnerOpType === compatibilityLayer;
+  const isAnotherRunnerOperationActive = Boolean(
+    (isInstallingRunner || isUpdatingRunner) &&
+      activeRunnerOpType &&
+      activeRunnerOpType !== compatibilityLayer
+  );
   const effectiveIsInstallingRunner =
-    isInstallingRunner || activeRunnerProgress?.operation === 'install';
+    (isInstallingRunner && isActiveOpOnSelectedRunner) ||
+    activeRunnerProgress?.operation === 'install';
   const effectiveIsUpdatingRunner =
-    isUpdatingRunner || activeRunnerProgress?.operation === 'update';
+    (isUpdatingRunner && isActiveOpOnSelectedRunner) ||
+    activeRunnerProgress?.operation === 'update';
   const wineSyncMode: WineSyncMode = resolveWineSyncMode(wineMsync, wineEsync);
 
   const activeInstalledVer = activeLayer?.version || activeUpdateInfo?.installedVersion;
@@ -564,13 +906,17 @@ export function useGameLaunchConfigForm({
     [activeInstalledDisplay, activeInstalledVer, activeInstalledBuild]
   );
 
+  const defaultBottleForLayer = resolveDefaultBottleForLayer(
+    activeLayer,
+    compatibilityLayer,
+    selectedRunnerDescriptor?.defaultBottleName
+  );
+  const effectiveResolvedBottle = wineBottleName.trim() || defaultBottleForLayer;
   const resolvedBottleFolderPath =
     winePrefixPath.trim() ||
     (activeLayer?.bottlesDir
-      ? wineBottleName.trim() || activeLayer.availableBottles?.[0]
-        ? `${activeLayer.bottlesDir.replace(/\/+$/, '')}/${
-            wineBottleName.trim() || activeLayer.availableBottles![0]
-          }`
+      ? effectiveResolvedBottle
+        ? `${activeLayer.bottlesDir.replace(/\/+$/, '')}/${effectiveResolvedBottle}`
         : activeLayer.bottlesDir
       : undefined);
 
@@ -597,7 +943,9 @@ export function useGameLaunchConfigForm({
 
   const isDxvkHudSupported =
     compatibilityLayer === 'wine' ||
-    ((compatibilityLayer === 'crossover' || compatibilityLayer === 'crossover_preview') &&
+    ((compatibilityLayer === 'crossover' ||
+      compatibilityLayer === 'crossover_preview' ||
+      compatibilityLayer === 'crossover_preview_arm64') &&
       (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'dxvk'));
 
   const primaryD3DVer =
@@ -610,7 +958,8 @@ export function useGameLaunchConfigForm({
     Boolean(
       activeLayer?.availableD3DMetalVersions
         ? activeLayer.availableD3DMetalVersions.length > 1
-        : compatibilityLayer === 'crossover_preview'
+        : compatibilityLayer === 'crossover_preview' ||
+          compatibilityLayer === 'crossover_preview_arm64'
     ) &&
     (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'd3dmetal');
 
@@ -874,12 +1223,15 @@ export function useGameLaunchConfigForm({
     isWindowsHost,
     launchMethod,
     compatibilityLayer,
+    wineBottleName,
+    detectedLayers,
     selectedRunnerDescriptor,
     activeLayer,
     activeUpdateInfo,
     isCheckingUpdates,
     isUpdatingRunner: effectiveIsUpdatingRunner,
     isInstallingRunner: effectiveIsInstallingRunner,
+    isAnotherRunnerOperationActive,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
     activeDisplayMethod,
@@ -901,12 +1253,15 @@ export function useGameLaunchConfigForm({
     isWindowsHost,
     launchMethod,
     compatibilityLayer,
+    wineBottleName,
+    detectedLayers,
     selectedRunnerDescriptor,
     activeLayer,
     activeUpdateInfo,
     isCheckingUpdates,
     isUpdatingRunner: effectiveIsUpdatingRunner,
     isInstallingRunner: effectiveIsInstallingRunner,
+    isAnotherRunnerOperationActive,
     resolvedBottleFolderPath,
     isNativeInstalledBuild,
     activeDisplayMethod,
@@ -938,9 +1293,13 @@ export function useGameLaunchConfigForm({
     setPreferredPlatformId(nextPlatId);
     cur.loadFormFieldsForPlatform(nextPlatId, nextDrafts);
     if (!launcherService.isGameInstalled(cur.game, nextPlatId)) {
+      const sessionId = formSessionIdRef.current;
       launcherService
         .getGameInstallInfo(cur.game, nextPlatId)
-        .then(() => setInstallInfoTick((t) => t + 1))
+        .then(() => {
+          if (formSessionIdRef.current !== sessionId) return;
+          setInstallInfoTick((t) => t + 1);
+        })
         .catch(() => {});
     }
   }, []);
@@ -1104,10 +1463,14 @@ export function useGameLaunchConfigForm({
   }, []);
 
   const handleRescanLayers = useCallback(async () => {
+    const sessionId = formSessionIdRef.current;
     setIsRescanningRunners(true);
     setRunnerActionFeedback(null);
     try {
       const refreshed = await launcherService.detectCompatibilityLayers();
+      if (formSessionIdRef.current !== sessionId) return;
+      hasDetectedLayersResolvedRef.current = true;
+      latestDetectedLayersRef.current = refreshed;
       setDetectedLayers(refreshed);
       const cur = latestRef.current;
       const matched = refreshed.find((l) => l.type === cur.compatibilityLayer);
@@ -1123,12 +1486,15 @@ export function useGameLaunchConfigForm({
         });
       }
     } finally {
-      setIsRescanningRunners(false);
+      if (formSessionIdRef.current === sessionId) {
+        setIsRescanningRunners(false);
+      }
     }
   }, []);
 
   const handleCheckRunnerUpdates = useCallback(async () => {
     if (latestRef.current.isCheckingUpdates) return;
+    const sessionId = formSessionIdRef.current;
     setIsCheckingUpdates(true);
     setRunnerUpdateFeedback(null);
     try {
@@ -1136,10 +1502,13 @@ export function useGameLaunchConfigForm({
         launcherService.checkCompatibilityLayerUpdates(),
         launcherService.detectCompatibilityLayers(),
       ]);
+      if (formSessionIdRef.current !== sessionId) return;
       if (updates && typeof updates === 'object') {
         setRunnerUpdates(updates);
       }
       if (Array.isArray(refreshedLayers)) {
+        hasDetectedLayersResolvedRef.current = true;
+        latestDetectedLayersRef.current = refreshedLayers;
         setDetectedLayers(refreshedLayers);
       }
       const cur = latestRef.current;
@@ -1157,72 +1526,193 @@ export function useGameLaunchConfigForm({
           }.`
         );
       }
+    } catch (err: unknown) {
+      if (formSessionIdRef.current !== sessionId) return;
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : `Could not check for ${latestRef.current.selectedRunnerDescriptor.shortLabel} updates.`;
+      setRunnerUpdateFeedback(errMsg);
     } finally {
-      setIsCheckingUpdates(false);
+      if (formSessionIdRef.current === sessionId) {
+        setIsCheckingUpdates(false);
+      }
     }
   }, []);
 
+  const clearRunnerProgressEntry = useCallback(
+    (runnerKey: Exclude<CompatibilityLayerType, 'native'>) => {
+      setRunnerProgressByType((prev) => {
+        if (!prev[runnerKey]) return prev;
+        const next = { ...prev };
+        delete next[runnerKey];
+        return next;
+      });
+    },
+    []
+  );
+
+  const applyStableCrossOverSwitch = useCallback(
+    (targetPlatformId: StorefrontId, refreshedLayers: CompatibilityLayerInfo[]) => {
+      const crossoverLayer = refreshedLayers.find((l) => l.type === 'crossover');
+      const crossoverAvailable = crossoverLayer?.availableBottles || [];
+      const isBottleValidForCrossover = (bottleValue: string): boolean => {
+        if (!bottleValue) return true;
+        const isInAvailable =
+          crossoverAvailable.length === 0 || crossoverAvailable.includes(bottleValue);
+        const isCompatible = isFormBottleCompatibleWithRunner(
+          bottleValue,
+          'crossover',
+          refreshedLayers
+        );
+        return isInAvailable && isCompatible;
+      };
+      userEditedCompatPlatformsRef.current.add(targetPlatformId);
+      userResetPendingDetectPlatformsRef.current.delete(targetPlatformId);
+      if (latestRef.current.preferredPlatformId === targetPlatformId) {
+        setCompatibilityLayer('crossover');
+        const currentBottle = latestRef.current.wineBottleName.trim();
+        if (currentBottle && !isBottleValidForCrossover(currentBottle)) {
+          setWineBottleName('');
+        }
+      } else {
+        setDraftsByPlatform((prev) => {
+          const baseDraft =
+            prev[targetPlatformId] ??
+            launcherService.getLaunchConfig(latestRef.current.game.id, targetPlatformId);
+          const draftBottle = baseDraft?.wineBottleName?.trim() || '';
+          const shouldClearDraftBottle =
+            Boolean(draftBottle) && !isBottleValidForCrossover(draftBottle);
+          return {
+            ...prev,
+            [targetPlatformId]: {
+              ...(baseDraft || {}),
+              compatibilityLayer: 'crossover',
+              ...(shouldClearDraftBottle ? { wineBottleName: undefined } : {}),
+            },
+          };
+        });
+        setDirtyInactivePlatforms((prev) =>
+          prev.includes(targetPlatformId) ? prev : [...prev, targetPlatformId]
+        );
+      }
+    },
+    []
+  );
+
   const handleUpdateRunner = useCallback(async () => {
     const cur = latestRef.current;
-    if (cur.isUpdatingRunner || cur.compatibilityLayer === 'native') return;
+    if (
+      cur.isUpdatingRunner ||
+      cur.isInstallingRunner ||
+      cur.isAnotherRunnerOperationActive ||
+      cur.compatibilityLayer === 'native'
+    ) {
+      return;
+    }
+    const sessionId = formSessionIdRef.current;
+    const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
+    const targetPlatformId = cur.preferredPlatformId;
+    const targetCompatEpoch = compatEditEpochByPlatformRef.current[targetPlatformId] ?? 0;
+    activeRunnerOpTypeRef.current = runnerKey;
+    setActiveRunnerOpType(runnerKey);
     setIsUpdatingRunner(true);
     setRunnerUpdateFeedback(null);
+    setRunnerActionFeedback(null);
     try {
+      const isPreviewBranch =
+        runnerKey === 'crossover_preview' || runnerKey === 'crossover_preview_arm64';
       const shouldSwitchPreviewToStable =
-        cur.compatibilityLayer === 'crossover_preview' &&
+        runnerKey === 'crossover_preview' &&
         Boolean(cur.activeUpdateInfo?.stableSurpassesPreview) &&
         !cur.activeUpdateInfo?.canAutoUpdate;
+      const shouldAuthenticateOnly =
+        isPreviewBranch &&
+        !shouldSwitchPreviewToStable &&
+        Boolean(cur.activeUpdateInfo?.authRequired) &&
+        !cur.activeUpdateInfo?.updateAvailable;
+
       const res = shouldSwitchPreviewToStable
         ? await launcherService.updateCompatibilityLayer('crossover_preview', {
             switchToStableCrossOver: true,
           })
-        : await launcherService.updateCompatibilityLayer(
-            cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>
-          );
+        : shouldAuthenticateOnly
+          ? await launcherService.updateCompatibilityLayer(runnerKey, { authenticateOnly: true })
+          : await launcherService.updateCompatibilityLayer(runnerKey);
+      if (formSessionIdRef.current !== sessionId) return;
       const refreshedLayers =
         res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+      if (formSessionIdRef.current !== sessionId) return;
+      hasDetectedLayersResolvedRef.current = true;
+      latestDetectedLayersRef.current = refreshedLayers;
       setDetectedLayers(refreshedLayers);
       if (res.updateInfo) {
         const latestFromService = launcherService.getRunnerUpdates();
-        const targetInfoKey = res.updateInfo.runnerType || cur.compatibilityLayer;
+        const targetInfoKey =
+          res.updateInfo.runnerType || res.runnerType || cur.compatibilityLayer;
         setRunnerUpdates((prev) => ({
           ...prev,
           ...latestFromService,
-          [cur.compatibilityLayer]: res.updateInfo!,
           [targetInfoKey]: res.updateInfo!,
         }));
       } else {
         setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
       }
       if (
-        cur.compatibilityLayer === 'crossover_preview' &&
+        shouldSwitchPreviewToStable &&
         res.success &&
         refreshedLayers.some((l) => l.type === 'crossover') &&
-        (shouldSwitchPreviewToStable ||
-          Boolean(cur.activeUpdateInfo?.stableSurpassesPreview) ||
-          res.runnerType === 'crossover' ||
-          !refreshedLayers.some((l) => l.type === 'crossover_preview'))
+        formSessionIdRef.current === sessionId &&
+        (compatEditEpochByPlatformRef.current[targetPlatformId] ?? 0) === targetCompatEpoch
       ) {
-        setCompatibilityLayer('crossover');
+        applyStableCrossOverSwitch(targetPlatformId, refreshedLayers);
       }
       setRunnerUpdateFeedback(res.message || res.error || null);
+    } catch (err: unknown) {
+      if (formSessionIdRef.current !== sessionId) return;
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : `Could not update ${cur.selectedRunnerDescriptor.shortLabel}.`;
+      setRunnerUpdateFeedback(errMsg);
+      setRunnerActionFeedback({ tone: 'amber', text: errMsg });
     } finally {
-      setIsUpdatingRunner(false);
+      if (activeRunnerOpTypeRef.current === runnerKey) {
+        activeRunnerOpTypeRef.current = null;
+      }
+      if (formSessionIdRef.current === sessionId) {
+        clearRunnerProgressEntry(runnerKey);
+        setActiveRunnerOpType((prev) => (prev === runnerKey ? null : prev));
+        setIsUpdatingRunner(false);
+      }
     }
-  }, []);
+  }, [applyStableCrossOverSwitch, clearRunnerProgressEntry]);
 
   const handleInstallRunnerViaBrew = useCallback(async () => {
     const cur = latestRef.current;
-    if (cur.isInstallingRunner || cur.compatibilityLayer === 'native') return;
+    if (
+      cur.isInstallingRunner ||
+      cur.isUpdatingRunner ||
+      cur.isAnotherRunnerOperationActive ||
+      cur.compatibilityLayer === 'native'
+    ) {
+      return;
+    }
+    const sessionId = formSessionIdRef.current;
+    const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
+    activeRunnerOpTypeRef.current = runnerKey;
+    setActiveRunnerOpType(runnerKey);
     setIsInstallingRunner(true);
     setRunnerActionFeedback(null);
     try {
-      const res = await launcherService.installCompatibilityLayer(
-        cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>,
-        'auto'
-      );
+      const res = await launcherService.installCompatibilityLayer(runnerKey, 'auto');
+      if (formSessionIdRef.current !== sessionId) return;
       const refreshed = res.layers || (await launcherService.detectCompatibilityLayers());
+      if (formSessionIdRef.current !== sessionId) return;
+      hasDetectedLayersResolvedRef.current = true;
+      latestDetectedLayersRef.current = refreshed;
       setDetectedLayers(refreshed);
+      setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
       if (res.success) {
         setRunnerActionFeedback({
           tone: 'emerald',
@@ -1239,59 +1729,91 @@ export function useGameLaunchConfigForm({
             `Could not install ${cur.selectedRunnerDescriptor.shortLabel}. Please check your internet connection and try again.`,
         });
       }
+    } catch (err: unknown) {
+      if (formSessionIdRef.current !== sessionId) return;
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : `Could not install ${cur.selectedRunnerDescriptor.shortLabel}. Please check your internet connection and try again.`;
+      setRunnerActionFeedback({
+        tone: 'amber',
+        text: errMsg,
+      });
     } finally {
-      setIsInstallingRunner(false);
+      if (activeRunnerOpTypeRef.current === runnerKey) {
+        activeRunnerOpTypeRef.current = null;
+      }
+      if (formSessionIdRef.current === sessionId) {
+        clearRunnerProgressEntry(runnerKey);
+        setActiveRunnerOpType((prev) => (prev === runnerKey ? null : prev));
+        setIsInstallingRunner(false);
+      }
     }
-  }, []);
+  }, [clearRunnerProgressEntry]);
 
   const handleInstallRunnerFromArchive = useCallback(async () => {
     const cur = latestRef.current;
-    if (cur.isInstallingRunner || cur.isUpdatingRunner || cur.compatibilityLayer === 'native') {
+    if (
+      cur.isInstallingRunner ||
+      cur.isUpdatingRunner ||
+      cur.isAnotherRunnerOperationActive ||
+      cur.compatibilityLayer === 'native'
+    ) {
       return;
     }
-    const archivePath = await launcherService.selectRunnerArchive();
-    if (!archivePath) return;
-
+    const sessionId = formSessionIdRef.current;
     const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
-    const isDmg = archivePath.toLowerCase().endsWith('.dmg');
-    const archiveOpts = {
-      archivePath,
-      ...(isDmg ? { dmgPath: archivePath } : {}),
-    };
+    const isUpdatingMode = Boolean(cur.activeLayer);
+    activeRunnerOpTypeRef.current = runnerKey;
+    setActiveRunnerOpType(runnerKey);
+    try {
+      const archivePath = await launcherService.selectRunnerArchive();
+      if (!archivePath || formSessionIdRef.current !== sessionId) return;
 
-    if (cur.activeLayer) {
-      setIsUpdatingRunner(true);
-      setRunnerUpdateFeedback(null);
-      try {
+      const isDmg = archivePath.toLowerCase().endsWith('.dmg');
+      const archiveOpts = {
+        archivePath,
+        ...(isDmg ? { dmgPath: archivePath } : {}),
+      };
+
+      if (cur.activeLayer) {
+        setIsUpdatingRunner(true);
+        setRunnerUpdateFeedback(null);
         const res = await launcherService.updateCompatibilityLayer(runnerKey, archiveOpts);
+        if (formSessionIdRef.current !== sessionId) return;
         const refreshedLayers =
           res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+        if (formSessionIdRef.current !== sessionId) return;
+        hasDetectedLayersResolvedRef.current = true;
+        latestDetectedLayersRef.current = refreshedLayers;
         setDetectedLayers(refreshedLayers);
         if (res.updateInfo) {
           const latestFromService = launcherService.getRunnerUpdates();
+          const targetInfoKey = res.updateInfo.runnerType || res.runnerType || runnerKey;
           setRunnerUpdates((prev) => ({
             ...prev,
             ...latestFromService,
-            [runnerKey]: res.updateInfo!,
+            [targetInfoKey]: res.updateInfo!,
           }));
         } else {
           setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
         }
         setRunnerUpdateFeedback(res.message || res.error || null);
-      } finally {
-        setIsUpdatingRunner(false);
-      }
-    } else {
-      setIsInstallingRunner(true);
-      setRunnerActionFeedback(null);
-      try {
+      } else {
+        setIsInstallingRunner(true);
+        setRunnerActionFeedback(null);
         const res = await launcherService.installCompatibilityLayer(
           runnerKey,
           'direct',
           archiveOpts
         );
+        if (formSessionIdRef.current !== sessionId) return;
         const refreshed = res.layers || (await launcherService.detectCompatibilityLayers());
+        if (formSessionIdRef.current !== sessionId) return;
+        hasDetectedLayersResolvedRef.current = true;
+        latestDetectedLayersRef.current = refreshed;
         setDetectedLayers(refreshed);
+        setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
         setRunnerActionFeedback({
           tone: res.success ? 'emerald' : 'amber',
           text:
@@ -1301,64 +1823,120 @@ export function useGameLaunchConfigForm({
               ? `${cur.selectedRunnerDescriptor.shortLabel} installed from local archive.`
               : `Could not install ${cur.selectedRunnerDescriptor.shortLabel} from archive.`),
         });
-      } finally {
+      }
+    } catch (err: unknown) {
+      if (formSessionIdRef.current !== sessionId) return;
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : isUpdatingMode
+            ? `Could not update ${cur.selectedRunnerDescriptor.shortLabel} from archive.`
+            : `Could not install ${cur.selectedRunnerDescriptor.shortLabel} from archive.`;
+      if (isUpdatingMode) {
+        setRunnerUpdateFeedback(errMsg);
+      }
+      setRunnerActionFeedback({ tone: 'amber', text: errMsg });
+    } finally {
+      if (activeRunnerOpTypeRef.current === runnerKey) {
+        activeRunnerOpTypeRef.current = null;
+      }
+      if (formSessionIdRef.current === sessionId) {
+        clearRunnerProgressEntry(runnerKey);
+        setActiveRunnerOpType((prev) => (prev === runnerKey ? null : prev));
+        setIsUpdatingRunner(false);
         setIsInstallingRunner(false);
       }
     }
-  }, []);
+  }, [clearRunnerProgressEntry]);
 
   const handleCancelRunnerOperation = useCallback(async () => {
     const cur = latestRef.current;
-    if (cur.compatibilityLayer === 'native') return;
-    const runnerKey = cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>;
+    const trackedRunnerKey = activeRunnerOpTypeRef.current;
+    if (!trackedRunnerKey && cur.compatibilityLayer === 'native') return;
+    const sessionId = formSessionIdRef.current;
+    const runnerKey =
+      trackedRunnerKey ||
+      (cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>);
+    const opDescriptor =
+      COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerKey) ||
+      cur.selectedRunnerDescriptor;
     await launcherService.cancelCompatibilityLayerOperation(runnerKey);
-    setRunnerProgressByType((prev) => {
-      if (!prev[runnerKey]) return prev;
-      const next = { ...prev };
-      delete next[runnerKey];
-      return next;
-    });
+    if (formSessionIdRef.current !== sessionId) return;
+    activeRunnerOpTypeRef.current = null;
+    setActiveRunnerOpType(null);
+    clearRunnerProgressEntry(runnerKey);
     setIsInstallingRunner(false);
     setIsUpdatingRunner(false);
     setRunnerActionFeedback({
       tone: 'amber',
-      text: `${cur.selectedRunnerDescriptor.shortLabel} operation cancelled.`,
+      text: `${opDescriptor.shortLabel} operation cancelled.`,
     });
-  }, []);
+  }, [clearRunnerProgressEntry]);
 
   const handleSwitchToStableCrossOver = useCallback(async () => {
     const cur = latestRef.current;
-    if (cur.isUpdatingRunner || cur.isInstallingRunner) return;
+    if (cur.isUpdatingRunner || cur.isInstallingRunner || cur.isAnotherRunnerOperationActive) return;
+    const sessionId = formSessionIdRef.current;
+    const targetPlatformId = cur.preferredPlatformId;
+    const targetCompatEpoch = compatEditEpochByPlatformRef.current[targetPlatformId] ?? 0;
+    activeRunnerOpTypeRef.current = 'crossover_preview';
+    setActiveRunnerOpType('crossover_preview');
     setIsUpdatingRunner(true);
     setRunnerUpdateFeedback(null);
     try {
       const res = await launcherService.updateCompatibilityLayer('crossover_preview', {
         switchToStableCrossOver: true,
       });
+      if (formSessionIdRef.current !== sessionId) return;
       const refreshedLayers =
         res.detectedLayers || (await launcherService.detectCompatibilityLayers());
+      if (formSessionIdRef.current !== sessionId) return;
+      hasDetectedLayersResolvedRef.current = true;
+      latestDetectedLayersRef.current = refreshedLayers;
       setDetectedLayers(refreshedLayers);
       setRunnerUpdates({ ...launcherService.getRunnerUpdates() });
-      if (res.success && refreshedLayers.some((l) => l.type === 'crossover')) {
-        setCompatibilityLayer('crossover');
+      if (
+        res.success &&
+        refreshedLayers.some((l) => l.type === 'crossover') &&
+        formSessionIdRef.current === sessionId &&
+        (compatEditEpochByPlatformRef.current[targetPlatformId] ?? 0) === targetCompatEpoch
+      ) {
+        applyStableCrossOverSwitch(targetPlatformId, refreshedLayers);
       }
       setRunnerUpdateFeedback(
         res.message ||
           res.error ||
           (res.success ? 'Switched to CrossOver Stable.' : 'Could not switch to CrossOver Stable.')
       );
+    } catch (err: unknown) {
+      if (formSessionIdRef.current !== sessionId) return;
+      const errMsg =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Could not switch to CrossOver Stable.';
+      setRunnerUpdateFeedback(errMsg);
     } finally {
-      setIsUpdatingRunner(false);
+      if (activeRunnerOpTypeRef.current === 'crossover_preview') {
+        activeRunnerOpTypeRef.current = null;
+      }
+      if (formSessionIdRef.current === sessionId) {
+        clearRunnerProgressEntry('crossover_preview');
+        clearRunnerProgressEntry('crossover');
+        setActiveRunnerOpType((prev) => (prev === 'crossover_preview' ? null : prev));
+        setIsUpdatingRunner(false);
+      }
     }
-  }, []);
+  }, [applyStableCrossOverSwitch, clearRunnerProgressEntry]);
 
   const handleDownloadRunner = useCallback(async () => {
     const cur = latestRef.current;
     if (cur.compatibilityLayer === 'native') return;
+    const sessionId = formSessionIdRef.current;
     const res = await launcherService.installCompatibilityLayer(
       cur.compatibilityLayer as Exclude<CompatibilityLayerType, 'native'>,
       'download'
     );
+    if (formSessionIdRef.current !== sessionId) return;
     setRunnerActionFeedback({
       tone: 'sky',
       text:
@@ -1376,9 +1954,35 @@ export function useGameLaunchConfigForm({
   }, []);
 
   const handleSelectCompatibilityLayer = useCallback((nextLayer: CompatibilityLayerType) => {
+    const cur = latestRef.current;
+    compatEditEpochByPlatformRef.current[cur.preferredPlatformId] =
+      (compatEditEpochByPlatformRef.current[cur.preferredPlatformId] ?? 0) + 1;
+    userEditedCompatPlatformsRef.current.add(cur.preferredPlatformId);
+    userResetPendingDetectPlatformsRef.current.delete(cur.preferredPlatformId);
     setCompatibilityLayer(nextLayer);
+    if (cur.wineBottleName) {
+      const nextLayerObj = cur.detectedLayers.find((l) => l.type === nextLayer);
+      const nextAvailable = nextLayerObj?.availableBottles || [];
+      const isCompatible = isFormBottleCompatibleWithRunner(
+        cur.wineBottleName,
+        nextLayer,
+        cur.detectedLayers
+      );
+      const isInNextAvailable =
+        nextAvailable.length === 0 || nextAvailable.includes(cur.wineBottleName);
+      if (!isCompatible || !isInNextAvailable) {
+        setWineBottleName('');
+      }
+    }
     setRunnerActionFeedback(null);
     setRunnerUpdateFeedback(null);
+  }, []);
+
+  const handleChangeWineBottleName = useCallback((value: SetStateAction<string>) => {
+    const curPlatId = latestRef.current.preferredPlatformId;
+    userEditedCompatPlatformsRef.current.add(curPlatId);
+    userResetPendingDetectPlatformsRef.current.delete(curPlatId);
+    setWineBottleName(value);
   }, []);
 
   const handleToggleMetalHud = useCallback(() => {
@@ -1520,21 +2124,41 @@ export function useGameLaunchConfigForm({
   }, []);
 
   const handleResetDefaults = async () => {
-    await launcherService.resetLaunchConfig(game.id, preferredPlatformId);
+    const sessionId = formSessionIdRef.current;
+    const targetPlatId = preferredPlatformId;
+    compatEditEpochByPlatformRef.current[targetPlatId] =
+      (compatEditEpochByPlatformRef.current[targetPlatId] ?? 0) + 1;
+    userEditedCompatPlatformsRef.current.add(targetPlatId);
+    if (!hasDetectedLayersResolvedRef.current && latestDetectedLayersRef.current.length === 0) {
+      userResetPendingDetectPlatformsRef.current.add(targetPlatId);
+    } else {
+      userResetPendingDetectPlatformsRef.current.delete(targetPlatId);
+    }
+    await launcherService.resetLaunchConfig(game.id, targetPlatId);
+    if (formSessionIdRef.current !== sessionId) return;
     setDraftsByPlatform((prev) => {
       const next = { ...prev };
-      delete next[preferredPlatformId];
+      delete next[targetPlatId];
       return next;
     });
-    const validLayers = detectedLayers.filter((l) =>
-      COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type)
+    const resetHostArch =
+      typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+    const currentLayers = latestDetectedLayersRef.current;
+    const validLayers = currentLayers.filter(
+      (l) =>
+        l.available !== false &&
+        COMPATIBILITY_RUNNER_DESCRIPTORS.some((d) => d.type === l.type) &&
+        (l.type !== 'crossover_preview_arm64' || resetHostArch === 'arm64')
     );
     const resetPreview = launcherService.resolveEffectiveLaunchModePreview(
       game,
-      preferredPlatformId,
+      targetPlatId,
       {}
     );
     const resetLayer: CompatibilityLayerType = validLayers[0]?.type || 'crossover';
+    if (latestRef.current.preferredPlatformId !== targetPlatId) {
+      return;
+    }
     setLaunchMethod(resetPreview.defaultLaunchMethod);
     setCustomExecutablePath('');
     setWorkingDirectory('');
@@ -1566,7 +2190,7 @@ export function useGameLaunchConfigForm({
     setPerfSettings(resetPerf);
     setInitialPerfSettings(resetPerf);
     setHasEditedGlobalPerfSettings(false);
-    setDirtyInactivePlatforms((prev) => prev.filter((id) => id !== preferredPlatformId));
+    setDirtyInactivePlatforms((prev) => prev.filter((id) => id !== targetPlatId));
     const resetSignature = JSON.stringify({
       launchMethod: resetPreview.defaultLaunchMethod,
       customExecutablePath: '',
@@ -1598,14 +2222,16 @@ export function useGameLaunchConfigForm({
     });
     setBaselineFieldsByPlatform((prev) => ({
       ...prev,
-      [preferredPlatformId]: resetSignature,
+      [targetPlatId]: resetSignature,
     }));
     setRunnerActionFeedback(null);
     setRunnerUpdateFeedback(null);
+    setSaveError(null);
   };
 
   const handleSave = async () => {
     setIsSaving(true);
+    setSaveError(null);
     try {
       const activeProfile = buildProfileFromCurrentState();
       const allPlatformConfigs: Partial<Record<StorefrontId, StorefrontLaunchProfile>> = {
@@ -1650,6 +2276,12 @@ export function useGameLaunchConfigForm({
 
       onSaved?.(config);
       onClose();
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Failed to save launch configuration.';
+      setSaveError(msg);
     } finally {
       setIsSaving(false);
     }
@@ -1694,7 +2326,7 @@ export function useGameLaunchConfigForm({
     setLaunchArguments,
     compatibilityLayer,
     wineBottleName,
-    setWineBottleName,
+    setWineBottleName: handleChangeWineBottleName,
     winePrefixPath,
     setWinePrefixPath,
     crossoverGraphicsBackend,
@@ -1738,7 +2370,9 @@ export function useGameLaunchConfigForm({
     hasUnsavedChanges,
     detectedLayers,
     isSaving,
+    saveError,
     isInstallingRunner: effectiveIsInstallingRunner,
+    isAnotherRunnerOperationActive,
     isRescanningRunners,
     runnerActionFeedback,
     runnerUpdates,

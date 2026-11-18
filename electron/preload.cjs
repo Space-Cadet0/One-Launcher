@@ -38,6 +38,7 @@ if (isTrustedMainRendererOrigin()) {
   contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
   platform: process.platform,
+  arch: process.arch,
   loginStore: (storefrontId) => ipcRenderer.invoke('auth:storefront', storefrontId),
   syncStore: (storefrontId, credentials) =>
     ipcRenderer.invoke('store:sync', storefrontId, credentials),

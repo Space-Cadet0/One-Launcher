@@ -78,6 +78,9 @@ export function formatRunnerOptionLabel(
     case 'crossover_preview':
       baseLabel = `CrossOver Preview — v${ver} Installed`;
       break;
+    case 'crossover_preview_arm64':
+      baseLabel = `CrossOver Preview (arm64 / FEX) — v${ver} Installed`;
+      break;
     case 'gptk':
       baseLabel = `Apple Game Porting Toolkit (GPTK) — v${ver} Installed`;
       break;

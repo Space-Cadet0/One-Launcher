@@ -532,6 +532,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         isX64: false,
         isX86: false,
         isArm64: false,
+        isArm64Ec: false,
         is16BitDos: true,
         importedDlls: /** @type {string[]} */ ([]),
       };
@@ -541,7 +542,8 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     const machineHex = `0x${machine.toString(16).padStart(4, '0')}`;
     const isX64 = machine === 0x8664;
     const isX86 = machine === 0x014c;
-    const isArm64 = machine === 0xaa64;
+    const isArm64Ec = machine === 0xa641;
+    const isArm64 = machine === 0xaa64 || isArm64Ec;
     const is64Bit = isX64 || isArm64;
     const is32Bit = isX86;
 
@@ -714,7 +716,15 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
         } catch {}
       }
     }
-    const arch = isX86 ? 'x86' : isX64 ? 'x64' : isArm64 ? 'arm64' : 'unknown';
+    const arch = isX86
+      ? 'x86'
+      : isX64
+        ? 'x64'
+        : isArm64Ec
+          ? 'arm64ec'
+          : isArm64
+            ? 'arm64'
+            : 'unknown';
     return {
       exists: true,
       isValidPe: true,
@@ -724,6 +734,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       isX64,
       isX86,
       isArm64,
+      isArm64Ec,
       is16BitDos: false,
       machine,
       machineHex,
@@ -749,6 +760,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       isX64: false,
       isX86: false,
       isArm64: false,
+      isArm64Ec: false,
       is16BitDos: false,
       isLargeAddressAware: false,
       isNxCompat: false,
@@ -779,9 +791,11 @@ function inspectPeCapabilities(exePath, options = {}) {
     ? 'x64'
     : pe.isX86
       ? 'x86'
-      : pe.isArm64
-        ? 'arm64'
-        : 'unknown';
+      : pe.isArm64Ec
+        ? 'arm64ec'
+        : pe.isArm64
+          ? 'arm64'
+          : 'unknown';
   const importedDlls = Array.isArray(pe.importedDlls) ? pe.importedDlls : [];
   const delayImportedDlls = Array.isArray(pe.delayImportedDlls) ? pe.delayImportedDlls : [];
   const is32Bit = Boolean(pe.isX86);
@@ -1903,19 +1917,35 @@ function resolveCaseInsensitiveRelFile(baseDir, relCandidate) {
 
 /**
  * Returns `true` when `peInfo` represents an executable runnable under x64/x86 Wine or x64 Windows
- * (`AMD64` `0x8664`, `I386` `0x014c`, or synthetic test MZ stubs), rejecting `ARM64` (`0xaa64`)
- * binaries unless running natively on Windows ARM64.
+ * (`AMD64` `0x8664`, `I386` `0x014c`, or synthetic test MZ stubs), rejecting `ARM64` (`0xaa64`) and
+ * `ARM64EC` (`0xa641`) binaries unless running natively on Windows ARM64 or explicitly inside an
+ * Apple Silicon arm64 FEX bottle (`options.allowArm64Pe === true` or `options.wineArch === 'arm64'`).
  *
  * @param {Record<string, any> | null | undefined} peInfo
- * @param {{ hostPlatform?: string, hostArch?: string }} [options]
+ * @param {{ hostPlatform?: string, hostArch?: string, allowArm64Pe?: boolean, wineArch?: string }} [options]
  * @returns {boolean}
  */
 function isCompatibleX86OrX64PeHeader(peInfo, options = {}) {
   if (!peInfo || peInfo.isValidPe !== true) return false;
   const hostPlatform = options.hostPlatform || process.platform;
   const hostArch = options.hostArch || process.arch;
-  if (peInfo.machine === 0xaa64 || peInfo.isArm64 === true) {
-    return hostPlatform === 'win32' && hostArch === 'arm64';
+  if (
+    peInfo.machine === 0xaa64 ||
+    peInfo.machine === 0xa641 ||
+    peInfo.isArm64 === true ||
+    peInfo.isArm64Ec === true
+  ) {
+    if (hostPlatform === 'win32' && hostArch === 'arm64') {
+      return true;
+    }
+    if (
+      hostPlatform === 'darwin' &&
+      hostArch === 'arm64' &&
+      (options.allowArm64Pe === true || options.wineArch === 'arm64')
+    ) {
+      return true;
+    }
+    return false;
   }
   return true;
 }
@@ -3308,6 +3338,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   const is64Bit =
     effectiveMachine === 'x64' ||
     effectiveMachine === 'arm64' ||
+    effectiveMachine === 'arm64ec' ||
     Boolean(effectivePe.is64Bit);
   const isLargeAddressAware = is64Bit || Boolean(effectivePe.isLargeAddressAware);
   const isNxCompat = effectivePe.isValidPe ? Boolean(effectivePe.isNxCompat) : is64Bit;

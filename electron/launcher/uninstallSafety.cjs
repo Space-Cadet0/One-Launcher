@@ -187,7 +187,7 @@ function normalizeWin32DevicePrefix(rawPath) {
 
 /**
  * Strict validator for Wine / CrossOver / Whisky / GPTK bottle slugs.
- * Rejects `.`, `..`, `/`, `\`, NUL bytes, leading/trailing dots-only names, and lengths outside 1..80.
+ * Rejects `.`, `..`, `/`, `\`, NUL bytes, leading hyphens, leading/trailing dots-only names, and lengths outside 1..80.
  *
  * @param {unknown} name
  * @returns {boolean}
@@ -198,6 +198,7 @@ function isSafeBottleSlug(name) {
   if (!/^[A-Za-z0-9._ -]{1,80}$/.test(name)) return false;
   const trimmed = name.trim();
   if (!trimmed || trimmed === '.' || trimmed === '..' || name.includes('..')) return false;
+  if (trimmed.startsWith('-')) return false;
   return true;
 }
 

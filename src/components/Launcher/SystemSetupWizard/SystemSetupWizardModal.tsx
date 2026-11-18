@@ -153,11 +153,16 @@ const RUNNER_COMPONENT_MAP: ReadonlyArray<{
   runner: Exclude<CompatibilityLayerType, 'native'>;
   componentId: Extract<
     EnvironmentComponentId,
-    'runner_crossover' | 'runner_crossover_preview' | 'runner_wine' | 'runner_gptk'
+    | 'runner_crossover'
+    | 'runner_crossover_preview'
+    | 'runner_crossover_preview_arm64'
+    | 'runner_wine'
+    | 'runner_gptk'
   >;
 }> = [
   { runner: 'crossover', componentId: 'runner_crossover' },
   { runner: 'crossover_preview', componentId: 'runner_crossover_preview' },
+  { runner: 'crossover_preview_arm64', componentId: 'runner_crossover_preview_arm64' },
   { runner: 'wine', componentId: 'runner_wine' },
   { runner: 'gptk', componentId: 'runner_gptk' },
 ];
@@ -168,6 +173,8 @@ function formatRunnerLabel(runner: Exclude<CompatibilityLayerType, 'native'>): s
       return 'CrossOver';
     case 'crossover_preview':
       return 'CrossOver Preview';
+    case 'crossover_preview_arm64':
+      return 'CrossOver Preview (arm64 / FEX)';
     case 'wine':
       return 'Wine';
     case 'gptk':
@@ -214,6 +221,7 @@ function resolveInitialStep(
   if (
     focusComponentId === 'runner_crossover' ||
     focusComponentId === 'runner_crossover_preview' ||
+    focusComponentId === 'runner_crossover_preview_arm64' ||
     focusComponentId === 'runner_wine' ||
     focusComponentId === 'runner_gptk' ||
     focusComponentId === 'bottle_default'
@@ -221,6 +229,57 @@ function resolveInitialStep(
     return hostPlatform === 'darwin' ? 'compatibility' : 'prerequisites';
   }
   return 'clients';
+}
+
+function isBottleCompatibleWithRunner(
+  bottle: { wineArch?: 'win64' | 'arm64'; bottleArch?: 'win64' | 'arm64'; name: string },
+  runner: Exclude<CompatibilityLayerType, 'native'> | 'skip'
+): boolean {
+  const arch = bottle.wineArch || bottle.bottleArch;
+  if (runner === 'crossover_preview_arm64') {
+    return arch ? arch === 'arm64' : /-arm64$/i.test(bottle.name);
+  }
+  if (runner === 'crossover' || runner === 'crossover_preview') {
+    return arch ? arch === 'win64' : !/-arm64$/i.test(bottle.name);
+  }
+  return true;
+}
+
+function isPersistedBottleCompatibleWithRunner(
+  bottleName: string,
+  runner: Exclude<CompatibilityLayerType, 'native'> | 'skip',
+  snap: EnvironmentHealthSnapshot
+): boolean {
+  if (runner === 'skip') return true;
+  const avail = snap.bottleSummary?.availableBottles ?? [];
+  const existing = avail.find((b) => b.name === bottleName);
+  if (existing) {
+    return isBottleCompatibleWithRunner(existing, runner);
+  }
+  if (runner === 'crossover_preview_arm64') {
+    return !/^OneLauncher$/i.test(bottleName);
+  }
+  if (runner === 'crossover' || runner === 'crossover_preview') {
+    return !/-arm64$/i.test(bottleName);
+  }
+  return true;
+}
+
+function resolveDefaultBottleForRunner(
+  runner: Exclude<CompatibilityLayerType, 'native'> | 'skip',
+  snap: EnvironmentHealthSnapshot
+): string {
+  const avail = snap.bottleSummary?.availableBottles ?? [];
+  const compatMatch = avail.find((b) => isBottleCompatibleWithRunner(b, runner));
+  if (compatMatch) {
+    return compatMatch.name;
+  }
+  if (runner === 'crossover_preview_arm64') {
+    const rec = snap.bottleSummary?.recommendedBottleName;
+    return rec && /-arm64$/i.test(rec) ? rec : 'OneLauncher-arm64';
+  }
+  const rec = snap.bottleSummary?.recommendedBottleName;
+  return rec && !/-arm64$/i.test(rec) ? rec : 'OneLauncher';
 }
 
 function resolveDefaultRunner(
@@ -238,6 +297,13 @@ function resolveDefaultRunner(
     ) {
       return 'crossover';
     }
+    if (
+      persistedRunner === 'crossover_preview_arm64' &&
+      !snap.isAppleSiliconMac &&
+      snap.components.runner_crossover_preview_arm64?.status !== 'ready'
+    ) {
+      return 'crossover';
+    }
     return persistedRunner;
   }
   if (snap.bottleSummary?.runnerType) {
@@ -245,7 +311,7 @@ function resolveDefaultRunner(
   }
   const firstDetected = snap.detectedRunners.find(
     (r): r is typeof r & { type: Exclude<CompatibilityLayerType, 'native'> } =>
-      r.type !== 'native'
+      r.type !== 'native' && r.available !== false
   );
   if (firstDetected) {
     return firstDetected.type;
@@ -357,17 +423,49 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
     const initialSnap =
       environmentSetupService.getLastSnapshot() ??
       buildFallbackEnvironmentSnapshot(connectedStorefronts);
-    return (initialSnap.bottleSummary?.availableBottles?.length ?? 0) > 0
+    const persistedWizard = environmentSetupService.getWizardState();
+    const initialRunner = resolveDefaultRunner(
+      initialSnap,
+      persistedWizard?.preferredRunnerType
+    );
+    const compatBottles = (initialSnap.bottleSummary?.availableBottles ?? []).filter((b) =>
+      isBottleCompatibleWithRunner(b, initialRunner)
+    );
+    const persistedBottle = persistedWizard?.preferredBottleName?.trim();
+    const canRestorePersisted = Boolean(
+      persistedBottle &&
+        (!persistedWizard?.preferredRunnerType ||
+          persistedWizard.preferredRunnerType === initialRunner) &&
+        isPersistedBottleCompatibleWithRunner(persistedBottle, initialRunner, initialSnap)
+    );
+    if (canRestorePersisted) {
+      return compatBottles.some((b) => b.name === persistedBottle)
+        ? 'reuse_existing'
+        : 'create_dedicated';
+    }
+    return compatBottles.length > 0
       ? 'reuse_existing'
-      : (initialSnap.bottleSummary?.recommendedBottleMode ?? 'create_dedicated');
+      : 'create_dedicated';
   });
   const [bottleName, setBottleName] = useState<string>(() => {
-    const persisted = environmentSetupService.getWizardState()?.preferredBottleName;
-    if (persisted) return persisted;
     const initialSnap =
       environmentSetupService.getLastSnapshot() ??
       buildFallbackEnvironmentSnapshot(connectedStorefronts);
-    return initialSnap.bottleSummary?.recommendedBottleName || 'OneLauncher';
+    const persistedWizard = environmentSetupService.getWizardState();
+    const initialRunner = resolveDefaultRunner(
+      initialSnap,
+      persistedWizard?.preferredRunnerType
+    );
+    const persistedBottle = persistedWizard?.preferredBottleName?.trim();
+    const canRestorePersisted = Boolean(
+      persistedBottle &&
+        (!persistedWizard?.preferredRunnerType ||
+          persistedWizard.preferredRunnerType === initialRunner) &&
+        isPersistedBottleCompatibleWithRunner(persistedBottle, initialRunner, initialSnap)
+    );
+    return canRestorePersisted
+      ? persistedBottle!
+      : resolveDefaultBottleForRunner(initialRunner, initialSnap);
   });
   const [gptkDmgPath, setGptkDmgPath] = useState<string>('');
   const [selectedIds, setSelectedIds] = useState<Set<EnvironmentComponentId>>(() => {
@@ -410,8 +508,13 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
   const [allPendingSkippedInQueue, setAllPendingSkippedInQueue] = useState<boolean>(false);
 
   const hasUserCustomizedSelectionRef = useRef<boolean>(false);
+  const hasUserCustomizedRunnerOrBottleRef = useRef<boolean>(false);
   const chosenRunnerRef = useRef(chosenRunner);
   chosenRunnerRef.current = chosenRunner;
+  const bottleModeRef = useRef(bottleMode);
+  bottleModeRef.current = bottleMode;
+  const bottleNameRef = useRef(bottleName);
+  bottleNameRef.current = bottleName;
 
   const wizardSteps = useMemo(
     () => getWizardStepsForHost(snapshot.hostPlatform),
@@ -467,8 +570,12 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
   }, [isOpen, focusComponentId]);
 
   useEffect(() => {
-    if (!isOpen) return undefined;
+    if (!isOpen) {
+      hasUserCustomizedRunnerOrBottleRef.current = false;
+      return undefined;
+    }
     let active = true;
+    hasUserCustomizedRunnerOrBottleRef.current = false;
     setIsProbing(true);
 
     Promise.all([
@@ -482,26 +589,81 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
           probedSnap,
           persistedState.preferredRunnerType
         );
-        setChosenRunner(resolvedRunner);
         const avail = probedSnap.bottleSummary?.availableBottles ?? [];
-        setBottleMode(
-          avail.length > 0
+        const compatAvail = avail.filter((b) =>
+          isBottleCompatibleWithRunner(b, resolvedRunner)
+        );
+        const persistedBottle = persistedState.preferredBottleName?.trim();
+        const canRestorePersisted = Boolean(
+          persistedBottle &&
+            (!persistedState.preferredRunnerType ||
+              persistedState.preferredRunnerType === resolvedRunner) &&
+            isPersistedBottleCompatibleWithRunner(persistedBottle, resolvedRunner, probedSnap)
+        );
+        const restoredBottleName = canRestorePersisted
+          ? persistedBottle!
+          : resolveDefaultBottleForRunner(resolvedRunner, probedSnap);
+        const restoredBottleMode: 'reuse_existing' | 'create_dedicated' = canRestorePersisted
+          ? compatAvail.some((b) => b.name === persistedBottle)
             ? 'reuse_existing'
-            : (probedSnap.bottleSummary?.recommendedBottleMode ?? 'create_dedicated')
-        );
-        setBottleName(
-          persistedState.preferredBottleName ||
-            probedSnap.bottleSummary?.recommendedBottleName ||
-            avail[0]?.name ||
-            'OneLauncher'
-        );
+            : 'create_dedicated'
+          : compatAvail.length > 0
+            ? 'reuse_existing'
+            : 'create_dedicated';
+        if (!hasUserCustomizedRunnerOrBottleRef.current) {
+          chosenRunnerRef.current = resolvedRunner;
+          bottleModeRef.current = restoredBottleMode;
+          bottleNameRef.current = restoredBottleName;
+          setChosenRunner(resolvedRunner);
+          setBottleMode(restoredBottleMode);
+          setBottleName(restoredBottleName);
+        }
         if (!hasUserCustomizedSelectionRef.current) {
-          setSelectedIds(
-            computeDefaultSelectedComponents(probedSnap, connectedStorefronts, {
-              chosenRunner: resolvedRunner,
-              focusComponentId,
-            })
-          );
+          const activeRunner = hasUserCustomizedRunnerOrBottleRef.current
+            ? chosenRunnerRef.current
+            : resolvedRunner;
+          const activeMode = hasUserCustomizedRunnerOrBottleRef.current
+            ? bottleModeRef.current
+            : restoredBottleMode;
+          const activeBottleName = hasUserCustomizedRunnerOrBottleRef.current
+            ? bottleNameRef.current
+            : restoredBottleName;
+          const nextSelected = computeDefaultSelectedComponents(probedSnap, connectedStorefronts, {
+            chosenRunner: activeRunner,
+            focusComponentId,
+          });
+          if (activeRunner !== 'skip') {
+            const trimmedTarget =
+              activeBottleName.trim() || resolveDefaultBottleForRunner(activeRunner, probedSnap);
+            const matchedTarget = avail.find(
+              (b) => b.name === trimmedTarget && isBottleCompatibleWithRunner(b, activeRunner)
+            );
+            const needsDedicatedCreation =
+              !matchedTarget &&
+              (avail.length > 0
+                ? activeMode === 'create_dedicated' ||
+                  activeRunner === 'crossover_preview_arm64'
+                : activeRunner === 'crossover_preview_arm64' &&
+                  (probedSnap.bottleSummary?.runnerType !== 'crossover_preview_arm64' ||
+                    probedSnap.bottleSummary?.recommendedBottleName !== trimmedTarget));
+            if (needsDedicatedCreation) {
+              const bottleComp = probedSnap.components.bottle_default;
+              if (bottleComp && bottleComp.status !== 'not_applicable') {
+                nextSelected.add('bottle_default');
+              }
+              const steamRelevant =
+                connectedStorefronts.includes('steam') || connectedStorefronts.length === 0;
+              const bottleSteamComp = probedSnap.components.bottle_steam;
+              if (
+                steamRelevant &&
+                bottleSteamComp &&
+                bottleSteamComp.status !== 'not_applicable'
+              ) {
+                nextSelected.add('bottle_steam');
+              }
+            }
+          }
+          setSelectedIds(nextSelected);
           setRunnerUpdateOptInIds(readServiceRunnerUpdateOptInSet(focusComponentId, probedSnap));
         }
       })
@@ -512,6 +674,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
 
     return () => {
       active = false;
+      hasUserCustomizedRunnerOrBottleRef.current = false;
     };
   }, [isOpen]);
 
@@ -534,7 +697,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
 
   const effectiveBottleName = isValidBottleNameInput(bottleName)
     ? bottleName.trim()
-    : snapshot.bottleSummary?.recommendedBottleName || 'OneLauncher';
+    : resolveDefaultBottleForRunner(chosenRunner, snapshot);
 
   const plannedTasks = useMemo(
     () =>
@@ -590,10 +753,110 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
     }
   };
 
+  const syncBottleComponentSelection = (
+    targetRunner: Exclude<CompatibilityLayerType, 'native'> | 'skip',
+    targetMode: 'reuse_existing' | 'create_dedicated',
+    targetBottleName: string
+  ) => {
+    if (targetRunner === 'skip') return;
+    const avail = snapshot.bottleSummary?.availableBottles ?? [];
+    const trimmedTarget =
+      targetBottleName.trim() || resolveDefaultBottleForRunner(targetRunner, snapshot);
+    const matchedTarget = avail.find(
+      (b) => b.name === trimmedTarget && isBottleCompatibleWithRunner(b, targetRunner)
+    );
+    const targetBottleExistsCompat = Boolean(matchedTarget);
+    const needsDedicatedCreation =
+      !targetBottleExistsCompat &&
+      (avail.length > 0
+        ? targetMode === 'create_dedicated' || targetRunner === 'crossover_preview_arm64'
+        : targetRunner === 'crossover_preview_arm64');
+    if (!needsDedicatedCreation) return;
+
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const bottleComp = snapshot.components.bottle_default;
+      if (bottleComp && bottleComp.status !== 'not_applicable') {
+        next.add('bottle_default');
+      }
+      const steamRelevant =
+        liveConnectedStorefronts.includes('steam') || liveConnectedStorefronts.length === 0;
+      const bottleSteamComp = snapshot.components.bottle_steam;
+      if (
+        steamRelevant &&
+        bottleSteamComp &&
+        bottleSteamComp.status !== 'not_applicable' &&
+        !matchedTarget?.hasSteam
+      ) {
+        next.add('bottle_steam');
+      }
+      return next;
+    });
+  };
+
+  const handleChangeBottleMode = (nextMode: 'reuse_existing' | 'create_dedicated') => {
+    hasUserCustomizedRunnerOrBottleRef.current = true;
+    bottleModeRef.current = nextMode;
+    setBottleMode(nextMode);
+    syncBottleComponentSelection(chosenRunnerRef.current, nextMode, bottleNameRef.current);
+  };
+
+  const handleChangeBottleName = (nextName: string) => {
+    hasUserCustomizedRunnerOrBottleRef.current = true;
+    bottleNameRef.current = nextName;
+    setBottleName(nextName);
+    syncBottleComponentSelection(chosenRunnerRef.current, bottleModeRef.current, nextName);
+  };
+
   const handleSelectRunner = (
     nextRunner: Exclude<CompatibilityLayerType, 'native'> | 'skip'
   ) => {
+    hasUserCustomizedRunnerOrBottleRef.current = true;
+    chosenRunnerRef.current = nextRunner;
     setChosenRunner(nextRunner);
+    const nextRunnerComponentId =
+      nextRunner !== 'skip'
+        ? RUNNER_COMPONENT_MAP.find((e) => e.runner === nextRunner)?.componentId
+        : undefined;
+    for (const entry of RUNNER_COMPONENT_MAP) {
+      if (entry.componentId !== nextRunnerComponentId) {
+        environmentSetupService.setRunnerUpdateOptIn(entry.componentId, false);
+      }
+    }
+    setRunnerUpdateOptInIds((prev) => {
+      const next = new Set<EnvironmentComponentId>();
+      if (nextRunnerComponentId && prev.has(nextRunnerComponentId)) {
+        next.add(nextRunnerComponentId);
+      }
+      return next;
+    });
+    let resolvedNextBottleName = bottleNameRef.current.trim();
+    let targetBottleExistsCompat = true;
+    if (nextRunner !== 'skip') {
+      const avail = snapshot.bottleSummary?.availableBottles ?? [];
+      const compatBottles = avail.filter((b) => isBottleCompatibleWithRunner(b, nextRunner));
+      const trimmedCur = bottleNameRef.current.trim();
+      const isDefaultBottle =
+        !trimmedCur || trimmedCur === 'OneLauncher' || trimmedCur === 'OneLauncher-arm64';
+      const existingBottle = avail.find((b) => b.name === trimmedCur);
+      const isExistingIncompatible =
+        Boolean(existingBottle) && !isBottleCompatibleWithRunner(existingBottle!, nextRunner);
+
+      if (isDefaultBottle || isExistingIncompatible) {
+        resolvedNextBottleName = resolveDefaultBottleForRunner(nextRunner, snapshot);
+        const nextMode = compatBottles.length > 0 ? 'reuse_existing' : 'create_dedicated';
+        bottleNameRef.current = resolvedNextBottleName;
+        bottleModeRef.current = nextMode;
+        setBottleName(resolvedNextBottleName);
+        setBottleMode(nextMode);
+      } else if (compatBottles.length === 0 && bottleModeRef.current === 'reuse_existing') {
+        bottleModeRef.current = 'create_dedicated';
+        setBottleMode('create_dedicated');
+      }
+      targetBottleExistsCompat = avail.some(
+        (b) => b.name === resolvedNextBottleName && isBottleCompatibleWithRunner(b, nextRunner)
+      );
+    }
     setSelectedIds((prev) => {
       const next = new Set(prev);
       for (const entry of RUNNER_COMPONENT_MAP) {
@@ -622,13 +885,27 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
           next.add(match.componentId);
         }
       }
+      const avail = snapshot.bottleSummary?.availableBottles ?? [];
       const bottleComp = snapshot.components.bottle_default;
-      if (bottleComp && bottleComp.status !== 'ready' && bottleComp.status !== 'not_applicable') {
+      const needsBottleCreation =
+        !targetBottleExistsCompat &&
+        (avail.length > 0 || nextRunner === 'crossover_preview_arm64');
+      if (
+        bottleComp &&
+        bottleComp.status !== 'not_applicable' &&
+        (bottleComp.status !== 'ready' || needsBottleCreation)
+      ) {
         next.add('bottle_default');
       }
       const steamRelevant =
         liveConnectedStorefronts.includes('steam') || liveConnectedStorefronts.length === 0;
-      if (steamRelevant && snapshot.components.bottle_steam?.status === 'missing') {
+      const bottleSteamComp = snapshot.components.bottle_steam;
+      if (
+        steamRelevant &&
+        bottleSteamComp &&
+        bottleSteamComp.status !== 'not_applicable' &&
+        (bottleSteamComp.status === 'missing' || needsBottleCreation)
+      ) {
         next.add('bottle_steam');
       }
       return next;
@@ -687,19 +964,23 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
 
   const handleSelectRemovedComponentsForRepair = () => {
     hasUserCustomizedSelectionRef.current = true;
-    const nextSelected = new Set(selectedIds);
     let nextRunner = chosenRunner;
     for (const comp of removedComponents) {
-      nextSelected.add(comp.id);
       const runnerEntry = RUNNER_COMPONENT_MAP.find((r) => r.componentId === comp.id);
       if (runnerEntry && snapshot.hostPlatform === 'darwin' && nextRunner === 'skip') {
         nextRunner = runnerEntry.runner;
       }
     }
     if (nextRunner !== chosenRunner) {
-      setChosenRunner(nextRunner);
+      handleSelectRunner(nextRunner);
     }
-    setSelectedIds(nextSelected);
+    setSelectedIds((prev) => {
+      const nextSelected = new Set(prev);
+      for (const comp of removedComponents) {
+        nextSelected.add(comp.id);
+      }
+      return nextSelected;
+    });
     navigateToStep('summary');
   };
 
@@ -864,6 +1145,24 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
 
   const isMacHost = snapshot.hostPlatform === 'darwin';
   const isWinHost = snapshot.hostPlatform === 'win32';
+  const trimmedBottleForNext = bottleName.trim();
+  const matchedBottleForNext = trimmedBottleForNext
+    ? (snapshot.bottleSummary?.availableBottles ?? []).find(
+        (b) => b.name === trimmedBottleForNext
+      )
+    : undefined;
+  const hasIncompatibleSelectedBottle = Boolean(
+    isMacHost &&
+      chosenRunner !== 'skip' &&
+      matchedBottleForNext &&
+      !isBottleCompatibleWithRunner(matchedBottleForNext, chosenRunner)
+  );
+  const isBlockedFromAdvancingCompat = Boolean(
+    activeStep === 'compatibility' &&
+      isMacHost &&
+      chosenRunner !== 'skip' &&
+      (!isValidBottleNameInput(bottleName) || hasIncompatibleSelectedBottle)
+  );
   const winPrereqsReady =
     isWinHost &&
     snapshot.components.win_vcredist?.status === 'ready' &&
@@ -962,7 +1261,10 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
               const isLockedByOperation =
                 (isProvisioningRunning && step.id !== 'summary') ||
                 (activeGuidedLoginTarget !== null && step.id !== 'client_logins');
-              const isStepDisabled = isUnprogressed || isLockedByOperation;
+              const isStepDisabled =
+                isUnprogressed ||
+                isLockedByOperation ||
+                (idx > currentStepIdx && isBlockedFromAdvancingCompat);
 
               return (
                 <div key={step.id} className="inline-flex items-center gap-2">
@@ -1076,9 +1378,9 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
               chosenRunner={chosenRunner}
               onSelectRunner={handleSelectRunner}
               bottleMode={bottleMode}
-              onChangeBottleMode={setBottleMode}
+              onChangeBottleMode={handleChangeBottleMode}
               bottleName={bottleName}
-              onChangeBottleName={setBottleName}
+              onChangeBottleName={handleChangeBottleName}
               gptkDmgPath={gptkDmgPath}
               onChangeGptkDmgPath={setGptkDmgPath}
               runnerUpdateOptInIds={runnerUpdateOptInIds}
@@ -1272,7 +1574,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
                 type="button"
                 data-testid="run-provisioning-btn"
                 disabled={isProvisioningRunning}
-                onClick={() => void handleRunProvisioning()}
+                onClick={() => handleRunProvisioning()}
                 className="min-h-6 px-4 py-2 rounded-md bg-[#66c0f4] text-slate-950 font-bold hover:brightness-110 transition-all text-xs flex items-center gap-1.5 shadow cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#66c0f4]"
               >
                 <Play aria-hidden="true" className="w-3.5 h-3.5 fill-slate-950" />
@@ -1291,10 +1593,7 @@ export const SystemSetupWizardModal: React.FC<SystemSetupWizardModalProps> = ({
                 disabled={
                   isProvisioningRunning ||
                   activeGuidedLoginTarget !== null ||
-                  (activeStep === 'compatibility' &&
-                    isMacHost &&
-                    chosenRunner !== 'skip' &&
-                    !isValidBottleNameInput(bottleName))
+                  isBlockedFromAdvancingCompat
                 }
                 onClick={() => navigateToStep(nextStep.id)}
                 className={`min-h-6 px-4 py-2 rounded-md text-xs flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#66c0f4] ${

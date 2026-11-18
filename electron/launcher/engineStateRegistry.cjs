@@ -348,7 +348,7 @@ function trimLauncherEngineMemory() {
   return { success: true };
 }
 
-function invalidateScanCaches() {
+function invalidateScanCaches(options = {}) {
   executableDiscoveryCache.clear();
   for (const [, entry] of steamAppInfoCache.entries()) {
     if (entry && entry.evictTimer) {
@@ -374,7 +374,7 @@ function invalidateScanCaches() {
   invalidateWindowsRegistryDiscoveryCache();
   for (const inv of externalCacheInvalidators) {
     try {
-      inv();
+      inv(options);
     } catch {}
   }
   lastProductionScanCache = { timestamp: 0, result: null };
@@ -1886,7 +1886,7 @@ function safeIsBottleSlug(slug) {
   }
   if (typeof slug !== 'string') return false;
   const trimmed = slug.trim();
-  if (!trimmed || trimmed === '.' || trimmed === '..') return false;
+  if (!trimmed || trimmed === '.' || trimmed === '..' || trimmed.startsWith('-')) return false;
   return !/[\\/\x00]/.test(trimmed) && !trimmed.includes('..');
 }
 

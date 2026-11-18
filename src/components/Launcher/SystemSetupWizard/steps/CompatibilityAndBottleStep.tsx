@@ -39,7 +39,8 @@ export interface CompatibilityAndBottleStepProps {
 export function isValidBottleNameInput(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) return false;
-  if (trimmed.includes('..')) return false;
+  if (trimmed.startsWith('-')) return false;
+  if (trimmed === '.' || trimmed.includes('..')) return false;
   return /^[A-Za-z0-9 _.-]{1,64}$/.test(trimmed);
 }
 
@@ -65,6 +66,9 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
     runner_crossover: environmentSetupService.getRunnerUpdateOptIn('runner_crossover'),
     runner_crossover_preview: environmentSetupService.getRunnerUpdateOptIn(
       'runner_crossover_preview'
+    ),
+    runner_crossover_preview_arm64: environmentSetupService.getRunnerUpdateOptIn(
+      'runner_crossover_preview_arm64'
     ),
     runner_wine: environmentSetupService.getRunnerUpdateOptIn('runner_wine'),
     runner_gptk: environmentSetupService.getRunnerUpdateOptIn('runner_gptk'),
@@ -93,6 +97,7 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
 
   const crossoverComp = snapshot.components.runner_crossover;
   const crossoverPreviewComp = snapshot.components.runner_crossover_preview;
+  const crossoverPreviewArm64Comp = snapshot.components.runner_crossover_preview_arm64;
   const wineComp = snapshot.components.runner_wine;
   const gptkComp = snapshot.components.runner_gptk;
   const availableBottles = snapshot.bottleSummary?.availableBottles ?? [];
@@ -103,10 +108,13 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
 
   const isCrossOverStdInstalled = isLayerInstalled(crossoverComp?.status);
   const isCrossOverPreviewInstalled = isLayerInstalled(crossoverPreviewComp?.status);
+  const isCrossOverPreviewArm64Installed = isLayerInstalled(crossoverPreviewArm64Comp?.status);
   const isCrossOverStdRemoved =
     !isCrossOverStdInstalled && Boolean(crossoverComp?.wasPreviouslyConfigured);
   const isCrossOverPreviewRemoved =
     !isCrossOverPreviewInstalled && Boolean(crossoverPreviewComp?.wasPreviouslyConfigured);
+  const isCrossOverPreviewArm64Removed =
+    !isCrossOverPreviewArm64Installed && Boolean(crossoverPreviewArm64Comp?.wasPreviouslyConfigured);
 
   const isWineInstalled = isLayerInstalled(wineComp?.status);
   const isWineRemoved = !isWineInstalled && Boolean(wineComp?.wasPreviouslyConfigured);
@@ -115,12 +123,16 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
   const isGptkRemoved = !isGptkInstalled && Boolean(gptkComp?.wasPreviouslyConfigured);
 
   const showCrossOverPreviewOption = true;
+  const showCrossOverPreviewArm64Option = Boolean(
+    snapshot.isAppleSiliconMac || snapshot.hostArch === 'arm64'
+  );
 
   const showGptkOption = snapshot.isAppleSiliconMac || isGptkInstalled;
 
   const runnerOptions: ReadonlyArray<Exclude<CompatibilityLayerType, 'native'> | 'skip'> = [
     'crossover',
     ...(showCrossOverPreviewOption ? (['crossover_preview'] as const) : []),
+    ...(showCrossOverPreviewArm64Option ? (['crossover_preview_arm64'] as const) : []),
     'wine',
     ...(showGptkOption ? (['gptk'] as const) : []),
     'skip',
@@ -130,6 +142,7 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
 
   const crossoverIndex = runnerOptions.indexOf('crossover');
   const crossoverPreviewIndex = runnerOptions.indexOf('crossover_preview');
+  const crossoverPreviewArm64Index = runnerOptions.indexOf('crossover_preview_arm64');
   const wineIndex = runnerOptions.indexOf('wine');
   const gptkIndex = runnerOptions.indexOf('gptk');
   const skipIndex = runnerOptions.indexOf('skip');
@@ -204,19 +217,39 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
           ? crossoverComp
           : targetRunner === 'crossover_preview'
             ? crossoverPreviewComp
-            : targetRunner === 'wine'
-              ? wineComp
-              : targetRunner === 'gptk'
-                ? gptkComp
-                : undefined;
+            : targetRunner === 'crossover_preview_arm64'
+              ? crossoverPreviewArm64Comp
+              : targetRunner === 'wine'
+                ? wineComp
+                : targetRunner === 'gptk'
+                  ? gptkComp
+                  : undefined;
       handleSelectRunnerCard(targetRunner, targetComp);
       runnerRadioRefs.current[targetIndex]?.focus();
     }
   };
 
-  const canReuseBottle = availableBottles.length > 0;
+  const defaultBottleForRunner =
+    chosenRunner === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+
+  const isBottleArchCompatible = (b: (typeof availableBottles)[number]): boolean => {
+    const arch = b.wineArch || b.bottleArch;
+    if (chosenRunner === 'crossover_preview_arm64') {
+      return arch ? arch === 'arm64' : /-arm64$/i.test(b.name);
+    }
+    if (chosenRunner === 'crossover' || chosenRunner === 'crossover_preview') {
+      return arch ? arch === 'win64' : !/-arm64$/i.test(b.name);
+    }
+    return true;
+  };
+
+  const compatibleBottles = availableBottles.filter(isBottleArchCompatible);
+  const canReuseBottle = compatibleBottles.length > 0;
   const isReuseBottleSelected = canReuseBottle && bottleMode === 'reuse_existing';
   const isCreateBottleSelected = !isReuseBottleSelected;
+  const matchedExistingBottle = availableBottles.find((b) => b.name === bottleName.trim());
+  const hasIncompatibleSelectedBottle =
+    Boolean(matchedExistingBottle) && !isBottleArchCompatible(matchedExistingBottle!);
 
   const activateBottleMode = (
     mode: 'reuse_existing' | 'create_dedicated',
@@ -225,8 +258,8 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
     if (mode === 'reuse_existing') {
       if (!canReuseBottle) return;
       onChangeBottleMode('reuse_existing');
-      if (!availableBottles.some((b) => b.name === bottleName.trim())) {
-        onChangeBottleName(availableBottles[0].name);
+      if (!compatibleBottles.some((b) => b.name === bottleName.trim())) {
+        onChangeBottleName(compatibleBottles[0].name);
       }
       if (focusButton) {
         reuseBottleRadioRef.current?.focus();
@@ -234,7 +267,7 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
     } else {
       onChangeBottleMode('create_dedicated');
       if (!bottleName.trim()) {
-        onChangeBottleName('OneLauncher');
+        onChangeBottleName(defaultBottleForRunner);
       }
       if (focusButton) {
         createBottleRadioRef.current?.focus();
@@ -274,6 +307,9 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
   }
   if (isCrossOverPreviewInstalled) {
     installedLayerLabels.push('CrossOver Preview');
+  }
+  if (isCrossOverPreviewArm64Installed) {
+    installedLayerLabels.push('CrossOver Preview (arm64 / FEX)');
   }
   if (isWineInstalled) {
     installedLayerLabels.push('Wine');
@@ -531,6 +567,76 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
             </div>
           )}
 
+          {/* 2b. CrossOver Preview (arm64 / FEX) — Apple Silicon only */}
+          {showCrossOverPreviewArm64Option && (
+            <div className={getRunnerCardShellClass(chosenRunner === 'crossover_preview_arm64')}>
+              <button
+                ref={(el) => {
+                  if (crossoverPreviewArm64Index >= 0) {
+                    runnerRadioRefs.current[crossoverPreviewArm64Index] = el;
+                  }
+                }}
+                type="button"
+                role="radio"
+                aria-checked={chosenRunner === 'crossover_preview_arm64'}
+                tabIndex={selectedRunnerIndex === crossoverPreviewArm64Index ? 0 : -1}
+                data-testid="setup-runner-crossover-preview-arm64"
+                onClick={() =>
+                  handleSelectRunnerCard('crossover_preview_arm64', crossoverPreviewArm64Comp)
+                }
+                className={`min-h-6 w-full flex-1 text-left p-3.5 cursor-pointer flex flex-col justify-between gap-2 rounded-lg ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+              >
+                <div className="space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs font-bold text-white">
+                        CrossOver Preview (arm64 / FEX)
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-indigo-500/20 border border-indigo-400/50 text-[10px] font-bold text-indigo-200">
+                        arm64 / FEX
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {renderInstallStatusBadge(
+                        'runner-install-status-crossover-preview-arm64',
+                        isCrossOverPreviewArm64Installed,
+                        isCrossOverPreviewArm64Removed
+                      )}
+                      {renderUpdateAvailableBadge(
+                        'crossover-preview-arm64',
+                        crossoverPreviewArm64Comp
+                      )}
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-200 leading-relaxed">
+                    Experimental arm64 Wine + FEX branch on Apple Silicon using an isolated{' '}
+                    <span className="font-mono text-indigo-200">OneLauncher-arm64</span> bottle.
+                  </p>
+                </div>
+                {isCrossOverPreviewArm64Installed ? (
+                  <div className="rounded bg-emerald-950/35 border border-emerald-500/40 px-2.5 py-1.5 text-[10px] text-emerald-200 leading-snug">
+                    Installed on your Mac — ready to use with dedicated arm64 bottles.
+                  </div>
+                ) : crossoverPreviewArm64Comp?.authRequired ? (
+                  <div className="rounded bg-amber-950/40 border border-amber-500/35 px-2.5 py-1.5 text-[10px] text-amber-200 leading-snug">
+                    CodeWeavers sign-in required — sign in during setup to download &amp; install
+                    into &ldquo;OneLauncher-arm64&rdquo;.
+                  </div>
+                ) : (
+                  <div className="rounded bg-[#131c27] border border-[#2a475e]/70 px-2.5 py-1.5 text-[10px] text-slate-300 leading-snug">
+                    Not installed yet — sign in to CodeWeavers during setup to auto-download &amp;
+                    install as CrossOver Preview arm64.
+                  </div>
+                )}
+              </button>
+              {renderRunnerUpdateOptInFooter(
+                'crossover-preview-arm64',
+                'crossover_preview_arm64',
+                crossoverPreviewArm64Comp
+              )}
+            </div>
+          )}
+
           {/* 3. Wine */}
           <div className={getRunnerCardShellClass(chosenRunner === 'wine')}>
             <button
@@ -704,16 +810,18 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-bold text-white">Use Existing Bottle</span>
-                {availableBottles.length > 0 && (
+                {compatibleBottles.length > 0 && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-bold">
-                    {availableBottles.length} Found
+                    {compatibleBottles.length} Compatible
                   </span>
                 )}
               </div>
               <p className="text-[11px] text-slate-300 mt-1 leading-snug">
-                {availableBottles.length > 0
+                {compatibleBottles.length > 0
                   ? 'Keeps your existing Windows apps and logins.'
-                  : 'No existing bottles found on this Mac.'}
+                  : availableBottles.length > 0
+                    ? `No ${chosenRunner === 'crossover_preview_arm64' ? 'arm64' : 'Intel / win64'} bottles found — create a dedicated "${defaultBottleForRunner}" bottle.`
+                    : 'No existing bottles found on this Mac.'}
               </p>
             </button>
 
@@ -732,10 +840,10 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
               }`}
             >
               <span className="text-xs font-bold text-white">
-                Create New &ldquo;OneLauncher&rdquo; Bottle
+                Create New &ldquo;{defaultBottleForRunner}&rdquo; Bottle
               </span>
               <p className="text-[11px] text-slate-300 mt-1 leading-snug">
-                Creates a clean folder for your Windows games and saves.
+                Creates a clean {chosenRunner === 'crossover_preview_arm64' ? 'arm64 / FEX ' : ''}folder for your Windows games and saves.
               </p>
             </button>
           </div>
@@ -746,6 +854,8 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
               <div className="text-[11px] font-semibold text-slate-300">Existing Bottles</div>
               <div className="flex flex-wrap gap-2">
                 {availableBottles.map((b) => {
+                  const isCompatible = isBottleArchCompatible(b);
+                  const bottleArch = b.wineArch || b.bottleArch;
                   const isActiveBottle =
                     bottleMode === 'reuse_existing' && bottleName.trim() === b.name;
                   return (
@@ -753,14 +863,25 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
                       key={`${b.runnerType}-${b.name}`}
                       type="button"
                       data-testid={`setup-existing-bottle-${b.name}`}
+                      disabled={!isCompatible}
+                      title={
+                        !isCompatible
+                          ? chosenRunner === 'crossover_preview_arm64'
+                            ? 'Incompatible Intel (win64) bottle — use a dedicated arm64 bottle to prevent corruption.'
+                            : 'Incompatible arm64 bottle — requires CrossOver Preview (arm64 / FEX).'
+                          : undefined
+                      }
                       onClick={() => {
+                        if (!isCompatible) return;
                         onChangeBottleMode('reuse_existing');
                         onChangeBottleName(b.name);
                       }}
-                      className={`min-h-6 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1.5 rounded-md border text-xs transition-all cursor-pointer ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
-                        isActiveBottle
-                          ? 'bg-[#1b2838] border-[#66c0f4] text-white'
-                          : 'bg-[#131c27] border-[#2a475e] text-slate-200 hover:border-[#66c0f4]/70'
+                      className={`min-h-6 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1.5 rounded-md border text-xs transition-all ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
+                        !isCompatible
+                          ? 'bg-[#131c27]/50 border-[#2a475e]/40 text-slate-400 opacity-55 cursor-not-allowed'
+                          : isActiveBottle
+                            ? 'bg-[#1b2838] border-[#66c0f4] text-white cursor-pointer'
+                            : 'bg-[#131c27] border-[#2a475e] text-slate-200 hover:border-[#66c0f4]/70 cursor-pointer'
                       }`}
                     >
                       <CheckCircle2
@@ -770,6 +891,16 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
                         aria-hidden="true"
                       />
                       <span className="font-semibold">{b.name}</span>
+                      {(bottleArch === 'arm64' || /-arm64$/i.test(b.name)) && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 border border-indigo-400/50 text-indigo-200 font-semibold">
+                          arm64 / FEX
+                        </span>
+                      )}
+                      {bottleArch === 'win64' && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-500/20 border border-slate-400/40 text-slate-200 font-semibold">
+                          Intel / win64
+                        </span>
+                      )}
                       {b.hasSteam && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 border border-sky-500/40 text-sky-200 font-semibold">
                           Steam
@@ -789,6 +920,22 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
                   );
                 })}
               </div>
+              {hasIncompatibleSelectedBottle && (
+                <div
+                  id="setup-bottle-arch-warning"
+                  data-testid="setup-bottle-arch-warning"
+                  role="alert"
+                  className="flex items-center gap-1.5 text-[11px] text-amber-200 mt-1"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+                  <span>
+                    Bottle &ldquo;{bottleName.trim()}&rdquo; uses an incompatible architecture for{' '}
+                    {chosenRunner === 'crossover_preview_arm64'
+                      ? 'CrossOver Preview (arm64 / FEX) — use a dedicated arm64 bottle like "OneLauncher-arm64".'
+                      : 'this Intel/Rosetta runner — choose a win64 bottle like "OneLauncher".'}
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -808,8 +955,8 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
               >
                 <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" aria-hidden="true" />
                 <span>
-                  Use 1–64 letters, numbers, spaces, dots, underscores, or hyphens (no
-                  &ldquo;..&rdquo;).
+                  Use 1–64 letters, numbers, spaces, dots, underscores, or hyphens (cannot be
+                  &ldquo;.&rdquo;, contain &ldquo;..&rdquo;, or start with &ldquo;-&rdquo;).
                 </span>
               </div>
             ) : (
@@ -821,11 +968,15 @@ export const CompatibilityAndBottleStep: React.FC<CompatibilityAndBottleStepProp
               id="setup-bottle-name-field"
               type="text"
               data-testid="setup-bottle-name-input"
-              aria-describedby="setup-bottle-name-desc"
-              aria-invalid={!bottleNameValid ? true : undefined}
+              aria-describedby={
+                hasIncompatibleSelectedBottle
+                  ? 'setup-bottle-name-desc setup-bottle-arch-warning'
+                  : 'setup-bottle-name-desc'
+              }
+              aria-invalid={!bottleNameValid || hasIncompatibleSelectedBottle ? true : undefined}
               value={bottleName}
               onChange={(e) => onChangeBottleName(e.target.value)}
-              placeholder="OneLauncher"
+              placeholder={defaultBottleForRunner}
               maxLength={64}
               autoComplete="off"
               autoCorrect="off"

@@ -2259,7 +2259,7 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
       completedAllLibraryPages = true;
     }
 
-    // Filter candidate records structurally through canonical `classifyNonGameStorefrontItem`
+    // Filter candidate records structurally; defer semantic classification until hydration resolves categories
     const filteredItems = [];
     for (const item of candidateRecords) {
       if (!item.appName || item.appName === '1' || item.sandboxType === 'PRIVATE') continue;
@@ -2273,28 +2273,49 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
 
       const metaTitle = (item.metadata?.title || '').trim();
       const itemType = (item.metadata?.itemType || '').toUpperCase();
-      const categories = item.metadata?.categories || [];
-      const mainGameItem = item.metadata?.mainGameItem || item.mainGameItem || null;
+      const rawCatalogId = String(item.catalogItemId || item.metadata?.id || '').trim();
+      const mainGameObj = item.metadata?.mainGameItem || item.mainGameItem || null;
+      const mainGameTargetId =
+        mainGameObj && typeof mainGameObj === 'object' && typeof mainGameObj.id === 'string'
+          ? mainGameObj.id.trim()
+          : '';
+      const hasDistinctParentGame = Boolean(
+        mainGameObj &&
+          (mainGameTargetId || mainGameObj.namespace) &&
+          (!rawCatalogId || !mainGameTargetId || mainGameTargetId !== rawCatalogId)
+      );
 
-      const structuralNonGameReason = classifyNonGameStorefrontItem({
-        store: 'epic',
-        title: metaTitle,
-        platformId: 'epic',
-        platformGameId: item.appName,
-        catalogItemId: item.catalogItemId || item.metadata?.id || '',
-        namespace: item.namespace || '',
-        sandboxType: item.sandboxType || '',
-        itemType,
-        mainGameItem,
-        categories,
-      });
+      const unambiguousDlcType = [
+        'ADD_ON',
+        'ADDON',
+        'ADD-ON',
+        'DLC',
+        'CONSUMABLE',
+        'WALLET',
+        'SUBSCRIPTION',
+        'PLUGIN',
+        'EXTRA',
+        'CURRENCY',
+      ].includes(itemType);
 
-      if (structuralNonGameReason) {
+      const rawCategories = Array.isArray(item.metadata?.categories) ? item.metadata.categories : [];
+      const earlyCatSegments = new Set();
+      for (const c of rawCategories) {
+        const p = String(typeof c === 'string' ? c : c?.path || '').toLowerCase();
+        for (const seg of p.split('/')) {
+          if (seg.trim()) earlyCatSegments.add(seg.trim());
+        }
+      }
+      const hasDefinitiveDlcCategory =
+        !earlyCatSegments.has('games') &&
+        ['addons', 'add-on', 'addon', 'dlc', 'consumable'].some((s) => earlyCatSegments.has(s));
+
+      if (unambiguousDlcType || hasDistinctParentGame || hasDefinitiveDlcCategory) {
         if (metaTitle) {
           pushEpicSuppressedItem(
             item,
             metaTitle,
-            structuralNonGameReason,
+            'Filtered: DLC / Add-On / Expansion Content',
             item.metadata?.description || '',
             item.metadata?.developer || '',
             item.metadata?.keyImages || []
@@ -2366,8 +2387,18 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
           let keyImages = item.metadata?.keyImages || [];
           let hasReleaseInfoMac = hasReleaseInfoPlatformMac(item.metadata?.releaseInfo);
           let catalogCustomAttributes = null;
+          let categories = Array.isArray(item.metadata?.categories) ? [...item.metadata.categories] : [];
+          let itemType = (item.metadata?.itemType || '').toUpperCase();
+          let mainGameItem = item.metadata?.mainGameItem || item.mainGameItem || null;
 
-          if (!item.metadata?.title || title === 'Live' || !title || /^[0-9a-f]{20,}$/i.test(title)) {
+          const needsCatalogLookup =
+            !title ||
+            title === 'Live' ||
+            /^[0-9a-f]{20,}$/i.test(title) ||
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title) ||
+            categories.length === 0;
+
+          if (needsCatalogLookup && item.namespace && item.catalogItemId) {
             let resolvedFromCatalog = false;
             const catAbort = new AbortController();
             const catTimer = setTimeout(() => catAbort.abort(), 6000);
@@ -2388,33 +2419,18 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
                   if (hasReleaseInfoPlatformMac(meta.releaseInfo)) {
                     hasReleaseInfoMac = true;
                   }
-                  const catalogNonGameReason = classifyNonGameStorefrontItem({
-                    store: 'epic',
-                    title: meta.title || title,
-                    platformId: 'epic',
-                    platformGameId: item.appName,
-                    catalogItemId: meta.id || item.catalogItemId || '',
-                    namespace: meta.namespace || item.namespace || '',
-                    itemType: meta.itemType || item.metadata?.itemType || '',
-                    mainGameItem: meta.mainGameItem || null,
-                    categories: meta.categories || [],
-                  });
-                  if (catalogNonGameReason) {
-                    if (meta.title) {
-                      pushEpicSuppressedItem(
-                        item,
-                        meta.title,
-                        catalogNonGameReason,
-                        meta.description || '',
-                        meta.developer || '',
-                        meta.keyImages || []
-                      );
-                    }
-                    return null;
-                  }
                   if (meta.title) {
                     title = meta.title;
                     resolvedFromCatalog = true;
+                  }
+                  if (Array.isArray(meta.categories) && meta.categories.length > 0) {
+                    categories = meta.categories;
+                  }
+                  if (meta.itemType) {
+                    itemType = meta.itemType.toUpperCase();
+                  }
+                  if (meta.mainGameItem) {
+                    mainGameItem = meta.mainGameItem;
                   }
                   description = meta.description || description;
                   developer = meta.developer || developer;
@@ -2428,24 +2444,35 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             } finally {
               clearTimeout(catTimer);
             }
-            if (!resolvedFromCatalog && !item.metadata?.title) {
+            const isUnhydratedTitle =
+              !title ||
+              title === 'Live' ||
+              /^[0-9a-f]{20,}$/i.test(title) ||
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title);
+
+            if (!resolvedFromCatalog && (isUnhydratedTitle || categories.length === 0)) {
               const localEpicFallback = storefrontLocalCacheFederator.resolveLocalEpicMetadata(
                 item.appName,
                 options
               );
               if (localEpicFallback && localEpicFallback.title) {
                 if (localEpicFallback.isDlc) return null;
-                title = localEpicFallback.title;
+                if (isUnhydratedTitle) {
+                  title = localEpicFallback.title;
+                }
                 description = localEpicFallback.shortDescription || description;
                 developer = localEpicFallback.developers?.[0] || developer;
                 keyImages =
                   Array.isArray(localEpicFallback.keyImages) && localEpicFallback.keyImages.length > 0
                     ? localEpicFallback.keyImages
                     : keyImages;
+                if (Array.isArray(localEpicFallback.categories) && localEpicFallback.categories.length > 0) {
+                  categories = localEpicFallback.categories;
+                }
                 if (localEpicFallback.platforms?.mac) {
                   hasReleaseInfoMac = true;
                 }
-              } else {
+              } else if (isUnhydratedTitle) {
                 if (catalogBatchEncounteredError) {
                   hadUnresolvedCatalogFailure = true;
                 }
@@ -2464,6 +2491,10 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
               hadUnresolvedCatalogFailure = true;
             }
             return null;
+          }
+
+          if (categories.length === 0) {
+            categories = [{ path: 'games' }];
           }
 
           let cleanDesc = String(description || '')
@@ -2492,8 +2523,9 @@ async function fetchEpicOwnedGames(accessToken, accountId, options = {}) {
             platformGameId: item.appName,
             catalogItemId: item.catalogItemId || '',
             namespace: item.namespace || '',
-            isDlc: false,
-            categories: item.metadata?.categories,
+            itemType,
+            mainGameItem,
+            categories,
           });
           if (nonGameReason) {
             pushEpicSuppressedItem(item, title, nonGameReason, cleanDesc, developer, keyImages);
@@ -4028,7 +4060,7 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
   // 1. Scan Legendary / Heroic Epic metadata directories (mtimeMs-cached per JSON file)
   const legendaryDirs =
     allowUnverifiedLocalCache || expectedEpicAccountId
-      ? customOptions.legendaryDirs || getLocalLegendaryBaseDirs()
+      ? customOptions.legendaryDirs || customOptions.legendaryBaseDirs || getLocalLegendaryBaseDirs(customOptions)
       : [];
   for (const baseDir of legendaryDirs) {
     const metaDir = fs.existsSync(path.join(baseDir, 'metadata'))
@@ -4094,16 +4126,20 @@ function scanLocalSuppressedStorefrontItems(customOptions = {}) {
           }
 
           const categories = json?.metadata?.categories || [];
+          const mainGameItem = json?.metadata?.mainGameItem || null;
           const hasMainGame = Boolean(
-            json?.metadata?.mainGameItem &&
-              (json.metadata.mainGameItem.id || json.metadata.mainGameItem.namespace)
+            mainGameItem && (mainGameItem.id || mainGameItem.namespace)
           );
           const itemType = json?.metadata?.itemType || '';
           const reason = classifyNonGameStorefrontItem({
+            store: 'epic',
             title,
             platformId: 'epic',
             platformGameId: appName,
+            catalogItemId: json?.metadata?.id || json?.catalog_item_id || '',
+            namespace: ns,
             isDlc: hasMainGame,
+            mainGameItem,
             itemType,
             categories,
           });

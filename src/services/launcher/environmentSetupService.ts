@@ -58,6 +58,7 @@ const ALL_ENVIRONMENT_COMPONENT_IDS: ReadonlySet<EnvironmentComponentId> = new S
   'win_webview2',
   'runner_crossover',
   'runner_crossover_preview',
+  'runner_crossover_preview_arm64',
   'runner_wine',
   'runner_gptk',
   'bottle_default',
@@ -80,17 +81,29 @@ const ALL_ENVIRONMENT_COMPONENT_IDS: ReadonlySet<EnvironmentComponentId> = new S
 
 const VALID_PREFERRED_RUNNERS: ReadonlySet<
   Exclude<CompatibilityLayerType, 'native'> | 'skip'
-> = new Set(['crossover', 'crossover_preview', 'gptk', 'wine', 'skip']);
+> = new Set([
+  'crossover',
+  'crossover_preview',
+  'crossover_preview_arm64',
+  'gptk',
+  'wine',
+  'skip',
+]);
 
 const RUNNER_COMPONENT_TO_TYPE: ReadonlyArray<{
   componentId: Extract<
     EnvironmentComponentId,
-    'runner_crossover' | 'runner_crossover_preview' | 'runner_wine' | 'runner_gptk'
+    | 'runner_crossover'
+    | 'runner_crossover_preview'
+    | 'runner_crossover_preview_arm64'
+    | 'runner_wine'
+    | 'runner_gptk'
   >;
   runnerType: Exclude<CompatibilityLayerType, 'native'>;
 }> = [
   { componentId: 'runner_crossover', runnerType: 'crossover' },
   { componentId: 'runner_crossover_preview', runnerType: 'crossover_preview' },
+  { componentId: 'runner_crossover_preview_arm64', runnerType: 'crossover_preview_arm64' },
   { componentId: 'runner_wine', runnerType: 'wine' },
   { componentId: 'runner_gptk', runnerType: 'gptk' },
 ];
@@ -444,6 +457,27 @@ export function buildFallbackEnvironmentSnapshot(
       whyExplanation:
         'Early-access version of CrossOver for active subscribers.',
       statusDetail: isMac ? 'Not installed.' : 'Not needed on Windows.',
+    },
+    runner_crossover_preview_arm64: {
+      id: 'runner_crossover_preview_arm64',
+      category: 'compatibility_runner',
+      scope: 'system',
+      title: 'CrossOver Preview (arm64 / FEX)',
+      shortLabel: 'Preview (arm64)',
+      status: isAppleSiliconMac ? 'missing' : 'not_applicable',
+      canAutoInstall: isAppleSiliconMac,
+      requiresExternalDownload: !isAppleSiliconMac,
+      externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
+      recommendationTier: isAppleSiliconMac ? 'optional' : 'not_needed',
+      recommendationBadge: isAppleSiliconMac ? 'Experimental' : 'Not Needed',
+      defaultSelected: false,
+      whyExplanation:
+        'Experimental arm64 Wine + FEX branch of CrossOver Preview with dedicated arm64 bottles on Apple Silicon.',
+      statusDetail: isAppleSiliconMac
+        ? 'Not installed yet.'
+        : isMac
+          ? 'Requires Apple Silicon.'
+          : 'Not needed on Windows.',
     },
     runner_wine: {
       id: 'runner_wine',
@@ -906,6 +940,20 @@ export function buildFallbackEnvironmentSnapshot(
   };
 }
 
+function isBottleCompatibleWithSetupRunner(
+  bottle: { wineArch?: 'win64' | 'arm64'; bottleArch?: 'win64' | 'arm64'; name: string },
+  runner: Exclude<CompatibilityLayerType, 'native'> | 'skip' | undefined
+): boolean {
+  const arch = bottle.wineArch || bottle.bottleArch;
+  if (runner === 'crossover_preview_arm64') {
+    return arch ? arch === 'arm64' : /-arm64$/i.test(bottle.name);
+  }
+  if (runner === 'crossover' || runner === 'crossover_preview') {
+    return arch ? arch === 'win64' : !/-arm64$/i.test(bottle.name);
+  }
+  return true;
+}
+
 /**
  * Compute smart default component selections based on host OS, detected runners,
  * connected storefronts, and any previously configured components that were removed.
@@ -967,19 +1015,41 @@ export function computeDefaultSelectedComponents(
   const hasRunnerSelected = RUNNER_COMPONENT_TO_TYPE.some(({ componentId }) =>
     selected.has(componentId)
   );
+  const chosenRunnerComp =
+    isMac && chosenRunner && !skipRunner
+      ? snapshot.components[
+          RUNNER_COMPONENT_TO_TYPE.find((e) => e.runnerType === chosenRunner)?.componentId ??
+            'runner_crossover'
+        ]
+      : undefined;
   const hasRunnerInstalledOrSelected =
     isMac &&
     !skipRunner &&
     (snapshot.detectedRunners.length > 0 ||
       snapshot.bottleSummary?.runnerInstalled === true ||
-      hasRunnerSelected);
+      hasRunnerSelected ||
+      chosenRunnerComp?.status === 'ready' ||
+      chosenRunnerComp?.status === 'update_available');
+
+  const effectiveRunnerForBottle =
+    chosenRunner && !skipRunner ? chosenRunner : snapshot.bottleSummary?.runnerType ?? undefined;
+  const availBottles = snapshot.bottleSummary?.availableBottles ?? [];
+  const hasCompatBottleForRunner =
+    effectiveRunnerForBottle === 'crossover_preview_arm64'
+      ? availBottles.length > 0
+        ? availBottles.some((b) => isBottleCompatibleWithSetupRunner(b, 'crossover_preview_arm64'))
+        : snapshot.bottleSummary?.runnerType === 'crossover_preview_arm64' &&
+          snapshot.components.bottle_default?.status === 'ready'
+      : availBottles.length > 0 && effectiveRunnerForBottle
+        ? availBottles.some((b) => isBottleCompatibleWithSetupRunner(b, effectiveRunnerForBottle))
+        : snapshot.components.bottle_default?.status === 'ready';
 
   // 3. Default Windows bottle on macOS when runner is installed or selected
   if (
     hasRunnerInstalledOrSelected &&
     snapshot.components.bottle_default &&
-    snapshot.components.bottle_default.status !== 'ready' &&
-    snapshot.components.bottle_default.status !== 'not_applicable'
+    snapshot.components.bottle_default.status !== 'not_applicable' &&
+    (snapshot.components.bottle_default.status !== 'ready' || !hasCompatBottleForRunner)
   ) {
     selected.add('bottle_default');
   }
@@ -993,7 +1063,9 @@ export function computeDefaultSelectedComponents(
   if (
     hasRunnerInstalledOrSelected &&
     steamRelevant &&
-    snapshot.components.bottle_steam?.status === 'missing'
+    snapshot.components.bottle_steam &&
+    snapshot.components.bottle_steam.status !== 'not_applicable' &&
+    (snapshot.components.bottle_steam.status === 'missing' || !hasCompatBottleForRunner)
   ) {
     selected.add('bottle_steam');
   }
@@ -1072,27 +1144,13 @@ export function buildProvisioningTasksFromSelection(
   const isMac = snapshot.hostPlatform === 'darwin';
   const isWin = snapshot.hostPlatform === 'win32';
   const skipRunner = chosenRunner === 'skip';
-  const trimmedBottleName = bottleName.trim() || snapshot.bottleSummary?.recommendedBottleName || 'OneLauncher';
-
-  const shouldProvision = (id: EnvironmentComponentId): boolean => {
-    const comp = snapshot.components[id];
-    if (comp?.status === 'not_applicable') return false;
-    const isRunnerComponent = RUNNER_COMPONENT_TO_TYPE.some((entry) => entry.componentId === id);
-    if (comp?.status === 'update_available' && isRunnerComponent) {
-      if (runnerUpdateOptInIds) {
-        return runnerUpdateOptInIds.has(id);
-      }
-      const serviceOptIn = environmentSetupService.getRunnerUpdateOptIn(id);
-      if (serviceOptIn !== undefined) {
-        return serviceOptIn;
-      }
-    }
-    if (!selectedIds.has(id)) return false;
-    if (comp?.status === 'ready' && !forceRepairIds?.has(id)) {
-      return false;
-    }
-    return true;
-  };
+  const defaultRunnerBottle =
+    chosenRunner === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+  const trimmedBottleName =
+    bottleName.trim() ||
+    (chosenRunner === 'crossover_preview_arm64'
+      ? defaultRunnerBottle
+      : snapshot.bottleSummary?.recommendedBottleName || defaultRunnerBottle);
 
   let effectiveRunnerType: Exclude<CompatibilityLayerType, 'native'> | undefined;
   if (!skipRunner) {
@@ -1106,6 +1164,56 @@ export function buildProvisioningTasksFromSelection(
     );
     effectiveRunnerType = firstDetected?.type;
   }
+
+  const availBottles = snapshot.bottleSummary?.availableBottles ?? [];
+  const matchedTargetBottle = availBottles.find((b) => b.name === trimmedBottleName);
+  const targetBottleExistsCompatibly = Boolean(
+    matchedTargetBottle &&
+      isBottleCompatibleWithSetupRunner(matchedTargetBottle, effectiveRunnerType)
+  );
+  const targetBottleNeedsCreation =
+    isMac &&
+    !skipRunner &&
+    snapshot.components.bottle_default?.status !== 'not_applicable' &&
+    !targetBottleExistsCompatibly &&
+    (availBottles.length > 0
+      ? bottleMode === 'create_dedicated' || chosenRunner === 'crossover_preview_arm64'
+      : chosenRunner === 'crossover_preview_arm64' &&
+        (snapshot.bottleSummary?.runnerType !== 'crossover_preview_arm64' ||
+          snapshot.bottleSummary?.recommendedBottleName !== trimmedBottleName));
+
+  const chosenRunnerComponentId: EnvironmentComponentId | null =
+    chosenRunner && chosenRunner !== 'skip'
+      ? RUNNER_COMPONENT_TO_TYPE.find((entry) => entry.runnerType === chosenRunner)?.componentId ?? null
+      : null;
+
+  const shouldProvision = (id: EnvironmentComponentId): boolean => {
+    const comp = snapshot.components[id];
+    if (comp?.status === 'not_applicable') return false;
+    const isRunnerComponent = RUNNER_COMPONENT_TO_TYPE.some((entry) => entry.componentId === id);
+    if (comp?.status === 'update_available' && isRunnerComponent) {
+      if (id !== chosenRunnerComponentId && !selectedIds.has(id)) {
+        return false;
+      }
+      if (runnerUpdateOptInIds) {
+        return runnerUpdateOptInIds.has(id);
+      }
+      const serviceOptIn = environmentSetupService.getRunnerUpdateOptIn(id);
+      if (serviceOptIn !== undefined) {
+        return serviceOptIn;
+      }
+    }
+    if (!selectedIds.has(id)) {
+      return id === 'bottle_default' && targetBottleNeedsCreation;
+    }
+    if (targetBottleNeedsCreation && (id === 'bottle_default' || id.startsWith('bottle_'))) {
+      return true;
+    }
+    if (comp?.status === 'ready' && !forceRepairIds?.has(id)) {
+      return false;
+    }
+    return true;
+  };
 
   const tasks: EnvironmentSetupTaskRequest[] = [];
 
@@ -1458,20 +1566,20 @@ export class EnvironmentSetupService {
 
   public probeHealth(
     connectedStorefronts?: StorefrontId[],
-    options?: { forceFresh?: boolean }
+    options?: { forceFresh?: boolean; forceRefreshRunnerUpdates?: boolean }
   ): Promise<EnvironmentHealthSnapshot> {
     this.ensureProgressSubscription();
     if (options?.forceFresh) {
       this.runnerUpdateOptIn.clear();
     }
     if (this.inFlightProbePromise) {
-      if (!options?.forceFresh) {
+      if (!options?.forceFresh && !options?.forceRefreshRunnerUpdates) {
         return this.inFlightProbePromise;
       }
       const prior = this.inFlightProbePromise;
       return prior
         .catch(() => undefined)
-        .then(() => this.probeHealth(connectedStorefronts, { forceFresh: false }));
+        .then(() => this.probeHealth(connectedStorefronts, options));
     }
 
     const effectiveStorefronts =
@@ -1485,6 +1593,10 @@ export class EnvironmentSetupService {
         try {
           const snapshot = await window.electronAPI.probeEnvironmentHealth({
             connectedStorefronts: effectiveStorefronts,
+            ...(options?.forceFresh ? { forceFresh: true } : {}),
+            ...(options?.forceRefreshRunnerUpdates
+              ? { forceRefreshRunnerUpdates: true }
+              : {}),
           });
           if (isCompleteHealthSnapshot(snapshot)) {
             this.lastSnapshot = snapshot;
@@ -1676,6 +1788,7 @@ export class EnvironmentSetupService {
         await Promise.allSettled([
           launcherService.detectCompatibilityLayers(),
           launcherService.detectInstalledStorefrontClients(),
+          launcherService.checkCompatibilityLayerUpdates(),
         ]);
 
         return {
@@ -1753,6 +1866,9 @@ export class EnvironmentSetupService {
               if (req.runnerType === 'crossover') impliedReadyIds.push('runner_crossover');
               if (req.runnerType === 'crossover_preview') {
                 impliedReadyIds.push('runner_crossover_preview');
+              }
+              if (req.runnerType === 'crossover_preview_arm64') {
+                impliedReadyIds.push('runner_crossover_preview_arm64');
               }
               if (req.runnerType === 'wine') impliedReadyIds.push('runner_wine');
               if (req.runnerType === 'gptk') impliedReadyIds.push('runner_gptk');
@@ -1847,3 +1963,12 @@ export class EnvironmentSetupService {
 }
 
 export const environmentSetupService = new EnvironmentSetupService();
+
+launcherService.registerPostRunnerMutationSyncHook(async () => {
+  if (
+    typeof window !== 'undefined' &&
+    typeof window.electronAPI?.probeEnvironmentHealth === 'function'
+  ) {
+    await environmentSetupService.probeHealth(undefined, { forceFresh: true });
+  }
+});

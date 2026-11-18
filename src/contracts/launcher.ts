@@ -24,6 +24,7 @@ export type CompatibilityLayerType =
   | 'native'
   | 'crossover'
   | 'crossover_preview'
+  | 'crossover_preview_arm64'
   | 'gptk'
   | 'wine';
 
@@ -64,6 +65,19 @@ export interface CompatibilityLayerInfo {
   version?: string;
   buildVersion?: string;
   displayVersion?: string;
+  previewBranch?: 'standard' | 'arm64';
+  supportedBottleArches?: Array<'win64' | 'arm64'>;
+  bottleDetails?: Record<
+    string,
+    {
+      wineArch?: 'win64' | 'arm64';
+      previewEnabled?: boolean;
+      timestamp?: string;
+    }
+  >;
+  buildTimestamp?: string;
+  previewDate?: string;
+  previewBuildDate?: string;
   d3dmetalVersion?: string;
   availableD3DMetalVersions?: BundledD3DMetalVersionInfo[];
   hostArch?: string;
@@ -114,10 +128,15 @@ export interface CompatibilityLayerUpdateInfo {
   latestDisplayVersion?: string;
   updateAvailable: boolean;
   downloadUrl?: string;
+  portalUrl?: string;
   releaseNotesUrl?: string;
   canAutoUpdate: boolean;
   updateMethod?: CompatibilityLayerUpdateMethod;
   estimatedDownloadBytes?: number;
+  authRequired?: boolean;
+  previewBranch?: 'standard' | 'arm64';
+  previewDate?: string;
+  semver?: string;
   stableSurpassesPreview?: boolean;
   stableFallbackVersion?: string;
   statusMessage?: string;
@@ -129,12 +148,15 @@ export interface UpdateCompatibilityLayerPayload {
   dmgPath?: string;
   archivePath?: string;
   switchToStableCrossOver?: boolean;
+  authenticateOnly?: boolean;
 }
 
 export interface UpdateCompatibilityLayerResult {
   success: boolean;
   runnerType: CompatibilityLayerType;
   updated: boolean;
+  authenticated?: boolean;
+  alreadyUpToDate?: boolean;
   cancelled?: boolean;
   previousVersion?: string;
   newVersion?: string;
@@ -161,6 +183,10 @@ export interface CompatibilityRunnerDescriptor {
   canAutoInstallViaBrew?: boolean;
   canAutoInstallDirect?: boolean;
   estimatedDownloadMB?: number;
+  previewBranch?: 'standard' | 'arm64';
+  defaultBottleName?: string;
+  requiresAppleSilicon?: boolean;
+  supportedBottleArches?: Array<'win64' | 'arm64'>;
 }
 
 export interface InstallCompatibilityLayerRequest {
@@ -168,15 +194,19 @@ export interface InstallCompatibilityLayerRequest {
   mode?: 'auto' | 'direct' | 'download';
   dmgPath?: string;
   archivePath?: string;
+  authenticateOnly?: boolean;
 }
 
 export interface InstallCompatibilityLayerResult {
   success: boolean;
   installed?: boolean;
+  authenticated?: boolean;
+  alreadyUpToDate?: boolean;
   cancelled?: boolean;
   openedExternalInstaller?: boolean;
   runnerType: string;
   installedPath?: string;
+  downloadUrl?: string;
   busyCode?: 'RUNNER_BUSY_ACTIVE_SESSION' | 'RUNNER_BUSY_EXTERNAL_PROCESS';
   message?: string;
   error?: string;
@@ -838,4 +868,48 @@ export interface AppUpdateCheckResult {
   downloadUrl?: string;
   publishedAt?: string;
   error?: string;
+}
+
+export function isBottleCompatibleWithLayer(
+  bottleName: string,
+  layer: Pick<CompatibilityLayerInfo, 'type' | 'bottleDetails'> | undefined,
+  layerType?: CompatibilityLayerType | string
+): boolean {
+  const trimmed = bottleName.trim();
+  if (!trimmed) return false;
+  const effectiveType = layerType || layer?.type;
+  const arch = layer?.bottleDetails?.[trimmed]?.wineArch;
+  if (effectiveType === 'crossover_preview_arm64') {
+    return arch ? arch === 'arm64' : !/^OneLauncher$/i.test(trimmed);
+  }
+  if (effectiveType === 'crossover' || effectiveType === 'crossover_preview') {
+    return arch ? arch === 'win64' : !/-arm64$/i.test(trimmed);
+  }
+  return true;
+}
+
+export function resolveDefaultBottleForLayer(
+  layer: Pick<CompatibilityLayerInfo, 'type' | 'availableBottles' | 'bottleDetails'> | undefined,
+  layerType?: CompatibilityLayerType | string,
+  descriptorDefault?: string
+): string | undefined {
+  const effectiveType = layerType || layer?.type;
+  const bottles = layer?.availableBottles || [];
+  const compatible = bottles.filter((b) => isBottleCompatibleWithLayer(b, layer, effectiveType));
+  const preferredDefault =
+    descriptorDefault ||
+    (effectiveType === 'crossover_preview_arm64'
+      ? 'OneLauncher-arm64'
+      : effectiveType === 'crossover' || effectiveType === 'crossover_preview'
+        ? 'OneLauncher'
+        : undefined);
+  if (preferredDefault) {
+    const exact = compatible.find((b) => b.toLowerCase() === preferredDefault.toLowerCase());
+    if (exact) return exact;
+  }
+  if (effectiveType === 'crossover' || effectiveType === 'crossover_preview') {
+    const defaultNamed = compatible.find((b) => b.toLowerCase() === 'default');
+    if (defaultNamed) return defaultNamed;
+  }
+  return compatible[0] || preferredDefault || bottles[0];
 }

@@ -40,6 +40,7 @@ const ALLOWED_ENVIRONMENT_COMPONENT_IDS = new Set([
   'win_webview2',
   'runner_crossover',
   'runner_crossover_preview',
+  'runner_crossover_preview_arm64',
   'runner_wine',
   'runner_gptk',
   'bottle_default',
@@ -57,6 +58,7 @@ const ALLOWED_ENVIRONMENT_COMPONENT_IDS = new Set([
   'bottle_bnet',
   'host_rockstar',
   'bottle_rockstar',
+  'host_riot',
   'xbox_runtime',
 ]);
 
@@ -72,6 +74,7 @@ const ALLOWED_ENVIRONMENT_TASK_ACTIONS = new Set([
 const ALLOWED_NON_NATIVE_RUNNERS = new Set([
   'crossover',
   'crossover_preview',
+  'crossover_preview_arm64',
   'gptk',
   'wine',
 ]);
@@ -86,6 +89,7 @@ const ALLOWED_COMPAT_INSTALL_MODES = new Set([
 const ALLOWED_PREFERRED_RUNNER_TYPES = new Set([
   'crossover',
   'crossover_preview',
+  'crossover_preview_arm64',
   'gptk',
   'wine',
   'skip',
@@ -126,6 +130,18 @@ const ALLOWED_SETUP_WIZARD_STATE_PATCH_KEYS = [
 const SAFE_BOTTLE_NAME_SLUG_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
 
 /**
+ * Normalize a compatibility runner identifier from renderer IPC:
+ * trim whitespace, lowercase, and strip any leading `'runner_'` component prefix.
+ *
+ * @param {unknown} rawValue
+ * @returns {string}
+ */
+function normalizeRunnerTypeInput(rawValue) {
+  if (typeof rawValue !== 'string') return '';
+  return rawValue.trim().toLowerCase().replace(/^runner_/, '');
+}
+
+/**
  * Validate and normalize a safe CrossOver/Wine bottle name slug (`[A-Za-z0-9 _.-]{1,64}`),
  * rejecting null bytes, path separators, and `.` / `..` segments.
  *
@@ -136,6 +152,7 @@ function sanitizeSafeBottleNameSlug(rawName) {
   if (typeof rawName !== 'string') return null;
   const trimmed = rawName.trim();
   if (!trimmed || trimmed.length > 64) return null;
+  if (trimmed.startsWith('-')) return null;
   if (trimmed.includes('\0') || trimmed.includes('/') || trimmed.includes('\\')) return null;
   if (!SAFE_BOTTLE_NAME_SLUG_RE.test(trimmed)) return null;
   if (trimmed === '.' || trimmed === '..' || trimmed.includes('..')) return null;
@@ -369,7 +386,7 @@ function sanitizeCompatLayerPayload(rawPayload, operation) {
         error: 'Invalid compatibility layer runnerType.',
       };
     }
-    const candidate = clean.runnerType.trim().toLowerCase();
+    const candidate = normalizeRunnerTypeInput(clean.runnerType);
     if (!ALLOWED_NON_NATIVE_RUNNERS.has(candidate)) {
       return {
         ok: false,
@@ -397,6 +414,9 @@ function sanitizeCompatLayerPayload(rawPayload, operation) {
   if (archiveCheck.value) {
     payloadOut.archivePath = archiveCheck.value;
   }
+  if (typeof clean.authenticateOnly === 'boolean') {
+    payloadOut.authenticateOnly = clean.authenticateOnly;
+  }
 
   if (operation === 'install') {
     if (clean.mode !== undefined && clean.mode !== null && clean.mode !== '') {
@@ -418,6 +438,19 @@ function sanitizeCompatLayerPayload(rawPayload, operation) {
   }
 
   return { ok: true, runnerType, payload: payloadOut };
+}
+
+/**
+ * Strict allowlist sanitizer for read-only compatibility layer detection and update check
+ * queries (`launcher:detect-compat-layers`, `launcher:check-compat-updates`).
+ * Strips all renderer-supplied overrides, test/DI hooks, mock feeds, candidate URLs,
+ * loopback flags, custom application directories, and host-spoofing properties.
+ *
+ * @param {unknown} _rawOptions
+ * @returns {Record<string, never>}
+ */
+function sanitizeCompatQueryOptions(_rawOptions) {
+  return {};
 }
 
 /**
@@ -505,13 +538,14 @@ function sanitizeEnvironmentSetupTasksPayload(rawPayload) {
       cleanTaskInput.runnerType !== null &&
       cleanTaskInput.runnerType !== ''
     ) {
+      const normalizedTaskRunner = normalizeRunnerTypeInput(cleanTaskInput.runnerType);
       if (
         typeof cleanTaskInput.runnerType !== 'string' ||
-        !ALLOWED_NON_NATIVE_RUNNERS.has(cleanTaskInput.runnerType.trim())
+        !ALLOWED_NON_NATIVE_RUNNERS.has(normalizedTaskRunner)
       ) {
         return { ok: false, runId: cleanRunId, error: 'Invalid runnerType in setup task.' };
       }
-      taskOut.runnerType = cleanTaskInput.runnerType.trim();
+      taskOut.runnerType = normalizedTaskRunner;
     }
 
     if (
@@ -619,13 +653,14 @@ function sanitizeGuidedClientLoginPayload(rawPayload) {
     cleanRoot.runnerType !== null &&
     cleanRoot.runnerType !== ''
   ) {
+    const normalizedLoginRunner = normalizeRunnerTypeInput(cleanRoot.runnerType);
     if (
       typeof cleanRoot.runnerType !== 'string' ||
-      !ALLOWED_NON_NATIVE_RUNNERS.has(cleanRoot.runnerType.trim())
+      !ALLOWED_NON_NATIVE_RUNNERS.has(normalizedLoginRunner)
     ) {
       return { ok: false, targetId: rawTargetId, error: 'Invalid runnerType for guided login.' };
     }
-    payloadOut.runnerType = cleanRoot.runnerType.trim();
+    payloadOut.runnerType = normalizedLoginRunner;
   }
 
   if (
@@ -680,11 +715,11 @@ function sanitizeSetupWizardStatePatch(rawPatch) {
     }
   }
 
-  if (
-    typeof cleanRoot.preferredRunnerType === 'string' &&
-    ALLOWED_PREFERRED_RUNNER_TYPES.has(cleanRoot.preferredRunnerType.trim())
-  ) {
-    out.preferredRunnerType = cleanRoot.preferredRunnerType.trim();
+  if (typeof cleanRoot.preferredRunnerType === 'string') {
+    const normalizedPreferred = normalizeRunnerTypeInput(cleanRoot.preferredRunnerType);
+    if (ALLOWED_PREFERRED_RUNNER_TYPES.has(normalizedPreferred)) {
+      out.preferredRunnerType = normalizedPreferred;
+    }
   }
 
   if (cleanRoot.preferredBottleName !== undefined && cleanRoot.preferredBottleName !== null) {
@@ -895,7 +930,7 @@ function registerLauncherIpcHandlers({
   const ipcActiveCompatOps = new Map();
 
   ipcMain.handle('launcher:detect-compat-layers', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
-    return launcherEngine.detectCompatibilityLayers(sanitizeRendererIpcOptions(options));
+    return launcherEngine.detectCompatibilityLayers(sanitizeCompatQueryOptions(options));
   });
 
   ipcMain.handle('launcher:install-compat-layer', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
@@ -941,7 +976,13 @@ function registerLauncherIpcHandlers({
     );
     ipcActiveCompatOps.set(validation.runnerType, { controller, promise: opPromise });
     try {
-      return await opPromise;
+      const res = await opPromise;
+      if (typeof launcherEngine.invalidateProberRunnerUpdatesCache === 'function') {
+        try {
+          launcherEngine.invalidateProberRunnerUpdatesCache({ skipPreviewUrlCacheClear: true });
+        } catch {}
+      }
+      return res;
     } finally {
       const cur = ipcActiveCompatOps.get(validation.runnerType);
       if (cur && cur.promise === opPromise) {
@@ -951,7 +992,7 @@ function registerLauncherIpcHandlers({
   });
 
   ipcMain.handle('launcher:check-compat-updates', async (/** @type {any} */ _event, /** @type {unknown} */ options) => {
-    return await launcherEngine.checkCompatibilityLayerUpdates(sanitizeRendererIpcOptions(options));
+    return await launcherEngine.checkCompatibilityLayerUpdates(sanitizeCompatQueryOptions(options));
   });
 
   ipcMain.handle('launcher:update-compat-layer', async (/** @type {any} */ _event, /** @type {unknown} */ payload) => {
@@ -993,7 +1034,13 @@ function registerLauncherIpcHandlers({
     );
     ipcActiveCompatOps.set(validation.runnerType, { controller, promise: opPromise });
     try {
-      return await opPromise;
+      const res = await opPromise;
+      if (typeof launcherEngine.invalidateProberRunnerUpdatesCache === 'function') {
+        try {
+          launcherEngine.invalidateProberRunnerUpdatesCache({ skipPreviewUrlCacheClear: true });
+        } catch {}
+      }
+      return res;
     } finally {
       const cur = ipcActiveCompatOps.get(validation.runnerType);
       if (cur && cur.promise === opPromise) {
@@ -1014,7 +1061,7 @@ function registerLauncherIpcHandlers({
     if (!rawCandidate || rawCandidate.includes('\0')) {
       return { success: false, cancelled: false };
     }
-    const cleanRunnerType = rawCandidate.trim().toLowerCase();
+    const cleanRunnerType = normalizeRunnerTypeInput(rawCandidate);
     if (!ALLOWED_NON_NATIVE_RUNNERS.has(cleanRunnerType)) {
       return { success: false, cancelled: false };
     }
@@ -1385,6 +1432,17 @@ function registerLauncherIpcHandlers({
           isMac ? 'missing' : 'not_applicable',
           isMac ? 'optional' : 'not_needed'
         ),
+        runner_crossover_preview_arm64: {
+          ...mkComp(
+            'runner_crossover_preview_arm64',
+            'compatibility_runner',
+            isAppleSiliconMac ? 'missing' : 'not_applicable',
+            isAppleSiliconMac ? 'optional' : 'not_needed'
+          ),
+          title: 'CrossOver Preview (arm64 / FEX)',
+          shortLabel: 'Preview (arm64)',
+          canAutoInstall: isAppleSiliconMac,
+        },
         runner_wine: mkComp(
           'runner_wine',
           'compatibility_runner',
@@ -1544,6 +1602,12 @@ function registerLauncherIpcHandlers({
       const cleanOpts = {};
       if (Array.isArray(sanitized.connectedStorefronts)) {
         cleanOpts.connectedStorefronts = sanitizeStorefrontIdList(sanitized.connectedStorefronts);
+      }
+      if (sanitized.forceFresh === true) {
+        cleanOpts.forceFresh = true;
+      }
+      if (sanitized.forceRefreshRunnerUpdates === true) {
+        cleanOpts.forceRefreshRunnerUpdates = true;
       }
       if (typeof launcherEngine.probeEnvironmentHealth !== 'function') {
         return buildContractSafeIpcSnapshotFallback(cleanOpts.connectedStorefronts);
@@ -1800,6 +1864,7 @@ module.exports = {
   validateOptionalDmgPath,
   validateOptionalRunnerArchivePath,
   sanitizeCompatLayerPayload,
+  sanitizeCompatQueryOptions,
   sanitizeEnvironmentSetupTasksPayload,
   sanitizeGuidedClientLoginPayload,
   sanitizeSetupWizardStatePatch,

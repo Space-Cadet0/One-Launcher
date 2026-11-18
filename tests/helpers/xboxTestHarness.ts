@@ -942,10 +942,26 @@ export function createDomain12DeepRenderer<P extends object>(RootComponent: Reac
   ): any => {
     if (node === null || node === undefined || typeof node === 'boolean') return node;
     if (typeof node === 'string' || typeof node === 'number') return node;
+    const ensureArrayElementKeys = (el: any, keyHint: string, originalKey?: any): any => {
+      if (el === null || el === undefined || typeof el !== 'object') return el;
+      if (Array.isArray(el)) {
+        return el.map((sub, subIdx) => ensureArrayElementKeys(sub, `${keyHint}.${subIdx}`));
+      }
+      if (el.$$typeof && (el.key === null || el.key === undefined)) {
+        const resolvedKey =
+          originalKey !== null && originalKey !== undefined ? originalKey : keyHint;
+        return React.cloneElement(el, { key: resolvedKey });
+      }
+      return el;
+    };
+
     if (Array.isArray(node)) {
-      return node.map((child, idx) =>
-        renderNode(child, `${pathPrefix}[${idx}]`, pendingEffects, visitedSlots)
-      );
+      return node.map((child, idx) => {
+        const childKey =
+          child && typeof child === 'object' ? child.key : undefined;
+        const rendered = renderNode(child, `${pathPrefix}[${idx}]`, pendingEffects, visitedSlots);
+        return ensureArrayElementKeys(rendered, `d12-${pathPrefix}-${idx}`, childKey);
+      });
     }
     if (typeof node !== 'object') return node;
 

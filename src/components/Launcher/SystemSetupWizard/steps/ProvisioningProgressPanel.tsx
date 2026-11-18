@@ -43,10 +43,13 @@ function describeTaskAction(
       return task.forceUpdate || components[task.componentId]?.status === 'update_available'
         ? `Update ${compTitle}`
         : `Install ${compTitle}`;
-    case 'ensure_bottle':
+    case 'ensure_bottle': {
+      const fallbackBottle =
+        task.runnerType === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
       return task.bottleMode === 'reuse_existing'
-        ? `Set up existing "${task.bottleName || 'OneLauncher'}" bottle`
-        : `Create "${task.bottleName || 'OneLauncher'}" bottle`;
+        ? `Set up existing "${task.bottleName || fallbackBottle}" bottle`
+        : `Create "${task.bottleName || fallbackBottle}" bottle`;
+    }
     case 'install_client':
       return `Install ${compTitle}`;
     case 'sync_first_party_manifests':

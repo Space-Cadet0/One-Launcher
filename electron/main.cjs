@@ -1331,12 +1331,12 @@ trustedIpcMain.handle('app:get-version', () => {
   try {
     return app.getVersion();
   } catch {
-    return '0.2.6';
+    return '0.2.7';
   }
 });
 
 trustedIpcMain.handle('app:get-info', () => {
-  let version = '0.2.6';
+  let version = '0.2.7';
   try {
     version = app.getVersion();
   } catch {}
@@ -1356,7 +1356,7 @@ trustedIpcMain.handle('app:check-for-updates', async () => {
     ? rawRepoSlug
     : 'Space-Cadet0/One-Launcher';
   const defaultReleaseUrl = `https://github.com/${repoSlug}/releases`;
-  let currentVersion = '0.2.6';
+  let currentVersion = '0.2.7';
   try {
     currentVersion = app.getVersion();
   } catch {}

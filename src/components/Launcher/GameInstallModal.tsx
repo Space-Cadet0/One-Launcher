@@ -9,6 +9,7 @@ import {
   DiskSpaceInfo,
   DownloadTaskState,
   GameInstallInfo,
+  resolveDefaultBottleForLayer,
 } from '../../contracts/launcher';
 import { launcherService } from '../../services/launcher/launcherService';
 import { environmentSetupService } from '../../services/launcher/environmentSetupService';
@@ -176,6 +177,85 @@ function deduplicateInstallers(
   return bestPerGroup.sort((a, b) => getSortRank(a) - getSortRank(b));
 }
 
+function isInstallBottleCompatibleWithRunner(
+  bottleName: string,
+  layer: CompatibilityLayerInfo | undefined,
+  runnerType: string,
+  allLayers?: CompatibilityLayerInfo[]
+): boolean {
+  if (!bottleName) return true;
+  const arch =
+    layer?.bottleDetails?.[bottleName]?.wineArch ||
+    allLayers?.find((l) => l.bottleDetails?.[bottleName]?.wineArch)?.bottleDetails?.[bottleName]
+      ?.wineArch;
+  if (runnerType === 'crossover_preview_arm64') {
+    return arch ? arch === 'arm64' : !/^OneLauncher$/i.test(bottleName);
+  }
+  if (runnerType === 'crossover' || runnerType === 'crossover_preview') {
+    return arch ? arch === 'win64' : !/-arm64$/i.test(bottleName);
+  }
+  return true;
+}
+
+function resolveInstallBottleForRunner(params: {
+  savedBottleName?: string;
+  savedRunner?: string;
+  resolvedRunner: string;
+  hostLayers: CompatibilityLayerInfo[];
+  allLayers?: CompatibilityLayerInfo[];
+  hostArch?: string;
+}): string {
+  const { savedBottleName, savedRunner, resolvedRunner, hostLayers, allLayers, hostArch } = params;
+  const trimmedBottle = savedBottleName?.trim() || '';
+  if (!trimmedBottle) return '';
+
+  const resolvedLayer = hostLayers.find((l) => l.type === resolvedRunner) || hostLayers[0];
+  const availableBottles = resolvedLayer?.availableBottles || [];
+  const compatibleBottles = availableBottles.filter((b) =>
+    isInstallBottleCompatibleWithRunner(b, resolvedLayer, resolvedRunner, allLayers)
+  );
+  const fallbackBottle =
+    compatibleBottles.length > 0
+      ? resolveDefaultBottleForLayer(
+          {
+            type: resolvedRunner as CompatibilityLayerType,
+            availableBottles: compatibleBottles,
+            bottleDetails: resolvedLayer?.bottleDetails,
+          },
+          resolvedRunner
+        ) || ''
+      : '';
+
+  const isOrphanInSelect = !availableBottles.includes(trimmedBottle);
+  if (isOrphanInSelect) {
+    return fallbackBottle;
+  }
+
+  const bottleArchFromAnyLayer =
+    resolvedLayer?.bottleDetails?.[trimmedBottle]?.wineArch ||
+    allLayers?.find((l) => l.bottleDetails?.[trimmedBottle]?.wineArch)?.bottleDetails?.[
+      trimmedBottle
+    ]?.wineArch;
+
+  const isCompatibleWithResolved =
+    isInstallBottleCompatibleWithRunner(trimmedBottle, resolvedLayer, resolvedRunner, allLayers) &&
+    !(
+      (resolvedRunner === 'crossover' || resolvedRunner === 'crossover_preview') &&
+      bottleArchFromAnyLayer === 'arm64'
+    ) &&
+    !(resolvedRunner === 'crossover_preview_arm64' && bottleArchFromAnyLayer === 'win64');
+
+  const wasRunnerRejectedOrDowngraded = Boolean(
+    savedRunner && savedRunner !== 'native' && savedRunner !== resolvedRunner
+  );
+
+  if (!isCompatibleWithResolved && (wasRunnerRejectedOrDowngraded || hostArch !== 'arm64')) {
+    return fallbackBottle;
+  }
+
+  return trimmedBottle;
+}
+
 function resolveTargetSteamDisplayPath(params: {
   isWindowsHost: boolean;
   selectedOs: 'mac' | 'windows' | 'linux';
@@ -200,12 +280,39 @@ function resolveTargetSteamDisplayPath(params: {
       !activeCompatLayer ||
       activeCompatLayer.type === 'crossover' ||
       activeCompatLayer.type === 'crossover_preview' ||
+      activeCompatLayer.type === 'crossover_preview_arm64' ||
       Boolean(selectedBottleName);
     if (isCrossOverLayer) {
+      const isPreviewLayer =
+        activeCompatLayer?.type === 'crossover_preview' ||
+        activeCompatLayer?.type === 'crossover_preview_arm64';
+      const defaultBottlesRoot = isPreviewLayer
+        ? '~/Library/Application Support/CrossOver Preview/Bottles'
+        : '~/Library/Application Support/CrossOver/Bottles';
       const bottlesRoot = (
-        activeCompatLayer?.bottlesDir || '~/Library/Application Support/CrossOver/Bottles'
+        activeCompatLayer?.bottlesDir || defaultBottlesRoot
       ).replace(/\/+$/, '');
-      const bottleName = selectedBottleName || activeCompatLayer?.availableBottles?.[0] || 'Steam';
+      const compatibleBottles = (activeCompatLayer?.availableBottles || []).filter((b) =>
+        isInstallBottleCompatibleWithRunner(
+          b,
+          activeCompatLayer,
+          activeCompatLayer?.type || ''
+        )
+      );
+      const fallbackBottle =
+        activeCompatLayer?.type === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+      const defaultResolvedBottle =
+        resolveDefaultBottleForLayer(
+          activeCompatLayer
+            ? {
+                type: activeCompatLayer.type,
+                availableBottles: compatibleBottles,
+                bottleDetails: activeCompatLayer.bottleDetails,
+              }
+            : undefined,
+          activeCompatLayer?.type
+        ) || fallbackBottle;
+      const bottleName = selectedBottleName || defaultResolvedBottle;
       return `${bottlesRoot}/${bottleName}/drive_c/Program Files (x86)/Steam/steamapps/common`;
     }
     const prefixRoot = (
@@ -295,26 +402,74 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     });
   }, [isOpen]);
 
+  const hostArch =
+    typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+  const allRawCompatLayers = isOpen ? launcherService.getCompatibilityLayers() : [];
   const compatLayers = isOpen
-    ? launcherService.getCompatibilityLayers().filter((l) => l.type !== 'native')
+    ? allRawCompatLayers.filter(
+        (l) =>
+          l.type !== 'native' &&
+          l.available !== false &&
+          (l.type !== 'crossover_preview_arm64' || hostArch === 'arm64')
+      )
     : [];
   const existingLaunchCfg = isOpen
     ? launcherService.getLaunchConfig(game.id, selectedPlatformId)
     : undefined;
-  const [selectedCompatRunner, setSelectedCompatRunner] = useState<string>(() =>
-    existingLaunchCfg?.compatibilityLayer && existingLaunchCfg.compatibilityLayer !== 'native'
-      ? existingLaunchCfg.compatibilityLayer
-      : compatLayers[0]?.type || 'crossover'
-  );
+  const [selectedCompatRunner, setSelectedCompatRunner] = useState<string>(() => {
+    const saved = existingLaunchCfg?.compatibilityLayer;
+    if (
+      saved &&
+      saved !== 'native' &&
+      (saved !== 'crossover_preview_arm64' || hostArch === 'arm64') &&
+      (compatLayers.length === 0 || compatLayers.some((l) => l.type === saved))
+    ) {
+      return saved;
+    }
+    return compatLayers[0]?.type || 'crossover';
+  });
   const [selectedBottleName, setSelectedBottleName] = useState<string>(() =>
-    existingLaunchCfg?.wineBottleName || ''
+    resolveInstallBottleForRunner({
+      savedBottleName: existingLaunchCfg?.wineBottleName,
+      savedRunner: existingLaunchCfg?.compatibilityLayer,
+      resolvedRunner: selectedCompatRunner,
+      hostLayers: compatLayers,
+      allLayers: allRawCompatLayers,
+      hostArch,
+    })
   );
+  const selectedCompatRunnerRef = useRef<string>(selectedCompatRunner);
+  const selectedBottleNameRef = useRef<string>(selectedBottleName);
+  const userChangedCompatInSessionRef = useRef<boolean>(false);
   const [steamDiskQueryTracker] = useState<{ lastPath: string | null }>(() => ({
     lastPath: null,
   }));
 
   const activeCompatLayer =
     compatLayers.find((l) => l.type === selectedCompatRunner) || compatLayers[0];
+  const effectiveCompatRunner = activeCompatLayer?.type || selectedCompatRunner;
+  const compatibleInstallBottles = (activeCompatLayer?.availableBottles || []).filter((b) =>
+    isInstallBottleCompatibleWithRunner(
+      b,
+      activeCompatLayer,
+      effectiveCompatRunner,
+      allRawCompatLayers
+    )
+  );
+  const defaultResolvedBottleName =
+    resolveDefaultBottleForLayer(
+      activeCompatLayer
+        ? {
+            type: effectiveCompatRunner,
+            availableBottles: compatibleInstallBottles,
+            bottleDetails: activeCompatLayer.bottleDetails,
+          }
+        : undefined,
+      effectiveCompatRunner
+    ) ||
+    (activeCompatLayer?.type === 'crossover_preview_arm64'
+      ? 'OneLauncher-arm64'
+      : 'OneLauncher');
 
   const isWindowsHost =
     (installInfo as { hostPlatform?: string } | null)?.hostPlatform === 'win32' ||
@@ -362,7 +517,41 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
       setIncludeDlcs(targetPlat === 'epic' || targetPlat === 'gog');
       setPreferClientlessExtraction(false);
       setErrorMsg(null);
+      userChangedCompatInSessionRef.current = false;
+
+      const currentHostArch =
+        typeof launcherService.getHostArch === 'function' ? launcherService.getHostArch() : 'arm64';
+      const allCurrentLayers = launcherService.getCompatibilityLayers();
+      const currentLayers = allCurrentLayers.filter(
+        (l) =>
+          l.type !== 'native' &&
+          l.available !== false &&
+          (l.type !== 'crossover_preview_arm64' || currentHostArch === 'arm64')
+      );
+      const platCfg = launcherService.getLaunchConfig(game.id, targetPlat);
+      const savedRunner =
+        platCfg?.compatibilityLayer &&
+        platCfg.compatibilityLayer !== 'native' &&
+        (platCfg.compatibilityLayer !== 'crossover_preview_arm64' || currentHostArch === 'arm64') &&
+        (currentLayers.length === 0 ||
+          currentLayers.some((l) => l.type === platCfg.compatibilityLayer))
+          ? platCfg.compatibilityLayer
+          : undefined;
+      const syncedRunner = savedRunner || currentLayers[0]?.type || 'crossover';
+      const syncedBottle = resolveInstallBottleForRunner({
+        savedBottleName: platCfg?.wineBottleName,
+        savedRunner: platCfg?.compatibilityLayer,
+        resolvedRunner: syncedRunner,
+        hostLayers: currentLayers,
+        allLayers: allCurrentLayers,
+        hostArch: currentHostArch,
+      });
+      selectedCompatRunnerRef.current = syncedRunner;
+      selectedBottleNameRef.current = syncedBottle;
+      setSelectedCompatRunner(syncedRunner);
+      setSelectedBottleName(syncedBottle);
     } else {
+      userChangedCompatInSessionRef.current = false;
       steamDiskQueryTracker.lastPath = null;
     }
   }, [isOpen, game.id, initialPlatformId]);
@@ -390,14 +579,46 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         setInstallDir(defaultDir);
 
         const platCfg = launcherService.getLaunchConfig(game.id, selectedPlatformId);
-        const resolvedRunner =
-          platCfg?.compatibilityLayer && platCfg.compatibilityLayer !== 'native'
+        const currentHostArch =
+          typeof launcherService.getHostArch === 'function'
+            ? launcherService.getHostArch()
+            : 'arm64';
+        const allCurrentLayers = launcherService.getCompatibilityLayers();
+        const currentLayers = allCurrentLayers.filter(
+          (l) =>
+            l.type !== 'native' &&
+            l.available !== false &&
+            (l.type !== 'crossover_preview_arm64' || currentHostArch === 'arm64')
+        );
+        const savedValidRunner =
+          platCfg?.compatibilityLayer &&
+          platCfg.compatibilityLayer !== 'native' &&
+          (platCfg.compatibilityLayer !== 'crossover_preview_arm64' ||
+            currentHostArch === 'arm64') &&
+          (currentLayers.length === 0 ||
+            currentLayers.some((l) => l.type === platCfg.compatibilityLayer))
             ? platCfg.compatibilityLayer
-            : selectedCompatRunner;
-        if (platCfg?.compatibilityLayer && platCfg.compatibilityLayer !== 'native') {
-          setSelectedCompatRunner(platCfg.compatibilityLayer);
-        }
-        const resolvedBottle = platCfg?.wineBottleName || '';
+            : undefined;
+        const resolvedRunner =
+          userChangedCompatInSessionRef.current &&
+          currentLayers.some((l) => l.type === selectedCompatRunnerRef.current)
+            ? selectedCompatRunnerRef.current
+            : savedValidRunner || currentLayers[0]?.type || 'crossover';
+        const resolvedBottle =
+          userChangedCompatInSessionRef.current &&
+          currentLayers.some((l) => l.type === selectedCompatRunnerRef.current)
+            ? selectedBottleNameRef.current
+            : resolveInstallBottleForRunner({
+                savedBottleName: platCfg?.wineBottleName,
+                savedRunner: platCfg?.compatibilityLayer,
+                resolvedRunner,
+                hostLayers: currentLayers,
+                allLayers: allCurrentLayers,
+                hostArch: currentHostArch,
+              });
+        selectedCompatRunnerRef.current = resolvedRunner;
+        selectedBottleNameRef.current = resolvedBottle;
+        setSelectedCompatRunner(resolvedRunner);
         setSelectedBottleName(resolvedBottle);
 
         const deduped = deduplicateInstallers(info.availableInstallers, winHost);
@@ -426,9 +647,6 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         const reqId = ++diskSpaceReqSeqRef.current;
 
         if (selectedPlatformId === 'steam') {
-          const currentLayers = launcherService
-            .getCompatibilityLayers()
-            .filter((l) => l.type !== 'native');
           const resolvedLayer =
             currentLayers.find((l) => l.type === resolvedRunner) || currentLayers[0];
           const initialSteamPath = resolveTargetSteamDisplayPath({
@@ -622,6 +840,21 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
   );
   const isCrossPlatformMacLauncher =
     !isWindowsHost && selectedInstaller?.id === 'xbox-external-mac-launcher';
+  const showPreinstallCompatConfig =
+    !isWindowsHost &&
+    selectedOs === 'windows' &&
+    !isCrossPlatformMacLauncher &&
+    compatLayers.length > 0;
+  const hasSelectedBottleArchMismatch = Boolean(
+    showPreinstallCompatConfig &&
+      selectedBottleName &&
+      !isInstallBottleCompatibleWithRunner(
+        selectedBottleName,
+        activeCompatLayer,
+        effectiveCompatRunner,
+        allRawCompatLayers
+      )
+  );
   const isRiotKernelAntiCheat = handoffKeyLower === 'riot';
   const hasChainedBottleInstaller =
     !isRiotKernelAntiCheat &&
@@ -712,7 +945,14 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
     );
 
   const handleStartInstall = async () => {
-    if (isStarting || isInstallBlockedByDiskSpace || isXboxMacBlocked) return;
+    if (
+      isStarting ||
+      isInstallBlockedByDiskSpace ||
+      isXboxMacBlocked ||
+      hasSelectedBottleArchMismatch
+    ) {
+      return;
+    }
     setIsStarting(true);
     setErrorMsg(null);
 
@@ -724,14 +964,24 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           selectedOs === 'windows' ||
           (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher)
         ) {
+          const safeBottleName =
+            selectedBottleName.trim() &&
+            isInstallBottleCompatibleWithRunner(
+              selectedBottleName.trim(),
+              activeCompatLayer,
+              effectiveCompatRunner,
+              allRawCompatLayers
+            )
+              ? selectedBottleName.trim()
+              : undefined;
           await launcherService.saveLaunchConfig(
             {
               ...(existingLaunchCfg || { gameId: game.id, launchMethod: 'compatibility_layer' }),
               gameId: game.id,
               preferredPlatformId: selectedPlatformId,
               launchMethod: 'compatibility_layer',
-              compatibilityLayer: (selectedCompatRunner || 'crossover') as CompatibilityLayerType,
-              wineBottleName: selectedBottleName.trim() || undefined,
+              compatibilityLayer: (effectiveCompatRunner || 'crossover') as CompatibilityLayerType,
+              wineBottleName: safeBottleName,
             },
             selectedPlatformId
           );
@@ -870,7 +1120,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
         (selectedOs === 'windows' ||
           (selectedPlatformId === 'xbox' && !isCrossPlatformMacLauncher))
           ? {
-              compatibilityLayer: selectedCompatRunner as CompatibilityLayerType,
+              compatibilityLayer: (effectiveCompatRunner || 'crossover') as CompatibilityLayerType,
               wineBottleName: selectedBottleName.trim() || undefined,
             }
           : {}),
@@ -1075,6 +1325,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                       key={plat.platformId}
                       type="button"
                       onClick={() => {
+                        userChangedCompatInSessionRef.current = false;
                         setSelectedPlatformId(plat.platformId);
                         setIncludeDlcs(plat.platformId === 'epic' || plat.platformId === 'gog');
                         setPreferClientlessExtraction(false);
@@ -1594,7 +1845,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           )}
 
           {/* Pre-Install Compatibility Runner & Bottle Selector (shown only on macOS when installing a Windows build) */}
-          {!isWindowsHost && selectedOs === 'windows' && compatLayers.length > 0 && (
+          {showPreinstallCompatConfig && (
             <div
               data-testid="preinstall-compat-config"
               className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-2.5"
@@ -1623,19 +1874,56 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     id={compatRunnerSelectId}
                     data-testid="preinstall-compat-runner"
                     aria-label="Compatibility Runner"
-                    value={selectedCompatRunner}
+                    value={effectiveCompatRunner}
                     onChange={(e) => {
                       const nextRunner = e.target.value;
+                      userChangedCompatInSessionRef.current = true;
+                      selectedCompatRunnerRef.current = nextRunner;
                       setSelectedCompatRunner(nextRunner);
+                      const nextLayer =
+                        compatLayers.find((l) => l.type === nextRunner) || compatLayers[0];
+                      const nextAvailableBottles = nextLayer?.availableBottles || [];
+                      let nextBottleName = selectedBottleNameRef.current || selectedBottleName;
+                      const isBottleCompatibleWithNext = isInstallBottleCompatibleWithRunner(
+                        nextBottleName,
+                        nextLayer,
+                        nextRunner,
+                        allRawCompatLayers
+                      );
+                      if (
+                        nextBottleName &&
+                        (!isBottleCompatibleWithNext ||
+                          !nextAvailableBottles.includes(nextBottleName))
+                      ) {
+                        const nextCompatBottles = nextAvailableBottles.filter((b) =>
+                          isInstallBottleCompatibleWithRunner(
+                            b,
+                            nextLayer,
+                            nextRunner,
+                            allRawCompatLayers
+                          )
+                        );
+                        nextBottleName =
+                          nextCompatBottles.length > 0
+                            ? resolveDefaultBottleForLayer(
+                                {
+                                  type: nextRunner as CompatibilityLayerType,
+                                  availableBottles: nextCompatBottles,
+                                  bottleDetails: nextLayer?.bottleDetails,
+                                },
+                                nextRunner
+                              ) || ''
+                            : '';
+                        selectedBottleNameRef.current = nextBottleName;
+                        setSelectedBottleName(nextBottleName);
+                      }
                       if (selectedPlatformId === 'steam') {
-                        const nextLayer =
-                          compatLayers.find((l) => l.type === nextRunner) || compatLayers[0];
                         querySteamDiskSpaceIfChanged(
                           resolveTargetSteamDisplayPath({
                             isWindowsHost,
                             selectedOs,
                             activeCompatLayer: nextLayer,
-                            selectedBottleName,
+                            selectedBottleName: nextBottleName,
                             winePrefixPath: existingLaunchCfg?.winePrefixPath,
                             installInfo,
                             installDir,
@@ -1665,9 +1953,15 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     id={compatBottleSelectId}
                     data-testid="preinstall-compat-bottle"
                     aria-label="Target Bottle"
+                    aria-invalid={hasSelectedBottleArchMismatch || undefined}
+                    aria-describedby={
+                      hasSelectedBottleArchMismatch ? 'preinstall-bottle-arch-warning' : undefined
+                    }
                     value={selectedBottleName}
                     onChange={(e) => {
                       const nextBottle = e.target.value;
+                      userChangedCompatInSessionRef.current = true;
+                      selectedBottleNameRef.current = nextBottle;
                       setSelectedBottleName(nextBottle);
                       if (selectedPlatformId === 'steam') {
                         querySteamDiskSpaceIfChanged(
@@ -1685,15 +1979,49 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     }}
                     className="w-full rounded-lg bg-[#141d2b] border border-[#2a475e] px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-400"
                   >
-                    <option value="">
-                      Default Bottle ({activeCompatLayer?.availableBottles?.[0] || 'OneLauncher'})
-                    </option>
-                    {(activeCompatLayer?.availableBottles || []).map((bottle) => (
-                      <option key={bottle} value={bottle}>
-                        {bottle}
-                      </option>
-                    ))}
+                    <option value="">Default Bottle ({defaultResolvedBottleName})</option>
+                    {(activeCompatLayer?.availableBottles || []).map((bottle) => {
+                      const bottleArch = activeCompatLayer?.bottleDetails?.[bottle]?.wineArch;
+                      const isCompatible = isInstallBottleCompatibleWithRunner(
+                        bottle,
+                        activeCompatLayer,
+                        effectiveCompatRunner,
+                        allRawCompatLayers
+                      );
+                      const archLabel =
+                        bottleArch === 'arm64'
+                          ? ' (arm64 / FEX)'
+                          : bottleArch === 'win64'
+                            ? ' (Intel / win64)'
+                            : '';
+                      return (
+                        <option key={bottle} value={bottle} disabled={!isCompatible}>
+                          {bottle}
+                          {archLabel}
+                          {!isCompatible ? ' — incompatible' : ''}
+                        </option>
+                      );
+                    })}
                   </select>
+                  {hasSelectedBottleArchMismatch && (
+                    <div
+                      id="preinstall-bottle-arch-warning"
+                      data-testid="preinstall-bottle-arch-warning"
+                      role="alert"
+                      className="flex items-start gap-1.5 rounded bg-amber-950/45 border border-amber-500/45 px-2 py-1 text-[10px] text-amber-200 mt-1"
+                    >
+                      <AlertTriangle
+                        className="w-3 h-3 text-amber-400 shrink-0 mt-0.5"
+                        aria-hidden="true"
+                      />
+                      <span>
+                        Bottle &ldquo;{selectedBottleName}&rdquo; is incompatible with{' '}
+                        {effectiveCompatRunner === 'crossover_preview_arm64'
+                          ? 'CrossOver Preview (arm64 / FEX) — choose an arm64 bottle like "OneLauncher-arm64".'
+                          : 'this Intel/Rosetta runner — choose a win64 bottle like "OneLauncher".'}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1801,11 +2129,11 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     className="truncate block text-xs font-mono text-gray-200"
                   >
                     {effectiveSteamDisplayPath}
-                  </code>
+                  </code>{' '}
                   <div className="text-[10px] text-steam-subtext truncate">
                     {!isWindowsHost && selectedOs === 'windows'
                       ? `CrossOver / Wine Bottle Steam Library (${
-                          selectedBottleName || activeCompatLayer?.availableBottles?.[0] || 'Steam'
+                          selectedBottleName || defaultResolvedBottleName
                         })`
                       : 'Native Steam Library'}
                   </div>
@@ -2042,7 +2370,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
                     typeof e?.target?.checked === 'boolean' ? e.target.checked : !includeDlcs
                   )
                 }
-                className="mt-0.5 rounded border-steam-border bg-[#0e151f] text-sky-500 focus:ring-0"
+                className="mt-0.5 rounded border-steam-border bg-[#0e151f] text-sky-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
               />
               <div className="space-y-0.5 min-w-0">
                 <div className="font-semibold text-white">Include Owned DLCs &amp; Expansions</div>
@@ -2090,7 +2418,7 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
               type="checkbox"
               checked={createShortcut}
               onChange={(e) => setCreateShortcut(e.target.checked)}
-              className="rounded border-steam-border bg-[#0e151f] text-sky-500 focus:ring-0"
+              className="rounded border-steam-border bg-[#0e151f] text-sky-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
             />
             <span>Automatically register executable & launch configuration on completion</span>
           </label>
@@ -2119,7 +2447,15 @@ export const GameInstallModal: React.FC<GameInstallModalProps> = ({
           <button
             type="button"
             onClick={handleStartInstall}
-            disabled={isStarting || isInstallBlockedByDiskSpace || isXboxMacBlocked}
+            disabled={
+              isStarting ||
+              isInstallBlockedByDiskSpace ||
+              isXboxMacBlocked ||
+              hasSelectedBottleArchMismatch
+            }
+            aria-describedby={
+              hasSelectedBottleArchMismatch ? 'preinstall-bottle-arch-warning' : undefined
+            }
             className="inline-flex items-center gap-2 min-h-6 px-5 py-2 rounded-lg font-bold text-xs text-white uppercase tracking-wider transition-opacity shadow-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             style={{
               background: 'linear-gradient(to right, #0284c7 0%, #1d4ed8 100%)',

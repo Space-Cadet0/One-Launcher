@@ -191,7 +191,9 @@ export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
 
       const isBottleScope = targetId.startsWith('bottle_');
       const currentRunner = effectiveRunnerRef.current;
-      const currentBottle = bottleNameRef.current.trim() || 'OneLauncher';
+      const defaultBottleForRunner =
+        currentRunner === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+      const currentBottle = bottleNameRef.current.trim() || defaultBottleForRunner;
 
       const result = await environmentSetupService.startGuidedLogin({
         targetId,
@@ -279,10 +281,12 @@ export const GuidedClientSignInStep: React.FC<GuidedClientSignInStepProps> = ({
     );
     const shouldForceInteractive = Boolean(probe?.authenticated && !hasMismatch);
     const isBottleScope = targetId.startsWith('bottle_');
+    const defaultBottleForRunner =
+      effectiveRunnerType === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
     const result = await environmentSetupService.startGuidedLogin({
       targetId,
       ...(isBottleScope && effectiveRunnerType ? { runnerType: effectiveRunnerType } : {}),
-      ...(isBottleScope ? { bottleName: bottleName.trim() || 'OneLauncher' } : {}),
+      ...(isBottleScope ? { bottleName: bottleName.trim() || defaultBottleForRunner } : {}),
       autoCloseOnSuccess,
       ...(shouldForceInteractive ? { forceInteractiveLogin: true } : {}),
     });

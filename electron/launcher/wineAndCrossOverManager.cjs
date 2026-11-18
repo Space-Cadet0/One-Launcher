@@ -1235,7 +1235,11 @@ function isCrossOverPerlWineWrapperOptions(options = {}) {
   )
     .trim()
     .toLowerCase();
-  if (layerType === 'crossover' || layerType === 'crossover_preview') {
+  if (
+    layerType === 'crossover' ||
+    layerType === 'crossover_preview' ||
+    layerType === 'crossover_preview_arm64'
+  ) {
     return !binPath || /\/bin\/wine$/i.test(binPath);
   }
   return false;
@@ -1269,21 +1273,33 @@ function deriveCrossOverRootPath(options = {}) {
       return `${appBundleMatch[1]}/Contents/SharedSupport/CrossOver`;
     }
     const directBinMatch = normalized.match(
-      /^(.*?\/CrossOver)\/bin\/(?:wine(?:64)?|wineloader(?:64|2)?|wineserver(?:64)?|cxbottle)$/i
+      /^(.*?\/CrossOver)\/bin\/(?:wine(?:64)?|wineloader(?:64|2)?|wineserver(?:-arm64|-x86|64)?|cxbottle)$/i
     );
     if (directBinMatch && directBinMatch[1]) {
       return directBinMatch[1];
+    }
+    const unixLoaderMatch = normalized.match(
+      /^(.*?)\/lib(?:64)?\/wine\/(?:aarch64|x86_64)-unix\/wine(?:\.app\/Contents\/MacOS\/wine)?$/i
+    );
+    if (unixLoaderMatch && unixLoaderMatch[1]) {
+      return unixLoaderMatch[1];
     }
   }
   const layerType = String(options.layerType || options.compatLayer?.type || '')
     .trim()
     .toLowerCase();
-  if (layerType === 'crossover' || layerType === 'crossover_preview') {
+  if (
+    layerType === 'crossover' ||
+    layerType === 'crossover_preview' ||
+    layerType === 'crossover_preview_arm64'
+  ) {
     const home = String(options.homedir || os.homedir() || '').trim();
     const appNames =
-      layerType === 'crossover_preview'
-        ? ['CrossOver Preview.app', 'CrossOver.app']
-        : ['CrossOver.app', 'CrossOver Preview.app'];
+      layerType === 'crossover_preview_arm64'
+        ? ['CrossOver Preview arm64.app', 'CrossOver Preview.app', 'CrossOver.app']
+        : layerType === 'crossover_preview'
+          ? ['CrossOver Preview.app', 'CrossOver.app']
+          : ['CrossOver.app', 'CrossOver Preview.app'];
     const roots = [
       typeof options.customApplicationsDir === 'string' ? options.customApplicationsDir.trim() : '',
       '/Applications',
@@ -1325,6 +1341,7 @@ function applyCrossOverEnvironmentHygiene(env = {}, options = {}) {
     Boolean(cxRoot) ||
     layerType === 'crossover' ||
     layerType === 'crossover_preview' ||
+    layerType === 'crossover_preview_arm64' ||
     isCrossOverPerlWineWrapperOptions(options) ||
     /crossover/i.test(binPath);
   if (!isCrossOverTarget) return env;
@@ -1332,10 +1349,23 @@ function applyCrossOverEnvironmentHygiene(env = {}, options = {}) {
   if (!env.CX_ROOT && cxRoot) {
     env.CX_ROOT = cxRoot;
   }
-  if (!env.CX_HOME) {
-    const home = String(options?.homedir || env.HOME || os.homedir() || '').trim();
-    if (home) {
-      env.CX_HOME = path.join(home, 'Library', 'Application Support', 'CrossOver');
+  const home = String(options?.homedir || env.HOME || os.homedir() || '').trim();
+  if (!env.CX_HOME && home) {
+    env.CX_HOME = path.join(home, 'Library', 'Application Support', 'CrossOver');
+  }
+  const resolvedBottlePath = String(
+    options?.bottlePath || options?.winePrefix || env.WINEPREFIX || ''
+  ).trim();
+  if (!env.CX_BOTTLE_PATH && resolvedBottlePath) {
+    const bottleParent = path.dirname(path.resolve(resolvedBottlePath));
+    const sharedBottlesDir = home
+      ? path.resolve(home, 'Library', 'Application Support', 'CrossOver', 'Bottles')
+      : '';
+    if (
+      (/\/Bottles$/i.test(bottleParent.replace(/\\/g, '/')) || Boolean(env.CX_BOTTLE)) &&
+      (!sharedBottlesDir || bottleParent !== sharedBottlesDir)
+    ) {
+      env.CX_BOTTLE_PATH = bottleParent;
     }
   }
   if (env.DOTNET_EnableWriteXorExecute === undefined || env.DOTNET_EnableWriteXorExecute === '') {
@@ -1383,12 +1413,24 @@ function sanitizeProvisionedBottleGraphicsBackend(bottlePath) {
  *
  * @param {Record<string, any>} [env]
  * @param {boolean|string|number} [advertiseAvx]
- * @param {{ isCrossOverWrapper?: boolean, wineBinaryPath?: string, binaryPath?: string, layerType?: string, compatLayer?: any, platform?: string, homedir?: string, cxRoot?: string }} [options]
+ * @param {{ isCrossOverWrapper?: boolean, wineBinaryPath?: string, binaryPath?: string, layerType?: string, compatLayer?: any, platform?: string, homedir?: string, cxRoot?: string, wineArch?: string, bottlePath?: string, winePrefix?: string }} [options]
  */
 function applyStrictRosettaAvxEnv(env = {}, advertiseAvx = undefined, options = {}) {
   if (!env || typeof env !== 'object') return env;
   applyCrossOverEnvironmentHygiene(env, options);
   const isCrossOverWrapper = isCrossOverPerlWineWrapperOptions(options);
+  const layerType = String(options?.layerType || options?.compatLayer?.type || '')
+    .trim()
+    .toLowerCase();
+  const isArm64Fex =
+    layerType === 'crossover_preview_arm64' ||
+    String(options?.wineArch || '')
+      .trim()
+      .toLowerCase() === 'arm64';
+  if (isArm64Fex && advertiseAvx === undefined) {
+    delete env.ROSETTA_ADVERTISE_AVX;
+    return env;
+  }
   if (advertiseAvx === true || advertiseAvx === '1' || advertiseAvx === 1) {
     env.ROSETTA_ADVERTISE_AVX = '1';
   } else if (advertiseAvx === false || advertiseAvx === '0' || advertiseAvx === 0) {
@@ -1605,7 +1647,7 @@ function inspectPeBinaryImportsSync(filePathOrBuf, options = {}) {
         ? 'x86'
         : rawMachine === 0x8664
           ? 'x64'
-          : rawMachine === 0xaa64
+          : rawMachine === 0xaa64 || rawMachine === 0xa641
             ? 'arm64'
             : '';
     const numSections = Math.min(peHdr.readUInt16LE(6), 96);
@@ -2700,21 +2742,60 @@ async function prepareXboxBottleEnvironment(options = {}) {
       const sys32ByLower = new Map(
         sys32Entries.map((name) => /** @type {[string, string]} */ ([name.toLowerCase(), name]))
       );
-      const extraWineWin64Dirs = compatBinPath
-        ? [
-            path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'x86_64-windows'),
-            path.resolve(path.dirname(compatBinPath), '..', 'lib64', 'wine', 'x86_64-windows'),
-            path.resolve(
-              path.dirname(compatBinPath),
-              '..',
-              'SharedSupport',
-              'CrossOver',
-              'lib',
-              'wine',
-              'x86_64-windows'
-            ),
-          ]
-        : [];
+      const isArm64Compat =
+        String(options?.compatLayer?.type || options?.layerType || '').toLowerCase() ===
+          'crossover_preview_arm64' ||
+        String(options?.wineArch || '').toLowerCase() === 'arm64';
+      const derivedCxRoot = compatBinPath
+        ? deriveCrossOverRootPath({ ...options, wineBinaryPath: compatBinPath })
+        : '';
+      const arm64WineDirs = Array.from(
+        new Set(
+          [
+            derivedCxRoot ? path.join(derivedCxRoot, 'lib', 'wine', 'aarch64-windows') : '',
+            ...(compatBinPath
+              ? [
+                  path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'aarch64-windows'),
+                  path.resolve(
+                    path.dirname(compatBinPath),
+                    '..',
+                    'SharedSupport',
+                    'CrossOver',
+                    'lib',
+                    'wine',
+                    'aarch64-windows'
+                  ),
+                ]
+              : []),
+          ].filter(Boolean)
+        )
+      );
+      const x64WineDirs = Array.from(
+        new Set(
+          [
+            derivedCxRoot ? path.join(derivedCxRoot, 'lib', 'wine', 'x86_64-windows') : '',
+            derivedCxRoot ? path.join(derivedCxRoot, 'lib64', 'wine', 'x86_64-windows') : '',
+            ...(compatBinPath
+              ? [
+                  path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'x86_64-windows'),
+                  path.resolve(path.dirname(compatBinPath), '..', 'lib64', 'wine', 'x86_64-windows'),
+                  path.resolve(
+                    path.dirname(compatBinPath),
+                    '..',
+                    'SharedSupport',
+                    'CrossOver',
+                    'lib',
+                    'wine',
+                    'x86_64-windows'
+                  ),
+                ]
+              : []),
+          ].filter(Boolean)
+        )
+      );
+      const extraWineWin64Dirs = isArm64Compat
+        ? [...arm64WineDirs, ...x64WineDirs]
+        : [...x64WineDirs, ...arm64WineDirs];
 
       for (const [donorName, targetAppName] of vcLibPairs) {
         if (sys32ByLower.has(targetAppName.toLowerCase())) continue;
@@ -2749,21 +2830,29 @@ async function prepareXboxBottleEnvironment(options = {}) {
       const syswowByLower = new Map(
         syswowEntries.map((name) => /** @type {[string, string]} */ ([name.toLowerCase(), name]))
       );
-      const extraWineWin32Dirs = compatBinPath
-        ? [
-            path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'i386-windows'),
-            path.resolve(path.dirname(compatBinPath), '..', 'lib32', 'wine', 'i386-windows'),
-            path.resolve(
-              path.dirname(compatBinPath),
-              '..',
-              'SharedSupport',
-              'CrossOver',
-              'lib',
-              'wine',
-              'i386-windows'
-            ),
-          ]
-        : [];
+      const extraWineWin32Dirs = Array.from(
+        new Set(
+          [
+            derivedCxRoot ? path.join(derivedCxRoot, 'lib', 'wine', 'i386-windows') : '',
+            derivedCxRoot ? path.join(derivedCxRoot, 'lib32', 'wine', 'i386-windows') : '',
+            ...(compatBinPath
+              ? [
+                  path.resolve(path.dirname(compatBinPath), '..', 'lib', 'wine', 'i386-windows'),
+                  path.resolve(path.dirname(compatBinPath), '..', 'lib32', 'wine', 'i386-windows'),
+                  path.resolve(
+                    path.dirname(compatBinPath),
+                    '..',
+                    'SharedSupport',
+                    'CrossOver',
+                    'lib',
+                    'wine',
+                    'i386-windows'
+                  ),
+                ]
+              : []),
+          ].filter(Boolean)
+        )
+      );
 
       // Ensure base x86 VC14 runtime DLLs exist in syswow64 on fresh prefixes when Wine/CrossOver provides them
       for (const [baseDllName] of vcLibPairsX86) {

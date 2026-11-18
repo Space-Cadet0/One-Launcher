@@ -50,6 +50,7 @@ const {
   discoverSteamLocations,
   normalizeComparableTitle,
   extractBottleRootFromPath,
+  inspectBottleConfMetadata,
   listAllInitializedBottlePaths,
   detectCompatibilityLayers,
   extractSiblingLauncherStem,
@@ -426,6 +427,20 @@ function loadChainedCatalogIndex(userDataDir, /** @type {any} */ options = {}, /
 function resolveBottleLayerMetadata(bottlePath, /** @type {any[]} */ detectedLayers) {
   const resolvedBottle = path.resolve(bottlePath);
   const normBottle = resolvedBottle.replace(/\\/g, '/');
+  const bottleBase = path.basename(resolvedBottle);
+  const confMeta = inspectBottleConfMetadata(resolvedBottle);
+  if (confMeta.wineArch === 'arm64') {
+    return {
+      compatibilityLayer: 'crossover_preview_arm64',
+      wineBottle: bottleBase,
+    };
+  }
+  if (confMeta.previewEnabled === true) {
+    return {
+      compatibilityLayer: 'crossover_preview',
+      wineBottle: bottleBase,
+    };
+  }
   for (const layer of detectedLayers) {
     if (!layer || !layer.bottlesDir) continue;
     const resolvedBottlesDir = path.resolve(layer.bottlesDir);
@@ -434,22 +449,28 @@ function resolveBottleLayerMetadata(bottlePath, /** @type {any[]} */ detectedLay
       resolvedBottle.startsWith(`${resolvedBottlesDir}${path.sep}`)
     ) {
       return {
-        compatibilityLayer: layer.type,
-        wineBottle: path.basename(resolvedBottle),
+        compatibilityLayer:
+          layer.type === 'crossover_preview_arm64' && confMeta.wineArch === 'win64'
+            ? 'crossover_preview'
+            : layer.type,
+        wineBottle: bottleBase,
       };
     }
   }
+  if (/\/CrossOver Preview arm64\/Bottles\//i.test(normBottle)) {
+    return { compatibilityLayer: 'crossover_preview_arm64', wineBottle: bottleBase };
+  }
   if (/\/CrossOver Preview\/Bottles\//i.test(normBottle)) {
-    return { compatibilityLayer: 'crossover_preview', wineBottle: path.basename(resolvedBottle) };
+    return { compatibilityLayer: 'crossover_preview', wineBottle: bottleBase };
   }
   if (/\/(?:CrossOver|Whisky)\/Bottles\//i.test(normBottle)) {
-    return { compatibilityLayer: 'crossover', wineBottle: path.basename(resolvedBottle) };
+    return { compatibilityLayer: 'crossover', wineBottle: bottleBase };
   }
   const preferredReady =
     detectedLayers.find((l) => l && l.available) || detectedLayers[0] || null;
   return {
     compatibilityLayer: preferredReady?.type || 'wine',
-    wineBottle: path.basename(resolvedBottle),
+    wineBottle: bottleBase,
   };
 }
 
@@ -826,14 +847,28 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
     // =========================================================================
     const discoveredBottleRoots = [];
     if (platform === 'darwin') {
-      const scanBottleContainers = [
-        path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
-        path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
-        path.join(homedir, 'Games/OneLauncher/Bottles'),
-        path.join(homedir, 'Bottles'),
-        path.join(homedir, 'Library/Application Support/Whisky/Bottles'),
-        path.join(homedir, 'Library/Application Support/Mythic/Bottles'),
-      ];
+      const detectedDarwinLayers = detectCompatibilityLayers({
+        platform,
+        homedir,
+        ...(options.customApplicationsDir
+          ? { customApplicationsDir: options.customApplicationsDir }
+          : {}),
+        ...(options.applicationsDirs ? { applicationsDirs: options.applicationsDirs } : {}),
+      });
+      const scanBottleContainers = Array.from(
+        new Set([
+          path.join(homedir, 'Library/Application Support/CrossOver/Bottles'),
+          path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
+          path.join(homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
+          path.join(homedir, 'Games/OneLauncher/Bottles'),
+          path.join(homedir, 'Bottles'),
+          path.join(homedir, 'Library/Application Support/Whisky/Bottles'),
+          path.join(homedir, 'Library/Application Support/Mythic/Bottles'),
+          ...(Array.isArray(detectedDarwinLayers) ? detectedDarwinLayers : [])
+            .map((/** @type {any} */ l) => l?.bottlesDir)
+            .filter((/** @type {any} */ d) => typeof d === 'string' && d.trim()),
+        ])
+      );
       for (const bottlesDir of scanBottleContainers) {
         if (!fs.existsSync(bottlesDir)) continue;
         try {

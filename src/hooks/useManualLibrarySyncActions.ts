@@ -155,8 +155,12 @@ export function useManualLibrarySyncActions({
             try {
               if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
                 const steamRes = await window.electronAPI.syncStore('steam');
-                if (Array.isArray(steamRes?.suppressedItems) && steamRes.suppressedItems.length > 0) {
-                  registerSuppressedCatalogEntries(steamRes.suppressedItems);
+                if (Array.isArray(steamRes?.suppressedItems)) {
+                  registerSuppressedCatalogEntries(steamRes.suppressedItems, {
+                    storefrontId: 'steam',
+                    authoritativeComplete: Boolean(steamRes?.authoritativeComplete),
+                    authoritativeGames: Array.isArray(steamRes?.games) ? steamRes.games : undefined,
+                  });
                 }
                 if (steamRes?.achievements && Object.keys(steamRes.achievements).length > 0) {
                   steamAchs = {
@@ -213,8 +217,12 @@ export function useManualLibrarySyncActions({
               let syncedGog = false;
               if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
                 const gogRes = await window.electronAPI.syncStore('gog', gogInteg.credentials);
-                if (Array.isArray(gogRes?.suppressedItems) && gogRes.suppressedItems.length > 0) {
-                  registerSuppressedCatalogEntries(gogRes.suppressedItems);
+                if (Array.isArray(gogRes?.suppressedItems)) {
+                  registerSuppressedCatalogEntries(gogRes.suppressedItems, {
+                    storefrontId: 'gog',
+                    authoritativeComplete: Boolean(gogRes?.authoritativeComplete),
+                    authoritativeGames: Array.isArray(gogRes?.games) ? gogRes.games : undefined,
+                  });
                 }
                 if (gogRes?.achievements && Object.keys(gogRes.achievements).length > 0) {
                   gogAchs = {
@@ -271,8 +279,12 @@ export function useManualLibrarySyncActions({
               let syncedEpic = false;
               if (typeof window !== 'undefined' && window.electronAPI?.syncStore) {
                 const epicRes = await window.electronAPI.syncStore('epic', epicInteg.credentials);
-                if (Array.isArray(epicRes?.suppressedItems) && epicRes.suppressedItems.length > 0) {
-                  registerSuppressedCatalogEntries(epicRes.suppressedItems);
+                if (Array.isArray(epicRes?.suppressedItems)) {
+                  registerSuppressedCatalogEntries(epicRes.suppressedItems, {
+                    storefrontId: 'epic',
+                    authoritativeComplete: Boolean(epicRes?.authoritativeComplete),
+                    authoritativeGames: Array.isArray(epicRes?.games) ? epicRes.games : undefined,
+                  });
                 }
                 if (epicRes?.achievements && Object.keys(epicRes.achievements).length > 0) {
                   epicAchs = {
@@ -336,8 +348,12 @@ export function useManualLibrarySyncActions({
                   syncMode,
                   forceRefresh: true,
                 });
-                if (Array.isArray(xboxRes?.suppressedItems) && xboxRes.suppressedItems.length > 0) {
-                  registerSuppressedCatalogEntries(xboxRes.suppressedItems);
+                if (Array.isArray(xboxRes?.suppressedItems)) {
+                  registerSuppressedCatalogEntries(xboxRes.suppressedItems, {
+                    storefrontId: 'xbox',
+                    authoritativeComplete: Boolean(xboxRes?.authoritativeComplete),
+                    authoritativeGames: Array.isArray(xboxRes?.games) ? xboxRes.games : undefined,
+                  });
                 }
                 if (xboxRes?.achievements && Object.keys(xboxRes.achievements).length > 0) {
                   xboxAchs = {

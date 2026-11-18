@@ -390,10 +390,14 @@ export class EpicIntegrationService {
             continue;
           }
 
-          // 3. Skip real DLCs & add-ons (only if mainGameItem has an actual id/namespace)
+          // 3. Skip real DLCs & add-ons (only if mainGameItem targets a distinct parent item)
+          const rawCatalogId = String(item.catalogItemId || '').trim();
+          const mainGameRef = item.metadata?.mainGameItem || item.mainGameItem;
+          const mainGameTargetId = String(mainGameRef?.id || '').trim();
+          const mainGameNamespace = String(mainGameRef?.namespace || '').trim();
           const hasRealMainGame = Boolean(
-            (item.metadata?.mainGameItem && (item.metadata.mainGameItem.id || item.metadata.mainGameItem.namespace)) ||
-            (item.mainGameItem && (item.mainGameItem.id || item.mainGameItem.namespace))
+            (mainGameTargetId || mainGameNamespace) &&
+              (!rawCatalogId || !mainGameTargetId || mainGameTargetId !== rawCatalogId)
           );
           if (hasRealMainGame) continue;
 
@@ -403,14 +407,32 @@ export class EpicIntegrationService {
             continue;
           }
 
-          // 5. Skip non-game category paths
+          // 5. Skip non-game category paths using `/`-delimited segment parsing (preserving games+mods / games+vault base games)
           const categories = item.metadata?.categories || [];
-          const isAddonCategory = categories.some((c: EpicCategoryItem) =>
-            ['addons', 'dlc', 'mods', 'digitalextras', 'consumable', 'vault'].some((sub) =>
-              (c.path || '').toLowerCase().includes(sub)
-            )
-          );
-          if (isAddonCategory) continue;
+          const categorySegments = new Set<string>();
+          for (const c of categories) {
+            const rawPath = String(c?.path || '').toLowerCase();
+            for (const seg of rawPath.split('/')) {
+              const trimmedSeg = seg.trim();
+              if (trimmedSeg) categorySegments.add(trimmedSeg);
+            }
+          }
+          const hasGamesSegment = categorySegments.has('games');
+          const hasHardAddonSegment = [
+            'addons',
+            'add-on',
+            'addon',
+            'dlc',
+            'digitalextras',
+            'consumable',
+            'audience',
+            'engines',
+            'editors',
+            'plugins',
+          ].some((seg) => categorySegments.has(seg));
+          const hasSoftModOrVaultOnly =
+            !hasGamesSegment && (categorySegments.has('mods') || categorySegments.has('vault'));
+          if (hasHardAddonSegment || hasSoftModOrVaultOnly) continue;
 
           // 6. Skip Fortnite microtransactions / item shop add-ons
           if (item.appName?.startsWith('Fortnite_')) continue;
@@ -480,10 +502,23 @@ export class EpicIntegrationService {
               });
               const meta = cRes.data?.[item.catalogItemId];
               if (meta) {
+                const metaCategorySegments = new Set<string>();
+                for (const c of meta.categories || []) {
+                  for (const seg of String(c?.path || '').toLowerCase().split('/')) {
+                    const trimmedSeg = seg.trim();
+                    if (trimmedSeg) metaCategorySegments.add(trimmedSeg);
+                  }
+                }
+                const metaMainId = String(meta.mainGameItem?.id || '').trim();
+                const metaMainNs = String(meta.mainGameItem?.namespace || '').trim();
+                const hasMetaParentGame = Boolean(
+                  (metaMainId || metaMainNs) &&
+                    (!rawCatalogId || !metaMainId || metaMainId !== rawCatalogId)
+                );
                 const isDlc =
-                  meta.categories?.some((c: EpicCategoryItem) =>
-                    ['addons', 'dlc'].includes(c.path || '')
-                  ) || Boolean(meta.mainGameItem);
+                  ['addons', 'add-on', 'addon', 'dlc', 'digitalextras', 'consumable'].some((seg) =>
+                    metaCategorySegments.has(seg)
+                  ) || hasMetaParentGame;
                 if (isDlc) continue;
                 if (meta.title) {
                   title = meta.title;

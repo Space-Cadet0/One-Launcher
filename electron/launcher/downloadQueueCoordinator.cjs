@@ -99,6 +99,9 @@ const {
   discoverSteamLocations,
   normalizeComparableTitle,
   extractBottleRootFromPath,
+  isValidBottleDirectory,
+  inspectBottleConfMetadata,
+  assertRunnerBottleArchCompatible,
   detectCompatibilityLayers,
   resolveSipSafeWineBinaryAndPreloadEnv,
   prepareCrossOverWineSpawnEnv,
@@ -2637,6 +2640,36 @@ async function sweepStaleGogTempBinsAsync(/** @type {string[]} */ targetDirs = [
 }
 
 /**
+ * Normalize compatibility layer / runner component IDs (e.g. `'runner_crossover_preview_arm64'`)
+ * into canonical `CompatibilityLayerType` values, treating `'auto'` and `'native'` as empty.
+ *
+ * @param {unknown} rawLayer
+ * @returns {string}
+ */
+function normalizeRequestedCompatibilityLayerType(rawLayer) {
+  const s = String(rawLayer || '')
+    .trim()
+    .toLowerCase();
+  if (!s || s === 'auto' || s === 'native') return '';
+  if (s === 'runner_crossover_preview_arm64' || s === 'crossover_preview_arm64') {
+    return 'crossover_preview_arm64';
+  }
+  if (s === 'runner_crossover_preview' || s === 'crossover_preview') {
+    return 'crossover_preview';
+  }
+  if (s === 'runner_crossover' || s === 'crossover') {
+    return 'crossover';
+  }
+  if (s === 'runner_wine' || s === 'wine') {
+    return 'wine';
+  }
+  if (s === 'runner_gptk' || s === 'gptk') {
+    return 'gptk';
+  }
+  return s.startsWith('runner_') ? s.slice('runner_'.length) : s;
+}
+
+/**
  * Shared Dual-OS (`darwin` Wine/CrossOver bottle + `win32` native host) installation orchestrator
  * for chained publisher games (`xbox` `publisher_managed`, `epic` `partner_launcher_link`, and
  * standalone publisher storefronts).
@@ -2734,29 +2767,11 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
     try {
       const homedir = options.homedir || os.homedir();
       const explicitHomedirOpt = options.homedir ? { homedir: options.homedir } : {};
-      const detectedLayers = detectCompatibilityLayers({
-        ...options,
-        platform: 'darwin',
-        ...explicitHomedirOpt,
-      });
-      const requestedLayerType = payload.compatibilityLayer || options.compatibilityLayer;
-      const chosenLayer =
-        options.compatibilityLayerObj ||
-        (requestedLayerType
-          ? detectedLayers.find(
-              (l) => l && (l.type === requestedLayerType || l.id === requestedLayerType)
-            )
-          : null) ||
-        detectedLayers.find(
-          (l) => l && (l.type === 'crossover' || l.type === 'crossover_preview')
-        ) ||
-        detectedLayers[0] ||
-        null;
-
-      const explicitBottleName = String(
-        payload.wineBottle || payload.wineBottleName || options.bottleName || ''
-      ).trim();
+      const hostArch = String(
+        options.arch || options.hostArch || process.arch || 'arm64'
+      ).toLowerCase();
       let gameCfgBottleName = '';
+      let gameCfgCompatLayer = '';
       try {
         const allLaunchCfgs = getGameLaunchConfigs(options) || {};
         const lookupId = String(payload.gameId || `${platformId}_${platformGameId}`).trim();
@@ -2767,25 +2782,169 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
           null;
         const resolvedSavedCfg = resolvePlatformLaunchConfig(rawSavedCfg || {}, platformId);
         gameCfgBottleName = String(resolvedSavedCfg?.wineBottleName || '').trim();
+        gameCfgCompatLayer = String(resolvedSavedCfg?.compatibilityLayer || '').trim();
       } catch {}
+      const requestedLayerType = normalizeRequestedCompatibilityLayerType(
+        payload.compatibilityLayer ||
+          payload.launchConfig?.compatibilityLayer ||
+          options.compatibilityLayer ||
+          gameCfgCompatLayer
+      );
+      if (requestedLayerType === 'crossover_preview_arm64' && hostArch !== 'arm64') {
+        throw new Error(
+          'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+        );
+      }
+      const detectedLayers = detectCompatibilityLayers({
+        ...options,
+        platform: 'darwin',
+        ...explicitHomedirOpt,
+      });
+      const explicitLayerMatch = requestedLayerType
+        ? detectedLayers.find(
+            (l) => l && (l.type === requestedLayerType || l.id === requestedLayerType)
+          )
+        : null;
+      if (requestedLayerType && !options.compatibilityLayerObj) {
+        if (!explicitLayerMatch) {
+          throw new Error(`Compatibility runner "${requestedLayerType}" is not installed.`);
+        }
+        if (
+          explicitLayerMatch.available === false ||
+          (explicitLayerMatch.type === 'crossover_preview_arm64' && hostArch !== 'arm64')
+        ) {
+          throw new Error(
+            explicitLayerMatch.type === 'crossover_preview_arm64'
+              ? 'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+              : `Compatibility runner "${requestedLayerType}" is unavailable on this host.`
+          );
+        }
+      }
+      const chosenLayer =
+        options.compatibilityLayerObj ||
+        explicitLayerMatch ||
+        detectedLayers.find(
+          (l) =>
+            l &&
+            l.available !== false &&
+            (l.type === 'crossover' ||
+              l.type === 'crossover_preview' ||
+              l.type === 'crossover_preview_arm64')
+        ) ||
+        detectedLayers.find((l) => l && l.available !== false) ||
+        detectedLayers[0] ||
+        null;
+      if (
+        chosenLayer?.type === 'crossover_preview_arm64' &&
+        (hostArch !== 'arm64' || chosenLayer.available === false)
+      ) {
+        throw new Error(
+          'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+        );
+      }
+
+      const explicitBottleName = String(
+        payload.wineBottle || payload.wineBottleName || options.bottleName || ''
+      ).trim();
       let wizardPreferredBottleName = '';
+      let wizardPreferredRunnerType = '';
       try {
         const getWizardStateFn = getSetupWizardStateLazy();
         const wizardState =
           typeof getWizardStateFn === 'function' ? getWizardStateFn(options) : null;
         wizardPreferredBottleName = String(wizardState?.preferredBottleName || '').trim();
+        wizardPreferredRunnerType = String(wizardState?.preferredRunnerType || '').trim();
       } catch {}
+      const chosenBottlesDir =
+        chosenLayer?.bottlesDir ||
+        path.join(homedir, 'Library', 'Application Support', 'CrossOver', 'Bottles');
+      const isArm64ChosenLayer = chosenLayer?.type === 'crossover_preview_arm64';
+      const isIntelCrossOverChosenLayer =
+        chosenLayer?.type === 'crossover' || chosenLayer?.type === 'crossover_preview';
       const discoveredBottleNames = Array.isArray(chosenLayer?.availableBottles)
-        ? chosenLayer.availableBottles
+        ? chosenLayer.availableBottles.map((/** @type {string} */ bName) => {
+            const bPath = path.join(chosenBottlesDir, bName);
+            const detailMeta = chosenLayer?.bottleDetails?.[bName];
+            const confMeta = detailMeta || inspectBottleConfMetadata(bPath);
+            const resolvedWineArch =
+              confMeta?.wineArch ||
+              (isValidBottleDirectory(bPath, false) ? 'win64' : undefined);
+            return {
+              name: bName,
+              ...(confMeta || {}),
+              ...(resolvedWineArch ? { wineArch: resolvedWineArch } : {}),
+            };
+          })
         : [];
+      let effectiveWizardPreferredBottleName = wizardPreferredBottleName;
+      if (
+        wizardPreferredBottleName &&
+        (isArm64ChosenLayer || isIntelCrossOverChosenLayer)
+      ) {
+        const candidateWizardBottleDirs = Array.from(
+          new Set(
+            [
+              chosenBottlesDir,
+              path.join(homedir, 'Library', 'Application Support', 'CrossOver', 'Bottles'),
+              path.join(
+                homedir,
+                'Library',
+                'Application Support',
+                'CrossOver Preview',
+                'Bottles'
+              ),
+              path.join(
+                homedir,
+                'Library',
+                'Application Support',
+                'CrossOver Preview arm64',
+                'Bottles'
+              ),
+            ].filter(Boolean)
+          )
+        );
+        const detailArch = chosenLayer?.bottleDetails?.[wizardPreferredBottleName]?.wineArch;
+        if (detailArch && (isArm64ChosenLayer ? detailArch !== 'arm64' : detailArch === 'arm64')) {
+          effectiveWizardPreferredBottleName = '';
+        } else {
+          for (const dir of candidateWizardBottleDirs) {
+            const candPath = path.join(dir, wizardPreferredBottleName);
+            if (!fs.existsSync(candPath)) continue;
+            const meta = inspectBottleConfMetadata(candPath);
+            const isInit =
+              Boolean(meta.wineArch) ||
+              fs.existsSync(path.join(candPath, 'cxbottle.conf')) ||
+              isValidBottleDirectory(candPath, false);
+            if (!isInit) continue;
+            const arch = meta.wineArch || 'win64';
+            if (isArm64ChosenLayer ? arch !== 'arm64' : arch === 'arm64') {
+              effectiveWizardPreferredBottleName = '';
+              break;
+            }
+          }
+        }
+        if (
+          effectiveWizardPreferredBottleName &&
+          wizardPreferredRunnerType &&
+          wizardPreferredRunnerType !== 'skip' &&
+          (wizardPreferredRunnerType === 'crossover_preview_arm64') !== isArm64ChosenLayer &&
+          wizardPreferredBottleName.toLowerCase() ===
+            (wizardPreferredRunnerType === 'crossover_preview_arm64'
+              ? 'onelauncher-arm64'
+              : 'onelauncher')
+        ) {
+          effectiveWizardPreferredBottleName = '';
+        }
+      }
       const helperBottleName =
         typeof chainedPublisherLaunchers.resolveDefaultChainedBottleName === 'function'
           ? String(
               chainedPublisherLaunchers.resolveDefaultChainedBottleName({
                 explicitBottleName,
                 gameConfigBottleName: gameCfgBottleName,
-                wizardPreferredBottleName,
+                wizardPreferredBottleName: effectiveWizardPreferredBottleName || undefined,
                 discoveredBottleNames,
+                runnerType: chosenLayer?.type,
               }) || ''
             ).trim()
           : '';
@@ -2793,8 +2952,8 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
         helperBottleName ||
         explicitBottleName ||
         gameCfgBottleName ||
-        wizardPreferredBottleName ||
-        'OneLauncher';
+        effectiveWizardPreferredBottleName ||
+        (isArm64ChosenLayer ? 'OneLauncher-arm64' : 'OneLauncher');
       /** @type {Record<string, any>} */
       const bottleInitEnv = {};
       let compatReadyRes = null;
@@ -2806,7 +2965,12 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
             bottleInitEnv,
             { ...options, platform: 'darwin', ...explicitHomedirOpt }
           );
-        } catch {}
+        } catch (/** @type {any} */ compatErr) {
+          const msg = String(compatErr?.message || compatErr || '');
+          if (/incompatible|WineArch=|Invalid CrossOver bottle/i.test(msg)) {
+            throw compatErr;
+          }
+        }
       }
       const resolvedBottlesRoot =
         chosenLayer?.bottlesDir ||
@@ -2818,6 +2982,9 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
           bottleInitEnv.WINEPREFIX ||
           path.join(resolvedBottlesRoot, requestedBottleName)
       );
+      if (chosenLayer?.type && targetBottlePath) {
+        assertRunnerBottleArchCompatible(chosenLayer.type, requestedBottleName, targetBottlePath);
+      }
 
       const ensurePublisherFn =
         options.ensureChainedPublisherLauncherInstalledFn ||
@@ -2960,7 +3127,9 @@ async function executeChainedPublisherInstallFlow(flowParams, options = {}) {
         compatibilityLayerType: effectiveLayerType,
       });
       const isCrossOverRunner =
-        effectiveLayerType === 'crossover' || effectiveLayerType === 'crossover_preview';
+        effectiveLayerType === 'crossover' ||
+        effectiveLayerType === 'crossover_preview' ||
+        effectiveLayerType === 'crossover_preview_arm64';
       const spawnImpl = typeof options.spawnFn === 'function' ? options.spawnFn : spawn;
       /** @type {Record<string, any>} */
       const childEnv = {
@@ -5709,183 +5878,340 @@ async function installGame(
       let targetVdfCandidates = [];
       let wasAuthenticatedAtLaunch = true;
       const layers = isWinCompatInstall ? detectCompatibilityLayers(options) : [];
+      const hostArch = String(
+        options.arch || options.hostArch || process.arch || 'arm64'
+      ).toLowerCase();
+      const existingConfigs = isWinCompatInstall ? getGameLaunchConfigs(options) : {};
+      const rawExistingConfig =
+        isWinCompatInstall && payload.gameId ? existingConfigs[payload.gameId] || {} : {};
+      const existingConfig = isWinCompatInstall
+        ? resolvePlatformLaunchConfig(rawExistingConfig, 'steam')
+        : {};
+      const requestedLayerType = isWinCompatInstall
+        ? normalizeRequestedCompatibilityLayerType(
+            payload.compatibilityLayer ||
+              payload.launchConfig?.compatibilityLayer ||
+              options.compatibilityLayer ||
+              existingConfig.compatibilityLayer
+          )
+        : '';
+      const failSteamWinCompatFast = (/** @type {string} */ errMsg) => {
+        downloadControllers.delete(taskId);
+        updateDownloadTask(
+          taskId,
+          {
+            status: 'failed',
+            speedBytesPerSec: 0,
+            etaSeconds: undefined,
+            error: errMsg,
+            statusMessage: errMsg,
+          },
+          options
+        );
+        return { success: false, error: errMsg };
+      };
+
+      if (
+        isWinCompatInstall &&
+        !options.disableWineSteamSpawn &&
+        requestedLayerType === 'crossover_preview_arm64' &&
+        hostArch !== 'arm64'
+      ) {
+        return failSteamWinCompatFast(
+          'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+        );
+      }
+
+      if (
+        isWinCompatInstall &&
+        !options.disableWineSteamSpawn &&
+        requestedLayerType &&
+        layers.length === 0
+      ) {
+        return failSteamWinCompatFast(
+          `Compatibility runner "${requestedLayerType}" is not installed.`
+        );
+      }
 
       if (isWinCompatInstall && !options.disableWineSteamSpawn && layers.length > 0) {
-        const existingConfigs = getGameLaunchConfigs(options);
-        const rawExistingConfig = (payload.gameId && existingConfigs[payload.gameId]) || {};
-        const existingConfig = resolvePlatformLaunchConfig(rawExistingConfig, 'steam');
-        const requestedLayerType = payload.compatibilityLayer || existingConfig.compatibilityLayer;
-        const preferredLayer =
-          (requestedLayerType && layers.find((l) => l.type === requestedLayerType)) ||
-          layers.find((l) => l.type === 'crossover' || l.type === 'crossover_preview') ||
-          layers[0];
-
-        const explicitBottleName = String(
-          payload.wineBottleName || existingConfig.wineBottleName || ''
-        ).trim();
-        const effectiveInstallBottleCfg = explicitBottleName
-          ? { ...existingConfig, wineBottleName: explicitBottleName }
-          : existingConfig;
-
-        /** @type {Record<string, any>} */
-        const env = { ...process.env };
-        await ensureCompatibilityLayerReady(preferredLayer, effectiveInstallBottleCfg, env, options);
-
-        const candidateBottles = [];
-        const targetBottleName =
-          explicitBottleName ||
-          env.CX_BOTTLE ||
-          (Array.isArray(preferredLayer.availableBottles) && preferredLayer.availableBottles[0]) ||
-          'OneLauncher';
-        const targetBottlePath =
-          (explicitBottleName && preferredLayer.bottlesDir
-            ? path.isAbsolute(explicitBottleName)
-              ? explicitBottleName
-              : path.join(preferredLayer.bottlesDir, explicitBottleName)
-            : '') ||
-          env.WINEPREFIX ||
-          (preferredLayer.bottlesDir ? path.join(preferredLayer.bottlesDir, targetBottleName) : '');
-
-        if (targetBottlePath) {
-          candidateBottles.push({
-            layer: preferredLayer,
-            bottleName: targetBottleName,
-            bottlePath: targetBottlePath,
-          });
+        const matchedRequestedLayer = requestedLayerType
+          ? layers.find((l) => l && (l.type === requestedLayerType || l.id === requestedLayerType))
+          : null;
+        if (requestedLayerType) {
+          if (!matchedRequestedLayer) {
+            return failSteamWinCompatFast(
+              `Compatibility runner "${requestedLayerType}" is not installed.`
+            );
+          }
+          if (
+            matchedRequestedLayer.available === false ||
+            (matchedRequestedLayer.type === 'crossover_preview_arm64' && hostArch !== 'arm64')
+          ) {
+            return failSteamWinCompatFast(
+              matchedRequestedLayer.type === 'crossover_preview_arm64'
+                ? 'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+                : `Compatibility runner "${requestedLayerType}" is unavailable on this host.`
+            );
+          }
         }
+        const preferredLayer =
+          matchedRequestedLayer ||
+          layers.find(
+            (l) =>
+              l &&
+              l.available !== false &&
+              (l.type === 'crossover' ||
+                l.type === 'crossover_preview' ||
+                l.type === 'crossover_preview_arm64')
+          ) ||
+          layers.find((l) => l && l.available !== false) ||
+          null;
 
-        if (!explicitBottleName || !targetBottlePath || !fs.existsSync(targetBottlePath)) {
-          for (const layer of layers) {
-            if (!layer.bottlesDir || !Array.isArray(layer.availableBottles)) continue;
-            for (const bottleName of layer.availableBottles) {
-              const bottlePath = path.join(layer.bottlesDir, bottleName);
-              if (!candidateBottles.some((b) => b.bottlePath === bottlePath)) {
-                candidateBottles.push({ layer, bottleName, bottlePath });
+        if (!preferredLayer) {
+          if (
+            hostArch !== 'arm64' &&
+            layers.some((l) => l && l.type === 'crossover_preview_arm64')
+          ) {
+            return failSteamWinCompatFast(
+              'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+            );
+          }
+        } else {
+          if (
+            preferredLayer.type === 'crossover_preview_arm64' &&
+            (hostArch !== 'arm64' || preferredLayer.available === false)
+          ) {
+            return failSteamWinCompatFast(
+              'CrossOver Preview (arm64 / FEX) requires an Apple Silicon (arm64) Mac and is unsupported on Intel x86_64 Macs.'
+            );
+          }
+
+          const explicitBottleName = String(
+            payload.wineBottleName || existingConfig.wineBottleName || ''
+          ).trim();
+          const effectiveInstallBottleCfg = explicitBottleName
+            ? { ...existingConfig, wineBottleName: explicitBottleName }
+            : existingConfig;
+
+          /** @type {Record<string, any>} */
+          const env = { ...process.env };
+          try {
+            await ensureCompatibilityLayerReady(
+              preferredLayer,
+              effectiveInstallBottleCfg,
+              env,
+              options
+            );
+          } catch (/** @type {any} */ compatErr) {
+            return failSteamWinCompatFast(
+              compatErr?.message || String(compatErr || 'Compatibility layer preparation failed.')
+            );
+          }
+
+          const preferredIsArm64 = preferredLayer.type === 'crossover_preview_arm64';
+          const isBottleArchCompatibleForInstall = (
+            /** @type {any} */ layerObj,
+            /** @type {string} */ bName,
+            /** @type {string} */ bPath
+          ) => {
+            const confMeta =
+              layerObj?.bottleDetails?.[bName] ||
+              (bPath ? inspectBottleConfMetadata(bPath) : {});
+            const arch =
+              confMeta?.wineArch ||
+              (bPath && isValidBottleDirectory(bPath, false) ? 'win64' : undefined);
+            if (!arch) {
+              return preferredIsArm64
+                ? layerObj?.type === 'crossover_preview_arm64'
+                : layerObj?.type !== 'crossover_preview_arm64';
+            }
+            return preferredIsArm64 ? arch === 'arm64' : arch !== 'arm64';
+          };
+          const compatiblePreferredBottles = Array.isArray(preferredLayer.availableBottles)
+            ? preferredLayer.availableBottles.filter((/** @type {string} */ bName) =>
+                isBottleArchCompatibleForInstall(
+                  preferredLayer,
+                  bName,
+                  preferredLayer.bottlesDir ? path.join(preferredLayer.bottlesDir, bName) : ''
+                )
+              )
+            : [];
+          const preferredFallbackBottleName = preferredIsArm64
+            ? 'OneLauncher-arm64'
+            : 'OneLauncher';
+
+          const candidateBottles = [];
+          const targetBottleName =
+            explicitBottleName ||
+            env.CX_BOTTLE ||
+            compatiblePreferredBottles.find(
+              (/** @type {string} */ b) =>
+                b.toLowerCase() === preferredFallbackBottleName.toLowerCase()
+            ) ||
+            compatiblePreferredBottles[0] ||
+            preferredFallbackBottleName;
+          const targetBottlePath =
+            (explicitBottleName && preferredLayer.bottlesDir
+              ? path.isAbsolute(explicitBottleName)
+                ? explicitBottleName
+                : path.join(preferredLayer.bottlesDir, explicitBottleName)
+              : '') ||
+            env.WINEPREFIX ||
+            (preferredLayer.bottlesDir
+              ? path.join(preferredLayer.bottlesDir, targetBottleName)
+              : '');
+
+          if (targetBottlePath) {
+            candidateBottles.push({
+              layer: preferredLayer,
+              bottleName: targetBottleName,
+              bottlePath: targetBottlePath,
+            });
+          }
+
+          if (!explicitBottleName || !targetBottlePath || !fs.existsSync(targetBottlePath)) {
+            for (const layer of layers) {
+              if (!layer.bottlesDir || !Array.isArray(layer.availableBottles)) continue;
+              if (
+                preferredIsArm64 &&
+                (layer.type === 'crossover' || layer.type === 'crossover_preview')
+              ) {
+                continue;
+              }
+              if (!preferredIsArm64 && layer.type === 'crossover_preview_arm64') {
+                continue;
+              }
+              for (const bottleName of layer.availableBottles) {
+                const bottlePath = path.join(layer.bottlesDir, bottleName);
+                if (!isBottleArchCompatibleForInstall(layer, bottleName, bottlePath)) continue;
+                if (!candidateBottles.some((b) => b.bottlePath === bottlePath)) {
+                  candidateBottles.push({ layer, bottleName, bottlePath });
+                }
               }
             }
           }
-        }
 
-        /** @type {any} */
-        let resolvedTarget = null;
-        if (explicitBottleName && targetBottlePath && fs.existsSync(targetBottlePath)) {
-          const explicitSteamExe = resolveBottleSteamExe(targetBottlePath);
-          if (explicitSteamExe) {
-            resolvedTarget = {
-              layer: preferredLayer,
-              bottleName: targetBottleName,
-              bottlePath: targetBottlePath,
-              foundSteamExe: explicitSteamExe,
-            };
-          }
-        } else {
-          for (const cand of candidateBottles) {
-            const foundSteamExe = resolveBottleSteamExe(cand.bottlePath);
-            if (foundSteamExe) {
-              resolvedTarget = { ...cand, foundSteamExe };
-              break;
-            }
-          }
-        }
-
-        if (
-          !resolvedTarget &&
-          targetBottlePath &&
-          preferredLayer.binaryPath &&
-          fs.existsSync(preferredLayer.binaryPath)
-        ) {
-          const bootstrappedExe = await ensureWindowsSteamInBottle(
-            preferredLayer,
-            targetBottleName,
-            targetBottlePath,
-            taskId,
-            options
-          );
-          if (bootstrappedExe) {
-            resolvedTarget = {
-              layer: preferredLayer,
-              bottleName: targetBottleName,
-              bottlePath: targetBottlePath,
-              foundSteamExe: bootstrappedExe,
-            };
-          }
-        }
-
-        if (
-          resolvedTarget &&
-          resolvedTarget.foundSteamExe &&
-          resolvedTarget.layer.binaryPath &&
-          (typeof options.spawnFn === 'function' || fs.existsSync(resolvedTarget.layer.binaryPath))
-        ) {
-          try {
-            const bottleVdfCandidates = [
-              path.join(path.dirname(resolvedTarget.foundSteamExe), 'config', 'loginusers.vdf'),
-              path.join(
-                resolvedTarget.bottlePath,
-                'drive_c/Program Files (x86)/Steam/config/loginusers.vdf'
-              ),
-              path.join(
-                resolvedTarget.bottlePath,
-                'drive_c/Program Files/Steam/config/loginusers.vdf'
-              ),
-            ];
-            wasAuthenticatedAtLaunch = await hasAuthenticatedSteamSessionInVdfCandidates(
-              bottleVdfCandidates,
-              expectedSteamId64
-            );
-
-            const spawnWineSteamInstall = () => {
-              const wineArgs = [resolvedTarget.foundSteamExe, `steam://install/${appId}`];
-              const spawnOpts = {
-                env: {
-                  ...process.env,
-                  ...env,
-                  CX_BOTTLE: resolvedTarget.bottleName,
-                  WINEPREFIX: resolvedTarget.bottlePath,
-                },
-                stdio: /** @type {'ignore'} */ ('ignore'),
-                detached: process.platform !== 'win32',
+          /** @type {any} */
+          let resolvedTarget = null;
+          if (explicitBottleName && targetBottlePath && fs.existsSync(targetBottlePath)) {
+            const explicitSteamExe = resolveBottleSteamExe(targetBottlePath);
+            if (explicitSteamExe) {
+              resolvedTarget = {
+                layer: preferredLayer,
+                bottleName: targetBottleName,
+                bottlePath: targetBottlePath,
+                foundSteamExe: explicitSteamExe,
               };
-              const child =
-                typeof options.spawnFn === 'function'
-                  ? options.spawnFn(resolvedTarget.layer.binaryPath, wineArgs, spawnOpts)
-                  : (() => {
-                      const resolvedWineSteamSpawn = resolveWindowsNodeShebangSpawn(
-                        resolvedTarget.layer.binaryPath,
-                        wineArgs
-                      );
-                      return spawn(
-                        resolvedWineSteamSpawn.cmd,
-                        resolvedWineSteamSpawn.args,
-                        spawnOpts
-                      );
-                    })();
-              if (child && typeof child.unref === 'function') child.unref();
-            };
-
-            spawnWineSteamInstall();
-            launchedViaWineSteam = true;
-            targetVdfCandidates = bottleVdfCandidates;
-            dispatchSteamInstallTriggerAsync = async () => {
-              spawnWineSteamInstall();
-            };
-
-            if (payload.gameId) {
-              try {
-                saveGameLaunchConfig(
-                  {
-                    ...existingConfig,
-                    gameId: payload.gameId,
-                    preferredPlatformId: 'steam',
-                    launchMethod: 'compatibility_layer',
-                    compatibilityLayer: resolvedTarget.layer.type,
-                    wineBottleName: resolvedTarget.bottleName,
-                  },
-                  options
-                );
-              } catch {}
             }
-          } catch {}
+          } else {
+            for (const cand of candidateBottles) {
+              const foundSteamExe = resolveBottleSteamExe(cand.bottlePath);
+              if (foundSteamExe) {
+                resolvedTarget = { ...cand, foundSteamExe };
+                break;
+              }
+            }
+          }
+
+          if (
+            !resolvedTarget &&
+            targetBottlePath &&
+            preferredLayer.binaryPath &&
+            fs.existsSync(preferredLayer.binaryPath)
+          ) {
+            const bootstrappedExe = await ensureWindowsSteamInBottle(
+              preferredLayer,
+              targetBottleName,
+              targetBottlePath,
+              taskId,
+              options
+            );
+            if (bootstrappedExe) {
+              resolvedTarget = {
+                layer: preferredLayer,
+                bottleName: targetBottleName,
+                bottlePath: targetBottlePath,
+                foundSteamExe: bootstrappedExe,
+              };
+            }
+          }
+
+          if (
+            resolvedTarget &&
+            resolvedTarget.foundSteamExe &&
+            resolvedTarget.layer.binaryPath &&
+            (typeof options.spawnFn === 'function' || fs.existsSync(resolvedTarget.layer.binaryPath))
+          ) {
+            try {
+              const bottleVdfCandidates = [
+                path.join(path.dirname(resolvedTarget.foundSteamExe), 'config', 'loginusers.vdf'),
+                path.join(
+                  resolvedTarget.bottlePath,
+                  'drive_c/Program Files (x86)/Steam/config/loginusers.vdf'
+                ),
+                path.join(
+                  resolvedTarget.bottlePath,
+                  'drive_c/Program Files/Steam/config/loginusers.vdf'
+                ),
+              ];
+              wasAuthenticatedAtLaunch = await hasAuthenticatedSteamSessionInVdfCandidates(
+                bottleVdfCandidates,
+                expectedSteamId64
+              );
+
+              const spawnWineSteamInstall = () => {
+                const wineArgs = [resolvedTarget.foundSteamExe, `steam://install/${appId}`];
+                const spawnOpts = {
+                  env: {
+                    ...process.env,
+                    ...env,
+                    CX_BOTTLE: resolvedTarget.bottleName,
+                    WINEPREFIX: resolvedTarget.bottlePath,
+                  },
+                  stdio: /** @type {'ignore'} */ ('ignore'),
+                  detached: process.platform !== 'win32',
+                };
+                const child =
+                  typeof options.spawnFn === 'function'
+                    ? options.spawnFn(resolvedTarget.layer.binaryPath, wineArgs, spawnOpts)
+                    : (() => {
+                        const resolvedWineSteamSpawn = resolveWindowsNodeShebangSpawn(
+                          resolvedTarget.layer.binaryPath,
+                          wineArgs
+                        );
+                        return spawn(
+                          resolvedWineSteamSpawn.cmd,
+                          resolvedWineSteamSpawn.args,
+                          spawnOpts
+                        );
+                      })();
+                if (child && typeof child.unref === 'function') child.unref();
+              };
+
+              spawnWineSteamInstall();
+              launchedViaWineSteam = true;
+              targetVdfCandidates = bottleVdfCandidates;
+              dispatchSteamInstallTriggerAsync = async () => {
+                spawnWineSteamInstall();
+              };
+
+              if (payload.gameId) {
+                try {
+                  saveGameLaunchConfig(
+                    {
+                      ...existingConfig,
+                      gameId: payload.gameId,
+                      preferredPlatformId: 'steam',
+                      launchMethod: 'compatibility_layer',
+                      compatibilityLayer: resolvedTarget.layer.type,
+                      wineBottleName: resolvedTarget.bottleName,
+                    },
+                    options
+                  );
+                } catch {}
+              }
+            } catch {}
+          }
         }
       } else if (platform === 'darwin' && !isWinCompatInstall && payload.gameId) {
         try {

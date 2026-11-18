@@ -28,7 +28,9 @@
  * @returns {string | null}
  */
 function classifyNonGameStorefrontItem({
+  store = '',
   title = '',
+  platformId = '',
   platformGameId = '',
   catalogItemId = '',
   namespace = '',
@@ -59,6 +61,7 @@ function classifyNonGameStorefrontItem({
   const lower = cleanTitle.toLowerCase();
   const compact = lower.replace(/[^a-z0-9]/g, '');
   const platIdLower = String(platformGameId || '').toLowerCase().trim();
+  const storeLower = String(store || platformId || '').toLowerCase().trim();
   const rawType = String(type || itemType || productType || productKind || '').trim();
   const normType = rawType.toLowerCase();
   const typeUpper = rawType.toUpperCase();
@@ -77,12 +80,18 @@ function classifyNonGameStorefrontItem({
     }
   }
   const hasGamesCategorySegment = categorySegments.has('games');
+  const hasBaseGameIndicators = hasGamesCategorySegment || isStandaloneGameType;
 
   // 1. Tools / Editors / Redistributables / Servers / SDKs / Standalone Storefront Launcher Utilities
-  // Note: NEVER match `'applications'` — Epic attaches `{ path: 'applications' }` to base games!
+  // Note: If an item possesses `hasGamesCategorySegment: true` (e.g. `{ path: 'games' }`), 'APPLICATION' is a
+  // game packaging format (used by Epic Games Store) and MUST NOT trigger tool/editor filtering.
+  const isToolType =
+    ['ENGINE', 'EDITOR', 'LEARNING', 'TOOL', 'CONFIG'].includes(typeUpper) ||
+    (!hasGamesCategorySegment && typeUpper === 'APPLICATION');
+
   if (
     platIdLower === 'gog-redist' ||
-    ['ENGINE', 'EDITOR', 'LEARNING', 'TOOL', 'APPLICATION', 'CONFIG'].includes(typeUpper) ||
+    isToolType ||
     ['engines', 'editors', 'plugins', 'codeplugins', 'projects', 'assets'].some((seg) =>
       categorySegments.has(seg)
     ) ||
@@ -148,22 +157,25 @@ function classifyNonGameStorefrontItem({
     !hasGamesCategorySegment && (categorySegments.has('mods') || categorySegments.has('vault'));
   const catHasDlc = catHasHardDlc || catHasSoftModOrVault;
 
-  const isDlcType = [
-    'ADD_ON',
-    'ADDON',
-    'ADD-ON',
-    'DLC',
-    'DURABLE',
-    'CONSUMABLE',
-    'WALLET',
-    'SUBSCRIPTION',
-    'PLUGIN',
-    'EXTRA',
-    'CURRENCY',
-    'ENTITLEMENT',
-    'OTHERS',
-    'INVALID',
-  ].includes(typeUpper);
+  // In Microsoft Store / Xbox catalog, ProductKind: "Durable" represents add-on DLCs.
+  // In Epic Games Store, itemType: "DURABLE" represents a permanent license for all base games and DLCs alike.
+  // Therefore, 'DURABLE' only triggers DLC filtering if store === 'xbox' or if hasGamesCategorySegment is false AND it lacks base game indicators.
+  const isDlcType =
+    [
+      'ADD_ON',
+      'ADDON',
+      'ADD-ON',
+      'DLC',
+      'CONSUMABLE',
+      'WALLET',
+      'SUBSCRIPTION',
+      'PLUGIN',
+      'EXTRA',
+      'CURRENCY',
+      'OTHERS',
+      'INVALID',
+    ].includes(typeUpper) ||
+    (typeUpper === 'DURABLE' && (storeLower === 'xbox' || !hasBaseGameIndicators));
 
   const cleanCatalogId = String(catalogItemId || '').trim();
   const mainGameObj =

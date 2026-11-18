@@ -399,6 +399,17 @@ function makeSyntheticSetupSnapshot(
       requiresExternalDownload: true,
       ...componentOverrides.runner_crossover_preview,
     }),
+    runner_crossover_preview_arm64: makeSyntheticComponentState(
+      'runner_crossover_preview_arm64',
+      {
+        title: 'CrossOver Preview (arm64 / FEX)',
+        shortLabel: 'Preview (arm64)',
+        status: 'missing',
+        canAutoInstall: hostPlatform === 'darwin',
+        requiresExternalDownload: false,
+        ...componentOverrides.runner_crossover_preview_arm64,
+      }
+    ),
     runner_wine: makeSyntheticComponentState('runner_wine', {
       title: 'Open-Source Wine',
       shortLabel: 'Open-Source Wine',
@@ -2511,7 +2522,11 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         runnerSelectNoPreview,
         (n) => n.type === 'option'
       ).map((o) => o.props.value);
-      expect(optionValuesNoPreview).toEqual(['crossover', 'crossover_preview', 'gptk', 'wine']);
+      const expectedRunnerOptions =
+        launcherService.getHostArch() === 'arm64'
+          ? ['crossover', 'crossover_preview', 'crossover_preview_arm64', 'gptk', 'wine']
+          : ['crossover', 'crossover_preview', 'gptk', 'wine'];
+      expect(optionValuesNoPreview).toEqual(expectedRunnerOptions);
 
       runnerSelectNoPreview.props.onChange({ target: { value: 'crossover_preview' } });
       treeNoPreview = modalNoPreview.render();
@@ -2544,12 +2559,7 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         findVNodeByTestId(treeAll, 'compat-runner-select'),
         (n) => n.type === 'option'
       ).map((o) => o.props.value);
-      expect(optionValuesWithPreview).toEqual([
-        'crossover',
-        'crossover_preview',
-        'gptk',
-        'wine',
-      ]);
+      expect(optionValuesWithPreview).toEqual(expectedRunnerOptions);
 
       const expectedButtons: Array<{
         runner: 'crossover' | 'gptk' | 'wine' | 'crossover_preview';
@@ -3855,23 +3865,28 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
       });
     });
 
-    it('4.7 auto-discovers standard macOS CrossOver Preview link after sign-in, excludes experimental arm64 build, and closes popup immediately', async () => {
+    it('4.7 auto-discovers standard and arm64 macOS CrossOver Preview links via branch classifier, captures silently for cached sessions (windowShownCount === 0), and closes popup immediately', async () => {
       const dir = makeTempDir('preview-portal-auto-capture-');
 
-      // 1. Deterministic link selector strictly picks standard crossover-preview-<date>.zip over arm64 & Linux links
+      // 1. Deterministic branch classifier & dual-branch selector
       expect(
-        environmentProvisioner.isExperimentalArm64CrossOverPreviewTarget(
+        environmentProvisioner.classifyCrossOverPreviewArchiveBranch(
           'https://www.codeweavers.com/preview/download/crossover-preview-arm64-20261015.zip'
         )
-      ).toBe(true);
+      ).toBe('arm64');
       expect(
-        environmentProvisioner.isExperimentalArm64CrossOverPreviewTarget(
+        environmentProvisioner.classifyCrossOverPreviewArchiveBranch(
           'https://www.codeweavers.com/preview/download/crossover-preview-20261015.zip'
         )
-      ).toBe(false);
+      ).toBe('standard');
+      expect(
+        environmentProvisioner.classifyCrossOverPreviewArchiveBranch(
+          '/preview/download/crossover-preview_27.0.0-1.deb'
+        )
+      ).toBeNull();
 
       const portalCandidateLinks = [
-        // Experimental ARM64 listed FIRST on the page — must be skipped!
+        // Experimental ARM64 listed FIRST on the page — must be skipped for standard and picked for arm64!
         '/preview/download/crossover-preview-arm64-20261015.zip',
         'https://www.codeweavers.com/preview/download/crossover-preview-aarch64-20261101.zip',
         // Linux & source links — must be skipped!
@@ -3883,7 +3898,7 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         'https://media.codeweavers.com/pub/crossover/cxmac/demo/crossover-26.3.0.zip',
         // Older standard Preview build
         '/preview/download/crossover-preview-20260920.zip',
-        // Current standard macOS Preview build (WANTED!)
+        // Current standard macOS Preview build (WANTED for standard!)
         '/preview/download/crossover-preview-20261015.zip',
       ];
 
@@ -3895,11 +3910,34 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         'https://www.codeweavers.com/preview/download/crossover-preview-20261015.zip'
       );
 
+      const chosenArm64Url = environmentProvisioner.selectPreferredCrossOverPreviewDownloadUrl(
+        portalCandidateLinks,
+        'https://www.codeweavers.com/preview/download',
+        { previewBranch: 'arm64' }
+      );
+      expect(chosenArm64Url).toBe(
+        'https://www.codeweavers.com/preview/download/crossover-preview-aarch64-20261101.zip'
+      );
+
+      expect(
+        environmentProvisioner.discoverCrossOverPreviewBranchUrls(
+          portalCandidateLinks,
+          'https://www.codeweavers.com/preview/download'
+        )
+      ).toEqual({
+        standard: 'https://www.codeweavers.com/preview/download/crossover-preview-20261015.zip',
+        arm64: 'https://www.codeweavers.com/preview/download/crossover-preview-aarch64-20261101.zip',
+      });
+
       // 2. Full post-login HTML portal flow: /preview/download -> 302 /login/ -> /account -> /preview/download HTML -> wc.downloadURL -> popup closed
-      const runSimulatedPortalFlow = async (opts: { alreadyAuthenticated: boolean }) => {
+      const runSimulatedPortalFlow = async (opts: {
+        alreadyAuthenticated: boolean;
+        previewBranch?: 'standard' | 'arm64';
+      }) => {
+        const branch = opts.previewBranch || 'standard';
         const destDir = path.join(
           dir,
-          opts.alreadyAuthenticated ? 'cached-session' : 'interactive-login'
+          `${opts.alreadyAuthenticated ? 'cached-session' : 'interactive-login'}-${branch}`
         );
         fs.mkdirSync(destDir, { recursive: true });
 
@@ -4037,11 +4075,13 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
           destDir,
           {
             runId: 'portal-flow-47',
-            componentId: 'runner_crossover_preview',
+            componentId:
+              branch === 'arm64' ? 'runner_crossover_preview_arm64' : 'runner_crossover_preview',
             stepIndex: 0,
             totalSteps: 1,
           },
           {
+            previewBranch: branch,
             freeDiskBytes: 20 * 1024 * 1024 * 1024,
             electronMod: {
               BrowserWindow: MockPortalBrowserWindow,
@@ -4062,25 +4102,40 @@ describe('Wave 3A — Background Runner Updater, Compatibility UI/UX, WCAG 2.2 A
         };
       };
 
-      // Scenario A: Interactive login -> shown on /login -> auto-navigates to /preview/download -> picks non-arm64 -> closes popup!
+      // Scenario A: Interactive login -> shown on /login -> auto-navigates to /preview/download -> picks standard -> closes popup!
       const interactiveRes = await runSimulatedPortalFlow({ alreadyAuthenticated: false });
       expect(interactiveRes.downloadedUrls).toEqual([
         'https://www.codeweavers.com/preview/download/crossover-preview-20261015.zip',
       ]);
-      expect(interactiveRes.windowShownCount).toBeGreaterThanOrEqual(1);
+      expect(interactiveRes.windowShownCount).toBe(1);
       expect(interactiveRes.windowHidden).toBe(true);
       expect(interactiveRes.windowDestroyed).toBe(true);
       expect(interactiveRes.captureRes.resolvedVersion).toBe('20261015');
       expect(fs.existsSync(interactiveRes.captureRes.archivePath)).toBe(true);
 
-      // Scenario B: Cached session in `persist:codeweavers-preview` -> silent capture with 0 popup flash!
-      const cachedRes = await runSimulatedPortalFlow({ alreadyAuthenticated: true });
+      // Scenario B: Cached session in `persist:codeweavers-preview` (standard) -> silent capture with 0 popup flash!
+      const cachedRes = await runSimulatedPortalFlow({
+        alreadyAuthenticated: true,
+        previewBranch: 'standard',
+      });
       expect(cachedRes.downloadedUrls).toEqual([
         'https://www.codeweavers.com/preview/download/crossover-preview-20261015.zip',
       ]);
       expect(cachedRes.windowShownCount).toBe(0);
       expect(cachedRes.windowDestroyed).toBe(true);
       expect(cachedRes.captureRes.resolvedVersion).toBe('20261015');
+
+      // Scenario C: Cached session in `persist:codeweavers-preview` (arm64) -> silent capture with 0 popup flash!
+      const cachedArm64Res = await runSimulatedPortalFlow({
+        alreadyAuthenticated: true,
+        previewBranch: 'arm64',
+      });
+      expect(cachedArm64Res.downloadedUrls).toEqual([
+        'https://www.codeweavers.com/preview/download/crossover-preview-arm64-20261015.zip',
+      ]);
+      expect(cachedArm64Res.windowShownCount).toBe(0);
+      expect(cachedArm64Res.windowDestroyed).toBe(true);
+      expect(cachedArm64Res.captureRes.resolvedVersion).toBe('20261015');
     });
   });
 });

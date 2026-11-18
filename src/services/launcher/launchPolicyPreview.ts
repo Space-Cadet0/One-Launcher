@@ -1,6 +1,8 @@
 import type { CanonicalGame, GamePlatformOwnership } from '../../contracts/game';
 import {
   DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+  isBottleCompatibleWithLayer,
+  resolveDefaultBottleForLayer,
   resolveEffectiveLaunchPolicy,
   sanitizeLaunchMethod,
   sanitizeStorefrontLifecyclePolicy,
@@ -76,6 +78,28 @@ export const COMPATIBILITY_RUNNER_DESCRIPTORS: CompatibilityRunnerDescriptor[] =
     canAutoInstallViaBrew: false,
     canAutoInstallDirect: true,
     estimatedDownloadMB: 480,
+    previewBranch: 'standard',
+    defaultBottleName: 'OneLauncher',
+    supportedBottleArches: ['win64'],
+  },
+  {
+    type: 'crossover_preview_arm64',
+    label: 'CrossOver Preview (arm64 / FEX)',
+    shortLabel: 'CrossOver Preview (arm64 / FEX)',
+    vendor: 'CodeWeavers',
+    description:
+      'Experimental arm64 Wine + FEX translation branch of CrossOver Preview for Apple Silicon Macs with dedicated arm64 bottles, D3DMetal, DXMT, and DXVK.',
+    bestFor:
+      'Testing Apple Silicon native arm64 Wine with FEX x86/x64 emulation in isolated arm64 bottles.',
+    downloadUrl: 'https://www.codeweavers.com/preview/download',
+    downloadLabel: 'Open Preview Portal',
+    canAutoInstallViaBrew: false,
+    canAutoInstallDirect: true,
+    estimatedDownloadMB: 480,
+    previewBranch: 'arm64',
+    defaultBottleName: 'OneLauncher-arm64',
+    requiresAppleSilicon: true,
+    supportedBottleArches: ['arm64'],
   },
   {
     type: 'gptk',
@@ -1558,22 +1582,28 @@ export function buildEffectiveLaunchModePreview(
     (draftConfig?.customExecutablePath?.trim() || undefined) ||
     (!hasCustomExecKeyInDraft ? savedConfig?.customExecutablePath : undefined);
 
+  const resolvedEffPlatform =
+    effPlatform ||
+    game?.platforms?.find((p) =>
+      targetPlatformId ? p?.platformId === targetPlatformId : true
+    );
+
   const executablePath =
     customExecPath ||
     effectiveRecordExec ||
-    effPlatform?.executablePath;
+    resolvedEffPlatform?.executablePath;
 
   const installPath =
-    effectiveRecordInstallPath || effPlatform?.installPath;
+    effectiveRecordInstallPath || resolvedEffPlatform?.installPath;
 
   const isInstalled = Boolean(
-    executablePath || installPath || effPlatform?.installed
+    executablePath || installPath || resolvedEffPlatform?.installed
   );
 
   const platformId: StorefrontId =
     targetPlatformId ||
     installedRecord?.platformId ||
-    effPlatform?.platformId ||
+    resolvedEffPlatform?.platformId ||
     (game?.steamAppId ? 'steam' : 'custom');
 
   const storeName =
@@ -1610,23 +1640,50 @@ export function buildEffectiveLaunchModePreview(
             : 'Steam desktop client is not installed on this system.'
       : undefined;
 
-  const selectedLayerType = sanitizeLegacyCompatLayer(mergedDraft.compatibilityLayer);
-  const activeLayer =
-    (selectedLayerType && selectedLayerType !== 'native'
-      ? layers.find((l) => l.type === selectedLayerType)
-      : undefined) ||
-    layers.find(
-      (l) => l.type === 'crossover' || l.type === 'crossover_preview'
-    ) ||
-    layers[0];
+  const isIntelX64Host = /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(String(hostArch || '').trim());
+  const hostSupportedLayers = isIntelX64Host
+    ? layers.filter((l) => l.type !== 'crossover_preview_arm64' && l.available !== false)
+    : layers.filter((l) => l.available !== false);
+  const rawSelectedLayerType = sanitizeLegacyCompatLayer(mergedDraft.compatibilityLayer);
+  const coercedFromArm64OnX64 =
+    isIntelX64Host && rawSelectedLayerType === 'crossover_preview_arm64';
+  const selectedLayerType: CompatibilityLayerType | undefined = coercedFromArm64OnX64
+    ? hostSupportedLayers.find((l) => l.type === 'crossover_preview')?.type ||
+      hostSupportedLayers.find((l) => l.type === 'crossover')?.type ||
+      hostSupportedLayers.find((l) => l.type !== 'native')?.type ||
+      'crossover'
+    : rawSelectedLayerType;
+  const hasExplicitNonNativeLayer = Boolean(selectedLayerType && selectedLayerType !== 'native');
+  const selectedDescriptor = hasExplicitNonNativeLayer
+    ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === selectedLayerType)
+    : undefined;
+  const activeLayer = hasExplicitNonNativeLayer
+    ? (isIntelX64Host ? hostSupportedLayers : layers).find((l) => l.type === selectedLayerType)
+    : hostSupportedLayers.find(
+        (l) =>
+          l.type === 'crossover' ||
+          l.type === 'crossover_preview' ||
+          (!isIntelX64Host && l.type === 'crossover_preview_arm64')
+      ) ||
+      hostSupportedLayers[0] ||
+      layers[0];
   const layerName =
     activeLayer?.name ||
-    (selectedLayerType && selectedLayerType !== 'native'
-      ? COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === selectedLayerType)?.shortLabel ||
-        selectedLayerType
-      : 'CrossOver / Wine');
+    selectedDescriptor?.shortLabel ||
+    selectedDescriptor?.label ||
+    (hasExplicitNonNativeLayer ? selectedLayerType! : 'CrossOver / Wine');
+  const rawDraftBottle = mergedDraft.wineBottleName?.trim() || '';
+  const draftBottleCompatible =
+    !rawDraftBottle ||
+    !coercedFromArm64OnX64 ||
+    isBottleCompatibleWithLayer(rawDraftBottle, activeLayer, selectedLayerType);
   const bottleName =
-    mergedDraft.wineBottleName || activeLayer?.availableBottles?.[0];
+    (draftBottleCompatible ? rawDraftBottle : '') ||
+    resolveDefaultBottleForLayer(
+      activeLayer,
+      selectedLayerType || activeLayer?.type,
+      selectedDescriptor?.defaultBottleName
+    );
 
   let hasMacInstaller = false;
   let hasWinInstaller = true;
@@ -1805,11 +1862,16 @@ export function buildEffectiveLaunchModePreview(
 
   const isLifecycleFastBypass = resolvedPolicy.effectiveLifecycle === 'fast_direct_bypass';
   const isFastDirectActive = resolvedPolicy.isFastDirectBypass;
-  const effectiveCompatLayer: CompatibilityLayerType =
+  const rawEffectiveCompatLayer: CompatibilityLayerType =
     sanitizeLegacyCompatLayer(draftConfig?.compatibilityLayer) ||
     sanitizeLegacyCompatLayer(savedConfig?.compatibilityLayer) ||
+    hostSupportedLayers[0]?.type ||
     layers[0]?.type ||
     'crossover';
+  const effectiveCompatLayer: CompatibilityLayerType =
+    isIntelX64Host && rawEffectiveCompatLayer === 'crossover_preview_arm64'
+      ? selectedLayerType || 'crossover'
+      : rawEffectiveCompatLayer;
 
   const isStorefrontUriMode = activeMode === 'storefront_uri';
 
@@ -1838,7 +1900,8 @@ export function buildEffectiveLaunchModePreview(
       compatibilityLayer: true,
       crossoverRendering:
         effectiveCompatLayer === 'crossover' ||
-        effectiveCompatLayer === 'crossover_preview',
+        effectiveCompatLayer === 'crossover_preview' ||
+        effectiveCompatLayer === 'crossover_preview_arm64',
       nativeMacMetalHud: false,
       executableAndArgs: true,
       environmentAndHooks: true,
@@ -1854,7 +1917,8 @@ export function buildEffectiveLaunchModePreview(
       crossoverRendering:
         showCompatForUninstalled &&
         (effectiveCompatLayer === 'crossover' ||
-          effectiveCompatLayer === 'crossover_preview'),
+          effectiveCompatLayer === 'crossover_preview' ||
+          effectiveCompatLayer === 'crossover_preview_arm64'),
       nativeMacMetalHud: showNativeMacForUninstalled,
       executableAndArgs: true,
       environmentAndHooks: showCompatForUninstalled,

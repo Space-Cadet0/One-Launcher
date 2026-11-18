@@ -198,6 +198,7 @@ export class LauncherService {
   > = new Map();
   private runnerProgressListeners: Set<(event: CompatibilityRunnerProgressEvent) => void> =
     new Set();
+  private postRunnerMutationSyncHooks: Set<() => Promise<void>> = new Set();
   private focusListener?: () => void;
   private activeDownloadPollTimer?: ReturnType<typeof setInterval> | null;
   private inFlightScanPromise: Promise<InstalledGameRecord[]> | null = null;
@@ -604,7 +605,11 @@ export class LauncherService {
         ]);
 
         if (appInfo && typeof (appInfo as AppInfoResult).arch === 'string') {
+          const prevArch = this.detectedHostArch;
           this.detectedHostArch = (appInfo as AppInfoResult).arch;
+          if (prevArch !== this.detectedHostArch) {
+            this.notifyStateChanged();
+          }
         }
 
         if (perfSettings && typeof perfSettings === 'object') {
@@ -1106,10 +1111,7 @@ export class LauncherService {
   }
 
   public getHostArch(): 'arm64' | 'x64' {
-    const rawArchProp: unknown =
-      typeof window !== 'undefined' && window.electronAPI
-        ? Reflect.get(window.electronAPI, 'arch')
-        : undefined;
+    const rawArchProp = typeof window !== 'undefined' ? window.electronAPI?.arch : undefined;
     const rawApiArch = typeof rawArchProp === 'string' ? rawArchProp.trim() : '';
     const candidateArch = rawApiArch || (this.detectedHostArch || '').trim();
     if (candidateArch) {
@@ -1122,8 +1124,12 @@ export class LauncherService {
       if (typeof uaDataArch === 'string' && uaDataArch.trim()) {
         return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(uaDataArch.trim()) ? 'x64' : 'arm64';
       }
+      const uaPlatform = `${navigator.platform || ''} ${navigator.userAgent || ''}`;
+      if (/\b(x86_64|x64|amd64|wow64|win64)\b/i.test(uaPlatform)) {
+        return 'x64';
+      }
     }
-    if (typeof process !== 'undefined' && typeof process.arch === 'string') {
+    if (typeof process !== 'undefined' && typeof process.arch === 'string' && process.arch.trim()) {
       return /^(x64|ia32|x86_64|x86|intel|amd64)$/i.test(process.arch) ? 'x64' : 'arm64';
     }
     return 'arm64';
@@ -1534,6 +1540,58 @@ export class LauncherService {
     };
   }
 
+  public registerPostRunnerMutationSyncHook(hook: () => Promise<void>): () => void {
+    this.postRunnerMutationSyncHooks.add(hook);
+    return () => {
+      this.postRunnerMutationSyncHooks.delete(hook);
+    };
+  }
+
+  private async runPostRunnerMutationSyncHooks(): Promise<void> {
+    if (this.postRunnerMutationSyncHooks.size === 0) return;
+    await Promise.allSettled(
+      Array.from(this.postRunnerMutationSyncHooks).map((hook) =>
+        Promise.resolve().then(() => hook())
+      )
+    );
+  }
+
+  private emitTerminalProgressIfActive(
+    runnerType: Exclude<CompatibilityLayerType, 'native'>,
+    operation: 'install' | 'update',
+    outcome: {
+      success: boolean;
+      cancelled?: boolean;
+      message?: string;
+      error?: string;
+    }
+  ): void {
+    if (!this.activeRunnerOperations.has(runnerType)) {
+      return;
+    }
+    const phase = outcome.cancelled
+      ? 'cancelled'
+      : outcome.success
+        ? 'completed'
+        : 'failed';
+    this.handleRunnerProgressEvent({
+      runnerType,
+      operation,
+      phase,
+      progressPercent: phase === 'completed' ? 100 : null,
+      message:
+        outcome.message ||
+        outcome.error ||
+        (phase === 'completed'
+          ? 'Operation completed.'
+          : phase === 'cancelled'
+            ? 'Operation cancelled.'
+            : 'Operation failed.'),
+      ...(phase === 'failed' && outcome.error ? { error: outcome.error } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   public async cancelCompatibilityLayerOperation(
     runnerType: Exclude<CompatibilityLayerType, 'native'>
   ): Promise<{ success: boolean; cancelled: boolean }> {
@@ -1566,7 +1624,7 @@ export class LauncherService {
   public async installCompatibilityLayer(
     runnerType: Exclude<CompatibilityLayerType, 'native'>,
     mode: 'auto' | 'direct' | 'download' = 'auto',
-    options?: { dmgPath?: string; archivePath?: string }
+    options?: { dmgPath?: string; archivePath?: string; authenticateOnly?: boolean }
   ): Promise<InstallCompatibilityLayerResult> {
     this.ensureRunnerProgressSubscription();
     const descriptor = COMPATIBILITY_RUNNER_DESCRIPTORS.find((d) => d.type === runnerType);
@@ -1595,6 +1653,9 @@ export class LauncherService {
       mode,
       ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
       ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
+      ...(options?.authenticateOnly !== undefined
+        ? { authenticateOnly: options.authenticateOnly }
+        : {}),
     };
 
     if (!this.activeRunnerOperations.has(runnerType)) {
@@ -1611,20 +1672,37 @@ export class LauncherService {
       });
     }
 
+    let result: InstallCompatibilityLayerResult;
     try {
       const res = await window.electronAPI.installCompatibilityLayer(requestPayload);
       this.compatibilityLayers = res.layers || (await this.detectCompatibilityLayers());
-      return res;
+      await this.checkCompatibilityLayerUpdates();
+      this.emitTerminalProgressIfActive(runnerType, 'install', {
+        success: res.success,
+        cancelled: res.cancelled,
+        message: res.message,
+        error: res.error,
+      });
+      await this.runPostRunnerMutationSyncHooks();
+      result = res;
     } catch (err: unknown) {
-      return {
+      const errMsg = this.getErrorMessage(err, 'Failed to install compatibility layer.');
+      this.emitTerminalProgressIfActive(runnerType, 'install', {
+        success: false,
+        message: errMsg,
+        error: errMsg,
+      });
+      await this.runPostRunnerMutationSyncHooks();
+      result = {
         success: false,
         runnerType,
-        error: this.getErrorMessage(err, 'Failed to install compatibility layer.'),
+        error: errMsg,
       };
     } finally {
       this.activeRunnerOperations.delete(runnerType);
       this.notifyStateChanged();
     }
+    return result;
   }
 
   public getRunnerUpdates(): Record<string, CompatibilityLayerUpdateInfo> {
@@ -1661,6 +1739,7 @@ export class LauncherService {
       dmgPath?: string;
       archivePath?: string;
       switchToStableCrossOver?: boolean;
+      authenticateOnly?: boolean;
     }
   ): Promise<UpdateCompatibilityLayerResult> {
     this.ensureRunnerProgressSubscription();
@@ -1690,6 +1769,9 @@ export class LauncherService {
       ...(options?.dmgPath ? { dmgPath: options.dmgPath } : {}),
       ...(options?.archivePath ? { archivePath: options.archivePath } : {}),
       ...(options?.switchToStableCrossOver ? { switchToStableCrossOver: true } : {}),
+      ...(options?.authenticateOnly !== undefined
+        ? { authenticateOnly: options.authenticateOnly }
+        : {}),
     };
 
     if (!this.activeRunnerOperations.has(runnerType)) {
@@ -1707,6 +1789,7 @@ export class LauncherService {
       });
     }
 
+    let result: UpdateCompatibilityLayerResult;
     try {
       const res = await window.electronAPI.updateCompatibilityLayer(payload);
       if (Array.isArray(res.detectedLayers)) {
@@ -1715,7 +1798,7 @@ export class LauncherService {
         await this.detectCompatibilityLayers();
       }
       if (res.updateInfo) {
-        const resultRunnerKey = res.runnerType || runnerType;
+        const resultRunnerKey = res.updateInfo.runnerType || res.runnerType || runnerType;
         this.runnerUpdates = {
           ...this.runnerUpdates,
           [resultRunnerKey]: res.updateInfo,
@@ -1723,10 +1806,23 @@ export class LauncherService {
       } else {
         await this.checkCompatibilityLayerUpdates();
       }
-      return res;
+      this.emitTerminalProgressIfActive(runnerType, 'update', {
+        success: res.success,
+        cancelled: res.cancelled,
+        message: res.message,
+        error: res.error,
+      });
+      await this.runPostRunnerMutationSyncHooks();
+      result = res;
     } catch (err: unknown) {
       const errMsg = this.getErrorMessage(err, 'Failed to update compatibility layer.');
-      return {
+      this.emitTerminalProgressIfActive(runnerType, 'update', {
+        success: false,
+        message: errMsg,
+        error: errMsg,
+      });
+      await this.runPostRunnerMutationSyncHooks();
+      result = {
         success: false,
         runnerType,
         updated: false,
@@ -1740,6 +1836,7 @@ export class LauncherService {
       }
       this.notifyStateChanged();
     }
+    return result;
   }
 
   public getInstalledRecords(): InstalledGameRecord[] {

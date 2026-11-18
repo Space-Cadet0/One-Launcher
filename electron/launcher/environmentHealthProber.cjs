@@ -36,6 +36,7 @@ const {
 } = require('./wineAndCrossOverManager.cjs');
 const {
   isValidBottleDirectory,
+  inspectBottleConfMetadata,
   detectCompatibilityLayers,
   checkCompatibilityLayerUpdates,
   resolveBottleGogGalaxyExe,
@@ -73,17 +74,29 @@ const PROBER_RUNNER_UPDATES_TTL_MS = 15 * 60 * 1000; // 15-minute in-memory TTL
 /** @type {{ key: string, expiresAt: number, value: Record<string, any> | null }} */
 let cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
 
-registerExternalCacheInvalidator(() => {
+function invalidateProberRunnerUpdatesCache(options = {}) {
   cachedProberRunnerUpdates = { key: '', expiresAt: 0, value: null };
+  if (!options?.skipPreviewUrlCacheClear) {
+    try {
+      const macNative = require('./macNativeInstallerAndCodesign.cjs');
+      if (typeof macNative?.clearCachedAuthenticatedPreviewUrl === 'function') {
+        macNative.clearCachedAuthenticatedPreviewUrl(undefined, { skipProberInvalidation: true });
+      }
+    } catch {}
+  }
+}
+
+registerExternalCacheInvalidator((invOpts) => {
+  invalidateProberRunnerUpdatesCache(invOpts);
 });
 
 /**
- * @typedef {'rosetta2' | 'win_vcredist' | 'win_webview2' | 'runner_crossover' | 'runner_crossover_preview' | 'runner_wine' | 'runner_gptk' | 'bottle_default' | 'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'host_ubisoft' | 'bottle_ubisoft' | 'host_ea' | 'bottle_ea' | 'host_bnet' | 'bottle_bnet' | 'host_rockstar' | 'bottle_rockstar' | 'host_riot' | 'xbox_runtime'} EnvironmentComponentId
+ * @typedef {'rosetta2' | 'win_vcredist' | 'win_webview2' | 'runner_crossover' | 'runner_crossover_preview' | 'runner_crossover_preview_arm64' | 'runner_wine' | 'runner_gptk' | 'bottle_default' | 'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'host_ubisoft' | 'bottle_ubisoft' | 'host_ea' | 'bottle_ea' | 'host_bnet' | 'bottle_bnet' | 'host_rockstar' | 'bottle_rockstar' | 'host_riot' | 'xbox_runtime'} EnvironmentComponentId
  * @typedef {'os_prerequisite' | 'compatibility_runner' | 'bottle' | 'host_client' | 'bottle_client' | 'built_in_runtime'} EnvironmentComponentCategory
  * @typedef {'ready' | 'partially_configured' | 'missing' | 'update_available' | 'not_applicable'} EnvironmentComponentStatus
  * @typedef {'required' | 'recommended' | 'optional' | 'not_needed' | 'built_in'} RecommendationTier
  * @typedef {'host_steam' | 'bottle_steam' | 'host_gog' | 'bottle_gog' | 'host_epic' | 'bottle_epic' | 'host_ubisoft' | 'bottle_ubisoft' | 'host_ea' | 'bottle_ea' | 'host_bnet' | 'bottle_bnet' | 'host_rockstar' | 'bottle_rockstar' | 'host_riot'} ClientLoginTargetId
- * @typedef {'crossover' | 'crossover_preview' | 'gptk' | 'wine'} NonNativeRunnerType
+ * @typedef {'crossover' | 'crossover_preview' | 'crossover_preview_arm64' | 'gptk' | 'wine'} NonNativeRunnerType
  * @typedef {'steam' | 'gog' | 'epic' | 'amazon' | 'xbox' | 'ubisoft' | 'ea' | 'bnet' | 'itch' | 'rockstar' | 'riot' | 'humble' | 'custom'} StorefrontId
  */
 
@@ -158,10 +171,12 @@ registerExternalCacheInvalidator(() => {
  * @property {NonNativeRunnerType | null} runnerType
  * @property {string} [runnerName]
  * @property {boolean} runnerInstalled
- * @property {Array<{ name: string, path: string, runnerType: NonNativeRunnerType, hasSteam: boolean, hasGogGalaxy: boolean, hasEpicLauncher: boolean, isSandboxed: boolean }>} availableBottles
+ * @property {Array<{ name: string, path: string, runnerType: NonNativeRunnerType, wineArch?: 'win64' | 'arm64', bottleArch?: 'win64' | 'arm64', previewEnabled?: boolean, hasSteam: boolean, hasGogGalaxy: boolean, hasEpicLauncher: boolean, isSandboxed: boolean }>} availableBottles
  * @property {'reuse_existing' | 'create_dedicated'} recommendedBottleMode
  * @property {string} recommendedBottleName
  * @property {string} [activeBottlePath]
+ * @property {'win64' | 'arm64'} [wineArch]
+ * @property {'win64' | 'arm64'} [bottleArch]
  */
 
 /**
@@ -192,6 +207,7 @@ const VALID_ENVIRONMENT_COMPONENT_IDS = new Set([
   'win_webview2',
   'runner_crossover',
   'runner_crossover_preview',
+  'runner_crossover_preview_arm64',
   'runner_wine',
   'runner_gptk',
   'bottle_default',
@@ -217,6 +233,7 @@ const VALID_ENVIRONMENT_COMPONENT_IDS = new Set([
 const VALID_PREFERRED_RUNNER_TYPES = new Set([
   'crossover',
   'crossover_preview',
+  'crossover_preview_arm64',
   'gptk',
   'wine',
   'skip',
@@ -1123,7 +1140,7 @@ function buildBottleEnvironmentSummary(
   }
 
   const isMockHomedir = Boolean(options.homedir || options.customApplicationsDir);
-  /** @type {Array<{ name: string, path: string, runnerType: NonNativeRunnerType, hasSteam: boolean, hasGogGalaxy: boolean, hasEpicLauncher: boolean, isSandboxed: boolean }>} */
+  /** @type {Array<{ name: string, path: string, runnerType: NonNativeRunnerType, wineArch?: 'win64' | 'arm64', bottleArch?: 'win64' | 'arm64', previewEnabled?: boolean, hasSteam: boolean, hasGogGalaxy: boolean, hasEpicLauncher: boolean, isSandboxed: boolean }>} */
   const availableBottles = [];
   /** @type {Set<string>} */
   const seenBottlePaths = new Set();
@@ -1141,7 +1158,9 @@ function buildBottleEnvironmentSummary(
 
   for (const layer of orderedRunners) {
     if (
-      (layer.type === 'crossover' || layer.type === 'crossover_preview') &&
+      (layer.type === 'crossover' ||
+        layer.type === 'crossover_preview' ||
+        layer.type === 'crossover_preview_arm64') &&
       layer.bottlesDir &&
       Array.isArray(layer.availableBottles)
     ) {
@@ -1151,10 +1170,33 @@ function buildBottleEnvironmentSummary(
         if (seenBottlePaths.has(resolvedKey)) continue;
         if (!isValidBottleDirectory(bottlePath, isMockHomedir)) continue;
         seenBottlePaths.add(resolvedKey);
+        const detailMeta = layer.bottleDetails?.[bottleName] || {};
+        const confMeta = inspectBottleConfMetadata(bottlePath);
+        const hasBottleConf = fs.existsSync(path.join(bottlePath, 'cxbottle.conf'));
+        /** @type {'win64' | 'arm64'} */
+        const wineArch =
+          confMeta.wineArch ||
+          detailMeta.wineArch ||
+          (hasBottleConf ? 'win64' : layer.type === 'crossover_preview_arm64' ? 'arm64' : 'win64');
+        const previewEnabled =
+          confMeta.previewEnabled !== undefined
+            ? confMeta.previewEnabled
+            : detailMeta.previewEnabled;
+        const effectiveRunnerType =
+          wineArch === 'arm64'
+            ? /** @type {NonNativeRunnerType} */ ('crossover_preview_arm64')
+            : layer.type === 'crossover_preview_arm64'
+              ? /** @type {NonNativeRunnerType} */ (
+                  previewEnabled ? 'crossover_preview' : 'crossover'
+                )
+              : /** @type {NonNativeRunnerType} */ (layer.type);
         availableBottles.push({
           name: bottleName,
           path: bottlePath,
-          runnerType: /** @type {NonNativeRunnerType} */ (layer.type),
+          runnerType: effectiveRunnerType,
+          wineArch,
+          bottleArch: wineArch,
+          ...(previewEnabled !== undefined ? { previewEnabled } : {}),
           hasSteam: Boolean(resolveBottleSteamExe(bottlePath)),
           hasGogGalaxy: Boolean(resolveBottleGogGalaxyExe(bottlePath)),
           hasEpicLauncher: Boolean(resolveBottleEpicLauncherExe(bottlePath)),
@@ -1175,6 +1217,10 @@ function buildBottleEnvironmentSummary(
       bottlesDir: path.join(homedir, 'Library/Application Support/CrossOver Preview/Bottles'),
       runnerType: /** @type {NonNativeRunnerType} */ ('crossover_preview'),
     },
+    {
+      bottlesDir: path.join(homedir, 'Library/Application Support/CrossOver Preview arm64/Bottles'),
+      runnerType: /** @type {NonNativeRunnerType} */ ('crossover_preview_arm64'),
+    },
   ];
   for (const rootSpec of directBottleRoots) {
     if (!fs.existsSync(rootSpec.bottlesDir)) continue;
@@ -1194,10 +1240,29 @@ function buildBottleEnvironmentSummary(
       if (seenBottlePaths.has(resolvedKey)) continue;
       if (!isValidBottleDirectory(bottlePath, isMockHomedir)) continue;
       seenBottlePaths.add(resolvedKey);
+      const confMeta = inspectBottleConfMetadata(bottlePath);
+      const hasBottleConf = fs.existsSync(path.join(bottlePath, 'cxbottle.conf'));
+      /** @type {'win64' | 'arm64'} */
+      const wineArch =
+        confMeta.wineArch ||
+        (hasBottleConf ? 'win64' : rootSpec.runnerType === 'crossover_preview_arm64' ? 'arm64' : 'win64');
+      const effectiveRunnerType =
+        wineArch === 'arm64'
+          ? /** @type {NonNativeRunnerType} */ ('crossover_preview_arm64')
+          : confMeta.previewEnabled
+            ? /** @type {NonNativeRunnerType} */ ('crossover_preview')
+            : rootSpec.runnerType === 'crossover_preview_arm64'
+              ? /** @type {NonNativeRunnerType} */ ('crossover')
+              : rootSpec.runnerType;
       availableBottles.push({
         name: bottleName,
         path: bottlePath,
-        runnerType: rootSpec.runnerType,
+        runnerType: effectiveRunnerType,
+        wineArch,
+        bottleArch: wineArch,
+        ...(confMeta.previewEnabled !== undefined
+          ? { previewEnabled: confMeta.previewEnabled }
+          : {}),
         hasSteam: Boolean(resolveBottleSteamExe(bottlePath)),
         hasGogGalaxy: Boolean(resolveBottleGogGalaxyExe(bottlePath)),
         hasEpicLauncher: Boolean(resolveBottleEpicLauncherExe(bottlePath)),
@@ -1229,6 +1294,8 @@ function buildBottleEnvironmentSummary(
         name: cand.name,
         path: cand.path,
         runnerType: /** @type {NonNativeRunnerType} */ (standaloneRunner.type),
+        wineArch: 'win64',
+        bottleArch: 'win64',
         hasSteam: Boolean(resolveBottleSteamExe(cand.path)),
         hasGogGalaxy: Boolean(resolveBottleGogGalaxyExe(cand.path)),
         hasEpicLauncher: Boolean(resolveBottleEpicLauncherExe(cand.path)),
@@ -1237,21 +1304,28 @@ function buildBottleEnvironmentSummary(
     }
   }
 
-  if (availableBottles.length > 0) {
+  const compatibleBottles =
+    activeRunner?.type === 'crossover_preview_arm64'
+      ? availableBottles.filter((b) => b.wineArch === 'arm64')
+      : activeRunner?.type === 'crossover' || activeRunner?.type === 'crossover_preview'
+        ? availableBottles.filter((b) => b.wineArch !== 'arm64')
+        : availableBottles;
+
+  if (compatibleBottles.length > 0) {
     const preferredExisting =
       wizardState.preferredBottleName && safeIsBottleSlug(wizardState.preferredBottleName)
-        ? availableBottles.find(
+        ? compatibleBottles.find(
             (b) =>
               b.name.toLowerCase() === String(wizardState.preferredBottleName).trim().toLowerCase()
           )
         : null;
     const resolvedExistingName = resolveDefaultChainedBottleName({
       wizardPreferredBottleName: preferredExisting ? preferredExisting.name : undefined,
-      discoveredBottleNames: availableBottles,
+      discoveredBottleNames: compatibleBottles,
       runnerType: activeRunner?.type,
     });
     const chosenBottle =
-      availableBottles.find((b) => b.name === resolvedExistingName) || availableBottles[0];
+      compatibleBottles.find((b) => b.name === resolvedExistingName) || compatibleBottles[0];
 
     return {
       runnerType: activeRunner
@@ -1263,22 +1337,45 @@ function buildBottleEnvironmentSummary(
       recommendedBottleMode: 'reuse_existing',
       recommendedBottleName: chosenBottle.name,
       activeBottlePath: chosenBottle.path,
+      ...(chosenBottle.wineArch
+        ? { wineArch: chosenBottle.wineArch, bottleArch: chosenBottle.wineArch }
+        : {}),
     };
   }
 
+  const isWizardPrefArchMismatch = Boolean(
+    wizardState.preferredBottleName &&
+      ((activeRunner?.type === 'crossover_preview_arm64' &&
+        availableBottles.some(
+          (b) =>
+            b.name.toLowerCase() === String(wizardState.preferredBottleName).trim().toLowerCase() &&
+            b.wineArch !== 'arm64'
+        )) ||
+        ((activeRunner?.type === 'crossover' || activeRunner?.type === 'crossover_preview') &&
+          availableBottles.some(
+            (b) =>
+              b.name.toLowerCase() ===
+                String(wizardState.preferredBottleName).trim().toLowerCase() &&
+              b.wineArch === 'arm64'
+          )))
+  );
   const defaultBottleName = resolveDefaultChainedBottleName({
-    wizardPreferredBottleName: wizardState.preferredBottleName,
+    wizardPreferredBottleName: isWizardPrefArchMismatch
+      ? undefined
+      : wizardState.preferredBottleName,
     discoveredBottleNames: [],
     runnerType: activeRunner?.type,
   });
 
+  const targetArch = activeRunner?.type === 'crossover_preview_arm64' ? 'arm64' : 'win64';
   return {
     runnerType: activeRunner ? /** @type {NonNativeRunnerType} */ (activeRunner.type) : null,
     ...(activeRunner?.name ? { runnerName: activeRunner.name } : {}),
     runnerInstalled: Boolean(activeRunner),
-    availableBottles: [],
+    availableBottles,
     recommendedBottleMode: 'create_dedicated',
     recommendedBottleName: defaultBottleName,
+    ...(activeRunner ? { wineArch: targetArch, bottleArch: targetArch } : {}),
   };
 }
 
@@ -1334,8 +1431,15 @@ async function probeClientLoginStates(options = {}) {
           runners.find((/** @type {any} */ r) => r.type === options.preferredRunnerType)) ||
         runners[0];
       if (layer) {
-        if ((layer.type === 'crossover' || layer.type === 'crossover_preview') && layer.bottlesDir) {
-          const candidatePath = path.join(layer.bottlesDir, activeBottleName || 'OneLauncher');
+        if (
+          (layer.type === 'crossover' ||
+            layer.type === 'crossover_preview' ||
+            layer.type === 'crossover_preview_arm64') &&
+          layer.bottlesDir
+        ) {
+          const fallbackDefault =
+            layer.type === 'crossover_preview_arm64' ? 'OneLauncher-arm64' : 'OneLauncher';
+          const candidatePath = path.join(layer.bottlesDir, activeBottleName || fallbackDefault);
           if (fs.existsSync(candidatePath)) activeBottlePath = candidatePath;
         } else {
           const candidatePrefix = path.join(
@@ -2618,11 +2722,13 @@ async function probeEnvironmentHealth(options = {}) {
   let detectedRunners = [];
   if (hostPlatform === 'darwin') {
     try {
-      detectedRunners = detectCompatibilityLayers({
-        ...options,
-        ...explicitHomedirOpt(options),
-        readOnly: true,
-      });
+      detectedRunners = Array.isArray(options.layers)
+        ? options.layers
+        : detectCompatibilityLayers({
+            ...options,
+            ...explicitHomedirOpt(options),
+            readOnly: true,
+          });
     } catch {
       detectedRunners = [];
     }
@@ -2631,9 +2737,15 @@ async function probeEnvironmentHealth(options = {}) {
   /** @type {Record<string, any>} */
   let runnerUpdates = {};
   if (hostPlatform === 'darwin') {
-    if (
+    if (options.runnerUpdates && typeof options.runnerUpdates === 'object') {
+      runnerUpdates = options.runnerUpdates;
+    } else if (
       options.mockFeeds ||
+      options.previewCandidateUrls ||
+      options.previewPortalHtml ||
       typeof options.httpGetText === 'function' ||
+      typeof options.previewSessionFetch === 'function' ||
+      typeof options.sessionFetch === 'function' ||
       (typeof options.fetchFn === 'function' && options.skipNetwork !== true)
     ) {
       try {
@@ -2651,12 +2763,14 @@ async function probeEnvironmentHealth(options = {}) {
       const layersCacheKey = detectedRunners
         .map(
           (r) =>
-            `${r.type}:${r.version || ''}:${r.buildVersion || ''}:${r.appPath || r.binaryPath || ''}`
+            `${r.type}:${r.version || ''}:${r.buildVersion || ''}:${r.previewDate || ''}:${r.appPath || r.binaryPath || ''}`
         )
         .join('|');
       const nowMs = Date.now();
+      const shouldBypassCache =
+        options.forceRefreshRunnerUpdates === true || options.forceFresh === true;
       if (
-        options.forceRefreshRunnerUpdates !== true &&
+        !shouldBypassCache &&
         cachedProberRunnerUpdates.value &&
         cachedProberRunnerUpdates.key === layersCacheKey &&
         nowMs < cachedProberRunnerUpdates.expiresAt
@@ -2770,6 +2884,23 @@ async function probeEnvironmentHealth(options = {}) {
     }
 
     const layer = detectedRunners.find((r) => r.type === runnerType);
+    if (runnerType === 'crossover_preview_arm64' && !isAppleSiliconMac) {
+      return {
+        id,
+        category: 'compatibility_runner',
+        scope: 'system',
+        title: meta.title,
+        shortLabel: meta.shortLabel,
+        status: 'not_applicable',
+        wasPreviouslyConfigured: configuredSet.has(id),
+        canAutoInstall: false,
+        recommendationTier: 'not_needed',
+        recommendationBadge: 'Apple Silicon Only',
+        defaultSelected: false,
+        whyExplanation: meta.whyExplanation,
+        statusDetail: 'CrossOver Preview (arm64 / FEX) requires a Mac with Apple Silicon (arm64).',
+      };
+    }
     if (runnerType === 'gptk' && !isAppleSiliconMac && !layer) {
       return {
         id,
@@ -2788,6 +2919,10 @@ async function probeEnvironmentHealth(options = {}) {
       };
     }
     const upd = runnerUpdates[runnerType];
+    const isAuthRequired = Boolean(
+      (runnerType === 'crossover_preview' || runnerType === 'crossover_preview_arm64') &&
+        upd?.authRequired
+    );
     /** @type {EnvironmentComponentStatus} */
     const status = layer
       ? upd?.updateAvailable
@@ -2797,10 +2932,14 @@ async function probeEnvironmentHealth(options = {}) {
     const rawDetail = layer
       ? upd?.updateAvailable
         ? `Installed (${layer.displayVersion || layer.version || 'Installed'}) — Update ${upd.latestDisplayVersion || upd.latestVersion} available`
-        : `Installed${layer.displayVersion || layer.version ? ` (${layer.displayVersion || layer.version})` : ''}`
-      : meta.requiresExternalDownload
-        ? 'Not installed — requires manual download'
-        : 'Not installed';
+        : isAuthRequired
+          ? `Installed (${layer.displayVersion || layer.version || 'Installed'}) — Sign in to CodeWeavers Preview to check for updates`
+          : `Installed${layer.displayVersion || layer.version ? ` (${layer.displayVersion || layer.version})` : ''}`
+      : isAuthRequired
+        ? 'Not installed — Sign in to CodeWeavers Preview to auto-install'
+        : meta.requiresExternalDownload
+          ? 'Not installed — requires manual download'
+          : 'Not installed';
 
     const canAutoInstallOrUpdate = Boolean(
       meta.canAutoInstall || (layer && upd?.canAutoUpdate === true)
@@ -2815,11 +2954,15 @@ async function probeEnvironmentHealth(options = {}) {
       title: meta.title,
       shortLabel: meta.shortLabel,
       status,
+      ...(isAuthRequired ? { authRequired: true } : {}),
       ...(layer?.displayVersion || layer?.version
         ? { version: layer.displayVersion || layer.version }
         : {}),
-      ...(upd?.latestDisplayVersion || upd?.latestVersion
-        ? { latestVersion: upd.latestDisplayVersion || upd.latestVersion }
+      ...(upd?.latestVersion || upd?.latestDisplayVersion
+        ? { latestVersion: upd.latestVersion || upd.latestDisplayVersion }
+        : {}),
+      ...(upd?.latestDisplayVersion
+        ? { latestDisplayVersion: upd.latestDisplayVersion }
         : {}),
       ...(layer?.binaryPath ? { binaryPath: layer.binaryPath } : {}),
       ...(layer?.appPath ? { installLocation: layer.appPath } : {}),
@@ -2828,7 +2971,12 @@ async function probeEnvironmentHealth(options = {}) {
       ...(typeof effectiveRequiresExternal === 'boolean'
         ? { requiresExternalDownload: effectiveRequiresExternal }
         : {}),
-      ...(meta.externalDownloadUrl ? { externalDownloadUrl: meta.externalDownloadUrl } : {}),
+      ...((upd?.downloadUrl || meta.externalDownloadUrl)
+        ? { externalDownloadUrl: upd?.downloadUrl || meta.externalDownloadUrl }
+        : {}),
+      ...(upd?.downloadUrl ? { downloadUrl: upd.downloadUrl } : {}),
+      ...(upd?.previewDate ? { previewDate: upd.previewDate } : {}),
+      ...(upd?.semver ? { semver: upd.semver } : {}),
       ...(meta.estimatedDownloadMB ? { estimatedDownloadMB: meta.estimatedDownloadMB } : {}),
       recommendationTier: meta.tier,
       recommendationBadge: meta.badge,
@@ -3116,6 +3264,24 @@ async function probeEnvironmentHealth(options = {}) {
         externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
         whyExplanation:
           'Early-access CodeWeavers build with bleeding-edge D3DMetal and DXMT fixes. Sign in to CodeWeavers Preview in-app to auto-install.',
+      }
+    ),
+
+    runner_crossover_preview_arm64: buildRunnerComponent(
+      'runner_crossover_preview_arm64',
+      'crossover_preview_arm64',
+      {
+        title: 'CrossOver Preview (arm64 / FEX)',
+        shortLabel: 'Preview (arm64)',
+        tier: 'optional',
+        badge: 'FEX Preview',
+        defaultSelected: false,
+        canAutoInstall: isAppleSiliconMac,
+        requiresExternalDownload: false,
+        estimatedDownloadMB: 490,
+        externalDownloadUrl: 'https://www.codeweavers.com/preview/download',
+        whyExplanation:
+          'Experimental Apple Silicon arm64 CrossOver Preview using FEX translation and dedicated arm64 bottles.',
       }
     ),
 
@@ -3563,6 +3729,7 @@ module.exports = {
   loadSavedTokensReadOnly,
   probeClientLoginStates,
   probeEnvironmentHealth,
+  invalidateProberRunnerUpdatesCache,
   parseSteamLoginUsersVdfDetails,
   parseEpicGameUserSettingsIni,
   parseWineGogRegistryUser,

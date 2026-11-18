@@ -814,7 +814,7 @@ export function useLocalInstallSync({
         .then((info) => {
           if (cancelled) return;
           const previousVersion = localStorage.getItem('one_launcher_last_run_version');
-          const currentVersion = info?.version || '0.2.6';
+          const currentVersion = info?.version || '0.2.7';
           localStorage.setItem('one_launcher_last_run_version', currentVersion);
           if (
             (previousVersion && previousVersion !== currentVersion) ||
@@ -850,9 +850,14 @@ export function useLocalInstallSync({
               if (savedTokens.steam?.access_token || savedTokens.steam?.steamId) {
                 try {
                   const syncRes = await syncStore('steam');
-                  if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
+                  if (Array.isArray(syncRes?.suppressedItems)) {
                     registerSuppressedCatalogEntries(
-                      syncRes.suppressedItems as SuppressedCatalogEntry[]
+                      syncRes.suppressedItems as SuppressedCatalogEntry[],
+                      {
+                        storefrontId: 'steam',
+                        authoritativeComplete: Boolean(syncRes?.authoritativeComplete),
+                        authoritativeGames: Array.isArray(syncRes?.games) ? syncRes.games : undefined,
+                      }
                     );
                   }
                   if (syncRes?.achievements && Object.keys(syncRes.achievements).length > 0) {
@@ -945,9 +950,14 @@ export function useLocalInstallSync({
                 try {
                   await yieldToMainThread();
                   const syncRes = await syncStore('gog');
-                  if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
+                  if (Array.isArray(syncRes?.suppressedItems)) {
                     registerSuppressedCatalogEntries(
-                      syncRes.suppressedItems as SuppressedCatalogEntry[]
+                      syncRes.suppressedItems as SuppressedCatalogEntry[],
+                      {
+                        storefrontId: 'gog',
+                        authoritativeComplete: Boolean(syncRes?.authoritativeComplete),
+                        authoritativeGames: Array.isArray(syncRes?.games) ? syncRes.games : undefined,
+                      }
                     );
                   }
                   if (syncRes?.achievements && Object.keys(syncRes.achievements).length > 0) {
@@ -995,9 +1005,14 @@ export function useLocalInstallSync({
                 try {
                   await yieldToMainThread();
                   const syncRes = await syncStore('epic');
-                  if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
+                  if (Array.isArray(syncRes?.suppressedItems)) {
                     registerSuppressedCatalogEntries(
-                      syncRes.suppressedItems as SuppressedCatalogEntry[]
+                      syncRes.suppressedItems as SuppressedCatalogEntry[],
+                      {
+                        storefrontId: 'epic',
+                        authoritativeComplete: Boolean(syncRes?.authoritativeComplete),
+                        authoritativeGames: Array.isArray(syncRes?.games) ? syncRes.games : undefined,
+                      }
                     );
                   }
                   if (syncRes?.achievements && Object.keys(syncRes.achievements).length > 0) {
@@ -1073,9 +1088,14 @@ export function useLocalInstallSync({
                     syncMode,
                     ...(shouldForceRefresh ? { forceRefresh: true } : {}),
                   });
-                  if (Array.isArray(syncRes?.suppressedItems) && syncRes.suppressedItems.length > 0) {
+                  if (Array.isArray(syncRes?.suppressedItems)) {
                     registerSuppressedCatalogEntries(
-                      syncRes.suppressedItems as SuppressedCatalogEntry[]
+                      syncRes.suppressedItems as SuppressedCatalogEntry[],
+                      {
+                        storefrontId: 'xbox',
+                        authoritativeComplete: Boolean(syncRes?.authoritativeComplete),
+                        authoritativeGames: Array.isArray(syncRes?.games) ? syncRes.games : undefined,
+                      }
                     );
                   }
                   if (syncRes?.achievements && Object.keys(syncRes.achievements).length > 0) {
@@ -1433,8 +1453,12 @@ export function useLocalInstallSync({
           forceRefresh: true,
         });
         if (cancelled || !syncRes) return;
-        if (Array.isArray(syncRes.suppressedItems) && syncRes.suppressedItems.length > 0) {
-          registerSuppressedCatalogEntries(syncRes.suppressedItems as SuppressedCatalogEntry[]);
+        if (Array.isArray(syncRes.suppressedItems)) {
+          registerSuppressedCatalogEntries(syncRes.suppressedItems as SuppressedCatalogEntry[], {
+            storefrontId: 'xbox',
+            authoritativeComplete: Boolean(syncRes.authoritativeComplete),
+            authoritativeGames: Array.isArray(syncRes.games) ? syncRes.games : undefined,
+          });
         }
         if (syncRes.achievements && Object.keys(syncRes.achievements).length > 0) {
           cacheUserXboxAchievements(

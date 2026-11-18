@@ -130,7 +130,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
   });
   const windowBlurredRef = useRef(false);
   const [downloadQueue, setDownloadQueue] = useState(() => launcherService.getDownloadQueue());
-  const [appVersion, setAppVersion] = useState<string>('0.2.6');
+  const [appVersion, setAppVersion] = useState<string>('');
   const [updateStatus, setUpdateStatus] = useState<
     'idle' | 'checking' | 'up-to-date' | 'update-available'
   >('idle');
@@ -1190,12 +1190,14 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                         Update
                       </span>
                     )}
-                    <span
-                      data-testid="menu-app-version"
-                      className="text-[10px] text-steam-subtext font-mono"
-                    >
-                      v{appVersion}
-                    </span>
+                    {appVersion && (
+                      <span
+                        data-testid="menu-app-version"
+                        className="text-[10px] text-steam-subtext font-mono"
+                      >
+                        v{appVersion}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -1569,13 +1571,17 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                             : updateInfo?.hasUpdate
                               ? `Update Available: v${updateInfo.latestVersion} — Download`
                               : updateStatus === 'up-to-date'
-                                ? `Up to date (v${appVersion})`
+                                ? appVersion
+                                  ? `Up to date (v${appVersion})`
+                                  : 'Up to date'
                                 : 'Check for Updates'}
                         </span>
                         <span className="text-[10px] text-steam-subtext truncate">
                           {updateInfo?.hasUpdate
                             ? 'Accounts & library preserved on update'
-                            : `Current version: v${appVersion}`}
+                            : appVersion
+                              ? `Current version: v${appVersion}`
+                              : 'Check for launcher updates'}
                         </span>
                       </div>
                     </div>
@@ -1595,7 +1601,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
                       <Info className="w-4 h-4 shrink-0 text-slate-300 group-hover:text-sky-400 transition-colors" />
                       <span className="font-semibold text-white truncate">About One Launcher</span>
                     </div>
-                    <span className="text-[10px] text-slate-300 font-mono shrink-0">v{appVersion}</span>
+                    {appVersion && (
+                      <span className="text-[10px] text-slate-300 font-mono shrink-0">v{appVersion}</span>
+                    )}
                   </button>
                 </div>
               </div>
@@ -1745,7 +1753,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
             <h2 id="about-one-launcher-title" className="text-base font-bold text-white">
               One Launcher
             </h2>
-            <p className="mt-0.5 text-xs text-slate-400 font-mono">Version v{appVersion}</p>
+            {appVersion && (
+              <p className="mt-0.5 text-xs text-slate-400 font-mono">Version v{appVersion}</p>
+            )}
           </div>
           <button
             type="button"

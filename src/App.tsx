@@ -1539,6 +1539,7 @@ export function App() {
               initialStep={systemSetupInitialStep}
               focusComponentId={systemSetupFocusComponent}
               connectedStorefronts={connectedStorefronts}
+              catalogGames={games}
               onClose={handleCloseSystemSetup}
               onOpenIntegrationsModal={handleOpenIntegrationsModal}
               onLibraryUpdated={handleIntegrationsLibraryUpdated}

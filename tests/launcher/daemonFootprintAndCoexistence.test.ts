@@ -1361,9 +1361,9 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
         const winRender = doRender();
         expect(winRender.html).toContain('data-testid="steam-library-location-display"');
         expect(winRender.html).toContain(
-          '/Users/test/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common'
+          '/Users/test/Library/Application Support/CrossOver/Bottles/OneLauncher/drive_c/Program Files (x86)/Steam/steamapps/common'
         );
-        expect(winRender.html).toContain('CrossOver / Wine Bottle Steam Library (Steam)');
+        expect(winRender.html).toContain('CrossOver / Wine Bottle Steam Library (OneLauncher)');
       } finally {
         prevHost.mockRestore();
         prevGetInfo.mockRestore();

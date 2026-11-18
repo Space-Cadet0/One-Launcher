@@ -342,6 +342,7 @@ export interface OfflineVaultBridge {
 export interface ElectronAPI {
   isElectron: boolean;
   platform: string;
+  readonly arch?: string;
   loginStore: (storefrontId: string) => Promise<StorefrontAuthResult>;
   syncStore: (
     storefrontId: string,
@@ -615,6 +616,8 @@ export interface ElectronAPI {
   >;
   probeEnvironmentHealth: (options?: {
     connectedStorefronts?: StorefrontId[];
+    forceFresh?: boolean;
+    forceRefreshRunnerUpdates?: boolean;
   }) => Promise<EnvironmentHealthSnapshot>;
   runEnvironmentSetupTasks: (
     payload: RunEnvironmentSetupRequest
