@@ -486,6 +486,9 @@ export function isSynopsisAlreadyProbed(
       game.enrichedMetadata.aboutTheGame ||
       game.enrichedMetadata.detailedDescription ||
       '';
+    if (game.enrichedMetadata.__quotaSlimmed === true && primaryMetaDesc.trim().length === 0) {
+      return false;
+    }
     if (
       /product_(?:description|feature)_\d+/i.test(primaryMetaDesc) ||
       isEmptyMarkdownLinkArtifact(primaryMetaDesc)

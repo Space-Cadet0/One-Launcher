@@ -6,6 +6,7 @@ import {
   SteamScreenshot,
   SteamMovie,
   SteamReviewSummary,
+  SteamSystemRequirements,
   SteamCategory,
   SteamLanguageOption,
   LanguageTableSchema,
@@ -125,6 +126,15 @@ interface GogV1ProductResponse {
   links?: { purchase_link?: string };
 }
 
+export interface GogSupportedOperatingSystem {
+  operatingSystem?: { name?: string; versions?: string };
+  systemRequirements?: Array<{
+    type?: string;
+    description?: string;
+    requirements?: Array<{ id?: string; name?: string; description?: string }>;
+  }>;
+}
+
 interface GogV2GameResponse {
   description?: string;
   _links?: {
@@ -138,6 +148,7 @@ interface GogV2GameResponse {
     tags?: Array<{ name?: string }>;
     localizations?: GogLocalizationItem[];
     product?: { globalReleaseDate?: string; title?: string };
+    supportedOperatingSystems?: GogSupportedOperatingSystem[];
   };
 }
 
@@ -165,10 +176,15 @@ interface EpicGalleryImage {
   url?: string;
 }
 
-interface EpicRequirementDetail {
+export interface EpicRequirementDetail {
   title?: string;
   minimum?: string;
   recommended?: string;
+}
+
+export interface EpicRequirementSystem {
+  systemType?: string;
+  details?: EpicRequirementDetail[];
 }
 
 interface EpicProductHomePage {
@@ -177,7 +193,7 @@ interface EpicProductHomePage {
     carousel?: { items?: EpicCarouselItem[] };
     gallery?: { galleryImages?: Array<string | EpicGalleryImage> };
     requirements?: {
-      systems?: Array<{ details?: EpicRequirementDetail[] }>;
+      systems?: EpicRequirementSystem[];
       languages?: string[] | string;
     };
     about?: {
@@ -232,6 +248,8 @@ interface NormalizedEpicIpcPayload {
   supportedLanguages?: string | string[];
   languages?: string | string[];
   systemRequirements?: { minimum?: string; recommended?: string };
+  macRequirements?: { minimum?: string; recommended?: string };
+  linuxRequirements?: { minimum?: string; recommended?: string };
   namespace?: string;
 }
 
@@ -507,6 +525,187 @@ export function formatGogSystemRequirements(raw?: string): string {
     .replace(/,\s*(Other|Additional Notes):/gi, '<br><strong>Additional Notes:</strong> ');
 }
 
+function normalizeRequirementFieldValue(raw?: string): string {
+  if (!raw || typeof raw !== 'string') return '';
+  const withLineBreaks = raw
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(?:p|div|li)>/gi, '\n')
+    .replace(/<\/?[a-z][^>]*>/gi, '');
+  const decoded = withLineBreaks
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&mdash;/gi, '—')
+    .replace(/&ndash;/gi, '–')
+    .replace(/&rsquo;|&lsquo;/gi, "'")
+    .replace(/&rdquo;|&ldquo;/gi, '"')
+    .replace(/&trade;/gi, '™')
+    .replace(/&reg;/gi, '®')
+    .replace(/&copy;/gi, '©')
+    .replace(/&#(\d+);/g, (_, dec: string) => {
+      const code = parseInt(dec, 10);
+      return Number.isFinite(code) && code >= 32 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : '';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code >= 32 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : '';
+    })
+    .replace(/&amp;/gi, '&');
+  const lines = decoded
+    .split(/\r?\n+/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  return lines.map((line) => escapeHtml(line)).join('<br>');
+}
+
+export function extractGogRequirementsByOs(
+  supportedOperatingSystems?: GogSupportedOperatingSystem[]
+): {
+  systemRequirements?: SteamSystemRequirements;
+  macRequirements?: SteamSystemRequirements;
+  linuxRequirements?: SteamSystemRequirements;
+} {
+  if (!Array.isArray(supportedOperatingSystems) || supportedOperatingSystems.length === 0) {
+    return {};
+  }
+
+  let systemRequirements: SteamSystemRequirements | undefined;
+  let macRequirements: SteamSystemRequirements | undefined;
+  let linuxRequirements: SteamSystemRequirements | undefined;
+
+  for (const osEntry of supportedOperatingSystems) {
+    const osName = String(osEntry?.operatingSystem?.name || '').trim();
+    if (!osName) continue;
+    const reqBlocks = Array.isArray(osEntry?.systemRequirements)
+      ? osEntry.systemRequirements
+      : [];
+    if (reqBlocks.length === 0) continue;
+
+    let minHtml = '';
+    let recHtml = '';
+
+    for (const block of reqBlocks) {
+      const reqType = String(block?.type || '').trim().toLowerCase();
+      const structuredItems = Array.isArray(block?.requirements) ? block.requirements : [];
+      let formattedBlock = '';
+      if (structuredItems.length > 0) {
+        formattedBlock = structuredItems
+          .map((item) => {
+            const label = normalizeRequirementFieldValue(item?.name).replace(/:$/, '');
+            const desc = normalizeRequirementFieldValue(item?.description);
+            if (label && desc) return `<strong>${label}:</strong> ${desc}`;
+            return desc || '';
+          })
+          .filter(Boolean)
+          .join('<br>');
+      }
+      if (!formattedBlock && typeof block?.description === 'string' && block.description.trim()) {
+        formattedBlock = formatGogSystemRequirements(block.description.trim());
+      }
+      if (!formattedBlock) continue;
+
+      if (reqType === 'recommended') {
+        if (!recHtml) recHtml = formattedBlock;
+      } else {
+        if (!minHtml) minHtml = formattedBlock;
+      }
+    }
+
+    if (!minHtml && !recHtml) continue;
+    const parsed: SteamSystemRequirements = {
+      ...(minHtml ? { minimum: minHtml } : {}),
+      ...(recHtml ? { recommended: recHtml } : {}),
+    };
+
+    if (/^(?:osx|mac)/i.test(osName)) {
+      if (!macRequirements) macRequirements = parsed;
+    } else if (/^linux/i.test(osName)) {
+      if (!linuxRequirements) linuxRequirements = parsed;
+    } else if (/^win/i.test(osName)) {
+      if (!systemRequirements) systemRequirements = parsed;
+    }
+  }
+
+  return {
+    ...(systemRequirements ? { systemRequirements } : {}),
+    ...(macRequirements ? { macRequirements } : {}),
+    ...(linuxRequirements ? { linuxRequirements } : {}),
+  };
+}
+
+export function extractEpicRequirementsByOs(
+  systems?: EpicRequirementSystem[]
+): {
+  systemRequirements?: SteamSystemRequirements;
+  macRequirements?: SteamSystemRequirements;
+  linuxRequirements?: SteamSystemRequirements;
+} {
+  if (!Array.isArray(systems) || systems.length === 0) {
+    return {};
+  }
+
+  let systemRequirements: SteamSystemRequirements | undefined;
+  let macRequirements: SteamSystemRequirements | undefined;
+  let linuxRequirements: SteamSystemRequirements | undefined;
+  let fallbackRequirements: SteamSystemRequirements | undefined;
+
+  for (const sys of systems) {
+    const details = Array.isArray(sys?.details) ? sys.details : [];
+    if (details.length === 0) continue;
+
+    const minHtml = details
+      .map((r) => {
+        const title = normalizeRequirementFieldValue(r?.title).replace(/:$/, '');
+        const min = normalizeRequirementFieldValue(r?.minimum);
+        return title && min ? `<strong>${title}:</strong> ${min}` : '';
+      })
+      .filter(Boolean)
+      .join('<br>');
+    const recHtml = details
+      .map((r) => {
+        const title = normalizeRequirementFieldValue(r?.title).replace(/:$/, '');
+        const rec = normalizeRequirementFieldValue(r?.recommended);
+        return title && rec ? `<strong>${title}:</strong> ${rec}` : '';
+      })
+      .filter(Boolean)
+      .join('<br>');
+
+    if (!minHtml && !recHtml) continue;
+    const parsed: SteamSystemRequirements = {
+      ...(minHtml ? { minimum: minHtml } : {}),
+      ...(recHtml ? { recommended: recHtml } : {}),
+    };
+
+    const sysType = String(sys?.systemType || '').trim();
+    if (/mac|osx|darwin/i.test(sysType)) {
+      if (!macRequirements) macRequirements = parsed;
+    } else if (/linux|ubuntu|steam\s*os/i.test(sysType)) {
+      if (!linuxRequirements) linuxRequirements = parsed;
+    } else if (/win/i.test(sysType)) {
+      if (!systemRequirements) systemRequirements = parsed;
+    } else if (!fallbackRequirements) {
+      fallbackRequirements = parsed;
+    }
+  }
+
+  if (!systemRequirements && fallbackRequirements) {
+    systemRequirements = fallbackRequirements;
+  }
+
+  return {
+    ...(systemRequirements ? { systemRequirements } : {}),
+    ...(macRequirements ? { macRequirements } : {}),
+    ...(linuxRequirements ? { linuxRequirements } : {}),
+  };
+}
+
 export function parseGogLocalizations(
   v2Localizations?: GogLocalizationItem[],
   v1Languages?: Record<string, string>
@@ -726,6 +925,11 @@ export class FallbackMetadataProvider {
     let v2Tags: string[] | undefined = cached?.tags?.length ? cached.tags : undefined;
     let v2Localizations: GogLocalizationItem[] | undefined = undefined;
     let v1Languages: Record<string, string> | undefined = undefined;
+    let v2Requirements: {
+      systemRequirements?: SteamSystemRequirements;
+      macRequirements?: SteamSystemRequirements;
+      linuxRequirements?: SteamSystemRequirements;
+    } = {};
 
     const cleanGogId = String(gogId).replace(/^gog-/, '').trim();
     const gogGameKey = `gog:${cleanGogId}`;
@@ -810,6 +1014,13 @@ export class FallbackMetadataProvider {
         }
         if (Array.isArray(v2Data._embedded?.localizations) && v2Data._embedded.localizations.length > 0) {
           v2Localizations = v2Data._embedded.localizations;
+        }
+        if (
+          !synopsisOnly &&
+          Array.isArray(v2Data._embedded?.supportedOperatingSystems) &&
+          v2Data._embedded.supportedOperatingSystems.length > 0
+        ) {
+          v2Requirements = extractGogRequirementsByOs(v2Data._embedded.supportedOperatingSystems);
         }
         const globalRel = v2Data._embedded?.product?.globalReleaseDate;
         if (globalRel && typeof globalRel === 'string' && releaseDate === 'TBA') {
@@ -1090,7 +1301,10 @@ export class FallbackMetadataProvider {
         (v2Pubs && v2Pubs.length > 0) ||
         (v2Genres && v2Genres.length > 0) ||
         v2Localizations ||
-        v1Languages
+        v1Languages ||
+        v2Requirements.systemRequirements ||
+        v2Requirements.macRequirements ||
+        v2Requirements.linuxRequirements
     );
 
     if (!hasResolvedGogContent) {
@@ -1104,11 +1318,24 @@ export class FallbackMetadataProvider {
       icon: getSteamCategoryIconUrl(c.id),
     }));
 
-    const sysReqs = synopsisOnly
+    const cachedSysReqs: SteamSystemRequirements = synopsisOnly
       ? {}
       : {
           minimum: formatGogSystemRequirements(cached?.systemRequirements?.minimum),
           recommended: formatGogSystemRequirements(cached?.systemRequirements?.recommended),
+        };
+    const sysReqs: SteamSystemRequirements = synopsisOnly
+      ? {}
+      : {
+          ...(v2Requirements.systemRequirements?.minimum || cachedSysReqs.minimum
+            ? { minimum: v2Requirements.systemRequirements?.minimum || cachedSysReqs.minimum }
+            : {}),
+          ...(v2Requirements.systemRequirements?.recommended || cachedSysReqs.recommended
+            ? {
+                recommended:
+                  v2Requirements.systemRequirements?.recommended || cachedSysReqs.recommended,
+              }
+            : {}),
         };
 
     const cleanGogShort = stripHtmlToPlainSynopsis(descriptionLead || descriptionFull);
@@ -1137,6 +1364,10 @@ export class FallbackMetadataProvider {
       languageOptions: parsedGogLangs.languageOptions,
       languageTableSchema: parsedGogLangs.languageTableSchema || 'audio_text',
       systemRequirements: sysReqs,
+      ...(v2Requirements.macRequirements ? { macRequirements: v2Requirements.macRequirements } : {}),
+      ...(v2Requirements.linuxRequirements
+        ? { linuxRequirements: v2Requirements.linuxRequirements }
+        : {}),
       metadataQuality: 'scraped',
       fetchedAt: Date.now(),
       achievements: undefined,
@@ -1263,6 +1494,8 @@ export class FallbackMetadataProvider {
               : {}),
             languageTableSchema: 'audio_text',
             ...(ipcData.systemRequirements ? { systemRequirements: ipcData.systemRequirements } : {}),
+            ...(ipcData.macRequirements ? { macRequirements: ipcData.macRequirements } : {}),
+            ...(ipcData.linuxRequirements ? { linuxRequirements: ipcData.linuxRequirements } : {}),
             ...(ipcData.namespace ? { epicNamespace: ipcData.namespace } : {}),
           } as Partial<SteamEnrichedMetadata>;
 
@@ -1413,23 +1646,7 @@ export class FallbackMetadataProvider {
         }
       });
 
-      const reqs = d.requirements?.systems?.[0]?.details || [];
-      const minReq = reqs
-        .map((r) =>
-          r.title && r.minimum
-            ? `<strong>${escapeHtml(String(r.title))}:</strong> ${escapeHtml(String(r.minimum))}`
-            : ''
-        )
-        .filter(Boolean)
-        .join('<br>');
-      const recReq = reqs
-        .map((r) =>
-          r.title && r.recommended
-            ? `<strong>${escapeHtml(String(r.title))}:</strong> ${escapeHtml(String(r.recommended))}`
-            : ''
-        )
-        .filter(Boolean)
-        .join('<br>');
+      const parsedEpicReqs = extractEpicRequirementsByOs(d.requirements?.systems);
 
       const parsedContentLangs = synopsisOnly
         ? {}
@@ -1464,10 +1681,16 @@ export class FallbackMetadataProvider {
         supportedLanguages: parsedContentLangs.supportedLanguages,
         languageOptions: parsedContentLangs.languageOptions,
         languageTableSchema: 'audio_text',
-        systemRequirements: {
-          minimum: minReq,
-          recommended: recReq,
+        systemRequirements: parsedEpicReqs.systemRequirements || {
+          minimum: '',
+          recommended: '',
         },
+        ...(parsedEpicReqs.macRequirements
+          ? { macRequirements: parsedEpicReqs.macRequirements }
+          : {}),
+        ...(parsedEpicReqs.linuxRequirements
+          ? { linuxRequirements: parsedEpicReqs.linuxRequirements }
+          : {}),
         releaseDate: d.meta?.releaseDate ? d.meta.releaseDate.substring(0, 10) : '',
         developers: d.about?.developerAttribution ? [d.about.developerAttribution] : undefined,
         publishers: d.about?.publisherAttribution ? [d.about.publisherAttribution] : undefined,
@@ -1507,6 +1730,14 @@ export class FallbackMetadataProvider {
             ipcMetadata.systemRequirements?.minimum || ipcMetadata.systemRequirements?.recommended
               ? ipcMetadata.systemRequirements
               : contentMetadata.systemRequirements,
+          macRequirements:
+            ipcMetadata.macRequirements?.minimum || ipcMetadata.macRequirements?.recommended
+              ? ipcMetadata.macRequirements
+              : contentMetadata.macRequirements,
+          linuxRequirements:
+            ipcMetadata.linuxRequirements?.minimum || ipcMetadata.linuxRequirements?.recommended
+              ? ipcMetadata.linuxRequirements
+              : contentMetadata.linuxRequirements,
           releaseDate: ipcMetadata.releaseDate || contentMetadata.releaseDate,
           developers:
             ipcMetadata.developers && ipcMetadata.developers.length > 0
@@ -1877,7 +2108,8 @@ export class FallbackMetadataProvider {
     }
 
     // 4. CRITICAL NON-CLOBBER GUARD: Never overwrite existing rich enrichedMetadata with an offline skeleton!
-    if (!storeMetadata && game.enrichedMetadata) {
+    // Never treat a __quotaSlimmed projection as a valid fallback record.
+    if (!storeMetadata && game.enrichedMetadata && !game.enrichedMetadata.__quotaSlimmed) {
       const existing = game.enrichedMetadata;
       const existingAbout = existing.aboutTheGame || existing.detailedDescription || '';
       const plainAbout = stripHtmlToPlainSynopsis(existingAbout, 0);

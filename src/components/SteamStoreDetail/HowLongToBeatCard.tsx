@@ -6,7 +6,7 @@ import {
   seedHltbFromVaultIfMissing,
 } from '../../services/hltb/howLongToBeat';
 import { sanitizeTitleForSearchQuery } from '../../services/common/titleUtils';
-import { Clock, ExternalLink, Trophy, Compass, Flag, Layers, CheckCircle2, Loader2 } from 'lucide-react';
+import { Clock, ExternalLink, Trophy, Compass, Flag, Layers, Loader2 } from 'lucide-react';
 
 interface HowLongToBeatCardProps {
   gameId?: string;
@@ -122,27 +122,10 @@ export const HowLongToBeatCard: React.FC<HowLongToBeatCardProps> = ({
             <Clock className="w-3.5 h-3.5" aria-hidden="true" />
           </div>
           <div>
-            <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-2">
               <span className="text-xs font-bold uppercase tracking-wider text-white">HowLongToBeat</span>
-              {hltb?.isAccurate ? (
-                <span className="inline-flex items-center gap-1 text-[10px] font-semibold tracking-wider px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-400 border border-emerald-500/30">
-                  <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400" aria-hidden="true" />
-                  Verified
-                </span>
-              ) : isLoading ? (
-                <span className="inline-flex items-center gap-1 text-[10px] tracking-wider px-1.5 py-0.5 rounded bg-[#1f2b38] text-steam-accent border border-steam-accent/30">
-                  <Loader2 className="w-2.5 h-2.5 animate-spin" aria-hidden="true" />
-                  Fetching...
-                </span>
-              ) : (
-                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[#1f2b38] text-steam-subtext border border-steam-border/40">
-                  Estimated
-                </span>
-              )}
-              {hltb?.gameplayType && (
-                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[#1f2b38] text-steam-subtext border border-steam-border/40">
-                  {hltb.gameplayType}
-                </span>
+              {isLoading && !hltb && (
+                <Loader2 className="w-3 h-3 animate-spin text-steam-accent" aria-hidden="true" />
               )}
             </div>
             <div className="text-[10px] text-steam-subtext">Community-sourced completion estimates</div>

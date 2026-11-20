@@ -336,7 +336,10 @@ export function useBackgroundMediaWarmup({
             ({
               syncJobManager,
               evaluateGameNeedsStoreMediaSync,
+              computeMediaRepairPriority,
               buildP2CoverHydrationBatch,
+              hasActiveMediaSyncCooldown,
+              MAX_PASSIVE_REPAIR_PER_BOOT,
             }) => {
               if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
               if (!onlineLifecycleManager.isOnline()) return;
@@ -367,6 +370,12 @@ export function useBackgroundMediaWarmup({
                 }
               };
 
+              if (hasActiveMediaSyncCooldown()) {
+                // C1: Abort passive warmup immediately when any media domain is in cooldown
+                queueSessionP2CoversOnce();
+                return;
+              }
+
               const activeJob = syncJobManager.getState();
               const hasActiveManualJob = Boolean(
                 activeJob &&
@@ -380,10 +389,29 @@ export function useBackgroundMediaWarmup({
                 return;
               }
 
-              const gamesNeedingWarmup = gamesRef.current.filter((g) => {
-                if (attemptedWarmupIdsRef.current.has(g.id)) return false;
-                return evaluateGameNeedsStoreMediaSync(g, false).eligible;
-              });
+              const eligibleWithPriority: Array<{
+                game: CanonicalGame;
+                priority: 0 | 1 | 2 | 3;
+                index: number;
+              }> = [];
+              const catalogSnapshot = gamesRef.current;
+              for (let idx = 0; idx < catalogSnapshot.length; idx++) {
+                const g = catalogSnapshot[idx];
+                if (attemptedWarmupIdsRef.current.has(g.id)) continue;
+                if (!evaluateGameNeedsStoreMediaSync(g, false, { isPostHydration: true }).eligible) {
+                  continue;
+                }
+                const priority = computeMediaRepairPriority(g);
+                // C1: Restrict passive startup warmup strictly to Tiers 0–2
+                // (Tier 3 non-active-host backfill heals on detail open or manual sync).
+                if (priority > 2) continue;
+                eligibleWithPriority.push({ game: g, priority, index: idx });
+              }
+
+              eligibleWithPriority.sort((a, b) => a.priority - b.priority || a.index - b.index);
+              const gamesNeedingWarmup = eligibleWithPriority
+                .slice(0, MAX_PASSIVE_REPAIR_PER_BOOT)
+                .map((entry) => entry.game);
 
               if (gamesNeedingWarmup.length === 0) {
                 queueSessionP2CoversOnce();
@@ -391,13 +419,12 @@ export function useBackgroundMediaWarmup({
                 return;
               }
 
-              for (const g of gamesNeedingWarmup) {
-                attemptedWarmupIdsRef.current.add(g.id);
-              }
-
+              // C1: Mark each game in attemptedWarmupIdsRef ONLY after per-game completion so
+              // an interruption (cooldown, offline, game launch) never permanently skips the rest.
               const completedInRunIds = new Set<string>();
               const onWarmupGameUpdated = (updatedGame: CanonicalGame) => {
                 completedInRunIds.add(updatedGame.id);
+                attemptedWarmupIdsRef.current.add(updatedGame.id);
                 if (updatedGame.enrichedMetadata?.metadataQuality === 'skeleton_fallback') {
                   return;
                 }
@@ -417,6 +444,13 @@ export function useBackgroundMediaWarmup({
                 syncJobManager.startStoreMediaSync(gamesNeedingWarmup, onWarmupGameUpdated, {
                   incremental: true,
                   isBackgroundWarmup: true,
+                  isPostHydration: true,
+                  maxRepairTier: 2,
+                  maxBatchSize: MAX_PASSIVE_REPAIR_PER_BOOT,
+                  onGameAttempted: (gameId) => {
+                    completedInRunIds.add(gameId);
+                    attemptedWarmupIdsRef.current.add(gameId);
+                  },
                 })
               )
                 .catch(() => {})

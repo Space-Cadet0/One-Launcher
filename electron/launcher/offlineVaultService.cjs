@@ -466,10 +466,109 @@ function extractXboxBigIdsFromGame(gameObj, platformsArr) {
   return Array.from(found);
 }
 
+function hasVaultReqContent(req) {
+  return Boolean(
+    req &&
+      typeof req === 'object' &&
+      ((typeof req.minimum === 'string' && req.minimum.trim().length > 0) ||
+        (typeof req.recommended === 'string' && req.recommended.trim().length > 0))
+  );
+}
+
+function mergeVaultSystemRequirements(incomingReq, existingReq) {
+  if (!hasVaultReqContent(existingReq)) return incomingReq;
+  if (!hasVaultReqContent(incomingReq)) return existingReq;
+  const nextMin =
+    typeof incomingReq.minimum === 'string' && incomingReq.minimum.trim().length > 0
+      ? incomingReq.minimum
+      : existingReq.minimum;
+  const nextRec =
+    typeof incomingReq.recommended === 'string' && incomingReq.recommended.trim().length > 0
+      ? incomingReq.recommended
+      : existingReq.recommended;
+  if (nextMin === incomingReq.minimum && nextRec === incomingReq.recommended) {
+    return incomingReq;
+  }
+  return {
+    ...(nextMin !== undefined ? { minimum: nextMin } : {}),
+    ...(nextRec !== undefined ? { recommended: nextRec } : {}),
+  };
+}
+
+function carryForwardVaultRequirements(incomingObj, existingObj) {
+  if (
+    !incomingObj ||
+    typeof incomingObj !== 'object' ||
+    !existingObj ||
+    typeof existingObj !== 'object' ||
+    incomingObj.__quotaSlimmed === true ||
+    existingObj.__quotaSlimmed === true
+  ) {
+    return;
+  }
+
+  const mergedWin = mergeVaultSystemRequirements(
+    incomingObj.systemRequirements,
+    existingObj.systemRequirements
+  );
+  if (mergedWin && mergedWin !== incomingObj.systemRequirements) {
+    incomingObj.systemRequirements = mergedWin;
+  }
+  if (!incomingObj.pcRequirementsHtml && existingObj.pcRequirementsHtml) {
+    incomingObj.pcRequirementsHtml = existingObj.pcRequirementsHtml;
+  }
+
+  const samePositiveAppId =
+    Number(incomingObj.appId) > 0 &&
+    Number(existingObj.appId) > 0 &&
+    Number(incomingObj.appId) === Number(existingObj.appId);
+  const sameSource =
+    Boolean(incomingObj.enrichedSource) &&
+    incomingObj.enrichedSource === existingObj.enrichedSource;
+  const canCarryMac =
+    samePositiveAppId ||
+    sameSource ||
+    (incomingObj.enrichedSource !== 'xbox' &&
+      (incomingObj.platforms?.mac === true ||
+        (!incomingObj.platforms && existingObj.platforms?.mac === true)));
+  const canCarryLinux =
+    samePositiveAppId ||
+    sameSource ||
+    (incomingObj.enrichedSource !== 'xbox' &&
+      (incomingObj.platforms?.linux === true ||
+        (!incomingObj.platforms && existingObj.platforms?.linux === true)));
+
+  if (canCarryMac) {
+    const mergedMac = mergeVaultSystemRequirements(
+      incomingObj.macRequirements,
+      existingObj.macRequirements
+    );
+    if (mergedMac && mergedMac !== incomingObj.macRequirements) {
+      incomingObj.macRequirements = mergedMac;
+    }
+  }
+  if (canCarryLinux) {
+    const mergedLinux = mergeVaultSystemRequirements(
+      incomingObj.linuxRequirements,
+      existingObj.linuxRequirements
+    );
+    if (mergedLinux && mergedLinux !== incomingObj.linuxRequirements) {
+      incomingObj.linuxRequirements = mergedLinux;
+    }
+  }
+}
+
+function hasVaultNonPlaceholderStrings(list, placeholder) {
+  return Boolean(
+    Array.isArray(list) &&
+      list.some((item) => typeof item === 'string' && item.trim().length > 0 && item !== placeholder)
+  );
+}
+
 /**
  * Infers truthful `MetadataQuality` for `OfflineVaultService`, preventing Xbox DisplayCatalog
- * baseline synopses (`enrichedSource: 'xbox'` or missing `appId`) from poisoning `vault_games`
- * as `'authoritative'` (rank 4).
+ * baseline synopses (`enrichedSource: 'xbox'` or missing `appId`) and `__quotaSlimmed`
+ * projections from poisoning `vault_games` as `'authoritative'` (rank 4).
  */
 function inferVaultMetadataQuality(game, enriched) {
   if (!enriched || typeof enriched !== 'object') {
@@ -480,6 +579,11 @@ function inferVaultMetadataQuality(game, enriched) {
     ) {
       return explicitGameQuality;
     }
+    return 'skeleton_fallback';
+  }
+
+  // Universal C8 Lattice Invariant: __quotaSlimmed projections are ALWAYS Rank 0 (`skeleton_fallback`)
+  if (enriched.__quotaSlimmed === true) {
     return 'skeleton_fallback';
   }
 
@@ -2474,11 +2578,91 @@ class OfflineVaultService {
                   ? existing.steam_app_id
                   : null;
 
+        const incomingIsSlimmed = Boolean(incomingEnrichedPreview?.__quotaSlimmed);
+        const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
+        const existingSummaryStr =
+          existing && existing.summary_json !== null && existing.summary_json !== undefined
+            ? decompressVaultJsonString(existing.summary_json)
+            : null;
+        let existingSummaryObj = null;
+        if (existingSummaryStr) {
+          try {
+            existingSummaryObj = JSON.parse(existingSummaryStr);
+          } catch {
+            existingSummaryObj = null;
+          }
+        }
+
         const summaryCopy = { ...g };
         delete summaryCopy.enrichedMetadata;
         if (platforms) {
           summaryCopy.platforms = platforms;
         }
+
+        // Protect summary_json against __quotaSlimmed / empty-field clobber
+        if (existingSummaryObj && typeof existingSummaryObj === 'object') {
+          if (
+            !(typeof summaryCopy.shortDescription === 'string' && summaryCopy.shortDescription.trim().length > 0) &&
+            typeof existingSummaryObj.shortDescription === 'string' &&
+            existingSummaryObj.shortDescription.trim().length > 0
+          ) {
+            summaryCopy.shortDescription = existingSummaryObj.shortDescription;
+          }
+          if (
+            !(typeof summaryCopy.detailedDescription === 'string' && summaryCopy.detailedDescription.trim().length > 0) &&
+            typeof existingSummaryObj.detailedDescription === 'string' &&
+            existingSummaryObj.detailedDescription.trim().length > 0
+          ) {
+            summaryCopy.detailedDescription = existingSummaryObj.detailedDescription;
+          }
+          if (
+            incomingIsSlimmed &&
+            !(typeof summaryCopy.aboutTheGame === 'string' && summaryCopy.aboutTheGame.trim().length > 0) &&
+            typeof existingSummaryObj.aboutTheGame === 'string' &&
+            existingSummaryObj.aboutTheGame.trim().length > 0
+          ) {
+            summaryCopy.aboutTheGame = existingSummaryObj.aboutTheGame;
+          }
+          if (
+            (incomingIsSlimmed || !hasVaultNonPlaceholderStrings(summaryCopy.developers, 'Unknown Developer')) &&
+            hasVaultNonPlaceholderStrings(existingSummaryObj.developers, 'Unknown Developer')
+          ) {
+            summaryCopy.developers = existingSummaryObj.developers;
+          }
+          if (
+            (incomingIsSlimmed || !hasVaultNonPlaceholderStrings(summaryCopy.publishers, 'Unknown Publisher')) &&
+            hasVaultNonPlaceholderStrings(existingSummaryObj.publishers, 'Unknown Publisher')
+          ) {
+            summaryCopy.publishers = existingSummaryObj.publishers;
+          }
+          if (
+            incomingIsSlimmed &&
+            (!Array.isArray(summaryCopy.tags) || summaryCopy.tags.length === 0) &&
+            Array.isArray(existingSummaryObj.tags) &&
+            existingSummaryObj.tags.length > 0
+          ) {
+            summaryCopy.tags = existingSummaryObj.tags;
+          }
+          if (
+            incomingIsSlimmed &&
+            Array.isArray(existingSummaryObj.genres) &&
+            existingSummaryObj.genres.length > (Array.isArray(summaryCopy.genres) ? summaryCopy.genres.length : 0)
+          ) {
+            summaryCopy.genres = existingSummaryObj.genres;
+          }
+          const incomingHasReviews = Boolean(
+            summaryCopy.reviewSummary &&
+              (summaryCopy.reviewSummary.totalReviews > 0 || summaryCopy.reviewSummary.positivePercent > 0)
+          );
+          const existingHasReviews = Boolean(
+            existingSummaryObj.reviewSummary &&
+              (existingSummaryObj.reviewSummary.totalReviews > 0 || existingSummaryObj.reviewSummary.positivePercent > 0)
+          );
+          if (!incomingHasReviews && existingHasReviews) {
+            summaryCopy.reviewSummary = existingSummaryObj.reviewSummary;
+          }
+        }
+
         if (
           Array.isArray(platforms) &&
           platforms.some((ep) => ep && ep.isCrossPlatformLauncherRuntime === true)
@@ -2528,6 +2712,9 @@ class OfflineVaultService {
         ) {
           incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
         }
+        if (incomingEnriched && existingEnrichedObj) {
+          carryForwardVaultRequirements(incomingEnriched, existingEnrichedObj);
+        }
 
         const rawIncomingEnrichedJson = incomingEnriched ? JSON.stringify(incomingEnriched) : null;
 
@@ -2537,8 +2724,11 @@ class OfflineVaultService {
 
         if (existing && existing.enriched_json) {
           let existingQuality = String(existing.metadata_quality || 'skeleton_fallback');
-          // Self-heal previously poisoned Xbox/cross-merged 'authoritative' rows lacking positive appId
-          if (
+          // Universal C8 Lattice Invariant: demote existing __quotaSlimmed rows to Rank 0
+          // so rich records always heal them while slimmed projections NEVER overwrite rich rows.
+          if (existingIsSlimmed) {
+            existingQuality = 'skeleton_fallback';
+          } else if (
             existingQuality === 'authoritative' &&
             existingEnrichedObj &&
             ((!(Number(existingEnrichedObj.appId) > 0) &&
@@ -2551,7 +2741,15 @@ class OfflineVaultService {
 
           const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
           const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-          if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
+          if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
+            keepExistingEnriched = true;
+            finalQuality = existingQuality;
+            finalEnrichedAt = Number(existing.enriched_at || nowTs);
+          } else if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
+            keepExistingEnriched = true;
+            finalQuality = existingQuality;
+            finalEnrichedAt = Number(existing.enriched_at || nowTs);
+          } else if (existingIsSlimmed && !incomingIsSlimmed && incomingRank === 0) {
             keepExistingEnriched = true;
             finalQuality = existingQuality;
             finalEnrichedAt = Number(existing.enriched_at || nowTs);
@@ -2566,10 +2764,6 @@ class OfflineVaultService {
 
         let isRowUnchanged = false;
         if (existing) {
-          const existingSummaryStr =
-            existing.summary_json !== null && existing.summary_json !== undefined
-              ? decompressVaultJsonString(existing.summary_json)
-              : null;
           const existingPlatformsStr =
             existing.platforms_json !== null && existing.platforms_json !== undefined
               ? decompressVaultJsonString(existing.platforms_json)
@@ -3071,6 +3265,8 @@ class OfflineVaultService {
 
     const existingEnrichedObj =
       existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
+    const incomingIsSlimmed = Boolean(incomingEnrichedObj?.__quotaSlimmed);
+    const existingIsSlimmed = Boolean(existingEnrichedObj?.__quotaSlimmed);
 
     if (
       incomingEnrichedObj &&
@@ -3078,6 +3274,9 @@ class OfflineVaultService {
       !incomingEnrichedObj.xboxDeliveryHints
     ) {
       incomingEnrichedObj.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
+    }
+    if (incomingEnrichedObj && existingEnrichedObj) {
+      carryForwardVaultRequirements(incomingEnrichedObj, existingEnrichedObj);
     }
 
     const incomingEnrichedJson = incomingEnrichedObj
@@ -3099,11 +3298,13 @@ class OfflineVaultService {
     let finalEnrichedAt =
       typeof payload.enrichedAt === 'number' && payload.enrichedAt > 0 ? payload.enrichedAt : nowTs;
 
-    // Non-Destructive Metadata Upsert Rule:
-    // NEVER overwrite higher-ranked enriched_json with lower-ranked or empty enriched_json!
+    // Non-Destructive Metadata Upsert Rule (C8 Lattice Invariant):
+    // NEVER overwrite higher-ranked or non-slimmed enriched_json with lower-ranked, slimmed, or empty enriched_json!
     if (existing && existing.enriched_json) {
       let existingQuality = String(existing.metadata_quality || 'skeleton_fallback');
-      if (
+      if (existingIsSlimmed) {
+        existingQuality = 'skeleton_fallback';
+      } else if (
         existingQuality === 'authoritative' &&
         existingEnrichedObj &&
         ((!(Number(existingEnrichedObj.appId) > 0) &&
@@ -3116,7 +3317,15 @@ class OfflineVaultService {
 
       const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
       const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-      if (!incomingEnrichedJson || existingRank > incomingRank) {
+      if (incomingIsSlimmed && existingEnrichedObj && !existingIsSlimmed) {
+        finalEnrichedJson = compressVaultJson(existing.enriched_json);
+        finalQuality = existingQuality;
+        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
+      } else if (!incomingEnrichedJson || existingRank > incomingRank) {
+        finalEnrichedJson = compressVaultJson(existing.enriched_json);
+        finalQuality = existingQuality;
+        finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);
+      } else if (existingIsSlimmed && !incomingIsSlimmed && incomingRank === 0) {
         finalEnrichedJson = compressVaultJson(existing.enriched_json);
         finalQuality = existingQuality;
         finalEnrichedAt = Number(existing.enriched_at || finalEnrichedAt);

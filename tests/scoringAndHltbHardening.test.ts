@@ -1168,7 +1168,10 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
             });
             const hydratedTree = hydratedCard.render();
             const hydratedText = getTextContent(hydratedTree);
-            expect(hydratedText).toContain('Verified');
+            expect(hydratedText).toContain('HowLongToBeat');
+            expect(hydratedText).not.toContain('Verified');
+            expect(hydratedText).not.toContain('Full Game');
+            expect(hydratedText).not.toContain('Estimated');
             expect(hydratedText).toContain('10½h');
             expect(hydratedText).toContain('14h');
             expect(hydratedText).toContain('21h');
@@ -1193,9 +1196,11 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
               appId: liveAppId,
             });
 
-            // Initial render runs effect -> sets isLoading=true; second render shows Fetching... with sanitized fallback URL
+            // Initial render runs effect -> sets isLoading=true; second render renders borderless spinner with sanitized fallback URL (no Fetching... pill)
             liveCard.render();
             const loadingTree = liveCard.render();
+            const loadingText = getTextContent(loadingTree);
+            expect(loadingText).not.toContain('Fetching...');
             const loadingLinks = findElements(loadingTree, (el) => el.type === 'a');
             expect(loadingLinks[0]?.props?.href).toBe(expectedFallbackHref);
 
@@ -1203,7 +1208,10 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
             await new Promise((resolve) => setTimeout(resolve, 15));
             const resolvedTree = liveCard.render();
             const resolvedText = getTextContent(resolvedTree);
-            expect(resolvedText).toContain('Verified');
+            expect(resolvedText).toContain('HowLongToBeat');
+            expect(resolvedText).not.toContain('Verified');
+            expect(resolvedText).not.toContain('Full Game');
+            expect(resolvedText).not.toContain('Estimated');
             expect(resolvedText).toContain('12h');
             expect(resolvedText).toContain('15h');
             expect(resolvedText).toContain('22h');
@@ -1724,7 +1732,10 @@ describe('Phase 3B & 4.1: Review Scoring Engine Hardening, HLTB Guard, and Reque
         await new Promise((r) => setTimeout(r, 15));
         const settledTree = card.render();
         const settledText = getTextContent(settledTree);
-        expect(settledText).toContain('Verified');
+        expect(settledText).toContain('HowLongToBeat');
+        expect(settledText).not.toContain('Verified');
+        expect(settledText).not.toContain('Full Game');
+        expect(settledText).not.toContain('Estimated');
         expect(settledText).toContain('6½h');
         expect(settledText).toContain('36h');
         expect(getGameDetailMock).toHaveBeenCalledWith('origin-bfv');
