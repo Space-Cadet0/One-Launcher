@@ -845,10 +845,11 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     const gridRowClass =
       'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-4';
 
-    const renderCard = (game: CanonicalGame, idx: number) =>
+    const renderCard = (game: CanonicalGame, idx: number, isVirtualized: boolean) =>
       renderLibraryGridCard({
         game,
         idx,
+        isVirtualized,
         sortBy,
         userOverridesMap,
         coverOverrides,
@@ -875,8 +876,9 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
           scrollElement={gridLayoutMetrics.scrollEl}
           columnCount={gridLayoutMetrics.cols}
           estimatedRowHeight={gridLayoutMetrics.rowHeight}
+          overscan={4}
           rowClassName={gridRowClass}
-          renderCard={renderCard}
+          renderCard={(game, idx) => renderCard(game, idx, true)}
         />
       );
     }
@@ -893,7 +895,7 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
 
     return (
       <div className={gridRowClass}>
-        {nonVirtualItems.map((game, idx) => renderCard(game, idx))}
+        {nonVirtualItems.map((game, idx) => renderCard(game, idx, false))}
       </div>
     );
   }, [

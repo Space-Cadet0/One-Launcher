@@ -31,6 +31,11 @@ import { isUserActivelyScrolling, waitUntilScrollIdle } from '../../utils/scroll
 import { onlineLifecycleManager } from './onlineLifecycleManager';
 import { unwrapOlMediaUrl } from '../../contracts/network';
 import { fetchAndCacheHltb, hasAttemptedHltbLookup } from '../hltb/howLongToBeat';
+import {
+  isGogCroppedHorizontalCover,
+  isUnsuitableCoverUrl,
+} from '../igdb/igdbCoverService';
+import { getCoverCandidates } from '../../components/Library/Grid/gridCoverUtils';
 
 export function evaluateGameNeedsStoreMediaSync(
   g: CanonicalGame,
@@ -120,8 +125,22 @@ export function evaluateGameNeedsStoreMediaSync(
           (!meta.appId || Number(meta.appId) <= 0)))
   );
   const needsRichSteamUpgrade = isStorefrontNativeMeta && canStillMatchSteam;
+  const needsAuthoritativeArtworkBackfill = Boolean(
+    meta &&
+      meta.metadataQuality === 'authoritative' &&
+      !ov?.capsuleImage &&
+      (!g.capsuleImage ||
+        isUnsuitableCoverUrl(g.capsuleImage) ||
+        isGogCroppedHorizontalCover(g.capsuleImage, g.headerImage))
+  );
 
-  if (meta && meta.metadataQuality !== 'skeleton_fallback' && hasScreenshots && !needsRichSteamUpgrade) {
+  if (
+    meta &&
+    meta.metadataQuality !== 'skeleton_fallback' &&
+    hasScreenshots &&
+    !needsRichSteamUpgrade &&
+    !needsAuthoritativeArtworkBackfill
+  ) {
     return { eligible: false, alreadyEnriched: true };
   }
 
@@ -130,6 +149,7 @@ export function evaluateGameNeedsStoreMediaSync(
     meta.metadataQuality !== 'skeleton_fallback' &&
     !hasScreenshots &&
     !needsRichSteamUpgrade &&
+    !needsAuthoritativeArtworkBackfill &&
     typeof meta.enrichedAt === 'number' &&
     Date.now() - meta.enrichedAt < 30 * 24 * 60 * 60 * 1000
   ) {
@@ -169,7 +189,16 @@ export function extractStaticHydrationAssets(
     assets.push(ordinal !== undefined ? { role, ordinal, url } : { role, url });
   };
 
-  addAsset('cover', game.capsuleImage || meta?.capsuleImage, 0);
+  const candidateGame: CanonicalGame =
+    meta && meta !== game.enrichedMetadata ? { ...game, enrichedMetadata: meta } : game;
+  const alignedCoverUrl =
+    getCoverCandidates(candidateGame, undefined, undefined, {
+      scheduleSwrReprobe: false,
+    })[0] ||
+    game.capsuleImage ||
+    meta?.capsuleImage;
+
+  addAsset('cover', alignedCoverUrl, 0);
   addAsset('header', meta?.headerImage || game.headerImage, 0);
   addAsset('icon', game.iconUrl, 0);
 
@@ -205,6 +234,59 @@ type FavoritableGame = CanonicalGame & {
   isFavorite?: boolean;
   favorited?: boolean;
 };
+
+export interface HydrationQueueGameEntry {
+  gameId: string;
+  title?: string;
+  steamAppId?: number | null;
+  gogId?: string | null;
+  epicAppName?: string | null;
+  xboxProductId?: string | null;
+  packageFamilyName?: string | null;
+  isInstalled?: boolean;
+  isFavorited?: boolean;
+  priority?: number;
+  assets: Array<{ role: string; ordinal?: number; url: string }>;
+}
+
+/**
+ * Builds a polite P2 background hydration batch (cover + icon ONLY) aligned with
+ * `getCoverCandidates(game)[0]` so `MediaHydrationEngine` pre-warms the exact cover
+ * URL requested by `GameCardCover`.
+ */
+export function buildP2CoverHydrationBatch(
+  games: CanonicalGame[]
+): HydrationQueueGameEntry[] {
+  const batch: HydrationQueueGameEntry[] = [];
+  for (const g of games) {
+    if (!g?.id) continue;
+    const gogPlat = g.platforms?.find((p) => p.platformId === 'gog');
+    const epicPlat = g.platforms?.find((p) => p.platformId === 'epic');
+    const xboxPlat = g.platforms?.find((p) => p.platformId === 'xbox');
+    const isInstalled = Boolean(g.platforms?.some((p) => p.installed));
+    const isFavorited = Boolean(
+      (g as FavoritableGame).isFavorite || (g as FavoritableGame).favorited
+    );
+    const p2Assets = extractStaticHydrationAssets(g, g.enrichedMetadata).filter(
+      (a) => a.role === 'cover' || a.role === 'icon'
+    );
+    if (p2Assets.length === 0) continue;
+    batch.push({
+      gameId: g.id,
+      title: g.title,
+      steamAppId: g.steamAppId ?? null,
+      gogId: gogPlat?.platformGameId ?? null,
+      epicAppName: epicPlat?.platformGameId ?? null,
+      xboxProductId: xboxPlat?.xboxProductId ?? xboxPlat?.platformGameId ?? null,
+      packageFamilyName: xboxPlat?.packageFamilyName ?? null,
+      isInstalled,
+      isFavorited,
+      priority: 2,
+      assets: p2Assets,
+    });
+  }
+  return batch;
+}
 
 interface MediaSyncRateError {
   isRateLimited?: boolean;
@@ -307,6 +389,58 @@ export class SyncJobManager {
 
   // Active background critic score loop cancellation token
   private criticLoopToken = 0;
+
+  // Serialized FIFO coordination lane for background warmup jobs (critic_scores <-> store_media)
+  // so sibling warmups queue/chain cleanly instead of cancelling each other during hydration waits.
+  private backgroundWarmupChain: Promise<void> = Promise.resolve();
+  private backgroundWarmupEpoch = 0;
+  private queuedBackgroundWarmups = new Set<'critic_scores' | 'store_media'>();
+
+  private hasActiveManualJob(): boolean {
+    return Boolean(
+      this.state &&
+        !this.state.id.startsWith('auto-') &&
+        (this.state.status === 'running' ||
+          this.state.status === 'paused' ||
+          this.state.status === 'rate_limited')
+    );
+  }
+
+  private enqueueBackgroundWarmup(
+    kind: 'critic_scores' | 'store_media',
+    runner: () => Promise<void>
+  ): Promise<void> {
+    if (this.queuedBackgroundWarmups.has(kind)) {
+      return Promise.resolve();
+    }
+    this.queuedBackgroundWarmups.add(kind);
+    const myEpoch = this.backgroundWarmupEpoch;
+    const prevTail = this.backgroundWarmupChain;
+    let releaseSlot!: () => void;
+    const slotDone = new Promise<void>((resolve) => {
+      releaseSlot = resolve;
+    });
+    this.backgroundWarmupChain = prevTail.then(() => slotDone);
+
+    return (async () => {
+      try {
+        await prevTail;
+        if (myEpoch !== this.backgroundWarmupEpoch) {
+          return;
+        }
+        if (!onlineLifecycleManager.isOnline()) {
+          return;
+        }
+        if (this.hasActiveManualJob()) {
+          return;
+        }
+        await runner();
+      } finally {
+        this.queuedBackgroundWarmups.delete(kind);
+        releaseSlot();
+      }
+    })();
+  }
 
   public getState(): SyncJobState | null {
     return this.state ? { ...this.state } : null;
@@ -730,6 +864,7 @@ export class SyncJobManager {
     if (!this.state || this.state.id !== id) return;
     this.isCancelled = true;
     this.criticLoopToken++;
+    this.backgroundWarmupEpoch++;
     this.categoryStats.clear();
     this.updateState({
       status: 'cancelled',
@@ -750,6 +885,9 @@ export class SyncJobManager {
   public reset(): void {
     this.isCancelled = true;
     this.criticLoopToken++;
+    this.backgroundWarmupEpoch++;
+    this.queuedBackgroundWarmups.clear();
+    this.backgroundWarmupChain = Promise.resolve();
     if (this.categoryClearTimer) {
       clearTimeout(this.categoryClearTimer);
       this.categoryClearTimer = null;
@@ -794,17 +932,25 @@ export class SyncJobManager {
     }
 
     // If a manual batch job is already running and this is just a passive background warmup, don't overwrite it
-    if (
-      isBackground &&
-      this.state &&
-      !this.state.id.startsWith('auto-') &&
-      (this.state.status === 'running' ||
-        this.state.status === 'paused' ||
-        this.state.status === 'rate_limited')
-    ) {
+    if (isBackground && this.hasActiveManualJob()) {
       return;
     }
 
+    if (isBackground) {
+      return this.enqueueBackgroundWarmup('critic_scores', () =>
+        this.executeCriticScoreSync(games, options, true)
+      );
+    }
+
+    this.backgroundWarmupEpoch++;
+    return this.executeCriticScoreSync(games, options, false);
+  }
+
+  private async executeCriticScoreSync(
+    games: CanonicalGame[],
+    options: { forceRefresh?: boolean; isBackgroundWarmup?: boolean; isBackground?: boolean } | undefined,
+    isBackground: boolean
+  ): Promise<void> {
     if (isBackground) {
       await whenStagedCacheHydrated();
       if (!onlineLifecycleManager.isOnline()) {
@@ -813,13 +959,7 @@ export class SyncJobManager {
       if (this.state?.type === 'critic_scores' && this.state?.status === 'running') {
         return;
       }
-      if (
-        this.state &&
-        !this.state.id.startsWith('auto-') &&
-        (this.state.status === 'running' ||
-          this.state.status === 'paused' ||
-          this.state.status === 'rate_limited')
-      ) {
+      if (this.hasActiveManualJob()) {
         return;
       }
     }
@@ -1125,8 +1265,6 @@ export class SyncJobManager {
     options?: { forceRefresh?: boolean; incremental?: boolean; isBackgroundWarmup?: boolean }
   ): Promise<void> {
     const isBackgroundWarmup = Boolean(options?.isBackgroundWarmup);
-    const forceRefresh = Boolean(options?.forceRefresh);
-    const shouldWarmHltb = Boolean(options?.isBackgroundWarmup || options?.incremental);
 
     if (isBackgroundWarmup && !onlineLifecycleManager.isOnline()) {
       return;
@@ -1134,33 +1272,49 @@ export class SyncJobManager {
 
     if (
       isBackgroundWarmup &&
-      this.state &&
-      !this.state.id.startsWith('auto-') &&
-      (this.state.status === 'running' ||
-        this.state.status === 'paused' ||
-        this.state.status === 'rate_limited')
+      this.state?.type === 'store_media' &&
+      this.state?.status === 'running'
     ) {
       return;
     }
+
+    if (isBackgroundWarmup && this.hasActiveManualJob()) {
+      return;
+    }
+
+    if (isBackgroundWarmup) {
+      return this.enqueueBackgroundWarmup('store_media', () =>
+        this.executeStoreMediaSync(games, onGameUpdated, options)
+      );
+    }
+
+    this.backgroundWarmupEpoch++;
+    return this.executeStoreMediaSync(games, onGameUpdated, options);
+  }
+
+  private async executeStoreMediaSync(
+    games: CanonicalGame[],
+    onGameUpdated: (updated: CanonicalGame) => void,
+    options?: { forceRefresh?: boolean; incremental?: boolean; isBackgroundWarmup?: boolean }
+  ): Promise<void> {
+    const isBackgroundWarmup = Boolean(options?.isBackgroundWarmup);
+    const forceRefresh = Boolean(options?.forceRefresh);
+    const shouldWarmHltb = Boolean(options?.isBackgroundWarmup || options?.incremental);
 
     if (isBackgroundWarmup) {
       await whenStagedCacheHydrated();
       if (!onlineLifecycleManager.isOnline()) {
         return;
       }
-      if (
-        this.state &&
-        !this.state.id.startsWith('auto-') &&
-        (this.state.status === 'running' ||
-          this.state.status === 'paused' ||
-          this.state.status === 'rate_limited')
-      ) {
+      if (this.hasActiveManualJob()) {
         return;
       }
     }
 
-    // If a job is already running, cancel the old one first
+    // Only manual user-triggered syncs preempt/cancel an existing running job;
+    // passive background warmups are serialized via `backgroundWarmupChain`.
     if (
+      !isBackgroundWarmup &&
       this.state &&
       (this.state.status === 'running' ||
         this.state.status === 'paused' ||
@@ -1417,16 +1571,26 @@ export class SyncJobManager {
                 !isNonSteamRouted && targetAppId
                   ? steamApi.peekCachedBrowseAssets(targetAppId)
                   : null;
+              const effectiveHeaderForCover =
+                refreshed.headerImage || cachedBrowse?.headerImage || game.headerImage;
               const rawCandidateCapsule = refreshed.capsuleImage || cachedBrowse?.capsuleImage;
               const validRefreshedCapsule =
                 rawCandidateCapsule &&
-                !rawCandidateCapsule.includes('184x69') &&
-                !rawCandidateCapsule.includes('231x87') &&
-                !rawCandidateCapsule.includes('capsule_sm_120') &&
-                !rawCandidateCapsule.includes('_glx_vertical_cover') &&
-                !rawCandidateCapsule.includes('header.jpg')
+                !isUnsuitableCoverUrl(rawCandidateCapsule) &&
+                !isGogCroppedHorizontalCover(rawCandidateCapsule, effectiveHeaderForCover)
                   ? rawCandidateCapsule
                   : undefined;
+
+              const gogPlatForRecovery = game.platforms?.find((p) => p.platformId === 'gog');
+              const artworkRecoveryCtx = {
+                gameId: game.id,
+                title: game.title,
+                steamAppId: isNonSteamRouted ? game.steamAppId : (targetAppId || game.steamAppId),
+                gogId: gogPlatForRecovery?.platformGameId ?? null,
+                userOverrideCapsule: ov?.capsuleImage ?? null,
+                userOverrideHeader: ov?.headerImage ?? null,
+                headerUrl: effectiveHeaderForCover,
+              };
 
               const rawMergedEnriched =
                 pickBestEnrichedMetadata(game.enrichedMetadata, refreshed) ||
@@ -1449,13 +1613,18 @@ export class SyncJobManager {
                   ? ov!.headerImage!
                   : pickPreferredHeaderImage(
                       game.headerImage,
-                      refreshed.headerImage || cachedBrowse?.headerImage
+                      refreshed.headerImage || cachedBrowse?.headerImage,
+                      artworkRecoveryCtx
                     ) ||
                     refreshed.headerImage ||
                     game.headerImage,
                 capsuleImage: preservePinnedCover
                   ? ov!.capsuleImage!
-                  : pickPreferredCapsuleImage(game.capsuleImage, validRefreshedCapsule) ||
+                  : pickPreferredCapsuleImage(
+                      game.capsuleImage,
+                      validRefreshedCapsule,
+                      artworkRecoveryCtx
+                    ) ||
                     validRefreshedCapsule ||
                     game.capsuleImage,
                 shortDescription: preservePinnedSynopsis

@@ -8,6 +8,8 @@ import { steamApi } from '../../../services/steam/steamApi';
 import {
   igdbCoverService,
   isGogCroppedHorizontalCover,
+  isKnownDeadSteamCover,
+  isUnsuitableCoverUrl,
 } from '../../../services/igdb/igdbCoverService';
 import { getUserOverrideForGame } from '../../../services/storage/userOverrideStorage';
 import { onlineLifecycleManager } from '../../../services/network/onlineLifecycleManager';
@@ -23,6 +25,7 @@ import {
 } from './gridScrollTracker';
 import {
   buildExplicitOverrideCoverUrlSet,
+  emittedCoverSelfHealKeys,
   failedCoverUrls,
   getCoverCandidates,
   hasUncheckedSteamBrowseAssets,
@@ -36,13 +39,22 @@ export interface GameCardCoverProps {
   userOverride?: UserGameOverride | null;
   onNeedCoverLookup?: (game: CanonicalGame) => void;
   cardIndex?: number;
+  isVirtualized?: boolean;
 }
 
 export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
-  ({ game, overrideCoverUrl, userOverride, onNeedCoverLookup, cardIndex }) => {
+  ({
+    game,
+    overrideCoverUrl,
+    userOverride,
+    onNeedCoverLookup,
+    cardIndex,
+    isVirtualized = false,
+  }) => {
     const [steamMatchVersion, setSteamMatchVersion] = useState(0);
     const [failedTick, setFailedTick] = useState(0);
     const [headerFallbackFailed, setHeaderFallbackFailed] = useState(false);
+    const isMountedRef = useRef(true);
 
     const gogPlatformGameId = game.platforms?.find((p) => p.platformId === 'gog')?.platformGameId;
     const epicPlatformGameId = game.platforms?.find((p) => p.platformId === 'epic')?.platformGameId;
@@ -68,6 +80,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         ? null
         : steamMatcher.getEffectiveSteamAppId(game) || game.steamAppId || null;
 
+    // Effect 0 MUST remain subscribeToCoverUpdates (relied on by O(1) shared listener tests)
     useEffect(() => {
       return subscribeToCoverUpdates(
         game.id,
@@ -82,14 +95,42 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       );
     }, [game.id, game.title, gogPlatformGameId, effectiveCoverSteamAppId]);
 
+    useEffect(() => {
+      isMountedRef.current = true;
+      return () => {
+        isMountedRef.current = false;
+      };
+    }, []);
+
     const isAboveFold = cardIndex === undefined || cardIndex < 28;
-    const [isCoverMounted, setIsCoverMounted] = useState<boolean>(
-      () => isAboveFold || typeof IntersectionObserver === 'undefined'
+    const [isCoverMounted, setIsCoverMounted] = useState<boolean>(() =>
+      isVirtualized
+        ? !isCurrentlyFastScrolling()
+        : isAboveFold || typeof IntersectionObserver === 'undefined'
     );
     const coverContainerRef = useRef<HTMLDivElement | null>(null);
 
     useEffect(() => {
       if (isCoverMounted) return undefined;
+
+      if (isVirtualized) {
+        if (!isCurrentlyFastScrolling()) {
+          setIsCoverMounted(true);
+          return undefined;
+        }
+        let pendingMount: (() => void) | null = () => {
+          pendingMount = null;
+          setIsCoverMounted(true);
+        };
+        addPendingFastScrollMount(pendingMount);
+        return () => {
+          if (pendingMount) {
+            removePendingFastScrollMount(pendingMount);
+            pendingMount = null;
+          }
+        };
+      }
+
       if (typeof IntersectionObserver === 'undefined') {
         setIsCoverMounted(true);
         return undefined;
@@ -139,7 +180,7 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
         cancelPendingMount();
         observer.disconnect();
       };
-    }, [isCoverMounted]);
+    }, [isCoverMounted, isVirtualized]);
 
     const candidates = useMemo(() => {
       return getCoverCandidates(game, overrideCoverUrl || undefined, effectiveOverride);
@@ -362,6 +403,87 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
       steamMatchVersion,
     ]);
 
+    // Task 4 Stage 3 Split-Brain Self-Heal:
+    // If GameCardCover resolves a valid cached GOG/IGDB cover while the catalog record's
+    // capsuleImage is missing or unsuitable, emit a deduplicated once-per-game-per-session
+    // event so the catalog record heals automatically even if hasAttemptedGogVerticalCover is already true.
+    useEffect(() => {
+      if (effectiveOverride?.capsuleImage) return;
+      if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return;
+
+      const needsCatalogCoverHeal =
+        !game.capsuleImage ||
+        isUnsuitableCoverUrl(game.capsuleImage) ||
+        isGogCroppedHorizontalCover(game.capsuleImage, game.headerImage);
+      if (!needsCatalogCoverHeal) return;
+
+      const gogInstantCover = gogPlatformGameId
+        ? igdbCoverService.getGogVerticalCoverInstant(gogPlatformGameId, game.title)
+        : null;
+      if (
+        gogInstantCover &&
+        !isUnsuitableCoverUrl(gogInstantCover) &&
+        !isGogCroppedHorizontalCover(gogInstantCover, game.headerImage)
+      ) {
+        const healKey = `${game.id}:gog`;
+        if (!emittedCoverSelfHealKeys.has(healKey)) {
+          emittedCoverSelfHealKeys.add(healKey);
+          const cleanGogId = String(gogPlatformGameId).replace(/^gog-/, '');
+          try {
+            window.dispatchEvent(
+              new CustomEvent('antigravity:gog-cover-updated', {
+                detail: {
+                  gameId: game.id,
+                  gogId: cleanGogId,
+                  title: game.title,
+                  coverUrl: gogInstantCover,
+                },
+              })
+            );
+          } catch {
+            // Ignore event dispatch errors
+          }
+        }
+        return;
+      }
+
+      const igdbInstantCover = igdbCoverService.getIgdbCoverInstant(
+        game.title,
+        game.steamAppId,
+        game.id
+      );
+      if (igdbInstantCover && !isUnsuitableCoverUrl(igdbInstantCover)) {
+        const healKey = `${game.id}:igdb`;
+        if (!emittedCoverSelfHealKeys.has(healKey)) {
+          emittedCoverSelfHealKeys.add(healKey);
+          try {
+            window.dispatchEvent(
+              new CustomEvent('antigravity:igdb-cover-updated', {
+                detail: {
+                  gameId: game.id,
+                  title: game.title,
+                  coverUrl: igdbInstantCover,
+                },
+              })
+            );
+          } catch {
+            // Ignore event dispatch errors
+          }
+        }
+      }
+    }, [
+      game.id,
+      game.title,
+      game.steamAppId,
+      game.capsuleImage,
+      game.headerImage,
+      gogPlatformGameId,
+      effectiveOverride?.capsuleImage,
+      steamMatchVersion,
+    ]);
+
+    const imgLoading: 'eager' | 'lazy' = isVirtualized || isAboveFold ? 'eager' : 'lazy';
+
     const matchReviewBadge =
       game.needsMatchReview === true && !effectiveOverride ? (
         <div
@@ -392,7 +514,9 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
             <img
               src={fallbackHeaderUrl}
               alt={game.title}
-              loading={isAboveFold ? 'eager' : 'lazy'}
+              width={460}
+              height={215}
+              loading={imgLoading}
               decoding="async"
               className="relative z-10 w-full aspect-[460/215] object-cover shadow-lg border-y border-white/10"
               onError={() => setHeaderFallbackFailed(true)}
@@ -430,7 +554,9 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
           key={currentSrc}
           src={currentSrc}
           alt={game.title}
-          loading={isAboveFold ? 'eager' : 'lazy'}
+          width={600}
+          height={900}
+          loading={imgLoading}
           fetchPriority={cardIndex === 0 ? 'high' : undefined}
           decoding="async"
           onLoad={(e) => {
@@ -448,20 +574,71 @@ export const GameCardCover: React.FC<GameCardCoverProps> = React.memo(
             if (currentSrc) {
               failedCoverUrls.add(currentSrc);
               if (rawCurrentSrc) failedCoverUrls.add(rawCurrentSrc);
-              const m = unwrappedCurrentSrc.match(/\/apps\/(\d+)\/library_600x900(?:_2x)?\.jpg/i);
-              if (m) {
-                const appIdNum = Number(m[1]);
-                const hasRemainingUnhashedSteam = candidates.some(
-                  (c) => !failedCoverUrls.has(c) && c.includes(`/apps/${m[1]}/library_600x900`)
-                );
-                if (!hasRemainingUnhashedSteam && onlineLifecycleManager.isOnline()) {
-                  if (typeof igdbCoverService.verifyAndRecordDeadSteamCover === 'function') {
+              const steamCoverMatch = unwrappedCurrentSrc.match(
+                /\/apps\/(\d+)\/(?:([a-f0-9]{40})\/)?library_(?:600x900|capsule)(?:_2x)?\.jpg/i
+              );
+              if (steamCoverMatch) {
+                const appIdNum = Number(steamCoverMatch[1]);
+                const sha1 = steamCoverMatch[2];
+                const isUnhashed600x900 =
+                  !sha1 && /\/library_600x900(?:_2x)?\.jpg/i.test(unwrappedCurrentSrc);
+                const isUnhashed1x =
+                  !sha1 && /\/library_600x900\.jpg(?:[?#]|$)/i.test(unwrappedCurrentSrc);
+
+                const markRemainingUnhashedFailed = (): boolean => {
+                  let markedAny = false;
+                  const unhashedPrefix = `/apps/${appIdNum}/library_600x900`;
+                  for (const cand of candidates) {
+                    if (cand.includes(unhashedPrefix) && !failedCoverUrls.has(cand)) {
+                      failedCoverUrls.add(cand);
+                      markedAny = true;
+                    }
+                  }
+                  const canonical2x = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appIdNum}/library_600x900_2x.jpg`;
+                  if (!failedCoverUrls.has(canonical2x)) {
+                    failedCoverUrls.add(canonical2x);
+                    markedAny = true;
+                  }
+                  return markedAny;
+                };
+
+                if (sha1) {
+                  // SHA1-hashed Steam URL: verify only that exact URL without poisoning the AppID
+                  if (
+                    onlineLifecycleManager.isOnline() &&
+                    typeof igdbCoverService.verifyAndRecordDeadSteamCover === 'function'
+                  ) {
                     void igdbCoverService.verifyAndRecordDeadSteamCover(
                       appIdNum,
                       unwrappedCurrentSrc
                     );
-                  } else {
-                    igdbCoverService.recordDeadSteamCover(appIdNum);
+                  }
+                } else if (isUnhashed600x900 && !isUserExplicitCover) {
+                  if (isUnhashed1x && isKnownDeadSteamCover(appIdNum)) {
+                    markRemainingUnhashedFailed();
+                  }
+                  const hasRemainingUnhashedSteam = candidates.some(
+                    (c) =>
+                      !failedCoverUrls.has(c) && c.includes(`/apps/${appIdNum}/library_600x900`)
+                  );
+                  if (onlineLifecycleManager.isOnline()) {
+                    if (typeof igdbCoverService.verifyAndRecordDeadSteamCover === 'function') {
+                      if (isUnhashed1x || !hasRemainingUnhashedSteam) {
+                        void igdbCoverService
+                          .verifyAndRecordDeadSteamCover(appIdNum, unwrappedCurrentSrc)
+                          .then((confirmedDead) => {
+                            if (confirmedDead && isUnhashed1x) {
+                              const markedAny = markRemainingUnhashedFailed();
+                              if (markedAny && isMountedRef.current) {
+                                setFailedTick((t) => t + 1);
+                              }
+                            }
+                          })
+                          .catch(() => {});
+                      }
+                    } else if (!hasRemainingUnhashedSteam) {
+                      igdbCoverService.recordDeadSteamCover(appIdNum);
+                    }
                   }
                 }
               }

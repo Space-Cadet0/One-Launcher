@@ -9,6 +9,8 @@ let idlePruneTimer1: ReturnType<typeof setTimeout> | null = null;
 let idlePruneTimer2: ReturnType<typeof setTimeout> | null = null;
 let lastPruneTimestamp = 0;
 
+export const FAST_SCROLL_CALM_MS = 75;
+
 let isFastScrolling = false;
 let fastScrollCalmTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingFastScrollMountFns = new Set<() => void>();
@@ -54,7 +56,7 @@ export function recordScrollActivity(scrollTop: number, sourceKey: string = 'mai
     if (stepDelta > 300) {
       isFastScrolling = true;
       if (fastScrollCalmTimer) clearTimeout(fastScrollCalmTimer);
-      fastScrollCalmTimer = setTimeout(flushFastScrollMountFns, 120);
+      fastScrollCalmTimer = setTimeout(flushFastScrollMountFns, FAST_SCROLL_CALM_MS);
     }
   } else {
     const stepDelta = Math.abs(scrollTop - prev.lastPos);
@@ -65,7 +67,7 @@ export function recordScrollActivity(scrollTop: number, sourceKey: string = 'mai
     if (stepDelta > 300 || (windowDist > 300 && windowElapsed <= 150)) {
       isFastScrolling = true;
       if (fastScrollCalmTimer) clearTimeout(fastScrollCalmTimer);
-      fastScrollCalmTimer = setTimeout(flushFastScrollMountFns, 120);
+      fastScrollCalmTimer = setTimeout(flushFastScrollMountFns, FAST_SCROLL_CALM_MS);
     }
     if (windowElapsed >= 100 || windowDist > 300) {
       prev.windowTime = now;

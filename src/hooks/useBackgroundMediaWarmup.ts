@@ -45,6 +45,7 @@ export function useBackgroundMediaWarmup({
 }: UseBackgroundMediaWarmupParams): void {
   const autoMediaWarmupRunningRef = useRef<boolean>(false);
   const autoHltbTrickleRunningRef = useRef<boolean>(false);
+  const hasQueuedSessionP2CoversRef = useRef<boolean>(false);
   const attemptedWarmupIdsRef = useRef<Set<string>>(new Set());
   const offlineSkippedIdsRef = useRef<Set<string>>(new Set());
   const attemptedHltbIdsRef = useRef<Set<string>>(new Set());
@@ -331,78 +332,111 @@ export function useBackgroundMediaWarmup({
         if (autoMediaWarmupRunningRef.current) return;
 
         void import('../services/network/syncJobManager')
-          .then(({ syncJobManager, evaluateGameNeedsStoreMediaSync }) => {
-            if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
-            if (!onlineLifecycleManager.isOnline()) return;
-            if (launcherService.getRunningGames().length > 0) return;
-            if (launcherService.isInGameHibernating()) return;
-            if (autoMediaWarmupRunningRef.current) return;
+          .then(
+            ({
+              syncJobManager,
+              evaluateGameNeedsStoreMediaSync,
+              buildP2CoverHydrationBatch,
+            }) => {
+              if (isBootHydratingRef.current || isModalSuspendedRef.current) return;
+              if (!onlineLifecycleManager.isOnline()) return;
+              if (launcherService.getRunningGames().length > 0) return;
+              if (launcherService.isInGameHibernating()) return;
+              if (autoMediaWarmupRunningRef.current) return;
 
-            const activeJob = syncJobManager.getState();
-            if (
-              activeJob &&
-              (activeJob.status === 'running' ||
-                activeJob.status === 'paused' ||
-                activeJob.status === 'rate_limited')
-            ) {
-              scheduleMediaWarmup(4000);
-              return;
-            }
+              const queueSessionP2CoversOnce = () => {
+                if (hasQueuedSessionP2CoversRef.current) return;
+                if (!onlineLifecycleManager.isOnline()) return;
+                if (
+                  typeof window === 'undefined' ||
+                  !window.electronAPI?.offlineVault?.queueHydration
+                ) {
+                  return;
+                }
+                const currentCatalog = gamesRef.current;
+                if (!currentCatalog || currentCatalog.length === 0) return;
+                const p2Batch = buildP2CoverHydrationBatch(currentCatalog);
+                if (p2Batch.length === 0) return;
+                hasQueuedSessionP2CoversRef.current = true;
+                try {
+                  void window.electronAPI.offlineVault
+                    .queueHydration({ games: p2Batch })
+                    ?.catch?.(() => {});
+                } catch {
+                  // Ignore vault IPC errors
+                }
+              };
 
-            const gamesNeedingWarmup = gamesRef.current.filter((g) => {
-              if (attemptedWarmupIdsRef.current.has(g.id)) return false;
-              return evaluateGameNeedsStoreMediaSync(g, false).eligible;
-            });
-
-            if (gamesNeedingWarmup.length === 0) {
-              scheduleHltbTrickle(900);
-              return;
-            }
-
-            for (const g of gamesNeedingWarmup) {
-              attemptedWarmupIdsRef.current.add(g.id);
-            }
-
-            const completedInRunIds = new Set<string>();
-            const onWarmupGameUpdated = (updatedGame: CanonicalGame) => {
-              completedInRunIds.add(updatedGame.id);
-              if (updatedGame.enrichedMetadata?.metadataQuality === 'skeleton_fallback') {
+              const activeJob = syncJobManager.getState();
+              const hasActiveManualJob = Boolean(
+                activeJob &&
+                  !activeJob.id.startsWith('auto-') &&
+                  (activeJob.status === 'running' ||
+                    activeJob.status === 'paused' ||
+                    activeJob.status === 'rate_limited')
+              );
+              if (hasActiveManualJob) {
+                scheduleMediaWarmup(4000);
                 return;
               }
-              pendingWarmupUpdatesRef.current.set(updatedGame.id, updatedGame);
-              if (isModalSuspendedRef.current) {
+
+              const gamesNeedingWarmup = gamesRef.current.filter((g) => {
+                if (attemptedWarmupIdsRef.current.has(g.id)) return false;
+                return evaluateGameNeedsStoreMediaSync(g, false).eligible;
+              });
+
+              if (gamesNeedingWarmup.length === 0) {
+                queueSessionP2CoversOnce();
+                scheduleHltbTrickle(900);
                 return;
               }
-              if (isVitestEnv) {
-                flushWarmupBatch();
-              } else if (batchFlushTimerRef.current === null) {
-                batchFlushTimerRef.current = setTimeout(flushWarmupBatch, 500);
-              }
-            };
 
-            autoMediaWarmupRunningRef.current = true;
-            Promise.resolve(
-              syncJobManager.startStoreMediaSync(gamesNeedingWarmup, onWarmupGameUpdated, {
-                incremental: true,
-                isBackgroundWarmup: true,
-              })
-            )
-              .catch(() => {})
-              .finally(() => {
-                autoMediaWarmupRunningRef.current = false;
-                if (!onlineLifecycleManager.isOnline()) {
-                  for (const g of gamesNeedingWarmup) {
-                    if (!completedInRunIds.has(g.id)) {
-                      offlineSkippedIdsRef.current.add(g.id);
+              for (const g of gamesNeedingWarmup) {
+                attemptedWarmupIdsRef.current.add(g.id);
+              }
+
+              const completedInRunIds = new Set<string>();
+              const onWarmupGameUpdated = (updatedGame: CanonicalGame) => {
+                completedInRunIds.add(updatedGame.id);
+                if (updatedGame.enrichedMetadata?.metadataQuality === 'skeleton_fallback') {
+                  return;
+                }
+                pendingWarmupUpdatesRef.current.set(updatedGame.id, updatedGame);
+                if (isModalSuspendedRef.current) {
+                  return;
+                }
+                if (isVitestEnv) {
+                  flushWarmupBatch();
+                } else if (batchFlushTimerRef.current === null) {
+                  batchFlushTimerRef.current = setTimeout(flushWarmupBatch, 500);
+                }
+              };
+
+              autoMediaWarmupRunningRef.current = true;
+              Promise.resolve(
+                syncJobManager.startStoreMediaSync(gamesNeedingWarmup, onWarmupGameUpdated, {
+                  incremental: true,
+                  isBackgroundWarmup: true,
+                })
+              )
+                .catch(() => {})
+                .finally(() => {
+                  autoMediaWarmupRunningRef.current = false;
+                  if (!onlineLifecycleManager.isOnline()) {
+                    for (const g of gamesNeedingWarmup) {
+                      if (!completedInRunIds.has(g.id)) {
+                        offlineSkippedIdsRef.current.add(g.id);
+                      }
                     }
                   }
-                }
-                if (!isModalSuspendedRef.current) {
-                  flushWarmupBatch();
-                  scheduleHltbTrickle(900);
-                }
-              });
-          })
+                  if (!isModalSuspendedRef.current) {
+                    flushWarmupBatch();
+                    queueSessionP2CoversOnce();
+                    scheduleHltbTrickle(900);
+                  }
+                });
+            }
+          )
           .catch(() => {});
       }, delayMs);
     };

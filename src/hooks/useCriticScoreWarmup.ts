@@ -87,6 +87,9 @@ export function useCriticScoreWarmup(
         void import('../services/network/syncJobManager')
           .then(({ syncJobManager }) => {
             if (isBootHydratingRef.current || isSuspendedRef.current) return;
+            if (!onlineLifecycleManager.isOnline()) return;
+            if (launcherService.getRunningGames().length > 0) return;
+            if (warmupActiveRef.current) return;
             const latestGames = gamesLatestRef.current;
             if (!latestGames || latestGames.length === 0) return;
             warmupActiveRef.current = true;

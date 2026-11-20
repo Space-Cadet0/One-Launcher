@@ -548,6 +548,7 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
       });
       const fallbackMeta = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(
         landscapeOnlyGame,
+        undefined,
         { synopsisOnly: true }
       );
       expect(fallbackMeta.headerImage).toBe('https://cdn.example.com/synthetic-banner-16x9.jpg');
@@ -969,7 +970,6 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
             { id: 2, description: 'Single-player' },
             { id: 22, description: 'Steam Achievements' },
           ],
-          dlc: [appId + 50000, appId + 50001],
           screenshots: Array.from({ length: 6 }, (__, sIdx) => ({
             id: sIdx,
             pathThumbnail: `https://shared.akamai.steamstatic.com/ss/${appId}/${sIdx}_thumb.jpg`,
@@ -983,6 +983,14 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
             },
           ],
           systemRequirements: { minimum: 'OS: 64-bit', recommended: 'RAM: 16 GB' },
+          reviewSummary: {
+            reviewScore: 8,
+            reviewScoreDesc: 'Very Positive',
+            totalPositive: 860,
+            totalNegative: 140,
+            totalReviews: 1000,
+            positivePercent: 86,
+          },
           metacritic: { score: 86, url: 'https://metacritic.example/game' },
           platforms: { windows: true, mac: false, linux: true },
           achievements: { total: 42 },
@@ -990,7 +998,7 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
           enrichedSource: 'steam',
           enrichedAt: 1715000000000,
           ...(i % 10 === 0
-            ? { xboxDeliveryHints: { isCrossGen: false, hasNativeWindowsBuild: true } }
+            ? { xboxDeliveryHints: { packageFormat: 'gdk', contentId: `synth-cid-${i}` } }
             : {}),
         };
         return makeSyntheticGame({
@@ -1015,7 +1023,7 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
       const serializedBytes = new TextEncoder().encode(JSON.stringify(slimmed)).length;
       expect(serializedBytes).toBeLessThan(1_200_000);
 
-      const sampleMeta = slimmed[0].enrichedMetadata as Record<string, unknown>;
+      const sampleMeta = slimmed[0].enrichedMetadata as unknown as Record<string, unknown>;
       expect(sampleMeta.__quotaSlimmed).toBe(true);
       expect(sampleMeta.hasScreenshotsCount).toBe(6);
       expect(sampleMeta.hasMoviesCount).toBe(1);
@@ -1024,8 +1032,8 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
       expect(sampleMeta.platforms).toEqual({ windows: true, mac: false, linux: true });
       expect(sampleMeta.achievements).toEqual({ total: 42 });
       expect(sampleMeta.xboxDeliveryHints).toEqual({
-        isCrossGen: false,
-        hasNativeWindowsBuild: true,
+        packageFormat: 'gdk',
+        contentId: 'synth-cid-0',
       });
       // Redundant top-level fields dropped from slimMeta
       expect(sampleMeta.shortDescription).toBeUndefined();
@@ -1048,10 +1056,9 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
             installed: true,
             installPath: 'C:/Games/SynthAlpha',
             playtimeMinutes: 120,
-            achievements: { unlocked: 5, total: 20 },
+            achievements: { unlocked: 5, total: 20, percentage: 25 },
           },
         ],
-        achievements: { unlocked: 5, total: 20 },
       });
       const identicalIncoming = makeSyntheticGame({
         id: 'steam-985001',
@@ -1063,10 +1070,9 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
             platformGameId: '985001',
             installed: false, // live install state preserved
             playtimeMinutes: 120,
-            achievements: { unlocked: 5, total: 20 },
+            achievements: { unlocked: 5, total: 20, percentage: 25 },
           },
         ],
-        achievements: { unlocked: 5, total: 20 },
       });
 
       const mergedPass1 = mergeStorefrontGames([existingGame], [identicalIncoming], 'steam');
@@ -1098,7 +1104,7 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
             platformGameId: '986001',
             installed: false,
             playtimeMinutes: 0,
-            supportedOs: ['windows'],
+            platforms: { windows: true },
           },
         ],
       });

@@ -22,6 +22,7 @@ import {
 export interface RenderLibraryGridCardArgs {
   game: CanonicalGame;
   idx: number;
+  isVirtualized?: boolean;
   sortBy: GridSortOption;
   userOverridesMap: Record<string, UserGameOverride>;
   coverOverrides: Record<string, string | null>;
@@ -40,6 +41,7 @@ export interface RenderLibraryGridCardArgs {
 export function renderLibraryGridCard({
   game,
   idx,
+  isVirtualized = false,
   sortBy,
   userOverridesMap,
   coverOverrides,
@@ -84,6 +86,12 @@ export function renderLibraryGridCard({
     getReleaseYear(game, steamMatcher.getEffectiveSteamAppId(game));
   const playtimeLabel = formatPlaytime(game);
 
+  const cardContainmentClass = isVirtualized
+    ? 'cv-card'
+    : idx >= 28
+      ? 'cv-card cv-card-deferred perf-card-contain'
+      : 'cv-card';
+
   return (
     <div
       key={game.id}
@@ -91,7 +99,7 @@ export function renderLibraryGridCard({
       onMouseEnter={(e) => onMouseEnter(game, e)}
       onMouseLeave={onMouseLeave}
       onContextMenu={(e) => onContextMenu(game, e)}
-      className={`${idx >= 28 ? 'cv-card cv-card-deferred perf-card-contain' : 'cv-card'} group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-colors duration-150 cursor-pointer shadow-md hover:shadow-2xl`}
+      className={`${cardContainmentClass} group relative flex flex-col rounded-md overflow-hidden bg-[#16202d] border border-steam-border/70 hover:border-steam-accent transition-colors duration-150 cursor-pointer shadow-md hover:shadow-2xl`}
     >
       <button
         type="button"
@@ -119,6 +127,7 @@ export function renderLibraryGridCard({
           userOverride={cardUserOverride}
           onNeedCoverLookup={onNeedCoverLookup}
           cardIndex={idx}
+          isVirtualized={isVirtualized}
         />
 
         {/* Gradient bottom shadow to ensure overlays pop */}

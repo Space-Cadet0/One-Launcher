@@ -297,9 +297,22 @@ export const globalAttemptedCoverLookups: Set<string> = new BoundedStringSet(
   MAX_COVER_SET_ENTRIES
 );
 export const failedCoverUrls: Set<string> = new BoundedStringSet(MAX_COVER_SET_ENTRIES);
+export const emittedCoverSelfHealKeys: Set<string> = new BoundedStringSet(MAX_COVER_SET_ENTRIES);
 
 export function clearAttemptedCoverLookups(): void {
   globalAttemptedCoverLookups.clear();
+}
+
+export function clearEmittedCoverSelfHealKeys(gameId?: string): void {
+  if (!gameId) {
+    emittedCoverSelfHealKeys.clear();
+    return;
+  }
+  for (const key of Array.from(emittedCoverSelfHealKeys)) {
+    if (key === gameId || key.startsWith(`${gameId}:`)) {
+      emittedCoverSelfHealKeys.delete(key);
+    }
+  }
 }
 
 export function clearFailedCoverUrls(gameId?: string): void {
@@ -361,10 +374,32 @@ export function buildExplicitOverrideCoverUrlSet(
   return result;
 }
 
+const UNHASHED_STEAM_LIBRARY_COVER_RE =
+  /\/apps\/\d+\/library_(?:600x900|capsule)(?:_2x)?\.jpg(?:[?#]|$)/i;
+
+function isValidVerifiedPortraitFallback(
+  url?: string | null,
+  headerImage?: string | null
+): boolean {
+  if (!url) return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  if (isUnsuitableCoverUrl(trimmed)) return false;
+  if (isGogCroppedHorizontalCover(trimmed, headerImage)) return false;
+  const unwrapped = unwrapOlMediaUrl(trimmed);
+  if (UNHASHED_STEAM_LIBRARY_COVER_RE.test(unwrapped)) return false;
+  return true;
+}
+
+export interface GetCoverCandidatesOptions {
+  scheduleSwrReprobe?: boolean;
+}
+
 export function getCoverCandidates(
   game: CanonicalGame,
   overrideCoverUrl?: string | null,
-  userOverride?: UserGameOverride | null
+  userOverride?: UserGameOverride | null,
+  options?: GetCoverCandidatesOptions
 ): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
@@ -423,6 +458,25 @@ export function getCoverCandidates(
     addWith1xPriority(rawImagesCover);
   }
 
+  // Pre-resolve verified non-Steam / storefront portrait fallbacks so Step 2 can
+  // honor IStoreBrowseService negative results & SWR expired dead-Steam suppression
+  // without stalling on speculative unhashed Steam 404 round-trips.
+  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+  const gogBoxArt = gogPlat?.platformGameId
+    ? igdbCoverService.getGogVerticalCoverInstant(gogPlat.platformGameId, game.title)
+    : null;
+  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
+
+  const hasVerifiedPortraitFallback = Boolean(
+    isValidVerifiedPortraitFallback(effectiveOverride?.capsuleImage, game.headerImage) ||
+      isValidVerifiedPortraitFallback(rawImagesCover, game.headerImage) ||
+      isValidVerifiedPortraitFallback(gogBoxArt, game.headerImage) ||
+      isValidVerifiedPortraitFallback(igdbCover, game.headerImage) ||
+      isValidVerifiedPortraitFallback(overrideCoverUrl, game.headerImage) ||
+      isValidVerifiedPortraitFallback(game.capsuleImage, game.headerImage) ||
+      isValidVerifiedPortraitFallback(game.enrichedMetadata?.capsuleImage, game.headerImage)
+  );
+
   // 2. Official Steam 600x900 2:3 Library Portrait Cover
   const isExplicitNonSteam =
     effectiveOverride?.steamAppId === null || game.isExplicitNonSteam === true;
@@ -432,6 +486,12 @@ export function getCoverCandidates(
 
   if (targetSteamId) {
     const browseAssets = steamApi.getStoreBrowseAssetsInstant(targetSteamId);
+    const browseConfirmsNoCapsule = Boolean(
+      browseAssets &&
+        !browseAssets.capsuleImage &&
+        (browseAssets.headerImage || browseAssets.iconUrl || typeof browseAssets.ts === 'number')
+    );
+
     if (browseAssets?.capsuleImage) {
       addWith1xPriority(browseAssets.capsuleImage);
     }
@@ -447,27 +507,37 @@ export function getCoverCandidates(
     ) {
       addWith1xPriority(game.enrichedMetadata.capsuleImage);
     }
-    if (!isKnownDeadSteamCover(targetSteamId)) {
-      add(
-        `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`
-      );
-      add(`https://cdn.akamai.steamstatic.com/steam/apps/${targetSteamId}/library_600x900.jpg`);
-      add(
-        `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`
-      );
-      add(
-        `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`
-      );
+
+    if (!browseConfirmsNoCapsule) {
+      const isDeadSteam = isKnownDeadSteamCover(targetSteamId);
+      const isExpiredDead =
+        !isDeadSteam &&
+        typeof igdbCoverService.isExpiredDeadSteamUnhashed === 'function' &&
+        igdbCoverService.isExpiredDeadSteamUnhashed(targetSteamId);
+
+      if (isExpiredDead && hasVerifiedPortraitFallback) {
+        // Stale-while-revalidate: serve verified fallback synchronously (<1ms cached blob)
+        // and schedule a single deduplicated idle background re-probe.
+        if (
+          options?.scheduleSwrReprobe !== false &&
+          typeof igdbCoverService.scheduleExpiredDeadSteamReprobe === 'function'
+        ) {
+          igdbCoverService.scheduleExpiredDeadSteamReprobe(targetSteamId);
+        }
+      } else if (!isDeadSteam) {
+        // Canonical 1x followed by 2x fallback (collapsed from 3 redundant 1x mirrors)
+        add(
+          `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900.jpg`
+        );
+        add(
+          `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${targetSteamId}/library_600x900_2x.jpg`
+        );
+      }
     }
   }
 
   // 3. Official Steam / Epic / GOG tall vertical posters
-  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
-  if (gogPlat?.platformGameId) {
-    const gogBoxArt = igdbCoverService.getGogVerticalCoverInstant(
-      gogPlat.platformGameId,
-      game.title
-    );
+  if (gogBoxArt) {
     add(gogBoxArt);
   }
 
@@ -492,7 +562,6 @@ export function getCoverCandidates(
   }
 
   // 4. Verified IGDB portrait box art fallback
-  const igdbCover = igdbCoverService.getIgdbCoverInstant(game.title, game.steamAppId, game.id);
   add(igdbCover);
   if (overrideCoverUrl) {
     add(overrideCoverUrl);

@@ -331,7 +331,7 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
   // TORTURE SCENARIO 1: Ultra-Fast Scroll Simulation (>5,000 px/s across 500 cards)
   // =========================================================================
   describe('Torture Scenario 1: Ultra-Fast Scroll Velocity Shielding & Exact Flush', () => {
-    it('simulates ultra-fast scroll at >12,500 px/s across 500 virtual card intersections: verifies 0 premature mounts and exact flush at 120ms', () => {
+    it('simulates ultra-fast scroll at >12,500 px/s across 500 virtual card intersections: verifies 0 premature mounts and exact flush at 75ms', () => {
       expect(isCurrentlyFastScrolling()).toBe(false);
 
       // Track mount executions
@@ -377,17 +377,17 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
       expect(cardIntersectionCursor).toBe(500);
       expect(mountedIndices.size).toBe(0);
 
-      // Advance by 50ms: 16ms + 50ms = 66ms total elapsed (well inside the 120ms calm window)
-      vi.advanceTimersByTime(50);
+      // Advance by 40ms: 16ms + 40ms = 56ms total elapsed (well inside the 75ms calm window)
+      vi.advanceTimersByTime(40);
       expect(isCurrentlyFastScrolling()).toBe(true);
       expect(mountedIndices.size).toBe(0);
 
-      // Advance by another 53ms: 66ms + 53ms = 119ms total elapsed (exactly 1ms before 120ms threshold)
-      vi.advanceTimersByTime(53);
+      // Advance by another 18ms: 56ms + 18ms = 74ms total elapsed (exactly 1ms before 75ms threshold)
+      vi.advanceTimersByTime(18);
       expect(isCurrentlyFastScrolling()).toBe(true);
       expect(mountedIndices.size).toBe(0);
 
-      // Advance by 2ms: 119ms + 2ms = 121ms total elapsed (calm threshold 120ms crossed!)
+      // Advance by 2ms: 74ms + 2ms = 76ms total elapsed (calm threshold 75ms crossed!)
       vi.advanceTimersByTime(2);
 
       // CRITICAL INVARIANT: Exact mount flush on scroll calm!
@@ -403,7 +403,7 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
     it('shields mounts during upward high-velocity scrolling (negative scroll delta)', () => {
       let currentScrollTop = 50000;
       recordScrollActivity(currentScrollTop, 'main');
-      vi.advanceTimersByTime(150); // settle initial position
+      vi.advanceTimersByTime(100); // settle initial position
 
       const mountedCards: number[] = [];
 
@@ -420,13 +420,13 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
         expect(mountedCards).toHaveLength(0); // 0 premature mounts
       }
 
-      // Settle past 120ms
-      vi.advanceTimersByTime(130);
+      // Settle past 75ms
+      vi.advanceTimersByTime(80);
       expect(isCurrentlyFastScrolling()).toBe(false);
       expect(mountedCards).toHaveLength(20);
     });
 
-    it('resets calm timer when high-velocity events keep arriving before 120ms expires', () => {
+    it('resets calm timer when high-velocity events keep arriving before 75ms expires', () => {
       recordScrollActivity(1000, 'main');
       expect(isCurrentlyFastScrolling()).toBe(true);
 
@@ -435,20 +435,20 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
         mounted = true;
       });
 
-      // User pauses briefly for 100ms (not yet 120ms)
-      vi.advanceTimersByTime(100);
+      // User pauses briefly for 60ms (not yet 75ms)
+      vi.advanceTimersByTime(60);
       expect(mounted).toBe(false);
 
       // User resumes scrolling! Calm timer must reset
       recordScrollActivity(1600, 'main');
       expect(isCurrentlyFastScrolling()).toBe(true);
 
-      // Advance another 100ms from the second scroll event (total 200ms from start, but only 100ms from last event)
-      vi.advanceTimersByTime(100);
+      // Advance another 60ms from the second scroll event (total 120ms from start, but only 60ms from last event)
+      vi.advanceTimersByTime(60);
       expect(mounted).toBe(false);
 
-      // Finally let 125ms elapse without scroll
-      vi.advanceTimersByTime(25);
+      // Finally let 80ms elapse without scroll
+      vi.advanceTimersByTime(20);
       expect(mounted).toBe(true);
       expect(isCurrentlyFastScrolling()).toBe(false);
     });
@@ -502,7 +502,7 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
       }
     });
 
-    it('cancels pending mount at 119ms (1ms before calm flush) cleanly without race condition', () => {
+    it('cancels pending mount at 74ms (1ms before calm flush) cleanly without race condition', () => {
       recordScrollActivity(1000, 'main');
 
       let mounted = false;
@@ -512,8 +512,8 @@ describe('Milestone M4: Adversarial Stress Test Harness — Virtual Grid & Scrol
 
       addPendingFastScrollMount(mountFn);
 
-      // Wait until 119ms
-      vi.advanceTimersByTime(119);
+      // Wait until 74ms
+      vi.advanceTimersByTime(74);
       expect(mounted).toBe(false);
 
       // Element unmounts right before calm flush
