@@ -9,6 +9,7 @@ const { execFile } = require('node:child_process');
 const { diagLog } = require('../utils/diagnosticLogger.cjs');
 const { isProcessAlive } = require('./processTreeUtils.cjs');
 const { resolveDriveCPathCaseInsensitive } = require('./wineAndCrossOverManager.cjs');
+const { isNetworkOnlineForLaunch } = require('./engineStateRegistry.cjs');
 
 /**
  * Determine whether caller options represent a synthetic test harness rather than a real host launch.
@@ -587,7 +588,7 @@ async function readLogTailBytesAsync(filePath, startByteOffset = 0, maxBytes = 1
  * Readiness barrier for GOG Galaxy `GalaxyCommunication` daemon (`127.0.0.1:9977` + active OAuth session).
  *
  * @param {Record<string, any>} [params]
- * @returns {Promise<{ ready: boolean, waitedMs: number, timedOut?: boolean, aborted?: boolean, reason?: string }>}
+ * @returns {Promise<{ ready: boolean, waitedMs: number, timedOut?: boolean, aborted?: boolean, offlineSkipped?: boolean, reason?: string }>}
  */
 async function waitForGogCommunicationServiceReady(params = {}) {
   const opts = params.options && typeof params.options === 'object' ? params.options : params;
@@ -600,6 +601,10 @@ async function waitForGogCommunicationServiceReady(params = {}) {
     params.enableStorefrontReadinessBarrier !== true
   ) {
     return { ready: true, waitedMs: 0, reason: 'skipped_in_test' };
+  }
+
+  if (!isNetworkOnlineForLaunch(opts) || !isNetworkOnlineForLaunch(params)) {
+    return { ready: true, waitedMs: 0, offlineSkipped: true, reason: 'offline_skipped' };
   }
 
   const port = Number(params.port ?? opts.gogSdkPort ?? 9977);
@@ -763,7 +768,7 @@ async function waitForGogPostExitFlush(params = {}) {
  * Readiness barrier for cold-started `EpicGamesLauncher.exe -silent` inside a Wine/CrossOver bottle.
  *
  * @param {Record<string, any>} [params]
- * @returns {Promise<{ ready: boolean, waitedMs: number, timedOut?: boolean, reason: string }>}
+ * @returns {Promise<{ ready: boolean, waitedMs: number, timedOut?: boolean, offlineSkipped?: boolean, reason: string }>}
  */
 async function waitForBottleEpicPortalReady(params = {}) {
   const opts = params.options && typeof params.options === 'object' ? params.options : params;
@@ -776,6 +781,10 @@ async function waitForBottleEpicPortalReady(params = {}) {
     params.enableEpicReadinessBarrier !== true
   ) {
     return { ready: true, waitedMs: 0, reason: 'skipped_in_test' };
+  }
+
+  if (!isNetworkOnlineForLaunch(opts) || !isNetworkOnlineForLaunch(params)) {
+    return { ready: true, waitedMs: 0, offlineSkipped: true, reason: 'offline_skipped' };
   }
 
   const bottlePath = String(params.bottlePath || '');
@@ -832,9 +841,15 @@ async function waitForBottleEpicPortalReady(params = {}) {
 
   /** @type {Map<string, number>} */
   const preOffsets = new Map();
-  if (typeof params.preBootOffset === 'number' && params.preBootOffset >= 0) {
+  const explicitPreBootOffset =
+    typeof params.preBootOffset === 'number' && params.preBootOffset >= 0
+      ? params.preBootOffset
+      : typeof params.preBootLogOffset === 'number' && params.preBootLogOffset >= 0
+        ? params.preBootLogOffset
+        : undefined;
+  if (typeof explicitPreBootOffset === 'number') {
     for (const c of discoverBottleEpicLogCandidates()) {
-      preOffsets.set(c, params.preBootOffset);
+      preOffsets.set(c, explicitPreBootOffset);
     }
   } else {
     for (const c of discoverBottleEpicLogCandidates()) {

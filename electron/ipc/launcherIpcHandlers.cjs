@@ -1307,6 +1307,17 @@ function registerLauncherIpcHandlers({
     'launcher:save-performance-settings',
     async (/** @type {any} */ _event, /** @type {unknown} */ settings, /** @type {unknown} */ rawOpts) => {
       const cleanSettings = sanitizeLauncherSettingsPayload(settings);
+      if (settings && typeof settings === 'object' && !Array.isArray(settings)) {
+        const rawSettingsObj = /** @type {Record<string, unknown>} */ (settings);
+        if (typeof rawSettingsObj.defaultPerformanceHud === 'boolean') {
+          cleanSettings.defaultPerformanceHud = rawSettingsObj.defaultPerformanceHud;
+        } else if (
+          rawSettingsObj.enableMetalHud === true ||
+          rawSettingsObj.enableMangoHud === true
+        ) {
+          cleanSettings.defaultPerformanceHud = true;
+        }
+      }
       return launcherEngine.saveLauncherPerformanceSettings(
         cleanSettings,
         sanitizeRendererIpcOptions(rawOpts)

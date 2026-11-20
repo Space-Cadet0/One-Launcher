@@ -146,6 +146,8 @@ setSecurityUserDataDirResolver((/** @type {any} */ customDir) => getUserDataDir(
 const activeSessions = new Map();
 
 // Concurrency & post-session race barriers
+const inFlightLaunchesByGameId = new Map();
+const inFlightLaunchAbortControllers = new Map();
 const inFlightPostSessionByGame = new Map();
 const pendingBottleLaunches = new Map();
 const inFlightPostSessionByBottle = new Map();
@@ -999,7 +1001,39 @@ function resolveHostLocaleInfo(/** @type {any} */ options = {}) {
 }
 
 /**
- * Awaited macOS quarantine removal helper with bounded tracking set (max 1000).
+ * Check whether the host currently has network connectivity.
+ * Supports explicit per-call DI (`options.isOnline`, `options.isOnlineFn`, `options.offline`)
+ * and falls back to `electron.net.isOnline()` (defaulting to `true` when Electron `net` is unavailable).
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {boolean}
+ */
+function isNetworkOnlineForLaunch(/** @type {any} */ options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  if (typeof opts.isOnline === 'boolean') {
+    return opts.isOnline;
+  }
+  if (typeof opts.isOnlineFn === 'function') {
+    try {
+      return opts.isOnlineFn() !== false;
+    } catch {
+      return true;
+    }
+  }
+  if (opts.offline === true) {
+    return false;
+  }
+  try {
+    const electronMod = getElectron();
+    if (electronMod && electronMod.net && typeof electronMod.net.isOnline === 'function') {
+      return electronMod.net.isOnline() !== false;
+    }
+  } catch {}
+  return true;
+}
+
+/**
+ * Awaited macOS quarantine removal helper with O(1) `xattr -p` pre-check and bounded tracking set (max 1000).
  */
 async function clearMacQuarantineAsync(targetPath, /** @type {any} */ options = {}) {
   const platform = options.platform || process.platform;
@@ -1017,40 +1051,54 @@ async function clearMacQuarantineAsync(targetPath, /** @type {any} */ options = 
         ? options.execFileImpl
         : execFile;
 
-  return new Promise((resolve) => {
-    try {
-      execFileFn(
-        '/usr/bin/xattr',
-        ['-dr', 'com.apple.quarantine', targetPath],
-        { timeout: 10000 },
-        (err) => {
-          if (!err) {
-            addBoundedSetEntry(quarantineClearedBinaries, resolved);
-          } else {
-            // Fallback to PATH lookup if mocked execFile expects 'xattr'
-            if (execFileFn !== execFile) {
+  const runXattr = (/** @type {string[]} */ xattrArgs, /** @type {number} */ timeoutMs) =>
+    new Promise((resolve) => {
+      try {
+        execFileFn(
+          '/usr/bin/xattr',
+          xattrArgs,
+          { timeout: timeoutMs },
+          (/** @type {any} */ err, /** @type {any} */ stdout, /** @type {any} */ stderr) => {
+            if (err && execFileFn !== execFile && (err.code === 'ENOENT' || /ENOENT/i.test(String(err.message || '')))) {
               try {
                 execFileFn(
                   'xattr',
-                  ['-dr', 'com.apple.quarantine', targetPath],
-                  { timeout: 10000 },
-                  () => {
-                    addBoundedSetEntry(quarantineClearedBinaries, resolved);
-                    resolve(true);
+                  xattrArgs,
+                  { timeout: timeoutMs },
+                  (/** @type {any} */ err2, /** @type {any} */ stdout2, /** @type {any} */ stderr2) => {
+                    resolve({ err: err2 || null, stdout: String(stdout2 || ''), stderr: String(stderr2 || '') });
                   }
                 );
                 return;
               } catch {}
             }
-            addBoundedSetEntry(quarantineClearedBinaries, resolved);
+            resolve({ err: err || null, stdout: String(stdout || ''), stderr: String(stderr || '') });
           }
-          resolve(true);
-        }
-      );
-    } catch {
-      resolve(false);
+        );
+      } catch (syncErr) {
+        resolve({ err: syncErr, stdout: '', stderr: '' });
+      }
+    });
+
+  // O(1) quarantine check before running recursive `xattr -dr` across large game directories
+  const probeRes = await runXattr(['-p', 'com.apple.quarantine', targetPath], 2000);
+  if (probeRes.err) {
+    const errText = `${probeRes.stderr} ${probeRes.err?.message || ''}`;
+    const isMissingAttr =
+      /No such xattr/i.test(errText) ||
+      (probeRes.err?.code === 1 && !/ENOENT|EACCES|EPERM/i.test(errText));
+    if (isMissingAttr) {
+      addBoundedSetEntry(quarantineClearedBinaries, resolved);
+      return true;
     }
-  });
+  } else if (execFileFn === execFile && !probeRes.stdout.trim()) {
+    addBoundedSetEntry(quarantineClearedBinaries, resolved);
+    return true;
+  }
+
+  await runXattr(['-dr', 'com.apple.quarantine', targetPath], 10000);
+  addBoundedSetEntry(quarantineClearedBinaries, resolved);
+  return true;
 }
 
 function isTrustedHelperBinaryStats(filePath, isUserWritableFallback = false) {
@@ -1351,6 +1399,7 @@ const LAUNCH_PROFILE_KEYS = [
   'wineEsync',
   'metalHud',
   'dxvkHud',
+  'performanceHud',
   'wineDebug',
   'preferredMaxFrameRate',
   'metalfxSpatialUpscaleFactor',
@@ -1367,6 +1416,70 @@ const LAUNCH_PROFILE_KEYS = [
   'preLaunchCommand',
   'postExitCommand',
 ];
+
+const VALID_PERFORMANCE_HUD_MODES = new Set(['default', 'on', 'off']);
+
+/**
+ * Pure, idempotent legacy HUD migration helper (`metalHud` / `dxvkHud` -> unified `performanceHud`).
+ * Preserves valid `'default' | 'on' | 'off'` values as-is, maps any legacy `true` to `'on'`,
+ * maps explicit legacy `false` (when neither is `true`) to `'off'`, and leaves `performanceHud`
+ * omitted when neither unified nor legacy booleans were configured.
+ *
+ * @param {any} profile
+ * @returns {any}
+ */
+function migrateLegacyHudConfig(profile) {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+    return profile;
+  }
+  /** @type {Record<string, any>} */
+  const migrated = { ...profile };
+  if (
+    typeof migrated.performanceHud === 'string' &&
+    VALID_PERFORMANCE_HUD_MODES.has(migrated.performanceHud)
+  ) {
+    // Keep existing valid unified setting idempotently
+  } else {
+    if (migrated.performanceHud !== undefined) {
+      delete migrated.performanceHud;
+    }
+    if (migrated.metalHud === true || migrated.dxvkHud === true) {
+      migrated.performanceHud = 'on';
+    } else if (migrated.metalHud === false || migrated.dxvkHud === false) {
+      migrated.performanceHud = 'off';
+    }
+  }
+  if (
+    migrated.platformConfigs &&
+    typeof migrated.platformConfigs === 'object' &&
+    !Array.isArray(migrated.platformConfigs)
+  ) {
+    /** @type {Record<string, any>} */
+    const nextPlatformConfigs = {};
+    for (const [platId, prof] of Object.entries(migrated.platformConfigs)) {
+      nextPlatformConfigs[platId] =
+        prof && typeof prof === 'object' && !Array.isArray(prof)
+          ? migrateLegacyHudConfig(prof)
+          : prof;
+    }
+    migrated.platformConfigs = nextPlatformConfigs;
+  }
+  return migrated;
+}
+
+/**
+ * Resolve the effective boolean Performance HUD state from a launch profile and global settings.
+ *
+ * @param {any} profile
+ * @param {any} perfSettings
+ * @returns {boolean}
+ */
+function resolveEffectivePerformanceHud(profile, perfSettings) {
+  const migrated = migrateLegacyHudConfig(profile && typeof profile === 'object' ? profile : {});
+  if (migrated && migrated.performanceHud === 'on') return true;
+  if (migrated && migrated.performanceHud === 'off') return false;
+  return Boolean(perfSettings && perfSettings.defaultPerformanceHud === true);
+}
 
 function resolvePlatformLaunchConfig(/** @type {any} */ rawConfig, platformId) {
   if (!rawConfig || typeof rawConfig !== 'object') return {};
@@ -1407,7 +1520,7 @@ function resolvePlatformLaunchConfig(/** @type {any} */ rawConfig, platformId) {
   if (resolved.launchMethod === 'custom') {
     resolved.launchMethod = 'auto';
   }
-  return resolved;
+  return migrateLegacyHudConfig(resolved);
 }
 
 function getLaunchConfigsFilePath(userDataDir) {
@@ -1497,7 +1610,12 @@ function getGameLaunchConfigs(/** @type {any} */ options = {}) {
           writeCachedStateJsonSync(filePath, parsed);
         } catch {}
       }
-      return parsed;
+      /** @type {Record<string, any>} */
+      const migratedAll = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        migratedAll[k] = v && typeof v === 'object' ? migrateLegacyHudConfig(v) : v;
+      }
+      return migratedAll;
     }
   } catch {}
   return {};
@@ -1506,7 +1624,7 @@ function getGameLaunchConfigs(/** @type {any} */ options = {}) {
 function getGameLaunchConfig(gameId, /** @type {any} */ options = {}) {
   if (!gameId) return null;
   const all = getGameLaunchConfigs(options);
-  return all[gameId] || null;
+  return all[gameId] ? migrateLegacyHudConfig(all[gameId]) : null;
 }
 
 function saveGameLaunchConfig(/** @type {any} */ config, /** @type {any} */ options = {}) {
@@ -1655,6 +1773,7 @@ const DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS = {
   defaultBottleDisplayScalingMode: 'auto_fullscreen',
   defaultDisplayAspectRatio: 'preserve_aspect',
   enableFullscreenHotkey: true,
+  defaultPerformanceHud: false,
 };
 
 const VALID_IN_GAME_BEHAVIORS = new Set([
@@ -1747,6 +1866,13 @@ function sanitizeLauncherPerformanceSettings(/** @type {any} */ raw = {}) {
       typeof src.enableFullscreenHotkey === 'boolean'
         ? src.enableFullscreenHotkey
         : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.enableFullscreenHotkey,
+    defaultPerformanceHud: Boolean(
+      typeof src.defaultPerformanceHud === 'boolean'
+        ? src.defaultPerformanceHud
+        : src.enableMetalHud === true || src.enableMangoHud === true
+          ? true
+          : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultPerformanceHud
+    ),
   };
 }
 
@@ -1793,7 +1919,8 @@ function resolveEffectivePerformancePolicy(
           'defaultBottleDisplayScalingMode' in perfSettingsOrOptions ||
           'defaultDisplayAspectRatio' in perfSettingsOrOptions ||
           'storefrontClientLifecycle' in perfSettingsOrOptions ||
-          'enableFullscreenHotkey' in perfSettingsOrOptions)
+          'enableFullscreenHotkey' in perfSettingsOrOptions ||
+          'defaultPerformanceHud' in perfSettingsOrOptions)
     );
   const effectiveOpts =
     maybeOptions !== undefined
@@ -1848,6 +1975,7 @@ function resolveEffectivePerformancePolicy(
       : base.defaultDisplayAspectRatio || 'preserve_aspect';
 
   const enableFullscreenHotkey = base.enableFullscreenHotkey !== false;
+  const effectivePerformanceHud = resolveEffectivePerformanceHud(cfg, base);
 
   return {
     ...base,
@@ -1856,6 +1984,7 @@ function resolveEffectivePerformancePolicy(
     effectiveDisplayScalingMode,
     effectiveDisplayAspectRatio,
     enableFullscreenHotkey,
+    effectivePerformanceHud,
   };
 }
 
@@ -2092,6 +2221,8 @@ module.exports = {
   MAX_BOUNDED_URI_AND_QUARANTINE_ENTRIES,
   STEAM_APPINFO_BUF_IDLE_TTL_MS,
   activeSessions,
+  inFlightLaunchesByGameId,
+  inFlightLaunchAbortControllers,
   inFlightPostSessionByGame,
   pendingBottleLaunches,
   inFlightPostSessionByBottle,
@@ -2140,6 +2271,7 @@ module.exports = {
   resolveWindowsNodeShebangSpawn,
   openExternalUri,
   resolveHostLocaleInfo,
+  isNetworkOnlineForLaunch,
   clearMacQuarantineAsync,
   findBundledOrSystemCliBinary,
   findLegendaryBinary,
@@ -2156,6 +2288,8 @@ module.exports = {
 
   // Launch configs & performance settings
   LAUNCH_PROFILE_KEYS,
+  migrateLegacyHudConfig,
+  resolveEffectivePerformanceHud,
   normalizeStorefrontClientLifecycle,
   resolvePlatformLaunchConfig,
   getGameLaunchConfigs,

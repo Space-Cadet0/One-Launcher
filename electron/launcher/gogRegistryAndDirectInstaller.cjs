@@ -54,6 +54,7 @@ const {
   setBoundedMapEntry,
   toLocalFsPath,
   resolveHostLocaleInfo,
+  isNetworkOnlineForLaunch,
   findGogdlBinary,
   writeManagedInstallSentinel,
   loadManagedInstalledGames,
@@ -75,6 +76,35 @@ const {
   isMockOrCorruptedToken,
   isPoisonedStorefrontToken,
 } = require('./epicLegendaryAndEosCoordinator.cjs');
+
+/** @type {Map<string, Promise<any>>} */
+const inFlightGogRefreshByToken = new Map();
+
+/**
+ * Single-flight mutex for GOG OAuth refresh token rotation so concurrent callers
+ * never issue overlapping refresh requests using the same rotated refresh token.
+ *
+ * @param {string} refreshToken
+ * @param {(token: string) => Promise<any>} renewFn
+ * @returns {Promise<any>}
+ */
+async function renewGogTokensSingleFlight(refreshToken, renewFn) {
+  const tokenKey = String(refreshToken || '').trim();
+  if (!tokenKey || typeof renewFn !== 'function') return null;
+  const existing = inFlightGogRefreshByToken.get(tokenKey);
+  if (existing) {
+    return existing;
+  }
+  const flight = Promise.resolve()
+    .then(() => renewFn(tokenKey))
+    .finally(() => {
+      if (inFlightGogRefreshByToken.get(tokenKey) === flight) {
+        inFlightGogRefreshByToken.delete(tokenKey);
+      }
+    });
+  inFlightGogRefreshByToken.set(tokenKey, flight);
+  return flight;
+}
 
 /** @type {{ updateDownloadTask: Function | null, computeSmoothedDownloadSpeed: Function | null }} */
 let gogDownloadTaskHooks = {
@@ -1487,7 +1517,9 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
         Number.isNaN(updatedAtMs) ||
         Date.now() - updatedAtMs > maxAgeMs);
 
-    if (needsRefresh) {
+    const canRefreshOnline = !options.skipNetwork && isNetworkOnlineForLaunch(options);
+
+    if (needsRefresh && canRefreshOnline) {
       /** @type {any[]} */
       const refreshQueue = [];
       if (gogData?.refresh_token) {
@@ -1505,7 +1537,9 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
       let renewedSuccess = false;
       for (const { cand, isExternal } of refreshQueue) {
         try {
-          const renewed = await activeStoreSync.renewGogTokens(cand.refresh_token);
+          const renewed = await renewGogTokensSingleFlight(cand.refresh_token, (tok) =>
+            activeStoreSync.renewGogTokens(tok)
+          );
           if (
             renewed &&
             renewed.access_token &&
@@ -1570,7 +1604,16 @@ async function ensureGogdlAuthConfig(/** @type {any} */ options = {}) {
       },
     };
     try {
-      atomicWriteSecureFileSync(gogAuthPath, JSON.stringify(authPayload, null, 2), options);
+      const nextSerialized = JSON.stringify(authPayload, null, 2);
+      let existingRaw = null;
+      try {
+        if (fs.existsSync(gogAuthPath)) {
+          existingRaw = fs.readFileSync(gogAuthPath, 'utf8');
+        }
+      } catch {}
+      if (existingRaw !== nextSerialized) {
+        atomicWriteSecureFileSync(gogAuthPath, nextSerialized, options);
+      }
     } catch (writeErr) {
       diagLog.warn('ensureGogdlAuthConfig.writeSecureAuthJson', writeErr, { gogAuthPath });
     }
@@ -4741,6 +4784,7 @@ module.exports = {
   syncGogFirstPartyLauncher,
   syncGogGameToGalaxy,
   unregisterGogFirstPartyLauncher,
+  renewGogTokensSingleFlight,
   ensureGogdlAuthConfig,
   ensureGogGalaxyBackgroundService,
   resolveGogGalaxyClientBinaryPath,
