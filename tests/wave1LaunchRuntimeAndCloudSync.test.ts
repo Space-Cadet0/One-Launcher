@@ -317,10 +317,11 @@ afterEach(() => {
 
 describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening', () => {
   describe('1. Contract Parity, Legacy HUD Migration & IPC Persistence', () => {
-    it('exports 11 DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS keys with defaultPerformanceHud and places performanceHud right after dxvkHud in LAUNCH_PROFILE_KEYS', () => {
+    it('exports 12 DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS keys with defaultPerformanceHud & ignoreLeadingTheWhenSorting and places performanceHud right after dxvkHud in LAUNCH_PROFILE_KEYS', () => {
       const defaults = engineStateRegistry.DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS;
-      expect(Object.keys(defaults)).toHaveLength(11);
+      expect(Object.keys(defaults)).toHaveLength(12);
       expect(defaults.defaultPerformanceHud).toBe(false);
+      expect(defaults.ignoreLeadingTheWhenSorting).toBe(true);
 
       const dxvkIdx = engineStateRegistry.LAUNCH_PROFILE_KEYS.indexOf('dxvkHud');
       const perfHudIdx = engineStateRegistry.LAUNCH_PROFILE_KEYS.indexOf('performanceHud');

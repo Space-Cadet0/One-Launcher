@@ -729,7 +729,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(resolvedGog.virtualDesktopResolution).toBe('1024x768');
     });
 
-    it('preserves all 11 LauncherPerformanceSettings keys through IPC sanitizeLauncherSettingsPayload and disk persistence', () => {
+    it('preserves all 12 LauncherPerformanceSettings keys through IPC sanitizeLauncherSettingsPayload and disk persistence', () => {
       const userDataDir = makeTempDir('userdata-perf-ipc');
       const incomingIpcPayload: LauncherPerformanceSettings & Record<string, unknown> = {
         inGameLauncherBehavior: 'zero_renderer_daemon',
@@ -743,6 +743,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         defaultDisplayAspectRatio: 'integer',
         enableFullscreenHotkey: false,
         defaultPerformanceHud: true,
+        ignoreLeadingTheWhenSorting: false,
         __proto_pollution_attempt__: 'blocked',
       };
 
@@ -752,6 +753,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(ipcCleaned.defaultDisplayAspectRatio).toBe('integer');
       expect(ipcCleaned.enableFullscreenHotkey).toBe(false);
       expect(ipcCleaned.defaultPerformanceHud).toBe(true);
+      expect(ipcCleaned.ignoreLeadingTheWhenSorting).toBe(false);
       expect(ipcCleaned.storefrontClientLifecycle).toBe('fast_direct_bypass');
       expect(ipcCleaned.autoShutdownWinePrefixOnExit).toBe(false);
       expect(ipcCleaned.suppressWineDebugLogging).toBe(false);
@@ -772,6 +774,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         defaultDisplayAspectRatio: 'integer',
         enableFullscreenHotkey: false,
         defaultPerformanceHud: true,
+        ignoreLeadingTheWhenSorting: false,
       });
       expect(tsSanitized).toEqual(reloaded);
 
@@ -784,6 +787,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       expect(afterReset.defaultDisplayAspectRatio).toBe('preserve_aspect');
       expect(afterReset.enableFullscreenHotkey).toBe(true);
       expect(afterReset.defaultPerformanceHud).toBe(false);
+      expect(afterReset.ignoreLeadingTheWhenSorting).toBe(true);
     });
   });
 

@@ -453,6 +453,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           defaultDisplayAspectRatio: 'preserve_aspect',
           enableFullscreenHotkey: true,
           defaultPerformanceHud: false,
+          ignoreLeadingTheWhenSorting: true,
         });
 
         const saved = launcherEngine.saveLauncherPerformanceSettings(
@@ -468,6 +469,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
             defaultDisplayAspectRatio: 'integer',
             enableFullscreenHotkey: false,
             defaultPerformanceHud: true,
+            ignoreLeadingTheWhenSorting: false,
           },
           { userDataDir: tempDir }
         );
@@ -484,6 +486,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           defaultDisplayAspectRatio: 'integer',
           enableFullscreenHotkey: false,
           defaultPerformanceHud: true,
+          ignoreLeadingTheWhenSorting: false,
         });
 
         const reloaded = launcherEngine.getLauncherPerformanceSettings({ userDataDir: tempDir });
