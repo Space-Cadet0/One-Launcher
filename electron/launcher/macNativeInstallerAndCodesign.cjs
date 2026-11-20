@@ -52,6 +52,7 @@ const {
   inspectPeCapabilities,
   inspectMacMachOHeader,
   parseSteamLibraryFoldersVdf,
+  selectPreferredGogPlayTask,
 } = require('./binaryAndManifestInspectors.cjs');
 const { compareSemver } = require('../utils/semverUtils.cjs');
 
@@ -1360,30 +1361,11 @@ function findPrimaryExecutable(installPath, /** @type {any} */ options = {}) {
         try {
           const parsed = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
           if (!Array.isArray(parsed?.playTasks)) continue;
-          const isFileTask = (/** @type {any} */ t) =>
-            Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
-          const hasLegacyGogLauncherExe =
-            platform === 'darwin' &&
-            (fs.existsSync(path.join(localInstallPath, 'GOGLauncher.exe')) ||
-              fs.existsSync(path.join(dir, 'GOGLauncher.exe')));
-          const primaryTask = parsed.playTasks.find(
-            (/** @type {any} */ t) => isFileTask(t) && t.isPrimary
+          const task = selectPreferredGogPlayTask(
+            parsed.playTasks,
+            [dir, localInstallPath, path.resolve(dir, '..', '..')],
+            { platform }
           );
-          const gameCategoryTask = parsed.playTasks.find(
-            (/** @type {any} */ t) =>
-              isFileTask(t) && String(t.category || '').trim().toLowerCase() === 'game'
-          );
-          const preferGameOverLegacyLauncher = Boolean(
-            hasLegacyGogLauncherExe &&
-              primaryTask &&
-              String(primaryTask.category || '').trim().toLowerCase() === 'launcher' &&
-              !primaryTask.arguments &&
-              gameCategoryTask
-          );
-          const task =
-            (preferGameOverLegacyLauncher ? gameCategoryTask : primaryTask) ||
-            gameCategoryTask ||
-            parsed.playTasks.find((/** @type {any} */ t) => isFileTask(t));
           if (task && task.path) {
             const relTaskPath = String(task.path).replace(/\\/g, path.sep);
             const candidates = [

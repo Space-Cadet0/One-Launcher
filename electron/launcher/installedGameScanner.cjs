@@ -20,6 +20,7 @@ const {
   parseSteamAcf,
   detectKernelAntiCheatMarkersInDir,
   resolveParadoxLauncherSettings,
+  selectPreferredGogPlayTask,
 } = require('./binaryAndManifestInspectors.cjs');
 const {
   getUserDataDir,
@@ -1003,28 +1004,11 @@ function scanAllInstalledGames(/** @type {any} */ options = {}) {
           if (Array.isArray(raw.playTasks)) {
             const isFileTask = (/** @type {any} */ t) =>
               Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
-            const hasLegacyGogLauncherExe =
-              platform === 'darwin' &&
-              (fs.existsSync(path.join(installPath, 'GOGLauncher.exe')) ||
-                fs.existsSync(path.join(path.dirname(infoFilePath), 'GOGLauncher.exe')));
-            const rawPrimaryTask = raw.playTasks.find(
-              (/** @type {any} */ t) => isFileTask(t) && t.isPrimary
+            let primaryTask = selectPreferredGogPlayTask(
+              raw.playTasks,
+              [path.dirname(infoFilePath), installPath],
+              { platform }
             );
-            const rawGameTask = raw.playTasks.find(
-              (/** @type {any} */ t) =>
-                isFileTask(t) && String(t.category || '').trim().toLowerCase() === 'game'
-            );
-            const preferGameOverLegacyLauncher = Boolean(
-              hasLegacyGogLauncherExe &&
-                rawPrimaryTask &&
-                String(rawPrimaryTask.category || '').trim().toLowerCase() === 'launcher' &&
-                !rawPrimaryTask.arguments &&
-                rawGameTask
-            );
-            let primaryTask =
-              (preferGameOverLegacyLauncher ? rawGameTask : rawPrimaryTask) ||
-              rawGameTask ||
-              raw.playTasks.find((/** @type {any} */ t) => isFileTask(t));
             if (primaryTask && primaryTask.path) {
               const baseName = path.basename(String(primaryTask.path).replace(/\\/g, '/'));
               const stem = extractSiblingLauncherStem(baseName);

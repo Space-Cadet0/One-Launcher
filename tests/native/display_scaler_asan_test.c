@@ -680,6 +680,77 @@ static void test_v3_three_tier_state_machine_and_multimonitor(void)
     ASSERT_TRUE(sx >= scr_dst_x && sy >= scr_dst_y && sw > 0 && sh > 0);
 }
 
+static void test_round3_vulkan_d3d9_subnative_viewport_and_cursor(void)
+{
+    /* L2: Sub-native 32-bit WineD3D Vulkan D3D9 1024x768 -> 3024x1964 across all 3 aspect modes */
+    ds_viewport_t vp_preserve, vp_stretch, vp_integer;
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 1024, 768, DS_ASPECT_PRESERVE, &vp_preserve));
+    ASSERT_TRUE(vp_preserve.dst_w == 2620 && vp_preserve.dst_h == 1964);
+    ASSERT_TRUE(vp_preserve.dst_x == 202 && vp_preserve.dst_y == 0);
+    ASSERT_TRUE((vp_preserve.dst_w % 2) == 0 && (vp_preserve.dst_h % 2) == 0);
+
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 1024, 768, DS_ASPECT_STRETCH, &vp_stretch));
+    ASSERT_TRUE(vp_stretch.dst_w == 3024 && vp_stretch.dst_h == 1964);
+    ASSERT_TRUE(vp_stretch.dst_x == 0 && vp_stretch.dst_y == 0);
+
+    ASSERT_TRUE(ds_compute_viewport(3024, 1964, 0, 1024, 768, DS_ASPECT_INTEGER, &vp_integer));
+    ASSERT_TRUE(vp_integer.dst_w == 2048 && vp_integer.dst_h == 1536);
+    ASSERT_TRUE(vp_integer.dst_x == 488 && vp_integer.dst_y == 214);
+
+    /* Exact pixel-center cursor round-trip across all 3 sub-native Vulkan D3D9 aspect viewports */
+    const ds_viewport_t vps[3] = { vp_preserve, vp_stretch, vp_integer };
+    for (int m = 0; m < 3; m++) {
+        for (int32_t vx = 0; vx < 1024; vx += 31) {
+            for (int32_t vy = 0; vy < 768; vy += 29) {
+                int32_t px = 0, py = 0, rvx = -1, rvy = -1;
+                ASSERT_TRUE(ds_map_cursor_virt_to_phys(
+                    vx, vy, vps[m].dst_x, vps[m].dst_y, vps[m].dst_w, vps[m].dst_h, 1024, 768, &px, &py
+                ));
+                ASSERT_TRUE(px >= vps[m].dst_x && px < vps[m].dst_x + vps[m].dst_w);
+                ASSERT_TRUE(py >= vps[m].dst_y && py < vps[m].dst_y + vps[m].dst_h);
+                ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+                    px, py, vps[m].dst_x, vps[m].dst_y, vps[m].dst_w, vps[m].dst_h, 1024, 768, &rvx, &rvy
+                ));
+                ASSERT_TRUE(rvx == vx && rvy == vy);
+            }
+        }
+    }
+
+    /* Pillarbox margin clamping (left & right black bars clamp cleanly to virtual x=0 and x=1023) */
+    int32_t cx0 = -1, cy0 = -1, cx1 = -1, cy1 = -1;
+    ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+        10, 500, vp_preserve.dst_x, vp_preserve.dst_y, vp_preserve.dst_w, vp_preserve.dst_h, 1024, 768, &cx0, &cy0
+    ));
+    ASSERT_TRUE(cx0 == 0 && cy0 >= 0 && cy0 < 768);
+    ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+        3020, 500, vp_preserve.dst_x, vp_preserve.dst_y, vp_preserve.dst_w, vp_preserve.dst_h, 1024, 768, &cx1, &cy1
+    ));
+    ASSERT_TRUE(cx1 == 1023 && cy1 == cy0);
+
+    /* Tier 2 stays active for 32-bit Vulkan D3D9 across fullscreen & user_forced_windowed exit */
+    ds_tier_input_t in;
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.d3d9_loaded = true;
+    in.d3d8_or_9_loaded = true;
+    in.legacy_d3d_loaded = true;
+    in.vulkan_loaded = true;
+    in.wined3d_uses_vulkan = true;
+    in.fullscreen_active = true;
+    ASSERT_TRUE(ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+    /* Sub-native vs native predicate distinction */
+    int32_t virt_w = 1024, virt_h = 768, screen_w = 3024, screen_h = 1964;
+    ASSERT_TRUE(ds_is_vulkan_legacy_d3d(&in) && in.fullscreen_active && (virt_w < screen_w || virt_h < screen_h));
+    virt_w = 3024; virt_h = 1964;
+    ASSERT_TRUE(!(virt_w < screen_w || virt_h < screen_h));
+    /* Windowed exit keeps Tier 2 reachable so ds_apply_window_presentation restores windowed bounds */
+    in.fullscreen_active = false;
+    in.borderless_active = true;
+    in.user_forced_windowed = true;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
@@ -690,6 +761,7 @@ int main(void)
     test_wave2a_watertight_strips_and_extended_ini();
     test_v3_user_override_and_mode_union();
     test_v3_three_tier_state_machine_and_multimonitor();
+    test_round3_vulkan_d3d9_subnative_viewport_and_cursor();
     printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
     return 0;
 }

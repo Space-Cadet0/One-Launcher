@@ -62,8 +62,8 @@ LONG_PTR ds_set_wnd_long_ptr_raw(HWND hwnd, int idx, LONG_PTR val, bool unicode)
 static BOOL CALLBACK ds_enum_adopt_window_cb(HWND hwnd, LPARAM lParam);
 
 #define DS_GL_HOST_CHILD_CLASS_W L"OneLauncherGLHostChild"
-#define DS_PROP_ORIG_PROC_W      L"OneLauncher_OrigWndProc"
-#define DS_PROP_ORIG_UNI_W       L"OneLauncher_OrigWndUni"
+#define DS_PROP_ORIG_PROC_W      L"DS_OrigProc"
+#define DS_PROP_ORIG_UNI_W       L"DS_OrigUni"
 
 static LRESULT CALLBACK ds_gl_host_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -436,18 +436,30 @@ void ds_reset_gl_host_for_gdi(void)
 
 static bool ds_has_dialog_child_controls(HWND hwnd)
 {
-    static const WCHAR k_dlg_cls_msz[] =
-        L"Button\0ComboBox\0Edit\0ListBox\0SysTabControl32\0"
-        L"SysListView32\0RichEdit20W\0RichEdit20A\0";
+    static const char k_dlg_cls_msz[] =
+        "Button\0ComboBox\0Edit\0ListBox\0SysTabControl32\0"
+        "SysListView32\0RichEdit20W\0RichEdit20A\0";
     HWND child = GetWindow(hwnd, GW_CHILD);
     for (int inspected = 0; child && inspected < 24; inspected++, child = GetWindow(child, GW_HWNDNEXT)) {
         if (!IsWindowVisible(child)) continue;
         WCHAR cls[64] = { 0 };
         if (GetClassNameW(child, cls, 63) > 0) {
-            for (const WCHAR *p = k_dlg_cls_msz; *p != L'\0'; p += wcslen(p) + 1) {
-                if (_wcsicmp(cls, p) == 0) return true;
+            for (const char *p = k_dlg_cls_msz; *p != '\0'; p += strlen(p) + 1) {
+                if (ds_wcs_ieq_ascii(cls, p)) return true;
             }
         }
+    }
+    return false;
+}
+
+static bool ds_wcs_has_ascii(const WCHAR *hay, const char *needle)
+{
+    if (!hay || !needle || !needle[0]) return false;
+    for (; *hay; hay++) {
+        const WCHAR *h = hay;
+        const char *n = needle;
+        while (*h && *n && *h == (WCHAR)(unsigned char)*n) { h++; n++; }
+        if (*n == '\0') return true;
     }
     return false;
 }
@@ -474,22 +486,20 @@ bool ds_is_candidate_game_window(HWND hwnd, int32_t *out_cw, int32_t *out_ch)
 
     WCHAR cls[96] = { 0 };
     if (GetClassNameW(hwnd, cls, 95) > 0) {
-        static const WCHAR k_skip_exact[] = L"#32770\0IME\0MSCTFIME UI\0ConsoleWindowClass\0";
-        static const WCHAR k_skip_sub[] = L"WinConsole\0WineExplorer\0WineD3D\0DirectDrawDeviceWnd\0";
-        for (const WCHAR *p = k_skip_exact; *p != L'\0'; p += wcslen(p) + 1) {
-            if (_wcsicmp(cls, p) == 0) return false;
+        static const char k_skip_exact[] = "#32770\0IME\0MSCTFIME UI\0ConsoleWindowClass\0";
+        static const char k_skip_sub[] = "WinConsole\0WineExplorer\0WineD3D\0DirectDrawDeviceWnd\0";
+        for (const char *p = k_skip_exact; *p != '\0'; p += strlen(p) + 1) {
+            if (ds_wcs_ieq_ascii(cls, p)) return false;
         }
-        for (const WCHAR *p = k_skip_sub; *p != L'\0'; p += wcslen(p) + 1) {
-            if (wcsstr(cls, p) != NULL) return false;
+        for (const char *p = k_skip_sub; *p != '\0'; p += strlen(p) + 1) {
+            if (ds_wcs_has_ascii(cls, p)) return false;
         }
     }
 
     if (GetWindowThreadProcessId(hwnd, NULL) == GetCurrentThreadId()) {
         WCHAR title[96] = { 0 };
-        if (GetWindowTextW(hwnd, title, 95) > 0) {
-            if (wcsstr(title, L"Console") != NULL) {
-                return false;
-            }
+        if (GetWindowTextW(hwnd, title, 95) > 0 && ds_wcs_has_ascii(title, "Console")) {
+            return false;
         }
     }
 
@@ -522,7 +532,7 @@ void ds_reapply_cursor_clip_locked(void)
         g_ds.real_ClipCursor(NULL);
         return;
     }
-    if (ds_is_modern_tier_locked()) {
+    if (ds_is_modern_tier_locked() && !ds_is_vulkan_d3d9_subnative_locked()) {
         return;
     }
     int32_t scr_dst_x = g_ds.win_mon_x + g_ds.vp.dst_x;
@@ -658,7 +668,25 @@ static LRESULT ds_forward_to_orig_wndproc(WNDPROC orig, bool is_unicode, HWND hw
     return res;
 }
 
-static void ds_compute_fs_styles(LONG_PTR saved_style, LONG_PTR saved_exstyle, bool app_inactive, LONG_PTR *out_style, LONG_PTR *out_ex)
+static void ds_reset_hwnd_tracking_locked(bool is_passive)
+{
+    g_ds.orig_wndproc = NULL;
+    g_ds.has_saved_window_state = false;
+    g_ds.has_saved_class_bg = false;
+    g_ds.has_saved_hmenu = false;
+    g_ds.saved_hmenu = NULL;
+    g_ds.gl_host_hide_queued = false;
+    g_ds.cocoa_fs_synced = false;
+    g_ds.app_inactive = false;
+    g_ds.visible_resync_needed = false;
+    g_ds.visible_resync_done = false;
+    g_ds.first_visible_tick = 0;
+    g_ds.borderless_active = false;
+    g_ds.window_mutated_by_scaler = false;
+    g_ds.passthrough_restored = is_passive;
+}
+
+void ds_compute_fs_styles(LONG_PTR saved_style, LONG_PTR saved_exstyle, bool app_inactive, LONG_PTR *out_style, LONG_PTR *out_ex)
 {
     *out_style = (saved_style & ~(LONG_PTR)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_DLGFRAME | WS_BORDER | WS_MAXIMIZE | WS_MINIMIZE))
                | (LONG_PTR)(WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
@@ -669,15 +697,122 @@ static void ds_compute_fs_styles(LONG_PTR saved_style, LONG_PTR saved_exstyle, b
     *out_ex = ex;
 }
 
+void ds_set_hwnd_orig_wndproc_props(HWND hwnd, WNDPROC orig, bool is_unicode)
+{
+    if (!hwnd || !orig || orig == ds_game_subclass_wndproc) {
+        return;
+    }
+    SetPropW(hwnd, DS_PROP_ORIG_PROC_W, (HANDLE)(uintptr_t)orig);
+    SetPropW(hwnd, DS_PROP_ORIG_UNI_W, (HANDLE)(uintptr_t)(is_unicode ? 2u : 1u));
+}
+
 static void ds_unsubclass_hwnd(HWND hwnd, WNDPROC orig, bool is_unicode)
 {
-    if (orig && (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC) == ds_game_subclass_wndproc) {
+    if (orig && orig != ds_game_subclass_wndproc &&
+        (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC) == ds_game_subclass_wndproc) {
         ds_enter_internal();
         ds_set_wnd_long_ptr_raw(hwnd, GWLP_WNDPROC, (LONG_PTR)orig, is_unicode);
         ds_leave_internal();
     }
     RemovePropW(hwnd, DS_PROP_ORIG_PROC_W);
     RemovePropW(hwnd, DS_PROP_ORIG_UNI_W);
+}
+
+static bool ds_remap_wnd_mouse_lparam(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM *lp,
+    int32_t dx,
+    int32_t dy,
+    int32_t dw,
+    int32_t dh,
+    int32_t vw,
+    int32_t vh,
+    int32_t mon_x,
+    int32_t mon_y,
+    bool win_scaled
+)
+{
+    switch (msg) {
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP: {
+            int32_t cx = (int32_t)(short)LOWORD(*lp);
+            int32_t cy = (int32_t)(short)HIWORD(*lp);
+            int32_t vx = cx, vy = cy;
+            if (ds_map_cursor_phys_to_virt(cx, cy, dx, dy, dw, dh, vw, vh, &vx, &vy)) {
+                *lp = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
+            }
+            return false;
+        }
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_CONTEXTMENU:
+        case WM_NCHITTEST: {
+            if (msg == WM_CONTEXTMENU && *lp == (LPARAM)-1) {
+                return false;
+            }
+            int32_t sx = (int32_t)(short)LOWORD(*lp);
+            int32_t sy = (int32_t)(short)HIWORD(*lp);
+            if (win_scaled) {
+                if (g_ds.real_ClientToScreen) {
+                    POINT orig_pt = { 0, 0 };
+                    ds_enter_internal();
+                    BOOL has_orig = g_ds.real_ClientToScreen(hwnd, &orig_pt);
+                    ds_leave_internal();
+                    if (has_orig) {
+                        int32_t rel_x = sx - orig_pt.x;
+                        int32_t rel_y = sy - orig_pt.y;
+                        if (msg != WM_NCHITTEST || (rel_x >= 0 && rel_x < dw && rel_y >= 0 && rel_y < dh)) {
+                            int32_t rvx = rel_x, rvy = rel_y;
+                            if (ds_map_cursor_phys_to_virt(rel_x, rel_y, 0, 0, dw, dh, vw, vh, &rvx, &rvy)) {
+                                *lp = MAKELPARAM((WORD)(short)(orig_pt.x + rvx), (WORD)(short)(orig_pt.y + rvy));
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            int32_t vx = sx, vy = sy;
+            if (ds_map_cursor_phys_to_virt(sx, sy, mon_x + dx, mon_y + dy, dw, dh, vw, vh, &vx, &vy)) {
+                *lp = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
+            }
+            return (msg == WM_NCHITTEST);
+        }
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED) {
+                *lp = MAKELPARAM((WORD)vw, (WORD)vh);
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static LRESULT ds_handle_fs_nchittest(WNDPROC orig, bool is_unicode, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (!orig) {
+        return HTCLIENT;
+    }
+    uintptr_t saved_ht_depth = ds_suspend_internal_depth();
+    LRESULT ht_res = is_unicode
+        ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+        : CallWindowProcA(orig, hwnd, msg, wParam, lParam);
+    ds_restore_internal_depth(saved_ht_depth);
+    if (ht_res == HTNOWHERE || ht_res == HTCAPTION || (ht_res >= HTSIZEFIRST && ht_res <= HTSIZELAST)) {
+        return HTCLIENT;
+    }
+    return ht_res;
 }
 
 LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -687,9 +822,15 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
 
     ds_lock();
     bool is_cur_game = (hwnd == g_ds.hwnd_game);
-    WNDPROC orig = prop_orig ? prop_orig : (is_cur_game ? g_ds.orig_wndproc : NULL);
-    bool is_unicode = (prop_uni != 0) ? (prop_uni == 2u) : (is_cur_game ? g_ds.orig_wndproc_unicode : (IsWindowUnicode(hwnd) != FALSE));
+    bool use_live = (is_cur_game && g_ds.orig_wndproc != NULL);
+    WNDPROC orig = use_live ? g_ds.orig_wndproc : prop_orig;
+    bool is_unicode = use_live
+        ? g_ds.orig_wndproc_unicode
+        : ((prop_uni != 0) ? (prop_uni == 2u) : (IsWindowUnicode(hwnd) != FALSE));
     ds_unlock();
+    if (orig == ds_game_subclass_wndproc) {
+        orig = NULL;
+    }
 
     /* If g_ds.hwnd_game moved to a newer window, unsubclass this stale HWND cleanly */
     if (!is_cur_game && msg != WM_NCDESTROY) {
@@ -772,20 +913,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
             g_ds.hwnd_gl_host = NULL;
             g_ds.gl_host_visible = false;
             g_ds.gl_host_want_visible = false;
-            g_ds.gl_host_hide_queued = false;
-            g_ds.borderless_active = false;
-            g_ds.window_mutated_by_scaler = false;
-            g_ds.passthrough_restored = false;
-            g_ds.cocoa_fs_synced = false;
-            g_ds.app_inactive = false;
-            g_ds.visible_resync_needed = false;
-            g_ds.visible_resync_done = false;
-            g_ds.first_visible_tick = 0;
-            g_ds.orig_wndproc = NULL;
-            g_ds.has_saved_window_state = false;
-            g_ds.has_saved_class_bg = false;
-            g_ds.has_saved_hmenu = false;
-            g_ds.saved_hmenu = NULL;
+            ds_reset_hwnd_tracking_locked(false);
         }
         ds_unlock();
         if (dead_host) {
@@ -801,6 +929,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
         : g_ds.presenter_tier;
     bool is_target_hwnd = (hwnd == g_ds.hwnd_game);
     bool borderless_active = (tier == DS_PRESENTER_MODERN_BORDERLESS && is_target_hwnd && g_ds.borderless_active);
+    bool vk_subnative = (tier == DS_PRESENTER_MODERN_BORDERLESS && is_target_hwnd && ds_is_vulkan_d3d9_subnative_locked());
     bool fs_active = (tier == DS_PRESENTER_LEGACY_VIRTUAL && is_target_hwnd && g_ds.fullscreen_active);
     int32_t win_scale = (tier == DS_PRESENTER_LEGACY_VIRTUAL && is_target_hwnd && !g_ds.fullscreen_active)
         ? ds_get_windowed_scale_locked()
@@ -820,7 +949,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
         return ds_forward_to_orig_wndproc(orig, is_unicode, hwnd, msg, wParam, lParam);
     }
 
-    /* Tier 2 (Modern Native Borderless): zero mouse/size/style virtualization; only display/focus upkeep */
+    /* Tier 2 (Modern Native Borderless): display/focus upkeep + sub-native Vulkan D3D9 input remap */
     if (tier == DS_PRESENTER_MODERN_BORDERLESS) {
         if (msg == WM_DISPLAYCHANGE && !ds_is_internal_call()) {
             ds_refresh_host_display_metrics_for_hwnd(hwnd);
@@ -845,97 +974,43 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     ds_set_window_pos_dpi(hwnd, HWND_TOPMOST, bx, by, bw, bh, SWP_SHOWWINDOW | SWP_NOACTIVATE, false);
                 }
             }
+        } else if (vk_subnative && vw > 0 && vh > 0 && vp.dst_w > 0 && vp.dst_h > 0) {
+            if (ds_remap_wnd_mouse_lparam(hwnd, msg, wParam, &lParam, vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h, vw, vh, mon_x, mon_y, false)) {
+                return ds_handle_fs_nchittest(orig, is_unicode, hwnd, msg, wParam, lParam);
+            }
         }
         return ds_forward_to_orig_wndproc(orig, is_unicode, hwnd, msg, wParam, lParam);
     }
 
     if (!fs_active && win_scale > 1 && vw > 0 && vh > 0) {
-        switch (msg) {
-            case WM_MOUSEMOVE:
-            case WM_LBUTTONDOWN:
-            case WM_LBUTTONUP:
-            case WM_LBUTTONDBLCLK:
-            case WM_RBUTTONDOWN:
-            case WM_RBUTTONUP:
-            case WM_RBUTTONDBLCLK:
-            case WM_MBUTTONDOWN:
-            case WM_MBUTTONUP:
-            case WM_MBUTTONDBLCLK:
-            case WM_XBUTTONDOWN:
-            case WM_XBUTTONUP: {
-                int32_t cx = (int32_t)(short)LOWORD(lParam);
-                int32_t cy = (int32_t)(short)HIWORD(lParam);
-                int32_t vx = cx, vy = cy;
-                if (ds_map_cursor_phys_to_virt(cx, cy, 0, 0, vw * win_scale, vh * win_scale, vw, vh, &vx, &vy)) {
-                    lParam = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
-                }
-                break;
-            }
-            case WM_MOUSEWHEEL:
-            case WM_MOUSEHWHEEL:
-            case WM_CONTEXTMENU:
-            case WM_NCHITTEST: {
-                if (msg == WM_CONTEXTMENU && lParam == (LPARAM)-1) {
-                    break;
-                }
-                if (g_ds.real_ClientToScreen) {
-                    POINT orig_pt = { 0, 0 };
-                    ds_enter_internal();
-                    BOOL has_orig = g_ds.real_ClientToScreen(hwnd, &orig_pt);
-                    ds_leave_internal();
-                    if (has_orig) {
-                        int32_t sx = (int32_t)(short)LOWORD(lParam);
-                        int32_t sy = (int32_t)(short)HIWORD(lParam);
-                        int32_t rel_x = sx - orig_pt.x;
-                        int32_t rel_y = sy - orig_pt.y;
-                        bool in_client = (rel_x >= 0 && rel_x < vw * win_scale && rel_y >= 0 && rel_y < vh * win_scale);
-                        if (msg != WM_NCHITTEST || in_client) {
-                            int32_t rvx = rel_x, rvy = rel_y;
-                            if (ds_map_cursor_phys_to_virt(rel_x, rel_y, 0, 0, vw * win_scale, vh * win_scale, vw, vh, &rvx, &rvy)) {
-                                lParam = MAKELPARAM((WORD)(short)(orig_pt.x + rvx), (WORD)(short)(orig_pt.y + rvy));
-                            }
-                        }
+        ds_remap_wnd_mouse_lparam(hwnd, msg, wParam, &lParam, 0, 0, vw * win_scale, vh * win_scale, vw, vh, 0, 0, true);
+        if (msg == WM_WINDOWPOSCHANGING) {
+            if (!ds_is_internal_call() && lParam != 0) {
+                WINDOWPOS *wp = (WINDOWPOS *)lParam;
+                if ((wp->flags & SWP_NOSIZE) == 0) {
+                    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
+                    DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
+                    RECT wrc = { 0, 0, vw * win_scale, vh * win_scale };
+                    if (g_ds.real_AdjustWindowRectEx) {
+                        g_ds.real_AdjustWindowRectEx(&wrc, cur_style, has_menu_win ? TRUE : FALSE, cur_exstyle);
+                    }
+                    int32_t ww = wrc.right - wrc.left;
+                    int32_t wh = wrc.bottom - wrc.top;
+                    if (wp->cx < ww - 16 || wp->cy < wh - 16) {
+                        wp->cx = ww;
+                        wp->cy = wh;
                     }
                 }
-                break;
             }
-            case WM_WINDOWPOSCHANGING:
-                if (!ds_is_internal_call() && lParam != 0) {
-                    WINDOWPOS *wp = (WINDOWPOS *)lParam;
-                    if ((wp->flags & SWP_NOSIZE) == 0) {
-                        DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
-                        DWORD cur_exstyle = (DWORD)ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
-                        RECT wrc = { 0, 0, vw * win_scale, vh * win_scale };
-                        if (g_ds.real_AdjustWindowRectEx) {
-                            g_ds.real_AdjustWindowRectEx(&wrc, cur_style, has_menu_win ? TRUE : FALSE, cur_exstyle);
-                        }
-                        int32_t ww = wrc.right - wrc.left;
-                        int32_t wh = wrc.bottom - wrc.top;
-                        if (wp->cx < ww - 16 || wp->cy < wh - 16) {
-                            wp->cx = ww;
-                            wp->cy = wh;
-                        }
-                    }
-                }
-                break;
-            case WM_SIZE:
-                if (wParam != SIZE_MINIMIZED) {
-                    lParam = MAKELPARAM((WORD)vw, (WORD)vh);
-                }
-                break;
-            case WM_DISPLAYCHANGE:
-                if (!ds_is_internal_call()) {
-                    ds_refresh_host_display_metrics_for_hwnd(hwnd);
-                }
-                break;
-            default:
-                break;
+        } else if (msg == WM_DISPLAYCHANGE && !ds_is_internal_call()) {
+            ds_refresh_host_display_metrics_for_hwnd(hwnd);
         }
     }
 
     if (fs_active && vw > 0 && vh > 0 && vp.dst_w > 0 && vp.dst_h > 0) {
-        int32_t scr_dst_x = mon_x + vp.dst_x;
-        int32_t scr_dst_y = mon_y + vp.dst_y;
+        if (ds_remap_wnd_mouse_lparam(hwnd, msg, wParam, &lParam, vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h, vw, vh, mon_x, mon_y, false)) {
+            return ds_handle_fs_nchittest(orig, is_unicode, hwnd, msg, wParam, lParam);
+        }
         switch (msg) {
             case WM_ERASEBKGND: {
                 HDC hdc = (HDC)wParam;
@@ -945,62 +1020,6 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 }
                 InterlockedIncrement(&g_ds.gdi_margin_gen);
                 return 1;
-            }
-            case WM_MOUSEMOVE:
-            case WM_LBUTTONDOWN:
-            case WM_LBUTTONUP:
-            case WM_LBUTTONDBLCLK:
-            case WM_RBUTTONDOWN:
-            case WM_RBUTTONUP:
-            case WM_RBUTTONDBLCLK:
-            case WM_MBUTTONDOWN:
-            case WM_MBUTTONUP:
-            case WM_MBUTTONDBLCLK:
-            case WM_XBUTTONDOWN:
-            case WM_XBUTTONUP: {
-                /* Client-relative coordinates: map against client-relative vp.dst_x/y */
-                int32_t cx = (int32_t)(short)LOWORD(lParam);
-                int32_t cy = (int32_t)(short)HIWORD(lParam);
-                int32_t vx = cx, vy = cy;
-                if (ds_map_cursor_phys_to_virt(cx, cy, vp.dst_x, vp.dst_y, vp.dst_w, vp.dst_h, vw, vh, &vx, &vy)) {
-                    lParam = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
-                }
-                break;
-            }
-            case WM_MOUSEWHEEL:
-            case WM_MOUSEHWHEEL:
-            case WM_CONTEXTMENU: {
-                /* Screen-absolute coordinates: offset by target monitor origin (mon_x, mon_y) */
-                if (msg == WM_CONTEXTMENU && lParam == (LPARAM)-1) {
-                    break;
-                }
-                int32_t sx = (int32_t)(short)LOWORD(lParam);
-                int32_t sy = (int32_t)(short)HIWORD(lParam);
-                int32_t vx = sx, vy = sy;
-                if (ds_map_cursor_phys_to_virt(sx, sy, scr_dst_x, scr_dst_y, vp.dst_w, vp.dst_h, vw, vh, &vx, &vy)) {
-                    lParam = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
-                }
-                break;
-            }
-            case WM_NCHITTEST: {
-                int32_t sx = (int32_t)(short)LOWORD(lParam);
-                int32_t sy = (int32_t)(short)HIWORD(lParam);
-                int32_t vx = sx, vy = sy;
-                if (ds_map_cursor_phys_to_virt(sx, sy, scr_dst_x, scr_dst_y, vp.dst_w, vp.dst_h, vw, vh, &vx, &vy)) {
-                    lParam = MAKELPARAM((WORD)(short)vx, (WORD)(short)vy);
-                }
-                if (!orig) {
-                    return HTCLIENT;
-                }
-                uintptr_t saved_ht_depth = ds_suspend_internal_depth();
-                LRESULT ht_res = is_unicode
-                    ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
-                    : CallWindowProcA(orig, hwnd, msg, wParam, lParam);
-                ds_restore_internal_depth(saved_ht_depth);
-                if (ht_res == HTNOWHERE || ht_res == HTCAPTION || (ht_res >= HTSIZEFIRST && ht_res <= HTSIZELAST)) {
-                    return HTCLIENT;
-                }
-                return ht_res;
             }
             case WM_GETMINMAXINFO:
                 if (lParam != 0) {
@@ -1017,8 +1036,9 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
             case WM_STYLECHANGING:
                 if (!ds_is_internal_call() && wParam == (WPARAM)GWL_STYLE && lParam != 0) {
                     STYLESTRUCT *ss = (STYLESTRUCT *)lParam;
-                    ss->styleNew = (ss->styleNew & ~(DWORD)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_DLGFRAME | WS_BORDER | WS_MAXIMIZE | WS_MINIMIZE))
-                                 | (DWORD)(WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
+                    LONG_PTR fs_st = 0, fs_ex = 0;
+                    ds_compute_fs_styles((LONG_PTR)ss->styleNew, 0, false, &fs_st, &fs_ex);
+                    ss->styleNew = (DWORD)fs_st;
                     return 0;
                 }
                 break;
@@ -1040,11 +1060,6 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 }
                 break;
             }
-            case WM_SIZE:
-                if (wParam != SIZE_MINIMIZED) {
-                    lParam = MAKELPARAM((WORD)vw, (WORD)vh);
-                }
-                break;
             case WM_DISPLAYCHANGE:
                 if (!ds_is_internal_call()) {
                     ds_refresh_host_display_metrics_for_hwnd(hwnd);
@@ -1186,6 +1201,8 @@ static void ds_capture_window_baseline_and_subclass(HWND hwnd)
         if (cur_proc == ds_game_subclass_wndproc) {
             s_orig = (WNDPROC)(uintptr_t)GetPropW(hwnd, DS_PROP_ORIG_PROC_W);
         } else {
+            /* Pre-seed per-HWND props BEFORE SetWindowLongPtr so cross-thread owner dispatch never sees NULL */
+            ds_set_hwnd_orig_wndproc_props(hwnd, cur_proc, s_uni);
             ds_enter_internal();
             s_orig = (WNDPROC)ds_set_wnd_long_ptr_raw(
                 hwnd,
@@ -1194,9 +1211,13 @@ static void ds_capture_window_baseline_and_subclass(HWND hwnd)
                 s_uni
             );
             ds_leave_internal();
-            if (s_orig) {
-                SetPropW(hwnd, DS_PROP_ORIG_PROC_W, (HANDLE)(uintptr_t)s_orig);
-                SetPropW(hwnd, DS_PROP_ORIG_UNI_W, (HANDLE)(uintptr_t)(s_uni ? 2u : 1u));
+            if (s_orig == ds_game_subclass_wndproc) {
+                s_orig = (WNDPROC)(uintptr_t)GetPropW(hwnd, DS_PROP_ORIG_PROC_W);
+            } else if (s_orig != NULL && s_orig != cur_proc) {
+                ds_set_hwnd_orig_wndproc_props(hwnd, s_orig, s_uni);
+            } else if (s_orig == NULL) {
+                RemovePropW(hwnd, DS_PROP_ORIG_PROC_W);
+                RemovePropW(hwnd, DS_PROP_ORIG_UNI_W);
             }
         }
     }
@@ -1287,6 +1308,38 @@ static void ds_destroy_gl_host_on_owner_thread(void)
     }
 }
 
+static BOOL ds_apply_win_style_and_menu(
+    HWND hwnd,
+    LONG_PTR saved_style,
+    LONG_PTR saved_exstyle,
+    HMENU saved_menu,
+    bool is_unicode,
+    bool ensure_windowed,
+    bool require_caption
+)
+{
+    LONG_PTR win_style = saved_style;
+    LONG_PTR win_ex = saved_exstyle;
+    if (ensure_windowed) {
+        if ((win_style & WS_POPUP) != 0 || (require_caption && (win_style & WS_CAPTION) == 0)) {
+            win_style = (win_style & ~(LONG_PTR)WS_POPUP) | (LONG_PTR)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
+        }
+        win_style |= WS_VISIBLE;
+        if (require_caption) {
+            win_ex &= ~(LONG_PTR)WS_EX_TOPMOST;
+        }
+    }
+    ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, win_style, is_unicode);
+    ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, win_ex, is_unicode);
+    if (saved_menu != NULL && IsMenu(saved_menu)) {
+        if (GetMenu(hwnd) != saved_menu) {
+            SetMenu(hwnd, saved_menu);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void ds_restore_window_on_passthrough(HWND hwnd)
 {
     if (!hwnd || !IsWindow(hwnd)) return;
@@ -1328,11 +1381,7 @@ void ds_restore_window_on_passthrough(HWND hwnd)
         if (has_bg) {
             ds_set_class_bg_brush(hwnd, saved_bg);
         }
-        ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, saved_style, is_unicode);
-        ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, saved_exstyle, is_unicode);
-        if (saved_menu != NULL && IsMenu(saved_menu) && GetMenu(hwnd) != saved_menu) {
-            SetMenu(hwnd, saved_menu);
-        }
+        (void)ds_apply_win_style_and_menu(hwnd, saved_style, saved_exstyle, saved_menu, is_unicode, false, false);
         if (g_ds.real_SetWindowPos) {
             int sw = saved_rc.right - saved_rc.left;
             int sh = saved_rc.bottom - saved_rc.top;
@@ -1367,7 +1416,7 @@ void ds_restore_window_on_passthrough(HWND hwnd)
     }
 }
 
-void ds_request_restore_passthrough(void)
+static void ds_dispatch_presentation_req(bool restore_pt)
 {
     ds_lock();
     HWND hwnd = g_ds.hwnd_game;
@@ -1377,10 +1426,19 @@ void ds_request_restore_passthrough(void)
 
     if (!hwnd || !IsWindow(hwnd)) return;
     if (GetCurrentThreadId() == owner_tid) {
-        ds_restore_window_on_passthrough(hwnd);
+        if (restore_pt) {
+            ds_restore_window_on_passthrough(hwnd);
+        } else {
+            ds_apply_window_presentation_on_owner_thread(hwnd);
+        }
     } else if (msg != 0) {
-        PostMessageW(hwnd, msg, (WPARAM)DS_APPLY_RESTORE_PASSTHROUGH, 0);
+        PostMessageW(hwnd, msg, restore_pt ? (WPARAM)DS_APPLY_RESTORE_PASSTHROUGH : 0, 0);
     }
+}
+
+void ds_request_restore_passthrough(void)
+{
+    ds_dispatch_presentation_req(true);
 }
 
 void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
@@ -1475,17 +1533,7 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
             g_ds.window_mutated_by_scaler = true;
             ds_unlock();
         } else {
-            LONG_PTR win_style = saved_style;
-            if ((win_style & WS_POPUP) != 0 || (win_style & WS_CAPTION) == 0) {
-                win_style = (win_style & ~(LONG_PTR)WS_POPUP) | (LONG_PTR)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
-            }
-            win_style |= WS_VISIBLE;
-            LONG_PTR win_ex = saved_exstyle & ~(LONG_PTR)WS_EX_TOPMOST;
-            ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, win_style, is_unicode);
-            ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, win_ex, is_unicode);
-            if (saved_menu != NULL && IsMenu(saved_menu) && GetMenu(hwnd) != saved_menu) {
-                SetMenu(hwnd, saved_menu);
-            }
+            (void)ds_apply_win_style_and_menu(hwnd, saved_style, saved_exstyle, saved_menu, is_unicode, true, true);
             int sw = saved_rc.right - saved_rc.left;
             int sh = saved_rc.bottom - saved_rc.top;
             bool saved_windowed = (sw > 0 && sh > 0 && (mon_w <= 0 || mon_h <= 0 || sw < mon_w || sh < mon_h));
@@ -1593,20 +1641,8 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
         if (g_ds.has_saved_class_bg) {
             ds_set_class_bg_brush(hwnd, g_ds.saved_class_bg);
         }
-        LONG_PTR win_style = saved_style;
-        if ((win_style & WS_POPUP) != 0) {
-            win_style = (win_style & ~(LONG_PTR)WS_POPUP) | (LONG_PTR)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
-        }
-        win_style |= WS_VISIBLE;
-        ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, win_style, is_unicode);
-        ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, saved_exstyle, is_unicode);
-        BOOL has_restored_menu = FALSE;
-        if (saved_menu != NULL && IsMenu(saved_menu)) {
-            if (GetMenu(hwnd) != saved_menu) {
-                SetMenu(hwnd, saved_menu);
-            }
-            has_restored_menu = TRUE;
-        }
+        BOOL has_restored_menu = ds_apply_win_style_and_menu(hwnd, saved_style, saved_exstyle, saved_menu, is_unicode, true, false);
+        LONG_PTR win_style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
 
         int32_t scale_factor = (mon_w >= 2000) ? 2 : 1;
         if (vw * scale_factor > mon_w || vh * scale_factor > mon_h) {
@@ -1645,18 +1681,28 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
 
 void ds_request_apply_presentation(void)
 {
-    ds_lock();
-    HWND hwnd = g_ds.hwnd_game;
-    DWORD owner_tid = g_ds.game_thread_id;
-    UINT msg = g_ds.msg_apply_presentation;
-    ds_unlock();
+    ds_dispatch_presentation_req(false);
+}
 
-    if (!hwnd || !IsWindow(hwnd)) return;
-    if (GetCurrentThreadId() == owner_tid) {
-        ds_apply_window_presentation_on_owner_thread(hwnd);
-    } else if (msg != 0) {
-        PostMessageW(hwnd, msg, 0, 0);
+static bool ds_should_adopt_hwnd_locked(HWND hwnd, bool is_passive)
+{
+    bool should_adopt = (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game) || g_ds.hwnd_game == hwnd);
+    if (!should_adopt && g_ds.hwnd_game != hwnd) {
+        WCHAR prev_cls[64] = { 0 };
+        GetClassNameW(g_ds.hwnd_game, prev_cls, 63);
+        if (ds_wcs_has_ascii(prev_cls, "Console") || !IsWindowVisible(g_ds.hwnd_game) || IsIconic(g_ds.hwnd_game)) {
+            should_adopt = true;
+        }
     }
+    if (!should_adopt) {
+        return false;
+    }
+    if (g_ds.hwnd_game != hwnd) {
+        ds_reset_hwnd_tracking_locked(is_passive);
+    }
+    g_ds.hwnd_game = hwnd;
+    g_ds.game_thread_id = GetWindowThreadProcessId(hwnd, NULL);
+    return true;
 }
 
 void ds_observe_game_window_passive(HWND hwnd)
@@ -1666,39 +1712,12 @@ void ds_observe_game_window_passive(HWND hwnd)
         return;
     }
 
-    bool adopted = false;
-    DWORD owner_tid = 0;
     ds_lock();
-    bool should_adopt = (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game) || g_ds.hwnd_game == hwnd);
-    if (!should_adopt && g_ds.hwnd_game != hwnd) {
-        WCHAR prev_cls[64] = { 0 };
-        GetClassNameW(g_ds.hwnd_game, prev_cls, 63);
-        if (wcsstr(prev_cls, L"Console") != NULL || !IsWindowVisible(g_ds.hwnd_game) || IsIconic(g_ds.hwnd_game)) {
-            should_adopt = true;
-        }
-    }
-    if (should_adopt) {
-        if (g_ds.hwnd_game != hwnd) {
-            g_ds.orig_wndproc = NULL;
-            g_ds.has_saved_window_state = false;
-            g_ds.has_saved_class_bg = false;
-            g_ds.has_saved_hmenu = false;
-            g_ds.saved_hmenu = NULL;
-            g_ds.borderless_active = false;
-            g_ds.window_mutated_by_scaler = false;
-            g_ds.passthrough_restored = true;
-        }
-        g_ds.hwnd_game = hwnd;
-        g_ds.game_thread_id = GetWindowThreadProcessId(hwnd, NULL);
-        owner_tid = g_ds.game_thread_id;
-        adopted = true;
-    }
+    bool adopted = ds_should_adopt_hwnd_locked(hwnd, true);
     ds_unlock();
 
     if (adopted) {
-        if (GetCurrentThreadId() == owner_tid) {
-            ds_capture_window_baseline_and_subclass(hwnd);
-        }
+        ds_capture_window_baseline_and_subclass(hwnd);
         ds_refresh_host_display_metrics_for_hwnd(hwnd);
     }
 }
@@ -1711,8 +1730,10 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
         : g_ds.presenter_tier;
     bool want_tier2_apply = (
         tier == DS_PRESENTER_MODERN_BORDERLESS &&
-        !g_ds.user_forced_windowed &&
-        (g_ds.scaling_mode == DS_MODE_FORCE_FULLSCREEN || g_ds.user_forced_fullscreen || g_ds.fullscreen_active)
+        (g_ds.scaling_mode == DS_MODE_FORCE_FULLSCREEN ||
+         g_ds.user_forced_fullscreen ||
+         g_ds.fullscreen_active ||
+         g_ds.user_forced_windowed)
     );
     ds_unlock();
 
@@ -1741,49 +1762,8 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
         ds_unlock();
         return;
     }
-    bool should_adopt = (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game) || g_ds.hwnd_game == hwnd);
-    if (!should_adopt && g_ds.hwnd_game != hwnd) {
-        WCHAR prev_cls[64] = { 0 };
-        GetClassNameW(g_ds.hwnd_game, prev_cls, 63);
-        if (wcsstr(prev_cls, L"Console") != NULL || !IsWindowVisible(g_ds.hwnd_game) || IsIconic(g_ds.hwnd_game)) {
-            should_adopt = true;
-        }
-    }
+    bool should_adopt = ds_should_adopt_hwnd_locked(hwnd, false);
     if (should_adopt) {
-        if (g_ds.hwnd_game != hwnd) {
-            g_ds.orig_wndproc = NULL;
-            g_ds.has_saved_window_state = false;
-            g_ds.has_saved_class_bg = false;
-            g_ds.has_saved_hmenu = false;
-            g_ds.saved_hmenu = NULL;
-            g_ds.gl_host_hide_queued = false;
-            g_ds.cocoa_fs_synced = false;
-            g_ds.app_inactive = false;
-            g_ds.visible_resync_needed = false;
-            g_ds.visible_resync_done = false;
-            g_ds.first_visible_tick = 0;
-            g_ds.borderless_active = false;
-            g_ds.window_mutated_by_scaler = false;
-            g_ds.passthrough_restored = false;
-        }
-        g_ds.hwnd_game = hwnd;
-        g_ds.game_thread_id = GetWindowThreadProcessId(hwnd, NULL);
-        if (!g_ds.has_saved_window_state) {
-            g_ds.saved_style = style;
-            g_ds.saved_exstyle = ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
-            ds_enter_internal();
-            if (g_ds.real_GetWindowRect) {
-                g_ds.real_GetWindowRect(hwnd, &g_ds.saved_window_rect);
-            }
-            ds_leave_internal();
-            g_ds.saved_client_w = cw;
-            g_ds.saved_client_h = ch;
-            g_ds.has_saved_window_state = true;
-        }
-        if (!g_ds.has_saved_hmenu) {
-            g_ds.saved_hmenu = GetMenu(hwnd);
-            g_ds.has_saved_hmenu = true;
-        }
         if (g_ds.virt_w <= 0 || g_ds.virt_h <= 0) {
             g_ds.virt_w = hint_virt_w > 0 ? hint_virt_w : cw;
             g_ds.virt_h = hint_virt_h > 0 ? hint_virt_h : ch;
@@ -1804,26 +1784,13 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
     DWORD owner_tid = g_ds.game_thread_id;
     ds_unlock();
 
-    if (should_adopt && !should_apply && GetCurrentThreadId() == owner_tid) {
-        ds_lock();
-        if (g_ds.orig_wndproc == NULL) {
-            g_ds.orig_wndproc_unicode = (IsWindowUnicode(hwnd) != FALSE);
-            WNDPROC cur_proc = (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC);
-            if (cur_proc != ds_game_subclass_wndproc) {
-                ds_enter_internal();
-                g_ds.orig_wndproc = (WNDPROC)ds_set_wnd_long_ptr_raw(
-                    hwnd,
-                    GWLP_WNDPROC,
-                    (LONG_PTR)ds_game_subclass_wndproc,
-                    g_ds.orig_wndproc_unicode
-                );
-                ds_leave_internal();
-            }
+    if (should_adopt) {
+        ds_capture_window_baseline_and_subclass(hwnd);
+        if (!should_apply && GetCurrentThreadId() == owner_tid) {
+            ds_enter_internal();
+            ds_ensure_gl_host_child_on_owner_thread(hwnd);
+            ds_leave_internal();
         }
-        ds_unlock();
-        ds_enter_internal();
-        ds_ensure_gl_host_child_on_owner_thread(hwnd);
-        ds_leave_internal();
     }
 
     if (should_apply) {
@@ -1948,15 +1915,28 @@ static bool ds_apply_parsed_control_locked(const ds_control_state_t *ctl)
     return changed;
 }
 
+static void ds_copy_wpath(WCHAR *dst, const WCHAR *src)
+{
+    wcsncpy(dst, src, MAX_PATH - 1);
+    dst[MAX_PATH - 1] = L'\0';
+}
+
+static void ds_notify_control_changed(void)
+{
+    if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
+        EnumWindows(ds_enum_adopt_window_cb, 0);
+    }
+    ds_request_apply_presentation();
+    ds_write_status_file();
+}
+
 static void ds_poll_active_session_if_needed(void)
 {
     WCHAR sess_path[MAX_PATH];
     WCHAR cur_ctl[MAX_PATH];
     ds_lock();
-    wcsncpy(sess_path, g_ds.active_session_file, MAX_PATH - 1);
-    sess_path[MAX_PATH - 1] = L'\0';
-    wcsncpy(cur_ctl, g_ds.control_file, MAX_PATH - 1);
-    cur_ctl[MAX_PATH - 1] = L'\0';
+    ds_copy_wpath(sess_path, g_ds.active_session_file);
+    ds_copy_wpath(cur_ctl, g_ds.control_file);
     ds_unlock();
 
     if (sess_path[0] == L'\0') return;
@@ -2008,13 +1988,11 @@ static void ds_poll_active_session_if_needed(void)
     ds_lock();
     uint64_t eff_seq = ds_effective_active_session_seq(&sess);
     if (new_ctl[0] != L'\0' && _wcsicmp(new_ctl, g_ds.control_file) != 0) {
-        wcsncpy(g_ds.control_file, new_ctl, MAX_PATH - 1);
-        g_ds.control_file[MAX_PATH - 1] = L'\0';
+        ds_copy_wpath(g_ds.control_file, new_ctl);
         g_ds.last_control_seq = 0;
     }
     if (new_status[0] != L'\0' && _wcsicmp(new_status, g_ds.status_file) != 0) {
-        wcsncpy(g_ds.status_file, new_status, MAX_PATH - 1);
-        g_ds.status_file[MAX_PATH - 1] = L'\0';
+        ds_copy_wpath(g_ds.status_file, new_status);
     }
     if (eff_seq > g_ds.last_active_session_seq) {
         g_ds.last_active_session_seq = eff_seq;
@@ -2023,11 +2001,7 @@ static void ds_poll_active_session_if_needed(void)
     ds_unlock();
 
     if (changed) {
-        if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
-            EnumWindows(ds_enum_adopt_window_cb, 0);
-        }
-        ds_request_apply_presentation();
-        ds_write_status_file();
+        ds_notify_control_changed();
     }
 }
 
@@ -2037,8 +2011,7 @@ void ds_poll_control_file_once(void)
 
     WCHAR ctl_path[MAX_PATH];
     ds_lock();
-    wcsncpy(ctl_path, g_ds.control_file, MAX_PATH - 1);
-    ctl_path[MAX_PATH - 1] = L'\0';
+    ds_copy_wpath(ctl_path, g_ds.control_file);
     ds_unlock();
 
     if (ctl_path[0] == L'\0') return;
@@ -2066,11 +2039,7 @@ void ds_poll_control_file_once(void)
     ds_unlock();
 
     if (changed) {
-        if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
-            EnumWindows(ds_enum_adopt_window_cb, 0);
-        }
-        ds_request_apply_presentation();
-        ds_write_status_file();
+        ds_notify_control_changed();
     }
 }
 

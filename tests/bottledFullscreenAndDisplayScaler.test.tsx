@@ -3042,5 +3042,282 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
         userDataDir: path.join(root, 'UserDataF2'),
       });
     });
+
+    it('Round 3 Universal Fixes (L1 UE4/UE5 depth-3 discovery, L3 8 MiB .rdata scan, L4 .NET GOG launcher stub bypass, R2-3 -opengl4 parity)', async () => {
+      const root = makeTempDir('display-scaler-round3-fixes');
+      const binaryInspectors = requireCjs('../electron/launcher/binaryAndManifestInspectors.cjs') as {
+        inspectPeCapabilities: (exePath: string, opts?: Record<string, unknown>) => Record<string, any>;
+        resolveEffectiveGameExecutableCapabilities: (
+          exePath: string,
+          installDir: string,
+          opts?: Record<string, unknown>
+        ) => Record<string, any>;
+        selectPreferredGogPlayTask: (
+          playTasks: Array<Record<string, unknown>>,
+          searchDirs?: string[],
+          opts?: Record<string, unknown>
+        ) => Record<string, any> | null;
+      };
+      const installedScanner = requireCjs('../electron/launcher/installedGameScanner.cjs') as {
+        scanAllInstalledGames: (opts?: Record<string, unknown>) => Promise<{
+          success: boolean;
+          installedGames: Array<Record<string, any>>;
+        }>;
+      };
+      const macNativeInstaller = requireCjs('../electron/launcher/macNativeInstallerAndCodesign.cjs') as {
+        findPrimaryExecutable: (dir: string, opts?: Record<string, unknown>) => {
+          executablePath?: string;
+          isWindowsBinaryOnMac?: boolean;
+        };
+      };
+      const supervisor = requireCjs('../electron/launcher/sessionAndProcessSupervisor.cjs') as {
+        collectChainedGameCandidateExeNames: (installPath: string, primaryExe?: string) => string[];
+        shouldWrapBottleSessionWithDisplayLauncher: (
+          caps: Record<string, unknown>,
+          mode: string,
+          launchArgsStr?: string
+        ) => boolean;
+        launchGame: (payload: Record<string, unknown>, opts?: Record<string, unknown>) => Promise<Record<string, any>>;
+        finalizeGameSession: (gameId: string, opts?: Record<string, unknown>) => Promise<unknown>;
+      };
+
+      // 1. L1: UE4/UE5 depth-3 `<Project>/Binaries/Win64/*-Shipping.exe` discovery despite 500+ dummy files in Engine/ & Content/Paks/
+      const ue4Dir = path.join(root, 'Ue4GameRoot');
+      const engineDir = path.join(ue4Dir, 'Engine', 'Binaries', 'ThirdParty');
+      const paksDir = path.join(ue4Dir, 'RootGame', 'Content', 'Paks');
+      const shipDir = path.join(ue4Dir, 'RootGame', 'Binaries', 'Win64');
+      fs.mkdirSync(engineDir, { recursive: true });
+      fs.mkdirSync(paksDir, { recursive: true });
+      fs.mkdirSync(shipDir, { recursive: true });
+      for (let i = 0; i < 300; i += 1) {
+        fs.writeFileSync(path.join(engineDir, `eng_${String(i).padStart(3, '0')}.dat`), 'x');
+      }
+      for (let i = 0; i < 200; i += 1) {
+        fs.writeFileSync(path.join(paksDir, `pak_${String(i).padStart(3, '0')}.pak`), 'y');
+      }
+      const rootStubExe = path.join(ue4Dir, 'RootGame.exe');
+      const shippingExe = path.join(shipDir, 'RootGame-Win64-Shipping.exe');
+      fs.writeFileSync(
+        rootStubExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'user32.dll', 'shell32.dll'],
+        })
+      );
+      fs.writeFileSync(
+        shippingExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'user32.dll', 'd3d11.dll', 'dxgi.dll', 'opengl32.dll'],
+        })
+      );
+
+      const ue4Caps = binaryInspectors.resolveEffectiveGameExecutableCapabilities(rootStubExe, ue4Dir);
+      expect(ue4Caps.usesModernGraphicsApi).toBe(true);
+      expect(ue4Caps.hasDpiAwareManifest).toBe(false);
+      expect(ue4Caps.hasChildGameExecutable).toBe(true);
+      expect(ue4Caps.targetExePaths.map((p: string) => path.resolve(p))).toContain(path.resolve(shippingExe));
+      expect(ue4Caps.targetExeBasenamesLower).toContain('rootgame-win64-shipping.exe');
+      expect(ue4Caps.targetExeBasenamesLower).toContain('rootgame.exe');
+
+      const chainedNames = supervisor.collectChainedGameCandidateExeNames(ue4Dir, rootStubExe);
+      expect(chainedNames).toContain('rootgame-win64-shipping.exe');
+
+      // 2. L3: Large 8 MiB `.rdata` engine DLL with D3D11/DXGI strings at +5.0 MiB offset
+      const bigDllPath = path.join(root, 'BigEngine64.dll');
+      const bigDllBuf = buildExtendedSyntheticPeBuffer({
+        arch: 'x64',
+        isDll: true,
+        importedDlls: ['kernel32.dll', 'user32.dll'],
+        rdataSize: 8 * 1024 * 1024,
+      });
+      // `.rdata` begins at file offset 0x200; place markers at +5.0 MiB inside `.rdata` (past old 4 MiB cap)
+      const markerOffset = 0x200 + 5 * 1024 * 1024;
+      bigDllBuf.write('dxgi.dll\0d3d11.dll\0D3D11CreateDevice\0CreateDXGIFactory\0', markerOffset, 'latin1');
+      fs.writeFileSync(bigDllPath, bigDllBuf);
+      const bigDllCaps = binaryInspectors.inspectPeCapabilities(bigDllPath);
+      expect(bigDllCaps.dynamicallyLoadsDxgi).toBe(true);
+      expect(bigDllCaps.dynamicallyLoadsD3d11).toBe(true);
+      expect(bigDllCaps.importsD3d11Or10).toBe(true);
+
+      // 3. L4: GOG `.NET` (`mscoree.dll`) launcher stub bypassed universally (NO `GOGLauncher.exe` on disk),
+      //    preferring non-hidden `category: "game"`, while native Win32 launchers are NOT falsely bypassed.
+      const gogRoot = path.join(root, 'GogLibrary');
+      const gogDotNetDir = path.join(gogRoot, 'ClassicDotNetGame');
+      fs.mkdirSync(gogDotNetDir, { recursive: true });
+      const dotNetLauncherExe = path.join(gogDotNetDir, 'GameLauncher.exe');
+      const classicGameExe = path.join(gogDotNetDir, 'gamew.exe');
+      const hiddenHrExe = path.join(gogDotNetDir, 'gamewHR.exe');
+      fs.writeFileSync(
+        dotNetLauncherExe,
+        buildExtendedSyntheticPeBuffer({ arch: 'x86', importedDlls: ['mscoree.dll'] })
+      );
+      fs.writeFileSync(
+        classicGameExe,
+        buildExtendedSyntheticPeBuffer({ arch: 'x86', importedDlls: ['kernel32.dll', 'ddraw.dll'] })
+      );
+      fs.writeFileSync(
+        hiddenHrExe,
+        buildExtendedSyntheticPeBuffer({ arch: 'x86', importedDlls: ['kernel32.dll', 'ddraw.dll'] })
+      );
+      const dotNetPlayTasks = [
+        { category: 'launcher', isPrimary: true, name: 'Launcher', path: 'GameLauncher.exe', type: 'FileTask' },
+        { category: 'game', name: 'Classic Game', path: 'gamew.exe', type: 'FileTask' },
+        { category: 'game', isHidden: true, name: 'Classic HR', path: 'gamewHR.exe', type: 'FileTask' },
+      ];
+      fs.writeFileSync(
+        path.join(gogDotNetDir, 'goggame-123456.info'),
+        JSON.stringify({
+          gameId: '123456',
+          name: 'Classic DotNet Game',
+          playTasks: dotNetPlayTasks,
+        }),
+        'utf8'
+      );
+
+      const pickedDotNet = binaryInspectors.selectPreferredGogPlayTask(
+        dotNetPlayTasks,
+        [gogDotNetDir],
+        { platform: 'darwin' }
+      );
+      expect(pickedDotNet?.path).toBe('gamew.exe');
+
+      const primaryFound = macNativeInstaller.findPrimaryExecutable(gogDotNetDir, {
+        platform: 'darwin',
+        preferWindowsExecutable: true,
+      });
+      expect(path.basename(String(primaryFound.executablePath || ''))).toBe('gamew.exe');
+
+      const fakeHomeL4 = path.join(root, 'homeL4');
+      const fakeUserDataL4 = path.join(root, 'userDataL4');
+      const scanL4 = await installedScanner.scanAllInstalledGames({
+        platform: 'darwin',
+        homedir: fakeHomeL4,
+        userDataDir: fakeUserDataL4,
+        customRoots: [gogRoot],
+        applicationsDirs: [],
+        skipRegistry: true,
+        forceRefresh: true,
+      });
+      const scannedDotNet = scanL4.installedGames.find((g) => String(g.platformGameId) === '123456');
+      expect(scannedDotNet).toBeDefined();
+      expect(path.basename(String(scannedDotNet?.executablePath || ''))).toBe('gamew.exe');
+
+      // Supervisor self-heals cached `executablePath: GameLauncher.exe` (with NO `GOGLauncher.exe`) -> `gamew.exe`
+      const appsDirL4 = path.join(root, 'AppsL4');
+      const wineBinL4 = path.join(
+        appsDirL4,
+        'CrossOver.app',
+        'Contents',
+        'SharedSupport',
+        'CrossOver',
+        'bin',
+        'wine'
+      );
+      fs.mkdirSync(path.dirname(wineBinL4), { recursive: true });
+      fs.writeFileSync(wineBinL4, '#!/usr/bin/perl\nexit 0;\n', { mode: 0o755 });
+      const bottleL4 = path.join(
+        fakeHomeL4,
+        'Library',
+        'Application Support',
+        'CrossOver',
+        'Bottles',
+        'BottleL4'
+      );
+      createSyntheticBottleTree(bottleL4);
+      const l4SpawnArgs: string[][] = [];
+      const launchL4 = await supervisor.launchGame(
+        {
+          gameId: 'gog-123456-dotnet-heal',
+          title: 'Classic DotNet Game',
+          platformId: 'gog',
+          platformGameId: '123456',
+          installPath: gogDotNetDir,
+          executablePath: dotNetLauncherExe,
+          launchConfig: {
+            launchMethod: 'compatibility_layer',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'BottleL4',
+            winePrefixPath: bottleL4,
+            displayScalingMode: 'off',
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: fakeHomeL4,
+          userDataDir: fakeUserDataL4,
+          customApplicationsDir: appsDirL4,
+          skipRegistrySpawn: true,
+          gameSpawnFn: (_cmd: string, args: string[]) => {
+            l4SpawnArgs.push([...args]);
+            return createFakeChildProcess(62401);
+          },
+        }
+      );
+      expect(launchL4.success).toBe(true);
+      expect(l4SpawnArgs.some((argv) => argv.some((a) => a.toLowerCase().endsWith('gamew.exe')))).toBe(true);
+      expect(l4SpawnArgs.some((argv) => argv.some((a) => a.toLowerCase().endsWith('gamelauncher.exe')))).toBe(false);
+      await supervisor.finalizeGameSession('gog-123456-dotnet-heal', {
+        platform: 'darwin',
+        userDataDir: fakeUserDataL4,
+      });
+
+      // Negative test: Native Win32 launcher (NO `mscoree.dll` and NO `GOGLauncher.exe`) MUST NOT be bypassed
+      const gogNativeDir = path.join(root, 'GogNativeLauncher');
+      fs.mkdirSync(gogNativeDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(gogNativeDir, 'NativeConfigLauncher.exe'),
+        buildExtendedSyntheticPeBuffer({ arch: 'x86', importedDlls: ['kernel32.dll', 'user32.dll'] })
+      );
+      fs.writeFileSync(
+        path.join(gogNativeDir, 'nativegame.exe'),
+        buildExtendedSyntheticPeBuffer({ arch: 'x86', importedDlls: ['kernel32.dll', 'd3d9.dll'] })
+      );
+      const nativeTasks = [
+        { category: 'launcher', isPrimary: true, name: 'Config', path: 'NativeConfigLauncher.exe', type: 'FileTask' },
+        { category: 'game', name: 'Play', path: 'nativegame.exe', type: 'FileTask' },
+      ];
+      const pickedNative = binaryInspectors.selectPreferredGogPlayTask(
+        nativeTasks,
+        [gogNativeDir],
+        { platform: 'darwin' }
+      );
+      expect(pickedNative?.path).toBe('NativeConfigLauncher.exe');
+
+      // 4. R2-3: `-opengl4` parity between `inspectPeCapabilities` / `resolveEffectiveGameExecutableCapabilities` and `shouldWrapBottleSessionWithDisplayLauncher`
+      const glParityDir = path.join(root, 'GlParity64');
+      fs.mkdirSync(glParityDir, { recursive: true });
+      const glParityExe = path.join(glParityDir, 'UnityOrUeMulti64.exe');
+      fs.writeFileSync(
+        glParityExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll', 'opengl32.dll', 'unityplayer.dll'],
+        })
+      );
+      const peDefault = binaryInspectors.inspectPeCapabilities(glParityExe, { launchArguments: '' });
+      const peOpengl4 = binaryInspectors.inspectPeCapabilities(glParityExe, { launchArguments: '-opengl4' });
+      expect(peDefault.importsLegacyD3dOrGl).toBe(false);
+      expect(peOpengl4.importsLegacyD3dOrGl).toBe(true);
+      const effDefault = binaryInspectors.resolveEffectiveGameExecutableCapabilities(
+        glParityExe,
+        glParityDir,
+        { launchArguments: '' }
+      );
+      const effOpengl4 = binaryInspectors.resolveEffectiveGameExecutableCapabilities(
+        glParityExe,
+        glParityDir,
+        { launchArguments: '-opengl4' }
+      );
+      expect(effDefault.usesOpenGl).toBe(false);
+      expect(effOpengl4.usesOpenGl).toBe(true);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(effDefault, 'auto_fullscreen', '')
+      ).toBe(false);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(effOpengl4, 'auto_fullscreen', '-opengl4')
+      ).toBe(true);
+    });
   });
 });

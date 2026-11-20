@@ -45,6 +45,7 @@ const {
   inspectWindowsExecutableHeader,
   hasMalformedBackslashExportForwarder,
   resolveEffectiveGameExecutableCapabilities,
+  selectPreferredGogPlayTask,
   resolveParadoxLauncherSettings,
   resolveCaseInsensitiveRelFile,
   isCompatibleX86OrX64PeHeader,
@@ -1887,29 +1888,71 @@ function collectChainedGameCandidateExeNames(realInstallPath, primaryGameExe = '
       'installers',
       'easyanticheat',
       'battleye',
+      'engine',
+      'content',
+      'paks',
+      'movies',
+      'assets',
+      'localization',
+      'streamingassets',
+      'saved',
+      'logs',
+      'config',
+      'shaders',
+      'audio',
+      'sound',
+      'textures',
+      'models',
+      'levels',
+      'maps',
+      'thirdparty',
+      'plugins',
     ]);
+    const priorityBinDirSet = new Set([
+      'bin',
+      'binaries',
+      'win64',
+      'win32',
+      'wingdk',
+      'x64',
+      'x86',
+      'system',
+      'shipping',
+      'retail',
+    ]);
+    /** @type {Array<{ dir: string, depth: number }>} */
+    const priorityQueue = [{ dir: realInstallPath, depth: 0 }];
+    /** @type {Array<{ dir: string, depth: number }>} */
+    const normalQueue = [];
     let visitedEntries = 0;
-    const walkInstallDir = (/** @type {string} */ dir, /** @type {number} */ depth) => {
-      if (depth > 4 || visitedEntries > 250) return;
+    const MAX_VISITED_ENTRIES = 500;
+    while (visitedEntries <= MAX_VISITED_ENTRIES && (priorityQueue.length > 0 || normalQueue.length > 0)) {
+      const node = priorityQueue.length > 0 ? priorityQueue.shift() : normalQueue.shift();
+      if (!node || node.depth > 4) continue;
       /** @type {fs.Dirent[]} */
       let entries = [];
       try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
+        entries = fs.readdirSync(node.dir, { withFileTypes: true });
       } catch {
-        return;
+        continue;
       }
       for (const ent of entries) {
         visitedEntries += 1;
-        if (visitedEntries > 250) break;
-        if (ent.isFile() && ent.name.toLowerCase().endsWith('.exe')) {
+        if (visitedEntries > MAX_VISITED_ENTRIES) break;
+        const lowerName = ent.name.toLowerCase();
+        if (ent.isFile() && lowerName.endsWith('.exe')) {
           tryAddExe(ent.name);
-        } else if (ent.isDirectory() && !ent.name.startsWith('.')) {
-          if (skipDirSet.has(ent.name.toLowerCase())) continue;
-          walkInstallDir(path.join(dir, ent.name), depth + 1);
+        } else if (ent.isDirectory() && !ent.name.startsWith('.') && node.depth < 4) {
+          if (skipDirSet.has(lowerName)) continue;
+          const nextNode = { dir: path.join(node.dir, ent.name), depth: node.depth + 1 };
+          if (priorityBinDirSet.has(lowerName)) {
+            priorityQueue.push(nextNode);
+          } else {
+            normalQueue.push(nextNode);
+          }
         }
       }
-    };
-    walkInstallDir(realInstallPath, 0);
+    }
   }
   return Array.from(candidates);
 }
@@ -5848,45 +5891,59 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
       resolvedExePath &&
       /\.exe$/i.test(resolvedExePath)
     ) {
-      const candidateGogDir = localInstallDir || path.dirname(resolvedExePath);
-      if (candidateGogDir && fs.existsSync(path.join(candidateGogDir, 'GOGLauncher.exe'))) {
+      const candidateGogDirs = Array.from(
+        new Set([path.dirname(resolvedExePath), localInstallDir].filter(Boolean))
+      );
+      const resolvedBaseLower = path.basename(resolvedExePath).toLowerCase();
+      for (const candidateGogDir of candidateGogDirs) {
         try {
+          if (!fs.existsSync(candidateGogDir) || !fs.statSync(candidateGogDir).isDirectory()) {
+            continue;
+          }
           const gogInfoFile = fs
             .readdirSync(candidateGogDir)
             .find((f) => /^\.?goggame-\d+\.info$/i.test(f));
-          if (gogInfoFile) {
-            const parsedInfo = JSON.parse(
-              fs.readFileSync(path.join(candidateGogDir, gogInfoFile), 'utf8')
-            );
-            if (Array.isArray(parsedInfo?.playTasks)) {
-              const resolvedBaseLower = path.basename(resolvedExePath).toLowerCase();
-              const matchedLauncherTask = parsedInfo.playTasks.find(
-                (/** @type {any} */ t) =>
-                  t &&
-                  typeof t.path === 'string' &&
-                  String(t.category || '').trim().toLowerCase() === 'launcher' &&
-                  !t.arguments &&
-                  path.win32.basename(t.path.trim()).toLowerCase() === resolvedBaseLower
+          if (!gogInfoFile) continue;
+          const parsedInfo = JSON.parse(
+            fs.readFileSync(path.join(candidateGogDir, gogInfoFile), 'utf8')
+          );
+          if (!Array.isArray(parsedInfo?.playTasks)) continue;
+          const matchedLauncherTask = parsedInfo.playTasks.find(
+            (/** @type {any} */ t) =>
+              t &&
+              typeof t.path === 'string' &&
+              String(t.category || '').trim().toLowerCase() === 'launcher' &&
+              !t.arguments &&
+              path.win32.basename(t.path.trim()).toLowerCase() === resolvedBaseLower
+          );
+          if (!matchedLauncherTask) continue;
+          const preferredTask = selectPreferredGogPlayTask(
+            parsedInfo.playTasks,
+            candidateGogDirs,
+            { platform }
+          );
+          if (
+            preferredTask &&
+            typeof preferredTask.path === 'string' &&
+            path.win32.basename(preferredTask.path.trim()).toLowerCase() !== resolvedBaseLower
+          ) {
+            const relTaskPath = String(preferredTask.path).trim().replace(/\\/g, '/');
+            let directGameExe = resolveCaseInsensitiveRelFile(candidateGogDir, relTaskPath);
+            if (
+              !directGameExe &&
+              typeof preferredTask.workingDir === 'string' &&
+              preferredTask.workingDir.trim()
+            ) {
+              const relWork = String(preferredTask.workingDir).trim().replace(/\\/g, '/');
+              directGameExe = resolveCaseInsensitiveRelFile(
+                candidateGogDir,
+                `${relWork}/${relTaskPath}`
               );
-              const gameTask = matchedLauncherTask
-                ? parsedInfo.playTasks.find(
-                    (/** @type {any} */ t) =>
-                      t &&
-                      typeof t.path === 'string' &&
-                      (!t.type || String(t.type) === 'FileTask') &&
-                      String(t.category || '').trim().toLowerCase() === 'game'
-                  )
-                : null;
-              if (gameTask && gameTask.path) {
-                const directGameExe = resolveCaseInsensitiveRelFile(
-                  candidateGogDir,
-                  String(gameTask.path).trim().replace(/\\/g, '/')
-                );
-                if (directGameExe && fs.existsSync(directGameExe)) {
-                  resolvedExePath = directGameExe;
-                  isWindowsBinaryOnMac = true;
-                }
-              }
+            }
+            if (directGameExe && fs.existsSync(directGameExe)) {
+              resolvedExePath = directGameExe;
+              isWindowsBinaryOnMac = true;
+              break;
             }
           }
         } catch {}

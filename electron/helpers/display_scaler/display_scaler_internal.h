@@ -423,11 +423,13 @@ extern ds_runtime_t g_ds;
 /* Shared presenter-tier & backend queries (`display_scaler_dll.c`) */
 bool ds_prefer_16bpp_ddraw(void);
 bool ds_is_vulkan_d3d9_locked(void);
+bool ds_is_vulkan_d3d9_subnative_locked(void);
 bool ds_is_modern_tier_locked(void);
 bool ds_is_modern_borderless_locked(void);
 bool ds_is_passthrough_locked(void);
 
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
+bool ds_wcs_ieq_ascii(const WCHAR *w, const char *a);
 void ds_lock(void);
 void ds_unlock(void);
 bool ds_is_internal_call(void);
@@ -455,6 +457,8 @@ void ds_tracef(const char *fmt, ...);
 
 /* Window, GL host child, WndProc, hotkeys & control-file watcher (`display_scaler_window.c`) */
 LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+void ds_compute_fs_styles(LONG_PTR saved_style, LONG_PTR saved_exstyle, bool app_inactive, LONG_PTR *out_style, LONG_PTR *out_ex);
+void ds_set_hwnd_orig_wndproc_props(HWND hwnd, WNDPROC orig, bool is_unicode);
 LONG_PTR ds_get_wnd_long_ptr(HWND hwnd, int idx);
 LONG_PTR ds_set_wnd_long_ptr_raw(HWND hwnd, int idx, LONG_PTR val, bool unicode);
 bool ds_is_candidate_game_window(HWND hwnd, int32_t *out_cw, int32_t *out_ch);
@@ -486,6 +490,7 @@ void ds_gl_release_all_host_dcs_for_hwnd(HWND host_hwnd);
 void ds_gl_on_release_dc(HWND hwnd, HDC hdc);
 void *ds_resolve_gl_hook_proc(const char *name, void *real_fn);
 void *ds_resolve_wined3d_gl_proc(const char *name, void *real_fn);
+void *ds_resolve_wined3d_vk_proc(const char *name, void *real_fn);
 
 int     WINAPI hook_ReleaseDC(HWND hWnd, HDC hDC);
 BOOL    WINAPI hook_DeleteDC(HDC hdc);

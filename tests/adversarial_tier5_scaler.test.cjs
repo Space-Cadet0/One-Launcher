@@ -613,12 +613,16 @@ runTest('TRK7-01', 'Three-Tier Presenter & hard GLHost barriers enforced in C11 
   assert.match(publicH, /DS_PRESENTER_MODERN_BORDERLESS/);
   assert.match(publicH, /ds_compute_presenter_tier/);
   assert.match(dllSrc, /ds_is_vulkan_d3d9_locked/);
+  assert.match(dllSrc, /ds_is_vulkan_d3d9_subnative_locked/);
   assert.match(dllSrc, /wined3d_uses_vulkan/);
-  assert.match(dllSrc, /L"dxgi\.dll"/);
+  assert.match(dllSrc, /"dxgi\.dll"/);
   assert.match(winSrc, /ds_dpi_guard_enter_for_hwnd/);
+  assert.match(winSrc, /ds_set_hwnd_orig_wndproc_props/);
   assert.match(winSrc, /ds_restore_window_on_passthrough/);
   assert.match(glSrc, /GL_MAX_TEXTURE_SIZE/);
   assert.match(glSrc, /g_ds\.wined3d_uses_gl\s*=\s*true/);
+  assert.match(glSrc, /ds_resolve_wined3d_vk_proc/);
+  assert.match(glSrc, /hook_vkCmdBlitImage/);
 });
 
 runTest('TRK7-02', 'Multi-PID --watch-dir injection and expanded non-game helper skip list', () => {

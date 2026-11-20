@@ -433,7 +433,7 @@ function setCachedPeHeader(key, value) {
 
 const PE_SCAN_CHUNK_BYTES = 262144; // 256 KiB
 const PE_SCAN_OVERLAP_BYTES = 64;
-const PE_SCAN_PER_FILE_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
+const PE_SCAN_PER_FILE_MAX_BYTES = 12 * 1024 * 1024; // 12 MiB (covers large multi-DLL engine `.rdata` e.g. 8 MiB+)
 
 const N_OPENGL32_DLL = Buffer.from('opengl32.dll\0', 'latin1');
 const N_OPENGL32 = Buffer.from('opengl32\0', 'latin1');
@@ -1240,7 +1240,7 @@ function inspectPeCapabilities(exePath, options = {}) {
   const hasDpiAwareManifest = Boolean(pe.hasDpiAwareManifest);
   const declaresPerMonitorDpi = Boolean(pe.declaresPerMonitorDpi);
   const callsPerMonitorDpiApi = Boolean(pe.callsPerMonitorDpiApi);
-  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+  const forceGlCore = /(?:^|\s)(?:-force-glcore\d*|-opengl\d*)\b/i.test(
     String(options?.launchArguments || '')
   );
   const mergedForGfx = delayImportedDlls.some(
@@ -3577,7 +3577,15 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     } catch {}
   }
 
-  // Bounded 1-level sibling `.exe` scan when primary `.exe` looks like a lightweight bootstrapper or stub
+  // Bounded depth-1..3 binary probe when primary `.exe` looks like a bootstrapper or lacks direct GFX imports
+  // (covers UE4/UE5 `<Project>/Binaries/{Win64,Win32,WinGDK}/*-Shipping.exe` and standard `bin/Win64` layouts).
+  const ENGINE_NON_BINARY_SUBDIR_RE =
+    /^(?:__installer|_commonredist|redist|directx|support|prereq|installers|easyanticheat|battleye|crashreporter|engine|content|paks|movies|assets|localization|streamingassets|saved|logs|config|shaders|audio|sound|textures|models|levels|maps|thirdparty|plugins)$/i;
+  const ENGINE_BINARY_CONTAINER_RE = /^(?:bin|binaries)$/i;
+  const ENGINE_ARCH_SUBDIR_RE = /^(?:win64|win32|wingdk|x64|x86|shipping|retail)$/i;
+  const DIRECT_BINARY_SUBDIR_RE =
+    /^(?:bin|binaries|win32|win64|wingdk|x86|x64|system|dosbox|[a-z]{2}(?:-[a-z]{2})?)$/i;
+
   let isLikelyBootstrapper = Boolean(launcherSettings.found || isLauncherStubCandidate);
   if (!isLikelyBootstrapper && normalizedExePath && primaryPe.exists) {
     try {
@@ -3591,7 +3599,26 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
       }
     } catch {}
   }
-  if (isLikelyBootstrapper) {
+  const explicitCandidateCount = candidateChildExePaths.length;
+  const scanArchBinDir = (/** @type {string} */ binDir) => {
+    try {
+      const binEntries = fs.readdirSync(binDir, { withFileTypes: true }).slice(0, 16);
+      for (const entry of binEntries) {
+        if (entry.isFile() && /\.exe$/i.test(entry.name)) {
+          pushChildCandidate(path.join(binDir, entry.name));
+        } else if (entry.isDirectory() && ENGINE_ARCH_SUBDIR_RE.test(entry.name)) {
+          const archDir = path.join(binDir, entry.name);
+          const archEntries = fs.readdirSync(archDir, { withFileTypes: true }).slice(0, 16);
+          for (const ae of archEntries) {
+            if (ae.isFile() && /\.exe$/i.test(ae.name)) {
+              pushChildCandidate(path.join(archDir, ae.name));
+            }
+          }
+        }
+      }
+    } catch {}
+  };
+  if (isLikelyBootstrapper || (primaryPe.exists && primaryPe.isValidPe && !hasPrimaryDirectGfx)) {
     for (const scanDir of infoSearchDirs) {
       try {
         if (!fs.existsSync(scanDir) || !fs.statSync(scanDir).isDirectory()) continue;
@@ -3599,23 +3626,58 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
         for (const dirent of dirents) {
           if (dirent.isFile() && /\.exe$/i.test(dirent.name)) {
             pushChildCandidate(path.join(scanDir, dirent.name));
-          } else if (
-            dirent.isDirectory() &&
-            /^(?:bin|binaries|win32|win64|x86|x64|system|dosbox|[a-z]{2}(?:-[a-z]{2})?)$/i.test(
-              dirent.name
-            )
-          ) {
+          } else if (dirent.isDirectory() && DIRECT_BINARY_SUBDIR_RE.test(dirent.name)) {
             const subDir = path.join(scanDir, dirent.name);
             const subEntries = fs.readdirSync(subDir, { withFileTypes: true }).slice(0, 32);
             for (const sub of subEntries) {
               if (sub.isFile() && /\.exe$/i.test(sub.name)) {
                 pushChildCandidate(path.join(subDir, sub.name));
+              } else if (
+                ENGINE_BINARY_CONTAINER_RE.test(dirent.name) &&
+                sub.isDirectory() &&
+                ENGINE_ARCH_SUBDIR_RE.test(sub.name)
+              ) {
+                const archDir = path.join(subDir, sub.name);
+                const archEntries = fs.readdirSync(archDir, { withFileTypes: true }).slice(0, 16);
+                for (const ae of archEntries) {
+                  if (ae.isFile() && /\.exe$/i.test(ae.name)) {
+                    pushChildCandidate(path.join(archDir, ae.name));
+                  }
+                }
+              }
+            }
+          } else if (
+            dirent.isDirectory() &&
+            !dirent.name.startsWith('.') &&
+            !ENGINE_NON_BINARY_SUBDIR_RE.test(dirent.name)
+          ) {
+            const projDir = path.join(scanDir, dirent.name);
+            const projEntries = fs.readdirSync(projDir, { withFileTypes: true }).slice(0, 32);
+            for (const peEnt of projEntries) {
+              if (peEnt.isDirectory() && ENGINE_BINARY_CONTAINER_RE.test(peEnt.name)) {
+                scanArchBinDir(path.join(projDir, peEnt.name));
               }
             }
           }
         }
       } catch {}
     }
+  }
+  if (candidateChildExePaths.length > explicitCandidateCount + 1) {
+    const scoreScannedChild = (/** @type {string} */ p) => {
+      const base = path.basename(p).toLowerCase();
+      const norm = p.replace(/\\/g, '/').toLowerCase();
+      let score = 0;
+      if (/-shipping\.exe$/i.test(base)) score += 40;
+      if (/\/(?:win64|wingdk|x64)\//i.test(norm)) score += 20;
+      else if (/\/(?:binaries|bin|win32|x86)\//i.test(norm)) score += 10;
+      return score;
+    };
+    const explicitPart = candidateChildExePaths.slice(0, explicitCandidateCount);
+    const scannedPart = candidateChildExePaths
+      .slice(explicitCandidateCount)
+      .sort((a, b) => scoreScannedChild(b) - scoreScannedChild(a));
+    candidateChildExePaths.splice(0, candidateChildExePaths.length, ...explicitPart, ...scannedPart);
   }
   if (candidateChildExePaths.length === 0 && fallbackEmulatorChildPaths.length > 0) {
     for (const emuPath of fallbackEmulatorChildPaths) {
@@ -3862,7 +3924,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     Boolean(options?.hasUe5IoStoreContainer) ||
     detectUe5IoStoreContainer(normalizedInstallDir, effectiveExePath);
 
-  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+  const forceGlCore = /(?:^|\s)(?:-force-glcore\d*|-opengl\d*)\b/i.test(
     String(options?.launchArguments || '')
   );
   const isModernUnity64Host = Boolean(
@@ -4000,6 +4062,90 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   };
 }
 
+/**
+ * Resolve the preferred GOG `playTasks` FileTask, bypassing macOS Wine-incompatible
+ * `category: "launcher"` stubs (`GOGLauncher.exe` or `.NET` `mscoree.dll` launchers
+ * with no custom arguments) when a sibling `category: "game"` task exists.
+ *
+ * @param {any[]} playTasks
+ * @param {string[]} [searchDirs]
+ * @param {{ platform?: string }} [options]
+ * @returns {any | null}
+ */
+function selectPreferredGogPlayTask(playTasks, searchDirs = [], options = {}) {
+  if (!Array.isArray(playTasks) || playTasks.length === 0) return null;
+  const platform = options?.platform || process.platform;
+  const normalizedSearchDirs = Array.from(
+    new Set(
+      (Array.isArray(searchDirs) ? searchDirs : [])
+        .filter((d) => typeof d === 'string' && d.trim().length > 0)
+        .map((d) => path.resolve(d.trim()))
+    )
+  );
+  const isFileTask = (/** @type {any} */ t) =>
+    Boolean(t && t.path && (!t.type || String(t.type) === 'FileTask'));
+  const primaryTask = playTasks.find((/** @type {any} */ t) => isFileTask(t) && t.isPrimary);
+  const gameCategoryTask =
+    playTasks.find(
+      (/** @type {any} */ t) =>
+        isFileTask(t) &&
+        String(t.category || '').trim().toLowerCase() === 'game' &&
+        !t.isHidden
+    ) ||
+    playTasks.find(
+      (/** @type {any} */ t) =>
+        isFileTask(t) && String(t.category || '').trim().toLowerCase() === 'game'
+    );
+
+  if (
+    platform === 'darwin' &&
+    primaryTask &&
+    String(primaryTask.category || '').trim().toLowerCase() === 'launcher' &&
+    !primaryTask.arguments &&
+    gameCategoryTask
+  ) {
+    const hasLegacyGogLauncherExe = normalizedSearchDirs.some((dir) => {
+      try {
+        return Boolean(resolveCaseInsensitiveRelFile(dir, 'GOGLauncher.exe'));
+      } catch {
+        return false;
+      }
+    });
+    let isDotNetClrLauncher = false;
+    if (!hasLegacyGogLauncherExe && typeof primaryTask.path === 'string') {
+      const relTaskPath = primaryTask.path.trim().replace(/\\/g, '/');
+      if (/\.exe$/i.test(relTaskPath)) {
+        for (const dir of normalizedSearchDirs) {
+          let resolvedPrimaryExe = resolveCaseInsensitiveRelFile(dir, relTaskPath);
+          if (
+            !resolvedPrimaryExe &&
+            typeof primaryTask.workingDir === 'string' &&
+            primaryTask.workingDir.trim()
+          ) {
+            const relWork = primaryTask.workingDir.trim().replace(/\\/g, '/');
+            resolvedPrimaryExe = resolveCaseInsensitiveRelFile(dir, `${relWork}/${relTaskPath}`);
+          }
+          if (resolvedPrimaryExe) {
+            const pe = inspectPeCapabilities(resolvedPrimaryExe, { skipRdataStringScan: true });
+            if (
+              pe.isValidPe &&
+              Array.isArray(pe.importedDlls) &&
+              pe.importedDlls.includes('mscoree.dll')
+            ) {
+              isDotNetClrLauncher = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+    if (hasLegacyGogLauncherExe || isDotNetClrLauncher) {
+      return gameCategoryTask;
+    }
+  }
+  return primaryTask || gameCategoryTask || playTasks.find(isFileTask) || null;
+}
+
 module.exports = {
   MAX_PLAUSIBLE_GAME_INSTALL_BYTES,
   sanitizeGameInstallSizeBytes,
@@ -4015,6 +4161,7 @@ module.exports = {
   detectUe5IoStoreContainer,
   derivePeGraphicsCapabilities,
   resolveEffectiveGameExecutableCapabilities,
+  selectPreferredGogPlayTask,
   isCompatibleX86OrX64PeHeader,
   resolveCaseInsensitiveRelFile,
   inspectMacMachOHeader,

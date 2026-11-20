@@ -271,7 +271,7 @@ static bool ds_gl_init_procs_once(void)
         }
     }
     g_gl.fbo_supported = ok;
-    ds_tracef("ds_gl_init_procs_once: fbo_supp=%d genFB=%p blitFB=%p bindFB=%p",
+    ds_tracef("gl_init: supp=%d gen=%p blit=%p bind=%p",
               (int)g_gl.fbo_supported, g_gl.p_glGenFramebuffers, g_gl.p_glBlitFramebuffer, g_gl.p_glBindFramebuffer);
     return g_gl.fbo_supported;
 }
@@ -391,7 +391,7 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
 
         GLenum status = g_gl.p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE) {
-            ds_tracef("ds_gl_sync_fbo: status=0x%x FAILED (not complete)", (unsigned int)status);
+            ds_tracef("gl_fbo: status=0x%x FAIL", (unsigned int)status);
             ds_gl_destroy_fbo_current_ctx();
             return false;
         }
@@ -408,7 +408,7 @@ static bool ds_gl_sync_fbo_for_current_ctx(int32_t virt_w, int32_t virt_h, int32
     static GLuint s_last_fbo = 0;
     if (s_last_vw != virt_w || s_last_vh != virt_h || s_last_dw != dst_w || s_last_dh != dst_h || s_last_fbo != g_gl.fbo_id) {
         s_last_vw = virt_w; s_last_vh = virt_h; s_last_dw = dst_w; s_last_dh = dst_h; s_last_fbo = g_gl.fbo_id;
-        ds_tracef("ds_gl_sync_fbo: OK virt=%dx%d dst=%dx%d want=%d fbo_id=%u redir=%d",
+        ds_tracef("gl_fbo: OK %dx%d->%dx%d w=%d id=%u r=%d",
                   virt_w, virt_h, dst_w, dst_h, (int)want_fbo, g_gl.fbo_id, (int)g_gl.fbo_redirect_active);
     }
     return true;
@@ -810,6 +810,18 @@ static void ds_gl_present_blit_to_backbuffer(
     }
 }
 
+static void ds_gl_pick_w3d_rect(const GLint saved[4], int32_t vw, int32_t vh, GLint out[4])
+{
+    if (saved[2] > 0 && saved[3] > 0) {
+        memcpy(out, saved, sizeof(GLint) * 4u);
+    } else {
+        out[0] = 0; out[1] = 0; out[2] = vw; out[3] = vh;
+    }
+}
+
+static bool ds_is_target_gl_win_locked(HWND win, bool allow_null);
+static void ds_gl_rebind_drawable_if_pending(HDC target_hdc);
+
 static void APIENTRY hook_glBlitFramebuffer(
     GLint srcX0,
     GLint srcY0,
@@ -843,10 +855,7 @@ static void APIENTRY hook_glBlitFramebuffer(
             g_ds.wined3d_uses_gl = true;
             g_ds.wined3d_uses_vulkan = false;
             ds_notify_gl_context_active_locked();
-            bool is_target_win = (cur_win == NULL ||
-                                  cur_win == g_ds.hwnd_game ||
-                                  cur_win == g_ds.hwnd_gl_host ||
-                                  (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, cur_win)));
+            bool is_target_win = ds_is_target_gl_win_locked(cur_win, true);
             int32_t win_scale = ds_get_windowed_scale_locked();
             int32_t vw = g_ds.virt_w;
             int32_t vh = g_ds.virt_h;
@@ -855,7 +864,7 @@ static void APIENTRY hook_glBlitFramebuffer(
             int32_t dst_x = g_ds.fullscreen_active ? g_ds.vp.dst_x : 0;
             int32_t dst_y = g_ds.fullscreen_active ? g_ds.vp.dst_y : 0;
             bool should_scale = (
-                !ds_is_passthrough_locked() &&
+                !ds_is_modern_tier_locked() &&
                 is_target_win &&
                 (g_ds.fullscreen_active || win_scale > 1) &&
                 vw > 0 &&
@@ -897,18 +906,13 @@ static void APIENTRY hook_glBlitFramebuffer(
                         g_gl.p_glGetIntegerv(GL_VIEWPORT, cur_vp);
                         g_gl.p_glGetIntegerv(GL_SCISSOR_BOX, cur_sc);
                         if (cur_vp[0] == 0 && cur_vp[1] == 0 && cur_vp[2] == backing_w && cur_vp[3] == backing_h) {
-                            GLint rx = (g_gl.last_w3d_vp[2] > 0) ? g_gl.last_w3d_vp[0] : 0;
-                            GLint ry = (g_gl.last_w3d_vp[2] > 0) ? g_gl.last_w3d_vp[1] : 0;
-                            GLsizei rw = (g_gl.last_w3d_vp[2] > 0) ? g_gl.last_w3d_vp[2] : vw;
-                            GLsizei rh = (g_gl.last_w3d_vp[3] > 0) ? g_gl.last_w3d_vp[3] : vh;
-                            g_gl.p_glViewport(rx, ry, rw, rh);
+                            GLint rv[4];
+                            ds_gl_pick_w3d_rect(g_gl.last_w3d_vp, vw, vh, rv);
+                            g_gl.p_glViewport(rv[0], rv[1], rv[2], rv[3]);
                             if (g_gl.p_glScissor && cur_sc[0] == 0 && cur_sc[1] == 0 &&
                                 cur_sc[2] == backing_w && cur_sc[3] == backing_h) {
-                                GLint sx = (g_gl.last_w3d_sc[2] > 0) ? g_gl.last_w3d_sc[0] : 0;
-                                GLint sy = (g_gl.last_w3d_sc[2] > 0) ? g_gl.last_w3d_sc[1] : 0;
-                                GLsizei sw = (g_gl.last_w3d_sc[2] > 0) ? g_gl.last_w3d_sc[2] : vw;
-                                GLsizei sh = (g_gl.last_w3d_sc[3] > 0) ? g_gl.last_w3d_sc[3] : vh;
-                                g_gl.p_glScissor(sx, sy, sw, sh);
+                                ds_gl_pick_w3d_rect(g_gl.last_w3d_sc, vw, vh, rv);
+                                g_gl.p_glScissor(rv[0], rv[1], rv[2], rv[3]);
                             }
                         } else if (cur_vp[2] > 0 && cur_vp[3] > 0) {
                             memcpy(g_gl.last_w3d_vp, cur_vp, sizeof(cur_vp));
@@ -916,6 +920,9 @@ static void APIENTRY hook_glBlitFramebuffer(
                                 memcpy(g_gl.last_w3d_sc, cur_sc, sizeof(cur_sc));
                             }
                         }
+                    }
+                    if (read_fbo != 0 && cur_hdc != NULL) {
+                        ds_gl_rebind_drawable_if_pending(cur_hdc);
                     }
                     ds_gl_clear_pillarbox_margins(dst_x, gl_dst_y, dst_x + dw, gl_dst_y + dh, backing_w, backing_h);
                 }
@@ -956,7 +963,22 @@ static void APIENTRY hook_glBlitFramebuffer(
     g_gl.p_glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 
+static void ds_gl_push_blit_caps(GLboolean *out_scissor, GLboolean *out_srgb)
+{
+    *out_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
+    *out_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
+    if (*out_scissor && g_gl.p_glDisable) g_gl.p_glDisable(GL_SCISSOR_TEST);
+    if (*out_srgb && g_gl.p_glDisable) g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+}
+
+static void ds_gl_pop_blit_caps(GLboolean was_scissor, GLboolean was_srgb)
+{
+    if (was_srgb && g_gl.p_glEnable) g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+    if (was_scissor && g_gl.p_glEnable) g_gl.p_glEnable(GL_SCISSOR_TEST);
+}
+
 static void ds_gl_upscale_wined3d_backbuffer(
+    HDC               target_hdc,
     HGLRC             cur_ctx,
     int32_t           vw,
     int32_t           vh,
@@ -1000,19 +1022,16 @@ static void ds_gl_upscale_wined3d_backbuffer(
         g_gl.w3d_h = vh;
     }
 
-    GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
-    GLboolean was_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
-    if (was_scissor && g_gl.p_glDisable) {
-        g_gl.p_glDisable(GL_SCISSOR_TEST);
-    }
-    if (was_srgb && g_gl.p_glDisable) {
-        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
-    }
+    GLboolean was_scissor = GL_FALSE, was_srgb = GL_FALSE;
+    ds_gl_push_blit_caps(&was_scissor, &was_srgb);
 
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gl.w3d_fbo_id);
     if (g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
     g_gl.p_glBlitFramebuffer(0, 0, vw, vh, 0, 0, vw, vh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    /* Rebind Cocoa drawable now that Frame 1 is safely preserved in `w3d_fbo_id` */
+    ds_gl_rebind_drawable_if_pending(target_hdc);
 
     g_gl.p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.w3d_fbo_id);
     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -1057,13 +1076,7 @@ static void ds_gl_upscale_wined3d_backbuffer(
     if (prev_draw_fbo == 0 && g_ds.real_glDrawBuffer) g_ds.real_glDrawBuffer(GL_BACK);
     if (prev_read_fbo == 0 && g_ds.real_glReadBuffer) g_ds.real_glReadBuffer(GL_BACK);
 
-    if (was_srgb && g_gl.p_glEnable) {
-        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
-    }
-    if (was_scissor && g_gl.p_glEnable) {
-        g_gl.p_glEnable(GL_SCISSOR_TEST);
-    }
-
+    ds_gl_pop_blit_caps(was_scissor, was_srgb);
     ds_leave_internal();
 }
 
@@ -1259,7 +1272,7 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
     if (g_ds.trace_file[0] != L'\0') {
         static volatile LONG s_map_logs = 0;
         if (InterlockedIncrement(&s_map_logs) <= 64) {
-            ds_tracef("ds_gl_map_hdc: game_hdc=%p (win=%p) -> host_hdc=%p (host=%p)",
+            ds_tracef("ds_gl_map_hdc: %p(%p)->%p(%p)",
                       hdc, win, host_hdc, host_hwnd);
         }
     }
@@ -1655,7 +1668,7 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
     if (g_ds.trace_file[0] != L'\0') {
         static volatile LONG s_wgl_calls = 0;
         if (InterlockedIncrement(&s_wgl_calls) <= 200) {
-            ds_tracef("hook_wglMakeCurrent: hdc=%p->%p win=%p hglrc=%p ok=%d is_wined3d=%d",
+            ds_tracef("wglMakeCurrent: %p->%p win=%p ctx=%p ok=%d is_wined3d=%d",
                       hdc, target_hdc, win, hglrc, (int)ok, (int)is_wined3d);
         }
     }
@@ -1730,7 +1743,7 @@ BOOL WINAPI hook_wglDeleteContext(HGLRC hglrc)
 
 static void ds_gl_rebind_drawable_if_pending(HDC target_hdc)
 {
-    if (InterlockedCompareExchange(&g_ds.gl_drawable_rebind_pending, 0, 1) != 1) {
+    if (!target_hdc || InterlockedCompareExchange(&g_ds.gl_drawable_rebind_pending, 0, 1) != 1) {
         return;
     }
     ds_gl_ensure_wgl_query_procs();
@@ -1761,18 +1774,10 @@ static void ds_gl_rebind_drawable_if_pending(HDC target_hdc)
             g_gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &saved_read_fbo);
             if (is_w3d && bw > 0 && bh > 0 && (vw != bw || vh != bh) &&
                 saved_vp[0] == 0 && saved_vp[1] == 0 && saved_vp[2] == bw && saved_vp[3] == bh) {
-                if (g_gl.last_w3d_vp[2] > 0 && g_gl.last_w3d_vp[3] > 0) {
-                    memcpy(saved_vp, g_gl.last_w3d_vp, sizeof(saved_vp));
-                } else if (vw > 0 && vh > 0) {
-                    saved_vp[2] = vw;
-                    saved_vp[3] = vh;
-                }
-                if (saved_sc[0] == 0 && saved_sc[1] == 0 && saved_sc[2] == bw && saved_sc[3] == bh) {
-                    if (g_gl.last_w3d_sc[2] > 0 && g_gl.last_w3d_sc[3] > 0) {
-                        memcpy(saved_sc, g_gl.last_w3d_sc, sizeof(saved_sc));
-                    } else if (vw > 0 && vh > 0) {
-                        saved_sc[2] = vw;
-                        saved_sc[3] = vh;
+                if (vw > 0 && vh > 0) {
+                    ds_gl_pick_w3d_rect(g_gl.last_w3d_vp, vw, vh, saved_vp);
+                    if (saved_sc[0] == 0 && saved_sc[1] == 0 && saved_sc[2] == bw && saved_sc[3] == bh) {
+                        ds_gl_pick_w3d_rect(g_gl.last_w3d_sc, vw, vh, saved_sc);
                     }
                 }
             }
@@ -1808,12 +1813,24 @@ static void ds_gl_rebind_drawable_if_pending(HDC target_hdc)
     }
 }
 
+static BOOL ds_call_real_swap(HDC hdc, bool use_wgl_swap)
+{
+    return use_wgl_swap
+        ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(hdc) : FALSE)
+        : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(hdc) : FALSE);
+}
+
+static bool ds_is_target_gl_win_locked(HWND win, bool allow_null)
+{
+    if (win == NULL) return allow_null;
+    return (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host ||
+            (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)));
+}
+
 static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *caller_ret)
 {
     if (!hdc || ds_is_internal_call()) {
-        return use_wgl_swap
-            ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(hdc) : FALSE)
-            : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(hdc) : FALSE);
+        return ds_call_real_swap(hdc, use_wgl_swap);
     }
     ds_ensure_runtime_started();
 
@@ -1821,6 +1838,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         HWND win = WindowFromDC(hdc);
         ds_lock();
         g_ds.wined3d_uses_gl = true;
+        g_ds.wined3d_uses_vulkan = false;
         g_ds.gl_upscale_active = true;
         ds_notify_gl_context_active_locked();
         ds_unlock();
@@ -1834,10 +1852,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
         ds_lock();
-        bool is_game_win = (
-            win != NULL &&
-            (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
-        );
+        bool is_game_win = ds_is_target_gl_win_locked(win, false);
         if (is_game_win) {
             g_gl.last_present_was_gl = true;
         }
@@ -1864,16 +1879,14 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
                 if (cur_ctx != NULL) {
                     int32_t gl_dst_y = real_h - (dst_y + dh);
-                    ds_gl_upscale_wined3d_backbuffer(cur_ctx, vw, vh, dst_x, gl_dst_y, dw, dh, aspect, w3d_filter);
+                    ds_gl_upscale_wined3d_backbuffer(target_hdc, cur_ctx, vw, vh, dst_x, gl_dst_y, dw, dh, aspect, w3d_filter);
                 }
             }
         }
         g_gl.w3d_scaled_in_blit = false;
 
         ds_enter_internal();
-        BOOL w3d_swapped = use_wgl_swap
-            ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(target_hdc) : FALSE)
-            : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(target_hdc) : FALSE);
+        BOOL w3d_swapped = ds_call_real_swap(target_hdc, use_wgl_swap);
         ds_leave_internal();
 
         if (is_game_win) {
@@ -1883,9 +1896,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
     }
 
     if (ds_is_system_renderer_caller(caller_ret)) {
-        return use_wgl_swap
-            ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(hdc) : FALSE)
-            : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(hdc) : FALSE);
+        return ds_call_real_swap(hdc, use_wgl_swap);
     }
 
     HWND win = WindowFromDC(hdc);
@@ -1905,10 +1916,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
     HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
     ds_lock();
-    bool is_game_win = (
-        win != NULL &&
-        (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
-    );
+    bool is_game_win = ds_is_target_gl_win_locked(win, false);
     bool fs_active = g_ds.fullscreen_active;
     int32_t win_scale = ds_get_windowed_scale_locked();
     ds_aspect_mode_t aspect = fs_active ? g_ds.aspect_mode : DS_ASPECT_PRESERVE;
@@ -1949,18 +1957,14 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 InterlockedIncrement(&g_ds.gdi_margin_gen);
                 ds_set_gl_host_visible(true);
                 if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && want_fbo && dw > 0 && dh > 0) {
+                    /* Rebind Cocoa drawable BEFORE blitting to FBO 0 while Frame 1 lives safely in `g_gl.fbo_id` */
+                    ds_gl_rebind_drawable_if_pending(target_hdc);
                     GLint dx0 = dst_x;
                     GLint dy0 = backing_h - (dst_y + dst_h);
                     GLint dx1 = dst_x + dst_w;
                     GLint dy1 = dy0 + dst_h;
-                    GLboolean was_scissor = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_SCISSOR_TEST) : GL_FALSE;
-                    GLboolean was_srgb = g_gl.p_glIsEnabled ? g_gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB) : GL_FALSE;
-                    if (was_scissor && g_gl.p_glDisable) {
-                        g_gl.p_glDisable(GL_SCISSOR_TEST);
-                    }
-                    if (was_srgb && g_gl.p_glDisable) {
-                        g_gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
-                    }
+                    GLboolean was_scissor = GL_FALSE, was_srgb = GL_FALSE;
+                    ds_gl_push_blit_caps(&was_scissor, &was_srgb);
 
                     g_gl.p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
                     if (g_ds.real_glDrawBuffer) {
@@ -1991,18 +1995,11 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                         filter_mode
                     );
 
-                    if (was_srgb && g_gl.p_glEnable) {
-                        g_gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
-                    }
-                    if (was_scissor && g_gl.p_glEnable) {
-                        g_gl.p_glEnable(GL_SCISSOR_TEST);
-                    }
+                    ds_gl_pop_blit_caps(was_scissor, was_srgb);
                 }
 
                 ds_enter_internal();
-                BOOL swapped = use_wgl_swap
-                    ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(target_hdc) : FALSE)
-                    : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(target_hdc) : FALSE);
+                BOOL swapped = ds_call_real_swap(target_hdc, use_wgl_swap);
                 ds_leave_internal();
 
                 ds_gl_rebind_drawable_if_pending(target_hdc);
@@ -2015,7 +2012,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 vh = g_ds.virt_h;
                 dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
                 dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-                want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
+                want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
                 ds_unlock();
                 ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
                 return swapped;
@@ -2023,9 +2020,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         }
     }
 
-    return use_wgl_swap
-        ? (g_ds.real_wglSwapBuffers ? g_ds.real_wglSwapBuffers(target_hdc) : FALSE)
-        : (g_ds.real_SwapBuffers ? g_ds.real_SwapBuffers(target_hdc) : FALSE);
+    return ds_call_real_swap(target_hdc, use_wgl_swap);
 }
 
 BOOL WINAPI hook_SwapBuffers(HDC hdc)
@@ -2066,6 +2061,391 @@ void ds_gl_notify_display_mode_switch(void)
     InterlockedExchange(&g_gl.mode_trace_budget, 16);
 }
 
+/* -------------------------------------------------------------------------
+ * Khronos Vulkan 1.0 ABI Swapchain Present Scaler (32-bit Legacy D3D on WineD3D Vulkan)
+ *
+ * When a 32-bit D3D9/D3D8/DDraw game requests sub-native exclusive fullscreen on
+ * WineD3D Vulkan, `wined3d_swapchain_vk_blit` blits `src=(0,0)-(vw,vh)` into
+ * `dst=(0,0)-(vw,vh)` of the full-monitor `VkSwapchainKHR`. Intercepting the
+ * standard Khronos Vulkan 1.0 `vkCmdBlitImage` targeting tracked swapchain images
+ * scales sub-native blits cleanly into the computed aspect viewport while leaving
+ * native-resolution blits, internal texture blits, DXVK, and DX11/DX12 untouched.
+ * ------------------------------------------------------------------------- */
+
+#define DS_VK_MAX_SWAPCHAINS          4u
+#define DS_VK_MAX_SC_IMAGES           8u
+#define DS_VK_FILTER_NEAREST          0u
+#define DS_VK_FILTER_LINEAR           1u
+#define DS_VK_IMAGE_ASPECT_COLOR_BIT  1u
+#define DS_VK_PIPELINE_STAGE_TRANSFER 0x1000u
+#define DS_VK_ACCESS_TRANSFER_WRITE   0x1000u
+#define DS_VK_STYPE_MEMORY_BARRIER    46u
+
+typedef struct {
+    uint32_t    sType;
+    const void *pNext;
+    uint32_t    flags;
+    uint64_t    surface;
+    uint32_t    minImageCount;
+    uint32_t    imageFormat;
+    uint32_t    imageColorSpace;
+    uint32_t    extent_w;
+    uint32_t    extent_h;
+} ds_vk_swapchain_ci_t;
+
+#if defined(_WIN64)
+_Static_assert(offsetof(ds_vk_swapchain_ci_t, extent_w) == 44, "VkSwapchainCreateInfoKHR x64 extent_w");
+_Static_assert(offsetof(ds_vk_swapchain_ci_t, extent_h) == 48, "VkSwapchainCreateInfoKHR x64 extent_h");
+#else
+_Static_assert(offsetof(ds_vk_swapchain_ci_t, extent_w) == 36, "VkSwapchainCreateInfoKHR x86 extent_w");
+_Static_assert(offsetof(ds_vk_swapchain_ci_t, extent_h) == 40, "VkSwapchainCreateInfoKHR x86 extent_h");
+#endif
+
+typedef struct {
+    uint32_t aspectMask;
+    uint32_t mipLevel;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+} ds_vk_subres_layers_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+} ds_vk_offset3d_t;
+
+typedef struct {
+    ds_vk_subres_layers_t srcSubresource;
+    ds_vk_offset3d_t      srcOffsets[2];
+    ds_vk_subres_layers_t dstSubresource;
+    ds_vk_offset3d_t      dstOffsets[2];
+} ds_vk_image_blit_t;
+
+_Static_assert(sizeof(ds_vk_image_blit_t) == 80, "VkImageBlit ABI size");
+
+typedef struct {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+} ds_vk_subres_range_t;
+
+typedef struct {
+    float float32[4];
+} ds_vk_clear_color_t;
+
+typedef struct {
+    uint32_t    sType;
+    const void *pNext;
+    uint32_t    srcAccessMask;
+    uint32_t    dstAccessMask;
+} ds_vk_mem_barrier_t;
+
+typedef void (WINAPI *pfn_vkVoidFunction_t)(void);
+typedef pfn_vkVoidFunction_t (WINAPI *pfn_vkGetInstanceProcAddr_t)(void *inst, const char *pName);
+typedef pfn_vkVoidFunction_t (WINAPI *pfn_vkGetDeviceProcAddr_t)(void *dev, const char *pName);
+typedef int32_t (WINAPI *pfn_vkCreateSwapchainKHR_t)(void *dev, const ds_vk_swapchain_ci_t *ci, const void *alloc, uint64_t *out_sc);
+typedef void (WINAPI *pfn_vkDestroySwapchainKHR_t)(void *dev, uint64_t sc, const void *alloc);
+typedef int32_t (WINAPI *pfn_vkGetSwapchainImagesKHR_t)(void *dev, uint64_t sc, uint32_t *count, uint64_t *imgs);
+typedef void (WINAPI *pfn_vkCmdBlitImage_t)(
+    void *cmd, uint64_t src_img, uint32_t src_layout, uint64_t dst_img, uint32_t dst_layout,
+    uint32_t region_count, const ds_vk_image_blit_t *regions, uint32_t filter
+);
+typedef void (WINAPI *pfn_vkCmdClearColorImage_t)(
+    void *cmd, uint64_t img, uint32_t layout, const ds_vk_clear_color_t *color,
+    uint32_t range_count, const ds_vk_subres_range_t *ranges
+);
+typedef void (WINAPI *pfn_vkCmdPipelineBarrier_t)(
+    void *cmd, uint32_t src_stage, uint32_t dst_stage, uint32_t dep_flags,
+    uint32_t mem_cnt, const ds_vk_mem_barrier_t *mem_barriers,
+    uint32_t buf_cnt, const void *buf_barriers,
+    uint32_t img_cnt, const void *img_barriers
+);
+
+typedef struct {
+    uint64_t sc;
+    int32_t  ext_w;
+    int32_t  ext_h;
+    uint32_t img_count;
+    uint64_t imgs[DS_VK_MAX_SC_IMAGES];
+} ds_vk_swapchain_slot_t;
+
+typedef struct {
+    pfn_vkGetInstanceProcAddr_t  p_vkGetInstanceProcAddr;
+    pfn_vkGetDeviceProcAddr_t    p_vkGetDeviceProcAddr;
+    pfn_vkCreateSwapchainKHR_t   p_vkCreateSwapchainKHR;
+    pfn_vkDestroySwapchainKHR_t  p_vkDestroySwapchainKHR;
+    pfn_vkGetSwapchainImagesKHR_t p_vkGetSwapchainImagesKHR;
+    pfn_vkCmdBlitImage_t         p_vkCmdBlitImage;
+    pfn_vkCmdClearColorImage_t   p_vkCmdClearColorImage;
+    pfn_vkCmdPipelineBarrier_t   p_vkCmdPipelineBarrier;
+    ds_vk_swapchain_slot_t       slots[DS_VK_MAX_SWAPCHAINS];
+    uint32_t                     next_slot;
+    volatile LONG                has_swapchain_imgs;
+} ds_vk_state_t;
+
+static ds_vk_state_t g_vk;
+
+static void ds_vk_recompute_has_imgs_locked(void)
+{
+    LONG any = 0;
+    for (uint32_t i = 0; i < DS_VK_MAX_SWAPCHAINS; i++) {
+        if (g_vk.slots[i].sc != 0 && g_vk.slots[i].img_count > 0) {
+            any = 1;
+            break;
+        }
+    }
+    InterlockedExchange(&g_vk.has_swapchain_imgs, any);
+}
+
+static ds_vk_swapchain_slot_t *ds_vk_find_slot_locked(uint64_t key, bool by_img)
+{
+    for (uint32_t i = 0; i < DS_VK_MAX_SWAPCHAINS; i++) {
+        ds_vk_swapchain_slot_t *s = &g_vk.slots[i];
+        if (!by_img) {
+            if (s->sc == key) return s;
+        } else if (s->sc != 0) {
+            for (uint32_t j = 0; j < s->img_count; j++) {
+                if (s->imgs[j] == key) return s;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int32_t WINAPI hook_vkCreateSwapchainKHR(
+    void *dev, const ds_vk_swapchain_ci_t *ci, const void *alloc, uint64_t *out_sc
+)
+{
+    if (!g_vk.p_vkCreateSwapchainKHR) return -13;
+    int32_t res = g_vk.p_vkCreateSwapchainKHR(dev, ci, alloc, out_sc);
+    if (res == 0 && ci != NULL && out_sc != NULL && *out_sc != 0 && ci->extent_w > 0 && ci->extent_h > 0) {
+        uint64_t sc = *out_sc;
+        ds_lock();
+        ds_vk_swapchain_slot_t *s = ds_vk_find_slot_locked(sc, false);
+        if (!s) s = ds_vk_find_slot_locked(0, false);
+        if (!s) {
+            uint32_t idx = g_vk.next_slot % DS_VK_MAX_SWAPCHAINS;
+            g_vk.next_slot = (idx + 1u) % DS_VK_MAX_SWAPCHAINS;
+            s = &g_vk.slots[idx];
+        }
+        memset(s, 0, sizeof(*s));
+        s->sc = sc;
+        s->ext_w = (int32_t)ci->extent_w;
+        s->ext_h = (int32_t)ci->extent_h;
+        ds_vk_recompute_has_imgs_locked();
+        ds_unlock();
+    }
+    return res;
+}
+
+static int32_t WINAPI hook_vkGetSwapchainImagesKHR(
+    void *dev, uint64_t sc, uint32_t *count, uint64_t *imgs
+)
+{
+    if (!g_vk.p_vkGetSwapchainImagesKHR) return -13;
+    int32_t res = g_vk.p_vkGetSwapchainImagesKHR(dev, sc, count, imgs);
+    if ((res == 0 || res == 5) && sc != 0 && imgs != NULL && count != NULL && *count > 0) {
+        uint32_t n = (*count > DS_VK_MAX_SC_IMAGES) ? DS_VK_MAX_SC_IMAGES : *count;
+        ds_lock();
+        ds_vk_swapchain_slot_t *s = ds_vk_find_slot_locked(sc, false);
+        if (s) {
+            memcpy(s->imgs, imgs, (size_t)n * sizeof(uint64_t));
+            s->img_count = n;
+            ds_vk_recompute_has_imgs_locked();
+        }
+        ds_unlock();
+    }
+    return res;
+}
+
+static void WINAPI hook_vkDestroySwapchainKHR(void *dev, uint64_t sc, const void *alloc)
+{
+    if (sc != 0) {
+        ds_lock();
+        ds_vk_swapchain_slot_t *s = ds_vk_find_slot_locked(sc, false);
+        if (s) memset(s, 0, sizeof(*s));
+        ds_vk_recompute_has_imgs_locked();
+        ds_unlock();
+    }
+    if (g_vk.p_vkDestroySwapchainKHR) {
+        g_vk.p_vkDestroySwapchainKHR(dev, sc, alloc);
+    }
+}
+
+static void WINAPI hook_vkCmdBlitImage(
+    void *cmd, uint64_t src_img, uint32_t src_layout, uint64_t dst_img, uint32_t dst_layout,
+    uint32_t region_count, const ds_vk_image_blit_t *regions, uint32_t filter
+)
+{
+    if (!g_vk.p_vkCmdBlitImage) return;
+    if (g_vk.has_swapchain_imgs == 0 || region_count != 1u || regions == NULL) {
+        g_vk.p_vkCmdBlitImage(cmd, src_img, src_layout, dst_img, dst_layout, region_count, regions, filter);
+        return;
+    }
+
+    int32_t sc_w = 0, sc_h = 0;
+    bool should_scale = false;
+    ds_aspect_mode_t aspect = DS_ASPECT_PRESERVE;
+    ds_viewport_t vp;
+    memset(&vp, 0, sizeof(vp));
+
+    int32_t sw = regions[0].srcOffsets[1].x - regions[0].srcOffsets[0].x;
+    int32_t sh = regions[0].srcOffsets[1].y - regions[0].srcOffsets[0].y;
+    if (sw < 0) sw = -sw;
+    if (sh < 0) sh = -sh;
+
+    ds_lock();
+    ds_vk_swapchain_slot_t *s = ds_vk_find_slot_locked(dst_img, true);
+    if (s && sw > 0 && sh > 0 && s->ext_w > 0 && s->ext_h > 0) {
+        sc_w = s->ext_w;
+        sc_h = s->ext_h;
+        bool active = (
+            ds_is_vulkan_d3d9_locked() &&
+            !ds_is_passthrough_locked() &&
+            !g_ds.user_forced_windowed &&
+            (g_ds.fullscreen_active || g_ds.borderless_active)
+        );
+        if (active && sw >= sc_w && sh >= sc_h) {
+            if (g_ds.mode_virtualized) {
+                g_ds.mode_virtualized = false;
+                g_ds.virt_w = g_ds.real_screen_w;
+                g_ds.virt_h = g_ds.real_screen_h;
+                ds_refresh_viewport_locked();
+                ds_cursor_warp_reset(&g_ds.warp);
+            }
+        } else if (active && (sw < sc_w || sh < sc_h)) {
+            if (g_ds.fullscreen_active && (g_ds.virt_w != sw || g_ds.virt_h != sh || !g_ds.mode_virtualized)) {
+                g_ds.virt_w = sw;
+                g_ds.virt_h = sh;
+                g_ds.mode_virtualized = true;
+                ds_refresh_viewport_locked();
+            }
+            aspect = g_ds.fullscreen_active ? g_ds.aspect_mode : DS_ASPECT_STRETCH;
+            should_scale = g_ds.fullscreen_active
+                ? ds_gl_compute_phys_viewport(sc_w, sc_h, sw, sh, aspect, &vp)
+                : ds_compute_viewport(sc_w, sc_h, 0, sw, sh, aspect, &vp);
+        }
+    }
+    ds_unlock();
+
+    if (!should_scale || vp.dst_w <= 0 || vp.dst_h <= 0) {
+        g_vk.p_vkCmdBlitImage(cmd, src_img, src_layout, dst_img, dst_layout, region_count, regions, filter);
+        return;
+    }
+
+    if ((vp.dst_w < sc_w || vp.dst_h < sc_h) && g_vk.p_vkCmdClearColorImage && g_vk.p_vkCmdPipelineBarrier) {
+        ds_vk_clear_color_t blk = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+        uint32_t lc = regions[0].dstSubresource.layerCount ? regions[0].dstSubresource.layerCount : 1u;
+        ds_vk_subres_range_t rng = {
+            DS_VK_IMAGE_ASPECT_COLOR_BIT,
+            regions[0].dstSubresource.mipLevel,
+            1u,
+            regions[0].dstSubresource.baseArrayLayer,
+            lc
+        };
+        g_vk.p_vkCmdClearColorImage(cmd, dst_img, dst_layout, &blk, 1u, &rng);
+        ds_vk_mem_barrier_t mb = {
+            DS_VK_STYPE_MEMORY_BARRIER,
+            NULL,
+            DS_VK_ACCESS_TRANSFER_WRITE,
+            DS_VK_ACCESS_TRANSFER_WRITE
+        };
+        g_vk.p_vkCmdPipelineBarrier(
+            cmd,
+            DS_VK_PIPELINE_STAGE_TRANSFER,
+            DS_VK_PIPELINE_STAGE_TRANSFER,
+            0u,
+            1u, &mb,
+            0u, NULL,
+            0u, NULL
+        );
+    }
+
+    ds_vk_image_blit_t patched = regions[0];
+    bool flip_x = (regions[0].dstOffsets[0].x > regions[0].dstOffsets[1].x);
+    bool flip_y = (regions[0].dstOffsets[0].y > regions[0].dstOffsets[1].y);
+    patched.dstOffsets[0].x = flip_x ? (vp.dst_x + vp.dst_w) : vp.dst_x;
+    patched.dstOffsets[1].x = flip_x ? vp.dst_x : (vp.dst_x + vp.dst_w);
+    patched.dstOffsets[0].y = flip_y ? (vp.dst_y + vp.dst_h) : vp.dst_y;
+    patched.dstOffsets[1].y = flip_y ? vp.dst_y : (vp.dst_y + vp.dst_h);
+    uint32_t out_filter = (aspect == DS_ASPECT_INTEGER) ? DS_VK_FILTER_NEAREST : DS_VK_FILTER_LINEAR;
+    g_vk.p_vkCmdBlitImage(cmd, src_img, src_layout, dst_img, dst_layout, 1u, &patched, out_filter);
+}
+
+typedef struct {
+    const char *name;
+    uint16_t    real_off;
+    void       *hook_fn;
+} ds_vk_hook_def_t;
+
+static const ds_vk_hook_def_t k_vk_hook_defs[] = {
+    { "vkCreateSwapchainKHR",    (uint16_t)offsetof(ds_vk_state_t, p_vkCreateSwapchainKHR),    (void *)(uintptr_t)hook_vkCreateSwapchainKHR },
+    { "vkGetSwapchainImagesKHR", (uint16_t)offsetof(ds_vk_state_t, p_vkGetSwapchainImagesKHR), (void *)(uintptr_t)hook_vkGetSwapchainImagesKHR },
+    { "vkDestroySwapchainKHR",   (uint16_t)offsetof(ds_vk_state_t, p_vkDestroySwapchainKHR),   (void *)(uintptr_t)hook_vkDestroySwapchainKHR },
+    { "vkCmdBlitImage",          (uint16_t)offsetof(ds_vk_state_t, p_vkCmdBlitImage),          (void *)(uintptr_t)hook_vkCmdBlitImage },
+};
+
+static pfn_vkVoidFunction_t ds_vk_match_hook_proc(void *dev, void *inst, const char *pName, pfn_vkVoidFunction_t real_fn)
+{
+    if (!pName || !real_fn) return real_fn;
+    for (size_t i = 0; i < sizeof(k_vk_hook_defs) / sizeof(k_vk_hook_defs[0]); i++) {
+        if (strcmp(pName, k_vk_hook_defs[i].name) == 0) {
+            *(void **)(void *)((uint8_t *)&g_vk + k_vk_hook_defs[i].real_off) = (void *)(uintptr_t)real_fn;
+            if (i == 3u) {
+                pfn_vkVoidFunction_t clr = NULL, bar = NULL;
+                if (dev != NULL && g_vk.p_vkGetDeviceProcAddr) {
+                    clr = g_vk.p_vkGetDeviceProcAddr(dev, "vkCmdClearColorImage");
+                    bar = g_vk.p_vkGetDeviceProcAddr(dev, "vkCmdPipelineBarrier");
+                } else if (inst != NULL && g_vk.p_vkGetInstanceProcAddr) {
+                    clr = g_vk.p_vkGetInstanceProcAddr(inst, "vkCmdClearColorImage");
+                    bar = g_vk.p_vkGetInstanceProcAddr(inst, "vkCmdPipelineBarrier");
+                }
+                g_vk.p_vkCmdClearColorImage = (pfn_vkCmdClearColorImage_t)(uintptr_t)clr;
+                g_vk.p_vkCmdPipelineBarrier = (pfn_vkCmdPipelineBarrier_t)(uintptr_t)bar;
+            }
+            return (pfn_vkVoidFunction_t)(uintptr_t)k_vk_hook_defs[i].hook_fn;
+        }
+    }
+    return real_fn;
+}
+
+static pfn_vkVoidFunction_t WINAPI hook_vkGetDeviceProcAddr(void *dev, const char *pName)
+{
+    if (!g_vk.p_vkGetDeviceProcAddr) return NULL;
+    pfn_vkVoidFunction_t real_fn = g_vk.p_vkGetDeviceProcAddr(dev, pName);
+    return ds_vk_match_hook_proc(dev, NULL, pName, real_fn);
+}
+
+static pfn_vkVoidFunction_t WINAPI hook_vkGetInstanceProcAddr(void *inst, const char *pName)
+{
+    if (!g_vk.p_vkGetInstanceProcAddr) return NULL;
+    pfn_vkVoidFunction_t real_fn = g_vk.p_vkGetInstanceProcAddr(inst, pName);
+    if (!pName || !real_fn) return real_fn;
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        g_vk.p_vkGetDeviceProcAddr = (pfn_vkGetDeviceProcAddr_t)(uintptr_t)real_fn;
+        return (pfn_vkVoidFunction_t)(uintptr_t)hook_vkGetDeviceProcAddr;
+    }
+    return ds_vk_match_hook_proc(NULL, inst, pName, real_fn);
+}
+
+void *ds_resolve_wined3d_vk_proc(const char *name, void *real_fn)
+{
+    if (!name || !real_fn) return real_fn;
+    if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
+        g_vk.p_vkGetInstanceProcAddr = (pfn_vkGetInstanceProcAddr_t)(uintptr_t)real_fn;
+        ds_lock();
+        if (!g_ds.wined3d_uses_gl) {
+            g_ds.wined3d_uses_vulkan = true;
+            (void)ds_update_presenter_tier_locked();
+        }
+        ds_unlock();
+        return (void *)(uintptr_t)hook_vkGetInstanceProcAddr;
+    }
+    return real_fn;
+}
+
 void ds_gl_shutdown(void)
 {
     g_gl.game_hglrc = NULL;
@@ -2073,6 +2453,7 @@ void ds_gl_shutdown(void)
     g_gl.sharp_ctx = NULL;
     g_gl.fbo_redirect_active = false;
     g_gl.last_present_was_gl = false;
+    InterlockedExchange(&g_vk.has_swapchain_imgs, 0);
     ds_gl_release_all_host_dcs_for_hwnd(NULL);
 }
 
@@ -2207,7 +2588,7 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
         ds_reset_gl_host_for_gdi();
     }
     if (g_ds.trace_file[0] != L'\0' && is_game_gdi_target && InterlockedDecrement(&g_gl.mode_trace_budget) >= 0) {
-        ds_tracef("gdi_present: win=%p match=%d reset_gl_host=%d vw=%dx%d",
+        ds_tracef("gdi: win=%p m=%d rst=%d %dx%d",
                   win, (int)match, (int)need_reset_gl_host, (int)g_ds.virt_w, (int)g_ds.virt_h);
     }
     return match;

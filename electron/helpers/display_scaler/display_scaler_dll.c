@@ -151,40 +151,38 @@ static void ds_invalidate_mod_cache(void)
     if (g_ds.lock_initialized) ds_unlock();
 }
 
-typedef struct {
-    const WCHAR *name;
-    uint16_t     flags;
-} ds_mod_desc_t;
+bool ds_wcs_ieq_ascii(const WCHAR *w, const char *a)
+{
+    if (!w || !a) return false;
+    while (*w && *a) {
+        WCHAR cw = *w++;
+        unsigned char ca = (unsigned char)*a++;
+        if (cw >= L'A' && cw <= L'Z') cw = (WCHAR)(cw + (L'a' - L'A'));
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+        if (cw != (WCHAR)ca) return false;
+    }
+    return (*w == L'\0' && *a == '\0');
+}
 
-static const ds_mod_desc_t k_ds_mod_table[] = {
-    { L"wined3d.dll",    DS_MODF_WINED3D | DS_MODF_SYS_RENDER },
-    { L"ddraw.dll",      DS_MODF_DDRAW },
-    { L"d3d8.dll",       DS_MODF_D3D8 | DS_MODF_SYS_RENDER },
-    { L"d3d9.dll",       DS_MODF_D3D9 | DS_MODF_SYS_RENDER },
-    { L"dxgi.dll",       DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"d3d10.dll",      DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3d10_1.dll",    DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3d10core.dll",  DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3d11.dll",      DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3d12.dll",      DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3d12core.dll",  DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF },
-    { L"d3dmetal.dll",   DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"winemetal.dll",  DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"vulkan-1.dll",   DS_MODF_VULKAN | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"winevulkan.dll", DS_MODF_VULKAN | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"opengl32.dll",   DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"winemac.drv",    DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"win32u.dll",     DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"user32.dll",     DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"gdi32.dll",      DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT },
-    { L"ntdll.dll",      DS_MODF_SKIP_IAT },
-    { L"kernel32.dll",   DS_MODF_SKIP_IAT },
-    { L"kernelbase.dll", DS_MODF_SKIP_IAT },
-    { L"ucrtbase.dll",   DS_MODF_SKIP_IAT },
-    { L"msvcrt.dll",     DS_MODF_SKIP_IAT },
-    { L"advapi32.dll",   DS_MODF_SKIP_IAT },
-    { L"rpcrt4.dll",     DS_MODF_SKIP_IAT },
-    { L"sechost.dll",    DS_MODF_SKIP_IAT },
+static const WCHAR k_ds_mod_names_msz[] =
+    L"wined3d.dll" L"\0"    L"ddraw.dll" L"\0"      L"d3d8.dll" L"\0"       L"d3d9.dll" L"\0"
+    L"dxgi.dll" L"\0"       L"d3d10.dll" L"\0"      L"d3d10_1.dll" L"\0"    L"d3d10core.dll" L"\0"
+    L"d3d11.dll" L"\0"      L"d3d12.dll" L"\0"      L"d3d12core.dll" L"\0"  L"d3dmetal.dll" L"\0"
+    L"winemetal.dll" L"\0"  L"vulkan-1.dll" L"\0"   L"winevulkan.dll" L"\0" L"opengl32.dll" L"\0"
+    L"winemac.drv" L"\0"    L"win32u.dll" L"\0"     L"user32.dll" L"\0"     L"gdi32.dll" L"\0"
+    L"ntdll.dll" L"\0"      L"kernel32.dll" L"\0"   L"kernelbase.dll" L"\0" L"ucrtbase.dll" L"\0"
+    L"msvcrt.dll" L"\0"     L"advapi32.dll" L"\0"   L"rpcrt4.dll" L"\0"     L"sechost.dll" L"\0";
+
+#define DS_MF_MDX (DS_MODF_MODERN_DX | DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF)
+#define DS_MF_SYS (DS_MODF_SYS_RENDER | DS_MODF_PHYS_SURF | DS_MODF_SKIP_IAT)
+static const uint16_t k_ds_mod_flags[28] = {
+    DS_MODF_WINED3D | DS_MODF_SYS_RENDER, DS_MODF_DDRAW,                       DS_MODF_D3D8 | DS_MODF_SYS_RENDER, DS_MODF_D3D9 | DS_MODF_SYS_RENDER,
+    DS_MF_MDX | DS_MODF_SKIP_IAT,         DS_MF_MDX,                           DS_MF_MDX,                         DS_MF_MDX,
+    DS_MF_MDX,                            DS_MF_MDX,                           DS_MF_MDX,                         DS_MF_MDX | DS_MODF_SKIP_IAT,
+    DS_MF_MDX | DS_MODF_SKIP_IAT,         DS_MODF_VULKAN | DS_MF_SYS,          DS_MODF_VULKAN | DS_MF_SYS,        DS_MF_SYS,
+    DS_MF_SYS,                            DS_MF_SYS,                           DS_MF_SYS,                         DS_MF_SYS,
+    DS_MODF_SKIP_IAT,                     DS_MODF_SKIP_IAT,                    DS_MODF_SKIP_IAT,                  DS_MODF_SKIP_IAT,
+    DS_MODF_SKIP_IAT,                     DS_MODF_SKIP_IAT,                    DS_MODF_SKIP_IAT,                  DS_MODF_SKIP_IAT,
 };
 
 /* DirectInput DLLs must receive physical surface coordinates for 3D mouse look (F10) */
@@ -205,9 +203,10 @@ static uint32_t ds_compute_mod_flags_by_base(const WCHAR *base)
             return flags | DS_MODF_PHYS_SURF;
         }
     }
-    for (size_t i = 0; i < sizeof(k_ds_mod_table) / sizeof(k_ds_mod_table[0]); i++) {
-        if (_wcsicmp(base, k_ds_mod_table[i].name) == 0) {
-            return flags | (uint32_t)k_ds_mod_table[i].flags;
+    size_t idx = 0;
+    for (const WCHAR *p = k_ds_mod_names_msz; *p != L'\0' && idx < 28u; p += wcslen(p) + 1, idx++) {
+        if (_wcsicmp(base, p) == 0) {
+            return flags | (uint32_t)k_ds_mod_flags[idx];
         }
     }
     return flags;
@@ -274,7 +273,10 @@ bool ds_is_system_renderer_caller(const void *ret_addr)
 
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
 {
-    if (ds_is_modern_tier_locked()) {
+    if (g_ds.lock_initialized) ds_lock();
+    bool skip_modern = (ds_is_modern_tier_locked() && !ds_is_vulkan_d3d9_subnative_locked());
+    if (g_ds.lock_initialized) ds_unlock();
+    if (skip_modern) {
         return false;
     }
     uint32_t flags = 0;
@@ -292,7 +294,7 @@ bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
          */
         return (g_ds.wined3d_uses_gl || (g_ds.legacy_d3d_loaded && !g_ds.wined3d_uses_vulkan));
     }
-    if ((flags & DS_MODF_D3D9) != 0 && g_ds.wined3d_uses_vulkan) {
+    if ((flags & (DS_MODF_D3D9 | DS_MODF_D3D8 | DS_MODF_DDRAW)) != 0 && g_ds.wined3d_uses_vulkan) {
         return false;
     }
     if ((flags & DS_MODF_PHYS_SURF) != 0) {
@@ -301,37 +303,37 @@ bool ds_should_virtualize_rect_for_caller(const void *ret_addr)
     return true;
 }
 
-static bool ds_current_exe_in_multisz(const WCHAR *msz, bool on_err)
+static bool ds_current_exe_in_multisz(const char *msz, bool on_err)
 {
     WCHAR exe_path[MAX_PATH] = { 0 };
     if (GetModuleFileNameW(NULL, exe_path, MAX_PATH - 1) == 0) {
         return on_err;
     }
     const WCHAR *base = ds_basename_w(exe_path);
-    for (const WCHAR *p = msz; *p != L'\0'; p += wcslen(p) + 1) {
-        if (_wcsicmp(base, p) == 0) return true;
+    for (const char *p = msz; *p != '\0'; p += strlen(p) + 1) {
+        if (ds_wcs_ieq_ascii(base, p)) return true;
     }
     return false;
 }
 
 static bool ds_is_passthrough_chaining_process(void)
 {
-    static const WCHAR k_chain_msz[] =
-        L"cmd.exe\0powershell.exe\0rundll32.exe\0steam.exe\0"
-        L"galaxyclient.exe\0galaxyclienthelper.exe\0galaxycommunication.exe\0"
-        L"epicgameslauncher.exe\0eadesktop.exe\0upc.exe\0";
+    static const char k_chain_msz[] =
+        "cmd.exe\0powershell.exe\0rundll32.exe\0steam.exe\0"
+        "galaxyclient.exe\0galaxyclienthelper.exe\0galaxycommunication.exe\0"
+        "epicgameslauncher.exe\0eadesktop.exe\0upc.exe\0";
     return ds_current_exe_in_multisz(k_chain_msz, false);
 }
 
 static bool ds_should_ignore_current_process(void)
 {
-    static const WCHAR k_ignored_msz[] =
-        L"services.exe\0plugplay.exe\0rpcss.exe\0winedevice.exe\0"
-        L"explorer.exe\0wineboot.exe\0conhost.exe\0svchost.exe\0"
-        L"reg.exe\0regedit.exe\0regsvr32.exe\0msiexec.exe\0"
-        L"one_display_launcher_x86.exe\0one_display_launcher_x64.exe\0"
-        L"one_xgr_win_launcher.exe\0one_xgr_win_launcher_x86.exe\0"
-        L"steamwebhelper.exe\0steamservice.exe\0epicwebhelper.exe\0";
+    static const char k_ignored_msz[] =
+        "services.exe\0plugplay.exe\0rpcss.exe\0winedevice.exe\0"
+        "explorer.exe\0wineboot.exe\0conhost.exe\0svchost.exe\0"
+        "reg.exe\0regedit.exe\0regsvr32.exe\0msiexec.exe\0"
+        "one_display_launcher_x86.exe\0one_display_launcher_x64.exe\0"
+        "one_xgr_win_launcher.exe\0one_xgr_win_launcher_x86.exe\0"
+        "steamwebhelper.exe\0steamservice.exe\0epicwebhelper.exe\0";
     return ds_current_exe_in_multisz(k_ignored_msz, true);
 }
 
@@ -353,6 +355,18 @@ bool ds_is_vulkan_d3d9_locked(void)
         !g_ds.ddraw_gdi_active
     );
 #endif
+}
+
+bool ds_is_vulkan_d3d9_subnative_locked(void)
+{
+    return (
+        ds_is_vulkan_d3d9_locked() &&
+        g_ds.fullscreen_active &&
+        g_ds.mode_virtualized &&
+        g_ds.virt_w > 0 && g_ds.virt_h > 0 &&
+        g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0 &&
+        (g_ds.virt_w < g_ds.real_screen_w || g_ds.virt_h < g_ds.real_screen_h)
+    );
 }
 
 bool ds_is_modern_tier_locked(void)
@@ -417,12 +431,14 @@ bool ds_update_presenter_tier_locked(void)
         if (next_tier == DS_PRESENTER_MODERN_PASSTHROUGH) {
             g_ds.fullscreen_active = false;
         }
-        g_ds.mode_virtualized = false;
+        if (next_tier == DS_PRESENTER_MODERN_PASSTHROUGH || !ds_is_vulkan_d3d9_locked()) {
+            g_ds.mode_virtualized = false;
+            g_ds.virt_w = g_ds.real_screen_w;
+            g_ds.virt_h = g_ds.real_screen_h;
+            g_ds.virt_bpp = g_ds.real_bpp;
+            g_ds.virt_hz = g_ds.real_hz;
+        }
         g_ds.passthrough_restored = false;
-        g_ds.virt_w = g_ds.real_screen_w;
-        g_ds.virt_h = g_ds.real_screen_h;
-        g_ds.virt_bpp = g_ds.real_bpp;
-        g_ds.virt_hz = g_ds.real_hz;
         ds_refresh_viewport_locked();
         return had_legacy_state || (g_ds.hwnd_game != NULL);
     }
@@ -688,7 +704,7 @@ static bool ds_process_owns_foreground_window(void)
 
 static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t req_h, int32_t req_bpp, int32_t req_hz, DWORD dwFlags, const void *caller_ret)
 {
-    ds_tracef("ChangeDisplaySettings is_reset=%d req=%dx%d@%dbpp flags=0x%lx hwnd=%p",
+    ds_tracef("CDS rst=%d %dx%d@%d f=0x%lx h=%p",
               is_reset ? 1 : 0, (int)req_w, (int)req_h, (int)req_bpp, (unsigned long)dwFlags, (void *)g_ds.hwnd_game);
     if (is_reset) {
         ds_lock();
@@ -703,7 +719,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
             int32_t keep_vw = g_ds.virt_w;
             int32_t keep_vh = g_ds.virt_h;
             ds_unlock();
-            ds_tracef("ChangeDisplaySettings reset ignored during focus-loss (preserving virt=%dx%d)",
+            ds_tracef("CDS rst ignored focus-loss virt=%dx%d",
                       (int)keep_vw, (int)keep_vh);
             return DISP_CHANGE_SUCCESSFUL;
         }
@@ -790,17 +806,26 @@ static LONG ds_handle_vulkan_d3d9_change_display(bool is_reset, int32_t req_w, i
     bool need_apply = false;
     ds_lock();
     if (is_reset) {
+        g_ds.mode_virtualized = false;
+        g_ds.virt_w = g_ds.real_screen_w;
+        g_ds.virt_h = g_ds.real_screen_h;
         if (g_ds.fullscreen_active && !g_ds.user_forced_fullscreen) {
             g_ds.fullscreen_active = false;
             (void)ds_update_presenter_tier_locked();
             need_apply = true;
         }
+        ds_refresh_viewport_locked();
+        ds_cursor_warp_reset(&g_ds.warp);
     } else if (!g_ds.user_forced_windowed &&
                req_w >= 240 && req_h >= 180 &&
                (req_w < g_ds.phys_screen_w || req_h < g_ds.phys_screen_h)) {
+        g_ds.virt_w = req_w;
+        g_ds.virt_h = req_h;
+        g_ds.mode_virtualized = true;
         g_ds.fullscreen_active = true;
-        g_ds.mode_virtualized = false;
         (void)ds_update_presenter_tier_locked();
+        ds_refresh_viewport_locked();
+        ds_cursor_warp_reset(&g_ds.warp);
         need_apply = true;
     }
     ds_unlock();
@@ -861,6 +886,15 @@ static LONG ds_change_display_settings_common(
             int32_t vh = (dm_fields & DM_PELSHEIGHT) ? h : g_ds.phys_screen_h;
             if (vw < g_ds.phys_screen_w || vh < g_ds.phys_screen_h) {
                 return ds_handle_vulkan_d3d9_change_display(false, vw, vh, dwFlags);
+            }
+            if ((dwFlags & CDS_TEST) == 0) {
+                ds_lock();
+                g_ds.mode_virtualized = false;
+                g_ds.virt_w = g_ds.real_screen_w;
+                g_ds.virt_h = g_ds.real_screen_h;
+                ds_refresh_viewport_locked();
+                ds_cursor_warp_reset(&g_ds.warp);
+                ds_unlock();
             }
             call_real = true;
         } else {
@@ -949,32 +983,30 @@ static int WINAPI hook_GetSystemMetrics(int nIndex)
  * Window Geometry & Zero-Drift Cursor Hooks
  * ------------------------------------------------------------------------- */
 
-static HWND WINAPI hook_CreateWindowExW(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+static HWND ds_on_created_top_window(HWND hwnd, HWND parent, DWORD style, int w, int h)
 {
-    if (!ds_is_internal_call()) {
-        ds_ensure_runtime_started();
-    }
-    HWND hwnd = g_ds.real_CreateWindowExW
-        ? g_ds.real_CreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam)
-        : NULL;
-    if (hwnd && !ds_is_internal_call() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
-        ds_attach_and_apply_game_window(hwnd, nWidth > 0 ? nWidth : 0, nHeight > 0 ? nHeight : 0);
+    if (hwnd && !ds_is_internal_call() && parent == NULL && (style & WS_CHILD) == 0) {
+        ds_attach_and_apply_game_window(hwnd, w > 0 ? w : 0, h > 0 ? h : 0);
     }
     return hwnd;
 }
 
+static HWND WINAPI hook_CreateWindowExW(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+    if (!ds_is_internal_call()) ds_ensure_runtime_started();
+    HWND hwnd = g_ds.real_CreateWindowExW
+        ? g_ds.real_CreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam)
+        : NULL;
+    return ds_on_created_top_window(hwnd, hWndParent, dwStyle, nWidth, nHeight);
+}
+
 static HWND WINAPI hook_CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
-    if (!ds_is_internal_call()) {
-        ds_ensure_runtime_started();
-    }
+    if (!ds_is_internal_call()) ds_ensure_runtime_started();
     HWND hwnd = g_ds.real_CreateWindowExA
         ? g_ds.real_CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam)
         : NULL;
-    if (hwnd && !ds_is_internal_call() && hWndParent == NULL && (dwStyle & WS_CHILD) == 0) {
-        ds_attach_and_apply_game_window(hwnd, nWidth > 0 ? nWidth : 0, nHeight > 0 ? nHeight : 0);
-    }
-    return hwnd;
+    return ds_on_created_top_window(hwnd, hWndParent, dwStyle, nWidth, nHeight);
 }
 
 static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
@@ -1296,18 +1328,21 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
             ds_attach_and_apply_game_window(target_hwnd, rc_w, rc_h);
         }
         ds_lock();
+        bool is_legacy_tier = !ds_is_modern_tier_locked();
+        bool is_vk_d3d9 = ds_is_vulkan_d3d9_locked();
         int32_t win_scale = ds_get_windowed_scale_locked();
         bool suppress_clamp = (
             target_hwnd == g_ds.hwnd_game &&
-            !ds_is_passthrough_locked() &&
-            (g_ds.fullscreen_active ||
-             win_scale > 1 ||
-             (!g_ds.user_forced_windowed &&
-              (g_ds.mode_virtualized ||
-               (g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0 &&
-                (rc_w < g_ds.real_screen_w || rc_h < g_ds.real_screen_h)))))
+            ((is_legacy_tier &&
+              (g_ds.fullscreen_active ||
+               win_scale > 1 ||
+               (!g_ds.user_forced_windowed &&
+                (g_ds.mode_virtualized ||
+                 (g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0 &&
+                  (rc_w < g_ds.real_screen_w || rc_h < g_ds.real_screen_h)))))) ||
+             (ds_is_modern_borderless_locked() && (g_ds.borderless_active || is_vk_d3d9) && !g_ds.user_forced_windowed))
         );
-        if (suppress_clamp &&
+        if (suppress_clamp && is_legacy_tier &&
             (!g_ds.mode_virtualized || g_ds.virt_w <= 0 || g_ds.virt_h <= 0 ||
              (g_ds.virt_w >= g_ds.real_screen_w && g_ds.virt_h >= g_ds.real_screen_h))) {
             g_ds.virt_w = rc_w;
@@ -1392,10 +1427,15 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             bool borderless_popup = ((cur_style & WS_POPUP) != 0 && (cur_style & (WS_CAPTION | WS_THICKFRAME)) == 0);
             if ((sys_caller && (hWndInsertAfter == HWND_TOPMOST || borderless_popup)) ||
                 (!sys_caller && borderless_popup && ((uFlags & SWP_NOMOVE) != 0 || (X == mon_x && Y == mon_y)))) {
+                g_ds.virt_w = cx;
+                g_ds.virt_h = cy;
+                g_ds.mode_virtualized = true;
                 g_ds.fullscreen_active = true;
                 g_ds.borderless_active = true;
                 g_ds.window_mutated_by_scaler = true;
                 (void)ds_update_presenter_tier_locked();
+                ds_refresh_viewport_locked();
+                ds_cursor_warp_reset(&g_ds.warp);
                 promoted_vk = true;
             }
         }
@@ -1669,14 +1709,17 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
             ds_unlock();
             return (LONG_PTR)prev_orig;
         }
-        if (is_game && (prev_orig != NULL || GetCurrentThreadId() == owner_tid)) {
+        bool should_rehook = (is_game && (prev_orig != NULL || GetCurrentThreadId() == owner_tid));
+        ds_unlock();
+
+        if (should_rehook) {
             /*
              * Keep `ds_game_subclass_wndproc` installed as the outermost `win32u` WndProc
              * when `wined3d` (`wined3d_register_window` / `entry_restore_proc`), SDL, or the
-             * game subclasses `GWLP_WNDPROC` after window creation. This guarantees mouse
-             * coordinate remapping, `WM_ACTIVATEAPP`, and hotkeys execute before `wined3d_wndproc`
-             * (even when `wined3d` temporarily sets `entry->filter_messages = 1`).
+             * game subclasses `GWLP_WNDPROC` after window creation, while syncing per-HWND
+             * `DS_PROP_ORIG_*` props outside `ds_lock()`.
              */
+            ds_set_hwnd_orig_wndproc_props(hWnd, (WNDPROC)dwNewLong, unicode);
             LONG_PTR ret_for_caller = 0;
             ds_enter_internal();
             if (prev_orig != NULL) {
@@ -1684,12 +1727,15 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
             }
             ret_for_caller = ds_set_wnd_long_ptr_raw(hWnd, GWLP_WNDPROC, (LONG_PTR)ds_game_subclass_wndproc, unicode);
             ds_leave_internal();
-            g_ds.orig_wndproc = (WNDPROC)dwNewLong;
-            g_ds.orig_wndproc_unicode = unicode;
+
+            ds_lock();
+            if (g_ds.hwnd_game == hWnd) {
+                g_ds.orig_wndproc = (WNDPROC)dwNewLong;
+                g_ds.orig_wndproc_unicode = unicode;
+            }
             ds_unlock();
             return ret_for_caller ? ret_for_caller : (LONG_PTR)prev_orig;
         }
-        ds_unlock();
     }
 
     if (!ds_is_internal_call() && hWnd != NULL && (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE)) {
@@ -1712,18 +1758,16 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
         }
 
         if (is_game_fs) {
-            LONG_PTR fs_val = dwNewLong;
-            if (nIndex == GWL_STYLE) {
-                fs_val = (dwNewLong & ~(LONG_PTR)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_DLGFRAME | WS_BORDER | WS_MAXIMIZE | WS_MINIMIZE))
-                       | (LONG_PTR)(WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
-            } else {
-                fs_val = (dwNewLong & ~(LONG_PTR)(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_TOPMOST));
-                if (!app_inactive) {
-                    fs_val |= (LONG_PTR)WS_EX_TOPMOST;
-                }
-            }
+            LONG_PTR fs_st = 0, fs_ex = 0;
+            ds_compute_fs_styles(
+                (nIndex == GWL_STYLE) ? dwNewLong : 0,
+                (nIndex == GWL_EXSTYLE) ? dwNewLong : 0,
+                app_inactive,
+                &fs_st,
+                &fs_ex
+            );
             ds_enter_internal();
-            ds_set_wnd_long_ptr_raw(hWnd, nIndex, fs_val, unicode);
+            ds_set_wnd_long_ptr_raw(hWnd, nIndex, (nIndex == GWL_STYLE) ? fs_st : fs_ex, unicode);
             ds_leave_internal();
             return prev_saved;
         }
@@ -1837,6 +1881,19 @@ static BOOL WINAPI hook_GetMonitorInfoA(HMONITOR hMonitor, LPMONITORINFO lpmi)
     return ok;
 }
 
+static bool ds_get_client_origin_internal(HWND hwnd, POINT *out)
+{
+    if (!out || !hwnd || !IsWindow(hwnd) || !g_ds.real_ClientToScreen) {
+        return false;
+    }
+    out->x = 0;
+    out->y = 0;
+    ds_enter_internal();
+    BOOL ok = g_ds.real_ClientToScreen(hwnd, out);
+    ds_leave_internal();
+    return ok != FALSE;
+}
+
 static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
 {
     if (!lpPoint || !g_ds.real_GetCursorPos) return FALSE;
@@ -1866,30 +1923,17 @@ static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
             g_ds.win_mon_y + g_ds.vp.dst_y,
             g_ds.vp.dst_w,
             g_ds.vp.dst_h,
-            g_ds.virt_w,
-            g_ds.virt_h,
+            vw,
+            vh,
             &vx,
             &vy
         );
-    } else if (win_scale > 1 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
-        POINT orig = { 0, 0 };
-        ds_enter_internal();
-        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-        ds_leave_internal();
-        if (has_orig) {
+    } else if (win_scale > 1) {
+        POINT orig;
+        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
             int32_t rel_vx = 0, rel_vy = 0;
             ds_cursor_resolve_get_pos(
-                &g_ds.warp,
-                phys.x,
-                phys.y,
-                orig.x,
-                orig.y,
-                vw * win_scale,
-                vh * win_scale,
-                vw,
-                vh,
-                &rel_vx,
-                &rel_vy
+                &g_ds.warp, phys.x, phys.y, orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &rel_vx, &rel_vy
             );
             vx = orig.x + rel_vx;
             vy = orig.y + rel_vy;
@@ -1928,24 +1972,12 @@ static BOOL WINAPI hook_SetCursorPos(int X, int Y)
             &px,
             &py
         );
-    } else if (win_scale > 1 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
-        POINT orig = { 0, 0 };
-        ds_enter_internal();
-        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-        ds_leave_internal();
-        if (has_orig) {
+    } else if (win_scale > 1) {
+        POINT orig;
+        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
             ds_cursor_record_warp(
-                &g_ds.warp,
-                X - orig.x,
-                Y - orig.y,
-                orig.x,
-                orig.y,
-                g_ds.virt_w * win_scale,
-                g_ds.virt_h * win_scale,
-                g_ds.virt_w,
-                g_ds.virt_h,
-                &px,
-                &py
+                &g_ds.warp, X - orig.x, Y - orig.y, orig.x, orig.y,
+                g_ds.virt_w * win_scale, g_ds.virt_h * win_scale, g_ds.virt_w, g_ds.virt_h, &px, &py
             );
         }
     }
@@ -1968,8 +2000,7 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
     }
     g_ds.has_virtual_clip = true;
     g_ds.virtual_clip_rect = *lpRect;
-    bool fs_active = g_ds.fullscreen_active;
-    if (fs_active) {
+    if (g_ds.fullscreen_active) {
         ds_reapply_cursor_clip_locked();
         ds_unlock();
         return TRUE;
@@ -1981,34 +2012,17 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
     RECT vclip = *lpRect;
     ds_unlock();
 
-    if (win_scale > 1 && vw > 0 && vh > 0 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
-        POINT orig = { 0, 0 };
-        ds_enter_internal();
-        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-        ds_leave_internal();
-        if (has_orig) {
-            int32_t rw = vclip.right - vclip.left;
-            int32_t rh = vclip.bottom - vclip.top;
-            int32_t px = 0, py = 0, pw = 0, ph = 0;
-            if (rw > 0 && rh > 0 &&
-                ds_map_subrect_virt_to_phys(
-                    vclip.left - orig.x,
-                    vclip.top - orig.y,
-                    rw,
-                    rh,
-                    orig.x,
-                    orig.y,
-                    vw * win_scale,
-                    vh * win_scale,
-                    vw,
-                    vh,
-                    &px,
-                    &py,
-                    &pw,
-                    &ph)) {
-                RECT phys_clip = { px, py, px + pw, py + ph };
-                return g_ds.real_ClipCursor(&phys_clip);
-            }
+    POINT orig;
+    if (win_scale > 1 && vw > 0 && vh > 0 && ds_get_client_origin_internal(hwnd_game, &orig)) {
+        int32_t rw = vclip.right - vclip.left;
+        int32_t rh = vclip.bottom - vclip.top;
+        int32_t px = 0, py = 0, pw = 0, ph = 0;
+        if (rw > 0 && rh > 0 &&
+            ds_map_subrect_virt_to_phys(
+                vclip.left - orig.x, vclip.top - orig.y, rw, rh,
+                orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &px, &py, &pw, &ph)) {
+            RECT phys_clip = { px, py, px + pw, py + ph };
+            return g_ds.real_ClipCursor(&phys_clip);
         }
     }
     return g_ds.real_ClipCursor(lpRect);
@@ -2057,37 +2071,15 @@ static DWORD WINAPI hook_GetMessagePos(void)
     int32_t vh = g_ds.virt_h;
     if (g_ds.fullscreen_active && vw > 0 && vh > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
         ds_map_cursor_phys_to_virt(
-            px,
-            py,
-            g_ds.win_mon_x + g_ds.vp.dst_x,
-            g_ds.win_mon_y + g_ds.vp.dst_y,
-            g_ds.vp.dst_w,
-            g_ds.vp.dst_h,
-            vw,
-            vh,
-            &vx,
-            &vy
+            px, py, g_ds.win_mon_x + g_ds.vp.dst_x, g_ds.win_mon_y + g_ds.vp.dst_y,
+            g_ds.vp.dst_w, g_ds.vp.dst_h, vw, vh, &vx, &vy
         );
         mapped = true;
-    } else if (win_scale > 1 && vw > 0 && vh > 0 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
-        POINT orig = { 0, 0 };
-        ds_enter_internal();
-        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-        ds_leave_internal();
-        if (has_orig) {
+    } else if (win_scale > 1 && vw > 0 && vh > 0) {
+        POINT orig;
+        if (ds_get_client_origin_internal(hwnd_game, &orig)) {
             int32_t rel_vx = 0, rel_vy = 0;
-            ds_map_cursor_phys_to_virt(
-                px,
-                py,
-                orig.x,
-                orig.y,
-                vw * win_scale,
-                vh * win_scale,
-                vw,
-                vh,
-                &rel_vx,
-                &rel_vy
-            );
+            ds_map_cursor_phys_to_virt(px, py, orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &rel_vx, &rel_vy);
             vx = orig.x + rel_vx;
             vy = orig.y + rel_vy;
             mapped = true;
@@ -2095,10 +2087,7 @@ static DWORD WINAPI hook_GetMessagePos(void)
     }
     ds_unlock();
 
-    if (!mapped) {
-        return raw;
-    }
-    return (DWORD)MAKELONG((WORD)(short)vx, (WORD)(short)vy);
+    return mapped ? (DWORD)MAKELONG((WORD)(short)vx, (WORD)(short)vy) : raw;
 }
 
 static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
@@ -2113,7 +2102,7 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
 
     ds_lock();
     bool fs_active = (
-        !ds_is_modern_tier_locked() &&
+        (!ds_is_modern_tier_locked() || ds_is_vulkan_d3d9_subnative_locked()) &&
         g_ds.fullscreen_active &&
         g_ds.real_screen_w > 0 &&
         g_ds.real_screen_h > 0 &&
@@ -2235,57 +2224,37 @@ static BOOL WINAPI hook_RegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevice
     return ok;
 }
 
-static BOOL WINAPI hook_ScreenToClient(HWND hWnd, LPPOINT lpPoint)
+static BOOL ds_client_screen_common(HWND hWnd, LPPOINT lpPoint, bool to_screen, const void *caller_ret)
 {
     if (!lpPoint) return FALSE;
-    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
+    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(caller_ret)) {
         ds_lock();
         bool is_game_fs = (hWnd != NULL && hWnd == g_ds.hwnd_game && g_ds.fullscreen_active);
         bool is_game_win_scaled = (hWnd != NULL && hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active && ds_get_windowed_scale_locked() > 1);
         ds_unlock();
         if (is_game_fs) {
-            /* Virtual screen origin is already (0, 0) == virtual client origin (0, 0) */
             return TRUE;
         }
-        if (is_game_win_scaled && g_ds.real_ClientToScreen) {
-            POINT orig = { 0, 0 };
-            ds_enter_internal();
-            BOOL has_orig = g_ds.real_ClientToScreen(hWnd, &orig);
-            ds_leave_internal();
-            if (has_orig) {
-                lpPoint->x -= orig.x;
-                lpPoint->y -= orig.y;
-                return TRUE;
-            }
+        POINT orig;
+        if (is_game_win_scaled && ds_get_client_origin_internal(hWnd, &orig)) {
+            lpPoint->x += to_screen ? orig.x : -orig.x;
+            lpPoint->y += to_screen ? orig.y : -orig.y;
+            return TRUE;
         }
     }
-    return g_ds.real_ScreenToClient ? g_ds.real_ScreenToClient(hWnd, lpPoint) : FALSE;
+    return to_screen
+        ? (g_ds.real_ClientToScreen ? g_ds.real_ClientToScreen(hWnd, lpPoint) : FALSE)
+        : (g_ds.real_ScreenToClient ? g_ds.real_ScreenToClient(hWnd, lpPoint) : FALSE);
+}
+
+static BOOL WINAPI hook_ScreenToClient(HWND hWnd, LPPOINT lpPoint)
+{
+    return ds_client_screen_common(hWnd, lpPoint, false, __builtin_return_address(0));
 }
 
 static BOOL WINAPI hook_ClientToScreen(HWND hWnd, LPPOINT lpPoint)
 {
-    if (!lpPoint) return FALSE;
-    if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        ds_lock();
-        bool is_game_fs = (hWnd != NULL && hWnd == g_ds.hwnd_game && g_ds.fullscreen_active);
-        bool is_game_win_scaled = (hWnd != NULL && hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active && ds_get_windowed_scale_locked() > 1);
-        ds_unlock();
-        if (is_game_fs) {
-            return TRUE;
-        }
-        if (is_game_win_scaled && g_ds.real_ClientToScreen) {
-            POINT orig = { 0, 0 };
-            ds_enter_internal();
-            BOOL has_orig = g_ds.real_ClientToScreen(hWnd, &orig);
-            ds_leave_internal();
-            if (has_orig) {
-                lpPoint->x += orig.x;
-                lpPoint->y += orig.y;
-                return TRUE;
-            }
-        }
-    }
-    return g_ds.real_ClientToScreen ? g_ds.real_ClientToScreen(hWnd, lpPoint) : FALSE;
+    return ds_client_screen_common(hWnd, lpPoint, true, __builtin_return_address(0));
 }
 
 static int WINAPI hook_MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
@@ -2314,21 +2283,16 @@ static int WINAPI hook_MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoi
                     SetLastError(0);
                     return 0;
                 }
-                if (win_scale > 1 && g_ds.real_ClientToScreen) {
-                    POINT orig = { 0, 0 };
-                    ds_enter_internal();
-                    BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-                    ds_leave_internal();
-                    if (has_orig) {
-                        LONG dx = (hWndFrom == hwnd_game) ? orig.x : -orig.x;
-                        LONG dy = (hWndFrom == hwnd_game) ? orig.y : -orig.y;
-                        for (UINT i = 0; i < cPoints; i++) {
-                            lpPoints[i].x += dx;
-                            lpPoints[i].y += dy;
-                        }
-                        SetLastError(0);
-                        return (int)(DWORD)MAKELONG((WORD)(short)dx, (WORD)(short)dy);
+                POINT orig;
+                if (win_scale > 1 && ds_get_client_origin_internal(hwnd_game, &orig)) {
+                    LONG dx = (hWndFrom == hwnd_game) ? orig.x : -orig.x;
+                    LONG dy = (hWndFrom == hwnd_game) ? orig.y : -orig.y;
+                    for (UINT i = 0; i < cPoints; i++) {
+                        lpPoints[i].x += dx;
+                        lpPoints[i].y += dy;
                     }
+                    SetLastError(0);
+                    return (int)(DWORD)MAKELONG((WORD)(short)dx, (WORD)(short)dy);
                 }
             }
         }
@@ -2348,60 +2312,30 @@ static HWND WINAPI hook_WindowFromPoint(POINT Point)
     HWND hwnd_game = g_ds.hwnd_game;
     HWND hwnd_gl_host = g_ds.hwnd_gl_host;
     int32_t win_scale = ds_get_windowed_scale_locked();
-    if (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
-        int32_t px = phys.x, py = phys.y, pw = 1, ph = 1;
+    int32_t vw = g_ds.virt_w, vh = g_ds.virt_h;
+    int32_t px = phys.x, py = phys.y, pw = 1, ph = 1;
+    if (g_ds.fullscreen_active && vw > 0 && vh > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
         if (ds_map_subrect_virt_to_phys(
-                Point.x,
-                Point.y,
-                1,
-                1,
-                g_ds.win_mon_x + g_ds.vp.dst_x,
-                g_ds.win_mon_y + g_ds.vp.dst_y,
-                g_ds.vp.dst_w,
-                g_ds.vp.dst_h,
-                g_ds.virt_w,
-                g_ds.virt_h,
-                &px,
-                &py,
-                &pw,
-                &ph)) {
+                Point.x, Point.y, 1, 1,
+                g_ds.win_mon_x + g_ds.vp.dst_x, g_ds.win_mon_y + g_ds.vp.dst_y,
+                g_ds.vp.dst_w, g_ds.vp.dst_h, vw, vh, &px, &py, &pw, &ph)) {
             phys.x = px;
             phys.y = py;
         }
-    } else if (win_scale > 1 && g_ds.virt_w > 0 && g_ds.virt_h > 0 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
-        POINT orig = { 0, 0 };
-        ds_enter_internal();
-        BOOL has_orig = g_ds.real_ClientToScreen(hwnd_game, &orig);
-        ds_leave_internal();
-        if (has_orig) {
-            int32_t px = phys.x, py = phys.y, pw = 1, ph = 1;
-            if (ds_map_subrect_virt_to_phys(
-                    Point.x - orig.x,
-                    Point.y - orig.y,
-                    1,
-                    1,
-                    orig.x,
-                    orig.y,
-                    g_ds.virt_w * win_scale,
-                    g_ds.virt_h * win_scale,
-                    g_ds.virt_w,
-                    g_ds.virt_h,
-                    &px,
-                    &py,
-                    &pw,
-                    &ph)) {
-                phys.x = px;
-                phys.y = py;
-            }
+    } else if (win_scale > 1 && vw > 0 && vh > 0) {
+        POINT orig;
+        if (ds_get_client_origin_internal(hwnd_game, &orig) &&
+            ds_map_subrect_virt_to_phys(
+                Point.x - orig.x, Point.y - orig.y, 1, 1,
+                orig.x, orig.y, vw * win_scale, vh * win_scale, vw, vh, &px, &py, &pw, &ph)) {
+            phys.x = px;
+            phys.y = py;
         }
     }
     ds_unlock();
 
     HWND hit = g_ds.real_WindowFromPoint(phys);
-    if (hit != NULL && hit == hwnd_gl_host && hwnd_game != NULL) {
-        return hwnd_game;
-    }
-    return hit;
+    return (hit != NULL && hit == hwnd_gl_host && hwnd_game != NULL) ? hwnd_game : hit;
 }
 
 /* -------------------------------------------------------------------------
@@ -2548,7 +2482,7 @@ static void ds_inject_into_suspended_child(const PROCESS_INFORMATION *pi)
                 CloseHandle(hpi.hThread);
                 CloseHandle(hpi.hProcess);
                 if (helper_exit != 0) {
-                    ds_tracef("cross-architecture APC injection helper exited with code %lu", (unsigned long)helper_exit);
+                    ds_tracef("cross-arch APC helper exit=%lu", (unsigned long)helper_exit);
                 }
             }
             ds_leave_internal();
@@ -2594,9 +2528,21 @@ static bool ds_append_env_entry_w(WCHAR **buf, size_t *len, size_t *cap, const W
     return true;
 }
 
-static void ds_append_kv_if_missing_w(WCHAR **buf, size_t *len, size_t *cap, const WCHAR *key, const WCHAR *val)
+static void ds_ascii_to_w(const char *a, WCHAR *w, size_t cap)
 {
-    if (!key || !key[0] || !val || !val[0]) return;
+    size_t i = 0;
+    while (a && a[i] && i + 1 < cap) {
+        w[i] = (WCHAR)(unsigned char)a[i];
+        i++;
+    }
+    if (cap > 0) w[i] = L'\0';
+}
+
+static void ds_append_kv_if_missing_w(WCHAR **buf, size_t *len, size_t *cap, const char *key_a, const WCHAR *val)
+{
+    if (!key_a || !key_a[0] || !val || !val[0]) return;
+    WCHAR key[48];
+    ds_ascii_to_w(key_a, key, 48);
     size_t klen = wcslen(key);
     if (ds_env_block_has_key_w(*buf, *len, key, klen)) return;
     WCHAR line[MAX_PATH + 96];
@@ -2608,18 +2554,18 @@ static void ds_append_kv_if_missing_w(WCHAR **buf, size_t *len, size_t *cap, con
 }
 
 typedef struct {
-    const WCHAR *key;
-    uint16_t     field_off;
+    uint16_t field_off;
+    char     key[36];
 } ds_path_env_t;
 
 static const ds_path_env_t k_ds_path_envs[] = {
-    { L"ONE_LAUNCHER_SCALER_DLL_X86",       (uint16_t)offsetof(ds_runtime_t, dll_x86) },
-    { L"ONE_LAUNCHER_SCALER_DLL_X64",       (uint16_t)offsetof(ds_runtime_t, dll_x64) },
-    { L"ONE_LAUNCHER_LAUNCHER_EXE_X86",     (uint16_t)offsetof(ds_runtime_t, launcher_x86) },
-    { L"ONE_LAUNCHER_LAUNCHER_EXE_X64",     (uint16_t)offsetof(ds_runtime_t, launcher_x64) },
-    { L"ONE_LAUNCHER_DISPLAY_CONTROL_FILE", (uint16_t)offsetof(ds_runtime_t, control_file) },
-    { L"ONE_LAUNCHER_DISPLAY_STATUS_FILE",  (uint16_t)offsetof(ds_runtime_t, status_file) },
-    { L"ONE_LAUNCHER_DISPLAY_TRACE_FILE",   (uint16_t)offsetof(ds_runtime_t, trace_file) },
+    { (uint16_t)offsetof(ds_runtime_t, dll_x86),      "ONE_LAUNCHER_SCALER_DLL_X86" },
+    { (uint16_t)offsetof(ds_runtime_t, dll_x64),      "ONE_LAUNCHER_SCALER_DLL_X64" },
+    { (uint16_t)offsetof(ds_runtime_t, launcher_x86), "ONE_LAUNCHER_LAUNCHER_EXE_X86" },
+    { (uint16_t)offsetof(ds_runtime_t, launcher_x64), "ONE_LAUNCHER_LAUNCHER_EXE_X64" },
+    { (uint16_t)offsetof(ds_runtime_t, control_file), "ONE_LAUNCHER_DISPLAY_CONTROL_FILE" },
+    { (uint16_t)offsetof(ds_runtime_t, status_file),  "ONE_LAUNCHER_DISPLAY_STATUS_FILE" },
+    { (uint16_t)offsetof(ds_runtime_t, trace_file),   "ONE_LAUNCHER_DISPLAY_TRACE_FILE" },
 };
 
 DS_ALWAYS_INLINE WCHAR *ds_path_env_field(size_t idx)
@@ -2634,7 +2580,9 @@ static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
         for (size_t i = 0; i < 6; i++) {
             WCHAR *f = ds_path_env_field(i);
             if (f[0]) {
-                SetEnvironmentVariableW(k_ds_path_envs[i].key, f);
+                WCHAR wk[48];
+                ds_ascii_to_w(k_ds_path_envs[i].key, wk, 48);
+                SetEnvironmentVariableW(wk, f);
             }
         }
         return NULL;
@@ -2725,40 +2673,38 @@ static BOOL ds_finish_created_process(
     return TRUE;
 }
 
-static BOOL WINAPI hook_CreateProcessW(LPCWSTR lpApp, LPWSTR lpCmd, LPSECURITY_ATTRIBUTES lpPA, LPSECURITY_ATTRIBUTES lpTA, BOOL bInherit, DWORD dwFlags, LPVOID lpEnv, LPCWSTR lpDir, LPSTARTUPINFOW lpSI, LPPROCESS_INFORMATION lpPI)
+static BOOL ds_create_process_common(
+    bool is_wide, const void *lpApp, void *lpCmd, LPSECURITY_ATTRIBUTES lpPA,
+    LPSECURITY_ATTRIBUTES lpTA, BOOL bInherit, DWORD dwFlags, LPVOID lpEnv,
+    const void *lpDir, void *lpSI, LPPROCESS_INFORMATION lpPI
+)
 {
-    if (!g_ds.real_CreateProcessW) return FALSE;
+    if (is_wide ? !g_ds.real_CreateProcessW : !g_ds.real_CreateProcessA) return FALSE;
     if (ds_is_internal_call()) {
-        return g_ds.real_CreateProcessW(lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, lpDir, lpSI, lpPI);
+        return is_wide
+            ? g_ds.real_CreateProcessW((LPCWSTR)lpApp, (LPWSTR)lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, (LPCWSTR)lpDir, (LPSTARTUPINFOW)lpSI, lpPI)
+            : g_ds.real_CreateProcessA((LPCSTR)lpApp, (LPSTR)lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, (LPCSTR)lpDir, (LPSTARTUPINFOA)lpSI, lpPI);
     }
     PROCESS_INFORMATION local_pi;
     memset(&local_pi, 0, sizeof(local_pi));
     LPPROCESS_INFORMATION out_pi = lpPI ? lpPI : &local_pi;
     WCHAR *merged_env = ds_build_merged_child_env_w(lpEnv, dwFlags);
-    BOOL ok = g_ds.real_CreateProcessW(
-        lpApp, lpCmd, lpPA, lpTA, bInherit,
-        (merged_env ? (dwFlags | CREATE_UNICODE_ENVIRONMENT) : dwFlags) | CREATE_SUSPENDED,
-        merged_env ? (LPVOID)merged_env : lpEnv, lpDir, lpSI, out_pi
-    );
+    DWORD eff_flags = (merged_env ? (dwFlags | CREATE_UNICODE_ENVIRONMENT) : dwFlags) | CREATE_SUSPENDED;
+    LPVOID eff_env = merged_env ? (LPVOID)merged_env : lpEnv;
+    BOOL ok = is_wide
+        ? g_ds.real_CreateProcessW((LPCWSTR)lpApp, (LPWSTR)lpCmd, lpPA, lpTA, bInherit, eff_flags, eff_env, (LPCWSTR)lpDir, (LPSTARTUPINFOW)lpSI, out_pi)
+        : g_ds.real_CreateProcessA((LPCSTR)lpApp, (LPSTR)lpCmd, lpPA, lpTA, bInherit, eff_flags, eff_env, (LPCSTR)lpDir, (LPSTARTUPINFOA)lpSI, out_pi);
     return ds_finish_created_process(ok, GetLastError(), merged_env, (dwFlags & CREATE_SUSPENDED) != 0, lpPI, out_pi);
+}
+
+static BOOL WINAPI hook_CreateProcessW(LPCWSTR lpApp, LPWSTR lpCmd, LPSECURITY_ATTRIBUTES lpPA, LPSECURITY_ATTRIBUTES lpTA, BOOL bInherit, DWORD dwFlags, LPVOID lpEnv, LPCWSTR lpDir, LPSTARTUPINFOW lpSI, LPPROCESS_INFORMATION lpPI)
+{
+    return ds_create_process_common(true, lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, lpDir, lpSI, lpPI);
 }
 
 static BOOL WINAPI hook_CreateProcessA(LPCSTR lpApp, LPSTR lpCmd, LPSECURITY_ATTRIBUTES lpPA, LPSECURITY_ATTRIBUTES lpTA, BOOL bInherit, DWORD dwFlags, LPVOID lpEnv, LPCSTR lpDir, LPSTARTUPINFOA lpSI, LPPROCESS_INFORMATION lpPI)
 {
-    if (!g_ds.real_CreateProcessA) return FALSE;
-    if (ds_is_internal_call()) {
-        return g_ds.real_CreateProcessA(lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, lpDir, lpSI, lpPI);
-    }
-    PROCESS_INFORMATION local_pi;
-    memset(&local_pi, 0, sizeof(local_pi));
-    LPPROCESS_INFORMATION out_pi = lpPI ? lpPI : &local_pi;
-    WCHAR *merged_env = ds_build_merged_child_env_w(lpEnv, dwFlags);
-    BOOL ok = g_ds.real_CreateProcessA(
-        lpApp, lpCmd, lpPA, lpTA, bInherit,
-        (merged_env ? (dwFlags | CREATE_UNICODE_ENVIRONMENT) : dwFlags) | CREATE_SUSPENDED,
-        merged_env ? (LPVOID)merged_env : lpEnv, lpDir, lpSI, out_pi
-    );
-    return ds_finish_created_process(ok, GetLastError(), merged_env, (dwFlags & CREATE_SUSPENDED) != 0, lpPI, out_pi);
+    return ds_create_process_common(false, lpApp, lpCmd, lpPA, lpTA, bInherit, dwFlags, lpEnv, lpDir, lpSI, lpPI);
 }
 
 /* -------------------------------------------------------------------------
@@ -2818,18 +2764,14 @@ static bool ds_is_batch_extension_w(const WCHAR *path)
     size_t len = wcslen(path);
     if (len < 4) return false;
     const WCHAR *ext = path + len - 4;
-    return (_wcsicmp(ext, L".bat") == 0 || _wcsicmp(ext, L".cmd") == 0);
+    return (ds_wcs_ieq_ascii(ext, ".bat") || ds_wcs_ieq_ascii(ext, ".cmd"));
 }
 
 static bool ds_is_exe_extension_w(const WCHAR *path)
 {
     if (!path) return false;
     size_t len = wcslen(path);
-    if (len < 4) return false;
-    const WCHAR *ext = path + len - 4;
-    return (_wcsicmp(ext, L".exe") == 0 ||
-            _wcsicmp(ext, L".bat") == 0 ||
-            _wcsicmp(ext, L".cmd") == 0);
+    return len >= 4 && (ds_wcs_ieq_ascii(path + len - 4, ".exe") || ds_is_batch_extension_w(path));
 }
 
 static bool ds_is_url_or_protocol_w(const WCHAR *str)
@@ -2944,7 +2886,7 @@ static BOOL WINAPI hook_ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
     }
 
     const WCHAR *verb = pExecInfo->lpVerb;
-    bool is_open_verb = (!verb || !verb[0] || _wcsicmp(verb, L"open") == 0 || _wcsicmp(verb, L"runas") == 0);
+    bool is_open_verb = (!verb || !verb[0] || ds_wcs_ieq_ascii(verb, "open") || ds_wcs_ieq_ascii(verb, "runas"));
     const WCHAR *file = pExecInfo->lpFile;
 
     if (is_open_verb && file && file[0]) {
@@ -3084,29 +3026,29 @@ static BOOL WINAPI hook_ShellExecuteExA(SHELLEXECUTEINFOA *pExecInfo)
         return real_sea ? real_sea(pExecInfo) : FALSE;
     }
 
-    WCHAR *wFile = ds_alloc_wide_from_acp(pExecInfo->lpFile);
-    WCHAR *wVerb = ds_alloc_wide_from_acp(pExecInfo->lpVerb);
-    WCHAR *wParams = ds_alloc_wide_from_acp(pExecInfo->lpParameters);
-    WCHAR *wDir = ds_alloc_wide_from_acp(pExecInfo->lpDirectory);
+    WCHAR *wstrs[4] = {
+        ds_alloc_wide_from_acp(pExecInfo->lpFile),
+        ds_alloc_wide_from_acp(pExecInfo->lpVerb),
+        ds_alloc_wide_from_acp(pExecInfo->lpParameters),
+        ds_alloc_wide_from_acp(pExecInfo->lpDirectory),
+    };
 
     SHELLEXECUTEINFOW seiW;
     memset(&seiW, 0, sizeof(seiW));
     seiW.cbSize = sizeof(seiW);
     seiW.fMask = pExecInfo->fMask;
     seiW.hwnd = pExecInfo->hwnd;
-    seiW.lpVerb = wVerb;
-    seiW.lpFile = wFile;
-    seiW.lpParameters = wParams;
-    seiW.lpDirectory = wDir;
+    seiW.lpFile = wstrs[0];
+    seiW.lpVerb = wstrs[1];
+    seiW.lpParameters = wstrs[2];
+    seiW.lpDirectory = wstrs[3];
     seiW.nShow = pExecInfo->nShow;
 
     BOOL ok = hook_ShellExecuteExW(&seiW);
     DWORD last_err = GetLastError();
-
-    if (wFile) HeapFree(GetProcessHeap(), 0, wFile);
-    if (wVerb) HeapFree(GetProcessHeap(), 0, wVerb);
-    if (wParams) HeapFree(GetProcessHeap(), 0, wParams);
-    if (wDir) HeapFree(GetProcessHeap(), 0, wDir);
+    for (int i = 0; i < 4; i++) {
+        if (wstrs[i]) HeapFree(GetProcessHeap(), 0, wstrs[i]);
+    }
 
     pExecInfo->hInstApp = seiW.hInstApp;
     if (ok) {
@@ -3438,8 +3380,8 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     if ((mflags & DS_MODF_SKIP_IAT) != 0) return;
 
     bool is_com_loader_only_mod = (
-        _wcsicmp(base, L"ole32.dll") == 0 ||
-        _wcsicmp(base, L"combase.dll") == 0
+        ds_wcs_ieq_ascii(base, "ole32.dll") ||
+        ds_wcs_ieq_ascii(base, "combase.dll")
     );
     bool is_wine_gfx_mod = ((mflags & (DS_MODF_WINED3D | DS_MODF_DDRAW | DS_MODF_D3D8 | DS_MODF_D3D9)) != 0);
 
@@ -3604,6 +3546,10 @@ static FARPROC WINAPI hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
             if (w3d_gl != (void *)(uintptr_t)real_fn) {
                 return (FARPROC)(uintptr_t)w3d_gl;
             }
+            void *w3d_vk = ds_resolve_wined3d_vk_proc(lpProcName, (void *)(uintptr_t)real_fn);
+            if (w3d_vk != (void *)(uintptr_t)real_fn) {
+                return (FARPROC)(uintptr_t)w3d_vk;
+            }
         }
         return real_fn;
     }
@@ -3656,22 +3602,24 @@ static HMODULE WINAPI hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
  * Initialization, Lazy Runtime Start & `DllMain`
  * ------------------------------------------------------------------------- */
 
-static void ds_read_env_w(const WCHAR *name, WCHAR *out_buf, size_t max_chars)
+static void ds_read_env_w(const char *name_a, WCHAR *out_buf, size_t max_chars)
 {
     out_buf[0] = L'\0';
-    DWORD n = GetEnvironmentVariableW(name, out_buf, (DWORD)max_chars);
+    WCHAR wk[48];
+    ds_ascii_to_w(name_a, wk, 48);
+    DWORD n = GetEnvironmentVariableW(wk, out_buf, (DWORD)max_chars);
     if (n == 0 || n >= (DWORD)max_chars) {
         out_buf[0] = L'\0';
     }
 }
 
-static void ds_read_env_utf8(const WCHAR *name, char *out_buf, size_t max_bytes)
+static void ds_read_env_utf8(const char *name, char *out_buf, size_t max_bytes)
 {
     out_buf[0] = '\0';
-    WCHAR wbuf[256] = { 0 };
-    DWORD n = GetEnvironmentVariableW(name, wbuf, 255);
-    if (n == 0 || n >= 255) return;
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out_buf, (int)max_bytes, NULL, NULL);
+    DWORD n = GetEnvironmentVariableA(name, out_buf, (DWORD)max_bytes);
+    if (n == 0 || n >= (DWORD)max_bytes) {
+        out_buf[0] = '\0';
+    }
 }
 
 static bool ds_read_ini_file_raw(const WCHAR *path, ds_control_state_t *out_ctl)
@@ -3744,14 +3692,14 @@ static void ds_probe_wined3d_vulkan_registry(void)
             LONG qres = pQuery(hk, L"renderer", NULL, &val_type, (LPBYTE)val, &val_sz);
             pClose(hk);
             if (qres == ERROR_SUCCESS && val_type == REG_SZ) {
-                if (_wcsicmp(val, L"vulkan") == 0) {
+                if (ds_wcs_ieq_ascii(val, "vulkan")) {
                     ds_lock();
                     g_ds.wined3d_uses_vulkan = true;
                     (void)ds_update_presenter_tier_locked();
                     ds_unlock();
                     return;
                 }
-                if (_wcsicmp(val, L"gl") == 0) {
+                if (ds_wcs_ieq_ascii(val, "gl")) {
                     return;
                 }
             }
@@ -3868,7 +3816,7 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
     if (phys_h <= 0) phys_h = win_h;
 
     char inset_str[32] = { 0 };
-    ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
+    ds_read_env_utf8("ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
 
     ds_lock();
     g_ds.target_monitor = hmon;
@@ -4037,6 +3985,15 @@ void ds_ensure_runtime_started(void)
     }
 }
 
+static void ds_apply_init_ctl_fields(const ds_control_state_t *c)
+{
+    if (c->has_scaling_mode)   g_ds.scaling_mode   = c->scaling_mode;
+    if (c->has_aspect)         g_ds.aspect_mode    = c->aspect;
+    if (c->has_filter)         g_ds.scale_filter   = c->filter;
+    if (c->has_safe_inset_top) g_ds.safe_inset_top = c->safe_inset_top;
+    if (c->has_hotkey)         g_ds.hotkey_enabled = c->hotkey;
+}
+
 static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
 {
     bool is_chaining_wrapper = ds_is_passthrough_chaining_process();
@@ -4058,15 +4015,15 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     }
 
     char ev[64];
-    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_SCALING_MODE", ev, sizeof(ev));
+    ds_read_env_utf8("ONE_LAUNCHER_DISPLAY_SCALING_MODE", ev, sizeof(ev));
     g_ds.scaling_mode = ev[0] ? ds_parse_scaling_mode(ev) : DS_MODE_AUTO_FULLSCREEN;
-    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_ASPECT", ev, sizeof(ev));
+    ds_read_env_utf8("ONE_LAUNCHER_DISPLAY_ASPECT", ev, sizeof(ev));
     g_ds.aspect_mode = ev[0] ? ds_parse_aspect_mode(ev) : DS_ASPECT_PRESERVE;
-    ds_read_env_utf8(L"ONE_LAUNCHER_SCALING_FILTER", ev, sizeof(ev));
+    ds_read_env_utf8("ONE_LAUNCHER_SCALING_FILTER", ev, sizeof(ev));
     g_ds.scale_filter = ev[0] ? ds_parse_scale_filter(ev) : DS_FILTER_AUTO;
-    ds_read_env_utf8(L"ONE_LAUNCHER_FULLSCREEN_HOTKEY", ev, sizeof(ev));
+    ds_read_env_utf8("ONE_LAUNCHER_FULLSCREEN_HOTKEY", ev, sizeof(ev));
     g_ds.hotkey_enabled = (ev[0] != '0');
-    ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", ev, sizeof(ev));
+    ds_read_env_utf8("ONE_LAUNCHER_SAFE_INSET_TOP", ev, sizeof(ev));
     g_ds.safe_inset_top = ev[0] ? (int32_t)atoi(ev) : 0;
 
     for (size_t i = 0; i < sizeof(k_ds_path_envs) / sizeof(k_ds_path_envs[0]); i++) {
@@ -4074,14 +4031,16 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     }
 
     if (g_ds.self_dir[0]) {
-        static const WCHAR *const k_sib_names[4] = {
-            L"one_display_scaler_x86.dll",
-            L"one_display_scaler_x64.dll",
-            L"one_display_launcher_x86.exe",
-            L"one_display_launcher_x64.exe"
+        static const char k_sib_names[4][30] = {
+            "one_display_scaler_x86.dll",
+            "one_display_scaler_x64.dll",
+            "one_display_launcher_x86.exe",
+            "one_display_launcher_x64.exe"
         };
         for (size_t i = 0; i < 4; i++) {
-            ds_fill_sibling_path_if_empty(ds_path_env_field(i), MAX_PATH, g_ds.self_dir, k_sib_names[i]);
+            WCHAR leaf[32];
+            ds_ascii_to_w(k_sib_names[i], leaf, 32);
+            ds_fill_sibling_path_if_empty(ds_path_env_field(i), MAX_PATH, g_ds.self_dir, leaf);
         }
     }
 
@@ -4106,11 +4065,7 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
                 MultiByteToWideChar(CP_UTF8, 0, act_ctl.status_file, -1, g_ds.status_file, MAX_PATH);
                 g_ds.status_file[MAX_PATH - 1] = L'\0';
             }
-            if (act_ctl.has_scaling_mode)   g_ds.scaling_mode   = act_ctl.scaling_mode;
-            if (act_ctl.has_aspect)         g_ds.aspect_mode    = act_ctl.aspect;
-            if (act_ctl.has_filter)         g_ds.scale_filter   = act_ctl.filter;
-            if (act_ctl.has_safe_inset_top) g_ds.safe_inset_top = act_ctl.safe_inset_top;
-            if (act_ctl.has_hotkey)         g_ds.hotkey_enabled = act_ctl.hotkey;
+            ds_apply_init_ctl_fields(&act_ctl);
         }
     }
 
@@ -4118,12 +4073,8 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     if (g_ds.control_file[0]) {
         ds_control_state_t init_ctl;
         if (ds_read_ini_file_raw(g_ds.control_file, &init_ctl)) {
-            if (init_ctl.has_seq)            initial_ctl_seq     = init_ctl.seq;
-            if (init_ctl.has_scaling_mode)   g_ds.scaling_mode   = init_ctl.scaling_mode;
-            if (init_ctl.has_aspect)         g_ds.aspect_mode    = init_ctl.aspect;
-            if (init_ctl.has_filter)         g_ds.scale_filter   = init_ctl.filter;
-            if (init_ctl.has_safe_inset_top) g_ds.safe_inset_top = init_ctl.safe_inset_top;
-            if (init_ctl.has_hotkey)         g_ds.hotkey_enabled = init_ctl.hotkey;
+            if (init_ctl.has_seq) initial_ctl_seq = init_ctl.seq;
+            ds_apply_init_ctl_fields(&init_ctl);
             if (init_ctl.has_fullscreen && init_ctl.user_override) {
                 g_ds.user_forced_fullscreen = init_ctl.fullscreen;
                 g_ds.user_forced_windowed = !init_ctl.fullscreen;
@@ -4161,7 +4112,7 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
 
     if (!is_chaining_wrapper) {
         char aff_env[16] = { 0 };
-        ds_read_env_utf8(L"ONE_LAUNCHER_SINGLE_CORE_AFFINITY", aff_env, sizeof(aff_env));
+        ds_read_env_utf8("ONE_LAUNCHER_SINGLE_CORE_AFFINITY", aff_env, sizeof(aff_env));
         bool want_up = (aff_env[0] == '1');
 #if !defined(_WIN64)
         if (!want_up && aff_env[0] != '0') {
