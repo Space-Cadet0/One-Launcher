@@ -276,8 +276,15 @@ export type GlobalDisplayAspectRatioMode = Exclude<DisplayAspectRatioMode, 'defa
 
 export type VirtualDesktopResolutionPreset =
   | 'auto'
+  | '3840x2160'
+  | '3440x1440'
+  | '3024x1964'
+  | '2560x1600'
+  | '2560x1440'
   | '1920x1080'
+  | '1728x1117'
   | '1600x900'
+  | '1512x982'
   | '1280x720'
   | '1024x768'
   | '800x600';
@@ -387,7 +394,7 @@ export interface StorefrontLaunchProfile {
   displayScalingMode?: BottleDisplayScalingMode;
   /** Bottled macOS fullscreen aspect ratio & filter policy ('default' inherits global LauncherPerformanceSettings) */
   displayAspectRatio?: DisplayAspectRatioMode;
-  /** Wine Mac Driver display mode emulation override (EmulateModeset) */
+  /** Wine display mode emulation override (X11 Driver\EmulateModeset) */
   emulateModeset?: boolean;
   /** 32-bit PE32 4 GB address space override (WINE_LARGE_ADDRESS_AWARE) */
   forceLargeAddressAware?: boolean;

@@ -24,6 +24,9 @@ extern "C" {
 /* Maximum synthesized DEVMODE entries (< 64 so fixed 64-slot legacy mode buffers never overflow) */
 #define DS_MAX_SYNTH_MODES 52u
 
+/* Maximum OS-union DEVMODE entries for non-legacy / 64-bit targets */
+#define DS_MAX_UNION_MODES 128u
+
 typedef enum ds_scaling_mode_e {
     DS_MODE_PASSTHROUGH      = 0,
     DS_MODE_AUTO_FULLSCREEN  = 1,
@@ -90,6 +93,8 @@ typedef struct ds_control_state_s {
     ds_scaling_mode_t scaling_mode;
     bool              has_hotkey;
     bool              hotkey;
+    bool              has_user_override;
+    bool              user_override;
     bool              has_updated_unix_ms;
     uint64_t          updated_unix_ms;
     bool              has_control_file;
@@ -127,6 +132,16 @@ size_t ds_build_mode_table(
     int32_t            native_hz,
     ds_display_mode_t *out_modes,
     size_t             max_modes
+);
+
+/* Unions OS-reported modes with synthesized modes, deduplicating by (w, h, bpp) preferring OS Hz */
+size_t ds_merge_mode_tables(
+    const ds_display_mode_t *os_modes,
+    size_t                   os_count,
+    const ds_display_mode_t *synth_modes,
+    size_t                   synth_count,
+    ds_display_mode_t       *out_modes,
+    size_t                   max_modes
 );
 
 /* 2D physical <-> virtual cursor coordinate mapping (clamped to [0..virt_w-1, 0..virt_h-1]) */

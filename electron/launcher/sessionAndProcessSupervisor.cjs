@@ -722,7 +722,8 @@ function shouldWrapBottleSessionWithDisplayLauncher(
     effectiveCaps &&
       !effectiveCaps.is32Bit &&
       effectiveCaps.is64Bit &&
-      (effectiveCaps.importsD3d12 ||
+      (effectiveCaps.usesModernGraphicsApi ||
+        effectiveCaps.importsD3d12 ||
         effectiveCaps.importsD3d11Or10 ||
         effectiveCaps.importsVulkan ||
         effectiveCaps.importsModernSdl ||
@@ -738,21 +739,27 @@ function shouldWrapBottleSessionWithDisplayLauncher(
 /**
  * Format the `display_ctl_<sessionId>.ini` control file consumed by `one_display_scaler`.
  * Interface Contract 1: display_ctl writes safe_inset_top = 0 under universal fullscreen.
+ * Preserves the exact 4-line contract whenever `userOverride` is omitted or matches `(seq > 1)`.
  *
  * @param {number} seq
  * @param {boolean} fullscreen
  * @param {string} aspect
  * @param {number} [safeInsetTop=0]
+ * @param {boolean} [userOverride]
  * @returns {string}
  */
-function formatDisplayScalerControlIni(seq, fullscreen, aspect, safeInsetTop = 0) {
+function formatDisplayScalerControlIni(seq, fullscreen, aspect, safeInsetTop = 0, userOverride) {
   const safeSeq = Math.max(1, Math.floor(Number(seq) || 1));
   const safeAspect = VALID_DISPLAY_ASPECT_MODES.has(aspect) ? aspect : 'preserve_aspect';
   let safe_inset_top = 0;
   if (typeof safeInsetTop === 'number' && Number.isFinite(safeInsetTop)) {
     safe_inset_top = Math.max(0, Math.min(80, Math.round(safeInsetTop)));
   }
-  return `seq=${safeSeq}\nfullscreen=${fullscreen ? 1 : 0}\naspect=${safeAspect}\nsafe_inset_top=${safe_inset_top}\n`;
+  const base = `seq=${safeSeq}\nfullscreen=${fullscreen ? 1 : 0}\naspect=${safeAspect}\nsafe_inset_top=${safe_inset_top}\n`;
+  if (typeof userOverride === 'boolean' && userOverride !== (safeSeq > 1)) {
+    return `${base}user_override=${userOverride ? 1 : 0}\n`;
+  }
+  return base;
 }
 
 let lastActiveSessionManifestMs = 0;
@@ -4327,51 +4334,92 @@ async function launchChainedPublisherGame(ctx) {
         : (typeof options?.safeInsetTop === 'number' && Number.isFinite(options.safeInsetTop)
             ? Math.max(0, Math.min(80, Math.round(options.safeInsetTop)))
             : 0);
-    bottleEnv.ONE_LAUNCHER_DISPLAY_SCALING_MODE = chainedDisplayScalingMode;
-    bottleEnv.ONE_LAUNCHER_DISPLAY_ASPECT = chainedDisplayAspectRatio;
-    bottleEnv.ONE_LAUNCHER_SAFE_INSET_TOP = String(chainedSafeInsetTop);
-    bottleEnv.ONE_LAUNCHER_FULLSCREEN_HOTKEY = chainedFullscreenHotkey ? '1' : '0';
+    const shouldWrapChainedDisplayScaler = shouldWrapBottleSessionWithDisplayLauncher(
+      chainedEffectiveCaps,
+      chainedDisplayScalingMode,
+      userLaunchArgs.join(' ')
+    );
     /** @type {ReturnType<typeof stageBottleDisplayScalerBinaries> | null} */
     let stagedChainedDisp = null;
-    if (bottlePath && fs.existsSync(bottlePath)) {
-      stagedChainedDisp = stageBottleDisplayScalerBinaries(bottlePath, options);
-      if (stagedChainedDisp.stageDirPosix) {
-        chainedDisplayControlFilePosix = path.join(
-          stagedChainedDisp.stageDirPosix,
-          `display_ctl_${chainedSessionId}.ini`
-        );
-        chainedDisplayStatusFilePosix = path.join(
-          stagedChainedDisp.stageDirPosix,
-          `display_status_${chainedSessionId}.json`
-        );
-        const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${chainedSessionId}.ini`;
-        const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${chainedSessionId}.json`;
-        try {
-          atomicWriteFileSync(
-            chainedDisplayControlFilePosix,
-            formatDisplayScalerControlIni(
-              1,
-              chainedInitialFullscreen,
-              chainedDisplayAspectRatio,
-              chainedSafeInsetTop
-            )
+    if (shouldWrapChainedDisplayScaler) {
+      bottleEnv.ONE_LAUNCHER_DISPLAY_SCALING_MODE = chainedDisplayScalingMode;
+      bottleEnv.ONE_LAUNCHER_DISPLAY_ASPECT = chainedDisplayAspectRatio;
+      bottleEnv.ONE_LAUNCHER_SAFE_INSET_TOP = String(chainedSafeInsetTop);
+      bottleEnv.ONE_LAUNCHER_FULLSCREEN_HOTKEY = chainedFullscreenHotkey ? '1' : '0';
+      if (bottlePath && fs.existsSync(bottlePath)) {
+        stagedChainedDisp = stageBottleDisplayScalerBinaries(bottlePath, options);
+        if (stagedChainedDisp.stageDirPosix) {
+          chainedDisplayControlFilePosix = path.join(
+            stagedChainedDisp.stageDirPosix,
+            `display_ctl_${chainedSessionId}.ini`
           );
-          writeActiveDisplaySessionManifestIni(stagedChainedDisp.stageDirPosix, {
-            seq: 1,
-            mode: chainedDisplayScalingMode,
-            aspect: chainedDisplayAspectRatio,
-            safeInsetTop: chainedSafeInsetTop,
-            hotkey: chainedFullscreenHotkey,
-            controlFileWin: winCtlFile,
-            statusFileWin: winStatusFile,
-          });
-        } catch {}
-        bottleEnv.ONE_LAUNCHER_SCALER_DLL_X86 = stagedChainedDisp.winDllX86;
-        bottleEnv.ONE_LAUNCHER_SCALER_DLL_X64 = stagedChainedDisp.winDllX64;
-        bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X86 = stagedChainedDisp.winLauncherX86;
-        bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X64 = stagedChainedDisp.winLauncherX64;
-        bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
-        bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
+          chainedDisplayStatusFilePosix = path.join(
+            stagedChainedDisp.stageDirPosix,
+            `display_status_${chainedSessionId}.json`
+          );
+          const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${chainedSessionId}.ini`;
+          const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${chainedSessionId}.json`;
+          try {
+            atomicWriteFileSync(
+              chainedDisplayControlFilePosix,
+              formatDisplayScalerControlIni(
+                1,
+                chainedInitialFullscreen,
+                chainedDisplayAspectRatio,
+                chainedSafeInsetTop
+              )
+            );
+            writeActiveDisplaySessionManifestIni(stagedChainedDisp.stageDirPosix, {
+              seq: 1,
+              mode: chainedDisplayScalingMode,
+              aspect: chainedDisplayAspectRatio,
+              safeInsetTop: chainedSafeInsetTop,
+              hotkey: chainedFullscreenHotkey,
+              controlFileWin: winCtlFile,
+              statusFileWin: winStatusFile,
+            });
+          } catch {}
+          bottleEnv.ONE_LAUNCHER_SCALER_DLL_X86 = stagedChainedDisp.winDllX86;
+          bottleEnv.ONE_LAUNCHER_SCALER_DLL_X64 = stagedChainedDisp.winDllX64;
+          bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X86 = stagedChainedDisp.winLauncherX86;
+          bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X64 = stagedChainedDisp.winLauncherX64;
+          bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
+          bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
+        }
+      }
+    } else {
+      delete bottleEnv.ONE_LAUNCHER_SCALER_DLL_X86;
+      delete bottleEnv.ONE_LAUNCHER_SCALER_DLL_X64;
+      delete bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X86;
+      delete bottleEnv.ONE_LAUNCHER_LAUNCHER_EXE_X64;
+      delete bottleEnv.ONE_LAUNCHER_DISPLAY_CONTROL_FILE;
+      delete bottleEnv.ONE_LAUNCHER_DISPLAY_STATUS_FILE;
+      bottleEnv.ONE_LAUNCHER_DISPLAY_SCALING_MODE =
+        chainedDisplayScalingMode === 'windowed' ? 'windowed' : 'off';
+      bottleEnv.ONE_LAUNCHER_DISPLAY_ASPECT = chainedDisplayAspectRatio;
+      bottleEnv.ONE_LAUNCHER_SAFE_INSET_TOP = String(chainedSafeInsetTop);
+      bottleEnv.ONE_LAUNCHER_FULLSCREEN_HOTKEY = '0';
+      if (bottlePath && fs.existsSync(bottlePath)) {
+        const existingStageDir = path.join(
+          bottlePath,
+          'drive_c',
+          'ProgramData',
+          'OneLauncher',
+          'display_scaler'
+        );
+        if (fs.existsSync(existingStageDir)) {
+          try {
+            writeActiveDisplaySessionManifestIni(existingStageDir, {
+              seq: 1,
+              mode: 'off',
+              aspect: chainedDisplayAspectRatio,
+              safeInsetTop: 0,
+              hotkey: false,
+              controlFileWin: '',
+              statusFileWin: '',
+            });
+          } catch {}
+        }
       }
     }
 
@@ -4431,11 +4479,7 @@ async function launchChainedPublisherGame(ctx) {
     const canWrapChainedDisplayScaler =
       (!isTestEnvironment(options) || options.enableDisplayScalerInTests === true) &&
       Boolean(stagedChainedDisp && stagedChainedDisp.allPresent) &&
-      shouldWrapBottleSessionWithDisplayLauncher(
-        chainedEffectiveCaps,
-        chainedDisplayScalingMode,
-        userLaunchArgs.join(' ')
-      );
+      shouldWrapChainedDisplayScaler;
     /** @type {any} */
     let chainedDisplayWatcherChild = null;
     const chainedWatchTargetDir =
@@ -4443,12 +4487,18 @@ async function launchChainedPublisherGame(ctx) {
     if (canWrapChainedDisplayScaler && stagedChainedDisp && bottlePath && chainedWatchTargetDir) {
       try {
         const winWatchDir = toWineWindowsPath(chainedWatchTargetDir, bottlePath);
-        if (winWatchDir) {
+        const chainedWatchLauncherPosix =
+          (chainedEffectiveCaps?.is64Bit
+            ? stagedChainedDisp.launcherX64Posix
+            : stagedChainedDisp.launcherX86Posix) ||
+          stagedChainedDisp.launcherX64Posix ||
+          stagedChainedDisp.launcherX86Posix;
+        if (winWatchDir && chainedWatchLauncherPosix) {
           chainedDisplayWatcherChild = gameSpawnImpl(
             wineSpawnCmd,
             [
               ...chainedDllArgs,
-              stagedChainedDisp.launcherX86Posix,
+              chainedWatchLauncherPosix,
               '--watch-dir',
               winWatchDir,
               '--dll-x86',
@@ -4487,6 +4537,7 @@ async function launchChainedPublisherGame(ctx) {
       fullscreenActive: chainedInitialFullscreen,
       displayScalingMode: chainedDisplayScalingMode,
       displayAspectRatio: chainedDisplayAspectRatio,
+      targetExeBasenamesLower: candidateExeNames,
     };
 
     const resolvedWineBinary = chosenLayer.binaryPath || null;
@@ -4502,6 +4553,7 @@ async function launchChainedPublisherGame(ctx) {
       pid: isDirectGameExeSpawn ? child?.pid || 0 : 0,
       elevatedTargetPid: 0,
       reLatchedBottleChildPid: 0,
+      is64Bit: Boolean(chainedEffectiveCaps?.is64Bit),
       isChainedPublisherLauncher: true,
       chainedLauncherHandoff: chainedHandoffId,
       launchedViaPublisherClient: !isDirectGameExeSpawn,
@@ -6827,11 +6879,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               localInstallDir && fs.existsSync(localInstallDir)
                 ? path.resolve(localInstallDir)
                 : '';
-            const effectiveSanitizeHighRes =
-              compatLayerCapOptions.enableLegacyDisplayModeSynthesis ||
-              compatLayerCapOptions.usesLegacyDirectDraw
-                ? false
-                : launchConfig.crossoverHighResolutionMode;
+            const effectiveSanitizeHighRes = launchConfig.crossoverHighResolutionMode;
             const sanitizeKey = `${path.resolve(targetWinePrefix)}:${String(effectiveSanitizeHighRes)}:${String(effectivePerfPolicy.effectiveDisplayScalingMode)}:${String(effectivePerfPolicy.effectiveDisplayAspectRatio)}:${installDirKey}`;
             const lastSanitizedAt = recentDisplaySanitizeCache.get(sanitizeKey) || 0;
             if (
@@ -7423,63 +7471,100 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
                 : (typeof options?.safeInsetTop === 'number' && Number.isFinite(options.safeInsetTop)
                     ? Math.max(0, Math.min(80, Math.round(options.safeInsetTop)))
                     : 0);
-            env.ONE_LAUNCHER_DISPLAY_SCALING_MODE = effectiveDisplayScalingMode;
-            env.ONE_LAUNCHER_DISPLAY_ASPECT = effectiveDisplayAspectRatio;
-            env.ONE_LAUNCHER_SAFE_INSET_TOP = String(safeInsetTop);
-            env.ONE_LAUNCHER_FULLSCREEN_HOTKEY = enableFullscreenHotkey ? '1' : '0';
+            const shouldWrapDisplayScaler = shouldWrapBottleSessionWithDisplayLauncher(
+              effectiveCaps,
+              effectiveDisplayScalingMode,
+              effectiveLaunchArgsStr
+            );
 
-            if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
-              bottleDisplayStagedInfo = stageBottleDisplayScalerBinaries(targetWinePrefix, options);
-              if (bottleDisplayStagedInfo.stageDirPosix) {
-                bottleDisplayControlFilePosix = path.join(
-                  bottleDisplayStagedInfo.stageDirPosix,
-                  `display_ctl_${preGeneratedSessionId}.ini`
-                );
-                bottleDisplayStatusFilePosix = path.join(
-                  bottleDisplayStagedInfo.stageDirPosix,
-                  `display_status_${preGeneratedSessionId}.json`
-                );
-                const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${preGeneratedSessionId}.ini`;
-                const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${preGeneratedSessionId}.json`;
-                try {
-                  atomicWriteFileSync(
-                    bottleDisplayControlFilePosix,
-                    formatDisplayScalerControlIni(
-                      1,
-                      initialBottleFullscreen,
-                      effectiveDisplayAspectRatio,
-                      safeInsetTop
-                    )
+            if (shouldWrapDisplayScaler) {
+              env.ONE_LAUNCHER_DISPLAY_SCALING_MODE = effectiveDisplayScalingMode;
+              env.ONE_LAUNCHER_DISPLAY_ASPECT = effectiveDisplayAspectRatio;
+              env.ONE_LAUNCHER_SAFE_INSET_TOP = String(safeInsetTop);
+              env.ONE_LAUNCHER_FULLSCREEN_HOTKEY = enableFullscreenHotkey ? '1' : '0';
+
+              if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
+                bottleDisplayStagedInfo = stageBottleDisplayScalerBinaries(targetWinePrefix, options);
+                if (bottleDisplayStagedInfo.stageDirPosix) {
+                  bottleDisplayControlFilePosix = path.join(
+                    bottleDisplayStagedInfo.stageDirPosix,
+                    `display_ctl_${preGeneratedSessionId}.ini`
                   );
-                  writeActiveDisplaySessionManifestIni(bottleDisplayStagedInfo.stageDirPosix, {
-                    seq: 1,
-                    mode: effectiveDisplayScalingMode,
-                    aspect: effectiveDisplayAspectRatio,
-                    safeInsetTop,
-                    hotkey: enableFullscreenHotkey,
-                    controlFileWin: winCtlFile,
-                    statusFileWin: winStatusFile,
-                  });
-                } catch {}
-                env.ONE_LAUNCHER_SCALER_DLL_X86 = bottleDisplayStagedInfo.winDllX86;
-                env.ONE_LAUNCHER_SCALER_DLL_X64 = bottleDisplayStagedInfo.winDllX64;
-                env.ONE_LAUNCHER_LAUNCHER_EXE_X86 = bottleDisplayStagedInfo.winLauncherX86;
-                env.ONE_LAUNCHER_LAUNCHER_EXE_X64 = bottleDisplayStagedInfo.winLauncherX64;
-                env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
-                env.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
+                  bottleDisplayStatusFilePosix = path.join(
+                    bottleDisplayStagedInfo.stageDirPosix,
+                    `display_status_${preGeneratedSessionId}.json`
+                  );
+                  const winCtlFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_ctl_${preGeneratedSessionId}.ini`;
+                  const winStatusFile = `C:\\ProgramData\\OneLauncher\\display_scaler\\display_status_${preGeneratedSessionId}.json`;
+                  try {
+                    atomicWriteFileSync(
+                      bottleDisplayControlFilePosix,
+                      formatDisplayScalerControlIni(
+                        1,
+                        initialBottleFullscreen,
+                        effectiveDisplayAspectRatio,
+                        safeInsetTop
+                      )
+                    );
+                    writeActiveDisplaySessionManifestIni(bottleDisplayStagedInfo.stageDirPosix, {
+                      seq: 1,
+                      mode: effectiveDisplayScalingMode,
+                      aspect: effectiveDisplayAspectRatio,
+                      safeInsetTop,
+                      hotkey: enableFullscreenHotkey,
+                      controlFileWin: winCtlFile,
+                      statusFileWin: winStatusFile,
+                    });
+                  } catch {}
+                  env.ONE_LAUNCHER_SCALER_DLL_X86 = bottleDisplayStagedInfo.winDllX86;
+                  env.ONE_LAUNCHER_SCALER_DLL_X64 = bottleDisplayStagedInfo.winDllX64;
+                  env.ONE_LAUNCHER_LAUNCHER_EXE_X86 = bottleDisplayStagedInfo.winLauncherX86;
+                  env.ONE_LAUNCHER_LAUNCHER_EXE_X64 = bottleDisplayStagedInfo.winLauncherX64;
+                  env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE = winCtlFile;
+                  env.ONE_LAUNCHER_DISPLAY_STATUS_FILE = winStatusFile;
+                }
               }
-            }
 
-            const canInjectDisplayScaler =
-              (!isTestEnvironment(options) || options.enableDisplayScalerInTests === true) &&
-              Boolean(bottleDisplayStagedInfo && bottleDisplayStagedInfo.allPresent);
-            wantDisplayLauncherWrap =
-              canInjectDisplayScaler &&
-              shouldWrapBottleSessionWithDisplayLauncher(
-                effectiveCaps,
-                effectiveDisplayScalingMode,
-                effectiveLaunchArgsStr
-              );
+              const canInjectDisplayScaler =
+                (!isTestEnvironment(options) || options.enableDisplayScalerInTests === true) &&
+                Boolean(bottleDisplayStagedInfo && bottleDisplayStagedInfo.allPresent);
+              wantDisplayLauncherWrap = canInjectDisplayScaler;
+            } else {
+              delete env.ONE_LAUNCHER_SCALER_DLL_X86;
+              delete env.ONE_LAUNCHER_SCALER_DLL_X64;
+              delete env.ONE_LAUNCHER_LAUNCHER_EXE_X86;
+              delete env.ONE_LAUNCHER_LAUNCHER_EXE_X64;
+              delete env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE;
+              delete env.ONE_LAUNCHER_DISPLAY_STATUS_FILE;
+              env.ONE_LAUNCHER_DISPLAY_SCALING_MODE =
+                effectiveDisplayScalingMode === 'windowed' ? 'windowed' : 'off';
+              env.ONE_LAUNCHER_DISPLAY_ASPECT = effectiveDisplayAspectRatio;
+              env.ONE_LAUNCHER_SAFE_INSET_TOP = String(safeInsetTop);
+              env.ONE_LAUNCHER_FULLSCREEN_HOTKEY = '0';
+              if (targetWinePrefix && fs.existsSync(targetWinePrefix)) {
+                const existingStageDir = path.join(
+                  targetWinePrefix,
+                  'drive_c',
+                  'ProgramData',
+                  'OneLauncher',
+                  'display_scaler'
+                );
+                if (fs.existsSync(existingStageDir)) {
+                  try {
+                    writeActiveDisplaySessionManifestIni(existingStageDir, {
+                      seq: 1,
+                      mode: 'off',
+                      aspect: effectiveDisplayAspectRatio,
+                      safeInsetTop: 0,
+                      hotkey: false,
+                      controlFileWin: '',
+                      statusFileWin: '',
+                    });
+                  } catch {}
+                }
+              }
+              wantDisplayLauncherWrap = false;
+            }
           }
 
           if (shouldLaunchViaBottleSteam && bottleSteamExe) {
@@ -8435,12 +8520,18 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             ) {
               try {
                 const winWatchDir = toWineWindowsPath(localInstallDir, targetWinePrefix);
-                if (winWatchDir) {
+                const bottleWatchLauncherPosix =
+                  (effectiveCaps?.is64Bit
+                    ? bottleDisplayStagedInfo.launcherX64Posix
+                    : bottleDisplayStagedInfo.launcherX86Posix) ||
+                  bottleDisplayStagedInfo.launcherX64Posix ||
+                  bottleDisplayStagedInfo.launcherX86Posix;
+                if (winWatchDir && bottleWatchLauncherPosix) {
                   bottleDisplayWatcherChild = gameSpawnImpl(
                     spawnCmd,
                     [
                       ...bottleSteamDisplayDllArgs,
-                      bottleDisplayStagedInfo.launcherX86Posix,
+                      bottleWatchLauncherPosix,
                       '--watch-dir',
                       winWatchDir,
                       '--dll-x86',
@@ -8471,36 +8562,6 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
             }
 
             const isBottledMacSession = Boolean(useCompatLayer && platform === 'darwin');
-            const session = {
-              sessionId: preGeneratedSessionId,
-              gameId,
-              title: String(payload.title || gameId),
-              platformId: payload.platformId || 'custom',
-              platformGameId: String(payload.platformGameId || gameId),
-              pid: shouldLaunchViaBottleSteam ? undefined : child.pid,
-              startedAt: new Date().toISOString(),
-              launchMethod: actualLaunchMethod,
-              executablePath: resolvedExePath,
-              status: 'running',
-              isBottledSession: isBottledMacSession,
-              ...(isBottledMacSession
-                ? {
-                    fullscreenActive: initialBottleFullscreen,
-                    displayScalingMode: effectiveDisplayScalingMode,
-                    displayAspectRatio: effectiveDisplayAspectRatio,
-                  }
-                : {}),
-            };
-
-            const resolvedWineBinary =
-              useCompatLayer && chosenCompatLayer ? chosenCompatLayer.binaryPath || null : null;
-            const resolvedWineserverBinary = resolvedWineBinary
-              ? resolveWineserverBinary(resolvedWineBinary)
-              : null;
-            const resolvedWinePrefix = useCompatLayer
-              ? compatResult?.winePrefix || env.WINEPREFIX || null
-              : null;
-
             const paradoxExpectedExe =
               effectiveCaps?.paradoxDirectGameExe ||
               (resolvedExePath && /^dowser\.exe$/i.test(path.basename(resolvedExePath))
@@ -8518,6 +8579,37 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               ])
             ).filter(Boolean);
 
+            const session = {
+              sessionId: preGeneratedSessionId,
+              gameId,
+              title: String(payload.title || gameId),
+              platformId: payload.platformId || 'custom',
+              platformGameId: String(payload.platformGameId || gameId),
+              pid: shouldLaunchViaBottleSteam ? undefined : child.pid,
+              startedAt: new Date().toISOString(),
+              launchMethod: actualLaunchMethod,
+              executablePath: resolvedExePath,
+              status: 'running',
+              isBottledSession: isBottledMacSession,
+              ...(isBottledMacSession
+                ? {
+                    fullscreenActive: initialBottleFullscreen,
+                    displayScalingMode: effectiveDisplayScalingMode,
+                    displayAspectRatio: effectiveDisplayAspectRatio,
+                    targetExeBasenamesLower: mergedTargetBasenames,
+                  }
+                : {}),
+            };
+
+            const resolvedWineBinary =
+              useCompatLayer && chosenCompatLayer ? chosenCompatLayer.binaryPath || null : null;
+            const resolvedWineserverBinary = resolvedWineBinary
+              ? resolveWineserverBinary(resolvedWineBinary)
+              : null;
+            const resolvedWinePrefix = useCompatLayer
+              ? compatResult?.winePrefix || env.WINEPREFIX || null
+              : null;
+
             /** @type {any} */
             const entry = {
               session,
@@ -8526,6 +8618,7 @@ async function launchGame(/** @type {any} */ payload = {}, /** @type {any} */ op
               pid: shouldLaunchViaBottleSteam ? 0 : child.pid || 0,
               elevatedTargetPid: 0,
               reLatchedBottleChildPid: 0,
+              is64Bit: Boolean(effectiveCaps?.is64Bit),
               targetExeBasenamesLower: mergedTargetBasenames,
               ...(paradoxExpectedExe ? { expectedGameExe: paradoxExpectedExe } : {}),
               pollTimer: null,
@@ -10273,10 +10366,14 @@ function toggleSessionFullscreen(payload = {}, options = {}) {
             layerType: targetEntry.chosenCompatLayerType || null,
           });
           const watchSpawnFn = mergedOpts.gameSpawnFn || mergedOpts.spawnFn || spawn;
+          const toggleWatchLauncherPosix =
+            (targetEntry.is64Bit ? staged.launcherX64Posix : staged.launcherX86Posix) ||
+            staged.launcherX64Posix ||
+            staged.launcherX86Posix;
           const watcherChild = watchSpawnFn(
             alignedWatch.binaryPath,
             [
-              staged.launcherX86Posix,
+              toggleWatchLauncherPosix,
               '--watch-dir',
               winWatchDir,
               '--dll-x86',

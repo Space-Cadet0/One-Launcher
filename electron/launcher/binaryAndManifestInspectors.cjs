@@ -317,13 +317,27 @@ function readPeDelayImportedDllNamesFromFd(fd, layout, fileSize) {
  * Derive normalized graphics & legacy API capability flags from deduplicated lowercase DLL names.
  *
  * @param {string[]} importedDlls
- * @param {{ usesDynamicQgl?: boolean, dynamicallyLoadsDirectDraw?: boolean, hasUe5IoStoreContainer?: boolean, is64Bit?: boolean, forceGlCore?: boolean }} [extra]
+ * @param {{
+ *   usesDynamicQgl?: boolean,
+ *   dynamicallyLoadsDirectDraw?: boolean,
+ *   dynamicallyLoadsD3d11?: boolean,
+ *   dynamicallyLoadsD3d12?: boolean,
+ *   dynamicallyLoadsDxgi?: boolean,
+ *   dynamicallyLoadsVulkan?: boolean,
+ *   hasUe5IoStoreContainer?: boolean,
+ *   is64Bit?: boolean,
+ *   forceGlCore?: boolean,
+ * }} [extra]
  */
 function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const dllList = Array.isArray(importedDlls) ? importedDlls : [];
   const dllSet = new Set(dllList.map((d) => String(d || '').trim().toLowerCase()).filter(Boolean));
   const usesDynamicQgl = Boolean(extra.usesDynamicQgl);
   const dynamicallyLoadsDirectDraw = Boolean(extra.dynamicallyLoadsDirectDraw);
+  const dynamicallyLoadsD3d11 = Boolean(extra.dynamicallyLoadsD3d11);
+  const dynamicallyLoadsD3d12 = Boolean(extra.dynamicallyLoadsD3d12);
+  const dynamicallyLoadsDxgi = Boolean(extra.dynamicallyLoadsDxgi);
+  const dynamicallyLoadsVulkan = Boolean(extra.dynamicallyLoadsVulkan);
   const hasUe5IoStoreContainer = Boolean(extra.hasUe5IoStoreContainer);
   const is64Bit = Boolean(extra.is64Bit);
   const forceGlCore = Boolean(extra.forceGlCore);
@@ -338,10 +352,11 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
   const importsSdl1 = dllSet.has('sdl.dll');
   const importsModernSdl = dllSet.has('sdl2.dll') || dllSet.has('sdl3.dll');
 
-  const importsD3d12 = dllSet.has('d3d12.dll') || dllSet.has('d3d12core.dll');
+  const importsD3d12 =
+    dllSet.has('d3d12.dll') || dllSet.has('d3d12core.dll') || dynamicallyLoadsD3d12;
   const importsD3d9 =
     dllSet.has('d3d9.dll') || dllList.some((d) => /^d3dx9(?:_\d+)?\.dll$/i.test(d));
-  const importsVulkan = dllSet.has('vulkan-1.dll');
+  const importsVulkan = dllSet.has('vulkan-1.dll') || dynamicallyLoadsVulkan;
   const importsLegacyD3dOrGl =
     importsD3d8 ||
     usesLegacyDdraw ||
@@ -351,11 +366,12 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
     dllSet.has('d3d10.dll') ||
     dllSet.has('d3d10_1.dll') ||
     dllSet.has('d3d10core.dll') ||
+    dynamicallyLoadsD3d11 ||
     dllList.some((d) => /^d3dx1[01](?:_\d+)?\.dll$/i.test(d));
   const importsD3d11Or10 =
     hasExplicitD3d11Or10 ||
     isModernUnity64Host ||
-    (dllSet.has('dxgi.dll') && !importsD3d12 && !hasUe5IoStoreContainer);
+    ((dllSet.has('dxgi.dll') || dynamicallyLoadsDxgi) && !importsD3d12 && !hasUe5IoStoreContainer);
   const isD3d12Only =
     (importsD3d12 || hasUe5IoStoreContainer) &&
     !importsD3d11Or10 &&
@@ -381,6 +397,368 @@ function derivePeGraphicsCapabilities(importedDlls, extra = {}) {
     hasUe5IoStoreContainer,
     isD3d12Only,
   };
+}
+
+const PE_HEADER_INSPECT_CACHE_MAX = 512;
+/** @type {Map<string, Record<string, any>>} */
+const peHeaderInspectCache = new Map();
+
+/**
+ * Bounded LRU read/write helpers for `inspectWindowsExecutableHeader` stat-keyed cache.
+ * @param {string} key
+ */
+function getCachedPeHeader(key) {
+  const hit = peHeaderInspectCache.get(key);
+  if (!hit) return null;
+  peHeaderInspectCache.delete(key);
+  peHeaderInspectCache.set(key, hit);
+  return hit;
+}
+
+/**
+ * @param {string} key
+ * @param {Record<string, any>} value
+ */
+function setCachedPeHeader(key, value) {
+  if (peHeaderInspectCache.has(key)) {
+    peHeaderInspectCache.delete(key);
+  } else if (peHeaderInspectCache.size >= PE_HEADER_INSPECT_CACHE_MAX) {
+    const oldestKey = peHeaderInspectCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      peHeaderInspectCache.delete(oldestKey);
+    }
+  }
+  peHeaderInspectCache.set(key, value);
+}
+
+const PE_SCAN_CHUNK_BYTES = 262144; // 256 KiB
+const PE_SCAN_OVERLAP_BYTES = 64;
+const PE_SCAN_PER_FILE_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+const N_OPENGL32_DLL = Buffer.from('opengl32.dll\0', 'latin1');
+const N_OPENGL32 = Buffer.from('opengl32\0', 'latin1');
+const N_WGL_CREATE = Buffer.from('wglCreateContext\0', 'latin1');
+const N_WGL_MAKE_CUR = Buffer.from('wglMakeCurrent\0', 'latin1');
+const N_WGL_GET_PROC = Buffer.from('wglGetProcAddress\0', 'latin1');
+const N_CHOOSE_PF = Buffer.from('ChoosePixelFormat\0', 'latin1');
+const N_SET_PF = Buffer.from('SetPixelFormat\0', 'latin1');
+const N_SWAP_BUFFERS = Buffer.from('SwapBuffers\0', 'latin1');
+const N_DDRAW_DLL = Buffer.from('ddraw.dll\0', 'latin1');
+const N_DDRAW = Buffer.from('ddraw\0', 'latin1');
+const N_DDRAW_CREATE = Buffer.from('directdrawcreate', 'latin1');
+const N_D3D11_DLL = Buffer.from('d3d11.dll\0', 'latin1');
+const N_D3D11_DLL_U16 = Buffer.from('d3d11.dll\0', 'utf16le');
+const N_D3D11_HINT = Buffer.from('d3d11', 'latin1');
+const N_D3D11_CREATE = Buffer.from('D3D11CreateDevice', 'latin1');
+const N_D3D12_DLL = Buffer.from('d3d12.dll\0', 'latin1');
+const N_D3D12_DLL_U16 = Buffer.from('d3d12.dll\0', 'utf16le');
+const N_D3D12CORE_DLL = Buffer.from('d3d12core.dll\0', 'latin1');
+const N_D3D12CORE_DLL_U16 = Buffer.from('d3d12core.dll\0', 'utf16le');
+const N_D3D12_CREATE = Buffer.from('D3D12CreateDevice\0', 'latin1');
+const N_DXGI_DLL = Buffer.from('dxgi.dll\0', 'latin1');
+const N_DXGI_DLL_U16 = Buffer.from('dxgi.dll\0', 'utf16le');
+const N_DXGI_HINT = Buffer.from('dxgi', 'latin1');
+const N_DXGI_FACTORY = Buffer.from('CreateDXGIFactory', 'latin1');
+const N_VULKAN_DLL = Buffer.from('vulkan-1.dll\0', 'latin1');
+const N_VULKAN_DLL_U16 = Buffer.from('vulkan-1.dll\0', 'utf16le');
+const N_VK_CREATE_INST = Buffer.from('vkCreateInstance\0', 'latin1');
+const N_SET_DPI_CTX = Buffer.from('SetProcessDpiAwarenessContext\0', 'latin1');
+const N_SET_DPI_AWARE = Buffer.from('SetProcessDpiAwareness\0', 'latin1');
+
+/**
+ * @param {Buffer} buf
+ * @param {number} idx
+ * @param {boolean} [isUtf16]
+ */
+function hasWordBoundaryBefore(buf, idx, isUtf16 = false) {
+  if (idx <= 0) return true;
+  if (isUtf16) {
+    if (idx < 2) return true;
+    const lo = buf[idx - 2];
+    const hi = buf[idx - 1];
+    if (hi !== 0) return true;
+    return !(
+      (lo >= 48 && lo <= 57) ||
+      (lo >= 65 && lo <= 90) ||
+      (lo >= 97 && lo <= 122) ||
+      lo === 95
+    );
+  }
+  const c = buf[idx - 1];
+  return !(
+    (c >= 48 && c <= 57) ||
+    (c >= 65 && c <= 90) ||
+    (c >= 97 && c <= 122) ||
+    c === 95
+  );
+}
+
+/**
+ * @param {Buffer} buf
+ * @param {number} len
+ * @param {Buffer} needle
+ * @param {boolean} [isUtf16]
+ */
+function indexOfWordBoundary(buf, len, needle, isUtf16 = false) {
+  let pos = 0;
+  while (pos < len) {
+    const idx = buf.indexOf(needle, pos);
+    if (idx < 0 || idx + needle.length > len) return -1;
+    if (hasWordBoundaryBefore(buf, idx, isUtf16)) return idx;
+    pos = idx + 1;
+  }
+  return -1;
+}
+
+/**
+ * Streaming `Buffer.indexOf` scanner over PE `.rdata` / `.data` / `.idata` ranges
+ * with bounded per-file and shared aggregate byte budgets.
+ *
+ * @param {number} fd
+ * @param {Array<{ offset: number, length: number }>} scanRanges
+ * @param {{
+ *   isX86: boolean,
+ *   scanLegacy: boolean,
+ *   scanModern: boolean,
+ *   scanDpiApi: boolean,
+ *   importedGdi32: boolean,
+ *   rdataBudget?: { remaining: number } | null,
+ * }} scanOpts
+ */
+function scanPeDynamicStringsFromFd(fd, scanRanges, scanOpts) {
+  const result = {
+    dynamicallyLoadsOpenGl: false,
+    dynamicallyLoadsDirectDraw: false,
+    dynamicallyLoadsD3d11: false,
+    dynamicallyLoadsD3d12: false,
+    dynamicallyLoadsDxgi: false,
+    dynamicallyLoadsVulkan: false,
+    callsPerMonitorDpiApi: false,
+    budgetExhausted: false,
+  };
+  if (!Array.isArray(scanRanges) || scanRanges.length === 0) {
+    return result;
+  }
+
+  let sawOpengl32 = false;
+  let sawOpengl32DllLiteral = false;
+  let sawWglCreateContext = false;
+  let sawPixelFormatSymbol = false;
+  let sawSwapBuffersSymbol = false;
+  let sawDdraw = false;
+  let sawDirectDrawCreate = false;
+  let sawD3d11CreateDevice = false;
+  let sawD3d11OrDxgiHint = false;
+  let sawDxgiDll = false;
+  let sawDxgiFactory = false;
+  let sawVulkanDll = false;
+  let sawVkCreateInstance = false;
+
+  const chunkBuf = Buffer.allocUnsafe(PE_SCAN_CHUNK_BYTES + PE_SCAN_OVERLAP_BYTES);
+  const lowerBuf = Buffer.allocUnsafe(PE_SCAN_CHUNK_BYTES + PE_SCAN_OVERLAP_BYTES);
+  let fileBytesRemaining = PE_SCAN_PER_FILE_MAX_BYTES;
+  const aggBudget =
+    scanOpts.rdataBudget && typeof scanOpts.rdataBudget.remaining === 'number'
+      ? scanOpts.rdataBudget
+      : null;
+
+  for (let rIdx = 0; rIdx < scanRanges.length; rIdx += 1) {
+    const range = scanRanges[rIdx];
+    if (!range || range.length <= 16) continue;
+
+    let pos = 0;
+    let carry = 0;
+    while (pos < range.length) {
+      const wantMoreLegacy =
+        scanOpts.scanLegacy &&
+        (!result.dynamicallyLoadsOpenGl || (scanOpts.isX86 && !result.dynamicallyLoadsDirectDraw));
+      const wantMoreModern =
+        scanOpts.scanModern &&
+        !(
+          result.dynamicallyLoadsD3d11 ||
+          result.dynamicallyLoadsD3d12 ||
+          result.dynamicallyLoadsDxgi ||
+          result.dynamicallyLoadsVulkan
+        );
+      const wantMoreDpi = scanOpts.scanDpiApi && !result.callsPerMonitorDpiApi;
+      if (!wantMoreLegacy && !wantMoreModern && !wantMoreDpi) {
+        break;
+      }
+
+      if (fileBytesRemaining <= 0) {
+        break;
+      }
+      if (aggBudget && aggBudget.remaining <= 0) {
+        result.budgetExhausted = true;
+        break;
+      }
+
+      let toRead = Math.min(PE_SCAN_CHUNK_BYTES, range.length - pos, fileBytesRemaining);
+      if (aggBudget) {
+        toRead = Math.min(toRead, aggBudget.remaining);
+      }
+      if (toRead <= 0) {
+        result.budgetExhausted = true;
+        break;
+      }
+
+      const nRead = fs.readSync(fd, chunkBuf, carry, toRead, range.offset + pos);
+      if (nRead <= 0) break;
+      pos += nRead;
+      fileBytesRemaining -= nRead;
+      if (aggBudget) {
+        aggBudget.remaining -= nRead;
+      }
+
+      const totalLen = carry + nRead;
+      for (let i = 0; i < totalLen; i += 1) {
+        const c = chunkBuf[i];
+        lowerBuf[i] = c >= 65 && c <= 90 ? c + 32 : c;
+      }
+
+      if (wantMoreLegacy) {
+        if (!result.dynamicallyLoadsOpenGl) {
+          if (!sawOpengl32DllLiteral && indexOfWordBoundary(lowerBuf, totalLen, N_OPENGL32_DLL) >= 0) {
+            sawOpengl32DllLiteral = true;
+            sawOpengl32 = true;
+          }
+          if (!sawOpengl32 && indexOfWordBoundary(lowerBuf, totalLen, N_OPENGL32) >= 0) {
+            sawOpengl32 = true;
+          }
+          if (
+            !sawWglCreateContext &&
+            (indexOfWordBoundary(chunkBuf, totalLen, N_WGL_CREATE) >= 0 ||
+              indexOfWordBoundary(chunkBuf, totalLen, N_WGL_MAKE_CUR) >= 0 ||
+              indexOfWordBoundary(chunkBuf, totalLen, N_WGL_GET_PROC) >= 0)
+          ) {
+            sawWglCreateContext = true;
+          }
+          if (
+            scanOpts.importedGdi32 &&
+            !sawPixelFormatSymbol &&
+            (indexOfWordBoundary(chunkBuf, totalLen, N_CHOOSE_PF) >= 0 ||
+              indexOfWordBoundary(chunkBuf, totalLen, N_SET_PF) >= 0)
+          ) {
+            sawPixelFormatSymbol = true;
+          }
+          if (
+            scanOpts.importedGdi32 &&
+            !sawSwapBuffersSymbol &&
+            indexOfWordBoundary(chunkBuf, totalLen, N_SWAP_BUFFERS) >= 0
+          ) {
+            sawSwapBuffersSymbol = true;
+          }
+          if (
+            sawOpengl32DllLiteral ||
+            (sawOpengl32 && sawWglCreateContext) ||
+            (scanOpts.importedGdi32 && sawPixelFormatSymbol && sawSwapBuffersSymbol)
+          ) {
+            result.dynamicallyLoadsOpenGl = true;
+          }
+        }
+        if (scanOpts.isX86 && !result.dynamicallyLoadsDirectDraw) {
+          if (
+            !sawDdraw &&
+            (indexOfWordBoundary(lowerBuf, totalLen, N_DDRAW_DLL) >= 0 ||
+              indexOfWordBoundary(lowerBuf, totalLen, N_DDRAW) >= 0)
+          ) {
+            sawDdraw = true;
+          }
+          if (
+            !sawDirectDrawCreate &&
+            indexOfWordBoundary(lowerBuf, totalLen, N_DDRAW_CREATE) >= 0
+          ) {
+            sawDirectDrawCreate = true;
+          }
+          if (sawDdraw && sawDirectDrawCreate) {
+            result.dynamicallyLoadsDirectDraw = true;
+          }
+        }
+      }
+
+      if (wantMoreModern) {
+        if (!result.dynamicallyLoadsD3d11) {
+          if (
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D11_DLL) >= 0 ||
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D11_DLL_U16, true) >= 0
+          ) {
+            result.dynamicallyLoadsD3d11 = true;
+          } else {
+            if (!sawD3d11CreateDevice && indexOfWordBoundary(chunkBuf, totalLen, N_D3D11_CREATE) >= 0) {
+              sawD3d11CreateDevice = true;
+            }
+            if (
+              !sawD3d11OrDxgiHint &&
+              (indexOfWordBoundary(lowerBuf, totalLen, N_D3D11_HINT) >= 0 ||
+                indexOfWordBoundary(lowerBuf, totalLen, N_DXGI_HINT) >= 0)
+            ) {
+              sawD3d11OrDxgiHint = true;
+            }
+            if (sawD3d11CreateDevice && sawD3d11OrDxgiHint) {
+              result.dynamicallyLoadsD3d11 = true;
+            }
+          }
+        }
+        if (!result.dynamicallyLoadsD3d12) {
+          if (
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D12_DLL) >= 0 ||
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D12_DLL_U16, true) >= 0 ||
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D12CORE_DLL) >= 0 ||
+            indexOfWordBoundary(lowerBuf, totalLen, N_D3D12CORE_DLL_U16, true) >= 0 ||
+            indexOfWordBoundary(chunkBuf, totalLen, N_D3D12_CREATE) >= 0
+          ) {
+            result.dynamicallyLoadsD3d12 = true;
+          }
+        }
+        if (!result.dynamicallyLoadsDxgi) {
+          if (
+            !sawDxgiDll &&
+            (indexOfWordBoundary(lowerBuf, totalLen, N_DXGI_DLL) >= 0 ||
+              indexOfWordBoundary(lowerBuf, totalLen, N_DXGI_DLL_U16, true) >= 0)
+          ) {
+            sawDxgiDll = true;
+          }
+          if (!sawDxgiFactory && indexOfWordBoundary(chunkBuf, totalLen, N_DXGI_FACTORY) >= 0) {
+            sawDxgiFactory = true;
+          }
+          if (sawDxgiDll && sawDxgiFactory) {
+            result.dynamicallyLoadsDxgi = true;
+          }
+        }
+        if (!result.dynamicallyLoadsVulkan) {
+          if (
+            !sawVulkanDll &&
+            (indexOfWordBoundary(lowerBuf, totalLen, N_VULKAN_DLL) >= 0 ||
+              indexOfWordBoundary(lowerBuf, totalLen, N_VULKAN_DLL_U16, true) >= 0)
+          ) {
+            sawVulkanDll = true;
+          }
+          if (!sawVkCreateInstance && indexOfWordBoundary(chunkBuf, totalLen, N_VK_CREATE_INST) >= 0) {
+            sawVkCreateInstance = true;
+          }
+          if (sawVulkanDll && sawVkCreateInstance) {
+            result.dynamicallyLoadsVulkan = true;
+          }
+        }
+      }
+
+      if (wantMoreDpi) {
+        if (
+          indexOfWordBoundary(chunkBuf, totalLen, N_SET_DPI_CTX) >= 0 ||
+          indexOfWordBoundary(chunkBuf, totalLen, N_SET_DPI_AWARE) >= 0
+        ) {
+          result.callsPerMonitorDpiApi = true;
+        }
+      }
+
+      carry = Math.min(PE_SCAN_OVERLAP_BYTES, totalLen);
+      if (carry > 0) {
+        chunkBuf.copy(chunkBuf, 0, totalLen - carry, totalLen);
+      }
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -425,6 +803,23 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       };
     }
     const size = stat.size;
+    const isExeTarget = /\.exe$/i.test(filePath);
+    const wantDpiManifest = opts.inspectDpiManifest !== false && isExeTarget;
+    const sidecarManifestPath = `${filePath}.manifest`;
+    let sidecarManifestSig = '';
+    if (opts.inspectElevationManifest || wantDpiManifest) {
+      try {
+        const mst = fs.statSync(sidecarManifestPath);
+        if (mst.isFile()) {
+          sidecarManifestSig = `${mst.mtimeMs}:${mst.size}`;
+        }
+      } catch {}
+    }
+    const cacheKey = `${path.resolve(filePath)}|${stat.mtimeMs}|${size}|${opts.skipImports ? 1 : 0}|${opts.skipRdataStringScan ? 1 : 0}|${opts.skipModernDynamicScan ? 1 : 0}|${opts.inspectElevationManifest ? 1 : 0}|${wantDpiManifest ? 1 : 0}|${allowSyntheticStub ? 1 : 0}|${sidecarManifestSig}`;
+    const cachedHit = getCachedPeHeader(cacheKey);
+    if (cachedHit) {
+      return cachedHit;
+    }
 
     if (size < 2) {
       return {
@@ -560,6 +955,12 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     let delayImportedDlls = /** @type {string[]} */ ([]);
     let dynamicallyLoadsOpenGl = false;
     let dynamicallyLoadsDirectDraw = false;
+    let dynamicallyLoadsD3d11 = false;
+    let dynamicallyLoadsD3d12 = false;
+    let dynamicallyLoadsDxgi = false;
+    let dynamicallyLoadsVulkan = false;
+    let callsPerMonitorDpiApi = false;
+    let scanBudgetExhausted = false;
     let peLayout = null;
     if (opts.skipImports !== true) {
       try {
@@ -583,34 +984,42 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
             d === 'dxgi.dll' ||
             d === 'vulkan-1.dll'
         );
-        if (
+        const wantLegacyScan =
           (isX86 || isX64) &&
           opts.skipRdataStringScan !== true &&
-          (!importedDlls.includes('opengl32.dll') || !importedDlls.includes('ddraw.dll')) &&
-          !hasModernGfxImports
-        ) {
-          const dataSections = peLayout.sections.filter(
-            (sec) =>
-              (sec.name === '.rdata' || sec.name === '.data' || sec.name === '.idata') &&
-              sec.rawPtr > 0 &&
-              sec.rawSize > 0 &&
-              sec.rawPtr < size
-          );
-          const scanRanges =
-            dataSections.length > 0
-              ? dataSections.map((sec) => ({
-                  offset: sec.rawPtr,
-                  length: Math.min(sec.rawSize, 393216, size - sec.rawPtr),
-                }))
-              : [
-                  {
-                    offset: Math.min(peLayout.headerLimit || 4096, size),
-                    length: Math.min(
-                      262144,
-                      Math.max(0, size - Math.min(peLayout.headerLimit || 4096, size))
-                    ),
-                  },
-                ];
+          !hasModernGfxImports &&
+          (!importedDlls.includes('opengl32.dll') || !importedDlls.includes('ddraw.dll'));
+        const wantModernScan =
+          (isX86 || isX64) &&
+          opts.skipRdataStringScan !== true &&
+          opts.skipModernDynamicScan !== true &&
+          !hasModernGfxImports;
+        const wantDpiApiScan =
+          (isX86 || isX64) &&
+          opts.skipRdataStringScan !== true &&
+          isExeTarget;
+        if (wantLegacyScan || wantModernScan || wantDpiApiScan) {
+          const dataSections = peLayout.sections
+            .filter(
+              (sec) =>
+                (sec.name === '.idata' || sec.name === '.rdata' || sec.name === '.data') &&
+                sec.rawPtr > 0 &&
+                sec.rawSize > 0 &&
+                sec.rawPtr < size
+            )
+            .sort((a, b) => {
+              const rank = (name) => (name === '.idata' ? 0 : name === '.rdata' ? 1 : 2);
+              return rank(a.name) - rank(b.name);
+            });
+          /** @type {Array<{ offset: number, length: number }>} */
+          const scanRanges = [];
+          const pushRange = (offset, length) => {
+            if (length <= 16 || offset < 0 || offset >= size) return;
+            const clampedLen = Math.min(length, size - offset);
+            if (clampedLen > 16) {
+              scanRanges.push({ offset, length: clampedLen });
+            }
+          };
           if (peLayout.importDir && peLayout.importDir.rva > 0 && peLayout.importDir.size > 0) {
             const importFileOff = mapPeRvaToFileOffset(
               peLayout.importDir.rva,
@@ -619,59 +1028,44 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
               size
             );
             if (importFileOff > 0 && importFileOff < size) {
-              const coveredBySection = scanRanges.some(
-                (r) => importFileOff >= r.offset && importFileOff < r.offset + r.length
-              );
-              if (!coveredBySection) {
-                scanRanges.push({
-                  offset: importFileOff,
-                  length: Math.min(
-                    Math.max(peLayout.importDir.size, 65536),
-                    262144,
-                    size - importFileOff
-                  ),
-                });
+              pushRange(importFileOff, Math.min(Math.max(peLayout.importDir.size, 65536), 262144));
+            }
+          }
+          if (dataSections.length > 0) {
+            const perSecCap = wantLegacyScan || wantModernScan ? PE_SCAN_PER_FILE_MAX_BYTES : 524288;
+            for (let sIdx = 0; sIdx < dataSections.length; sIdx += 1) {
+              const sec = dataSections[sIdx];
+              const avail = Math.min(sec.rawSize, size - sec.rawPtr);
+              if (avail <= perSecCap) {
+                pushRange(sec.rawPtr, avail);
+              } else {
+                const headLen = Math.floor((perSecCap * 3) / 4);
+                const tailLen = perSecCap - headLen;
+                pushRange(sec.rawPtr, headLen);
+                pushRange(sec.rawPtr + avail - tailLen, tailLen);
               }
             }
+          } else {
+            const fallbackStart = Math.min(peLayout.headerLimit || 4096, size);
+            pushRange(fallbackStart, Math.min(262144, Math.max(0, size - fallbackStart)));
           }
-          let sawOpengl32 = false;
-          let sawOpengl32DllLiteral = false;
-          let sawWglCreateContext = false;
-          let sawPixelFormatSymbol = false;
-          let sawSwapBuffersSymbol = false;
-          let sawDdraw = false;
-          let sawDirectDrawCreate = false;
-          for (let sIdx = 0; sIdx < scanRanges.length; sIdx += 1) {
-            const { offset: dynOffset, length: dynLen } = scanRanges[sIdx];
-            if (dynLen <= 16) continue;
-            const dynBuf = Buffer.alloc(dynLen);
-            const dynRead = fs.readSync(fd, dynBuf, 0, dynLen, dynOffset);
-            if (dynRead <= 16) continue;
-            const dynLatin1 = dynBuf.subarray(0, dynRead).toString('latin1');
-            if (/\bopengl32\.dll\x00/i.test(dynLatin1)) sawOpengl32DllLiteral = true;
-            if (/\bopengl32(?:\.dll)?\x00/i.test(dynLatin1)) sawOpengl32 = true;
-            if (/\bwgl(?:CreateContext|MakeCurrent|GetProcAddress)\x00/.test(dynLatin1)) {
-              sawWglCreateContext = true;
-            }
-            if (/\b(?:ChoosePixelFormat|SetPixelFormat)\x00/.test(dynLatin1)) {
-              sawPixelFormatSymbol = true;
-            }
-            if (/\bSwapBuffers\x00/.test(dynLatin1)) {
-              sawSwapBuffersSymbol = true;
-            }
-            if (/\bddraw(?:\.dll)?\x00/i.test(dynLatin1)) sawDdraw = true;
-            if (/\bDirectDrawCreate/i.test(dynLatin1)) sawDirectDrawCreate = true;
-          }
-          if (
-            sawOpengl32DllLiteral ||
-            (sawOpengl32 && sawWglCreateContext) ||
-            (importedDlls.includes('gdi32.dll') && sawPixelFormatSymbol && sawSwapBuffersSymbol)
-          ) {
-            dynamicallyLoadsOpenGl = true;
-          }
-          if (isX86 && sawDdraw && sawDirectDrawCreate) {
-            dynamicallyLoadsDirectDraw = true;
-          }
+
+          const scanRes = scanPeDynamicStringsFromFd(fd, scanRanges, {
+            isX86,
+            scanLegacy: wantLegacyScan,
+            scanModern: wantModernScan,
+            scanDpiApi: wantDpiApiScan,
+            importedGdi32: importedDlls.includes('gdi32.dll'),
+            rdataBudget: opts.rdataBudget || null,
+          });
+          dynamicallyLoadsOpenGl = scanRes.dynamicallyLoadsOpenGl;
+          dynamicallyLoadsDirectDraw = scanRes.dynamicallyLoadsDirectDraw;
+          dynamicallyLoadsD3d11 = scanRes.dynamicallyLoadsD3d11;
+          dynamicallyLoadsD3d12 = scanRes.dynamicallyLoadsD3d12;
+          dynamicallyLoadsDxgi = scanRes.dynamicallyLoadsDxgi;
+          dynamicallyLoadsVulkan = scanRes.dynamicallyLoadsVulkan;
+          callsPerMonitorDpiApi = scanRes.callsPerMonitorDpiApi;
+          scanBudgetExhausted = scanRes.budgetExhausted;
         }
       } catch {
         importedDlls = [];
@@ -680,19 +1074,40 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     }
 
     let requiresElevation = false;
-    if (opts.inspectElevationManifest) {
+    let hasDpiAwareManifest = false;
+    let declaresPerMonitorDpi = false;
+    if (opts.inspectElevationManifest || wantDpiManifest) {
       const elevationRe =
         /requestedExecutionLevel[^>]*level\s*=\s*["'](?:requireAdministrator|highestAvailable)["']/i;
-      try {
-        const sidecarManifest = `${filePath}.manifest`;
-        if (fs.existsSync(sidecarManifest)) {
-          const manifestText = fs.readFileSync(sidecarManifest, 'utf8');
-          if (elevationRe.test(manifestText)) {
-            requiresElevation = true;
+      const dpiAwareRe = /<dpiAware[^>]*>\s*(?:true|true\/pm|per\s*monitor)\s*</i;
+      const dpiAwarenessRe = /<dpiAwareness[^>]*>[^<]*(?:PerMonitor|System)[^<]*</i;
+      const perMonitorAwareRe = /<dpiAware[^>]*>\s*true\/pm\s*</i;
+      const perMonitorAwarenessRe = /<dpiAwareness[^>]*>[^<]*PerMonitor[^<]*</i;
+      const applyManifestText = (text) => {
+        if (!text) return;
+        if (opts.inspectElevationManifest && !requiresElevation && elevationRe.test(text)) {
+          requiresElevation = true;
+        }
+        if (wantDpiManifest) {
+          if (!hasDpiAwareManifest && (dpiAwareRe.test(text) || dpiAwarenessRe.test(text))) {
+            hasDpiAwareManifest = true;
+          }
+          if (
+            !declaresPerMonitorDpi &&
+            (perMonitorAwareRe.test(text) || perMonitorAwarenessRe.test(text))
+          ) {
+            declaresPerMonitorDpi = true;
           }
         }
+      };
+      try {
+        if (sidecarManifestSig && fs.existsSync(sidecarManifestPath)) {
+          applyManifestText(fs.readFileSync(sidecarManifestPath, 'utf8'));
+        }
       } catch {}
-      if (!requiresElevation) {
+      const stillNeedElevation = Boolean(opts.inspectElevationManifest && !requiresElevation);
+      const stillNeedDpi = Boolean(wantDpiManifest && (!hasDpiAwareManifest || !declaresPerMonitorDpi));
+      if (stillNeedElevation || stillNeedDpi) {
         try {
           // Locate .rsrc section if present in COFF section headers, otherwise scan trailing 256 KiB
           const layout = peLayout || readPeSectionsAndDataDirectories(fd, peOffset, size);
@@ -709,8 +1124,8 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
           if (scanLen > 0) {
             const rsrcBuf = Buffer.alloc(scanLen);
             const rsrcRead = fs.readSync(fd, rsrcBuf, 0, scanLen, scanOffset);
-            if (rsrcRead > 0 && elevationRe.test(rsrcBuf.subarray(0, rsrcRead).toString('latin1'))) {
-              requiresElevation = true;
+            if (rsrcRead > 0) {
+              applyManifestText(rsrcBuf.subarray(0, rsrcRead).toString('latin1'));
             }
           }
         } catch {}
@@ -725,7 +1140,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
           : isArm64
             ? 'arm64'
             : 'unknown';
-    return {
+    const peResult = {
       exists: true,
       isValidPe: true,
       arch,
@@ -736,6 +1151,7 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       isArm64,
       isArm64Ec,
       is16BitDos: false,
+      isSyntheticStub: false,
       machine,
       machineHex,
       coffCharacteristics,
@@ -747,8 +1163,19 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
       delayImportedDlls,
       dynamicallyLoadsOpenGl,
       dynamicallyLoadsDirectDraw,
+      dynamicallyLoadsD3d11,
+      dynamicallyLoadsD3d12,
+      dynamicallyLoadsDxgi,
+      dynamicallyLoadsVulkan,
+      hasDpiAwareManifest,
+      declaresPerMonitorDpi,
+      callsPerMonitorDpiApi,
       ...(opts.inspectElevationManifest ? { requiresElevation } : {}),
     };
+    if (!scanBudgetExhausted) {
+      setCachedPeHeader(cacheKey, peResult);
+    }
+    return peResult;
   } catch (err) {
     diagLog.debug('inspector.peHeader', err, { filePath });
     return {
@@ -805,6 +1232,13 @@ function inspectPeCapabilities(exePath, options = {}) {
   const isDynamicBase = Boolean(pe.isDynamicBase);
   const dynamicallyLoadsOpenGl = Boolean(pe.dynamicallyLoadsOpenGl);
   const dynamicallyLoadsDirectDraw = Boolean(pe.dynamicallyLoadsDirectDraw);
+  const dynamicallyLoadsD3d11 = Boolean(pe.dynamicallyLoadsD3d11);
+  const dynamicallyLoadsD3d12 = Boolean(pe.dynamicallyLoadsD3d12);
+  const dynamicallyLoadsDxgi = Boolean(pe.dynamicallyLoadsDxgi);
+  const dynamicallyLoadsVulkan = Boolean(pe.dynamicallyLoadsVulkan);
+  const hasDpiAwareManifest = Boolean(pe.hasDpiAwareManifest);
+  const declaresPerMonitorDpi = Boolean(pe.declaresPerMonitorDpi);
+  const callsPerMonitorDpiApi = Boolean(pe.callsPerMonitorDpiApi);
   const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
     String(options?.launchArguments || '')
   );
@@ -816,6 +1250,10 @@ function inspectPeCapabilities(exePath, options = {}) {
   const gfxCaps = derivePeGraphicsCapabilities(mergedForGfx, {
     usesDynamicQgl: dynamicallyLoadsOpenGl,
     dynamicallyLoadsDirectDraw,
+    dynamicallyLoadsD3d11,
+    dynamicallyLoadsD3d12,
+    dynamicallyLoadsDxgi,
+    dynamicallyLoadsVulkan,
     hasUe5IoStoreContainer: Boolean(options?.hasUe5IoStoreContainer),
     is64Bit,
     forceGlCore,
@@ -834,6 +1272,13 @@ function inspectPeCapabilities(exePath, options = {}) {
     delayImportedDlls,
     dynamicallyLoadsOpenGl,
     dynamicallyLoadsDirectDraw,
+    dynamicallyLoadsD3d11,
+    dynamicallyLoadsD3d12,
+    dynamicallyLoadsDxgi,
+    dynamicallyLoadsVulkan,
+    hasDpiAwareManifest,
+    declaresPerMonitorDpi,
+    callsPerMonitorDpiApi,
     isDosboxExecutable,
     ...gfxCaps,
   };
@@ -2848,7 +3293,7 @@ const SYSTEM_GRAPHICS_PROXY_DLL_RE =
   /^(?:d3d(?:8|9|10|10_1|10core|11|12|12core)|dxgi|ddraw|d3dim|d3dim700|opengl32|vulkan-1|wined3d)\.dll$/i;
 
 const NON_ENGINE_REDIST_DLL_RE =
-  /^(?:msvcp\d+|vcruntime\d+|ucrtbase|concrt\d+|vcomp\d+|mfc\d+|api-ms-win-|ext-ms-win-|xinput|dinput|bink|fmod|steam_api|galaxy|eossdk|nvngx|amd_ags|sl\.|libxess)/i;
+  /^(?:msvcp\d+|vcruntime\d+|ucrtbase|concrt\d+|vcomp\d+|mfc\d+|api-ms-win-|ext-ms-win-|xinput|dinput|bink|fmod|steam_api|galaxy|eossdk|nvngx|amd_ags|sl\.|libxess|libcef|chrome_elf|libegl|libglesv2|vk_swiftshader|swiftshader|qt\d+(?:webengine|gui|widgets|core|quick|network|qml)|webview2|discord|crashpad|breakpad|sentry|ffmpeg|avcodec|avformat|avutil|swscale|d3dcompiler|dxcompiler|dxil|icu(?:dt|in|uc))/i;
 
 /**
  * Bounded read-only check for Unreal Engine 5 IoStore `.utoc` containers (`<root>/.../Content/Paks/*.utoc`).
@@ -2965,9 +3410,14 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   const normalizedExePath = typeof exePath === 'string' ? exePath.trim() : '';
   const normalizedInstallDir = typeof localInstallDir === 'string' ? localInstallDir.trim() : '';
   const exeDir = normalizedExePath ? path.dirname(normalizedExePath) : '';
+  const rdataBudget =
+    options && options.rdataBudget && typeof options.rdataBudget.remaining === 'number'
+      ? options.rdataBudget
+      : { remaining: 16 * 1024 * 1024 };
+  const inspectOpts = { ...(options && typeof options === 'object' ? options : {}), rdataBudget };
 
   const primaryPe = normalizedExePath
-    ? inspectPeCapabilities(normalizedExePath, options)
+    ? inspectPeCapabilities(normalizedExePath, inspectOpts)
     : {
         exists: false,
         isValidPe: false,
@@ -2985,6 +3435,13 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
         delayImportedDlls: /** @type {string[]} */ ([]),
         dynamicallyLoadsOpenGl: false,
         dynamicallyLoadsDirectDraw: false,
+        dynamicallyLoadsD3d11: false,
+        dynamicallyLoadsD3d12: false,
+        dynamicallyLoadsDxgi: false,
+        dynamicallyLoadsVulkan: false,
+        hasDpiAwareManifest: false,
+        declaresPerMonitorDpi: false,
+        callsPerMonitorDpiApi: false,
         usesDynamicQgl: false,
         importsD3d12: false,
         importsD3d11Or10: false,
@@ -3168,7 +3625,7 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
   /** @type {Array<{ exePath: string, pe: ReturnType<typeof inspectPeCapabilities> }>} */
   const validChildren = [];
   for (const childPath of candidateChildExePaths.slice(0, 12)) {
-    const cPe = inspectPeCapabilities(childPath, options);
+    const cPe = inspectPeCapabilities(childPath, inspectOpts);
     if (cPe.isValidPe && isCompatibleX86OrX64PeHeader(cPe, options)) {
       validChildren.push({ exePath: childPath, pe: cPe });
     }
@@ -3194,7 +3651,14 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           : null;
     const withGraphicsImports = validChildren.find(
       (c) =>
-        Boolean(c.pe.dynamicallyLoadsOpenGl || c.pe.dynamicallyLoadsDirectDraw) ||
+        Boolean(
+          c.pe.dynamicallyLoadsOpenGl ||
+            c.pe.dynamicallyLoadsDirectDraw ||
+            c.pe.dynamicallyLoadsD3d11 ||
+            c.pe.dynamicallyLoadsD3d12 ||
+            c.pe.dynamicallyLoadsDxgi ||
+            c.pe.dynamicallyLoadsVulkan
+        ) ||
         c.pe.importedDlls.some(
           (d) =>
             d === 'opengl32.dll' ||
@@ -3231,9 +3695,20 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
 
   let dllDynamicOpenGl = false;
   let dllDynamicDdraw = false;
+  let dllDynamicD3d11 = false;
+  let dllDynamicD3d12 = false;
+  let dllDynamicDxgi = false;
+  let dllDynamicVulkan = false;
   const hasDirectGraphicsImport =
-    allInspectedPes.some(
-      (p) => Boolean(p.dynamicallyLoadsOpenGl || p.dynamicallyLoadsDirectDraw)
+    allInspectedPes.some((p) =>
+      Boolean(
+        p.dynamicallyLoadsOpenGl ||
+          p.dynamicallyLoadsDirectDraw ||
+          p.dynamicallyLoadsD3d11 ||
+          p.dynamicallyLoadsD3d12 ||
+          p.dynamicallyLoadsDxgi ||
+          p.dynamicallyLoadsVulkan
+      )
     ) ||
     Array.from(dllSet).some(
       (d) =>
@@ -3253,9 +3728,17 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
         /^d3dx(?:9|10|11)(?:_\d+)?\.dll$/i.test(d)
     );
 
-  // If the primary/child `.exe` does not directly import a D3D/GL/Vulkan DLL, scan up to 20
-  // top-level `.dll` files in `path.dirname(targetExe)` (and `exeDir` / `installDir` when distinct).
+  // If the primary/child `.exe` does not directly import a D3D/GL/Vulkan DLL, scan up to 32
+  // top-level `.dll` files in `path.dirname(targetExe)` (and `exeDir` / `installDir` when distinct),
+  // prioritizing non-redist engine DLLs sorted by descending file size.
   if (!hasDirectGraphicsImport && (effectiveExePath || normalizedInstallDir)) {
+    const MODERN_GFX_DLL_SET = new Set([
+      'd3d11.dll',
+      'd3d12.dll',
+      'd3d12core.dll',
+      'dxgi.dll',
+      'vulkan-1.dll',
+    ]);
     /** @type {string[]} */
     const dllScanDirs = [];
     const pushDllDir = (d) => {
@@ -3271,7 +3754,9 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
       try {
         if (!fs.existsSync(targetExeDir) || !fs.statSync(targetExeDir).isDirectory()) continue;
         const rawEntries = fs.readdirSync(targetExeDir, { withFileTypes: true });
-        const candidateDllNames = [];
+        /** @type {Array<{ name: string, size: number }>} */
+        const candidateDllEntries = [];
+        /** @type {string[]} */
         const fallbackDllNames = [];
         for (let i = 0; i < rawEntries.length; i += 1) {
           const entry = rawEntries[i];
@@ -3280,10 +3765,18 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           if (NON_ENGINE_REDIST_DLL_RE.test(entry.name)) {
             fallbackDllNames.push(entry.name);
           } else {
-            candidateDllNames.push(entry.name);
+            let fileSize = 0;
+            try {
+              fileSize = fs.statSync(path.join(targetExeDir, entry.name)).size || 0;
+            } catch {}
+            candidateDllEntries.push({ name: entry.name, size: fileSize });
           }
         }
-          const orderedDllNames = candidateDllNames.concat(fallbackDllNames).slice(0, 20);
+        candidateDllEntries.sort((a, b) => b.size - a.size || a.name.localeCompare(b.name));
+        const orderedDllNames = candidateDllEntries
+          .map((e) => e.name)
+          .concat(fallbackDllNames)
+          .slice(0, 32);
         for (let i = 0; i < orderedDllNames.length; i += 1) {
           const dllName = orderedDllNames[i];
           if (/^unityplayer\.dll$/i.test(dllName)) {
@@ -3292,8 +3785,9 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           const dllPath = path.join(targetExeDir, dllName);
           const isRedistDll = NON_ENGINE_REDIST_DLL_RE.test(dllName);
           const dllHeader = inspectWindowsExecutableHeader(dllPath, {
-            ...options,
+            ...inspectOpts,
             skipRdataStringScan: isRedistDll ? true : Boolean(options?.skipRdataStringScan),
+            skipModernDynamicScan: isRedistDll,
           });
           if (!dllHeader.isValidPe) continue;
           if (
@@ -3308,7 +3802,26 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
           if ('dynamicallyLoadsDirectDraw' in dllHeader && dllHeader.dynamicallyLoadsDirectDraw) {
             dllDynamicDdraw = true;
           }
+          if (!isRedistDll) {
+            if ('dynamicallyLoadsD3d11' in dllHeader && dllHeader.dynamicallyLoadsD3d11) {
+              dllDynamicD3d11 = true;
+            }
+            if ('dynamicallyLoadsD3d12' in dllHeader && dllHeader.dynamicallyLoadsD3d12) {
+              dllDynamicD3d12 = true;
+            }
+            if ('dynamicallyLoadsDxgi' in dllHeader && dllHeader.dynamicallyLoadsDxgi) {
+              dllDynamicDxgi = true;
+            }
+            if ('dynamicallyLoadsVulkan' in dllHeader && dllHeader.dynamicallyLoadsVulkan) {
+              dllDynamicVulkan = true;
+            }
+          }
           for (const dep of dllHeader.importedDlls || []) {
+            // Never let browser/UI/redist DLLs (e.g. libcef.dll, Qt5WebEngineCore.dll)
+            // promote a launcher stub into a modern graphics game host.
+            if (isRedistDll && MODERN_GFX_DLL_SET.has(String(dep || '').toLowerCase())) {
+              continue;
+            }
             dllSet.add(dep);
           }
         }
@@ -3359,9 +3872,21 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     dllDynamicOpenGl || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsOpenGl));
   const anyDynamicDdraw =
     dllDynamicDdraw || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsDirectDraw));
+  const anyDynamicD3d11 =
+    dllDynamicD3d11 || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsD3d11));
+  const anyDynamicD3d12 =
+    dllDynamicD3d12 || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsD3d12));
+  const anyDynamicDxgi =
+    dllDynamicDxgi || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsDxgi));
+  const anyDynamicVulkan =
+    dllDynamicVulkan || allInspectedPes.some((p) => Boolean(p.dynamicallyLoadsVulkan));
   const gfxCaps = derivePeGraphicsCapabilities(importedDlls, {
     usesDynamicQgl: anyDynamicQgl,
     dynamicallyLoadsDirectDraw: anyDynamicDdraw,
+    dynamicallyLoadsD3d11: anyDynamicD3d11,
+    dynamicallyLoadsD3d12: anyDynamicD3d12,
+    dynamicallyLoadsDxgi: anyDynamicDxgi,
+    dynamicallyLoadsVulkan: anyDynamicVulkan,
     hasUe5IoStoreContainer,
     is64Bit,
     forceGlCore,
@@ -3374,15 +3899,28 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     ) || anyDynamicDdraw;
   const usesModernGraphicsApi =
     isModernUnity64Host ||
+    anyDynamicD3d11 ||
+    anyDynamicD3d12 ||
+    anyDynamicDxgi ||
+    anyDynamicVulkan ||
     importedDlls.some(
-      (d) => d === 'd3d12.dll' || d === 'vulkan-1.dll' || d === 'dxgi.dll' || d === 'd3d11.dll'
+      (d) =>
+        d === 'd3d12.dll' ||
+        d === 'd3d12core.dll' ||
+        d === 'vulkan-1.dll' ||
+        d === 'dxgi.dll' ||
+        d === 'd3d11.dll'
     );
-  const effectiveIsLauncherStubCandidate = isModernUnity64Host
-    ? Boolean(
-        validChildren.length > 0 ||
-          launcherSettings.resolvedTargetExePath ||
-          paradoxSettings.paradoxDirectGameExe
-      )
+  const hasDiscoveredChildTarget = Boolean(
+    validChildren.length > 0 ||
+      launcherSettings.resolvedTargetExePath ||
+      paradoxSettings.paradoxDirectGameExe
+  );
+  const isModern64Host = Boolean(
+    is64Bit && !is32Bit && usesModernGraphicsApi && !usesLegacyDirectDrawOrD3d && !usesOpenGl
+  );
+  const effectiveIsLauncherStubCandidate = isModern64Host
+    ? hasDiscoveredChildTarget
     : isLauncherStubCandidate;
   const isLegacy32BitOpenGl =
     effectiveMachine === 'x86' && usesOpenGl && !usesModernGraphicsApi;
@@ -3390,6 +3928,9 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     effectiveMachine === 'x86' &&
     (usesOpenGl || usesLegacyDirectDrawOrD3d) &&
     !usesModernGraphicsApi;
+  const hasDpiAwareManifest = Boolean(effectivePe.hasDpiAwareManifest);
+  const declaresPerMonitorDpi = Boolean(effectivePe.declaresPerMonitorDpi);
+  const callsPerMonitorDpiApi = Boolean(effectivePe.callsPerMonitorDpiApi);
 
   /** @type {string[]} */
   const targetExePaths = [];
@@ -3439,12 +3980,12 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
     usesModernGraphicsApi,
     isLegacy32BitOpenGl,
     needsLegacyDisplayModeSynthesis,
+    hasDpiAwareManifest,
+    declaresPerMonitorDpi,
+    callsPerMonitorDpiApi,
     isDosboxExecutable,
     isLauncherStubCandidate: effectiveIsLauncherStubCandidate,
-    hasChildGameExecutable:
-      validChildren.length > 0 ||
-      Boolean(launcherSettings.resolvedTargetExePath) ||
-      Boolean(paradoxSettings.paradoxDirectGameExe),
+    hasChildGameExecutable: hasDiscoveredChildTarget,
     targetExePaths,
     targetExeBasenamesLower: Array.from(basenameSet),
     launcherSettings,

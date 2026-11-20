@@ -248,8 +248,15 @@ export const VIRTUAL_DESKTOP_RESOLUTION_OPTIONS: readonly {
   label: string;
 }[] = [
   { value: 'auto', label: 'Match Display Automatically' },
+  { value: '3840x2160', label: '3840 × 2160 (16:9 4K UHD)' },
+  { value: '3440x1440', label: '3440 × 1440 (21:9 UWQHD)' },
+  { value: '3024x1964', label: '3024 × 1964 (14" MacBook Native)' },
+  { value: '2560x1600', label: '2560 × 1600 (16:10 WQXGA)' },
+  { value: '2560x1440', label: '2560 × 1440 (16:9 QHD)' },
   { value: '1920x1080', label: '1920 × 1080 (16:9 FHD)' },
+  { value: '1728x1117', label: '1728 × 1117 (16" MacBook Logical)' },
   { value: '1600x900', label: '1600 × 900 (16:9 HD+)' },
+  { value: '1512x982', label: '1512 × 982 (14" MacBook Logical)' },
   { value: '1280x720', label: '1280 × 720 (16:9 HD)' },
   { value: '1024x768', label: '1024 × 768 (4:3 XGA)' },
   { value: '800x600', label: '800 × 600 (4:3 SVGA)' },

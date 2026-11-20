@@ -598,6 +598,98 @@ runTest('TRK6-04', 'Universal Portability & Zero-PII: Scaler source tree contain
 });
 
 // ============================================================================
+// TRACK 7: Display Scaler v3 Three-Tier Presenter, Vulkan D3D9 & Multi-Monitor
+// ============================================================================
+console.log('\n--- TRACK 7: Display Scaler v3 Architecture & Multi-Display Hardening ---');
+
+runTest('TRK7-01', 'Three-Tier Presenter & hard GLHost barriers enforced in C11 scaler', () => {
+  const internalH = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_internal.h'), 'utf8');
+  const dllSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_dll.c'), 'utf8');
+  const winSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_window.c'), 'utf8');
+  const glSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_gl_gdi.c'), 'utf8');
+
+  assert.match(internalH, /DS_PRESENTER_LEGACY_VIRTUAL/);
+  assert.match(internalH, /DS_PRESENTER_MODERN_PASSTHROUGH/);
+  assert.match(internalH, /DS_PRESENTER_MODERN_BORDERLESS/);
+  assert.match(dllSrc, /ds_is_vulkan_d3d9_locked/);
+  assert.match(dllSrc, /wined3d_uses_vulkan/);
+  assert.match(dllSrc, /L"dxgi\.dll"/);
+  assert.match(winSrc, /ds_dpi_guard_enter/);
+  assert.match(winSrc, /ds_restore_window_on_passthrough/);
+  assert.match(glSrc, /GL_MAX_TEXTURE_SIZE/);
+  assert.match(glSrc, /g_ds\.wined3d_uses_gl\s*=\s*true/);
+});
+
+runTest('TRK7-02', 'Multi-PID --watch-dir injection and expanded non-game helper skip list', () => {
+  const launcherSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_launcher.c'), 'utf8');
+  assert.match(launcherSrc, /injected_pids\[64\]/);
+  assert.match(launcherSrc, /crashhandler64\.exe/i);
+  assert.match(launcherSrc, /unitycrashhandler64\.exe/i);
+  assert.match(launcherSrc, /easyanticheat_eos_setup\.exe/i);
+});
+
+runTest('TRK7-03', 'Zero hardcoded host display dimensions in C11 display scaler runtime code', () => {
+  const files = [
+    'display_scaler.h',
+    'display_scaler_internal.h',
+    'display_scaler_math.c',
+    'display_scaler_dll.c',
+    'display_scaler_window.c',
+    'display_scaler_gl_gdi.c',
+    'display_launcher.c',
+  ];
+  for (const file of files) {
+    const raw = fs.readFileSync(path.join(SCALER_DIR, file), 'utf8');
+    const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    assert.doesNotMatch(
+      stripped,
+      /\b(1512|982|3024|1964)\b/,
+      `Runtime C source ${file} must not hardcode machine-specific display dimensions`
+    );
+  }
+});
+
+runTest('TRK7-04', 'detectDisplayGeometry parses Apple Silicon main display & More Space backing without hardcoding', () => {
+  const verifierMod = require(VERIFIER_SCRIPT);
+  const mockJson = JSON.stringify({
+    SPDisplaysDataType: [
+      {
+        spdisplays_ndrvs: [
+          {
+            _name: 'Side 1080p',
+            _spdisplays_pixels: '1920 x 1080',
+            _spdisplays_resolution: '1920 x 1080 @ 60Hz',
+            spdisplays_main: 'spdisplays_no',
+            spdisplays_online: 'spdisplays_yes',
+          },
+          {
+            _name: 'Built-in Retina',
+            _spdisplays_pixels: '3024 x 1964',
+            _spdisplays_resolution: '1800 x 1169 @ 120Hz',
+            spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+            spdisplays_main: 'spdisplays_yes',
+            spdisplays_online: 'spdisplays_yes',
+          },
+        ],
+      },
+    ],
+  });
+  const geom = verifierMod.detectDisplayGeometry({ platform: 'darwin', execSyncFn: () => mockJson });
+  assert.strictEqual(geom.width, 3600);
+  assert.strictEqual(geom.height, 2338);
+  assert.strictEqual(geom.logicalWidth, 1800);
+  assert.strictEqual(geom.logicalHeight, 1169);
+  assert.strictEqual(geom.panelWidth, 3024);
+  assert.strictEqual(geom.panelHeight, 1964);
+  assert.strictEqual(geom.isMain, true);
+
+  // Non-macOS fallback must use generic 1920x1080, not machine-specific 3024x1964
+  const fallback = verifierMod.detectDisplayGeometry({ platform: 'linux' });
+  assert.strictEqual(fallback.width, 1920);
+  assert.strictEqual(fallback.height, 1080);
+});
+
+// ============================================================================
 // FINAL SUMMARY & VERDICT
 // ============================================================================
 console.log('\n================================================================');

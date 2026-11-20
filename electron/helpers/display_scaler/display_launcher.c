@@ -154,10 +154,15 @@ static bool is_excluded_helper_exe(const WCHAR *full_path)
         L"regedit.exe", L"winecfg.exe", L"winedbg.exe", L"msiexec.exe",
         L"rundll32.exe", L"wineboot.exe", L"winemenubuilder.exe",
         L"dxsetup.exe", L"vcredist_x86.exe", L"vcredist_x64.exe",
+        L"vc_redist.x86.exe", L"vc_redist.x64.exe",
         L"steam.exe", L"steamwebhelper.exe", L"steamservice.exe",
         L"steamerrorreporter.exe", L"steamerrorreporter64.exe", L"gameoverlayui.exe",
         L"galaxyclient.exe", L"galaxyclienthelper.exe", L"galaxycommunication.exe",
-        L"epicgameslauncher.exe", L"epicwebhelper.exe", L"crashreportclient.exe",
+        L"goglauncher.exe", L"eadesktop.exe", L"ubisoftconnect.exe", L"upc.exe",
+        L"epicgameslauncher.exe", L"epicwebhelper.exe",
+        L"crashreportclient.exe", L"crashhandler.exe", L"crashhandler64.exe",
+        L"unitycrashhandler32.exe", L"unitycrashhandler64.exe",
+        L"easyanticheat_eos_setup.exe", L"battleye_launcher.exe",
         L"one_display_launcher_x86.exe", L"one_display_launcher_x64.exe",
         L"one_xgr_win_launcher.exe", L"one_xgr_win_launcher_x86.exe"
     };
@@ -532,6 +537,32 @@ static void normalize_dir_prefix_w(const WCHAR *src, WCHAR *out_buf, size_t cap)
     out_buf[j] = L'\0';
 }
 
+static bool watch_active_session_is_off(void)
+{
+    WCHAR self_path[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(NULL, self_path, MAX_PATH - 1) == 0) return false;
+    WCHAR *last_sep = NULL;
+    for (WCHAR *p = self_path; *p; p++) {
+        if (*p == L'\\' || *p == L'/') last_sep = p;
+    }
+    if (!last_sep) return false;
+    *last_sep = L'\0';
+    WCHAR ini_path[MAX_PATH] = { 0 };
+    _snwprintf(ini_path, MAX_PATH - 1, L"%ls\\active_session.ini", self_path);
+    HANDLE hf = CreateFileW(
+        ini_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    char buf[512];
+    DWORD nr = 0;
+    BOOL ok = ReadFile(hf, buf, (DWORD)(sizeof(buf) - 1), &nr, NULL);
+    CloseHandle(hf);
+    if (!ok || nr == 0) return false;
+    buf[nr] = '\0';
+    return (strstr(buf, "mode=off") != NULL || strstr(buf, "mode=passthrough") != NULL);
+}
+
 static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, const WCHAR *dll_x64, DWORD timeout_ms)
 {
     WCHAR norm_dir[MAX_PATH];
@@ -542,8 +573,18 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
     DWORD self_pid = GetCurrentProcessId();
     ULONGLONG start_ms = GetTickCount64();
     DWORD max_wait = (timeout_ms > 0) ? timeout_ms : 90000u;
+    const ULONGLONG post_inject_grace_ms = 15000ULL;
+
+    DWORD injected_pids[64];
+    size_t injected_count = 0;
+    ULONGLONG last_inject_ms = 0;
+    DWORD poll_iters = 0;
 
     for (;;) {
+        if ((poll_iters++ % 10u) == 0 && watch_active_session_is_off()) {
+            return (injected_count > 0) ? 0 : 0;
+        }
+
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe;
@@ -553,6 +594,15 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
                 do {
                     if (pe.th32ProcessID == 0 || pe.th32ProcessID == self_pid) continue;
                     if (is_excluded_helper_exe(pe.szExeFile)) continue;
+
+                    bool already_injected = false;
+                    for (size_t idx = 0; idx < injected_count; idx++) {
+                        if (injected_pids[idx] == pe.th32ProcessID) {
+                            already_injected = true;
+                            break;
+                        }
+                    }
+                    if (already_injected) continue;
 
                     HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
                     if (!hp) continue;
@@ -576,8 +626,13 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
 
                     if (k > dir_len && memcmp(norm_img, norm_dir, dir_len * sizeof(WCHAR)) == 0) {
                         if (inject_pid_dispatch(pe.th32ProcessID, NULL, dll_x86, dll_x64)) {
-                            CloseHandle(snap);
-                            return 0;
+                            if (injected_count < 64u) {
+                                injected_pids[injected_count++] = pe.th32ProcessID;
+                            } else {
+                                memmove(injected_pids, injected_pids + 1, 63u * sizeof(DWORD));
+                                injected_pids[63] = pe.th32ProcessID;
+                            }
+                            last_inject_ms = GetTickCount64();
                         }
                     }
                 } while (Process32NextW(snap, &pe));
@@ -585,8 +640,12 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
             CloseHandle(snap);
         }
 
-        if ((GetTickCount64() - start_ms) >= (ULONGLONG)max_wait) {
-            return DS_LAUNCH_ERR_WATCH_TIMEOUT;
+        ULONGLONG now_ms = GetTickCount64();
+        if (injected_count > 0 && last_inject_ms > 0 && (now_ms - last_inject_ms) >= post_inject_grace_ms) {
+            return 0;
+        }
+        if ((now_ms - start_ms) >= (ULONGLONG)max_wait) {
+            return (injected_count > 0) ? 0 : DS_LAUNCH_ERR_WATCH_TIMEOUT;
         }
         Sleep(50);
     }

@@ -1673,8 +1673,8 @@ function CompatibilityLayerSectionImpl(
                 <option value="false">Disabled</option>
               </LaunchSelect>
               <p id={emulateModesetHintId} className="text-[10px] text-steam-subtext leading-snug">
-                Emulates Win32 display mode switches inside Wine Mac Driver without altering macOS
-                desktop resolution.
+                Emulates Win32 display mode switches inside Wine (X11 Driver\EmulateModeset) without
+                altering macOS desktop resolution.
               </p>
             </div>
           </div>

@@ -446,6 +446,85 @@ size_t ds_build_mode_table(
     return out_count;
 }
 
+size_t ds_merge_mode_tables(
+    const ds_display_mode_t *os_modes,
+    size_t                   os_count,
+    const ds_display_mode_t *synth_modes,
+    size_t                   synth_count,
+    ds_display_mode_t       *out_modes,
+    size_t                   max_modes
+)
+{
+    if (!out_modes || max_modes == 0) {
+        return 0;
+    }
+
+    size_t hard_cap = (max_modes < DS_MAX_UNION_MODES) ? max_modes : DS_MAX_UNION_MODES;
+    size_t count = 0;
+
+    /* 1. Add OS modes first (deduplicating by (w, h, bpp), preferring higher refresh_hz) */
+    if (os_modes && os_count > 0) {
+        for (size_t i = 0; i < os_count; i++) {
+            ds_display_mode_t m = os_modes[i];
+            if (m.width <= 0 || m.height <= 0 || m.bpp < 8) continue;
+            if (m.refresh_hz <= 0) m.refresh_hz = 60;
+            bool found = false;
+            for (size_t j = 0; j < count; j++) {
+                if (out_modes[j].width == m.width &&
+                    out_modes[j].height == m.height &&
+                    out_modes[j].bpp == m.bpp) {
+                    if (m.refresh_hz > out_modes[j].refresh_hz) {
+                        out_modes[j].refresh_hz = m.refresh_hz;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && count < hard_cap) {
+                out_modes[count++] = m;
+            }
+        }
+    }
+
+    /* 2. Add missing synthesized modes without overwriting OS refresh rates */
+    if (synth_modes && synth_count > 0) {
+        for (size_t i = 0; i < synth_count && count < hard_cap; i++) {
+            ds_display_mode_t m = synth_modes[i];
+            if (m.width <= 0 || m.height <= 0 || m.bpp < 8) continue;
+            if (m.refresh_hz <= 0) m.refresh_hz = 60;
+            bool found = false;
+            for (size_t j = 0; j < count; j++) {
+                if (out_modes[j].width == m.width &&
+                    out_modes[j].height == m.height &&
+                    out_modes[j].bpp == m.bpp) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                out_modes[count++] = m;
+            }
+        }
+    }
+
+    /* 3. Insertion sort ascending by (width, height, bpp) */
+    for (size_t i = 1; i < count; i++) {
+        ds_display_mode_t cur = out_modes[i];
+        size_t j = i;
+        while (j > 0 &&
+               (out_modes[j - 1].width > cur.width ||
+                (out_modes[j - 1].width == cur.width && out_modes[j - 1].height > cur.height) ||
+                (out_modes[j - 1].width == cur.width && out_modes[j - 1].height == cur.height &&
+                 out_modes[j - 1].bpp > cur.bpp))) {
+            out_modes[j] = out_modes[j - 1];
+            j--;
+        }
+        out_modes[j] = cur;
+    }
+
+    return count;
+}
+
 static int64_t ds_clamp_i64(int64_t val, int64_t lo, int64_t hi)
 {
     if (val < lo) return lo;
@@ -767,6 +846,19 @@ static bool ds_copy_unquoted_span(const char *s, size_t len, char *out_buf, size
     return true;
 }
 
+static bool ds_parse_bool_span(const char *val, size_t val_len, bool *out_val)
+{
+    if (ds_ascii_ieq_span(val, val_len, "1") || ds_ascii_ieq_span(val, val_len, "true")) {
+        *out_val = true;
+        return true;
+    }
+    if (ds_ascii_ieq_span(val, val_len, "0") || ds_ascii_ieq_span(val, val_len, "false")) {
+        *out_val = false;
+        return true;
+    }
+    return false;
+}
+
 bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_state)
 {
     if (out_state) {
@@ -817,12 +909,8 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
                 out_state->seq = parsed_seq;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "fullscreen")) {
-            if (ds_ascii_ieq_span(val, val_len, "1") || ds_ascii_ieq_span(val, val_len, "true")) {
+            if (ds_parse_bool_span(val, val_len, &out_state->fullscreen)) {
                 out_state->has_fullscreen = true;
-                out_state->fullscreen = true;
-            } else if (ds_ascii_ieq_span(val, val_len, "0") || ds_ascii_ieq_span(val, val_len, "false")) {
-                out_state->has_fullscreen = true;
-                out_state->fullscreen = false;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "aspect")) {
             if (ds_ascii_ieq_span(val, val_len, "preserve_aspect") ||
@@ -865,12 +953,12 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
                 out_state->scaling_mode = DS_MODE_PASSTHROUGH;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "hotkey")) {
-            if (ds_ascii_ieq_span(val, val_len, "1") || ds_ascii_ieq_span(val, val_len, "true")) {
+            if (ds_parse_bool_span(val, val_len, &out_state->hotkey)) {
                 out_state->has_hotkey = true;
-                out_state->hotkey = true;
-            } else if (ds_ascii_ieq_span(val, val_len, "0") || ds_ascii_ieq_span(val, val_len, "false")) {
-                out_state->has_hotkey = true;
-                out_state->hotkey = false;
+            }
+        } else if (ds_ascii_ieq_span(key, key_len, "user_override")) {
+            if (ds_parse_bool_span(val, val_len, &out_state->user_override)) {
+                out_state->has_user_override = true;
             }
         } else if (ds_ascii_ieq_span(key, key_len, "updated_unix_ms")) {
             uint64_t parsed_ts = 0;
@@ -889,6 +977,10 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
         }
     }
 
+    if (!out_state->has_user_override) {
+        out_state->user_override = (out_state->has_seq && out_state->seq > 1ULL);
+    }
+
     return out_state->has_seq ||
            out_state->has_fullscreen ||
            out_state->has_aspect ||
@@ -896,6 +988,7 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
            out_state->has_filter ||
            out_state->has_scaling_mode ||
            out_state->has_hotkey ||
+           out_state->has_user_override ||
            out_state->has_updated_unix_ms ||
            out_state->has_control_file ||
            out_state->has_status_file;

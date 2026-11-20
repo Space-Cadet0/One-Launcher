@@ -49,6 +49,7 @@ const {
 const windowsRegistryDiscovery = require('../utils/windowsRegistryDiscovery.cjs');
 const {
   inspectWindowsExecutableHeader,
+  inspectPeCapabilities,
   inspectMacMachOHeader,
   parseSteamLibraryFoldersVdf,
 } = require('./binaryAndManifestInspectors.cjs');
@@ -305,6 +306,143 @@ function readMacBundleIdFromInfoPlist(appBundlePath) {
   }
 }
 
+/**
+ * Check whether a file starts with a Mach-O or Fat/Universal Mach-O magic header.
+ * @param {string} filePath
+ */
+function isMachOBinaryFile(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const hdr = Buffer.alloc(4);
+    if (fs.readSync(fd, hdr, 0, 4, 0) < 4) return false;
+    const magic = hdr.readUInt32BE(0);
+    return (
+      magic === 0xfeedface ||
+      magic === 0xcefaedfe ||
+      magic === 0xfeedfacf ||
+      magic === 0xcffaedfe ||
+      magic === 0xcafebabe ||
+      magic === 0xbebafeca
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Collect nested signable macOS bundle items inside `Contents/{Frameworks,PlugIns,Helpers,Library,Resources,MacOS}`
+ * ordered deepest-first (inside-out) so ad-hoc re-signing never relies on deprecated `codesign --deep`.
+ *
+ * @param {string} appBundlePath
+ * @returns {string[]}
+ */
+function collectNestedMacSignableItems(appBundlePath) {
+  const contentsDir = path.join(appBundlePath, 'Contents');
+  const subdirs = ['Frameworks', 'PlugIns', 'Helpers', 'Library', 'Resources', 'MacOS'];
+  /** @type {Array<{ targetPath: string, depth: number }>} */
+  const items = [];
+  const seen = new Set();
+
+  const walk = (/** @type {string} */ dir, /** @type {number} */ depth, /** @type {boolean} */ inMacOsDir) => {
+    if (depth > 8) return;
+    /** @type {fs.Dirent[]} */
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const isNestedBundle = /\.(?:framework|xpc|app|bundle|appex)$/i.test(entry.name);
+        walk(fullPath, depth + 1, inMacOsDir || entry.name === 'MacOS');
+        if (isNestedBundle && !seen.has(fullPath)) {
+          seen.add(fullPath);
+          items.push({ targetPath: fullPath, depth });
+        }
+      } else if (entry.isFile()) {
+        const isCodeExt = /\.(?:dylib|so)$/i.test(entry.name);
+        if ((isCodeExt || (inMacOsDir && isMachOBinaryFile(fullPath))) && !seen.has(fullPath)) {
+          seen.add(fullPath);
+          items.push({ targetPath: fullPath, depth });
+        }
+      }
+    }
+  };
+
+  for (const sub of subdirs) {
+    const subPath = path.join(contentsDir, sub);
+    if (fs.existsSync(subPath)) {
+      walk(subPath, 1, sub === 'MacOS');
+    }
+  }
+
+  items.sort((a, b) => b.depth - a.depth || b.targetPath.length - a.targetPath.length);
+  return items.map((item) => item.targetPath);
+}
+
+/**
+ * Inside-out ad-hoc macOS app bundle signing (sync). Never passes `--deep` to `codesign --sign`.
+ * @param {string} appBundlePath
+ * @param {string | null} bundleId
+ * @param {(cmd: string, args: string[], opts: any) => any} execFileSyncImpl
+ */
+function signMacAppBundleInsideOutSync(appBundlePath, bundleId, execFileSyncImpl) {
+  const nestedItems = collectNestedMacSignableItems(appBundlePath);
+  for (const itemPath of nestedItems) {
+    execFileSyncImpl('codesign', ['--force', '--sign', '-', itemPath], {
+      stdio: 'ignore',
+      timeout: 15000,
+    });
+  }
+  const outerSignArgs = [
+    '--force',
+    '--sign',
+    '-',
+    ...(bundleId ? ['--identifier', bundleId, `-r=designated => identifier "${bundleId}"`] : []),
+    appBundlePath,
+  ];
+  execFileSyncImpl('codesign', outerSignArgs, {
+    stdio: 'ignore',
+    timeout: 15000,
+  });
+  execFileSyncImpl('codesign', ['--verify', '--deep', '--strict', appBundlePath], {
+    stdio: 'ignore',
+    timeout: 5000,
+  });
+}
+
+/**
+ * Inside-out ad-hoc macOS app bundle signing (async). Never passes `--deep` to `codesign --sign`.
+ * @param {string} appBundlePath
+ * @param {string | null} bundleId
+ * @param {(cmd: string, args: string[], timeout: number) => Promise<any>} runCmd
+ */
+async function signMacAppBundleInsideOutAsync(appBundlePath, bundleId, runCmd) {
+  const nestedItems = collectNestedMacSignableItems(appBundlePath);
+  for (const itemPath of nestedItems) {
+    await runCmd('codesign', ['--force', '--sign', '-', itemPath], 15000);
+  }
+  const outerSignArgs = [
+    '--force',
+    '--sign',
+    '-',
+    ...(bundleId ? ['--identifier', bundleId, `-r=designated => identifier "${bundleId}"`] : []),
+    appBundlePath,
+  ];
+  await runCmd('codesign', outerSignArgs, 15000);
+  await runCmd('codesign', ['--verify', '--deep', '--strict', appBundlePath], 5000);
+}
+
 function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options = {}) {
   const platform = options.platform || process.platform;
   if (
@@ -360,20 +498,7 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
   } catch {
     try {
       const bundleId = readMacBundleIdFromInfoPlist(appBundlePath);
-      const signArgs = [
-        '--force',
-        '--deep',
-        '--sign',
-        '-',
-        ...(bundleId
-          ? ['--identifier', bundleId, `-r=designated => identifier "${bundleId}"`]
-          : []),
-        appBundlePath,
-      ];
-      execFileSyncImpl('codesign', signArgs, {
-        stdio: 'ignore',
-        timeout: 15000,
-      });
+      signMacAppBundleInsideOutSync(appBundlePath, bundleId, execFileSyncImpl);
       if (useCache) {
         const postSig = computeMacAppBundleStatSignature(appBundlePath);
         if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
@@ -453,17 +578,7 @@ async function ensureMacAppCodeSignatureValidAsync(targetPath, /** @type {any} *
   } catch {
     try {
       const bundleId = readMacBundleIdFromInfoPlist(appBundlePath);
-      const signArgs = [
-        '--force',
-        '--deep',
-        '--sign',
-        '-',
-        ...(bundleId
-          ? ['--identifier', bundleId, `-r=designated => identifier "${bundleId}"`]
-          : []),
-        appBundlePath,
-      ];
-      await runCmd('codesign', signArgs, 15000);
+      await signMacAppBundleInsideOutAsync(appBundlePath, bundleId, runCmd);
       if (useCache) {
         const postSig = computeMacAppBundleStatSignature(appBundlePath);
         if (postSig) setBoundedMapEntry(macCodesignValidCache, appBundlePath, postSig, 500);
@@ -7664,6 +7779,7 @@ const CX_ENV_MANAGED_FORWARD_KEYS = [
   'ONE_LAUNCHER_SUPPRESS_PRELOAD',
   'ONE_LAUNCHER_DISPLAY_SCALING_MODE',
   'ONE_LAUNCHER_DISPLAY_ASPECT',
+  'ONE_LAUNCHER_SCALING_FILTER',
   'ONE_LAUNCHER_SAFE_INSET_TOP',
   'ONE_LAUNCHER_FULLSCREEN_HOTKEY',
   'ONE_LAUNCHER_SCALER_DLL_X86',
@@ -7672,6 +7788,8 @@ const CX_ENV_MANAGED_FORWARD_KEYS = [
   'ONE_LAUNCHER_LAUNCHER_EXE_X64',
   'ONE_LAUNCHER_DISPLAY_CONTROL_FILE',
   'ONE_LAUNCHER_DISPLAY_STATUS_FILE',
+  'ONE_LAUNCHER_DISPLAY_TRACE_FILE',
+  'ONE_LAUNCHER_SINGLE_CORE_AFFINITY',
   'MTL_HUD_ENABLED',
   'WINEMSYNC',
   'WINEESYNC',
@@ -9048,7 +9166,7 @@ function applyCrossOverPerGameSettings(
     effectiveOptions.wineBinary ||
     '';
 
-  const peCapsSrc =
+  let peCapsSrc =
     (effectiveOptions.peCapabilities && typeof effectiveOptions.peCapabilities === 'object'
       ? effectiveOptions.peCapabilities
       : null) ||
@@ -9056,6 +9174,25 @@ function applyCrossOverPerGameSettings(
       ? effectiveOptions.effectiveCaps
       : null) ||
     (cfg.peCapabilities && typeof cfg.peCapabilities === 'object' ? cfg.peCapabilities : null);
+  if (!peCapsSrc) {
+    const candidateDiskExe =
+      (explicitExeNameFromArg &&
+      (explicitExeNameFromArg.includes('/') || explicitExeNameFromArg.includes('\\'))
+        ? explicitExeNameFromArg
+        : '') ||
+      (typeof effectiveOptions.exePath === 'string' ? effectiveOptions.exePath : '') ||
+      (typeof cfg.executablePath === 'string' ? cfg.executablePath : '');
+    if (candidateDiskExe) {
+      try {
+        if (fs.existsSync(candidateDiskExe) && fs.statSync(candidateDiskExe).isFile()) {
+          const autoInspected = inspectPeCapabilities(candidateDiskExe);
+          if (autoInspected && autoInspected.isValidPe) {
+            peCapsSrc = autoInspected;
+          }
+        }
+      } catch {}
+    }
+  }
   const hasPeCaps = Boolean(
     peCapsSrc ||
       typeof effectiveOptions.is32Bit === 'boolean' ||
@@ -9921,7 +10058,7 @@ function applyCrossOverPerGameSettings(
       }
       const targetExes = Array.from(targetExeSet);
 
-      // Inspect pre-existing user.reg state once for non-destructive RetinaMode & baseline hygiene
+      // Inspect pre-existing user.reg state once for non-destructive RetinaMode, AppCompatFlags\Layers & baseline hygiene
       let priorMacDriverManaged = false;
       /** @type {string | null} */
       let priorRetinaModeVal = null;
@@ -9931,6 +10068,8 @@ function applyCrossOverPerGameSettings(
       let hasValveSteamInUserReg = false;
       /** @type {string | null} */
       let globalWineVersionVal = null;
+      /** @type {Map<string, string>} */
+      const existingAppCompatLayers = new Map();
 
       if (fs.existsSync(userRegPath)) {
         try {
@@ -9993,6 +10132,25 @@ function applyCrossOverPerGameSettings(
             if (spMatch) savedPriorRetinaVal = spMatch[1];
           }
 
+          const layersSecMatch =
+            /^\[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\AppCompatFlags\\\\Layers\](?:\s+\d+)?[^\r\n]*$/im.exec(
+              existingUserReg
+            );
+          if (layersSecMatch) {
+            const secStart = layersSecMatch.index + layersSecMatch[0].length;
+            const afterSec = existingUserReg.slice(secStart);
+            const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+            const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+            const kvRe = /^"([^"]+)"\s*=\s*"([^"]*)"/gm;
+            let kvMatch;
+            while ((kvMatch = kvRe.exec(secBody)) !== null) {
+              const kLower = String(kvMatch[1] || '').trim().toLowerCase();
+              if (kLower) {
+                existingAppCompatLayers.set(kLower, String(kvMatch[2] || ''));
+              }
+            }
+          }
+
           const globalWineMatch = /^\[Software\\\\Wine\](?:\s+\d+)?[^\r\n]*$/im.exec(
             existingUserReg
           );
@@ -10007,7 +10165,7 @@ function applyCrossOverPerGameSettings(
         } catch {}
       }
 
-      // 1. Per-exe AppDefaults\Mac Driver + Non-destructive global RetinaMode & LogPixels DPI hygiene
+      // 1. Per-exe AppDefaults\Mac Driver + Self-healing global RetinaMode & LogPixels DPI hygiene
       const captureDisplaysVal = 'n';
       const commonMacDriverEntries = /** @type {Array<[string, any]>} */ ([
         ['CaptureDisplaysForFullscreen', { type: 'sz', value: captureDisplaysVal }],
@@ -10016,50 +10174,56 @@ function applyCrossOverPerGameSettings(
         ['LeftOptionIsAlt', { type: 'sz', value: 'y' }],
         ['RightOptionIsAlt', { type: 'sz', value: 'y' }],
       ]);
-      if (typeof effectiveHighResolutionMode === 'boolean') {
-        const retinaVal = effectiveHighResolutionMode ? 'y' : 'n';
-        const logPixelsVal = effectiveHighResolutionMode ? 0xc0 : 0x60;
+      if (effectiveHighResolutionMode === false) {
+        const priorToSave = savedPriorRetinaVal || (priorRetinaModeVal === 'n' ? 'y' : priorRetinaModeVal || 'y');
         userRegBatchSpecs.push(
           {
             subKeyPath: 'Software\\Wine\\Mac Driver',
-            entries: [['RetinaMode', { type: 'sz', value: retinaVal }], ...commonMacDriverEntries],
+            entries: [
+              ['RetinaMode', { type: 'sz', value: 'n' }],
+              ['OneLauncherManagedRetina', { type: 'sz', value: '1' }],
+              ['OneLauncherPriorRetina', { type: 'sz', value: priorToSave }],
+              ...commonMacDriverEntries,
+            ],
           },
           {
             subKeyPath: 'Control Panel\\Desktop',
-            entries: [['LogPixels', { type: 'dword', value: logPixelsVal }]],
+            entries: [['LogPixels', { type: 'dword', value: 0x60 }]],
+          },
+          {
+            subKeyPath: 'Software\\Wine\\Fonts',
+            entries: [['LogPixels', { type: 'dword', value: 0x60 }]],
           }
         );
-        if (hasFontsSectionInUserReg) {
-          userRegBatchSpecs.push({
-            subKeyPath: 'Software\\Wine\\Fonts',
-            entries: [['LogPixels', { type: 'dword', value: logPixelsVal }]],
-          });
-        }
         for (const tExe of targetExes) {
           userRegBatchSpecs.push({
             subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
             entries: [
-              ['RetinaMode', { type: 'sz', value: retinaVal }],
+              ['RetinaMode', { type: 'sz', value: 'n' }],
               ...commonMacDriverEntries,
             ],
           });
         }
       } else {
-        const healedGlobalRetina =
-          priorMacDriverManaged && savedPriorRetinaVal !== null
-            ? savedPriorRetinaVal
-            : priorRetinaModeVal === 'n' && !priorMacDriverManaged
-              ? 'n'
-              : 'y';
-        userRegBatchSpecs.push({
-          subKeyPath: 'Software\\Wine\\Mac Driver',
-          entries: [
-            ...(priorMacDriverManaged || priorRetinaModeVal === null
-              ? /** @type {Array<[string, any]>} */ ([['RetinaMode', { type: 'sz', value: healedGlobalRetina }]])
-              : []),
-            ...commonMacDriverEntries,
-          ],
-        });
+        // Both `effectiveHighResolutionMode === true` and `undefined` (Default) enforce/heal
+        // global RetinaMode="y" + LogPixels=0xc0 (including fresh CrossOver bottles defaulting to "n"
+        // and prior `false` launches) and delete OneLauncherManagedRetina / OneLauncherPriorRetina.
+        userRegBatchSpecs.push(
+          {
+            subKeyPath: 'Software\\Wine\\Mac Driver',
+            entries: [['RetinaMode', { type: 'sz', value: 'y' }], ...commonMacDriverEntries],
+          },
+          {
+            subKeyPath: 'Control Panel\\Desktop',
+            entries: [['LogPixels', { type: 'dword', value: 0xc0 }]],
+          }
+        );
+        if (hasFontsSectionInUserReg) {
+          userRegBatchSpecs.push({
+            subKeyPath: 'Software\\Wine\\Fonts',
+            entries: [['LogPixels', { type: 'dword', value: 0xc0 }]],
+          });
+        }
         for (const tExe of targetExes) {
           userRegBatchSpecs.push({
             subKeyPath: `Software\\Wine\\AppDefaults\\${tExe}\\Mac Driver`,
@@ -10069,6 +10233,101 @@ function applyCrossOverPerGameSettings(
             ],
           });
         }
+      }
+
+      // 1b. Per-executable Wine-native AppCompatFlags\Layers (`HIGHDPIAWARE`) for crisp native Retina rendering
+      const STOREFRONT_DPI_EXCLUDED_EXES = new Set([
+        'steam.exe',
+        'steamwebhelper.exe',
+        'steamservice.exe',
+        'galaxyclient.exe',
+        'galaxyclienthelper.exe',
+        'galaxycommunication.exe',
+        'epicgameslauncher.exe',
+        'epicwebhelper.exe',
+        'upc.exe',
+        'eadesktop.exe',
+        'battlenet.exe',
+        'riotclientservices.exe',
+        'origin.exe',
+        'explorer.exe',
+      ]);
+      const SECONDARY_LAUNCHER_UTILITY_RE =
+        /(?:launcher|config|setup|updater|redist|crash|bootstrapper)\.exe$/i;
+      const primaryExeInput =
+        explicitExeNamesFromArg[0] || effectiveOptions.exeName || cfg.exeName || '';
+      const primaryExeBasenameLower =
+        typeof primaryExeInput === 'string' && primaryExeInput.trim()
+          ? path.win32.basename(primaryExeInput.trim()).toLowerCase()
+          : '';
+      const isUnwrappedLegacyWindowed = Boolean(
+        effectiveScalingMode === 'windowed' &&
+          hasPeCaps &&
+          (peCaps.is32Bit ||
+            peCaps.usesLegacyDdraw ||
+            peCaps.importsD3d8 ||
+            peCaps.importsOpenGl ||
+            peCaps.importsLegacyD3dOrGl) &&
+          !peCaps.usesModernGraphicsApi
+      );
+      const exeDeclaresOwnDpi = Boolean(
+        hasPeCaps &&
+          (peCaps.hasDpiAwareManifest ||
+            peCaps.declaresPerMonitorDpi ||
+            peCaps.callsPerMonitorDpiApi)
+      );
+      const hasNonUtilityTargetExe = targetExes.some(
+        (t) => !STOREFRONT_DPI_EXCLUDED_EXES.has(t) && !SECONDARY_LAUNCHER_UTILITY_RE.test(t)
+      );
+      /** @type {Array<[string, any]>} */
+      const appCompatLayersUpserts = [];
+      /** @type {string[]} */
+      const appCompatLayersRemovals = [];
+      for (const tExe of targetExes) {
+        if (STOREFRONT_DPI_EXCLUDED_EXES.has(tExe)) continue;
+        const isPrimaryLauncherStub = Boolean(
+          hasPeCaps &&
+            peCaps.hasChildGameExecutable &&
+            peCaps.isLauncherStubCandidate &&
+            primaryExeBasenameLower &&
+            tExe === primaryExeBasenameLower
+        );
+        if (isPrimaryLauncherStub) continue;
+        if (targetExes.length > 1 && hasNonUtilityTargetExe && SECONDARY_LAUNCHER_UTILITY_RE.test(tExe)) {
+          continue;
+        }
+        const wantHighDpiAware =
+          effectiveHighResolutionMode !== false &&
+          !exeDeclaresOwnDpi &&
+          !isUnwrappedLegacyWindowed;
+        const rawExisting = existingAppCompatLayers.get(tExe) || '';
+        const existingTokens = rawExisting
+          .split(/\s+/)
+          .map((tok) => tok.trim())
+          .filter((tok) => tok && tok !== '~');
+        if (wantHighDpiAware) {
+          const mergedTokens = existingTokens.slice();
+          if (!mergedTokens.some((tok) => /^highdpiaware$/i.test(tok))) {
+            mergedTokens.push('HIGHDPIAWARE');
+          }
+          appCompatLayersUpserts.push([tExe, { type: 'sz', value: `~ ${mergedTokens.join(' ')}` }]);
+        } else if (existingAppCompatLayers.has(tExe)) {
+          const remainingTokens = existingTokens.filter((tok) => !/^highdpiaware$/i.test(tok));
+          if (remainingTokens.length > 0) {
+            appCompatLayersUpserts.push([
+              tExe,
+              { type: 'sz', value: `~ ${remainingTokens.join(' ')}` },
+            ]);
+          } else {
+            appCompatLayersRemovals.push(tExe);
+          }
+        }
+      }
+      if (appCompatLayersUpserts.length > 0) {
+        userRegBatchSpecs.push({
+          subKeyPath: 'Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers',
+          entries: appCompatLayersUpserts,
+        });
       }
 
       // 2. Global `[Software\\Wine]` `"Version"` poisoning recovery for 64-bit launches
@@ -10098,8 +10357,8 @@ function applyCrossOverPerGameSettings(
           ? effectiveHighResolutionMode
           : true;
       const hostRes = getHostMaxDisplayResolution(effectiveRetinaCoordSpace, displayProbeOpts);
-      const autoDesktopWidth = Math.max(640, Math.round(Number(hostRes?.width) || 1512));
-      const autoDesktopHeight = Math.max(480, Math.round(Number(hostRes?.height) || 982));
+      const autoDesktopWidth = Math.max(640, Math.round(Number(hostRes?.width) || 1920));
+      const autoDesktopHeight = Math.max(480, Math.round(Number(hostRes?.height) || 1080));
 
       const wantVirtualDesktop = Boolean(
         effectiveScalingMode === 'virtual_desktop' ||
@@ -10195,7 +10454,7 @@ function applyCrossOverPerGameSettings(
           ? true
           : cfg.emulateModeset === false || effectiveOptions.emulateModeset === false
             ? false
-            : effectiveScalingMode === 'windowed';
+            : false;
       if (wantEmulateModeset) {
         userRegBatchSpecs.push({
           subKeyPath: 'Software\\Wine\\AppDefaults\\explorer.exe\\X11 Driver',
@@ -10252,15 +10511,7 @@ function applyCrossOverPerGameSettings(
         'RetinaMode',
         regUpsertOpts
       );
-      if (priorMacDriverManaged) {
-        if (typeof effectiveHighResolutionMode !== 'boolean' && savedPriorRetinaVal === null) {
-          removeWineRegNamedValue(
-            userRegPath,
-            'Software\\Wine\\Mac Driver',
-            'RetinaMode',
-            regUpsertOpts
-          );
-        }
+      if (effectiveHighResolutionMode !== false) {
         removeWineRegNamedValue(
           userRegPath,
           'Software\\Wine\\Mac Driver',
@@ -10271,6 +10522,14 @@ function applyCrossOverPerGameSettings(
           userRegPath,
           'Software\\Wine\\Mac Driver',
           'OneLauncherPriorRetina',
+          regUpsertOpts
+        );
+      }
+      for (const remExe of appCompatLayersRemovals) {
+        removeWineRegNamedValue(
+          userRegPath,
+          'Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers',
+          remExe,
           regUpsertOpts
         );
       }
@@ -10569,8 +10828,11 @@ function applyCrossOverPerGameSettings(
   return env;
 }
 
-/** @type {{ maxW: number, maxH: number, logW: number, logH: number } | null} */
+/** @type {{ maxW: number, maxH: number, logW: number, logH: number, panelW: number, panelH: number } | null} */
 let cachedHostDisplayMetrics = null;
+let cachedHostDisplayMetricsAt = 0;
+let hostDisplayMetricsListenerBound = false;
+const HOST_DISPLAY_METRICS_TTL_MS = 10_000;
 
 function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} */ options = {}) {
   if (Number(options?.maxWidth) > 0 && Number(options?.maxHeight) > 0) {
@@ -10578,6 +10840,8 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
     const mh = Math.round(Number(options.maxHeight));
     const lw = Math.round(Number(options.logicalWidth || mw));
     const lh = Math.round(Number(options.logicalHeight || mh));
+    const pw = Math.round(Number(options.panelWidth || mw));
+    const ph = Math.round(Number(options.panelHeight || mh));
     return {
       width: highResolutionMode ? mw : lw,
       height: highResolutionMode ? mh : lh,
@@ -10585,113 +10849,156 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
       nativeHeight: mh,
       logicalWidth: lw,
       logicalHeight: lh,
+      panelWidth: pw,
+      panelHeight: ph,
     };
   }
 
-  const electron = getElectron();
-  if (electron.screen && typeof electron.screen.getAllDisplays === 'function') {
+  const hasCustomProbeFn = typeof options?.execFileSyncFn === 'function';
+  const electron = !hasCustomProbeFn ? getElectron() : null;
+  if (
+    electron &&
+    electron.screen &&
+    (typeof electron.screen.getPrimaryDisplay === 'function' ||
+      typeof electron.screen.getAllDisplays === 'function')
+  ) {
+    if (!hostDisplayMetricsListenerBound && typeof electron.screen.on === 'function') {
+      hostDisplayMetricsListenerBound = true;
+      try {
+        electron.screen.on('display-metrics-changed', () => {
+          cachedHostDisplayMetrics = null;
+          cachedHostDisplayMetricsAt = 0;
+        });
+      } catch {}
+    }
     try {
-      const displays = electron.screen.getAllDisplays();
-      if (Array.isArray(displays) && displays.length > 0) {
-        let maxW = 0;
-        let maxH = 0;
-        let logW = 0;
-        let logH = 0;
-        for (const d of displays) {
-          const w = Number(d?.size?.width || 0);
-          const h = Number(d?.size?.height || 0);
-          const scale = Number(d?.scaleFactor || 1);
-          const physW = Math.round(w * scale);
-          const physH = Math.round(h * scale);
-          if (physW > maxW) {
-            maxW = physW;
-            maxH = physH;
-          }
-          if (w > logW) {
-            logW = Math.round(w);
-            logH = Math.round(h);
-          }
-        }
-        if (maxW > 0 && maxH > 0) {
+      const primary =
+        typeof electron.screen.getPrimaryDisplay === 'function'
+          ? electron.screen.getPrimaryDisplay()
+          : null;
+      const allDisplays =
+        !primary && typeof electron.screen.getAllDisplays === 'function'
+          ? electron.screen.getAllDisplays()
+          : [];
+      const targetDisplay = primary || (Array.isArray(allDisplays) ? allDisplays[0] : null);
+      if (targetDisplay) {
+        const w = Number(targetDisplay?.size?.width || targetDisplay?.bounds?.width || 0);
+        const h = Number(targetDisplay?.size?.height || targetDisplay?.bounds?.height || 0);
+        const scale = Number(targetDisplay?.scaleFactor || 1);
+        const backingW = Math.round(w * scale);
+        const backingH = Math.round(h * scale);
+        const logW = Math.round(w);
+        const logH = Math.round(h);
+        if (backingW > 0 && backingH > 0) {
           return {
-            width: highResolutionMode ? maxW : logW,
-            height: highResolutionMode ? maxH : logH,
-            nativeWidth: maxW,
-            nativeHeight: maxH,
+            width: highResolutionMode ? backingW : logW,
+            height: highResolutionMode ? backingH : logH,
+            nativeWidth: backingW,
+            nativeHeight: backingH,
             logicalWidth: logW,
             logicalHeight: logH,
+            panelWidth: backingW,
+            panelHeight: backingH,
           };
         }
       }
     } catch {}
   }
 
+  const now = typeof options?.nowMs === 'number' ? options.nowMs : Date.now();
+  const useProbeCache = !hasCustomProbeFn || options?.useCacheWithProbeFn === true;
+  const forceRefresh = Boolean(options?.forceRefresh || !useProbeCache);
+  const cacheFresh = Boolean(
+    !forceRefresh &&
+      cachedHostDisplayMetrics &&
+      now - cachedHostDisplayMetricsAt <= HOST_DISPLAY_METRICS_TTL_MS
+  );
+
+  /** @type {{ maxW: number, maxH: number, logW: number, logH: number, panelW: number, panelH: number } | null} */
+  let probedMetrics = cacheFresh ? cachedHostDisplayMetrics : null;
   if (
-    !cachedHostDisplayMetrics &&
-    process.platform === 'darwin' &&
-    !options?.skipDisplayProbe &&
-    !options?.homedir
+    !probedMetrics &&
+    (hasCustomProbeFn ||
+      (process.platform === 'darwin' && !options?.skipDisplayProbe && !options?.homedir))
   ) {
     try {
-      const out = execFileSync(
+      const execFn = hasCustomProbeFn ? options.execFileSyncFn : execFileSync;
+      const out = execFn(
         '/usr/sbin/system_profiler',
         ['SPDisplaysDataType', '-json'],
         { timeout: 2000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
       );
       const parsed = JSON.parse(String(out || '').trim());
       const gpus = Array.isArray(parsed?.SPDisplaysDataType) ? parsed.SPDisplaysDataType : [];
-      let maxW = 0;
-      let maxH = 0;
-      let logW = 0;
-      let logH = 0;
+      /** @type {any[]} */
+      const allDisplays = [];
+      for (const gpu of gpus) {
+        const displays = Array.isArray(gpu?.spdisplays_ndrvs) ? gpu.spdisplays_ndrvs : [];
+        for (const d of displays) {
+          if (d && typeof d === 'object') allDisplays.push(d);
+        }
+      }
+      const primaryDisplay =
+        allDisplays.find((d) => String(d?.spdisplays_main || '').toLowerCase() === 'spdisplays_yes') ||
+        allDisplays.find((d) => String(d?.spdisplays_online || '').toLowerCase() === 'spdisplays_yes') ||
+        allDisplays[0] ||
+        null;
+
       const parseResPair = (/** @type {any} */ val) => {
         const m = String(val || '').match(/(\d{3,5})\s*[xX×]\s*(\d{3,5})/);
         return m ? [Number(m[1]), Number(m[2])] : [0, 0];
       };
-      for (const gpu of gpus) {
-        const displays = Array.isArray(gpu?.spdisplays_ndrvs) ? gpu.spdisplays_ndrvs : [];
-        for (const d of displays) {
-          const [pw, ph] = parseResPair(d?._spdisplays_pixels || d?.spdisplays_pixelresolution);
-          const [rw, rh] = parseResPair(d?.spdisplays_resolution);
-          const isRetina = /retina/i.test(
-            String(d?.spdisplays_resolution || d?.spdisplays_retina || '')
-          );
-          const physW = pw || (isRetina && rw ? rw * 2 : rw);
-          const physH = ph || (isRetina && rh ? rh * 2 : rh);
-          const logicalW =
-            isRetina && physW > 0 && (!rw || rw === physW)
-              ? Math.round(physW / 2)
-              : rw || physW;
-          const logicalH =
-            isRetina && physH > 0 && (!rh || rh === physH)
-              ? Math.round(physH / 2)
-              : rh || physH;
-          if (physW > maxW) {
-            maxW = physW;
-            maxH = physH;
-          }
-          if (logicalW > logW) {
-            logW = logicalW;
-            logH = logicalH;
+      if (primaryDisplay) {
+        const [pw, ph] = parseResPair(
+          primaryDisplay._spdisplays_pixels ||
+            primaryDisplay.spdisplays_pixels ||
+            primaryDisplay.spdisplays_pixelresolution
+        );
+        const [rw, rh] = parseResPair(
+          primaryDisplay._spdisplays_resolution || primaryDisplay.spdisplays_resolution
+        );
+        const isRetina =
+          /retina/i.test(String(primaryDisplay.spdisplays_pixelresolution || '')) ||
+          /retina/i.test(String(primaryDisplay.spdisplays_display_type || '')) ||
+          /retina/i.test(String(primaryDisplay._spdisplays_resolution || '')) ||
+          /retina/i.test(String(primaryDisplay.spdisplays_resolution || '')) ||
+          String(primaryDisplay.spdisplays_retina || '').toLowerCase() === 'spdisplays_yes' ||
+          (pw > 0 && rw > 0 && pw >= rw * 1.5);
+        const logicalW = rw > 0 ? rw : isRetina && pw > 0 ? Math.round(pw / 2) : pw;
+        const logicalH = rh > 0 ? rh : isRetina && ph > 0 ? Math.round(ph / 2) : ph;
+        // Under non-integer HiDPI presets like "More Space" (e.g. 1800x1169 UI on 3024x1964 panel),
+        // CoreGraphics / winemac.drv presents a 2x virtual backing surface (rw * 2 x rh * 2).
+        const backingW =
+          isRetina && rw > 0 && rw * 2 > pw ? rw * 2 : pw || (isRetina && rw ? rw * 2 : rw);
+        const backingH =
+          isRetina && rh > 0 && rh * 2 > ph ? rh * 2 : ph || (isRetina && rh ? rh * 2 : rh);
+        const panelW = pw || backingW;
+        const panelH = ph || backingH;
+        if (backingW > 0 && backingH > 0) {
+          probedMetrics = {
+            maxW: Math.round(backingW),
+            maxH: Math.round(backingH),
+            logW: Math.round(logicalW || backingW),
+            logH: Math.round(logicalH || backingH),
+            panelW: Math.round(panelW),
+            panelH: Math.round(panelH),
+          };
+          if (useProbeCache) {
+            cachedHostDisplayMetrics = probedMetrics;
+            cachedHostDisplayMetricsAt = now;
           }
         }
-      }
-      if (maxW > 0 && maxH > 0) {
-        cachedHostDisplayMetrics = {
-          maxW: Math.round(maxW),
-          maxH: Math.round(maxH),
-          logW: Math.round(logW || maxW),
-          logH: Math.round(logH || maxH),
-        };
       }
     } catch {}
   }
 
-  const metrics = cachedHostDisplayMetrics || {
+  const metrics = probedMetrics || {
     maxW: 3840,
     maxH: 2160,
     logW: 1920,
     logH: 1080,
+    panelW: 3840,
+    panelH: 2160,
   };
 
   return {
@@ -10701,6 +11008,8 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
     nativeHeight: metrics.maxH,
     logicalWidth: metrics.logW,
     logicalHeight: metrics.logH,
+    panelWidth: metrics.panelW,
+    panelHeight: metrics.panelH,
   };
 }
 
@@ -11030,8 +11339,14 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
       const userRegPath = path.join(winePrefix, 'user.reg');
       if (fs.existsSync(userRegPath)) {
         const regHead = fs.readFileSync(userRegPath, 'utf8');
-        if (/^"RetinaMode"\s*=\s*"n"/im.test(regHead)) {
-          highResolutionMode = false;
+        const macSecMatch = /^\[Software\\\\Wine\\\\Mac Driver\](?:\s+\d+)?[^\r\n]*$/im.exec(regHead);
+        if (macSecMatch) {
+          const afterSec = regHead.slice(macSecMatch.index + macSecMatch[0].length);
+          const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
+          const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
+          if (/^"RetinaMode"\s*=\s*"n"/im.test(secBody)) {
+            highResolutionMode = false;
+          }
         }
       }
     } catch {}
@@ -11129,6 +11444,20 @@ function sanitizeWinePrefixDisplayConfigs(winePrefix, /** @type {any} */ options
     explicitScalingMode !== null
       ? explicitScalingMode !== 'windowed'
       : false;
+
+  if (isUniversalFullscreenActive) {
+    if (hasValidInstallDir && resolvedInstallDir) {
+      try {
+        if (fs.statSync(resolvedInstallDir).isDirectory()) {
+          normalizeDosboxDisplayConfigs(resolvedInstallDir, {
+            scalingMode: effectiveScalingMode,
+            aspectRatio: effectiveAspectRatio,
+          });
+        }
+      } catch {}
+    }
+    return { sanitizedFiles, maxWidth, maxHeight };
+  }
 
   const sanitizeConfigFile = (/** @type {string} */ filePath) => {
     if (isUniversalFullscreenActive) return;

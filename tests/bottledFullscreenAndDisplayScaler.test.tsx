@@ -29,6 +29,7 @@ import {
 } from '../src/services/launcher/launchConfigStore';
 import { launcherService } from '../src/services/launcher/launcherService';
 import { CompatibilityLayerSection } from '../src/components/Launcher/LaunchConfig/CompatibilityLayerSection';
+import { VIRTUAL_DESKTOP_RESOLUTION_OPTIONS } from '../src/components/Launcher/LaunchConfig/launchConfigHelpers';
 import { StorefrontLifecycleSection } from '../src/components/Launcher/LaunchConfig/StorefrontLifecycleSection';
 import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
 import { createDomain12DeepRenderer } from './helpers/xboxTestHarness';
@@ -127,6 +128,45 @@ const macNativeInstaller = requireCjs(
     options?: Record<string, unknown>
   ) => {
     updatedFiles: Array<{ filePath: string }>;
+  };
+  getHostMaxDisplayResolution: (
+    highResolutionMode?: boolean,
+    options?: Record<string, unknown>
+  ) => {
+    width: number;
+    height: number;
+    nativeWidth: number;
+    nativeHeight: number;
+    logicalWidth: number;
+    logicalHeight: number;
+    panelWidth: number;
+    panelHeight: number;
+  };
+  prepareCrossOverWineSpawnEnv: (
+    wineBinaryPath: string,
+    env?: Record<string, string>,
+    options?: Record<string, unknown>
+  ) => string;
+  ensureMacAppCodeSignatureValid: (
+    targetPath: string,
+    options?: Record<string, unknown>
+  ) => Record<string, any>;
+  ensureMacAppCodeSignatureValidAsync: (
+    targetPath: string,
+    options?: Record<string, unknown>
+  ) => Promise<Record<string, any>>;
+};
+
+const verifyDisplayOutput = requireCjs('../scripts/verify-display-output.cjs') as {
+  detectDisplayGeometry: (options?: Record<string, unknown>) => {
+    width: number;
+    height: number;
+    logicalWidth: number;
+    logicalHeight: number;
+    panelWidth: number;
+    panelHeight: number;
+    name: string;
+    isMain: boolean;
   };
 };
 
@@ -1784,6 +1824,919 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       );
       expect(launcherSrc).toContain('is_excluded_pid(pid)');
       expect(launcherSrc).toContain('jeli_clear.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK');
+    });
+  });
+
+  describe('11. Display Scaler v3: Modern Dynamic-Import Bypass, AppCompat HIGHDPIAWARE, Shared-Bottle Healing, Multi-Display & Portability', () => {
+    interface ExtendedPeSpec extends SyntheticPeSpec {
+      rdataSize?: number;
+      rdataTailStrings?: string[];
+      rsrcManifestXml?: string;
+    }
+
+    function buildExtendedSyntheticPeBuffer(spec: ExtendedPeSpec): Buffer {
+      const rdataSize = Math.max(0x1000, Math.ceil((spec.rdataSize || 0x1000) / 0x200) * 0x200);
+      const rsrcBuf = spec.rsrcManifestXml ? Buffer.from(spec.rsrcManifestXml, 'utf8') : null;
+      const rsrcSize = rsrcBuf ? Math.max(0x400, Math.ceil((rsrcBuf.length + 16) / 0x200) * 0x200) : 0;
+      const numSections = rsrcBuf ? 2 : 1;
+      const totalSize = 0x200 + rdataSize + rsrcSize;
+      const buf = Buffer.alloc(totalSize, 0);
+      const peOffset = 0x80;
+
+      buf.writeUInt16LE(0x5a4d, 0x00); // 'MZ'
+      buf.writeUInt32LE(peOffset, 0x3c); // e_lfanew
+      buf.writeUInt32LE(0x00004550, peOffset); // 'PE\0\0'
+      const isX64 = spec.arch === 'x64';
+      buf.writeUInt16LE(isX64 ? 0x8664 : 0x014c, peOffset + 4);
+      buf.writeUInt16LE(numSections, peOffset + 6);
+
+      const optHeaderSize = isX64 ? 0xf0 : 0xe0;
+      buf.writeUInt16LE(optHeaderSize, peOffset + 20);
+      let characteristics = 0x0002;
+      if (spec.largeAddressAware) characteristics |= 0x0020;
+      if (!isX64 && !spec.largeAddressAware) characteristics |= 0x0100;
+      if (spec.isDll) characteristics |= 0x2000;
+      buf.writeUInt16LE(characteristics, peOffset + 22);
+
+      const optOffset = peOffset + 24;
+      buf.writeUInt16LE(isX64 ? 0x020b : 0x010b, optOffset);
+      if (isX64) {
+        buf.writeBigUInt64LE(0x0000000140000000n, optOffset + 24);
+      } else {
+        buf.writeUInt32LE(0x00400000, optOffset + 28);
+      }
+
+      let dllChars = 0;
+      if (spec.dynamicBase ?? true) dllChars |= 0x0040;
+      if (spec.nxCompat ?? true) dllChars |= 0x0100;
+      buf.writeUInt16LE(dllChars, optOffset + 70);
+
+      const numRvaOffset = optOffset + (isX64 ? 108 : 92);
+      buf.writeUInt32LE(16, numRvaOffset);
+      const dataDirOffset = optOffset + (isX64 ? 112 : 96);
+
+      const secTableOffset = optOffset + optHeaderSize;
+      buf.write('.rdata\0\0', secTableOffset, 'ascii');
+      buf.writeUInt32LE(rdataSize, secTableOffset + 8);
+      buf.writeUInt32LE(0x1000, secTableOffset + 12);
+      buf.writeUInt32LE(rdataSize, secTableOffset + 16);
+      buf.writeUInt32LE(0x0200, secTableOffset + 20);
+      buf.writeUInt32LE(0x40000040, secTableOffset + 36);
+
+      if (rsrcBuf) {
+        const sec1 = secTableOffset + 40;
+        buf.write('.rsrc\0\0\0', sec1, 'ascii');
+        buf.writeUInt32LE(rsrcSize, sec1 + 8);
+        buf.writeUInt32LE(0x1000 + rdataSize, sec1 + 12);
+        buf.writeUInt32LE(rsrcSize, sec1 + 16);
+        buf.writeUInt32LE(0x0200 + rdataSize, sec1 + 20);
+        buf.writeUInt32LE(0x40000040, sec1 + 36);
+        rsrcBuf.copy(buf, 0x0200 + rdataSize);
+      }
+
+      const rvaToFile = (rva: number): number => 0x0200 + (rva - 0x1000);
+      let stringCursorRva = 0x1400;
+      const writeAsciiRva = (text: string): number => {
+        const rva = stringCursorRva;
+        const raw = rvaToFile(rva);
+        buf.write(text, raw, 'ascii');
+        buf[raw + text.length] = 0;
+        stringCursorRva += text.length + 1;
+        if (stringCursorRva % 2 !== 0) stringCursorRva += 1;
+        return rva;
+      };
+
+      const importedDlls = spec.importedDlls || [];
+      if (importedDlls.length > 0) {
+        const importDirRva = 0x1000;
+        const importDirSize = (importedDlls.length + 1) * 20;
+        buf.writeUInt32LE(importDirRva, dataDirOffset + 1 * 8);
+        buf.writeUInt32LE(importDirSize, dataDirOffset + 1 * 8 + 4);
+        for (let i = 0; i < importedDlls.length; i += 1) {
+          const nameRva = writeAsciiRva(importedDlls[i]);
+          const descFileOff = rvaToFile(importDirRva + i * 20);
+          buf.writeUInt32LE(nameRva, descFileOff + 12);
+        }
+      }
+
+      for (const literal of spec.rdataStrings || []) {
+        writeAsciiRva(literal);
+      }
+
+      if (spec.rdataTailStrings && spec.rdataTailStrings.length > 0) {
+        let tailOff = 0x0200 + Math.max(0x90000, rdataSize - 0x2000);
+        for (const literal of spec.rdataTailStrings) {
+          buf.write(literal, tailOff, 'ascii');
+          buf[tailOff + literal.length] = 0;
+          tailOff += literal.length + 2;
+        }
+      }
+
+      return buf;
+    }
+
+    it('detects dynamic DX11/DXGI in large CryEngine-style sibling DLL (>512 KiB offset), skips scaler in auto_fullscreen, and strips scaler env + writes active_session.ini mode=off', async () => {
+      const root = makeTempDir('cryengine-v3');
+      const binDir = path.join(root, 'Bin', 'Win64');
+      fs.mkdirSync(binDir, { recursive: true });
+
+      const exePath = path.join(binDir, 'MedievalRPG.exe');
+      const engineDllPath = path.join(binDir, 'EngineGameCore.dll');
+      fs.writeFileSync(
+        exePath,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          largeAddressAware: true,
+          importedDlls: ['kernel32.dll', 'user32.dll', 'EngineGameCore.dll'],
+        })
+      );
+      // 1.5 MiB .rdata section with d3d11.dll\0 and dxgi.dll\0 past 512 KiB (at ~1.49 MiB)
+      fs.writeFileSync(
+        engineDllPath,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          isDll: true,
+          largeAddressAware: true,
+          importedDlls: ['kernel32.dll', 'user32.dll'],
+          rdataSize: 0x180000,
+          rdataTailStrings: ['d3d11.dll', 'dxgi.dll'],
+        })
+      );
+
+      const caps = binaryInspectors.resolveEffectiveGameExecutableCapabilities(exePath, root);
+      expect(caps.is64Bit).toBe(true);
+      expect(caps.usesModernGraphicsApi).toBe(true);
+      expect(caps.isLauncherStubCandidate).toBe(false);
+      expect(caps.usesLegacyDdraw).toBe(false);
+      expect(caps.importsOpenGl).toBe(false);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(caps, 'auto_fullscreen')
+      ).toBe(false);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(caps, 'force_fullscreen')
+      ).toBe(true);
+
+      // Launch unwrapped in auto_fullscreen: must NOT wrap, must strip stale scaler env, and must write mode=off to existing active_session.ini
+      const homedir = path.join(root, 'home');
+      const appsDir = path.join(root, 'Applications');
+      const bottleDir = path.join(
+        homedir,
+        'Library',
+        'Application Support',
+        'CrossOver',
+        'Bottles',
+        'SynthBottle'
+      );
+      createSyntheticBottleTree(bottleDir);
+      const fakeWineBin = path.join(
+        appsDir,
+        'CrossOver.app',
+        'Contents',
+        'SharedSupport',
+        'CrossOver',
+        'bin',
+        'wine'
+      );
+      fs.mkdirSync(path.dirname(fakeWineBin), { recursive: true });
+      fs.writeFileSync(fakeWineBin, '#!/usr/bin/perl\nexit 0;\n', { mode: 0o755 });
+
+      // Pre-stage stale active_session.ini from an earlier legacy game on the same bottle
+      const staged = supervisor.stageBottleDisplayScalerBinaries(bottleDir);
+      expect(staged.allPresent).toBe(true);
+      const activeSessionPath = path.join(staged.stageDirPosix, 'active_session.ini');
+      fs.writeFileSync(activeSessionPath, 'seq=9\nmode=auto_fullscreen\nfullscreen=1\n', 'utf8');
+
+      const spawnCalls: Array<{ cmd: string; args: string[]; env: Record<string, string> }> = [];
+      const fakeChild = createFakeChildProcess(62101);
+      const launchRes = await supervisor.launchGame(
+        {
+          gameId: 'gog-cryengine-v3',
+          title: 'Medieval RPG Synth',
+          platformId: 'gog',
+          platformGameId: '1000000777',
+          installPath: root,
+          executablePath: exePath,
+          launchConfig: {
+            launchMethod: 'compatibility_layer',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'SynthBottle',
+            winePrefixPath: bottleDir,
+            displayScalingMode: 'auto_fullscreen',
+            environmentVariables: {
+              ONE_LAUNCHER_SCALER_DLL_X64: 'C:\\stale\\scaler.dll',
+              ONE_LAUNCHER_DISPLAY_CONTROL_FILE: 'C:\\stale\\ctl.ini',
+            },
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir,
+          userDataDir: path.join(root, 'UserData'),
+          customApplicationsDir: appsDir,
+          enableDisplayScalerInTests: true,
+          skipRegistrySpawn: true,
+          gameSpawnFn: (cmd: string, args: string[], opts?: { env?: Record<string, string> }) => {
+            spawnCalls.push({ cmd, args: [...args], env: { ...(opts?.env || {}) } });
+            return fakeChild;
+          },
+        }
+      );
+
+      expect(launchRes.success).toBe(true);
+      expect(spawnCalls.length).toBe(1);
+      // Must NOT invoke one_display_launcher_*.exe
+      expect(spawnCalls[0].args.join(' ')).not.toContain('one_display_launcher');
+      // Stale scaler env vars stripped cleanly
+      expect(spawnCalls[0].env.ONE_LAUNCHER_SCALER_DLL_X64).toBeUndefined();
+      expect(spawnCalls[0].env.ONE_LAUNCHER_SCALER_DLL_X86).toBeUndefined();
+      expect(spawnCalls[0].env.ONE_LAUNCHER_DISPLAY_CONTROL_FILE).toBeUndefined();
+      expect(spawnCalls[0].env.ONE_LAUNCHER_DISPLAY_STATUS_FILE).toBeUndefined();
+      expect(spawnCalls[0].env.ONE_LAUNCHER_DISPLAY_SCALING_MODE).toBe('off');
+      // Stale active_session.ini neutralized to mode=off with hotkey=0 and empty control/status files
+      const activeIni = fs.readFileSync(activeSessionPath, 'utf8');
+      expect(activeIni).toContain('mode=off');
+      expect(activeIni).toContain('hotkey=0');
+      expect(activeIni).toContain('control_file=\n');
+      // DPI-unaware modern x64 game received lowercase AppCompatFlags\Layers HIGHDPIAWARE
+      const userReg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(userReg).toContain(
+        '[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\AppCompatFlags\\\\Layers]'
+      );
+      expect(userReg).toContain('"medievalrpg.exe"="~ HIGHDPIAWARE"');
+
+      await supervisor.finalizeGameSession('gog-cryengine-v3', {
+        platform: 'darwin',
+        userDataDir: path.join(root, 'UserData'),
+      });
+    });
+
+    it('classifies libcef.dll & Qt5WebEngineCore.dll as redists so a 64-bit CEF launcher stub still wraps and propagates to a 32-bit legacy child game', () => {
+      const root = makeTempDir('cef-launcher-v3');
+      const launcherExe = path.join(root, 'GameLauncher.exe');
+      const libcefDll = path.join(root, 'libcef.dll');
+      const qtWebDll = path.join(root, 'Qt5WebEngineCore.dll');
+      const binDir = path.join(root, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const legacyChildExe = path.join(binDir, 'ClassicGame.exe');
+
+      fs.writeFileSync(
+        launcherExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          largeAddressAware: true,
+          importedDlls: ['kernel32.dll', 'user32.dll', 'libcef.dll', 'Qt5WebEngineCore.dll'],
+        })
+      );
+      fs.writeFileSync(
+        libcefDll,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          isDll: true,
+          importedDlls: ['kernel32.dll', 'd3d11.dll', 'dxgi.dll'],
+          rdataSize: 0x120000,
+          rdataTailStrings: ['d3d11.dll', 'dxgi.dll', 'vulkan-1.dll'],
+        })
+      );
+      fs.writeFileSync(
+        qtWebDll,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          isDll: true,
+          importedDlls: ['kernel32.dll', 'd3d11.dll', 'dxgi.dll'],
+          rdataStrings: ['d3d11.dll', 'dxgi.dll'],
+        })
+      );
+      fs.writeFileSync(
+        legacyChildExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x86',
+          importedDlls: ['kernel32.dll', 'user32.dll', 'ddraw.dll'],
+        })
+      );
+
+      const caps = binaryInspectors.resolveEffectiveGameExecutableCapabilities(launcherExe, root);
+      expect(caps.isLauncherStubCandidate).toBe(true);
+      expect(caps.usesModernGraphicsApi).toBe(false);
+      expect(caps.usesLegacyDdraw).toBe(true);
+      expect(caps.hasChildGameExecutable).toBe(true);
+      expect(caps.targetExePaths).toContain(legacyChildExe);
+      expect(caps.targetExeBasenamesLower).toContain('classicgame.exe');
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(caps, 'auto_fullscreen')
+      ).toBe(true);
+    });
+
+    it('manages per-exe AppCompatFlags\\Layers HIGHDPIAWARE accurately across DPI-aware manifests, API callers, storefronts, launcher stubs, secondary utilities, unwrapped legacy windowed games, and false-mode token-preserving strip', () => {
+      const root = makeTempDir('appcompat-layers-v3');
+      const bottleDir = path.join(root, 'Bottle');
+      createSyntheticBottleTree(bottleDir, {
+        userRegExtra: [
+          '[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\AppCompatFlags\\\\Layers]',
+          '"medievalrpg.exe"="~ WIN7RTM HIGHDPIAWARE"',
+          '',
+        ].join('\n'),
+      });
+      const fakeWineBin = path.join(root, 'CrossOver.app', 'Contents', 'SharedSupport', 'CrossOver', 'bin', 'wine');
+      fs.mkdirSync(path.dirname(fakeWineBin), { recursive: true });
+      fs.writeFileSync(fakeWineBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      // 1. DPI-unaware modern x64 game + secondary utility + discovered child game exe
+      const gameDir = path.join(root, 'ModernGame');
+      fs.mkdirSync(gameDir, { recursive: true });
+      const mainExe = path.join(gameDir, 'MedievalRPG.exe');
+      const childGameExe = path.join(gameDir, 'MedievalRPG_Bin64.exe');
+      fs.writeFileSync(
+        mainExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+        })
+      );
+      fs.writeFileSync(
+        childGameExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+        })
+      );
+
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        mainExe,
+        { displayScalingMode: 'auto_fullscreen' },
+        {
+          platform: 'darwin',
+          targetExeNames: ['MedievalRPG.exe', 'MedievalRPG_Bin64.exe', 'Config.exe', 'Steam.exe'],
+          installDir: gameDir,
+        }
+      );
+      let reg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(reg).toContain('"medievalrpg.exe"="~ WIN7RTM HIGHDPIAWARE"');
+      expect(reg).toContain('"medievalrpg_bin64.exe"="~ HIGHDPIAWARE"');
+      // Secondary utility (Config.exe) and storefront client (Steam.exe) MUST NOT receive HIGHDPIAWARE
+      expect(reg).not.toContain('"config.exe"');
+      expect(reg).not.toContain('"steam.exe"');
+
+      // 2. Explicit crossoverHighResolutionMode === false strips HIGHDPIAWARE while preserving WIN7RTM!
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        mainExe,
+        { crossoverHighResolutionMode: false, displayScalingMode: 'auto_fullscreen' },
+        {
+          platform: 'darwin',
+          targetExeNames: ['MedievalRPG.exe', 'MedievalRPG_Bin64.exe'],
+          installDir: gameDir,
+        }
+      );
+      reg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(reg).toContain('"medievalrpg.exe"="~ WIN7RTM"');
+      expect(reg).not.toContain('"medievalrpg_bin64.exe"');
+
+      // 3. Skip EXEs with <dpiAware> manifest OR SetProcessDpiAwarenessContext import/string
+      const dpiAwareManifestExe = path.join(gameDir, 'ManifestAware.exe');
+      fs.writeFileSync(
+        dpiAwareManifestExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+          rsrcManifestXml:
+            '<assembly><application><windowsSettings><dpiAware>true/pm</dpiAware></windowsSettings></application></assembly>',
+        })
+      );
+      const dpiApiExe = path.join(gameDir, 'ApiAware.exe');
+      fs.writeFileSync(
+        dpiApiExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'user32.dll', 'd3d11.dll'],
+          rdataStrings: ['SetProcessDpiAwarenessContext'],
+        })
+      );
+      const legacyWinExe = path.join(gameDir, 'LegacyWindowed.exe');
+      fs.writeFileSync(
+        legacyWinExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x86',
+          importedDlls: ['kernel32.dll', 'ddraw.dll'],
+        })
+      );
+
+      const manifestCaps = binaryInspectors.inspectPeCapabilities(dpiAwareManifestExe);
+      expect(manifestCaps.hasDpiAwareManifest).toBe(true);
+      expect(manifestCaps.declaresPerMonitorDpi).toBe(true);
+      const apiCaps = binaryInspectors.inspectPeCapabilities(dpiApiExe);
+      expect(apiCaps.callsPerMonitorDpiApi).toBe(true);
+
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        dpiAwareManifestExe,
+        { displayScalingMode: 'auto_fullscreen' },
+        { platform: 'darwin', installDir: gameDir }
+      );
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        dpiApiExe,
+        { displayScalingMode: 'auto_fullscreen' },
+        { platform: 'darwin', installDir: gameDir }
+      );
+      // Unwrapped legacy 32-bit windowed game must NOT be marked HIGHDPIAWARE
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        legacyWinExe,
+        { displayScalingMode: 'windowed' },
+        { platform: 'darwin', installDir: gameDir }
+      );
+      reg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(reg).not.toContain('"manifestaware.exe"');
+      expect(reg).not.toContain('"apiaware.exe"');
+      expect(reg).not.toContain('"legacywindowed.exe"');
+    });
+
+    it('self-heals shared-bottle RetinaMode + Desktop & Fonts LogPixels, heals fresh unmanaged RetinaMode="n", keeps EmulateModeset off in windowed mode, and scopes sanitizeWinePrefixDisplayConfigs cleanly', () => {
+      const root = makeTempDir('bottle-heal-v3');
+      const bottleDir = path.join(root, 'Bottle');
+      createSyntheticBottleTree(bottleDir, {
+        userRegExtra: [
+          '[Control Panel\\\\Desktop]',
+          '"LogPixels"=dword:000000c0',
+          '',
+          '[Software\\\\Wine\\\\Fonts]',
+          '"LogPixels"=dword:000000c0',
+          '',
+        ].join('\n'),
+      });
+      const gameExe = path.join(root, 'ModernTitle.exe');
+      fs.writeFileSync(
+        gameExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+        })
+      );
+
+      // Step 1: Game A disables High Resolution Mode (false) -> writes managed markers + 96 DPI in Desktop AND Fonts
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        gameExe,
+        { crossoverHighResolutionMode: false, displayScalingMode: 'windowed' },
+        { platform: 'darwin' }
+      );
+      let reg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(reg).toContain('"RetinaMode"="n"');
+      expect(reg).toContain('"OneLauncherManagedRetina"="1"');
+      expect(reg).toContain('"OneLauncherPriorRetina"="y"');
+      const desktopSec1 = reg.slice(reg.indexOf('[Control Panel\\\\Desktop]'), reg.indexOf('[Software\\\\Wine\\\\Fonts]'));
+      const fontsSec1 = reg.slice(reg.indexOf('[Software\\\\Wine\\\\Fonts]'));
+      expect(desktopSec1).toContain('"LogPixels"=dword:00000060');
+      expect(fontsSec1).toContain('"LogPixels"=dword:00000060');
+      // Windowed mode must NOT auto-enable EmulateModeset
+      expect(reg).not.toContain('"EmulateModeset"="Y"');
+
+      // Step 2: Game B launches with default (undefined) -> self-heals RetinaMode="y", restores 0xc0 in BOTH Desktop & Fonts, and deletes managed markers
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleDir,
+        gameExe,
+        { crossoverHighResolutionMode: undefined, displayScalingMode: 'windowed' },
+        { platform: 'darwin' }
+      );
+      reg = fs.readFileSync(path.join(bottleDir, 'user.reg'), 'utf8');
+      expect(reg).toContain('"RetinaMode"="y"');
+      expect(reg).not.toContain('OneLauncherManagedRetina');
+      expect(reg).not.toContain('OneLauncherPriorRetina');
+      const desktopSec2 = reg.slice(reg.indexOf('[Control Panel\\\\Desktop]'), reg.indexOf('[Software\\\\Wine\\\\Fonts]'));
+      const fontsSec2 = reg.slice(reg.indexOf('[Software\\\\Wine\\\\Fonts]'));
+      expect(desktopSec2).toContain('"LogPixels"=dword:000000c0');
+      expect(fontsSec2).toContain('"LogPixels"=dword:000000c0');
+      expect(reg).not.toContain('"EmulateModeset"="Y"');
+
+      // Step 3: Fresh CrossOver bottle starting with UNMANAGED RetinaMode="n" also heals to "y" + 0xc0!
+      const freshBottleDir = path.join(root, 'FreshBottle');
+      createSyntheticBottleTree(freshBottleDir, {
+        userRegExtra: [
+          '[Control Panel\\\\Desktop]',
+          '"LogPixels"=dword:00000060',
+          '',
+          '[Software\\\\Wine\\\\Fonts]',
+          '"LogPixels"=dword:00000060',
+          '',
+        ].join('\n'),
+      });
+      const freshRegPath = path.join(freshBottleDir, 'user.reg');
+      fs.writeFileSync(
+        freshRegPath,
+        fs.readFileSync(freshRegPath, 'utf8').replace('"RetinaMode"="y"', '"RetinaMode"="n"'),
+        'utf8'
+      );
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        freshBottleDir,
+        gameExe,
+        { crossoverHighResolutionMode: undefined, displayScalingMode: 'auto_fullscreen' },
+        { platform: 'darwin' }
+      );
+      const freshReg = fs.readFileSync(freshRegPath, 'utf8');
+      expect(freshReg).toContain('"RetinaMode"="y"');
+      expect(freshReg).toContain('"LogPixels"=dword:000000c0');
+      expect(freshReg).not.toContain('OneLauncherManagedRetina');
+
+      // Step 4: sanitizeWinePrefixDisplayConfigs scopes RetinaMode="n" strictly to [Software\\Wine\\Mac Driver]
+      const scopedBottleDir = path.join(root, 'ScopedBottle');
+      createSyntheticBottleTree(scopedBottleDir, {
+        userRegExtra: [
+          '[Software\\\\SomeOtherVendor\\\\Display]',
+          '"RetinaMode"="n"',
+          '',
+        ].join('\n'),
+      });
+      const cfgPath = path.join(scopedBottleDir, 'drive_c', 'users', 'crossover', 'Saved Games', 'video.cfg');
+      fs.writeFileSync(cfgPath, 'r_width = 2560\nr_height = 1440\n', 'utf8');
+      const sanRes = macNativeInstaller.sanitizeWinePrefixDisplayConfigs(scopedBottleDir, {
+        maxWidth: 3024,
+        maxHeight: 1964,
+        logicalWidth: 1512,
+        logicalHeight: 982,
+        displayScalingMode: 'windowed',
+      });
+      // Because [Software\\Wine\\Mac Driver] has RetinaMode="y", maxWidth stays 3024 (not falsely downgraded by SomeOtherVendor)
+      expect(sanRes.maxWidth).toBe(3024);
+      expect(sanRes.sanitizedFiles.length).toBe(0);
+    });
+
+    it('parses Apple Silicon system_profiler keys, More Space backing buffers, multi-display main selection, and 10s TTL + forceRefresh in getHostMaxDisplayResolution and verify-display-output.cjs', () => {
+      const appleSiliconDefaultJson = JSON.stringify({
+        SPDisplaysDataType: [
+          {
+            spdisplays_ndrvs: [
+              {
+                _name: 'External HDMI 1080p',
+                _spdisplays_pixels: '1920 x 1080',
+                _spdisplays_resolution: '1920 x 1080 @ 60.00Hz',
+                spdisplays_main: 'spdisplays_no',
+                spdisplays_online: 'spdisplays_yes',
+              },
+              {
+                _name: 'Color LCD',
+                _spdisplays_pixels: '3024 x 1964',
+                _spdisplays_resolution: '1512 x 982 @ 120.00Hz',
+                spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+                spdisplays_display_type: 'spdisplays_built-in-liquid-retina-xdr',
+                spdisplays_main: 'spdisplays_yes',
+                spdisplays_online: 'spdisplays_yes',
+              },
+            ],
+          },
+        ],
+      });
+
+      const appleSiliconMoreSpaceJson = JSON.stringify({
+        SPDisplaysDataType: [
+          {
+            spdisplays_ndrvs: [
+              {
+                _name: 'Color LCD',
+                _spdisplays_pixels: '3024 x 1964',
+                _spdisplays_resolution: '1800 x 1169 @ 120.00Hz',
+                spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+                spdisplays_display_type: 'spdisplays_built-in-liquid-retina-xdr',
+                spdisplays_main: 'spdisplays_yes',
+                spdisplays_online: 'spdisplays_yes',
+              },
+            ],
+          },
+        ],
+      });
+
+      // Multi-display: index 0 is external 1x, index 1 is main 2x Retina -> MUST select index 1
+      const hostDefault = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: () => appleSiliconDefaultJson,
+      });
+      expect(hostDefault.width).toBe(3024);
+      expect(hostDefault.height).toBe(1964);
+      expect(hostDefault.logicalWidth).toBe(1512);
+      expect(hostDefault.logicalHeight).toBe(982);
+      expect(hostDefault.panelWidth).toBe(3024);
+      expect(hostDefault.panelHeight).toBe(1964);
+
+      const verifierDefault = verifyDisplayOutput.detectDisplayGeometry({
+        platform: 'darwin',
+        execSyncFn: () => appleSiliconDefaultJson,
+      });
+      expect(verifierDefault.width).toBe(3024);
+      expect(verifierDefault.height).toBe(1964);
+      expect(verifierDefault.logicalWidth).toBe(1512);
+      expect(verifierDefault.logicalHeight).toBe(982);
+      expect(verifierDefault.isMain).toBe(true);
+
+      // "More Space" scaled preset (1800x1169 UI on 3024x1964 panel -> 3600x2338 backing!)
+      const hostMoreSpace = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: () => appleSiliconMoreSpaceJson,
+      });
+      expect(hostMoreSpace.width).toBe(3600);
+      expect(hostMoreSpace.height).toBe(2338);
+      expect(hostMoreSpace.logicalWidth).toBe(1800);
+      expect(hostMoreSpace.logicalHeight).toBe(1169);
+      expect(hostMoreSpace.panelWidth).toBe(3024);
+      expect(hostMoreSpace.panelHeight).toBe(1964);
+
+      const verifierMoreSpace = verifyDisplayOutput.detectDisplayGeometry({
+        platform: 'darwin',
+        execSyncFn: () => appleSiliconMoreSpaceJson,
+      });
+      expect(verifierMoreSpace.width).toBe(3600);
+      expect(verifierMoreSpace.height).toBe(2338);
+      expect(verifierMoreSpace.logicalWidth).toBe(1800);
+      expect(verifierMoreSpace.logicalHeight).toBe(1169);
+      expect(verifierMoreSpace.panelWidth).toBe(3024);
+      expect(verifierMoreSpace.panelHeight).toBe(1964);
+
+      // 10s TTL caching + forceRefresh verification
+      let probeCalls = 0;
+      const probeMock = () => {
+        probeCalls += 1;
+        return probeCalls === 1 ? appleSiliconDefaultJson : appleSiliconMoreSpaceJson;
+      };
+      const t0 = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: probeMock,
+        useCacheWithProbeFn: true,
+        forceRefresh: true,
+        nowMs: 1_000_000,
+      });
+      expect(t0.width).toBe(3024);
+      expect(probeCalls).toBe(1);
+      // Within 10s TTL -> cached hit
+      const t1 = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: probeMock,
+        useCacheWithProbeFn: true,
+        nowMs: 1_005_000,
+      });
+      expect(t1.width).toBe(3024);
+      expect(probeCalls).toBe(1);
+      // Beyond 10s TTL -> re-probes
+      const t2 = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: probeMock,
+        useCacheWithProbeFn: true,
+        nowMs: 1_015_000,
+      });
+      expect(t2.width).toBe(3600);
+      expect(probeCalls).toBe(2);
+      // forceRefresh immediately re-probes within TTL
+      const t3 = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: probeMock,
+        useCacheWithProbeFn: true,
+        forceRefresh: true,
+        nowMs: 1_016_000,
+      });
+      expect(t3.width).toBe(3600);
+      expect(probeCalls).toBe(3);
+    });
+
+    it('forwards SIP-protected scaler keys in CX_ENV, signs macOS bundles inside-out without --deep, uses x64 --watch-dir for 64-bit toggles, preserves empty-HOME & Windows/macOS path portability, and exposes expanded Virtual Desktop presets', async () => {
+      const root = makeTempDir('cx-codesign-portability-v3');
+      const fakeCxRoot = path.join(root, 'CrossOver.app', 'Contents', 'SharedSupport', 'CrossOver');
+      const fakeWineBin = path.join(fakeCxRoot, 'bin', 'wine');
+      fs.mkdirSync(path.dirname(fakeWineBin), { recursive: true });
+      fs.writeFileSync(fakeWineBin, '#!/usr/bin/perl\nexit 0;\n', { mode: 0o755 });
+
+      // 1. CX_ENV forwarding of ONE_LAUNCHER_SCALING_FILTER, ONE_LAUNCHER_DISPLAY_TRACE_FILE, ONE_LAUNCHER_SINGLE_CORE_AFFINITY
+      const spawnEnv: Record<string, string> = {
+        ONE_LAUNCHER_SCALING_FILTER: 'sharp',
+        ONE_LAUNCHER_DISPLAY_TRACE_FILE: 'C:\\users\\Public\\trace.log',
+        ONE_LAUNCHER_SINGLE_CORE_AFFINITY: '1',
+      };
+      macNativeInstaller.prepareCrossOverWineSpawnEnv(fakeWineBin, spawnEnv, {
+        platform: 'darwin',
+      });
+      const cxEnv = String(spawnEnv.CX_ENV || '');
+      expect(cxEnv).toContain('ONE_LAUNCHER_SCALING_FILTER');
+      expect(cxEnv).toContain('ONE_LAUNCHER_DISPLAY_TRACE_FILE');
+      expect(cxEnv).toContain('ONE_LAUNCHER_SINGLE_CORE_AFFINITY');
+
+      // 2. Inside-out codesign (sync + async) NEVER passes --deep to codesign --sign
+      const appDir = path.join(root, 'SyntheticRunner.app');
+      const macOsDir = path.join(appDir, 'Contents', 'MacOS');
+      const fwDir = path.join(appDir, 'Contents', 'Frameworks');
+      fs.mkdirSync(macOsDir, { recursive: true });
+      fs.mkdirSync(fwDir, { recursive: true });
+      const machOHeader = Buffer.alloc(64, 0);
+      machOHeader.writeUInt32LE(0xfeedfacf, 0); // MH_MAGIC_64
+      const nestedDylib = path.join(fwDir, 'libhelper.dylib');
+      const mainExec = path.join(macOsDir, 'SyntheticRunner');
+      fs.writeFileSync(nestedDylib, machOHeader);
+      fs.writeFileSync(mainExec, machOHeader);
+      fs.writeFileSync(
+        path.join(appDir, 'Contents', 'Info.plist'),
+        '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.synth.runner</string></dict></plist>',
+        'utf8'
+      );
+
+      const syncInvocations: Array<{ cmd: string; args: string[] }> = [];
+      let syncVerifiedOnce = false;
+      const syncSignRes = macNativeInstaller.ensureMacAppCodeSignatureValid(appDir, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        forceCodesignRecheck: true,
+        execFileSyncFn: (cmd: string, args: string[]) => {
+          syncInvocations.push({ cmd, args: [...args] });
+          if (cmd === 'codesign' && args.includes('--verify') && !syncVerifiedOnce) {
+            syncVerifiedOnce = true;
+            throw new Error('unsigned');
+          }
+          return '';
+        },
+      });
+      expect(syncSignRes.verified).toBe(true);
+      expect(syncSignRes.repaired).toBe(true);
+      const syncSignCalls = syncInvocations.filter(
+        (c) => c.cmd === 'codesign' && c.args.includes('--sign')
+      );
+      expect(syncSignCalls.length).toBeGreaterThanOrEqual(3);
+      for (const call of syncSignCalls) {
+        expect(call.args).not.toContain('--deep');
+      }
+      // Nested dylib must be signed BEFORE the outer .app bundle
+      const dylibIdx = syncSignCalls.findIndex((c) => c.args.includes(nestedDylib));
+      const outerIdx = syncSignCalls.findIndex((c) => c.args[c.args.length - 1] === appDir);
+      expect(dylibIdx).toBeGreaterThanOrEqual(0);
+      expect(outerIdx).toBeGreaterThan(dylibIdx);
+
+      const asyncInvocations: Array<{ cmd: string; args: string[] }> = [];
+      let asyncVerifiedOnce = false;
+      const asyncSignRes = await macNativeInstaller.ensureMacAppCodeSignatureValidAsync(appDir, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        forceCodesignRecheck: true,
+        execFileImpl: (
+          cmd: string,
+          args: string[],
+          _opts: unknown,
+          cb: (err: Error | null) => void
+        ) => {
+          asyncInvocations.push({ cmd, args: [...args] });
+          if (cmd === 'codesign' && args.includes('--verify') && !asyncVerifiedOnce) {
+            asyncVerifiedOnce = true;
+            cb(new Error('unsigned'));
+            return;
+          }
+          cb(null);
+        },
+      });
+      expect(asyncSignRes.verified).toBe(true);
+      expect(asyncSignRes.repaired).toBe(true);
+      const asyncSignCalls = asyncInvocations.filter(
+        (c) => c.cmd === 'codesign' && c.args.includes('--sign')
+      );
+      expect(asyncSignCalls.length).toBeGreaterThanOrEqual(3);
+      for (const call of asyncSignCalls) {
+        expect(call.args).not.toContain('--deep');
+      }
+
+      // 3. Empty-HOME & Windows backslash vs macOS slash path separator portability
+      const emptyHome = makeTempDir('empty-home-v3');
+      const portableBottle = path.join(emptyHome, 'PortableBottle');
+      createSyntheticBottleTree(portableBottle);
+      const prevHome = process.env.HOME;
+      try {
+        process.env.HOME = '';
+        macNativeInstaller.applyCrossOverPerGameSettings(
+          portableBottle,
+          'C:\\Games\\Studio\\Bin\\Portable64.exe',
+          { displayScalingMode: 'auto_fullscreen' },
+          { platform: 'darwin', homedir: emptyHome }
+        );
+      } finally {
+        process.env.HOME = prevHome;
+      }
+      const portableReg = fs.readFileSync(path.join(portableBottle, 'user.reg'), 'utf8');
+      expect(portableReg).toContain('"RetinaMode"="y"');
+      expect(portableReg).toContain('"portable64.exe"="~ HIGHDPIAWARE"');
+
+      // 4. Expanded Virtual Desktop presets + accurate X11 Driver EmulateModeset hint
+      const vdValues = VIRTUAL_DESKTOP_RESOLUTION_OPTIONS.map((o) => o.value);
+      for (const expectedPreset of [
+        'auto',
+        '3840x2160',
+        '3440x1440',
+        '3024x1964',
+        '2560x1600',
+        '2560x1440',
+        '1920x1080',
+        '1728x1117',
+        '1512x982',
+      ]) {
+        expect(vdValues).toContain(expectedPreset);
+      }
+      const repoRoot = path.resolve(__dirname, '..');
+      const compatSrc = fs.readFileSync(
+        path.join(repoRoot, 'src/components/Launcher/LaunchConfig/CompatibilityLayerSection.tsx'),
+        'utf8'
+      );
+      expect(compatSrc).toContain('X11 Driver\\EmulateModeset');
+
+      // 5. Arch-matched --watch-dir launcher selection (x64 for 64-bit sessions) in toggleSessionFullscreen
+      const homedir64 = path.join(root, 'home64');
+      const appsDir64 = path.join(root, 'Applications64');
+      const fakeWineBin64 = path.join(
+        appsDir64,
+        'CrossOver.app',
+        'Contents',
+        'SharedSupport',
+        'CrossOver',
+        'bin',
+        'wine'
+      );
+      fs.mkdirSync(path.dirname(fakeWineBin64), { recursive: true });
+      fs.writeFileSync(fakeWineBin64, '#!/usr/bin/perl\nexit 0;\n', { mode: 0o755 });
+      const bottle64 = path.join(
+        homedir64,
+        'Library',
+        'Application Support',
+        'CrossOver',
+        'Bottles',
+        'Bottle64'
+      );
+      createSyntheticBottleTree(bottle64);
+      const game64Dir = path.join(root, 'Game64');
+      fs.mkdirSync(game64Dir, { recursive: true });
+      const game64Exe = path.join(game64Dir, 'Modern64.exe');
+      fs.writeFileSync(
+        game64Exe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+        })
+      );
+      const watcherSpawns: Array<{ cmd: string; args: string[] }> = [];
+      const child64 = createFakeChildProcess(62202);
+      const launch64 = await supervisor.launchGame(
+        {
+          gameId: 'gog-watchdir-x64',
+          title: 'Modern64 WatchDir Test',
+          platformId: 'gog',
+          platformGameId: '1000000888',
+          installPath: game64Dir,
+          executablePath: game64Exe,
+          launchConfig: {
+            launchMethod: 'compatibility_layer',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'Bottle64',
+            winePrefixPath: bottle64,
+            displayScalingMode: 'auto_fullscreen',
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: homedir64,
+          userDataDir: path.join(root, 'UserData64'),
+          customApplicationsDir: appsDir64,
+          enableDisplayScalerInTests: true,
+          skipRegistrySpawn: true,
+          gameSpawnFn: (cmd: string, args: string[]) => {
+            watcherSpawns.push({ cmd, args: [...args] });
+            return child64;
+          },
+        }
+      );
+      expect(launch64.success).toBe(true);
+      const toggleRes = supervisor.toggleSessionFullscreen(
+        { gameId: 'gog-watchdir-x64', fullscreen: true },
+        {
+          platform: 'darwin',
+          enableDisplayScalerInTests: true,
+          spawnFn: (cmd: string, args: string[]) => {
+            watcherSpawns.push({ cmd, args: [...args] });
+            return createFakeChildProcess(62203);
+          },
+        }
+      );
+      expect(toggleRes.success).toBe(true);
+      const watchDirCall = watcherSpawns.find((s) => s.args.includes('--watch-dir'));
+      expect(watchDirCall).toBeDefined();
+      expect(watchDirCall?.args.join(' ')).toContain('one_display_launcher_x64.exe');
+      expect(watchDirCall?.args.join(' ')).not.toContain('one_display_launcher_x86.exe');
+      await supervisor.finalizeGameSession('gog-watchdir-x64', {
+        platform: 'darwin',
+        userDataDir: path.join(root, 'UserData64'),
+      });
+
+      // 6. Native libone_coop_activate.dylib Node-API addon smoke check (0-arg & scoped options)
+      if (process.platform === 'darwin') {
+        const dylibPath = path.join(repoRoot, 'electron/helpers/libone_coop_activate.dylib');
+        if (fs.existsSync(dylibPath)) {
+          const mod = { exports: {} as Record<string, any> };
+          process.dlopen(mod, dylibPath);
+          expect(typeof mod.exports.pollAndActivateBottledGame).toBe('function');
+          const resZeroArg = Number(mod.exports.pollAndActivateBottledGame());
+          const resScoped = Number(
+            mod.exports.pollAndActivateBottledGame({
+              rootPid: process.pid,
+              targetExeNames: ['SyntheticGame.exe'],
+            })
+          );
+          expect(Number.isFinite(resZeroArg) && resZeroArg >= 0).toBe(true);
+          expect(Number.isFinite(resScoped) && resScoped >= 0).toBe(true);
+        }
+      }
     });
   });
 });

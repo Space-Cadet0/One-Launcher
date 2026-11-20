@@ -84,6 +84,19 @@
 #define RIDEV_CAPTUREMOUSE                 0x00000200
 #endif
 
+#define DS_APPLY_RESTORE_PASSTHROUGH       2u
+#define DS_DPI_CTX_PMV2                    ((HANDLE)(intptr_t)-4)
+
+typedef enum ds_presenter_tier_e {
+    DS_PRESENTER_LEGACY_VIRTUAL     = 0,
+    DS_PRESENTER_MODERN_PASSTHROUGH = 1,
+    DS_PRESENTER_MODERN_BORDERLESS  = 2
+} ds_presenter_tier_t;
+
+typedef HANDLE (WINAPI *pfn_SetThreadDpiAwarenessContext_t)(HANDLE);
+typedef HANDLE (WINAPI *pfn_GetWindowDpiAwarenessContext_t)(HWND);
+typedef BOOL   (WINAPI *pfn_SetProcessDpiAwarenessContext_t)(HANDLE);
+
 /* Win32 function pointer typedefs */
 typedef HMODULE (WINAPI *pfn_LoadLibraryA_t)(LPCSTR);
 typedef HMODULE (WINAPI *pfn_LoadLibraryW_t)(LPCWSTR);
@@ -218,26 +231,41 @@ typedef struct ds_runtime_s {
     uint64_t            last_active_session_seq;
     uint64_t            status_seq;
 
+    HMONITOR            target_monitor;
+    WCHAR               target_device[32];
+    int32_t             win_mon_x;
+    int32_t             win_mon_y;
     int32_t             real_screen_w;
     int32_t             real_screen_h;
     int32_t             phys_screen_w;
     int32_t             phys_screen_h;
     int32_t             real_bpp;
     int32_t             real_hz;
+    int32_t             gl_max_texture_size;
 
-    ds_display_mode_t   modes[DS_MAX_SYNTH_MODES];
+    ds_display_mode_t   modes[DS_MAX_UNION_MODES];
     size_t              mode_count;
 
+    ds_presenter_tier_t presenter_tier;
     bool                mode_virtualized;
     bool                fullscreen_active;
+    bool                borderless_active;
+    bool                window_mutated_by_scaler;
+    bool                passthrough_restored;
     bool                user_forced_windowed;
     bool                user_forced_fullscreen;
     bool                is_wine;
     bool                wined3d_uses_gl;
+    bool                wined3d_uses_vulkan;
+    bool                gl_upscale_active;
+    bool                ddraw_gdi_active;
     bool                game_gl_active;
     bool                legacy_d3d_loaded;
     bool                ddraw_loaded;
     bool                d3d8_or_9_loaded;
+    bool                d3d9_loaded;
+    bool                dxgi_or_d3d10_plus_loaded;
+    bool                vulkan_loaded;
     bool                modern_gfx_loaded;
     bool                modern_swapchain_passthrough;
     bool                dpi_aware_applied;
@@ -369,7 +397,17 @@ typedef struct ds_runtime_s {
     pfn_glDrawBuffer_t            real_glDrawBuffer;
     pfn_glReadBuffer_t            real_glReadBuffer;
     pfn_glGetIntegerv_t           real_glGetIntegerv;
+
+    pfn_SetThreadDpiAwarenessContext_t  p_SetThreadDpiAwarenessContext;
+    pfn_GetWindowDpiAwarenessContext_t  p_GetWindowDpiAwarenessContext;
+    pfn_SetProcessDpiAwarenessContext_t p_SetProcessDpiAwarenessContext;
+    void                               *real_ShellExecuteA;
+    void                               *real_ShellExecuteW;
+    void                               *real_ShellExecuteExA;
+    void                               *real_ShellExecuteExW;
 } ds_runtime_t;
+
+_Static_assert(sizeof(ds_runtime_t) < 65535u, "ds_runtime_t offsets must fit in uint16_t");
 
 extern ds_runtime_t g_ds;
 
@@ -378,22 +416,49 @@ extern ds_runtime_t g_ds;
  * is loaded without D3D8/D3D9 (`d3d8.dll` / `d3d9.dll`), preserving 1990s DirectDraw/D3D5-7
  * hardware acceleration while keeping 32bpp untouched for D3D8+ titles.
  */
-static inline bool ds_prefer_16bpp_ddraw(void)
+#if defined(__GNUC__) || defined(__clang__)
+#define DS_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define DS_ALWAYS_INLINE static inline
+#endif
+
+DS_ALWAYS_INLINE bool ds_prefer_16bpp_ddraw(void)
 {
     return g_ds.ddraw_loaded && !g_ds.d3d8_or_9_loaded;
 }
 
-static inline bool ds_is_passthrough_locked(void)
+DS_ALWAYS_INLINE bool ds_is_vulkan_d3d9_locked(void)
+{
+#if defined(_WIN64)
+    return false;
+#else
+    return (
+        !g_ds.dxgi_or_d3d10_plus_loaded &&
+        g_ds.d3d9_loaded &&
+        g_ds.wined3d_uses_vulkan &&
+        !g_ds.wined3d_uses_gl
+    );
+#endif
+}
+
+DS_ALWAYS_INLINE bool ds_is_modern_tier_locked(void)
+{
+    return (g_ds.scaling_mode == DS_MODE_PASSTHROUGH ||
+            g_ds.presenter_tier != DS_PRESENTER_LEGACY_VIRTUAL);
+}
+
+DS_ALWAYS_INLINE bool ds_is_modern_borderless_locked(void)
+{
+    return (g_ds.scaling_mode != DS_MODE_PASSTHROUGH &&
+            g_ds.presenter_tier == DS_PRESENTER_MODERN_BORDERLESS);
+}
+
+DS_ALWAYS_INLINE bool ds_is_passthrough_locked(void)
 {
     if (g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
         return true;
     }
-    if (g_ds.scaling_mode == DS_MODE_AUTO_FULLSCREEN &&
-        g_ds.modern_swapchain_passthrough &&
-        !g_ds.user_forced_fullscreen) {
-        return true;
-    }
-    return false;
+    return (g_ds.presenter_tier == DS_PRESENTER_MODERN_PASSTHROUGH);
 }
 
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
@@ -402,13 +467,17 @@ void ds_enter_internal(void);
 void ds_leave_internal(void);
 uintptr_t ds_suspend_internal_depth(void);
 void ds_restore_internal_depth(uintptr_t saved_depth);
+HANDLE ds_dpi_guard_enter(HANDLE target_ctx);
+void ds_dpi_guard_leave(HANDLE prev_ctx);
 bool ds_is_system_renderer_caller(const void *ret_addr);
 bool ds_is_wined3d_caller(const void *ret_addr);
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr);
 void ds_patch_loaded_modules(void);
 void ds_refresh_viewport_locked(void);
 void ds_refresh_host_display_metrics(void);
+void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd);
 void ds_ensure_runtime_started(void);
+bool ds_update_presenter_tier_locked(void);
 void ds_notify_gl_context_active_locked(void);
 int32_t ds_get_windowed_scale_locked(void);
 void ds_clear_wine_present_rect_on_hwnd(HWND hwnd);
@@ -419,7 +488,10 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
 LONG_PTR ds_get_wnd_long_ptr(HWND hwnd, int idx);
 LONG_PTR ds_set_wnd_long_ptr_raw(HWND hwnd, int idx, LONG_PTR val, bool unicode);
 bool ds_is_candidate_game_window(HWND hwnd, int32_t *out_cw, int32_t *out_ch);
+void ds_observe_game_window_passive(HWND hwnd);
 void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hint_virt_h);
+void ds_restore_window_on_passthrough(HWND hwnd);
+void ds_request_restore_passthrough(void);
 void ds_ensure_game_window_bounds(HWND candidate_hwnd);
 void ds_ensure_gl_host_child_on_owner_thread(HWND hwnd_parent);
 void ds_sync_gl_host_bounds_on_owner_thread(HWND hwnd_parent);

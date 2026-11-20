@@ -436,47 +436,111 @@ function detectScreenLockState() {
 }
 
 /**
- * Queries connected physical macOS displays to find the primary panel resolution.
+ * Queries connected physical macOS displays to find the main display geometry,
+ * handling Apple Silicon `system_profiler` keys, multi-display main selection,
+ * and HiDPI "More Space" scaled backing buffers.
+ *
+ * @param {{ execSyncFn?: typeof execSync, platform?: string }} [options]
  */
-function detectDisplayGeometry() {
-  if (process.platform === 'darwin') {
+function detectDisplayGeometry(options = {}) {
+  const platform = options.platform || process.platform;
+  const runExecSync = typeof options.execSyncFn === 'function' ? options.execSyncFn : execSync;
+  const parseDimPair = (val) => {
+    if (typeof val !== 'string' || !val) return [0, 0];
+    const m = val.match(/(\d+)\s*x\s*(\d+)/i);
+    if (!m) return [0, 0];
+    const w = parseInt(m[1], 10);
+    const h = parseInt(m[2], 10);
+    return w >= 640 && h >= 480 ? [w, h] : [0, 0];
+  };
+
+  if (platform === 'darwin') {
     try {
-      const res = execSync('system_profiler SPDisplaysDataType -json', {
+      const res = runExecSync('system_profiler SPDisplaysDataType -json', {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe'],
         timeout: 5000,
       });
-      const data = JSON.parse(res);
+      const data = JSON.parse(String(res || '{}'));
       const displaysList = data.SPDisplaysDataType;
       if (Array.isArray(displaysList)) {
+        const allDisplays = [];
         for (const item of displaysList) {
-          const ndrvs = item.spdisplays_ndrvs;
+          const ndrvs = item && item.spdisplays_ndrvs;
           if (Array.isArray(ndrvs)) {
             for (const disp of ndrvs) {
-              const pixelsStr = disp._spdisplays_pixels; // e.g. "3024 x 1964"
-              if (pixelsStr) {
-                const m = pixelsStr.match(/(\d+)\s*x\s*(\d+)/);
-                if (m) {
-                  return {
-                    width: parseInt(m[1], 10),
-                    height: parseInt(m[2], 10),
-                    name: disp._name || 'Liquid Retina Display',
-                    isMain: disp.spdisplays_main === 'spdisplays_yes',
-                  };
-                }
+              if (disp && typeof disp === 'object') {
+                allDisplays.push(disp);
               }
             }
+          }
+        }
+        const primary =
+          allDisplays.find((d) => d.spdisplays_main === 'spdisplays_yes') ||
+          allDisplays.find((d) => d.spdisplays_online === 'spdisplays_yes') ||
+          allDisplays[0] ||
+          null;
+        if (primary) {
+          const [pw, ph] = parseDimPair(
+            primary._spdisplays_pixels ||
+              primary.spdisplays_pixels ||
+              primary.spdisplays_pixelresolution ||
+              ''
+          );
+          const [rw, rh] = parseDimPair(
+            primary._spdisplays_resolution || primary.spdisplays_resolution || ''
+          );
+          const isRetina =
+            /retina/i.test(String(primary.spdisplays_pixelresolution || '')) ||
+            /retina/i.test(String(primary.spdisplays_display_type || '')) ||
+            /retina/i.test(String(primary._spdisplays_resolution || '')) ||
+            String(primary.spdisplays_retina || '') === 'spdisplays_yes' ||
+            (pw > 0 && rw > 0 && pw >= rw * 1.5);
+
+          let width = 0;
+          let height = 0;
+          if (isRetina && rw > 0 && rh > 0 && (rw * 2 > pw || rh * 2 > ph)) {
+            // macOS HiDPI "More Space" backing buffer exceeds native panel pixels
+            width = rw * 2;
+            height = rh * 2;
+          } else if (pw > 0 && ph > 0) {
+            width = pw;
+            height = ph;
+          } else if (rw > 0 && rh > 0) {
+            width = isRetina ? rw * 2 : rw;
+            height = isRetina ? rh * 2 : rh;
+          }
+
+          if (width >= 640 && height >= 480) {
+            const logicalWidth = rw > 0 ? rw : isRetina ? Math.round(width / 2) : width;
+            const logicalHeight = rh > 0 ? rh : isRetina ? Math.round(height / 2) : height;
+            const panelWidth = pw > 0 ? pw : width;
+            const panelHeight = ph > 0 ? ph : height;
+            return {
+              width,
+              height,
+              logicalWidth,
+              logicalHeight,
+              panelWidth,
+              panelHeight,
+              name: primary._name || 'Display',
+              isMain: primary.spdisplays_main === 'spdisplays_yes',
+            };
           }
         }
       }
     } catch {}
   }
 
-  // Standard Apple Silicon 14"/16" Liquid Retina physical baseline
+  // Generic non-machine-specific fallback when display probe is unavailable
   return {
-    width: 3024,
-    height: 1964,
-    name: 'Liquid Retina Reference Panel (3024x1964)',
+    width: 1920,
+    height: 1080,
+    logicalWidth: 1920,
+    logicalHeight: 1080,
+    panelWidth: 1920,
+    panelHeight: 1080,
+    name: 'Generic Display Fallback (1920x1080)',
     isMain: true,
   };
 }
@@ -1226,8 +1290,8 @@ function verifyDisplayOutput(options = {}) {
         displayH = displayH || 1964;
       } else {
         const detected = detectDisplayGeometry();
-        displayW = displayW || (detected && detected.width) || 3024;
-        displayH = displayH || (detected && detected.height) || 1964;
+        displayW = displayW || (detected && detected.width) || 1920;
+        displayH = displayH || (detected && detected.height) || 1080;
       }
     }
 

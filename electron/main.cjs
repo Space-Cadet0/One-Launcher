@@ -329,7 +329,7 @@ function ensureAppTray() {
 
 /** @type {ReturnType<typeof setInterval> | null} */
 let macBottleFocusTimer = null;
-/** @type {{ pollAndActivateBottledGame?: () => number } | null | false} */
+/** @type {{ pollAndActivateBottledGame?: (opts?: { rootPid?: number; targetExeNames?: string[] }) => number } | null | false} */
 let macCoopActivateAddon = null;
 
 function loadMacCoopActivateHelper() {
@@ -356,7 +356,7 @@ function loadMacCoopActivateHelper() {
       const mod = { exports: {} };
       process.dlopen(mod, dylibPath);
       if (typeof (/** @type {any} */ (mod.exports).pollAndActivateBottledGame) === 'function') {
-        macCoopActivateAddon = /** @type {{ pollAndActivateBottledGame: () => number }} */ (
+        macCoopActivateAddon = /** @type {{ pollAndActivateBottledGame: (opts?: { rootPid?: number; targetExeNames?: string[] }) => number }} */ (
           mod.exports
         );
         return macCoopActivateAddon;
@@ -405,6 +405,22 @@ function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
     return;
   }
 
+  const coopActivateOpts = {
+    rootPid: Number(sessionInfo && sessionInfo.pid) || 0,
+    targetExeNames: Array.from(
+      new Set(
+        [
+          exePath ? path.basename(exePath) : '',
+          ...(Array.isArray(sessionInfo && sessionInfo.targetExeBasenamesLower)
+            ? sessionInfo.targetExeBasenamesLower
+            : []),
+        ]
+          .map((n) => String(n || '').trim())
+          .filter(Boolean)
+      )
+    ),
+  };
+
   let ticks = 0;
   let activeLayerTicks = 0;
   let activeTicks = 0;
@@ -417,7 +433,7 @@ function activateMacBottleGameWindowOnLaunch(eventPayload, _effectivePolicy) {
       return;
     }
     try {
-      const encoded = Number(helper.pollAndActivateBottledGame() || 0);
+      const encoded = Number(helper.pollAndActivateBottledGame(coopActivateOpts) || 0);
       if ((encoded & 1) === 0) {
         return;
       }

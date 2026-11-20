@@ -436,6 +436,117 @@ static void test_wave2a_watertight_strips_and_extended_ini(void)
     ASSERT_TRUE(ds_effective_active_session_seq(&s3) > ds_effective_active_session_seq(&s2));
 }
 
+static void test_v3_user_override_and_mode_union(void)
+{
+    /* 1. ds_parse_control_ini: user_override defaults from seq (seq <= 1 -> false, seq >= 2 -> true)
+     *    and respects explicit user_override=0|1 */
+    ds_control_state_t c1, c2, c3, c4, c5;
+    const char *ini_seq1 = "seq=1\nfullscreen=1\naspect=preserve_aspect\nsafe_inset_top=0\n";
+    ASSERT_TRUE(ds_parse_control_ini(ini_seq1, strlen(ini_seq1), &c1));
+    ASSERT_TRUE(c1.has_seq && c1.seq == 1ULL);
+    ASSERT_TRUE(c1.has_fullscreen && c1.fullscreen == true);
+    ASSERT_TRUE(!c1.has_user_override);
+    ASSERT_TRUE(c1.user_override == false);
+
+    const char *ini_seq2 = "seq=2\nfullscreen=0\naspect=preserve_aspect\nsafe_inset_top=0\n";
+    ASSERT_TRUE(ds_parse_control_ini(ini_seq2, strlen(ini_seq2), &c2));
+    ASSERT_TRUE(c2.has_seq && c2.seq == 2ULL);
+    ASSERT_TRUE(c2.has_fullscreen && c2.fullscreen == false);
+    ASSERT_TRUE(!c2.has_user_override);
+    ASSERT_TRUE(c2.user_override == true);
+
+    const char *ini_exp_0 = "seq=5\nfullscreen=1\nuser_override=0\n";
+    ASSERT_TRUE(ds_parse_control_ini(ini_exp_0, strlen(ini_exp_0), &c3));
+    ASSERT_TRUE(c3.has_user_override && c3.user_override == false);
+
+    const char *ini_exp_1 = "seq=1\nfullscreen=1\nuser_override=1\n";
+    ASSERT_TRUE(ds_parse_control_ini(ini_exp_1, strlen(ini_exp_1), &c4));
+    ASSERT_TRUE(c4.has_user_override && c4.user_override == true);
+
+    const char *ini_off = "seq=1\nmode=off\nfullscreen=0\n";
+    ASSERT_TRUE(ds_parse_control_ini(ini_off, strlen(ini_off), &c5));
+    ASSERT_TRUE(c5.has_scaling_mode && c5.scaling_mode == DS_MODE_PASSTHROUGH);
+    ASSERT_TRUE(c5.user_override == false);
+
+    /* 2. ds_merge_mode_tables: OS-union deduplication, OS refresh-rate preference, ascending sort,
+     *    and strict DS_MAX_UNION_MODES = 128u capacity bound under ASan/UBSan */
+    ds_display_mode_t synth[DS_MAX_SYNTH_MODES];
+    size_t synth_n = ds_build_mode_table(3024, 1964, 60, synth, DS_MAX_SYNTH_MODES);
+    ASSERT_TRUE(synth_n > 0 && synth_n <= DS_MAX_SYNTH_MODES);
+
+    ds_display_mode_t os_modes[5] = {
+        { 3024, 1964, 32, 120 },
+        { 1920, 1080, 32, 120 },
+        { 2560, 1600, 32, 120 },
+        { 1920, 1080, 32, 60 }, /* duplicate lower Hz after 120 Hz */
+        { 3024, 1964, 32, 120 }, /* exact duplicate */
+    };
+
+    ds_display_mode_t merged[DS_MAX_UNION_MODES];
+    size_t merged_n = ds_merge_mode_tables(os_modes, 5, synth, synth_n, merged, DS_MAX_UNION_MODES);
+    ASSERT_TRUE(merged_n >= synth_n && merged_n <= DS_MAX_UNION_MODES);
+
+    bool found_3024_120 = false;
+    bool found_1920_120 = false;
+    bool found_2560_120 = false;
+    for (size_t i = 0; i < merged_n; i++) {
+        if (i > 0) {
+            /* Strictly ascending (width, height, bpp) with zero duplicates */
+            ASSERT_TRUE(
+                merged[i - 1].width < merged[i].width ||
+                (merged[i - 1].width == merged[i].width && merged[i - 1].height < merged[i].height) ||
+                (merged[i - 1].width == merged[i].width &&
+                 merged[i - 1].height == merged[i].height &&
+                 merged[i - 1].bpp < merged[i].bpp)
+            );
+        }
+        if (merged[i].width == 3024 && merged[i].height == 1964 && merged[i].bpp == 32) {
+            ASSERT_TRUE(merged[i].refresh_hz == 120);
+            found_3024_120 = true;
+        }
+        if (merged[i].width == 1920 && merged[i].height == 1080 && merged[i].bpp == 32) {
+            ASSERT_TRUE(merged[i].refresh_hz == 120);
+            found_1920_120 = true;
+        }
+        if (merged[i].width == 2560 && merged[i].height == 1600 && merged[i].bpp == 32) {
+            ASSERT_TRUE(merged[i].refresh_hz == 120);
+            found_2560_120 = true;
+        }
+    }
+    ASSERT_TRUE(found_3024_120 && found_1920_120 && found_2560_120);
+
+    /* Capacity saturation test: > 160 distinct OS+synth modes must never overflow DS_MAX_UNION_MODES */
+    ds_display_mode_t flood_os[100];
+    ds_display_mode_t flood_synth[100];
+    for (size_t i = 0; i < 100; i++) {
+        flood_os[i].width = (int32_t)(640 + i * 16);
+        flood_os[i].height = (int32_t)(480 + i * 10);
+        flood_os[i].bpp = 32;
+        flood_os[i].refresh_hz = 120;
+        flood_synth[i].width = (int32_t)(640 + i * 16);
+        flood_synth[i].height = (int32_t)(480 + i * 10);
+        flood_synth[i].bpp = 16;
+        flood_synth[i].refresh_hz = 60;
+    }
+    size_t sat_n = ds_merge_mode_tables(flood_os, 100, flood_synth, 100, merged, DS_MAX_UNION_MODES);
+    ASSERT_TRUE(sat_n == DS_MAX_UNION_MODES);
+    for (size_t i = 1; i < sat_n; i++) {
+        ASSERT_TRUE(
+            merged[i - 1].width < merged[i].width ||
+            (merged[i - 1].width == merged[i].width && merged[i - 1].height < merged[i].height) ||
+            (merged[i - 1].width == merged[i].width &&
+             merged[i - 1].height == merged[i].height &&
+             merged[i - 1].bpp < merged[i].bpp)
+        );
+    }
+
+    /* Edge cases: NULL inputs and zero capacity */
+    ASSERT_TRUE(ds_merge_mode_tables(NULL, 0, NULL, 0, merged, DS_MAX_UNION_MODES) == 0);
+    ASSERT_TRUE(ds_merge_mode_tables(os_modes, 5, synth, synth_n, NULL, DS_MAX_UNION_MODES) == 0);
+    ASSERT_TRUE(ds_merge_mode_tables(os_modes, 5, synth, synth_n, merged, 0) == 0);
+    ASSERT_TRUE(ds_merge_mode_tables(NULL, 0, synth, synth_n, merged, DS_MAX_UNION_MODES) == synth_n);
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
@@ -444,6 +555,7 @@ int main(void)
     test_subrect_and_control_ini_parser();
     test_wave2a_exact_cursor_roundtrip_and_even_viewports();
     test_wave2a_watertight_strips_and_extended_ini();
+    test_v3_user_override_and_mode_union();
     printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
     return 0;
 }
