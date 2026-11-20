@@ -113,6 +113,7 @@ const trackedCacheKeys = new Set<string>();
 let inFlightBulkVaultHydration: Promise<number> | null = null;
 let bootHydrationPromise: Promise<number> | null = null;
 let stagedVaultHydrationComplete = false;
+let hasWrittenStagedToVaultInProcess = false;
 
 function addBoundedKey(set: Set<string>, key: string): void {
   if (set.has(key)) {
@@ -470,6 +471,7 @@ export function saveStagedCache<T>(
   addBoundedKey(trackedCacheKeys, key);
 
   setMemoryFallbackBounded(key, entry);
+  hasWrittenStagedToVaultInProcess = true;
   void vaultSet(`staged:${key}`, entry);
 
   const serialized = JSON.stringify(entry);
@@ -595,6 +597,7 @@ async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unkn
   }
 
   let db: IDBDatabase | null = null;
+  let wasNewlyCreated = false;
   try {
     db = await new Promise<IDBDatabase>((resolve, reject) => {
       const openReq = indexedDB.open(STAGED_VAULT_DB_NAME);
@@ -605,6 +608,7 @@ async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unkn
           upgradeDb.objectStoreNames &&
           !upgradeDb.objectStoreNames.contains(STAGED_VAULT_STORE_NAME)
         ) {
+          wasNewlyCreated = true;
           upgradeDb.createObjectStore(STAGED_VAULT_STORE_NAME);
         }
       };
@@ -613,7 +617,7 @@ async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unkn
     });
 
     if (!db || !db.objectStoreNames || !db.objectStoreNames.contains(STAGED_VAULT_STORE_NAME)) {
-      return [];
+      return null;
     }
 
     const keysTx = db.transaction(STAGED_VAULT_STORE_NAME, 'readonly');
@@ -646,6 +650,14 @@ async function readStagedEntriesViaKeyFilteredIdb(): Promise<Array<[string, unkn
       : [];
 
     if (stagedKeys.length === 0) {
+      // If the kv store was freshly created during this open OR this process already wrote
+      // staged:* entries through `vaultSet` (e.g. a unit-test harness replaced globalThis.indexedDB
+      // after `idb-keyval` cached its store handle), fall back to `vaultEntries()`.
+      // On an existing production DB with a real catalog and no staged writes, return `[]`
+      // directly so `vaultEntries()` never deserializes the multi-MB main catalog.
+      if (wasNewlyCreated || hasWrittenStagedToVaultInProcess) {
+        return null;
+      }
       return [];
     }
 
