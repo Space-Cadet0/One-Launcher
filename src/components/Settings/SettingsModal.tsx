@@ -85,7 +85,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const idPrefix = useSafeId('global-settings');
   const hostCapabilities = resolveSettingsHostCapabilities(hostPlatform);
   const isMacHost = hostCapabilities.supportsWindowsTranslation;
-  const isWindowsHost = hostCapabilities.isWindows;
 
   const [draft, setDraft] = useState<LauncherPerformanceSettings>(() =>
     sanitizePerformanceSettings(launcherService.getPerformanceSettings())
@@ -246,17 +245,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       value: 'hide_tray_hibernate',
       label: 'Hibernate',
       badge: 'Recommended',
-      description: isWindowsHost
-        ? 'Hide to system tray & pause UI GPU rendering'
-        : 'Hide to menu bar & pause UI GPU rendering',
+      description: hostCapabilities.isMac
+        ? 'Hide to menu bar & pause UI GPU rendering'
+        : 'Hide to system tray & pause UI GPU rendering',
       testId: 'settings-ingame-hibernate',
     },
     {
       value: 'minimize_taskbar',
       label: 'Minimize',
-      description: isWindowsHost
-        ? 'Minimize One Launcher to the taskbar'
-        : 'Minimize One Launcher to the Dock',
+      description: hostCapabilities.isMac
+        ? 'Minimize One Launcher to the Dock'
+        : 'Minimize One Launcher to the taskbar',
       testId: 'settings-ingame-minimize',
     },
     {
@@ -433,9 +432,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 Settings
               </h2>
               <p className="text-xs text-steam-subtext truncate">
-                {isWindowsHost
-                  ? 'Global library sorting, gameplay footprint & launch defaults for all games'
-                  : 'Global library sorting, gameplay footprint, performance HUD & platform defaults for all games'}
+                {hostCapabilities.supportsBottleDisplayScaler
+                  ? 'Global library sorting, gameplay footprint, performance HUD & platform defaults for all games'
+                  : 'Global library sorting, gameplay footprint & launch defaults for all games'}
               </p>
             </div>
           </div>
@@ -555,13 +554,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span id={defaultHudLabelId} className="flex items-center gap-1.5 text-xs font-semibold text-white">
                     <Gauge className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-hidden="true" />
                     <span>
-                      {isWindowsHost ? 'DXVK Performance HUD' : 'Performance HUD Overlay'}
+                      {hostCapabilities.supportsMetalHud
+                        ? 'Performance HUD Overlay'
+                        : 'DXVK Performance HUD'}
                     </span>
                   </span>
                   <p id={defaultHudHintId} className="text-[10px] text-steam-subtext leading-snug">
-                    {isWindowsHost
-                      ? 'Shows FPS & frametime overlay on Vulkan / DXVK-wrapped games'
-                      : 'Shows FPS & GPU frametime overlay (Apple Metal HUD with automatic DXVK fallback)'}
+                    {hostCapabilities.supportsMetalHud
+                      ? 'Shows FPS & GPU frametime overlay (Apple Metal HUD with automatic DXVK fallback)'
+                      : 'Shows FPS & frametime overlay on Vulkan / DXVK-wrapped games'}
                   </p>
                 </div>
                 <SwitchControl

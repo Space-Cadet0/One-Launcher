@@ -627,12 +627,12 @@ export function evaluateLibraryFilter(
 ): CanonicalGame[] {
   if (!games || games.length === 0) return [];
   const bounds = { minYear: index.minReleaseYear, maxYear: index.maxReleaseYear };
-  if (!isLibraryFilterActive(state, bounds)) {
+  const supportsWindowsTranslation =
+    launcherService.getHostCapabilities().supportsWindowsTranslation;
+  if (!isLibraryFilterActive(state, bounds, { supportsWindowsTranslation })) {
     return games;
   }
 
-  const supportsWindowsTranslation =
-    launcherService.getHostCapabilities().supportsWindowsTranslation;
   const effectiveOsCompatibility = supportsWindowsTranslation
     ? state.osCompatibility
     : state.osCompatibility.filter((opt) => opt !== 'mac_compat_layer');

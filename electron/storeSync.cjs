@@ -1114,39 +1114,72 @@ async function resolveGogClientId(productId, options = {}) {
     'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0'),
   };
 
+  const MAX_GOG_MANIFEST_REDIRECTS = 3;
+  /**
+   * Fetches an allowlisted GOG HTTPS URL with bounded manual redirect handling (`C2`),
+   * re-validating every 3xx `Location` against `GOG_MANIFEST_ALLOWED_HOSTS` and public-DNS rules.
+   *
+   * @param {string} initialUrl
+   * @param {Record<string, string>} reqHeaders
+   * @returns {Promise<any | null>}
+   */
+  const fetchGogAllowlistedHttps = async (initialUrl, reqHeaders) => {
+    let currentUrl = String(initialUrl || '').trim();
+    for (let hop = 0; hop <= MAX_GOG_MANIFEST_REDIRECTS; hop++) {
+      if (!isAllowedHttpsHost(currentUrl, GOG_MANIFEST_ALLOWED_HOSTS)) {
+        console.warn(`Blocked non-GOG manifest link host during clientId resolution`);
+        return null;
+      }
+      assertSafePublicHttpsUrlSyntax(currentUrl);
+      if (!hasCustomFetch || options.enforceDnsCheck === true) {
+        await assertSafePublicHttpsUrl(
+          currentUrl,
+          typeof options.dnsLookup === 'function' ? { dnsLookup: options.dnsLookup } : {}
+        );
+      }
+
+      const res = await fetchImpl(currentUrl, {
+        headers: reqHeaders,
+        redirect: 'manual',
+        signal: buildStoreFetchSignal(options?.signal),
+      });
+      const status = Number(res?.status || 0);
+      if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+        const locationHeader =
+          res?.headers && typeof res.headers.get === 'function'
+            ? res.headers.get('location')
+            : '';
+        try {
+          await res?.body?.cancel?.();
+        } catch {}
+        if (!locationHeader || !String(locationHeader).trim() || hop >= MAX_GOG_MANIFEST_REDIRECTS) {
+          return null;
+        }
+        currentUrl = new URL(String(locationHeader).trim(), currentUrl).toString();
+        continue;
+      }
+
+      return res;
+    }
+    return null;
+  };
+
   for (const osName of ['windows', 'osx', 'linux']) {
     try {
       const buildsUrl = `https://content-system.gog.com/products/${encodeURIComponent(
         cleanProductId
       )}/os/${osName}/builds?generation=2`;
-      const buildsRes = await fetchImpl(buildsUrl, {
-        headers,
-        signal: buildStoreFetchSignal(options?.signal),
-      });
-      if (!buildsRes.ok) continue;
+      const buildsRes = await fetchGogAllowlistedHttps(buildsUrl, headers);
+      if (!buildsRes || !buildsRes.ok) continue;
       const buildsData = await buildsRes.json();
       const firstItem = Array.isArray(buildsData?.items) ? buildsData.items[0] : null;
       const link = typeof firstItem?.link === 'string' ? firstItem.link.trim() : '';
       if (!link) continue;
 
-      // SSRF defense (`C2`): enforce GOG host allowlist + public HTTPS URL validation
-      if (!isAllowedHttpsHost(link, GOG_MANIFEST_ALLOWED_HOSTS)) {
-        console.warn(`Blocked non-GOG manifest link host during clientId resolution`);
-        continue;
-      }
-      assertSafePublicHttpsUrlSyntax(link);
-      if (!hasCustomFetch || options.enforceDnsCheck === true) {
-        await assertSafePublicHttpsUrl(
-          link,
-          typeof options.dnsLookup === 'function' ? { dnsLookup: options.dnsLookup } : {}
-        );
-      }
-
-      const manifestRes = await fetchImpl(link, {
-        headers: { 'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0') },
-        signal: buildStoreFetchSignal(options?.signal),
+      const manifestRes = await fetchGogAllowlistedHttps(link, {
+        'User-Agent': buildPlatformStoreUserAgent('GOGGalaxy/2.0'),
       });
-      if (!manifestRes.ok) continue;
+      if (!manifestRes || !manifestRes.ok) continue;
 
       const compressedBuf = await readBoundedResponseBuffer(
         manifestRes,

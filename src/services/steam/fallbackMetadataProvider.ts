@@ -250,6 +250,7 @@ interface NormalizedEpicIpcPayload {
   systemRequirements?: { minimum?: string; recommended?: string };
   macRequirements?: { minimum?: string; recommended?: string };
   linuxRequirements?: { minimum?: string; recommended?: string };
+  platforms?: { windows?: boolean; mac?: boolean; linux?: boolean };
   namespace?: string;
 }
 
@@ -925,6 +926,7 @@ export class FallbackMetadataProvider {
     let v2Tags: string[] | undefined = cached?.tags?.length ? cached.tags : undefined;
     let v2Localizations: GogLocalizationItem[] | undefined = undefined;
     let v1Languages: Record<string, string> | undefined = undefined;
+    let v2SupportedOperatingSystems: GogSupportedOperatingSystem[] | undefined = undefined;
     let v2Requirements: {
       systemRequirements?: SteamSystemRequirements;
       macRequirements?: SteamSystemRequirements;
@@ -1016,11 +1018,13 @@ export class FallbackMetadataProvider {
           v2Localizations = v2Data._embedded.localizations;
         }
         if (
-          !synopsisOnly &&
           Array.isArray(v2Data._embedded?.supportedOperatingSystems) &&
           v2Data._embedded.supportedOperatingSystems.length > 0
         ) {
-          v2Requirements = extractGogRequirementsByOs(v2Data._embedded.supportedOperatingSystems);
+          v2SupportedOperatingSystems = v2Data._embedded.supportedOperatingSystems;
+          if (!synopsisOnly) {
+            v2Requirements = extractGogRequirementsByOs(v2SupportedOperatingSystems);
+          }
         }
         const globalRel = v2Data._embedded?.product?.globalReleaseDate;
         if (globalRel && typeof globalRel === 'string' && releaseDate === 'TBA') {
@@ -1193,6 +1197,16 @@ export class FallbackMetadataProvider {
               ) {
                 v2Localizations = catV2Data._embedded.localizations;
               }
+              if (
+                !v2SupportedOperatingSystems?.length &&
+                Array.isArray(catV2Data?._embedded?.supportedOperatingSystems) &&
+                catV2Data._embedded.supportedOperatingSystems.length > 0
+              ) {
+                v2SupportedOperatingSystems = catV2Data._embedded.supportedOperatingSystems;
+                if (!synopsisOnly) {
+                  v2Requirements = extractGogRequirementsByOs(v2SupportedOperatingSystems);
+                }
+              }
               if (catData) {
                 if (!v1Languages && catData.languages && typeof catData.languages === 'object') {
                   v1Languages = catData.languages;
@@ -1345,6 +1359,35 @@ export class FallbackMetadataProvider {
         ? cached.supportedLanguages
         : undefined;
 
+    const hasGogWinReq = Boolean(sysReqs.minimum?.trim() || sysReqs.recommended?.trim());
+    const hasGogMacReq = Boolean(
+      v2Requirements.macRequirements?.minimum?.trim() ||
+        v2Requirements.macRequirements?.recommended?.trim()
+    );
+    const hasGogLinuxReq = Boolean(
+      v2Requirements.linuxRequirements?.minimum?.trim() ||
+        v2Requirements.linuxRequirements?.recommended?.trim()
+    );
+    let gogPlatforms: SteamEnrichedMetadata['platforms'] | undefined;
+    if (Array.isArray(v2SupportedOperatingSystems) && v2SupportedOperatingSystems.length > 0) {
+      const osNames = v2SupportedOperatingSystems
+        .map((entry) => String(entry?.operatingSystem?.name || '').trim())
+        .filter(Boolean);
+      if (osNames.length > 0 || hasGogWinReq || hasGogMacReq || hasGogLinuxReq) {
+        gogPlatforms = {
+          windows: hasGogWinReq || osNames.some((n) => /^win/i.test(n)),
+          mac: hasGogMacReq || osNames.some((n) => /^(?:osx|mac)/i.test(n)),
+          linux: hasGogLinuxReq || osNames.some((n) => /^linux/i.test(n)),
+        };
+      }
+    } else if (hasGogWinReq || hasGogMacReq || hasGogLinuxReq) {
+      gogPlatforms = {
+        windows: hasGogWinReq,
+        mac: hasGogMacReq,
+        linux: hasGogLinuxReq,
+      };
+    }
+
     return {
       aboutTheGame: descriptionFull,
       detailedDescription: descriptionFull,
@@ -1368,7 +1411,9 @@ export class FallbackMetadataProvider {
       ...(v2Requirements.linuxRequirements
         ? { linuxRequirements: v2Requirements.linuxRequirements }
         : {}),
+      ...(gogPlatforms ? { platforms: gogPlatforms } : {}),
       metadataQuality: 'scraped',
+      enrichedSource: 'gog',
       fetchedAt: Date.now(),
       achievements: undefined,
     };
@@ -1474,6 +1519,30 @@ export class FallbackMetadataProvider {
             ? {}
             : parseEpicLanguages(ipcData.supportedLanguages || ipcData.languages);
 
+          const hasIpcWin = Boolean(
+            ipcData.platforms?.windows ||
+              ipcData.systemRequirements?.minimum?.trim() ||
+              ipcData.systemRequirements?.recommended?.trim()
+          );
+          const hasIpcMac = Boolean(
+            ipcData.platforms?.mac ||
+              ipcData.macRequirements?.minimum?.trim() ||
+              ipcData.macRequirements?.recommended?.trim()
+          );
+          const hasIpcLinux = Boolean(
+            ipcData.platforms?.linux ||
+              ipcData.linuxRequirements?.minimum?.trim() ||
+              ipcData.linuxRequirements?.recommended?.trim()
+          );
+          const ipcPlatforms: SteamEnrichedMetadata['platforms'] | undefined =
+            ipcData.platforms || hasIpcWin || hasIpcMac || hasIpcLinux
+              ? {
+                  windows: hasIpcWin,
+                  mac: hasIpcMac,
+                  linux: hasIpcLinux,
+                }
+              : undefined;
+
           ipcMetadata = {
             name: ipcData.title || options?.title || slugOrTitle,
             shortDescription: cleanShort,
@@ -1496,6 +1565,8 @@ export class FallbackMetadataProvider {
             ...(ipcData.systemRequirements ? { systemRequirements: ipcData.systemRequirements } : {}),
             ...(ipcData.macRequirements ? { macRequirements: ipcData.macRequirements } : {}),
             ...(ipcData.linuxRequirements ? { linuxRequirements: ipcData.linuxRequirements } : {}),
+            ...(ipcPlatforms ? { platforms: ipcPlatforms } : {}),
+            enrichedSource: 'epic',
             ...(ipcData.namespace ? { epicNamespace: ipcData.namespace } : {}),
           } as Partial<SteamEnrichedMetadata>;
 
@@ -1669,6 +1740,35 @@ export class FallbackMetadataProvider {
         d.hero?.logoImage?.src ||
         '';
 
+      const epicSysTypes = Array.isArray(d.requirements?.systems)
+        ? d.requirements.systems
+            .map((sys) => String(sys?.systemType || '').trim())
+            .filter(Boolean)
+        : [];
+      const hasContentWin = Boolean(
+        parsedEpicReqs.systemRequirements?.minimum?.trim() ||
+          parsedEpicReqs.systemRequirements?.recommended?.trim() ||
+          epicSysTypes.some((t) => /win/i.test(t))
+      );
+      const hasContentMac = Boolean(
+        parsedEpicReqs.macRequirements?.minimum?.trim() ||
+          parsedEpicReqs.macRequirements?.recommended?.trim() ||
+          epicSysTypes.some((t) => /mac|osx|darwin/i.test(t))
+      );
+      const hasContentLinux = Boolean(
+        parsedEpicReqs.linuxRequirements?.minimum?.trim() ||
+          parsedEpicReqs.linuxRequirements?.recommended?.trim() ||
+          epicSysTypes.some((t) => /linux|ubuntu|steam\s*os/i.test(t))
+      );
+      const contentPlatforms: SteamEnrichedMetadata['platforms'] | undefined =
+        hasContentWin || hasContentMac || hasContentLinux
+          ? {
+              windows: hasContentWin,
+              mac: hasContentMac,
+              linux: hasContentLinux,
+            }
+          : undefined;
+
       const contentMetadata: Partial<SteamEnrichedMetadata> = {
         aboutTheGame: formattedAbout,
         detailedDescription: formattedAbout,
@@ -1691,6 +1791,8 @@ export class FallbackMetadataProvider {
         ...(parsedEpicReqs.linuxRequirements
           ? { linuxRequirements: parsedEpicReqs.linuxRequirements }
           : {}),
+        ...(contentPlatforms ? { platforms: contentPlatforms } : {}),
+        enrichedSource: 'epic',
         releaseDate: d.meta?.releaseDate ? d.meta.releaseDate.substring(0, 10) : '',
         developers: d.about?.developerAttribution ? [d.about.developerAttribution] : undefined,
         publishers: d.about?.publisherAttribution ? [d.about.publisherAttribution] : undefined,
@@ -1704,6 +1806,16 @@ export class FallbackMetadataProvider {
             (s) => !(ipcMetadata?.screenshots || []).some((existing) => existing.pathFull === s.pathFull)
           ),
         ];
+        const mergedPlatforms: SteamEnrichedMetadata['platforms'] | undefined =
+          ipcMetadata.platforms || contentMetadata.platforms
+            ? {
+                windows: Boolean(
+                  ipcMetadata.platforms?.windows || contentMetadata.platforms?.windows
+                ),
+                mac: Boolean(ipcMetadata.platforms?.mac || contentMetadata.platforms?.mac),
+                linux: Boolean(ipcMetadata.platforms?.linux || contentMetadata.platforms?.linux),
+              }
+            : undefined;
         return {
           ...contentMetadata,
           ...ipcMetadata,
@@ -1738,6 +1850,8 @@ export class FallbackMetadataProvider {
             ipcMetadata.linuxRequirements?.minimum || ipcMetadata.linuxRequirements?.recommended
               ? ipcMetadata.linuxRequirements
               : contentMetadata.linuxRequirements,
+          ...(mergedPlatforms ? { platforms: mergedPlatforms } : {}),
+          enrichedSource: 'epic',
           releaseDate: ipcMetadata.releaseDate || contentMetadata.releaseDate,
           developers:
             ipcMetadata.developers && ipcMetadata.developers.length > 0
@@ -2278,6 +2392,7 @@ export class FallbackMetadataProvider {
       extUserAccountNotice: storeMetadata?.extUserAccountNotice,
       website: storeMetadata?.website,
       metadataQuality: resolvedQuality,
+      ...(storeMetadata?.platforms ? { platforms: storeMetadata.platforms } : {}),
       ...(storeMetadata?.enrichedSource ? { enrichedSource: storeMetadata.enrichedSource } : {}),
       ...(preservedXboxHints ? { xboxDeliveryHints: preservedXboxHints } : {}),
       fetchedAt: storeMetadata?.fetchedAt || Date.now(),

@@ -217,11 +217,24 @@ describe('Wave 1: Decoupled User Tag Overrides, Authoritative Resolver & Anchore
         'GOG Exclusive',
       ]);
 
-      // Resetting split GOG copy must NEVER delete sibling Steam copy's record
+      // Resetting split GOG copy must NEVER delete sibling Steam copy's record AND must prune
+      // `'gog:456'` from Steam's aliases so `gog-456` does not resurrect `'Shared Tag'` (`F7`)
       resetUserTagsForGame(splitGogCopy);
       const loadedMap = loadUserTagOverrides();
       expect(loadedMap['steam-123']?.addedTags).toEqual(['Shared Tag']);
+      expect(loadedMap['steam-123']?.platformAliases).toEqual(['steam:123']);
       expect(loadedMap['gog-456']).toBeUndefined();
+      expect(getUserTagOverrideForGame(splitGogCopy)).toBeUndefined();
+      expect(resolveEffectiveGameTags(splitGogCopy).userAddedTags).toEqual([]);
+
+      // Direct Reset on a freshly split child (without editing it first) also prevents resurrection
+      mockStorage.clear();
+      addUserTagForGame(mergedInitial, 'Cozy', []);
+      expect(resolveEffectiveGameTags(splitGogCopy).userAddedTags).toEqual(['Cozy']);
+      resetUserTagsForGame(splitGogCopy);
+      expect(getUserTagOverrideForGame(splitGogCopy)).toBeUndefined();
+      expect(resolveEffectiveGameTags(splitGogCopy).userAddedTags).toEqual([]);
+      expect(resolveEffectiveGameTags(splitSteamCopy).userAddedTags).toEqual(['Cozy']);
     });
 
     it('reconciles localStorage and Electron vault via hydrateUserTagOverridesFromVault (newest updatedAt wins) and responds to StorageEvent', async () => {
@@ -853,6 +866,80 @@ describe('Wave 1: Decoupled User Tag Overrides, Authoritative Resolver & Anchore
 
         tree = renderer.render({ hasUserEdits: false });
         expect(findByTestId(tree, 'tag-manager-reset-btn')).toBeUndefined();
+      } finally {
+        renderer.unmount();
+      }
+    });
+
+    it('prevents native popover="auto" light-dismiss from immediately re-opening on trigger click (F6)', () => {
+      const renderer = createDomain12DeepRenderer(TagManagerPopover, {
+        gameTitle: 'Popover Race Game',
+        entries: [],
+        availableLibraryTags: [{ key: 'rpg', label: 'RPG', count: 5 }],
+        hasUserEdits: false,
+        onAddTag: vi.fn(),
+        onRemoveTag: vi.fn(),
+      });
+
+      try {
+        let tree = renderer.render();
+        const dialogHost = renderer.getHostElementByTestId('tag-manager-popover') as unknown as {
+          showPopover: () => void;
+          hidePopover: () => void;
+          matches: (sel: string) => boolean;
+          addEventListener: (type: string, fn: (e: Event) => void) => void;
+          removeEventListener: (type: string, fn: (e: Event) => void) => void;
+        };
+        const toggleListeners = new Set<(e: Event) => void>();
+        let domPopoverOpen = false;
+        const showPopoverSpy = vi.fn(() => {
+          domPopoverOpen = true;
+        });
+        const hidePopoverSpy = vi.fn(() => {
+          domPopoverOpen = false;
+        });
+        dialogHost.showPopover = showPopoverSpy;
+        dialogHost.hidePopover = hidePopoverSpy;
+        dialogHost.matches = (sel: string) => sel === ':popover-open' && domPopoverOpen;
+        dialogHost.addEventListener = (type: string, fn: (e: Event) => void) => {
+          if (type === 'toggle') toggleListeners.add(fn);
+        };
+        dialogHost.removeEventListener = (type: string, fn: (e: Event) => void) => {
+          if (type === 'toggle') toggleListeners.delete(fn);
+        };
+
+        // Re-render so effect binds native `toggle` listener on our patched host
+        tree = renderer.render({ gameTitle: 'Popover Race Game!' });
+        const triggerOpen = findByTestId(tree, 'hero-tag-manager-trigger')!;
+        (triggerOpen.props.onPointerDown as () => void)();
+        (triggerOpen.props.onClick as () => void)();
+        tree = renderer.render();
+        expect(showPopoverSpy).toHaveBeenCalledTimes(1);
+        expect(findByTestId(tree, 'hero-tag-manager-trigger')!.props['aria-expanded']).toBe(true);
+
+        // Now simulate clicking `+` while open:
+        // 1. pointerdown runs while popover is open
+        const triggerClose = findByTestId(tree, 'hero-tag-manager-trigger')!;
+        (triggerClose.props.onPointerDown as () => void)();
+        // 2. Native popover="auto" light-dismiss fires `toggle` (newState: 'closed') on pointerup BEFORE click
+        domPopoverOpen = false;
+        for (const fn of toggleListeners) {
+          fn({ type: 'toggle', newState: 'closed' } as unknown as Event);
+        }
+        tree = renderer.render();
+        expect(findByTestId(tree, 'hero-tag-manager-trigger')!.props['aria-expanded']).toBe(false);
+        // 3. click fires right after -> MUST NOT call showPopover() again!
+        (findByTestId(tree, 'hero-tag-manager-trigger')!.props.onClick as () => void)();
+        tree = renderer.render();
+        expect(showPopoverSpy).toHaveBeenCalledTimes(1);
+        expect(findByTestId(tree, 'hero-tag-manager-trigger')!.props['aria-expanded']).toBe(false);
+
+        // Next click on `+` while closed opens normally
+        (findByTestId(tree, 'hero-tag-manager-trigger')!.props.onPointerDown as () => void)();
+        (findByTestId(tree, 'hero-tag-manager-trigger')!.props.onClick as () => void)();
+        tree = renderer.render();
+        expect(showPopoverSpy).toHaveBeenCalledTimes(2);
+        expect(findByTestId(tree, 'hero-tag-manager-trigger')!.props['aria-expanded']).toBe(true);
       } finally {
         renderer.unmount();
       }

@@ -709,9 +709,100 @@ export function getUserTagOverrideForGame(
   return mergeAliasTagOverrides(exactId, matched);
 }
 
+function pruneAliasesFromSiblingRecords(
+  current: UserTagOverridesMap,
+  ownerGameId: string,
+  aliasesToPrune?: readonly string[]
+): { mutated: boolean; updatedSiblings: UserTagOverride[] } {
+  if (!Array.isArray(aliasesToPrune) || aliasesToPrune.length === 0) {
+    return { mutated: false, updatedSiblings: [] };
+  }
+
+  const pruneVariantSet = new Set<string>();
+  for (const alias of aliasesToPrune) {
+    for (const variant of expandAliasLookupVariants(alias)) {
+      pruneVariantSet.add(variant);
+      pruneVariantSet.add(variant.toLowerCase());
+    }
+  }
+  if (pruneVariantSet.size === 0) {
+    return { mutated: false, updatedSiblings: [] };
+  }
+
+  let mutated = false;
+  const updatedBySiblingId = new Map<string, UserTagOverride>();
+  const seenSiblings = new Set<string>();
+
+  for (const rec of Object.values(current)) {
+    if (!rec || !rec.gameId || rec.gameId === ownerGameId || seenSiblings.has(rec.gameId)) {
+      continue;
+    }
+    seenSiblings.add(rec.gameId);
+    if (!Array.isArray(rec.platformAliases) || rec.platformAliases.length === 0) {
+      continue;
+    }
+    const filteredAliases = rec.platformAliases.filter((alias) => {
+      const variants = expandAliasLookupVariants(alias);
+      return !variants.some((v) => pruneVariantSet.has(v) || pruneVariantSet.has(v.toLowerCase()));
+    });
+    if (filteredAliases.length !== rec.platformAliases.length) {
+      mutated = true;
+      const updatedSibling: UserTagOverride = {
+        ...rec,
+        platformAliases: filteredAliases.length > 0 ? filteredAliases : undefined,
+        updatedAt: nextMonotonicTimestamp(rec.updatedAt),
+      };
+      updatedBySiblingId.set(rec.gameId, updatedSibling);
+    }
+  }
+
+  for (const [key, rec] of Object.entries(current)) {
+    if (!rec || !rec.gameId || rec.gameId === ownerGameId) continue;
+
+    if (
+      key !== rec.gameId &&
+      (pruneVariantSet.has(key) || pruneVariantSet.has(key.toLowerCase()))
+    ) {
+      delete current[key];
+      mutated = true;
+      continue;
+    }
+
+    const updatedSibling = updatedBySiblingId.get(rec.gameId);
+    if (updatedSibling) {
+      current[key] = updatedSibling;
+    }
+  }
+
+  return {
+    mutated,
+    updatedSiblings: Array.from(updatedBySiblingId.values()),
+  };
+}
+
+function syncSiblingsToOfflineVault(siblings: readonly UserTagOverride[]): void {
+  if (
+    siblings.length === 0 ||
+    typeof window === 'undefined' ||
+    typeof window.electronAPI?.offlineVault?.saveUserTagOverride !== 'function'
+  ) {
+    return;
+  }
+  for (const sibling of siblings) {
+    try {
+      void window.electronAPI.offlineVault
+        .saveUserTagOverride(sibling.gameId, sibling)
+        ?.catch?.(() => {});
+    } catch (vaultErr) {
+      console.warn('Failed to sync pruned sibling user tag override to offlineVault:', vaultErr);
+    }
+  }
+}
+
 /**
  * Persists a canonical `UserTagOverride` keyed strictly under `override.gameId` with ONLY
- * `override.platformAliases`, never mutating sibling split-game records or `user_overrides.json`.
+ * `override.platformAliases`, pruning overlapping aliases from sibling split-game records
+ * without mutating those sibling records' own tags or `user_overrides.json`.
  */
 export function saveUserTagOverride(
   override: UserTagOverride,
@@ -725,12 +816,22 @@ export function saveUserTagOverride(
   if (!sanitized) return null;
 
   if (sanitized.addedTags.length === 0 && sanitized.removedTags.length === 0) {
-    removeUserTagOverride(sanitized.gameId, { silentEvent: options?.silentEvent });
+    removeUserTagOverride(sanitized.gameId, {
+      pruneSiblingAliases: sanitized.platformAliases,
+      silentEvent: options?.silentEvent,
+    });
     return null;
   }
 
   try {
     const current: UserTagOverridesMap = { ...loadUserTagOverrides() };
+
+    // Prune aliases claimed by `sanitized` from any sibling records (`F7` split-game isolation)
+    const pruned = pruneAliasesFromSiblingRecords(
+      current,
+      sanitized.gameId,
+      sanitized.platformAliases
+    );
 
     // Rebind stale alias pointers belonging strictly to THIS `gameId` (never touching sibling games!)
     for (const [k, existingRec] of Object.entries(current)) {
@@ -768,6 +869,7 @@ export function saveUserTagOverride(
         console.warn('Failed to sync user tag override to offlineVault:', vaultErr);
       }
     }
+    syncSiblingsToOfflineVault(pruned.updatedSiblings);
 
     return sanitized;
   } catch (err) {
@@ -778,11 +880,11 @@ export function saveUserTagOverride(
 
 /**
  * Removes a `UserTagOverride` by canonical `gameId` (and any explicitly supplied `aliasKeys`),
- * leaving sibling games' canonical records strictly untouched.
+ * optionally pruning `pruneSiblingAliases` from sibling records while leaving sibling tags intact.
  */
 export function removeUserTagOverride(
   gameId: string,
-  options?: { aliasKeys?: string[]; silentEvent?: boolean }
+  options?: { aliasKeys?: string[]; pruneSiblingAliases?: readonly string[]; silentEvent?: boolean }
 ): boolean {
   const safeId = normalizeSafeIdKey(gameId);
   if (!safeId) return false;
@@ -812,7 +914,13 @@ export function removeUserTagOverride(
       }
     }
 
-    if (removedAny) {
+    const pruned = pruneAliasesFromSiblingRecords(
+      current,
+      safeId,
+      options?.pruneSiblingAliases
+    );
+
+    if (removedAny || pruned.mutated) {
       persistUserTagOverridesMapToStorage(current);
       if (!options?.silentEvent) {
         dispatchUserTagOverridesUpdatedEvent({ gameId: safeId });
@@ -834,8 +942,9 @@ export function removeUserTagOverride(
         console.warn('Failed to remove user tag override in offlineVault:', vaultErr);
       }
     }
+    syncSiblingsToOfflineVault(pruned.updatedSiblings);
 
-    return removedAny;
+    return removedAny || pruned.mutated;
   } catch (err) {
     console.error('Failed to remove user tag override:', err);
     return false;
@@ -900,7 +1009,9 @@ export function addUserTagForGame(
   }
 
   if (nextAdded.length === 0 && nextRemoved.length === 0) {
-    removeUserTagOverride(gameId);
+    removeUserTagOverride(gameId, {
+      pruneSiblingAliases: extractGameTagPlatformAliases(game),
+    });
     return null;
   }
 
@@ -954,7 +1065,9 @@ export function removeUserTagForGame(
   }
 
   if (nextAdded.length === 0 && nextRemoved.length === 0) {
-    removeUserTagOverride(gameId);
+    removeUserTagOverride(gameId, {
+      pruneSiblingAliases: extractGameTagPlatformAliases(game),
+    });
     return null;
   }
 
@@ -971,14 +1084,17 @@ export function removeUserTagForGame(
 /**
  * Resets all user tag edits for `game` back to synced defaults.
  * Preserves sibling split-game records: only deletes `game.id` plus any legacy alias-matched record
- * whose entire `platformAliases` set is a strict subset of `game`'s own current aliases.
+ * whose entire `platformAliases` set is a strict subset of `game`'s own current aliases, while
+ * pruning `game`'s current aliases from remaining sibling records so split games cannot resurrect
+ * tags from a former merged parent (`F7`).
  */
 export function resetUserTagsForGame(game: TagOverrideGameIdentity): boolean {
   const gameId = normalizeSafeIdKey(game?.id);
   if (!gameId) return false;
 
   const map = loadUserTagOverrides();
-  const currentAliases = new Set(extractGameTagPlatformAliases(game));
+  const currentAliasesList = extractGameTagPlatformAliases(game);
+  const currentAliases = new Set(currentAliasesList);
   const subsumedLegacyIds: string[] = [];
 
   if (currentAliases.size > 0) {
@@ -998,6 +1114,7 @@ export function resetUserTagsForGame(game: TagOverrideGameIdentity): boolean {
 
   return removeUserTagOverride(gameId, {
     aliasKeys: subsumedLegacyIds,
+    pruneSiblingAliases: currentAliasesList,
   });
 }
 

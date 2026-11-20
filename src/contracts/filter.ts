@@ -1,3 +1,5 @@
+import { getHostCapabilities } from './hostPlatform';
+
 export type FilterType =
   | 'developer'
   | 'publisher'
@@ -86,11 +88,17 @@ export function isReleaseYearRangeActive(
 
 export function countActiveFilterCriteria(
   state: LibraryFilterState,
-  bounds?: { minYear: number; maxYear: number }
+  bounds?: { minYear: number; maxYear: number },
+  options?: { supportsWindowsTranslation?: boolean }
 ): number {
   if (!state) return 0;
+  const supportsWindowsTranslation =
+    options?.supportsWindowsTranslation ?? getHostCapabilities().supportsWindowsTranslation;
+  const osCount = supportsWindowsTranslation
+    ? state.osCompatibility.length
+    : state.osCompatibility.filter((opt) => opt !== 'mac_compat_layer').length;
   return (
-    state.osCompatibility.length +
+    osCount +
     state.criticTiers.length +
     (state.minCriticScore !== null ? 1 : 0) +
     state.reviewSentiments.length +
@@ -104,9 +112,10 @@ export function countActiveFilterCriteria(
 
 export function isLibraryFilterActive(
   state: LibraryFilterState,
-  bounds?: { minYear: number; maxYear: number }
+  bounds?: { minYear: number; maxYear: number },
+  options?: { supportsWindowsTranslation?: boolean }
 ): boolean {
-  return countActiveFilterCriteria(state, bounds) > 0;
+  return countActiveFilterCriteria(state, bounds, options) > 0;
 }
 
 function mapFeatureKeyword(target: string): FeatureFilterOption | null {

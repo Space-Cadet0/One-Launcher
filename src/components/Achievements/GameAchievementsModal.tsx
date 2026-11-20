@@ -67,6 +67,19 @@ function shouldSwrRevalidateMap(map: MultiStoreAchievementsMap): boolean {
   });
 }
 
+function hasHigherPlatformUnlockedSummary(
+  game: CanonicalGame,
+  cachedMap: MultiStoreAchievementsMap
+): boolean {
+  return game.platforms.some((plat) => {
+    const summaryUnlocked = plat.achievements?.unlocked ?? 0;
+    if (summaryUnlocked <= 0) return false;
+    const cachedEntry = cachedMap[plat.platformId as StorefrontId];
+    if (!cachedEntry) return true;
+    return summaryUnlocked > cachedEntry.unlocked;
+  });
+}
+
 type ProgressFillStyle = React.CSSProperties & { '--ol-progress-fill'?: string };
 
 export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
@@ -152,39 +165,46 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
 
       const hasElectronIpc =
         typeof window !== 'undefined' && Boolean(window.electronAPI?.getStoreAchievements);
-      if (currentlyOnline && (hasElectronIpc || shouldSwrRevalidateMap(syncCached))) {
+      const needsSwr =
+        shouldSwrRevalidateMap(syncCached) ||
+        hasHigherPlatformUnlockedSummary(game, syncCached);
+      if (currentlyOnline && needsSwr) {
         setIsRefreshing(true);
-        const forceSwr = hasElectronIpc && shouldSwrRevalidateMap(syncCached);
-        achievementDetailService
-          .fetchGameAchievements(game, forceSwr)
-          .then((fresh) => {
+        const forceSwr = hasElectronIpc;
+        achievementDetailService.fetchGameAchievements(game, forceSwr).then(
+          (fresh) => {
             if (fresh && Object.keys(fresh).length > 0) {
               applyResolvedData(fresh);
             }
-          })
-          .catch(() => {})
-          .finally(() => {
             if (!cancelled && fetchSeqRef.current === reqSeq) {
               setIsRefreshing(false);
             }
-          });
+          },
+          () => {
+            if (!cancelled && fetchSeqRef.current === reqSeq) {
+              setIsRefreshing(false);
+            }
+          }
+        );
       } else {
         setIsRefreshing(false);
       }
     } else {
       setIsLoading(true);
       setIsRefreshing(false);
-      achievementDetailService
-        .fetchGameAchievements(game)
-        .then((data) => {
+      achievementDetailService.fetchGameAchievements(game).then(
+        (data) => {
           applyResolvedData(data);
-        })
-        .catch(() => {})
-        .finally(() => {
           if (!cancelled && fetchSeqRef.current === reqSeq) {
             setIsLoading(false);
           }
-        });
+        },
+        () => {
+          if (!cancelled && fetchSeqRef.current === reqSeq) {
+            setIsLoading(false);
+          }
+        }
+      );
     }
 
     return () => {
@@ -196,20 +216,20 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
     if (!game || isLoading || isRefreshing || !onlineLifecycleManager.isOnline()) return;
     const reqSeq = ++fetchSeqRef.current;
     setIsRefreshing(true);
-    achievementDetailService
-      .fetchGameAchievements(game, true)
-      .then((fresh) => {
+    achievementDetailService.fetchGameAchievements(game, true).then(
+      (fresh) => {
         if (fetchSeqRef.current !== reqSeq) return;
         if (fresh && Object.keys(fresh).length > 0) {
           setMultiStoreData(fresh);
         }
-      })
-      .catch(() => {})
-      .finally(() => {
+        setIsRefreshing(false);
+      },
+      () => {
         if (fetchSeqRef.current === reqSeq) {
           setIsRefreshing(false);
         }
-      });
+      }
+    );
   }, [game, isLoading, isRefreshing]);
 
   const handleSelectStorefront = useCallback((storeId: StorefrontId) => {
@@ -238,14 +258,15 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
         );
       if (needsRefetch) {
         setIsLoading(true);
-        achievementDetailService
-          .fetchGameAchievements(game)
-          .then((data) => {
+        achievementDetailService.fetchGameAchievements(game).then(
+          (data) => {
             setMultiStoreData(data);
-          })
-          .finally(() => {
             setIsLoading(false);
-          });
+          },
+          () => {
+            setIsLoading(false);
+          }
+        );
       }
     });
     return () => {

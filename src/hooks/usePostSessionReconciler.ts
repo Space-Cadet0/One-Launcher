@@ -22,6 +22,7 @@ import { isMicrosoftStoreCdnUrl } from '../services/common/titleUtils';
 import { sanitizeGameInstallSizeBytes } from '../utils/formatBytes';
 import { SyncNoticeTone } from './useSyncNotice';
 import { isUserActivelyScrolling } from '../utils/scrollActivityTracker';
+import { onlineLifecycleManager } from '../services/network/onlineLifecycleManager';
 
 export interface UsePostSessionReconcilerParams {
   gamesRef?: MutableRefObject<CanonicalGame[]>;
@@ -653,13 +654,17 @@ export function usePostSessionReconciler({
         }
         const hadPrevExactList = prevDetailedList.length > 0 && prevCachedMap?.[targetStorefront]?.unlockPrecision !== 'summary_count_only';
 
-        await achievementDetailService.invalidateGame(targetGame.id);
-
         const electronApi = typeof window !== 'undefined' ? window.electronAPI : undefined;
         if (!electronApi?.getStoreAchievements) {
+          if (onlineLifecycleManager.isOnline()) {
+            await achievementDetailService.invalidateGame(targetGame.id);
+          }
           return { handledToast: false };
         }
 
+        // `fetchGameAchievements(targetGame, true)` already bypasses the cache short-circuit
+        // and atomically overwrites memory + localStorage + IndexedDB + SQLite on success while
+        // preserving the cached snapshot when offline (`F5`).
         const freshMap = await achievementDetailService.fetchGameAchievements(targetGame, true);
         const freshStoreData = freshMap?.[targetStorefront];
         if (!freshStoreData || (freshStoreData.total <= 0 && freshStoreData.unlocked <= 0)) {

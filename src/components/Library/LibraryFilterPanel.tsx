@@ -159,11 +159,9 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
   const activeVisibleOsCount = supportsWindowsTranslation
     ? filterState.osCompatibility.length
     : filterState.osCompatibility.filter((opt) => opt !== 'mac_compat_layer').length;
-  const hiddenMacCompatCount = filterState.osCompatibility.length - activeVisibleOsCount;
-  const activeCriteriaCount = Math.max(
-    0,
-    countActiveFilterCriteria(filterState, yearBounds) - hiddenMacCompatCount
-  );
+  const activeCriteriaCount = countActiveFilterCriteria(filterState, yearBounds, {
+    supportsWindowsTranslation,
+  });
 
   const fromYear = filterState.releaseYearRange
     ? Math.max(minYear, Math.min(filterState.releaseYearRange[0], filterState.releaseYearRange[1]))

@@ -850,7 +850,10 @@ export class SteamApiService {
     }
   }
 
-  private needsOnlineUpgrade(meta: SteamEnrichedMetadata | null | undefined): boolean {
+  private needsOnlineUpgrade(
+    meta: SteamEnrichedMetadata | null | undefined,
+    expectMacRequirements: boolean = false
+  ): boolean {
     if (!meta) return false;
     if (meta.__quotaSlimmed === true) return true;
     if (typeof meta.fetchedAt === 'number' && meta.fetchedAt > 0) return false;
@@ -861,21 +864,24 @@ export class SteamApiService {
     const hasMacReq = Boolean(
       meta.macRequirements?.minimum?.trim() || meta.macRequirements?.recommended?.trim()
     );
-    if (meta.platforms?.mac === true && !hasMacReq) return true;
+    if ((meta.platforms?.mac === true || expectMacRequirements) && !hasMacReq) return true;
     return false;
   }
 
   async fetchGameMetadata(
     appId: number,
     priority: number = RequestPriority.P1_VIEWPORT,
-    options?: { forceRefresh?: boolean }
+    options?: { forceRefresh?: boolean; expectMacRequirements?: boolean }
   ): Promise<SteamEnrichedMetadata | null> {
     const forceRefresh = Boolean(options?.forceRefresh);
+    const expectMacRequirements = Boolean(options?.expectMacRequirements);
     const isOnline = onlineLifecycleManager.isOnline();
     const canFetchLive = isOnline && !this.isStoreRateLimited();
     const inMemoryCached = this.metadataCache.get(appId) || null;
     const inMemoryNeedsOnlineUpgrade =
-      Boolean(inMemoryCached) && canFetchLive && this.needsOnlineUpgrade(inMemoryCached);
+      Boolean(inMemoryCached) &&
+      canFetchLive &&
+      this.needsOnlineUpgrade(inMemoryCached, expectMacRequirements);
 
     if (inMemoryCached && !inMemoryNeedsOnlineUpgrade && (!forceRefresh || !canFetchLive)) {
       this.setCacheEntry(appId, inMemoryCached);
@@ -954,7 +960,9 @@ export class SteamApiService {
 
     const persisted = await this.loadPersistedMetadata(appId);
     const persistedNeedsOnlineUpgrade =
-      Boolean(persisted) && canFetchLive && this.needsOnlineUpgrade(persisted);
+      Boolean(persisted) &&
+      canFetchLive &&
+      this.needsOnlineUpgrade(persisted, expectMacRequirements);
     if (persisted && !persistedNeedsOnlineUpgrade && (!canFetchLive || !forceRefresh)) {
       this.setCacheEntry(appId, persisted);
       return persisted;

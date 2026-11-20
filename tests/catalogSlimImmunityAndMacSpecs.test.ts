@@ -1376,6 +1376,49 @@ describe('Tasks 1, 3a/3b & 6 — HLTB Badge Cleanup, __quotaSlimmed Immunity, Ti
       expect(onlineUpgraded?.macRequirements?.minimum).toContain('macOS 14.0+ Apple Silicon');
       expect(typeof onlineUpgraded?.fetchedAt).toBe('number');
 
+      // 2b. Legacy pre-2026-10-29 cached Mac row lacking BOTH `meta.platforms` AND `meta.macRequirements`
+      // upgrades immediately when caller passes `{ expectMacRequirements: true }` (F11)
+      const legacyNoPlatAppId = 991083;
+      const legacyNoPlatMeta = makeRichMeta({
+        appId: legacyNoPlatAppId,
+        name: 'Synthetic Legacy No-Platforms Mac RPG',
+        macRequirements: undefined,
+        fetchedAt: undefined,
+        platforms: undefined,
+      });
+      testEnv.idbStore.set(`enriched_metadata:${legacyNoPlatAppId}`, legacyNoPlatMeta);
+      axiosSpy.mockImplementation(async (url: string) => {
+        if (url.includes('appdetails')) {
+          return {
+            data: {
+              [String(legacyNoPlatAppId)]: {
+                success: true,
+                data: {
+                  name: 'Synthetic Legacy No-Platforms Mac RPG',
+                  short_description: 'Upgraded Mac specs.',
+                  detailed_description: '<p>Upgraded Mac specs.</p>',
+                  about_the_game: '<p>Upgraded Mac specs.</p>',
+                  header_image: `https://cdn.example.invalid/${legacyNoPlatAppId}/header.jpg`,
+                  developers: ['Synthetic Mac Studio'],
+                  publishers: ['Synthetic Pub'],
+                  platforms: { windows: true, mac: true, linux: false },
+                  pc_requirements: { minimum: 'Windows 10' },
+                  mac_requirements: {
+                    minimum: '<strong>OS:</strong> macOS 15 Sequoia Apple Silicon',
+                  },
+                },
+              },
+            },
+          };
+        }
+        return { data: { query_summary: { total_reviews: 0 } } };
+      });
+      const upgradedNoPlat = await api.fetchGameMetadata(legacyNoPlatAppId, undefined, {
+        expectMacRequirements: true,
+      });
+      expect(upgradedNoPlat?.macRequirements?.minimum).toContain('macOS 15 Sequoia Apple Silicon');
+      expect(upgradedNoPlat?.platforms?.mac).toBe(true);
+
       // 3. Fallback preserved when live upgrade network request fails
       const failAppId = 991082;
       const failLegacyMeta = makeRichMeta({

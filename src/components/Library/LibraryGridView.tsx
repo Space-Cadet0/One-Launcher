@@ -431,13 +431,22 @@ export const LibraryGridView: React.FC<LibraryGridViewProps> = ({
     onClearActiveFilter?.();
   }, [onResetLibraryFilterState, onClearActiveFilter]);
 
+  const supportsWindowsTranslation =
+    typeof launcherService.getHostCapabilities === 'function'
+      ? launcherService.getHostCapabilities().supportsWindowsTranslation
+      : true;
+
   const activeCriteriaCount = useMemo(
     () =>
-      countActiveFilterCriteria(effectiveFilterState, {
-        minYear: effectiveFilterIndex.minReleaseYear,
-        maxYear: effectiveFilterIndex.maxReleaseYear,
-      }),
-    [effectiveFilterState, effectiveFilterIndex]
+      countActiveFilterCriteria(
+        effectiveFilterState,
+        {
+          minYear: effectiveFilterIndex.minReleaseYear,
+          maxYear: effectiveFilterIndex.maxReleaseYear,
+        },
+        { supportsWindowsTranslation }
+      ),
+    [effectiveFilterState, effectiveFilterIndex, supportsWindowsTranslation]
   );
 
   const activeFilterChips = useMemo(

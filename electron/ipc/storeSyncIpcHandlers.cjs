@@ -2644,13 +2644,22 @@ function registerStoreSyncIpcHandlers({
 
         if (platformId === 'steam') {
           const savedTokens =
-            typeof storeSync.loadSavedTokens === 'function' ? storeSync.loadSavedTokens() : {};
+            typeof storeSync.loadSavedTokensAsync === 'function'
+              ? await storeSync.loadSavedTokensAsync(sharedVaultOpts)
+              : typeof storeSync.loadSavedTokens === 'function'
+                ? storeSync.loadSavedTokens(sharedVaultOpts)
+                : {};
           const savedSteam = savedTokens?.steam || {};
-          return await fetchSteamDetailedGameAchievements(payload, {
+          const steamProviderFn =
+            typeof storeSync.fetchSteamDetailedGameAchievements === 'function'
+              ? storeSync.fetchSteamDetailedGameAchievements
+              : fetchSteamDetailedGameAchievements;
+          return await steamProviderFn(payload, {
             ...sharedVaultOpts,
             steamId: savedSteam.steamId || payload?.steamId,
-            apiKey: savedSteam.apiKey || savedSteam.api_key,
+            apiKey: savedSteam.apiKey || savedSteam.api_key || payload?.apiKey,
             webapiToken: savedSteam.webapi_token,
+            ...(payload?.existingSummary ? { existingSummary: payload.existingSummary } : {}),
           });
         }
 

@@ -1285,7 +1285,9 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             : null;
 
         const [liveData, liveAchs] = await Promise.all([
-          steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE),
+          steamApi.fetchGameMetadata(targetAppId, RequestPriority.P0_INTERACTIVE, {
+            expectMacRequirements: activeStoreSupportsMac,
+          }),
           steamAchievementsService.fetchPlayerGameAchievements(targetAppId),
         ]);
 
@@ -1423,12 +1425,25 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             hasChanges = true;
           }
 
+          const gainedOsRequirements = Boolean(
+            resolvedMetadata &&
+              ((!game.enrichedMetadata?.macRequirements?.minimum &&
+                !game.enrichedMetadata?.macRequirements?.recommended &&
+                (resolvedMetadata.macRequirements?.minimum ||
+                  resolvedMetadata.macRequirements?.recommended)) ||
+                (!game.enrichedMetadata?.linuxRequirements?.minimum &&
+                  !game.enrichedMetadata?.linuxRequirements?.recommended &&
+                  (resolvedMetadata.linuxRequirements?.minimum ||
+                    resolvedMetadata.linuxRequirements?.recommended)))
+          );
+
           if (
             canPersistMetadata &&
             resolvedMetadata &&
             (!game.enrichedMetadata ||
               Boolean(game.enrichedMetadata.__quotaSlimmed) ||
               isOverrideUpdated ||
+              gainedOsRequirements ||
               !isAuthoritativeSteamMetadata(game.enrichedMetadata, targetAppId))
           ) {
             hasChanges = true;

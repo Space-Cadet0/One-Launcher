@@ -43,6 +43,7 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDialogElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const wasOpenOnPointerDownRef = useRef(false);
 
   const [isOpen, setIsOpen] = useState(false);
   const [usesFallbackMode, setUsesFallbackMode] = useState(false);
@@ -154,14 +155,40 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
     focusTrigger();
   }, [focusTrigger]);
 
+  const handleTriggerPointerDown = useCallback(() => {
+    const el = popoverRef.current;
+    let isDomPopoverOpen = false;
+    if (el && typeof el.matches === 'function') {
+      try {
+        isDomPopoverOpen = el.matches(':popover-open');
+      } catch {
+        isDomPopoverOpen = false;
+      }
+    }
+    wasOpenOnPointerDownRef.current = isOpen || isDomPopoverOpen;
+  }, [isOpen]);
+
+  const handleTriggerPointerCancel = useCallback(() => {
+    wasOpenOnPointerDownRef.current = false;
+  }, []);
+
+  const handleTriggerKeyDown = useCallback((e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      wasOpenOnPointerDownRef.current = false;
+    }
+  }, []);
+
   const handleTogglePopover = useCallback(() => {
+    const wasOpenOnPointerDown = wasOpenOnPointerDownRef.current;
+    wasOpenOnPointerDownRef.current = false;
+
     const el = popoverRef.current;
     const supportsNativePopover = Boolean(
       el && typeof el.showPopover === 'function' && typeof el.hidePopover === 'function'
     );
 
     if (supportsNativePopover && el) {
-      if (isOpen) {
+      if (isOpen || wasOpenOnPointerDown) {
         handleClose();
       } else {
         try {
@@ -178,7 +205,7 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
 
     // JSDOM / non-Popover fallback
     setUsesFallbackMode(true);
-    if (isOpen) {
+    if (isOpen || wasOpenOnPointerDown) {
       setIsOpen(false);
       setQuery('');
       focusTrigger();
@@ -336,6 +363,9 @@ export const TagManagerPopover: React.FC<TagManagerPopoverProps> = ({
         aria-label="Manage tags"
         aria-expanded={isOpen}
         aria-controls={popoverId}
+        onPointerDown={handleTriggerPointerDown}
+        onPointerCancel={handleTriggerPointerCancel}
+        onKeyDown={handleTriggerKeyDown}
         onClick={handleTogglePopover}
         style={{ anchorName: anchorToken }}
         className={

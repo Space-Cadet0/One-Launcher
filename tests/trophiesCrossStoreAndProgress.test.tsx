@@ -5,9 +5,12 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import React from 'react';
 import { renderToString } from 'react-dom/server';
+import axios from 'axios';
 import type { CanonicalGame } from '../src/contracts/game';
 import type { MultiStoreAchievementsMap } from '../src/contracts/achievement';
 import { achievementDetailService } from '../src/services/achievements/achievementDetailService';
+import { steamAchievementsService } from '../src/services/steam/steamAchievementsService';
+import { onlineLifecycleManager } from '../src/services/network/onlineLifecycleManager';
 import { GameAchievementsModal } from '../src/components/Achievements/GameAchievementsModal';
 import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamLibraryActionBar';
 import {
@@ -292,6 +295,91 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
         forceRefresh: true,
       });
       expect(bombResult).toBeNull();
+    });
+
+    it('enforces bounded manual redirect loop in resolveGogClientId: blocks 302 to http://127.0.0.1/internal, allows allowlisted GOG HTTPS hop, and caps >3 redirects (F4)', async () => {
+      const requestedUrls: string[] = [];
+      const seenRedirectModes: Array<string | undefined> = [];
+
+      // 1. 302 redirect from gog-cdn-fastly.gog.com -> http://127.0.0.1/internal MUST be blocked
+      const fetchRedirectSsrf = vi.fn(async (input: string, init?: RequestInit) => {
+        const url = String(input);
+        requestedUrls.push(url);
+        seenRedirectModes.push(init?.redirect);
+        if (url.includes('content-system.gog.com/products/9900099901/os/windows/builds')) {
+          return makeMockJsonResponse({
+            items: [{ link: 'https://gog-cdn-fastly.gog.com/manifests/evil_redir.zlib' }],
+          });
+        }
+        if (url === 'https://gog-cdn-fastly.gog.com/manifests/evil_redir.zlib') {
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'http://127.0.0.1/internal' },
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      });
+
+      const blocked = await storeSync.resolveGogClientId('9900099901', {
+        fetchFn: fetchRedirectSsrf,
+        forceRefresh: true,
+      });
+      expect(blocked).toBeNull();
+      expect(requestedUrls.some((u) => u.includes('127.0.0.1'))).toBe(false);
+      expect(seenRedirectModes.every((mode) => mode === 'manual')).toBe(true);
+
+      // 2. Legitimate 302 redirect within allowlisted GOG CDN hosts resolves clientId cleanly
+      const validManifestZlib = zlib.deflateSync(
+        Buffer.from(JSON.stringify({ clientId: '59999111222333444' }))
+      );
+      const fetchRedirectAllowed = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('content-system.gog.com/products/9900099902/os/windows/builds')) {
+          return makeMockJsonResponse({
+            items: [{ link: 'https://gog-cdn-fastly.gog.com/manifests/hop0.zlib' }],
+          });
+        }
+        if (url === 'https://gog-cdn-fastly.gog.com/manifests/hop0.zlib') {
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://cdn.gog-statics.com/manifests/hop1.zlib' },
+          });
+        }
+        if (url === 'https://cdn.gog-statics.com/manifests/hop1.zlib') {
+          return new Response(new Uint8Array(validManifestZlib), { status: 200 });
+        }
+        return makeMockJsonResponse({}, 404);
+      });
+
+      const allowed = await storeSync.resolveGogClientId('9900099902', {
+        fetchFn: fetchRedirectAllowed,
+        forceRefresh: true,
+      });
+      expect(allowed).toBe('59999111222333444');
+
+      // 3. Exceeding maxRedirects (3) aborts safely instead of looping infinitely
+      let hopCount = 0;
+      const fetchRedirectLoop = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('content-system.gog.com/products/9900099903/os/windows/builds')) {
+          return makeMockJsonResponse({
+            items: [{ link: 'https://gog-cdn-fastly.gog.com/manifests/loop0.zlib' }],
+          });
+        }
+        hopCount++;
+        return new Response(null, {
+          status: 302,
+          headers: { location: `https://gog-cdn-fastly.gog.com/manifests/loop${hopCount}.zlib` },
+        });
+      });
+
+      const loopBlocked = await storeSync.resolveGogClientId('9900099903', {
+        fetchFn: fetchRedirectLoop,
+        forceRefresh: true,
+      });
+      expect(loopBlocked).toBeNull();
+      // 3 OS builds * (initial hop + 3 redirects = 4 manifest fetches) = 12 manifest fetches max
+      expect(hopCount).toBeLessThanOrEqual(12);
     });
 
     it('renews expiring GOG tokens, retries once on 401, paginates gameplay.gog.com, and falls back to profilesData with Unix ms conversion', async () => {
@@ -906,6 +994,129 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
       const deepBuf = encodeBinaryVdfMap(deepObj);
       expect(() => steamAchProvider.parseBinaryVdf(deepBuf)).toThrow(/nesting depth exceeds/i);
     });
+
+    it('discovers local steamId & accountId32 from loginusers.vdf / userdataDirs when steamId is omitted and never emits exact unlockPrecision on unverified schema_fallback (F1)', async () => {
+      const rootDir = makeTempDir('steam-local-discover-');
+      tempDirs.push(rootDir);
+
+      const bottleSteamRoot = path.join(rootDir, 'bottle-steam');
+      const bottleConfigDir = path.join(bottleSteamRoot, 'config');
+      const bottleUserdataDir = path.join(bottleSteamRoot, 'userdata');
+      const bottleStatsDir = path.join(bottleSteamRoot, 'appcache', 'stats');
+      fs.mkdirSync(bottleConfigDir, { recursive: true });
+      fs.mkdirSync(path.join(bottleUserdataDir, '1'), { recursive: true });
+      fs.mkdirSync(bottleStatsDir, { recursive: true });
+
+      // Synthetic SteamID64 = 76561197960265728 + 1 = 76561197960265729
+      fs.writeFileSync(
+        path.join(bottleConfigDir, 'loginusers.vdf'),
+        `"users"\n{\n  "76561197960265729"\n  {\n    "AccountName" "syntheticlocal"\n    "MostRecent" "1"\n    "Timestamp" "1783855196"\n  }\n}\n`,
+        'utf8'
+      );
+
+      const schemaVdf = encodeBinaryVdfMap({
+        '1643320': {
+          stats: {
+            '1': {
+              type: 4,
+              bits: {
+                '0': {
+                  name: 'ACH_LOCAL_FIRST',
+                  display: {
+                    name: { english: 'Local Explorer' },
+                    desc: { english: 'Discovered locally.' },
+                    hidden: '0',
+                  },
+                },
+                '1': {
+                  name: 'ACH_LOCAL_PROGRESS',
+                  display: {
+                    name: { english: 'Local Marksman' },
+                    desc: { english: 'Score 50 hits.' },
+                    hidden: '0',
+                  },
+                  progress: {
+                    min_val: '0',
+                    max_val: '50',
+                    value: { operation: 'statvalue', operand1: 'LocalHits' },
+                  },
+                },
+              },
+            },
+            '2': { type: 1, name: 'LocalHits' },
+          },
+        },
+      });
+      const userVdf = encodeBinaryVdfMap({
+        cache: {
+          '1': { data: 1, AchievementTimes: { '0': 1783855196 } },
+          '2': { data: 44 },
+        },
+      });
+      fs.writeFileSync(path.join(bottleStatsDir, 'UserGameStatsSchema_1643320.bin'), schemaVdf);
+      fs.writeFileSync(path.join(bottleStatsDir, 'UserGameStats_1_1643320.bin'), userVdf);
+
+      const requestedSsrUrls: string[] = [];
+      const fetchPrivateForLocal = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('steamcommunity.com')) {
+          requestedSsrUrls.push(url);
+          return new Response(
+            '<html><body><div class="profile_private_info">This profile is private.</div></body></html>',
+            { status: 200 }
+          );
+        }
+        return makeMockJsonResponse({ response: { achievements: [] } });
+      });
+
+      // Omit steamId completely -> discovers 76561197960265729 from loginusers.vdf, queries SSR, then cascades to bottle VDF
+      const discoveredRes = await steamAchProvider.fetchSteamDetailedGameAchievements(
+        { steamAppId: 1643320 },
+        {
+          userdataDirs: [bottleUserdataDir],
+          statsDirs: [bottleStatsDir],
+          fetchFn: fetchPrivateForLocal,
+        }
+      );
+      expect(requestedSsrUrls).toEqual([
+        'https://steamcommunity.com/profiles/76561197960265729/achievements/1643320?l=english',
+      ]);
+      expect(discoveredRes).toBeTruthy();
+      expect(discoveredRes.source).toBe('local_cache');
+      expect(discoveredRes.unlockPrecision).toBe('exact');
+      expect(discoveredRes.unlocked).toBe(1);
+      const localProg = discoveredRes.achievements.find(
+        (a: { apiName: string }) => a.apiName === 'ACH_LOCAL_PROGRESS'
+      );
+      expect(localProg?.progress).toEqual({ current: 44, max: 50, percentage: 88 });
+
+      // schema_fallback with NO steamId / NO verified user query must NEVER emit unlockPrecision: 'exact'
+      const emptyStatsDir = path.join(rootDir, 'empty-stats', 'appcache', 'stats');
+      fs.mkdirSync(emptyStatsDir, { recursive: true });
+      const fetchSchemaOnly = vi.fn(async () =>
+        makeMockJsonResponse({
+          response: {
+            achievements: [
+              {
+                internal_name: 'ACH_1',
+                localized_name: 'Unverified Schema Trophy',
+                player_percent_unlocked: '42.0',
+              },
+            ],
+          },
+        })
+      );
+      const unverifiedRes = await steamAchProvider.fetchSteamDetailedGameAchievements(
+        { steamAppId: 1643320 },
+        {
+          statsDirs: [emptyStatsDir],
+          fetchFn: fetchSchemaOnly,
+        }
+      );
+      expect(unverifiedRes).toBeTruthy();
+      expect(unverifiedRes.source).toBe('schema_fallback');
+      expect(unverifiedRes.unlockPrecision).toBe('summary_count_only');
+    });
   });
 
   // =========================================================================
@@ -1067,6 +1278,133 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
         storefrontId: 'xbox',
         unlocked: 20,
       });
+    });
+
+    it('uses loadSavedTokensAsync(sharedVaultOpts), forwards payload steamId/apiKey/existingSummary, and falls through schema_fallback with 0 unlocks to browser XML (F1)', async () => {
+      const handlers = new Map<string, (e: unknown, p: Record<string, unknown>) => Promise<unknown>>();
+      const loadSavedTokensAsyncSpy = vi.fn(async () => ({ steam: {} }));
+      const steamProviderSpy = vi.fn(async () => ({
+        storefrontId: 'steam',
+        storefrontName: 'Steam',
+        total: 2,
+        unlocked: 0,
+        percentage: 0,
+        isMastered: false,
+        source: 'schema_fallback',
+        unlockPrecision: 'summary_count_only',
+        supportsAchievements: true,
+        achievements: [
+          {
+            id: 'steam:1643320:ACH_1',
+            apiName: 'ACH_1',
+            name: 'First Steps',
+            unlocked: false,
+            iconUnlockedUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/1643320/a1.jpg',
+          },
+          {
+            id: 'steam:1643320:ACH_2',
+            apiName: 'ACH_2',
+            name: 'Zone Veteran',
+            unlocked: false,
+            iconUnlockedUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/apps/1643320/a2.jpg',
+          },
+        ],
+      }));
+
+      registerStoreSyncIpcHandlers({
+        ipcMain: {
+          handle: (ch: string, fn: (e: unknown, p: Record<string, unknown>) => Promise<unknown>) =>
+            handlers.set(ch, fn),
+          on: vi.fn(),
+          removeListener: vi.fn(),
+        },
+        BrowserWindow: vi.fn(),
+        session: {},
+        getMainWindow: () => null,
+        options: { userDataDir: '/tmp/synthetic-vault-f1' },
+        storeSync: {
+          loadSavedTokensAsync: loadSavedTokensAsyncSpy,
+          loadSavedTokens: () => ({}),
+          fetchSteamDetailedGameAchievements: steamProviderSpy,
+        },
+        launcherEngine: {},
+      });
+
+      const ipcHandler = handlers.get('store:get-achievements')!;
+      const ipcPayload = {
+        platformId: 'steam',
+        storefrontId: 'steam',
+        gameId: 'steam-1643320',
+        platformGameId: '1643320',
+        steamAppId: 1643320,
+        steamId: '76561198000000042',
+        apiKey: 'SYNTHETIC_API_KEY',
+        existingSummary: { unlocked: 1, total: 2 },
+        title: 'Synthetic Zone',
+      };
+      await ipcHandler({}, ipcPayload);
+
+      expect(loadSavedTokensAsyncSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ userDataDir: '/tmp/synthetic-vault-f1' })
+      );
+      expect(steamProviderSpy).toHaveBeenCalledWith(
+        ipcPayload,
+        expect.objectContaining({
+          userDataDir: '/tmp/synthetic-vault-f1',
+          steamId: '76561198000000042',
+          apiKey: 'SYNTHETIC_API_KEY',
+          existingSummary: { unlocked: 1, total: 2 },
+        })
+      );
+
+      // End-to-end renderer AchievementDetailService -> IPC -> XML fallthrough when IPC returns schema_fallback with 0 unlocks
+      const getStoreAchievementsMock = vi.fn(
+        async (payload: Record<string, unknown>) => await ipcHandler({}, payload)
+      );
+      (globalThis as Record<string, unknown>).window = {
+        localStorage: storage,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        electronAPI: {
+          isElectron: true,
+          getStoreAchievements: getStoreAchievementsMock,
+        },
+      };
+
+      vi.spyOn(onlineLifecycleManager, 'isOnline').mockReturnValue(true);
+      vi.spyOn(steamAchievementsService, 'getActiveSteamCredentials').mockReturnValue({
+        steamId: '76561198000000042',
+        apiKey: 'SYNTHETIC_API_KEY',
+      });
+      vi.spyOn(achievementDetailService, 'fetchSteamGlobalPercentages').mockResolvedValue(
+        new Map([['ach_1', 64.5]])
+      );
+      const axiosGetSpy = vi.spyOn(axios, 'get').mockResolvedValue({
+        data: `<?xml version="1.0" encoding="UTF-8"?><playerstats><achievements>
+          <achievement closed="1"><name><![CDATA[First Steps]]></name><apiname>ACH_1</apiname><description><![CDATA[Begin the run.]]></description><iconClosed>https://shared.fastly.steamstatic.com/a1.jpg</iconClosed><iconOpen>https://shared.fastly.steamstatic.com/a1_g.jpg</iconOpen><unlockTimestamp>1783855196</unlockTimestamp></achievement>
+          <achievement closed="0"><name><![CDATA[Zone Veteran]]></name><apiname>ACH_2</apiname><description><![CDATA[Finish the run.]]></description><iconClosed>https://shared.fastly.steamstatic.com/a2.jpg</iconClosed><iconOpen>https://shared.fastly.steamstatic.com/a2_g.jpg</iconOpen></achievement>
+        </achievements></playerstats>`,
+      });
+
+      const resolved = await achievementDetailService.fetchSteamDetailedAchievements(
+        1643320,
+        'Synthetic Zone',
+        { unlocked: 1, total: 2, percentage: 50, isMastered: false }
+      );
+
+      expect(getStoreAchievementsMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          steamAppId: 1643320,
+          steamId: '76561198000000042',
+          apiKey: 'SYNTHETIC_API_KEY',
+          existingSummary: { unlocked: 1, total: 2 },
+        })
+      );
+      expect(axiosGetSpy).toHaveBeenCalled();
+      expect(resolved?.source).toBe('live_cloud');
+      expect(resolved?.unlockPrecision).toBe('exact');
+      expect(resolved?.unlocked).toBe(1);
+      expect(resolved?.achievements[0].unlocked).toBe(true);
     });
   });
 
@@ -1269,6 +1607,126 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
       expect(xboxHtml).not.toContain('64 / 100');
 
       harness.unmount();
+    });
+
+    it('avoids Refreshing... flicker on fresh Electron cache hits while triggering SWR when platform summary unlocked exceeds cached count (F2 & F8)', async () => {
+      (globalThis as Record<string, unknown>).window = {
+        localStorage: storage,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        electronAPI: {
+          isElectron: true,
+          getStoreAchievements: vi.fn(async () => null),
+        },
+      };
+      vi.spyOn(onlineLifecycleManager, 'isOnline').mockReturnValue(true);
+
+      const freshGame: CanonicalGame = {
+        id: 'steam-1643320',
+        title: 'Synthetic Fresh Cache',
+        sortTitle: 'Synthetic Fresh Cache',
+        steamAppId: 1643320,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1643320',
+            installed: true,
+            achievements: { unlocked: 1, total: 2, percentage: 50, isMastered: false },
+          },
+        ],
+        capsuleImage: 'https://example.com/c.jpg',
+        headerImage: 'https://example.com/h.jpg',
+        developers: ['Dev'],
+        publishers: ['Pub'],
+        genres: ['Action'],
+        tags: ['FPS'],
+      };
+
+      const freshCachedMap: MultiStoreAchievementsMap = {
+        steam: {
+          storefrontId: 'steam',
+          storefrontName: 'Steam',
+          total: 2,
+          unlocked: 1,
+          percentage: 50,
+          isMastered: false,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: true,
+          cacheVersion: 2,
+          syncedAt: new Date().toISOString(),
+          achievements: [
+            {
+              id: 'steam:1643320:a1',
+              apiName: 'A1',
+              name: 'First Steps',
+              unlocked: true,
+              iconUnlockedUrl: 'https://example.com/a1.jpg',
+              storefrontId: 'steam',
+            },
+            {
+              id: 'steam:1643320:a2',
+              apiName: 'A2',
+              name: 'Second Steps',
+              unlocked: false,
+              iconUnlockedUrl: 'https://example.com/a2.jpg',
+              storefrontId: 'steam',
+            },
+          ],
+        },
+      };
+      achievementDetailService.setCachedMultiStoreAchievements(freshGame.id, freshCachedMap);
+
+      const fetchSpy = vi
+        .spyOn(achievementDetailService, 'fetchGameAchievements')
+        .mockResolvedValue(freshCachedMap);
+
+      const freshHarness = createFiveHookHarness(GameAchievementsModal, {
+        isOpen: true,
+        game: freshGame,
+        onClose: vi.fn(),
+      });
+      freshHarness.render();
+      const freshHtml = renderToString(freshHarness.render()).replace(/<!--\s*-->/g, '');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(freshHtml).not.toContain('Refreshing...');
+      freshHarness.unmount();
+
+      // Now platform summary unlocked (2) exceeds cached unlocked (1) -> triggers background SWR and settles in same microtask!
+      const higherSummaryGame: CanonicalGame = {
+        ...freshGame,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '1643320',
+            installed: true,
+            achievements: { unlocked: 2, total: 2, percentage: 100, isMastered: true },
+          },
+        ],
+      };
+      const updatedMap: MultiStoreAchievementsMap = {
+        steam: {
+          ...freshCachedMap.steam!,
+          unlocked: 2,
+          percentage: 100,
+          isMastered: true,
+          achievements: freshCachedMap.steam!.achievements.map((a) => ({ ...a, unlocked: true })),
+        },
+      };
+      fetchSpy.mockResolvedValueOnce(updatedMap);
+
+      const swrHarness = createFiveHookHarness(GameAchievementsModal, {
+        isOpen: true,
+        game: higherSummaryGame,
+        onClose: vi.fn(),
+      });
+      swrHarness.render();
+      expect(fetchSpy).toHaveBeenCalledWith(higherSummaryGame, true);
+      await Promise.resolve();
+      const settledHtml = renderToString(swrHarness.render()).replace(/<!--\s*-->/g, '');
+      expect(settledHtml).not.toContain('Refreshing...');
+      expect(settledHtml).toContain('2 of 2 Unlocked');
+      swrHarness.unmount();
     });
   });
 
@@ -1491,6 +1949,109 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
         6000
       );
       expect(currentGames[0].platforms[0].achievements?.unlocked).toBe(2);
+
+      harness.unmount();
+    });
+
+    it('preserves cached GOG detailed achievements when a game session ends while offline (F5)', async () => {
+      const target = new EventTarget();
+      const getStoreAchievements = vi.fn(async () => null);
+      (globalThis as Record<string, unknown>).window = {
+        localStorage: storage,
+        addEventListener: target.addEventListener.bind(target),
+        removeEventListener: target.removeEventListener.bind(target),
+        dispatchEvent: target.dispatchEvent.bind(target),
+        electronAPI: {
+          isElectron: true,
+          getStoreAchievements,
+        },
+      };
+
+      vi.spyOn(onlineLifecycleManager, 'isOnline').mockReturnValue(false);
+      vi.spyOn(integrationStorage, 'saveCurrentCatalog').mockImplementation(() => {});
+
+      const gogGame: CanonicalGame = {
+        id: 'gog-1947927225',
+        title: 'Synthetic Offline GOG Classic',
+        sortTitle: 'Synthetic Offline GOG Classic',
+        platforms: [
+          {
+            platformId: 'gog',
+            platformGameId: '1947927225',
+            installed: true,
+            playtimeMinutes: 60,
+            achievements: { unlocked: 2, total: 5, percentage: 40, isMastered: false },
+          },
+        ],
+        capsuleImage: 'https://example.com/gog.jpg',
+        headerImage: 'https://example.com/gog_h.jpg',
+        developers: ['Dev'],
+        publishers: ['Pub'],
+        genres: ['RPG'],
+        tags: ['DRM-Free'],
+      };
+
+      achievementDetailService.setCachedMultiStoreAchievements(gogGame.id, {
+        gog: {
+          storefrontId: 'gog',
+          storefrontName: 'GOG GALAXY',
+          total: 5,
+          unlocked: 2,
+          percentage: 40,
+          isMastered: false,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: true,
+          cacheVersion: 2,
+          syncedAt: '2026-11-19T12:00:00.000Z',
+          achievements: [
+            {
+              id: 'gog:1947927225:a1',
+              apiName: 'A1',
+              name: 'Cached Trophy 1',
+              unlocked: true,
+              iconUnlockedUrl: 'https://images.gog.com/a1.jpg',
+              storefrontId: 'gog',
+            },
+          ],
+        },
+      });
+
+      const invalidateSpy = vi.spyOn(achievementDetailService, 'invalidateGame');
+      let currentGames: CanonicalGame[] = [gogGame];
+      const gamesRef = { current: currentGames };
+      const setGames = vi.fn((updater: React.SetStateAction<CanonicalGame[]>) => {
+        currentGames = typeof updater === 'function' ? updater(currentGames) : updater;
+        gamesRef.current = currentGames;
+      });
+      const showSyncNotice = vi.fn();
+
+      const Probe: React.FC<UsePostSessionReconcilerParams> = (props) => {
+        usePostSessionReconciler(props);
+        return null;
+      };
+      const harness = createFiveHookHarness(Probe, { gamesRef, setGames, showSyncNotice });
+      harness.render();
+
+      target.dispatchEvent(
+        new CustomEvent('antigravity:game-session-ended', {
+          detail: {
+            sessionId: 'sess-gog-offline-1',
+            sessionEvent: 'stopped',
+            gameId: gogGame.id,
+            platformId: 'gog',
+            platformGameId: '1947927225',
+            sessionMinutesPlayed: 15,
+          },
+        })
+      );
+
+      await new Promise((r) => setTimeout(r, 40));
+
+      expect(invalidateSpy).not.toHaveBeenCalled();
+      const stillCached = achievementDetailService.peekCachedGameAchievements(gogGame.id);
+      expect(stillCached?.gog?.unlocked).toBe(2);
+      expect(stillCached?.gog?.achievements[0].name).toBe('Cached Trophy 1');
 
       harness.unmount();
     });

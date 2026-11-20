@@ -26,6 +26,7 @@ import { ModalShell } from '../src/components/Common/ModalShell';
 import { SettingsModal } from '../src/components/Settings/SettingsModal';
 import { TopNavBar } from '../src/components/Navigation/TopNavBar';
 import { GameLaunchConfigModal } from '../src/components/Launcher/GameLaunchConfigModal';
+import { useGameLaunchConfigForm } from '../src/components/Launcher/LaunchConfig/useGameLaunchConfigForm';
 import {
   createDomain12DeepRenderer,
   createMemoryStorage,
@@ -499,6 +500,22 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       expect(html).not.toContain('DXMT');
       expect(html).not.toContain('MetalFX');
       expect(html).not.toContain('Bottle');
+    });
+
+    it('uses honest Linux DXVK HUD & launch defaults copy when hostPlatform="linux" (F10)', () => {
+      vi.spyOn(launcherService, 'getPerformanceSettings').mockReturnValue({
+        ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+      });
+
+      const html = renderToString(
+        <SettingsModal isOpen={true} onClose={() => {}} hostPlatform="linux" />
+      );
+      expect(html).not.toContain('data-testid="settings-section-macos-bottle"');
+      expect(html).toContain('Global library sorting, gameplay footprint &amp; launch defaults for all games');
+      expect(html).toContain('DXVK Performance HUD');
+      expect(html).toContain('Vulkan / DXVK-wrapped games');
+      expect(html).not.toContain('Apple Metal HUD');
+      expect(html).not.toContain('to the Dock');
     });
 
     it('discards unsaved changes without saving when Discard Changes is clicked', async () => {
@@ -1146,6 +1163,69 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
           expect(findByTestId(detailsEl, 'wine-sync-mode-group')).toBeUndefined();
           expect(findByTestId(detailsEl, 'toggle-force-laa')).toBeUndefined();
         }
+      } finally {
+        renderer.unmount();
+      }
+    });
+
+    it('gates metalfxSpatialUpscaleFactor in compatOverrideCount on resolveMetalfxSpatialEligibility (F9)', async () => {
+      const game = makeCanonicalGameFixture({
+        id: 'steam-990777',
+        title: 'Synthetic MetalFX Count Test',
+        steamAppId: 990777,
+        platforms: [{ platformId: 'steam', platformGameId: '990777', installed: true }],
+      });
+      const cxLayer = createCrossOverLayerFixture({
+        id: 'crossover',
+        type: 'crossover',
+        name: 'CrossOver',
+        version: '26.0.0',
+      });
+      vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue([cxLayer]);
+      vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue([cxLayer]);
+      vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue({
+        gameId: game.id,
+        launchMethod: 'compatibility_layer',
+        compatibilityLayer: 'crossover',
+        crossoverGraphicsBackend: 'dxmt',
+        metalfxSpatialUpscaleFactor: 1.5,
+      });
+
+      let latestForm: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const FormProbe: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
+        latestForm = useGameLaunchConfigForm({
+          isOpen,
+          game,
+          initialPlatformId: 'steam',
+          onClose: () => {},
+        });
+        return null;
+      };
+
+      const renderer = createDomain12DeepRenderer(FormProbe, { isOpen: true });
+      try {
+        renderer.render();
+        await Promise.resolve();
+        renderer.render();
+        expect(latestForm!.compatOverrideCount).toBe(1);
+
+        // Switching to unsupported backends excludes metalfxSpatialUpscaleFactor from compatOverrideCount
+        latestForm!.setCrossoverGraphicsBackend('d3dmetal');
+        renderer.render();
+        expect(latestForm!.compatOverrideCount).toBe(0);
+
+        latestForm!.setCrossoverGraphicsBackend('dxvk');
+        renderer.render();
+        expect(latestForm!.compatOverrideCount).toBe(0);
+
+        latestForm!.setCrossoverGraphicsBackend('wined3d');
+        renderer.render();
+        expect(latestForm!.compatOverrideCount).toBe(0);
+
+        // Switching back to auto / dxmt includes it again
+        latestForm!.setCrossoverGraphicsBackend('auto');
+        renderer.render();
+        expect(latestForm!.compatOverrideCount).toBe(1);
       } finally {
         renderer.unmount();
       }

@@ -474,6 +474,13 @@ export interface ElectronAPI {
           storefrontId?: string;
           gameId?: string;
           platformGameId?: string;
+          steamAppId?: number;
+          steamId?: string;
+          apiKey?: string;
+          existingSummary?: {
+            unlocked?: number;
+            total?: number;
+          };
           xboxProductId?: string;
           xboxTitleId?: string;
           packageFamilyName?: string;

@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React from 'react';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import axios from 'axios';
 import ts from 'typescript';
 
 import type { CanonicalGame } from '../src/contracts/game';
@@ -17,6 +19,7 @@ import { SteamLibraryActionBar } from '../src/components/SteamStoreDetail/SteamL
 import { steamApi } from '../src/services/steam/steamApi';
 import { steamAchievementsService } from '../src/services/steam/steamAchievementsService';
 import { fallbackMetadataProvider } from '../src/services/steam/fallbackMetadataProvider';
+import { pickBestEnrichedMetadata } from '../src/services/storage/librarySync';
 import { launcherService } from '../src/services/launcher/launcherService';
 import {
   STORAGE_KEY_USER_TAG_OVERRIDES,
@@ -31,7 +34,19 @@ import {
   findElements,
   getTextContent,
   makeCanonicalGameFixture,
+  nodeRequire,
 } from './helpers/xboxTestHarness';
+
+const { OfflineVaultService } = nodeRequire('../../electron/launcher/offlineVaultService.cjs') as {
+  OfflineVaultService: new (opts: { userDataDir: string; now?: () => number }) => {
+    upsertGames: (games: CanonicalGame[]) => { success: boolean; upserted: number; skipped: number };
+    getGameDetail: (gameId: string) => {
+      enrichedMetadata?: SteamEnrichedMetadata;
+      metadataQuality?: string;
+    } | null;
+    shutdown: () => void;
+  };
+};
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 
@@ -486,6 +501,229 @@ describe('Wave 2 Integration: SteamStorePage (T2/T3/T6/T7), ActionBar (T5), Vaul
         findElements(xboxTree, (el) => el.type === 'button' && getTextContent(el).trim() === 'Linux')
       ).toHaveLength(0);
       xboxPage.unmount();
+    });
+
+    it('pipes real fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame() output (GOG & Epic) into SteamStorePage, pickBestEnrichedMetadata, and OfflineVaultService.upsertGames (F3)', async () => {
+      const tmpVaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-f3-e2e-vault-'));
+      const vault = new OfflineVaultService({ userDataDir: tmpVaultDir });
+
+      try {
+        vi.spyOn(steamApi, 'fetchGameMetadata').mockResolvedValue(null);
+        vi.spyOn(axios, 'get').mockImplementation(async (url: string) => {
+          if (url.includes('/products/990123456')) {
+            return {
+              data: {
+                title: 'GOG Real Pipeline Adventure',
+                description: {
+                  lead: 'A complete multi-OS GOG adventure with full native Linux and macOS support.',
+                  full: '<p>A complete multi-OS GOG adventure with full native Linux and macOS support.</p>',
+                },
+                release_date: '2025-05-01',
+              },
+            };
+          }
+          if (url.includes('/v2/games/990123456')) {
+            return {
+              data: {
+                _embedded: {
+                  developers: [{ name: 'Synthetic GOG Dev' }],
+                  publishers: [{ name: 'Synthetic GOG Pub' }],
+                  supportedOperatingSystems: [
+                    {
+                      operatingSystem: { name: 'windows', versions: '10, 11' },
+                      systemRequirements: [
+                        {
+                          type: 'minimum',
+                          requirements: [{ name: 'OS', description: 'Windows 10 64-bit' }],
+                        },
+                      ],
+                    },
+                    {
+                      operatingSystem: { name: 'osx', versions: '13+' },
+                      systemRequirements: [
+                        {
+                          type: 'minimum',
+                          requirements: [{ name: 'OS', description: 'macOS 13 Ventura' }],
+                        },
+                      ],
+                    },
+                    {
+                      operatingSystem: { name: 'linux', versions: 'Ubuntu 22.04' },
+                      systemRequirements: [
+                        {
+                          type: 'minimum',
+                          requirements: [{ name: 'OS', description: 'Ubuntu 22.04 LTS 64-bit' }],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            };
+          }
+          if (url.includes('/content/products/epic-real-pipeline-game')) {
+            return {
+              data: {
+                pages: [
+                  {
+                    type: 'productHome',
+                    data: {
+                      about: {
+                        shortDescription: 'Epic multi-OS game with native macOS and Linux builds.',
+                        description:
+                          'Epic multi-OS game with native macOS and Linux builds across all systems.',
+                        developerAttribution: 'Synthetic Epic Studio',
+                        publisherAttribution: 'Synthetic Epic Pub',
+                      },
+                      meta: { releaseDate: '2025-07-14T00:00:00.000Z' },
+                      requirements: {
+                        systems: [
+                          {
+                            systemType: 'Windows',
+                            details: [{ title: 'OS', minimum: 'Windows 10' }],
+                          },
+                          {
+                            systemType: 'Mac',
+                            details: [{ title: 'OS', minimum: 'macOS 14 Sonoma' }],
+                          },
+                          {
+                            systemType: 'Linux',
+                            details: [{ title: 'OS', minimum: 'SteamOS 3 / Ubuntu 22.04' }],
+                          },
+                        ],
+                      },
+                    },
+                  },
+                ],
+              },
+            };
+          }
+          throw new Error(`Unexpected URL ${url}`);
+        });
+
+        // 1. Real GOG metadata (NOTE: NO worksOn.linux and NO activePlatformEntry.platforms pre-injected!)
+        const rawGogGame = makeCanonicalGameFixture({
+          id: 'gog-990123456',
+          title: 'GOG Real Pipeline Adventure',
+          isExplicitNonSteam: true,
+          platforms: [{ platformId: 'gog', platformGameId: '990123456', installed: false }],
+        });
+        const realGogMeta = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(rawGogGame);
+        expect(realGogMeta.enrichedSource).toBe('gog');
+        expect(realGogMeta.platforms).toEqual({ windows: true, mac: true, linux: true });
+        expect(realGogMeta.macRequirements?.minimum).toContain('macOS 13 Ventura');
+        expect(realGogMeta.linuxRequirements?.minimum).toContain('Ubuntu 22.04 LTS 64-bit');
+
+        // SteamStorePage renders Linux tab directly from real fallbackMetadataProvider output
+        const gogWithRealMeta: CanonicalGame = { ...rawGogGame, enrichedMetadata: realGogMeta };
+        const gogPage = createDomain12DeepRenderer(SteamStorePage, {
+          game: gogWithRealMeta,
+          collections: [],
+          connectedStorefronts: ['gog'],
+        });
+        const gogTree = gogPage.render();
+        expect(
+          findElements(gogTree, (el) => el.type === 'button' && getTextContent(el).trim() === 'Linux').length
+        ).toBeGreaterThanOrEqual(1);
+        gogPage.unmount();
+
+        // 2. Real Epic metadata (NOTE: NO activePlatformEntry.platforms pre-injected!)
+        const rawEpicGame = makeCanonicalGameFixture({
+          id: 'epic-real-pipeline-game',
+          title: 'Epic Real Pipeline Game',
+          isExplicitNonSteam: true,
+          platforms: [{ platformId: 'epic', platformGameId: 'epic-real-pipeline-game', installed: false }],
+        });
+        const realEpicMeta = await fallbackMetadataProvider.getEnrichedMetadataForNonSteamGame(rawEpicGame);
+        expect(realEpicMeta.enrichedSource).toBe('epic');
+        expect(realEpicMeta.platforms).toEqual({ windows: true, mac: true, linux: true });
+        expect(realEpicMeta.macRequirements?.minimum).toContain('macOS 14 Sonoma');
+        expect(realEpicMeta.linuxRequirements?.minimum).toContain('SteamOS 3 / Ubuntu 22.04');
+
+        // SteamStorePage renders Linux tab directly from real Epic fallbackMetadataProvider output
+        const epicWithRealMeta: CanonicalGame = { ...rawEpicGame, enrichedMetadata: realEpicMeta };
+        const epicPage = createDomain12DeepRenderer(SteamStorePage, {
+          game: epicWithRealMeta,
+          collections: [],
+          connectedStorefronts: ['epic'],
+        });
+        const epicTree = epicPage.render();
+        expect(
+          findElements(epicTree, (el) => el.type === 'button' && getTextContent(el).trim() === 'Linux').length
+        ).toBeGreaterThanOrEqual(1);
+        epicPage.unmount();
+
+        // 3. pickBestEnrichedMetadata monotonic carry-forward preserves macRequirements & linuxRequirements on partial update
+        const partialEpicUpdate: SteamEnrichedMetadata = {
+          ...realEpicMeta,
+          macRequirements: undefined,
+          linuxRequirements: undefined,
+          fetchedAt: Date.now() + 10_000,
+        };
+        const mergedEpic = pickBestEnrichedMetadata(realEpicMeta, partialEpicUpdate);
+        expect(mergedEpic?.macRequirements?.minimum).toContain('macOS 14 Sonoma');
+        expect(mergedEpic?.linuxRequirements?.minimum).toContain('SteamOS 3 / Ubuntu 22.04');
+
+        // 4. OfflineVaultService.upsertGames monotonic carry-forward preserves GOG & Epic OS specs on partial update
+        vault.upsertGames([gogWithRealMeta, epicWithRealMeta]);
+        vault.upsertGames([
+          {
+            ...gogWithRealMeta,
+            enrichedMetadata: {
+              ...realGogMeta,
+              macRequirements: undefined,
+              linuxRequirements: undefined,
+              fetchedAt: Date.now() + 10_000,
+            },
+          },
+          {
+            ...epicWithRealMeta,
+            enrichedMetadata: partialEpicUpdate,
+          },
+        ]);
+        const storedGog = vault.getGameDetail(gogWithRealMeta.id);
+        const storedEpic = vault.getGameDetail(epicWithRealMeta.id);
+        expect(storedGog?.enrichedMetadata?.macRequirements?.minimum).toContain('macOS 13 Ventura');
+        expect(storedGog?.enrichedMetadata?.linuxRequirements?.minimum).toContain('Ubuntu 22.04 LTS');
+        expect(storedEpic?.enrichedMetadata?.macRequirements?.minimum).toContain('macOS 14 Sonoma');
+        expect(storedEpic?.enrichedMetadata?.linuxRequirements?.minimum).toContain('SteamOS 3 / Ubuntu 22.04');
+      } finally {
+        vault.shutdown();
+        fs.rmSync(tmpVaultDir, { recursive: true, force: true });
+      }
+    });
+
+    it('passes expectMacRequirements: true into steamApi.fetchGameMetadata from SteamStorePage when activeStoreSupportsMac is true (F11)', async () => {
+      const fetchMetaSpy = vi.spyOn(steamApi, 'fetchGameMetadata').mockResolvedValue(null);
+      const macSteamGame = makeCanonicalGameFixture({
+        id: 'steam-778899',
+        steamAppId: 778899,
+        title: 'Legacy Mac Steam Title',
+        nativePlatforms: ['windows', 'mac'],
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '778899',
+            installed: false,
+            platforms: { windows: true, mac: true, linux: false },
+          },
+        ],
+      });
+
+      const page = createDomain12DeepRenderer(SteamStorePage, {
+        game: macSteamGame,
+        collections: [],
+        connectedStorefronts: ['steam'],
+      });
+      page.render();
+      await Promise.resolve();
+
+      expect(fetchMetaSpy).toHaveBeenCalledWith(
+        778899,
+        expect.any(Number),
+        expect.objectContaining({ expectMacRequirements: true })
+      );
+      page.unmount();
     });
   });
 

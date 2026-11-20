@@ -38,7 +38,10 @@ import {
   stripManagedEnvVars,
   type WineSyncMode,
 } from './launchConfigHelpers';
-import { resolveDlssEligibility } from './CompatibilityLayerSection';
+import {
+  resolveDlssEligibility,
+  resolveMetalfxSpatialEligibility,
+} from './CompatibilityLayerSection';
 
 function resolveFormHostCapabilities(): HostPlatformCapabilities {
   if (typeof launcherService.getHostCapabilities === 'function') {
@@ -1194,7 +1197,7 @@ export function useGameLaunchConfigForm({
       preferredMaxFrameRate: includeCompatSettings ? preferredMaxFrameRate : undefined,
       metalfxSpatialUpscaleFactor:
         includeCrossoverOnly &&
-        (crossoverGraphicsBackend === 'auto' || crossoverGraphicsBackend === 'dxmt')
+        resolveMetalfxSpatialEligibility({ crossoverGraphicsBackend }).supported
           ? metalfxSpatialUpscaleFactor
           : undefined,
       displayScalingMode:
@@ -2270,9 +2273,13 @@ export function useGameLaunchConfigForm({
     (crossoverHighResolutionMode === false ? 1 : 0) +
     (emulateModeset !== undefined ? 1 : 0);
 
+  const isMetalfxSpatialEligible = resolveMetalfxSpatialEligibility({
+    crossoverGraphicsBackend,
+  }).supported;
+
   const compatOverrideCount =
     (showD3DMetalVersionSelector && crossoverD3DMetalVersion !== 'auto' ? 1 : 0) +
-    (metalfxSpatialUpscaleFactor !== undefined ? 1 : 0) +
+    (isMetalfxSpatialEligible && metalfxSpatialUpscaleFactor !== undefined ? 1 : 0) +
     (wineSyncMode !== 'msync' ? 1 : 0) +
     (forceLargeAddressAware === true ? 1 : 0) +
     (winePrefixPath.trim() ? 1 : 0);

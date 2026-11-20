@@ -52,19 +52,21 @@ class MockStorage implements Storage {
 }
 
 const mockStorage = new MockStorage();
+const globalRecord = globalThis as Record<string, unknown>;
 
-if (typeof (globalThis as any).localStorage === 'undefined') {
-  (globalThis as any).localStorage = mockStorage;
+if (typeof globalRecord.localStorage === 'undefined') {
+  globalRecord.localStorage = mockStorage;
 }
 
 const eventTarget = new EventTarget();
 
-if (typeof (globalThis as any).window === 'undefined') {
-  (globalThis as any).window = {
-    addEventListener: (type: string, listener: any) => eventTarget.addEventListener(type, listener),
-    removeEventListener: (type: string, listener: any) =>
+if (typeof globalRecord.window === 'undefined') {
+  globalRecord.window = {
+    addEventListener: (type: string, listener: EventListenerOrEventListenerObject) =>
+      eventTarget.addEventListener(type, listener),
+    removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) =>
       eventTarget.removeEventListener(type, listener),
-    dispatchEvent: (event: any) => eventTarget.dispatchEvent(event),
+    dispatchEvent: (event: Event) => eventTarget.dispatchEvent(event),
     localStorage: mockStorage,
     location: { hostname: 'example.com' },
     innerWidth: 1440,
@@ -72,45 +74,74 @@ if (typeof (globalThis as any).window === 'undefined') {
     open: vi.fn(),
   };
 } else {
-  (window as any).localStorage = (globalThis as any).localStorage || mockStorage;
+  (globalRecord.window as Record<string, unknown>).localStorage =
+    globalRecord.localStorage || mockStorage;
 }
 
-if (typeof (globalThis as any).document === 'undefined') {
-  (globalThis as any).document = {
-    addEventListener: (type: string, listener: any) => eventTarget.addEventListener(type, listener),
-    removeEventListener: (type: string, listener: any) =>
+if (typeof globalRecord.document === 'undefined') {
+  globalRecord.document = {
+    addEventListener: (type: string, listener: EventListenerOrEventListenerObject) =>
+      eventTarget.addEventListener(type, listener),
+    removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) =>
       eventTarget.removeEventListener(type, listener),
     body: {},
   };
 }
 
-function getTextContent(node: any): string {
+interface TestVNodeProps {
+  children?: unknown;
+  onClick: (...args: unknown[]) => unknown;
+  onChange: (...args: unknown[]) => unknown;
+  min?: number;
+  max?: number;
+  className?: string;
+  autoCorrect?: string;
+  autoCapitalize?: string;
+  spellCheck?: boolean;
+  htmlFor?: string;
+  id?: string;
+  title?: string;
+  [key: string]: unknown;
+}
+
+interface TestVNode {
+  type?: unknown;
+  props: TestVNodeProps;
+}
+
+function getTextContent(node: unknown): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (Array.isArray(node)) return node.map(getTextContent).join('');
-  if (node && typeof node === 'object' && node.props) {
-    return getTextContent(node.props.children);
+  if (node && typeof node === 'object' && 'props' in node) {
+    const props = (node as { props?: { children?: unknown } }).props;
+    if (props) return getTextContent(props.children);
   }
   return '';
 }
 
-function findElements(node: any, predicate: (el: any) => boolean, acc: any[] = []): any[] {
+function findElements(
+  node: unknown,
+  predicate: (el: TestVNode) => boolean,
+  acc: TestVNode[] = []
+): TestVNode[] {
   if (!node || typeof node !== 'object') return acc;
   if (Array.isArray(node)) {
     for (const child of node) findElements(child, predicate, acc);
     return acc;
   }
-  if (predicate(node)) acc.push(node);
-  if (node.props && node.props.children) {
-    findElements(node.props.children, predicate, acc);
+  const el = node as TestVNode;
+  if (predicate(el)) acc.push(el);
+  if (el.props && el.props.children) {
+    findElements(el.props.children, predicate, acc);
   }
   return acc;
 }
 
 function createComponentHarness<P extends object>(Component: React.FC<P>, initialProps: P) {
-  const states: any[] = [];
-  const refs: Array<{ current: any }> = [];
-  const prevDeps: Array<any[] | undefined> = [];
+  const states: unknown[] = [];
+  const refs: Array<{ current: unknown }> = [];
+  const prevDeps: Array<unknown[] | undefined> = [];
   const cleanups: Array<(() => void) | undefined> = [];
   let currentProps = initialProps;
 
@@ -121,13 +152,16 @@ function createComponentHarness<P extends object>(Component: React.FC<P>, initia
     let stateIdx = 0;
     let refIdx = 0;
     let effectIdx = 0;
-    const pendingEffects: Array<{ idx: number; fn: () => any }> = [];
+    const pendingEffects: Array<{ idx: number; fn: () => void | (() => void) }> = [];
 
-    const internals = (React as any)
-      .__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+    const internals = (
+      React as unknown as {
+        __CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE: { H: unknown };
+      }
+    ).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
     const prevH = internals.H;
 
-    const runEffectHook = (fn: () => any, deps?: any[]) => {
+    const runEffectHook = (fn: () => void | (() => void), deps?: unknown[]) => {
       const idx = effectIdx++;
       const oldDeps = prevDeps[idx];
       const changed =
@@ -142,17 +176,20 @@ function createComponentHarness<P extends object>(Component: React.FC<P>, initia
     };
 
     const dispatcher = {
-      useState(initial: any) {
+      useState<T>(initial: T | (() => T)) {
         const idx = stateIdx++;
         if (idx >= states.length) {
-          states.push(typeof initial === 'function' ? initial() : initial);
+          states.push(typeof initial === 'function' ? (initial as () => T)() : initial);
         }
-        const setState = (updater: any) => {
-          states[idx] = typeof updater === 'function' ? updater(states[idx]) : updater;
+        const setState = (updater: T | ((prev: T) => T)) => {
+          states[idx] =
+            typeof updater === 'function'
+              ? (updater as (prev: T) => T)(states[idx] as T)
+              : updater;
         };
         return [states[idx], setState];
       },
-      useRef(initial: any) {
+      useRef<T>(initial: T) {
         const idx = refIdx++;
         if (idx >= refs.length) {
           refs.push({ current: initial });
@@ -161,39 +198,40 @@ function createComponentHarness<P extends object>(Component: React.FC<P>, initia
       },
       useEffect: runEffectHook,
       useLayoutEffect: runEffectHook,
-      useMemo(fn: () => any) {
+      useMemo<T>(fn: () => T) {
         return fn();
       },
-      useCallback(fn: any) {
+      useCallback<T>(fn: T) {
         return fn;
       },
-      useDeferredValue(val: any) {
+      useDeferredValue<T>(val: T) {
         return val;
       },
     };
 
     // Expand nested custom function components (such as LibraryFilterPanel inside LibraryGridView)
-    const expandNode = (node: any): any => {
+    const expandNode = (node: unknown): unknown => {
       if (!node || typeof node !== 'object') return node;
       if (Array.isArray(node)) return node.map(expandNode);
-      if (typeof node.type === 'function' && node.type === LibraryFilterPanel) {
-        const renderedChild = node.type(node.props);
+      const el = node as { type?: unknown; props?: Record<string, unknown> };
+      if (typeof el.type === 'function' && el.type === LibraryFilterPanel) {
+        const renderedChild = (el.type as (props: unknown) => unknown)(el.props);
         return expandNode(renderedChild);
       }
-      if (node.props && node.props.children) {
+      if (el.props && el.props.children) {
         return {
-          ...node,
+          ...el,
           props: {
-            ...node.props,
-            children: expandNode(node.props.children),
+            ...el.props,
+            children: expandNode(el.props.children),
           },
         };
       }
-      return node;
+      return el;
     };
 
     internals.H = dispatcher;
-    let tree: any;
+    let tree: unknown;
     try {
       const rawTree = Component(currentProps);
       tree = expandNode(rawTree);
@@ -1360,6 +1398,44 @@ describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider',
       expect(
         findElements(panelTree, (el) => el.props?.['data-testid'] === 'filter-os-windows_native')
       ).toHaveLength(1);
+
+      // F10: countActiveFilterCriteria and LibraryGridView toolbar badge strip mac_compat_layer on win32
+      expect(
+        countActiveFilterCriteria(
+          {
+            ...DEFAULT_LIBRARY_FILTER_STATE,
+            osCompatibility: ['mac_compat_layer'],
+          },
+          undefined,
+          { supportsWindowsTranslation: false }
+        )
+      ).toBe(0);
+      expect(
+        countActiveFilterCriteria(
+          {
+            ...DEFAULT_LIBRARY_FILTER_STATE,
+            osCompatibility: ['windows_native', 'mac_compat_layer'],
+          },
+          undefined,
+          { supportsWindowsTranslation: false }
+        )
+      ).toBe(1);
+
+      const winGridHarness = createComponentHarness(LibraryGridView, {
+        games: SAMPLE_GAMES,
+        onSelectGame: () => {},
+        libraryFilterIndex: winIndex,
+        libraryFilterState: {
+          ...DEFAULT_LIBRARY_FILTER_STATE,
+          osCompatibility: ['mac_compat_layer'],
+        },
+      });
+      const winGridTree = winGridHarness.render();
+      const winFilterToggle = findElements(
+        winGridTree,
+        (el) => el.props?.['data-testid'] === 'library-filter-toggle-btn'
+      )[0];
+      expect(getTextContent(winFilterToggle).trim()).toBe('Filter');
     });
   });
 });

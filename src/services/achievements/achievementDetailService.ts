@@ -621,6 +621,25 @@ export class AchievementDetailService {
       };
     }
 
+    const creds = steamAchievementsService.getActiveSteamCredentials();
+    const knownUser =
+      getKnownSteamAchievements(appId) ||
+      steamAchievementsService.getCachedAchievements(appId) ||
+      KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
+    const resolvedSummaryUnlocked = Math.max(
+      existingSummary?.unlocked ?? 0,
+      knownUser ? knownUser.unlocked : 0
+    );
+    const resolvedSummaryTotal = Math.max(
+      existingSummary?.total ?? 0,
+      knownUser ? knownUser.total : 0
+    );
+    const ipcExistingSummary =
+      existingSummary || knownUser
+        ? { unlocked: resolvedSummaryUnlocked, total: resolvedSummaryTotal }
+        : undefined;
+    let ipcSchemaFallbackResult: StorefrontAchievementsData | null = null;
+
     // 1. Unified Electron Main-Process Provider (SSR renderContext.queryData + Web API + Bottle Binary VDF)
     if (typeof window !== 'undefined' && window.electronAPI?.getStoreAchievements) {
       try {
@@ -629,6 +648,10 @@ export class AchievementDetailService {
           storefrontId: 'steam',
           gameId: `steam-${appId}`,
           platformGameId: String(appId),
+          steamAppId: appId,
+          steamId: creds.steamId || undefined,
+          apiKey: creds.apiKey || undefined,
+          existingSummary: ipcExistingSummary,
           title: gameTitle,
         });
         const { list: rawSteamList, envelope: steamEnv } = extractLiveAchievementsList(liveRes);
@@ -684,14 +707,7 @@ export class AchievementDetailService {
 
           const total = achievements.length;
           const exactUnlocked = achievements.filter((a) => a.unlocked).length;
-          const knownUser =
-            getKnownSteamAchievements(appId) ||
-            steamAchievementsService.getCachedAchievements(appId) ||
-            KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
-          const summaryUnlocked = Math.max(
-            existingSummary?.unlocked ?? 0,
-            knownUser ? knownUser.unlocked : 0
-          );
+          const summaryUnlocked = resolvedSummaryUnlocked;
           const envPrecision = steamEnv?.unlockPrecision;
           const isSummaryOnly =
             envPrecision === 'summary_count_only' ||
@@ -701,7 +717,7 @@ export class AchievementDetailService {
             : exactUnlocked;
           const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
 
-          return {
+          const ipcResult: StorefrontAchievementsData = {
             storefrontId: 'steam',
             storefrontName: 'Steam',
             total,
@@ -715,6 +731,17 @@ export class AchievementDetailService {
             supportsAchievements: true,
             cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
           };
+
+          if (
+            steamEnv?.source === 'schema_fallback' &&
+            exactUnlocked === 0 &&
+            Boolean(creds.steamId) &&
+            onlineLifecycleManager.isOnline()
+          ) {
+            ipcSchemaFallbackResult = ipcResult;
+          } else {
+            return ipcResult;
+          }
         }
       } catch {
         // Fall through to browser XML / canonical schema fallback
@@ -722,7 +749,6 @@ export class AchievementDetailService {
     }
 
     if (onlineLifecycleManager.isOnline()) {
-      const creds = steamAchievementsService.getActiveSteamCredentials();
       const steamId = creds.steamId;
 
       let globalPercentages = new Map<string, number>();
@@ -846,6 +872,10 @@ export class AchievementDetailService {
       }
     }
 
+    if (ipcSchemaFallbackResult) {
+      return ipcSchemaFallbackResult;
+    }
+
     // Fallback: If live SSR/XML failed or profile is private, use canonical schema without fabricating per-item unlocks
     const schema =
       canonicalSchema && canonicalSchema.length > 0
@@ -868,11 +898,7 @@ export class AchievementDetailService {
               })
             : [];
 
-    const knownUser =
-      getKnownSteamAchievements(appId) ||
-      steamAchievementsService.getCachedAchievements(appId) ||
-      KNOWN_USER_STEAM_ACHIEVEMENTS[appId];
-    const unlockedCount = Math.max(existingSummary?.unlocked ?? 0, knownUser ? knownUser.unlocked : 0);
+    const unlockedCount = resolvedSummaryUnlocked;
     const totalCount =
       schema.length > 0
         ? schema.length

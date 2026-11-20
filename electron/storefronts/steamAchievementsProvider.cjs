@@ -3,7 +3,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { resolveLocalSteamUserdataDirs } = require('./steamLocalScanner.cjs');
+const {
+  resolveLocalSteamUserdataDirs,
+  resolveActiveSteamAccountDirs,
+  parseActiveAccountIdFromLoginUsersVdf,
+} = require('./steamLocalScanner.cjs');
 
 const STEAM_ACH_HTTP_TIMEOUT_MS = 12_000;
 const MAX_VDF_FILE_BYTES = 16 * 1024 * 1024; // 16 MB hard cap (C2)
@@ -54,6 +58,117 @@ function steamId64ToAccountId32(steamId64) {
   } catch {
     return '';
   }
+}
+
+/**
+ * Convert a positive 32-bit Steam account ID string into a 17-digit SteamID64 string.
+ * @param {string | number | undefined | null} accountId32
+ * @returns {string}
+ */
+function accountId32ToSteamId64(accountId32) {
+  const clean = String(accountId32 || '').trim();
+  if (!/^[1-9]\d*$/.test(clean)) return '';
+  try {
+    const val = BigInt(clean);
+    if (val <= 0n || val > 0xffffffffn) return '';
+    return String(STEAM_ID64_BASE + val);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Discover the most recently active local Steam account (`steamId` + `accountId32`) from
+ * `resolveLocalSteamUserdataDirs()` and sibling `config/loginusers.vdf` across native Steam
+ * and CrossOver/OneLauncher bottles when no explicit `steamId` was supplied.
+ *
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<{ steamId: string, accountId32: string }>}
+ */
+async function discoverLocalSteamIdentity(options = {}) {
+  if (options.disableLocalDiscovery === true) {
+    return { steamId: '', accountId32: '' };
+  }
+
+  /** @type {string[]} */
+  let userdataDirs = [];
+  if (Array.isArray(options.userdataDirs) && options.userdataDirs.length > 0) {
+    userdataDirs = Array.from(new Set(options.userdataDirs.filter(Boolean)));
+  } else if (Array.isArray(options.statsDirs) && options.statsDirs.length > 0) {
+    // Respect explicitly scoped `statsDirs` (e.g. unit tests) instead of scanning host `os.homedir()`
+    /** @type {Set<string>} */
+    const derived = new Set();
+    for (const statsDir of options.statsDirs) {
+      if (!statsDir || typeof statsDir !== 'string') continue;
+      const appcacheDir = path.dirname(statsDir);
+      const steamRoot = path.dirname(appcacheDir);
+      if (steamRoot && steamRoot !== appcacheDir) {
+        derived.add(path.join(steamRoot, 'userdata'));
+      }
+    }
+    userdataDirs = Array.from(derived);
+  } else {
+    userdataDirs = await resolveLocalSteamUserdataDirs(options).catch(() => []);
+  }
+
+  if (userdataDirs.length === 0) {
+    return { steamId: '', accountId32: '' };
+  }
+
+  /** @type {{ accountId32: string, mtimeMs: number } | null} */
+  let bestFromLoginUsers = null;
+  /** @type {{ accountId32: string, mtimeMs: number } | null} */
+  let bestFromUserdataDir = null;
+
+  for (const ud of userdataDirs) {
+    if (!ud || typeof ud !== 'string') continue;
+    const steamRoot = path.dirname(ud);
+    const loginUsersPath = path.join(steamRoot, 'config', 'loginusers.vdf');
+
+    try {
+      const [content, st] = await Promise.all([
+        fs.promises.readFile(loginUsersPath, 'utf8'),
+        fs.promises.stat(loginUsersPath),
+      ]);
+      const acct32 = parseActiveAccountIdFromLoginUsersVdf(content);
+      if (acct32) {
+        const mtimeMs = Number(st?.mtimeMs || 0);
+        if (!bestFromLoginUsers || mtimeMs > bestFromLoginUsers.mtimeMs) {
+          bestFromLoginUsers = { accountId32: acct32, mtimeMs };
+        }
+        continue;
+      }
+    } catch {}
+
+    try {
+      const activeDirs = await resolveActiveSteamAccountDirs(ud, options);
+      const acct32 = activeDirs[0];
+      if (acct32) {
+        let mtimeMs = 0;
+        try {
+          const cfgStat = await fs.promises.stat(path.join(ud, acct32, 'config', 'localconfig.vdf'));
+          mtimeMs = Number(cfgStat?.mtimeMs || 0);
+        } catch {
+          try {
+            const dirStat = await fs.promises.stat(path.join(ud, acct32));
+            mtimeMs = Number(dirStat?.mtimeMs || 0);
+          } catch {}
+        }
+        if (!bestFromUserdataDir || mtimeMs > bestFromUserdataDir.mtimeMs) {
+          bestFromUserdataDir = { accountId32: acct32, mtimeMs };
+        }
+      }
+    } catch {}
+  }
+
+  const chosen = bestFromLoginUsers || bestFromUserdataDir;
+  if (!chosen) {
+    return { steamId: '', accountId32: '' };
+  }
+  return {
+    steamId: accountId32ToSteamId64(chosen.accountId32),
+    accountId32: chosen.accountId32,
+  };
 }
 
 /**
@@ -981,7 +1096,20 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
   if (!Number.isFinite(appId) || appId <= 0) return null;
 
   const fetchImpl = typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch;
-  const steamId = String(options.steamId || payload.steamId || '').trim();
+  let steamId = String(options.steamId || payload.steamId || '').trim();
+  let discoveredAccountId32 = String(options.accountId32 || '').trim();
+  if (!steamId) {
+    const discovered = await discoverLocalSteamIdentity(options).catch(() => ({
+      steamId: '',
+      accountId32: '',
+    }));
+    if (discovered.steamId) {
+      steamId = discovered.steamId;
+    }
+    if (!discoveredAccountId32 && discovered.accountId32) {
+      discoveredAccountId32 = discovered.accountId32;
+    }
+  }
   const existingUnlocked = Number(
     payload.existingSummary?.unlocked ?? options.existingSummary?.unlocked ?? 0
   );
@@ -1048,6 +1176,7 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
     readLocalSteamBinaryVdfAchievements(appId, {
       ...options,
       steamId,
+      ...(discoveredAccountId32 ? { accountId32: discoveredAccountId32 } : {}),
     }).catch(() => null),
     !options.skipNetwork && !(ssrResult && ssrResult.achievements.length > 0)
       ? fetchSteamGameAchievementsSchema(appId, { ...options, fetchFn: fetchImpl }).catch(() => [])
@@ -1196,8 +1325,15 @@ async function fetchSteamDetailedGameAchievements(payload = {}, options = {}) {
     const total = cleanSchema.length;
     const unlocked = existingUnlocked > 0 ? existingUnlocked : 0;
     const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+    const userUnlockVerified = Boolean(
+      steamId &&
+        !options.skipNetwork &&
+        ssrResult &&
+        ssrResult.hasUserQuery &&
+        !ssrResult.isPrivateProfile
+    );
     const unlockPrecision =
-      unlocked > 0 || Boolean(ssrResult?.isPrivateProfile) ? 'summary_count_only' : 'exact';
+      unlocked > 0 || !userUnlockVerified ? 'summary_count_only' : 'exact';
     return {
       storefrontId: 'steam',
       storefrontName: 'Steam',
@@ -1226,6 +1362,8 @@ module.exports = {
   MAX_VDF_RECURSION_DEPTH,
   classifyRarityTier,
   steamId64ToAccountId32,
+  accountId32ToSteamId64,
+  discoverLocalSteamIdentity,
   parseBinaryVdf,
   resolveLocalSteamAppcacheStatsDirs,
   readLocalSteamBinaryVdfAchievements,
