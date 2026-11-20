@@ -81,7 +81,7 @@ export interface NativeGameBaselineSnapshot {
 
 export interface SearchMatchCandidate {
   id: string | number;
-  source: 'steam' | 'igdb' | 'gog' | 'epic';
+  source: 'steam' | 'igdb' | 'gog' | 'epic' | 'xbox';
   title: string;
   year?: string | number;
   storeUrl?: string;

@@ -1,6 +1,7 @@
 import { CriticScoreData } from '../../contracts/critic';
 import { classifyNetworkError, isWafOrChallengeResponse } from '../../contracts/network';
 import { calculateTier, isSequelMismatch, normalizeCriticTitleKey } from './criticUtils';
+import { normalizeTitleForStoreSearch } from '../common/titleUtils';
 import { isTitleCompatible } from './metacriticResolver';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
@@ -27,6 +28,8 @@ interface XboxStarMetadataRecord {
 
 export class StorefrontStarResolver {
   private cache = new Map<string, CriticScoreData | null>();
+  private cacheKeysByTitle = new Map<string, Set<string>>();
+  private cacheKeysByXboxId = new Map<string, Set<string>>();
   private inFlight = new Map<string, Promise<CriticScoreData | null>>();
   private transientErrorKeys = new Set<string>();
 
@@ -38,15 +41,70 @@ export class StorefrontStarResolver {
     } catch {}
   }
 
+  private extractKeyParts(key: string): { titleLower?: string; xboxIdLower?: string } {
+    if (key.startsWith('xbox:')) {
+      const rest = key.slice(5);
+      const sep = rest.indexOf(':');
+      if (sep >= 0) {
+        return {
+          xboxIdLower: rest.slice(0, sep) || undefined,
+          titleLower: rest.slice(sep + 1) || undefined,
+        };
+      }
+      return { xboxIdLower: rest || undefined };
+    }
+    return { titleLower: key || undefined };
+  }
+
+  private indexCacheKey(key: string): void {
+    const { titleLower, xboxIdLower } = this.extractKeyParts(key);
+    if (titleLower) {
+      let set = this.cacheKeysByTitle.get(titleLower);
+      if (!set) {
+        set = new Set<string>();
+        this.cacheKeysByTitle.set(titleLower, set);
+      }
+      set.add(key);
+    }
+    if (xboxIdLower) {
+      let set = this.cacheKeysByXboxId.get(xboxIdLower);
+      if (!set) {
+        set = new Set<string>();
+        this.cacheKeysByXboxId.set(xboxIdLower, set);
+      }
+      set.add(key);
+    }
+  }
+
+  private unindexCacheKey(key: string): void {
+    const { titleLower, xboxIdLower } = this.extractKeyParts(key);
+    if (titleLower) {
+      const set = this.cacheKeysByTitle.get(titleLower);
+      if (set) {
+        set.delete(key);
+        if (set.size === 0) this.cacheKeysByTitle.delete(titleLower);
+      }
+    }
+    if (xboxIdLower) {
+      const set = this.cacheKeysByXboxId.get(xboxIdLower);
+      if (set) {
+        set.delete(key);
+        if (set.size === 0) this.cacheKeysByXboxId.delete(xboxIdLower);
+      }
+    }
+  }
+
   private setCacheBounded(key: string, val: CriticScoreData | null): void {
     if (this.cache.has(key)) {
       this.cache.delete(key);
     }
     this.cache.set(key, val);
+    this.indexCacheKey(key);
     while (this.cache.size > MAX_STAR_CACHE_ENTRIES) {
       const oldest = this.cache.keys().next().value;
       if (oldest === undefined) break;
       this.cache.delete(oldest);
+      this.unindexCacheKey(oldest);
     }
   }
 
@@ -90,16 +148,9 @@ export class StorefrontStarResolver {
       // 1. Try GOG Catalog API
       if (rawTitle) {
         try {
-          const cleanTitle = rawTitle
-            .replace(/[®™©]/g, '')
-            .replace(/['’ʼ`]/g, '')
-            .replace(/[:\-–—_+]/g, ' ')
-            .replace(
-              /\b(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|extended|enchanted|anniversary|directors-cut|director'?s cut|goty|game of the year|remastered|remake)( edition| pack| bundle| collection)?\b/gi,
-              ''
-            )
-            .replace(/\s+/g, ' ')
-            .trim();
+          const cleanTitle =
+            normalizeTitleForStoreSearch(rawTitle, { stripEditions: true }) ||
+            normalizeTitleForStoreSearch(rawTitle);
 
           const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
           const queryUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=5`;
@@ -312,8 +363,50 @@ export class StorefrontStarResolver {
     return this.resolveStorefrontScore(input);
   }
 
+  public evictForGame(rawTitle?: string | null, xboxProductId?: string | null): void {
+    const keysToDelete = new Set<string>();
+    const titleLower = (rawTitle || '').trim().toLowerCase();
+    const xboxIdLower = (xboxProductId || '').trim().toLowerCase();
+
+    if (titleLower) {
+      this.transientErrorKeys.delete(titleLower);
+      keysToDelete.add(titleLower);
+      const indexedByTitle = this.cacheKeysByTitle.get(titleLower);
+      if (indexedByTitle) {
+        for (const k of indexedByTitle) keysToDelete.add(k);
+      }
+      const normTitle = normalizeCriticTitleKey(titleLower);
+      if (normTitle && normTitle !== titleLower) {
+        this.transientErrorKeys.delete(normTitle);
+        keysToDelete.add(normTitle);
+        const indexedByNorm = this.cacheKeysByTitle.get(normTitle);
+        if (indexedByNorm) {
+          for (const k of indexedByNorm) keysToDelete.add(k);
+        }
+      }
+    }
+
+    if (xboxIdLower) {
+      const indexedByXbox = this.cacheKeysByXboxId.get(xboxIdLower);
+      if (indexedByXbox) {
+        for (const k of indexedByXbox) keysToDelete.add(k);
+      }
+      if (titleLower) {
+        keysToDelete.add(`xbox:${xboxIdLower}:${titleLower}`);
+      }
+    }
+
+    for (const k of keysToDelete) {
+      this.cache.delete(k);
+      this.inFlight.delete(k);
+      this.unindexCacheKey(k);
+    }
+  }
+
   clearCache(): void {
     this.cache.clear();
+    this.cacheKeysByTitle.clear();
+    this.cacheKeysByXboxId.clear();
     this.inFlight.clear();
     this.transientErrorKeys.clear();
   }

@@ -8,6 +8,9 @@ import {
 } from '../../../services/scraper/metadataScraperService';
 import { isGenericPlaceholderSynopsis } from '../../../services/steam/fallbackMetadataProvider';
 import { steamApi } from '../../../services/steam/steamApi';
+import { igdbCoverService, isUnsuitableCoverUrl } from '../../../services/igdb/igdbCoverService';
+import { isEmptyMarkdownLinkArtifact } from '../../../services/common/synopsisTextUtils';
+import { normalizeTitleKey } from '../../../services/common/titleUtils';
 import gogEnrichedCache from '../../../services/storage/gogEnrichedCache.json';
 import steamBlurbCache from '../../../services/storage/steamBlurbCache.json';
 import {
@@ -206,7 +209,10 @@ export function extractCleanSynopsisText(htmlOrText?: string): string {
   if (!htmlOrText) return '';
   return htmlOrText
     .replace(/<[^>]+>/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[\/*[a-z0-9_=]+\]/gi, ' ')
+    .replace(/product_(?:description|feature)_\d+/gi, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
@@ -217,11 +223,100 @@ export function extractCleanSynopsisText(htmlOrText?: string): string {
     .trim();
 }
 
-function isGenuineSynopsisCandidate(raw: string | undefined, gameTitle: string): boolean {
-  if (!raw || raw.length < 25) return false;
+function hasAuthoritativeSynopsisProvenance(game: CanonicalGame): boolean {
+  const quality = game.enrichedMetadata?.metadataQuality;
+  if (quality === 'authoritative' || quality === 'storefront_native') {
+    return true;
+  }
+  if (typeof game.steamAppId === 'number' && game.steamAppId > 0) {
+    return true;
+  }
+  if (
+    Array.isArray(game.platforms) &&
+    game.platforms.some(
+      (p) =>
+        (p.platformId === 'steam' && Boolean(p.platformGameId)) ||
+        (p.platformId === 'xbox' &&
+          Boolean(
+            p.xboxProductId ||
+              (p.platformGameId && /^[A-Z0-9]{12}$/i.test(String(p.platformGameId)))
+          ))
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isGenuineSynopsisCandidate(
+  raw: string | undefined,
+  gameTitle: string,
+  allowShortAuthoritative: boolean = false
+): boolean {
+  const minLen = allowShortAuthoritative ? 10 : 25;
+  if (!raw || raw.length < minLen) return false;
+  if (isEmptyMarkdownLinkArtifact(raw)) return false;
   const bounded = raw.length > 2400 ? raw.slice(0, 2400) : raw;
+  if (/product_(?:description|feature)_\d+/i.test(bounded)) return false;
   const cleaned = extractCleanSynopsisText(bounded);
-  return cleaned.length >= 25 && !isGenericPlaceholderSynopsis(cleaned, gameTitle);
+  if (cleaned.length < minLen) return false;
+  if (cleaned.length < 25) {
+    // Reject residual broken markdown/template fragments or bare title echoes on short taglines
+    if (/\[[^\]]*\]\([^)]*\)|\[\s*\]\(|\{\{|\}\}/.test(cleaned)) return false;
+    const normCleaned = normalizeTitleKey(cleaned);
+    const normTitle = normalizeTitleKey(gameTitle);
+    if (normCleaned && normTitle && normCleaned === normTitle) return false;
+  }
+  return !isGenericPlaceholderSynopsis(cleaned, gameTitle);
+}
+
+/**
+ * Resolves whether a game has an effective 2:3 vertical cover across user overrides,
+ * catalog `capsuleImage`, instant GOG vertical boxart cache, and instant IGDB cover cache.
+ */
+export function hasEffectiveVerticalCover(
+  game: CanonicalGame,
+  override?: UserGameOverride
+): boolean {
+  if (
+    override?.capsuleImage &&
+    override.capsuleImage.trim().length > 0 &&
+    !isUnsuitableCoverUrl(override.capsuleImage)
+  ) {
+    return true;
+  }
+  if (
+    game.capsuleImage &&
+    game.capsuleImage.trim().length > 0 &&
+    !isUnsuitableCoverUrl(game.capsuleImage)
+  ) {
+    return true;
+  }
+  const gogPlat = game.platforms?.find((p) => p.platformId === 'gog');
+  if (gogPlat?.platformGameId || game.id?.startsWith('gog-')) {
+    const gogId =
+      gogPlat?.platformGameId || (game.id?.startsWith('gog-') ? game.id.slice(4) : undefined);
+    const cachedGogCover = igdbCoverService.getGogVerticalCoverInstant(gogId, game.title);
+    if (cachedGogCover && !isUnsuitableCoverUrl(cachedGogCover)) {
+      return true;
+    }
+  }
+  const cachedIgdbCover = igdbCoverService.getIgdbCoverInstant(
+    game.title,
+    game.steamAppId,
+    game.id
+  );
+  if (cachedIgdbCover && !isUnsuitableCoverUrl(cachedIgdbCover)) {
+    return true;
+  }
+  return false;
+}
+
+function hasEffectiveHeaderArt(game: CanonicalGame, override?: UserGameOverride): boolean {
+  return Boolean(
+    (override?.headerImage && override.headerImage.trim().length > 0) ||
+      (game.headerImage && game.headerImage.trim().length > 0)
+  );
 }
 
 export function isLikelyNonStoreOrTestBranchTitle(title?: string): boolean {
@@ -242,9 +337,14 @@ export function hasGenuineStoreSynopsis(
   probedSynopsisMap?: Record<string, string | null>,
   preloadedSteamMeta?: CachedSteamMeta
 ): boolean {
+  const allowShortAuthoritative = hasAuthoritativeSynopsisProvenance(game);
+
   if (probedSynopsisMap && game.id in probedSynopsisMap) {
     const probed = probedSynopsisMap[game.id];
-    if (typeof probed === 'string' && isGenuineSynopsisCandidate(probed, game.title)) {
+    if (
+      typeof probed === 'string' &&
+      isGenuineSynopsisCandidate(probed, game.title, allowShortAuthoritative)
+    ) {
       return true;
     }
     if (probed === null) {
@@ -254,20 +354,34 @@ export function hasGenuineStoreSynopsis(
 
   // 1. Short-circuit on inline override & game synopsis fields first (zero storage/JSON parse)
   if (
-    isGenuineSynopsisCandidate(override?.shortDescription, game.title) ||
-    isGenuineSynopsisCandidate(override?.detailedDescription, game.title) ||
-    isGenuineSynopsisCandidate(game.shortDescription, game.title) ||
-    isGenuineSynopsisCandidate(game.detailedDescription, game.title) ||
-    isGenuineSynopsisCandidate(game.enrichedMetadata?.shortDescription, game.title) ||
-    isGenuineSynopsisCandidate(game.enrichedMetadata?.aboutTheGame, game.title) ||
-    isGenuineSynopsisCandidate(game.enrichedMetadata?.detailedDescription, game.title)
+    isGenuineSynopsisCandidate(override?.shortDescription, game.title, true) ||
+    isGenuineSynopsisCandidate(override?.detailedDescription, game.title, true) ||
+    isGenuineSynopsisCandidate(game.shortDescription, game.title, allowShortAuthoritative) ||
+    isGenuineSynopsisCandidate(game.detailedDescription, game.title, allowShortAuthoritative) ||
+    isGenuineSynopsisCandidate(
+      game.enrichedMetadata?.shortDescription,
+      game.title,
+      allowShortAuthoritative
+    ) ||
+    isGenuineSynopsisCandidate(
+      game.enrichedMetadata?.aboutTheGame,
+      game.title,
+      allowShortAuthoritative
+    ) ||
+    isGenuineSynopsisCandidate(
+      game.enrichedMetadata?.detailedDescription,
+      game.title,
+      allowShortAuthoritative
+    )
   ) {
     return true;
   }
 
   // 2. Check static Steam blurb hash & cached Steam metadata only when inline fields miss
   if (game.steamAppId) {
-    if (isGenuineSynopsisCandidate(TYPED_STEAM_BLURB_CACHE[String(game.steamAppId)], game.title)) {
+    if (
+      isGenuineSynopsisCandidate(TYPED_STEAM_BLURB_CACHE[String(game.steamAppId)], game.title, true)
+    ) {
       return true;
     }
     const cachedSteam =
@@ -276,9 +390,9 @@ export function hasGenuineStoreSynopsis(
         : steamApi.getCachedMetadata(game.steamAppId);
     if (
       cachedSteam &&
-      (isGenuineSynopsisCandidate(cachedSteam.shortDescription, game.title) ||
-        isGenuineSynopsisCandidate(cachedSteam.aboutTheGame, game.title) ||
-        isGenuineSynopsisCandidate(cachedSteam.detailedDescription, game.title))
+      (isGenuineSynopsisCandidate(cachedSteam.shortDescription, game.title, true) ||
+        isGenuineSynopsisCandidate(cachedSteam.aboutTheGame, game.title, true) ||
+        isGenuineSynopsisCandidate(cachedSteam.detailedDescription, game.title, true))
     ) {
       return true;
     }
@@ -291,10 +405,10 @@ export function hasGenuineStoreSynopsis(
         const gogEntry = TYPED_GOG_ENRICHED_CACHE[p.platformGameId];
         if (
           gogEntry &&
-          (isGenuineSynopsisCandidate(gogEntry.shortDescription, game.title) ||
-            isGenuineSynopsisCandidate(gogEntry.description, game.title) ||
-            isGenuineSynopsisCandidate(gogEntry.aboutTheGame, game.title) ||
-            isGenuineSynopsisCandidate(gogEntry.detailedDescription, game.title))
+          (isGenuineSynopsisCandidate(gogEntry.shortDescription, game.title, true) ||
+            isGenuineSynopsisCandidate(gogEntry.description, game.title, true) ||
+            isGenuineSynopsisCandidate(gogEntry.aboutTheGame, game.title, true) ||
+            isGenuineSynopsisCandidate(gogEntry.detailedDescription, game.title, true))
         ) {
           return true;
         }
@@ -367,13 +481,14 @@ export function isSynopsisAlreadyProbed(
   if (game?.id && hasDurableEmptySynopsisProbe(game.id, durableProbeMap)) return true;
   if (override?.shortDescription || override?.detailedDescription) return true;
   if (game.enrichedMetadata) {
+    const primaryMetaDesc =
+      game.enrichedMetadata.shortDescription ||
+      game.enrichedMetadata.aboutTheGame ||
+      game.enrichedMetadata.detailedDescription ||
+      '';
     if (
-      /product_(?:description|feature)_\d+/i.test(
-        game.enrichedMetadata.shortDescription ||
-          game.enrichedMetadata.aboutTheGame ||
-          game.enrichedMetadata.detailedDescription ||
-          ''
-      )
+      /product_(?:description|feature)_\d+/i.test(primaryMetaDesc) ||
+      isEmptyMarkdownLinkArtifact(primaryMetaDesc)
     ) {
       return false;
     }
@@ -390,6 +505,7 @@ export function isSynopsisAlreadyProbed(
   if (
     Boolean(game.shortDescription && game.shortDescription.trim().length > 0) &&
     !/product_(?:description|feature)_\d+/i.test(game.shortDescription || '') &&
+    !isEmptyMarkdownLinkArtifact(game.shortDescription) &&
     (!isGenericPlaceholderSynopsis(game.shortDescription, game.title) ||
       !game.platforms?.some((p) => p.platformId === 'epic' || p.platformId === 'gog') ||
       isLikelyNonStoreOrTestBranchTitle(game.title))
@@ -398,7 +514,9 @@ export function isSynopsisAlreadyProbed(
   }
   if (isLikelyNonStoreOrTestBranchTitle(game.title)) return true;
   if (!game.steamAppId && !game.platforms?.some((p) => Boolean(p.platformGameId))) return true;
-  if (!game.capsuleImage || !game.headerImage) return true;
+  if (!hasEffectiveVerticalCover(game, override) || !hasEffectiveHeaderArt(game, override)) {
+    return true;
+  }
   return false;
 }
 
@@ -410,14 +528,17 @@ export function getGranularUnmatchedReasons(
 ): UnmatchedDiagnosticReason[] {
   const reasons: UnmatchedDiagnosticReason[] = [];
 
-  if (!game.capsuleImage && !game.headerImage) {
+  const hasVerticalCover = hasEffectiveVerticalCover(game, override);
+  const hasHeaderArt = hasEffectiveHeaderArt(game, override);
+
+  if (!hasVerticalCover && !hasHeaderArt) {
     reasons.push({
       code: 'missing_all_art',
       label: 'Missing All Artwork',
       tooltip: 'Missing both 2:3 vertical cover and 16:9 header image',
       colorClass: 'bg-rose-950/70 border-rose-500/40 text-rose-300',
     });
-  } else if (!game.capsuleImage && Boolean(game.headerImage)) {
+  } else if (!hasVerticalCover && hasHeaderArt) {
     reasons.push({
       code: 'missing_vertical_cover',
       label: 'Missing 2:3 Cover Art',

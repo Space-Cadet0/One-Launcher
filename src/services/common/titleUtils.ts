@@ -278,9 +278,7 @@ export function normalizeTitleKey(title: string): string {
   const cached = normalizeTitleKeyMemo.get(title);
   if (cached !== undefined) return cached;
 
-  let working = stripStorefrontPlatformDisambiguators(
-    stripTrademarkSymbols(decodeTitleHtmlEntities(title))
-  );
+  let working = stripPlatformAndDistributionNoise(title);
   if (NON_ASCII_RE.test(working)) {
     working = foldLatinLigaturesAndDiacritics(working)
       .replace(/['’‘ʼ`´"“”]/g, '')
@@ -502,9 +500,7 @@ const COMPILATION_CLAUSE_STOP_WORDS = new Set([
 
 function tokenizeCompilationClause(str: string): string[] {
   const preCleaned = foldLatinLigaturesAndDiacritics(
-    stripYearEditionPhrases(
-      stripStorefrontPlatformDisambiguators(stripTrademarkSymbols(decodeTitleHtmlEntities(str)))
-    )
+    stripYearEditionPhrases(stripPlatformAndDistributionNoise(str))
   );
   const baseTokens = preCleaned
     .toLowerCase()
@@ -527,9 +523,7 @@ function getNormalizedSequelTokens(str: string): string[] {
   const cached = sequelTokensMemo.get(str);
   if (cached !== undefined) return cached;
   const preCleaned = foldLatinLigaturesAndDiacritics(
-    stripYearEditionPhrases(
-      stripStorefrontPlatformDisambiguators(stripTrademarkSymbols(decodeTitleHtmlEntities(str)))
-    )
+    stripYearEditionPhrases(stripPlatformAndDistributionNoise(str))
   );
   const tokens = preCleaned
     .toLowerCase()
@@ -764,9 +758,13 @@ export function isSteamCdnAssetUrl(url?: string | null): boolean {
   return /(?:steamstatic\.com|steamcdn-a\.akamaihd\.net|steamcommunity\.com)/i.test(url);
 }
 
-function stripStorefrontDistributionSuffixes(input: string): string {
+export function stripStorefrontDistributionSuffixes(input: string): string {
   if (!input) return '';
   return input
+    .replace(
+      /\s*[\(\[]\s*(?:amazon\s+prime(?:\s+gaming)?|prime\s+gaming|ea\s+play(?:\s+pro)?|ubisoft\s+connect|xbox\s+game\s+pass)(?:\s+(?:edition|version))?\s*[\)\]]/gi,
+      ''
+    )
     .replace(
       /(?:[:\-–—]\s*|\s+)(?:amazon\s+prime(?:\s+gaming)?|prime\s+gaming|ea\s+play(?:\s+pro)?|ubisoft\s+connect|xbox\s+game\s+pass)(?:\s+(?:edition|version))?\s*$/gi,
       ''
@@ -775,7 +773,7 @@ function stripStorefrontDistributionSuffixes(input: string): string {
     .trim();
 }
 
-function stripPlatformAndDistributionNoise(rawTitle: string): string {
+export function stripPlatformAndDistributionNoise(rawTitle: string): string {
   if (!rawTitle || typeof rawTitle !== 'string') return '';
   let cur = stripTrademarkSymbols(decodeTitleHtmlEntities(rawTitle));
   for (let pass = 0; pass < 3; pass++) {
@@ -829,7 +827,7 @@ function sanitizeSearchQueryClause(
         ''
       )
       .replace(
-        /\b(?:digital\s+)?(?:the\s+)?(?:standard|deluxe|gold|silver|platinum|diamond|premium|collector'?s|ultimate|complete|extended|special|limited|definitive|enhanced|anniversary|celebration|director'?s\s+cut|final\s+cut|classic\s+and\s+uncut|royal\s+edition|original\s+edition|drm[\s\-]?free(?:\s+edition)?|goty|game\s+of\s+the\s+year|remastered|remaster|remake)\b.*$/i,
+        /\b(?:digital\s+)?(?:the\s+)?(?:standard|deluxe|gold|silver|platinum|diamond|premium|collector'?s|ultimate|complete|extended|special|limited|definitive|enhanced|enchanted|anniversary|celebration|director'?s\s+cut|final\s+cut|classic\s+and\s+uncut|royal\s+edition|original\s+edition|drm[\s\-]?free(?:\s+edition)?|goty|game\s+of\s+the\s+year|remastered|remaster|remake)\b.*$/i,
         ''
       )
       .replace(/[\s\-]+(?:edition|pack|bundle|collection)\s*$/i, '')
@@ -864,6 +862,22 @@ function sanitizeSearchQueryClause(
  */
 export function sanitizeTitleForSearchQuery(rawTitle: string): string {
   return sanitizeSearchQueryClause(rawTitle, { stripEditions: false, splitHyphens: false });
+}
+
+/**
+ * Canonical title normalizer for storefront & critic review search queries across all resolvers.
+ * Decodes HTML entities, folds Latin ligatures/diacritics, strips trademarks and storefront
+ * platform/distribution suffixes ("- Amazon Prime", "PC Edition", "Game Preview", "Windows Edition"),
+ * preserves sequel numbers and edition tags unless `stripEditions: true` is requested.
+ */
+export function normalizeTitleForStoreSearch(
+  rawTitle: string,
+  options?: { stripEditions?: boolean }
+): string {
+  return sanitizeSearchQueryClause(rawTitle, {
+    stripEditions: Boolean(options?.stripEditions),
+    splitHyphens: true,
+  });
 }
 
 /**

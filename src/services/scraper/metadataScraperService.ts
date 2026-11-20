@@ -623,7 +623,7 @@ export class MetadataScraperService {
 
       candidates.push({
         id: `xbox-${xboxIdToken}`,
-        source: 'igdb',
+        source: 'xbox',
         title: xboxCandidateTitle,
         storeUrl: xboxStoreUrl,
         year: game.releaseDate ? String(game.releaseDate).substring(0, 4) : undefined,
@@ -664,9 +664,10 @@ export class MetadataScraperService {
 
     for (const cand of candidates) {
       if (nonSteamOnly && cand.source === 'steam') continue;
-      const candEffectiveSource = isXboxStoreCandidateId(cand.id, cand.storeUrl)
-        ? 'xbox'
-        : cand.source.toLowerCase();
+      const candEffectiveSource =
+        cand.source === 'xbox' || isXboxStoreCandidateId(cand.id, cand.storeUrl)
+          ? 'xbox'
+          : cand.source.toLowerCase();
       if (
         sourceFilter &&
         sourceFilter.toLowerCase() !== 'all' &&
@@ -1229,7 +1230,7 @@ export class MetadataScraperService {
               const sanitizedDate = sanitizeStoreReleaseDate(prod.releaseDate);
               candidates.push({
                 id: `xbox-${prodId}`,
-                source: 'igdb',
+                source: 'xbox',
                 title: prodTitle,
                 storeUrl:
                   prod.storeUrl ||
@@ -2172,7 +2173,7 @@ export class MetadataScraperService {
     // -------------------------------------------------------------
     // 3b. MATCHING TO XBOX / MICROSOFT STORE
     // -------------------------------------------------------------
-    if (isXboxStoreCandidateId(candidate.id, candidate.storeUrl)) {
+    if (candidate.source === 'xbox' || isXboxStoreCandidateId(candidate.id, candidate.storeUrl)) {
       const xboxRawId = String(candidate.id).replace(/^xbox-/i, '').trim();
       const xboxPlat = originalGame?.platforms?.find((p) => p.platformId === 'xbox');
       const xboxBigId =
@@ -2637,7 +2638,7 @@ export class MetadataScraperService {
     const rawCovers: ScrapedCoverOption[] = [];
 
     for (const cand of candidates) {
-      if (isXboxStoreCandidateId(cand.id, cand.storeUrl) && cand.capsuleImage) {
+      if ((cand.source === 'xbox' || isXboxStoreCandidateId(cand.id, cand.storeUrl)) && cand.capsuleImage) {
         rawCovers.push({
           url: cand.capsuleImage,
           source: 'original',
@@ -2739,7 +2740,7 @@ export class MetadataScraperService {
       const pickedKeys = new Set<string>();
       for (const src of sourcesOrder) {
         const topForSrc = candidates.find((c) => {
-          const isXbx = isXboxStoreCandidateId(c.id, c.storeUrl);
+          const isXbx = c.source === 'xbox' || isXboxStoreCandidateId(c.id, c.storeUrl);
           if (src === 'xbox') return isXbx;
           if (src === 'igdb') return c.source === 'igdb' && !isXbx;
           return c.source === src;
@@ -2763,7 +2764,7 @@ export class MetadataScraperService {
 
     const builtOptions = await Promise.all(
       selectedCandidates.map(async (cand): Promise<MetadataSourceOption | null> => {
-        if (isXboxStoreCandidateId(cand.id, cand.storeUrl)) {
+        if (cand.source === 'xbox' || isXboxStoreCandidateId(cand.id, cand.storeUrl)) {
           const xboxRawId = String(cand.id).replace(/^xbox-/i, '').trim();
           const xboxBigId = extractXboxBigId(xboxRawId);
           let storeMeta = null;

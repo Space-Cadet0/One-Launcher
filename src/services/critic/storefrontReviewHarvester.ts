@@ -9,6 +9,15 @@ import { KNOWN_CRITIC_SCORES } from './knownCriticScores';
 import { isTitleCompatible } from './metacriticResolver';
 import { requestScheduler, Priority } from '../network/requestScheduler';
 import { onlineLifecycleManager } from '../network/onlineLifecycleManager';
+import {
+  loadStagedCache,
+  saveStagedCache,
+  STAGED_CACHE_PREFIX,
+} from '../storage/stagedCacheService';
+import { normalizeTitleForStoreSearch, normalizeTitleKey } from '../common/titleUtils';
+
+const STEAM_APPDETAILS_404_KEY_PREFIX = `${STAGED_CACHE_PREFIX}steam_appdetails_404_v1_`;
+const STEAM_APPDETAILS_404_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
 const GOG_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -329,9 +338,11 @@ export class StorefrontReviewHarvester {
     }
 
     let sawTransientError = !onlineLifecycleManager.isOnline() || steamApi.isStoreRateLimited();
+    const neg404Key = `${STEAM_APPDETAILS_404_KEY_PREFIX}${steamAppId}`;
+    const isKnown404 = loadStagedCache<null>(neg404Key, false).valid;
 
-    // 3. Query Steam Store API directly if not present in cache
-    if (onlineLifecycleManager.isOnline() && !steamApi.isStoreRateLimited()) {
+    // 3. Query Steam Store API via steamApi (honoring the 14-day steam_appdetails_404_v1_ negative cache)
+    if (!isKnown404 && onlineLifecycleManager.isOnline() && !steamApi.isStoreRateLimited()) {
       try {
         const liveMeta = await steamApi.fetchGameMetadata(steamAppId);
         if (liveMeta?.metacritic) {
@@ -354,8 +365,8 @@ export class StorefrontReviewHarvester {
           }
         }
 
-        // Only fire fallback direct fetch if liveMeta was null (e.g. mocked/bypassed steamApi in tests)
-        if (!liveMeta) {
+        // Only fire fallback direct fetch if liveMeta was null AND steamApi did not record a 404/delisted AppID
+        if (!liveMeta && !loadStagedCache<null>(neg404Key, false).valid) {
           if (steamApi.isStoreRateLimited() || !onlineLifecycleManager.isOnline()) {
             sawTransientError = true;
           } else {
@@ -375,24 +386,39 @@ export class StorefrontReviewHarvester {
               Priority.P1_VIEWPORT,
               'store.steampowered.com'
             );
-            const appData = res.data?.[steamAppId]?.data;
-            if (appData?.metacritic) {
-              const score = typeof appData.metacritic.score === 'number' ? appData.metacritic.score : undefined;
-              const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
-              const slug = extractMetacriticSlugFromUrl(url);
+            const respHeaders =
+              res.headers && typeof res.headers === 'object'
+                ? (res.headers as Record<string, unknown>)
+                : undefined;
+            if (isWafOrChallengeResponse(res.status, res.data, respHeaders, true)) {
+              sawTransientError = true;
+            } else {
+              const entry = res.data?.[steamAppId];
+              if (entry && entry.success === false && onlineLifecycleManager.isOnline()) {
+                saveStagedCache<null>(neg404Key, null, 'negative', {
+                  failureReason: 'not_found',
+                  customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
+                });
+              }
+              const appData = entry?.data;
+              if (appData?.metacritic) {
+                const score = typeof appData.metacritic.score === 'number' ? appData.metacritic.score : undefined;
+                const url = typeof appData.metacritic.url === 'string' ? appData.metacritic.url : undefined;
+                const slug = extractMetacriticSlugFromUrl(url);
 
-              if ((score !== undefined || url) && (!slug || !appData.name || isTitleCompatible(appData.name, slug.replace(/-/g, ' ')))) {
-                const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
-                const anchor: StorefrontReviewAnchor = {
-                  storefront: 'steam',
-                  metacriticUrl: canonicalMcUrl,
-                  metacriticScore: score,
-                  metacriticSlug: slug,
-                  rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
-                  isVerifiedGroundTruth: true,
-                };
-                this.setAnchorCacheBounded(cacheKey, anchor);
-                return anchor;
+                if ((score !== undefined || url) && (!slug || !appData.name || isTitleCompatible(appData.name, slug.replace(/-/g, ' ')))) {
+                  const canonicalMcUrl = slug ? `https://www.metacritic.com/game/${slug}/critic-reviews/` : url;
+                  const anchor: StorefrontReviewAnchor = {
+                    storefront: 'steam',
+                    metacriticUrl: canonicalMcUrl,
+                    metacriticScore: score,
+                    metacriticSlug: slug,
+                    rawStoreUrl: `https://store.steampowered.com/app/${steamAppId}`,
+                    isVerifiedGroundTruth: true,
+                  };
+                  this.setAnchorCacheBounded(cacheKey, anchor);
+                  return anchor;
+                }
               }
             }
           }
@@ -400,6 +426,15 @@ export class StorefrontReviewHarvester {
       } catch (err: unknown) {
         const resp = getHttpErrorResponse(err);
         if (
+          resp.status === 404 &&
+          onlineLifecycleManager.isOnline() &&
+          !isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
+        ) {
+          saveStagedCache<null>(neg404Key, null, 'negative', {
+            failureReason: 'not_found',
+            customTtlMs: STEAM_APPDETAILS_404_TTL_MS,
+          });
+        } else if (
           classifyNetworkError(err).status === 'transient_error' ||
           isWafOrChallengeResponse(resp.status, resp.data, resp.headers)
         ) {
@@ -539,15 +574,10 @@ export class StorefrontReviewHarvester {
     }
 
     if (!slug && rawTitle) {
-      const cleanTitle = rawTitle
-        .replace(/[®™©]/g, '')
-        .replace(/[:\-–—_+]/g, ' ')
-        .replace(
-          /\b(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|directors-cut|director'?s cut|goty|game of the year|remastered|remake)( edition| pack| bundle| collection)?\b/gi,
-          ''
-        )
-        .replace(/\s+/g, ' ')
-        .trim();
+      const cleanTitle =
+        normalizeTitleForStoreSearch(rawTitle, { stripEditions: true }) ||
+        normalizeTitleForStoreSearch(rawTitle) ||
+        rawTitle;
       try {
         const cleanLike = cleanTitle.replace(/^like:/i, '').trim();
         const catalogUrl = `https://catalog.gog.com/v1/catalog?query=${encodeURIComponent(`like:${cleanLike}`)}&limit=1`;
@@ -687,19 +717,12 @@ export class StorefrontReviewHarvester {
     }
 
     if (effectiveTitle) {
-      const cleanTitle = effectiveTitle
-        .replace(/[®™©]/g, '')
-        .replace(
-          /\b(digital\s+)?(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|director'?s cut|goty|game of the year|remastered|remake)\b.*$/i,
-          ''
-        )
-        .trim();
+      const cleanTitle =
+        normalizeTitleForStoreSearch(effectiveTitle, { stripEditions: true }) ||
+        normalizeTitleForStoreSearch(effectiveTitle) ||
+        effectiveTitle;
 
-      const titleSlug = cleanTitle
-        .toLowerCase()
-        .replace(/['’]/g, '')
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
+      const titleSlug = normalizeTitleKey(cleanTitle).replace(/\s+/g, '-');
 
       if (titleSlug) {
         const withPrefix = `EPIC_${titleSlug}`;
@@ -1102,6 +1125,48 @@ export class StorefrontReviewHarvester {
 
     this.inFlight.set(cacheKey, promise);
     return promise;
+  }
+
+  /**
+   * Targeted O(1) eviction for a single game across anchor cache, in-flight, and transient keys.
+   */
+  public evictForGame(params: {
+    gameId?: string | null;
+    title?: string | null;
+    steamAppId?: number | null;
+    platforms?: Array<{ platformId?: string; platformGameId?: string; xboxProductId?: string }>;
+  }): void {
+    const keys = new Set<string>();
+    if (params.gameId) {
+      keys.add(params.gameId);
+      const clean = params.gameId.trim();
+      if (clean) keys.add(clean);
+    }
+    if (typeof params.steamAppId === 'number' && params.steamAppId > 0) {
+      keys.add(`steam-${params.steamAppId}`);
+    }
+    const lowerTitle = (params.title || '').trim().toLowerCase();
+    if (lowerTitle) {
+      keys.add(`title-${lowerTitle}`);
+      keys.add(`gog-${lowerTitle}`);
+      keys.add(`epic-${lowerTitle}`);
+      keys.add(`xbox-${lowerTitle}`);
+    }
+    if (Array.isArray(params.platforms)) {
+      for (const p of params.platforms) {
+        const pid = (p.platformId || '').toLowerCase();
+        const gid = (p.xboxProductId || p.platformGameId || '').trim();
+        if (pid && gid) {
+          keys.add(`${pid}-${gid}`);
+          keys.add(`${pid}-${gid.toLowerCase()}`);
+        }
+      }
+    }
+    for (const key of keys) {
+      this.anchorCache.delete(key);
+      this.inFlight.delete(key);
+      this.transientErrorKeys.delete(key);
+    }
   }
 
   /**

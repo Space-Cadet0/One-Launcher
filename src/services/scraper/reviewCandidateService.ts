@@ -5,6 +5,7 @@ import type {
   ScrapedMetadataBundle,
   ReviewScoreRoute,
 } from '../../contracts/override';
+import { normalizeTitleForStoreSearch } from '../common/titleUtils';
 import {
   calculateSyntheticSteamScore,
   calculateTier,
@@ -335,8 +336,9 @@ export class ReviewCandidateService {
 
     const xboxPlat = game.platforms?.find((p) => p.platformId === 'xbox');
     const xboxCandidateId = !isDifferentQueryTitle
-      ? (String(candidate?.id || '').toLowerCase().startsWith('xbox-')
-          ? String(candidate?.id).replace(/^xbox-/i, '')
+      ? (candidate?.source === 'xbox' ||
+        String(candidate?.id || '').toLowerCase().startsWith('xbox-')
+          ? String(candidate?.id || '').replace(/^xbox-/i, '') || undefined
           : undefined) ||
         (String(scrapedBundle?.matchedId || '').toLowerCase().startsWith('xbox-')
           ? String(scrapedBundle?.matchedId).replace(/^xbox-/i, '')
@@ -650,13 +652,9 @@ export class ReviewCandidateService {
     const fetchOpenCriticTask = async (): Promise<ReviewCandidateOption | null> => {
       if (!title) return null;
       try {
-        const cleanTitle = title
-          .replace(/[™®©]/g, '')
-          .replace(
-            /\b(standard|deluxe|gold|silver|platinum|diamond|collector'?s|ultimate|complete|special|limited|definitive|enhanced|anniversary|directors-cut|director'?s cut|goty|game of the year|remastered|remake)( edition)?\b/gi,
-            ''
-          )
-          .trim();
+        const cleanTitle =
+          normalizeTitleForStoreSearch(title, { stripEditions: true }) ||
+          normalizeTitleForStoreSearch(title);
 
         const baseUrl =
           typeof window !== 'undefined' && window.location?.hostname === 'localhost'
