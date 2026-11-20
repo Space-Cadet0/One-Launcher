@@ -53,6 +53,9 @@ export interface LibraryFilterState {
   includeUnknownReleaseYear: boolean;
   // Category 6: Creator (Developers & Publishers)
   creators: string[];
+  // Category 7: Tags
+  tags: string[];
+  tagMatchMode: 'any' | 'all';
 }
 
 export const DEFAULT_LIBRARY_FILTER_STATE: LibraryFilterState = {
@@ -66,6 +69,8 @@ export const DEFAULT_LIBRARY_FILTER_STATE: LibraryFilterState = {
   releaseYearRange: null,
   includeUnknownReleaseYear: true,
   creators: [],
+  tags: [],
+  tagMatchMode: 'any',
 };
 
 export function isReleaseYearRangeActive(
@@ -92,7 +97,8 @@ export function countActiveFilterCriteria(
     state.genres.length +
     state.features.length +
     (isReleaseYearRangeActive(state.releaseYearRange, bounds) ? 1 : 0) +
-    state.creators.length
+    state.creators.length +
+    (state.tags?.length ?? 0)
   );
 }
 
@@ -131,6 +137,8 @@ export function activeGameFilterToLibraryFilterState(
         features: [...prev.features],
         releaseYearRange: prev.releaseYearRange ? [prev.releaseYearRange[0], prev.releaseYearRange[1]] : null,
         creators: [...prev.creators],
+        tags: [...(prev.tags || [])],
+        tagMatchMode: prev.tagMatchMode ?? 'any',
       }
     : {
         ...DEFAULT_LIBRARY_FILTER_STATE,
@@ -141,6 +149,8 @@ export function activeGameFilterToLibraryFilterState(
         features: [],
         releaseYearRange: null,
         creators: [],
+        tags: [],
+        tagMatchMode: 'any',
       };
 
   if (!filter || !filter.value?.trim()) {
@@ -248,17 +258,104 @@ export function activeGameFilterToLibraryFilterState(
   }
 
   if (filter.type === 'tag') {
-    const feat = mapFeatureKeyword(target);
-    if (feat) {
-      if (!base.features.includes(feat)) {
-        base.features.push(feat);
-      }
-    } else {
-      pushUniqueCaseInsensitive(base.genres, rawVal);
-    }
+    pushUniqueCaseInsensitive(base.tags, rawVal);
     return base;
   }
 
   return base;
+}
+
+/**
+ * Returns true if `activeFilter` is still faithfully represented by `nextState`.
+ * Returns false when all criteria are cleared, when the facet mirrored from `activeFilter`
+ * is removed, or when an OR-evaluated category is broadened beyond the single `activeFilter`
+ * value so `App.tsx` clears the stale `activeFilter` instead of trapping the grid.
+ */
+export function doesLibraryFilterStateStillMatchActiveFilter(
+  activeFilter: ActiveGameFilter | null,
+  nextState: LibraryFilterState,
+  bounds?: { minYear: number; maxYear: number }
+): boolean {
+  if (!activeFilter) return true;
+  if (countActiveFilterCriteria(nextState, bounds) === 0) {
+    return false;
+  }
+
+  const mapped = activeGameFilterToLibraryFilterState(activeFilter);
+  if (countActiveFilterCriteria(mapped) === 0) {
+    return true;
+  }
+
+  const hasAllNormalized = (haystack: readonly string[] | undefined, needles: readonly string[]) => {
+    const set = new Set((haystack || []).map((v) => v.toLowerCase().trim()).filter(Boolean));
+    return needles.every((n) => set.has(n.toLowerCase().trim()));
+  };
+
+  if (mapped.osCompatibility.length > 0) {
+    if (
+      !mapped.osCompatibility.every((opt) => nextState.osCompatibility.includes(opt)) ||
+      nextState.osCompatibility.length > mapped.osCompatibility.length
+    ) {
+      return false;
+    }
+  }
+
+  if (mapped.criticTiers.length > 0) {
+    if (
+      !mapped.criticTiers.every((tier) => nextState.criticTiers.includes(tier)) ||
+      nextState.criticTiers.length > mapped.criticTiers.length
+    ) {
+      return false;
+    }
+  }
+
+  if (mapped.minCriticScore !== null && nextState.minCriticScore !== mapped.minCriticScore) {
+    return false;
+  }
+
+  if (mapped.reviewSentiments.length > 0) {
+    if (
+      !mapped.reviewSentiments.every((sent) => nextState.reviewSentiments.includes(sent)) ||
+      nextState.reviewSentiments.length > mapped.reviewSentiments.length
+    ) {
+      return false;
+    }
+  }
+
+  if (mapped.genres.length > 0) {
+    if (!hasAllNormalized(nextState.genres, mapped.genres)) {
+      return false;
+    }
+    if (nextState.genreMatchMode !== 'all' && nextState.genres.length > mapped.genres.length) {
+      return false;
+    }
+  }
+
+  if (mapped.features.length > 0) {
+    if (!mapped.features.every((feat) => nextState.features.includes(feat))) {
+      return false;
+    }
+  }
+
+  if (mapped.creators.length > 0) {
+    if (
+      !hasAllNormalized(nextState.creators, mapped.creators) ||
+      nextState.creators.length > mapped.creators.length
+    ) {
+      return false;
+    }
+  }
+
+  if (mapped.tags.length > 0) {
+    const nextTags = nextState.tags || [];
+    if (!hasAllNormalized(nextTags, mapped.tags)) {
+      return false;
+    }
+    if ((nextState.tagMatchMode ?? 'any') !== 'all' && nextTags.length > mapped.tags.length) {
+      return false;
+    }
+  }
+
+  return true;
 }
 

@@ -10,12 +10,15 @@ import {
   countActiveFilterCriteria,
 } from '../../contracts/filter';
 import { LibraryFilterIndex } from '../../services/filter/libraryFilterIndex';
+import { launcherService } from '../../services/launcher/launcherService';
+import { normalizeTagKey } from '../../services/tags/gameTagResolver';
 import { VirtualListRows } from '../Common/VirtualContainers';
-import { useSafeId } from '../../utils/useSafeId';
+import { useSafeDeferredValue, useSafeId } from '../../utils/useSafeId';
 import {
   Monitor,
   Award,
   Tags,
+  Tag,
   Sparkles,
   Calendar,
   Building2,
@@ -114,12 +117,26 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
 }) => {
   const genreSearchInputId = useSafeId('filter-genre-search');
   const creatorSearchInputId = useSafeId('filter-creator-search');
+  const tagSearchInputId = useSafeId('filter-tag-search');
   const includeUnknownYearId = useSafeId('release-year-include-unknown');
 
   const [genreSearch, setGenreSearch] = useState('');
   const [creatorSearch, setCreatorSearch] = useState('');
+  const [tagSearch, setTagSearch] = useState('');
+  const deferredTagSearch = useSafeDeferredValue(tagSearch);
+  const [showAllTags, setShowAllTags] = useState(false);
   const [creatorScrollHeight, setCreatorScrollHeight] = useState(0);
   const creatorScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const supportsWindowsTranslation =
+    launcherService.getHostCapabilities().supportsWindowsTranslation;
+  const visibleOsOptions = useMemo(
+    () =>
+      supportsWindowsTranslation
+        ? OS_OPTIONS
+        : OS_OPTIONS.filter((opt) => opt.id !== 'mac_compat_layer'),
+    [supportsWindowsTranslation]
+  );
 
   useEffect(() => {
     const el = creatorScrollRef.current;
@@ -139,7 +156,14 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
   const maxYear = Math.max(filterIndex.minReleaseYear, filterIndex.maxReleaseYear);
   const yearBounds = useMemo(() => ({ minYear, maxYear }), [minYear, maxYear]);
 
-  const activeCriteriaCount = countActiveFilterCriteria(filterState, yearBounds);
+  const activeVisibleOsCount = supportsWindowsTranslation
+    ? filterState.osCompatibility.length
+    : filterState.osCompatibility.filter((opt) => opt !== 'mac_compat_layer').length;
+  const hiddenMacCompatCount = filterState.osCompatibility.length - activeVisibleOsCount;
+  const activeCriteriaCount = Math.max(
+    0,
+    countActiveFilterCriteria(filterState, yearBounds) - hiddenMacCompatCount
+  );
 
   const fromYear = filterState.releaseYearRange
     ? Math.max(minYear, Math.min(filterState.releaseYearRange[0], filterState.releaseYearRange[1]))
@@ -203,6 +227,19 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
     onChange({ ...filterState, creators: next });
   };
 
+  const selectedTags = filterState.tags || [];
+  const tagMatchMode = filterState.tagMatchMode ?? 'any';
+
+  const toggleTag = (tagKey: string) => {
+    const key = normalizeTagKey(tagKey);
+    if (!key) return;
+    const exists = selectedTags.some((t) => normalizeTagKey(t) === key);
+    const next = exists
+      ? selectedTags.filter((t) => normalizeTagKey(t) !== key)
+      : [...selectedTags, key];
+    onChange({ ...filterState, tags: next });
+  };
+
   const applyEraPreset = (presetFrom: number | null, presetTo: number | null) => {
     if (presetFrom === null || presetTo === null) {
       onChange({ ...filterState, releaseYearRange: null });
@@ -235,6 +272,36 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
     () => new Set(filterState.creators.map((c) => c.toLowerCase().trim())),
     [filterState.creators]
   );
+
+  const selectedTagKeySet = useMemo(
+    () => new Set(selectedTags.map((t) => normalizeTagKey(t)).filter(Boolean)),
+    [selectedTags]
+  );
+
+  const TAG_PREVIEW_LIMIT = 40;
+  const allTagCounts = filterIndex.tagCounts || [];
+  const normalizedTagQuery = deferredTagSearch.trim().toLowerCase();
+
+  const filteredTags = useMemo(() => {
+    if (!normalizedTagQuery) return allTagCounts;
+    return allTagCounts.filter(
+      (t) => t.label.toLowerCase().includes(normalizedTagQuery) || t.key.includes(normalizedTagQuery)
+    );
+  }, [allTagCounts, normalizedTagQuery]);
+
+  const isTagSearchEmpty = tagSearch.trim() === '' && normalizedTagQuery === '';
+  const isTagListCollapsed =
+    isTagSearchEmpty && !showAllTags && filteredTags.length > TAG_PREVIEW_LIMIT;
+
+  const visibleTags = useMemo(() => {
+    if (!isTagListCollapsed) return filteredTags;
+    const topSlice = filteredTags.slice(0, TAG_PREVIEW_LIMIT);
+    const topKeySet = new Set(topSlice.map((t) => t.key));
+    const extraSelected = filteredTags.filter(
+      (t) => selectedTagKeySet.has(t.key) && !topKeySet.has(t.key)
+    );
+    return extraSelected.length > 0 ? [...topSlice, ...extraSelected] : topSlice;
+  }, [filteredTags, isTagListCollapsed, selectedTagKeySet]);
 
   const renderCreatorItem = (creator: LibraryFilterIndex['creatorCounts'][number]) => {
     const isSelected = selectedCreatorSet.has(creator.key);
@@ -318,9 +385,9 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
         </div>
       </div>
 
-      {/* 6-Category Responsive Facet Grid */}
+      {/* Responsive Facet Grid */}
       <div className="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {/* Category 1: OS & Compatibility */}
+        {/* Category 1: Operating System / OS & Compatibility */}
         <div
           data-testid="filter-cat-os"
           className="rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
@@ -328,17 +395,19 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
           <div className="flex items-center justify-between border-b border-steam-border/40 pb-2">
             <div className="flex items-center gap-1.5 font-bold text-white uppercase tracking-wider text-[11px]">
               <Monitor className="w-3.5 h-3.5 text-steam-accent" />
-              <span>1. OS &amp; Compatibility</span>
+              <span>
+                {supportsWindowsTranslation ? '1. OS & Compatibility' : '1. Operating System'}
+              </span>
             </div>
-            {filterState.osCompatibility.length > 0 && (
+            {activeVisibleOsCount > 0 && (
               <span className="text-[10px] text-steam-accent font-semibold">
-                {filterState.osCompatibility.length} selected
+                {activeVisibleOsCount} selected
               </span>
             )}
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {OS_OPTIONS.map((opt) => {
+            {visibleOsOptions.map((opt) => {
               const isSelected = filterState.osCompatibility.includes(opt.id);
               const count = filterIndex.osCounts[opt.id] ?? 0;
               return (
@@ -809,6 +878,130 @@ export const LibraryFilterPanel: React.FC<LibraryFilterPanelProps> = ({
               />
             ) : (
               filteredCreators.map((creator) => renderCreatorItem(creator))
+            )}
+          </div>
+        </div>
+
+        {/* Category 7: Tags (Full-Width Row Matching 3. Genres) */}
+        <div
+          data-testid="filter-cat-tags"
+          className="md:col-span-2 xl:col-span-3 rounded-md bg-[#0f1620] border border-steam-border/50 p-3.5 flex flex-col gap-2.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-steam-border/40 pb-2">
+            <div className="flex items-center gap-2 font-bold text-white uppercase tracking-wider text-[11px]">
+              <Tag className="w-3.5 h-3.5 text-steam-accent" />
+              <span>7. Tags</span>
+              {selectedTags.length > 0 && (
+                <span className="text-[10px] text-steam-accent font-semibold normal-case tracking-normal">
+                  {selectedTags.length} selected
+                </span>
+              )}
+            </div>
+            {/* ANY / ALL Match Mode Toggle */}
+            <div className="inline-flex items-center rounded bg-[#16202d] border border-steam-border/60 p-0.5 text-[10px]">
+              <button
+                type="button"
+                data-testid="filter-tag-mode-any"
+                aria-pressed={tagMatchMode === 'any'}
+                onClick={() => onChange({ ...filterState, tagMatchMode: 'any' })}
+                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
+                  tagMatchMode === 'any'
+                    ? 'bg-steam-accent text-black'
+                    : 'text-steam-subtext hover:text-white'
+                }`}
+                title="Match games with ANY selected tag (OR)"
+              >
+                ANY
+              </button>
+              <button
+                type="button"
+                data-testid="filter-tag-mode-all"
+                aria-pressed={tagMatchMode === 'all'}
+                onClick={() => onChange({ ...filterState, tagMatchMode: 'all' })}
+                className={`min-w-6 min-h-6 px-2 py-0.5 rounded font-semibold transition-colors cursor-pointer ${
+                  tagMatchMode === 'all'
+                    ? 'bg-steam-accent text-black'
+                    : 'text-steam-subtext hover:text-white'
+                }`}
+                title="Match games with ALL selected tags (AND)"
+              >
+                ALL
+              </button>
+            </div>
+          </div>
+
+          {/* Search Tags Input */}
+          <div className="relative">
+            <label htmlFor={tagSearchInputId} className="sr-only">
+              Search tags
+            </label>
+            <Search className="w-3 h-3 text-steam-subtext absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              id={tagSearchInputId}
+              type="text"
+              data-testid="filter-tag-search"
+              value={tagSearch}
+              onChange={(e) => setTagSearch(e.target.value)}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              placeholder="Search tags..."
+              className="w-full bg-[#16202d] border border-steam-border/60 rounded pl-7 pr-7 py-1 text-xs text-white placeholder-steam-subtext focus:outline-none focus:border-steam-accent"
+            />
+            {tagSearch.length > 0 && (
+              <button
+                type="button"
+                data-testid="filter-tag-search-clear"
+                aria-label="Clear tag search"
+                onClick={() => setTagSearch('')}
+                className="min-w-6 min-h-6 inline-flex items-center justify-center absolute right-1 top-1/2 -translate-y-1/2 text-steam-subtext hover:text-white rounded cursor-pointer"
+              >
+                <X aria-hidden="true" className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+
+          {/* Scrollable Multi-Select Tag Cloud */}
+          <div className="max-h-44 overflow-y-auto pr-1 flex flex-wrap gap-1.5 items-center">
+            {visibleTags.length === 0 ? (
+              <div className="text-[11px] text-steam-subtext italic py-2">No matching tags</div>
+            ) : (
+              <>
+                {visibleTags.map((tag) => {
+                  const isSelected = selectedTagKeySet.has(tag.key);
+                  return (
+                    <button
+                      key={tag.key}
+                      type="button"
+                      data-testid={`filter-tag-${tag.key}`}
+                      aria-pressed={isSelected}
+                      onClick={() => toggleTag(tag.key)}
+                      className={`min-h-6 inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] transition-all cursor-pointer ${
+                        isSelected
+                          ? 'bg-steam-accent/20 border-steam-accent text-white font-semibold shadow-sm'
+                          : 'bg-[#16202d]/70 border-steam-border/50 text-steam-text hover:border-steam-accent/50 hover:text-white'
+                      }`}
+                    >
+                      <span>{tag.label}</span>
+                      <span className="text-[10px] text-steam-subtext font-mono">
+                        ({tag.count})
+                      </span>
+                    </button>
+                  );
+                })}
+                {isTagSearchEmpty && filteredTags.length > TAG_PREVIEW_LIMIT && (
+                  <button
+                    type="button"
+                    data-testid="filter-tags-show-all"
+                    aria-expanded={showAllTags}
+                    onClick={() => setShowAllTags((prev) => !prev)}
+                    className="min-h-6 inline-flex items-center px-2.5 py-1 rounded border border-steam-accent/40 bg-steam-accent/10 hover:bg-steam-accent/20 text-steam-accent hover:text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                  >
+                    {showAllTags ? 'Show fewer tags' : `Show all ${filteredTags.length} tags`}
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { CanonicalGame } from '../../contracts/game';
 import { SteamEnrichedMetadata } from '../../contracts/steam';
 import { CriticScoreData } from '../../contracts/critic';
@@ -37,16 +37,21 @@ import {
 import { SteamLanguagesTable } from './SteamLanguagesTable';
 import { SteamFeaturesList } from './SteamFeaturesList';
 import { SteamSidebarNotices } from './SteamSidebarNotices';
-import {
-  isGameOwnedOnSteam,
-  getEffectiveTags,
-} from '../../services/steam/steamFeatureNormalizer';
+import { isGameOwnedOnSteam } from '../../services/steam/steamFeatureNormalizer';
 import { steamAchievementsService } from '../../services/steam/steamAchievementsService';
 import {
   getUserOverrideForGame,
   inferMetadataRouteFromOverride,
   updateRoutedMetadataSnapshot,
 } from '../../services/storage/userOverrideStorage';
+import {
+  USER_TAG_OVERRIDES_UPDATED_EVENT,
+  addUserTagForGame,
+  removeUserTagForGame,
+  resetUserTagsForGame,
+} from '../../services/storage/userTagStorage';
+import { resolveEffectiveGameTags } from '../../services/tags/gameTagResolver';
+import type { TagFacetCount } from '../../contracts/tags';
 import {
   Sparkles,
   ArrowLeft,
@@ -61,6 +66,7 @@ import { launcherService } from '../../services/launcher/launcherService';
 export interface SteamStorePageProps {
   game: CanonicalGame;
   collections?: GameCollection[];
+  availableLibraryTags?: TagFacetCount[];
   onBackToLibrary?: () => void;
   onManageCollections?: () => void;
   onToggleInstallStatus?: (platformId?: StorefrontId) => void;
@@ -80,7 +86,9 @@ function isSkeletonMetadata(meta?: SteamEnrichedMetadata | null): boolean {
 }
 
 function hasRichMetadata(meta?: SteamEnrichedMetadata | null): boolean {
-  return Boolean(meta && meta.metadataQuality !== 'skeleton_fallback');
+  return Boolean(
+    meta && meta.metadataQuality !== 'skeleton_fallback' && !meta.__quotaSlimmed
+  );
 }
 
 function isAuthoritativeSteamMetadata(
@@ -89,6 +97,7 @@ function isAuthoritativeSteamMetadata(
 ): boolean {
   return (
     Boolean(meta) &&
+    !meta!.__quotaSlimmed &&
     Number(meta!.appId) > 0 &&
     (!expectedAppId || Number(meta!.appId) === Number(expectedAppId)) &&
     meta!.metadataQuality !== 'storefront_native' &&
@@ -571,6 +580,7 @@ function resolveInitialDetailPlatformId(targetGame: CanonicalGame): StorefrontId
 export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   game,
   collections,
+  availableLibraryTags,
   onBackToLibrary,
   onManageCollections,
   onToggleInstallStatus,
@@ -675,7 +685,43 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         : getNativeOsPlatforms(currentGame),
     [currentGame, activePlatformId]
   );
-  const activeStoreSupportsMac = activeStoreNativePlatforms.includes('mac');
+  const activePlatformEntry = useMemo(
+    () => currentGame.platforms?.find((p) => p.platformId === activePlatformId),
+    [currentGame.platforms, activePlatformId]
+  );
+  const activeStoreSupportsMac =
+    activeStoreNativePlatforms.includes('mac') ||
+    (activePlatformId === 'steam' && metadata?.platforms?.mac === true);
+  const activeStoreSupportsLinux = useMemo(() => {
+    if (activePlatformId === 'xbox') return false;
+    if (typeof activePlatformEntry?.platforms?.linux === 'boolean') {
+      return activePlatformEntry.platforms.linux;
+    }
+    const hasLinuxReq = Boolean(
+      metadata?.linuxRequirements?.minimum?.trim() ||
+        metadata?.linuxRequirements?.recommended?.trim()
+    );
+    if (activePlatformId === 'steam') {
+      return metadata?.platforms?.linux === true || hasLinuxReq;
+    }
+    if (activePlatformId === 'gog' || activePlatformId === 'epic') {
+      const metadataMatchesActiveStore =
+        metadata?.enrichedSource === activePlatformId ||
+        (activePlatformId === 'gog' && Boolean(currentGame.worksOn?.linux));
+      return Boolean(
+        metadataMatchesActiveStore && (metadata?.platforms?.linux === true || hasLinuxReq)
+      );
+    }
+    return false;
+  }, [
+    activePlatformId,
+    activePlatformEntry?.platforms?.linux,
+    currentGame.worksOn?.linux,
+    metadata?.enrichedSource,
+    metadata?.platforms?.linux,
+    metadata?.linuxRequirements?.minimum,
+    metadata?.linuxRequirements?.recommended,
+  ]);
 
   useEffect(() => {
     const computePageLauncherSig = () => {
@@ -696,16 +742,20 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
   }, [game]);
 
   const [overrideTick, setOverrideTick] = useState(0);
+  const [tagOverridesTick, setTagOverridesTick] = useState(0);
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
       return undefined;
     }
     const handleOverrideEvent = () => setOverrideTick((t) => t + 1);
+    const handleTagOverrideEvent = () => setTagOverridesTick((t) => t + 1);
     window.addEventListener('antigravity:user-override-updated', handleOverrideEvent);
     window.addEventListener('antigravity:user-override-removed', handleOverrideEvent);
+    window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
     return () => {
       window.removeEventListener('antigravity:user-override-updated', handleOverrideEvent);
       window.removeEventListener('antigravity:user-override-removed', handleOverrideEvent);
+      window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverrideEvent);
     };
   }, []);
 
@@ -869,7 +919,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
         incoming: SteamEnrichedMetadata | null | undefined,
         expectedSteamAppId?: number | null
       ): { resolved: SteamEnrichedMetadata | null; canPersistMetadata: boolean } => {
-        if (incoming && !isSkeletonMetadata(incoming)) {
+        if (incoming && !isSkeletonMetadata(incoming) && !incoming.__quotaSlimmed) {
           if (
             !isOverrideUpdated &&
             !isRoutedToNonSteamStore &&
@@ -1078,6 +1128,20 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             meta.languageTableSchema &&
               meta.languageTableSchema !== baselineMeta?.languageTableSchema
           );
+        const hasReqText = (req?: { minimum?: string; recommended?: string }) =>
+          Boolean(req?.minimum?.trim() || req?.recommended?.trim());
+        const updatedSystemRequirements =
+          hasReqText(meta.systemRequirements) &&
+          (meta.systemRequirements?.minimum !== baselineMeta?.systemRequirements?.minimum ||
+            meta.systemRequirements?.recommended !== baselineMeta?.systemRequirements?.recommended);
+        const updatedMacRequirements =
+          hasReqText(meta.macRequirements) &&
+          (meta.macRequirements?.minimum !== baselineMeta?.macRequirements?.minimum ||
+            meta.macRequirements?.recommended !== baselineMeta?.macRequirements?.recommended);
+        const updatedLinuxRequirements =
+          hasReqText(meta.linuxRequirements) &&
+          (meta.linuxRequirements?.minimum !== baselineMeta?.linuxRequirements?.minimum ||
+            meta.linuxRequirements?.recommended !== baselineMeta?.linuxRequirements?.recommended);
 
         const topLevelChanged =
           nextShortDescription !== game.shortDescription ||
@@ -1090,7 +1154,10 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           richerMovies ||
           upgradedPlaceholderSynopsis ||
           updatedAbout ||
-          updatedLanguages;
+          updatedLanguages ||
+          updatedSystemRequirements ||
+          updatedMacRequirements ||
+          updatedLinuxRequirements;
 
         return {
           nextShortDescription,
@@ -1159,7 +1226,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           } = buildEnrichedTopLevelFields(canPersistMetadata ? resolved : null);
           let updatedPlatforms = game.platforms;
           let hasChanges =
-            canPersistMetadata && (!game.enrichedMetadata || isOverrideUpdated || topLevelChanged);
+            canPersistMetadata &&
+            (!game.enrichedMetadata ||
+              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
+              isOverrideUpdated ||
+              topLevelChanged);
 
           if (liveAchs) {
             const currentSteamPlat = game.platforms.find((p) => p.platformId === 'steam');
@@ -1356,6 +1427,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             canPersistMetadata &&
             resolvedMetadata &&
             (!game.enrichedMetadata ||
+              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
               isOverrideUpdated ||
               !isAuthoritativeSteamMetadata(game.enrichedMetadata, targetAppId))
           ) {
@@ -1468,7 +1540,11 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
               nextCapsuleImage,
               topLevelChanged,
             } = buildEnrichedTopLevelFields(resolved);
-            const hasChanges = !game.enrichedMetadata || isOverrideUpdated || topLevelChanged;
+            const hasChanges =
+              !game.enrichedMetadata ||
+              Boolean(game.enrichedMetadata.__quotaSlimmed) ||
+              isOverrideUpdated ||
+              topLevelChanged;
             if (hasChanges) {
               const updatedGame: CanonicalGame = {
                 ...game,
@@ -1661,18 +1737,6 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     ? cleanMetaReleaseDate || userOverride?.releaseDate || cleanGameReleaseDate || 'TBA'
     : userOverride?.releaseDate || cleanMetaReleaseDate || cleanGameReleaseDate || 'TBA';
 
-  const tags = isDynamicRouted
-    ? metadata?.tags?.length
-      ? metadata.tags
-      : userOverride?.tags?.length
-      ? userOverride.tags
-      : currentGame.tags || game.tags || []
-    : userOverride?.tags?.length
-    ? userOverride.tags
-    : metadata?.tags?.length
-    ? metadata.tags
-    : currentGame.tags || game.tags || [];
-
   const genres = isDynamicRouted
     ? metadata?.genres?.length
       ? metadata.genres
@@ -1685,8 +1749,39 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
     ? metadata.genres
     : currentGame.genres || game.genres || [];
 
-  const isOwnedOnSteam = isGameOwnedOnSteam(game.platforms);
-  const effectiveTags = getEffectiveTags(tags, isOwnedOnSteam);
+  const isOwnedOnSteam = isGameOwnedOnSteam(currentGame.platforms || game.platforms);
+
+  const resolvedTagsResult = useMemo(
+    () =>
+      resolveEffectiveGameTags(currentGame, {
+        liveMetadata: metadata,
+        fixMatchOverride: userOverride,
+        isDynamicRouted,
+      }),
+    [currentGame, metadata, userOverride, isDynamicRouted, tagOverridesTick]
+  );
+  const effectiveTags = resolvedTagsResult.tags;
+
+  const handleAddTag = useCallback(
+    (tag: string) => {
+      addUserTagForGame(currentGame, tag, resolvedTagsResult.syncedTags);
+      setTagOverridesTick((t) => t + 1);
+    },
+    [currentGame, resolvedTagsResult.syncedTags]
+  );
+
+  const handleRemoveTag = useCallback(
+    (tag: string) => {
+      removeUserTagForGame(currentGame, tag, resolvedTagsResult.syncedTags);
+      setTagOverridesTick((t) => t + 1);
+    },
+    [currentGame, resolvedTagsResult.syncedTags]
+  );
+
+  const handleResetTags = useCallback(() => {
+    resetUserTagsForGame(currentGame);
+    setTagOverridesTick((t) => t + 1);
+  }, [currentGame]);
 
   const pickRichDetailed = (m?: SteamEnrichedMetadata | null): string | undefined => {
     if (!m || isSkeletonMetadata(m)) return undefined;
@@ -1972,6 +2067,13 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
             developers={developers}
             publishers={publishers}
             tags={effectiveTags}
+            tagEntries={resolvedTagsResult.entries}
+            availableLibraryTags={availableLibraryTags}
+            hasUserTagEdits={resolvedTagsResult.hasUserEdits}
+            onAddTag={handleAddTag}
+            onRemoveTag={handleRemoveTag}
+            onResetTags={handleResetTags}
+            platforms={currentGame.platforms}
             onApplyFilter={onApplyFilter}
             gameId={game.id}
             steamAppId={resolvedSteamAppId}
@@ -2006,8 +2108,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
           {/* Main Column: "About This Game" */}
           <div className="lg:col-span-8 space-y-6">
             <div className="cv-store-section bg-[#16202d] rounded border border-steam-border p-6 shadow-md">
-              <h2 className="text-sm font-bold tracking-wider text-steam-accent uppercase border-b border-steam-border/60 pb-3 mb-4 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-steam-accent" />
+              <h2 className="text-sm font-bold tracking-wider text-steam-accent uppercase border-b border-steam-border/60 pb-3 mb-4">
                 About This Game
               </h2>
 
@@ -2048,7 +2149,7 @@ export const SteamStorePage: React.FC<SteamStorePageProps> = ({
                 requirements={metadata?.systemRequirements}
                 macRequirements={activeStoreSupportsMac ? metadata?.macRequirements : undefined}
                 linuxRequirements={
-                  activePlatformId === 'steam' ? metadata?.linuxRequirements : undefined
+                  activeStoreSupportsLinux ? metadata?.linuxRequirements : undefined
                 }
                 metadataQuality={
                   metadata?.metadataQuality === 'storefront_native'

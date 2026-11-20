@@ -48,6 +48,7 @@ import {
   applyUserOverridesToCatalog,
   hydrateUserOverridesFromVault,
 } from '../storage/userOverrideStorage';
+import { hydrateUserTagOverridesFromVault } from '../storage/userTagStorage';
 import { criticScoreService } from '../critic/criticScoreService';
 import { seedHltbFromVaultIfMissing } from '../hltb/howLongToBeat';
 import { clearExpiredStagedCache } from '../storage/stagedCacheService';
@@ -1462,6 +1463,7 @@ function writeCatalogToLocalStorage(
 export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | null> {
   if (typeof window === 'undefined') return null;
   await hydrateUserOverridesFromVault().catch(() => false);
+  await hydrateUserTagOverridesFromVault().catch(() => false);
   let vaultCatalog = await vaultGet<CanonicalGame[]>(IDB_KEY_MAIN_CATALOG);
   let vaultSnapIds: Set<string> | null = null;
 

@@ -15,6 +15,7 @@ import {
   LibraryFilterState,
   DEFAULT_LIBRARY_FILTER_STATE,
   activeGameFilterToLibraryFilterState,
+  doesLibraryFilterStateStillMatchActiveFilter,
 } from './contracts/filter';
 import type {
   EnvironmentComponentId,
@@ -35,6 +36,7 @@ import { InGameHibernationView } from './components/Launcher/InGameHibernationVi
 import { markScrollActivity } from './utils/scrollActivityTracker';
 import { matchesLooseSearchQuery } from './services/common/titleUtils';
 import { getUserOverrideForGame } from './services/storage/userOverrideStorage';
+import { USER_TAG_OVERRIDES_UPDATED_EVENT } from './services/storage/userTagStorage';
 import {
   loadIntegrations,
   loadCurrentCatalog,
@@ -448,6 +450,33 @@ export function App() {
   const [installedOnly, setInstalledOnly] = useState(false);
   const [isSyncingAllMedia, setIsSyncingAllMedia] = useState(false);
   const [gameRefreshKey, setGameRefreshKey] = useState(0);
+  const [tagOverridesVersion, setTagOverridesVersion] = useState(0);
+  const [ignoreLeadingTheWhenSorting, setIgnoreLeadingTheWhenSorting] = useState<boolean>(
+    () => launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined;
+    }
+    const handleTagOverridesUpdated = () => {
+      setTagOverridesVersion((v) => v + 1);
+    };
+    window.addEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverridesUpdated);
+    return () => {
+      window.removeEventListener(USER_TAG_OVERRIDES_UPDATED_EVENT, handleTagOverridesUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncTitleSortSetting = () => {
+      const next =
+        launcherService.getPerformanceSettings?.()?.ignoreLeadingTheWhenSorting ?? true;
+      setIgnoreLeadingTheWhenSorting((prev) => (prev === next ? prev : next));
+    };
+    syncTitleSortSetting();
+    return launcherService.subscribe(syncTitleSortSetting);
+  }, []);
 
   const { syncNotice, syncNoticeTone, showSyncNotice } = useSyncNotice();
   const { isHibernating, runningGames, resumeFullUi } = useLauncherHibernationState();
@@ -865,7 +894,7 @@ export function App() {
 
   const libraryFilterIndex = useMemo(
     () => buildLibraryFilterIndex(games),
-    [games, gameRefreshKey]
+    [games, gameRefreshKey, tagOverridesVersion]
   );
 
   const filteredGames = useMemo(() => {
@@ -1121,7 +1150,11 @@ export function App() {
 
   const handleOpenRunnerSetupFromSettings = useCallback(() => {
     setIsSettingsOpen(false);
-    handleOpenSystemSetup('health_check', 'compatibility');
+    const initialStep: SetupWizardStepId =
+      launcherService.getHostCapabilities().supportsWindowsTranslation
+        ? 'compatibility'
+        : 'prerequisites';
+    handleOpenSystemSetup('health_check', initialStep);
   }, [handleOpenSystemSetup]);
 
   const handleOpenIntegrationsFromSettings = useCallback(() => {
@@ -1177,10 +1210,14 @@ export function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const getDefaultCompatOrPrereqStep = (): SetupWizardStepId =>
+      launcherService.getHostCapabilities().supportsWindowsTranslation
+        ? 'compatibility'
+        : 'prerequisites';
     const normalizeWizardStep = (step?: string): SetupWizardStepId | undefined => {
       if (!step) return undefined;
       if (step === 'compatibility_and_bottle' || step === 'compatibility') {
-        return 'compatibility';
+        return getDefaultCompatOrPrereqStep();
       }
       if (
         step === 'prerequisites' ||
@@ -1214,7 +1251,7 @@ export function App() {
       ).detail;
       handleOpenSystemSetup(
         detail?.mode || 'health_check',
-        normalizeWizardStep(detail?.initialStep) || 'compatibility',
+        normalizeWizardStep(detail?.initialStep) || getDefaultCompatOrPrereqStep(),
         detail?.focusComponentId
       );
     };
@@ -1299,6 +1336,38 @@ export function App() {
       handleHideGame(g);
     },
     [handleHideGame]
+  );
+
+  const handleUpdateLibraryFilterState = useCallback(
+    (next: LibraryFilterState) => {
+      setLibraryFilterState(next);
+      if (activeFilter) {
+        const bounds = {
+          minYear: libraryFilterIndex.minReleaseYear,
+          maxYear: libraryFilterIndex.maxReleaseYear,
+        };
+        if (!doesLibraryFilterStateStillMatchActiveFilter(activeFilter, next, bounds)) {
+          pushEntry({
+            view: 'grid',
+            selectedGameId: selectedGame?.id || null,
+            activeFilter: null,
+            activeGroupId,
+            title: activeGroupId
+              ? collections.find((c) => c.id === activeGroupId)?.name || 'Collection'
+              : 'All Games',
+          });
+        }
+      }
+    },
+    [
+      activeFilter,
+      activeGroupId,
+      collections,
+      libraryFilterIndex.maxReleaseYear,
+      libraryFilterIndex.minReleaseYear,
+      pushEntry,
+      selectedGame?.id,
+    ]
   );
 
   const handleResetLibraryFilterState = useCallback(() => {
@@ -1505,6 +1574,7 @@ export function App() {
           activeFilter={activeFilter}
           onClearActiveFilter={navigateClearFilter}
           connectedStorefronts={connectedStorefronts}
+          ignoreLeadingTheWhenSorting={ignoreLeadingTheWhenSorting}
         />
 
         {/* Right Main Pane: Storefront Detail Layout OR Group/Whole Library Grid View */}
@@ -1550,17 +1620,19 @@ export function App() {
               sortBy={gridSortBy}
               onSortChange={setGridSortBy}
               libraryFilterState={libraryFilterState}
-              onUpdateLibraryFilterState={setLibraryFilterState}
+              onUpdateLibraryFilterState={handleUpdateLibraryFilterState}
               onResetLibraryFilterState={handleResetLibraryFilterState}
               libraryFilterIndex={libraryFilterIndex}
               unfilteredTotalCount={games.length}
               isPreFiltered={deferredLibraryFilterState === libraryFilterState}
+              ignoreLeadingTheWhenSorting={ignoreLeadingTheWhenSorting}
             />
           ) : (
             <SteamStorePage
               key={currentEntry.selectedGameId || selectedGame.id}
               game={selectedGame}
               collections={collections}
+              availableLibraryTags={libraryFilterIndex.tagCounts}
               onBackToLibrary={navigateHome}
               onManageCollections={handleStoreManageCollections}
               onToggleInstallStatus={handleStoreToggleInstallStatus}

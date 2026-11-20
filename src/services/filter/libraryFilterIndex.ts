@@ -11,6 +11,7 @@ import {
   isLibraryFilterActive,
   isReleaseYearRangeActive,
 } from '../../contracts/filter';
+import type { TagFacetCount } from '../../contracts/tags';
 import steamEnrichedCache from '../storage/steamEnrichedCache.json';
 import { getOpenCriticData } from '../opencritic/openCritic';
 import { steamMatcher } from '../steam/steamMatcher';
@@ -26,6 +27,10 @@ import {
   isPureUwpWindowsGame,
 } from '../platform/nativeOsService';
 import { launcherService } from '../launcher/launcherService';
+import { loadUserTagOverrides } from '../storage/userTagStorage';
+import { normalizeTagKey, resolveEffectiveGameTags } from '../tags/gameTagResolver';
+
+export type { TagFacetCount };
 
 interface CachedSteamFilterRecord {
   reviewSummary?: Partial<SteamReviewSummary>;
@@ -60,6 +65,7 @@ export interface GameFilterIndexEntry {
   features: Set<FeatureFilterOption>;
   releaseYear: number | null;
   creatorsNormalized: Set<string>;
+  tagsNormalized: Set<string>;
 }
 
 export type GameFilterEntry = GameFilterIndexEntry;
@@ -88,6 +94,7 @@ export interface LibraryFilterIndex {
   maxReleaseYear: number;
   unknownReleaseYearCount: number;
   creatorCounts: CreatorFacetCount[];
+  tagCounts: TagFacetCount[];
 }
 
 export interface ActiveFilterChipDescriptor {
@@ -273,7 +280,10 @@ export function buildLibraryFilterIndex(
   options?: { hostPlatform?: 'darwin' | 'win32' | 'linux' }
 ): LibraryFilterIndex {
   const entriesById = new Map<string, GameFilterIndexEntry>();
-  const hostOs = options?.hostPlatform ?? launcherService.getHostPlatform();
+  const supportsWindowsTranslation = launcherService.getHostCapabilities(
+    options?.hostPlatform
+  ).supportsWindowsTranslation;
+  const userTagOverrides = loadUserTagOverrides();
 
   const osCounts: Record<OsCompatibilityFilterOption, number> = {
     mac_native: 0,
@@ -311,6 +321,7 @@ export function buildLibraryFilterIndex(
     string,
     { name: string; hasDev: boolean; hasPub: boolean; count: number }
   >();
+  const tagMap = new Map<string, { label: string; count: number; hasUserLabel: boolean }>();
 
   let minReleaseYear = Infinity;
   let maxReleaseYear = -Infinity;
@@ -328,7 +339,7 @@ export function buildLibraryFilterIndex(
     const isWinNative = isNativelyAvailableOnWindows(game);
     const hasXboxPlatform = (game.platforms || []).some((p) => p.platformId === 'xbox');
     const cachedXboxInstallInfo =
-      hostOs !== 'win32' && hasXboxPlatform
+      supportsWindowsTranslation && hasXboxPlatform
         ? launcherService.getCachedInstallInfo(game.id, 'xbox')
         : undefined;
     const hintIsUwp =
@@ -346,7 +357,7 @@ export function buildLibraryFilterIndex(
       if (storeFlags.windows) {
         platSet.add('windows_native');
       }
-      if (hostOs !== 'win32') {
+      if (supportsWindowsTranslation) {
         const isStorePureUwp =
           p.platformId === 'xbox'
             ? p.xboxBottleCompatibilityTier === 'tier_b_legacy_uwp' ||
@@ -371,7 +382,7 @@ export function buildLibraryFilterIndex(
     }
 
     let isCompatLayerEligible = false;
-    if (hostOs !== 'win32') {
+    if (supportsWindowsTranslation) {
       const pureUwpOnly = isPureUwpWindowsGame(
         game,
         cachedXboxInstallInfo?.xboxCompatibility?.tier
@@ -513,6 +524,30 @@ export function buildLibraryFilterIndex(
       }
     }
 
+    // Category 7: Tags (authoritative effective tags honoring preloaded user tag overrides)
+    const tagsNormalized = new Set<string>();
+    const resolvedTags = resolveEffectiveGameTags(game, {
+      overridesMap: userTagOverrides,
+    });
+    for (const tagEntry of resolvedTags.entries) {
+      if (!tagEntry.key || tagsNormalized.has(tagEntry.key)) continue;
+      tagsNormalized.add(tagEntry.key);
+      const existing = tagMap.get(tagEntry.key);
+      if (!existing) {
+        tagMap.set(tagEntry.key, {
+          label: tagEntry.label,
+          count: 1,
+          hasUserLabel: tagEntry.source === 'user',
+        });
+      } else {
+        existing.count += 1;
+        if (tagEntry.source === 'user' && !existing.hasUserLabel) {
+          existing.label = tagEntry.label;
+          existing.hasUserLabel = true;
+        }
+      }
+    }
+
     entriesById.set(game.id, {
       gameId: game.id,
       effectiveSteamAppId,
@@ -527,6 +562,7 @@ export function buildLibraryFilterIndex(
       features,
       releaseYear,
       creatorsNormalized,
+      tagsNormalized,
     });
   }
 
@@ -557,6 +593,14 @@ export function buildLibraryFilterIndex(
     }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 
+  const tagCounts: TagFacetCount[] = Array.from(tagMap.entries())
+    .map(([key, val]) => ({
+      key,
+      label: val.label,
+      count: val.count,
+    }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+
   return {
     entriesById,
     osCounts,
@@ -568,6 +612,7 @@ export function buildLibraryFilterIndex(
     maxReleaseYear,
     unknownReleaseYearCount,
     creatorCounts,
+    tagCounts,
   };
 }
 
@@ -586,7 +631,12 @@ export function evaluateLibraryFilter(
     return games;
   }
 
-  const hasOsFilter = state.osCompatibility.length > 0;
+  const supportsWindowsTranslation =
+    launcherService.getHostCapabilities().supportsWindowsTranslation;
+  const effectiveOsCompatibility = supportsWindowsTranslation
+    ? state.osCompatibility
+    : state.osCompatibility.filter((opt) => opt !== 'mac_compat_layer');
+  const hasOsFilter = effectiveOsCompatibility.length > 0;
   const hasCriticTierFilter = state.criticTiers.length > 0;
   const hasMinScoreFilter = state.minCriticScore !== null;
   const hasSentimentFilter = state.reviewSentiments.length > 0;
@@ -602,6 +652,22 @@ export function evaluateLibraryFilter(
     : 0;
   const normalizedCreators = state.creators.map((c) => c.toLowerCase().trim()).filter(Boolean);
   const hasCreatorFilter = normalizedCreators.length > 0;
+  const normalizedTags = (state.tags || []).map((t) => normalizeTagKey(t)).filter(Boolean);
+  const hasTagFilter = normalizedTags.length > 0;
+
+  if (
+    !hasOsFilter &&
+    !hasCriticTierFilter &&
+    !hasMinScoreFilter &&
+    !hasSentimentFilter &&
+    !hasGenreFilter &&
+    !hasFeatureFilter &&
+    !hasYearFilter &&
+    !hasCreatorFilter &&
+    !hasTagFilter
+  ) {
+    return games;
+  }
 
   return games.filter((game) => {
     const entry = index.entriesById.get(game.id);
@@ -613,7 +679,7 @@ export function evaluateLibraryFilter(
         selectedPlatform && selectedPlatform !== 'all'
           ? entry.osFlagsByPlatform.get(selectedPlatform)
           : entry.osFlags;
-      if (!targetOsFlags || !state.osCompatibility.some((opt) => targetOsFlags.has(opt))) {
+      if (!targetOsFlags || !effectiveOsCompatibility.some((opt) => targetOsFlags.has(opt))) {
         return false;
       }
     }
@@ -676,6 +742,19 @@ export function evaluateLibraryFilter(
       }
     }
 
+    // Category 7: Tags ('any' = OR, 'all' = AND)
+    if (hasTagFilter) {
+      if (state.tagMatchMode === 'all') {
+        if (!normalizedTags.every((t) => entry.tagsNormalized.has(t))) {
+          return false;
+        }
+      } else {
+        if (!normalizedTags.some((t) => entry.tagsNormalized.has(t))) {
+          return false;
+        }
+      }
+    }
+
     return true;
   });
 }
@@ -690,6 +769,9 @@ export function describeActiveFilterChips(
   const chips: ActiveFilterChipDescriptor[] = [];
   if (!state) return chips;
 
+  const supportsWindowsTranslation =
+    launcherService.getHostCapabilities().supportsWindowsTranslation;
+
   const genreLabelByKey = new Map<string, string>();
   for (const g of index.genreCounts) {
     genreLabelByKey.set(g.key, g.label);
@@ -698,8 +780,15 @@ export function describeActiveFilterChips(
   for (const c of index.creatorCounts) {
     creatorNameByKey.set(c.key, c.name);
   }
+  const tagLabelByKey = new Map<string, string>();
+  for (const t of index.tagCounts || []) {
+    tagLabelByKey.set(t.key, t.label);
+  }
 
   for (const osOpt of state.osCompatibility) {
+    if (!supportsWindowsTranslation && osOpt === 'mac_compat_layer') {
+      continue;
+    }
     chips.push({
       id: `os:${osOpt}`,
       category: 'OS',
@@ -799,6 +888,21 @@ export function describeActiveFilterChips(
       remove: (prev) => ({
         ...prev,
         creators: prev.creators.filter((item) => item.toLowerCase().trim() !== key),
+      }),
+    });
+  }
+
+  for (const tag of state.tags || []) {
+    const key = normalizeTagKey(tag);
+    if (!key) continue;
+    const display = tagLabelByKey.get(key) || tag;
+    chips.push({
+      id: `tag:${key}`,
+      category: 'Tag',
+      label: display,
+      remove: (prev) => ({
+        ...prev,
+        tags: (prev.tags || []).filter((item) => normalizeTagKey(item) !== key),
       }),
     });
   }

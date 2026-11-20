@@ -20,6 +20,8 @@ import { LibraryFilterPanel } from '../src/components/Library/LibraryFilterPanel
 import { LibraryGridView } from '../src/components/Library/LibraryGridView';
 import { LibrarySidebar } from '../src/components/Library/LibrarySidebar';
 import { TopNavBar } from '../src/components/Navigation/TopNavBar';
+import { launcherService } from '../src/services/launcher/launcherService';
+import * as userTagStorage from '../src/services/storage/userTagStorage';
 import * as openCriticModule from '../src/services/opencritic/openCritic';
 
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -373,6 +375,7 @@ const SAMPLE_GAMES: CanonicalGame[] = [
 describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    window.localStorage.removeItem(userTagStorage.STORAGE_KEY_USER_TAG_OVERRIDES);
   });
 
   describe('Category 1 — OS & Compatibility (mac_native, windows_native, mac_compat_layer)', () => {
@@ -902,6 +905,25 @@ describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider',
           value: 'RPG',
         }).genres
       ).toEqual(['RPG']);
+
+      const tagFilterState = activeGameFilterToLibraryFilterState({
+        type: 'tag',
+        label: 'Tag',
+        value: 'Cozy',
+      });
+      expect(tagFilterState.tags).toEqual(['Cozy']);
+      expect(tagFilterState.genres).toEqual([]);
+      expect(tagFilterState.features).toEqual([]);
+
+      // Even feature-like tag clicks route directly into `tags` (not `features` or `genres`)
+      const coopTagState = activeGameFilterToLibraryFilterState({
+        type: 'tag',
+        label: 'Tag',
+        value: 'Online Co-op',
+      });
+      expect(coopTagState.tags).toEqual(['Online Co-op']);
+      expect(coopTagState.features).toEqual([]);
+      expect(coopTagState.genres).toEqual([]);
     });
 
     it('enforces strict v2 constraints behaviorally: LibrarySidebar does not render LibraryFilterPanel and TopNavBar exposes interactive Storefront & Installed Only controls', () => {
@@ -1061,6 +1083,283 @@ describe('v2 6-Category Library Filter System & Dual-Range Release Year Slider',
 
       expect(matched.length).toBeGreaterThan(0);
       expect(elapsedMs).toBeLessThan(5);
+
+      // Also verify 7-category evaluation including `tags` (ANY and ALL) stays < 5ms
+      const withTagsFilter: LibraryFilterState = {
+        ...multiCategoryFilter,
+        tags: ['Single-player', 'Steam Cloud'],
+        tagMatchMode: 'all',
+      };
+      const tagStartMs = performance.now();
+      const tagMatched = evaluateLibraryFilter(syntheticGames, index, withTagsFilter);
+      const tagElapsedMs = performance.now() - tagStartMs;
+      expect(tagMatched.length).toBeGreaterThan(0);
+      expect(tagElapsedMs).toBeLessThan(5);
+    });
+  });
+
+  describe('Category 7 — Tags (ANY vs ALL, User Overrides, Chips & Progressive Disclosure)', () => {
+    it('indexes effective tags using a single loadUserTagOverrides() call, supports ANY/ALL evaluation, and emits removable Tag chips', () => {
+      // Apply user tag edits on bg3 (+Cozy Night, -Online Co-op) and disco (+Cozy Night)
+      userTagStorage.addUserTagForGame(SAMPLE_GAMES[0], 'Cozy Night', SAMPLE_GAMES[0].tags);
+      userTagStorage.removeUserTagForGame(SAMPLE_GAMES[0], 'Online Co-op', SAMPLE_GAMES[0].tags);
+      userTagStorage.addUserTagForGame(SAMPLE_GAMES[2], 'Cozy Night', SAMPLE_GAMES[2].tags);
+
+      const loadSpy = vi.spyOn(userTagStorage, 'loadUserTagOverrides');
+      const index = buildLibraryFilterIndex(SAMPLE_GAMES);
+      // Preloaded ONCE outside the games loop for < 5ms benchmark compliance
+      expect(loadSpy).toHaveBeenCalledTimes(1);
+
+      const cozyFacet = index.tagCounts.find((t) => t.key === 'cozy night');
+      expect(cozyFacet).toEqual({ key: 'cozy night', label: 'Cozy Night', count: 2 });
+
+      // Single-player is on 5 games, so it ranks ahead of Cozy Night (2)
+      const singlePlayerIdx = index.tagCounts.findIndex((t) => t.key === 'single-player');
+      const cozyIdx = index.tagCounts.findIndex((t) => t.key === 'cozy night');
+      expect(singlePlayerIdx).toBeGreaterThanOrEqual(0);
+      expect(cozyIdx).toBeGreaterThan(singlePlayerIdx);
+
+      // Removed synced tag ('Online Co-op') is excluded from bg3, remaining only on halo
+      const coopMatches = evaluateLibraryFilter(SAMPLE_GAMES, index, {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        tags: ['Online Co-op'],
+        tagMatchMode: 'any',
+      });
+      expect(coopMatches.map((g) => g.id)).toEqual(['game-halo']);
+
+      // ANY (OR) mode: Cozy Night OR Multiplayer -> bg3, disco, retro-tba
+      const anyTagMatches = evaluateLibraryFilter(SAMPLE_GAMES, index, {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        tags: ['cozy night', 'multiplayer'],
+        tagMatchMode: 'any',
+      });
+      expect(anyTagMatches.map((g) => g.id)).toEqual(['game-bg3', 'game-disco', 'game-retro-tba']);
+
+      // ALL (AND) mode: Cozy Night AND Steam Cloud -> bg3 only
+      const allTagMatches = evaluateLibraryFilter(SAMPLE_GAMES, index, {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        tags: ['Cozy Night', 'Steam Cloud'],
+        tagMatchMode: 'all',
+      });
+      expect(allTagMatches.map((g) => g.id)).toEqual(['game-bg3']);
+
+      // countActiveFilterCriteria & isLibraryFilterActive account for tags
+      const tagState: LibraryFilterState = {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        tags: ['cozy night', 'steam cloud'],
+        tagMatchMode: 'all',
+      };
+      expect(countActiveFilterCriteria(tagState)).toBe(2);
+      expect(isLibraryFilterActive(tagState)).toBe(true);
+
+      // describeActiveFilterChips emits removable Tag chips with canonical display label
+      const chips = describeActiveFilterChips(tagState, index);
+      const cozyChip = chips.find((c) => c.id === 'tag:cozy night');
+      expect(cozyChip).toBeDefined();
+      expect(cozyChip?.category).toBe('Tag');
+      expect(cozyChip?.label).toBe('Cozy Night');
+
+      const afterRemove = cozyChip!.remove(tagState);
+      expect(afterRemove.tags).toEqual(['steam cloud']);
+    });
+
+    it('renders full-width 7. Tags card with ANY/ALL mode, search input, top-40 + selected tags progressive disclosure, and updated toolbar tooltip', () => {
+      // Build a catalog with 48 distinct tags so top-40 progressive disclosure engages
+      const manyTags = Array.from({ length: 48 }, (_, i) => `CustomTag-${String(i + 1).padStart(2, '0')}`);
+      const gamesWithManyTags: CanonicalGame[] = [
+        {
+          ...SAMPLE_GAMES[0],
+          id: 'tag-heavy-1',
+          tags: manyTags.slice(0, 48),
+        },
+        {
+          ...SAMPLE_GAMES[1],
+          id: 'tag-heavy-2',
+          tags: manyTags.slice(0, 40),
+        },
+      ];
+
+      const index = buildLibraryFilterIndex(gamesWithManyTags);
+      expect(index.tagCounts.length).toBe(48);
+      // Tail tag ranked #48 (count 1) is outside top-40
+      const tailTag = index.tagCounts[47];
+      expect(tailTag.count).toBe(1);
+
+      // Pre-select the #48 tail tag so we verify selected tags outside top-40 stay visible!
+      let state: LibraryFilterState = {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        tags: [tailTag.key],
+      };
+
+      const harness = createComponentHarness(LibraryFilterPanel, {
+        filterState: state,
+        onChange: (next) => {
+          state = next;
+        },
+        onReset: () => {
+          state = { ...DEFAULT_LIBRARY_FILTER_STATE };
+        },
+        filterIndex: index,
+        filteredCount: 1,
+        totalCount: 2,
+      });
+
+      const tree1 = harness.render();
+      const tagsCard = findElements(
+        tree1,
+        (el) => el.props?.['data-testid'] === 'filter-cat-tags'
+      )[0];
+      expect(tagsCard).toBeDefined();
+      expect(tagsCard.props.className).toContain('md:col-span-2');
+      expect(tagsCard.props.className).toContain('xl:col-span-3');
+      expect(getTextContent(tagsCard)).toContain('7. Tags');
+
+      // Verify search input accessibility & attributes
+      const tagSearchInput = findElements(
+        tree1,
+        (el) => el.props?.['data-testid'] === 'filter-tag-search'
+      )[0];
+      expect(tagSearchInput).toBeDefined();
+      expect(tagSearchInput.props.autoCorrect).toBe('off');
+      expect(tagSearchInput.props.autoCapitalize).toBe('none');
+      expect(tagSearchInput.props.spellCheck).toBe(false);
+
+      const srLabel = findElements(
+        tagsCard,
+        (el) => el.type === 'label' && el.props?.htmlFor === tagSearchInput.props.id
+      )[0];
+      expect(srLabel).toBeDefined();
+      expect(getTextContent(srLabel)).toBe('Search tags');
+
+      // Top 40 + 1 selected tail tag = 41 rendered pills, plus "Show all 48 tags" button
+      const tagPills1 = findElements(
+        tagsCard,
+        (el) =>
+          typeof el.props?.['data-testid'] === 'string' &&
+          el.props['data-testid'].startsWith('filter-tag-') &&
+          !el.props['data-testid'].startsWith('filter-tag-mode-') &&
+          !el.props['data-testid'].startsWith('filter-tag-search')
+      );
+      expect(tagPills1).toHaveLength(41);
+      expect(
+        tagPills1.some((el) => el.props['data-testid'] === `filter-tag-${tailTag.key}` && el.props['aria-pressed'] === true)
+      ).toBe(true);
+
+      const showAllBtn = findElements(
+        tagsCard,
+        (el) => el.props?.['data-testid'] === 'filter-tags-show-all'
+      )[0];
+      expect(showAllBtn).toBeDefined();
+      expect(getTextContent(showAllBtn)).toBe('Show all 48 tags');
+      expect(showAllBtn.props['aria-expanded']).toBe(false);
+
+      // Click "Show all 48 tags" -> all 48 pills render
+      showAllBtn.props.onClick();
+      const tree2 = harness.render();
+      const tagPills2 = findElements(
+        tree2,
+        (el) =>
+          typeof el.props?.['data-testid'] === 'string' &&
+          el.props['data-testid'].startsWith('filter-tag-') &&
+          !el.props['data-testid'].startsWith('filter-tag-mode-') &&
+          !el.props['data-testid'].startsWith('filter-tag-search')
+      );
+      expect(tagPills2).toHaveLength(48);
+
+      // Switch tag match mode to ALL
+      const allModeBtn = findElements(
+        tree2,
+        (el) => el.props?.['data-testid'] === 'filter-tag-mode-all'
+      )[0];
+      expect(allModeBtn).toBeDefined();
+      allModeBtn.props.onClick();
+      expect(state.tagMatchMode).toBe('all');
+
+      // Live search filters immediately across all tags
+      const searchInput2 = findElements(
+        tree2,
+        (el) => el.props?.['data-testid'] === 'filter-tag-search'
+      )[0];
+      searchInput2.props.onChange({ target: { value: 'customtag-48' } });
+      const tree3 = harness.render({ filterState: state });
+      const tagPills3 = findElements(
+        tree3,
+        (el) =>
+          typeof el.props?.['data-testid'] === 'string' &&
+          el.props['data-testid'].startsWith('filter-tag-') &&
+          !el.props['data-testid'].startsWith('filter-tag-mode-') &&
+          !el.props['data-testid'].startsWith('filter-tag-search')
+      );
+      expect(tagPills3).toHaveLength(1);
+      expect(tagPills3[0].props['data-testid']).toBe('filter-tag-customtag-48');
+
+      // Verify LibraryGridToolbar tooltip no longer hardcodes "6-category"
+      const gridHarness = createComponentHarness(LibraryGridView, {
+        games: SAMPLE_GAMES,
+        onSelectGame: () => {},
+        libraryFilterIndex: buildLibraryFilterIndex(SAMPLE_GAMES),
+      });
+      const gridTree = gridHarness.render();
+      const filterToggle = findElements(
+        gridTree,
+        (el) => el.props?.['data-testid'] === 'library-filter-toggle-btn'
+      )[0];
+      expect(filterToggle?.props?.title).toBe('Open library filter panel');
+    });
+  });
+
+  describe('Task 5 — Windows (win32) mac_compat_layer Isolation in Filter Engine & Panel', () => {
+    it('hides filter-os-mac_compat_layer, titles Category 1 "1. Operating System", and ignores mac_compat_layer in evaluation & chips on win32', () => {
+      vi.spyOn(launcherService, 'getHostPlatform').mockReturnValue('win32');
+
+      const winIndex = buildLibraryFilterIndex(SAMPLE_GAMES);
+      expect(winIndex.osCounts.mac_compat_layer).toBe(0);
+      expect(winIndex.osCounts.windows_native).toBe(5);
+      expect(winIndex.osCounts.mac_native).toBe(2);
+
+      // evaluateLibraryFilter strips mac_compat_layer on win32 instead of returning 0 games
+      const compatOnlyResult = evaluateLibraryFilter(SAMPLE_GAMES, winIndex, {
+        ...DEFAULT_LIBRARY_FILTER_STATE,
+        osCompatibility: ['mac_compat_layer'],
+      });
+      expect(compatOnlyResult.map((g) => g.id)).toEqual(SAMPLE_GAMES.map((g) => g.id));
+
+      // describeActiveFilterChips strips mac_compat_layer on win32 while preserving valid chips
+      const winChips = describeActiveFilterChips(
+        {
+          ...DEFAULT_LIBRARY_FILTER_STATE,
+          osCompatibility: ['windows_native', 'mac_compat_layer'],
+        },
+        winIndex
+      );
+      expect(winChips.map((c) => c.id)).toEqual(['os:windows_native']);
+
+      // LibraryFilterPanel hides CrossOver / Wine (Mac) and uses "1. Operating System" heading
+      const panelHarness = createComponentHarness(LibraryFilterPanel, {
+        filterState: DEFAULT_LIBRARY_FILTER_STATE,
+        onChange: () => {},
+        onReset: () => {},
+        filterIndex: winIndex,
+        filteredCount: SAMPLE_GAMES.length,
+        totalCount: SAMPLE_GAMES.length,
+      });
+      const panelTree = panelHarness.render();
+      const osCard = findElements(
+        panelTree,
+        (el) => el.props?.['data-testid'] === 'filter-cat-os'
+      )[0];
+      expect(osCard).toBeDefined();
+      const osCardText = getTextContent(osCard);
+      expect(osCardText).toContain('1. Operating System');
+      expect(osCardText).not.toContain('1. OS & Compatibility');
+      expect(osCardText).not.toContain('CrossOver / Wine (Mac)');
+
+      expect(
+        findElements(panelTree, (el) => el.props?.['data-testid'] === 'filter-os-mac_compat_layer')
+      ).toHaveLength(0);
+      expect(
+        findElements(panelTree, (el) => el.props?.['data-testid'] === 'filter-os-windows_native')
+      ).toHaveLength(1);
     });
   });
 });

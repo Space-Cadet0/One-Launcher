@@ -346,9 +346,9 @@ export const SteamLibraryActionBar: React.FC<SteamLibraryActionBarProps> = ({
     Boolean(activePlatform?.installed);
 
   const isWindowsHost =
-    (typeof (launcherService as { isWindowsHost?: () => boolean }).isWindowsHost === 'function' &&
-      (launcherService as { isWindowsHost: () => boolean }).isWindowsHost()) ||
-    (typeof window !== 'undefined' && window.electronAPI?.platform === 'win32');
+    typeof launcherService.getHostCapabilities === 'function'
+      ? launcherService.getHostCapabilities().isWindows
+      : typeof window !== 'undefined' && window.electronAPI?.platform === 'win32';
 
   const isBottledRunningSession = useMemo(() => {
     if (!isRunning || isWindowsHost) return false;

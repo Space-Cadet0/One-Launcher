@@ -139,7 +139,7 @@ export function renderLibraryGridToolbar({
                 ? 'bg-steam-accent/20 border-steam-accent text-white shadow-sm'
                 : 'bg-[#16202d] border-steam-border text-steam-text hover:text-white hover:border-steam-accent/60'
             }`}
-            title="Open 6-category library filter panel"
+            title="Open library filter panel"
           >
             <SlidersHorizontal aria-hidden="true" className="w-3.5 h-3.5 text-steam-accent" />
             <span>Filter</span>
@@ -247,7 +247,7 @@ export function renderLibraryGridToolbar({
         </div>
       </div>
 
-      {/* Collapsible 6-Category Filter Panel */}
+      {/* Collapsible Library Filter Panel */}
       {isFilterPanelOpen && (
         <LibraryFilterPanel
           filterState={effectiveFilterState}
