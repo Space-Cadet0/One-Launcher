@@ -194,6 +194,7 @@ export interface CompatibilityLayerSectionProps {
   wineSyncMode?: WineSyncMode;
   onSelectWineSyncMode?: (mode: WineSyncMode) => void;
   displayOverrideCount?: number;
+  /** @deprecated Compatibility & Engine Tweaks now renders directly in the main Compatibility & Graphics card */
   compatOverrideCount?: number;
   renderSectionPart?: 'all' | 'primary' | 'advanced';
   /** @deprecated Legacy embedded runner management props retained optional for call-site compatibility */
@@ -526,14 +527,6 @@ function CompatibilityLayerSectionImpl(
       (isLegacy96DpiActive ? 1 : 0) +
       (effectiveEmulateModeset !== undefined ? 1 : 0);
 
-  const computedCompatOverrideCount =
-    props.compatOverrideCount ??
-    (effectiveShowD3DMetalVersionSelector && crossoverD3DMetalVersion !== 'auto' ? 1 : 0) +
-      (effectiveMetalfxSpatialUpscaleFactor !== undefined ? 1 : 0) +
-      (effectiveWineSyncMode !== 'msync' ? 1 : 0) +
-      (effectiveForceLargeAddressAware ? 1 : 0) +
-      (winePrefixPath.trim() ? 1 : 0);
-
   const winePrefixInputId = `${idPrefix}-wine-prefix-path`;
   const winePrefixHintId = `${idPrefix}-wine-prefix-hint`;
   const graphicsBackendSelectId = `${idPrefix}-graphics-backend`;
@@ -568,7 +561,10 @@ function CompatibilityLayerSectionImpl(
       className={showPrimary && showAdvanced ? 'space-y-4' : 'space-y-3'}
     >
       {showPrimary && (
-        <div className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-3.5">
+        <div
+          data-testid="compatibility-graphics-card"
+          className="rounded-lg bg-[#0e151f] border border-[#223447] p-3.5 space-y-3.5"
+        >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Cpu className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
@@ -830,6 +826,80 @@ function CompatibilityLayerSectionImpl(
             </div>
           )}
 
+          {/* Per-Game D3DMetal Version Switcher (CrossOver Preview dual D3DMetal) */}
+          {preview.visibleSections.crossoverRendering && effectiveShowD3DMetalVersionSelector && (
+            <div
+              data-testid="crossover-d3dmetal-version-section"
+              className="rounded-lg bg-[#141d2b] border border-[#26384d] p-2.5 space-y-2"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                  D3DMetal Engine Version
+                </span>
+                <span className="text-[10px] text-steam-subtext">
+                  Bundled: v{effectivePrimaryD3DVer} &amp; v{effectiveFallbackD3DVer}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {[
+                  {
+                    value: 'auto' as CrossOverD3DMetalVersion,
+                    testId: 'd3dmetal-version-auto',
+                    title: `Auto (v${effectivePrimaryD3DVer})`,
+                    desc: `Default D3DMetal ${effectivePrimaryD3DVer} with compatdb fallback`,
+                  },
+                  {
+                    value: '4' as CrossOverD3DMetalVersion,
+                    testId: 'd3dmetal-version-4',
+                    title: `Force v${effectivePrimaryD3DVer}`,
+                    desc: `Forces lib/apple_gptk (D3DMetal ${effectivePrimaryD3DVer})`,
+                  },
+                  {
+                    value: '3' as CrossOverD3DMetalVersion,
+                    testId: 'd3dmetal-version-3',
+                    title: `Force v${effectiveFallbackD3DVer}`,
+                    desc: `Fallback to lib/apple_gptk3 (D3DMetal ${effectiveFallbackD3DVer})`,
+                  },
+                ].map((item) => {
+                  const isSelected = crossoverD3DMetalVersion === item.value;
+                  return (
+                    <button
+                      key={item.value}
+                      type="button"
+                      data-testid={item.testId}
+                      aria-pressed={isSelected}
+                      onClick={() => onChangeCrossoverD3DMetalVersion(item.value)}
+                      className={`min-h-[28px] text-left rounded-lg p-2 border transition-colors cursor-pointer flex flex-col justify-between gap-1 ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
+                        isSelected
+                          ? 'bg-sky-500/15 border-sky-400 text-white'
+                          : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:border-[#385370] hover:text-white'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1.5">
+                        <span
+                          className={`text-[11px] font-bold leading-tight ${
+                            isSelected ? 'text-sky-300' : 'text-white'
+                          }`}
+                        >
+                          {item.title}
+                        </span>
+                        {isSelected && (
+                          <CheckCircle2
+                            className="w-3.5 h-3.5 text-sky-400 shrink-0"
+                            aria-hidden="true"
+                          />
+                        )}
+                      </div>
+                      <span className="text-[10px] text-steam-subtext leading-snug">
+                        {item.desc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Primary 4 & 5: Display Mode & Frame Rate Limit */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-3">
             <div className="ol-subgrid-field">
@@ -956,6 +1026,161 @@ function CompatibilityLayerSectionImpl(
               />
             </div>
           )}
+
+          {/* DXMT MetalFX Spatial Upscaling (<select>) */}
+          {showMetalfxSpatialControl && (
+            <div className="space-y-1.5">
+              <label
+                htmlFor={metalfxSpatialSelectId}
+                className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
+              >
+                <Sparkles className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                <span>MetalFX Spatial Upscaling (DXMT)</span>
+              </label>
+              <LaunchSelect
+                id={metalfxSpatialSelectId}
+                data-testid="metalfx-spatial-upscale-select"
+                aria-describedby={metalfxSpatialHintId}
+                value={
+                  effectiveMetalfxSpatialUpscaleFactor !== undefined
+                    ? String(effectiveMetalfxSpatialUpscaleFactor)
+                    : ''
+                }
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === '') {
+                    handleMetalfxSpatialUpscaleChange(undefined);
+                    return;
+                  }
+                  const parsed = Number(val);
+                  handleMetalfxSpatialUpscaleChange(
+                    Number.isFinite(parsed) && parsed > 1 ? parsed : undefined
+                  );
+                }}
+              >
+                <option value="">Off (Native Resolution)</option>
+                <option value="1.33">1.33x (Ultra Quality)</option>
+                <option value="1.5">1.5x (Quality)</option>
+                <option value="1.7">1.7x (Balanced)</option>
+                <option value="2">2.0x (Performance)</option>
+              </LaunchSelect>
+              <p id={metalfxSpatialHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Applies DXMT driver-level MetalFX spatial swapchain upscaling for DirectX 10/11
+                games without built-in DLSS.
+              </p>
+            </div>
+          )}
+
+          {/* Compatibility & Engine Tweaks (directly visible inside Compatibility & Graphics) */}
+          <div className="pt-3 border-t border-[#1e2f42] space-y-3.5">
+            {/* CPU Thread Synchronization (<fieldset> Radio Group) */}
+            <SegmentedRadioGroup
+              name={`${idPrefix}-wine-sync-mode`}
+              legend={
+                <>
+                  <Activity className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
+                  <span>CPU Thread Synchronization</span>
+                </>
+              }
+              value={effectiveWineSyncMode}
+              options={[
+                {
+                  value: 'msync',
+                  label: 'MSync',
+                  badge: 'Recommended',
+                  description: 'macOS Mach semaphores for lowest multi-threaded latency.',
+                  testId: 'wine-sync-msync',
+                },
+                {
+                  value: 'esync',
+                  label: 'ESync',
+                  description: 'Eventfd compatibility mode when MSync has regressions.',
+                  testId: 'wine-sync-esync',
+                },
+                {
+                  value: 'default',
+                  label: 'Default',
+                  description: 'Legacy wineserver sync for older single-threaded titles.',
+                  testId: 'wine-sync-default',
+                },
+              ]}
+              onChange={handleSelectSyncMode}
+              columns={3}
+              variant="cards"
+              testId="wine-sync-mode-group"
+            />
+
+            {/* 32-Bit 4 GB Address Space Override */}
+            <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2.5">
+              <div className="min-w-0 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span id={forceLaaLabelId} className="text-xs font-semibold text-white">
+                    32-Bit 4 GB Address Space Override
+                  </span>
+                  {isConfirmed64BitBinary && (
+                    <span
+                      data-testid="force-laa-64bit-badge"
+                      className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/15 text-steam-subtext font-medium"
+                    >
+                      64-bit Binary — Not Needed
+                    </span>
+                  )}
+                </div>
+                <p id={forceLaaHintId} className="text-[10px] text-steam-subtext leading-snug">
+                  {isLaaNotNeededAndOff
+                    ? 'Detected a 64-bit Windows executable (PE32+); WINE_LARGE_ADDRESS_AWARE applies only to 32-bit x86 binaries.'
+                    : 'Forces WINE_LARGE_ADDRESS_AWARE=1 for legacy 32-bit x86 games hitting 2 GB out-of-memory crashes.'}
+                </p>
+              </div>
+              <SwitchControl
+                dataTestId="toggle-force-laa"
+                checked={effectiveForceLargeAddressAware}
+                disabled={isLaaNotNeededAndOff}
+                ariaLabelledBy={forceLaaLabelId}
+                ariaDescribedBy={forceLaaHintId}
+                onChange={handleToggleForceLaa}
+                tone="amber"
+              />
+            </div>
+
+            {/* Custom Wine Prefix Path */}
+            <div className="space-y-1.5">
+              <label
+                htmlFor={winePrefixInputId}
+                className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
+              >
+                {isCrossOverFamily
+                  ? 'Custom WinePrefix Directory (Optional Bottle Override)'
+                  : 'WinePrefix Directory'}
+              </label>
+              <div className="flex items-center gap-1.5">
+                <input
+                  id={winePrefixInputId}
+                  type="text"
+                  aria-describedby={winePrefixHintId}
+                  value={winePrefixPath}
+                  onChange={(e) => onChangeWinePrefixPath(e.target.value)}
+                  placeholder={winePrefixPlaceholder}
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  className={`${LAUNCH_TEXT_INPUT_CLASSES} flex-1 font-mono`}
+                />
+                <button
+                  type="button"
+                  onClick={onBrowseWinePrefix}
+                  className={`min-h-6 h-9 px-3 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
+                >
+                  Browse...
+                </button>
+              </div>
+              <p id={winePrefixHintId} className="text-[10px] text-steam-subtext leading-snug">
+                Self-contained Windows C: drive environment containing registry, saves, and DirectX
+                runtime.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1128,242 +1353,6 @@ function CompatibilityLayerSectionImpl(
               </LaunchSelect>
               <p id={emulateModesetHintId} className="text-[10px] text-steam-subtext leading-snug">
                 Legacy X11 Driver\EmulateModeset fallback without changing macOS display mode.
-              </p>
-            </div>
-          </LaunchDisclosure>
-
-          {/* Disclosure 2: Compatibility & Engine Tweaks */}
-          <LaunchDisclosure
-            summary="Compatibility & Engine Tweaks"
-            subtitle="MetalFX spatial, CPU sync, D3DMetal version & Wine prefix"
-            overrideCount={computedCompatOverrideCount}
-            testId="disclosure-compat-tweaks"
-            summaryTestId="disclosure-compat-tweaks-summary"
-            overrideBadgeTestId="disclosure-compat-tweaks-badge"
-          >
-            {/* Per-Game D3DMetal Version Switcher */}
-            {preview.visibleSections.crossoverRendering && effectiveShowD3DMetalVersionSelector && (
-              <div
-                data-testid="crossover-d3dmetal-version-section"
-                className="rounded-lg bg-[#141d2b] border border-[#26384d] p-2.5 space-y-2"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-1">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-sky-300">
-                    D3DMetal Engine Version
-                  </span>
-                  <span className="text-[10px] text-steam-subtext">
-                    Bundled: v{effectivePrimaryD3DVer} &amp; v{effectiveFallbackD3DVer}
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                  {[
-                    {
-                      value: 'auto' as CrossOverD3DMetalVersion,
-                      testId: 'd3dmetal-version-auto',
-                      title: `Auto (v${effectivePrimaryD3DVer})`,
-                      desc: `Default D3DMetal ${effectivePrimaryD3DVer} with compatdb fallback`,
-                    },
-                    {
-                      value: '4' as CrossOverD3DMetalVersion,
-                      testId: 'd3dmetal-version-4',
-                      title: `Force v${effectivePrimaryD3DVer}`,
-                      desc: `Forces lib/apple_gptk (D3DMetal ${effectivePrimaryD3DVer})`,
-                    },
-                    {
-                      value: '3' as CrossOverD3DMetalVersion,
-                      testId: 'd3dmetal-version-3',
-                      title: `Force v${effectiveFallbackD3DVer}`,
-                      desc: `Fallback to lib/apple_gptk3 (D3DMetal ${effectiveFallbackD3DVer})`,
-                    },
-                  ].map((item) => {
-                    const isSelected = crossoverD3DMetalVersion === item.value;
-                    return (
-                      <button
-                        key={item.value}
-                        type="button"
-                        data-testid={item.testId}
-                        aria-pressed={isSelected}
-                        onClick={() => onChangeCrossoverD3DMetalVersion(item.value)}
-                        className={`min-h-[28px] text-left rounded-lg p-2 border transition-colors cursor-pointer flex flex-col justify-between gap-1 ${LAUNCH_BUTTON_FOCUS_CLASSES} ${
-                          isSelected
-                            ? 'bg-sky-500/15 border-sky-400 text-white'
-                            : 'bg-[#0e151f] border-[#26384d] text-steam-subtext hover:border-[#385370] hover:text-white'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-1.5">
-                          <span
-                            className={`text-[11px] font-bold leading-tight ${
-                              isSelected ? 'text-sky-300' : 'text-white'
-                            }`}
-                          >
-                            {item.title}
-                          </span>
-                          {isSelected && (
-                            <CheckCircle2
-                              className="w-3.5 h-3.5 text-sky-400 shrink-0"
-                              aria-hidden="true"
-                            />
-                          )}
-                        </div>
-                        <span className="text-[10px] text-steam-subtext leading-snug">
-                          {item.desc}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Preserved DXMT MetalFX Spatial Upscaling (<select>) */}
-            {showMetalfxSpatialControl && (
-              <div className="space-y-1.5">
-                <label
-                  htmlFor={metalfxSpatialSelectId}
-                  className="text-[10px] font-bold uppercase tracking-wider text-steam-subtext flex items-center gap-1"
-                >
-                  <Sparkles className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-                  <span>MetalFX Spatial Upscaling (DXMT)</span>
-                </label>
-                <LaunchSelect
-                  id={metalfxSpatialSelectId}
-                  data-testid="metalfx-spatial-upscale-select"
-                  aria-describedby={metalfxSpatialHintId}
-                  value={
-                    effectiveMetalfxSpatialUpscaleFactor !== undefined
-                      ? String(effectiveMetalfxSpatialUpscaleFactor)
-                      : ''
-                  }
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === '') {
-                      handleMetalfxSpatialUpscaleChange(undefined);
-                      return;
-                    }
-                    const parsed = Number(val);
-                    handleMetalfxSpatialUpscaleChange(
-                      Number.isFinite(parsed) && parsed > 1 ? parsed : undefined
-                    );
-                  }}
-                >
-                  <option value="">Off (Native Resolution)</option>
-                  <option value="1.33">1.33x (Ultra Quality)</option>
-                  <option value="1.5">1.5x (Quality)</option>
-                  <option value="1.7">1.7x (Balanced)</option>
-                  <option value="2">2.0x (Performance)</option>
-                </LaunchSelect>
-                <p id={metalfxSpatialHintId} className="text-[10px] text-steam-subtext leading-snug">
-                  Applies DXMT driver-level MetalFX spatial swapchain upscaling for DirectX 10/11
-                  games without built-in DLSS.
-                </p>
-              </div>
-            )}
-
-            {/* CPU Thread Synchronization (<fieldset> Radio Group) */}
-            <SegmentedRadioGroup
-              name={`${idPrefix}-wine-sync-mode`}
-              legend={
-                <>
-                  <Activity className="w-3 h-3 text-sky-400 shrink-0" aria-hidden="true" />
-                  <span>CPU Thread Synchronization</span>
-                </>
-              }
-              value={effectiveWineSyncMode}
-              options={[
-                {
-                  value: 'msync',
-                  label: 'MSync',
-                  badge: 'Recommended',
-                  description: 'macOS Mach semaphores for lowest multi-threaded latency.',
-                  testId: 'wine-sync-msync',
-                },
-                {
-                  value: 'esync',
-                  label: 'ESync',
-                  description: 'Eventfd compatibility mode when MSync has regressions.',
-                  testId: 'wine-sync-esync',
-                },
-                {
-                  value: 'default',
-                  label: 'Default',
-                  description: 'Legacy wineserver sync for older single-threaded titles.',
-                  testId: 'wine-sync-default',
-                },
-              ]}
-              onChange={handleSelectSyncMode}
-              columns={3}
-              variant="cards"
-              testId="wine-sync-mode-group"
-            />
-
-            {/* 32-Bit 4 GB Address Space Override */}
-            <div className="flex items-center justify-between gap-3 rounded-lg bg-[#141d2b] border border-[#26384d] px-3 py-2.5">
-              <div className="min-w-0 space-y-0.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span id={forceLaaLabelId} className="text-xs font-semibold text-white">
-                    32-Bit 4 GB Address Space Override
-                  </span>
-                  {isConfirmed64BitBinary && (
-                    <span
-                      data-testid="force-laa-64bit-badge"
-                      className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/15 text-steam-subtext font-medium"
-                    >
-                      64-bit Binary — Not Needed
-                    </span>
-                  )}
-                </div>
-                <p id={forceLaaHintId} className="text-[10px] text-steam-subtext leading-snug">
-                  {isLaaNotNeededAndOff
-                    ? 'Detected a 64-bit Windows executable (PE32+); WINE_LARGE_ADDRESS_AWARE applies only to 32-bit x86 binaries.'
-                    : 'Forces WINE_LARGE_ADDRESS_AWARE=1 for legacy 32-bit x86 games hitting 2 GB out-of-memory crashes.'}
-                </p>
-              </div>
-              <SwitchControl
-                dataTestId="toggle-force-laa"
-                checked={effectiveForceLargeAddressAware}
-                disabled={isLaaNotNeededAndOff}
-                ariaLabelledBy={forceLaaLabelId}
-                ariaDescribedBy={forceLaaHintId}
-                onChange={handleToggleForceLaa}
-                tone="amber"
-              />
-            </div>
-
-            {/* Custom Wine Prefix Path */}
-            <div className="space-y-1.5">
-              <label
-                htmlFor={winePrefixInputId}
-                className="block text-[10px] font-bold uppercase tracking-wider text-steam-subtext"
-              >
-                {isCrossOverFamily
-                  ? 'Custom WinePrefix Directory (Optional Bottle Override)'
-                  : 'WinePrefix Directory'}
-              </label>
-              <div className="flex items-center gap-1.5">
-                <input
-                  id={winePrefixInputId}
-                  type="text"
-                  aria-describedby={winePrefixHintId}
-                  value={winePrefixPath}
-                  onChange={(e) => onChangeWinePrefixPath(e.target.value)}
-                  placeholder={winePrefixPlaceholder}
-                  autoComplete="off"
-                  spellCheck={false}
-                  autoCorrect="off"
-                  autoCapitalize="off"
-                  className={`${LAUNCH_TEXT_INPUT_CLASSES} flex-1 font-mono`}
-                />
-                <button
-                  type="button"
-                  onClick={onBrowseWinePrefix}
-                  className={`min-h-6 h-9 px-3 rounded-lg bg-[#1b2838] hover:bg-[#25374d] border border-[#2a475e] text-xs font-semibold text-sky-300 hover:text-white transition-colors cursor-pointer shrink-0 ${LAUNCH_BUTTON_FOCUS_CLASSES}`}
-                >
-                  Browse...
-                </button>
-              </div>
-              <p id={winePrefixHintId} className="text-[10px] text-steam-subtext leading-snug">
-                Self-contained Windows C: drive environment containing registry, saves, and DirectX
-                runtime.
               </p>
             </div>
           </LaunchDisclosure>

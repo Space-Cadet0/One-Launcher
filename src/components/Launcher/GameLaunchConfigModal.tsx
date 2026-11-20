@@ -234,7 +234,6 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
     wineSyncMode: form.wineSyncMode,
     onSelectWineSyncMode: form.handleSelectWineSyncMode,
     displayOverrideCount: form.displayOverrideCount,
-    compatOverrideCount: form.compatOverrideCount,
   };
 
   const showExecutionDisclosure =
@@ -416,7 +415,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
             mode: 'storefront_uri_only',
           })}
 
-          {/* Primary Controls 2-4: Compatibility Layer, Bottle, Graphics Backend, Display Mode, FPS Cap & DLSS (bottled only) */}
+          {/* Primary Controls 2-4: Compatibility & Graphics (Layer, Bottle, Backend, D3DMetal Version, Display Mode, FPS Cap, DLSS, MetalFX Spatial, CPU Sync, 4GB LAA & WinePrefix) */}
           {renderSection(CompatibilityLayerSection, CompatibilityLayerSectionBase, {
             ...compatSectionProps,
             renderSectionPart: 'primary',
@@ -460,13 +459,13 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
 
           {/* Collapsed Native <details> Disclosures for Advanced & Rare Overrides */}
           <div className="space-y-2.5">
-            {/* Disclosures 1 & 2 (Bottled): Display & Legacy Scaling Overrides + Compatibility & Engine Tweaks */}
+            {/* Disclosure 1 (Bottled): Display & Legacy Scaling Overrides */}
             {renderSection(CompatibilityLayerSection, CompatibilityLayerSectionBase, {
               ...compatSectionProps,
               renderSectionPart: 'advanced',
             })}
 
-            {/* Disclosure 3: Execution, Arguments & Hooks */}
+            {/* Disclosure 2: Execution, Arguments & Hooks */}
             {showExecutionDisclosure && (
               <LaunchDisclosure
                 summary="Execution, Arguments & Hooks"
@@ -508,7 +507,7 @@ export const GameLaunchConfigModal: React.FC<GameLaunchConfigModalProps> = ({
               </LaunchDisclosure>
             )}
 
-            {/* Disclosure 4: Launcher & Storefront Lifecycle Overrides */}
+            {/* Disclosure 3: Launcher & Storefront Lifecycle Overrides */}
             <LaunchDisclosure
               summary="Launcher & Storefront Lifecycle Overrides"
               subtitle="Per-game in-game behavior & storefront policy"

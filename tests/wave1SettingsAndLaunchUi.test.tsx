@@ -726,14 +726,33 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         expect(legacy96Switch!.props['aria-checked']).toBe(false);
         expect(findByTestId(tree, 'disclosure-display-overrides-badge')).toBeUndefined();
 
-        // Compat disclosure shows "1 override" for metalfxSpatialUpscaleFactor: 1.5
-        const compatBadge = findByTestId(tree, 'disclosure-compat-tweaks-badge');
-        expect(compatBadge).toBeDefined();
-        expect(getTextContent(compatBadge)).toBe('1 override');
+        // Compatibility & Engine Tweaks controls render directly inside the main Compatibility & Graphics card (not collapsed in a <details> accordion)
+        expect(findByTestId(tree, 'disclosure-compat-tweaks')).toBeUndefined();
+        expect(findByTestId(tree, 'disclosure-compat-tweaks-badge')).toBeUndefined();
+        const compatGraphicsCard = findByTestId(tree, 'compatibility-graphics-card');
+        expect(compatGraphicsCard).toBeDefined();
+        expect(findElements(compatGraphicsCard, (el) => el.type === 'details')).toHaveLength(0);
+        expect(findByTestId(compatGraphicsCard, 'metalfx-spatial-upscale-select')).toBeDefined();
+        expect(findByTestId(compatGraphicsCard, 'wine-sync-mode-group')).toBeDefined();
+        expect(findByTestId(compatGraphicsCard, 'toggle-force-laa')).toBeDefined();
+        expect(
+          findElements(
+            compatGraphicsCard,
+            (el) =>
+              el.type === 'input' &&
+              typeof el.props?.id === 'string' &&
+              el.props.id.endsWith('-wine-prefix-path')
+          )
+        ).toHaveLength(1);
 
-        // All 4 native <details> disclosures start collapsed and contain ZERO headings inside <summary>
+        // All 3 remaining native <details> disclosures start collapsed and contain ZERO headings inside <summary>
         const detailsNodes = findElements(tree, (el) => el.type === 'details');
-        expect(detailsNodes).toHaveLength(4);
+        expect(detailsNodes).toHaveLength(3);
+        expect(detailsNodes.map((d) => d.props?.['data-testid'])).toEqual([
+          'disclosure-display-overrides',
+          'disclosure-execution-hooks',
+          'disclosure-lifecycle-overrides',
+        ]);
         for (const detailsEl of detailsNodes) {
           expect(detailsEl.props.open).toBeUndefined();
           const summaryEl = findElements(detailsEl, (el) => el.type === 'summary')[0];
@@ -952,6 +971,125 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       expect(winHtml).toContain('Vulkan / DXVK-wrapped games');
       expect(winHtml).not.toContain('DXVK Overlay HUD (DXVK_HUD=1)');
       expect(winHtml).not.toContain('data-section="compatibility-layer-settings"');
+    });
+
+    it('renders all Compatibility & Engine Tweaks controls (including D3DMetal version switcher) directly inside the main Compatibility & Graphics card', async () => {
+      const previewLayer = createCrossOverLayerFixture({
+        id: 'crossover-preview',
+        type: 'crossover_preview',
+        name: 'CrossOver Preview',
+        version: '27.0.0',
+        d3dmetalVersion: '4.0b3',
+        availableD3DMetalVersions: [
+          { id: '4', version: '4.0b3', label: 'D3DMetal 4.0b3 (Default)', isDefault: true },
+          { id: '3', version: '3.0', label: 'D3DMetal 3.0 (Fallback)', isDefault: false },
+        ],
+      });
+
+      const game = makeCanonicalGameFixture({
+        id: 'synth-preview-compat-card',
+        title: 'Synthetic Preview Bottled Title',
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '999002',
+            installed: true,
+            installPath: '/tmp/synthetic-bottles/OneLauncher/drive_c/Games/PreviewSynth',
+            executablePath:
+              '/tmp/synthetic-bottles/OneLauncher/drive_c/Games/PreviewSynth/Game.exe',
+          },
+        ],
+      });
+
+      vi.spyOn(launcherService, 'getPerformanceSettings').mockReturnValue({
+        ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS,
+      });
+      vi.spyOn(launcherService, 'getLaunchConfig').mockReturnValue({
+        gameId: game.id,
+        preferredPlatformId: 'steam',
+        launchMethod: 'compatibility_layer',
+        compatibilityLayer: 'crossover_preview',
+        crossoverGraphicsBackend: 'auto',
+        crossoverD3DMetalVersion: '3',
+        metalfxSpatialUpscaleFactor: 1.7,
+        wineMsync: false,
+        wineEsync: true,
+        forceLargeAddressAware: true,
+        winePrefixPath: '/tmp/synthetic-bottles/CustomPrefix',
+      });
+      vi.spyOn(launcherService, 'getCompatibilityLayers').mockReturnValue([previewLayer]);
+      vi.spyOn(launcherService, 'detectCompatibilityLayers').mockResolvedValue([previewLayer]);
+      vi.spyOn(launcherService, 'isGameInstalled').mockReturnValue(true);
+      vi.spyOn(launcherService, 'getInstalledRecordForGame').mockReturnValue({
+        platformId: 'steam',
+        platformGameId: '999002',
+        installPath: '/tmp/synthetic-bottles/OneLauncher/drive_c/Games/PreviewSynth',
+        executablePath: '/tmp/synthetic-bottles/OneLauncher/drive_c/Games/PreviewSynth/Game.exe',
+        isWindowsBinaryOnMac: true,
+        executableArchitecture: 'x86',
+        is32BitExecutable: true,
+      });
+
+      const renderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
+        isOpen: true,
+        game,
+        initialPlatformId: 'steam',
+        onClose: () => {},
+      });
+
+      try {
+        renderer.render();
+        await Promise.resolve();
+        const tree = renderer.render();
+
+        const compatCard = findByTestId(tree, 'compatibility-graphics-card');
+        expect(compatCard).toBeDefined();
+        expect(findByTestId(tree, 'disclosure-compat-tweaks')).toBeUndefined();
+        expect(findElements(compatCard, (el) => el.type === 'details')).toHaveLength(0);
+
+        // All 5 former Compatibility & Engine Tweaks controls live directly inside compatibility-graphics-card
+        expect(findByTestId(compatCard, 'crossover-d3dmetal-version-section')).toBeDefined();
+        expect(findByTestId(compatCard, 'd3dmetal-version-auto')).toBeDefined();
+        expect(findByTestId(compatCard, 'd3dmetal-version-4')).toBeDefined();
+        expect(findByTestId(compatCard, 'd3dmetal-version-3')!.props['aria-pressed']).toBe(true);
+
+        const spatialSelect = findByTestId(compatCard, 'metalfx-spatial-upscale-select');
+        expect(spatialSelect).toBeDefined();
+        expect(spatialSelect!.props.value).toBe('1.7');
+
+        expect(findByTestId(compatCard, 'wine-sync-mode-group')).toBeDefined();
+        const esyncRadio = findElements(
+          findByTestId(compatCard, 'wine-sync-esync'),
+          (el) => el.type === 'input'
+        )[0];
+        expect(esyncRadio.props.checked).toBe(true);
+
+        const laaSwitch = findByTestId(compatCard, 'toggle-force-laa');
+        expect(laaSwitch).toBeDefined();
+        expect(laaSwitch!.props['aria-checked']).toBe(true);
+
+        const prefixInputs = findElements(
+          compatCard,
+          (el) =>
+            el.type === 'input' &&
+            typeof el.props?.id === 'string' &&
+            el.props.id.endsWith('-wine-prefix-path')
+        );
+        expect(prefixInputs).toHaveLength(1);
+        expect(prefixInputs[0].props.value).toBe('/tmp/synthetic-bottles/CustomPrefix');
+
+        // None of the 5 controls appear inside any <details> disclosure
+        const detailsNodes = findElements(tree, (el) => el.type === 'details');
+        expect(detailsNodes).toHaveLength(3);
+        for (const detailsEl of detailsNodes) {
+          expect(findByTestId(detailsEl, 'crossover-d3dmetal-version-section')).toBeUndefined();
+          expect(findByTestId(detailsEl, 'metalfx-spatial-upscale-select')).toBeUndefined();
+          expect(findByTestId(detailsEl, 'wine-sync-mode-group')).toBeUndefined();
+          expect(findByTestId(detailsEl, 'toggle-force-laa')).toBeUndefined();
+        }
+      } finally {
+        renderer.unmount();
+      }
     });
   });
 
