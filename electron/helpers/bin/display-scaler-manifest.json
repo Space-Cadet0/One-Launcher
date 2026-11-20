@@ -28,26 +28,26 @@
     "electron/helpers/display_scaler/display_scaler.h": "d873264b1c66057f209465d0a2f5c83ef1f01c408d6827b321bf2ae425d87abe",
     "electron/helpers/display_scaler/display_scaler_internal.h": "65adc370a0a59155e35c7cc88fdbb24f92c2137e76b44e742196d25e3be54a29",
     "electron/helpers/display_scaler/display_scaler_math.c": "882124dfa37416b39d0b5f80add787245110fff822b2e1fe7aa9d2fce02604d1",
-    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "1aa2bc016a9ba5a87c22fe4a09fa879b01c6d4cda9a0f333bf5492f2415bfdd5",
+    "electron/helpers/display_scaler/display_scaler_gl_gdi.c": "4950c13f8206c0bc5b22c951718acaa7ad601e11b4c3bfefec104d3a090f0934",
     "electron/helpers/display_scaler/display_scaler_window.c": "50f1d7be22fb053d54e80279ce47dc68e12690b03d15007ab7d108a1dc6b1d9c",
-    "electron/helpers/display_scaler/display_scaler_dll.c": "683327029160036d6fe2683cfde844b5e7cbf0c466512d1ac3b1b39b31b8c854",
+    "electron/helpers/display_scaler/display_scaler_dll.c": "f2734ec9b0306e7fc199cc2649a13d3b0525b1103752c22d28a3ab51f5fefaa8",
     "electron/helpers/display_scaler/display_launcher.c": "278d8fc33fc6a94b9adb5fd0479f86d5c899e5201f21e3013d85932859c11f8c",
     "electron/helpers/display_scaler/display_scaler.def": "a975f9534e4087f11271db76527cbdea06c7f30954041ac3e73f57e29a47aad1",
     "scripts/build-display-scaler.cjs": "508fdbfe7983333865a8640e02d22f8716da60dc7b21345d0f3596003bcc6c25"
   },
   "outputs": {
     "one_display_scaler_x86.dll": {
-      "sha256": "f66e4a7bc398f4b942c33aef7e5b1c6a4c335a46b36e27e00fda9ed606b83eed",
+      "sha256": "0da423e0ca0b5bbfc3be82a3fd14dcb2ff226320ac2b8ebce760a59ced9b27d1",
       "sizeBytes": 122368,
       "machine": "0x14c",
-      "peCheckSum": "0x0002c6be",
+      "peCheckSum": "0x00028929",
       "exportedCount": 2
     },
     "one_display_scaler_x64.dll": {
-      "sha256": "29fc0f476c69afe7dac4f84b5d0d2c736061761f8c1c519dd327fea14aa5b182",
+      "sha256": "6e529d1db5e3746d4e4a710aa9c0a7d34c72b9468405ccf81aca12f5b8338fc8",
       "sizeBytes": 115200,
       "machine": "0x8664",
-      "peCheckSum": "0x00023f77",
+      "peCheckSum": "0x000293f2",
       "exportedCount": 2
     },
     "one_display_launcher_x86.exe": {

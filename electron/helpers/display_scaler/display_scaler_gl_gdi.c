@@ -2402,8 +2402,8 @@ static pfn_vkVoidFunction_t ds_vk_match_hook_proc(void *dev, void *inst, const c
                     clr = g_vk.p_vkGetInstanceProcAddr(inst, "vkCmdClearColorImage");
                     bar = g_vk.p_vkGetInstanceProcAddr(inst, "vkCmdPipelineBarrier");
                 }
-                g_vk.p_vkCmdClearColorImage = (pfn_vkCmdClearColorImage_t)(uintptr_t)clr;
-                g_vk.p_vkCmdPipelineBarrier = (pfn_vkCmdPipelineBarrier_t)(uintptr_t)bar;
+                if (clr) g_vk.p_vkCmdClearColorImage = (pfn_vkCmdClearColorImage_t)(uintptr_t)clr;
+                if (bar) g_vk.p_vkCmdPipelineBarrier = (pfn_vkCmdPipelineBarrier_t)(uintptr_t)bar;
             }
             return (pfn_vkVoidFunction_t)(uintptr_t)k_vk_hook_defs[i].hook_fn;
         }
@@ -2453,7 +2453,6 @@ void ds_gl_shutdown(void)
     g_gl.sharp_ctx = NULL;
     g_gl.fbo_redirect_active = false;
     g_gl.last_present_was_gl = false;
-    InterlockedExchange(&g_vk.has_swapchain_imgs, 0);
     ds_gl_release_all_host_dcs_for_hwnd(NULL);
 }
 

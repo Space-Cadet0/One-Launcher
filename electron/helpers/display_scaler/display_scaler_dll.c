@@ -359,13 +359,15 @@ bool ds_is_vulkan_d3d9_locked(void)
 
 bool ds_is_vulkan_d3d9_subnative_locked(void)
 {
+    int32_t eff_w = (g_ds.phys_screen_w > 0) ? g_ds.phys_screen_w : g_ds.real_screen_w;
+    int32_t eff_h = (g_ds.phys_screen_h > 0) ? g_ds.phys_screen_h : g_ds.real_screen_h;
     return (
         ds_is_vulkan_d3d9_locked() &&
         g_ds.fullscreen_active &&
         g_ds.mode_virtualized &&
         g_ds.virt_w > 0 && g_ds.virt_h > 0 &&
-        g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0 &&
-        (g_ds.virt_w < g_ds.real_screen_w || g_ds.virt_h < g_ds.real_screen_h)
+        eff_w > 0 && eff_h > 0 &&
+        (g_ds.virt_w < eff_w || g_ds.virt_h < eff_h)
     );
 }
 
