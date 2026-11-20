@@ -452,6 +452,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           defaultBottleDisplayScalingMode: 'auto_fullscreen',
           defaultDisplayAspectRatio: 'preserve_aspect',
           enableFullscreenHotkey: true,
+          defaultPerformanceHud: false,
         });
 
         const saved = launcherEngine.saveLauncherPerformanceSettings(
@@ -466,6 +467,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
             defaultBottleDisplayScalingMode: 'force_fullscreen',
             defaultDisplayAspectRatio: 'integer',
             enableFullscreenHotkey: false,
+            defaultPerformanceHud: true,
           },
           { userDataDir: tempDir }
         );
@@ -481,6 +483,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
           defaultBottleDisplayScalingMode: 'force_fullscreen',
           defaultDisplayAspectRatio: 'integer',
           enableFullscreenHotkey: false,
+          defaultPerformanceHud: true,
         });
 
         const reloaded = launcherEngine.getLauncherPerformanceSettings({ userDataDir: tempDir });
@@ -985,7 +988,7 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
       expect(resumedTaskIds).toContain('dl-task-active-1');
     });
 
-    it('renders In-Game Performance & Resource Footprint controls in GameLaunchConfigModal', () => {
+    it('renders In-Game Performance & Resource Footprint controls in GameLaunchConfigModal and global defaults in SettingsModal', async () => {
       const sampleGame: CanonicalGame = {
         id: 'steam-1091500',
         title: 'Cyberpunk 2077',
@@ -1009,11 +1012,23 @@ describe("Universal Game Launcher QA — Auth Self-Healing, Footprint & TCC Coex
 
       expect(html).toContain('data-testid="in-game-performance-section"');
       expect(html).toContain('data-testid="in-game-launcher-behavior-select"');
-      expect(html).toContain('data-testid="post-game-launcher-behavior-select"');
       expect(html).toContain('data-testid="storefront-client-lifecycle-select"');
-      expect(html).toContain('data-testid="toggle-pause-sync-in-game"');
-      expect(html).toContain('data-testid="toggle-pause-downloads-in-game"');
-      expect(html).toContain('data-testid="toggle-auto-shutdown-wine"');
+      expect(html).toContain('data-testid="edit-global-defaults-btn"');
+      expect(html).not.toContain('data-testid="global-gameplay-performance-card"');
+
+      const { SettingsModal } = await import('../../src/components/Settings/SettingsModal');
+      const settingsHtml = renderToString(
+        React.createElement(SettingsModal, {
+          isOpen: true,
+          onClose: vi.fn(),
+          hostPlatform: 'darwin',
+        })
+      );
+      expect(settingsHtml).toContain('data-testid="settings-postgame-behavior-group"');
+      expect(settingsHtml).toContain('data-testid="settings-toggle-pause-sync"');
+      expect(settingsHtml).toContain('data-testid="settings-toggle-pause-downloads"');
+      expect(settingsHtml).toContain('data-testid="settings-toggle-auto-shutdown-wine"');
+      expect(settingsHtml).toContain('data-testid="settings-toggle-default-performance-hud"');
     });
   });
 

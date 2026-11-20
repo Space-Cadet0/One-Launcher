@@ -968,7 +968,8 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         .props.onChange({ target: { value: 'crossover_preview' } });
       modalUpToDate.rerender();
 
-      expect(modalUpToDate.html).toContain('data-testid="runner-up-to-date-badge"');
+      expect(modalUpToDate.html).toContain('data-testid="runner-status-banner"');
+      expect(modalUpToDate.html).not.toContain('data-testid="runner-update-available-badge"');
       expect(modalUpToDate.html).not.toContain('data-testid="update-runner-btn"');
       expect(modalUpToDate.html).not.toContain('Update Preview Build');
       modalUpToDate.unmount();
@@ -1005,9 +1006,9 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
       modalNeedsUpdate.rerender();
 
       expect(modalNeedsUpdate.html).toContain('data-testid="runner-update-available-badge"');
-      expect(modalNeedsUpdate.html).toContain('data-testid="update-runner-btn"');
-      expect(modalNeedsUpdate.html).toContain('aria-label="Update CrossOver Preview to v26.4.0"');
-      expect(modalNeedsUpdate.html).toContain('>Update<');
+      expect(modalNeedsUpdate.html).toContain('Update v26.4.0');
+      expect(modalNeedsUpdate.html).toContain('data-testid="manage-runners-bottles-btn"');
+      expect(modalNeedsUpdate.html).not.toContain('data-testid="update-runner-btn"');
       modalNeedsUpdate.unmount();
     });
 

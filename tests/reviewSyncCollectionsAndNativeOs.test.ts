@@ -188,7 +188,7 @@ describe('Review Sync Deduplication, Reviews Card Cleanup, Collection Icons & Na
       expect(candidates.slice(0, 3)).toContain('stalker-2-heart-of-chornobyl');
     });
 
-    it('criticScoreService.getCriticScore heals a poisoned id:<steamAppId> cache entry (2186680 with mc-nights-into-dreams-2012) from a valid title:<title> entry and persists the healed id:<steamAppId>', () => {
+    it('criticScoreService.getCriticScore heals a poisoned id:<steamAppId> cache entry (2186680 with mc-nights-into-dreams-2012) from a valid title:<title> entry and persists the healed id:<steamAppId>', async () => {
       const appId = 2186680;
       const title = 'Warhammer 40,000: Rogue Trader';
       const lowerTitle = title.toLowerCase();
@@ -242,6 +242,9 @@ describe('Review Sync Deduplication, Reviews Card Cleanup, Collection Icons & Na
       expect(resolved?.id).toBe('mc-warhammer-40000-rogue-trader');
       expect(resolved?.score).toBe(75);
       expect(resolved?.url).toContain('warhammer-40000-rogue-trader');
+
+      // H7 pure render-path: persistence is flushed asynchronously via queueMicrotask
+      await Promise.resolve();
 
       // Verify localStorage id:2186680 was healed and persisted with the valid Rogue Trader entry
       const healedStaged = loadStagedCache<CriticScoreData>(

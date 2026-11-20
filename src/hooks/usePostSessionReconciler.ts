@@ -44,6 +44,8 @@ interface GogCoverEventDetail {
 }
 
 interface GameSessionEndedEventDetail {
+  sessionId?: string;
+  sessionEvent?: 'stopped' | 'playtime_synced';
   gameId?: string;
   platformId?: StorefrontId;
   platformGameId?: string;
@@ -529,10 +531,77 @@ export function usePostSessionReconciler({
 
     const pendingSteamMatches = new Map<string, number>();
     const pendingGogCovers = new Map<string, string>();
+    const MAX_RECONCILED_SESSION_IDS = 128;
+    const FALLBACK_SESSION_DEDUPE_WINDOW_MS = 60_000;
+    const reconciledAchievementsBySessionId = new Set<string>();
+    const recentFallbackSessionRefreshAt = new Map<string, number>();
     let batchUpdateTimer: ReturnType<typeof setTimeout> | null = null;
     let persistCatalogTimer: ReturnType<typeof setTimeout> | null = null;
     let latestCatalogForPersist: CanonicalGame[] | null = null;
     const isVitest = isVitestRuntime();
+
+    const recordBoundedSessionKey = (key: string) => {
+      reconciledAchievementsBySessionId.add(key);
+      while (reconciledAchievementsBySessionId.size > MAX_RECONCILED_SESSION_IDS) {
+        const oldest = reconciledAchievementsBySessionId.values().next().value;
+        if (oldest === undefined) break;
+        reconciledAchievementsBySessionId.delete(oldest);
+      }
+    };
+
+    const claimPostSessionAchievementRefresh = (
+      detail: GameSessionEndedEventDetail
+    ): boolean => {
+      const explicitSessionId =
+        typeof detail.sessionId === 'string' && detail.sessionId.trim()
+          ? detail.sessionId.trim()
+          : '';
+      if (explicitSessionId) {
+        if (reconciledAchievementsBySessionId.has(explicitSessionId)) {
+          return false;
+        }
+        recordBoundedSessionKey(explicitSessionId);
+        return true;
+      }
+
+      // Fallback key when sessionId is omitted (e.g. legacy emitters or unit tests)
+      const nowMs = Date.now();
+      const targetKey = `${detail.platformId || 'unknown'}:${String(
+        detail.gameId || detail.platformGameId || ''
+      )
+        .trim()
+        .toLowerCase()}`;
+      const lastPlayedKey =
+        typeof detail.lastPlayed === 'string' && detail.lastPlayed.trim()
+          ? `${targetKey}:${detail.lastPlayed.trim()}`
+          : '';
+      if (lastPlayedKey && reconciledAchievementsBySessionId.has(lastPlayedKey)) {
+        return false;
+      }
+      const prevAt = recentFallbackSessionRefreshAt.get(targetKey);
+      const isPlaytimeFollowup =
+        detail.sessionEvent === 'playtime_synced' ||
+        (detail.sessionMinutesPlayed === 0 &&
+          typeof detail.storefrontTotalPlaytimeMinutes === 'number' &&
+          detail.storefrontTotalPlaytimeMinutes > 0);
+      if (
+        typeof prevAt === 'number' &&
+        nowMs - prevAt < FALLBACK_SESSION_DEDUPE_WINDOW_MS &&
+        isPlaytimeFollowup
+      ) {
+        return false;
+      }
+      if (lastPlayedKey) {
+        recordBoundedSessionKey(lastPlayedKey);
+      }
+      recentFallbackSessionRefreshAt.set(targetKey, nowMs);
+      while (recentFallbackSessionRefreshAt.size > MAX_RECONCILED_SESSION_IDS) {
+        const oldestKey = recentFallbackSessionRefreshAt.keys().next().value;
+        if (oldestKey === undefined) break;
+        recentFallbackSessionRefreshAt.delete(oldestKey);
+      }
+      return true;
+    };
 
     const readCurrentCatalogSnapshot = (): CanonicalGame[] => {
       if (gamesRef && Array.isArray(gamesRef.current)) {
@@ -694,12 +763,63 @@ export function usePostSessionReconciler({
         );
       }
 
-      if (Number(sessionMinutesPlayed) > 0 || hasStorefrontTotal) {
+      if (
+        (Number(sessionMinutesPlayed) > 0 || hasStorefrontTotal) &&
+        claimPostSessionAchievementRefresh(detail)
+      ) {
         const electronApi = typeof window !== 'undefined' ? window.electronAPI : undefined;
+        const matchedGame = preSessionResult.nextGames.find(
+          (g) =>
+            g.id === gameId ||
+            Boolean(
+              platformGameId &&
+                g.platforms.some(
+                  (p) =>
+                    (!platformId || p.platformId === platformId) &&
+                    (String(p.platformGameId) === String(platformGameId) ||
+                      (p.xboxProductId &&
+                        String(p.xboxProductId).toUpperCase() ===
+                          String(platformGameId).toUpperCase()) ||
+                      (p.xboxTitleId && String(p.xboxTitleId) === String(platformGameId)))
+                )
+            )
+        );
+        const matchedPlatform = matchedGame?.platforms.find(
+          (p) =>
+            (platformId && p.platformId === platformId) ||
+            Boolean(
+              platformGameId &&
+                (String(p.platformGameId) === String(platformGameId) ||
+                  (p.xboxProductId &&
+                    String(p.xboxProductId).toUpperCase() ===
+                      String(platformGameId).toUpperCase()) ||
+                  (p.xboxTitleId && String(p.xboxTitleId) === String(platformGameId)))
+            )
+        );
+        const scopedTitle = matchedGame?.title || matchedGameTitle || undefined;
+
         if (platformId === 'epic' && electronApi?.fetchEpicAchievements) {
+          const resolvedNamespace = matchedPlatform?.namespace?.trim() || undefined;
+          const resolvedAppName = String(
+            matchedPlatform?.storefrontAppId ||
+              matchedPlatform?.platformGameId ||
+              platformGameId ||
+              ''
+          )
+            .replace(/^epic[-_]/i, '')
+            .trim();
+          const resolvedCatalogItemId = matchedPlatform?.catalogItemId?.trim() || undefined;
+          const epicScopePayload: Record<string, unknown> = {
+            ...(resolvedNamespace
+              ? { sandboxId: resolvedNamespace, namespace: resolvedNamespace }
+              : {}),
+            ...(resolvedAppName ? { appName: resolvedAppName } : {}),
+            ...(resolvedCatalogItemId ? { catalogItemId: resolvedCatalogItemId } : {}),
+            ...(scopedTitle ? { title: scopedTitle } : {}),
+          };
           void (async () => {
             try {
-              const res = await electronApi.fetchEpicAchievements!({});
+              const res = await electronApi.fetchEpicAchievements!(epicScopePayload);
               const fetchedEpic = normalizeAchievementRecordMap(res);
               if (fetchedEpic && Object.keys(fetchedEpic).length > 0) {
                 cacheUserEpicAchievements(fetchedEpic);
@@ -751,9 +871,28 @@ export function usePostSessionReconciler({
             }
           })();
         } else if (platformId === 'xbox' && electronApi?.fetchXboxAchievements) {
+          const resolvedXboxTitleId =
+            matchedPlatform?.xboxTitleId?.trim() ||
+            (platformGameId && /^\d+$/.test(String(platformGameId).trim())
+              ? String(platformGameId).trim()
+              : undefined);
+          const resolvedXboxProductId =
+            matchedPlatform?.xboxProductId?.trim() ||
+            (matchedPlatform?.platformGameId && !/^\d+$/.test(matchedPlatform.platformGameId)
+              ? matchedPlatform.platformGameId.trim()
+              : platformGameId && !/^\d+$/.test(String(platformGameId).trim())
+                ? String(platformGameId).trim()
+                : undefined);
+          const resolvedXboxPfn = matchedPlatform?.packageFamilyName?.trim() || undefined;
+          const xboxScopePayload: Record<string, unknown> = {
+            ...(resolvedXboxTitleId ? { titleId: resolvedXboxTitleId } : {}),
+            ...(resolvedXboxProductId ? { productId: resolvedXboxProductId } : {}),
+            ...(resolvedXboxPfn ? { pfn: resolvedXboxPfn } : {}),
+            ...(scopedTitle ? { title: scopedTitle } : {}),
+          };
           void (async () => {
             try {
-              const res = await electronApi.fetchXboxAchievements!({});
+              const res = await electronApi.fetchXboxAchievements!(xboxScopePayload);
               const fetchedXbox = normalizeAchievementRecordMap(res);
               if (fetchedXbox && Object.keys(fetchedXbox).length > 0) {
                 cacheUserXboxAchievements(fetchedXbox);
@@ -838,9 +977,19 @@ export function usePostSessionReconciler({
             }
           })();
         } else if (platformId === 'gog' && electronApi?.fetchGogAchievements) {
+          const rawGogProductId = String(
+            matchedPlatform?.platformGameId || platformGameId || gameId || ''
+          )
+            .replace(/^gog[-_]/i, '')
+            .trim();
+          const gogScopePayload: Record<string, unknown> = {
+            ...(rawGogProductId ? { productId: rawGogProductId } : {}),
+            ...(gameId || matchedGame?.id ? { gameId: gameId || matchedGame?.id } : {}),
+            ...(scopedTitle ? { title: scopedTitle } : {}),
+          };
           void (async () => {
             try {
-              const res = await electronApi.fetchGogAchievements!({});
+              const res = await electronApi.fetchGogAchievements!(gogScopePayload);
               const fetchedGog = normalizeAchievementRecordMap(res);
               if (fetchedGog && Object.keys(fetchedGog).length > 0) {
                 cacheUserGogAchievements(fetchedGog);

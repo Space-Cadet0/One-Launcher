@@ -3753,13 +3753,13 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
         const secTree = compatSection.render();
         expect(auditWcag22AA(secTree)).toEqual([]);
         openedEvents.length = 0;
-        const wizTrigger = findVNodeByTestId(secTree, 'open-system-setup-wizard-btn');
+        const wizTrigger = findVNodeByTestId(secTree, 'manage-runners-bottles-btn');
         expect(wizTrigger).toBeDefined();
-        expect(extractVNodeText(wizTrigger)).toContain('Setup Wizard...');
+        expect(extractVNodeText(wizTrigger)).toContain('Manage Runners & Bottles');
         wizTrigger.props.onClick();
         expect(openedEvents).toEqual([
           {
-            mode: 'repair',
+            mode: 'health_check',
             initialStep: 'compatibility',
           },
         ]);

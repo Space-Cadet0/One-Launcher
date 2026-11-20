@@ -31,6 +31,7 @@ import {
   type CompatibilityLayerSectionProps,
 } from '../../../src/components/Launcher/LaunchConfig/CompatibilityLayerSection';
 import { GameLaunchConfigModal } from '../../../src/components/Launcher/GameLaunchConfigModal';
+import { useGameLaunchConfigForm } from '../../../src/components/Launcher/LaunchConfig/useGameLaunchConfigForm';
 import {
   buildFallbackEnvironmentSnapshot,
   environmentSetupService,
@@ -302,57 +303,61 @@ describe('Tier 2 — F10 & F12 Boundaries: UI Gating, R1 Defect Regression & Por
 
     try {
       await launcherService.initialize();
-      const renderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        onClose: vi.fn(),
-      });
+      let formA: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const FormHarnessA = () => {
+        formA = useGameLaunchConfigForm({
+          isOpen: true,
+          game,
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', { 'data-testid': 'form-harness-a' });
+      };
+      const renderer = createDomain12DeepRenderer(FormHarnessA, {});
 
-      let tree = renderer.render();
+      renderer.render();
       await flushMicrotasks();
-      tree = renderer.render();
-
-      const installBtn =
-        findVNodeByTestId(tree, 'install-runner-brew-btn') ||
-        findVNodeByTestId(tree, 'sign-in-runner-btn');
-      expect(installBtn).toBeDefined();
+      renderer.render();
 
       // 1) IPC rejection handled cleanly -> runnerActionFeedback displays error text
-      await expect(Promise.resolve(installBtn.props.onClick?.())).resolves.toBeUndefined();
+      await expect(formA!.handleInstallRunnerViaBrew()).resolves.toBeUndefined();
       await flushMicrotasks();
-      tree = renderer.render();
-      expect(extractVNodeText(tree)).toMatch(/Synthetic install transport failure|Could not install/i);
+      renderer.render();
+      expect(formA!.runnerActionFeedback?.text || '').toMatch(
+        /Synthetic install transport failure|Could not install/i
+      );
       renderer.unmount();
 
-      // 2) Direct service rejection inside handleInstallRunnerViaBrew on a clean modal instance
+      // 2) Direct service rejection inside handleInstallRunnerViaBrew on a clean form instance
       //    must actively invoke installCompatibilityLayer and catch the rejection cleanly
       resetFrontendServiceSingletons();
       await launcherService.initialize();
 
-      const retryRenderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        onClose: vi.fn(),
-      });
+      let formRetry: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const FormHarnessRetry = () => {
+        formRetry = useGameLaunchConfigForm({
+          isOpen: true,
+          game,
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', { 'data-testid': 'form-harness-retry' });
+      };
+      const retryRenderer = createDomain12DeepRenderer(FormHarnessRetry, {});
       try {
-        let retryTree = retryRenderer.render();
+        retryRenderer.render();
         await flushMicrotasks();
-        retryTree = retryRenderer.render();
+        retryRenderer.render();
 
         const installSpy = vi
           .spyOn(launcherService, 'installCompatibilityLayer')
           .mockRejectedValueOnce(new Error('Synthetic service failure'));
         try {
-          const installBtnRetry =
-            findVNodeByTestId(retryTree, 'install-runner-brew-btn') ||
-            findVNodeByTestId(retryTree, 'sign-in-runner-btn');
-          expect(installBtnRetry).toBeDefined();
-          expect(installBtnRetry?.props?.disabled).toBeFalsy();
-          await expect(Promise.resolve(installBtnRetry?.props.onClick?.())).resolves.toBeUndefined();
+          await expect(formRetry!.handleInstallRunnerViaBrew()).resolves.toBeUndefined();
           expect(installSpy).toHaveBeenCalledTimes(1);
           await flushMicrotasks();
-          retryTree = retryRenderer.render();
-          expect(extractVNodeText(retryTree)).toMatch(/Synthetic service failure|Could not install/i);
+          retryRenderer.render();
+          expect(formRetry!.runnerActionFeedback?.text || '').toMatch(
+            /Synthetic service failure|Could not install/i
+          );
         } finally {
           installSpy.mockRestore();
         }
@@ -432,29 +437,31 @@ describe('Tier 2 — F10 & F12 Boundaries: UI Gating, R1 Defect Regression & Por
 
     try {
       await launcherService.initialize();
-      const renderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        onClose: vi.fn(),
-      });
+      let formRef: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const FormHarness = () => {
+        formRef = useGameLaunchConfigForm({
+          isOpen: true,
+          game,
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', { 'data-testid': 'form-harness-b4' });
+      };
+      const renderer = createDomain12DeepRenderer(FormHarness, {});
 
-      let tree = renderer.render();
+      renderer.render();
       await flushMicrotasks();
-      tree = renderer.render();
+      renderer.render();
 
-      const signInBtn = findVNodeByTestId(tree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
-      await signInBtn.props.onClick?.();
+      expect(formRef!.activeUpdateInfo?.authRequired).toBe(true);
+      await formRef!.handleUpdateRunner();
       await flushMicrotasks();
-      tree = renderer.render();
+      renderer.render();
 
       expect(updateCalls[0]?.authenticateOnly).toBe(true);
       expect(updateCalls[0]?.runnerType).toBe('crossover_preview_arm64');
 
-      const updateBtn = findVNodeByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-      expect(updateBtn?.props?.disabled).toBeFalsy();
-      await updateBtn.props.onClick?.();
+      expect(formRef!.activeUpdateInfo?.updateAvailable).toBe(true);
+      await formRef!.handleUpdateRunner();
       await flushMicrotasks();
 
       expect(updateCalls).toHaveLength(2);

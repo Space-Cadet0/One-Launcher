@@ -31,6 +31,7 @@ import {
 } from '../harness';
 import { SystemSetupWizardModal } from '../../../src/components/Launcher/SystemSetupWizard/SystemSetupWizardModal';
 import { GameLaunchConfigModal } from '../../../src/components/Launcher/GameLaunchConfigModal';
+import { useGameLaunchConfigForm } from '../../../src/components/Launcher/LaunchConfig/useGameLaunchConfigForm';
 import { launcherService } from '../../../src/services/launcher/launcherService';
 import { environmentSetupService } from '../../../src/services/launcher/environmentSetupService';
 import { createDomain12DeepRenderer } from '../../helpers/xboxTestHarness';
@@ -595,33 +596,34 @@ describe('Tier 4 — End-to-End Real-World User Scenarios', () => {
       await launcherService.initialize();
       await environmentSetupService.probeHealth(['steam'], { forceFresh: true });
 
-      const renderer = createDomain12DeepRenderer(GameLaunchConfigModal, {
-        isOpen: true,
-        game,
-        onClose: vi.fn(),
-      });
-      let tree = renderer.render();
+      let formRef: ReturnType<typeof useGameLaunchConfigForm> | null = null;
+      const Scenario4Harness = () => {
+        formRef = useGameLaunchConfigForm({
+          isOpen: true,
+          game,
+          onClose: vi.fn(),
+        });
+        return React.createElement('div', { 'data-testid': 'scenario4-harness' });
+      };
+      const renderer = createDomain12DeepRenderer(Scenario4Harness, {});
+      renderer.render();
       await flushMicrotasks();
-      tree = renderer.render();
+      renderer.render();
 
-      // 1) Initially authRequired -> sign-in button shown, downloadUrl absent
+      // 1) Initially authRequired -> downloadUrl absent, handleUpdateRunner sends authenticateOnly: true
       expect(launcherService.getRunnerUpdates()['crossover_preview_arm64']?.downloadUrl).toBeUndefined();
-      const signInBtn = findVNodeByTestId(tree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
-      await signInBtn.props.onClick?.();
+      expect(formRef!.activeUpdateInfo?.authRequired).toBe(true);
+      await formRef!.handleUpdateRunner();
       await flushMicrotasks();
-      tree = renderer.render();
+      renderer.render();
 
-      // 2) After re-auth -> updateAvailable=true, update button shown and enabled
+      // 2) After re-auth -> updateAvailable=true, second handleUpdateRunner installs update
       expect(updateCalls).toHaveLength(1);
       expect(updateCalls[0]?.authenticateOnly).toBe(true);
       expect(launcherService.getRunnerUpdates()['crossover_preview_arm64']?.updateAvailable).toBe(true);
-      const updateBtn = findVNodeByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-      expect(updateBtn?.props?.disabled).toBeFalsy();
-      await updateBtn.props.onClick?.();
+      await formRef!.handleUpdateRunner();
       await flushMicrotasks();
-      tree = renderer.render();
+      renderer.render();
 
       expect(updateCalls).toHaveLength(2);
       expect(updateCalls[1]?.authenticateOnly).toBeFalsy();

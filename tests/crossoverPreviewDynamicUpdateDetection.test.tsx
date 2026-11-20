@@ -17,6 +17,10 @@ import type {
 } from '../src/contracts/environmentSetup';
 
 import { GameLaunchConfigModal } from '../src/components/Launcher/GameLaunchConfigModal';
+import {
+  useGameLaunchConfigForm,
+  type UseGameLaunchConfigFormParams,
+} from '../src/components/Launcher/LaunchConfig/useGameLaunchConfigForm';
 import { CompatibilityAndBottleStep } from '../src/components/Launcher/SystemSetupWizard/steps/CompatibilityAndBottleStep';
 import { launcherService } from '../src/services/launcher/launcherService';
 import {
@@ -64,6 +68,25 @@ function extractVNodeText(node: any): string {
     return extractVNodeText(node.props.children);
   }
   return '';
+}
+
+function createLaunchConfigFormHarness(params: UseGameLaunchConfigFormParams) {
+  let latestForm!: ReturnType<typeof useGameLaunchConfigForm>;
+  const FormProbe = (props: UseGameLaunchConfigFormParams) => {
+    latestForm = useGameLaunchConfigForm(props);
+    return null;
+  };
+  const renderer = createDomain12DeepRenderer(FormProbe, params);
+  return {
+    render: (next?: Partial<UseGameLaunchConfigFormParams>) => {
+      renderer.render(next);
+      return latestForm;
+    },
+    get current() {
+      return latestForm;
+    },
+    unmount: () => renderer.unmount(),
+  };
 }
 
 function makeSyntheticSetupSnapshot(
@@ -443,20 +466,31 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       await Promise.resolve();
       tree = modal.render();
 
-      // Verify the Update Available badge is present with the new version 20261111
+      // Verify the compact Update badge is present with the new version 20261111
       const updateBadge = findVNodeByTestId(tree, 'runner-update-available-badge');
       expect(updateBadge).toBeDefined();
-      expect(extractVNodeText(updateBadge)).toContain('Update Available: v20261111');
+      expect(extractVNodeText(updateBadge)).toContain('Update v20261111');
 
-      // Verify the Update button is present and clickable
-      const updateBtn = findVNodeByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-      expect(updateBtn.props['aria-label']).toContain('Update CrossOver Preview to v20261111');
-
-      await updateBtn.props.onClick();
-      expect(updateSpy).toHaveBeenCalledWith('crossover_preview');
+      // Streamlined Launch Config routes runner updates to Setup Wizard via Manage Runners & Bottles
+      const manageBtn = findVNodeByTestId(tree, 'manage-runners-bottles-btn');
+      expect(manageBtn).toBeDefined();
+      expect(findVNodeByTestId(tree, 'update-runner-btn')).toBeUndefined();
 
       modal.unmount();
+
+      // Verify underlying form hook update handler still targets crossover_preview cleanly
+      const formHarness = createLaunchConfigFormHarness({
+        isOpen: true,
+        game: synthGame,
+        initialPlatformId: 'steam',
+        onClose: vi.fn(),
+      });
+      formHarness.render();
+      await Promise.resolve();
+      formHarness.render();
+      await formHarness.current.handleUpdateRunner();
+      expect(updateSpy).toHaveBeenCalledWith('crossover_preview');
+      formHarness.unmount();
     });
 
     it('2.4 updates CrossOver Preview and updates version metadata cleanly', async () => {
@@ -612,24 +646,34 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         message: 'Successfully updated CrossOver Preview to 28.0.0 (Preview 20261111).',
       } as any);
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
 
+      formHarness.render();
+      await Promise.resolve();
+      formHarness.render();
+
+      expect(formHarness.current.compatibilityLayer).toBe('crossover_preview');
+      await formHarness.current.handleUpdateRunner();
+      formHarness.render();
+
+      // Form MUST still select crossover_preview and not be demoted to crossover
+      expect(formHarness.current.compatibilityLayer).toBe('crossover_preview');
+      formHarness.unmount();
+
+      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+        isOpen: true,
+        game: synthGame,
+        initialPlatformId: 'steam',
+        onClose: vi.fn(),
+      });
       let tree = modal.render();
       await Promise.resolve();
       tree = modal.render();
-
-      const updateBtn = findVNodeByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-
-      await updateBtn.props.onClick();
-      tree = modal.render();
-
-      // Form MUST still select crossover_preview and not be demoted to crossover
       const runnerSelect = findVNodeByTestId(tree, 'compat-runner-select');
       expect(runnerSelect.props.value).toBe('crossover_preview');
 
@@ -1644,13 +1688,25 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       await Promise.resolve();
       modalTree = modal.render();
 
-      const authBadge = findVNodeByTestId(modalTree, 'runner-auth-required-badge');
-      expect(authBadge).toBeDefined();
-      expect(extractVNodeText(authBadge)).toBe('Sign-In Required');
+      const statusBanner = findVNodeByTestId(modalTree, 'runner-status-banner');
+      expect(statusBanner).toBeDefined();
+      expect(findVNodeByTestId(modalTree, 'manage-runners-bottles-btn')).toBeDefined();
+      // Embedded auth/installer buttons were moved to Setup Wizard in Wave 1
+      expect(findVNodeByTestId(modalTree, 'runner-auth-required-badge')).toBeUndefined();
+      expect(findVNodeByTestId(modalTree, 'sign-in-runner-btn')).toBeUndefined();
+      modal.unmount();
 
-      const signInBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
-      expect(extractVNodeText(signInBtn)).toContain('Sign In & Check');
+      const formHarness = createLaunchConfigFormHarness({
+        isOpen: true,
+        game: synthGame,
+        initialPlatformId: 'steam',
+        onClose: vi.fn(),
+      });
+      formHarness.render();
+      await Promise.resolve();
+      formHarness.render();
+      expect(formHarness.current.activeUpdateInfo?.authRequired).toBe(true);
+      formHarness.unmount();
     });
 
     it('5.18 captureCodeWeaversPreviewDownload prevents options.downloadUrl from bypassing login gate when hasPasswordInput is true (ISSUE-03)', async () => {
@@ -2347,31 +2403,30 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       const updatePromise = new Promise((r) => { resolveUpdate = r; });
       vi.spyOn(launcherService, 'updateCompatibilityLayer').mockImplementation(() => updatePromise as any);
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
-      let modalTree = modal.render();
+      formHarness.render();
       await Promise.resolve();
-      modalTree = modal.render();
+      formHarness.render();
 
-      const signInBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
-      expect(extractVNodeText(signInBtn)).toContain('Sign In & Check');
+      expect(formHarness.current.activeUpdateInfo?.authRequired).toBe(true);
+      expect(formHarness.current.isUpdatingRunner).toBe(false);
 
-      // Click to start operation
-      void signInBtn.props.onClick();
-      modalTree = modal.render();
-
-      const activeBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(activeBtn.props.disabled).toBe(true);
-      expect(extractVNodeText(activeBtn)).toMatch(/Signing In\.\.\./i);
+      // Start sign-in / update operation and verify isUpdatingRunner tracks active flight
+      const pendingOp = formHarness.current.handleUpdateRunner();
+      formHarness.render();
+      expect(formHarness.current.isUpdatingRunner).toBe(true);
+      expect(formHarness.current.isAnotherRunnerOperationActive).toBe(false);
 
       resolveUpdate({ success: true, updated: true, detectedLayers: [installedLayer] });
-      await Promise.resolve();
-      modal.unmount();
+      await pendingOp;
+      formHarness.render();
+      expect(formHarness.current.isUpdatingRunner).toBe(false);
+      formHarness.unmount();
     });
 
     it('5.31 Setup Wizard renders auth detail before probe update, and surfaces update badge & opt-in toggle when snapshot reports update_available', async () => {
@@ -2654,51 +2709,42 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         };
       });
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
-      let modalTree = modal.render();
+      formHarness.render();
       await Promise.resolve();
-      modalTree = modal.render();
+      formHarness.render();
 
-      const signInBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
+      expect(formHarness.current.activeUpdateInfo?.authRequired).toBe(true);
 
-      // Click "Sign In & Check"
-      await signInBtn.props.onClick();
-      modalTree = modal.render();
+      // First call triggers authenticateOnly: true (zero archive download)
+      await formHarness.current.handleUpdateRunner();
+      formHarness.render();
 
-      // Verify authenticateOnly: true was requested (zero archive download)
       expect(capturedUpdateCalls).toHaveLength(1);
       expect(capturedUpdateCalls[0]).toEqual({
         runnerType: 'crossover_preview',
         options: { authenticateOnly: true },
       });
 
-      // Now "Sign-In Required" is gone, and "Update Available: v20261111" + "Update" button are rendered
-      expect(findVNodeByTestId(modalTree, 'runner-auth-required-badge')).toBeUndefined();
-      expect(findVNodeByTestId(modalTree, 'sign-in-runner-btn')).toBeUndefined();
+      // Now authRequired is cleared and updateAvailable is populated with v20261111
+      expect(formHarness.current.activeUpdateInfo?.authRequired).toBe(false);
+      expect(formHarness.current.activeUpdateInfo?.updateAvailable).toBe(true);
+      expect(formHarness.current.activeUpdateInfo?.latestVersion).toBe('20261111');
 
-      const updateBadge = findVNodeByTestId(modalTree, 'runner-update-available-badge');
-      expect(updateBadge).toBeDefined();
-      expect(extractVNodeText(updateBadge)).toContain('Update Available: v20261111');
-
-      const updateBtn = findVNodeByTestId(modalTree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
-      expect(extractVNodeText(updateBtn)).toContain('Update');
-
-      // Click "Update" to download and apply the 20261111 build
-      await updateBtn.props.onClick();
+      // Second call downloads and applies the 20261111 build
+      await formHarness.current.handleUpdateRunner();
       expect(capturedUpdateCalls).toHaveLength(2);
       expect(capturedUpdateCalls[1]).toEqual({
         runnerType: 'crossover_preview',
         options: undefined,
       });
 
-      modal.unmount();
+      formHarness.unmount();
     });
 
     it('5.34 captureCodeWeaversPreviewDownload in authenticateOnly mode closes window and settles upon finding candidate link without triggering download', async () => {
@@ -2976,30 +3022,26 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         }],
       });
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
 
-      let tree = modal.render();
+      formHarness.render();
       await Promise.resolve();
-      tree = modal.render();
+      formHarness.render();
 
-      const updateBtn = findVNodeByTestId(tree, 'update-runner-btn');
-      expect(updateBtn).toBeDefined();
+      // Trigger update - which triggers the rejected promise
+      await formHarness.current.handleUpdateRunner();
+      formHarness.render();
 
-      // Click update - which triggers the rejected promise
-      await updateBtn.props.onClick();
-
-      const updatedTree = modal.render();
-      const feedback = findVNodeByTestId(updatedTree, 'runner-update-feedback');
-      expect(feedback).toBeDefined();
-      expect(extractVNodeText(feedback)).toContain('Network connection abruptly dropped');
+      expect(formHarness.current.isUpdatingRunner).toBe(false);
+      expect(formHarness.current.runnerUpdateFeedback).toContain('Network connection abruptly dropped');
 
       launcherService.updateCompatibilityLayer = origUpdate;
-      modal.unmount();
+      formHarness.unmount();
     });
 
     it('5.39 onWillDownload cancels download and resolves immediately with metadata when authenticateOnly is true', async () => {
@@ -3290,30 +3332,25 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         .spyOn(launcherService, 'updateCompatibilityLayer')
         .mockRejectedValue(new Error('Auth dialog abruptly closed'));
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
 
-      let tree = modal.render();
+      formHarness.render();
       await Promise.resolve();
-      tree = modal.render();
+      formHarness.render();
 
-      const signInBtn = findVNodeByTestId(tree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
-
-      // Invoking onClick must not result in an unhandled promise rejection
-      await expect(signInBtn.props.onClick()).resolves.toBeUndefined();
+      // Invoking handleUpdateRunner must not result in an unhandled promise rejection
+      await expect(formHarness.current.handleUpdateRunner()).resolves.toBeUndefined();
       expect(rejectingSignInSpy).toHaveBeenCalledTimes(1);
 
-      tree = modal.render();
-      const errBanner = findVNodeByTestId(tree, 'runner-update-feedback');
-      expect(errBanner).toBeDefined();
-      expect(extractVNodeText(errBanner)).toContain('Auth dialog abruptly closed');
+      formHarness.render();
+      expect(formHarness.current.runnerUpdateFeedback).toContain('Auth dialog abruptly closed');
 
-      modal.unmount();
+      formHarness.unmount();
     });
 
     it('5.44 Electron 44.9.3 real API: resolvePreviewFetch uses previewSession.fetch with credentials:include and strips redirect:manual when previewSession.net is undefined', async () => {
@@ -3888,25 +3925,20 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         message: 'CodeWeavers Preview sign-in cancelled.',
       });
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarnessC = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
-      let treeC = modal.render();
+      formHarnessC.render();
       await Promise.resolve();
-      treeC = modal.render();
+      formHarnessC.render();
 
-      const signInBtnC = findVNodeByTestId(treeC, 'sign-in-runner-btn');
-      expect(signInBtnC).toBeDefined();
-      await signInBtnC.props.onClick();
-
-      treeC = modal.render();
-      const feedback = findVNodeByTestId(treeC, 'runner-update-feedback');
-      expect(feedback).toBeDefined();
-      expect(extractVNodeText(feedback)).toContain('CodeWeavers Preview sign-in cancelled.');
-      modal.unmount();
+      await formHarnessC.current.handleUpdateRunner();
+      formHarnessC.render();
+      expect(formHarnessC.current.runnerUpdateFeedback).toContain('CodeWeavers Preview sign-in cancelled.');
+      formHarnessC.unmount();
     });
 
     it('5.52 Launch & Compatibility Settings: updateCompatibilityLayer returns crisp messages for update available vs up to date', async () => {
@@ -4275,13 +4307,26 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       await Promise.resolve();
       modalTree = modal.render();
 
-      const badge = findVNodeByTestId(modalTree, 'runner-auth-required-badge');
-      expect(badge).toBeDefined();
-      const signInBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
+      // Streamlined Launch Config shows not-installed callout + Manage Runners & Bottles link
+      expect(findVNodeByTestId(modalTree, 'runner-not-installed-callout')).toBeDefined();
+      expect(findVNodeByTestId(modalTree, 'manage-runners-bottles-btn')).toBeDefined();
+      modal.unmount();
 
-      await signInBtn.props.onClick();
+      // Underlying form hook still invokes authenticateOnly when authRequired is true
+      const formHarness = createLaunchConfigFormHarness({
+        isOpen: true,
+        game: synthGame,
+        initialPlatformId: 'steam',
+        onClose: vi.fn(),
+      });
+      formHarness.render();
+      await Promise.resolve();
+      formHarness.render();
+
+      expect(formHarness.current.activeUpdateInfo?.authRequired).toBe(true);
+      await formHarness.current.handleUpdateRunner();
       expect(updateSpy).toHaveBeenCalledWith('crossover_preview', { authenticateOnly: true });
+      formHarness.unmount();
     });
 
     it('5.59 updateCompatibilityLayer returns ready to install for uninstalled preview instead of claiming up to date', async () => {
@@ -4486,32 +4531,27 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
       vi.spyOn(launcherService, 'updateCompatibilityLayer').mockReturnValue(slowUpdatePromise as any);
       const installSpy = vi.spyOn(launcherService, 'installCompatibilityLayer');
 
-      const modal = createDomain12DeepRenderer(GameLaunchConfigModal, {
+      const formHarness = createLaunchConfigFormHarness({
         isOpen: true,
         game: synthGame,
         initialPlatformId: 'steam',
         onClose: vi.fn(),
       });
-      let modalTree = modal.render();
+      formHarness.render();
       await Promise.resolve();
-      modalTree = modal.render();
-
-      const signInBtn = findVNodeByTestId(modalTree, 'sign-in-runner-btn');
-      expect(signInBtn).toBeDefined();
+      formHarness.render();
 
       // Trigger update/sign-in (which sets isUpdatingRunner = true)
-      const updateCallPromise = signInBtn.props.onClick();
+      const updateCallPromise = formHarness.current.handleUpdateRunner();
 
-      // Re-render modal to reflect isUpdatingRunner = true
-      modalTree = modal.render();
+      // Re-render hook to reflect isUpdatingRunner = true
+      formHarness.render();
+      expect(formHarness.current.isUpdatingRunner).toBe(true);
 
-      // Find install button and attempt concurrent click
-      const installBtn = findVNodeByTestId(modalTree, 'install-runner-brew-btn');
-      if (installBtn) {
-        await installBtn.props.onClick();
-        // installCompatibilityLayer must NOT have been called while updating was in progress!
-        expect(installSpy).not.toHaveBeenCalled();
-      }
+      // Attempt concurrent install via brew
+      await formHarness.current.handleInstallRunnerViaBrew();
+      // installCompatibilityLayer must NOT have been called while updating was in progress!
+      expect(installSpy).not.toHaveBeenCalled();
 
       slowUpdateResolver!({
         success: true,
@@ -4521,6 +4561,7 @@ describe('CrossOver Preview Dynamic Update Detection, Download & Installation (R
         message: 'Signed in successfully.',
       });
       await updateCallPromise;
+      formHarness.unmount();
     });
 
     it('5.66 captureCodeWeaversPreviewDownload honors timeoutMs, cancels downloads, cleans up listeners, and closes window with TimeoutError', async () => {
