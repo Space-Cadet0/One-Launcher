@@ -372,7 +372,7 @@ function isCodesignTimeoutError(/** @type {any} */ err) {
 
 function hasTrustedAppleOrDeveloperAuthority(outputText) {
   const text = String(outputText || '');
-  return /^\s*Authority\s*=\s*(?:Developer ID Application:|Apple Distribution:|Mac App Store|Apple Worldwide Developer Relations|Software Signing)/im.test(
+  return /^\s*Authority\s*=\s*(?:Developer ID Application:|Apple Distribution:|Mac App Store|Apple Worldwide Developer Relations|(?:macOS\s+)?Software Signing)/im.test(
     text
   );
 }
@@ -7755,12 +7755,29 @@ function applyUnifiedPerformanceHudEnv(params = {}) {
   const userRequestedDxvkHud = !explicitlyOff && Boolean(userCustomDxvkHud);
   const hudEnabled = configHudEnabled || userRequestedMetalHud || userRequestedDxvkHud;
 
+  const splitDyldInsertLibraries = (/** @type {unknown} */ raw) => {
+    const str = String(raw || '');
+    if (!str) return [];
+    const rawParts = str.split(':');
+    /** @type {string[]} */
+    const out = [];
+    for (let i = 0; i < rawParts.length; i += 1) {
+      const part = rawParts[i];
+      if (/^[A-Za-z]$/.test(part) && i + 1 < rawParts.length && rawParts[i + 1].startsWith('\\')) {
+        out.push(`${part}:${rawParts[i + 1]}`);
+        i += 1;
+      } else if (part.trim()) {
+        out.push(part.trim());
+      }
+    }
+    return out;
+  };
+
   const stripPreloadFromDyldInsertIfAllowed = () => {
     if (!audioClampActive && env.DYLD_INSERT_LIBRARIES) {
-      const remainingInsert = String(env.DYLD_INSERT_LIBRARIES)
-        .split(':')
-        .map((s) => s.trim())
-        .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
+      const remainingInsert = splitDyldInsertLibraries(env.DYLD_INSERT_LIBRARIES).filter(
+        (s) => s && !s.endsWith('libone_metal_preload.dylib')
+      );
       if (remainingInsert.length > 0) {
         env.DYLD_INSERT_LIBRARIES = remainingInsert.join(':');
       } else {
@@ -7899,10 +7916,7 @@ function applyUnifiedPerformanceHudEnv(params = {}) {
     const moltenVkPath = resolveWineLayerMoltenVkPath(candidateWineBin);
     if (preloadDylib) {
       env.MTL_HUD_ENABLED = '1';
-      const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
-        .split(/:(?![\\/])/)
-        .map((s) => s.trim())
-        .filter(Boolean);
+      const existingInsert = splitDyldInsertLibraries(env.DYLD_INSERT_LIBRARIES);
       if (!existingInsert.includes(preloadDylib)) {
         existingInsert.unshift(preloadDylib);
       }
@@ -10097,10 +10111,22 @@ function applyCrossOverPerGameSettings(
     if (loaderAllowsDyldInsert) {
       const preloadDylib = ensureWineMetalPreloadDylib(effectiveOptions);
       if (preloadDylib) {
-        const existingInsert = String(env.DYLD_INSERT_LIBRARIES || '')
-          .split(/:(?![\\/])/)
-          .map((s) => s.trim())
-          .filter(Boolean);
+        const rawInsertParts = String(env.DYLD_INSERT_LIBRARIES || '').split(':');
+        /** @type {string[]} */
+        const existingInsert = [];
+        for (let i = 0; i < rawInsertParts.length; i += 1) {
+          const part = rawInsertParts[i];
+          if (
+            /^[A-Za-z]$/.test(part) &&
+            i + 1 < rawInsertParts.length &&
+            rawInsertParts[i + 1].startsWith('\\')
+          ) {
+            existingInsert.push(`${part}:${rawInsertParts[i + 1]}`);
+            i += 1;
+          } else if (part.trim()) {
+            existingInsert.push(part.trim());
+          }
+        }
         if (!existingInsert.includes(preloadDylib)) {
           existingInsert.unshift(preloadDylib);
         }

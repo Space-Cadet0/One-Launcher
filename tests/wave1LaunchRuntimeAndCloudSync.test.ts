@@ -763,11 +763,13 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       const bottleDir = path.join(bottlesDir, 'SynthBottle');
       seedValidSyntheticBottle(bottleDir);
 
+      const fakeWineBin = path.join(tmp, 'fake-wine');
+      fs.writeFileSync(fakeWineBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       const mockLayer = {
         id: 'crossover',
         type: 'crossover',
         name: 'CrossOver',
-        binaryPath: '/bin/sh',
+        binaryPath: fakeWineBin,
         bottlesDir,
         availableBottles: ['SynthBottle'],
       };
@@ -826,14 +828,14 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
         { crossoverHighResolutionMode: true },
         envA,
         bottleDir,
-        { syncLiveWineReg: true, execFileFn: mockExecFile }
+        { platform: 'darwin', syncLiveWineReg: true, execFileFn: mockExecFile }
       );
       macInstaller.applyCrossOverPerGameSettings(
         mockLayer,
         { crossoverHighResolutionMode: false },
         envB,
         bottleDir,
-        { syncLiveWineReg: true, execFileFn: mockExecFile }
+        { platform: 'darwin', syncLiveWineReg: true, execFileFn: mockExecFile }
       );
 
       await new Promise((r) => setTimeout(r, 15));
@@ -1248,7 +1250,7 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
               packageFamilyName: 'Synth.Package_12345',
             },
             'pre_launch',
-            { offline: true, userDataDir: tmp, homedir: tmp }
+            { offline: true, platform: 'darwin', userDataDir: tmp, homedir: tmp }
           ),
           supervisor.waitForSteamColdStartupCloudReady(tmp, '999999', {
             offline: true,

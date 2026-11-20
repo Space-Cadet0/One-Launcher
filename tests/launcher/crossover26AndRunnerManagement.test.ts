@@ -2600,6 +2600,7 @@ setTimeout(() => process.exit(0), 1000);
         homedir: verHome,
       });
       const updates = await launcherEngine.checkCompatibilityLayerUpdates({
+        platform: 'darwin',
         layers,
         mockFeeds: {
           crossover: {

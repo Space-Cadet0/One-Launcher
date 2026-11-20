@@ -218,9 +218,11 @@ describe('Dual-OS Comprehensive Audit Remediation Suite (macOS ARM64/Rosetta 2 +
         'utf8'
       );
       const binPath = path.join(macOsDir, 'SyntheticQuest');
-      // Copy /usr/bin/true bytes into temp bundle so codesign signs a valid Mach-O slice
+      // Copy /usr/bin/true bytes into temp bundle and strip its Apple OS signature so codesign
+      // exercises the unsigned/ad-hoc repair path on every macOS version (including macOS 15+).
       fs.copyFileSync('/usr/bin/true', binPath);
       fs.chmodSync(binPath, 0o755);
+      execFileSync('codesign', ['--remove-signature', binPath], { stdio: 'ignore' });
 
       const firstSync = launcherEngine.ensureMacAppCodeSignatureValid(appBundle, {
         platform: 'darwin',

@@ -1125,6 +1125,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         // 1. Heroic Wine-Staging -> queries Gcenx/macOS_Wine_builds/releases/latest ('vendor_portal')
         const requestedUrls: string[] = [];
         const heroicCheck = await launcherEngine.checkCompatibilityLayerUpdates({
+          platform: 'darwin',
           layers: [
             {
               id: 'wine',
@@ -1157,6 +1158,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         // 2. Retired Wine-CrossOver -> skips Wine feed completely & reports updateAvailable: false
         requestedUrls.length = 0;
         const retiredCheck = await launcherEngine.checkCompatibilityLayerUpdates({
+          platform: 'darwin',
           layers: [
             {
               id: 'wine',
@@ -1183,6 +1185,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         // 3. Homebrew Wine Staging.app -> queries wine@staging.json ('homebrew_cask')
         requestedUrls.length = 0;
         const brewStagingCheck = await launcherEngine.checkCompatibilityLayerUpdates({
+          platform: 'darwin',
           layers: [
             {
               id: 'wine',
@@ -1215,6 +1218,7 @@ describe('Bottle Storefront Lifecycle, Cold-Bottle Startup Trade-Offs & Compatib
         // 4. Standalone /Applications/Wine Stable.app -> queries wine-stable.json ('direct_download')
         requestedUrls.length = 0;
         const brewStableCheck = await launcherEngine.checkCompatibilityLayerUpdates({
+          platform: 'darwin',
           layers: [
             {
               id: 'wine',

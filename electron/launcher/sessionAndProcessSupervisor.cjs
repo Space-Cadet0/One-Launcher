@@ -868,10 +868,19 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
   delete clientEnv.DXVK_HUD;
   delete clientEnv.ONE_LAUNCHER_MOLTENVK_PATH;
   if (typeof clientEnv.DYLD_INSERT_LIBRARIES === 'string' && clientEnv.DYLD_INSERT_LIBRARIES) {
-    const remainingInsert = clientEnv.DYLD_INSERT_LIBRARIES
-      .split(':')
-      .map((s) => s.trim())
-      .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
+    const rawParts = clientEnv.DYLD_INSERT_LIBRARIES.split(':');
+    /** @type {string[]} */
+    const parsedParts = [];
+    for (let i = 0; i < rawParts.length; i += 1) {
+      const part = rawParts[i];
+      if (/^[A-Za-z]$/.test(part) && i + 1 < rawParts.length && rawParts[i + 1].startsWith('\\')) {
+        parsedParts.push(`${part}:${rawParts[i + 1]}`);
+        i += 1;
+      } else if (part.trim()) {
+        parsedParts.push(part.trim());
+      }
+    }
+    const remainingInsert = parsedParts.filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
     if (remainingInsert.length > 0) {
       clientEnv.DYLD_INSERT_LIBRARIES = remainingInsert.join(':');
     } else {
