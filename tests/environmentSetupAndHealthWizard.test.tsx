@@ -2558,6 +2558,12 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
       fs.writeFileSync(flushVdfPath, '"users"\n{\n}\n', 'utf8');
 
       const flushCloseSpy = vi.fn(async () => {});
+      let flushWriteTimer: ReturnType<typeof setTimeout> | null = null;
+      let flushTestCleanedUp = false;
+      let resolveFlushVdfWritten!: () => void;
+      const flushVdfWritten = new Promise<void>((resolve) => {
+        resolveFlushVdfWritten = resolve;
+      });
       const flushGuidedPromise = environmentProvisioner.startGuidedClientLogin(
         {
           targetId: 'bottle_steam',
@@ -2573,7 +2579,12 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
           pollIntervalMs: 15,
           postLoginFlushDelayMs: 5000,
           spawnClientFn: async () => {
-            setTimeout(() => {
+            flushWriteTimer = setTimeout(() => {
+              flushWriteTimer = null;
+              if (flushTestCleanedUp || !fs.existsSync(path.dirname(flushVdfPath))) {
+                resolveFlushVdfWritten();
+                return;
+              }
               fs.writeFileSync(
                 flushVdfPath,
                 buildSteamLoginUsersVdf([
@@ -2587,21 +2598,31 @@ describe('System Setup & Environment Health Wizard — Dual-OS Hermetic Verifica
                 ]),
                 'utf8'
               );
+              resolveFlushVdfWritten();
             }, 10);
           },
           closeClientFn: flushCloseSpy,
         }
       );
 
-      // Wait until guided_login_detected enters the 5000ms flush delay, then cancel immediately
-      await new Promise((r) => setTimeout(r, 45));
-      const cancelDuringFlushStart = Date.now();
-      environmentProvisioner.cancelGuidedClientLogin('bottle_steam');
-      const flushCancelledRes = await flushGuidedPromise;
-      expect(Date.now() - cancelDuringFlushStart).toBeLessThan(500);
-      expect(flushCancelledRes.cancelled).toBe(true);
-      expect(flushCancelledRes.authenticated).toBe(false);
-      expect(flushCloseSpy).not.toHaveBeenCalled();
+      try {
+        // Wait until the simulated Steam loginusers.vdf write completes and guided_login_detected enters the 5000ms flush delay
+        await flushVdfWritten;
+        await new Promise((r) => setTimeout(r, 45));
+        const cancelDuringFlushStart = Date.now();
+        environmentProvisioner.cancelGuidedClientLogin('bottle_steam');
+        const flushCancelledRes = await flushGuidedPromise;
+        expect(Date.now() - cancelDuringFlushStart).toBeLessThan(500);
+        expect(flushCancelledRes.cancelled).toBe(true);
+        expect(flushCancelledRes.authenticated).toBe(false);
+        expect(flushCloseSpy).not.toHaveBeenCalled();
+      } finally {
+        flushTestCleanedUp = true;
+        if (flushWriteTimer) {
+          clearTimeout(flushWriteTimer);
+          flushWriteTimer = null;
+        }
+      }
     });
 
     it('4.5 recognizes bottled & win32 GOG Galaxy 2.0/2.1 Configuration/config.json + user.reg + 17-digit INT64 Users(id) schema and exits tray-minimized Galaxy cleanly', async () => {
