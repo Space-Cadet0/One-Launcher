@@ -202,12 +202,12 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       // 4. metalHud: false + dxvkHud: true -> 'on'
       expect(migrateLegacyHudConfig({ metalHud: false, dxvkHud: true }).performanceHud).toBe('on');
 
-      // 5. metalHud: false + (dxvkHud: false | undefined) -> 'off'
-      expect(migrateLegacyHudConfig({ metalHud: false, dxvkHud: false }).performanceHud).toBe('off');
-      expect(migrateLegacyHudConfig({ metalHud: false }).performanceHud).toBe('off');
+      // 5. Legacy metalHud: false / dxvkHud: false (saved unconditionally pre-Wave-1) -> 'default'
+      expect(migrateLegacyHudConfig({ metalHud: false, dxvkHud: false }).performanceHud).toBe('default');
+      expect(migrateLegacyHudConfig({ metalHud: false }).performanceHud).toBe('default');
 
-      // 6. dxvkHud: false + metalHud: undefined -> 'off'
-      expect(migrateLegacyHudConfig({ dxvkHud: false }).performanceHud).toBe('off');
+      // 6. Legacy dxvkHud: false + metalHud: undefined -> 'default'
+      expect(migrateLegacyHudConfig({ dxvkHud: false }).performanceHud).toBe('default');
 
       // 7. Both undefined -> 'default'
       expect(migrateLegacyHudConfig({}).performanceHud).toBe('default');
@@ -223,7 +223,8 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
       expect(resolveEffectivePerformanceHud({ performanceHud: 'default' }, { defaultPerformanceHud: true })).toBe(true);
       expect(resolveEffectivePerformanceHud({ performanceHud: 'default' }, { defaultPerformanceHud: false })).toBe(false);
       expect(resolveEffectivePerformanceHud({ metalHud: true, dxvkHud: false }, { defaultPerformanceHud: false })).toBe(true);
-      expect(resolveEffectivePerformanceHud({ metalHud: false, dxvkHud: false }, { defaultPerformanceHud: true })).toBe(false);
+      expect(resolveEffectivePerformanceHud({ metalHud: false, dxvkHud: false }, { defaultPerformanceHud: true })).toBe(true);
+      expect(resolveEffectivePerformanceHud({ metalHud: false, dxvkHud: false }, { defaultPerformanceHud: false })).toBe(false);
       expect(resolveEffectivePerformanceHud(undefined, { defaultPerformanceHud: true })).toBe(true);
       expect(resolveEffectivePerformanceHud(null, null)).toBe(false);
 
@@ -235,12 +236,12 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         dxvkHud: false,
         platformConfigs: {
           steam: { launchMethod: 'auto', metalHud: false, dxvkHud: false },
-          gog: { launchMethod: 'auto' },
+          gog: { launchMethod: 'auto', performanceHud: 'off' },
         },
       });
       expect(sanitized.performanceHud).toBe('on');
-      expect(sanitized.platformConfigs?.steam?.performanceHud).toBe('off');
-      expect(sanitized.platformConfigs?.gog?.performanceHud).toBe('default');
+      expect(sanitized.platformConfigs?.steam?.performanceHud).toBe('default');
+      expect(sanitized.platformConfigs?.gog?.performanceHud).toBe('off');
     });
   });
 
@@ -393,11 +394,23 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         expect(generalText).toContain('Apple Metal HUD');
         expect(generalText).toContain('DXVK fallback');
 
-        // Reserved-space confirmation bar and Discard Changes button exist in DOM as visibility: hidden
+        // Reserved-space confirmation bar keeps an always-exposed role="status" aria-live="polite"
+        // live region (empty until triggered) while Discard Changes button uses visibility: hidden + tabIndex=-1
         const confirmBarBefore = findByTestId(tree, 'settings-unsaved-confirm-bar');
+        const liveRegionBefore = findElements(
+          confirmBarBefore!,
+          (el) => el.props.role === 'status' && el.props['aria-live'] === 'polite'
+        )[0];
         const discardBtnBefore = findByTestId(tree, 'settings-discard-changes-btn');
-        expect((confirmBarBefore!.props.style as Record<string, string>).visibility).toBe('hidden');
+        expect(String(confirmBarBefore!.props.className || '')).toContain('min-h-[34px]');
+        expect(confirmBarBefore!.props['aria-hidden']).toBeUndefined();
+        expect(liveRegionBefore).toBeDefined();
+        expect(liveRegionBefore.props['aria-hidden']).toBeUndefined();
+        expect(liveRegionBefore.props.style).toBeUndefined();
+        expect(getTextContent(liveRegionBefore)).toBe('');
         expect((discardBtnBefore!.props.style as Record<string, string>).visibility).toBe('hidden');
+        expect(discardBtnBefore!.props.tabIndex).toBe(-1);
+        expect(discardBtnBefore!.props['aria-hidden']).toBe(true);
 
         // Toggle defaultPerformanceHud ON and autoShutdownWinePrefixOnExit OFF
         const hudSwitch = findByTestId(tree, 'settings-toggle-default-performance-hud');
@@ -421,9 +434,16 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         expect(onClose).not.toHaveBeenCalled();
 
         const confirmBarAfter = findByTestId(tree, 'settings-unsaved-confirm-bar');
+        const liveRegionAfter = findElements(
+          confirmBarAfter!,
+          (el) => el.props.role === 'status' && el.props['aria-live'] === 'polite'
+        )[0];
         const discardBtnAfter = findByTestId(tree, 'settings-discard-changes-btn');
-        expect((confirmBarAfter!.props.style as Record<string, string>).visibility).toBe('visible');
+        expect(liveRegionAfter).toBeDefined();
+        expect(getTextContent(liveRegionAfter)).toContain('You have unsaved changes.');
         expect((discardBtnAfter!.props.style as Record<string, string>).visibility).toBe('visible');
+        expect(discardBtnAfter!.props.tabIndex).toBe(0);
+        expect(discardBtnAfter!.props['aria-hidden']).toBe(false);
 
         // Quick shortcuts call respective callbacks
         (findByTestId(tree, 'settings-manage-runners-btn')!.props.onClick as () => void)();
@@ -746,14 +766,20 @@ describe('Wave 1: Global SettingsModal, TopNavBar Settings, Streamlined GameLaun
         });
         tree = renderer.render();
         expect(onClose).not.toHaveBeenCalled();
-        expect(
-          (findByTestId(tree, 'launch-config-unsaved-confirm-bar')!.props.style as Record<string, string>)
-            .visibility
-        ).toBe('visible');
-        expect(
-          (findByTestId(tree, 'launch-config-discard-changes-btn')!.props.style as Record<string, string>)
-            .visibility
-        ).toBe('visible');
+        const launchConfirmBar = findByTestId(tree, 'launch-config-unsaved-confirm-bar');
+        const launchLiveRegion = findElements(
+          launchConfirmBar!,
+          (el) => el.props.role === 'status' && el.props['aria-live'] === 'polite'
+        )[0];
+        expect(String(launchConfirmBar!.props.className || '')).toContain('min-h-[34px]');
+        expect(launchConfirmBar!.props['aria-hidden']).toBeUndefined();
+        expect(launchLiveRegion).toBeDefined();
+        expect(launchLiveRegion.props['aria-hidden']).toBeUndefined();
+        expect(getTextContent(launchLiveRegion)).toContain('You have unsaved changes.');
+        const launchDiscardBtn = findByTestId(tree, 'launch-config-discard-changes-btn');
+        expect((launchDiscardBtn!.props.style as Record<string, string>).visibility).toBe('visible');
+        expect(launchDiscardBtn!.props.tabIndex).toBe(0);
+        expect(launchDiscardBtn!.props['aria-hidden']).toBe(false);
 
         // Save per-game config: writes performanceHud: 'off', omits legacy metalHud/dxvkHud, NEVER saves global settings!
         const saveBtn = findByTestId(tree, 'launch-config-save-btn');

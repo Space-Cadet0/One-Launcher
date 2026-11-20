@@ -151,6 +151,10 @@ const macInstaller = require('../electron/launcher/macNativeInstallerAndCodesign
     launchConfig: Record<string, unknown>,
     options?: Record<string, unknown>
   ) => string;
+  ensureMacAppCodeSignatureValid: (
+    targetPath: string,
+    options?: Record<string, unknown>
+  ) => Record<string, unknown>;
   ensureMacAppCodeSignatureValidAsync: (
     targetPath: string,
     options?: Record<string, unknown>
@@ -255,6 +259,10 @@ const xboxTitleStorageSync = require('../electron/storefronts/xbox/xboxTitleStor
 
 const supervisor = require('../electron/launcher/sessionAndProcessSupervisor.cjs') as {
   resetSupervisorStateForTests: () => void;
+  sanitizeBottleBackgroundClientWakeEnv: (
+    clientEnv: Record<string, string | undefined>,
+    launchConfig?: Record<string, unknown> | null
+  ) => void;
   launchGame: (
     payload: Record<string, unknown>,
     options?: Record<string, unknown>
@@ -331,8 +339,8 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
         { input: { performanceHud: 'default', metalHud: true }, expected: 'default' },
         { input: { metalHud: true, dxvkHud: false }, expected: 'on' },
         { input: { metalHud: false, dxvkHud: true }, expected: 'on' },
-        { input: { metalHud: false, dxvkHud: false }, expected: 'off' },
-        { input: {}, expected: undefined },
+        { input: { metalHud: false, dxvkHud: false }, expected: 'default' },
+        { input: {}, expected: 'default' },
       ];
 
       for (const tc of cases) {
@@ -359,6 +367,24 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       });
       expect(readLegacy?.performanceHud).toBe('on');
 
+      // Legacy { metalHud: false, dxvkHud: false } inherits Global defaultPerformanceHud: true
+      const policyLegacyFalse = engineStateRegistry.resolveEffectivePerformancePolicy(
+        { metalHud: false, dxvkHud: false },
+        { userDataDir }
+      );
+      expect(policyLegacyFalse.effectivePerformanceHud).toBe(true);
+
+      const legacyFalseEnv: Record<string, string | undefined> = {};
+      const legacyFalseHudRes = macInstaller.applyUnifiedPerformanceHudEnv({
+        env: legacyFalseEnv,
+        launchConfig: { metalHud: false, dxvkHud: false },
+        platform: 'darwin',
+        useCompatLayer: false,
+        perfSettings: { defaultPerformanceHud: true },
+      });
+      expect(legacyFalseHudRes.hudEnabled).toBe(true);
+      expect(legacyFalseEnv.MTL_HUD_ENABLED).toBe('1');
+
       const policyDefault = engineStateRegistry.resolveEffectivePerformancePolicy(
         { performanceHud: 'default' },
         { userDataDir }
@@ -372,7 +398,7 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       expect(policyOff.effectivePerformanceHud).toBe(false);
     });
 
-    it('preserves defaultPerformanceHud through launcher:save-performance-settings IPC handler', async () => {
+    it('preserves defaultPerformanceHud through launcher:save-performance-settings IPC handler and allows legacy enableMetalHud: false to disable it', async () => {
       const userDataDir = makeTempDir('ol-ipc-perf-');
       const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
       const mockIpcMain = {
@@ -407,6 +433,14 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       expect(
         engineStateRegistry.getLauncherPerformanceSettings({ userDataDir }).defaultPerformanceHud
       ).toBe(true);
+
+      // Legacy { enableMetalHud: false } IPC payload can turn defaultPerformanceHud OFF
+      await handler?.({}, { enableMetalHud: false }, {});
+      expect(savedPayloads[1]?.defaultPerformanceHud).toBe(false);
+      expect('enableMetalHud' in (savedPayloads[1] || {})).toBe(false);
+      expect(
+        engineStateRegistry.getLauncherPerformanceSettings({ userDataDir }).defaultPerformanceHud
+      ).toBe(false);
     });
   });
 
@@ -661,9 +695,28 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       );
 
       await new Promise((r) => setTimeout(r, 25));
-      const stopRes = await supervisor.stopGame('custom:l01-abort', { userDataDir });
+      const stopEvents: Array<Record<string, unknown>> = [];
+      const stopRes = await supervisor.stopGame('custom:l01-abort', {
+        userDataDir,
+        onSessionUpdated: (evt: Record<string, unknown>) => {
+          stopEvents.push(evt);
+        },
+      });
       expect(stopRes.success).toBe(true);
       expect(stopRes.cancelled).toBe(true);
+      expect(stopEvents).toHaveLength(1);
+      expect(stopEvents[0]).toMatchObject({
+        session: {
+          gameId: 'custom:l01-abort',
+          status: 'stopped',
+          statusMessage: 'Launch cancelled',
+        },
+        gameId: 'custom:l01-abort',
+        status: 'stopped',
+        event: 'stopped',
+        cancelled: true,
+        statusMessage: 'Launch cancelled',
+      });
       releasePostSession();
 
       const launchRes = await pendingLaunch;
@@ -671,6 +724,36 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       expect(launchRes.cancelled).toBe(true);
       expect(abortSpawnCalls).toBe(0);
       expect(engineStateRegistry.inFlightLaunchesByGameId.size).toBe(0);
+    });
+
+    it('M-4: sanitizeBottleBackgroundClientWakeEnv strips libone_metal_preload.dylib from DYLD_INSERT_LIBRARIES and CX_ENV while preserving custom user dylibs', () => {
+      const envOnlyPreload: Record<string, string | undefined> = {
+        MTL_HUD_ENABLED: '1',
+        DXVK_HUD: 'fps',
+        DYLD_INSERT_LIBRARIES: '/opt/one-launcher/helpers/libone_metal_preload.dylib',
+        CX_ENV:
+          'MTL_HUD_ENABLED=1 DYLD_INSERT_LIBRARIES=/opt/one-launcher/helpers/libone_metal_preload.dylib WINEDLLOVERRIDES=foo=n',
+      };
+      supervisor.sanitizeBottleBackgroundClientWakeEnv(envOnlyPreload, {});
+      expect(envOnlyPreload.MTL_HUD_ENABLED).toBeUndefined();
+      expect(envOnlyPreload.DXVK_HUD).toBeUndefined();
+      expect(envOnlyPreload.DYLD_INSERT_LIBRARIES).toBeUndefined();
+      expect(envOnlyPreload.CX_ENV).toBe('WINEDLLOVERRIDES=foo=n');
+
+      const envWithCustomAndPreload: Record<string, string | undefined> = {
+        DYLD_INSERT_LIBRARIES:
+          '/opt/user/custom_hook.dylib:/opt/one-launcher/helpers/libone_metal_preload.dylib',
+        CX_ENV:
+          'FOO=1 DYLD_INSERT_LIBRARIES=/opt/user/custom_hook.dylib:/opt/one-launcher/helpers/libone_metal_preload.dylib',
+      };
+      supervisor.sanitizeBottleBackgroundClientWakeEnv(envWithCustomAndPreload, {
+        environmentVariables: { DYLD_INSERT_LIBRARIES: '/opt/user/custom_hook.dylib' },
+      });
+      expect(envWithCustomAndPreload.DYLD_INSERT_LIBRARIES).toBe('/opt/user/custom_hook.dylib');
+      expect(envWithCustomAndPreload.CX_ENV).toBe(
+        'FOO=1 DYLD_INSERT_LIBRARIES=/opt/user/custom_hook.dylib'
+      );
+      expect(envWithCustomAndPreload.CX_ENV).not.toContain('libone_metal_preload.dylib');
     });
 
     it('L-02 & L-08: predicts bottle prefix, awaits inFlightPostSessionByBottle before mutating cxbottle.conf, shares sanitize cache key, and chains pendingWineRegSyncByPrefix', async () => {
@@ -946,6 +1029,114 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       expect(devIdRes.repaired).toBe(false);
       expect(devIdCmds.some((c) => c.includes('--sign'))).toBe(false);
 
+      // 3b. H-1 regression: sync ensureMacAppCodeSignatureValid preserves Developer ID apps when
+      // `codesign -dv` writes Authority=... ONLY to stderr (stdout: "") via spawnSync
+      const syncDevIdExecCmds: string[][] = [];
+      const syncDevIdSpawnCmds: string[][] = [];
+      const syncDevIdRes = macInstaller.ensureMacAppCodeSignatureValid(appBundle, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        userDataDir,
+        execFileSyncFn: (cmd: string, args: string[]) => {
+          syncDevIdExecCmds.push([cmd, ...args]);
+          if (cmd === 'xattr' && args[0] === '-p') {
+            const err = new Error('No such xattr') as Error & { status?: number; stderr?: string };
+            err.status = 1;
+            err.stderr = 'No such xattr: com.apple.quarantine';
+            throw err;
+          }
+          if (cmd === 'codesign' && args.includes('--verify')) {
+            throw new Error('invalid resource seal');
+          }
+          return '';
+        },
+        spawnSyncFn: (cmd: string, args: string[]) => {
+          syncDevIdSpawnCmds.push([cmd, ...args]);
+          return {
+            status: 0,
+            stdout: '',
+            stderr: 'Authority=Developer ID Application: Synthetic Studio (TEAM12345)\n',
+            signal: null,
+            error: undefined,
+          };
+        },
+      });
+      expect(syncDevIdSpawnCmds).toHaveLength(1);
+      expect(syncDevIdSpawnCmds[0]).toEqual(['codesign', '-dv', '--verbose=2', appBundle]);
+      expect(syncDevIdRes.preservedTrustedSignature).toBe(true);
+      expect(syncDevIdRes.repaired).toBe(false);
+      expect(syncDevIdExecCmds.some((c) => c.includes('--sign'))).toBe(false);
+
+      // 3c. H-1 regression: BOTH sync and async return timedOut: true WITHOUT --sign when `codesign -dv` times out
+      const syncDvTimeoutExecCmds: string[][] = [];
+      const syncDvTimeoutRes = macInstaller.ensureMacAppCodeSignatureValid(appBundle, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        userDataDir,
+        execFileSyncFn: (cmd: string, args: string[]) => {
+          syncDvTimeoutExecCmds.push([cmd, ...args]);
+          if (cmd === 'xattr' && args[0] === '-p') {
+            const err = new Error('No such xattr') as Error & { status?: number; stderr?: string };
+            err.status = 1;
+            err.stderr = 'No such xattr: com.apple.quarantine';
+            throw err;
+          }
+          if (cmd === 'codesign' && args.includes('--verify')) {
+            throw new Error('invalid resource seal');
+          }
+          return '';
+        },
+        spawnSyncFn: () => {
+          const timeoutErr = new Error('spawnSync codesign ETIMEDOUT') as Error & { code?: string };
+          timeoutErr.code = 'ETIMEDOUT';
+          return {
+            status: null,
+            stdout: '',
+            stderr: '',
+            signal: 'SIGTERM',
+            error: timeoutErr,
+          };
+        },
+      });
+      expect(syncDvTimeoutRes.timedOut).toBe(true);
+      expect(syncDvTimeoutRes.verified).toBe(false);
+      expect(syncDvTimeoutRes.repaired).toBe(false);
+      expect(syncDvTimeoutExecCmds.some((c) => c.includes('--sign'))).toBe(false);
+
+      const asyncDvTimeoutCmds: string[][] = [];
+      const asyncDvTimeoutRes = await macInstaller.ensureMacAppCodeSignatureValidAsync(appBundle, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        userDataDir,
+        execFileFn: (
+          cmd: string,
+          args: string[],
+          _opts: unknown,
+          cb: (err: Error | null, stdout?: string, stderr?: string) => void
+        ) => {
+          asyncDvTimeoutCmds.push([cmd, ...args]);
+          if (cmd === 'codesign' && args.includes('--verify')) {
+            cb(new Error('invalid resource seal'), '', 'invalid resource seal');
+            return;
+          }
+          if (cmd === 'codesign' && args.includes('-dv')) {
+            const dvTimeoutErr = new Error('Command timed out') as Error & {
+              killed?: boolean;
+              signal?: string;
+            };
+            dvTimeoutErr.killed = true;
+            dvTimeoutErr.signal = 'SIGTERM';
+            cb(dvTimeoutErr, '', '');
+            return;
+          }
+          cb(null, '', '');
+        },
+      });
+      expect(asyncDvTimeoutRes.timedOut).toBe(true);
+      expect(asyncDvTimeoutRes.verified).toBe(false);
+      expect(asyncDvTimeoutRes.repaired).toBe(false);
+      expect(asyncDvTimeoutCmds.some((c) => c.includes('--sign'))).toBe(false);
+
       // 4. Verified signature persists across cold restart (cleared in-memory map)
       let verifyCount = 0;
       const okExec = (
@@ -1197,6 +1388,97 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
       expect(peakAtomUploads).toBeGreaterThan(1);
       expect(peakAtomUploads).toBeLessThanOrEqual(4);
       // All parallel 412s coalesce onto a single lock re-acquisition
+      expect(lockCalls).toBe(1);
+    });
+
+    it('H-2 regression: Xbox runWithSessionLockRecovery succeeds for BOTH containers under staggered 412 latency (20ms vs 60ms)', async () => {
+      const wgsUserDir = makeTempDir('ol-xbox-staggered-412-');
+      const containers: LocalWgsContainerInput[] = [
+        {
+          name: 'SlotA',
+          displayName: 'SlotA',
+          containerNum: 1,
+          dirty: true,
+          modifiedIso: '2026-10-26T12:00:00.000Z',
+          blobs: [{ name: 'save.bin', data: Buffer.from('payload-fast-A', 'utf8') }],
+        },
+        {
+          name: 'SlotB',
+          displayName: 'SlotB',
+          containerNum: 2,
+          dirty: true,
+          modifiedIso: '2026-10-26T12:00:01.000Z',
+          blobs: [{ name: 'save.bin', data: Buffer.from('payload-slow-B', 'utf8') }],
+        },
+      ];
+      await xboxTitleStorageSync.writeLocalWgsWorkspace(wgsUserDir, { containers });
+
+      let lockCalls = 0;
+      let staleLockActive = true;
+      const attemptCountByPayload = new Map<string, number>();
+      const storedContainers = new Map<string, boolean>();
+
+      const fetchImpl = async (urlStr: string, init?: { method?: string; body?: unknown }) => {
+        const method = String(init?.method || 'GET').toUpperCase();
+        const u = new URL(urlStr);
+        const match = /^\/connectedstorage\/users\/xuid\([^)]+\)\/scids\/[^/]+(.*)$/.exec(
+          u.pathname
+        );
+        const subPath = match ? decodeURIComponent(match[1] || '') : '';
+
+        if (subPath === '/lock' && method === 'PUT') {
+          lockCalls += 1;
+          // Completes at t=35ms (20ms + 15ms), BEFORE Container B's first attempt returns at t=60ms
+          await new Promise((r) => setTimeout(r, 15));
+          staleLockActive = false;
+          return new Response(JSON.stringify({ quotaBytes: 268435456 }), { status: 200 });
+        }
+        if (subPath === '/lock' && method === 'DELETE') {
+          return new Response(null, { status: 204 });
+        }
+        if ((subPath === '' || subPath === '/') && method === 'GET') {
+          return new Response(JSON.stringify({ blobs: [] }), { status: 200 });
+        }
+        if (subPath.endsWith(',binary') && method === 'PUT') {
+          const payloadText = Buffer.isBuffer(init?.body)
+            ? init.body.toString('utf8')
+            : String(init?.body || '');
+          const attempt = (attemptCountByPayload.get(payloadText) || 0) + 1;
+          attemptCountByPayload.set(payloadText, attempt);
+          const sentUnderStaleLock = staleLockActive;
+          const isSlowContainer = payloadText.includes('slow-B');
+          // Container A hits 412 at 20ms; already-in-flight Container B hits 412 at 60ms (after A's lock finished at 35ms!)
+          const delayMs = attempt === 1 ? (isSlowContainer ? 60 : 20) : 5;
+          await new Promise((r) => setTimeout(r, delayMs));
+          if (sentUnderStaleLock) {
+            return new Response('Precondition Failed', { status: 412 });
+          }
+          return new Response(null, { status: 201 });
+        }
+        if (subPath.endsWith(',savedgame') && method === 'PUT') {
+          const cName = subPath.slice(1, -',savedgame'.length);
+          storedContainers.set(cName, true);
+          return new Response('{}', { status: 200 });
+        }
+        return new Response('Not Found', { status: 404 });
+      };
+
+      const res = await xboxTitleStorageSync.syncXboxTitleStorage({
+        mode: 'post_exit',
+        wgsUserDir,
+        xuid: '2533274799999999',
+        scid: '00000000-0000-0000-0000-000000000003',
+        packageFamilyName: 'Synth.Package_8wekyb3d8bbwe',
+        authorizationHeader: 'XBL3.0 x=2533274799999999;mock_jwt',
+        titleStorageOrigin: 'https://titlestorage.mock.local',
+        alreadyLocked: true,
+        fetchImpl,
+        blobConcurrency: 4,
+      });
+
+      expect(res.synced).toBe(true);
+      expect(res.uploadedContainers).toBe(2);
+      expect(storedContainers.size).toBe(2);
       expect(lockCalls).toBe(1);
     });
 
@@ -1461,21 +1743,21 @@ describe('Wave 1 Launch Runtime, Unified Performance HUD & Cloud-Save Hardening'
           steamEntry.wokeSteamByLauncher = true;
           steamEntry.effectiveStorefrontLifecycle = 'minimal_keep_running';
         }
+        await supervisor.finalizeGameSession('steam:777001', {
+          userDataDir,
+          homedir: tmp,
+          steamRoot,
+          steamCloudSyncTimeoutMs: 2000,
+          steamCloudPollIntervalMs: 20,
+        });
         setTimeout(() => {
           fs.appendFileSync(
             cloudLogPath,
             '[2026-01-01 00:00:01] [AppID 777001] Upload complete\n',
             'utf8'
           );
-        }, 25);
-        await supervisor.finalizeGameSession('steam:777001', {
-          userDataDir,
-          homedir: tmp,
-          steamRoot,
-          steamCloudSyncTimeoutMs: 500,
-          steamCloudPollIntervalMs: 20,
-        });
-        await supervisor.waitForActivePostSessionWork(1500);
+        }, 30);
+        await supervisor.waitForActivePostSessionWork(2500);
       } finally {
         unsubTelemetry();
       }

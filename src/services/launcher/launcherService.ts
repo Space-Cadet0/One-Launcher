@@ -1137,7 +1137,18 @@ export class LauncherService {
       return;
     }
 
-    if (!session || !session.gameId) return;
+    if (!session || !session.gameId) {
+      if (data?.event === 'stopped') {
+        const rawGameId: unknown = Reflect.get(data, 'gameId');
+        const fallbackGameId = typeof rawGameId === 'string' ? rawGameId.trim() : '';
+        if (fallbackGameId) {
+          this.activeSessions.delete(fallbackGameId);
+          this.syncInGameResourceThrottle();
+          this.notifyStateChanged();
+        }
+      }
+      return;
+    }
 
     if (data.event === 'playtime_synced') {
       if (

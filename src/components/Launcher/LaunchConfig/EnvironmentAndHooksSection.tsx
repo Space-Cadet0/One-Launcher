@@ -15,9 +15,6 @@ export interface EnvironmentAndHooksSectionProps {
   onChangePreLaunchCommand: (value: string) => void;
   postExitCommand: string;
   onChangePostExitCommand: (value: string) => void;
-  /** @deprecated Legacy quick-env chip props retained optional for call-site compatibility */
-  currentEnvMap?: Record<string, string>;
-  onToggleQuickEnv?: (key: string, value: string) => void;
 }
 
 function EnvironmentAndHooksSectionImpl({

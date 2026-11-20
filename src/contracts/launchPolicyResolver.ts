@@ -136,6 +136,11 @@ export function sanitizePerformanceHudMode(value?: unknown): PerformanceHudMode 
 /**
  * Lossless, idempotent migration from legacy split `metalHud`/`dxvkHud` booleans
  * to the unified `performanceHud` ('default' | 'on' | 'off') setting.
+ *
+ * Pre-Wave-1 saves unconditionally wrote `{ metalHud: false, dxvkHud: false }` when no global
+ * HUD default existed, so legacy `false` / omitted flags map to `'default'` (preserving behavior
+ * when `defaultPerformanceHud` is `false` while letting existing libraries inherit `true`),
+ * legacy `true` maps to `'on'`, and any explicit `'on' | 'off' | 'default'` is preserved verbatim.
  */
 export function migrateLegacyHudConfig<T extends Partial<StorefrontLaunchProfile>>(
   cfg: T
@@ -149,13 +154,8 @@ export function migrateLegacyHudConfig<T extends Partial<StorefrontLaunchProfile
       performanceHud: PerformanceHudMode;
     };
   }
-  const hasMetal = typeof cfg.metalHud === 'boolean';
-  const hasDxvk = typeof cfg.dxvkHud === 'boolean';
   if (cfg.metalHud === true || cfg.dxvkHud === true) {
     return { ...cfg, performanceHud: 'on' };
-  }
-  if (hasMetal || hasDxvk) {
-    return { ...cfg, performanceHud: 'off' };
   }
   return { ...cfg, performanceHud: 'default' };
 }

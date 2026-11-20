@@ -294,6 +294,112 @@ describe('Wave 1 — Storefront Sync Hardening, Scoped Achievements & Non-Blocki
       const tokensPath = storeSync.getTokensFilePath(vaultOpts);
       expect(fs.statSync(tokensPath).size).toBeLessThan(2048);
     });
+
+    it('L-1 regression: skips rewriting one_launcher_steam_owned_cache.json when merged achievements/playtime match the cached Steam record', async () => {
+      const userDataDir = makeTempDir('ol-w1-steam-l1-');
+      const vaultOpts = { userDataDir };
+      storeSync.saveTokens(
+        'steam',
+        {
+          access_token: 'steam_web_session_l1',
+          steamId: '76561198000000002',
+          accountName: 'SynthSteamL1',
+          webapi_token: 'synth_webapi_token_l1',
+        },
+        vaultOpts
+      );
+      storeSync.saveSteamOwnedGamesCache(
+        [
+          {
+            id: 'steam-910003',
+            title: 'Synthetic Cached Steam Entry',
+            steamAppId: 910003,
+            isVerifiedEntitlement: true,
+            platforms: [
+              {
+                platformId: 'steam',
+                platformGameId: '910003',
+                installed: false,
+                playtimeMinutes: 120,
+                achievements: {
+                  unlocked: 5,
+                  total: 10,
+                  percentage: 50,
+                  isMastered: false,
+                },
+              },
+            ],
+          },
+        ],
+        { ...vaultOpts, steamId: '76561198000000002' }
+      );
+
+      const handlers = new Map<string, MockIpcHandler>();
+      const mockIpcMain = {
+        handle: vi.fn((ch: string, fn: MockIpcHandler) => {
+          handlers.set(ch, fn);
+        }),
+        on: vi.fn(),
+        removeListener: vi.fn(),
+      };
+      const saveSteamOwnedCacheSpy = vi.fn((games: unknown[], opts: Record<string, unknown>) =>
+        storeSync.saveSteamOwnedGamesCache(games, opts)
+      );
+
+      // Simulate GetOwnedGames timeout (falls back to disk cache) + batch achievements returning identical 5/10
+      const fetchSpy = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('GetOwnedGames')) {
+          const err = new Error('Timeout');
+          err.name = 'TimeoutError';
+          throw err;
+        }
+        if (url.includes('GetAchievementsProgress')) {
+          return makeJsonRes({
+            response: {
+              achievement_progress: [
+                {
+                  appid: 910003,
+                  unlocked: 5,
+                  total: 10,
+                  percentage: 50,
+                },
+              ],
+            },
+          });
+        }
+        return makeJsonRes({ response: {} });
+      });
+
+      registerStoreSyncIpcHandlers({
+        ipcMain: mockIpcMain,
+        BrowserWindow: vi.fn(),
+        session: { fromPartition: () => ({ fetch: vi.fn() }) },
+        getMainWindow: () => null,
+        storeSync: {
+          ...storeSync,
+          loadSavedTokens: () => storeSync.loadSavedTokens(vaultOpts),
+          saveTokens: vi.fn(),
+          loadSteamOwnedGamesCache: (opts: Record<string, unknown>) =>
+            storeSync.loadSteamOwnedGamesCache({ ...vaultOpts, ...(opts || {}) }),
+          saveSteamOwnedGamesCache: saveSteamOwnedCacheSpy,
+          scanLocalSuppressedStorefrontItems: () => [],
+        },
+        launcherEngine: {},
+        options: {
+          userDataDir,
+          isOnline: () => true,
+          fetchFn: fetchSpy,
+        },
+      });
+
+      const syncHandler = handlers.get('store:sync')!;
+      const res = (await syncHandler({}, 'steam')) as { success: boolean; games: unknown[] };
+      expect(res.success).toBe(true);
+      expect(res.games).toHaveLength(1);
+      // Identical playtime + achievements + isVerifiedEntitlement must NOT trigger a redundant disk cache write
+      expect(saveSteamOwnedCacheSpy).not.toHaveBeenCalled();
+    });
   });
 
   // =========================================================================

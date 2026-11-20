@@ -37,6 +37,7 @@ import { fallbackMetadataProvider } from '../src/services/steam/fallbackMetadata
 import { SteamMatcherService, steamMatcher } from '../src/services/steam/steamMatcher';
 import { SteamApiService, steamApi } from '../src/services/steam/steamApi';
 import * as indexedDbVault from '../src/services/storage/indexedDbVault';
+import { markScrollActivity } from '../src/utils/scrollActivityTracker';
 import {
   clearStagedMemoryFallback,
   hydrateAllStagedCacheFromVault,
@@ -1199,6 +1200,88 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
         'idb_universal_game_library_catalog_v2',
         expect.any(Array)
       );
+    });
+
+    it('M-1 regression: coalesces production small dirty slices behind scroll-aware debounce without writing synchronously during active scroll', () => {
+      vi.useFakeTimers();
+      const upsertGamesSpy = vi.fn().mockResolvedValue({ success: true });
+      const winRef = globalThis.window as unknown as {
+        electronAPI?: {
+          isElectron: boolean;
+          offlineVault: { upsertGames: typeof upsertGamesSpy };
+        };
+      };
+      winRef.electronAPI = {
+        isElectron: true,
+        offlineVault: { upsertGames: upsertGamesSpy },
+      };
+
+      const vaultSetSpy = vi.spyOn(indexedDbVault, 'vaultSet').mockResolvedValue(true);
+      const largeCatalog: CanonicalGame[] = Array.from({ length: 400 }, (_, idx) => {
+        const appId = 991000 + idx;
+        return makeSyntheticGame({
+          id: `steam-${appId}`,
+          title: `Synthetic Scroll Entry ${idx}`,
+          steamAppId: appId,
+          platforms: [
+            {
+              platformId: 'steam',
+              platformGameId: String(appId),
+              installed: false,
+              playtimeMinutes: 0,
+            },
+          ],
+        });
+      });
+
+      const origVitest = process.env.VITEST;
+      const origNodeEnv = process.env.NODE_ENV;
+      try {
+        delete process.env.VITEST;
+        process.env.NODE_ENV = 'production';
+
+        // Simulate active user scroll
+        markScrollActivity();
+
+        // Two rapid small dirty slices arrive during scroll: NEITHER writes synchronously!
+        saveCurrentCatalog(largeCatalog, {
+          dirtyGameIds: ['steam-991001'],
+          skipSanitize: true,
+        });
+        saveCurrentCatalog(largeCatalog, {
+          dirtyGameIds: ['steam-991002'],
+          skipSanitize: true,
+        });
+        expect(upsertGamesSpy).not.toHaveBeenCalled();
+        expect(vaultSetSpy).not.toHaveBeenCalled();
+
+        // Keep scrolling at 200ms and 400ms so scroll stays active across the initial 600ms check
+        vi.advanceTimersByTime(200);
+        markScrollActivity();
+        vi.advanceTimersByTime(200);
+        markScrollActivity();
+        vi.advanceTimersByTime(200);
+        // At t=600ms, scroll is STILL active (last markScrollActivity was at t=400ms, settles at t=620ms)
+        expect(upsertGamesSpy).not.toHaveBeenCalled();
+
+        // Let scroll settle (t=620ms) and the rescheduled 600ms idle timer fire (t=1200ms)
+        vi.advanceTimersByTime(600);
+        expect(upsertGamesSpy).toHaveBeenCalledTimes(1);
+        const coalescedArgs = upsertGamesSpy.mock.calls[0] as unknown as [CanonicalGame[]];
+        expect(coalescedArgs[0].map((g) => g.id).sort()).toEqual(['steam-991001', 'steam-991002']);
+
+        // Snapshot mirror is STILL debounced for 3,000ms after the coalesced flush
+        expect(vaultSetSpy).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(3000);
+        expect(vaultSetSpy).toHaveBeenCalledWith(
+          'idb_universal_game_library_catalog_v2',
+          expect.any(Array)
+        );
+      } finally {
+        process.env.VITEST = origVitest;
+        process.env.NODE_ENV = origNodeEnv;
+        flushPendingCatalogSave();
+      }
     });
 
     it('reads ONLY staged:* keys via getAllKeys in stagedCacheService.hydrateAllStagedCacheFromVault without reading idb_universal_game_library_catalog_v2 (S-07)', async () => {

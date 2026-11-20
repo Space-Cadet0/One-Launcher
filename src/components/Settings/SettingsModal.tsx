@@ -770,17 +770,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         )}
 
-        {/* Reserved-space unsaved-changes confirmation bar (zero layout shift!) */}
+        {/* Reserved-space unsaved-changes confirmation bar (zero layout shift, always-exposed live region!) */}
         <div
           data-testid="settings-unsaved-confirm-bar"
-          role="status"
-          aria-live="polite"
-          aria-hidden={!showDiscardConfirm}
-          style={{ visibility: showDiscardConfirm ? 'visible' : 'hidden' }}
-          className="px-5 py-2 bg-amber-950/55 border-t border-amber-500/40 flex items-center gap-2 text-xs text-amber-200 shrink-0"
+          className={`min-h-[34px] px-5 py-2 border-t flex items-center gap-2 text-xs shrink-0 transition-colors ${
+            showDiscardConfirm
+              ? 'bg-amber-950/55 border-amber-500/40 text-amber-200'
+              : 'bg-transparent border-transparent text-transparent'
+          }`}
         >
-          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
-          <span>You have unsaved changes. Save settings or discard changes to close.</span>
+          <AlertTriangle
+            className="w-3.5 h-3.5 text-amber-400 shrink-0"
+            style={{ visibility: showDiscardConfirm ? 'visible' : 'hidden' }}
+            aria-hidden="true"
+          />
+          <span role="status" aria-live="polite" className="text-amber-200">
+            {showDiscardConfirm
+              ? 'You have unsaved changes. Save settings or discard changes to close.'
+              : ''}
+          </span>
         </div>
 
         {/* Footer */}

@@ -1531,5 +1531,110 @@ describe('Wave 2: App Settings Wiring, Cold-Boot Barriers, Parallel Sync & Sessi
 
       harness.unmount();
     });
+
+    it('H-3 regression: supervisor.stopGame abort event piped into LauncherService.handleSessionUpdated cleanly clears active session state (and top-level gameId fallback works too)', async () => {
+      const os = await import('node:os');
+      const engineStateRegistry = require('../electron/launcher/engineStateRegistry.cjs') as {
+        inFlightLaunchAbortControllers: Map<string, AbortController>;
+      };
+      const supervisor = require('../electron/launcher/sessionAndProcessSupervisor.cjs') as {
+        stopGame: (
+          gameId: string,
+          options?: Record<string, unknown>
+        ) => Promise<Record<string, unknown>>;
+      };
+
+      const sessionCbBox: { current: ((payload: Record<string, unknown>) => void) | null } = {
+        current: null,
+      };
+      const tmpUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-h3-e2e-'));
+      try {
+        installMockBrowserEnvironment({
+          getAppInfo: vi.fn().mockResolvedValue({ platform: 'darwin', arch: 'arm64' }),
+          detectCompatibilityLayers: vi.fn().mockResolvedValue({ success: true, layers: [] }),
+          scanAllInstalledGames: vi.fn().mockResolvedValue({ success: true, installedGames: [] }),
+          getActiveDownloads: vi.fn().mockResolvedValue({ success: true, downloads: [] }),
+          getRunningGames: vi.fn().mockResolvedValue([
+            {
+              sessionId: 'sess-h3-abort',
+              gameId: 'custom:h3-abort-game',
+              title: 'Synthetic H3 Abort Game',
+              platformId: 'custom',
+              platformGameId: 'h3-abort-game',
+              status: 'launching',
+              startedAt: Date.now(),
+            },
+          ]),
+          getGameLaunchConfigs: vi.fn().mockResolvedValue({ success: true, configs: {} }),
+          getLauncherPerformanceSettings: vi.fn().mockResolvedValue({}),
+          onDownloadUpdated: vi.fn(() => () => {}),
+          onSessionUpdated: vi.fn((cb: (payload: Record<string, unknown>) => void) => {
+            sessionCbBox.current = cb;
+            return () => {
+              sessionCbBox.current = null;
+            };
+          }),
+          drainPendingCompletedSessions: vi.fn().mockResolvedValue([]),
+        });
+
+        await launcherService.initialize();
+        expect(sessionCbBox.current).toBeTypeOf('function');
+        expect(launcherService.getActiveSession('custom:h3-abort-game')).toBeDefined();
+
+        const abortCtrl = new AbortController();
+        engineStateRegistry.inFlightLaunchAbortControllers.set('custom:h3-abort-game', abortCtrl);
+
+        let notifyCalls = 0;
+        const unsub = launcherService.subscribe(() => {
+          notifyCalls += 1;
+        });
+        try {
+          const stopRes = await supervisor.stopGame('custom:h3-abort-game', {
+            userDataDir: tmpUserDataDir,
+            onSessionUpdated: (payload: Record<string, unknown>) => {
+              sessionCbBox.current?.(payload);
+            },
+          });
+
+          expect(stopRes.success).toBe(true);
+          expect(stopRes.cancelled).toBe(true);
+          expect(abortCtrl.signal.aborted).toBe(true);
+          expect(launcherService.getActiveSession('custom:h3-abort-game')).toBeUndefined();
+          expect(notifyCalls).toBeGreaterThanOrEqual(1);
+
+          // Also verify defensive top-level `data.gameId` fallback when `data.session` is absent
+          sessionCbBox.current?.({
+            session: {
+              sessionId: 'sess-h3-fallback',
+              gameId: 'custom:h3-fallback-game',
+              title: 'Synthetic H3 Fallback',
+              platformId: 'custom',
+              platformGameId: 'h3-fallback-game',
+              status: 'running',
+              startedAt: Date.now(),
+            },
+            event: 'started',
+          });
+          expect(launcherService.getActiveSession('custom:h3-fallback-game')).toBeDefined();
+
+          const notifyBeforeFallback = notifyCalls;
+          sessionCbBox.current?.({
+            gameId: 'custom:h3-fallback-game',
+            status: 'stopped',
+            event: 'stopped',
+            cancelled: true,
+          });
+          expect(launcherService.getActiveSession('custom:h3-fallback-game')).toBeUndefined();
+          expect(notifyCalls).toBeGreaterThan(notifyBeforeFallback);
+        } finally {
+          unsub();
+          engineStateRegistry.inFlightLaunchAbortControllers.delete('custom:h3-abort-game');
+        }
+      } finally {
+        try {
+          fs.rmSync(tmpUserDataDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
   });
 });

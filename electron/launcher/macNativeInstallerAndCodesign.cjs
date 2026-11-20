@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile, execFileSync, spawnSync } = require('node:child_process');
 
 const {
   diagLog,
@@ -560,8 +560,10 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
     return { verified: false, repaired: false, appBundlePath: null };
   }
 
+  const hasCustomExecFileSync = typeof options.execFileSyncFn === 'function';
+  const hasCustomSpawnSync = typeof options.spawnSyncFn === 'function';
   const useCache =
-    (typeof options.execFileSyncFn !== 'function' || options.useCodesignCache === true) &&
+    ((!hasCustomExecFileSync && !hasCustomSpawnSync) || options.useCodesignCache === true) &&
     options.forceCodesignRecheck !== true;
   if (useCache) {
     hydrateCodesignDiskCache(options);
@@ -571,8 +573,8 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
     return { verified: true, repaired: false, cached: true, appBundlePath };
   }
 
-  const execFileSyncImpl =
-    typeof options.execFileSyncFn === 'function' ? options.execFileSyncFn : execFileSync;
+  const execFileSyncImpl = hasCustomExecFileSync ? options.execFileSyncFn : execFileSync;
+  const spawnSyncImpl = hasCustomSpawnSync ? options.spawnSyncFn : spawnSync;
 
   try {
     ensureMacExecutablePermissions(appBundlePath);
@@ -635,20 +637,62 @@ function ensureMacAppCodeSignatureValid(targetPath, /** @type {any} */ options =
       return { verified: false, repaired: false, timedOut: true, appBundlePath };
     }
     try {
-      const dvOut = execFileSyncImpl('codesign', ['-dv', '--verbose=2', appBundlePath], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 5000,
-      });
-      if (hasTrustedAppleOrDeveloperAuthority(dvOut)) {
-        diagLog.warn(
-          'codesign.refusedAdHocResignTrustedAuthority',
-          'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
-          { appBundlePath }
-        );
-        return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+      if (hasCustomSpawnSync || !hasCustomExecFileSync) {
+        // On macOS, `codesign -dv --verbose=2` writes Authority=... metadata to stderr (stdout is empty).
+        const dvRes = spawnSyncImpl('codesign', ['-dv', '--verbose=2', appBundlePath], {
+          encoding: 'utf8',
+          timeout: 5000,
+        });
+        if (
+          dvRes &&
+          (isCodesignTimeoutError(dvRes.error) ||
+            dvRes.signal === 'SIGTERM' ||
+            dvRes.signal === 'SIGKILL')
+        ) {
+          diagLog.warn(
+            'codesign.dvTimedOut',
+            'Skipped ad-hoc re-sign after codesign -dv timeout',
+            { appBundlePath }
+          );
+          return { verified: false, repaired: false, timedOut: true, appBundlePath };
+        }
+        const combinedDvOut = `${dvRes?.stdout || ''}\n${dvRes?.stderr || ''}`;
+        if (hasTrustedAppleOrDeveloperAuthority(combinedDvOut)) {
+          diagLog.warn(
+            'codesign.refusedAdHocResignTrustedAuthority',
+            'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+            { appBundlePath }
+          );
+          return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+        }
+      } else {
+        const dvOut = execFileSyncImpl('codesign', ['-dv', '--verbose=2', appBundlePath], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 5000,
+        });
+        const combinedDvOut =
+          dvOut && typeof dvOut === 'object'
+            ? `${dvOut.stdout || ''}\n${dvOut.stderr || ''}`
+            : String(dvOut || '');
+        if (hasTrustedAppleOrDeveloperAuthority(combinedDvOut)) {
+          diagLog.warn(
+            'codesign.refusedAdHocResignTrustedAuthority',
+            'Refused to overwrite Developer ID / Apple Distribution signature with ad-hoc signature',
+            { appBundlePath }
+          );
+          return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
+        }
       }
     } catch (/** @type {any} */ dvErr) {
+      if (isCodesignTimeoutError(dvErr)) {
+        diagLog.warn(
+          'codesign.dvTimedOut',
+          'Skipped ad-hoc re-sign after codesign -dv timeout',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, timedOut: true, appBundlePath };
+      }
       const combinedDvErr = `${dvErr?.stdout || ''}\n${dvErr?.stderr || ''}\n${dvErr?.message || ''}`;
       if (hasTrustedAppleOrDeveloperAuthority(combinedDvErr)) {
         diagLog.warn(
@@ -777,6 +821,14 @@ async function ensureMacAppCodeSignatureValidAsync(targetPath, /** @type {any} *
         return { verified: false, repaired: false, preservedTrustedSignature: true, appBundlePath };
       }
     } catch (/** @type {any} */ dvErr) {
+      if (isCodesignTimeoutError(dvErr)) {
+        diagLog.warn(
+          'codesign.dvTimedOut',
+          'Skipped ad-hoc re-sign after codesign -dv timeout',
+          { appBundlePath }
+        );
+        return { verified: false, repaired: false, timedOut: true, appBundlePath };
+      }
       const combinedDvErr = `${dvErr?.stdout || ''}\n${dvErr?.stderr || ''}\n${dvErr?.message || ''}`;
       if (hasTrustedAppleOrDeveloperAuthority(combinedDvErr)) {
         diagLog.warn(
@@ -7681,19 +7733,15 @@ function applyUnifiedPerformanceHudEnv(params = {}) {
     cfg.performanceHud === 'on' || cfg.performanceHud === 'off' || cfg.performanceHud === 'default'
       ? cfg.performanceHud
       : undefined;
-  const hasLegacyBool = typeof cfg.metalHud === 'boolean' || typeof cfg.dxvkHud === 'boolean';
-  const explicitlyOff =
-    perfHudSetting === 'off' ||
-    (!perfHudSetting && hasLegacyBool && cfg.metalHud !== true && cfg.dxvkHud !== true);
+  const legacyHudOn = !perfHudSetting && (cfg.metalHud === true || cfg.dxvkHud === true);
+  const explicitlyOff = perfHudSetting === 'off';
 
   const configHudEnabled =
-    perfHudSetting === 'on'
+    perfHudSetting === 'on' || legacyHudOn
       ? true
-      : perfHudSetting === 'off'
+      : explicitlyOff
         ? false
-        : !perfHudSetting && hasLegacyBool
-          ? Boolean(cfg.metalHud === true || cfg.dxvkHud === true)
-          : Boolean(perfSettings?.defaultPerformanceHud);
+        : Boolean(perfSettings?.defaultPerformanceHud);
 
   const userRequestedMetalHud =
     !explicitlyOff &&
@@ -7705,7 +7753,7 @@ function applyUnifiedPerformanceHudEnv(params = {}) {
   const stripPreloadFromDyldInsertIfAllowed = () => {
     if (!audioClampActive && env.DYLD_INSERT_LIBRARIES) {
       const remainingInsert = String(env.DYLD_INSERT_LIBRARIES)
-        .split(/:(?![\\/])/)
+        .split(':')
         .map((s) => s.trim())
         .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
       if (remainingInsert.length > 0) {

@@ -359,8 +359,8 @@ export function useGameLaunchConfigForm({
       const hasExplicitHudField = Boolean(
         source &&
           (source.performanceHud !== undefined ||
-            typeof source.metalHud === 'boolean' ||
-            typeof source.dxvkHud === 'boolean')
+            source.metalHud === true ||
+            source.dxvkHud === true)
       );
       const loadedPerformanceHud: PerformanceHudMode = hasExplicitHudField
         ? (migrateLegacyHudConfig(source!).performanceHud ?? 'default')
@@ -1403,20 +1403,6 @@ export function useGameLaunchConfigForm({
     return m;
   });
 
-  const currentEnvMap = useMemo(() => parseEnvVars(envText), [envText]);
-
-  const handleToggleQuickEnv = useCallback((key: string, val: string) => {
-    setEnvText((prev) => {
-      const next = { ...parseEnvVars(prev) };
-      if (next[key] === val) {
-        delete next[key];
-      } else {
-        next[key] = val;
-      }
-      return serializeEnvVars(next);
-    });
-  }, []);
-
   const handleBrowseExecutable = useCallback(async () => {
     const cur = latestRef.current;
     const selected = await launcherService.selectExecutable(
@@ -2382,13 +2368,11 @@ export function useGameLaunchConfigForm({
     isMacNativeBuild,
     isNativeInstalledBuild,
     visibleLaunchModes,
-    currentEnvMap,
     buildBadgeTone,
     activeModeWarning,
     discoveredTargetPath,
     executablePathLabel,
     handleSelectStorefront,
-    handleToggleQuickEnv,
     handleBrowseExecutable,
     handleBrowseWorkingDir,
     handleBrowseWinePrefix,

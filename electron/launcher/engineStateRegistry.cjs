@@ -552,6 +552,12 @@ function emitSessionUpdated(/** @type {any} */ payload, /** @type {any} */ optio
     } catch {}
   }
 
+  if (typeof options?.onSessionUpdated === 'function') {
+    try {
+      options.onSessionUpdated(payload);
+    } catch {}
+  }
+
   if (typeof sessionLifecycleHook === 'function' && payload) {
     try {
       const sess = payload.session || payload;
@@ -1422,8 +1428,9 @@ const VALID_PERFORMANCE_HUD_MODES = new Set(['default', 'on', 'off']);
 /**
  * Pure, idempotent legacy HUD migration helper (`metalHud` / `dxvkHud` -> unified `performanceHud`).
  * Preserves valid `'default' | 'on' | 'off'` values as-is, maps any legacy `true` to `'on'`,
- * maps explicit legacy `false` (when neither is `true`) to `'off'`, and leaves `performanceHud`
- * omitted when neither unified nor legacy booleans were configured.
+ * and maps legacy `false` / omitted booleans to `'default'` so previously saved games cleanly
+ * inherit Global `defaultPerformanceHud` while any explicit `'off'` saved in the unified UI
+ * overrides the global setting.
  *
  * @param {any} profile
  * @returns {any}
@@ -1445,8 +1452,8 @@ function migrateLegacyHudConfig(profile) {
     }
     if (migrated.metalHud === true || migrated.dxvkHud === true) {
       migrated.performanceHud = 'on';
-    } else if (migrated.metalHud === false || migrated.dxvkHud === false) {
-      migrated.performanceHud = 'off';
+    } else {
+      migrated.performanceHud = 'default';
     }
   }
   if (
@@ -1869,8 +1876,8 @@ function sanitizeLauncherPerformanceSettings(/** @type {any} */ raw = {}) {
     defaultPerformanceHud: Boolean(
       typeof src.defaultPerformanceHud === 'boolean'
         ? src.defaultPerformanceHud
-        : src.enableMetalHud === true || src.enableMangoHud === true
-          ? true
+        : typeof src.enableMetalHud === 'boolean' || typeof src.enableMangoHud === 'boolean'
+          ? src.enableMetalHud === true || src.enableMangoHud === true
           : DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS.defaultPerformanceHud
     ),
   };
@@ -1890,10 +1897,19 @@ function getLauncherPerformanceSettings(/** @type {any} */ options = {}) {
 function saveLauncherPerformanceSettings(/** @type {any} */ settings = {}, /** @type {any} */ options = {}) {
   const filePath = getPerformanceSettingsFilePath(options);
   const current = getLauncherPerformanceSettings(options);
+  /** @type {Record<string, any>} */
+  const rawNext = settings && typeof settings === 'object' ? { ...settings } : {};
+  if (
+    rawNext.defaultPerformanceHud === undefined &&
+    (typeof rawNext.enableMetalHud === 'boolean' || typeof rawNext.enableMangoHud === 'boolean')
+  ) {
+    rawNext.defaultPerformanceHud =
+      rawNext.enableMetalHud === true || rawNext.enableMangoHud === true;
+  }
   const merged =
-    settings && settings.reset === true
+    rawNext.reset === true
       ? { ...DEFAULT_LAUNCHER_PERFORMANCE_SETTINGS }
-      : sanitizeLauncherPerformanceSettings({ ...current, ...(settings || {}) });
+      : sanitizeLauncherPerformanceSettings({ ...current, ...rawNext });
   try {
     writeCachedStateJsonSync(filePath, merged);
   } catch {}

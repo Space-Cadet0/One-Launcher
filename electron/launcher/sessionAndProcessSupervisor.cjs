@@ -867,6 +867,17 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
   delete clientEnv.MTL_HUD_ENABLED;
   delete clientEnv.DXVK_HUD;
   delete clientEnv.ONE_LAUNCHER_MOLTENVK_PATH;
+  if (typeof clientEnv.DYLD_INSERT_LIBRARIES === 'string' && clientEnv.DYLD_INSERT_LIBRARIES) {
+    const remainingInsert = clientEnv.DYLD_INSERT_LIBRARIES
+      .split(':')
+      .map((s) => s.trim())
+      .filter((s) => s && !s.endsWith('libone_metal_preload.dylib'));
+    if (remainingInsert.length > 0) {
+      clientEnv.DYLD_INSERT_LIBRARIES = remainingInsert.join(':');
+    } else {
+      delete clientEnv.DYLD_INSERT_LIBRARIES;
+    }
+  }
   const keysToStrip = ['MTL_HUD_ENABLED', 'DXVK_HUD', ...DISPLAY_SCALER_ENV_KEYS];
   for (const dispKey of DISPLAY_SCALER_ENV_KEYS) {
     delete clientEnv[dispKey];
@@ -880,8 +891,32 @@ function sanitizeBottleBackgroundClientWakeEnv(clientEnv, launchConfig) {
     delete clientEnv.WINED3DMETAL;
     keysToStrip.push('CX_GRAPHICS_BACKEND', 'WINED3DMETAL');
   }
+  const hasCustomUserDyldInsert = Boolean(
+    typeof launchConfig?.environmentVariables?.DYLD_INSERT_LIBRARIES === 'string' &&
+      launchConfig.environmentVariables.DYLD_INSERT_LIBRARIES.trim()
+  );
+  if (
+    !hasCustomUserDyldInsert ||
+    (typeof clientEnv.CX_ENV === 'string' &&
+      clientEnv.CX_ENV.includes('libone_metal_preload.dylib'))
+  ) {
+    keysToStrip.push('DYLD_INSERT_LIBRARIES');
+  }
   if (typeof clientEnv.CX_ENV === 'string' && clientEnv.CX_ENV) {
-    const cleaned = stripKeysFromCxEnv(clientEnv.CX_ENV, keysToStrip);
+    let cleaned = stripKeysFromCxEnv(clientEnv.CX_ENV, keysToStrip);
+    if (
+      hasCustomUserDyldInsert &&
+      typeof clientEnv.DYLD_INSERT_LIBRARIES === 'string' &&
+      clientEnv.DYLD_INSERT_LIBRARIES.trim() &&
+      keysToStrip.includes('DYLD_INSERT_LIBRARIES')
+    ) {
+      const escapedVal = clientEnv.DYLD_INSERT_LIBRARIES.includes(' ')
+        ? `'${clientEnv.DYLD_INSERT_LIBRARIES.replace(/'/g, "'\\''")}'`
+        : clientEnv.DYLD_INSERT_LIBRARIES;
+      cleaned = cleaned
+        ? `${cleaned} DYLD_INSERT_LIBRARIES=${escapedVal}`
+        : `DYLD_INSERT_LIBRARIES=${escapedVal}`;
+    }
     if (cleaned) {
       clientEnv.CX_ENV = cleaned;
     } else {
@@ -10406,13 +10441,21 @@ async function stopGame(/** @type {any} */ request = {}, /** @type {any} */ opti
         try {
           launchCtrl?.abort(new Error('Launch cancelled by user'));
         } catch {}
-        emitSessionUpdated({
-          gameId: requestedGameId,
-          status: 'stopped',
-          event: 'stopped',
-          cancelled: true,
-          statusMessage: 'Launch cancelled',
-        });
+        emitSessionUpdated(
+          {
+            session: {
+              gameId: requestedGameId,
+              status: 'stopped',
+              statusMessage: 'Launch cancelled',
+            },
+            gameId: requestedGameId,
+            status: 'stopped',
+            event: 'stopped',
+            cancelled: true,
+            statusMessage: 'Launch cancelled',
+          },
+          options
+        );
         return {
           success: true,
           cancelled: true,
@@ -13934,6 +13977,7 @@ module.exports = {
   computeBottleGraphicsEnvContract,
   getLiveBottleDaemonEnvContract,
   resetSupervisorStateForTests,
+  sanitizeBottleBackgroundClientWakeEnv,
   applyMoltenVkMetalHudDeadlockGuard,
   findLiveBottleGameChildPid,
   isSafeBottleChainedGameDirToDelete,

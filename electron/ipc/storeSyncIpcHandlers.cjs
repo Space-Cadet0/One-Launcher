@@ -2029,40 +2029,58 @@ function registerStoreSyncIpcHandlers({
                   mergedLocalDelta = true;
                   return { ...g, isVerifiedEntitlement: true };
                 }
-                mergedLocalDelta = true;
-                return {
-                  ...g,
-                  isVerifiedEntitlement: true,
-                  platforms: (g.platforms || []).map((/** @type {any} */ p) => {
-                    if (p.platformId !== 'steam') return p;
-                    const mergedPt =
-                      localPt && localPt.playtimeMinutes
-                        ? Math.max(Number(p.playtimeMinutes || 0), localPt.playtimeMinutes)
-                        : Number(p.playtimeMinutes || 0);
-                    const existingAch = p.achievements;
-                    let mergedAch = existingAch;
-                    if (ach && ach.total > 0) {
-                      const bestUnlocked = existingAch
-                        ? Math.max(ach.unlocked, Number(existingAch.unlocked || 0))
-                        : ach.unlocked;
-                      const bestTotal = existingAch
-                        ? Math.max(ach.total, Number(existingAch.total || 0))
-                        : ach.total;
-                      const pct = bestTotal > 0 ? Math.round((bestUnlocked / bestTotal) * 100) : 0;
+                let gameChanged = g.isVerifiedEntitlement !== true;
+                const nextPlatforms = (g.platforms || []).map((/** @type {any} */ p) => {
+                  if (p.platformId !== 'steam') return p;
+                  const prevPt = Number(p.playtimeMinutes || 0);
+                  const mergedPt =
+                    localPt && localPt.playtimeMinutes
+                      ? Math.max(prevPt, localPt.playtimeMinutes)
+                      : prevPt;
+                  const existingAch = p.achievements;
+                  let mergedAch = existingAch;
+                  let achChanged = false;
+                  if (ach && ach.total > 0) {
+                    const bestUnlocked = existingAch
+                      ? Math.max(ach.unlocked, Number(existingAch.unlocked || 0))
+                      : ach.unlocked;
+                    const bestTotal = existingAch
+                      ? Math.max(ach.total, Number(existingAch.total || 0))
+                      : ach.total;
+                    const pct = bestTotal > 0 ? Math.round((bestUnlocked / bestTotal) * 100) : 0;
+                    const isMastered =
+                      Boolean(ach.isMastered) || (bestTotal > 0 && bestUnlocked >= bestTotal);
+                    if (
+                      !existingAch ||
+                      Number(existingAch.unlocked || 0) !== bestUnlocked ||
+                      Number(existingAch.total || 0) !== bestTotal ||
+                      Number(existingAch.percentage || 0) !== pct ||
+                      Boolean(existingAch.isMastered) !== isMastered
+                    ) {
+                      achChanged = true;
                       mergedAch = {
                         unlocked: bestUnlocked,
                         total: bestTotal,
                         percentage: pct,
-                        isMastered:
-                          Boolean(ach.isMastered) || (bestTotal > 0 && bestUnlocked >= bestTotal),
+                        isMastered,
                       };
                     }
-                    return {
-                      ...p,
-                      playtimeMinutes: mergedPt,
-                      achievements: mergedAch,
-                    };
-                  }),
+                  }
+                  const ptChanged = mergedPt !== prevPt || p.playtimeMinutes !== mergedPt;
+                  if (!ptChanged && !achChanged) return p;
+                  gameChanged = true;
+                  return {
+                    ...p,
+                    playtimeMinutes: mergedPt,
+                    achievements: mergedAch,
+                  };
+                });
+                if (!gameChanged) return g;
+                mergedLocalDelta = true;
+                return {
+                  ...g,
+                  isVerifiedEntitlement: true,
+                  platforms: nextPlatforms,
                 };
               });
 

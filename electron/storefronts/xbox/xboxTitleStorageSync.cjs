@@ -1622,6 +1622,7 @@ async function syncXboxTitleStorage(options = {}) {
 
   let lockAcquired = Boolean(alreadyLocked);
   let reacquiredExpiredSessionLock = false;
+  let sessionLockGeneration = 0;
   /** @type {Promise<any> | null} */
   let inFlightSessionLockRecovery = null;
   let readOnlyFallback = false;
@@ -1683,31 +1684,38 @@ async function syncXboxTitleStorage(options = {}) {
   };
 
   const runWithSessionLockRecovery = async (writeFn) => {
+    const attemptGeneration = sessionLockGeneration;
     try {
       return await writeFn();
     } catch (writeErr) {
-      if (
-        alreadyLocked &&
-        (!reacquiredExpiredSessionLock || inFlightSessionLockRecovery) &&
-        (writeErr?.status === 403 || writeErr?.status === 412)
-      ) {
-        if (!inFlightSessionLockRecovery) {
-          reacquiredExpiredSessionLock = true;
-          inFlightSessionLockRecovery = Promise.resolve()
-            .then(() => client.acquireLock(signal))
-            .then((lockInfo) => {
-              lockAcquired = lockInfo.locked;
-              if (lockInfo.quotaBytes > 0) {
-                quotaBytes = lockInfo.quotaBytes;
-              }
-              return lockInfo;
-            })
-            .finally(() => {
-              inFlightSessionLockRecovery = null;
-            });
+      if (alreadyLocked && (writeErr?.status === 403 || writeErr?.status === 412)) {
+        if (attemptGeneration < sessionLockGeneration) {
+          return await writeFn();
         }
-        await inFlightSessionLockRecovery;
-        return await writeFn();
+        if (!reacquiredExpiredSessionLock || inFlightSessionLockRecovery) {
+          let pendingLock = inFlightSessionLockRecovery;
+          if (!pendingLock) {
+            reacquiredExpiredSessionLock = true;
+            pendingLock = Promise.resolve()
+              .then(() => client.acquireLock(signal))
+              .then((lockInfo) => {
+                lockAcquired = lockInfo.locked;
+                if (lockInfo.quotaBytes > 0) {
+                  quotaBytes = lockInfo.quotaBytes;
+                }
+                sessionLockGeneration += 1;
+                return lockInfo;
+              })
+              .finally(() => {
+                if (inFlightSessionLockRecovery === pendingLock) {
+                  inFlightSessionLockRecovery = null;
+                }
+              });
+            inFlightSessionLockRecovery = pendingLock;
+          }
+          await pendingLock;
+          return await writeFn();
+        }
       }
       throw writeErr;
     }

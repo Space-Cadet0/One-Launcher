@@ -486,6 +486,7 @@ export interface SaveCatalogOptions {
 }
 
 const MODAL_CLOSE_FLUSH_DEBOUNCE_MS = 250;
+const SMALL_DELTA_COALESCE_DEBOUNCE_MS = 250;
 const SMALL_DELTA_MAX_DIRTY_GAMES = 20;
 const SMALL_DELTA_SNAPSHOT_DEBOUNCE_MS = 3000;
 
@@ -1084,14 +1085,21 @@ function scheduleDebouncedCatalogSnapshotMirror(compacted: CanonicalGame[]): voi
     clearTimeout(pendingSnapshotMirrorTimer);
     pendingSnapshotMirrorTimer = null;
   }
-  pendingSnapshotMirrorTimer = setTimeout(() => {
-    pendingSnapshotMirrorTimer = null;
-    const snap = pendingSnapshotGames;
-    pendingSnapshotGames = null;
-    if (snap) {
-      persistCatalogSnapshotToIdbAndLocalStorage(snap);
-    }
-  }, SMALL_DELTA_SNAPSHOT_DEBOUNCE_MS);
+  const scheduleMirror = (delayMs: number) => {
+    pendingSnapshotMirrorTimer = setTimeout(() => {
+      pendingSnapshotMirrorTimer = null;
+      if (!isTestEnv() && (isModalOverlayOpen() || isUserActivelyScrolling())) {
+        scheduleMirror(600);
+        return;
+      }
+      const snap = pendingSnapshotGames;
+      pendingSnapshotGames = null;
+      if (snap) {
+        persistCatalogSnapshotToIdbAndLocalStorage(snap);
+      }
+    }, delayMs);
+  };
+  scheduleMirror(SMALL_DELTA_SNAPSHOT_DEBOUNCE_MS);
 }
 
 function writeCatalogToLocalStorage(
@@ -1378,7 +1386,10 @@ export async function hydrateCatalogFromIndexedDb(): Promise<CanonicalGame[] | n
 
 export const loadNormalizedCatalogAsync = hydrateCatalogFromIndexedDb;
 
-export function flushPendingCatalogSave(): void {
+function flushPendingCatalogSaveInternal(options?: {
+  allowDeferredSnapshotMirror?: boolean;
+}): void {
+  const allowDeferredSnapshotMirror = options?.allowDeferredSnapshotMirror === true;
   if (pendingCatalogSaveTimer) {
     clearTimeout(pendingCatalogSaveTimer);
     pendingCatalogSaveTimer = null;
@@ -1387,7 +1398,7 @@ export function flushPendingCatalogSave(): void {
     clearTimeout(modalCloseFlushTimer);
     modalCloseFlushTimer = null;
   }
-  if (pendingSnapshotMirrorTimer) {
+  if (!allowDeferredSnapshotMirror && pendingSnapshotMirrorTimer) {
     clearTimeout(pendingSnapshotMirrorTimer);
     pendingSnapshotMirrorTimer = null;
   }
@@ -1405,6 +1416,12 @@ export function flushPendingCatalogSave(): void {
         !pendingIsFullCatalogSync && pendingRemovedGameIds.size > 0
           ? new Set<string>(pendingRemovedGameIds)
           : null;
+      const shouldDeferSnapshotMirror =
+        allowDeferredSnapshotMirror &&
+        dirtySnapshot !== null &&
+        dirtySnapshot.size > 0 &&
+        dirtySnapshot.size <= SMALL_DELTA_MAX_DIRTY_GAMES &&
+        toWrite.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD;
       if (pendingCatalogNeedsOverrides) {
         const userOverrides = loadUserOverrides();
         toWrite = applyUserOverridesToCatalog(toWrite, userOverrides);
@@ -1416,20 +1433,27 @@ export function flushPendingCatalogSave(): void {
         );
       }
       pendingCatalogGames = null;
-      pendingSnapshotGames = null;
+      if (!shouldDeferSnapshotMirror) {
+        pendingSnapshotGames = null;
+      }
       pendingCatalogNeedsSanitize = false;
       pendingCatalogNeedsOverrides = false;
       pendingIsFullCatalogSync = false;
       pendingDirtyGameIds.clear();
       pendingRemovedGameIds.clear();
       pendingModalDeferStartedAt = null;
-      writeCatalogToLocalStorage(toWrite, dirtySnapshot, removedSnapshot);
+      writeCatalogToLocalStorage(
+        toWrite,
+        dirtySnapshot,
+        removedSnapshot,
+        shouldDeferSnapshotMirror ? { deferSnapshotMirror: true } : undefined
+      );
     } catch (err) {
       console.error('[IntegrationStorage] Failed to flush pending catalog save:', err);
     }
     return;
   }
-  if (pendingSnapshotGames !== null && typeof window !== 'undefined') {
+  if (!allowDeferredSnapshotMirror && pendingSnapshotGames !== null && typeof window !== 'undefined') {
     const snap = pendingSnapshotGames;
     pendingSnapshotGames = null;
     try {
@@ -1438,6 +1462,10 @@ export function flushPendingCatalogSave(): void {
       console.error('[IntegrationStorage] Failed to flush pending catalog snapshot:', err);
     }
   }
+}
+
+export function flushPendingCatalogSave(): void {
+  flushPendingCatalogSaveInternal({ allowDeferredSnapshotMirror: false });
 }
 
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -1474,7 +1502,7 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
         if (!isTestEnv() && isModalOverlayOpen()) {
           return;
         }
-        flushPendingCatalogSave();
+        flushPendingCatalogSaveInternal({ allowDeferredSnapshotMirror: true });
       }, MODAL_CLOSE_FLUSH_DEBOUNCE_MS);
     }
   });
@@ -1611,63 +1639,6 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     const incomingRemovedIds = collectRemovedGameIdsFromOptions(options);
     const isIncrementalCall = incomingDirtyIds !== null;
 
-    const isSmallDirtySliceOnLargeCatalog =
-      !options?.immediate &&
-      incomingDirtyIds !== null &&
-      !pendingIsFullCatalogSync &&
-      incomingDirtyIds.length > 0 &&
-      incomingDirtyIds.length <= SMALL_DELTA_MAX_DIRTY_GAMES &&
-      games.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD &&
-      (isTestEnv() || !isModalOverlayOpen());
-
-    if (isSmallDirtySliceOnLargeCatalog && incomingDirtyIds !== null) {
-      if (
-        lastPersistedVaultCatalogIds === null &&
-        Array.isArray(inMemoryCatalogCache) &&
-        inMemoryCatalogCache.length > 0
-      ) {
-        lastPersistedVaultCatalogIds = new Set(
-          inMemoryCatalogCache.map((g) => g?.id).filter((id): id is string => Boolean(id))
-        );
-      }
-      const mergedDirty = new Set<string>(pendingDirtyGameIds);
-      const mergedRemoved = new Set<string>(pendingRemovedGameIds);
-      for (const id of incomingDirtyIds) {
-        mergedDirty.add(id);
-        mergedRemoved.delete(id);
-      }
-      for (const id of incomingRemovedIds) {
-        mergedRemoved.add(id);
-        mergedDirty.delete(id);
-      }
-      if (mergedDirty.size <= SMALL_DELTA_MAX_DIRTY_GAMES) {
-        pendingCatalogGames = null;
-        pendingCatalogNeedsSanitize = false;
-        pendingCatalogNeedsOverrides = false;
-        pendingDirtyGameIds.clear();
-        pendingRemovedGameIds.clear();
-        pendingModalDeferStartedAt = null;
-        if (pendingCatalogSaveTimer) {
-          clearTimeout(pendingCatalogSaveTimer);
-          pendingCatalogSaveTimer = null;
-        }
-        if (modalCloseFlushTimer) {
-          clearTimeout(modalCloseFlushTimer);
-          modalCloseFlushTimer = null;
-        }
-        const userOverrides = loadUserOverrides();
-        const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
-        const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
-        writeCatalogToLocalStorage(
-          cleaned,
-          mergedDirty,
-          mergedRemoved.size > 0 ? mergedRemoved : null,
-          { deferSnapshotMirror: true }
-        );
-        return;
-      }
-    }
-
     if (!options?.immediate && !isTestEnv()) {
       const hadPendingSave = pendingCatalogGames !== null;
       if (
@@ -1732,15 +1703,26 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
             return;
           }
           try {
-            flushPendingCatalogSave();
+            flushPendingCatalogSaveInternal({ allowDeferredSnapshotMirror: true });
           } catch (e) {
             console.error('[IntegrationStorage] Deferred catalog flush failed:', e);
           }
         }, delayMs);
       };
 
+      const isSmallPendingDirtySlice =
+        !pendingIsFullCatalogSync &&
+        pendingDirtyGameIds.size > 0 &&
+        pendingDirtyGameIds.size <= SMALL_DELTA_MAX_DIRTY_GAMES &&
+        games.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD;
+
       if (!pendingCatalogSaveTimer || (hadPendingSave && pendingIsFullCatalogSync)) {
-        scheduleDeferredFlush(1200);
+        const debounceDelayMs = isUserActivelyScrolling()
+          ? 600
+          : isSmallPendingDirtySlice
+            ? SMALL_DELTA_COALESCE_DEBOUNCE_MS
+            : 1200;
+        scheduleDeferredFlush(debounceDelayMs);
       }
       return;
     }
@@ -1779,10 +1761,22 @@ export function saveCurrentCatalog(games: CanonicalGame[], options?: SaveCatalog
     pendingRemovedGameIds.clear();
     pendingModalDeferStartedAt = null;
 
+    const shouldDeferSnapshotMirror =
+      !options?.immediate &&
+      immediateDirtySnapshot !== null &&
+      immediateDirtySnapshot.size > 0 &&
+      immediateDirtySnapshot.size <= SMALL_DELTA_MAX_DIRTY_GAMES &&
+      games.length > PROACTIVE_SLIM_LOCALSTORAGE_GAME_COUNT_THRESHOLD;
+
     const userOverrides = loadUserOverrides();
     const withOverrides = applyUserOverridesToCatalog(games, userOverrides);
     const cleaned = options?.skipSanitize ? withOverrides : sanitizeGameCatalog(withOverrides);
-    writeCatalogToLocalStorage(cleaned, immediateDirtySnapshot, immediateRemovedSnapshot);
+    writeCatalogToLocalStorage(
+      cleaned,
+      immediateDirtySnapshot,
+      immediateRemovedSnapshot,
+      shouldDeferSnapshotMirror ? { deferSnapshotMirror: true } : undefined
+    );
   } catch (err) {
     console.error('Failed to save universal catalog', err);
   }

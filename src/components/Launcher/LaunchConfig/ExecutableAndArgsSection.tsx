@@ -19,9 +19,6 @@ export interface ExecutableAndArgsSectionProps {
   onBrowseWorkingDir: () => void;
   launchArguments: string;
   onChangeLaunchArguments: (value: string) => void;
-  /** @deprecated Legacy native Mac HUD props removed in favor of unified Performance HUD control */
-  metalHud?: boolean;
-  onToggleMetalHud?: () => void;
   sectionFilter?: 'all' | 'executable_only' | 'native_mac_only';
 }
 

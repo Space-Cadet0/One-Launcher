@@ -235,12 +235,14 @@ describe('Wave 1: Vault Media Non-Destructive Pinning, Unified url_resolution_ca
       expect('enableMetalHud' in explicitOffWins).toBe(false);
       expect('enableMangoHud' in explicitOffWins).toBe(false);
 
-      // False legacy keys do not synthesize defaultPerformanceHud and are stripped
+      // False legacy keys translate to defaultPerformanceHud: false (so legacy callers can turn it off) and are stripped
       const legacyFalse = securityUtils.sanitizeLauncherSettingsPayload({
         enableMetalHud: false,
         enableMangoHud: false,
       });
-      expect(legacyFalse).toEqual({});
+      expect(legacyFalse).toEqual({ defaultPerformanceHud: false });
+      expect('enableMetalHud' in legacyFalse).toBe(false);
+      expect('enableMangoHud' in legacyFalse).toBe(false);
 
       // All 11 keys pass cleanly while unknown keys are stripped
       const fullPayload = securityUtils.sanitizeLauncherSettingsPayload({

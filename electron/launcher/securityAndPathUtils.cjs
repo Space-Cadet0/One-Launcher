@@ -1692,7 +1692,7 @@ function sanitizeLaunchConfigRecursive(rawValue, depth = 0) {
 
 /**
  * Strict allowlist validator for `launcher:save-settings` / `launcher:save-performance-settings`.
- * Migrates legacy `enableMetalHud === true || enableMangoHud === true` onto `defaultPerformanceHud`
+ * Migrates legacy boolean `enableMetalHud` / `enableMangoHud` onto `defaultPerformanceHud`
  * when `defaultPerformanceHud` is not explicitly provided, without ever emitting the retired keys.
  */
 function sanitizeLauncherSettingsPayload(rawSettings) {
@@ -1717,14 +1717,15 @@ function sanitizeLauncherSettingsPayload(rawSettings) {
         .slice(0, 64);
     }
   }
-  if (
-    clean.defaultPerformanceHud === undefined &&
-    ((Object.prototype.hasOwnProperty.call(rawSettings, 'enableMetalHud') &&
-      rawSettings.enableMetalHud === true) ||
-      (Object.prototype.hasOwnProperty.call(rawSettings, 'enableMangoHud') &&
-        rawSettings.enableMangoHud === true))
-  ) {
-    clean.defaultPerformanceHud = true;
+  const hasLegacyMetalHud =
+    Object.prototype.hasOwnProperty.call(rawSettings, 'enableMetalHud') &&
+    typeof rawSettings.enableMetalHud === 'boolean';
+  const hasLegacyMangoHud =
+    Object.prototype.hasOwnProperty.call(rawSettings, 'enableMangoHud') &&
+    typeof rawSettings.enableMangoHud === 'boolean';
+  if (clean.defaultPerformanceHud === undefined && (hasLegacyMetalHud || hasLegacyMangoHud)) {
+    clean.defaultPerformanceHud =
+      rawSettings.enableMetalHud === true || rawSettings.enableMangoHud === true;
   }
   return clean;
 }
