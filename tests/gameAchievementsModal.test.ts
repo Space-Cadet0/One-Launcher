@@ -87,6 +87,12 @@ describe('GameAchievementsModal Component', () => {
     expect(html).toContain('All');
     expect(html).toContain('Unlocked');
     expect(html).toContain('Locked');
+    expect(html).toContain('data-testid="achievements-filter-tabs"');
+    const filterTabsMatch = html.match(
+      /data-testid="achievements-filter-tabs"[^>]*class="([^"]+)"/
+    );
+    expect(filterTabsMatch?.[1]).toContain('flex-wrap');
+    expect(filterTabsMatch?.[1]).not.toContain('overflow-x-auto');
 
     // Sorting controls
     expect(html).toContain('Default Order');

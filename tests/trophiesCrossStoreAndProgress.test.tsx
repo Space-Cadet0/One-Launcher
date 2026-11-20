@@ -8,7 +8,10 @@ import { renderToString } from 'react-dom/server';
 import axios from 'axios';
 import type { CanonicalGame } from '../src/contracts/game';
 import type { MultiStoreAchievementsMap } from '../src/contracts/achievement';
-import { achievementDetailService } from '../src/services/achievements/achievementDetailService';
+import {
+  achievementDetailService,
+  deduplicateDetailedAchievements,
+} from '../src/services/achievements/achievementDetailService';
 import { steamAchievementsService } from '../src/services/steam/steamAchievementsService';
 import { onlineLifecycleManager } from '../src/services/network/onlineLifecycleManager';
 import { GameAchievementsModal } from '../src/components/Achievements/GameAchievementsModal';
@@ -516,6 +519,231 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
         new Date(1732052197 * 1000).toISOString()
       );
       expect(fallbackDetail.achievements[0].iconUnlockedUrl).toBe('https://images.gog.com/pf_u.jpg');
+    });
+
+    it('prevents GOG gameplay.gog.com pagination doubling when page 1 returns all 35 items with a non-empty page_token, and self-heals cached doubled 50/70 entries to 25/35 on read', async () => {
+      const vaultDir = makeTempDir('gog-dedupe-vault-');
+      tempDirs.push(vaultDir);
+
+      const page1Items = Array.from({ length: 35 }, (_, idx) => ({
+        achievement_id: `ach_${idx + 1}`,
+        achievement_key: `KEY_${idx + 1}`,
+        name: `Plague Tale Trophy ${idx + 1}`,
+        description: `Complete chapter milestone ${idx + 1}.`,
+        date_unlocked: idx < 25 ? `2026-10-${String((idx % 28) + 1).padStart(2, '0')}T12:00:00Z` : null,
+        rarity: Number((10 + idx).toFixed(1)),
+        visible: idx < 30,
+        image_url_unlocked: `https://images.gog.com/pt_${idx + 1}_u.jpg`,
+        image_url_locked: `https://images.gog.com/pt_${idx + 1}_l.jpg`,
+      }));
+
+      // Case A: GOG returns total_count: 35 + all 35 items + non-empty page_token that repeats the same 35 items
+      let gameplayCallsWithTotal = 0;
+      const fetchWithTotalCount = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('gameplay.gog.com/clients/52799531131185574/users/555000111/achievements')) {
+          gameplayCallsWithTotal++;
+          return makeMockJsonResponse({
+            total_count: 35,
+            page_token: 'opaque_same_page_token',
+            items: page1Items,
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      });
+
+      const detailA = await storeSync.fetchGogDetailedGameAchievements(
+        { productId: '1901367087', clientId: '52799531131185574' },
+        {
+          userDataDir: vaultDir,
+          accessToken: 'valid_gog_tok',
+          userId: '555000111',
+          fetchFn: fetchWithTotalCount,
+        }
+      );
+
+      expect(detailA).toBeTruthy();
+      expect(detailA.total).toBe(35);
+      expect(detailA.totalCount).toBe(35);
+      expect(detailA.unlocked).toBe(25);
+      expect(detailA.percentage).toBe(71);
+      expect(detailA.achievements).toHaveLength(35);
+      expect(gameplayCallsWithTotal).toBe(1);
+
+      // Case B: GOG omits total_count AND returns a changing page_token that repeats the exact same 35 items on page 2
+      let gameplayCallsWithoutTotal = 0;
+      const fetchWithoutTotalCount = vi.fn(async (input: string) => {
+        const url = String(input);
+        if (url.includes('gameplay.gog.com/clients/52799531131185575/users/555000111/achievements')) {
+          gameplayCallsWithoutTotal++;
+          return makeMockJsonResponse({
+            page_token: `token_page_${gameplayCallsWithoutTotal}`,
+            items: page1Items,
+          });
+        }
+        return makeMockJsonResponse({}, 404);
+      });
+
+      const detailB = await storeSync.fetchGogDetailedGameAchievements(
+        { productId: '1901367088', clientId: '52799531131185575' },
+        {
+          userDataDir: vaultDir,
+          accessToken: 'valid_gog_tok',
+          userId: '555000111',
+          fetchFn: fetchWithoutTotalCount,
+        }
+      );
+
+      expect(detailB).toBeTruthy();
+      expect(detailB.total).toBe(35);
+      expect(detailB.unlocked).toBe(25);
+      expect(detailB.percentage).toBe(71);
+      expect(detailB.achievements).toHaveLength(35);
+      // Stops immediately on page 2 once 0 newly unseen items are added!
+      expect(gameplayCallsWithoutTotal).toBe(2);
+
+      // Case C: Pure helper deduplicates mixed unlock states preferring `unlocked: true` while preserving order
+      const mixedDupes = deduplicateDetailedAchievements({
+        storefrontId: 'gog',
+        storefrontName: 'GOG GALAXY',
+        total: 4,
+        unlocked: 1,
+        percentage: 25,
+        isMastered: false,
+        source: 'live_cloud',
+        achievements: [
+          {
+            id: 'gog:1901367087:ach_1',
+            apiName: 'KEY_1',
+            name: 'First',
+            unlocked: false,
+            iconUnlockedUrl: 'https://images.gog.com/1.jpg',
+            storefrontId: 'gog',
+          },
+          {
+            id: 'gog:1901367087:ach_2',
+            apiName: 'KEY_2',
+            name: 'Second',
+            unlocked: false,
+            iconUnlockedUrl: 'https://images.gog.com/2.jpg',
+            storefrontId: 'gog',
+          },
+          {
+            id: 'gog:1901367087:ach_1',
+            apiName: 'KEY_1',
+            name: 'First',
+            unlocked: true,
+            unlockedAt: '2026-10-01T12:00:00.000Z',
+            iconUnlockedUrl: 'https://images.gog.com/1.jpg',
+            storefrontId: 'gog',
+          },
+          {
+            id: 'gog:1901367087:ach_2',
+            apiName: 'KEY_2',
+            name: 'Second',
+            unlocked: false,
+            iconUnlockedUrl: 'https://images.gog.com/2.jpg',
+            storefrontId: 'gog',
+          },
+        ],
+      });
+      expect(mixedDupes.total).toBe(2);
+      expect(mixedDupes.unlocked).toBe(1);
+      expect(mixedDupes.percentage).toBe(50);
+      expect(mixedDupes.achievements.map((a) => a.id)).toEqual([
+        'gog:1901367087:ach_1',
+        'gog:1901367087:ach_2',
+      ]);
+      expect(mixedDupes.achievements[0].unlocked).toBe(true);
+      expect(mixedDupes.achievements[0].unlockedAt).toBe('2026-10-01T12:00:00.000Z');
+
+      // Case D: Cached doubled 50/70 GOG entry in localStorage & SQLite vault self-heals to 25/35 on read and persists back!
+      const unique35 = page1Items.map((item, idx) => ({
+        id: `gog:1901367087:${item.achievement_id}`,
+        apiName: item.achievement_key,
+        name: item.name,
+        description: item.description,
+        unlocked: idx < 25,
+        unlockedAt: item.date_unlocked || undefined,
+        iconUnlockedUrl: item.image_url_unlocked,
+        iconLockedUrl: item.image_url_locked,
+        globalPercentage: item.rarity,
+        isSecret: !item.visible,
+        storefrontId: 'gog' as const,
+      }));
+      const doubledCachedMap: MultiStoreAchievementsMap = {
+        gog: {
+          storefrontId: 'gog',
+          storefrontName: 'GOG GALAXY',
+          total: 70,
+          unlocked: 50,
+          percentage: 71,
+          isMastered: false,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: true,
+          cacheVersion: 2,
+          syncedAt: '2026-11-20T12:00:00.000Z',
+          achievements: [...unique35, ...unique35],
+        },
+      };
+
+      const saveGameDetailSpy = vi.fn(async () => ({ success: true }));
+      const getGameDetailSpy = vi.fn(async () => ({
+        achievements: structuredClone(doubledCachedMap),
+      }));
+      (globalThis as Record<string, unknown>).window = {
+        localStorage: storage,
+        electronAPI: {
+          offlineVault: {
+            getGameDetail: getGameDetailSpy,
+            saveGameDetail: saveGameDetailSpy,
+          },
+        },
+      };
+
+      // D1: localStorage self-heal on synchronous read (`getCachedMultiStoreAchievements`)
+      storage.setItem(
+        'antigravity_detailed_achievements_gog-1901367087',
+        JSON.stringify(doubledCachedMap)
+      );
+      const healedFromLs = achievementDetailService.getCachedMultiStoreAchievements('gog-1901367087');
+      expect(healedFromLs?.gog?.total).toBe(35);
+      expect(healedFromLs?.gog?.unlocked).toBe(25);
+      expect(healedFromLs?.gog?.percentage).toBe(71);
+      expect(healedFromLs?.gog?.achievements).toHaveLength(35);
+      const persistedLs = JSON.parse(
+        storage.getItem('antigravity_detailed_achievements_gog-1901367087') || '{}'
+      ) as MultiStoreAchievementsMap;
+      expect(persistedLs.gog?.total).toBe(35);
+      expect(persistedLs.gog?.unlocked).toBe(25);
+      expect(saveGameDetailSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          gameId: 'gog-1901367087',
+          achievements: expect.objectContaining({
+            gog: expect.objectContaining({ total: 35, unlocked: 25 }),
+          }),
+        })
+      );
+
+      // D2: SQLite `vault_games.achievements_json` self-heal via `getVaultCachedMultiStoreAchievements`
+      achievementDetailService.clearCache();
+      storage.clear();
+      saveGameDetailSpy.mockClear();
+      const healedFromVault =
+        await achievementDetailService.getVaultCachedMultiStoreAchievements('gog-1901367087-sqlite');
+      expect(getGameDetailSpy).toHaveBeenCalledWith('gog-1901367087-sqlite');
+      expect(healedFromVault?.gog?.total).toBe(35);
+      expect(healedFromVault?.gog?.unlocked).toBe(25);
+      expect(healedFromVault?.gog?.achievements).toHaveLength(35);
+      expect(saveGameDetailSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          gameId: 'gog-1901367087-sqlite',
+          achievements: expect.objectContaining({
+            gog: expect.objectContaining({ total: 35, unlocked: 25 }),
+          }),
+        })
+      );
     });
   });
 
@@ -1564,6 +1792,25 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
       expect(html).toContain('Reveal All Secrets');
       expect(html).toContain('aria-label="Refresh achievements"');
 
+      // Live UI Polish #3: Filter tabs use flex-wrap (not overflow-x-auto clipping) in a stacked 2-row toolbar
+      const filterTabsEl = findElements(
+        vnode,
+        (el) => el.props?.['data-testid'] === 'achievements-filter-tabs'
+      )[0];
+      expect(filterTabsEl).toBeTruthy();
+      const filterTabsClass = String(filterTabsEl.props?.className || '');
+      expect(filterTabsClass).toContain('flex-wrap');
+      expect(filterTabsClass).not.toContain('overflow-x-auto');
+
+      const toolbarEl = findElements(
+        vnode,
+        (el) => el.props?.['data-testid'] === 'achievements-toolbar'
+      )[0];
+      expect(toolbarEl).toBeTruthy();
+      const toolbarClass = String(toolbarEl.props?.className || '');
+      expect(toolbarClass).toContain('flex-col');
+      expect(toolbarClass).not.toContain('md:flex-row');
+
       // C12 Spoiler safety: hidden achievement title/description NOT leaked in alt or aria-label!
       expect(html).not.toContain('Secret Boss Finale');
       expect(html).not.toContain('Defeat the true hidden boss.');
@@ -1605,6 +1852,259 @@ describe('Cross-Store Trophies, Individual Unlocks & Progress Bars (Tasks 10, 10
       const xboxHtml = renderToString(harness.render()).replace(/<!--\s*-->/g, '');
       expect(xboxHtml).toContain('64%');
       expect(xboxHtml).not.toContain('64 / 100');
+
+      harness.unmount();
+    });
+
+    it('isolates Quake II (steam-2320) GOG & Steam tabs with unique keys, self-heals doubled 26->13 GOG rows on read, and prevents cross-store DOM bleed across gog -> steam -> gog switches (#147)', () => {
+      const quake2Game: CanonicalGame = {
+        id: 'steam-2320',
+        title: 'Quake II',
+        sortTitle: 'Quake II',
+        steamAppId: 2320,
+        platforms: [
+          {
+            platformId: 'steam',
+            platformGameId: '2320',
+            installed: true,
+            achievements: { total: 13, unlocked: 2, percentage: 15, isMastered: false },
+          },
+          {
+            platformId: 'gog',
+            platformGameId: '1947927225',
+            installed: false,
+            achievements: { total: 13, unlocked: 1, percentage: 8, isMastered: false },
+          },
+        ],
+        capsuleImage: 'https://example.com/q2_c.jpg',
+        headerImage: 'https://example.com/q2_h.jpg',
+        developers: ['id Software'],
+        publishers: ['Bethesda Softworks'],
+        genres: ['Action'],
+        tags: ['FPS'],
+      };
+
+      const gogUnlockIso = '2026-10-24T20:51:43.000Z';
+      const steamEstablishIso = '2023-11-09T20:41:00.000Z';
+      const steamGridIso = '2024-01-13T21:13:00.000Z';
+
+      const gogUnique13 = [
+        {
+          id: 'gog:1947927225:56737654446866238',
+          apiName: 'EST_COMM',
+          name: 'Establish Communications',
+          description: 'Establish communications with the command ship.',
+          unlocked: true,
+          unlockedAt: gogUnlockIso,
+          iconUnlockedUrl: 'https://images.gog.com/q2_1.jpg',
+          storefrontId: 'gog' as const,
+        },
+        {
+          id: 'gog:1947927225:56737654446866239',
+          apiName: 'DESTROY_GRID',
+          name: 'Destroy Security Grid',
+          description: 'Disable the Strogg security grid.',
+          unlocked: false,
+          iconUnlockedUrl: 'https://images.gog.com/q2_2.jpg',
+          storefrontId: 'gog' as const,
+        },
+        ...Array.from({ length: 11 }, (_, idx) => ({
+          id: `gog:1947927225:567376544468662${40 + idx}`,
+          apiName: `GOG_Q2_${idx + 3}`,
+          name: `GOG Mission ${idx + 3}`,
+          description: `Complete mission ${idx + 3}.`,
+          unlocked: false,
+          iconUnlockedUrl: `https://images.gog.com/q2_${idx + 3}.jpg`,
+          storefrontId: 'gog' as const,
+        })),
+      ];
+
+      const steamUnique13 = [
+        {
+          id: 'steam:2320:EST_COMM',
+          apiName: 'EST_COMM',
+          name: 'Establish Communications',
+          description: 'Establish communications with the command ship.',
+          unlocked: true,
+          unlockedAt: steamEstablishIso,
+          iconUnlockedUrl: 'https://shared.fastly.steamstatic.com/q2_1.jpg',
+          storefrontId: 'steam' as const,
+        },
+        {
+          id: 'steam:2320:DESTROY_GRID',
+          apiName: 'DESTROY_GRID',
+          name: 'Destroy Security Grid',
+          description: 'Disable the Strogg security grid.',
+          unlocked: true,
+          unlockedAt: steamGridIso,
+          iconUnlockedUrl: 'https://shared.fastly.steamstatic.com/q2_2.jpg',
+          storefrontId: 'steam' as const,
+        },
+        ...Array.from({ length: 11 }, (_, idx) => ({
+          id: `steam:2320:STEAM_Q2_${idx + 3}`,
+          apiName: `STEAM_Q2_${idx + 3}`,
+          name: `Steam Mission ${idx + 3}`,
+          description: `Complete mission ${idx + 3}.`,
+          unlocked: false,
+          iconUnlockedUrl: `https://shared.fastly.steamstatic.com/q2_${idx + 3}.jpg`,
+          storefrontId: 'steam' as const,
+        })),
+      ];
+
+      const corruptedQuake2Map: MultiStoreAchievementsMap = {
+        gog: {
+          storefrontId: 'gog',
+          storefrontName: 'GOG GALAXY',
+          total: 26,
+          unlocked: 2,
+          percentage: 8,
+          isMastered: false,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: true,
+          cacheVersion: 2,
+          syncedAt: new Date().toISOString(),
+          achievements: [...gogUnique13, ...gogUnique13],
+        },
+        steam: {
+          storefrontId: 'steam',
+          storefrontName: 'Steam',
+          total: 13,
+          unlocked: 2,
+          percentage: 15,
+          isMastered: false,
+          source: 'live_cloud',
+          unlockPrecision: 'exact',
+          supportsAchievements: true,
+          cacheVersion: 2,
+          syncedAt: new Date().toISOString(),
+          achievements: steamUnique13,
+        },
+      };
+
+      const saveGameDetailSpy = vi.fn(async () => ({ success: true }));
+      (globalThis as Record<string, unknown>).window = {
+        localStorage: storage,
+        electronAPI: {
+          offlineVault: {
+            saveGameDetail: saveGameDetailSpy,
+          },
+        },
+      };
+
+      // Seed raw corrupted localStorage payload directly (bypassing setCachedMultiStoreAchievements)
+      // to verify instantaneous self-heal + write-back to SQLite on modal open!
+      storage.setItem(
+        `antigravity_detailed_achievements_${quake2Game.id}`,
+        JSON.stringify(corruptedQuake2Map)
+      );
+
+      const countOccurrences = (haystack: string, needle: string): number =>
+        haystack.split(needle).length - 1;
+
+      const harness = createFiveHookHarness(GameAchievementsModal, {
+        isOpen: true,
+        game: quake2Game,
+        initialStorefrontId: 'gog',
+        onClose: vi.fn(),
+      });
+
+      // 1. Open on GOG tab -> self-heals 26 -> 13 and persists healed map to SQLite
+      harness.render();
+      const gogVnode = harness.render();
+      const gogHtml = renderToString(gogVnode).replace(/<!--\s*-->/g, '');
+      const gogText = gogHtml.replace(/<[^>]+>/g, '');
+
+      expect(countOccurrences(gogText, 'Establish Communications')).toBe(1);
+      expect(countOccurrences(gogText, 'Destroy Security Grid')).toBe(1);
+      expect(gogText).toContain('1 of 13 Unlocked');
+      expect(gogText).toContain('Showing 13 of 13 achievements');
+      expect(gogText).toContain('2026');
+      expect(gogText).not.toContain('2023');
+
+      const gogPane = findElements(
+        gogVnode,
+        (el) => el.props?.['data-testid'] === 'achievements-list-pane'
+      )[0] as React.ReactElement<{ children?: React.ReactElement[] }> | undefined;
+      expect(gogPane).toBeTruthy();
+      expect(gogPane?.key).toBe('gog');
+      const gogCardKeys = (Array.isArray(gogPane?.props?.children) ? gogPane.props.children : [])
+        .map((c) => c?.key)
+        .filter((k): k is string => typeof k === 'string');
+      expect(gogCardKeys).toHaveLength(13);
+      expect(new Set(gogCardKeys).size).toBe(13);
+      expect(gogCardKeys.every((k) => k.startsWith('gog:'))).toBe(true);
+
+      // SQLite write-back happened immediately with healed 13-item GOG record
+      expect(saveGameDetailSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          gameId: 'steam-2320',
+          achievements: expect.objectContaining({
+            gog: expect.objectContaining({ total: 13, unlocked: 1 }),
+          }),
+        })
+      );
+
+      // 2. Switch to Steam tab -> pane key changes to 'steam', zero GOG 2026 bleed, both achievements appear ONCE!
+      const steamTabBtn = findElements(gogVnode, (el) => {
+        if (el.type !== 'button') return false;
+        const txt = renderToString(el as React.ReactElement).replace(/<!--\s*-->/g, '');
+        return txt.includes('Steam') && txt.includes('2/13');
+      })[0];
+      expect(steamTabBtn).toBeTruthy();
+      (steamTabBtn.props?.onClick as () => void)();
+
+      const steamVnode = harness.render();
+      const steamHtml = renderToString(steamVnode).replace(/<!--\s*-->/g, '');
+      const steamText = steamHtml.replace(/<[^>]+>/g, '');
+
+      expect(countOccurrences(steamText, 'Establish Communications')).toBe(1);
+      expect(countOccurrences(steamText, 'Destroy Security Grid')).toBe(1);
+      expect(steamText).toContain('2 of 13 Unlocked');
+      expect(steamText).toContain('Showing 13 of 13 achievements');
+      expect(steamText).toContain('2023');
+      expect(steamText).toContain('2024');
+      expect(steamText).not.toContain('2026');
+
+      const steamPane = findElements(
+        steamVnode,
+        (el) => el.props?.['data-testid'] === 'achievements-list-pane'
+      )[0] as React.ReactElement<{ children?: React.ReactElement[] }> | undefined;
+      expect(steamPane).toBeTruthy();
+      expect(steamPane?.key).toBe('steam');
+      const steamCardKeys = (
+        Array.isArray(steamPane?.props?.children) ? steamPane.props.children : []
+      )
+        .map((c) => c?.key)
+        .filter((k): k is string => typeof k === 'string');
+      expect(steamCardKeys).toHaveLength(13);
+      expect(new Set(steamCardKeys).size).toBe(13);
+      expect(steamCardKeys.every((k) => k.startsWith('steam:'))).toBe(true);
+
+      // 3. Switch back to GOG tab -> Establish Communications STILL appears exactly once (zero 3x stacking!)
+      const gogTabBtn = findElements(steamVnode, (el) => {
+        if (el.type !== 'button') return false;
+        const txt = renderToString(el as React.ReactElement).replace(/<!--\s*-->/g, '');
+        return txt.includes('GOG') && txt.includes('1/13');
+      })[0];
+      expect(gogTabBtn).toBeTruthy();
+      (gogTabBtn.props?.onClick as () => void)();
+
+      const gogAgainVnode = harness.render();
+      const gogAgainText = renderToString(gogAgainVnode)
+        .replace(/<!--\s*-->/g, '')
+        .replace(/<[^>]+>/g, '');
+      expect(countOccurrences(gogAgainText, 'Establish Communications')).toBe(1);
+      expect(countOccurrences(gogAgainText, 'Destroy Security Grid')).toBe(1);
+      expect(gogAgainText).toContain('1 of 13 Unlocked');
+      expect(gogAgainText).toContain('2026');
+      expect(gogAgainText).not.toContain('2023');
+
+      const gogAgainPane = findElements(
+        gogAgainVnode,
+        (el) => el.props?.['data-testid'] === 'achievements-list-pane'
+      )[0] as React.ReactElement | undefined;
+      expect(gogAgainPane?.key).toBe('gog');
 
       harness.unmount();
     });

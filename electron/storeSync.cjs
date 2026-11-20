@@ -1420,6 +1420,8 @@ async function fetchGogDetailedGameAchievements(payload = {}, options = {}) {
   if (clientId && userId && accessToken) {
     const fetchAllPages = async (tokenToUse) => {
       const collected = [];
+      const seenKeys = new Set();
+      const seenIndexByKey = new Map();
       let totalCount = 0;
       let pageToken = '';
       const authHeader = tokenToUse.startsWith('Bearer ') ? tokenToUse : `Bearer ${tokenToUse}`;
@@ -1452,13 +1454,49 @@ async function fetchGogDetailedGameAchievements(payload = {}, options = {}) {
         if (typeof gpData?.total_count === 'number' && gpData.total_count > totalCount) {
           totalCount = gpData.total_count;
         }
-        collected.push(...pageItems);
+        let addedOnPage = 0;
+        for (const item of pageItems) {
+          const itemKey =
+            (item?.achievement_id !== undefined &&
+              item?.achievement_id !== null &&
+              String(item.achievement_id).trim()) ||
+            (item?.id !== undefined && item?.id !== null && String(item.id).trim()) ||
+            (item?.achievement_key !== undefined &&
+              item?.achievement_key !== null &&
+              String(item.achievement_key).trim()) ||
+            '';
+          if (itemKey) {
+            if (seenKeys.has(itemKey)) {
+              const existingIdx = seenIndexByKey.get(itemKey);
+              if (
+                existingIdx !== undefined &&
+                !collected[existingIdx]?.date_unlocked &&
+                item?.date_unlocked
+              ) {
+                collected[existingIdx] = item;
+              }
+              continue;
+            }
+            seenKeys.add(itemKey);
+            seenIndexByKey.set(itemKey, collected.length);
+          }
+          collected.push(item);
+          addedOnPage++;
+        }
         const nextToken = typeof gpData?.page_token === 'string' ? gpData.page_token.trim() : '';
-        if (!nextToken || nextToken === pageToken || pageItems.length === 0) break;
+        if (
+          !nextToken ||
+          nextToken === pageToken ||
+          pageItems.length === 0 ||
+          addedOnPage === 0 ||
+          (totalCount > 0 && collected.length >= totalCount)
+        ) {
+          break;
+        }
         pageToken = nextToken;
       }
 
-      return { ok: true, items: collected, totalCount: totalCount || collected.length };
+      return { ok: true, items: collected, totalCount: collected.length };
     };
 
     try {
@@ -1531,7 +1569,7 @@ async function fetchGogDetailedGameAchievements(payload = {}, options = {}) {
           };
         });
 
-        const total = Math.max(mapped.length, gpResult.totalCount || 0);
+        const total = mapped.length;
         const unlocked = mapped.filter((a) => a.unlocked).length;
         const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
         return {

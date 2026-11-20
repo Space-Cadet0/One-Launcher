@@ -5,7 +5,10 @@ import type {
   StorefrontAchievementsData,
   MultiStoreAchievementsMap,
 } from '../../contracts/achievement';
-import { achievementDetailService } from '../../services/achievements/achievementDetailService';
+import {
+  achievementDetailService,
+  deduplicateDetailedAchievements,
+} from '../../services/achievements/achievementDetailService';
 import { onlineLifecycleManager } from '../../services/network/onlineLifecycleManager';
 import { toOlMediaUrl } from '../../contracts/network';
 import { matchesLooseSearchQuery } from '../../services/common/titleUtils';
@@ -57,6 +60,9 @@ function shouldSwrRevalidateMap(map: MultiStoreAchievementsMap): boolean {
     if (entry.schemaUnavailableOffline) return true;
     if (entry.unlockPrecision === 'summary_count_only') return true;
     if ((entry.cacheVersion ?? 0) < 2) return true;
+    if (Array.isArray(entry.achievements) && entry.achievements.length > 0 && entry.total !== entry.achievements.length) {
+      return true;
+    }
     if (entry.syncedAt) {
       const syncedMs = Date.parse(entry.syncedAt);
       if (!Number.isNaN(syncedMs) && now - syncedMs > SWR_STALE_AGE_MS) {
@@ -290,8 +296,12 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
     return () => ro.disconnect();
   }, [isOpen]);
 
-  // Active storefront data
-  const currentStoreData: StorefrontAchievementsData | undefined = multiStoreData[activeStorefront];
+  // Active storefront data (defensively deduplicated so duplicate React keys never reach reconciler)
+  const rawStoreData: StorefrontAchievementsData | undefined = multiStoreData[activeStorefront];
+  const currentStoreData: StorefrontAchievementsData | undefined = useMemo(
+    () => (rawStoreData ? deduplicateDetailedAchievements(rawStoreData) : undefined),
+    [rawStoreData]
+  );
   const isSummaryCountOnly = currentStoreData?.unlockPrecision === 'summary_count_only';
 
   // Locked secret IDs for "Reveal All Secrets" toggle
@@ -337,10 +347,26 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
     ).length;
   }, [currentStoreData, isSummaryCountOnly]);
 
-  // Filtered and sorted achievements list
+  // Filtered and sorted achievements list (with defensive deduplication by ach.id)
   const displayedAchievements = useMemo(() => {
     if (!currentStoreData?.achievements) return [];
-    let list = [...currentStoreData.achievements];
+    const deduped: StorefrontAchievementsData['achievements'] = [];
+    const seenIndexById = new Map<string, number>();
+    for (const ach of currentStoreData.achievements) {
+      const idKey = typeof ach?.id === 'string' ? ach.id.trim() : '';
+      if (idKey) {
+        const existingIdx = seenIndexById.get(idKey);
+        if (existingIdx !== undefined) {
+          if (!deduped[existingIdx].unlocked && ach.unlocked) {
+            deduped[existingIdx] = { ...deduped[existingIdx], ...ach, unlocked: true };
+          }
+          continue;
+        }
+        seenIndexById.set(idKey, deduped.length);
+      }
+      deduped.push(ach);
+    }
+    let list = deduped;
 
     // Filter tab (avoid misleading per-item locked/unlocked filtering when precision is summary_count_only)
     if (!isSummaryCountOnly) {
@@ -432,7 +458,8 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
   if (!isOpen || !game) return null;
 
   const renderAchievementCard = (
-    ach: StorefrontAchievementsData['achievements'][number]
+    ach: StorefrontAchievementsData['achievements'][number],
+    idx: number
   ) => {
     const isUnlocked = ach.unlocked;
     const isSecretHidden = ach.isSecret && !isUnlocked && !revealedSecrets.has(ach.id);
@@ -491,7 +518,7 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
 
     return (
       <div
-        key={ach.id}
+        key={`${activeStorefront}:${ach.id || idx}`}
         className={`rounded-lg p-3.5 border transition-all duration-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 ${
           isUnlocked
             ? 'bg-[#15202e] border-[#2b4b6f] hover:border-steam-accent/70 shadow-md'
@@ -919,78 +946,87 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
           </div>
         )}
 
-        {/* Toolbar: Search, Filter Tabs & Sort Dropdown */}
-        <div className="px-6 py-3 bg-[#111923] border-b border-[#2a475e]/60 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shrink-0">
-          {/* Status Tabs */}
-          <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar">
-            <button
-              type="button"
-              onClick={() => setActiveFilterTab('all')}
-              className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 ${
-                activeFilterTab === 'all'
-                  ? 'bg-[#1b2b3d] text-white border border-steam-accent/70'
-                  : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
-              }`}
+        {/* Toolbar: Filter Tabs (Row 1) & Search + Sort Controls (Row 2) */}
+        <div
+          data-testid="achievements-toolbar"
+          className="px-6 py-3 bg-[#111923] border-b border-[#2a475e]/60 flex flex-col gap-2.5 shrink-0"
+        >
+          {/* Row 1: Status Filter Tabs & Secret Reveal Toggle */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div
+              data-testid="achievements-filter-tabs"
+              className="flex flex-wrap items-center gap-1.5"
             >
-              All ({totalCount})
-            </button>
-            {!isSummaryCountOnly && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterTab('unlocked')}
-                  className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                    activeFilterTab === 'unlocked'
-                      ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-500/70'
-                      : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
-                  }`}
-                >
-                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                  <span>Unlocked ({unlockedCount})</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterTab('locked')}
-                  className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                    activeFilterTab === 'locked'
-                      ? 'bg-slate-800 text-slate-200 border border-slate-600'
-                      : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
-                  }`}
-                >
-                  <Lock className="w-3 h-3 text-slate-300" />
-                  <span>Locked ({lockedCount})</span>
-                </button>
-                {inProgressCount > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setActiveFilterTab('in_progress')}
-                    className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                      activeFilterTab === 'in_progress'
-                        ? 'bg-sky-950/70 text-sky-200 border border-sky-400/70'
-                        : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
-                    }`}
-                  >
-                    <TrendingUp className="w-3 h-3 text-sky-400" />
-                    <span>In Progress ({inProgressCount})</span>
-                  </button>
-                )}
-              </>
-            )}
-            {secretCount > 0 && (
               <button
                 type="button"
-                onClick={() => setActiveFilterTab('secret')}
-                className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
-                  activeFilterTab === 'secret'
-                    ? 'bg-purple-950/70 text-purple-300 border border-purple-500/70'
+                onClick={() => setActiveFilterTab('all')}
+                className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 ${
+                  activeFilterTab === 'all'
+                    ? 'bg-[#1b2b3d] text-white border border-steam-accent/70'
                     : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
                 }`}
               >
-                <EyeOff className="w-3 h-3 text-purple-400" />
-                <span>Secret ({secretCount})</span>
+                All ({totalCount})
               </button>
-            )}
-            {!isSummaryCountOnly && lockedSecretIds.length > 0 && (
+              {!isSummaryCountOnly && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setActiveFilterTab('unlocked')}
+                    className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                      activeFilterTab === 'unlocked'
+                        ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-500/70'
+                        : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
+                    }`}
+                  >
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                    <span>Unlocked ({unlockedCount})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveFilterTab('locked')}
+                    className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                      activeFilterTab === 'locked'
+                        ? 'bg-slate-800 text-slate-200 border border-slate-600'
+                        : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
+                    }`}
+                  >
+                    <Lock className="w-3 h-3 text-slate-300" />
+                    <span>Locked ({lockedCount})</span>
+                  </button>
+                  {inProgressCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveFilterTab('in_progress')}
+                      className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                        activeFilterTab === 'in_progress'
+                          ? 'bg-sky-950/70 text-sky-200 border border-sky-400/70'
+                          : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
+                      }`}
+                    >
+                      <TrendingUp className="w-3 h-3 text-sky-400" />
+                      <span>In Progress ({inProgressCount})</span>
+                    </button>
+                  )}
+                </>
+              )}
+              {secretCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveFilterTab('secret')}
+                  className={`min-h-6 px-3 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                    activeFilterTab === 'secret'
+                      ? 'bg-purple-950/70 text-purple-300 border border-purple-500/70'
+                      : 'text-slate-300 hover:text-white bg-[#16202d] border border-transparent'
+                  }`}
+                >
+                  <EyeOff className="w-3 h-3 text-purple-400" />
+                  <span>Secret ({secretCount})</span>
+                </button>
+              )}
+            </div>
+
+            {!isSummaryCountOnly && secretCount > 0 && lockedSecretIds.length > 0 && (
               <button
                 type="button"
                 onClick={toggleRevealAllSecrets}
@@ -1011,9 +1047,9 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
             )}
           </div>
 
-          {/* Search & Sort Controls */}
-          <div className="flex items-center gap-2.5">
-            <div className="relative flex-1 md:w-56">
+          {/* Row 2: Search & Sort Controls */}
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+            <div className="relative flex-1">
               <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
               <input
                 type="text"
@@ -1038,13 +1074,13 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
             </div>
 
             {/* Sort Selector */}
-            <div className="flex items-center gap-1 bg-[#16202d] border border-[#2a475e] rounded px-2 py-1">
+            <div className="flex items-center gap-1 bg-[#16202d] border border-[#2a475e] rounded px-2 py-1 sm:w-52 shrink-0">
               <ArrowUpDown className="w-3 h-3 text-slate-400 shrink-0" />
               <select
                 aria-label="Sort achievements"
                 value={sortOption}
                 onChange={(e) => setSortOption(e.target.value as SortOption)}
-                className="bg-transparent text-xs text-slate-200 focus:outline-none cursor-pointer pr-1"
+                className="w-full bg-transparent text-xs text-slate-200 focus:outline-none cursor-pointer pr-1"
               >
                 <option value="default" className="bg-[#16202d] text-white">Default Order</option>
                 <option value="closest_progress" className="bg-[#16202d] text-white">Closest to Unlock</option>
@@ -1105,17 +1141,26 @@ export const GameAchievementsModal: React.FC<GameAchievementsModalProps> = ({
                 </button>
               )}
             </div>
-          ) : displayedAchievements.length > 60 && listClientHeight > 0 ? (
-            <VirtualListRows
-              items={displayedAchievements}
-              scrollElement={listScrollRef.current}
-              estimatedItemHeight={96}
-              itemGapPx={12}
-              getItemKey={(ach) => ach.id}
-              renderItem={(ach) => renderAchievementCard(ach)}
-            />
           ) : (
-            displayedAchievements.map((ach) => renderAchievementCard(ach))
+            <div
+              key={activeStorefront}
+              data-testid="achievements-list-pane"
+              className="space-y-3"
+            >
+              {displayedAchievements.length > 60 && listClientHeight > 0 ? (
+                <VirtualListRows
+                  key={activeStorefront}
+                  items={displayedAchievements}
+                  scrollElement={listScrollRef.current}
+                  estimatedItemHeight={96}
+                  itemGapPx={12}
+                  getItemKey={(ach, idx) => `${activeStorefront}:${ach.id || idx}`}
+                  renderItem={(ach, idx) => renderAchievementCard(ach, idx)}
+                />
+              ) : (
+                displayedAchievements.map((ach, idx) => renderAchievementCard(ach, idx))
+              )}
+            </div>
           )}
         </div>
 

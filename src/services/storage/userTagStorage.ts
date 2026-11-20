@@ -790,8 +790,12 @@ function syncSiblingsToOfflineVault(siblings: readonly UserTagOverride[]): void 
   }
   for (const sibling of siblings) {
     try {
+      const ipcPayload: UserTagOverride = {
+        ...sibling,
+        platformAliases: Array.isArray(sibling.platformAliases) ? sibling.platformAliases : [],
+      };
       void window.electronAPI.offlineVault
-        .saveUserTagOverride(sibling.gameId, sibling)
+        .saveUserTagOverride(sibling.gameId, ipcPayload)
         ?.catch?.(() => {});
     } catch (vaultErr) {
       console.warn('Failed to sync pruned sibling user tag override to offlineVault:', vaultErr);

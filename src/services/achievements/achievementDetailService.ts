@@ -187,6 +187,136 @@ function extractLiveAchievementsList(
   return { list: null, envelope: null };
 }
 
+/**
+ * Deduplicates `achievements` by `ach.id` preserving first-seen order (preferring `unlocked: true`
+ * when duplicates disagree) and recomputes `total`, `unlocked`, `percentage`, and `isMastered`.
+ * Returns `data` untouched when no duplicate IDs are present.
+ */
+export function deduplicateDetailedAchievements(
+  data: StorefrontAchievementsData
+): StorefrontAchievementsData {
+  if (!data || !Array.isArray(data.achievements) || data.achievements.length <= 1) {
+    return data;
+  }
+
+  const deduped: DetailedAchievement[] = [];
+  const indexById = new Map<string, number>();
+  let hasDuplicates = false;
+
+  for (const ach of data.achievements) {
+    const idKey = typeof ach?.id === 'string' ? ach.id.trim() : '';
+    if (idKey) {
+      const existingIdx = indexById.get(idKey);
+      if (existingIdx !== undefined) {
+        hasDuplicates = true;
+        const existing = deduped[existingIdx];
+        if (!existing.unlocked && ach.unlocked) {
+          deduped[existingIdx] = {
+            ...existing,
+            ...ach,
+            unlocked: true,
+            unlockedAt: ach.unlockedAt ?? existing.unlockedAt,
+            description: ach.description || existing.description,
+            iconUnlockedUrl: ach.iconUnlockedUrl || existing.iconUnlockedUrl,
+            iconLockedUrl: ach.iconLockedUrl || existing.iconLockedUrl,
+            globalPercentage: ach.globalPercentage ?? existing.globalPercentage,
+            rarityTier: ach.rarityTier ?? existing.rarityTier,
+            progress: ach.progress ?? existing.progress,
+          };
+        } else if (existing.unlocked === ach.unlocked) {
+          const needsBackfill =
+            (!existing.unlockedAt && Boolean(ach.unlockedAt)) ||
+            (!existing.description && Boolean(ach.description)) ||
+            (existing.globalPercentage === undefined && ach.globalPercentage !== undefined) ||
+            (!existing.progress && Boolean(ach.progress));
+          if (needsBackfill) {
+            deduped[existingIdx] = {
+              ...existing,
+              unlockedAt: existing.unlockedAt ?? ach.unlockedAt,
+              description: existing.description || ach.description,
+              globalPercentage: existing.globalPercentage ?? ach.globalPercentage,
+              rarityTier: existing.rarityTier ?? ach.rarityTier,
+              progress: existing.progress ?? ach.progress,
+            };
+          }
+        }
+        continue;
+      }
+      indexById.set(idKey, deduped.length);
+    }
+    deduped.push(ach);
+  }
+
+  const hasDoubledOrUnderstatedTotal =
+    deduped.length > 0 &&
+    (data.total < deduped.length || (deduped.length > 1 && data.total === deduped.length * 2));
+
+  if (!hasDuplicates && !hasDoubledOrUnderstatedTotal) {
+    return data;
+  }
+
+  const total = deduped.length;
+  const exactUnlocked = deduped.filter((a) => a.unlocked).length;
+  const unlocked =
+    data.unlockPrecision === 'summary_count_only' && exactUnlocked === 0
+      ? Math.min(Math.max(0, data.unlocked || 0), total)
+      : exactUnlocked;
+  const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+
+  let hasGamerscore = false;
+  let totalGamerscore = 0;
+  let earnedGamerscore = 0;
+  let hasXp = false;
+  let totalXp = 0;
+  let earnedXp = 0;
+
+  for (const ach of deduped) {
+    if (typeof ach.gamerscore === 'number' && Number.isFinite(ach.gamerscore)) {
+      hasGamerscore = true;
+      totalGamerscore += ach.gamerscore;
+      if (ach.unlocked) earnedGamerscore += ach.gamerscore;
+    }
+    if (typeof ach.xp === 'number' && Number.isFinite(ach.xp)) {
+      hasXp = true;
+      totalXp += ach.xp;
+      if (ach.unlocked) earnedXp += ach.xp;
+    }
+  }
+
+  return {
+    ...data,
+    achievements: deduped,
+    total,
+    unlocked,
+    percentage,
+    isMastered: total > 0 && unlocked >= total,
+    ...(hasGamerscore && data.totalGamerscore !== undefined ? { totalGamerscore } : {}),
+    ...(hasGamerscore && data.earnedGamerscore !== undefined ? { earnedGamerscore } : {}),
+    ...(hasXp && data.totalXp !== undefined ? { totalXp } : {}),
+    ...(hasXp && data.earnedXp !== undefined ? { earnedXp } : {}),
+  };
+}
+
+function normalizeMultiStoreAchievementsMap(
+  map: MultiStoreAchievementsMap
+): { normalized: MultiStoreAchievementsMap; changed: boolean } {
+  let changed = false;
+  let normalized: MultiStoreAchievementsMap = map;
+  for (const key of Object.keys(map) as Array<keyof MultiStoreAchievementsMap>) {
+    const entry = map[key];
+    if (!entry) continue;
+    const deduped = deduplicateDetailedAchievements(entry);
+    if (deduped !== entry) {
+      if (!changed) {
+        normalized = { ...map };
+        changed = true;
+      }
+      normalized[key] = deduped;
+    }
+  }
+  return { normalized, changed };
+}
+
 export class AchievementDetailService {
   public static readonly MAX_MEMORY_CACHE_ENTRIES = 60;
   public static readonly CURRENT_CACHE_VERSION = 2;
@@ -276,13 +406,20 @@ export class AchievementDetailService {
   }
 
   /**
-   * Loads cached detailed achievements from localStorage.
+   * Loads cached detailed achievements from memory or localStorage, automatically
+   * self-healing any legacy duplicate-ID entries (e.g., doubled GOG pagination payloads).
    */
   getCachedMultiStoreAchievements(gameId: string): MultiStoreAchievementsMap | null {
     if (this.inMemoryCache.has(gameId)) {
       const hit = this.inMemoryCache.get(gameId)!;
-      this.setMemoryCacheEntry(gameId, hit);
-      return hit;
+      const { normalized, changed } = normalizeMultiStoreAchievementsMap(hit);
+      if (changed) {
+        this.setMemoryCacheEntry(gameId, normalized);
+        this.setCachedMultiStoreAchievements(gameId, normalized);
+      } else {
+        this.setMemoryCacheEntry(gameId, normalized);
+      }
+      return normalized;
     }
 
     if (typeof localStorage !== 'undefined') {
@@ -292,8 +429,12 @@ export class AchievementDetailService {
           const parsed: unknown = JSON.parse(raw);
           if (parsed && typeof parsed === 'object') {
             const typed = parsed as MultiStoreAchievementsMap;
-            this.setMemoryCacheEntry(gameId, typed);
-            return typed;
+            const { normalized, changed } = normalizeMultiStoreAchievementsMap(typed);
+            this.setMemoryCacheEntry(gameId, normalized);
+            if (changed) {
+              this.setCachedMultiStoreAchievements(gameId, normalized);
+            }
+            return normalized;
           }
         }
       } catch {}
@@ -302,25 +443,29 @@ export class AchievementDetailService {
   }
 
   /**
-   * Persists detailed achievements to memory, IndexedDB vault, and localStorage.
+   * Persists detailed achievements to memory, IndexedDB vault, SQLite vault, and localStorage.
    */
   setCachedMultiStoreAchievements(gameId: string, data: MultiStoreAchievementsMap): void {
     if (!data || Object.keys(data).length === 0) return;
     if (Object.values(data).some((entry) => entry?.schemaUnavailableOffline === true)) {
       return;
     }
-    this.setMemoryCacheEntry(gameId, data);
-    void vaultSet(`detailed_achievements:${gameId}`, data);
+    const { normalized } = normalizeMultiStoreAchievementsMap(data);
+    this.setMemoryCacheEntry(gameId, normalized);
+    void vaultSet(`detailed_achievements:${gameId}`, normalized);
     if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.saveGameDetail) {
       try {
         void window.electronAPI.offlineVault
-          .saveGameDetail({ gameId, achievements: data })
+          .saveGameDetail({ gameId, achievements: normalized })
           ?.catch?.(() => {});
       } catch {}
     }
     if (typeof localStorage !== 'undefined') {
       try {
-        localStorage.setItem(`antigravity_detailed_achievements_${gameId}`, JSON.stringify(data));
+        localStorage.setItem(
+          `antigravity_detailed_achievements_${gameId}`,
+          JSON.stringify(normalized)
+        );
       } catch {
         // QuotaExceededError: detailed schema remains persisted in IndexedDB vault
       }
@@ -341,8 +486,12 @@ export class AchievementDetailService {
       Object.keys(vaultHit).length > 0 &&
       !Object.values(vaultHit).some((s) => s?.schemaUnavailableOffline)
     ) {
-      this.setMemoryCacheEntry(gameId, vaultHit);
-      return vaultHit;
+      const { normalized, changed } = normalizeMultiStoreAchievementsMap(vaultHit);
+      this.setMemoryCacheEntry(gameId, normalized);
+      if (changed) {
+        this.setCachedMultiStoreAchievements(gameId, normalized);
+      }
+      return normalized;
     }
     if (typeof window !== 'undefined' && window.electronAPI?.offlineVault?.getGameDetail) {
       try {
@@ -354,8 +503,12 @@ export class AchievementDetailService {
           Object.keys(vaultAch).length > 0 &&
           !Object.values(vaultAch).some((s) => s?.schemaUnavailableOffline)
         ) {
-          this.setMemoryCacheEntry(gameId, vaultAch);
-          return vaultAch;
+          const { normalized, changed } = normalizeMultiStoreAchievementsMap(vaultAch);
+          this.setMemoryCacheEntry(gameId, normalized);
+          if (changed) {
+            this.setCachedMultiStoreAchievements(gameId, normalized);
+          }
+          return normalized;
         }
       } catch {}
     }
@@ -717,7 +870,7 @@ export class AchievementDetailService {
             : exactUnlocked;
           const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
 
-          const ipcResult: StorefrontAchievementsData = {
+          const ipcResult: StorefrontAchievementsData = deduplicateDetailedAchievements({
             storefrontId: 'steam',
             storefrontName: 'Steam',
             total,
@@ -730,7 +883,7 @@ export class AchievementDetailService {
             unlockPrecision: isSummaryOnly ? 'summary_count_only' : 'exact',
             supportsAchievements: true,
             cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-          };
+          });
 
           if (
             steamEnv?.source === 'schema_fallback' &&
@@ -848,7 +1001,7 @@ export class AchievementDetailService {
             const unlocked = achievements.filter((a) => a.unlocked).length;
             const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
 
-            return {
+            return deduplicateDetailedAchievements({
               storefrontId: 'steam',
               storefrontName: 'Steam',
               total,
@@ -861,7 +1014,7 @@ export class AchievementDetailService {
               unlockPrecision: 'exact',
               supportsAchievements: true,
               cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-            };
+            });
           }
         } catch (err: unknown) {
           console.warn(
@@ -920,7 +1073,7 @@ export class AchievementDetailService {
         effectiveUnlocked > 0 && exactUnlocked === 0 ? 'summary_count_only' : 'exact';
       const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
 
-      return {
+      return deduplicateDetailedAchievements({
         storefrontId: 'steam',
         storefrontName: 'Steam',
         total: totalCount,
@@ -933,7 +1086,7 @@ export class AchievementDetailService {
         unlockPrecision,
         supportsAchievements: true,
         cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      };
+      });
     }
 
     const isOffline = !onlineLifecycleManager.isOnline();
@@ -1209,7 +1362,7 @@ export class AchievementDetailService {
       envEarnedXp ??
       (hasExactUnlocks && hasSchemaXp ? sumEarnedSchemaXp : userEpic?.xp?.earned);
 
-    return {
+    return deduplicateDetailedAchievements({
       storefrontId: 'epic',
       storefrontName: 'Epic Games',
       total: totalCount,
@@ -1224,7 +1377,7 @@ export class AchievementDetailService {
       unlockPrecision,
       supportsAchievements: true,
       cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-    };
+    });
   }
 
   /**
@@ -1412,7 +1565,7 @@ export class AchievementDetailService {
         const unlocked = achievements.filter((a) => a.unlocked).length;
         const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
 
-        return {
+        return deduplicateDetailedAchievements({
           storefrontId: 'gog',
           storefrontName: 'GOG GALAXY',
           total,
@@ -1425,7 +1578,7 @@ export class AchievementDetailService {
           unlockPrecision: 'exact',
           supportsAchievements: true,
           cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-        };
+        });
       }
 
       // Partial live unlock list: reconcile unlocked IDs/keys against canonical schema
@@ -1470,7 +1623,7 @@ export class AchievementDetailService {
       const unlocked = reconciledAchievements.filter((a) => a.unlocked).length;
       const percentage = total > 0 ? Math.round((unlocked / total) * 100) : 0;
 
-      return {
+      return deduplicateDetailedAchievements({
         storefrontId: 'gog',
         storefrontName: 'GOG GALAXY',
         total,
@@ -1483,7 +1636,7 @@ export class AchievementDetailService {
         unlockPrecision: 'exact',
         supportsAchievements: true,
         cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-      };
+      });
     }
 
     const schema = await resolveFallbackSchema();
@@ -1530,7 +1683,7 @@ export class AchievementDetailService {
     const percentage = totalCount > 0 ? Math.round((effectiveUnlocked / totalCount) * 100) : 0;
     const isMastered = totalCount > 0 && effectiveUnlocked >= totalCount;
 
-    return {
+    return deduplicateDetailedAchievements({
       storefrontId: 'gog',
       storefrontName: 'GOG GALAXY',
       total: totalCount,
@@ -1543,7 +1696,7 @@ export class AchievementDetailService {
       unlockPrecision,
       supportsAchievements: true,
       cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-    };
+    });
   }
 
   /**
@@ -1702,7 +1855,7 @@ export class AchievementDetailService {
               : undefined) ??
             (sumTotalG > 0 ? sumEarnedG : userXbox?.gamerscore?.earned);
 
-          return {
+          return deduplicateDetailedAchievements({
             storefrontId: 'xbox',
             storefrontName: 'Xbox',
             total,
@@ -1717,7 +1870,7 @@ export class AchievementDetailService {
             unlockPrecision: 'exact',
             supportsAchievements: true,
             cacheVersion: AchievementDetailService.CURRENT_CACHE_VERSION,
-          };
+          });
         }
       } catch {
         // Fall through to Xbox game schema / canonical schema fallback
@@ -1875,7 +2028,7 @@ export class AchievementDetailService {
       userXbox?.gamerscore?.earned ??
       (hasExactUnlocks && hasSchemaGamerscore ? sumSchemaEarnedG : undefined);
 
-    return {
+    return deduplicateDetailedAchievements({
       storefrontId: 'xbox',
       storefrontName: 'Xbox',
       total: totalCount,
@@ -1889,7 +2042,7 @@ export class AchievementDetailService {
       source: hasExactUnlocks ? 'live_cloud' : 'schema_fallback',
       unlockPrecision,
       supportsAchievements: true,
-    };
+    });
   }
 
   /**
@@ -1937,7 +2090,10 @@ export class AchievementDetailService {
           (entry) =>
             Boolean(entry) &&
             (entry.unlockPrecision === 'summary_count_only' ||
-              (entry.cacheVersion ?? 0) < AchievementDetailService.CURRENT_CACHE_VERSION)
+              (entry.cacheVersion ?? 0) < AchievementDetailService.CURRENT_CACHE_VERSION ||
+              (Array.isArray(entry.achievements) &&
+                entry.achievements.length > 0 &&
+                entry.total !== entry.achievements.length))
         );
       if (!steamStale && !epicStale && !gogStale && !xboxStale && !ipcUpgradeNeeded) {
         return cached;

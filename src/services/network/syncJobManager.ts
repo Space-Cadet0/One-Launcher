@@ -612,8 +612,9 @@ export class SyncJobManager {
   private preemptionResolvers: Array<() => void> = [];
   private priorityCompleteTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Active background critic score loop cancellation token
+  // Active background critic score & store media loop cancellation tokens
   private criticLoopToken = 0;
+  private mediaSyncLoopToken = 0;
 
   // Serialized FIFO coordination lane for background warmup jobs (critic_scores <-> store_media)
   // so sibling warmups queue/chain cleanly instead of cancelling each other during hydration waits.
@@ -930,10 +931,11 @@ export class SyncJobManager {
   /**
    * Waits while the job is manually paused by the user OR preempted by an on-demand priority action.
    */
-  private async waitWhilePausedOrPreempted(): Promise<void> {
+  private async waitWhilePausedOrPreempted(shouldAbort?: () => boolean): Promise<void> {
     while (
       (this.state?.status === 'paused' || this.priorityScopes.size > 0) &&
-      !this.isCancelled
+      !this.isCancelled &&
+      !(shouldAbort && shouldAbort())
     ) {
       if (this.state?.status === 'paused') {
         await new Promise<void>((resolve) => {
@@ -1089,6 +1091,7 @@ export class SyncJobManager {
     if (!this.state || this.state.id !== id) return;
     this.isCancelled = true;
     this.criticLoopToken++;
+    this.mediaSyncLoopToken++;
     this.backgroundWarmupEpoch++;
     this.categoryStats.clear();
     this.updateState({
@@ -1110,6 +1113,7 @@ export class SyncJobManager {
   public reset(): void {
     this.isCancelled = true;
     this.criticLoopToken++;
+    this.mediaSyncLoopToken++;
     this.backgroundWarmupEpoch++;
     this.queuedBackgroundWarmups.clear();
     this.backgroundWarmupChain = Promise.resolve();
@@ -1274,6 +1278,7 @@ export class SyncJobManager {
     }
 
     const myToken = ++this.criticLoopToken;
+    this.mediaSyncLoopToken++;
     this.isCancelled = false;
 
     const jobId = isBackground
@@ -1533,30 +1538,41 @@ export class SyncJobManager {
     const shouldWarmHltb = Boolean(options?.isBackgroundWarmup || options?.incremental);
 
     if (isBackgroundWarmup) {
+      const entryMediaToken = this.mediaSyncLoopToken;
+      const entryWarmupEpoch = this.backgroundWarmupEpoch;
       await whenStagedCacheHydrated();
-      if (!onlineLifecycleManager.isOnline()) {
-        return;
-      }
-      if (hasActiveMediaSyncCooldown()) {
-        return;
-      }
-      if (this.hasActiveManualJob()) {
+      if (
+        this.mediaSyncLoopToken !== entryMediaToken ||
+        this.backgroundWarmupEpoch !== entryWarmupEpoch ||
+        !onlineLifecycleManager.isOnline() ||
+        hasActiveMediaSyncCooldown() ||
+        (this.state?.type === 'store_media' && this.state?.status === 'running') ||
+        this.hasActiveManualJob()
+      ) {
         return;
       }
     }
 
     // Only manual user-triggered syncs preempt/cancel an existing running job;
     // passive background warmups are serialized via `backgroundWarmupChain`.
-    if (
+    const shouldYieldAfterCancel = Boolean(
       !isBackgroundWarmup &&
-      this.state &&
-      (this.state.status === 'running' ||
-        this.state.status === 'paused' ||
-        this.state.status === 'rate_limited')
-    ) {
+        this.state &&
+        (this.state.status === 'running' ||
+          this.state.status === 'paused' ||
+          this.state.status === 'rate_limited')
+    );
+    if (shouldYieldAfterCancel && this.state) {
       this.cancelJob(this.state.id);
-      // Brief yield to allow clean loop termination
+    }
+
+    const myToken = ++this.mediaSyncLoopToken;
+    if (shouldYieldAfterCancel) {
+      // Brief yield to allow clean loop termination of the preempted run
       await new Promise((r) => setTimeout(r, 10));
+      if (this.mediaSyncLoopToken !== myToken) {
+        return;
+      }
     }
 
     const alreadyEnrichedForHydration: CanonicalGame[] = [];
@@ -1629,9 +1645,21 @@ export class SyncJobManager {
       } catch {}
     }
 
+    if (this.mediaSyncLoopToken !== myToken) {
+      return;
+    }
+
     const jobId = isBackgroundWarmup
-      ? `auto-store-media-${Date.now()}`
-      : `sync-store-media-${Date.now()}`;
+      ? `auto-store-media-${Date.now()}-${myToken}`
+      : `sync-store-media-${Date.now()}-${myToken}`;
+    const isPreemptedOrStale = (): boolean =>
+      this.mediaSyncLoopToken !== myToken || this.state?.id !== jobId;
+    const safeUpdateState = (partial: Partial<SyncJobState>): boolean => {
+      if (isPreemptedOrStale()) return false;
+      this.updateState(partial);
+      return true;
+    };
+
     this.isCancelled = false;
     this.pausePromiseResolve = null;
 
@@ -1679,13 +1707,19 @@ export class SyncJobManager {
           await steamApi
             .fetchStoreBrowseAssetsBatch(knownBatchAppIds, RequestPriority.P2_BACKGROUND)
             .catch(() => new Map());
+          if (isPreemptedOrStale()) {
+            return;
+          }
         }
       }
 
       const retryCounts = new Map<string, number>();
 
       for (let i = 0; i < eligibleGames.length; i++) {
-        if (this.isCancelled || this.state.status === 'cancelled') {
+        if (isPreemptedOrStale()) {
+          return;
+        }
+        if (this.isCancelled || this.state?.status === 'cancelled') {
           break;
         }
         if (isBackgroundWarmup && !onlineLifecycleManager.isOnline()) {
@@ -1693,21 +1727,27 @@ export class SyncJobManager {
         }
 
         const game = eligibleGames[i];
-        this.updateState({
-          current: i,
-          currentItemName: game.title,
-        });
+        if (
+          !safeUpdateState({
+            current: i,
+            currentItemName: game.title,
+          })
+        ) {
+          return;
+        }
 
         // 1. Pause & Priority Preemption handling
-        await this.waitWhilePausedOrPreempted();
+        await this.waitWhilePausedOrPreempted(isPreemptedOrStale);
+        if (isPreemptedOrStale()) return;
         if (
           isBackgroundWarmup &&
           isUserActivelyScrolling() &&
           !(typeof process !== 'undefined' && process.env.VITEST)
         ) {
           await waitUntilScrollIdle(1500);
+          if (isPreemptedOrStale()) return;
         }
-        if (this.isCancelled) break;
+        if (this.isCancelled || isPreemptedOrStale()) break;
 
         // 2. Multi-domain CDN / edge rate-limit cooldown handling
         const activeCooldownSec = requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS);
@@ -1716,30 +1756,45 @@ export class SyncJobManager {
             // C1: Abort passive background warmup immediately on any media domain cooldown
             break;
           }
-          this.updateState({
-            status: 'rate_limited',
-            cooldownSecondsRemaining: activeCooldownSec,
-          });
+          if (
+            !safeUpdateState({
+              status: 'rate_limited',
+              cooldownSecondsRemaining: activeCooldownSec,
+            })
+          ) {
+            return;
+          }
 
           while (
             requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS) > 0 &&
-            !this.isCancelled
+            !this.isCancelled &&
+            !isPreemptedOrStale()
           ) {
             await new Promise((r) => setTimeout(r, 1000));
+            if (isPreemptedOrStale()) return;
             if (this.state && this.state.status === 'rate_limited') {
-              this.updateState({
-                cooldownSecondsRemaining:
-                  requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS),
-              });
+              if (
+                !safeUpdateState({
+                  cooldownSecondsRemaining:
+                    requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS),
+                })
+              ) {
+                return;
+              }
             }
           }
 
+          if (isPreemptedOrStale()) return;
           if (this.isCancelled) break;
 
-          this.updateState({
-            status: 'running',
-            cooldownSecondsRemaining: undefined,
-          });
+          if (
+            !safeUpdateState({
+              status: 'running',
+              cooldownSecondsRemaining: undefined,
+            })
+          ) {
+            return;
+          }
         }
 
         // 3. Perform fetch (respecting Step 4 MetadataSourceRoute)
@@ -1768,6 +1823,7 @@ export class SyncJobManager {
             developers: game.developers,
             priority: RequestPriority.P2_BACKGROUND,
           });
+          if (isPreemptedOrStale()) return;
           if (dynamicallyMatchedId && dynamicallyMatchedId > 0) {
             targetAppId = dynamicallyMatchedId;
           }
@@ -1807,6 +1863,7 @@ export class SyncJobManager {
                 : await steamApi.fetchGameMetadata(targetAppId!, RequestPriority.P2_BACKGROUND, {
                     forceRefresh: existingNeedsForceRefresh,
                   });
+            if (isPreemptedOrStale()) return;
 
             const isSkeletonRefreshed = refreshed?.metadataQuality === 'skeleton_fallback';
             const hasRichExisting = Boolean(
@@ -2038,13 +2095,14 @@ export class SyncJobManager {
             }
 
             gameCompletedWithoutAbort = true;
-            if (shouldWarmHltb && onlineLifecycleManager.isOnline()) {
+            if (shouldWarmHltb && onlineLifecycleManager.isOnline() && !isPreemptedOrStale()) {
               try {
                 const effectiveHltbAppId = targetAppId || game.steamAppId;
                 if (!hasAttemptedHltbLookup(game.title, effectiveHltbAppId)) {
                   const liveHltb = await fetchAndCacheHltb(game.title, effectiveHltbAppId).catch(
                     () => null
                   );
+                  if (isPreemptedOrStale()) return;
                   if (
                     liveHltb &&
                     typeof window !== 'undefined' &&
@@ -2063,6 +2121,7 @@ export class SyncJobManager {
               } catch {}
             }
           } catch (err: unknown) {
+            if (isPreemptedOrStale()) return;
             const rateErr = (err && typeof err === 'object' ? err : {}) as MediaSyncRateError;
             const is429 =
               Boolean(rateErr.isRateLimited) ||
@@ -2084,32 +2143,47 @@ export class SyncJobManager {
                   cooldownSec * 1000,
                   1000 * Math.pow(2, attempt - 1)
                 );
-                this.updateState({
-                  status: 'rate_limited',
-                  cooldownSecondsRemaining: Math.ceil(waitMs / 1000),
-                });
+                if (
+                  !safeUpdateState({
+                    status: 'rate_limited',
+                    cooldownSecondsRemaining: Math.ceil(waitMs / 1000),
+                  })
+                ) {
+                  return;
+                }
                 let remainingMs = waitMs;
-                while (remainingMs > 0 && !this.isCancelled) {
+                while (remainingMs > 0 && !this.isCancelled && !isPreemptedOrStale()) {
                   const sliceMs = Math.min(1000, remainingMs);
                   await new Promise((r) => setTimeout(r, sliceMs));
+                  if (isPreemptedOrStale()) return;
                   remainingMs -= sliceMs;
                   if (!this.isCancelled && this.state?.status === 'rate_limited') {
                     const nextSec = Math.max(
                       Math.ceil(Math.max(0, remainingMs) / 1000),
                       requestScheduler.getMaxCooldownRemaining(MEDIA_SYNC_DOMAINS)
                     );
-                    this.updateState({
-                      cooldownSecondsRemaining: nextSec,
-                    });
+                    if (
+                      !safeUpdateState({
+                        cooldownSecondsRemaining: nextSec,
+                      })
+                    ) {
+                      return;
+                    }
                   }
                 }
+                if (isPreemptedOrStale()) return;
                 if (this.isCancelled) break;
-                this.updateState({
-                  status: 'running',
-                  cooldownSecondsRemaining: undefined,
-                });
+                if (
+                  !safeUpdateState({
+                    status: 'running',
+                    cooldownSecondsRemaining: undefined,
+                  })
+                ) {
+                  return;
+                }
                 i--;
                 await yieldToMainThread();
+                if (isPreemptedOrStale()) return;
                 continue;
               }
               console.warn(
@@ -2121,11 +2195,15 @@ export class SyncJobManager {
                 rateErr.message || err
               );
             }
-            if (!this.isCancelled && onlineLifecycleManager.isOnline()) {
+            if (!this.isCancelled && !isPreemptedOrStale() && onlineLifecycleManager.isOnline()) {
               recordMediaSyncAttempt(game.id, 'transient_error');
               gameCompletedWithoutAbort = true;
             }
           }
+        }
+
+        if (isPreemptedOrStale()) {
+          return;
         }
 
         if (gameCompletedWithoutAbort) {
@@ -2137,32 +2215,45 @@ export class SyncJobManager {
           break;
         }
 
-        this.updateState({
-          current: i + 1,
-        });
+        if (
+          !safeUpdateState({
+            current: i + 1,
+          })
+        ) {
+          return;
+        }
         await yieldToMainThread();
+        if (isPreemptedOrStale()) {
+          return;
+        }
+      }
+
+      if (isPreemptedOrStale()) {
+        return;
       }
 
       if (this.isCancelled || this.state?.status === 'cancelled') {
-        this.updateState({
+        safeUpdateState({
           status: 'cancelled',
           currentItemName: undefined,
         });
       } else {
-        this.updateState({
+        safeUpdateState({
           status: 'completed',
           current: eligibleGames.length,
           currentItemName: undefined,
         });
       }
     } finally {
-      try {
-        flushPendingCatalogSave();
-        steamApi.trimMemoryCache(30);
-        if (typeof window !== 'undefined') {
-          window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
-        }
-      } catch {}
+      if (this.state?.id === jobId) {
+        try {
+          flushPendingCatalogSave();
+          steamApi.trimMemoryCache(30);
+          if (typeof window !== 'undefined') {
+            window.electronAPI?.trimMemory?.({ passive: true })?.catch?.(() => {});
+          }
+        } catch {}
+      }
     }
   }
 
@@ -2177,6 +2268,7 @@ export class SyncJobManager {
       checkCancelled: () => boolean
     ) => Promise<void>
   ): Promise<void> {
+    this.mediaSyncLoopToken++;
     this.isCancelled = false;
     const jobId = `trophy-sync-${Date.now()}`;
     const safeTotal = Math.max(1, totalSteps);

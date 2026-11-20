@@ -237,6 +237,78 @@ describe('Wave 1: Decoupled User Tag Overrides, Authoritative Resolver & Anchore
       expect(resolveEffectiveGameTags(splitSteamCopy).userAddedTags).toEqual(['Cozy']);
     });
 
+    it('passes platformAliases: [] to saveUserTagOverride IPC when sibling-alias pruning empties a sibling record so disk aliases are cleared', async () => {
+      const splitGogCopy = makeCanonicalGameFixture({
+        id: 'gog-456',
+        title: 'Shared Title (GOG)',
+        platforms: [{ platformId: 'gog', platformGameId: '456', installed: false }],
+      });
+
+      const saveTagIpcCalls: Array<{ gameId: string; payload: UserTagOverride }> = [];
+      const tmpDiskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ol-sibling-prune-'));
+      const ipcHandlers = new Map<string, (event: unknown, ...args: unknown[]) => Promise<unknown>>();
+      const ipcReg = offlineVaultIpcMod.registerOfflineVaultIpcHandlers({
+        ipcMain: {
+          handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => Promise<unknown>) => {
+            ipcHandlers.set(channel, fn);
+          },
+        },
+        offlineVaultService: { userDataDir: tmpDiskDir },
+        mediaHydrationEngine: null,
+        userDataDir: tmpDiskDir,
+      });
+
+      try {
+        const ipcSaveTag = ipcHandlers.get('offlineVault:save-user-tag-override')!;
+        const ipcGetTags = ipcHandlers.get('offlineVault:get-user-tag-overrides')!;
+        const pendingIpcWrites: Array<Promise<unknown>> = [];
+
+        (globalRecord.window as unknown as { electronAPI: unknown }).electronAPI = {
+          isElectron: true,
+          platform: 'darwin',
+          offlineVault: {
+            saveUserTagOverride: vi.fn((gameId: string, payload: UserTagOverride) => {
+              saveTagIpcCalls.push({ gameId, payload });
+              const p = ipcSaveTag({}, gameId, payload);
+              pendingIpcWrites.push(p);
+              return p;
+            }),
+            removeUserTagOverride: vi.fn((arg: unknown) => {
+              const p = ipcHandlers.get('offlineVault:remove-user-tag-override')!({}, arg);
+              pendingIpcWrites.push(p);
+              return p;
+            }),
+          },
+        };
+
+        // Seed sibling record whose ONLY platformAlias is `'gog:456'`
+        saveUserTagOverride({
+          gameId: 'steam-999',
+          platformAliases: ['gog:456'],
+          addedTags: ['Steam Only Tag'],
+          removedTags: [],
+          updatedAt: '2026-06-01T00:00:00.000Z',
+        });
+
+        // Now claiming `'gog:456'` on `splitGogCopy` prunes `'gog:456'` from `steam-999` -> length 0!
+        addUserTagForGame(splitGogCopy, 'GOG Exclusive', []);
+        await Promise.all(pendingIpcWrites);
+
+        const siblingSyncCall = saveTagIpcCalls.filter((c) => c.gameId === 'steam-999').at(-1);
+        expect(siblingSyncCall).toBeDefined();
+        expect(siblingSyncCall?.payload.platformAliases).toEqual([]);
+
+        const diskAfterPrune = (await ipcGetTags({})) as Record<string, UserTagOverride>;
+        expect(diskAfterPrune['steam-999']?.addedTags).toEqual(['Steam Only Tag']);
+        expect(diskAfterPrune['steam-999']?.platformAliases).toBeUndefined();
+      } finally {
+        ipcReg.dispose();
+        try {
+          fs.rmSync(tmpDiskDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
     it('reconciles localStorage and Electron vault via hydrateUserTagOverridesFromVault (newest updatedAt wins) and responds to StorageEvent', async () => {
       const olderLocal: UserTagOverride = {
         gameId: 'steam-10',

@@ -1220,6 +1220,152 @@ describe('Tasks 1, 3a/3b & 6 — HLTB Badge Cleanup, __quotaSlimmed Immunity, Ti
       expect(attemptedIds).toEqual([tier0Games[0].id, tier0Games[1].id]);
     });
 
+    it('prevents a preempted auto-store-media background warmup from clobbering an active manual store media sync job state (Live Bug #2)', async () => {
+      vi.useRealTimers();
+      requestScheduler.reset();
+      vi.spyOn(stagedCacheService, 'whenStagedCacheHydrated').mockResolvedValue(0);
+      vi.spyOn(steamApi, 'fetchStoreBrowseAssetsBatch').mockResolvedValue(new Map());
+
+      const makeSlimGame = (appId: number, label: string): CanonicalGame =>
+        makeGame({
+          id: `steam-${appId}`,
+          title: label,
+          steamAppId: appId,
+          shortDescription: '',
+          detailedDescription: '',
+          enrichedMetadata: {
+            ...makeRichMeta({ appId, name: label }),
+            shortDescription: '',
+            aboutTheGame: '',
+            detailedDescription: '',
+            screenshots: [],
+            __quotaSlimmed: true,
+            hasScreenshotsCount: 4,
+          },
+        });
+
+      const warmupBatch = [
+        makeSlimGame(994001, 'Warmup Game 1'),
+        makeSlimGame(994002, 'Warmup Game 2'),
+      ];
+      const manualBatch = [
+        makeSlimGame(994101, 'Manual Game 1'),
+        makeSlimGame(994102, 'Manual Game 2'),
+        makeSlimGame(994103, 'Manual Game 3'),
+        makeSlimGame(994104, 'Manual Game 4'),
+      ];
+
+      let resolveWarmupFetch!: (meta: SteamEnrichedMetadata) => void;
+      let signalWarmupStarted!: () => void;
+      const warmupStartedPromise = new Promise<void>((resolve) => {
+        signalWarmupStarted = resolve;
+      });
+
+      const manualResolvers: Array<() => void> = [];
+      let signalManualFirstStarted!: () => void;
+      const manualFirstStartedPromise = new Promise<void>((resolve) => {
+        signalManualFirstStarted = resolve;
+      });
+
+      vi.spyOn(steamApi, 'fetchGameMetadata').mockImplementation(async (appId) => {
+        if (appId === 994001) {
+          signalWarmupStarted();
+          return await new Promise<SteamEnrichedMetadata>((resolve) => {
+            resolveWarmupFetch = resolve;
+          });
+        }
+        if (appId >= 994101 && appId <= 994104) {
+          if (appId === 994101) {
+            signalManualFirstStarted();
+          }
+          await new Promise<void>((resolve) => {
+            manualResolvers.push(resolve);
+          });
+          return makeRichMeta({ appId, name: `Manual ${appId}`, fetchedAt: Date.now() });
+        }
+        return makeRichMeta({ appId, fetchedAt: Date.now() });
+      });
+
+      const mgr = new SyncJobManager();
+      const observedStates: Array<{
+        id: string;
+        status: string;
+        current: number;
+        total: number;
+      }> = [];
+      const unsub = mgr.subscribe((st) => {
+        if (st) {
+          observedStates.push({
+            id: st.id,
+            status: st.status,
+            current: st.current,
+            total: st.total,
+          });
+        }
+      });
+
+      try {
+        // 1. Start passive background warmup (auto-store-media) and wait until it is mid-fetch
+        const warmupPromise = mgr.startStoreMediaSync(warmupBatch, () => {}, {
+          isBackgroundWarmup: true,
+          isPostHydration: true,
+        });
+        await warmupStartedPromise;
+        expect(mgr.getState()?.id.startsWith('auto-store-media-')).toBe(true);
+        expect(mgr.getState()?.status).toBe('running');
+
+        // 2. User triggers manual "Sync Store Media (All Games)" while warmup is mid-fetch!
+        const manualPromise = mgr.startStoreMediaSync(manualBatch, () => {}, {
+          isManualSync: true,
+        });
+        await manualFirstStartedPromise;
+
+        const manualStateBeforeWarmupResolve = mgr.getState();
+        expect(manualStateBeforeWarmupResolve).not.toBeNull();
+        expect(manualStateBeforeWarmupResolve!.id.startsWith('sync-store-media-')).toBe(true);
+        expect(manualStateBeforeWarmupResolve!.status).toBe('running');
+        expect(manualStateBeforeWarmupResolve!.total).toBe(4);
+        expect(manualStateBeforeWarmupResolve!.current).toBe(0);
+
+        // 3. Preempted warmup's in-flight fetch now resolves — it MUST NOT clobber manual job's state!
+        resolveWarmupFetch(makeRichMeta({ appId: 994001, name: 'Warmup Game 1', fetchedAt: Date.now() }));
+        await warmupPromise;
+        await new Promise((r) => setTimeout(r, 15));
+
+        const manualStateAfterWarmupResolve = mgr.getState();
+        expect(manualStateAfterWarmupResolve?.id).toBe(manualStateBeforeWarmupResolve!.id);
+        expect(manualStateAfterWarmupResolve?.status).toBe('running');
+        expect(manualStateAfterWarmupResolve?.total).toBe(4);
+        expect(manualStateAfterWarmupResolve?.current).toBe(0);
+
+        // Zero premature 'completed' states were ever emitted for the manual job!
+        const manualId = manualStateBeforeWarmupResolve!.id;
+        const prematureCompleted = observedStates.filter(
+          (s) => s.id === manualId && s.status === 'completed'
+        );
+        expect(prematureCompleted).toHaveLength(0);
+
+        // 4. Unblock manual sync items one by one -> manual sync finishes cleanly at 4/4!
+        while (mgr.getState()?.status === 'running') {
+          const nextResolve = manualResolvers.shift();
+          if (nextResolve) {
+            nextResolve();
+          }
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        await manualPromise;
+
+        const finalState = mgr.getState();
+        expect(finalState?.id).toBe(manualId);
+        expect(finalState?.status).toBe('completed');
+        expect(finalState?.current).toBe(4);
+        expect(finalState?.total).toBe(4);
+      } finally {
+        unsub();
+        mgr.reset();
+      }
+    });
+
     it('passes gamesRef.current and { isManualSync: true } in handleSyncStoreMedia with accurate count completion toasts', async () => {
       const staleGames: CanonicalGame[] = [];
       const freshGames = [
