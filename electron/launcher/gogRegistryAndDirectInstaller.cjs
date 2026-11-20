@@ -64,7 +64,7 @@ const {
 } = require('./engineStateRegistry.cjs');
 const {
   ensureMacExecutablePermissions,
-  ensureMacAppCodeSignatureValid,
+  ensureMacAppCodeSignatureValidAsync,
   resolveMacAppBundleBinary,
   flattenGogNestedInstallDir,
   findPrimaryExecutable,
@@ -1190,7 +1190,9 @@ function syncGogFirstPartyLauncher(/** @type {any} */ record, /** @type {any} */
 
     if (platform === 'darwin' && !isWinBottleInstall) {
       try {
-        ensureMacAppCodeSignatureValid(galaxyInstallPath || installPath, options);
+        void ensureMacAppCodeSignatureValidAsync(galaxyInstallPath || installPath, options).catch(
+          () => {}
+        );
       } catch {}
     }
 

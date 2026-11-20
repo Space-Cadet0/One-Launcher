@@ -173,7 +173,8 @@ const verifyDisplayOutput = requireCjs('../scripts/verify-display-output.cjs') a
 const supervisor = requireCjs('../electron/launcher/sessionAndProcessSupervisor.cjs') as {
   shouldWrapBottleSessionWithDisplayLauncher: (
     effectiveCaps: Record<string, unknown> | null | undefined,
-    effectiveDisplayScalingMode: string
+    effectiveDisplayScalingMode: string,
+    launchArgsStr?: string
   ) => boolean;
   stageBottleDisplayScalerBinaries: (
     targetWinePrefix: string,
@@ -2604,7 +2605,11 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
           { platform: 'darwin', homedir: emptyHome }
         );
       } finally {
-        process.env.HOME = prevHome;
+        if (prevHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = prevHome;
+        }
       }
       const portableReg = fs.readFileSync(path.join(portableBottle, 'user.reg'), 'utf8');
       expect(portableReg).toContain('"RetinaMode"="y"');
@@ -2615,6 +2620,7 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
       for (const expectedPreset of [
         'auto',
         '3840x2160',
+        '3456x2234',
         '3440x1440',
         '3024x1964',
         '2560x1600',
@@ -2737,6 +2743,304 @@ describe('Universal Bottled Fullscreen, Display Virtualization & Dual-OS Packagi
           expect(Number.isFinite(resScoped) && resScoped >= 0).toBe(true);
         }
       }
+    });
+
+    it('covers Round 2 hardening: toggleSessionFullscreen windowed active_session.ini mode, dynamic DXGI+DX12 chunk-2 scan, XML-namespaced DPI manifests, 64-bit multi-renderer bypass, Larger Text/5K HiDPI backing, inside-out Helpers Mach-O / Java .class / bundleId hygiene, and mode=off legacy HIGHDPIAWARE exclusion', async () => {
+      const root = makeTempDir('round2-hardening');
+
+      // 1. F7: Dynamic DXGI in chunk 1 + DX12 in chunk 2 (>256 KiB offset) MUST NOT short-circuit before finding d3d12.dll!
+      const dx12Exe = path.join(root, 'DynamicDx12.exe');
+      fs.writeFileSync(
+        dx12Exe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'user32.dll'],
+          rdataSize: 0x100000,
+          rdataStrings: ['dxgi.dll', 'CreateDXGIFactory'],
+          rdataTailStrings: ['d3d12.dll', 'D3D12CreateDevice'],
+        })
+      );
+      const dx12Caps = binaryInspectors.inspectPeCapabilities(dx12Exe);
+      expect(dx12Caps.dynamicallyLoadsDxgi).toBe(true);
+      expect(dx12Caps.dynamicallyLoadsD3d12).toBe(true);
+      expect(dx12Caps.importsD3d12).toBe(true);
+      expect(dx12Caps.isD3d12Only).toBe(true);
+
+      // 2. F7: XML-namespaced DPI manifests (<asmv3:dpiAware> and <ws2:dpiAwareness>) detected cleanly
+      const nsManifestExe = path.join(root, 'NamespacedDpi.exe');
+      fs.writeFileSync(
+        nsManifestExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+          rsrcManifestXml:
+            '<assembly><asmv3:application><asmv3:windowsSettings><asmv3:dpiAware>true/pm</asmv3:dpiAware><ws2:dpiAwareness>PerMonitorV2</ws2:dpiAwareness></asmv3:windowsSettings></asmv3:application></assembly>',
+        })
+      );
+      const nsCaps = binaryInspectors.inspectPeCapabilities(nsManifestExe);
+      expect(nsCaps.hasDpiAwareManifest).toBe(true);
+      expect(nsCaps.declaresPerMonitorDpi).toBe(true);
+
+      // 3. F7: 64-bit multi-renderer UE4-style binary (d3d11 + opengl32) is modern 64-bit host unless -opengl4 is passed
+      const multiDir = path.join(root, 'MultiRenderer64');
+      fs.mkdirSync(multiDir, { recursive: true });
+      const multiExe = path.join(multiDir, 'Multi64-Win64-Shipping.exe');
+      fs.writeFileSync(
+        multiExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll', 'opengl32.dll'],
+        })
+      );
+      const multiCaps = binaryInspectors.resolveEffectiveGameExecutableCapabilities(multiExe, multiDir);
+      expect(multiCaps.usesModernGraphicsApi).toBe(true);
+      expect(multiCaps.isLauncherStubCandidate).toBe(false);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(multiCaps, 'auto_fullscreen', '')
+      ).toBe(false);
+      expect(
+        supervisor.shouldWrapBottleSessionWithDisplayLauncher(multiCaps, 'auto_fullscreen', '-opengl4')
+      ).toBe(true);
+
+      // 4. F8: macOS HiDPI "Larger Text" (1352x878 -> 2704x1756), 5K 1080p HiDPI (1920x1080 -> 3840x2160), and 1x Native (3024x1964 -> 3024x1964)
+      const largerTextJson = JSON.stringify({
+        SPDisplaysDataType: [
+          {
+            spdisplays_ndrvs: [
+              {
+                _name: 'Color LCD',
+                _spdisplays_pixels: '3024 x 1964',
+                _spdisplays_resolution: '1352 x 878 @ 120.00Hz',
+                spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+                spdisplays_main: 'spdisplays_yes',
+                spdisplays_online: 'spdisplays_yes',
+              },
+            ],
+          },
+        ],
+      });
+      const fiveKScaledJson = JSON.stringify({
+        SPDisplaysDataType: [
+          {
+            spdisplays_ndrvs: [
+              {
+                _name: 'Studio Display',
+                _spdisplays_pixels: '5120 x 2880',
+                _spdisplays_resolution: '1920 x 1080 @ 60.00Hz',
+                spdisplays_retina: 'spdisplays_yes',
+                spdisplays_main: 'spdisplays_yes',
+                spdisplays_online: 'spdisplays_yes',
+              },
+            ],
+          },
+        ],
+      });
+      const native1xJson = JSON.stringify({
+        SPDisplaysDataType: [
+          {
+            spdisplays_ndrvs: [
+              {
+                _name: 'Color LCD',
+                _spdisplays_pixels: '3024 x 1964',
+                _spdisplays_resolution: '3024 x 1964 @ 120.00Hz',
+                spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+                spdisplays_main: 'spdisplays_yes',
+                spdisplays_online: 'spdisplays_yes',
+              },
+            ],
+          },
+        ],
+      });
+
+      const hostLT = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: () => largerTextJson,
+      });
+      expect(hostLT.width).toBe(2704);
+      expect(hostLT.height).toBe(1756);
+      expect(hostLT.logicalWidth).toBe(1352);
+      expect(hostLT.panelWidth).toBe(3024);
+
+      const verLT = verifyDisplayOutput.detectDisplayGeometry({
+        platform: 'darwin',
+        execSyncFn: () => largerTextJson,
+      });
+      expect(verLT.width).toBe(2704);
+      expect(verLT.height).toBe(1756);
+
+      const host5K = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: () => fiveKScaledJson,
+      });
+      expect(host5K.width).toBe(3840);
+      expect(host5K.height).toBe(2160);
+      expect(host5K.panelWidth).toBe(5120);
+
+      const host1x = macNativeInstaller.getHostMaxDisplayResolution(true, {
+        execFileSyncFn: () => native1xJson,
+      });
+      expect(host1x.width).toBe(3024);
+      expect(host1x.height).toBe(1964);
+
+      // 5. F9: Inside-out codesign signs extensionless Mach-O in Contents/Helpers, rejects Java .class 0xCAFEBABE, and sanitizes quoted bundleId
+      const appDir = path.join(root, 'HelperHardened.app');
+      const macOsDir = path.join(appDir, 'Contents', 'MacOS');
+      const helpersDir = path.join(appDir, 'Contents', 'Helpers');
+      fs.mkdirSync(macOsDir, { recursive: true });
+      fs.mkdirSync(helpersDir, { recursive: true });
+      const machO64 = Buffer.alloc(64, 0);
+      machO64.writeUInt32BE(0xfeedfacf, 0);
+      const fatMachO = Buffer.alloc(64, 0);
+      fatMachO.writeUInt32BE(0xcafebabe, 0);
+      fatMachO.writeUInt32BE(2, 4); // nfat_arch = 2 (valid Mach-O universal)
+      const javaClass = Buffer.alloc(64, 0);
+      javaClass.writeUInt32BE(0xcafebabe, 0);
+      javaClass.writeUInt16BE(0, 4); // minor = 0
+      javaClass.writeUInt16BE(52, 6); // major = 52 (Java 8 .class -> uint32 BE = 52 > 32!)
+      const helperExec = path.join(helpersDir, 'chrome_crashpad_handler');
+      const javaClassPath = path.join(helpersDir, 'Fake.class');
+      fs.writeFileSync(path.join(macOsDir, 'HelperHardened'), machO64);
+      fs.writeFileSync(helperExec, fatMachO);
+      fs.writeFileSync(javaClassPath, javaClass);
+      fs.writeFileSync(
+        path.join(appDir, 'Contents', 'Info.plist'),
+        '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.bad"quote.id</string></dict></plist>',
+        'utf8'
+      );
+      const signCalls: string[][] = [];
+      let failedVerify = false;
+      macNativeInstaller.ensureMacAppCodeSignatureValid(appDir, {
+        platform: 'darwin',
+        allowCodesignInTest: true,
+        forceCodesignRecheck: true,
+        execFileSyncFn: (cmd: string, args: string[]) => {
+          if (cmd === 'codesign' && args.includes('--verify') && !failedVerify) {
+            failedVerify = true;
+            throw new Error('unsigned');
+          }
+          if (cmd === 'codesign' && args.includes('--sign')) {
+            signCalls.push([...args]);
+          }
+          return '';
+        },
+      });
+      // Extensionless Fat Mach-O in Contents/Helpers WAS signed; Java .class was NOT signed!
+      expect(signCalls.some((a) => a.includes(helperExec))).toBe(true);
+      expect(signCalls.some((a) => a.includes(javaClassPath))).toBe(false);
+      // Malformed bundleId with quote MUST NOT be interpolated into -r=designated
+      expect(signCalls.some((a) => a.some((tok) => tok.includes('com.bad')))).toBe(false);
+
+      // 6. F11: Legacy 32-bit game in displayScalingMode === 'off' MUST NOT receive HIGHDPIAWARE
+      const bottleOff = path.join(root, 'BottleOff');
+      createSyntheticBottleTree(bottleOff);
+      const legacyOffExe = path.join(root, 'LegacyOff32.exe');
+      fs.writeFileSync(
+        legacyOffExe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x86',
+          importedDlls: ['kernel32.dll', 'ddraw.dll'],
+        })
+      );
+      macNativeInstaller.applyCrossOverPerGameSettings(
+        bottleOff,
+        legacyOffExe,
+        { displayScalingMode: 'off' },
+        { platform: 'darwin' }
+      );
+      const offReg = fs.readFileSync(path.join(bottleOff, 'user.reg'), 'utf8');
+      expect(offReg).not.toContain('"legacyoff32.exe"="~ HIGHDPIAWARE"');
+
+      // 7. F2: toggleSessionFullscreen({ fullscreen: false }) writes mode=auto_fullscreen (NOT mode=windowed)
+      //    so late-injected --watch-dir scaler initializes and honors display_ctl seq=2, fullscreen=0
+      const homedirF2 = path.join(root, 'homeF2');
+      const appsDirF2 = path.join(root, 'AppsF2');
+      const wineBinF2 = path.join(
+        appsDirF2,
+        'CrossOver.app',
+        'Contents',
+        'SharedSupport',
+        'CrossOver',
+        'bin',
+        'wine'
+      );
+      fs.mkdirSync(path.dirname(wineBinF2), { recursive: true });
+      fs.writeFileSync(wineBinF2, '#!/usr/bin/perl\nexit 0;\n', { mode: 0o755 });
+      const bottleF2 = path.join(
+        homedirF2,
+        'Library',
+        'Application Support',
+        'CrossOver',
+        'Bottles',
+        'BottleF2'
+      );
+      createSyntheticBottleTree(bottleF2);
+      const gameF2Dir = path.join(root, 'GameF2');
+      fs.mkdirSync(gameF2Dir, { recursive: true });
+      const gameF2Exe = path.join(gameF2Dir, 'ModernF2.exe');
+      fs.writeFileSync(
+        gameF2Exe,
+        buildExtendedSyntheticPeBuffer({
+          arch: 'x64',
+          importedDlls: ['kernel32.dll', 'd3d11.dll'],
+        })
+      );
+      const f2Spawns: Array<{ args: string[]; env: Record<string, string> }> = [];
+      const launchF2 = await supervisor.launchGame(
+        {
+          gameId: 'gog-f2-windowed-toggle',
+          title: 'Modern F2 Toggle Test',
+          platformId: 'gog',
+          platformGameId: '1000000991',
+          installPath: gameF2Dir,
+          executablePath: gameF2Exe,
+          launchConfig: {
+            launchMethod: 'compatibility_layer',
+            compatibilityLayer: 'crossover',
+            wineBottleName: 'BottleF2',
+            winePrefixPath: bottleF2,
+            displayScalingMode: 'auto_fullscreen',
+          },
+        },
+        {
+          platform: 'darwin',
+          arch: 'arm64',
+          homedir: homedirF2,
+          userDataDir: path.join(root, 'UserDataF2'),
+          customApplicationsDir: appsDirF2,
+          enableDisplayScalerInTests: true,
+          skipRegistrySpawn: true,
+          gameSpawnFn: (cmd: string, args: string[], opts?: { env?: Record<string, string> }) => {
+            void cmd;
+            f2Spawns.push({ args: [...args], env: { ...(opts?.env || {}) } });
+            return createFakeChildProcess(62301);
+          },
+        }
+      );
+      expect(launchF2.success).toBe(true);
+      const toggleWinRes = supervisor.toggleSessionFullscreen(
+        { gameId: 'gog-f2-windowed-toggle', fullscreen: false },
+        {
+          platform: 'darwin',
+          enableDisplayScalerInTests: true,
+          spawnFn: (_cmd: string, args: string[], opts?: { env?: Record<string, string> }) => {
+            f2Spawns.push({ args: [...args], env: { ...(opts?.env || {}) } });
+            return createFakeChildProcess(62302);
+          },
+        }
+      );
+      expect(toggleWinRes.success).toBe(true);
+      expect(toggleWinRes.fullscreenActive).toBe(false);
+      const watchSpawnF2 = f2Spawns.find((s) => s.args.includes('--watch-dir'));
+      expect(watchSpawnF2).toBeDefined();
+      expect(watchSpawnF2?.env.ONE_LAUNCHER_DISPLAY_SCALING_MODE).toBe('auto_fullscreen');
+      const activeIniF2 = fs.readFileSync(
+        path.join(bottleF2, 'drive_c', 'ProgramData', 'OneLauncher', 'display_scaler', 'active_session.ini'),
+        'utf8'
+      );
+      expect(activeIniF2).toContain('mode=auto_fullscreen');
+      expect(activeIniF2).not.toContain('mode=windowed');
+      await supervisor.finalizeGameSession('gog-f2-windowed-toggle', {
+        platform: 'darwin',
+        userDataDir: path.join(root, 'UserDataF2'),
+      });
     });
   });
 });

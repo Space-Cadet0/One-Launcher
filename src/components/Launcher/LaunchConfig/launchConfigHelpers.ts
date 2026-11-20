@@ -249,6 +249,7 @@ export const VIRTUAL_DESKTOP_RESOLUTION_OPTIONS: readonly {
 }[] = [
   { value: 'auto', label: 'Match Display Automatically' },
   { value: '3840x2160', label: '3840 × 2160 (16:9 4K UHD)' },
+  { value: '3456x2234', label: '3456 × 2234 (16" MacBook Native)' },
   { value: '3440x1440', label: '3440 × 1440 (21:9 UWQHD)' },
   { value: '3024x1964', label: '3024 × 1964 (14" MacBook Native)' },
   { value: '2560x1600', label: '2560 × 1600 (16:10 WQXGA)' },

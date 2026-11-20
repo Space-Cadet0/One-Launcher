@@ -763,7 +763,7 @@ static void ds_gl_present_blit_to_backbuffer(
                         g_gl.p_glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
                     }
                     fbo_cap = (int32_t)max_tex;
-                    if (fbo_cap < 4096) fbo_cap = 4096;
+                    if (fbo_cap <= 0) fbo_cap = 4096;
                     if (fbo_cap > 16384) fbo_cap = 16384;
                     g_ds.gl_max_texture_size = fbo_cap;
                 }
@@ -841,6 +841,7 @@ static void APIENTRY hook_glBlitFramebuffer(
 
             EnterCriticalSection(&g_ds.lock);
             g_ds.wined3d_uses_gl = true;
+            g_ds.wined3d_uses_vulkan = false;
             ds_notify_gl_context_active_locked();
             bool is_target_win = (cur_win == NULL ||
                                   cur_win == g_ds.hwnd_game ||
@@ -1091,7 +1092,7 @@ void ds_gl_release_all_host_dcs_for_hwnd(HWND host_hwnd)
     ds_gl_dc_entry_t to_free[DS_MAX_GL_DC_MAP];
     int count = 0;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
         if (g_gl.dc_map[i].host_hdc != NULL &&
             (host_hwnd == NULL || g_gl.dc_map[i].host_hwnd == host_hwnd)) {
@@ -1099,7 +1100,7 @@ void ds_gl_release_all_host_dcs_for_hwnd(HWND host_hwnd)
             memset(&g_gl.dc_map[i], 0, sizeof(g_gl.dc_map[i]));
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (count > 0) {
         ds_enter_internal();
@@ -1122,7 +1123,7 @@ void ds_gl_on_release_dc(HWND hwnd, HDC hdc)
     if (!hdc) return;
 
     ds_gl_dc_entry_t victim = { 0 };
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
         if (g_gl.dc_map[i].game_hdc == hdc) {
             victim = g_gl.dc_map[i];
@@ -1130,7 +1131,7 @@ void ds_gl_on_release_dc(HWND hwnd, HDC hdc)
             break;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (victim.host_hdc && victim.host_hwnd && IsWindow(victim.host_hwnd)) {
         ds_enter_internal();
@@ -1153,14 +1154,14 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
     HWND cached_host = NULL;
     HDC  cached_host_hdc = NULL;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return hdc;
     }
     for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
         if (g_gl.dc_map[i].host_hdc == hdc) {
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             return hdc;
         }
         if (g_gl.dc_map[i].game_hdc == hdc &&
@@ -1173,7 +1174,7 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
             break;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (cached_host_hdc != NULL) {
         if (cached_game != NULL && WindowFromDC(hdc) == cached_game && IsWindow(cached_host)) {
@@ -1191,11 +1192,11 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
         ds_attach_and_apply_game_window(win, 0, 0);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND game_hwnd = g_ds.hwnd_game;
     HWND host_hwnd = g_ds.hwnd_gl_host;
     DWORD owner_tid = g_ds.game_thread_id;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (host_hwnd != NULL && win == host_hwnd) {
         return hdc;
@@ -1206,9 +1207,9 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
 
     if ((!host_hwnd || !IsWindow(host_hwnd)) && GetCurrentThreadId() == owner_tid) {
         ds_ensure_gl_host_child_on_owner_thread(game_hwnd);
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         host_hwnd = g_ds.hwnd_gl_host;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
 
     if (!host_hwnd || !IsWindow(host_hwnd)) {
@@ -1223,12 +1224,12 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
     }
 
     ds_gl_dc_entry_t evicted = { 0 };
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     int free_slot = -1;
     for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
         if (g_gl.dc_map[i].game_hdc == hdc && g_gl.dc_map[i].host_hwnd == host_hwnd && g_gl.dc_map[i].host_hdc != NULL) {
             HDC winner = g_gl.dc_map[i].host_hdc;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             ds_enter_internal();
             if (g_ds.real_ReleaseDC) g_ds.real_ReleaseDC(host_hwnd, host_hdc);
             else ReleaseDC(host_hwnd, host_hdc);
@@ -1246,7 +1247,7 @@ static HDC ds_gl_map_hdc_for_wgl(HDC hdc)
     g_gl.dc_map[free_slot].game_hdc  = hdc;
     g_gl.dc_map[free_slot].host_hdc  = host_hdc;
     g_gl.dc_map[free_slot].host_hwnd = host_hwnd;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (evicted.host_hdc && evicted.host_hwnd && IsWindow(evicted.host_hwnd)) {
         ds_enter_internal();
@@ -1271,14 +1272,14 @@ static HDC ds_gl_unmap_host_hdc(HDC hdc)
         return hdc;
     }
     HDC mapped = hdc;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     for (int i = 0; i < DS_MAX_GL_DC_MAP; i++) {
         if (g_gl.dc_map[i].host_hdc == hdc && g_gl.dc_map[i].game_hdc != NULL) {
             mapped = g_gl.dc_map[i].game_hdc;
             break;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     return mapped;
 }
 
@@ -1321,13 +1322,13 @@ BOOL WINAPI hook_SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR
     HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
     BOOL ok = g_ds.real_SetPixelFormat ? g_ds.real_SetPixelFormat(target_hdc, format, ppfd) : FALSE;
     if (ok && target_hdc != hdc && format > 0) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_gl.last_host_pf = format;
         if (ppfd) {
             g_gl.last_host_pfd = *ppfd;
             g_gl.has_last_host_pfd = true;
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
     return ok;
 }
@@ -1338,14 +1339,15 @@ static void ds_gl_mark_context_creator_caller(const void *caller_ret)
     bool is_wined3d = ds_is_wined3d_caller(caller_ret);
     bool is_sys = ds_is_system_renderer_caller(caller_ret);
     if (is_wined3d || !is_sys) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (is_wined3d) {
             g_ds.wined3d_uses_gl = true;
+            g_ds.wined3d_uses_vulkan = false;
         } else {
             g_ds.game_gl_active = true;
         }
         ds_notify_gl_context_active_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
 }
 
@@ -1397,13 +1399,13 @@ BOOL WINAPI hook_wglSetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIP
         ? g_ds.real_wglSetPixelFormat(target_hdc, format, ppfd)
         : (g_ds.real_SetPixelFormat ? g_ds.real_SetPixelFormat(target_hdc, format, ppfd) : FALSE);
     if (ok && target_hdc != hdc && format > 0) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_gl.last_host_pf = format;
         if (ppfd) {
             g_gl.last_host_pfd = *ppfd;
             g_gl.has_last_host_pfd = true;
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
     return ok;
 }
@@ -1416,9 +1418,9 @@ static BOOL WINAPI hook_wglSetPixelFormatWINE(HDC hdc, int format)
     HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
     BOOL ok = g_gl.p_wglSetPixelFormatWINE(target_hdc, format);
     if (ok && target_hdc != hdc && format > 0) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_gl.last_host_pf = format;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
     return ok;
 }
@@ -1586,6 +1588,19 @@ static void ds_gl_ensure_wgl_query_procs(void)
     }
 }
 
+static void ds_gl_reset_fbo_state(HGLRC next_ctx)
+{
+    g_gl.fbo_ctx = next_ctx;
+    g_gl.fbo_id = 0;
+    g_gl.color_tex = 0;
+    g_gl.depth_rb = 0;
+    g_gl.fbo_w = 0;
+    g_gl.fbo_h = 0;
+    g_gl.fbo_redirect_active = false;
+    g_gl.game_draw_fbo = 0;
+    g_gl.game_read_fbo = 0;
+}
+
 BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
 {
     if (!g_ds.real_wglMakeCurrent) return FALSE;
@@ -1600,14 +1615,15 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
     HWND win = hdc ? WindowFromDC(hdc) : NULL;
 
     if (win && hglrc != NULL && (!is_sys || is_wined3d)) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (is_wined3d) {
             g_ds.wined3d_uses_gl = true;
+            g_ds.wined3d_uses_vulkan = false;
         } else {
             g_ds.game_gl_active = true;
         }
         ds_notify_gl_context_active_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
 
     if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
@@ -1619,11 +1635,11 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
         ds_enter_internal();
         int cur_pf = g_ds.real_GetPixelFormat ? g_ds.real_GetPixelFormat(target_hdc) : GetPixelFormat(target_hdc);
         if (cur_pf == 0) {
-            EnterCriticalSection(&g_ds.lock);
+            ds_lock();
             int saved_pf = g_gl.last_host_pf;
             bool has_pfd = g_gl.has_last_host_pfd;
             PIXELFORMATDESCRIPTOR saved_pfd = g_gl.last_host_pfd;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             if (saved_pf > 0) {
                 if (g_gl.p_wglSetPixelFormatWINE) {
                     g_gl.p_wglSetPixelFormatWINE(target_hdc, saved_pf);
@@ -1663,7 +1679,7 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
         ds_attach_and_apply_game_window(win, 0, 0);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool is_game_win = (
         win != NULL &&
         (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
@@ -1675,19 +1691,11 @@ BOOL WINAPI hook_wglMakeCurrent(HDC hdc, HGLRC hglrc)
     int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
     int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
     bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (is_game_win) {
         if (g_gl.fbo_ctx != hglrc) {
-            g_gl.fbo_ctx = hglrc;
-            g_gl.fbo_id = 0;
-            g_gl.color_tex = 0;
-            g_gl.depth_rb = 0;
-            g_gl.fbo_w = 0;
-            g_gl.fbo_h = 0;
-            g_gl.fbo_redirect_active = false;
-            g_gl.game_draw_fbo = 0;
-            g_gl.game_read_fbo = 0;
+            ds_gl_reset_fbo_state(hglrc);
         }
         g_gl.game_hglrc = hglrc;
         ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
@@ -1699,15 +1707,7 @@ BOOL WINAPI hook_wglDeleteContext(HGLRC hglrc)
 {
     if (hglrc && (hglrc == g_gl.game_hglrc || hglrc == g_gl.fbo_ctx)) {
         g_gl.game_hglrc = NULL;
-        g_gl.fbo_ctx = NULL;
-        g_gl.fbo_id = 0;
-        g_gl.color_tex = 0;
-        g_gl.depth_rb = 0;
-        g_gl.fbo_w = 0;
-        g_gl.fbo_h = 0;
-        g_gl.fbo_redirect_active = false;
-        g_gl.game_draw_fbo = 0;
-        g_gl.game_read_fbo = 0;
+        ds_gl_reset_fbo_state(NULL);
     }
     if (hglrc && hglrc == g_gl.w3d_hglrc) {
         g_gl.w3d_hglrc = NULL;
@@ -1739,13 +1739,13 @@ static void ds_gl_rebind_drawable_if_pending(HDC target_hdc)
     HDC cur_dc = g_gl.p_wglGetCurrentDC ? g_gl.p_wglGetCurrentDC() : NULL;
     HDC read_dc = g_gl.p_wglGetCurrentReadDCARB ? g_gl.p_wglGetCurrentReadDCARB() : cur_dc;
     if (rebind_ctx != NULL && g_ds.real_wglMakeCurrent && (read_dc == NULL || read_dc == cur_dc)) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
         int32_t bw = g_ds.fullscreen_active ? g_ds.phys_screen_w : 0;
         int32_t bh = g_ds.fullscreen_active ? g_ds.phys_screen_h : 0;
         bool is_w3d = g_ds.wined3d_uses_gl;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         ds_enter_internal();
         GLint saved_vp[4] = { 0, 0, 0, 0 };
@@ -1819,11 +1819,11 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
 
     if (ds_is_wined3d_caller(caller_ret)) {
         HWND win = WindowFromDC(hdc);
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_ds.wined3d_uses_gl = true;
         g_ds.gl_upscale_active = true;
         ds_notify_gl_context_active_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (win && win != g_ds.hwnd_gl_host && g_ds.hwnd_game == NULL && ds_is_candidate_game_window(win, NULL, NULL)) {
             ds_attach_and_apply_game_window(win, 0, 0);
@@ -1833,7 +1833,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
 
         HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game_win = (
             win != NULL &&
             (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
@@ -1853,7 +1853,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
         int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
         int32_t real_h = fs_active ? g_ds.real_screen_h : dh;
         bool want_scale = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (is_game_win) {
             InterlockedIncrement(&g_ds.gdi_margin_gen);
@@ -1890,11 +1890,11 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
 
     HWND win = WindowFromDC(hdc);
     if (win) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_ds.game_gl_active = true;
         g_ds.gl_upscale_active = true;
         ds_notify_gl_context_active_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
     if (win && win != g_ds.hwnd_gl_host && (g_ds.hwnd_game == NULL || g_ds.hwnd_game != win) && ds_is_candidate_game_window(win, NULL, NULL)) {
         ds_attach_and_apply_game_window(win, 0, 0);
@@ -1904,7 +1904,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
 
     HDC target_hdc = ds_gl_map_hdc_for_wgl(hdc);
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool is_game_win = (
         win != NULL &&
         (win == g_ds.hwnd_game || win == g_ds.hwnd_gl_host || (g_ds.hwnd_game != NULL && IsChild(g_ds.hwnd_game, win)))
@@ -1933,7 +1933,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
             dst_h = phys_vp.dst_h;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (is_game_win && ds_gl_init_procs_once()) {
         HGLRC cur_ctx = g_gl.p_wglGetCurrentContext ? g_gl.p_wglGetCurrentContext() : NULL;
@@ -1943,9 +1943,9 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
             }
             if (cur_ctx == g_gl.game_hglrc) {
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 g_gl.last_present_was_gl = true;
-                LeaveCriticalSection(&g_ds.lock);
+                ds_unlock();
                 InterlockedIncrement(&g_ds.gdi_margin_gen);
                 ds_set_gl_host_visible(true);
                 if (g_gl.fbo_redirect_active && g_gl.fbo_id != 0 && want_fbo && dw > 0 && dh > 0) {
@@ -2008,7 +2008,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 ds_gl_rebind_drawable_if_pending(target_hdc);
 
                 /* Prepare FBO (or unbind to 0 if unscaled windowed) for next frame */
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 fs_active = g_ds.fullscreen_active;
                 win_scale = ds_get_windowed_scale_locked();
                 vw = g_ds.virt_w;
@@ -2016,7 +2016,7 @@ static BOOL ds_present_gl_and_swap(HDC hdc, bool use_wgl_swap, const void *calle
                 dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
                 dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
                 want_fbo = (fs_active || (win_scale > 1)) && !ds_is_passthrough_locked();
-                LeaveCriticalSection(&g_ds.lock);
+                ds_unlock();
                 ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
                 return swapped;
             }
@@ -2045,7 +2045,7 @@ void ds_gl_notify_mode_changed(void)
         return;
     }
     if (g_gl.p_wglGetCurrentContext() == g_gl.game_hglrc) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool fs_active = g_ds.fullscreen_active;
         int32_t win_scale = ds_get_windowed_scale_locked();
         int32_t vw = g_ds.virt_w;
@@ -2053,7 +2053,7 @@ void ds_gl_notify_mode_changed(void)
         int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
         int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
         bool want_fbo = (fs_active || (win_scale > 1)) && !ds_is_modern_tier_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         ds_gl_sync_fbo_for_current_ctx(vw, vh, dw, dh, want_fbo);
     }
 }
@@ -2155,9 +2155,9 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
     ds_ensure_runtime_started();
 
     bool need_reset_gl_host = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return false;
     }
     int32_t win_scale = ds_get_windowed_scale_locked();
@@ -2201,7 +2201,7 @@ static bool ds_should_scale_gdi_dc(HDC hdcDst, const void *caller_ret, int32_t *
         g_gl.last_present_was_gl = false;
         need_reset_gl_host = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (need_reset_gl_host) {
         ds_reset_gl_host_for_gdi();
@@ -2218,14 +2218,14 @@ int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
     if (!ds_is_internal_call() && !ds_is_system_renderer_caller(__builtin_return_address(0))) {
         ds_ensure_runtime_started();
         if (hdc == NULL || GetObjectType(hdc) == OBJ_DC) {
-            EnterCriticalSection(&g_ds.lock);
+            ds_lock();
             bool passthrough = ds_is_modern_tier_locked();
             bool active = !passthrough && g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
             int32_t vw = g_ds.virt_w;
             int32_t vh = g_ds.virt_h;
             int32_t vbpp = g_ds.virt_bpp > 0 ? g_ds.virt_bpp : g_ds.real_bpp;
             int32_t vhz = g_ds.virt_hz > 0 ? g_ds.virt_hz : g_ds.real_hz;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
 
             if (!passthrough) {
                 if (active) {
@@ -2251,6 +2251,22 @@ int WINAPI hook_GetDeviceCaps(HDC hdc, int index)
     return g_ds.real_GetDeviceCaps ? g_ds.real_GetDeviceCaps(hdc, index) : 0;
 }
 
+static int ds_gdi_enter_coloroncolor(HDC hdc)
+{
+    int prev = GetStretchBltMode(hdc);
+    if (prev != COLORONCOLOR) {
+        SetStretchBltMode(hdc, COLORONCOLOR);
+    }
+    return prev;
+}
+
+static void ds_gdi_leave_coloroncolor(HDC hdc, int prev)
+{
+    if (prev > 0 && prev != COLORONCOLOR) {
+        SetStretchBltMode(hdc, prev);
+    }
+}
+
 static BOOL ds_gdi_try_scaled_blt(
     HDC hdcDst, int xDst, int yDst, int wDst, int hDst,
     HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
@@ -2263,14 +2279,9 @@ static BOOL ds_gdi_try_scaled_blt(
         int32_t px = 0, py = 0, pw = 0, ph = 0;
         if (ds_map_subrect_virt_to_phys(xDst, yDst, wDst, hDst, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
             ds_clear_gdi_margins(hdcDst, dx, dy, dw, dh, (xDst <= 0 && yDst <= 0 && wDst >= vw && hDst >= vh));
-            int prev_mode = GetStretchBltMode(hdcDst);
-            if (prev_mode != COLORONCOLOR) {
-                SetStretchBltMode(hdcDst, COLORONCOLOR);
-            }
+            int prev_mode = ds_gdi_enter_coloroncolor(hdcDst);
             *out_res = g_ds.real_StretchBlt(hdcDst, px, py, pw, ph, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
-            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
-                SetStretchBltMode(hdcDst, prev_mode);
-            }
+            ds_gdi_leave_coloroncolor(hdcDst, prev_mode);
             return TRUE;
         }
     }
@@ -2343,16 +2354,11 @@ int WINAPI hook_SetDIBitsToDevice(HDC hdc, int xDest, int yDest, DWORD w, DWORD 
                         }
                         if (use_bmi != NULL) {
                             ds_clear_gdi_margins(hdc, dx, dy, dw, dh, (xDest <= 0 && band_y_dest <= 0 && (int32_t)w >= vw && vis_h >= vh));
-                            int prev_mode = GetStretchBltMode(hdc);
-                            if (prev_mode != COLORONCOLOR) {
-                                SetStretchBltMode(hdc, COLORONCOLOR);
-                            }
+                            int prev_mode = ds_gdi_enter_coloroncolor(hdc);
                             int drawn = g_ds.real_StretchDIBits(
                                 hdc, px, py, pw, ph, xSrc, adj_y_src, (int)w, vis_h, lpvBits, use_bmi, ColorUse, SRCCOPY
                             );
-                            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
-                                SetStretchBltMode(hdc, prev_mode);
-                            }
+                            ds_gdi_leave_coloroncolor(hdc, prev_mode);
                             return (drawn == (int)GDI_ERROR) ? 0 : vis_h;
                         }
                     }
@@ -2373,14 +2379,9 @@ int WINAPI hook_StretchDIBits(HDC hdc, int xDest, int yDest, int DestWidth, int 
         int32_t px = 0, py = 0, pw = 0, ph = 0;
         if (ds_map_subrect_virt_to_phys(xDest, yDest, DestWidth, DestHeight, dx, dy, dw, dh, vw, vh, &px, &py, &pw, &ph)) {
             ds_clear_gdi_margins(hdc, dx, dy, dw, dh, (xDest <= 0 && yDest <= 0 && DestWidth >= vw && DestHeight >= vh));
-            int prev_mode = GetStretchBltMode(hdc);
-            if (prev_mode != COLORONCOLOR) {
-                SetStretchBltMode(hdc, COLORONCOLOR);
-            }
+            int prev_mode = ds_gdi_enter_coloroncolor(hdc);
             int res = g_ds.real_StretchDIBits(hdc, px, py, pw, ph, xSrc, ySrc, SrcWidth, SrcHeight, lpBits, lpbmi, iUsage, rop);
-            if (prev_mode > 0 && prev_mode != COLORONCOLOR) {
-                SetStretchBltMode(hdc, prev_mode);
-            }
+            ds_gdi_leave_coloroncolor(hdc, prev_mode);
             return res;
         }
     }

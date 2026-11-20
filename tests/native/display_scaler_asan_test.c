@@ -547,6 +547,139 @@ static void test_v3_user_override_and_mode_union(void)
     ASSERT_TRUE(ds_merge_mode_tables(NULL, 0, synth, synth_n, merged, DS_MAX_UNION_MODES) == synth_n);
 }
 
+static void test_v3_three_tier_state_machine_and_multimonitor(void)
+{
+    ds_tier_input_t in;
+
+    /* 1. Tier 0: Legacy 32-bit DDraw / D3D8 / OpenGL stays DS_PRESENTER_LEGACY_VIRTUAL */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.ddraw_loaded = true;
+    in.legacy_d3d_loaded = true;
+    ASSERT_TRUE(!ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_LEGACY_VIRTUAL);
+
+    /* 2. Tier 1: Modern 64-bit DX11/DX12/Vulkan in auto_fullscreen -> DS_PRESENTER_MODERN_PASSTHROUGH */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.is_64bit = true;
+    in.dxgi_or_d3d10_plus_loaded = true;
+    in.modern_gfx_loaded = true;
+    ASSERT_TRUE(!ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_PASSTHROUGH);
+
+    /* 3. Tier 2: force_fullscreen or user_forced_fullscreen -> DS_PRESENTER_MODERN_BORDERLESS */
+    in.scaling_mode = DS_MODE_FORCE_FULLSCREEN;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.user_forced_fullscreen = true;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* 4. F1 regression: Tier 2 -> Windowed (user_forced_windowed = true) stays in Tier 2
+     *    so Tier 2's windowed-exit presentation branch executes cleanly */
+    in.user_forced_fullscreen = false;
+    in.user_forced_windowed = true;
+    in.borderless_active = true;
+    in.window_mutated_by_scaler = true;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* Even when exiting a native Tier 1 fullscreen game on first Ctrl+Option+F */
+    in.borderless_active = false;
+    in.window_mutated_by_scaler = false;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* DS_MODE_PASSTHROUGH always resolves to Tier 1 */
+    in.scaling_mode = DS_MODE_PASSTHROUGH;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_PASSTHROUGH);
+
+    /* 5. F3 regression: 32-bit Pure D3D9 / D3D8 / DDraw on WineD3D-Vulkan or DXVK */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.is_64bit = false;
+    in.d3d9_loaded = true;
+    in.d3d8_or_9_loaded = true;
+    in.legacy_d3d_loaded = true;
+    in.vulkan_loaded = true;
+    in.wined3d_uses_vulkan = true;
+    ASSERT_TRUE(ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_PASSTHROUGH);
+    in.fullscreen_active = true;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* 32-bit D3D8 on WineD3D-Vulkan (no d3d9_loaded) ALSO routes through Vulkan legacy D3D */
+    in.d3d9_loaded = false;
+    ASSERT_TRUE(ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* 32-bit DDraw on WineD3D-Vulkan without GDI path ALSO routes through Vulkan legacy D3D */
+    in.d3d8_or_9_loaded = false;
+    in.ddraw_loaded = true;
+    ASSERT_TRUE(ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_BORDERLESS);
+
+    /* 6. F3 regression: 32-bit DDraw/GDI with Vulkan overlay stays Tier 0 Legacy Virtual */
+    in.ddraw_gdi_active = true;
+    ASSERT_TRUE(!ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_LEGACY_VIRTUAL);
+
+    /* 7. F3 regression: GL-after-Vulkan-probe (wined3d_uses_gl = true wins over prior Vulkan probe) */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.d3d9_loaded = true;
+    in.d3d8_or_9_loaded = true;
+    in.legacy_d3d_loaded = true;
+    in.vulkan_loaded = true;
+    in.wined3d_uses_vulkan = true;
+    in.wined3d_uses_gl = true;
+    ASSERT_TRUE(!ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_LEGACY_VIRTUAL);
+
+    /* Native OpenGL game with Vulkan overlay also stays Tier 0 */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.vulkan_loaded = true;
+    in.wined3d_uses_vulkan = true;
+    in.game_gl_active = true;
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_LEGACY_VIRTUAL);
+
+    /* 64-bit Vulkan + D3D9 never claims 32-bit Vulkan legacy D3D */
+    memset(&in, 0, sizeof(in));
+    in.scaling_mode = DS_MODE_AUTO_FULLSCREEN;
+    in.is_64bit = true;
+    in.d3d9_loaded = true;
+    in.vulkan_loaded = true;
+    in.wined3d_uses_vulkan = true;
+    ASSERT_TRUE(!ds_is_vulkan_legacy_d3d(&in));
+    ASSERT_TRUE(ds_compute_presenter_tier(&in) == DS_PRESENTER_MODERN_PASSTHROUGH);
+
+    /* 8. Multi-monitor negative-origin coordinate mapping (left-of-primary & above-primary monitor) */
+    ds_viewport_t neg_vp;
+    ASSERT_TRUE(ds_compute_viewport(1920, 1080, 0, 640, 480, DS_ASPECT_PRESERVE, &neg_vp));
+    int32_t mon_x = -1920;
+    int32_t mon_y = -1080;
+    int32_t scr_dst_x = mon_x + neg_vp.dst_x;
+    int32_t scr_dst_y = mon_y + neg_vp.dst_y;
+    for (int32_t vx = 0; vx < 640; vx += 17) {
+        for (int32_t vy = 0; vy < 480; vy += 19) {
+            int32_t px = 0, py = 0, rvx = -1, rvy = -1;
+            ASSERT_TRUE(ds_map_cursor_virt_to_phys(
+                vx, vy, scr_dst_x, scr_dst_y, neg_vp.dst_w, neg_vp.dst_h, 640, 480, &px, &py
+            ));
+            ASSERT_TRUE(px >= scr_dst_x && px < scr_dst_x + neg_vp.dst_w);
+            ASSERT_TRUE(py >= scr_dst_y && py < scr_dst_y + neg_vp.dst_h);
+            ASSERT_TRUE(ds_map_cursor_phys_to_virt(
+                px, py, scr_dst_x, scr_dst_y, neg_vp.dst_w, neg_vp.dst_h, 640, 480, &rvx, &rvy
+            ));
+            ASSERT_TRUE(rvx == vx && rvy == vy);
+        }
+    }
+    int32_t sx = 0, sy = 0, sw = 0, sh = 0;
+    ASSERT_TRUE(ds_map_subrect_virt_to_phys(
+        10, 20, 100, 80, scr_dst_x, scr_dst_y, neg_vp.dst_w, neg_vp.dst_h, 640, 480, &sx, &sy, &sw, &sh
+    ));
+    ASSERT_TRUE(sx >= scr_dst_x && sy >= scr_dst_y && sw > 0 && sh > 0);
+}
+
 int main(void)
 {
     test_viewport_and_notch_geometry();
@@ -556,6 +689,7 @@ int main(void)
     test_wave2a_exact_cursor_roundtrip_and_even_viewports();
     test_wave2a_watertight_strips_and_extended_ini();
     test_v3_user_override_and_mode_union();
+    test_v3_three_tier_state_machine_and_multimonitor();
     printf("[DS-ASAN-PASS] All display_scaler C11 geometry, mode-table, zero-drift mouselook & INI tests passed.\n");
     return 0;
 }

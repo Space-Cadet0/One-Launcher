@@ -277,6 +277,7 @@ export type GlobalDisplayAspectRatioMode = Exclude<DisplayAspectRatioMode, 'defa
 export type VirtualDesktopResolutionPreset =
   | 'auto'
   | '3840x2160'
+  | '3456x2234'
   | '3440x1440'
   | '3024x1964'
   | '2560x1600'

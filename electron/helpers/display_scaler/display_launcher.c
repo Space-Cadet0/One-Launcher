@@ -537,6 +537,24 @@ static void normalize_dir_prefix_w(const WCHAR *src, WCHAR *out_buf, size_t cap)
     out_buf[j] = L'\0';
 }
 
+static bool line_equals_ascii_token(const char *buf, const char *token)
+{
+    size_t tlen = strlen(token);
+    const char *p = buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *eol = p;
+        while (*eol && *eol != '\r' && *eol != '\n') eol++;
+        const char *end = eol;
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - p) == tlen && _strnicmp(p, token, tlen) == 0) {
+            return true;
+        }
+        p = (*eol == '\r' && eol[1] == '\n') ? (eol + 2) : (*eol ? eol + 1 : eol);
+    }
+    return false;
+}
+
 static bool watch_active_session_is_off(void)
 {
     WCHAR self_path[MAX_PATH] = { 0 };
@@ -560,7 +578,28 @@ static bool watch_active_session_is_off(void)
     CloseHandle(hf);
     if (!ok || nr == 0) return false;
     buf[nr] = '\0';
-    return (strstr(buf, "mode=off") != NULL || strstr(buf, "mode=passthrough") != NULL);
+    return line_equals_ascii_token(buf, "mode=off") ||
+           line_equals_ascii_token(buf, "mode=passthrough");
+}
+
+typedef struct ds_injected_proc_s {
+    DWORD    pid;
+    FILETIME create_time;
+    bool     has_create_time;
+    bool     is_launcher_stub;
+    bool     exited;
+} ds_injected_proc_t;
+
+static bool is_launcher_gui_stub_norm(const WCHAR *norm_img)
+{
+    if (!norm_img) return false;
+    const WCHAR *base = norm_img;
+    for (const WCHAR *p = norm_img; *p; p++) {
+        if (*p == L'\\') base = p + 1;
+    }
+    return (wcsstr(base, L"launcher") != NULL ||
+            wcsstr(base, L"config") != NULL ||
+            wcsstr(base, L"setup") != NULL);
 }
 
 static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, const WCHAR *dll_x64, DWORD timeout_ms)
@@ -575,14 +614,14 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
     DWORD max_wait = (timeout_ms > 0) ? timeout_ms : 90000u;
     const ULONGLONG post_inject_grace_ms = 15000ULL;
 
-    DWORD injected_pids[64];
+    ds_injected_proc_t injected_pids[64];
     size_t injected_count = 0;
     ULONGLONG last_inject_ms = 0;
     DWORD poll_iters = 0;
 
     for (;;) {
         if ((poll_iters++ % 10u) == 0 && watch_active_session_is_off()) {
-            return (injected_count > 0) ? 0 : 0;
+            return 0;
         }
 
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -595,17 +634,27 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
                     if (pe.th32ProcessID == 0 || pe.th32ProcessID == self_pid) continue;
                     if (is_excluded_helper_exe(pe.szExeFile)) continue;
 
-                    bool already_injected = false;
-                    for (size_t idx = 0; idx < injected_count; idx++) {
-                        if (injected_pids[idx] == pe.th32ProcessID) {
-                            already_injected = true;
-                            break;
-                        }
-                    }
-                    if (already_injected) continue;
-
                     HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
                     if (!hp) continue;
+
+                    FILETIME ft_create = { 0, 0 }, ft_exit = { 0, 0 }, ft_kern = { 0, 0 }, ft_user = { 0, 0 };
+                    bool has_ct = (GetProcessTimes(hp, &ft_create, &ft_exit, &ft_kern, &ft_user) != FALSE);
+
+                    bool already_injected = false;
+                    for (size_t idx = 0; idx < injected_count; idx++) {
+                        if (injected_pids[idx].pid == pe.th32ProcessID) {
+                            if (!has_ct || !injected_pids[idx].has_create_time ||
+                                (injected_pids[idx].create_time.dwLowDateTime == ft_create.dwLowDateTime &&
+                                 injected_pids[idx].create_time.dwHighDateTime == ft_create.dwHighDateTime)) {
+                                already_injected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (already_injected) {
+                        CloseHandle(hp);
+                        continue;
+                    }
 
                     WCHAR img[MAX_PATH];
                     img[0] = L'\0';
@@ -626,11 +675,17 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
 
                     if (k > dir_len && memcmp(norm_img, norm_dir, dir_len * sizeof(WCHAR)) == 0) {
                         if (inject_pid_dispatch(pe.th32ProcessID, NULL, dll_x86, dll_x64)) {
+                            ds_injected_proc_t rec;
+                            rec.pid = pe.th32ProcessID;
+                            rec.create_time = ft_create;
+                            rec.has_create_time = has_ct;
+                            rec.is_launcher_stub = is_launcher_gui_stub_norm(norm_img);
+                            rec.exited = false;
                             if (injected_count < 64u) {
-                                injected_pids[injected_count++] = pe.th32ProcessID;
+                                injected_pids[injected_count++] = rec;
                             } else {
-                                memmove(injected_pids, injected_pids + 1, 63u * sizeof(DWORD));
-                                injected_pids[63] = pe.th32ProcessID;
+                                memmove(injected_pids, injected_pids + 1, 63u * sizeof(ds_injected_proc_t));
+                                injected_pids[63] = rec;
                             }
                             last_inject_ms = GetTickCount64();
                         }
@@ -641,7 +696,35 @@ static int run_watch_dir_mode(const WCHAR *watch_dir, const WCHAR *dll_x86, cons
         }
 
         ULONGLONG now_ms = GetTickCount64();
-        if (injected_count > 0 && last_inject_ms > 0 && (now_ms - last_inject_ms) >= post_inject_grace_ms) {
+        bool launcher_stub_alive = false;
+        for (size_t idx = 0; idx < injected_count; idx++) {
+            if (injected_pids[idx].exited) continue;
+            bool alive = false;
+            HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, injected_pids[idx].pid);
+            if (hp) {
+                DWORD ec = 0;
+                FILETIME ft_c = { 0, 0 }, ft_e = { 0, 0 }, ft_k = { 0, 0 }, ft_u = { 0, 0 };
+                bool same_proc = true;
+                if (injected_pids[idx].has_create_time &&
+                    GetProcessTimes(hp, &ft_c, &ft_e, &ft_k, &ft_u)) {
+                    same_proc = (ft_c.dwLowDateTime == injected_pids[idx].create_time.dwLowDateTime &&
+                                 ft_c.dwHighDateTime == injected_pids[idx].create_time.dwHighDateTime);
+                }
+                if (same_proc && GetExitCodeProcess(hp, &ec) && ec == STILL_ACTIVE) {
+                    alive = true;
+                }
+                CloseHandle(hp);
+            }
+            if (!alive) {
+                injected_pids[idx].exited = true;
+                /* Process exited (e.g., splash/launcher handed off to child) -> restart grace window */
+                last_inject_ms = now_ms;
+            } else if (injected_pids[idx].is_launcher_stub) {
+                launcher_stub_alive = true;
+            }
+        }
+        if (injected_count > 0 && !launcher_stub_alive && last_inject_ms > 0 &&
+            (now_ms - last_inject_ms) >= post_inject_grace_ms) {
             return 0;
         }
         if ((now_ms - start_ms) >= (ULONGLONG)max_wait) {

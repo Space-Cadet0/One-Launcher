@@ -26,6 +26,16 @@ uint32_t WINAPI OneLauncherDisplayScalerGetVersion(void)
     return (m && m[0]) ? 0x00010000u : 0u;
 }
 
+void ds_lock(void)
+{
+    EnterCriticalSection(&g_ds.lock);
+}
+
+void ds_unlock(void)
+{
+    LeaveCriticalSection(&g_ds.lock);
+}
+
 bool ds_is_internal_call(void)
 {
     if (g_ds.tls_depth_idx == TLS_OUT_OF_INDEXES) return false;
@@ -72,12 +82,34 @@ HANDLE ds_dpi_guard_enter(HANDLE target_ctx)
     return g_ds.p_SetThreadDpiAwarenessContext(target_ctx);
 }
 
+HANDLE ds_dpi_guard_enter_for_hwnd(HWND hwnd)
+{
+    HANDLE win_ctx = (hwnd && IsWindow(hwnd) && g_ds.p_GetWindowDpiAwarenessContext)
+        ? g_ds.p_GetWindowDpiAwarenessContext(hwnd)
+        : DS_DPI_CTX_PMV2;
+    return ds_dpi_guard_enter(win_ctx);
+}
+
 void ds_dpi_guard_leave(HANDLE prev_ctx)
 {
     if (!prev_ctx || !g_ds.p_SetThreadDpiAwarenessContext) {
         return;
     }
     (void)g_ds.p_SetThreadDpiAwarenessContext(prev_ctx);
+}
+
+BOOL ds_set_window_pos_dpi(HWND hwnd, HWND after, int x, int y, int w, int h, UINT flags, bool clear_present)
+{
+    if (!g_ds.real_SetWindowPos) return FALSE;
+    HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
+    ds_enter_internal();
+    if (clear_present) {
+        ds_clear_wine_present_rect_on_hwnd(hwnd);
+    }
+    BOOL ok = g_ds.real_SetWindowPos(hwnd, after, x, y, w, h, flags);
+    ds_leave_internal();
+    ds_dpi_guard_leave(prev_dpi);
+    return ok;
 }
 
 static const WCHAR *ds_basename_w(const WCHAR *path)
@@ -114,9 +146,9 @@ static ds_mod_cache_entry_t s_mod_cache[DS_MOD_CACHE_SLOTS];
 
 static void ds_invalidate_mod_cache(void)
 {
-    if (g_ds.lock_initialized) EnterCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_lock();
     memset(s_mod_cache, 0, sizeof(s_mod_cache));
-    if (g_ds.lock_initialized) LeaveCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_unlock();
 }
 
 typedef struct {
@@ -198,14 +230,14 @@ static bool ds_classify_caller_module(const void *ret_addr, uint32_t *out_flags)
     }
 
     size_t slot = (size_t)((((uintptr_t)hmod >> 16) ^ ((uintptr_t)hmod >> 4)) & (DS_MOD_CACHE_SLOTS - 1u));
-    if (g_ds.lock_initialized) EnterCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_lock();
     if (s_mod_cache[slot].hmod == hmod && (s_mod_cache[slot].flags & DS_MODF_VALID) != 0) {
         uint32_t cached = s_mod_cache[slot].flags;
-        if (g_ds.lock_initialized) LeaveCriticalSection(&g_ds.lock);
+        if (g_ds.lock_initialized) ds_unlock();
         if (out_flags) *out_flags = cached;
         return true;
     }
-    if (g_ds.lock_initialized) LeaveCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_unlock();
 
     WCHAR mod_path[MAX_PATH];
     mod_path[0] = L'\0';
@@ -213,10 +245,10 @@ static bool ds_classify_caller_module(const void *ret_addr, uint32_t *out_flags)
         return false;
     }
     uint32_t computed = ds_compute_mod_flags_by_base(ds_basename_w(mod_path));
-    if (g_ds.lock_initialized) EnterCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_lock();
     s_mod_cache[slot].hmod = hmod;
     s_mod_cache[slot].flags = computed;
-    if (g_ds.lock_initialized) LeaveCriticalSection(&g_ds.lock);
+    if (g_ds.lock_initialized) ds_unlock();
 
     if (out_flags) *out_flags = computed;
     return true;
@@ -303,36 +335,74 @@ static bool ds_should_ignore_current_process(void)
     return ds_current_exe_in_multisz(k_ignored_msz, true);
 }
 
+bool ds_prefer_16bpp_ddraw(void)
+{
+    return g_ds.ddraw_loaded && !g_ds.d3d8_or_9_loaded;
+}
+
+bool ds_is_vulkan_d3d9_locked(void)
+{
+#if defined(_WIN64)
+    return false;
+#else
+    return (
+        !g_ds.dxgi_or_d3d10_plus_loaded &&
+        (g_ds.d3d9_loaded || g_ds.d3d8_or_9_loaded || g_ds.ddraw_loaded) &&
+        g_ds.wined3d_uses_vulkan &&
+        !g_ds.wined3d_uses_gl &&
+        !g_ds.ddraw_gdi_active
+    );
+#endif
+}
+
+bool ds_is_modern_tier_locked(void)
+{
+    return (g_ds.scaling_mode == DS_MODE_PASSTHROUGH ||
+            g_ds.presenter_tier != DS_PRESENTER_LEGACY_VIRTUAL);
+}
+
+bool ds_is_modern_borderless_locked(void)
+{
+    return (g_ds.scaling_mode != DS_MODE_PASSTHROUGH &&
+            g_ds.presenter_tier == DS_PRESENTER_MODERN_BORDERLESS);
+}
+
+bool ds_is_passthrough_locked(void)
+{
+    return (g_ds.scaling_mode == DS_MODE_PASSTHROUGH ||
+            g_ds.presenter_tier == DS_PRESENTER_MODERN_PASSTHROUGH);
+}
+
 bool ds_update_presenter_tier_locked(void)
 {
-    bool has_active_legacy_renderer = (
-        g_ds.gl_upscale_active ||
-        g_ds.ddraw_gdi_active ||
-        g_ds.game_gl_active ||
-        (g_ds.wined3d_uses_gl && !g_ds.wined3d_uses_vulkan)
-    );
-    bool is_vulkan_d3d9 = ds_is_vulkan_d3d9_locked();
-    bool is_modern_swapchain = (
-        !has_active_legacy_renderer &&
-        (g_ds.modern_gfx_loaded || is_vulkan_d3d9)
-    );
+    ds_tier_input_t ti;
+    ti.scaling_mode              = g_ds.scaling_mode;
+    ti.prev_tier                 = g_ds.presenter_tier;
+#if defined(_WIN64)
+    ti.is_64bit                  = true;
+#else
+    ti.is_64bit                  = false;
+#endif
+    ti.gl_upscale_active         = g_ds.gl_upscale_active;
+    ti.ddraw_gdi_active          = g_ds.ddraw_gdi_active;
+    ti.game_gl_active            = g_ds.game_gl_active;
+    ti.wined3d_uses_gl           = g_ds.wined3d_uses_gl;
+    ti.wined3d_uses_vulkan       = g_ds.wined3d_uses_vulkan;
+    ti.ddraw_loaded              = g_ds.ddraw_loaded;
+    ti.d3d8_or_9_loaded          = g_ds.d3d8_or_9_loaded;
+    ti.d3d9_loaded               = g_ds.d3d9_loaded;
+    ti.legacy_d3d_loaded         = g_ds.legacy_d3d_loaded;
+    ti.dxgi_or_d3d10_plus_loaded = g_ds.dxgi_or_d3d10_plus_loaded;
+    ti.vulkan_loaded             = g_ds.vulkan_loaded;
+    ti.modern_gfx_loaded         = g_ds.modern_gfx_loaded;
+    ti.fullscreen_active         = g_ds.fullscreen_active;
+    ti.borderless_active         = g_ds.borderless_active;
+    ti.window_mutated_by_scaler  = g_ds.window_mutated_by_scaler;
+    ti.user_forced_windowed      = g_ds.user_forced_windowed;
+    ti.user_forced_fullscreen    = g_ds.user_forced_fullscreen;
 
     ds_presenter_tier_t prev_tier = g_ds.presenter_tier;
-    ds_presenter_tier_t next_tier = DS_PRESENTER_LEGACY_VIRTUAL;
-
-    if (g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
-        next_tier = DS_PRESENTER_MODERN_PASSTHROUGH;
-    } else if (is_modern_swapchain) {
-        bool want_borderless = (
-            !g_ds.user_forced_windowed &&
-            (g_ds.scaling_mode == DS_MODE_FORCE_FULLSCREEN ||
-             g_ds.user_forced_fullscreen ||
-             (is_vulkan_d3d9 && g_ds.fullscreen_active))
-        );
-        next_tier = want_borderless
-            ? DS_PRESENTER_MODERN_BORDERLESS
-            : DS_PRESENTER_MODERN_PASSTHROUGH;
-    }
+    ds_presenter_tier_t next_tier = ds_compute_presenter_tier(&ti);
 
     g_ds.presenter_tier = next_tier;
     g_ds.modern_swapchain_passthrough = (next_tier == DS_PRESENTER_MODERN_PASSTHROUGH);
@@ -469,7 +539,7 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
         return g_ds.real_EnumDisplaySettingsExW ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool pass_through = (ds_is_modern_tier_locked() && !ds_is_vulkan_d3d9_locked());
     bool non_target_dev = (
         lpszDeviceName != NULL &&
@@ -478,8 +548,8 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
         _wcsicmp(lpszDeviceName, g_ds.target_device) != 0
     );
     bool mode_virt = g_ds.mode_virtualized;
-    int32_t mon_x = g_ds.win_mon_x;
-    int32_t mon_y = g_ds.win_mon_y;
+    int32_t phys_x = g_ds.phys_mon_x;
+    int32_t phys_y = g_ds.phys_mon_y;
     WCHAR dev_name[32];
     if (g_ds.target_device[0] != L'\0') {
         wcsncpy(dev_name, g_ds.target_device, 31);
@@ -487,7 +557,7 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
     } else {
         wcscpy(dev_name, L"\\\\.\\DISPLAY1");
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (pass_through || non_target_dev) {
         return g_ds.real_EnumDisplaySettingsExW ? g_ds.real_EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
@@ -507,7 +577,7 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
             memset(lpDevMode, 0, sz);
             lpDevMode->dmSize = sz;
         }
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         int32_t bpp = ds_prefer_16bpp_ddraw()
             ? 16
             : ((g_ds.virt_bpp > 0) ? g_ds.virt_bpp : g_ds.real_bpp);
@@ -517,21 +587,21 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
             ds_fill_devmode_w(lpDevMode, g_ds.phys_screen_w > 0 ? g_ds.phys_screen_w : g_ds.real_screen_w,
                               g_ds.phys_screen_h > 0 ? g_ds.phys_screen_h : g_ds.real_screen_h, bpp, g_ds.real_hz);
         }
-        lpDevMode->dmPosition.x = mon_x;
-        lpDevMode->dmPosition.y = mon_y;
+        lpDevMode->dmPosition.x = phys_x;
+        lpDevMode->dmPosition.y = phys_y;
         lpDevMode->dmFields |= DM_POSITION;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return TRUE;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     size_t count = g_ds.mode_count;
     ds_display_mode_t m = { 0, 0, 32, 60 };
     bool valid = ((size_t)iModeNum < count);
     if (valid) {
         m = g_ds.modes[iModeNum];
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!valid) {
         return FALSE;
@@ -543,9 +613,6 @@ static BOOL WINAPI hook_EnumDisplaySettingsExW(LPCWSTR lpszDeviceName, DWORD iMo
     lpDevMode->dmSize = sz;
     wcsncpy((WCHAR *)lpDevMode->dmDeviceName, dev_name, CCHDEVICENAME - 1);
     ds_fill_devmode_w(lpDevMode, m.width, m.height, m.bpp, m.refresh_hz);
-    lpDevMode->dmPosition.x = mon_x;
-    lpDevMode->dmPosition.y = mon_y;
-    lpDevMode->dmFields |= DM_POSITION;
     return TRUE;
 }
 
@@ -564,9 +631,9 @@ static BOOL WINAPI hook_EnumDisplaySettingsExA(LPCSTR lpszDeviceName, DWORD iMod
         return g_ds.real_EnumDisplaySettingsExA ? g_ds.real_EnumDisplaySettingsExA(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool pass_through = (ds_is_modern_tier_locked() && !ds_is_vulkan_d3d9_locked());
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     if (pass_through) {
         return g_ds.real_EnumDisplaySettingsExA ? g_ds.real_EnumDisplaySettingsExA(lpszDeviceName, iModeNum, lpDevMode, dwFlags) : FALSE;
     }
@@ -624,7 +691,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
     ds_tracef("ChangeDisplaySettings is_reset=%d req=%dx%d@%dbpp flags=0x%lx hwnd=%p",
               is_reset ? 1 : 0, (int)req_w, (int)req_h, (int)req_bpp, (unsigned long)dwFlags, (void *)g_ds.hwnd_game);
     if (is_reset) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool ignore_focus_loss_reset = (
             ds_is_wined3d_caller(caller_ret) &&
             g_ds.fullscreen_active &&
@@ -635,7 +702,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
             ds_cursor_warp_reset(&g_ds.warp);
             int32_t keep_vw = g_ds.virt_w;
             int32_t keep_vh = g_ds.virt_h;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             ds_tracef("ChangeDisplaySettings reset ignored during focus-loss (preserving virt=%dx%d)",
                       (int)keep_vw, (int)keep_vh);
             return DISP_CHANGE_SUCCESSFUL;
@@ -658,7 +725,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
         }
         ds_refresh_viewport_locked();
         ds_cursor_warp_reset(&g_ds.warp);
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         ds_request_apply_presentation();
         ds_gl_notify_display_mode_switch();
         ds_write_status_file();
@@ -679,7 +746,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
     bool mode_actually_changed = false;
     int32_t eff_bpp = 32;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     eff_bpp = req_bpp > 0 ? req_bpp : (g_ds.virt_bpp > 0 ? g_ds.virt_bpp : g_ds.real_bpp);
     if (ds_prefer_16bpp_ddraw() && eff_bpp > 16 && req_w <= 640 && req_h <= 480) {
         eff_bpp = 16;
@@ -701,7 +768,7 @@ static LONG ds_handle_change_display_mode(bool is_reset, int32_t req_w, int32_t 
     ds_refresh_viewport_locked();
     ds_cursor_warp_reset(&g_ds.warp);
     target_hwnd = g_ds.hwnd_game;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (target_hwnd && IsWindow(target_hwnd)) {
         ds_request_apply_presentation();
@@ -721,7 +788,7 @@ static LONG ds_handle_vulkan_d3d9_change_display(bool is_reset, int32_t req_w, i
         return DISP_CHANGE_SUCCESSFUL;
     }
     bool need_apply = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (is_reset) {
         if (g_ds.fullscreen_active && !g_ds.user_forced_fullscreen) {
             g_ds.fullscreen_active = false;
@@ -736,7 +803,7 @@ static LONG ds_handle_vulkan_d3d9_change_display(bool is_reset, int32_t req_w, i
         (void)ds_update_presenter_tier_locked();
         need_apply = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     if (need_apply) {
         ds_request_apply_presentation();
         ds_write_status_file();
@@ -760,10 +827,10 @@ static LONG ds_change_display_settings_common(
     bool call_real = ds_is_internal_call();
     bool vk_d3d9 = false;
     if (!call_real) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool modern_tier = ds_is_modern_tier_locked();
         vk_d3d9 = ds_is_vulkan_d3d9_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         call_real = (modern_tier && !vk_d3d9);
     }
     if (!call_real) {
@@ -851,11 +918,11 @@ static int WINAPI hook_GetSystemMetrics(int nIndex)
         ds_ensure_runtime_started();
     }
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool virt = g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (virt) {
             if (nIndex == SM_CXSCREEN || nIndex == SM_CXFULLSCREEN) {
@@ -864,11 +931,14 @@ static int WINAPI hook_GetSystemMetrics(int nIndex)
             if (nIndex == SM_CYSCREEN || nIndex == SM_CYFULLSCREEN) {
                 return vh;
             }
-            int num_mons = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CMONITORS) : 1;
-            if (num_mons <= 1) {
-                if (nIndex == SM_CXVIRTUALSCREEN) return vw;
-                if (nIndex == SM_CYVIRTUALSCREEN) return vh;
-                if (nIndex == SM_XVIRTUALSCREEN || nIndex == SM_YVIRTUALSCREEN) return 0;
+            if (nIndex == SM_CXVIRTUALSCREEN || nIndex == SM_CYVIRTUALSCREEN ||
+                nIndex == SM_XVIRTUALSCREEN || nIndex == SM_YVIRTUALSCREEN) {
+                int num_mons = g_ds.real_GetSystemMetrics ? g_ds.real_GetSystemMetrics(SM_CMONITORS) : 1;
+                if (num_mons <= 1) {
+                    if (nIndex == SM_CXVIRTUALSCREEN) return vw;
+                    if (nIndex == SM_CYVIRTUALSCREEN) return vh;
+                    return 0;
+                }
             }
         }
     }
@@ -929,7 +999,7 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
         ds_attach_and_apply_game_window(hWnd, 0, 0);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool modern_tier = ds_is_modern_tier_locked();
     bool tier2_borderless = (ds_is_modern_borderless_locked() && hWnd == g_ds.hwnd_game && g_ds.borderless_active);
     bool is_game_fs = (
@@ -939,7 +1009,7 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
         g_ds.vp.dst_w > 0 &&
         g_ds.vp.dst_h > 0
     );
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (modern_tier) {
         if (tier2_borderless && is_minimize) {
@@ -962,14 +1032,14 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
 
     if (is_game_fs && !is_hide && !is_minimize) {
         bool was_inactive = false;
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (g_ds.app_inactive &&
             (nCmdShow == SW_RESTORE ||
              (nCmdShow != SW_SHOWNA && nCmdShow != SW_SHOWNOACTIVATE && ds_process_owns_foreground_window()))) {
             g_ds.app_inactive = false;
         }
         was_inactive = g_ds.app_inactive;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (was_inactive) {
             ds_enter_internal();
@@ -1000,14 +1070,14 @@ static BOOL ds_handle_show_window_hook(HWND hWnd, int nCmdShow, bool is_async)
     }
 
     if (!is_hide && !is_minimize && hWnd) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool fs_dialog_raise = (
             hWnd != g_ds.hwnd_game &&
             g_ds.fullscreen_active &&
             !g_ds.app_inactive &&
             g_ds.real_SetWindowPos != NULL
         );
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (fs_dialog_raise) {
             DWORD wnd_pid = 0;
@@ -1048,7 +1118,7 @@ static BOOL WINAPI hook_SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT *lpw
         return g_ds.real_SetWindowPlacement(hWnd, lpwndpl);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool modern_tier = ds_is_modern_tier_locked();
     bool is_game_fs = (
         !modern_tier &&
@@ -1061,7 +1131,7 @@ static BOOL WINAPI hook_SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT *lpw
     int32_t mon_y = g_ds.win_mon_y;
     int32_t mon_w = g_ds.real_screen_w;
     int32_t mon_h = g_ds.real_screen_h;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (modern_tier) {
         return g_ds.real_SetWindowPlacement(hWnd, lpwndpl);
@@ -1115,7 +1185,9 @@ static bool ds_try_promote_fullscreen_resize_locked(
     int cx,
     int cy,
     UINT uFlags,
-    bool sys_caller)
+    bool sys_caller,
+    DWORD cur_style,
+    bool is_vis)
 {
     if (hWnd != g_ds.hwnd_game || g_ds.fullscreen_active || g_ds.user_forced_windowed ||
         ds_is_modern_tier_locked()) {
@@ -1127,13 +1199,13 @@ static bool ds_try_promote_fullscreen_resize_locked(
         return false;
     }
 
-    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
     bool is_borderless_popup = (cur_style & WS_POPUP) != 0 &&
                                (cur_style & (WS_CAPTION | WS_THICKFRAME)) == 0;
     bool want_promote = false;
     if (sys_caller && (hWndInsertAfter == HWND_TOPMOST || is_borderless_popup)) {
         want_promote = true;
-    } else if (!sys_caller && is_borderless_popup && ((uFlags & SWP_NOMOVE) != 0 || (X == 0 && Y == 0))) {
+    } else if (!sys_caller && is_borderless_popup &&
+               ((uFlags & SWP_NOMOVE) != 0 || (X == g_ds.win_mon_x && Y == g_ds.win_mon_y))) {
         want_promote = true;
     } else if (g_ds.scaling_mode == DS_MODE_FORCE_FULLSCREEN) {
         want_promote = true;
@@ -1149,7 +1221,7 @@ static bool ds_try_promote_fullscreen_resize_locked(
     g_ds.fullscreen_active = true;
     g_ds.visible_resync_needed = false;
     g_ds.visible_resync_done = false;
-    if (IsWindowVisible(hWnd) != FALSE) {
+    if (is_vis) {
         g_ds.cocoa_fs_synced = true;
         g_ds.first_visible_tick = 0;
     } else if (g_ds.real_screen_w >= 800 && g_ds.real_screen_h >= 600) {
@@ -1223,7 +1295,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
         if (g_ds.hwnd_game == NULL) {
             ds_attach_and_apply_game_window(target_hwnd, rc_w, rc_h);
         }
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         int32_t win_scale = ds_get_windowed_scale_locked();
         bool suppress_clamp = (
             target_hwnd == g_ds.hwnd_game &&
@@ -1242,7 +1314,7 @@ static LONG WINAPI hook_D3DKMTEscape(const ds_d3dkmt_escape_t *desc)
             g_ds.virt_h = rc_h;
             ds_refresh_viewport_locked();
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (suppress_clamp) {
             RECT empty_rc = { 0, 0, 0, 0 };
@@ -1300,7 +1372,9 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
     }
 
     bool sys_caller = ds_is_system_renderer_caller(caller_ret);
-    EnterCriticalSection(&g_ds.lock);
+    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
+    bool is_vis = (IsWindowVisible(hWnd) != FALSE);
+    ds_lock();
     bool modern_tier = ds_is_modern_tier_locked();
     if (modern_tier) {
         bool vk_d3d9 = ds_is_vulkan_d3d9_locked();
@@ -1315,10 +1389,9 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             (uFlags & (SWP_NOSIZE | SWP_HIDEWINDOW)) == 0 &&
             cx >= 240 && cy >= 180 && mon_w > 0 && mon_h > 0 &&
             (cx < mon_w || cy < mon_h)) {
-            DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
             bool borderless_popup = ((cur_style & WS_POPUP) != 0 && (cur_style & (WS_CAPTION | WS_THICKFRAME)) == 0);
             if ((sys_caller && (hWndInsertAfter == HWND_TOPMOST || borderless_popup)) ||
-                (!sys_caller && borderless_popup && ((uFlags & SWP_NOMOVE) != 0 || (X == 0 && Y == 0)))) {
+                (!sys_caller && borderless_popup && ((uFlags & SWP_NOMOVE) != 0 || (X == mon_x && Y == mon_y)))) {
                 g_ds.fullscreen_active = true;
                 g_ds.borderless_active = true;
                 g_ds.window_mutated_by_scaler = true;
@@ -1333,24 +1406,16 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
             !app_inact &&
             mon_w > 0 && mon_h > 0
         );
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (enforce_borderless) {
-            int nx = (uFlags & SWP_NOMOVE) ? X : mon_x;
-            int ny = (uFlags & SWP_NOMOVE) ? Y : mon_y;
-            int ncx = (uFlags & SWP_NOSIZE) ? cx : mon_w;
-            int ncy = (uFlags & SWP_NOSIZE) ? cy : mon_h;
-            ds_enter_internal();
-            ds_clear_wine_present_rect_on_hwnd(hWnd);
-            BOOL bres = g_ds.real_SetWindowPos(
-                hWnd,
-                HWND_TOPMOST,
-                nx,
-                ny,
-                ncx,
-                ncy,
-                uFlags | (promoted_vk ? SWP_FRAMECHANGED : 0)
-            );
-            ds_leave_internal();
+            UINT eff_flags = promoted_vk
+                ? ((uFlags & ~(UINT)(SWP_NOMOVE | SWP_NOSIZE)) | SWP_FRAMECHANGED)
+                : uFlags;
+            int nx = (eff_flags & SWP_NOMOVE) ? X : mon_x;
+            int ny = (eff_flags & SWP_NOMOVE) ? Y : mon_y;
+            int ncx = (eff_flags & SWP_NOSIZE) ? cx : mon_w;
+            int ncy = (eff_flags & SWP_NOSIZE) ? cy : mon_h;
+            BOOL bres = ds_set_window_pos_dpi(hWnd, HWND_TOPMOST, nx, ny, ncx, ncy, eff_flags, true);
             if (promoted_vk) {
                 ds_write_status_file();
             }
@@ -1359,7 +1424,7 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
         return g_ds.real_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
     }
 
-    bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, sys_caller);
+    bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags, sys_caller, cur_style, is_vis);
     bool is_game_fs = (hWnd == g_ds.hwnd_game && g_ds.fullscreen_active && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
     bool app_inactive = g_ds.app_inactive;
     bool staging_birth = (is_game_fs && !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0 &&
@@ -1382,7 +1447,7 @@ static BOOL WINAPI hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int
     if (is_game_fs) {
         g_ds.window_mutated_by_scaler = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (is_game_fs) {
         if (GetCurrentThreadId() == g_ds.game_thread_id) {
@@ -1457,7 +1522,9 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
     }
 
     bool sys_caller = ds_is_system_renderer_caller(__builtin_return_address(0));
-    EnterCriticalSection(&g_ds.lock);
+    DWORD cur_style = (DWORD)ds_get_wnd_long_ptr(hWnd, GWL_STYLE);
+    bool is_vis = (IsWindowVisible(hWnd) != FALSE);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
         bool is_target = (hWnd == g_ds.hwnd_game);
         bool enforce_borderless = (
@@ -1471,17 +1538,19 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
         int32_t by = g_ds.win_mon_y;
         int32_t bw = g_ds.real_screen_w;
         int32_t bh = g_ds.real_screen_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (enforce_borderless) {
+            HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hWnd);
             ds_enter_internal();
             ds_clear_wine_present_rect_on_hwnd(hWnd);
             BOOL bres = g_ds.real_MoveWindow(hWnd, bx, by, bw, bh, bRepaint);
             ds_leave_internal();
+            ds_dpi_guard_leave(prev_dpi);
             return bres;
         }
         return g_ds.real_MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
     }
-    bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, NULL, X, Y, nWidth, nHeight, 0, sys_caller);
+    bool promoted_fs = ds_try_promote_fullscreen_resize_locked(hWnd, NULL, X, Y, nWidth, nHeight, 0, sys_caller, cur_style, is_vis);
     bool is_game_fs = (hWnd == g_ds.hwnd_game && g_ds.fullscreen_active && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
     int32_t win_scale = (hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active) ? ds_get_windowed_scale_locked() : 1;
     int32_t vw = g_ds.virt_w;
@@ -1493,7 +1562,7 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
     if (is_game_fs) {
         g_ds.window_mutated_by_scaler = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (is_game_fs) {
         if (GetCurrentThreadId() == g_ds.game_thread_id) {
@@ -1546,9 +1615,9 @@ static BOOL WINAPI hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHei
 static LONG_PTR ds_handle_get_window_long(HWND hWnd, int nIndex, bool unicode)
 {
     if (!ds_is_internal_call() && hWnd != NULL && nIndex == GWLP_WNDPROC) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         WNDPROC orig = (hWnd == g_ds.hwnd_game) ? g_ds.orig_wndproc : NULL;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (orig != NULL) {
             return (LONG_PTR)orig;
         }
@@ -1591,13 +1660,13 @@ static LONG_PTR WINAPI hook_GetWindowLongPtrW(HWND hWnd, int nIndex)
 static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewLong, bool unicode, const void *caller_ret)
 {
     if (!ds_is_internal_call() && hWnd != NULL && nIndex == GWLP_WNDPROC && dwNewLong != 0) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game = (hWnd == g_ds.hwnd_game);
         DWORD owner_tid = g_ds.game_thread_id;
         WNDPROC prev_orig = g_ds.orig_wndproc;
         bool prev_unicode = g_ds.orig_wndproc_unicode;
         if (is_game && (WNDPROC)dwNewLong == ds_game_subclass_wndproc) {
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             return (LONG_PTR)prev_orig;
         }
         if (is_game && (prev_orig != NULL || GetCurrentThreadId() == owner_tid)) {
@@ -1617,14 +1686,14 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
             ds_leave_internal();
             g_ds.orig_wndproc = (WNDPROC)dwNewLong;
             g_ds.orig_wndproc_unicode = unicode;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             return ret_for_caller ? ret_for_caller : (LONG_PTR)prev_orig;
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
 
     if (!ds_is_internal_call() && hWnd != NULL && (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE)) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool modern_tier = ds_is_modern_tier_locked();
         bool is_game_fs = (!modern_tier && hWnd == g_ds.hwnd_game && g_ds.fullscreen_active);
         bool app_inactive = g_ds.app_inactive;
@@ -1636,7 +1705,7 @@ static LONG_PTR ds_handle_set_window_long(HWND hWnd, int nIndex, LONG_PTR dwNewL
                 g_ds.saved_exstyle = dwNewLong;
             }
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (modern_tier) {
             return ds_set_wnd_long_ptr_raw(hWnd, nIndex, dwNewLong, unicode);
@@ -1690,14 +1759,14 @@ static BOOL WINAPI hook_GetClientRect(HWND hWnd, LPRECT lpRect)
     if (!lpRect) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
         HWND desk = GetDesktopWindow();
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game_virt = (hWnd != NULL &&
                              ((hWnd == g_ds.hwnd_game && (g_ds.fullscreen_active || ds_get_windowed_scale_locked() > 1)) ||
                               (hWnd == desk && g_ds.fullscreen_active)) &&
                              g_ds.virt_w > 0 && g_ds.virt_h > 0);
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (is_game_virt) {
             lpRect->left = 0;
@@ -1714,12 +1783,12 @@ static BOOL WINAPI hook_GetWindowRect(HWND hWnd, LPRECT lpRect)
 {
     if (!lpRect) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game_fs = ((hWnd == g_ds.hwnd_game || hWnd == GetDesktopWindow()) &&
                            g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0);
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (is_game_fs) {
             lpRect->left = 0;
@@ -1736,12 +1805,12 @@ static void ds_virtualize_monitor_info(HMONITOR hMonitor, LPMONITORINFO lpmi, co
 {
     if (!lpmi || ds_is_internal_call()) return;
     if (ds_should_virtualize_rect_for_caller(caller_ret)) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_target_mon = (g_ds.target_monitor == NULL || hMonitor == g_ds.target_monitor);
         bool virt = is_target_mon && g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0;
         int32_t vw = g_ds.virt_w;
         int32_t vh = g_ds.virt_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (virt) {
             lpmi->rcMonitor.left = 0;
             lpmi->rcMonitor.top = 0;
@@ -1780,7 +1849,7 @@ static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
         return TRUE;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool fs_active = (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0);
     int32_t win_scale = ds_get_windowed_scale_locked();
     HWND hwnd_game = g_ds.hwnd_game;
@@ -1826,7 +1895,7 @@ static BOOL WINAPI hook_GetCursorPos(LPPOINT lpPoint)
             vy = orig.y + rel_vy;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     lpPoint->x = vx;
     lpPoint->y = vy;
@@ -1842,7 +1911,7 @@ static BOOL WINAPI hook_SetCursorPos(int X, int Y)
 
     int32_t px = X;
     int32_t py = Y;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     int32_t win_scale = ds_get_windowed_scale_locked();
     HWND hwnd_game = g_ds.hwnd_game;
     if (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0 && g_ds.vp.dst_w > 0 && g_ds.vp.dst_h > 0) {
@@ -1880,7 +1949,7 @@ static BOOL WINAPI hook_SetCursorPos(int X, int Y)
             );
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     return g_ds.real_SetCursorPos(px, py);
 }
 
@@ -1891,10 +1960,10 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
         return g_ds.real_ClipCursor(lpRect);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (!lpRect) {
         g_ds.has_virtual_clip = false;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return g_ds.real_ClipCursor(NULL);
     }
     g_ds.has_virtual_clip = true;
@@ -1902,7 +1971,7 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
     bool fs_active = g_ds.fullscreen_active;
     if (fs_active) {
         ds_reapply_cursor_clip_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return TRUE;
     }
     int32_t win_scale = ds_get_windowed_scale_locked();
@@ -1910,7 +1979,7 @@ static BOOL WINAPI hook_ClipCursor(const RECT *lpRect)
     int32_t vw = g_ds.virt_w;
     int32_t vh = g_ds.virt_h;
     RECT vclip = *lpRect;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (win_scale > 1 && vw > 0 && vh > 0 && hwnd_game && IsWindow(hwnd_game) && g_ds.real_ClientToScreen) {
         POINT orig = { 0, 0 };
@@ -1949,10 +2018,10 @@ static BOOL WINAPI hook_GetClipCursor(LPRECT lpRect)
 {
     if (!lpRect || !g_ds.real_GetClipCursor) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (g_ds.has_virtual_clip) {
             *lpRect = g_ds.virtual_clip_rect;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             return TRUE;
         }
         if (g_ds.fullscreen_active && g_ds.virt_w > 0 && g_ds.virt_h > 0) {
@@ -1960,10 +2029,10 @@ static BOOL WINAPI hook_GetClipCursor(LPRECT lpRect)
             lpRect->top = 0;
             lpRect->right = g_ds.virt_w;
             lpRect->bottom = g_ds.virt_h;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
             return TRUE;
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
     return g_ds.real_GetClipCursor(lpRect);
 }
@@ -1981,7 +2050,7 @@ static DWORD WINAPI hook_GetMessagePos(void)
     int32_t vy = py;
     bool mapped = false;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     int32_t win_scale = ds_get_windowed_scale_locked();
     HWND hwnd_game = g_ds.hwnd_game;
     int32_t vw = g_ds.virt_w;
@@ -2024,7 +2093,7 @@ static DWORD WINAPI hook_GetMessagePos(void)
             mapped = true;
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!mapped) {
         return raw;
@@ -2042,7 +2111,7 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
         return;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool fs_active = (
         !ds_is_modern_tier_locked() &&
         g_ds.fullscreen_active &&
@@ -2056,7 +2125,7 @@ static void ds_remap_rawinput_mouse_packet(RAWINPUT *raw)
     int32_t rsw = g_ds.real_screen_w;
     int32_t rsh = g_ds.real_screen_h;
     ds_viewport_t vp = g_ds.vp;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!fs_active) {
         return;
@@ -2154,12 +2223,12 @@ static BOOL WINAPI hook_RegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevice
             if (dev->usUsagePage == 0x01 && dev->usUsage == 0x02) {
                 bool remove_dev = (dev->dwFlags & 0x00000001u) != 0;
                 bool want_confine = !remove_dev && (dev->dwFlags & (RIDEV_NOLEGACY | RIDEV_CAPTUREMOUSE)) != 0;
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 g_ds.raw_mouse_nolegacy = want_confine;
                 if (want_confine && g_ds.fullscreen_active && !g_ds.app_inactive) {
                     ds_reapply_cursor_clip_locked();
                 }
-                LeaveCriticalSection(&g_ds.lock);
+                ds_unlock();
             }
         }
     }
@@ -2170,10 +2239,10 @@ static BOOL WINAPI hook_ScreenToClient(HWND hWnd, LPPOINT lpPoint)
 {
     if (!lpPoint) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game_fs = (hWnd != NULL && hWnd == g_ds.hwnd_game && g_ds.fullscreen_active);
         bool is_game_win_scaled = (hWnd != NULL && hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active && ds_get_windowed_scale_locked() > 1);
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (is_game_fs) {
             /* Virtual screen origin is already (0, 0) == virtual client origin (0, 0) */
             return TRUE;
@@ -2197,10 +2266,10 @@ static BOOL WINAPI hook_ClientToScreen(HWND hWnd, LPPOINT lpPoint)
 {
     if (!lpPoint) return FALSE;
     if (!ds_is_internal_call() && ds_should_virtualize_rect_for_caller(__builtin_return_address(0))) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool is_game_fs = (hWnd != NULL && hWnd == g_ds.hwnd_game && g_ds.fullscreen_active);
         bool is_game_win_scaled = (hWnd != NULL && hWnd == g_ds.hwnd_game && !g_ds.fullscreen_active && ds_get_windowed_scale_locked() > 1);
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (is_game_fs) {
             return TRUE;
         }
@@ -2229,11 +2298,11 @@ static int WINAPI hook_MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoi
         bool from_desk = (hWndFrom == NULL || hWndFrom == desk);
         bool to_desk = (hWndTo == NULL || hWndTo == desk);
 
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         HWND hwnd_game = g_ds.hwnd_game;
         bool fs_active = g_ds.fullscreen_active;
         int32_t win_scale = ds_get_windowed_scale_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (hwnd_game != NULL && (hWndFrom == hwnd_game || hWndTo == hwnd_game)) {
             if (hWndFrom == hWndTo) {
@@ -2275,7 +2344,7 @@ static HWND WINAPI hook_WindowFromPoint(POINT Point)
     }
 
     POINT phys = Point;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd_game = g_ds.hwnd_game;
     HWND hwnd_gl_host = g_ds.hwnd_gl_host;
     int32_t win_scale = ds_get_windowed_scale_locked();
@@ -2326,7 +2395,7 @@ static HWND WINAPI hook_WindowFromPoint(POINT Point)
             }
         }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     HWND hit = g_ds.real_WindowFromPoint(phys);
     if (hit != NULL && hit == hwnd_gl_host && hwnd_game != NULL) {
@@ -2623,11 +2692,11 @@ static WCHAR *ds_build_merged_child_env_w(LPVOID caller_env, DWORD caller_flags)
         FreeEnvironmentStringsW(parent_env);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     for (size_t i = 0; i < sizeof(k_ds_path_envs) / sizeof(k_ds_path_envs[0]); i++) {
         ds_append_kv_if_missing_w(&out_buf, &out_len, &out_cap, k_ds_path_envs[i].key, ds_path_env_field(i));
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!out_buf) {
         out_buf = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 2 * sizeof(WCHAR));
@@ -3299,60 +3368,71 @@ static void ds_patch_single_module_iat(HMODULE hmod)
 
     uint32_t mflags = ds_compute_mod_flags_by_base(base);
     bool mod_state_changed = false;
-    if ((mflags & DS_MODF_DDRAW) != 0) {
-        if (!g_ds.ddraw_loaded || !g_ds.legacy_d3d_loaded) {
-            g_ds.ddraw_loaded = true;
-            g_ds.legacy_d3d_loaded = true;
-            mod_state_changed = true;
-        }
-    } else if ((mflags & DS_MODF_D3D8) != 0) {
-        if (!g_ds.d3d8_or_9_loaded || !g_ds.legacy_d3d_loaded) {
-            g_ds.d3d8_or_9_loaded = true;
-            g_ds.legacy_d3d_loaded = true;
-            mod_state_changed = true;
-        }
-    } else if ((mflags & DS_MODF_D3D9) != 0) {
-        if (!g_ds.d3d8_or_9_loaded || !g_ds.d3d9_loaded || !g_ds.legacy_d3d_loaded) {
-            g_ds.d3d8_or_9_loaded = true;
-            g_ds.d3d9_loaded = true;
-            g_ds.legacy_d3d_loaded = true;
-            mod_state_changed = true;
-        }
-        /* Positive DXVK d3d9.dll check: DXVK loads without wined3d.dll and imports vulkan-1/winevulkan */
-        if (!g_ds.wined3d_uses_vulkan &&
+    bool dxvk_d3d9_hint = false;
+    if ((mflags & DS_MODF_D3D9) != 0) {
+        /* Positive DXVK d3d9.dll check outside g_ds.lock */
+        dxvk_d3d9_hint = (
             GetModuleHandleW(L"wined3d.dll") == NULL &&
-            (GetModuleHandleW(L"vulkan-1.dll") != NULL || GetModuleHandleW(L"winevulkan.dll") != NULL)) {
-            g_ds.wined3d_uses_vulkan = true;
-            mod_state_changed = true;
+            (GetModuleHandleW(L"vulkan-1.dll") != NULL || GetModuleHandleW(L"winevulkan.dll") != NULL)
+        );
+    }
+    bool tier_changed = false;
+    bool now_modern = false;
+    if ((mflags & (DS_MODF_DDRAW | DS_MODF_D3D8 | DS_MODF_D3D9 | DS_MODF_MODERN_DX | DS_MODF_VULKAN)) != 0) {
+        if (g_ds.lock_initialized) ds_lock();
+        if ((mflags & DS_MODF_DDRAW) != 0) {
+            if (!g_ds.ddraw_loaded || !g_ds.legacy_d3d_loaded) {
+                g_ds.ddraw_loaded = true;
+                g_ds.legacy_d3d_loaded = true;
+                mod_state_changed = true;
+            }
+        } else if ((mflags & DS_MODF_D3D8) != 0) {
+            if (!g_ds.d3d8_or_9_loaded || !g_ds.legacy_d3d_loaded) {
+                g_ds.d3d8_or_9_loaded = true;
+                g_ds.legacy_d3d_loaded = true;
+                mod_state_changed = true;
+            }
+        } else if ((mflags & DS_MODF_D3D9) != 0) {
+            if (!g_ds.d3d8_or_9_loaded || !g_ds.d3d9_loaded || !g_ds.legacy_d3d_loaded) {
+                g_ds.d3d8_or_9_loaded = true;
+                g_ds.d3d9_loaded = true;
+                g_ds.legacy_d3d_loaded = true;
+                mod_state_changed = true;
+            }
+            if (dxvk_d3d9_hint && !g_ds.wined3d_uses_vulkan && !g_ds.wined3d_uses_gl) {
+                g_ds.wined3d_uses_vulkan = true;
+                mod_state_changed = true;
+            }
+        } else if ((mflags & DS_MODF_MODERN_DX) != 0) {
+            if (!g_ds.dxgi_or_d3d10_plus_loaded || !g_ds.modern_gfx_loaded) {
+                g_ds.dxgi_or_d3d10_plus_loaded = true;
+                g_ds.modern_gfx_loaded = true;
+                mod_state_changed = true;
+            }
+        } else if ((mflags & DS_MODF_VULKAN) != 0) {
+            if (!g_ds.vulkan_loaded) {
+                g_ds.vulkan_loaded = true;
+                mod_state_changed = true;
+            }
+            if (!g_ds.wined3d_uses_gl && !g_ds.wined3d_uses_vulkan) {
+                g_ds.wined3d_uses_vulkan = true;
+                mod_state_changed = true;
+            }
         }
-    } else if ((mflags & DS_MODF_MODERN_DX) != 0) {
-        if (!g_ds.dxgi_or_d3d10_plus_loaded || !g_ds.modern_gfx_loaded) {
-            g_ds.dxgi_or_d3d10_plus_loaded = true;
-            g_ds.modern_gfx_loaded = true;
-            mod_state_changed = true;
+        if (mod_state_changed && g_ds.lock_initialized) {
+            tier_changed = ds_update_presenter_tier_locked();
+            now_modern = ds_is_modern_tier_locked();
         }
-    } else if ((mflags & DS_MODF_VULKAN) != 0) {
-        if (!g_ds.vulkan_loaded || !g_ds.wined3d_uses_vulkan || !g_ds.modern_gfx_loaded) {
-            g_ds.vulkan_loaded = true;
-            g_ds.wined3d_uses_vulkan = true;
-            g_ds.modern_gfx_loaded = true;
-            mod_state_changed = true;
-        }
+        if (g_ds.lock_initialized) ds_unlock();
     }
 
-    if (mod_state_changed && g_ds.lock_initialized) {
-        EnterCriticalSection(&g_ds.lock);
-        bool tier_changed = ds_update_presenter_tier_locked();
-        bool now_modern = ds_is_modern_tier_locked();
-        LeaveCriticalSection(&g_ds.lock);
-        if (tier_changed) {
-            if (now_modern) {
-                ds_request_restore_passthrough();
-            } else {
-                ds_request_apply_presentation();
-            }
-            ds_write_status_file();
+    if (tier_changed) {
+        if (now_modern) {
+            ds_request_restore_passthrough();
+        } else {
+            ds_request_apply_presentation();
         }
+        ds_write_status_file();
     }
 
     if ((mflags & DS_MODF_SKIP_IAT) != 0) return;
@@ -3373,7 +3453,10 @@ static void ds_patch_single_module_iat(HMODULE hmod)
     size_t size_of_image = (size_t)nt->OptionalHeader.SizeOfImage;
     if (size_of_image < 512 || (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > size_of_image) return;
 
-    IMAGE_DATA_DIRECTORY imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    IMAGE_DATA_DIRECTORY imp_dir = { 0, 0 };
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    }
     if (imp_dir.VirtualAddress != 0 && imp_dir.Size != 0 &&
         (size_t)imp_dir.VirtualAddress < size_of_image &&
         (size_t)imp_dir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= size_of_image) {
@@ -3662,10 +3745,10 @@ static void ds_probe_wined3d_vulkan_registry(void)
             pClose(hk);
             if (qres == ERROR_SUCCESS && val_type == REG_SZ) {
                 if (_wcsicmp(val, L"vulkan") == 0) {
-                    EnterCriticalSection(&g_ds.lock);
+                    ds_lock();
                     g_ds.wined3d_uses_vulkan = true;
                     (void)ds_update_presenter_tier_locked();
-                    LeaveCriticalSection(&g_ds.lock);
+                    ds_unlock();
                     return;
                 }
                 if (_wcsicmp(val, L"gl") == 0) {
@@ -3773,6 +3856,8 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
 
     ds_leave_internal();
 
+    int32_t phys_x = has_phys_mi ? (int32_t)mi_phys.rcMonitor.left : 0;
+    int32_t phys_y = has_phys_mi ? (int32_t)mi_phys.rcMonitor.top : 0;
     int32_t win_x = has_win_mi ? (int32_t)mi_win.rcMonitor.left : 0;
     int32_t win_y = has_win_mi ? (int32_t)mi_win.rcMonitor.top : 0;
     int32_t win_w = has_win_mi ? (int32_t)(mi_win.rcMonitor.right - mi_win.rcMonitor.left)
@@ -3785,7 +3870,7 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
     char inset_str[32] = { 0 };
     ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     g_ds.target_monitor = hmon;
     if (dev_name && dev_name[0] != L'\0') {
         wcsncpy(g_ds.target_device, dev_name, 31);
@@ -3795,6 +3880,8 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
     }
     g_ds.win_mon_x     = win_x;
     g_ds.win_mon_y     = win_y;
+    g_ds.phys_mon_x    = phys_x;
+    g_ds.phys_mon_y    = phys_y;
     g_ds.real_screen_w = win_w;
     g_ds.real_screen_h = win_h;
     g_ds.phys_screen_w = phys_w;
@@ -3854,7 +3941,7 @@ void ds_refresh_host_display_metrics_for_hwnd(HWND hwnd)
     }
     ds_refresh_viewport_locked();
     InterlockedIncrement(&g_ds.gdi_margin_gen);
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 }
 
 void ds_refresh_host_display_metrics(void)
@@ -3881,6 +3968,9 @@ static void ds_resolve_loaded_system_apis(void)
         if (hm) {
             *slot = (void *)(uintptr_t)g_ds.real_GetProcAddress(hm, e->name);
         }
+        if (*slot == NULL && e->mod_id == DS_HK_MOD_GL32 && mods[DS_HK_MOD_G32]) {
+            *slot = (void *)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], e->name);
+        }
     }
 
     if (g_ds.is_wine && !g_ds.real_D3DKMTEscape) {
@@ -3894,13 +3984,6 @@ static void ds_resolve_loaded_system_apis(void)
         if (!g_ds.real_D3DKMTEscape) {
             g_ds.real_D3DKMTEscape = g_ds.real_NtGdiDdDDIEscape;
         }
-    }
-
-    if (mods[DS_HK_MOD_G32]) {
-        if (!g_ds.real_wglChoosePixelFormat)   g_ds.real_wglChoosePixelFormat   = (pfn_wglChoosePixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "wglChoosePixelFormat");
-        if (!g_ds.real_wglDescribePixelFormat) g_ds.real_wglDescribePixelFormat = (pfn_wglDescribePixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "wglDescribePixelFormat");
-        if (!g_ds.real_wglGetPixelFormat)      g_ds.real_wglGetPixelFormat      = (pfn_wglGetPixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "wglGetPixelFormat");
-        if (!g_ds.real_wglSetPixelFormat)      g_ds.real_wglSetPixelFormat      = (pfn_wglSetPixelFormat_t)(uintptr_t)g_ds.real_GetProcAddress(mods[DS_HK_MOD_G32], "wglSetPixelFormat");
     }
 
     ds_ensure_shell32_loaded(false);
@@ -3917,7 +4000,12 @@ void ds_ensure_runtime_started(void)
     ds_resolve_loaded_system_apis();
     ds_probe_wined3d_vulkan_registry();
 
-    if (!ds_is_passthrough_locked() && !g_ds.dpi_aware_applied) {
+    bool need_dpi_init = false;
+    if (g_ds.lock_initialized) ds_lock();
+    need_dpi_init = (!ds_is_passthrough_locked() && !g_ds.dpi_aware_applied);
+    if (g_ds.lock_initialized) ds_unlock();
+
+    if (need_dpi_init) {
         HMODULE u32 = GetModuleHandleW(L"user32.dll");
         if (u32 && g_ds.real_GetProcAddress) {
             ds_enter_internal();
@@ -3969,22 +4057,17 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
         }
     }
 
-    char mode_str[64] = { 0 };
-    char aspect_str[64] = { 0 };
-    char filter_str[32] = { 0 };
-    char inset_str[32] = { 0 };
-    char hotkey_str[16] = { 0 };
-    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_SCALING_MODE", mode_str, sizeof(mode_str));
-    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_ASPECT", aspect_str, sizeof(aspect_str));
-    ds_read_env_utf8(L"ONE_LAUNCHER_SCALING_FILTER", filter_str, sizeof(filter_str));
-    ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", inset_str, sizeof(inset_str));
-    ds_read_env_utf8(L"ONE_LAUNCHER_FULLSCREEN_HOTKEY", hotkey_str, sizeof(hotkey_str));
-
-    g_ds.scaling_mode   = mode_str[0] ? ds_parse_scaling_mode(mode_str) : DS_MODE_AUTO_FULLSCREEN;
-    g_ds.aspect_mode    = aspect_str[0] ? ds_parse_aspect_mode(aspect_str) : DS_ASPECT_PRESERVE;
-    g_ds.scale_filter   = filter_str[0] ? ds_parse_scale_filter(filter_str) : DS_FILTER_AUTO;
-    g_ds.hotkey_enabled = (hotkey_str[0] != '0');
-    g_ds.safe_inset_top = inset_str[0] ? (int32_t)atoi(inset_str) : 0;
+    char ev[64];
+    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_SCALING_MODE", ev, sizeof(ev));
+    g_ds.scaling_mode = ev[0] ? ds_parse_scaling_mode(ev) : DS_MODE_AUTO_FULLSCREEN;
+    ds_read_env_utf8(L"ONE_LAUNCHER_DISPLAY_ASPECT", ev, sizeof(ev));
+    g_ds.aspect_mode = ev[0] ? ds_parse_aspect_mode(ev) : DS_ASPECT_PRESERVE;
+    ds_read_env_utf8(L"ONE_LAUNCHER_SCALING_FILTER", ev, sizeof(ev));
+    g_ds.scale_filter = ev[0] ? ds_parse_scale_filter(ev) : DS_FILTER_AUTO;
+    ds_read_env_utf8(L"ONE_LAUNCHER_FULLSCREEN_HOTKEY", ev, sizeof(ev));
+    g_ds.hotkey_enabled = (ev[0] != '0');
+    ds_read_env_utf8(L"ONE_LAUNCHER_SAFE_INSET_TOP", ev, sizeof(ev));
+    g_ds.safe_inset_top = ev[0] ? (int32_t)atoi(ev) : 0;
 
     for (size_t i = 0; i < sizeof(k_ds_path_envs) / sizeof(k_ds_path_envs[0]); i++) {
         ds_read_env_w(k_ds_path_envs[i].key, ds_path_env_field(i), MAX_PATH);
@@ -4122,9 +4205,9 @@ static void ds_resolve_real_apis_and_init(HMODULE hinstDLL)
     g_ds.active = true;
 
     ds_patch_loaded_modules();
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     (void)ds_update_presenter_tier_locked();
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)

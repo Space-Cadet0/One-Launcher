@@ -707,7 +707,7 @@ function shouldWrapBottleSessionWithDisplayLauncher(
   ) {
     return false;
   }
-  const forceGlCore = /(?:^|\s)-force-glcore(?:\d*|\b)/i.test(
+  const forceGlCore = /(?:^|\s)(?:-force-glcore\d*|-opengl\d*)\b/i.test(
     String(launchArgsStr || effectiveCaps?.launchArguments || '')
   );
   const isModernUnity64 = Boolean(
@@ -717,7 +717,19 @@ function shouldWrapBottleSessionWithDisplayLauncher(
       effectiveCaps.importsUnityPlayer &&
       !forceGlCore
   );
-  const effectiveUsesOpenGl = Boolean(effectiveCaps?.usesOpenGl && !isModernUnity64);
+  const isModernMultiRenderer64 = Boolean(
+    effectiveCaps &&
+      !effectiveCaps.is32Bit &&
+      effectiveCaps.is64Bit &&
+      (effectiveCaps.usesModernGraphicsApi ||
+        effectiveCaps.importsD3d12 ||
+        effectiveCaps.importsD3d11Or10 ||
+        effectiveCaps.importsVulkan) &&
+      !forceGlCore
+  );
+  const effectiveUsesOpenGl = Boolean(
+    effectiveCaps?.usesOpenGl && !isModernUnity64 && !isModernMultiRenderer64
+  );
   const isModernSelfScaling64Bit = Boolean(
     effectiveCaps &&
       !effectiveCaps.is32Bit &&
@@ -10309,13 +10321,13 @@ function toggleSessionFullscreen(payload = {}, options = {}) {
         );
         const toggleStageDir = path.dirname(controlFilePosix);
         const sessionIdForIni = String(targetEntry.session.sessionId || '');
+        const activeSessionMode =
+          nextFullscreen && targetEntry.session.displayScalingMode === 'force_fullscreen'
+            ? 'force_fullscreen'
+            : 'auto_fullscreen';
         writeActiveDisplaySessionManifestIni(toggleStageDir, {
           seq: nextSeq,
-          mode: nextFullscreen
-            ? targetEntry.session.displayScalingMode === 'force_fullscreen'
-              ? 'force_fullscreen'
-              : 'auto_fullscreen'
-            : 'windowed',
+          mode: activeSessionMode,
           aspect: nextAspect,
           safeInsetTop: 0,
           hotkey: true,
@@ -10348,7 +10360,7 @@ function toggleSessionFullscreen(payload = {}, options = {}) {
           const auxEnv = {
             ...(targetEntry.launchEnv || process.env),
             WINEPREFIX: targetPrefix,
-            ONE_LAUNCHER_DISPLAY_SCALING_MODE: nextFullscreen ? 'force_fullscreen' : 'windowed',
+            ONE_LAUNCHER_DISPLAY_SCALING_MODE: nextFullscreen ? 'force_fullscreen' : 'auto_fullscreen',
             ONE_LAUNCHER_DISPLAY_ASPECT: nextAspect,
             ONE_LAUNCHER_SAFE_INSET_TOP: '0',
             ONE_LAUNCHER_SCALER_DLL_X86: staged.winDllX86,

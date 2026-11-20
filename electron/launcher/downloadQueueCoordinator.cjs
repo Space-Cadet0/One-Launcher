@@ -91,7 +91,7 @@ const macNativeInstallerAndCodesign = /** @type {any} */ (
 );
 const {
   resolveMacAppBundleBinary,
-  ensureMacAppCodeSignatureValid,
+  ensureMacAppCodeSignatureValidAsync,
   flattenGogNestedInstallDir,
   findPrimaryExecutable,
   resolveSteamAppInfoLaunchSpec,
@@ -6719,7 +6719,10 @@ async function installGame(
 
               if (platform === 'darwin' && !isWindowsBinaryOnMac) {
                 try {
-                  ensureMacAppCodeSignatureValid(executablePath || actualInstallPath, options);
+                  void ensureMacAppCodeSignatureValidAsync(
+                    executablePath || actualInstallPath,
+                    options
+                  ).catch(() => {});
                 } catch {}
               }
 

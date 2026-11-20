@@ -603,18 +603,19 @@ runTest('TRK6-04', 'Universal Portability & Zero-PII: Scaler source tree contain
 console.log('\n--- TRACK 7: Display Scaler v3 Architecture & Multi-Display Hardening ---');
 
 runTest('TRK7-01', 'Three-Tier Presenter & hard GLHost barriers enforced in C11 scaler', () => {
-  const internalH = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_internal.h'), 'utf8');
+  const publicH = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler.h'), 'utf8');
   const dllSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_dll.c'), 'utf8');
   const winSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_window.c'), 'utf8');
   const glSrc = fs.readFileSync(path.join(SCALER_DIR, 'display_scaler_gl_gdi.c'), 'utf8');
 
-  assert.match(internalH, /DS_PRESENTER_LEGACY_VIRTUAL/);
-  assert.match(internalH, /DS_PRESENTER_MODERN_PASSTHROUGH/);
-  assert.match(internalH, /DS_PRESENTER_MODERN_BORDERLESS/);
+  assert.match(publicH, /DS_PRESENTER_LEGACY_VIRTUAL/);
+  assert.match(publicH, /DS_PRESENTER_MODERN_PASSTHROUGH/);
+  assert.match(publicH, /DS_PRESENTER_MODERN_BORDERLESS/);
+  assert.match(publicH, /ds_compute_presenter_tier/);
   assert.match(dllSrc, /ds_is_vulkan_d3d9_locked/);
   assert.match(dllSrc, /wined3d_uses_vulkan/);
   assert.match(dllSrc, /L"dxgi\.dll"/);
-  assert.match(winSrc, /ds_dpi_guard_enter/);
+  assert.match(winSrc, /ds_dpi_guard_enter_for_hwnd/);
   assert.match(winSrc, /ds_restore_window_on_passthrough/);
   assert.match(glSrc, /GL_MAX_TEXTURE_SIZE/);
   assert.match(glSrc, /g_ds\.wined3d_uses_gl\s*=\s*true/);
@@ -682,6 +683,29 @@ runTest('TRK7-04', 'detectDisplayGeometry parses Apple Silicon main display & Mo
   assert.strictEqual(geom.panelWidth, 3024);
   assert.strictEqual(geom.panelHeight, 1964);
   assert.strictEqual(geom.isMain, true);
+
+  // HiDPI "Larger Text" preset (1352x878 logical on 3024x1964 panel -> 2704x1756 CoreGraphics backing)
+  const largerTextJson = JSON.stringify({
+    SPDisplaysDataType: [
+      {
+        spdisplays_ndrvs: [
+          {
+            _name: 'Built-in Retina',
+            _spdisplays_pixels: '3024 x 1964',
+            _spdisplays_resolution: '1352 x 878 @ 120Hz',
+            spdisplays_pixelresolution: 'spdisplays_3024x1964Retina',
+            spdisplays_main: 'spdisplays_yes',
+            spdisplays_online: 'spdisplays_yes',
+          },
+        ],
+      },
+    ],
+  });
+  const geomLT = verifierMod.detectDisplayGeometry({ platform: 'darwin', execSyncFn: () => largerTextJson });
+  assert.strictEqual(geomLT.width, 2704);
+  assert.strictEqual(geomLT.height, 1756);
+  assert.strictEqual(geomLT.logicalWidth, 1352);
+  assert.strictEqual(geomLT.panelWidth, 3024);
 
   // Non-macOS fallback must use generic 1920x1080, not machine-specific 3024x1964
   const fallback = verifierMod.detectDisplayGeometry({ platform: 'linux' });

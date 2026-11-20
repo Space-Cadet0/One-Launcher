@@ -993,3 +993,60 @@ bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_
            out_state->has_control_file ||
            out_state->has_status_file;
 }
+
+bool ds_is_vulkan_legacy_d3d(const ds_tier_input_t *in)
+{
+    if (!in || in->is_64bit) return false;
+    return (
+        !in->dxgi_or_d3d10_plus_loaded &&
+        (in->d3d9_loaded || in->d3d8_or_9_loaded || in->ddraw_loaded) &&
+        in->wined3d_uses_vulkan &&
+        !in->wined3d_uses_gl &&
+        !in->ddraw_gdi_active
+    );
+}
+
+ds_presenter_tier_t ds_compute_presenter_tier(const ds_tier_input_t *in)
+{
+    if (!in) return DS_PRESENTER_LEGACY_VIRTUAL;
+    if (in->scaling_mode == DS_MODE_PASSTHROUGH) {
+        return DS_PRESENTER_MODERN_PASSTHROUGH;
+    }
+
+    /* Live WGL/GDI rendering always takes ground-truth precedence over prior Vulkan probes */
+    bool has_active_legacy_renderer = (
+        in->gl_upscale_active ||
+        in->ddraw_gdi_active ||
+        in->game_gl_active ||
+        in->wined3d_uses_gl
+    );
+    bool is_vulkan_legacy = ds_is_vulkan_legacy_d3d(in);
+    bool has_pure_vulkan = (
+        in->vulkan_loaded &&
+        (in->is_64bit ||
+         (!in->legacy_d3d_loaded && !in->ddraw_loaded && !in->d3d8_or_9_loaded && !in->d3d9_loaded))
+    );
+    bool is_modern_swapchain = (
+        !has_active_legacy_renderer &&
+        (in->dxgi_or_d3d10_plus_loaded || in->modern_gfx_loaded || has_pure_vulkan || is_vulkan_legacy)
+    );
+
+    if (!is_modern_swapchain) {
+        return DS_PRESENTER_LEGACY_VIRTUAL;
+    }
+
+    /*
+     * Keep Tier 2 active both when forcing/holding borderless fullscreen AND when
+     * `user_forced_windowed` explicitly requested windowed mode so Tier 2's windowed-exit
+     * path executes cleanly instead of demoting to passive Tier 1.
+     */
+    bool want_borderless = (
+        in->user_forced_windowed ||
+        in->scaling_mode == DS_MODE_FORCE_FULLSCREEN ||
+        in->user_forced_fullscreen ||
+        (is_vulkan_legacy && in->fullscreen_active)
+    );
+    return want_borderless
+        ? DS_PRESENTER_MODERN_BORDERLESS
+        : DS_PRESENTER_MODERN_PASSTHROUGH;
+}

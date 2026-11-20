@@ -86,12 +86,8 @@
 
 #define DS_APPLY_RESTORE_PASSTHROUGH       2u
 #define DS_DPI_CTX_PMV2                    ((HANDLE)(intptr_t)-4)
-
-typedef enum ds_presenter_tier_e {
-    DS_PRESENTER_LEGACY_VIRTUAL     = 0,
-    DS_PRESENTER_MODERN_PASSTHROUGH = 1,
-    DS_PRESENTER_MODERN_BORDERLESS  = 2
-} ds_presenter_tier_t;
+/* Three-Tier Presenter enum (`DS_PRESENTER_LEGACY_VIRTUAL`, `DS_PRESENTER_MODERN_PASSTHROUGH`,
+ * `DS_PRESENTER_MODERN_BORDERLESS`) is declared in `display_scaler.h` for shared C11 ASan testing. */
 
 typedef HANDLE (WINAPI *pfn_SetThreadDpiAwarenessContext_t)(HANDLE);
 typedef HANDLE (WINAPI *pfn_GetWindowDpiAwarenessContext_t)(HWND);
@@ -235,6 +231,8 @@ typedef struct ds_runtime_s {
     WCHAR               target_device[32];
     int32_t             win_mon_x;
     int32_t             win_mon_y;
+    int32_t             phys_mon_x;
+    int32_t             phys_mon_y;
     int32_t             real_screen_w;
     int32_t             real_screen_h;
     int32_t             phys_screen_w;
@@ -422,53 +420,25 @@ extern ds_runtime_t g_ds;
 #define DS_ALWAYS_INLINE static inline
 #endif
 
-DS_ALWAYS_INLINE bool ds_prefer_16bpp_ddraw(void)
-{
-    return g_ds.ddraw_loaded && !g_ds.d3d8_or_9_loaded;
-}
-
-DS_ALWAYS_INLINE bool ds_is_vulkan_d3d9_locked(void)
-{
-#if defined(_WIN64)
-    return false;
-#else
-    return (
-        !g_ds.dxgi_or_d3d10_plus_loaded &&
-        g_ds.d3d9_loaded &&
-        g_ds.wined3d_uses_vulkan &&
-        !g_ds.wined3d_uses_gl
-    );
-#endif
-}
-
-DS_ALWAYS_INLINE bool ds_is_modern_tier_locked(void)
-{
-    return (g_ds.scaling_mode == DS_MODE_PASSTHROUGH ||
-            g_ds.presenter_tier != DS_PRESENTER_LEGACY_VIRTUAL);
-}
-
-DS_ALWAYS_INLINE bool ds_is_modern_borderless_locked(void)
-{
-    return (g_ds.scaling_mode != DS_MODE_PASSTHROUGH &&
-            g_ds.presenter_tier == DS_PRESENTER_MODERN_BORDERLESS);
-}
-
-DS_ALWAYS_INLINE bool ds_is_passthrough_locked(void)
-{
-    if (g_ds.scaling_mode == DS_MODE_PASSTHROUGH) {
-        return true;
-    }
-    return (g_ds.presenter_tier == DS_PRESENTER_MODERN_PASSTHROUGH);
-}
+/* Shared presenter-tier & backend queries (`display_scaler_dll.c`) */
+bool ds_prefer_16bpp_ddraw(void);
+bool ds_is_vulkan_d3d9_locked(void);
+bool ds_is_modern_tier_locked(void);
+bool ds_is_modern_borderless_locked(void);
+bool ds_is_passthrough_locked(void);
 
 /* Internal recursion guard & caller module classifier (`display_scaler_dll.c`) */
+void ds_lock(void);
+void ds_unlock(void);
 bool ds_is_internal_call(void);
 void ds_enter_internal(void);
 void ds_leave_internal(void);
 uintptr_t ds_suspend_internal_depth(void);
 void ds_restore_internal_depth(uintptr_t saved_depth);
 HANDLE ds_dpi_guard_enter(HANDLE target_ctx);
+HANDLE ds_dpi_guard_enter_for_hwnd(HWND hwnd);
 void ds_dpi_guard_leave(HANDLE prev_ctx);
+BOOL ds_set_window_pos_dpi(HWND hwnd, HWND after, int x, int y, int w, int h, UINT flags, bool clear_present);
 bool ds_is_system_renderer_caller(const void *ret_addr);
 bool ds_is_wined3d_caller(const void *ret_addr);
 bool ds_should_virtualize_rect_for_caller(const void *ret_addr);

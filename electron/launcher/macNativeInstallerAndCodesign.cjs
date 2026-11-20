@@ -300,7 +300,8 @@ function readMacBundleIdFromInfoPlist(appBundlePath) {
     const idMatch = plistRaw.match(
       /<key>\s*CFBundleIdentifier\s*<\/key>\s*<string>\s*([^<\s]+)\s*<\/string>/i
     );
-    return idMatch && idMatch[1] ? idMatch[1].trim() : '';
+    const candidate = idMatch && idMatch[1] ? idMatch[1].trim() : '';
+    return /^[A-Za-z0-9._-]+$/.test(candidate) ? candidate : '';
   } catch {
     return '';
   }
@@ -308,23 +309,36 @@ function readMacBundleIdFromInfoPlist(appBundlePath) {
 
 /**
  * Check whether a file starts with a Mach-O or Fat/Universal Mach-O magic header.
+ * Validates `nfat_arch` (`1..32`) for `0xCAFEBABE` so Java `.class` files are rejected.
  * @param {string} filePath
  */
 function isMachOBinaryFile(filePath) {
   let fd = null;
   try {
     fd = fs.openSync(filePath, 'r');
-    const hdr = Buffer.alloc(4);
-    if (fs.readSync(fd, hdr, 0, 4, 0) < 4) return false;
+    const hdr = Buffer.alloc(8);
+    const nRead = fs.readSync(fd, hdr, 0, 8, 0);
+    if (nRead < 4) return false;
     const magic = hdr.readUInt32BE(0);
-    return (
+    if (
       magic === 0xfeedface ||
       magic === 0xcefaedfe ||
       magic === 0xfeedfacf ||
-      magic === 0xcffaedfe ||
-      magic === 0xcafebabe ||
-      magic === 0xbebafeca
-    );
+      magic === 0xcffaedfe
+    ) {
+      return true;
+    }
+    if (nRead >= 8) {
+      if (magic === 0xcafebabe || magic === 0xcafebabf) {
+        const nfat = hdr.readUInt32BE(4);
+        return nfat >= 1 && nfat <= 32;
+      }
+      if (magic === 0xbebafeca || magic === 0xbfbafeca) {
+        const nfat = hdr.readUInt32LE(4);
+        return nfat >= 1 && nfat <= 32;
+      }
+    }
+    return false;
   } catch {
     return false;
   } finally {
@@ -350,7 +364,7 @@ function collectNestedMacSignableItems(appBundlePath) {
   const items = [];
   const seen = new Set();
 
-  const walk = (/** @type {string} */ dir, /** @type {number} */ depth, /** @type {boolean} */ inMacOsDir) => {
+  const walk = (/** @type {string} */ dir, /** @type {number} */ depth, /** @type {boolean} */ inExecDir) => {
     if (depth > 8) return;
     /** @type {fs.Dirent[]} */
     let entries = [];
@@ -364,14 +378,14 @@ function collectNestedMacSignableItems(appBundlePath) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         const isNestedBundle = /\.(?:framework|xpc|app|bundle|appex)$/i.test(entry.name);
-        walk(fullPath, depth + 1, inMacOsDir || entry.name === 'MacOS');
+        walk(fullPath, depth + 1, inExecDir || entry.name === 'MacOS' || entry.name === 'Helpers');
         if (isNestedBundle && !seen.has(fullPath)) {
           seen.add(fullPath);
           items.push({ targetPath: fullPath, depth });
         }
       } else if (entry.isFile()) {
         const isCodeExt = /\.(?:dylib|so)$/i.test(entry.name);
-        if ((isCodeExt || (inMacOsDir && isMachOBinaryFile(fullPath))) && !seen.has(fullPath)) {
+        if ((isCodeExt || (inExecDir && isMachOBinaryFile(fullPath))) && !seen.has(fullPath)) {
           seen.add(fullPath);
           items.push({ targetPath: fullPath, depth });
         }
@@ -382,7 +396,7 @@ function collectNestedMacSignableItems(appBundlePath) {
   for (const sub of subdirs) {
     const subPath = path.join(contentsDir, sub);
     if (fs.existsSync(subPath)) {
-      walk(subPath, 1, sub === 'MacOS');
+      walk(subPath, 1, sub === 'MacOS' || sub === 'Helpers');
     }
   }
 
@@ -9996,6 +10010,7 @@ function applyCrossOverPerGameSettings(
     'native_driver',
     'windowed',
     'virtual_desktop',
+    'off',
   ]);
   const effectiveScalingMode =
     typeof effectiveOptions.displayScalingMode === 'string' &&
@@ -10059,7 +10074,6 @@ function applyCrossOverPerGameSettings(
       const targetExes = Array.from(targetExeSet);
 
       // Inspect pre-existing user.reg state once for non-destructive RetinaMode, AppCompatFlags\Layers & baseline hygiene
-      let priorMacDriverManaged = false;
       /** @type {string | null} */
       let priorRetinaModeVal = null;
       /** @type {string | null} */
@@ -10125,7 +10139,6 @@ function applyCrossOverPerGameSettings(
             const afterSec = existingUserReg.slice(secStart);
             const nextSec = /^\[[^\]]+\]/m.exec(afterSec);
             const secBody = nextSec ? afterSec.slice(0, nextSec.index) : afterSec;
-            priorMacDriverManaged = /^"OneLauncherManagedRetina"\s*=\s*"1"/im.test(secBody);
             const rmMatch = /^"RetinaMode"\s*=\s*"([^"]*)"/im.exec(secBody);
             if (rmMatch) priorRetinaModeVal = rmMatch[1];
             const spMatch = /^"OneLauncherPriorRetina"\s*=\s*"([^"]*)"/im.exec(secBody);
@@ -10261,7 +10274,7 @@ function applyCrossOverPerGameSettings(
           ? path.win32.basename(primaryExeInput.trim()).toLowerCase()
           : '';
       const isUnwrappedLegacyWindowed = Boolean(
-        effectiveScalingMode === 'windowed' &&
+        (effectiveScalingMode === 'windowed' || effectiveScalingMode === 'off') &&
           hasPeCaps &&
           (peCaps.is32Bit ||
             peCaps.usesLegacyDdraw ||
@@ -10966,12 +10979,12 @@ function getHostMaxDisplayResolution(highResolutionMode = true, /** @type {any} 
           (pw > 0 && rw > 0 && pw >= rw * 1.5);
         const logicalW = rw > 0 ? rw : isRetina && pw > 0 ? Math.round(pw / 2) : pw;
         const logicalH = rh > 0 ? rh : isRetina && ph > 0 ? Math.round(ph / 2) : ph;
-        // Under non-integer HiDPI presets like "More Space" (e.g. 1800x1169 UI on 3024x1964 panel),
-        // CoreGraphics / winemac.drv presents a 2x virtual backing surface (rw * 2 x rh * 2).
-        const backingW =
-          isRetina && rw > 0 && rw * 2 > pw ? rw * 2 : pw || (isRetina && rw ? rw * 2 : rw);
-        const backingH =
-          isRetina && rh > 0 && rh * 2 > ph ? rh * 2 : ph || (isRetina && rh ? rh * 2 : rh);
+        // Under macOS HiDPI scaling presets ("Default", "More Space", "Larger Text", or 5K scaled),
+        // CoreGraphics / winemac.drv presents a 2x virtual backing surface (rw * 2 x rh * 2)
+        // whenever logical UI dimensions differ from 1x native panel pixels.
+        const useRetina2xBacking = Boolean(isRetina && rw > 0 && rh > 0 && !(rw === pw && rh === ph));
+        const backingW = useRetina2xBacking ? rw * 2 : pw || rw;
+        const backingH = useRetina2xBacking ? rh * 2 : ph || rh;
         const panelW = pw || backingW;
         const panelH = ph || backingH;
         if (backingW > 0 && backingH > 0) {

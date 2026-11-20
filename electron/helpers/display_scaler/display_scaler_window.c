@@ -62,6 +62,8 @@ LONG_PTR ds_set_wnd_long_ptr_raw(HWND hwnd, int idx, LONG_PTR val, bool unicode)
 static BOOL CALLBACK ds_enum_adopt_window_cb(HWND hwnd, LPARAM lParam);
 
 #define DS_GL_HOST_CHILD_CLASS_W L"OneLauncherGLHostChild"
+#define DS_PROP_ORIG_PROC_W      L"OneLauncher_OrigWndProc"
+#define DS_PROP_ORIG_UNI_W       L"OneLauncher_OrigWndUni"
 
 static LRESULT CALLBACK ds_gl_host_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -101,11 +103,11 @@ static LRESULT CALLBACK ds_gl_host_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
 
 static void ds_get_gl_host_target_size(HWND hwnd_parent, int32_t *out_w, int32_t *out_h)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool fs_active = (hwnd_parent == g_ds.hwnd_game && g_ds.fullscreen_active);
     int32_t rw = g_ds.real_screen_w;
     int32_t rh = g_ds.real_screen_h;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (fs_active && rw > 0 && rh > 0) {
         *out_w = rw;
@@ -132,14 +134,14 @@ void ds_sync_gl_host_bounds_on_owner_thread(HWND hwnd_parent)
         return;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     HWND host = g_ds.hwnd_gl_host;
     bool vis = g_ds.gl_host_visible;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!host || !IsWindow(host) || GetParent(host) != hwnd_parent) {
         return;
@@ -164,14 +166,14 @@ void ds_refresh_gl_host_drawable_on_owner_thread(HWND hwnd_parent)
         return;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     HWND host = g_ds.hwnd_gl_host;
     bool vis = (g_ds.gl_host_visible || g_ds.gl_host_want_visible);
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     InterlockedExchange(&g_ds.gl_drawable_rebind_pending, 1);
 
     if (!host || !IsWindow(host) || GetParent(host) != hwnd_parent || !vis) {
@@ -196,10 +198,10 @@ void ds_refresh_gl_host_drawable_on_owner_thread(HWND hwnd_parent)
 
 void ds_demote_fullscreen_on_deactivate(HWND target_hwnd)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     g_ds.app_inactive = true;
     ds_cursor_warp_reset(&g_ds.warp);
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     ds_enter_internal();
     if (GetCurrentThreadId() == g_ds.game_thread_id) {
@@ -220,13 +222,13 @@ void ds_ensure_gl_host_child_on_owner_thread(HWND hwnd_parent)
         return;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     HWND cur_host = g_ds.hwnd_gl_host;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (cur_host != NULL && IsWindow(cur_host) && GetParent(cur_host) == hwnd_parent) {
         ds_sync_gl_host_bounds_on_owner_thread(hwnd_parent);
@@ -298,10 +300,10 @@ void ds_ensure_gl_host_child_on_owner_thread(HWND hwnd_parent)
               NULL);
     ds_leave_internal();
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     g_ds.hwnd_gl_host = host;
     g_ds.gl_host_visible = false;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 }
 
 static void ds_apply_gl_host_ctl_on_owner_thread(HWND hwnd_game, WPARAM mode, LPARAM expected_host)
@@ -311,11 +313,11 @@ static void ds_apply_gl_host_ctl_on_owner_thread(HWND hwnd_game, WPARAM mode, LP
     }
 
     if (mode == 1) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool want_vis = g_ds.gl_host_want_visible;
         HWND cur_host = g_ds.hwnd_gl_host;
         g_ds.gl_host_hide_queued = false;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (!want_vis) {
             return;
@@ -325,10 +327,10 @@ static void ds_apply_gl_host_ctl_on_owner_thread(HWND hwnd_game, WPARAM mode, LP
         }
 
         ds_ensure_gl_host_child_on_owner_thread(hwnd_game);
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         HWND host = g_ds.hwnd_gl_host;
         g_ds.gl_host_visible = (host != NULL && IsWindow(host));
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (host && IsWindow(host)) {
             int32_t cw = 0, ch = 0;
@@ -344,18 +346,18 @@ static void ds_apply_gl_host_ctl_on_owner_thread(HWND hwnd_game, WPARAM mode, LP
         return;
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND old_host = g_ds.hwnd_gl_host;
     bool was_visible = g_ds.gl_host_visible;
     g_ds.gl_host_visible = false;
     g_ds.gl_host_want_visible = false;
     g_ds.gl_host_hide_queued = false;
     if (!was_visible && old_host != NULL && IsWindow(old_host) && GetParent(old_host) == hwnd_game) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     g_ds.hwnd_gl_host = NULL;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (old_host) {
         ds_gl_release_all_host_dcs_for_hwnd(old_host);
@@ -381,7 +383,7 @@ static void ds_apply_gl_host_ctl_on_owner_thread(HWND hwnd_game, WPARAM mode, LP
 void ds_set_gl_host_visible(bool visible)
 {
     bool should_post = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd = g_ds.hwnd_game;
     HWND host = g_ds.hwnd_gl_host;
     DWORD owner_tid = g_ds.game_thread_id;
@@ -396,7 +398,7 @@ void ds_set_gl_host_visible(bool visible)
         g_ds.gl_host_hide_queued = true;
         should_post = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!hwnd || !IsWindow(hwnd)) return;
     if (visible && cur_vis && prev_want) return;
@@ -412,7 +414,7 @@ void ds_set_gl_host_visible(bool visible)
 void ds_reset_gl_host_for_gdi(void)
 {
     bool should_post = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd = g_ds.hwnd_game;
     DWORD owner_tid = g_ds.game_thread_id;
     UINT msg = g_ds.msg_gl_host_ctl;
@@ -422,7 +424,7 @@ void ds_reset_gl_host_for_gdi(void)
         g_ds.gl_host_hide_queued = true;
         should_post = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!hwnd || !IsWindow(hwnd) || !need_hide) return;
     if (GetCurrentThreadId() == owner_tid) {
@@ -564,9 +566,9 @@ void ds_reapply_cursor_clip_locked(void)
 
 void ds_write_status_file(void)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (g_ds.status_file[0] == L'\0') {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     WCHAR path_buf[MAX_PATH];
@@ -582,7 +584,7 @@ void ds_write_status_file(void)
     int32_t win_scale = ds_get_windowed_scale_locked();
     int32_t dw = fs_active ? g_ds.vp.dst_w : (vw * win_scale);
     int32_t dh = fs_active ? g_ds.vp.dst_h : (vh * win_scale);
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     char json[448];
     int len = snprintf(
@@ -667,10 +669,33 @@ static void ds_compute_fs_styles(LONG_PTR saved_style, LONG_PTR saved_exstyle, b
     *out_ex = ex;
 }
 
+static void ds_unsubclass_hwnd(HWND hwnd, WNDPROC orig, bool is_unicode)
+{
+    if (orig && (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC) == ds_game_subclass_wndproc) {
+        ds_enter_internal();
+        ds_set_wnd_long_ptr_raw(hwnd, GWLP_WNDPROC, (LONG_PTR)orig, is_unicode);
+        ds_leave_internal();
+    }
+    RemovePropW(hwnd, DS_PROP_ORIG_PROC_W);
+    RemovePropW(hwnd, DS_PROP_ORIG_UNI_W);
+}
+
 LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    WNDPROC orig = g_ds.orig_wndproc;
-    bool is_unicode = g_ds.orig_wndproc_unicode;
+    WNDPROC prop_orig = (WNDPROC)(uintptr_t)GetPropW(hwnd, DS_PROP_ORIG_PROC_W);
+    uintptr_t prop_uni = (uintptr_t)GetPropW(hwnd, DS_PROP_ORIG_UNI_W);
+
+    ds_lock();
+    bool is_cur_game = (hwnd == g_ds.hwnd_game);
+    WNDPROC orig = prop_orig ? prop_orig : (is_cur_game ? g_ds.orig_wndproc : NULL);
+    bool is_unicode = (prop_uni != 0) ? (prop_uni == 2u) : (is_cur_game ? g_ds.orig_wndproc_unicode : (IsWindowUnicode(hwnd) != FALSE));
+    ds_unlock();
+
+    /* If g_ds.hwnd_game moved to a newer window, unsubclass this stale HWND cleanly */
+    if (!is_cur_game && msg != WM_NCDESTROY) {
+        ds_unsubclass_hwnd(hwnd, orig, is_unicode);
+        return ds_forward_to_orig_wndproc(orig, is_unicode, hwnd, msg, wParam, lParam);
+    }
 
     if (g_ds.msg_apply_presentation != 0 && msg == g_ds.msg_apply_presentation) {
         if (wParam == (WPARAM)DS_APPLY_RESTORE_PASSTHROUGH) {
@@ -689,9 +714,28 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
         bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool alt_down  = (GetKeyState(VK_MENU) & 0x8000) != 0;
         if (ctrl_down && alt_down && (wParam == 'F' || wParam == 'A')) {
-            EnterCriticalSection(&g_ds.lock);
+            RECT cur_rc = { 0, 0, 0, 0 };
+            BOOL has_cur_rc = FALSE;
+            if (wParam == 'F' && g_ds.real_GetWindowRect) {
+                HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
+                ds_enter_internal();
+                has_cur_rc = g_ds.real_GetWindowRect(hwnd, &cur_rc);
+                ds_leave_internal();
+                ds_dpi_guard_leave(prev_dpi);
+            }
+            ds_lock();
             if (wParam == 'F') {
-                bool cur_fs = ds_is_modern_tier_locked() ? g_ds.borderless_active : g_ds.fullscreen_active;
+                bool cur_fs = g_ds.fullscreen_active;
+                if (ds_is_modern_tier_locked()) {
+                    bool native_full = (
+                        g_ds.presenter_tier == DS_PRESENTER_MODERN_PASSTHROUGH &&
+                        has_cur_rc &&
+                        g_ds.real_screen_w > 0 && g_ds.real_screen_h > 0 &&
+                        (cur_rc.right - cur_rc.left) >= g_ds.real_screen_w &&
+                        (cur_rc.bottom - cur_rc.top) >= g_ds.real_screen_h
+                    );
+                    cur_fs = g_ds.borderless_active || native_full;
+                }
                 bool next_fs = !cur_fs;
                 g_ds.fullscreen_active = next_fs;
                 g_ds.user_forced_windowed = !next_fs;
@@ -709,7 +753,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
             }
             ds_refresh_viewport_locked();
             ds_cursor_warp_reset(&g_ds.warp);
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
 
             ds_apply_window_presentation_on_owner_thread(hwnd);
             ds_write_status_file();
@@ -718,12 +762,11 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
     }
 
     if (msg == WM_NCDESTROY) {
+        ds_unsubclass_hwnd(hwnd, orig, is_unicode);
+
         HWND dead_host = NULL;
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (hwnd == g_ds.hwnd_game) {
-            if ((WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC) == ds_game_subclass_wndproc) {
-                ds_set_wnd_long_ptr_raw(hwnd, GWLP_WNDPROC, (LONG_PTR)orig, is_unicode);
-            }
             dead_host = g_ds.hwnd_gl_host;
             g_ds.hwnd_game = NULL;
             g_ds.hwnd_gl_host = NULL;
@@ -744,7 +787,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
             g_ds.has_saved_hmenu = false;
             g_ds.saved_hmenu = NULL;
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         if (dead_host) {
             ds_gl_release_all_host_dcs_for_hwnd(dead_host);
         }
@@ -752,7 +795,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
         return ds_forward_to_orig_wndproc(orig, is_unicode, hwnd, msg, wParam, lParam);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     ds_presenter_tier_t tier = (g_ds.scaling_mode == DS_MODE_PASSTHROUGH)
         ? DS_PRESENTER_MODERN_PASSTHROUGH
         : g_ds.presenter_tier;
@@ -770,7 +813,7 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
     int32_t mon_h = g_ds.real_screen_h;
     ds_viewport_t vp = g_ds.vp;
     bool has_menu_win = (g_ds.has_saved_hmenu && g_ds.saved_hmenu != NULL);
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     /* Tier 1 (Modern Full Passthrough): zero-overhead transparent forwarding */
     if (tier == DS_PRESENTER_MODERN_PASSTHROUGH) {
@@ -786,22 +829,20 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
             }
         } else if (msg == WM_ACTIVATEAPP && borderless_active) {
             if (wParam == FALSE) {
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 g_ds.app_inactive = true;
-                LeaveCriticalSection(&g_ds.lock);
+                ds_unlock();
                 ds_drop_hwnd_topmost_and_unclip(hwnd);
             } else {
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 g_ds.app_inactive = false;
                 int32_t bx = g_ds.win_mon_x;
                 int32_t by = g_ds.win_mon_y;
                 int32_t bw = g_ds.real_screen_w;
                 int32_t bh = g_ds.real_screen_h;
-                LeaveCriticalSection(&g_ds.lock);
-                if (g_ds.real_SetWindowPos && bw > 0 && bh > 0) {
-                    ds_enter_internal();
-                    g_ds.real_SetWindowPos(hwnd, HWND_TOPMOST, bx, by, bw, bh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-                    ds_leave_internal();
+                ds_unlock();
+                if (bw > 0 && bh > 0) {
+                    ds_set_window_pos_dpi(hwnd, HWND_TOPMOST, bx, by, bw, bh, SWP_SHOWWINDOW | SWP_NOACTIVATE, false);
                 }
             }
         }
@@ -982,10 +1023,10 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 }
                 break;
             case WM_WINDOWPOSCHANGING: {
-                EnterCriticalSection(&g_ds.lock);
+                ds_lock();
                 bool staging_birth = !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0 &&
                                      (GetTickCount() - g_ds.first_visible_tick) < 250;
-                LeaveCriticalSection(&g_ds.lock);
+                ds_unlock();
                 if (!ds_is_internal_call() && !staging_birth && lParam != 0) {
                     WINDOWPOS *wp = (WINDOWPOS *)lParam;
                     if ((wp->flags & SWP_NOMOVE) == 0) {
@@ -1020,9 +1061,9 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 if (wParam == FALSE) {
                     ds_drop_hwnd_topmost_and_unclip(hwnd);
                 } else {
-                    EnterCriticalSection(&g_ds.lock);
+                    ds_lock();
                     bool active_now = !g_ds.app_inactive;
-                    LeaveCriticalSection(&g_ds.lock);
+                    ds_unlock();
                     if (active_now) {
                         ds_request_apply_presentation();
                     }
@@ -1030,17 +1071,17 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 break;
             case WM_ACTIVATEAPP:
                 if (wParam == FALSE) {
-                    EnterCriticalSection(&g_ds.lock);
+                    ds_lock();
                     g_ds.app_inactive = true;
                     ds_cursor_warp_reset(&g_ds.warp);
-                    LeaveCriticalSection(&g_ds.lock);
+                    ds_unlock();
                     ds_ensure_fullscreen_styles_on_owner_thread(hwnd);
                     ds_drop_hwnd_topmost_and_unclip(hwnd);
                     if (g_ds.real_ClipCursor) {
                         g_ds.real_ClipCursor(NULL);
                     }
                 } else {
-                    EnterCriticalSection(&g_ds.lock);
+                    ds_lock();
                     g_ds.app_inactive = false;
                     ds_cursor_warp_reset(&g_ds.warp);
                     bool staging_birth = !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0 &&
@@ -1049,10 +1090,11 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     int32_t ay = g_ds.win_mon_y;
                     int32_t aw = g_ds.real_screen_w;
                     int32_t ah = g_ds.real_screen_h;
-                    LeaveCriticalSection(&g_ds.lock);
+                    ds_unlock();
                     if (!staging_birth) {
                         ds_ensure_fullscreen_styles_on_owner_thread(hwnd);
                         if (g_ds.real_SetWindowPos) {
+                            HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
                             ds_enter_internal();
                             ds_clear_wine_present_rect_on_hwnd(hwnd);
                             g_ds.real_SetWindowPos(
@@ -1070,12 +1112,13 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
                             SetFocus(hwnd);
                             InvalidateRect(hwnd, NULL, FALSE);
                             ds_leave_internal();
+                            ds_dpi_guard_leave(prev_dpi);
                         }
                         ds_refresh_gl_host_drawable_on_owner_thread(hwnd);
                     }
-                    EnterCriticalSection(&g_ds.lock);
+                    ds_lock();
                     ds_reapply_cursor_clip_locked();
-                    LeaveCriticalSection(&g_ds.lock);
+                    ds_unlock();
                 }
                 break;
             default:
@@ -1089,57 +1132,112 @@ LRESULT CALLBACK ds_game_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LP
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
-static void ds_capture_window_baseline_and_subclass_locked(HWND hwnd)
+static void ds_capture_window_baseline_and_subclass(HWND hwnd)
 {
-    if (!g_ds.has_saved_window_state) {
-        g_ds.saved_style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
-        g_ds.saved_exstyle = ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
+    if (!hwnd || !IsWindow(hwnd)) return;
+
+    ds_lock();
+    if (g_ds.hwnd_game != hwnd) {
+        ds_unlock();
+        return;
+    }
+    bool need_state = !g_ds.has_saved_window_state;
+    bool need_menu = !g_ds.has_saved_hmenu;
+    bool need_bg = !g_ds.has_saved_class_bg;
+    bool need_subclass = (g_ds.orig_wndproc == NULL);
+    ds_unlock();
+
+    if (!need_state && !need_menu && !need_bg && !need_subclass) {
+        return;
+    }
+
+    LONG_PTR s_style = 0, s_ex = 0, s_bg = 0;
+    RECT s_wrc = { 0, 0, 0, 0 };
+    int32_t s_cw = 0, s_ch = 0;
+    HMENU s_menu = NULL;
+    WNDPROC s_orig = NULL;
+    bool s_uni = false;
+
+    if (need_state) {
+        HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
         ds_enter_internal();
+        s_style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
+        s_ex = ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
         if (g_ds.real_GetWindowRect) {
-            g_ds.real_GetWindowRect(hwnd, &g_ds.saved_window_rect);
+            g_ds.real_GetWindowRect(hwnd, &s_wrc);
         }
         RECT crc = { 0, 0, 0, 0 };
         if (g_ds.real_GetClientRect && g_ds.real_GetClientRect(hwnd, &crc)) {
-            g_ds.saved_client_w = crc.right - crc.left;
-            g_ds.saved_client_h = crc.bottom - crc.top;
+            s_cw = crc.right - crc.left;
+            s_ch = crc.bottom - crc.top;
         }
         ds_leave_internal();
-        g_ds.has_saved_window_state = true;
+        ds_dpi_guard_leave(prev_dpi);
     }
-    if (!g_ds.has_saved_hmenu) {
-        g_ds.saved_hmenu = GetMenu(hwnd);
-        g_ds.has_saved_hmenu = true;
+    if (need_menu) {
+        s_menu = GetMenu(hwnd);
     }
-    if (!g_ds.has_saved_class_bg) {
-        g_ds.saved_class_bg = ds_get_class_bg_brush(hwnd);
-        g_ds.has_saved_class_bg = true;
+    if (need_bg) {
+        s_bg = ds_get_class_bg_brush(hwnd);
     }
-    if (g_ds.orig_wndproc == NULL) {
-        g_ds.orig_wndproc_unicode = (IsWindowUnicode(hwnd) != FALSE);
+    if (need_subclass) {
+        s_uni = (IsWindowUnicode(hwnd) != FALSE);
         WNDPROC cur_proc = (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC);
-        if (cur_proc != ds_game_subclass_wndproc) {
+        if (cur_proc == ds_game_subclass_wndproc) {
+            s_orig = (WNDPROC)(uintptr_t)GetPropW(hwnd, DS_PROP_ORIG_PROC_W);
+        } else {
             ds_enter_internal();
-            g_ds.orig_wndproc = (WNDPROC)ds_set_wnd_long_ptr_raw(
+            s_orig = (WNDPROC)ds_set_wnd_long_ptr_raw(
                 hwnd,
                 GWLP_WNDPROC,
                 (LONG_PTR)ds_game_subclass_wndproc,
-                g_ds.orig_wndproc_unicode
+                s_uni
             );
             ds_leave_internal();
+            if (s_orig) {
+                SetPropW(hwnd, DS_PROP_ORIG_PROC_W, (HANDLE)(uintptr_t)s_orig);
+                SetPropW(hwnd, DS_PROP_ORIG_UNI_W, (HANDLE)(uintptr_t)(s_uni ? 2u : 1u));
+            }
         }
     }
+
+    ds_lock();
+    if (g_ds.hwnd_game == hwnd) {
+        if (need_state && !g_ds.has_saved_window_state) {
+            g_ds.saved_style = s_style;
+            g_ds.saved_exstyle = s_ex;
+            g_ds.saved_window_rect = s_wrc;
+            g_ds.saved_client_w = s_cw;
+            g_ds.saved_client_h = s_ch;
+            g_ds.has_saved_window_state = true;
+        }
+        if (need_menu && !g_ds.has_saved_hmenu) {
+            g_ds.saved_hmenu = s_menu;
+            g_ds.has_saved_hmenu = true;
+        }
+        if (need_bg && !g_ds.has_saved_class_bg) {
+            g_ds.saved_class_bg = s_bg;
+            g_ds.has_saved_class_bg = true;
+        }
+        if (need_subclass && g_ds.orig_wndproc == NULL && s_orig != NULL) {
+            g_ds.orig_wndproc = s_orig;
+            g_ds.orig_wndproc_unicode = s_uni;
+        }
+    }
+    ds_unlock();
 }
 
 void ds_ensure_fullscreen_styles_on_owner_thread(HWND hwnd)
 {
     if (!hwnd || !IsWindow(hwnd)) return;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_capture_window_baseline_and_subclass(hwnd);
+
+    ds_lock();
     if (g_ds.hwnd_game != hwnd || !g_ds.fullscreen_active || ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
-    ds_capture_window_baseline_and_subclass_locked(hwnd);
     LONG_PTR saved_style = g_ds.saved_style;
     LONG_PTR saved_exstyle = g_ds.saved_exstyle;
     bool app_inactive = g_ds.app_inactive;
@@ -1147,7 +1245,7 @@ void ds_ensure_fullscreen_styles_on_owner_thread(HWND hwnd)
         ? g_ds.orig_wndproc_unicode
         : (IsWindowUnicode(hwnd) != FALSE);
     g_ds.window_mutated_by_scaler = true;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     LONG_PTR fs_style = 0, fs_ex = 0;
     ds_compute_fs_styles(saved_style, saved_exstyle, app_inactive, &fs_style, &fs_ex);
@@ -1171,13 +1269,13 @@ void ds_ensure_fullscreen_styles_on_owner_thread(HWND hwnd)
 static void ds_destroy_gl_host_on_owner_thread(void)
 {
     HWND host = NULL;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     host = g_ds.hwnd_gl_host;
     g_ds.hwnd_gl_host = NULL;
     g_ds.gl_host_visible = false;
     g_ds.gl_host_want_visible = false;
     g_ds.gl_host_hide_queued = false;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (host != NULL) {
         ds_gl_release_all_host_dcs_for_hwnd(host);
@@ -1196,9 +1294,9 @@ void ds_restore_window_on_passthrough(HWND hwnd)
     ds_destroy_gl_host_on_owner_thread();
     ds_gl_shutdown();
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (g_ds.hwnd_game != hwnd) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     bool mutated = g_ds.window_mutated_by_scaler;
@@ -1222,7 +1320,7 @@ void ds_restore_window_on_passthrough(HWND hwnd)
     g_ds.mode_virtualized = false;
     g_ds.cocoa_fs_synced = false;
     g_ds.passthrough_restored = true;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     ds_enter_internal();
     ds_clear_wine_present_rect_on_hwnd(hwnd);
@@ -1236,36 +1334,24 @@ void ds_restore_window_on_passthrough(HWND hwnd)
             SetMenu(hwnd, saved_menu);
         }
         if (g_ds.real_SetWindowPos) {
-            RECT cur_rc = { 0, 0, 0, 0 };
-            BOOL has_cur = g_ds.real_GetWindowRect ? g_ds.real_GetWindowRect(hwnd, &cur_rc) : FALSE;
-            bool cur_is_full = has_cur && mon_w > 0 && mon_h > 0 &&
-                               (cur_rc.right - cur_rc.left) >= mon_w &&
-                               (cur_rc.bottom - cur_rc.top) >= mon_h;
             int sw = saved_rc.right - saved_rc.left;
             int sh = saved_rc.bottom - saved_rc.top;
-            if (!cur_is_full && sw > 0 && sh > 0) {
-                UINT restore_flags = SWP_NOACTIVATE | SWP_FRAMECHANGED;
-                g_ds.real_SetWindowPos(
-                    hwnd,
-                    HWND_NOTOPMOST,
-                    saved_rc.left,
-                    saved_rc.top,
-                    sw,
-                    sh,
-                    restore_flags
-                );
-            } else {
-                UINT restore_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED;
-                g_ds.real_SetWindowPos(
-                    hwnd,
-                    HWND_NOTOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    restore_flags
-                );
-            }
+            bool saved_is_windowed = (
+                sw > 0 && sh > 0 &&
+                (mon_w <= 0 || mon_h <= 0 || sw < mon_w || sh < mon_h)
+            );
+            ds_set_window_pos_dpi(
+                hwnd,
+                HWND_NOTOPMOST,
+                saved_is_windowed ? saved_rc.left : 0,
+                saved_is_windowed ? saved_rc.top : 0,
+                saved_is_windowed ? sw : 0,
+                saved_is_windowed ? sh : 0,
+                saved_is_windowed
+                    ? (SWP_NOACTIVATE | SWP_FRAMECHANGED)
+                    : (SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED),
+                false
+            );
         }
     }
     if (g_ds.real_ClipCursor) {
@@ -1283,11 +1369,11 @@ void ds_restore_window_on_passthrough(HWND hwnd)
 
 void ds_request_restore_passthrough(void)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd = g_ds.hwnd_game;
     DWORD owner_tid = g_ds.game_thread_id;
     UINT msg = g_ds.msg_apply_presentation;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!hwnd || !IsWindow(hwnd)) return;
     if (GetCurrentThreadId() == owner_tid) {
@@ -1307,13 +1393,13 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
         ds_refresh_host_display_metrics_for_hwnd(hwnd);
     }
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_capture_window_baseline_and_subclass(hwnd);
+
+    ds_lock();
     if (g_ds.hwnd_game != hwnd) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
-
-    ds_capture_window_baseline_and_subclass_locked(hwnd);
 
     ds_presenter_tier_t tier = (g_ds.scaling_mode == DS_MODE_PASSTHROUGH)
         ? DS_PRESENTER_MODERN_PASSTHROUGH
@@ -1347,7 +1433,7 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
     RECT saved_rc = g_ds.saved_window_rect;
     HMENU saved_menu = g_ds.has_saved_hmenu ? g_ds.saved_hmenu : NULL;
     bool is_unicode = g_ds.orig_wndproc_unicode;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     /* Tier 1 (Modern Full Passthrough): ensure clean restoration and never mutate window */
     if (tier == DS_PRESENTER_MODERN_PASSTHROUGH) {
@@ -1361,67 +1447,62 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
     if (tier == DS_PRESENTER_MODERN_BORDERLESS) {
         ds_destroy_gl_host_on_owner_thread();
         ds_refresh_host_display_metrics_for_hwnd(hwnd);
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         mon_x = g_ds.win_mon_x;
         mon_y = g_ds.win_mon_y;
         mon_w = g_ds.real_screen_w;
         mon_h = g_ds.real_screen_h;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
-        HANDLE win_ctx = (g_ds.p_GetWindowDpiAwarenessContext != NULL)
-            ? g_ds.p_GetWindowDpiAwarenessContext(hwnd)
-            : DS_DPI_CTX_PMV2;
-        HANDLE prev_dpi = ds_dpi_guard_enter(win_ctx);
         ds_enter_internal();
         if (want_tier2_fs && mon_w > 0 && mon_h > 0) {
             LONG_PTR fs_style = 0, fs_ex = 0;
             ds_compute_fs_styles(saved_style, saved_exstyle, app_inactive, &fs_style, &fs_ex);
             ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, fs_style, is_unicode);
             ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, fs_ex, is_unicode);
-            if (g_ds.real_SetWindowPos) {
-                UINT t2_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | (app_inactive ? SWP_NOACTIVATE : 0);
-                ds_clear_wine_present_rect_on_hwnd(hwnd);
-                g_ds.real_SetWindowPos(
-                    hwnd,
-                    app_inactive ? HWND_NOTOPMOST : HWND_TOPMOST,
-                    mon_x,
-                    mon_y,
-                    mon_w,
-                    mon_h,
-                    t2_flags
-                );
-            }
-            EnterCriticalSection(&g_ds.lock);
+            ds_set_window_pos_dpi(
+                hwnd,
+                app_inactive ? HWND_NOTOPMOST : HWND_TOPMOST,
+                mon_x,
+                mon_y,
+                mon_w,
+                mon_h,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW | (app_inactive ? SWP_NOACTIVATE : 0),
+                true
+            );
+            ds_lock();
             g_ds.borderless_active = true;
             g_ds.window_mutated_by_scaler = true;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
         } else {
             LONG_PTR win_style = saved_style;
-            if ((win_style & WS_POPUP) != 0) {
+            if ((win_style & WS_POPUP) != 0 || (win_style & WS_CAPTION) == 0) {
                 win_style = (win_style & ~(LONG_PTR)WS_POPUP) | (LONG_PTR)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
             }
             win_style |= WS_VISIBLE;
+            LONG_PTR win_ex = saved_exstyle & ~(LONG_PTR)WS_EX_TOPMOST;
             ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, win_style, is_unicode);
-            ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, saved_exstyle, is_unicode);
+            ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, win_ex, is_unicode);
             if (saved_menu != NULL && IsMenu(saved_menu) && GetMenu(hwnd) != saved_menu) {
                 SetMenu(hwnd, saved_menu);
             }
-            if (g_ds.real_SetWindowPos) {
-                int sw = saved_rc.right - saved_rc.left;
-                int sh = saved_rc.bottom - saved_rc.top;
-                if (sw > 0 && sh > 0) {
-                    g_ds.real_SetWindowPos(hwnd, HWND_NOTOPMOST, saved_rc.left, saved_rc.top, sw, sh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                } else {
-                    g_ds.real_SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                }
-            }
-            EnterCriticalSection(&g_ds.lock);
+            int sw = saved_rc.right - saved_rc.left;
+            int sh = saved_rc.bottom - saved_rc.top;
+            bool saved_windowed = (sw > 0 && sh > 0 && (mon_w <= 0 || mon_h <= 0 || sw < mon_w || sh < mon_h));
+            int wx = saved_windowed ? saved_rc.left : (mon_x + (mon_w - (mon_w * 3) / 4) / 2);
+            int wy = saved_windowed ? saved_rc.top : (mon_y + (mon_h - (mon_h * 3) / 4) / 2);
+            int ww = saved_windowed ? sw : ((mon_w * 3) / 4);
+            int wh = saved_windowed ? sh : ((mon_h * 3) / 4);
+            UINT wf = (saved_windowed || (mon_w > 0 && mon_h > 0))
+                ? (SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+                : (SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            ds_set_window_pos_dpi(hwnd, HWND_NOTOPMOST, wx, wy, ww, wh, wf, false);
+            ds_lock();
             g_ds.borderless_active = false;
             g_ds.window_mutated_by_scaler = false;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
         }
         ds_leave_internal();
-        ds_dpi_guard_leave(prev_dpi);
         return;
     }
 
@@ -1433,15 +1514,12 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
         return;
     }
 
-    HANDLE win_ctx = (g_ds.p_GetWindowDpiAwarenessContext != NULL)
-        ? g_ds.p_GetWindowDpiAwarenessContext(hwnd)
-        : DS_DPI_CTX_PMV2;
-    HANDLE prev_dpi = ds_dpi_guard_enter(win_ctx);
+    HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
     ds_enter_internal();
     if (fs_active && vp.dst_w > 0 && vp.dst_h > 0) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         g_ds.window_mutated_by_scaler = true;
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         ds_set_class_bg_brush(hwnd, (LONG_PTR)GetStockObject(BLACK_BRUSH));
         if (GetMenu(hwnd) != NULL) {
             SetMenu(hwnd, NULL);
@@ -1454,10 +1532,10 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
 
         if (!was_visible && !cocoa_synced && mon_w >= 800 && mon_h >= 600) {
             DWORD birth_tick = now_tick ? now_tick : 1;
-            EnterCriticalSection(&g_ds.lock);
+            ds_lock();
             g_ds.first_visible_tick = birth_tick;
             g_ds.cocoa_fs_synced = false;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
 
             ds_set_wnd_long_ptr_raw(hwnd, GWL_STYLE, fs_style & ~(LONG_PTR)WS_VISIBLE, is_unicode);
             ds_set_wnd_long_ptr_raw(hwnd, GWL_EXSTYLE, fs_ex, is_unicode);
@@ -1470,10 +1548,10 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
         } else if (!cocoa_synced && vis_tick != 0 && (now_tick - vis_tick) < 250) {
             /* Hold centered birth rect briefly while Wine drains initial Cocoa frame events */
         } else {
-            EnterCriticalSection(&g_ds.lock);
+            ds_lock();
             g_ds.cocoa_fs_synced = true;
             g_ds.first_visible_tick = 0;
-            LeaveCriticalSection(&g_ds.lock);
+            ds_unlock();
 
             LONG_PTR cur_style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
             LONG_PTR cur_ex = ds_get_wnd_long_ptr(hwnd, GWL_EXSTYLE);
@@ -1559,19 +1637,19 @@ void ds_apply_window_presentation_on_owner_thread(HWND hwnd)
     ds_leave_internal();
     ds_dpi_guard_leave(prev_dpi);
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     ds_reapply_cursor_clip_locked();
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     ds_gl_notify_mode_changed();
 }
 
 void ds_request_apply_presentation(void)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd = g_ds.hwnd_game;
     DWORD owner_tid = g_ds.game_thread_id;
     UINT msg = g_ds.msg_apply_presentation;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!hwnd || !IsWindow(hwnd)) return;
     if (GetCurrentThreadId() == owner_tid) {
@@ -1590,7 +1668,7 @@ void ds_observe_game_window_passive(HWND hwnd)
 
     bool adopted = false;
     DWORD owner_tid = 0;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool should_adopt = (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game) || g_ds.hwnd_game == hwnd);
     if (!should_adopt && g_ds.hwnd_game != hwnd) {
         WCHAR prev_cls[64] = { 0 };
@@ -1614,20 +1692,20 @@ void ds_observe_game_window_passive(HWND hwnd)
         g_ds.game_thread_id = GetWindowThreadProcessId(hwnd, NULL);
         owner_tid = g_ds.game_thread_id;
         adopted = true;
-        if (GetCurrentThreadId() == owner_tid) {
-            ds_capture_window_baseline_and_subclass_locked(hwnd);
-        }
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (adopted) {
+        if (GetCurrentThreadId() == owner_tid) {
+            ds_capture_window_baseline_and_subclass(hwnd);
+        }
         ds_refresh_host_display_metrics_for_hwnd(hwnd);
     }
 }
 
 void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hint_virt_h)
 {
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     ds_presenter_tier_t tier = (g_ds.scaling_mode == DS_MODE_PASSTHROUGH)
         ? DS_PRESENTER_MODERN_PASSTHROUGH
         : g_ds.presenter_tier;
@@ -1636,7 +1714,7 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
         !g_ds.user_forced_windowed &&
         (g_ds.scaling_mode == DS_MODE_FORCE_FULLSCREEN || g_ds.user_forced_fullscreen || g_ds.fullscreen_active)
     );
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (tier != DS_PRESENTER_LEGACY_VIRTUAL) {
         ds_observe_game_window_passive(hwnd);
@@ -1658,9 +1736,9 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
     LONG_PTR style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
     bool should_apply = false;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ds_is_modern_tier_locked()) {
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         return;
     }
     bool should_adopt = (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game) || g_ds.hwnd_game == hwnd);
@@ -1724,10 +1802,10 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
         should_apply = g_ds.fullscreen_active;
     }
     DWORD owner_tid = g_ds.game_thread_id;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (should_adopt && !should_apply && GetCurrentThreadId() == owner_tid) {
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (g_ds.orig_wndproc == NULL) {
             g_ds.orig_wndproc_unicode = (IsWindowUnicode(hwnd) != FALSE);
             WNDPROC cur_proc = (WNDPROC)ds_get_wnd_long_ptr(hwnd, GWLP_WNDPROC);
@@ -1742,7 +1820,7 @@ void ds_attach_and_apply_game_window(HWND hwnd, int32_t hint_virt_w, int32_t hin
                 ds_leave_internal();
             }
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
         ds_enter_internal();
         ds_ensure_gl_host_child_on_owner_thread(hwnd);
         ds_leave_internal();
@@ -1874,12 +1952,12 @@ static void ds_poll_active_session_if_needed(void)
 {
     WCHAR sess_path[MAX_PATH];
     WCHAR cur_ctl[MAX_PATH];
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     wcsncpy(sess_path, g_ds.active_session_file, MAX_PATH - 1);
     sess_path[MAX_PATH - 1] = L'\0';
     wcsncpy(cur_ctl, g_ds.control_file, MAX_PATH - 1);
     cur_ctl[MAX_PATH - 1] = L'\0';
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (sess_path[0] == L'\0') return;
     if (cur_ctl[0] != L'\0') {
@@ -1927,7 +2005,7 @@ static void ds_poll_active_session_if_needed(void)
     }
 
     bool changed = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     uint64_t eff_seq = ds_effective_active_session_seq(&sess);
     if (new_ctl[0] != L'\0' && _wcsicmp(new_ctl, g_ds.control_file) != 0) {
         wcsncpy(g_ds.control_file, new_ctl, MAX_PATH - 1);
@@ -1942,7 +2020,7 @@ static void ds_poll_active_session_if_needed(void)
         g_ds.last_active_session_seq = eff_seq;
         changed = ds_apply_parsed_control_locked(&sess);
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (changed) {
         if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
@@ -1958,10 +2036,10 @@ void ds_poll_control_file_once(void)
     ds_poll_active_session_if_needed();
 
     WCHAR ctl_path[MAX_PATH];
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     wcsncpy(ctl_path, g_ds.control_file, MAX_PATH - 1);
     ctl_path[MAX_PATH - 1] = L'\0';
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (ctl_path[0] == L'\0') return;
 
@@ -1977,7 +2055,7 @@ void ds_poll_control_file_once(void)
     }
 
     bool changed = false;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (ctl.seq > g_ds.last_control_seq) {
         g_ds.last_control_seq = ctl.seq;
         if (ctl.has_status_file && ctl.status_file[0] != '\0' && g_ds.status_file[0] == L'\0') {
@@ -1985,7 +2063,7 @@ void ds_poll_control_file_once(void)
         }
         changed = ds_apply_parsed_control_locked(&ctl);
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (changed) {
         if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
@@ -2000,7 +2078,7 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
 {
     if (ds_is_internal_call()) return;
 
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     HWND hwnd = g_ds.hwnd_game;
     ds_presenter_tier_t tier = (g_ds.scaling_mode == DS_MODE_PASSTHROUGH)
         ? DS_PRESENTER_MODERN_PASSTHROUGH
@@ -2013,18 +2091,20 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
     int32_t mon_y = g_ds.win_mon_y;
     int32_t mon_w = g_ds.real_screen_w;
     int32_t mon_h = g_ds.real_screen_h;
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (!want_check || app_inactive || mon_w <= 0 || mon_h <= 0) return;
     if (!hwnd || !IsWindow(hwnd)) return;
     if (candidate_hwnd != NULL && candidate_hwnd != hwnd) return;
     if (!IsWindowVisible(hwnd)) return;
 
+    HANDLE prev_dpi = ds_dpi_guard_enter_for_hwnd(hwnd);
     ds_enter_internal();
     RECT rc = { 0, 0, 0, 0 };
     BOOL has_rc = g_ds.real_GetWindowRect ? g_ds.real_GetWindowRect(hwnd, &rc) : FALSE;
     LONG_PTR style = ds_get_wnd_long_ptr(hwnd, GWL_STYLE);
     ds_leave_internal();
+    ds_dpi_guard_leave(prev_dpi);
 
     bool rect_drifted = !has_rc ||
                         rc.left != mon_x ||
@@ -2044,7 +2124,7 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
     bool check_visible_hit = false;
     static DWORD s_last_hit_probe_tick = 0;
     static int s_consec_resync_attempts = 0;
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     if (g_ds.hwnd_game == hwnd && !g_ds.cocoa_fs_synced && g_ds.first_visible_tick != 0) {
         if ((now_tick - g_ds.first_visible_tick) < 250) {
             waiting_birth_drain = true;
@@ -2058,7 +2138,7 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
         s_last_hit_probe_tick = now_tick;
         check_visible_hit = true;
     }
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
 
     if (waiting_birth_drain) {
         return;
@@ -2069,7 +2149,7 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
         ds_enter_internal();
         HWND hit = g_ds.real_WindowFromPoint(edge_pt);
         ds_leave_internal();
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         if (g_ds.hwnd_game == hwnd) {
             if (hit == NULL || hit == GetDesktopWindow()) {
                 if (s_consec_resync_attempts < 6) {
@@ -2083,7 +2163,7 @@ void ds_ensure_game_window_bounds(HWND candidate_hwnd)
                 g_ds.visible_resync_done = true;
             }
         }
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
     }
 
     if (rect_drifted || style_drifted || promote_staged_birth) {
@@ -2103,9 +2183,9 @@ static DWORD WINAPI ds_control_watcher_proc(LPVOID param)
 
         ds_poll_control_file_once();
 
-        EnterCriticalSection(&g_ds.lock);
+        ds_lock();
         bool passthrough = ds_is_passthrough_locked();
-        LeaveCriticalSection(&g_ds.lock);
+        ds_unlock();
 
         if (!passthrough) {
             if (g_ds.hwnd_game == NULL || !IsWindow(g_ds.hwnd_game)) {
@@ -2178,9 +2258,9 @@ DWORD WINAPI OneLauncherDisplayScalerTriggerScan(LPVOID lpParam)
     ds_ensure_runtime_started();
     ds_patch_loaded_modules();
     ds_poll_control_file_once();
-    EnterCriticalSection(&g_ds.lock);
+    ds_lock();
     bool passthrough = ds_is_passthrough_locked();
-    LeaveCriticalSection(&g_ds.lock);
+    ds_unlock();
     if (!passthrough) {
         EnumWindows(ds_enum_adopt_window_cb, 0);
     }

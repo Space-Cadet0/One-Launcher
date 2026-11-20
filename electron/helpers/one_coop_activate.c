@@ -229,7 +229,7 @@ static bool pid_is_descendant_of(int32_t pid, int32_t root_pid) {
 static bool proc_args_match_target_exes(int32_t pid, const coop_scope_t *scope) {
     if (!scope || scope->target_count == 0 || pid <= 0) return false;
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
-    char buf[2048];
+    char buf[4096];
     size_t sz = sizeof(buf) - 1;
     if (sysctl(mib, 3, buf, &sz, NULL, 0) != 0 || sz <= sizeof(int)) {
         return false;
@@ -350,11 +350,18 @@ static bool find_top_bottled_game_window(const coop_scope_t *scope, int32_t *out
             CFNumberGetValue(layer_ref, kCFNumberSInt32Type, &layer);
         }
 
-        /* Multi-monitor per-display target bounds scoring */
+        /* Multi-monitor per-display target bounds scoring (prefer center point to prevent edge bleed) */
         CGDirectDisplayID disp_id = CGMainDisplayID();
         uint32_t disp_count = 0;
-        if (CGGetDisplaysWithRect(rect, 1, &disp_id, &disp_count) != kCGErrorSuccess || disp_count == 0) {
-            disp_id = CGMainDisplayID();
+        CGPoint center_pt = CGPointMake(
+            rect.origin.x + rect.size.width * 0.5,
+            rect.origin.y + rect.size.height * 0.5
+        );
+        if (CGGetDisplaysWithPoint(center_pt, 1, &disp_id, &disp_count) != kCGErrorSuccess || disp_count == 0) {
+            disp_count = 0;
+            if (CGGetDisplaysWithRect(rect, 1, &disp_id, &disp_count) != kCGErrorSuccess || disp_count == 0) {
+                disp_id = CGMainDisplayID();
+            }
         }
         CGRect disp_bounds = CGDisplayBounds(disp_id);
         double screen_area = (disp_bounds.size.width > 0.0 && disp_bounds.size.height > 0.0)

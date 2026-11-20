@@ -499,8 +499,9 @@ function detectDisplayGeometry(options = {}) {
 
           let width = 0;
           let height = 0;
-          if (isRetina && rw > 0 && rh > 0 && (rw * 2 > pw || rh * 2 > ph)) {
-            // macOS HiDPI "More Space" backing buffer exceeds native panel pixels
+          if (isRetina && rw > 0 && rh > 0 && !(rw === pw && rh === ph)) {
+            // macOS HiDPI presets ("Default", "More Space", "Larger Text", 5K scaled)
+            // render into a 2x CoreGraphics backing surface (rw * 2 x rh * 2).
             width = rw * 2;
             height = rh * 2;
           } else if (pw > 0 && ph > 0) {
@@ -546,13 +547,21 @@ function detectDisplayGeometry(options = {}) {
 }
 
 /**
- * Captures full display output to disk using screencapture -x.
+ * Captures full display output to disk using screencapture -x (optionally targeting `-D <displayIndex>`).
+ * @param {string} outputPath
+ * @param {{ displayIndex?: number }} [options]
  */
-function captureWholeDisplay(outputPath) {
+function captureWholeDisplay(outputPath, options = {}) {
   if (process.platform !== 'darwin') {
     throw new Error(`Live display capture is only supported on macOS (current: ${process.platform})`);
   }
-  execFileSync('screencapture', ['-x', outputPath], { stdio: 'pipe' });
+  const args = ['-x'];
+  const dispIdx = Number(options?.displayIndex);
+  if (Number.isInteger(dispIdx) && dispIdx >= 1) {
+    args.push('-D', String(dispIdx));
+  }
+  args.push(outputPath);
+  execFileSync('screencapture', args, { stdio: 'pipe' });
 }
 
 // -----------------------------------------------------------------------------

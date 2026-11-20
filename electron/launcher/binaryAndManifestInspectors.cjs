@@ -575,9 +575,8 @@ function scanPeDynamicStringsFromFd(fd, scanRanges, scanOpts) {
       const wantMoreModern =
         scanOpts.scanModern &&
         !(
-          result.dynamicallyLoadsD3d11 ||
-          result.dynamicallyLoadsD3d12 ||
-          result.dynamicallyLoadsDxgi ||
+          result.dynamicallyLoadsD3d11 &&
+          result.dynamicallyLoadsD3d12 &&
           result.dynamicallyLoadsVulkan
         );
       const wantMoreDpi = scanOpts.scanDpiApi && !result.callsPerMonitorDpiApi;
@@ -1079,10 +1078,12 @@ function inspectWindowsExecutableHeader(filePath, options = {}) {
     if (opts.inspectElevationManifest || wantDpiManifest) {
       const elevationRe =
         /requestedExecutionLevel[^>]*level\s*=\s*["'](?:requireAdministrator|highestAvailable)["']/i;
-      const dpiAwareRe = /<dpiAware[^>]*>\s*(?:true|true\/pm|per\s*monitor)\s*</i;
-      const dpiAwarenessRe = /<dpiAwareness[^>]*>[^<]*(?:PerMonitor|System)[^<]*</i;
-      const perMonitorAwareRe = /<dpiAware[^>]*>\s*true\/pm\s*</i;
-      const perMonitorAwarenessRe = /<dpiAwareness[^>]*>[^<]*PerMonitor[^<]*</i;
+      const dpiAwareRe =
+        /<(?:[a-z0-9_-]+:)?dpiAware\b[^>]*>\s*(?:true|true\/pm|per\s*monitor)\s*</i;
+      const dpiAwarenessRe =
+        /<(?:[a-z0-9_-]+:)?dpiAwareness\b[^>]*>[^<]*(?:PerMonitor|System)[^<]*</i;
+      const perMonitorAwareRe = /<(?:[a-z0-9_-]+:)?dpiAware\b[^>]*>\s*true\/pm\s*</i;
+      const perMonitorAwarenessRe = /<(?:[a-z0-9_-]+:)?dpiAwareness\b[^>]*>[^<]*PerMonitor[^<]*</i;
       const applyManifestText = (text) => {
         if (!text) return;
         if (opts.inspectElevationManifest && !requiresElevation && elevationRe.test(text)) {
@@ -3917,7 +3918,11 @@ function resolveEffectiveGameExecutableCapabilities(exePath, localInstallDir = '
       paradoxSettings.paradoxDirectGameExe
   );
   const isModern64Host = Boolean(
-    is64Bit && !is32Bit && usesModernGraphicsApi && !usesLegacyDirectDrawOrD3d && !usesOpenGl
+    is64Bit &&
+      !is32Bit &&
+      usesModernGraphicsApi &&
+      !usesLegacyDirectDrawOrD3d &&
+      (!usesOpenGl || !forceGlCore)
   );
   const effectiveIsLauncherStubCandidate = isModern64Host
     ? hasDiscoveredChildTarget

@@ -46,6 +46,35 @@ typedef enum ds_scale_filter_e {
     DS_FILTER_NEAREST = 3
 } ds_scale_filter_t;
 
+typedef enum ds_presenter_tier_e {
+    DS_PRESENTER_LEGACY_VIRTUAL     = 0,
+    DS_PRESENTER_MODERN_PASSTHROUGH = 1,
+    DS_PRESENTER_MODERN_BORDERLESS  = 2
+} ds_presenter_tier_t;
+
+typedef struct ds_tier_input_s {
+    ds_scaling_mode_t   scaling_mode;
+    ds_presenter_tier_t prev_tier;
+    bool                is_64bit;
+    bool                gl_upscale_active;
+    bool                ddraw_gdi_active;
+    bool                game_gl_active;
+    bool                wined3d_uses_gl;
+    bool                wined3d_uses_vulkan;
+    bool                ddraw_loaded;
+    bool                d3d8_or_9_loaded;
+    bool                d3d9_loaded;
+    bool                legacy_d3d_loaded;
+    bool                dxgi_or_d3d10_plus_loaded;
+    bool                vulkan_loaded;
+    bool                modern_gfx_loaded;
+    bool                fullscreen_active;
+    bool                borderless_active;
+    bool                window_mutated_by_scaler;
+    bool                user_forced_windowed;
+    bool                user_forced_fullscreen;
+} ds_tier_input_t;
+
 typedef struct ds_viewport_s {
     int32_t usable_x;
     int32_t usable_y;
@@ -222,6 +251,10 @@ bool ds_map_subrect_virt_to_phys(
 
 /* Live control INI file parser (`seq=...`, `fullscreen=0|1`, `aspect=...`) */
 bool ds_parse_control_ini(const char *text, size_t len, ds_control_state_t *out_state);
+
+/* Pure Three-Tier presenter state transition & 32-bit Vulkan legacy-D3D classification */
+bool ds_is_vulkan_legacy_d3d(const ds_tier_input_t *in);
+ds_presenter_tier_t ds_compute_presenter_tier(const ds_tier_input_t *in);
 
 /*
  * Canonical monotonic version key for `active_session.ini` shared between `DllMain`
