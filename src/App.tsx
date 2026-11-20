@@ -534,32 +534,32 @@ export function App() {
     }
 
     try {
-      if (prev.length === games.length && prev !== games) {
-        const dirtyIds: string[] = [];
-        let orderPreserved = true;
-        for (let i = 0; i < games.length; i++) {
-          if (prev[i].id !== games[i].id) {
-            orderPreserved = false;
-            break;
+      if (prev !== games && prev.length > 0) {
+        if (prev.length === games.length) {
+          const dirtyIds: string[] = [];
+          let orderPreserved = true;
+          for (let i = 0; i < games.length; i++) {
+            if (prev[i].id !== games[i].id) {
+              orderPreserved = false;
+              break;
+            }
+            if (prev[i] !== games[i] && !isCanonicalGameMateriallyUnchanged(prev[i], games[i])) {
+              dirtyIds.push(games[i].id);
+            }
           }
-          if (prev[i] !== games[i]) {
-            dirtyIds.push(games[i].id);
+          if (orderPreserved) {
+            if (dirtyIds.length === 0) {
+              lastExplicitlySavedCatalogRef.current = games;
+              return;
+            }
+            if (dirtyIds.length < games.length) {
+              lastExplicitlySavedCatalogRef.current = games;
+              saveCurrentCatalog(games, { skipSanitize: true, dirtyGameIds: dirtyIds });
+              return;
+            }
           }
         }
-        if (orderPreserved) {
-          if (dirtyIds.length === 0) {
-            lastExplicitlySavedCatalogRef.current = games;
-            return;
-          }
-          if (dirtyIds.length < games.length) {
-            lastExplicitlySavedCatalogRef.current = games;
-            saveCurrentCatalog(games, { skipSanitize: true, dirtyGameIds: dirtyIds });
-            return;
-          }
-        }
-      }
 
-      if (prev !== games && prev.length > 0 && Math.abs(prev.length - games.length) <= 20) {
         const prevById = new Map<string, CanonicalGame>();
         for (let i = 0; i < prev.length; i++) {
           const pg = prev[i];
@@ -570,7 +570,7 @@ export function App() {
           const g = games[i];
           if (!g?.id) continue;
           const prevGame = prevById.get(g.id);
-          if (!prevGame || prevGame !== g) {
+          if (!prevGame || (prevGame !== g && !isCanonicalGameMateriallyUnchanged(prevGame, g))) {
             dirtyIds.push(g.id);
           }
           if (prevGame) {
@@ -578,12 +578,16 @@ export function App() {
           }
         }
         const removedIds = Array.from(prevById.keys());
-        if (dirtyIds.length + removedIds.length <= 20 && dirtyIds.length < games.length) {
+        if (dirtyIds.length === 0 && removedIds.length === 0) {
+          lastExplicitlySavedCatalogRef.current = games;
+          return;
+        }
+        if (dirtyIds.length < games.length) {
           lastExplicitlySavedCatalogRef.current = games;
           saveCurrentCatalog(games, {
             skipSanitize: true,
             dirtyGameIds: dirtyIds,
-            removedGameIds: removedIds,
+            ...(removedIds.length > 0 ? { removedGameIds: removedIds } : {}),
           });
           return;
         }

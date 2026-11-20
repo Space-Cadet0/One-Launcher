@@ -682,11 +682,86 @@ export function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame
   Reflect.deleteProperty(slim, 'shortDescription');
   Reflect.deleteProperty(slim, 'screenshots');
   Reflect.deleteProperty(slim, 'movies');
+  Reflect.deleteProperty(slim, 'reviewSummary');
+  Reflect.deleteProperty(slim, 'reviewScoreOverride');
+  Reflect.deleteProperty(slim, 'lastSyncedAt');
+  Reflect.deleteProperty(slim, 'controllerSupport');
+  Reflect.deleteProperty(slim, 'hdrSupport');
+  Reflect.deleteProperty(slim, 'antiCheatName');
+  Reflect.deleteProperty(slim, 'matchConfidence');
+  Reflect.deleteProperty(slim, 'needsMatchReview');
+  Reflect.deleteProperty(slim, 'isVerifiedEntitlement');
+  if (slim.worksOn || game.enrichedMetadata?.platforms) {
+    Reflect.deleteProperty(slim, 'platforms_os');
+  }
+  if (slim.iconUrl && (slim.iconUrl === slim.headerImage || slim.iconUrl === slim.capsuleImage)) {
+    Reflect.deleteProperty(slim, 'iconUrl');
+  }
   if (slim.sortTitle === slim.title) {
     Reflect.deleteProperty(slim, 'sortTitle');
   }
   if (slim.originalStoreTitle === slim.title) {
     Reflect.deleteProperty(slim, 'originalStoreTitle');
+  }
+  // Trim non-first-paint metadata arrays (all restored losslessly on IDB/SQLite vault hydration)
+  slim.developers = [];
+  slim.publishers = [];
+  slim.tags = [];
+  slim.genres = Array.isArray(game.genres) ? game.genres.slice(0, 2) : [];
+
+  if (Array.isArray(game.platforms)) {
+    slim.platforms = game.platforms.map((p): GamePlatformOwnership => {
+      const slimPlat: GamePlatformOwnership = {
+        platformId: p.platformId,
+        platformGameId: p.platformGameId,
+        installed: Boolean(p.installed),
+      };
+      if (p.storefrontAppId && p.storefrontAppId !== p.platformGameId) {
+        slimPlat.storefrontAppId = p.storefrontAppId;
+      }
+      if (p.originalTitle && p.originalTitle !== game.title) {
+        slimPlat.originalTitle = p.originalTitle;
+      }
+      if (typeof p.playtimeMinutes === 'number' && p.playtimeMinutes > 0) {
+        slimPlat.playtimeMinutes = p.playtimeMinutes;
+      }
+      if (p.lastPlayed) {
+        slimPlat.lastPlayed = p.lastPlayed;
+      }
+      if (p.platforms && typeof p.platforms === 'object') {
+        slimPlat.platforms = p.platforms;
+      }
+      if (p.installed) {
+        if (p.installPath) slimPlat.installPath = p.installPath;
+        if (p.executablePath) slimPlat.executablePath = p.executablePath;
+        if (typeof p.installSize === 'number' && p.installSize > 0) {
+          slimPlat.installSize = p.installSize;
+        }
+        if (p.isWindowsBinaryOnMac !== undefined) {
+          slimPlat.isWindowsBinaryOnMac = p.isWindowsBinaryOnMac;
+        }
+      }
+      if (p.isCrossPlatformLauncherRuntime) {
+        slimPlat.isCrossPlatformLauncherRuntime = true;
+      }
+      if (p.xboxProductId) slimPlat.xboxProductId = p.xboxProductId;
+      if (p.xboxTitleId) slimPlat.xboxTitleId = p.xboxTitleId;
+      if (p.packageFamilyName) slimPlat.packageFamilyName = p.packageFamilyName;
+      if (p.ownershipType !== undefined) {
+        slimPlat.ownershipType = p.ownershipType;
+        if (p.gamePassTier) slimPlat.gamePassTier = p.gamePassTier;
+        if (Array.isArray(p.satisfyingPassIds) && p.satisfyingPassIds.length > 0) {
+          slimPlat.satisfyingPassIds = p.satisfyingPassIds;
+        }
+        if (p.subscriptionTierId) slimPlat.subscriptionTierId = p.subscriptionTierId;
+        if (p.subscriptionExpired !== undefined) {
+          slimPlat.subscriptionExpired = p.subscriptionExpired;
+        }
+        if (p.isLeavingSoon) slimPlat.isLeavingSoon = true;
+        if (p.isRecentlyAddedToGamePass) slimPlat.isRecentlyAddedToGamePass = true;
+      }
+      return slimPlat;
+    });
   }
   if (game.enrichedMetadata && typeof game.enrichedMetadata === 'object') {
     const prevMeta = game.enrichedMetadata;
@@ -698,7 +773,7 @@ export function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame
       : (prevMeta.hasMoviesCount ?? topMoviesLen);
     // Drop all fields already mirrored at top-level CanonicalGame (`name`, `shortDescription`,
     // `headerImage`, `capsuleImage`, `developers`, `publishers`, `genres`, `tags`, `categories`,
-    // `dlc`, `releaseDate`, `metacritic`, `reviewSummary`, etc.) so 1,275+ games stay < 1.2 MB
+    // `dlc`, `releaseDate`, `metacritic`, `reviewSummary`, etc.) so 1,275+ games stay compact
     // in localStorage while preserving `__quotaSlimmed: true` and instant first-paint semantics.
     const compactMeta: Record<string, unknown> = {
       appId: prevMeta.appId,
@@ -731,7 +806,11 @@ export function slimGameForLocalStorageQuota(game: CanonicalGame): CanonicalGame
     if (prevMeta.platforms && typeof prevMeta.platforms === 'object') {
       compactMeta.platforms = prevMeta.platforms;
     }
-    if (prevMeta.achievements && typeof prevMeta.achievements === 'object') {
+    if (
+      prevMeta.achievements &&
+      typeof prevMeta.achievements === 'object' &&
+      prevMeta.achievements.total > 0
+    ) {
       compactMeta.achievements = { total: prevMeta.achievements.total };
     }
     if (prevMeta.xboxDeliveryHints && typeof prevMeta.xboxDeliveryHints === 'object') {
@@ -1833,7 +1912,7 @@ function areStringArraysEqual(
   return true;
 }
 
-function areAchievementSummariesEqual(
+function areAchievementSummariesSubstantivelyEqual(
   a?: StoreAchievementSummary | null,
   b?: StoreAchievementSummary | null
 ): boolean {
@@ -1843,16 +1922,24 @@ function areAchievementSummariesEqual(
     a.unlocked === b.unlocked &&
     a.total === b.total &&
     a.percentage === b.percentage &&
-    a.isMastered === b.isMastered &&
+    Boolean(a.isMastered) === Boolean(b.isMastered) &&
     a.source === b.source &&
-    a.syncedAt === b.syncedAt &&
-    a.hasConflict === b.hasConflict &&
+    Boolean(a.hasConflict) === Boolean(b.hasConflict) &&
     a.conflictDetails === b.conflictDetails &&
     a.gamerscore?.earned === b.gamerscore?.earned &&
     a.gamerscore?.total === b.gamerscore?.total &&
     a.xp?.earned === b.xp?.earned &&
     a.xp?.total === b.xp?.total
   );
+}
+
+function areAchievementSummariesEqual(
+  a?: StoreAchievementSummary | null,
+  b?: StoreAchievementSummary | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return areAchievementSummariesSubstantivelyEqual(a, b) && a.syncedAt === b.syncedAt;
 }
 
 function arePlatformOsFlagsEqual(
@@ -2492,7 +2579,7 @@ export function mergeStorefrontGames(
                   platformOwnership.achievements,
                   { title: newGame.title, appId: newGame.steamAppId, store: storefrontId }
                 );
-                return areAchievementSummariesEqual(p.achievements, reconciled)
+                return areAchievementSummariesSubstantivelyEqual(p.achievements, reconciled)
                   ? p.achievements
                   : reconciled;
               })(),
@@ -2555,7 +2642,7 @@ export function mergeStorefrontGames(
       );
       const nextIconUrl = !isUnsuitableHeaderUrl(existing.iconUrl)
         ? existing.iconUrl
-        : newGame.iconUrl || newGame.capsuleImage || newGame.headerImage;
+        : newGame.iconUrl || newGame.capsuleImage || newGame.headerImage || existing.iconUrl;
 
       const nextTitle = preferStorefrontTitle ? newGame.title : existing.title;
       const nextSortTitle = preferStorefrontTitle
@@ -3480,7 +3567,7 @@ export function mergeUpdatedGamePreservingLivePlatformState(
         store: incPlat.platformId,
       }
     );
-    const nextAchievements = areAchievementSummariesEqual(
+    const nextAchievements = areAchievementSummariesSubstantivelyEqual(
       incPlat.achievements,
       rawReconciledAchievements
     )
@@ -3508,11 +3595,17 @@ export function mergeUpdatedGamePreservingLivePlatformState(
         ? undefined
         : authXboxOwnershipPlat.gamePassTier || undefined
       : livePlat.gamePassTier ?? incPlat.gamePassTier;
-    const nextSatisfyingPassIds: string[] | undefined = authXboxOwnershipPlat
+    const rawNextSatisfyingPassIds: string[] | undefined = authXboxOwnershipPlat
       ? nextOwnershipType === 'owned'
         ? undefined
         : authXboxOwnershipPlat.satisfyingPassIds || undefined
       : livePlat.satisfyingPassIds ?? incPlat.satisfyingPassIds;
+    const nextSatisfyingPassIds: string[] | undefined = areStringArraysEqual(
+      incPlat.satisfyingPassIds,
+      rawNextSatisfyingPassIds
+    )
+      ? incPlat.satisfyingPassIds
+      : rawNextSatisfyingPassIds;
     const nextSubscriptionTierId: XboxSubscriptionTierId | undefined = authXboxOwnershipPlat
       ? nextOwnershipType === 'owned'
         ? undefined

@@ -747,10 +747,7 @@ function areStructuredValuesEqual(a: unknown, b: unknown, depth = 0): boolean {
 function computeDirtyCatalogGameIds(
   prevGames: CanonicalGame[],
   nextGames: CanonicalGame[]
-): string[] | null {
-  if (nextGames.length < prevGames.length) {
-    return null;
-  }
+): { dirtyIds: string[]; removedIds: string[] } {
   const prevById = new Map<string, CanonicalGame>();
   for (let i = 0; i < prevGames.length; i++) {
     const g = prevGames[i];
@@ -758,23 +755,20 @@ function computeDirtyCatalogGameIds(
       prevById.set(g.id, g);
     }
   }
-  let matchedPrevCount = 0;
   const dirtyIds: string[] = [];
   for (let i = 0; i < nextGames.length; i++) {
     const g = nextGames[i];
     if (!g?.id) continue;
     const prev = prevById.get(g.id);
     if (prev !== undefined) {
-      matchedPrevCount++;
+      prevById.delete(g.id);
     }
     if (prev === undefined || (prev !== g && !areStructuredValuesEqual(prev, g))) {
       dirtyIds.push(g.id);
     }
   }
-  if (matchedPrevCount < prevById.size) {
-    return null;
-  }
-  return dirtyIds;
+  const removedIds = Array.from(prevById.keys());
+  return { dirtyIds, removedIds };
 }
 
 type StartupStorefrontId = 'steam' | 'gog' | 'epic' | 'xbox';
@@ -789,15 +783,15 @@ const CANONICAL_STARTUP_STOREFRONT_ORDER: readonly StartupStorefrontId[] = [
 function didCatalogChangeRelativeToBase(
   base: CanonicalGame[],
   next: CanonicalGame[]
-): { changed: boolean; dirtyIds: string[] | null } {
+): { changed: boolean; dirtyIds: string[]; removedIds: string[] } {
   if (next === base) {
-    return { changed: false, dirtyIds: [] };
+    return { changed: false, dirtyIds: [], removedIds: [] };
   }
-  const dirtyIds = computeDirtyCatalogGameIds(base, next);
-  if (dirtyIds !== null && dirtyIds.length === 0 && next.length === base.length) {
-    return { changed: false, dirtyIds: [] };
+  const { dirtyIds, removedIds } = computeDirtyCatalogGameIds(base, next);
+  if (dirtyIds.length === 0 && removedIds.length === 0 && next.length === base.length) {
+    return { changed: false, dirtyIds: [], removedIds: [] };
   }
-  return { changed: true, dirtyIds };
+  return { changed: true, dirtyIds, removedIds };
 }
 
 /**
@@ -843,8 +837,12 @@ export function useLocalInstallSync({
       const diff = didCatalogChangeRelativeToBase(initialBase, working);
       if (!diff.changed) return;
       gamesRef.current = working;
-      if (diff.dirtyIds !== null) {
-        saveCurrentCatalog(working, { skipSanitize: true, dirtyGameIds: diff.dirtyIds });
+      if (diff.dirtyIds.length < working.length) {
+        saveCurrentCatalog(working, {
+          skipSanitize: true,
+          dirtyGameIds: diff.dirtyIds,
+          ...(diff.removedIds.length > 0 ? { removedGameIds: diff.removedIds } : {}),
+        });
       } else {
         saveCurrentCatalog(working, { skipSanitize: true });
       }
@@ -868,8 +866,12 @@ export function useLocalInstallSync({
       const diff = didCatalogChangeRelativeToBase(base, res.nextGames);
       if (!diff.changed) return;
       gamesRef.current = res.nextGames;
-      if (diff.dirtyIds !== null) {
-        saveCurrentCatalog(res.nextGames, { skipSanitize: true, dirtyGameIds: diff.dirtyIds });
+      if (diff.dirtyIds.length < res.nextGames.length) {
+        saveCurrentCatalog(res.nextGames, {
+          skipSanitize: true,
+          dirtyGameIds: diff.dirtyIds,
+          ...(diff.removedIds.length > 0 ? { removedGameIds: diff.removedIds } : {}),
+        });
       } else {
         saveCurrentCatalog(res.nextGames, { skipSanitize: true });
       }
@@ -1462,8 +1464,12 @@ export function useLocalInstallSync({
       const diff = didCatalogChangeRelativeToBase(base, res.nextGames);
       if (!diff.changed) return;
       gamesRef.current = res.nextGames;
-      if (diff.dirtyIds !== null) {
-        saveCurrentCatalog(res.nextGames, { skipSanitize: true, dirtyGameIds: diff.dirtyIds });
+      if (diff.dirtyIds.length < res.nextGames.length) {
+        saveCurrentCatalog(res.nextGames, {
+          skipSanitize: true,
+          dirtyGameIds: diff.dirtyIds,
+          ...(diff.removedIds.length > 0 ? { removedGameIds: diff.removedIds } : {}),
+        });
       } else {
         saveCurrentCatalog(res.nextGames, { skipSanitize: true });
       }

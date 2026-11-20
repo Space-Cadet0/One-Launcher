@@ -1094,6 +1094,166 @@ describe('Wave 1 — Catalog, Artwork Monotonicity, Dead-Steam Isolation & Stora
       expect(mergedHydrated[0]).toBe(stabilizedGame);
     });
 
+    it('preserves existing platform achievements (syncedAt) and exact object identity when storefront sync returns unchanged counts with a fresh syncedAt timestamp', () => {
+      const existingEpic = makeSyntheticGame({
+        id: 'epic-synth-ach-1',
+        title: 'Synthetic Epic Horizon',
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: 'synth-epic-ach-1',
+            installed: false,
+            achievements: {
+              unlocked: 12,
+              total: 40,
+              percentage: 30,
+              isMastered: false,
+              xp: { earned: 300, total: 1000 },
+              source: 'live_cloud_graphql',
+              syncedAt: '2026-10-01T10:00:00.000Z',
+            },
+          },
+        ],
+      });
+
+      // Stabilize baseline first
+      const baseMerged = mergeStorefrontGames([existingEpic], [existingEpic], 'epic');
+      const stabilized = baseMerged[0];
+
+      // Incoming Epic cold-boot sync stamps a brand-new syncedAt ISO timestamp with identical achievement counts/XP/source
+      const incomingSameCountsNewTimestamp = makeSyntheticGame({
+        id: 'epic-synth-ach-1',
+        title: 'Synthetic Epic Horizon',
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: 'synth-epic-ach-1',
+            installed: false,
+            achievements: {
+              unlocked: 12,
+              total: 40,
+              percentage: 30,
+              isMastered: false,
+              xp: { earned: 300, total: 1000 },
+              source: 'live_cloud_graphql',
+              syncedAt: '2026-11-20T15:23:22.058Z',
+            },
+          },
+        ],
+      });
+
+      const mergedNoOp = mergeStorefrontGames(
+        [stabilized],
+        [incomingSameCountsNewTimestamp],
+        'epic'
+      );
+      expect(mergedNoOp).toHaveLength(1);
+      expect(mergedNoOp[0]).toBe(stabilized);
+      expect(mergedNoOp[0].platforms[0].achievements?.syncedAt).toBe('2026-10-01T10:00:00.000Z');
+
+      // When actual progress changes (unlocked 12 -> 13), the achievement summary DOES update
+      const incomingProgress = makeSyntheticGame({
+        id: 'epic-synth-ach-1',
+        title: 'Synthetic Epic Horizon',
+        platforms: [
+          {
+            platformId: 'epic',
+            platformGameId: 'synth-epic-ach-1',
+            installed: false,
+            achievements: {
+              unlocked: 13,
+              total: 40,
+              percentage: 33,
+              isMastered: false,
+              xp: { earned: 350, total: 1000 },
+              source: 'live_cloud_graphql',
+              syncedAt: '2026-11-20T15:25:00.000Z',
+            },
+          },
+        ],
+      });
+      const mergedUpdated = mergeStorefrontGames([stabilized], [incomingProgress], 'epic');
+      expect(mergedUpdated[0]).not.toBe(stabilized);
+      expect(mergedUpdated[0].platforms[0].achievements?.unlocked).toBe(13);
+      expect(mergedUpdated[0].platforms[0].achievements?.syncedAt).toBe('2026-11-20T15:25:00.000Z');
+    });
+
+    it('slims multi-storefront platforms, tags, and reviewSummary in slimGameForLocalStorageQuota below 1.2 MB while preserving lossless IDB hydration', () => {
+      const richGames: CanonicalGame[] = Array.from({ length: 1275 }, (_, i) => {
+        const appId = 970000 + i;
+        return makeSyntheticGame({
+          id: `steam-${appId}`,
+          title: `Synthetic MultiStore Entry ${i}`,
+          steamAppId: appId,
+          developers: ['Synthetic Studio Dev Alpha', 'Synthetic Co-Dev'],
+          publishers: ['Synthetic Global Publishing'],
+          genres: ['Action', 'RPG', 'Strategy', 'Adventure'],
+          tags: ['Singleplayer', 'Atmospheric', 'Sci-Fi', 'Controller', 'Story Rich', 'Co-op'],
+          reviewSummary: {
+            reviewScore: 8,
+            reviewScoreDesc: 'Very Positive',
+            totalPositive: 850,
+            totalNegative: 150,
+            totalReviews: 1000,
+            positivePercent: 85,
+          },
+          platforms: [
+            {
+              platformId: 'steam',
+              platformGameId: String(appId),
+              storefrontAppId: String(appId),
+              originalTitle: `Synthetic MultiStore Entry ${i}`,
+              installed: false,
+              playtimeMinutes: i % 400,
+              platforms: { windows: true, mac: i % 5 === 0, linux: false },
+              achievements: {
+                unlocked: 10,
+                total: 50,
+                percentage: 20,
+                source: 'live_cloud_api',
+                syncedAt: '2026-11-20T12:00:00.000Z',
+              },
+            },
+            ...(i % 3 === 0
+              ? [
+                  {
+                    platformId: 'epic' as const,
+                    platformGameId: `epic-app-${i}`,
+                    namespace: `ns-${i}-abcdef0123456789`,
+                    catalogItemId: `cat-${i}-9876543210abcdef`,
+                    originalTitle: `Synthetic MultiStore Entry ${i}`,
+                    installed: false,
+                    achievements: {
+                      unlocked: 5,
+                      total: 25,
+                      percentage: 20,
+                      xp: { earned: 200, total: 1000 },
+                      source: 'live_cloud_graphql' as const,
+                      syncedAt: '2026-11-20T12:00:00.000Z',
+                    },
+                  },
+                ]
+              : []),
+          ],
+          headerImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
+          capsuleImage: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_capsule_2x.jpg`,
+          iconUrl: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/icon.jpg`,
+        });
+      });
+
+      const slimmed = richGames.map((g) => slimGameForLocalStorageQuota(g));
+      const slimBytes = new TextEncoder().encode(JSON.stringify(slimmed)).length;
+      expect(slimBytes).toBeLessThan(1_200_000);
+      expect(slimmed[0].tags).toEqual([]);
+      expect(slimmed[0].reviewSummary).toBeUndefined();
+      expect(slimmed[0].genres).toEqual(['Action', 'RPG']);
+      expect(slimmed[0].platforms[0].achievements).toBeUndefined();
+
+      // Hydrating full rich record over slimmed localStorage snapshot restores full platforms/achievements/tags losslessly
+      const restored = mergeHydratedCatalogPreservingLiveState([slimmed[0]], [richGames[0]]);
+      expect(restored[0]).toBe(richGames[0]);
+    });
+
     it('skips vaultSet in hydrateCatalogFromIndexedDb when zero repairs/upgrades are needed', async () => {
       const cleanGame = makeSyntheticGame({
         id: 'steam-986001',

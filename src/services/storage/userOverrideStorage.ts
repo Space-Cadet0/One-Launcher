@@ -253,6 +253,27 @@ function serializeUserOverridesEnvelopeV2(map: UserGameOverridesMap): string {
   return JSON.stringify(envelope);
 }
 
+function isDeduplicatedUserOverridesEnvelopeV2(parsed: unknown): boolean {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return false;
+  }
+  const rawObj = parsed as Record<string, unknown>;
+  if (
+    rawObj.__v !== 2 ||
+    !rawObj.records ||
+    typeof rawObj.records !== 'object' ||
+    Array.isArray(rawObj.records)
+  ) {
+    return false;
+  }
+  for (const k of Object.keys(rawObj)) {
+    if (k !== '__v' && k !== 'records' && k !== 'aliases') {
+      return false;
+    }
+  }
+  return true;
+}
+
 function deserializeUserOverridesPayload(parsed: unknown): UserGameOverridesMap {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {};
@@ -584,10 +605,20 @@ export function loadUserOverrides(): UserGameOverridesMap {
     }
     const parsed: unknown = JSON.parse(raw);
     const map = deserializeUserOverridesPayload(parsed);
+    const needsV2Upgrade = !isDeduplicatedUserOverridesEnvelopeV2(parsed);
     cachedStorageRef = storage;
     cachedOverridesRaw = raw;
     cachedOverridesMap = map;
     inMemoryOverridesHydrated = true;
+    if (needsV2Upgrade && Object.keys(map).length > 0) {
+      try {
+        const serializedV2 = serializeUserOverridesEnvelopeV2(map);
+        storage.setItem(STORAGE_KEY_USER_OVERRIDES, serializedV2);
+        cachedOverridesRaw = isTestEnv() ? serializedV2 : null;
+      } catch {
+        // Keep deserialized in-memory map if localStorage write fails
+      }
+    }
     return map;
   } catch (err) {
     console.warn('Failed to load user game overrides from localStorage:', err);
@@ -2403,6 +2434,19 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
   inFlightVaultOverrideSync = (async (): Promise<boolean> => {
     try {
       const vaultRaw = await window.electronAPI!.offlineVault!.getUserOverrides();
+      const storage = getStorage();
+      let diskNeedsV2Migration = false;
+      if (storage) {
+        try {
+          const rawBeforeLoad = storage.getItem(STORAGE_KEY_USER_OVERRIDES);
+          if (rawBeforeLoad) {
+            const parsedBeforeLoad: unknown = JSON.parse(rawBeforeLoad);
+            diskNeedsV2Migration = !isDeduplicatedUserOverridesEnvelopeV2(parsedBeforeLoad);
+          }
+        } catch {
+          // Ignore parse errors; loadUserOverrides will handle fallback
+        }
+      }
       const localMap: UserGameOverridesMap = { ...loadUserOverrides() };
 
       const canonicalLocal: Record<string, UserGameOverride> = {};
@@ -2457,6 +2501,7 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
         }
       }
 
+      let prunedLocalEntitlements = false;
       const newestLocalByEntitlement = new Map<string, { gameId: string; ts: number }>();
       for (const [gameId, localOv] of Object.entries(canonicalLocal)) {
         if (!localOv.platformId || !localOv.platformGameId || localOv.splitFromMerged) continue;
@@ -2467,11 +2512,13 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
           if (prev && prev.gameId !== gameId) {
             delete canonicalLocal[prev.gameId];
             delete localMap[prev.gameId];
+            prunedLocalEntitlements = true;
           }
           newestLocalByEntitlement.set(entKey, { gameId, ts });
         } else {
           delete canonicalLocal[gameId];
           delete localMap[gameId];
+          prunedLocalEntitlements = true;
         }
       }
 
@@ -2525,6 +2572,11 @@ export async function hydrateUserOverridesFromVault(): Promise<boolean> {
             } catch {}
           }
         }
+      } else if (
+        (diskNeedsV2Migration || prunedLocalEntitlements) &&
+        Object.keys(localMap).length > 0
+      ) {
+        persistUserOverridesMapToStorage(localMap);
       }
 
       const pushIds = Object.keys(missingOrNewerForVault);

@@ -806,6 +806,92 @@ describe('Wave 1: Vault Media Non-Destructive Pinning, Unified url_resolution_ca
       }
     });
 
+    it('skips rewriting byte-identical vault_games rows in upsertGames() without bumping updated_at, while updating mutated rows', () => {
+      const sandbox = makeTempSandbox('ol-upsert-idempotent-');
+      let fakeNow = 1_750_000_000_000;
+
+      const vault = offlineVaultMod.createOfflineVaultService({
+        userDataDir: sandbox,
+        federator: makeHermeticFederator(),
+        disableJitter: true,
+        nowFn: () => fakeNow,
+      });
+
+      try {
+        const gameA = {
+          id: 'epic-idemp-1',
+          title: 'Synthetic Idempotent Alpha',
+          capsuleImage: 'https://cdn.example.test/idemp/a.jpg',
+          platforms: [{ platformId: 'epic', platformGameId: 'idemp-1', installed: false }],
+        };
+        const gameB = {
+          id: 'epic-idemp-2',
+          title: 'Synthetic Idempotent Beta',
+          capsuleImage: 'https://cdn.example.test/idemp/b.jpg',
+          platforms: [{ platformId: 'epic', platformGameId: 'idemp-2', installed: false }],
+        };
+
+        const first = vault.upsertGames([gameA, gameB]) as {
+          success: boolean;
+          upserted?: number;
+          skipped?: number;
+        };
+        expect(first.success).toBe(true);
+        expect(first.upserted).toBe(2);
+        expect(first.skipped).toBe(0);
+
+        const db = vault.ensureOpen();
+        const ts1A = db
+          .prepare('SELECT updated_at FROM vault_games WHERE game_id = ?')
+          .get('epic-idemp-1')?.updated_at;
+        const ts1B = db
+          .prepare('SELECT updated_at FROM vault_games WHERE game_id = ?')
+          .get('epic-idemp-2')?.updated_at;
+        expect(ts1A).toBe(1_750_000_000_000);
+        expect(ts1B).toBe(1_750_000_000_000);
+
+        // Advance clock by 65 seconds and re-upsert identical payloads -> 0 rows rewritten, updated_at unchanged!
+        fakeNow += 65_000;
+        const second = vault.upsertGames([
+          structuredClone(gameA),
+          structuredClone(gameB),
+        ]) as { success: boolean; upserted?: number; skipped?: number };
+        expect(second.success).toBe(true);
+        expect(second.upserted).toBe(0);
+        expect(second.skipped).toBe(2);
+
+        expect(
+          db.prepare('SELECT updated_at FROM vault_games WHERE game_id = ?').get('epic-idemp-1')
+            ?.updated_at
+        ).toBe(1_750_000_000_000);
+        expect(
+          db.prepare('SELECT updated_at FROM vault_games WHERE game_id = ?').get('epic-idemp-2')
+            ?.updated_at
+        ).toBe(1_750_000_000_000);
+
+        // Mutate ONLY gameB -> exactly 1 row updated (gameB bumped), gameA untouched!
+        fakeNow += 10_000;
+        const third = vault.upsertGames([
+          structuredClone(gameA),
+          { ...structuredClone(gameB), title: 'Synthetic Idempotent Beta Remastered' },
+        ]) as { success: boolean; upserted?: number; skipped?: number };
+        expect(third.success).toBe(true);
+        expect(third.upserted).toBe(1);
+        expect(third.skipped).toBe(1);
+
+        expect(
+          db.prepare('SELECT updated_at FROM vault_games WHERE game_id = ?').get('epic-idemp-1')
+            ?.updated_at
+        ).toBe(1_750_000_000_000);
+        expect(
+          db.prepare('SELECT updated_at FROM vault_games WHERE game_id = ?').get('epic-idemp-2')
+            ?.updated_at
+        ).toBe(1_750_000_075_000);
+      } finally {
+        vault.shutdown();
+      }
+    });
+
     it('cleans url_resolution_cache on deleteGames() and bounds secondary blobs (max 1 newest <= 14d), stale 404s (> 30d), and nonexistent games in sweepOrphanBlobs()', async () => {
       const sandbox = makeTempSandbox('ol-sweep-bounded-');
       const DAY_MS = 24 * 60 * 60 * 1000;

@@ -69,6 +69,7 @@ import {
   STORAGE_KEY_USER_OVERRIDES,
   saveUserOverride,
   loadUserOverrides,
+  hydrateUserOverridesFromVault,
   patchUserOverrideReviewScore,
   applyUserOverrideToGame,
   getUserOverridesRevision,
@@ -243,6 +244,60 @@ describe('Wave 1: Critic, HLTB, Override Storage & Match Diagnostics Hardening',
       const fromHybrid = loadUserOverrides();
       expect(fromHybrid['gog-551101']?.title).toBe('Base V2 Entry');
       expect(fromHybrid['gog-551102']?.title).toBe('Spread Override Entry');
+
+      // Auto-upgraded hybrid spread to canonical v2 envelope on read
+      const upgradedDisk = JSON.parse(localStorage.getItem(STORAGE_KEY_USER_OVERRIDES)!) as {
+        __v: number;
+        records: Record<string, UserGameOverride>;
+        aliases: Record<string, string>;
+      };
+      expect(upgradedDisk.__v).toBe(2);
+      expect(Object.keys(upgradedDisk).sort()).toEqual(['__v', 'aliases', 'records']);
+      expect(upgradedDisk.records['gog-551101']?.title).toBe('Base V2 Entry');
+      expect(upgradedDisk.records['gog-551102']?.title).toBe('Spread Override Entry');
+    });
+
+    it('M3-AutoMigrate: upgrades legacy flat v1 localStorage overrides to deduplicated v2 on startup even when hydratedFromVault.length === 0', async () => {
+      const longSynopsis = 'Synthetic legacy duplicated synopsis payload. '.repeat(30);
+      const canonicalRecord: UserGameOverride = {
+        gameId: 'gog-552200',
+        platformId: 'gog',
+        platformGameId: '552200',
+        matchedStore: 'gog',
+        title: 'Synthetic Auto-Migrated Legacy Override',
+        shortDescription: longSynopsis,
+        updatedAt: '2026-03-01T12:00:00.000Z',
+      };
+      // Legacy flat v1 layout with duplicated canonical + colon alias copy
+      const legacyV1Payload = {
+        'gog-552200': canonicalRecord,
+        'gog:552200': { ...canonicalRecord },
+      };
+      const rawV1 = JSON.stringify(legacyV1Payload);
+      localStorage.setItem(STORAGE_KEY_USER_OVERRIDES, rawV1);
+
+      // Mock offlineVault returning identical timestamp so hydratedFromVault.length === 0
+      (window as unknown as { electronAPI?: unknown }).electronAPI = {
+        offlineVault: {
+          getUserOverrides: vi.fn().mockResolvedValue({
+            'gog-552200': canonicalRecord,
+          }),
+          saveUserOverride: vi.fn().mockResolvedValue({ success: true }),
+        },
+      };
+
+      await hydrateUserOverridesFromVault();
+
+      const rawAfter = localStorage.getItem(STORAGE_KEY_USER_OVERRIDES)!;
+      expect(rawAfter.length).toBeLessThan(rawV1.length);
+      const parsedAfter = JSON.parse(rawAfter) as {
+        __v: number;
+        records: Record<string, UserGameOverride>;
+        aliases: Record<string, string>;
+      };
+      expect(parsedAfter.__v).toBe(2);
+      expect(Object.keys(parsedAfter.records)).toEqual(['gog-552200']);
+      expect(parsedAfter.aliases['gog:552200']).toBe('gog-552200');
     });
 
     it('C4: patchUserOverrideReviewScore updates immutably, bumps updatedAt + revision, persists v2, and syncs to offlineVault', () => {

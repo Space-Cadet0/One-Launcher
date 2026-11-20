@@ -1115,6 +1115,201 @@ describe('Wave 2: App Settings Wiring, Cold-Boot Barriers, Parallel Sync & Sessi
 
       harness.unmount();
     });
+
+    it('sends ONLY exact dirtyGameIds slice (> 20 dirty rows) and removedGameIds on partial startup sync, and emits 0 writes when only Epic achievements.syncedAt changes', async () => {
+      // Build 50 Steam games + 30 Epic games (80 total)
+      const seedSteam = Array.from({ length: 50 }, (_, i) =>
+        makeCanonicalGameFixture({
+          id: `steam-${890000 + i}`,
+          title: `Synthetic Steam Base ${i}`,
+          originalStoreTitle: `Synthetic Steam Base ${i}`,
+          steamAppId: 890000 + i,
+          isVerifiedEntitlement: true,
+          platforms: [
+            {
+              platformId: 'steam',
+              platformGameId: String(890000 + i),
+              originalTitle: `Synthetic Steam Base ${i}`,
+              installed: false,
+              playtimeMinutes: 10,
+            },
+          ],
+        })
+      );
+      const seedEpic = Array.from({ length: 30 }, (_, i) =>
+        makeCanonicalGameFixture({
+          id: `epic-sync-${i}`,
+          title: `Synthetic Epic Sync ${i}`,
+          originalStoreTitle: `Synthetic Epic Sync ${i}`,
+          isVerifiedEntitlement: true,
+          platforms: [
+            {
+              platformId: 'epic',
+              platformGameId: `sync-${i}`,
+              originalTitle: `Synthetic Epic Sync ${i}`,
+              installed: false,
+              achievements: {
+                unlocked: 4,
+                total: 20,
+                percentage: 20,
+                xp: { earned: 100, total: 500 },
+                source: 'live_cloud_graphql',
+                syncedAt: '2026-10-01T00:00:00.000Z',
+              },
+            },
+          ],
+        })
+      );
+      const stabilized = integrationStorage.mergeStorefrontGames(
+        integrationStorage.mergeStorefrontGames([], seedSteam, 'steam'),
+        seedEpic,
+        'epic',
+        { authoritativeComplete: true }
+      );
+      expect(stabilized).toHaveLength(80);
+
+      // Case A: Startup Epic sync stamps fresh syncedAt on all 30 Epic games with identical counts -> 0 upsertGames writes!
+      const upsertSpyA = vi.fn().mockResolvedValue({ success: true });
+      const deleteSpyA = vi.fn().mockResolvedValue({ success: true });
+      installMockBrowserEnvironment({
+        getAppInfo: vi.fn().mockResolvedValue({ platform: 'darwin', arch: 'arm64' }),
+        getGameLaunchConfigs: vi.fn().mockResolvedValue({ success: true, configs: {} }),
+        scanAllInstalledGames: vi.fn().mockResolvedValue({ success: true, installedGames: [] }),
+        detectCompatibilityLayers: vi.fn().mockResolvedValue({ success: true, layers: [] }),
+        getRunningGames: vi.fn().mockResolvedValue({ success: true, runningGames: [] }),
+        onGameSessionEvent: vi.fn().mockReturnValue(() => {}),
+        onCompatibilityRunnerProgress: vi.fn().mockReturnValue(() => {}),
+        getSavedTokens: vi.fn().mockResolvedValue({
+          epic: { access_token: 'tok-epic', accountId: 'u-epic' },
+        }),
+        syncStore: vi.fn().mockResolvedValue({
+          success: true,
+          authoritativeComplete: true,
+          games: seedEpic.map((g) => ({
+            ...g,
+            platforms: g.platforms.map((p) => ({
+              ...p,
+              achievements: p.achievements
+                ? { ...p.achievements, syncedAt: '2026-11-20T15:23:22.058Z' }
+                : undefined,
+            })),
+          })),
+        }),
+        offlineVault: {
+          upsertGames: upsertSpyA,
+          deleteGames: deleteSpyA,
+          getCatalogSnapshot: vi.fn().mockResolvedValue({ success: false, games: [] }),
+        },
+      });
+      vi.spyOn(integrationStorage, 'loadIntegrations').mockReturnValue([
+        { storefrontId: 'epic', isConnected: true, accountName: 'EpicUser' },
+      ] as ReturnType<typeof integrationStorage.loadIntegrations>);
+      vi.spyOn(integrationStorage, 'saveIntegrations').mockImplementation(() => {});
+      vi.spyOn(localSystemScanner, 'scanLocalInstalledGames').mockResolvedValue({
+        success: true,
+        installedSteamAppIds: [],
+        installedGames: [],
+      });
+      vi.spyOn(steamAchievementsService, 'scanLocalAchievementsSingleFlight').mockResolvedValue({});
+      vi.spyOn(steamAchievementsService, 'syncUserLibraryAchievements').mockResolvedValue({});
+
+      let currentGamesA = stabilized;
+      const gamesRefA = { current: currentGamesA };
+      const setGamesA = vi.fn((u: React.SetStateAction<CanonicalGame[]>) => {
+        currentGamesA = typeof u === 'function' ? u(currentGamesA) : u;
+        gamesRefA.current = currentGamesA;
+      });
+      const HookProbe = (props: UseLocalInstallSyncParams) => {
+        useLocalInstallSync(props);
+        return null;
+      };
+      const harnessA = createDomain12DeepRenderer(HookProbe, {
+        gamesRef: gamesRefA,
+        setGames: setGamesA,
+        overlayLauncherInstalledState: (catalog) => catalog,
+        showSyncNotice: vi.fn(),
+        isModalOpen: false,
+        isCatalogVaultHydrated: true,
+        onCatalogPersisted: vi.fn(),
+      });
+      harnessA.render();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await flushMicrotasks(20);
+      expect(upsertSpyA).not.toHaveBeenCalled();
+      expect(deleteSpyA).not.toHaveBeenCalled();
+      expect(setGamesA).not.toHaveBeenCalled();
+      harnessA.unmount();
+
+      // Case B: 25 Epic games progress unlocked 4 -> 5 AND 1 Epic game (#29) is authoritatively removed ->
+      // upsertGames receives ONLY the 25 mutated games (NOT all 79!) and deleteGames receives the 1 removed game!
+      const upsertSpyB = vi.fn().mockResolvedValue({ success: true });
+      const deleteSpyB = vi.fn().mockResolvedValue({ success: true });
+      const incomingEpicMutated = seedEpic.slice(0, 29).map((g, idx) =>
+        idx < 25
+          ? {
+              ...g,
+              platforms: g.platforms.map((p) => ({
+                ...p,
+                achievements: p.achievements
+                  ? {
+                      ...p.achievements,
+                      unlocked: 5,
+                      percentage: 25,
+                      syncedAt: '2026-11-20T15:24:00.000Z',
+                    }
+                  : undefined,
+              })),
+            }
+          : g
+      );
+      installMockBrowserEnvironment({
+        getAppInfo: vi.fn().mockResolvedValue({ platform: 'darwin', arch: 'arm64' }),
+        getGameLaunchConfigs: vi.fn().mockResolvedValue({ success: true, configs: {} }),
+        scanAllInstalledGames: vi.fn().mockResolvedValue({ success: true, installedGames: [] }),
+        detectCompatibilityLayers: vi.fn().mockResolvedValue({ success: true, layers: [] }),
+        getRunningGames: vi.fn().mockResolvedValue({ success: true, runningGames: [] }),
+        onGameSessionEvent: vi.fn().mockReturnValue(() => {}),
+        onCompatibilityRunnerProgress: vi.fn().mockReturnValue(() => {}),
+        getSavedTokens: vi.fn().mockResolvedValue({
+          epic: { access_token: 'tok-epic', accountId: 'u-epic' },
+        }),
+        syncStore: vi.fn().mockResolvedValue({
+          success: true,
+          authoritativeComplete: true,
+          games: incomingEpicMutated,
+        }),
+        offlineVault: {
+          upsertGames: upsertSpyB,
+          deleteGames: deleteSpyB,
+          getCatalogSnapshot: vi.fn().mockResolvedValue({ success: false, games: [] }),
+        },
+      });
+
+      let currentGamesB = stabilized;
+      const gamesRefB = { current: currentGamesB };
+      const setGamesB = vi.fn((u: React.SetStateAction<CanonicalGame[]>) => {
+        currentGamesB = typeof u === 'function' ? u(currentGamesB) : u;
+        gamesRefB.current = currentGamesB;
+      });
+      const harnessB = createDomain12DeepRenderer(HookProbe, {
+        gamesRef: gamesRefB,
+        setGames: setGamesB,
+        overlayLauncherInstalledState: (catalog) => catalog,
+        showSyncNotice: vi.fn(),
+        isModalOpen: false,
+        isCatalogVaultHydrated: true,
+        onCatalogPersisted: vi.fn(),
+      });
+      harnessB.render();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await flushMicrotasks(20);
+
+      expect(upsertSpyB).toHaveBeenCalledTimes(1);
+      const upsertedSlice = (upsertSpyB.mock.calls[0] as unknown as [CanonicalGame[]])[0];
+      expect(upsertedSlice).toHaveLength(25);
+      expect(deleteSpyB).toHaveBeenCalledWith(['epic-sync-29']);
+      harnessB.unmount();
+    });
   });
 
   // ---------------------------------------------------------------------------

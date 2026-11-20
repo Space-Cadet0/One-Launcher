@@ -2281,9 +2281,10 @@ class OfflineVaultService {
     const db = this.ensureOpen();
     const nowTs = this.now();
     let upserted = 0;
+    let skipped = 0;
 
     const selectExistingStmt = db.prepare(
-      'SELECT steam_app_id, is_favorited, archived_by_subscription_rotation, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
+      'SELECT canonical_title, steam_app_id, is_installed, is_favorited, archived_by_subscription_rotation, platforms_json, summary_json, enriched_json, metadata_quality, enriched_at FROM vault_games WHERE game_id = ?'
     );
     const deleteOrphanAssetsStmt = db.prepare('DELETE FROM game_media_assets WHERE game_id = ?');
     const deleteOrphanUrlCacheStmt = db.prepare('DELETE FROM url_resolution_cache WHERE game_id = ?');
@@ -2319,8 +2320,18 @@ class OfflineVaultService {
         const rawPlatforms = Array.isArray(g.platforms) ? g.platforms : null;
         const incomingEnrichedPreview =
           g.enrichedMetadata && typeof g.enrichedMetadata === 'object' ? g.enrichedMetadata : null;
-        const existingEnrichedObj =
-          existing && existing.enriched_json ? parseVaultJson(existing.enriched_json) : null;
+        const existingEnrichedStr =
+          existing && existing.enriched_json
+            ? decompressVaultJsonString(existing.enriched_json)
+            : null;
+        let existingEnrichedObj = null;
+        if (existingEnrichedStr) {
+          try {
+            existingEnrichedObj = JSON.parse(existingEnrichedStr);
+          } catch {
+            existingEnrichedObj = null;
+          }
+        }
         const hasEnrichedForOsSanitize = Boolean(
           (incomingEnrichedPreview &&
             !(
@@ -2497,8 +2508,8 @@ class OfflineVaultService {
         ) {
           summaryCopy.worksOn = { windows: true, mac: false, linux: false };
         }
-        const summaryJson = compressVaultJson(JSON.stringify(summaryCopy));
-        const platformsJson = platforms ? compressVaultJson(JSON.stringify(platforms)) : null;
+        const rawSummaryJson = JSON.stringify(summaryCopy);
+        const rawPlatformsJson = platforms ? JSON.stringify(platforms) : null;
 
         const incomingEnriched =
           g.enrichedMetadata && typeof g.enrichedMetadata === 'object'
@@ -2518,13 +2529,11 @@ class OfflineVaultService {
           incomingEnriched.xboxDeliveryHints = existingEnrichedObj.xboxDeliveryHints;
         }
 
-        const incomingEnrichedJson = incomingEnriched
-          ? compressVaultJson(JSON.stringify(incomingEnriched))
-          : null;
+        const rawIncomingEnrichedJson = incomingEnriched ? JSON.stringify(incomingEnriched) : null;
 
-        let finalEnrichedJson = incomingEnrichedJson;
+        let keepExistingEnriched = false;
         let finalQuality = incomingQuality;
-        let finalEnrichedAt = incomingEnrichedJson ? nowTs : 0;
+        let finalEnrichedAt = rawIncomingEnrichedJson ? nowTs : 0;
 
         if (existing && existing.enriched_json) {
           let existingQuality = String(existing.metadata_quality || 'skeleton_fallback');
@@ -2542,9 +2551,12 @@ class OfflineVaultService {
 
           const existingRank = METADATA_QUALITY_RANK[existingQuality] ?? 0;
           const incomingRank = METADATA_QUALITY_RANK[incomingQuality] ?? 0;
-          if (!incomingEnrichedJson || existingRank > incomingRank) {
-            finalEnrichedJson = compressVaultJson(existing.enriched_json);
+          if (!rawIncomingEnrichedJson || existingRank > incomingRank) {
+            keepExistingEnriched = true;
             finalQuality = existingQuality;
+            finalEnrichedAt = Number(existing.enriched_at || nowTs);
+          } else if (rawIncomingEnrichedJson === existingEnrichedStr) {
+            keepExistingEnriched = true;
             finalEnrichedAt = Number(existing.enriched_at || nowTs);
           }
         }
@@ -2552,23 +2564,66 @@ class OfflineVaultService {
         const archivedByRotation =
           g.archivedBySubscriptionRotation === true ? 1 : 0;
 
-        upsertStmt.run(
-          gameId,
-          String(g.title || ''),
-          steamAppId,
-          isInstalled,
-          isFavorited,
-          archivedByRotation,
-          platformsJson,
-          summaryJson,
-          finalEnrichedJson,
-          finalQuality,
-          nowTs,
-          finalEnrichedAt
-        );
+        let isRowUnchanged = false;
+        if (existing) {
+          const existingSummaryStr =
+            existing.summary_json !== null && existing.summary_json !== undefined
+              ? decompressVaultJsonString(existing.summary_json)
+              : null;
+          const existingPlatformsStr =
+            existing.platforms_json !== null && existing.platforms_json !== undefined
+              ? decompressVaultJsonString(existing.platforms_json)
+              : null;
+          const effectivePlatformsStr =
+            rawPlatformsJson !== null ? rawPlatformsJson : existingPlatformsStr;
+          const incomingTitle = String(g.title || '');
+          const effectiveTitle =
+            incomingTitle !== '' ? incomingTitle : String(existing.canonical_title || '');
+          const effectiveEnrichedStr = keepExistingEnriched
+            ? existingEnrichedStr
+            : rawIncomingEnrichedJson;
 
-        const activeEnriched =
-          finalEnrichedJson === incomingEnrichedJson ? incomingEnriched : existingEnrichedObj;
+          isRowUnchanged =
+            effectiveTitle === String(existing.canonical_title || '') &&
+            (steamAppId ?? null) === (existing.steam_app_id ?? null) &&
+            isInstalled === Number(existing.is_installed || 0) &&
+            isFavorited === Number(existing.is_favorited || 0) &&
+            archivedByRotation === Number(existing.archived_by_subscription_rotation || 0) &&
+            finalQuality === String(existing.metadata_quality || 'skeleton_fallback') &&
+            rawSummaryJson === existingSummaryStr &&
+            effectivePlatformsStr === existingPlatformsStr &&
+            effectiveEnrichedStr === existingEnrichedStr;
+        }
+
+        if (isRowUnchanged) {
+          skipped++;
+        } else {
+          const summaryJson = compressVaultJson(rawSummaryJson);
+          const platformsJson = rawPlatformsJson ? compressVaultJson(rawPlatformsJson) : null;
+          const finalEnrichedJson = keepExistingEnriched
+            ? compressVaultJson(existing.enriched_json)
+            : rawIncomingEnrichedJson
+              ? compressVaultJson(rawIncomingEnrichedJson)
+              : null;
+
+          upsertStmt.run(
+            gameId,
+            String(g.title || ''),
+            steamAppId,
+            isInstalled,
+            isFavorited,
+            archivedByRotation,
+            platformsJson,
+            summaryJson,
+            finalEnrichedJson,
+            finalQuality,
+            nowTs,
+            finalEnrichedAt
+          );
+          upserted++;
+        }
+
+        const activeEnriched = keepExistingEnriched ? existingEnrichedObj : incomingEnriched;
         const coverCandidate = g.capsuleImage || activeEnriched?.capsuleImage;
         const headerCandidate = g.headerImage || activeEnriched?.headerImage;
         const iconCandidate = g.iconUrl || activeEnriched?.iconUrl;
@@ -2611,8 +2666,6 @@ class OfflineVaultService {
             }
           });
         }
-
-        upserted++;
       }
       db.exec('COMMIT');
     } catch (txErr) {
@@ -2625,7 +2678,7 @@ class OfflineVaultService {
       };
     }
 
-    return { success: true, upserted };
+    return { success: true, upserted, skipped };
   }
 
   /**
